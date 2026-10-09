@@ -19,6 +19,7 @@
 //!    these pairs). Without named graphs GSPO is SPO behind the one graph. Writers run
 //!    in threads of their own. Statistics for the planner are gathered on the way.
 
+mod iostat;
 mod runs;
 mod vocabmerge;
 
@@ -196,6 +197,10 @@ pub struct Builder {
     named_graphs: AtomicBool,
     progress: Option<MessageFn>,
     interrupt: Option<InterruptFn>,
+    /// bytes written to temporary files, for the phase log (see [`iostat`])
+    tmp_bytes: iostat::TmpBytes,
+    /// the start of the current phase and of the build
+    phases: Mutex<(iostat::Phases, iostat::Phases)>,
 }
 
 /// The messages of a long-running build, one per phase (`building POS`). A build does
@@ -232,6 +237,8 @@ impl Builder {
             named_graphs: AtomicBool::new(false),
             progress: None,
             interrupt: None,
+            tmp_bytes: Default::default(),
+            phases: Mutex::new((iostat::Phases::start(), iostat::Phases::start())),
         })
     }
 
@@ -250,6 +257,11 @@ impl Builder {
             Some(f) => f(),
             None => Ok(()),
         }
+    }
+
+    /// Log the phase `name` that ends now (see [`iostat`]).
+    fn phase_done(&self, name: &str) {
+        self.phases.lock().0.end(name, &self.tmp_bytes);
     }
 
     fn report(&self, msg: &str) {
@@ -301,11 +313,14 @@ impl Builder {
             rank[*local as usize] = r as u64;
         }
         let mut w = BufWriter::new(File::create(self.tmp.join(format!("b{id}.voc")))?);
+        let mut voc_bytes = 0;
         for (k, _) in &entries {
             w.write_all(&(k.len() as u32).to_le_bytes())?;
             w.write_all(k)?;
+            voc_bytes += 4 + k.len() as u64;
         }
         w.flush()?;
+        self.tmp_bytes.add(iostat::Tmp::PartialVocab, voc_bytes);
         let samples = vocabmerge::samples(entries.iter().map(|(k, _)| &**k));
         for q in quads.iter_mut() {
             for v in q.iter_mut() {
@@ -315,6 +330,8 @@ impl Builder {
             }
         }
         write_u64s(&self.tmp.join(format!("b{id}.q")), quads.as_flattened())?;
+        self.tmp_bytes
+            .add(iostat::Tmp::Quads, quads.len() as u64 * 32);
         self.input_quads
             .fetch_add(quads.len() as u64, Ordering::Relaxed);
         if quads.iter().any(|q| q[3] != Id::DEFAULT_GRAPH.0) {
@@ -334,6 +351,7 @@ impl Builder {
         let mut batches = std::mem::take(&mut *self.batches.lock());
         batches.sort_by_key(|b| b.id);
         let total_in: u64 = batches.iter().map(|b| b.quads).sum();
+        self.phase_done("parse");
         self.report(&format!(
             "merging {} partial vocabularies ({} input quads)",
             batches.len(),
@@ -360,12 +378,18 @@ impl Builder {
                 samples: std::mem::take(&mut b.samples),
             })
             .collect();
-        let (terms, starts) = vocabmerge::merge(&self.dir, &self.tmp, &parts, threads, &|| {
-            self.interrupted()
-        })?;
+        let (terms, starts) = vocabmerge::merge(
+            &self.dir,
+            &self.tmp,
+            &parts,
+            threads,
+            &self.tmp_bytes,
+            &|| self.interrupted(),
+        )?;
         for p in parts {
             std::fs::remove_file(p.voc)?;
         }
+        self.phase_done("vocabulary merge");
         self.report(&format!("vocabulary: {terms} terms"));
 
         // ---- 3. remap and sort; 4. permutations ------------------------------------
@@ -377,10 +401,15 @@ impl Builder {
         drop(vocab);
         let plan = Plan::new(self.named_graphs.load(Ordering::Relaxed));
         let mut built = if total_in as usize <= self.opts.sort_mem_quads {
-            self.build_in_memory(&batches, &starts, &plan, rdf_type)?
+            let built = self.build_in_memory(&batches, &starts, &plan, rdf_type)?;
+            self.phase_done("sort and permutations");
+            built
         } else {
             let runs = self.sorted_runs(&batches, &starts, &plan)?;
-            self.merge_runs(runs, &plan, rdf_type)?
+            self.phase_done("chunk sorts");
+            let built = self.merge_runs(runs, &plan, rdf_type)?;
+            self.phase_done("permutations");
+            built
         };
         // statistics in Perm::ALL order: POS adds to the predicates PSO found
         built.sort_by_key(|(p, _, _)| p.index());
@@ -420,6 +449,21 @@ impl Builder {
         )?;
         let _ = std::fs::remove_dir_all(&self.tmp);
         crate::store::sync_dir(&self.dir)?;
+        {
+            let mut phases = self.phases.lock();
+            phases.0.end("statistics", &self.tmp_bytes);
+            phases.1.end("total", &self.tmp_bytes);
+        }
+        let index_bytes: u64 = std::fs::read_dir(&self.dir)?
+            .filter_map(|e| e.ok()?.metadata().ok())
+            .filter(|m| m.is_file())
+            .map(|m| m.len())
+            .sum();
+        tracing::info!(
+            target: "sparkles::builder",
+            "index files: {:.1} MB",
+            index_bytes as f64 / 1e6
+        );
         self.report(&format!("index complete: {rows} quads, {terms} terms"));
         Ok(meta)
     }
@@ -523,7 +567,8 @@ impl Builder {
                     buf.dedup();
                 }
                 let p = self.tmp.join(format!("run-{}-{c}", first.name()));
-                runs::write_run(&p, &buf)?;
+                let n = runs::write_run(&p, &buf)?;
+                self.tmp_bytes.add(iostat::Tmp::Runs, n);
                 runs[o].push(p);
             }
         }
@@ -642,6 +687,7 @@ impl Builder {
                                 }
                             }
                             rg.finish(&mut put)?;
+                            self.tmp_bytes.add(iostat::Tmp::Spills, rg.spilled_bytes);
                         }
                         // the same order behind a constant column: GSPO from SPO in one graph
                         None => {

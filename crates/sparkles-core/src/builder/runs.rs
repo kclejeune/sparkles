@@ -27,17 +27,19 @@ const READ_AHEAD: usize = 2;
 /// Bytes of a block header: rows and four column lengths.
 const HEADER: usize = 20;
 
-/// Write sorted keys as a run file.
-pub(super) fn write_run(path: &Path, keys: &[Key]) -> Result<()> {
+/// Write sorted keys as a run file. Returns its size.
+pub(super) fn write_run(path: &Path, keys: &[Key]) -> Result<u64> {
     let mut w = BufWriter::with_capacity(1 << 20, File::create(path)?);
+    let mut n = 0;
     for group in keys.chunks(RUN_BLOCK * ENCODE_GROUP) {
         let blocks: Vec<Vec<u8>> = group.par_chunks(RUN_BLOCK).map(encode_block).collect();
         for b in blocks {
             w.write_all(&b)?;
+            n += b.len() as u64;
         }
     }
     w.flush()?;
-    Ok(())
+    Ok(n)
 }
 
 fn encode_block(rows: &[Key]) -> Vec<u8> {
@@ -222,6 +224,8 @@ pub(super) struct Regroup {
     tmp: PathBuf,
     name: String,
     spilled: usize,
+    /// bytes of the spill files written so far
+    pub(super) spilled_bytes: u64,
 }
 
 impl Regroup {
@@ -234,6 +238,7 @@ impl Regroup {
             tmp: tmp.to_path_buf(),
             name: name.to_string(),
             spilled: 0,
+            spilled_bytes: 0,
         }
     }
 
@@ -256,7 +261,7 @@ impl Regroup {
             .tmp
             .join(format!("{}-spill-{}", self.name, self.spilled));
         self.spilled += 1;
-        write_run(&p, &self.buf)?;
+        self.spilled_bytes += write_run(&p, &self.buf)?;
         self.spills.push(p);
         self.buf.clear();
         Ok(())

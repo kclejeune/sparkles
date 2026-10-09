@@ -10,6 +10,7 @@
 //! range in the high bits and the id within the range in the low ones (see [`global`]).
 //! The range files are appended to the vocabulary in key order as they complete.
 
+use super::iostat::{Tmp, TmpBytes};
 use crate::error::{Error, Result};
 use crate::vocab::{VocabWriter, read_varint, write_varint};
 use std::cmp::Reverse;
@@ -51,6 +52,7 @@ pub(super) fn merge(
     tmp: &Path,
     parts: &[Partial],
     threads: usize,
+    tmp_bytes: &TmpBytes,
     interrupted: &(dyn Fn() -> Result<()> + Sync),
 ) -> Result<(u64, Vec<u64>)> {
     // the range boundaries: quantiles of the sampled keys
@@ -69,6 +71,7 @@ pub(super) fn merge(
         .map(|p| -> Result<File> {
             let f = File::create(&p.map)?;
             f.set_len(p.keys * 8)?;
+            tmp_bytes.add(Tmp::Maps, p.keys * 8);
             Ok(f)
         })
         .collect::<Result<_>>()?;
@@ -110,6 +113,7 @@ pub(super) fn merge(
             while let Some((n, path)) = done.remove(&starts.len()) {
                 starts.push(w.len());
                 let mut f = BufReader::with_capacity(1 << 20, File::open(&path)?);
+                tmp_bytes.add(Tmp::VocabRanges, f.get_ref().metadata()?.len());
                 key.clear();
                 for _ in 0..n {
                     read_front_coded(&mut f, &mut key, &mut buf)?;
@@ -374,7 +378,8 @@ mod tests {
                 }
             })
             .collect();
-        let (terms, starts) = merge(dir.path(), &tmp, &parts, 3, &|| Ok(())).unwrap();
+        let (terms, starts) =
+            merge(dir.path(), &tmp, &parts, 3, &Default::default(), &|| Ok(())).unwrap();
         let mut all: Vec<&Vec<u8>> = sets.iter().flatten().collect();
         all.sort();
         all.dedup();
