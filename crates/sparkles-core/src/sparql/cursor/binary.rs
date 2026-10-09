@@ -356,6 +356,32 @@ impl Binary {
             {
                 continue;
             }
+            let Some(expression) = &self.expression else {
+                // Without a predicate the merged row goes straight to the output.
+                self.matched = true;
+                match self.mode {
+                    Mode::Anti | Mode::Minus => self.advance(),
+                    Mode::Semi => {
+                        for (column, &(p, _)) in output.table.cols.iter_mut().zip(&self.columns) {
+                            column.push(p.map_or(Id::UNDEF, |c| probe.cols[c][self.row]));
+                        }
+                        output.table.len += 1;
+                        self.advance();
+                    }
+                    Mode::Inner | Mode::Optional => {
+                        for (column, &(p, b)) in output.table.cols.iter_mut().zip(&self.columns) {
+                            let p = p.map_or(Id::UNDEF, |c| probe.cols[c][self.row]);
+                            column.push(if p.is_undef() {
+                                b.map_or(p, |c| build.cols[c][other])
+                            } else {
+                                p
+                            });
+                        }
+                        output.table.len += 1;
+                    }
+                }
+                continue;
+            };
             for (column, &(p, b)) in predicate.cols.iter_mut().zip(&self.columns) {
                 let p = p.map_or(Id::UNDEF, |c| probe.cols[c][self.row]);
                 column[0] = if p.is_undef() {
@@ -364,19 +390,13 @@ impl Binary {
                     p
                 };
             }
-            if self.expression.as_ref().is_some_and(|e| {
-                !ebv(
-                    e,
-                    &Row {
-                        table: &predicate,
-                        i: 0,
-                        map: &map,
-                        dec: None,
-                    },
-                    ctx,
-                )
-                .unwrap_or(false)
-            }) {
+            let row = Row {
+                table: &predicate,
+                i: 0,
+                map: &map,
+                dec: None,
+            };
+            if !ebv(expression, &row, ctx).unwrap_or(false) {
                 ctx.check()?;
                 continue;
             }
