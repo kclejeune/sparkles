@@ -339,9 +339,13 @@ with Dataset("mydb") as ds:
 
 ## Development
 
-`mise run ci` runs the formatting checks, Clippy, every workspace test and the UI tests,
-and `mise run test:w3c`, `test:shacl` and `test:shex` run the conformance suites from an
-Apache Jena checkout. [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) covers the rest.
+`mise run ci` runs the formatting checks, the check of the source paths the docs cite,
+Clippy over the workspace and over feature combinations, the WebAssembly build of the
+formatter, every workspace test, the UI's type check and tests, the Python, JVM and
+Node bindings' lints and tests, and the third-party license check. `mise run ci:fast`
+runs only the formatting, doc path, Clippy and workspace test steps. `mise run
+test:w3c`, `test:shacl` and `test:shex` run the conformance suites from an Apache Jena
+checkout. [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) covers the rest.
 
 ## License
 
