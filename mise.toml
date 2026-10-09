@@ -824,6 +824,7 @@ flag "--warmup <n>" default="3" help="untimed requests per query and server proc
 flag "--rayon-threads <n>" default="1" help="RAYON_NUM_THREADS of the servers, or default"
 flag "--no-spin" help="no idle-priority busy loops on the server and client CPUs"
 flag "--serve-args <flags>" help="extra sparkles serve flags for both servers"
+flag "--execution <mode>" help="execution=MODE with every query, or A_MODE,B_MODE per variant"
 flag "--cargo-args <flags>" help="extra cargo build flags for revisions"
 flag "--duration <d>" default="2h" help="the instance's lifetime cap"
 flag "--out <dir>" help="results directory (default target/nsc-bench/<UTC time>)"
@@ -832,6 +833,7 @@ run = '''
 scripts/nsc-bench.sh --people "$usage_people" --rounds "$usage_rounds" --reps "$usage_reps" \
   --warmup "$usage_warmup" --rayon-threads "$usage_rayon_threads" --duration "$usage_duration" \
   ${usage_queries:+--queries "$usage_queries"} ${usage_query_dir:+--query-dir "$usage_query_dir"} \
-  ${usage_serve_args:+--serve-args "$usage_serve_args"} ${usage_cargo_args:+--cargo-args "$usage_cargo_args"} \
+  ${usage_serve_args:+--serve-args "$usage_serve_args"} ${usage_execution:+--execution "$usage_execution"} \
+  ${usage_cargo_args:+--cargo-args "$usage_cargo_args"} \
   ${usage_out:+--out "$usage_out"} ${usage_no_spin:+--no-spin} "$usage_a" "$usage_b"
 '''

@@ -24,7 +24,7 @@ cd "$(dirname "$0")"
 # shellcheck source=/dev/null
 source ./run.env
 : "${ROUNDS:=4}" "${REPS:=20}" "${WARMUP:=3}" "${SERVER_CPU:=2}" "${CLIENT_CPU:=4}"
-: "${RAYON_THREADS:=1}" "${PORT:=3999}" "${SERVE_ARGS:=}" "${MAX_TIME:=300}" "${SPIN:=1}"
+: "${RAYON_THREADS:=1}" "${PORT:=3999}" "${SERVE_ARGS:=}" "${EXECUTION:=}" "${MAX_TIME:=300}" "${SPIN:=1}"
 R=results
 mkdir -p "$R"
 # this script, its curl client and the log writer run on the client CPU, each server on its
@@ -86,9 +86,15 @@ mapfile -t QUERIES < <(cd queries && for f in *.rq; do echo "${f%.rq}"; done)
 log "queries: ${QUERIES[*]}"
 
 URL=localhost:$PORT/bench/sparql
+# EXECUTION is one mode for both variants or "A_MODE,B_MODE". The mode for the running
+# variant goes in the form body next to the query and is left out when EXECUTION is empty.
+EXEC_FIELD=()
 SPID=
 start_server() { # <variant> <epoch>
-  local env=()
+  local env=() mode=${EXECUTION%%,*}
+  [ "$1" = B ] && mode=${EXECUTION#*,}
+  EXEC_FIELD=()
+  [ -z "$mode" ] || EXEC_FIELD=(--data-urlencode "execution=$mode")
   [ "$RAYON_THREADS" != default ] && env=(RAYON_NUM_THREADS="$RAYON_THREADS")
   rm -rf "srv"
   # shellcheck disable=SC2086 # BIN is a command line and SERVE_ARGS a list of flags
@@ -113,7 +119,7 @@ SPINNERS=()
 request() { # <query> -> "execMs wallSeconds", or "error"
   local w e
   if ! w=$(curl -sS -f --max-time "$MAX_TIME" -o resp.json -w '%{time_total}' -H 'Accept: application/x-sparkles+json' \
-    --data-urlencode "query@queries/$1.rq" "$URL" 2> /dev/null); then
+    --data-urlencode "query@queries/$1.rq" "${EXEC_FIELD[@]}" "$URL" 2> /dev/null); then
     echo error
     return
   fi
@@ -141,7 +147,7 @@ for round in $(seq "$ROUNDS"); do
       checked+="$v "
       for q in "${QUERIES[@]}"; do
         if curl -sS -f --max-time "$MAX_TIME" -o ans.tsv -H 'Accept: text/tab-separated-values' \
-          --data-urlencode "query@queries/$q.rq" "$URL" 2> /dev/null; then
+          --data-urlencode "query@queries/$q.rq" "${EXEC_FIELD[@]}" "$URL" 2> /dev/null; then
           printf '%s\t%s\t%s\t%s\n' "$v" "$q" "$(($(wc -l < ans.tsv) - 1))" "$(sort ans.tsv | sha256sum | cut -c1-16)" >> "$R/answers.tsv"
         else
           printf '%s\t%s\terror\terror\n' "$v" "$q" >> "$R/answers.tsv"
