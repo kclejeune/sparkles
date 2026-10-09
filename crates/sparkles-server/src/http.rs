@@ -3258,7 +3258,7 @@ fn text_summary(ds: &Dataset) -> J {
 
 fn dataset_info(st: &AppState, ds: &Dataset) -> J {
     let n = &ds.name;
-    #[allow(unused_mut)]
+    #[cfg_attr(not(any(feature = "shacl", feature = "shex")), allow(unused_mut))]
     let mut endpoints = json!({
         "query": format!("/{n}/sparql"),
         "update": format!("/{n}/update"),

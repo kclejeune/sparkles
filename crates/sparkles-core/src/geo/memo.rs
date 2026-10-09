@@ -349,7 +349,6 @@ fn from_column(ctx: &Ctx, id: Id) -> Option<GeomRef> {
 
 /// Argument `i` of a function call as a geometry: the generation's geometry column for
 /// stored literals, else the memo (parsing on a miss). Not a geometry: a type error.
-#[allow(dead_code)] // the functions call it
 pub(crate) fn geom_arg(args: &[Expr], i: usize, row: &Row<'_>, ctx: &Ctx) -> EvalResult<GeomRef> {
     let e = args.get(i).ok_or(TypeError)?;
     match e {

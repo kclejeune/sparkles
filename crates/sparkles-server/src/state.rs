@@ -1286,7 +1286,6 @@ impl TaskHandle {
     }
 
     /// Whether a cancel request came in.
-    #[cfg_attr(not(any(test, feature = "backup")), allow(dead_code))]
     #[cfg(test)]
     pub fn is_cancelled(&self) -> bool {
         self.cancel.load(Ordering::Relaxed)

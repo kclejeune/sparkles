@@ -304,7 +304,7 @@ pub async fn whoami(
         principal["name"] = p.name.to_string().into();
     }
     let server: Vec<&str> = p.server_perms().iter().map(|s| s.as_str()).collect();
-    #[allow(unused_mut)]
+    #[cfg_attr(not(feature = "auth"), allow(unused_mut))]
     let mut doc = json!({
         "authEnabled": st.auth.is_some(),
         "principal": principal,

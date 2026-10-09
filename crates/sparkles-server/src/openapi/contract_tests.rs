@@ -247,7 +247,7 @@ async fn until(app: &axum::Router, uri: &str, done: impl Fn(&J) -> bool) {
 async fn admin_responses_match_their_schemas() {
     let dir = tempfile::tempdir().unwrap();
     // mutable for the backup state, in builds that have it
-    #[allow(unused_mut)]
+    #[cfg_attr(not(feature = "backup"), allow(unused_mut))]
     let mut st = AppState::new(
         &dir.path().join("data"),
         Default::default(),
@@ -280,7 +280,15 @@ async fn admin_responses_match_their_schemas() {
         .unwrap();
     assert!(res.status().is_success());
     // the routes to check, after the features they report on are set up
-    #[allow(unused_mut)]
+    #[cfg_attr(
+        not(any(
+            feature = "text",
+            feature = "geo",
+            feature = "reasoning",
+            feature = "backup"
+        )),
+        allow(unused_mut)
+    )]
     let mut routes: Vec<(&str, &str)> = vec![
         ("/$/history/{ds}", "/$/history/h"),
         ("/$/snapshots/{ds}", "/$/snapshots/h"),
