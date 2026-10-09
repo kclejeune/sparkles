@@ -156,10 +156,15 @@ These are features other RDF stores have and Sparkles does not have yet.
 [BENCHMARKS.md](BENCHMARKS.md#where-sparkles-loses) covers performance.
 
 * **Scale and execution.** The largest measured dataset is English DBpedia, 1.24 billion
-  triples on one machine. Nothing larger, such as Wikidata, has been tried. Every
-  operator materializes its result, within budgets. There is no lazy, block-wise
-  execution, FSST vocabulary compression, IRI encoding, pattern trick, pinned results,
-  materialized views or live query monitoring.
+  triples on one machine. Nothing larger, such as Wikidata, has been tried. Queries run
+  eagerly by default, and each operator then materializes its result within budgets.
+  Streaming execution ([X05](specs/X05-streaming-query-execution.md)) is opt-in, apart
+  from the scans and OPTIONAL counts that automatic selection picks. It runs scans,
+  joins, DISTINCT and eligible aggregates batch by batch. Sorts and DESCRIBE still
+  collect their whole input, and EXISTS and the operators it does not support run
+  eagerly. Operator state is never spilled to disk, so a query whose state outgrows its
+  budget fails. There is no FSST vocabulary compression, IRI encoding, pattern trick,
+  pinned results, materialized views or live query monitoring.
 * **Inference.** Inference is forward materialization, plus Jena's RDFS on read. There
   are no other on-the-fly rules and no backward (LP) rules. Incremental maintenance does not cover rules with `noValue`,
   `now` or new blank nodes, or RDF lists that change under OWL 2 RL. Those runs, and the
