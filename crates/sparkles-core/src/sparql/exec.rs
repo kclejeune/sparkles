@@ -6,6 +6,7 @@ use super::exprcache::Report as ExprReport;
 use super::plan::{
     Agg, GraphFilter, JoinAlgo, Kind, Node, OrderedTopK, PathEnd, PathSpec, RangeSpec, ScanSpec,
 };
+use super::sortkey::{Entry, Screen, SortKey, TopK, sort_positions};
 use super::table::{Table, VarId};
 use super::value::{NumOp, Value, arith, order_cmp};
 use crate::error::{Error, Result};
@@ -3381,6 +3382,23 @@ fn order_by(
         ids.dedup();
         ctx.snap.generation.vocab.prefetch_sorted(&ids);
     }
+    if let Some(k) = limit
+        && k > 0
+        && k < t.len()
+        && heap_eligible(ctx)
+    {
+        let n = t.len();
+        let mut heap = TopK::new(k, keys.iter().map(|(_, asc)| *asc).collect());
+        let ranked = offer_rows(ctx, &mut heap, &t, keys, report, &mut RowIndex)?;
+        ctx.check()?;
+        let idx: Vec<usize> = heap.into_sorted().into_iter().map(|e| e.payload).collect();
+        ctx.check_output(idx.len(), t.width())?;
+        let note = format!(
+            "[top-k heap kept {} of {n} rows, {ranked} ranked on every key]",
+            idx.len()
+        );
+        return Ok((t.take_rows(&idx), Some(note)));
+    }
     let mut notes = Vec::new();
     let mut cursor_candidate_charge = None;
     if let Some(k) = limit
@@ -3415,6 +3433,131 @@ fn order_by(
     }
     let note = (!notes.is_empty()).then(|| notes.join(" "));
     Ok((order_by_rows(ctx, t, keys, limit, report)?, note))
+}
+
+/// Whether ORDER BY with LIMIT keeps its rows in a [`TopK`] heap. Extension callbacks
+/// in a key would be called for fewer rows than the full sort calls them for, so their
+/// queries keep the full sort.
+pub(super) fn heap_eligible(ctx: &Ctx) -> bool {
+    ctx.opt.topk_heap && !ctx.calls_extensions
+}
+
+/// How [`offer_rows`] reads an ORDER BY key of a row.
+enum HeapKey<'a> {
+    /// A variable's column, or unbound on every row when the input lacks it.
+    Var(Option<&'a [Id]>),
+    /// The first key, evaluated for the whole input once per distinct value or per row.
+    Column(super::exprcache::Column<SortKey>),
+    /// A later key, evaluated only when a row's first key lets it enter.
+    Expr(&'a Expr),
+}
+
+/// The key of a variable's id. Inline numbers need no decoding.
+#[inline]
+fn id_key(ctx: &Ctx, id: Id) -> SortKey {
+    SortKey::new(ctx.value(id))
+}
+
+/// Where [`offer_rows`] keeps the rows that may enter a [`TopK`].
+pub(super) trait HeapRows<P> {
+    /// Keep row `i` of the input for an entry with these keys.
+    fn keep(&mut self, i: usize, keys: &[SortKey]) -> Result<P>;
+    /// An entry left the heap, or an offered row did not enter.
+    fn release(&mut self, entry: Entry<P>) -> Result<()>;
+}
+
+/// Eager execution keeps the input table, so an entry is a row index.
+struct RowIndex;
+
+impl HeapRows<usize> for RowIndex {
+    fn keep(&mut self, i: usize, _: &[SortKey]) -> Result<usize> {
+        Ok(i)
+    }
+    fn release(&mut self, _: Entry<usize>) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Offer every row of `t` to `heap`, in row order. The first key is read for every row.
+/// The later keys are evaluated only for rows whose first key does not already rank
+/// them behind every kept row, so later keys that must be decoded or computed cost
+/// nothing for most rows. Returns how many rows were evaluated on every key.
+pub(super) fn offer_rows<P>(
+    ctx: &Ctx,
+    heap: &mut TopK<P>,
+    t: &Table,
+    keys: &[(Expr, bool)],
+    report: &mut ExprReport,
+    rows: &mut impl HeapRows<P>,
+) -> Result<usize> {
+    let mut sources = Vec::with_capacity(keys.len());
+    for (i, (e, _)) in keys.iter().enumerate() {
+        sources.push(match e {
+            Expr::Var(v) => HeapKey::Var(t.col_of(*v).map(|c| t.cols[c].as_slice())),
+            _ if i == 0 => HeapKey::Column(key_column(ctx, t, e, report)?.map(SortKey::new)),
+            _ => HeapKey::Expr(e),
+        });
+    }
+    let map = t.var_map(ctx.nvars());
+    let key_of = |i: usize, k: usize| -> SortKey {
+        match &sources[k] {
+            HeapKey::Var(Some(col)) => id_key(ctx, col[i]),
+            HeapKey::Var(None) => SortKey::NULL,
+            HeapKey::Column(c) => c.get(i).clone(),
+            HeapKey::Expr(e) => SortKey::new(
+                eval(
+                    e,
+                    &Row {
+                        table: t,
+                        i,
+                        map: &map,
+                        dec: None,
+                    },
+                    ctx,
+                )
+                .ok()
+                .and_then(|v| match v {
+                    Val::Id(id) => ctx.value(id),
+                    Val::V(v) | Val::Dec(_, v) => Some(v),
+                }),
+            ),
+        }
+    };
+    let mut ranked = 0;
+    for i in 0..t.len() {
+        if i.is_multiple_of(4096) {
+            ctx.check()?;
+        }
+        let first = match &sources[0] {
+            HeapKey::Column(c) => {
+                // screen by reference: most rows of a large input leave here
+                if heap.screen(c.get(i)) == Screen::Reject {
+                    heap.skip();
+                    continue;
+                }
+                c.get(i).clone()
+            }
+            _ => {
+                let first = key_of(i, 0);
+                if heap.screen(&first) == Screen::Reject {
+                    heap.skip();
+                    continue;
+                }
+                first
+            }
+        };
+        let mut row = Vec::with_capacity(keys.len());
+        row.push(first);
+        for k in 1..keys.len() {
+            row.push(key_of(i, k));
+        }
+        ranked += 1;
+        let payload = rows.keep(i, &row)?;
+        if let Some(out) = heap.offer(row, payload) {
+            rows.release(out)?;
+        }
+    }
+    Ok(ranked)
 }
 
 /// Candidates for `ORDER BY k1 k2 … LIMIT k`: a row whose first key is worse than the
@@ -3621,7 +3764,19 @@ fn order_by_rows(
         .map(|((e, _), _)| e)
         .collect();
     let dec = decode_for(ctx, &t, &rest);
-    let key_vals: Vec<super::exprcache::Column<Option<Value>>> = keys
+    // Each key is classified once, so a comparison rarely needs the values themselves.
+    let _key_charge = if ctx.is_cursor() {
+        Some(
+            ctx.charge(
+                (t.len() as u64)
+                    .saturating_mul(keys.len() as u64)
+                    .saturating_mul(std::mem::size_of::<SortKey>() as u64),
+            )?,
+        )
+    } else {
+        None
+    };
+    let key_vals: Vec<super::exprcache::Column<SortKey>> = keys
         .iter()
         .zip(cached)
         .map(|((e, _), c)| {
@@ -3632,31 +3787,34 @@ fn order_by_rows(
                     vals: key_rows(ctx, &t, e, dec.as_ref())?,
                     _charge: None,
                 },
-            })
+            }
+            .map(SortKey::new))
         })
         .collect::<Result<_>>()?;
     ctx.check()?;
-    let cmp = |a: &usize, b: &usize| {
+    let order = |a: usize, b: usize| {
         for (k, (_, asc)) in keys.iter().enumerate() {
-            let o = order_cmp(key_vals[k].get(*a).as_ref(), key_vals[k].get(*b).as_ref());
+            let o = key_vals[k].get(a).cmp(key_vals[k].get(b));
             let o = if *asc { o } else { o.reverse() };
             if o != Ordering::Equal {
                 return o;
             }
         }
-        a.cmp(b)
+        Ordering::Equal
     };
-    let mut idx: Vec<usize> = (0..t.len()).collect();
-    match limit {
-        Some(k) if k < idx.len() => {
+    let idx = match limit {
+        Some(k) if k < t.len() => {
+            let cmp = |a: &usize, b: &usize| order(*a, *b).then(a.cmp(b));
+            let mut idx: Vec<usize> = (0..t.len()).collect();
             if k > 0 {
                 idx.select_nth_unstable_by(k - 1, cmp);
             }
             idx.truncate(k);
             idx.sort_by(cmp);
+            idx
         }
-        _ => idx.par_sort_by(cmp),
-    }
+        _ => sort_positions(t.len(), order),
+    };
     ctx.check()?;
     ctx.check_output(idx.len(), t.width())?;
     Ok(t.take_rows(&idx))

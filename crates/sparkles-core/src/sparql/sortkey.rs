@@ -101,11 +101,6 @@ impl SortKey {
         }
     }
 
-    /// The value the key was made from.
-    pub fn value(&self) -> Option<&Value> {
-        self.value.as_ref()
-    }
-
     /// Bytes this key keeps beyond its own size, for memory accounting.
     pub fn payload_bytes(&self) -> u64 {
         match &self.value {
@@ -223,27 +218,19 @@ impl<P> TopK<P> {
         }
     }
 
-    pub fn len(&self) -> usize {
+    /// The number of rows kept now.
+    pub fn kept(&self) -> usize {
         self.heap.len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.heap.is_empty()
-    }
-
-    /// Rows offered so far.
-    pub fn seen(&self) -> u64 {
-        self.seen
+    /// The number of rows kept at most.
+    pub fn k(&self) -> usize {
+        self.k
     }
 
     /// Whether the heap holds `k` rows, so that a new row must beat the worst of them.
     pub fn is_full(&self) -> bool {
         self.heap.len() >= self.k
-    }
-
-    /// The kept entries, in heap order.
-    pub fn entries(&self) -> &[Entry<P>] {
-        &self.heap
     }
 
     fn worse(&self, a: &Entry<P>, b: &Entry<P>) -> bool {

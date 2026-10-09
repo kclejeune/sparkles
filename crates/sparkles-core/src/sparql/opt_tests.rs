@@ -598,6 +598,7 @@ fn numeric_top_k_prefilter_keeps_the_exact_order() {
         // compare with the same plan minus the prefilter
         let with = Optimizations {
             ordered_topk: false,
+            topk_heap: false,
             ..Optimizations::ALL
         };
         let fast = run(&s, q, with);
@@ -608,11 +609,28 @@ fn numeric_top_k_prefilter_keeps_the_exact_order() {
         let slow = run(&s, q, without);
         assert_eq!(fast.rows(), slow.rows(), "{q}");
         assert!(has_desc(&fast.plan, "numeric prefilter"), "{q}");
+        let heap = run(
+            &s,
+            q,
+            Optimizations {
+                topk_heap: true,
+                ..with
+            },
+        );
+        assert_eq!(heap.rows(), slow.rows(), "{q}");
+        assert!(has_desc(&heap.plan, "top-k heap"), "{q}");
     }
     // a non-numeric value disables it
     update(&s, "INSERT DATA { ex:x ex:v \"text\" }");
     let q = "SELECT ?s ?v WHERE { ?s ex:v ?v } ORDER BY DESC(?v) LIMIT 10";
-    let fast = run(&s, q, Optimizations::ALL);
+    let fast = run(
+        &s,
+        q,
+        Optimizations {
+            topk_heap: false,
+            ..Optimizations::ALL
+        },
+    );
     assert!(!has_desc(&fast.plan, "numeric prefilter"));
     assert_eq!(
         solutions(&fast),
@@ -756,9 +774,13 @@ fn topk_queries() -> Vec<String> {
 #[test]
 fn first_key_prefilter_keeps_the_exact_order() {
     let s = topk_store(0x5851_f42d_4c95_7f2d, 6000, StoreOptions::default());
+    let with = Optimizations {
+        topk_heap: false,
+        ..Optimizations::ALL
+    };
     let without = Optimizations {
         topk_first_key: false,
-        ..Optimizations::ALL
+        ..with
     };
     let mut kept = 0;
     let queries = [
@@ -776,10 +798,13 @@ fn first_key_prefilter_keeps_the_exact_order() {
         "SELECT ?s ?w WHERE { ?s ex:w ?w } ORDER BY STRLEN(\"x\") ?w ?s LIMIT 10",
     ];
     for q in queries {
-        let fast = run(&s, q, Optimizations::ALL);
+        let fast = run(&s, q, with);
         let slow = run(&s, q, without);
         assert_eq!(fast.rows(), slow.rows(), "{q}");
         assert!(!has_desc(&slow.plan, "first-key prefilter"), "{q}");
+        let heap = run(&s, q, Optimizations::ALL);
+        assert_eq!(heap.rows(), slow.rows(), "{q}");
+        assert!(has_desc(&heap.plan, "top-k heap"), "{q}");
         assert_eq!(
             solutions(&fast),
             solutions(&run(&s, q, Optimizations::NONE)),
@@ -788,6 +813,48 @@ fn first_key_prefilter_keeps_the_exact_order() {
         kept += has_desc(&fast.plan, "first-key prefilter") as usize;
     }
     assert!(kept >= queries.len() - 2, "{kept} of {}", queries.len());
+}
+
+#[test]
+fn top_k_heap_matches_the_full_sort_on_random_data() {
+    let s = topk_store(0x6a09_e667_f3bc_c908, 6000, StoreOptions::default());
+    let heap = Optimizations {
+        ordered_topk: false,
+        ..Optimizations::ALL
+    };
+    // the full sort and selection, without any top-k shortcut
+    let sort = Optimizations {
+        topk_heap: false,
+        topk_prefilter: false,
+        topk_first_key: false,
+        ..heap
+    };
+    let mut queries = topk_queries();
+    queries.extend(
+        [
+            "SELECT ?s ?v WHERE { ?s ex:v ?v } ORDER BY DESC(?v) ?s LIMIT 10",
+            "SELECT ?s ?v WHERE { ?s ex:v ?v } ORDER BY STR(?v) DESC(?s) LIMIT 25 OFFSET 3",
+            "SELECT ?s ?v WHERE { ?s ex:v ?v } ORDER BY ABS(?v) LIMIT 40",
+            "SELECT ?s ?v WHERE { ?s ex:v ?v } ORDER BY DESC(LANG(?v)) DATATYPE(?v) ?v ?s LIMIT 30",
+            "SELECT ?s ?w WHERE { ?s ex:w ?w } ORDER BY DESC(?w * 0) ?s LIMIT 15",
+            "SELECT ?s ?v ?w WHERE { ?s ex:v ?v OPTIONAL { ?s ex:w ?w FILTER(?w > 200) } } ORDER BY DESC(?w) ?v LIMIT 12",
+            "SELECT ?s ?v WHERE { ?s ex:v ?v } ORDER BY ?v LIMIT 5999",
+            "SELECT ?s ?v WHERE { ?s ex:v ?v } ORDER BY ?v LIMIT 1 OFFSET 5998",
+        ]
+        .map(String::from),
+    );
+    let mut used = 0;
+    for q in &queries {
+        let fast = run(&s, q, heap);
+        let slow = run(&s, q, sort);
+        assert_eq!(fast.rows(), slow.rows(), "{q}");
+        used += has_desc(&fast.plan, "top-k heap") as usize;
+    }
+    assert!(
+        used * 10 >= queries.len() * 8,
+        "{used} of {}",
+        queries.len()
+    );
 }
 
 #[test]
@@ -1259,7 +1326,7 @@ fn optimized_operators_obey_the_memory_budget() {
         ),
         (
             "SELECT ?s ?v WHERE { ?s ex:v ?v } ORDER BY DESC(?v) LIMIT 5",
-            "desc:numeric prefilter",
+            "desc:top-k heap",
         ),
         (
             "SELECT * WHERE { ?a ex:org ?o . ?b ex:org ?o }",
