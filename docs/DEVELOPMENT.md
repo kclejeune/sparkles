@@ -80,6 +80,7 @@ mise run bench:text   # full-text search: Sparkles vs Fuseki with jena-text vs Q
 mise run bench:watdiv # the same engines on WatDiv's 20 query templates, 11M triples
 mise run bench:shacl 100000; mise run bench:reasoner 100000 owl-rl
 mise run bench:shacl-write 100000   # 1-triple INSERT DATA latency with validation off / warn / reject
+mise run bench:nsc main HEAD        # interleaved A/B of two revisions on a Namespace instance (needs nsc)
 mise run licenses     # regenerate the third-party notices after a Cargo.lock or UI dependency change (licenses:check)
 ```
 
@@ -495,6 +496,64 @@ flake runs the same tests as its `ui-e2e` check (see [Nix](#nix)).
   WatDiv may be used freely on the condition that publications cite G. Aluç, O. Hartig,
   M. T. Özsu and K. Daudjee, "Diversified Stress Testing of RDF Data Management
   Systems", ISWC 2014.
+* `scripts/nsc-bench.sh A B` (`mise run bench:nsc A B`) compares the query times of two
+  Sparkles builds on an ephemeral [Namespace](https://namespace.so) instance, so a
+  relative A/B comparison does not have to wait for a quiet local machine. It needs the
+  `nsc` CLI, logged in to the workspace. A and B are git revisions or paths to `sparkles`
+  binaries. The script builds each revision locally before it creates the instance,
+  from a `git archive` of the revision, and caches the binary in `~/.cache/sparkles-nsc`
+  (`SPARKLES_NSC_CACHE`). The dataset comes from `scripts/gen-data.py` and is cached
+  there as zstd. The queries are those of `scripts/bench.sh` except `export-500k`.
+
+  ```sh
+  mise run bench:nsc main my-branch                                   # 1.05M triples, every query
+  mise run bench:nsc ba547b89 c2fe4b92 --queries "optional-count minus regex-iri"
+  scripts/nsc-bench.sh --people 1000000 --rounds 4 old/sparkles new/sparkles   # 10.5M triples
+  ```
+
+  The script creates one `linux/amd64:8x16` instance with a lifetime cap of two hours
+  (`--duration`) and destroys it when it exits, also after an error or Ctrl-C. It uploads
+  the compressed binaries, the data, the queries and `scripts/nsc-bench-remote.sh`, which
+  runs detached on the instance and needs only bash, busybox, curl and zstd. The binaries
+  are dynamically linked against the build host's glibc and run under the instance's
+  glibc loader. Each binary loads its own store from the same data. The remote script
+  then runs four rounds of A, B, B, A (`--rounds`). Each of these runs a fresh server
+  process pinned to CPU 2 with `RAYON_NUM_THREADS=1`, and the client and curl are pinned
+  to CPU 4, a different physical core. A busy loop at the lowest scheduling priority runs
+  on both CPUs, so that their vCPUs do not halt between requests (`--no-spin` turns it
+  off). In a test with one binary, this halved the variation of the timings. In each
+  server process every query gets 3 untimed and 20 timed requests (`--warmup`, `--reps`). A timed request records the server's
+  execution time (`execMs` of `application/x-sparkles+json`) and curl's wall time. Before
+  the first timed run, each binary's sorted TSV answer to every query is checksummed.
+
+  The results go to `target/nsc-bench/<time>` (`--out`). `summary.md` has, for each
+  query and for both measures, the medians of A and B, the ratio B/A, the ratio within
+  each round and the spread of each binary between its server processes, followed by the
+  geometric mean of the ratios. It also reports differing answers and both load times.
+  `manifest.txt` records each binary's commit and SHA-256, the instance, the time of each
+  phase and the billed vCPU-minutes. `results/samples.tsv` has every timed request.
+
+  A run of all 27 queries at 1.05M triples takes about five minutes from creation to
+  destruction, of which the instance spends about 10 seconds receiving 224 MB of
+  binaries and data. Namespace bills it as 40 to 48 vCPU-minutes, about 7 cents at the
+  overage rate. Building the two revisions locally usually takes longer than the run.
+  The instances are AMD EPYC (Zen 4) virtual machines with 4 cores and 8 threads, and
+  they are noisier than a dedicated host. Within one server process, the interquartile
+  range of a query's execution time is about 10 to 15% of its median. Medians of the
+  same binary in different server processes differ by 10 to 30%. In a control run that
+  compared one binary with itself, each ratio for a query of 0.3 ms or more was within
+  6% of 1, and the geometric mean was 0.986. Queries under 0.1 ms vary by 20% or more
+  and say nothing. The script is therefore suited to changes of about 10% or more and
+  to checking that a change leaves the other queries alone. It cannot confirm a change
+  of a few percent.
+
+  The instances also have a different microarchitecture from the Intel machines used
+  for the published benchmarks. On Atlas, the merge zipper fix in `c2fe4b92` made
+  `optional-count` 28.5% faster and `minus` 31.9% faster at 1.05M triples. On Namespace,
+  the same comparison measured −1.0% and −1.8%. The regression it fixed, from
+  `c4b49fab`, also measured +1.0% on Namespace, against +15% on Atlas. The other queries
+  agreed with Atlas within the noise. A result that depends on how one CPU schedules a
+  loop has to be measured on that CPU.
 * `scripts/gen-data.py N` generates a synthetic dataset for benchmarking.
 * `scripts/gen-geo.py N` generates a GeoSPARQL dataset and its queries. The data has
   points around cities, lines, polygons and an administrative hierarchy.
