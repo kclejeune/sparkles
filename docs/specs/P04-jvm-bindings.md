@@ -1613,3 +1613,8 @@ About 0.3 ms of it is the native path and the rest is Jena's parsing, the query'
 serialization and the plan, so the small-query work of Phase 2 starts there. TDB2 was
 faster on `values-star` and about even on `employee-docs` and `path-plus`, and Sparkles
 was faster on the other 25 queries.
+
+**Release platforms (2026-10-09).** The release workflows now build only for Linux on
+x86_64 and arm64 and for macOS on Apple silicon, on Namespace runners. The Windows and
+Intel macOS jobs were removed to keep CI time down. The code paths for those platforms
+remain, and they come back by adding their jobs again.

@@ -2,6 +2,11 @@
   "name": "@sparkles-rdf/engine-linux-arm64-musl",
   "version": "0.1.0",
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kclejeune/sparkles.git",
+    "directory": "js/engine/npm/linux-arm64-musl"
+  },
   "main": "sparkles.linux-arm64-musl.node",
   "files": [
     "sparkles.linux-arm64-musl.node",

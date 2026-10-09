@@ -3,6 +3,11 @@
   "version": "0.1.0",
   "type": "module",
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kclejeune/sparkles.git",
+    "directory": "js/engine"
+  },
   "engines": {
     "node": ">=22.12"
   },
@@ -44,8 +49,6 @@
     "@sparkles-rdf/engine-linux-arm64-gnu": "workspace:*",
     "@sparkles-rdf/engine-linux-x64-musl": "workspace:*",
     "@sparkles-rdf/engine-linux-arm64-musl": "workspace:*",
-    "@sparkles-rdf/engine-darwin-x64": "workspace:*",
-    "@sparkles-rdf/engine-darwin-arm64": "workspace:*",
-    "@sparkles-rdf/engine-win32-x64-msvc": "workspace:*"
+    "@sparkles-rdf/engine-darwin-arm64": "workspace:*"
   }
 }

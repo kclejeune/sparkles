@@ -3,14 +3,13 @@ import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 const engine = fileURLToPath(new URL('../engine/', import.meta.url));
 const version = JSON.parse(await readFile(join(engine, 'package.json'), 'utf8')).version;
+// Release targets: Linux on x64 and arm64 (glibc and musl) and macOS on Apple silicon.
 const targets = [
   'linux-x64-gnu',
   'linux-arm64-gnu',
   'linux-x64-musl',
   'linux-arm64-musl',
-  'darwin-x64',
   'darwin-arm64',
-  'win32-x64-msvc',
 ];
 for (const target of targets) {
   const [os, cpu, libc] = target.split('-');
@@ -20,6 +19,12 @@ for (const target of targets) {
     name: `@sparkles-rdf/engine-${target}`,
     version,
     license: 'Apache-2.0',
+    // npm checks the provenance statement against this repository
+    repository: {
+      type: 'git',
+      url: 'git+https://github.com/kclejeune/sparkles.git',
+      directory: `js/engine/npm/${target}`,
+    },
     main: `sparkles.${target}.node`,
     files: [`sparkles.${target}.node`, 'LICENSE', 'THIRD_PARTY_LICENSES.md'],
     os: [os],

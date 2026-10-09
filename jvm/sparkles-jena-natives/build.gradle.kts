@@ -50,7 +50,8 @@ tasks.jar {
     from(rootDir.resolve("sparkles-jena/THIRD_PARTY_LICENSES.md")) { into("META-INF") }
     manifest { attributes("Automatic-Module-Name" to "io.github.kclejeune.sparkles.natives", "Implementation-Version" to project.version) }
 }
-val platforms = listOf("linux-x86_64", "linux-aarch64", "macos-x86_64", "macos-aarch64", "windows-x86_64")
+// The platforms the release workflow builds; the loader also knows macos-x86_64 and windows-x86_64.
+val platforms = listOf("linux-x86_64", "linux-aarch64", "macos-aarch64")
 val classifiers = platforms.map { p -> tasks.register<Jar>("${p.replace('-', '_')}Jar") {
     archiveClassifier = p
     from(packNative) { include("io/github/kclejeune/sparkles/native/$p/**") }

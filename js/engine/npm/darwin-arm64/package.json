@@ -2,6 +2,11 @@
   "name": "@sparkles-rdf/engine-darwin-arm64",
   "version": "0.1.0",
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kclejeune/sparkles.git",
+    "directory": "js/engine/npm/darwin-arm64"
+  },
   "main": "sparkles.darwin-arm64.node",
   "files": [
     "sparkles.darwin-arm64.node",

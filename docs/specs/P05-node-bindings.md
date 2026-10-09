@@ -1295,3 +1295,8 @@ client test runs in `mise run node:test` and in the Linux x64 job of the Node wo
 The `onProgress` callbacks of §5.2 are deferred. Loads have no progress hook in the
 engine, so they need engine work before a ThreadsafeFunction can report anything, and
 compaction alone did not justify a separate callback path in the binding.
+
+**Release platforms (2026-10-09).** The release workflows now build only for Linux on
+x86_64 and arm64 and for macOS on Apple silicon, on Namespace runners. The Windows and
+Intel macOS jobs were removed to keep CI time down. The code paths for those platforms
+remain, and they come back by adding their jobs again.

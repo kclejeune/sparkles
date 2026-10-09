@@ -13,7 +13,7 @@ importers:
         version: 5.4.1
       '@napi-rs/cli':
         specifier: 3.10.7
-        version: 3.10.7(@emnapi/core@1.9.2)(@emnapi/runtime@1.9.2)(@types/node@24.19.1)
+        version: 3.10.7(@emnapi/core@1.11.2)(@emnapi/runtime@1.11.2)(@types/node@24.19.1)
       '@rdfjs/types':
         specifier: 2.0.1
         version: 2.0.1
@@ -66,9 +66,6 @@ importers:
       '@sparkles-rdf/engine-darwin-arm64':
         specifier: workspace:*
         version: link:npm/darwin-arm64
-      '@sparkles-rdf/engine-darwin-x64':
-        specifier: workspace:*
-        version: link:npm/darwin-x64
       '@sparkles-rdf/engine-linux-arm64-gnu':
         specifier: workspace:*
         version: link:npm/linux-arm64-gnu
@@ -81,13 +78,8 @@ importers:
       '@sparkles-rdf/engine-linux-x64-musl':
         specifier: workspace:*
         version: link:npm/linux-x64-musl
-      '@sparkles-rdf/engine-win32-x64-msvc':
-        specifier: workspace:*
-        version: link:npm/win32-x64-msvc
 
   engine/npm/darwin-arm64: {}
-
-  engine/npm/darwin-x64: {}
 
   engine/npm/linux-arm64-gnu: {}
 
@@ -96,8 +88,6 @@ importers:
   engine/npm/linux-x64-gnu: {}
 
   engine/npm/linux-x64-musl: {}
-
-  engine/npm/win32-x64-msvc: {}
 
 packages:
 
@@ -5384,7 +5374,7 @@ snapshots:
     dependencies:
       event-emitter-promisify: 1.1.0
 
-  '@napi-rs/cli@3.10.7(@emnapi/core@1.9.2)(@emnapi/runtime@1.9.2)(@types/node@24.19.1)':
+  '@napi-rs/cli@3.10.7(@emnapi/core@1.11.2)(@emnapi/runtime@1.11.2)(@types/node@24.19.1)':
     dependencies:
       '@inquirer/prompts': 8.7.3(@types/node@24.19.1)
       '@napi-rs/cross-toolchain': 1.0.3
@@ -5399,8 +5389,8 @@ snapshots:
       typanion: 3.14.0
       typescript: 6.0.3
     optionalDependencies:
-      '@emnapi/core': 1.9.2
-      '@emnapi/runtime': 1.9.2
+      '@emnapi/core': 1.11.2
+      '@emnapi/runtime': 1.11.2
     transitivePeerDependencies:
       - '@napi-rs/cross-toolchain-arm64-target-aarch64'
       - '@napi-rs/cross-toolchain-arm64-target-armv7'

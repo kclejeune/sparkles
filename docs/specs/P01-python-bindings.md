@@ -838,3 +838,8 @@ flat names. The query, load, dump, transaction and term APIs are unchanged, and
 Reports that the flat methods returned with snake_case keys are camelCase dictionaries
 now, such as `sourceQuads` in the report of `clone_to`. `ds.validation.guard.reset()`
 returns `None`, where `set_write_validation(None)` returned a status dictionary.
+
+**Release platforms (2026-10-09).** The release workflows now build only for Linux on
+x86_64 and arm64 and for macOS on Apple silicon, on Namespace runners. The Windows and
+Intel macOS jobs were removed to keep CI time down. The code paths for those platforms
+remain, and they come back by adding their jobs again.

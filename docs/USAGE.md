@@ -2711,8 +2711,8 @@ server.
 The `sparkles` Python package embeds the same engine. It is built from
 `crates/sparkles-py` with PyO3 and maturin into an abi3 wheel, which works on CPython
 3.10 and later. The release workflow builds wheels for Linux (manylinux 2.28 and
-musllinux 1.2, on x86_64 and aarch64), macOS (x86_64 and arm64) and Windows x64, and a
-source distribution. The package is not on PyPI. Build and install it from the
+musllinux 1.2, on x86_64 and aarch64) and for macOS on Apple silicon, and a source
+distribution. The package is not on PyPI. Build and install it from the
 repository:
 
 ```sh
