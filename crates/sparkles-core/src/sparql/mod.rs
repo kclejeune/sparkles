@@ -43,6 +43,7 @@ pub mod textpf;
 pub mod update;
 pub mod value;
 mod vectortopk;
+mod zipper;
 
 use crate::error::{Error, Result};
 use crate::id::Id;
