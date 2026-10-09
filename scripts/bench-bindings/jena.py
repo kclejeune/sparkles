@@ -365,9 +365,10 @@ def main():
 
     def git(*a):
         try:
-            return subprocess.run(["git", *a], capture_output=True, text=True, cwd=ROOT).stdout.strip()
+            out = subprocess.run(["git", *a], capture_output=True, text=True, cwd=ROOT).stdout.strip()
         except OSError:
-            return os.environ.get("BENCH_COMMIT", "?")
+            out = ""
+        return out or os.environ.get("BENCH_COMMIT", "?")
     cpu = "?"
     try:
         cpu = re.search(r"model name\s*:\s*(.*)", Path("/proc/cpuinfo").read_text()).group(1)
