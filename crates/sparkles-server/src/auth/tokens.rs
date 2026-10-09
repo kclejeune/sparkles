@@ -55,7 +55,7 @@ struct TokenFile {
     tokens: Vec<TokenRecord>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Inner {
     by_id: BTreeMap<String, TokenRecord>,
     by_digest: HashMap<[u8; 32], String>,
@@ -108,6 +108,15 @@ impl TokenStore {
         })
     }
 
+    /// Write `next` and only then make it the in-memory state, so that a failed write
+    /// leaves memory matching the file. Otherwise a revoked token would vanish from memory
+    /// and authenticate again after a restart.
+    fn commit(&self, inner: &mut Inner, mut next: Inner) -> Result<()> {
+        self.save(&mut next)?;
+        *inner = next;
+        Ok(())
+    }
+
     fn save(&self, inner: &mut Inner) -> Result<()> {
         for (id, t) in std::mem::take(&mut inner.last_used) {
             if let Some(r) = inner.by_id.get_mut(&id) {
@@ -127,7 +136,8 @@ impl TokenStore {
         if inner.last_used.is_empty() {
             return Ok(());
         }
-        self.save(&mut inner)
+        let next = inner.clone();
+        self.commit(&mut inner, next)
     }
 
     pub fn by_digest(&self, d: &[u8; 32]) -> Option<TokenRecord> {
@@ -164,8 +174,9 @@ impl TokenStore {
     pub fn insert_within(&self, rec: TokenRecord, now: i64, max: usize) -> Result<bool> {
         let digest = super::config::parse_token_hash(&rec.hash).context("token hash")?;
         let mut inner = self.inner.lock();
-        prune(&mut inner, now);
-        let owned = inner
+        let mut next = inner.clone();
+        prune(&mut next, now);
+        let owned = next
             .by_id
             .values()
             .filter(|t| t.owner.kind == rec.owner.kind && t.owner.name == rec.owner.name)
@@ -173,9 +184,9 @@ impl TokenStore {
         if owned >= max {
             return Ok(false);
         }
-        inner.by_digest.insert(digest, rec.id.clone());
-        inner.by_id.insert(rec.id.clone(), rec);
-        self.save(&mut inner).map(|_| true)
+        next.by_digest.insert(digest, rec.id.clone());
+        next.by_id.insert(rec.id.clone(), rec);
+        self.commit(&mut inner, next).map(|_| true)
     }
 
     /// Remove tokens, and the tokens they minted. Returns how many were removed.
@@ -197,18 +208,19 @@ impl TokenStore {
             }
             i += 1;
         }
+        let mut next = inner.clone();
         let mut n = 0;
         for id in &gone {
-            if let Some(r) = inner.by_id.remove(id) {
+            if let Some(r) = next.by_id.remove(id) {
                 n += 1;
                 if let Some(d) = super::config::parse_token_hash(&r.hash) {
-                    inner.by_digest.remove(&d);
+                    next.by_digest.remove(&d);
                 }
-                inner.last_used.remove(id);
+                next.last_used.remove(id);
             }
         }
         if n > 0 {
-            self.save(&mut inner)?;
+            self.commit(&mut inner, next)?;
         }
         Ok(n)
     }
@@ -220,15 +232,16 @@ impl TokenStore {
         let hash = super::policy::token_hash(&token);
         let digest = super::config::parse_token_hash(&hash).context("token hash")?;
         let mut inner = self.inner.lock();
-        let Some(rec) = inner.by_id.get_mut(id).filter(|r| r.expires_at() > now) else {
+        let mut next = inner.clone();
+        let Some(rec) = next.by_id.get_mut(id).filter(|r| r.expires_at() > now) else {
             return Ok(None);
         };
         let old = std::mem::replace(&mut rec.hash, hash);
         if let Some(d) = super::config::parse_token_hash(&old) {
-            inner.by_digest.remove(&d);
+            next.by_digest.remove(&d);
         }
-        inner.by_digest.insert(digest, id.to_string());
-        self.save(&mut inner)?;
+        next.by_digest.insert(digest, id.to_string());
+        self.commit(&mut inner, next)?;
         Ok(Some(token))
     }
 
@@ -236,8 +249,9 @@ impl TokenStore {
     /// their permissions follow the provider. Returns how many tokens changed.
     pub fn refresh_groups(&self, who: &Identity) -> Result<usize> {
         let mut inner = self.inner.lock();
+        let mut next = inner.clone();
         let mut n = 0;
-        for t in inner.by_id.values_mut() {
+        for t in next.by_id.values_mut() {
             if t.owner.kind == who.kind && t.owner.name == who.name && t.owner.groups != who.groups
             {
                 t.owner.groups = who.groups.clone();
@@ -245,7 +259,7 @@ impl TokenStore {
             }
         }
         if n > 0 {
-            self.save(&mut inner)?;
+            self.commit(&mut inner, next)?;
         }
         Ok(n)
     }
@@ -347,5 +361,48 @@ mod tests {
                 .is_match(&id),
             "{id}"
         );
+    }
+
+    /// A save that fails must leave memory as it was: a revoked token still works, a
+    /// reissued token keeps its old secret and a refused mint is not visible.
+    #[test]
+    fn failed_save_leaves_memory_unchanged() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("tokens.json");
+        let s = TokenStore::open(path.clone()).unwrap();
+        let a = super::super::policy::new_token();
+        s.insert(rec("tok_a", None, &a), 0).unwrap();
+        let da = crypto::sha256(a.as_bytes());
+        // A directory where the writer wants its temporary file makes every save fail.
+        let tmp = d.path().join("tokens.json.tmp");
+        std::fs::create_dir(&tmp).unwrap();
+
+        assert!(s.remove(&["tok_a".into()]).is_err());
+        assert_eq!(s.by_digest(&da).unwrap().id, "tok_a");
+        assert!(s.reissue("tok_a", 0).is_err());
+        assert_eq!(s.by_digest(&da).unwrap().id, "tok_a");
+        let c = super::super::policy::new_token();
+        assert!(s.insert(rec("tok_c", None, &c), 0).is_err());
+        assert!(s.get("tok_c").is_none());
+        assert!(s.by_digest(&crypto::sha256(c.as_bytes())).is_none());
+        let who = Identity {
+            groups: vec!["g".into()],
+            ..s.get("tok_a").unwrap().owner
+        };
+        assert!(s.refresh_groups(&who).is_err());
+        assert!(s.get("tok_a").unwrap().owner.groups.is_empty());
+        s.touch("tok_a", 1_800_000_000);
+        assert!(s.flush().is_err());
+        assert_eq!(
+            s.last_used("tok_a").as_deref(),
+            Some(rfc3339(1_800_000_000).as_str())
+        );
+
+        // Once the disk works again, memory and file agree.
+        std::fs::remove_dir(&tmp).unwrap();
+        assert_eq!(s.remove(&["tok_a".into()]).unwrap(), 1);
+        assert!(s.by_digest(&da).is_none());
+        let s2 = TokenStore::open(path).unwrap();
+        assert!(s2.by_digest(&da).is_none());
     }
 }
