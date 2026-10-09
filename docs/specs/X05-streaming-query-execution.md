@@ -602,10 +602,10 @@ visited. DISTINCT owns a charged key set. Groups keep aggregate state rather tha
 rows for composite keys, expression arguments, DISTINCT aggregates, GROUP_CONCAT,
 SAMPLE and the statistical aggregates. Group counts read from the index or its
 statistics, and counts of two-hop joins over key runs, run as barriers that return
-their counts without an eager fallback. Blocking sorts without
-LIMIT consume normal input batches even when the requested output prefix is small. They reserve their input, keys and
-reordering state, and they report their full-input barrier separately from eager
-fallback, so the strict policy admits them. Growing state fails explicitly when its
+their counts without an eager fallback. Blocking sorts without LIMIT consume normal
+input batches even when the requested output prefix is small. They reserve their input,
+keys and reordering state, and they report their full-input barrier separately from
+eager fallback, so the strict policy admits them. Growing state fails explicitly when its
 reservation exceeds the budget, because disk spill is not implemented.
 
 An operator without a cursor implementation materializes only itself. It reads its
