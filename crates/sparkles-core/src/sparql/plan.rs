@@ -3738,6 +3738,10 @@ fn value_order_segments() -> Vec<(u64, u64, Option<bool>)> {
     out
 }
 
+/// What placing the read steps at the best end of a monotone [`OrderedTopK`] piece costs,
+/// in rows read (see [`ordered_topk`]).
+const TOPK_EDGE_ROWS: f64 = (crate::index::BLOCK_ROWS / 8) as f64;
+
 #[cfg(test)]
 thread_local! {
     /// tests: choose [`OrderedTopK`] whenever it applies, whatever it costs
@@ -3848,16 +3852,18 @@ fn ordered_topk(n: Node, ctx: &Ctx) -> Node {
             }
             let rows = rows as f64;
             total += rows;
-            // a monotone piece is read from its best end: the leading columns of about
-            // one block are decoded to place the steps, and more rows when filters drop
-            // rows
+            // A monotone piece is read from its best end. Placing the steps decodes the
+            // leading key columns of about one block, which the block cache keeps, and
+            // the steps read k rows, more when filters drop rows. That costs about an
+            // eighth of reading the block's rows: charged a whole block, a 1.05M range
+            // TopK kept the full scan and ran 16% slower than the ordered read.
             let sel = if d.exact {
                 sel
             } else {
                 sel * FILTER_SELECTIVITY
             };
             read += match mono {
-                Some(_) => rows.min(crate::index::BLOCK_ROWS as f64 + k as f64 / sel),
+                Some(_) => rows.min(TOPK_EDGE_ROWS + k as f64 / sel),
                 None => rows,
             };
             pieces.push(TopKPiece {
