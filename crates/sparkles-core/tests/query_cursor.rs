@@ -3175,3 +3175,41 @@ fn transitive_paths_stream_one_start_at_a_time() {
         .unwrap();
     }
 }
+
+/// A count of a two-hop join over key runs reads its scans itself and counts as a
+/// scalar barrier rather than an eager fallback, also over pending changes.
+#[test]
+fn count_joins_from_key_runs_run_without_fallback() {
+    fn has(plan: &sparkles_core::sparql::CursorPlan, prefix: &str) -> bool {
+        plan.operator.operator.starts_with(prefix) || plan.children.iter().any(|c| has(c, prefix))
+    }
+    let s = store(20);
+    let data = (0..60)
+        .map(|i| format!("<urn:s:{}> <urn:k> <urn:s:{}> .\n", i % 13, (i * 5) % 17))
+        .collect::<String>();
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    s.compact().unwrap();
+    let q = "SELECT (COUNT(*) AS ?n) WHERE { ?a <urn:k> ?b . ?b <urn:k> ?c }";
+    for round in 0..2 {
+        let expected = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+        for cap in [1, 4096] {
+            let c = open(&s, q, cap);
+            if round == 0 {
+                assert!(has(c.plan(), "CountJoinFromRuns"), "{:?}", c.plan());
+            }
+            assert!(!c.plan().has_materialization());
+            assert_eq!(all(c), expected, "cap {cap}; round {round}");
+        }
+        sparkles_core::sparql::update::update(
+            &s,
+            "INSERT DATA { <urn:s:1> <urn:k> <urn:s:2> . <urn:s:2> <urn:k> <urn:s:1> } ; DELETE DATA { <urn:s:0> <urn:k> <urn:s:0> }",
+            &Default::default(),
+        )
+        .unwrap();
+    }
+}

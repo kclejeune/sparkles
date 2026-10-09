@@ -1159,6 +1159,7 @@ fn supported(kind: &Kind) -> bool {
         | Kind::CountScan { .. }
         | Kind::CountDistinctScan { .. }
         | Kind::GroupCountScan { .. }
+        | Kind::CountJoinRuns { .. }
         | Kind::Slice { .. }
         | Kind::Union => true,
         Kind::RangeScan(_, r) => !r.filter.iter().any(super::expr::Expr::has_exists),
@@ -1321,7 +1322,9 @@ impl Operator {
         } else {
             Vec::new()
         };
-        let children = if materializes && !native_blocking && !inputs {
+        // A count over the key runs of two scans reads those scans itself.
+        let reads_scans = matches!(node.kind, Kind::CountJoinRuns { .. });
+        let children = if (materializes && !native_blocking && !inputs) || reads_scans {
             Vec::new()
         } else {
             let built = std::mem::take(&mut node.children)
@@ -1361,6 +1364,7 @@ impl Operator {
                 | Kind::RangeScan(..)
                 | Kind::Distinct
                 | Kind::GroupCountScan { .. }
+                | Kind::CountJoinRuns { .. }
         ) || materializes
             || native_blocking
             || incremental_merge
@@ -1447,7 +1451,8 @@ impl Operator {
                 Kind::Empty => State::Empty,
                 Kind::CountScan { .. }
                 | Kind::CountDistinctScan { .. }
-                | Kind::CountFilterScan { .. } => State::Scalar(node),
+                | Kind::CountFilterScan { .. }
+                | Kind::CountJoinRuns { .. } => State::Scalar(node),
                 Kind::GroupCountScan { .. } => State::Counts {
                     node,
                     loaded: None,
