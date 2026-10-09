@@ -69,7 +69,7 @@ class BridgeCallsTest {
         assertTrue(QueryExec.dataset(dsg).query("ASK { <${ex}s1> <${ex}p> ?o }").context(native).ask())
         assertFalse(QueryExec.dataset(dsg).query("ASK { <${ex}s9> <${ex}p> ?o }").context(native).ask())
         assertTrue(QueryExec.dataset(dsg).query("ASK {}").ask())
-        assertTrue(Txn.calculateRead(dsg) { QueryExec.dataset(dsg).query("ASK { ?s <${ex}p> \"v2\" }").ask() })
+        assertTrue(Txn.calculateRead(dsg) { QueryExec.dataset(dsg).query("ASK { ?s <${ex}p> \"v2\" }").context(native).ask() })
         val after = dsg.stats()
         assertEquals(before.nativeQueries + 4, after.nativeQueries)
         assertEquals(before.fallbackQueries, after.fallbackQueries)

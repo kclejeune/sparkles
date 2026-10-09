@@ -10,6 +10,7 @@ import org.apache.jena.sparql.exec.QueryExec
 import org.apache.jena.sparql.exec.QueryExecDatasetBuilder
 import org.apache.jena.sparql.util.Context
 import org.apache.jena.system.Txn
+import org.apache.jena.graph.Node
 import org.apache.jena.graph.NodeFactory
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
@@ -26,13 +27,13 @@ class SmallQueriesTest {
     private val prefixes = "PREFIX : <http://example/> PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> "
     private val open = ArrayList<DatasetGraphSparkles>()
 
-    private fun estimate(q: String, vararg bound: String): Double? {
+    private fun estimate(q: String, vararg bound: String, count: ((Node, Node) -> Long)? = null): Double? {
         val input = if (bound.isEmpty()) BindingFactory.empty() else {
             val b = BindingFactory.builder()
             for (v in bound) b.add(Var.alloc(v), NodeFactory.createURI("http://example/x"))
             b.build()
         }
-        return SmallQueries.estimate(QueryFactory.create(prefixes + q), input, setOf("http://jena.apache.org/text#query"), Context())
+        return SmallQueries.estimate(QueryFactory.create(prefixes + q), input, setOf("http://jena.apache.org/text#query"), Context(), count)
     }
 
     private fun data(): DatasetGraphSparkles {
@@ -63,6 +64,25 @@ class SmallQueriesTest {
         assertEquals(35.0, estimate("SELECT * { VALUES ?p { :p1 :p2 :p3 :p4 :p5 } ?p :name ?n ; :age ?a ; :knows ?k }"))
         assertEquals(1.0, estimate("SELECT ?n { ?s :name ?n }", "s"))
         assertEquals(1.0, estimate("SELECT DISTINCT ?o { :p1 :knows ?o } LIMIT 3"))
+        // filters of comparisons and logic, and COUNT, are evaluated alike
+        assertEquals(1.0, estimate("SELECT ?o { :p1 :name ?o FILTER(?o != \"x\") }"))
+        assertEquals(3.0, estimate("SELECT ?f { :p1 :knows ?f . ?f :age ?a FILTER(?a > 30 && ?a * 2 <= 100 || !BOUND(?f)) }"))
+        assertEquals(1.0, estimate("SELECT (COUNT(*) AS ?c) { :p1 :knows ?o }"))
+        assertEquals(1.0, estimate("SELECT ?o (COUNT(DISTINCT ?p) AS ?c) { :p1 ?p ?o } GROUP BY ?o"))
+    }
+
+    @Test
+    fun an_unbound_subject_with_a_constant_predicate_and_object_is_counted() {
+        val asked = ArrayList<String>()
+        val count = { p: Node, o: Node -> asked.add("${p.localName} ${o.localName}"); 10L }
+        // ten employees, then each one's name
+        assertEquals(11.0, estimate("SELECT ?p ?n { ?p :worksFor :org1 ; :name ?n }", count = count))
+        assertEquals(1.0, estimate("SELECT (COUNT(?p) AS ?c) { ?p :worksFor :org1 }", count = count))
+        assertEquals(listOf("worksFor org1", "worksFor org1"), asked)
+        // a variable object, a second unbound subject, or a variable predicate is not counted
+        assertNull(estimate("SELECT ?n { ?s :name ?n }", count = count))
+        assertNull(estimate("SELECT * { ?p :worksFor :org1 . ?q :worksFor :org2 }", count = count))
+        assertNull(estimate("SELECT * { ?p ?w :org1 }", count = count))
     }
 
     @Test
@@ -75,13 +95,17 @@ class SmallQueriesTest {
         assertNull(estimate("SELECT * { ?p :name ?n } VALUES ?p { :p1 }"))
         assertNull(estimate("SELECT * { VALUES ?p { :p1 UNDEF } ?p :name ?n }"))
         for (q in listOf(
-            "SELECT ?o { :p1 :name ?o FILTER(?o != \"x\") }",
+            "SELECT ?o { :p1 :name ?o FILTER(REGEX(?o, \"x\")) }",
+            "SELECT ?o { :p1 :age ?o FILTER(?o / 2 > 10) }",
+            "SELECT ?o { :p1 :name ?o FILTER(<http://example/f>(?o)) }",
             "SELECT ?o { :p1 :name ?o OPTIONAL { :p1 :age ?a } }",
             "SELECT ?o { { :p1 :name ?o } UNION { :p2 :name ?o } }",
             "SELECT ?o { GRAPH :g { :p1 :name ?o } }",
             "SELECT ?o { :p1 :knows/:name ?o }",
             "SELECT ?o { :p1 :name ?o } ORDER BY ?o",
-            "SELECT (COUNT(*) AS ?c) { :p1 :knows ?o }",
+            "SELECT (SUM(?a) AS ?c) { :p1 :age ?a }",
+            "SELECT (COUNT(*) AS ?c) { :p1 :knows ?o } GROUP BY (STR(?o))",
+            "SELECT (COUNT(*) AS ?c) { :p1 :knows ?o } HAVING (COUNT(*) > 1)",
             "SELECT (STR(?o) AS ?s) { :p1 :name ?o }",
             "SELECT ?o FROM :g { :p1 :name ?o }",
             "ASK { :p1 :label \"p1\"@en }",
@@ -134,6 +158,13 @@ class SmallQueriesTest {
             "ASK { :p2 :age 22 }",
             "ASK { :p2 :age \"22\"^^<http://www.w3.org/2001/XMLSchema#integer> }",
             "SELECT ?l { :p2 :label ?l }",
+            "SELECT ?p ?a { ?p :worksFor :org2 ; :age ?a FILTER(?a > 40) }",
+            "SELECT ?p ?n { ?p :worksFor :org0 ; :name ?n }",
+            "SELECT (COUNT(?p) AS ?c) { ?p :worksFor :org3 }",
+            "SELECT (COUNT(?p) AS ?c) { ?p :worksFor :nowhere }",
+            "SELECT ?f (COUNT(DISTINCT ?k) AS ?c) { :p5 :knows ?f . ?f :knows ?k } GROUP BY ?f",
+            "ASK { :p6 :age ?a FILTER(?a >= 26 && ?a != 30) }",
+            "SELECT ?o { :p1 :name ?o FILTER(isLiteral(?o) && !isIRI(?o) && !sameTerm(?o, :p1)) }",
         )
         val before = dsg.stats()
         for (q in queries) assertEquals(rows(dsg, q, smallQueries = false), rows(dsg, q, smallQueries = true), q)
