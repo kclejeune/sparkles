@@ -1,7 +1,7 @@
 //! Build one input, then resume compatible probe rows without materializing the
 //! join's output or a Cartesian vector of matching row pairs.
 use super::{Buffer, CursorOptions, Operator, merge};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::id::Id;
 use crate::sparql::ctx::{Ctx, RetainedCharge};
 use crate::sparql::expr::{Expr, Row, ebv};
@@ -47,16 +47,137 @@ pub(super) struct Binary {
     probe_side: usize,
     columns: Vec<(Option<usize>, Option<usize>)>,
     shared: Vec<(usize, usize)>,
-    hash_key: Option<(usize, usize)>,
-    hash: FxHashMap<Id, Vec<usize>>,
+    /// Probe columns in order of preference for the hash key: certain on the probe
+    /// side first. The build data decides which one is used.
+    preferred: Vec<(usize, usize)>,
+    index: Option<HashIndex>,
     build: Option<Buffer>,
     probe: Option<Buffer>,
     row: usize,
-    candidate: usize,
+    candidates: Candidates,
     matched: bool,
     expression: Option<Expr>,
     _charge: Option<RetainedCharge>,
-    _hash_charge: Option<RetainedCharge>,
+}
+
+/// The end of a row chain.
+const NONE: u32 = u32::MAX;
+
+/// Build rows grouped on one shared column. Each bound key has a chain of its rows in
+/// build order. Rows that leave the key unbound are compatible with every probe value,
+/// so every bound probe also visits them, and an unbound probe visits every build row.
+struct HashIndex {
+    /// The probe column that carries the key.
+    probe: usize,
+    heads: FxHashMap<Id, u32>,
+    next: Vec<u32>,
+    unbound: Vec<u32>,
+    _charge: Option<RetainedCharge>,
+}
+
+impl HashIndex {
+    /// Index `build` on its column `column`. Row numbers are 32 bits wide, and the
+    /// chains, the unbound rows and the key table are charged while they grow.
+    fn new(ctx: &Ctx, build: &Table, column: usize, probe: usize) -> Result<Self> {
+        let rows = u32::try_from(build.len)
+            .ok()
+            .filter(|&n| n < NONE)
+            .ok_or_else(|| Error::invalid("a hash join build input has too many rows"))?;
+        // A growing key table holds its old and new buckets at once.
+        let mut charge = ctx.retained_charge(u64::from(rows) * 72 + 1024)?;
+        let mut heads: FxHashMap<Id, u32> = FxHashMap::default();
+        let mut next = vec![NONE; rows as usize];
+        let mut unbound = Vec::new();
+        // Walk backwards so that every chain lists its rows in build order.
+        for row in (0..rows).rev() {
+            if row % 1024 == 0 {
+                ctx.check()?;
+            }
+            let key = build.cols[column][row as usize];
+            if key.is_undef() {
+                unbound.push(row);
+            } else if let Some(head) = heads.insert(key, row) {
+                next[row as usize] = head;
+            }
+        }
+        unbound.reverse();
+        unbound.shrink_to_fit();
+        if let Some(charge) = &mut charge {
+            charge.resize(
+                (next.capacity() as u64 + unbound.capacity() as u64) * 4
+                    + heads.capacity() as u64 * 24
+                    + 1024,
+            )?;
+        }
+        Ok(Self {
+            probe,
+            heads,
+            next,
+            unbound,
+            _charge: charge,
+        })
+    }
+}
+
+/// Where the build rows of the current probe row are being visited.
+#[derive(Clone, Copy)]
+enum Candidates {
+    Start,
+    Chain(u32),
+    Unbound(usize),
+    All(usize),
+    Done,
+}
+
+/// The next build row that may match the probe row, or None when it has none left.
+fn candidate(
+    state: &mut Candidates,
+    index: Option<&HashIndex>,
+    probe: &Table,
+    row: usize,
+    rows: usize,
+) -> Option<usize> {
+    loop {
+        match *state {
+            Candidates::Start => {
+                *state = match index {
+                    Some(index) => {
+                        let key = probe.cols[index.probe][row];
+                        if key.is_undef() {
+                            Candidates::All(0)
+                        } else {
+                            Candidates::Chain(index.heads.get(&key).copied().unwrap_or(NONE))
+                        }
+                    }
+                    None => Candidates::All(0),
+                }
+            }
+            Candidates::Chain(NONE) => *state = Candidates::Unbound(0),
+            Candidates::Chain(at) => {
+                let index = index.expect("a chain belongs to an index");
+                *state = Candidates::Chain(index.next[at as usize]);
+                return Some(at as usize);
+            }
+            Candidates::Unbound(at) => {
+                let index = index.expect("unbound rows belong to an index");
+                match index.unbound.get(at) {
+                    Some(&other) => {
+                        *state = Candidates::Unbound(at + 1);
+                        return Some(other as usize);
+                    }
+                    None => *state = Candidates::Done,
+                }
+            }
+            Candidates::All(at) if at < rows => {
+                *state = Candidates::All(at + 1);
+                return Some(at);
+            }
+            Candidates::All(_) | Candidates::Done => {
+                *state = Candidates::Done;
+                return None;
+            }
+        }
+    }
 }
 
 impl Binary {
@@ -87,12 +208,8 @@ impl Binary {
             .enumerate()
             .filter_map(|(p, v)| build.vars.iter().position(|x| x == v).map(|b| (p, b)))
             .collect();
-        let hash_key = shared
-            .iter()
-            .find(|&&(p, b)| {
-                probe.certain.contains(&probe.vars[p]) && build.certain.contains(&build.vars[b])
-            })
-            .copied();
+        let mut preferred = shared.clone();
+        preferred.sort_by_key(|&(p, _)| !probe.certain.contains(&probe.vars[p]));
         let expression = match &node.kind {
             Kind::LeftJoin { expr } => expr.clone(),
             _ => None,
@@ -102,16 +219,15 @@ impl Binary {
             probe_side,
             columns,
             shared,
-            hash_key,
-            hash: Default::default(),
+            preferred,
+            index: None,
             build: None,
             probe: None,
             row: 0,
-            candidate: 0,
+            candidates: Candidates::Start,
             matched: false,
             expression,
             _charge: charge,
-            _hash_charge: None,
         })
     }
 
@@ -127,7 +243,7 @@ impl Binary {
         }
         self.probe = None;
         self.row = 0;
-        self.candidate = 0;
+        self.candidates = Candidates::Start;
         self.matched = false;
         self.probe = children[self.probe_side].next(ctx, options, cap)?;
         Ok(self.probe.is_some())
@@ -145,15 +261,25 @@ impl Binary {
             let n = batch.table.len;
             merge::append(ctx, &mut build, &batch.table, 0..n)?;
         }
-        if let Some((_, column)) = self.hash_key {
-            // Includes simultaneous old/new buckets and per-key row vectors.
-            self._hash_charge = ctx.retained_charge(build.table.len as u64 * 384 + 1024)?;
-            for (row, &key) in build.table.cols[column].iter().enumerate() {
-                if row.is_multiple_of(1024) {
-                    ctx.check()?;
-                }
-                self.hash.entry(key).or_default().push(row);
+        // Key on the shared column that the build data leaves unbound least often.
+        // A column that is unbound in every build row selects nothing.
+        let table = &build.table;
+        let unbound = |column: usize| table.cols[column].iter().filter(|x| x.is_undef()).count();
+        let mut best: Option<((usize, usize), usize)> = None;
+        for &(p, b) in &self.preferred {
+            ctx.check()?;
+            let n = unbound(b);
+            if n < table.len && best.is_none_or(|(_, m)| n < m) {
+                best = Some(((p, b), n));
             }
+            if n == 0 {
+                break;
+            }
+        }
+        if let Some(((p, b), _)) = best
+            && table.len > 1
+        {
+            self.index = Some(HashIndex::new(ctx, table, b, p)?);
         }
         self.build = Some(build);
         Ok(())
@@ -161,7 +287,7 @@ impl Binary {
 
     fn advance(&mut self) {
         self.row += 1;
-        self.candidate = 0;
+        self.candidates = Candidates::Start;
         self.matched = false;
     }
 
@@ -199,15 +325,13 @@ impl Binary {
             }
             let probe = &self.probe.as_ref().expect("available probe").table;
             let build = &self.build.as_ref().expect("captured build").table;
-            let candidates = self
-                .hash_key
-                .and_then(|(column, _)| self.hash.get(&probe.cols[column][self.row]));
-            let count = if self.hash_key.is_some() {
-                candidates.map_or(0, Vec::len)
-            } else {
-                build.len
-            };
-            if self.candidate == count {
+            let Some(other) = candidate(
+                &mut self.candidates,
+                self.index.as_ref(),
+                probe,
+                self.row,
+                build.len,
+            ) else {
                 let keep =
                     !self.matched && matches!(self.mode, Mode::Optional | Mode::Anti | Mode::Minus);
                 if keep {
@@ -218,9 +342,7 @@ impl Binary {
                 }
                 self.advance();
                 continue;
-            }
-            let other = candidates.map_or(self.candidate, |rows| rows[self.candidate]);
-            self.candidate += 1;
+            };
             if !self.shared.iter().all(|&(p, b)| {
                 let (p, b) = (probe.cols[p][self.row], build.cols[b][other]);
                 p == b || p.is_undef() || b.is_undef()

@@ -624,3 +624,118 @@ fn keys_are_read_by_clustered_seeks() {
     assert_eq!(seeks(&snap, true, Optimizations::ALL), (5, 5));
     seeks(&snap, false, Optimizations::ALL);
 }
+
+/// The rows of `q` read through a cursor with `rows` per batch, planned with forced
+/// index joins, with the cursor's plan and its largest batch.
+fn cursor_rows(
+    snap: &Arc<crate::store::Snapshot>,
+    q: &str,
+    rows: usize,
+) -> (Vec<String>, super::cursor::CursorPlan, usize) {
+    FORCE_INDEX_JOIN.with(|f| f.set(true));
+    let opened = super::cursor::select_cursor(
+        snap.clone(),
+        &format!("{PREFIXES}{q}"),
+        &QueryOptions {
+            no_cache: true,
+            ..Default::default()
+        },
+        &super::cursor::CursorOptions {
+            batch_rows: rows,
+            ..Default::default()
+        },
+    );
+    FORCE_INDEX_JOIN.with(|f| f.set(false));
+    let mut c = opened.unwrap_or_else(|e| panic!("{q}: {e}"));
+    let plan = c.plan().clone();
+    let mut out = Vec::new();
+    let mut largest = 0;
+    while let Some(b) = c.next_batch().unwrap() {
+        largest = largest.max(b.len());
+        for i in 0..b.len() {
+            out.push(
+                b.row(i)
+                    .unwrap()
+                    .into_iter()
+                    .map(|t| t.map_or("UNDEF".to_string(), |t| t.to_string()))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
+        }
+    }
+    out.sort();
+    (out, plan, largest)
+}
+
+/// Whether the cursor plan has an `op` operator, clearing `streamed` when one of them
+/// materializes.
+fn cursor_plan_has(plan: &super::cursor::CursorPlan, op: &str, streamed: &mut bool) -> bool {
+    let here = plan.operator.operator == op;
+    if here && plan.materializes {
+        *streamed = false;
+    }
+    plan.children
+        .iter()
+        .fold(here, |found, c| cursor_plan_has(c, op, streamed) || found)
+}
+
+/// Index joins and stars stream through cursors over each input batch, and match the
+/// eager answers at every batch size, before and after updates.
+#[test]
+fn index_joins_stream_through_cursors() {
+    let s = Store::in_memory(StoreOptions::default());
+    load(&s, &random_trig(0x51ee_d0c5_0000_0003, 120));
+    let mut snapshots = vec![s.snapshot()];
+    for u in UPDATES {
+        update(&s, u);
+    }
+    snapshots.push(s.snapshot());
+    let mut streamed_shapes = 0;
+    for snap in &snapshots {
+        for (q, op) in shapes() {
+            let mut want = rows(&forced(snap, q, Optimizations::ALL, None));
+            want.sort();
+            for batch in [1, 2, 3, 4096] {
+                let (got, plan, largest) = cursor_rows(snap, q, batch);
+                assert!(largest <= batch, "{q}: a batch of {largest} rows");
+                assert_eq!(got, want, "{batch} rows: {q}");
+                if let Some(op) = op {
+                    let mut streamed = true;
+                    if cursor_plan_has(&plan, op, &mut streamed) {
+                        assert!(streamed, "{q}: {plan:#?}");
+                        streamed_shapes += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert!(streamed_shapes > 0);
+}
+
+/// One input row whose key has many rows expands across many output batches, each
+/// within the cap.
+#[test]
+fn an_index_join_resumes_a_large_expansion_across_batches() {
+    let s = Store::in_memory(StoreOptions::default());
+    let mut data = String::from("@prefix ex: <http://ex.org/> .\n");
+    for i in 0..5000 {
+        data.push_str(&format!("ex:hub ex:p {i} .\nex:s{i} ex:p {i} .\n"));
+    }
+    load(&s, &data);
+    let snap = s.snapshot();
+    let q = "SELECT ?s ?o WHERE { VALUES ?s { ex:s1 ex:hub ex:s2 } ?s ex:p ?o }";
+    let mut want = rows(&forced(&snap, q, Optimizations::ALL, None));
+    want.sort();
+    assert_eq!(want.len(), 5002);
+    for batch in [7, 4096] {
+        let (got, plan, largest) = cursor_rows(&snap, q, batch);
+        let mut streamed = true;
+        assert!(
+            cursor_plan_has(&plan, "IndexJoin", &mut streamed),
+            "{plan:#?}"
+        );
+        assert!(streamed);
+        assert!(largest <= batch);
+        assert_eq!(got, want);
+    }
+}

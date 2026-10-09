@@ -19,12 +19,14 @@ use std::time::Instant;
 mod binary;
 mod bind;
 mod distinct;
+mod expand;
 mod filter;
 pub mod graph;
 mod group;
 pub use graph::{GraphBatch, GraphCursor, graph_cursor};
 mod merge;
 mod topk;
+mod walk;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum FallbackPolicy {
@@ -1081,11 +1083,20 @@ fn plan_bytes(node: &Node) -> u64 {
 
 enum State {
     Scalar(Node),
+    /// Counts per key, read from the index or its statistics into charged group state
+    /// before the first output.
+    Counts {
+        node: Node,
+        loaded: Option<Buffer>,
+        at: usize,
+    },
     Merge(Box<merge::Merge>),
     Distinct(distinct::Distinct),
     Binary(Box<binary::Binary>),
     Group(Box<group::Group>),
     Filter(Box<filter::Filter>),
+    Expand(Box<expand::Expand>),
+    Walk(Box<walk::Walk>),
     Scan(Scan),
     Values {
         table: Table,
@@ -1100,10 +1111,17 @@ enum State {
     Union {
         at: usize,
     },
+    /// An operator without a cursor implementation. With `inputs`, its children are
+    /// cursors whose output it collects before running. Otherwise its whole subtree
+    /// runs eagerly.
     Fallback {
         node: Node,
         loaded: Option<Buffer>,
         at: usize,
+        inputs: bool,
+        /// Scans among the inputs, which an eager scan reads straight into a table of
+        /// the right size. The fallback holds its whole input either way.
+        scans: Vec<Option<Node>>,
     },
     Blocking {
         node: Node,
@@ -1142,6 +1160,8 @@ fn supported(kind: &Kind) -> bool {
         | Kind::Distinct
         | Kind::CountScan { .. }
         | Kind::CountDistinctScan { .. }
+        | Kind::GroupCountScan { .. }
+        | Kind::CountJoinRuns { .. }
         | Kind::Slice { .. }
         | Kind::Union => true,
         Kind::RangeScan(_, r) => !r.filter.iter().any(super::expr::Expr::has_exists),
@@ -1220,12 +1240,27 @@ fn output_order(node: &Node, children: &[Operator], role: Role) -> Vec<VarId> {
                 spec.cols.iter().map(|&(_, v)| v).collect()
             }
             Kind::Values(table) => table.sorted.clone(),
+            Kind::Path { .. } if node.children.is_empty() => walk::order(node),
+            // A path over its input joins each batch with the paths of its start nodes.
+            Kind::Path { .. } => Vec::new(),
+            // Keys come in index order, one row each.
+            Kind::GroupCountScan { key, .. } => vec![*key],
             Kind::Project(_)
             | Kind::Distinct
             | Kind::Filter(_)
             | Kind::Extend(..)
             | Kind::Slice { .. } => child(0).to_vec(),
             Kind::Union if children.len() == 1 => child(0).to_vec(),
+            // Each input row expands in place, but an unbound input value may be
+            // filled.
+            Kind::IndexJoin(_) | Kind::Assign(..) | Kind::Unfold { .. } | Kind::Unpack { .. } => {
+                let fills = expand::fills(node);
+                child(0)
+                    .iter()
+                    .take_while(|v| node.children[0].certain.contains(v) || !fills.contains(v))
+                    .copied()
+                    .collect()
+            }
             // Concatenated UNION arms are not ordered, and counts are a single row.
             _ => Vec::new(),
         },
@@ -1243,6 +1278,8 @@ impl Operator {
         // materializes does not depend on the order its children turn out to have.
         let joins = binary::eligible(&node);
         let incremental_group = group::eligible(&node);
+        let expanding = expand::eligible(&node);
+        let walking = walk::eligible(&node);
         let native_blocking =
             matches!(node.kind, Kind::Sort(_) | Kind::OrderBy { .. }) && node.children.len() == 1;
         // A native sort consumes cursor batches into charged state. It blocks before
@@ -1253,6 +1290,8 @@ impl Operator {
         let materializes = !supported(&node.kind)
             && !joins
             && !incremental_group
+            && !expanding
+            && !walking
             && (!native_blocking || exists_keys);
         if materializes && fallback == FallbackPolicy::RejectMaterialization {
             return Err(Error::Unsupported(format!(
@@ -1267,7 +1306,27 @@ impl Operator {
         info.children.clear();
         info.actual_rows = 0;
         let vars = node.vars.clone();
-        let children = if materializes && !native_blocking {
+        // A fallback materializes only its own operator when it reads its children as
+        // input tables. Those children then stream as cursors of their own.
+        let inputs = materializes
+            && !native_blocking
+            && !node.children.is_empty()
+            && exec::reads_inputs(&node);
+        let scans: Vec<Option<Node>> = if inputs {
+            node.children
+                .iter()
+                .map(|child| {
+                    (matches!(child.kind, Kind::Scan(_) | Kind::RangeScan(..))
+                        && supported(&child.kind))
+                    .then(|| child.clone())
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        // A count over the key runs of two scans reads those scans itself.
+        let reads_scans = matches!(node.kind, Kind::CountJoinRuns { .. });
+        let children = if (materializes && !native_blocking && !inputs) || reads_scans {
             Vec::new()
         } else {
             let built = std::mem::take(&mut node.children)
@@ -1302,12 +1361,19 @@ impl Operator {
         let incremental_binary = !incremental_merge && joins;
         let growing = matches!(
             node.kind,
-            Kind::Extend(..) | Kind::Filter(_) | Kind::RangeScan(..) | Kind::Distinct
+            Kind::Extend(..)
+                | Kind::Filter(_)
+                | Kind::RangeScan(..)
+                | Kind::Distinct
+                | Kind::GroupCountScan { .. }
+                | Kind::CountJoinRuns { .. }
         ) || materializes
             || native_blocking
             || incremental_merge
             || incremental_binary
-            || incremental_group;
+            || incremental_group
+            || expanding
+            || walking;
         let order = output_order(
             &node,
             &children,
@@ -1364,6 +1430,10 @@ impl Operator {
             State::Filter(Box::new(filter::Filter::new(node)))
         } else if heap {
             State::TopK(Box::new(topk::TopK::new(ctx, &node, &children[0].vars)?))
+        } else if expanding {
+            State::Expand(Box::new(expand::Expand::new(node)))
+        } else if walking {
+            State::Walk(Box::new(walk::Walk::new(ctx, &node)?))
         } else if native_blocking {
             State::Blocking {
                 node,
@@ -1375,6 +1445,8 @@ impl Operator {
                 node,
                 loaded: None,
                 at: 0,
+                inputs,
+                scans,
             }
         } else {
             match &node.kind {
@@ -1389,7 +1461,13 @@ impl Operator {
                 Kind::Empty => State::Empty,
                 Kind::CountScan { .. }
                 | Kind::CountDistinctScan { .. }
-                | Kind::CountFilterScan { .. } => State::Scalar(node),
+                | Kind::CountFilterScan { .. }
+                | Kind::CountJoinRuns { .. } => State::Scalar(node),
+                Kind::GroupCountScan { .. } => State::Counts {
+                    node,
+                    loaded: None,
+                    at: 0,
+                },
                 Kind::Distinct => State::Distinct(distinct::Distinct::new(ctx)?),
                 Kind::Slice { offset, limit } => State::Slice {
                     offset: *offset,
@@ -1462,7 +1540,11 @@ impl Operator {
 
     fn describe(&self, ctx: &Ctx) -> CursorPlan {
         let children = match &self.state {
-            State::Fallback { node, .. } => node
+            State::Fallback {
+                node,
+                inputs: false,
+                ..
+            } => node
                 .children
                 .iter()
                 .map(|n| {
@@ -1496,6 +1578,7 @@ impl Operator {
                     State::Binary(_)
                         | State::Group(_)
                         | State::Scalar(_)
+                        | State::Counts { .. }
                         | State::Blocking { .. }
                         | State::TopK(_)
                 ),
@@ -1666,8 +1749,11 @@ impl Operator {
                 .checked_add(b.table.len)
                 .ok_or_else(|| Error::invalid("cursor operator row count overflow"))?;
             ctx.check_rows(self.rows)?;
-            // Eager fallback already counted all its operator work during execution.
-            if !matches!(self.state, State::Fallback { .. } | State::Scalar(_)) {
+            // Eager kernels already counted all their operator work during execution.
+            if !matches!(
+                self.state,
+                State::Fallback { .. } | State::Scalar(_) | State::Counts { .. } | State::Expand(_)
+            ) {
                 ctx.produced(b.table.len)?;
             }
             if !matches!(self.state, State::Fallback { .. }) {
@@ -1696,6 +1782,20 @@ impl Operator {
                     self.done = true;
                     Some(Buffer { table, charge })
                 }
+                State::Counts { node, loaded, at } => {
+                    if loaded.is_none() {
+                        let (table, _) = exec::execute(ctx, node)?;
+                        let charge = OwnedCharge::new(ctx, capacity_bytes(&table))?;
+                        *loaded = Some(Buffer { table, charge });
+                    }
+                    let table = &loaded.as_ref().expect("loaded counts").table;
+                    let batch = copy_rows(ctx, table, *at, cap)?;
+                    if let Some(batch) = &batch {
+                        *at += batch.table.len;
+                    }
+                    self.done = *at == table.len;
+                    batch
+                }
                 State::Merge(merge) => {
                     merge.next(ctx, &mut self.children, options, &self.vars, cap)?
                 }
@@ -1708,6 +1808,17 @@ impl Operator {
                 State::Filter(filter) => {
                     let batch = filter.next(ctx, &mut self.children[0], options, cap)?;
                     self.done = filter.done(self.children[0].done);
+                    batch
+                }
+                State::Walk(walk) => {
+                    let batch = walk.next(ctx, &self.vars, cap)?;
+                    self.done = walk.done();
+                    batch
+                }
+                State::Expand(expand) => {
+                    let batch =
+                        expand.next(ctx, &mut self.children[0], options, &self.vars, cap)?;
+                    self.done = expand.done(self.children[0].done);
                     batch
                 }
                 State::Distinct(distinct) => {
@@ -1769,9 +1880,36 @@ impl Operator {
                     self.done = *at == table.len;
                     batch
                 }
-                State::Fallback { node, loaded, at } => {
+                State::Fallback {
+                    node,
+                    loaded,
+                    at,
+                    inputs,
+                    scans,
+                } => {
                     if loaded.is_none() {
-                        let (mut table, mut info) = exec::execute(ctx, node)?;
+                        let (mut table, mut info) = if *inputs {
+                            let children = &mut self.children;
+                            let mut collect = |i: usize| match &scans[i] {
+                                Some(scan) => {
+                                    let (table, info) = exec::execute(ctx, scan)?;
+                                    let child = &mut children[i];
+                                    child.rows = table.len;
+                                    child.info.actual_rows = info.actual_rows;
+                                    child.info.time_ms = info.time_ms;
+                                    child.done = true;
+                                    Ok((table, info))
+                                }
+                                None => collect_input(ctx, &mut children[i], options),
+                            };
+                            exec::execute_with_inputs(ctx, node, &mut collect)?
+                        } else {
+                            exec::execute(ctx, node)?
+                        };
+                        if *inputs {
+                            // The child operators describe themselves.
+                            info.children.clear();
+                        }
                         if ctx.graphs.is_some() {
                             info.redact();
                         }
@@ -1887,6 +2025,25 @@ impl Operator {
             }
         }
     }
+}
+
+/// Collect a child cursor's output as the input table of an eager operator. The table
+/// keeps the order of its operator, and its charge passes to the eager operator, which
+/// holds its input tables while it runs.
+fn collect_input(
+    ctx: &Arc<Ctx>,
+    child: &mut Operator,
+    options: &CursorOptions,
+) -> Result<(Table, PlanInfo)> {
+    let mut input = Buffer::new(ctx, &child.vars, 0)?;
+    input.table.sorted.clone_from(&child.order);
+    while let Some(batch) = child.next(ctx, options, options.batch_rows)? {
+        merge::append(ctx, &mut input, &batch.table, 0..batch.table.len)?;
+    }
+    let Buffer { mut table, charge } = input;
+    drop(charge);
+    table.sorted.clone_from(&child.order);
+    Ok((table, child.info.clone()))
 }
 
 fn copy_rows(ctx: &Arc<Ctx>, table: &Table, at: usize, cap: usize) -> Result<Option<Buffer>> {

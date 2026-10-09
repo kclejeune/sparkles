@@ -857,7 +857,7 @@ fn charged_exists_state_matches_eager_with_budget_decline_and_partial_keys() {
 #[test]
 fn eager_fallback_is_visible_lazy_and_budgeted() {
     let s = store(100);
-    let q = "SELECT ?s ?o WHERE { ?s <urn:p>+ ?o }";
+    let q = "SELECT ?s ?o WHERE { ?s <urn:p> ?o FILTER NOT EXISTS { ?s <urn:q> ?o } }";
     assert!(matches!(
         select_cursor(s.snapshot(), q, &Default::default(), &options(2)),
         Err(Error::Unsupported(_))
@@ -1626,6 +1626,57 @@ fn resumable_binary_joins_preserve_bags_compatibility_and_optional_filters() {
     }
 }
 
+/// The hash join keys on the shared column that its build data leaves unbound least
+/// often. Bound probes must still meet build rows that leave the key unbound, and an
+/// unbound probe meets every build row, with duplicates kept.
+#[test]
+fn hash_join_keys_cover_unbound_build_and_probe_values_with_duplicates() {
+    let s = store(0);
+    let left = "VALUES (?x ?y ?a) { (1 UNDEF 10) (UNDEF 2 11) (1 2 12) (1 2 12) (UNDEF UNDEF 13) (3 UNDEF 14) (2 3 15) }";
+    let right = "VALUES (?x ?y ?b) { (1 2 20) (1 2 20) (UNDEF 2 21) (1 UNDEF 22) (UNDEF UNDEF 23) (2 3 24) (2 UNDEF 25) (4 4 26) }";
+    // Every build row binds ?y here except one, and ?x is unbound in two.
+    let mostly =
+        "VALUES (?x ?y ?b) { (UNDEF 2 20) (1 2 21) (1 2 21) (UNDEF 3 22) (2 UNDEF 23) (3 4 24) }";
+    let mut queries = Vec::new();
+    for (l, r) in [(left, right), (right, left), (left, mostly), (mostly, left)] {
+        queries.push(format!("SELECT * WHERE {{ {l} {r} }}"));
+        queries.push(format!("SELECT * WHERE {{ {l} OPTIONAL {{ {r} }} }}"));
+        queries.push(format!(
+            "SELECT * WHERE {{ {l} OPTIONAL {{ {r} FILTER(?b > ?a + 10) }} }}"
+        ));
+        queries.push(format!("SELECT * WHERE {{ {l} MINUS {{ {r} }} }}"));
+    }
+    // Long runs of one key, so that chains are longer than a batch.
+    let many: String = (0..300).map(|i| format!("({} {}) ", i % 3, i)).collect();
+    let few: String = (0..40)
+        .map(|i| {
+            if i % 7 == 0 {
+                format!("(UNDEF {i}) ")
+            } else {
+                format!("({} {i}) ", i % 4)
+            }
+        })
+        .collect();
+    queries.push(format!(
+        "SELECT * WHERE {{ VALUES (?x ?a) {{ {many} }} VALUES (?x ?b) {{ {few} }} }}"
+    ));
+    queries.push(format!(
+        "SELECT * WHERE {{ VALUES (?x ?a) {{ {many} }} OPTIONAL {{ VALUES (?x ?b) {{ {few} }} }} }}"
+    ));
+    queries.push(format!(
+        "SELECT * WHERE {{ VALUES (?x ?a) {{ {few} }} MINUS {{ VALUES (?x ?b) {{ {many} }} }} }}"
+    ));
+    for q in &queries {
+        let q = q.as_str();
+        let expected = bag(query(s.snapshot(), q, &Default::default()).unwrap().rows());
+        for cap in [1, 2, 3, 4096] {
+            let c = open(&s, q, cap);
+            assert!(!c.plan().has_materialization());
+            assert_eq!(bag(all(c)), expected, "{q}; cap {cap}");
+        }
+    }
+}
+
 #[test]
 fn incremental_groups_match_eager_for_empty_unbound_numeric_and_text_inputs() {
     let s = store(0);
@@ -1988,7 +2039,7 @@ fn strict_automatic_execution_never_hides_materialization_in_eager_mode() {
     assert!(matches!(
         query_execution(
             s.snapshot(),
-            "SELECT * {?s <urn:p>+ ?o}",
+            "SELECT * {?s ?p ?o FILTER NOT EXISTS {?o ?p ?s}}",
             &Default::default(),
             &strict,
             ExecutionMode::Auto,
@@ -2445,7 +2496,7 @@ impl Gen {
 
     fn aggregate(&mut self) -> String {
         let x = self.var();
-        match self.rng.below(8) {
+        match self.rng.below(12) {
             0 => "COUNT(*)".into(),
             1 => format!("COUNT({x})"),
             2 => format!("COUNT(DISTINCT {x})"),
@@ -2453,7 +2504,11 @@ impl Gen {
             4 => format!("MIN({x})"),
             5 => format!("MAX({x})"),
             6 => format!("AVG({x})"),
-            _ => format!("SUM({x} + 1)"),
+            7 => format!("SUM({x} + 1)"),
+            8 => format!("SUM(DISTINCT {x})"),
+            9 => format!("AVG({x} * 2)"),
+            10 => format!("MAX(STR({x}))"),
+            _ => format!("COUNT(DISTINCT COALESCE({x}, 0))"),
         }
     }
 
@@ -2467,6 +2522,8 @@ impl Gen {
                 "<urn:q>",
                 "(<urn:q>|<urn:p>)/(<urn:q>|<urn:p>)",
                 "<urn:q>/(<urn:q>|<urn:p>)",
+                "<urn:q>+",
+                "^<urn:q>*",
             ]);
             let scope = [s, o].into_iter().filter(|v| v.starts_with('?')).collect();
             return (format!("{s} {p} {o} ."), scope);
@@ -2946,6 +3003,215 @@ fn random_queries_agree_between_cursor_and_eager_through_a_masked_view() {
                 .len()
     );
     differential("masked", &snapshot, &opts, SEEDS);
+}
+
+/// An operator without a cursor implementation materializes only itself. Its inputs
+/// are cursors of their own, and they stream into it.
+#[test]
+fn a_fallback_materializes_only_its_operator_and_streams_its_inputs() {
+    let s = store(60);
+    let data = (0..60)
+        .map(|i| format!("<urn:s:{i}> <urn:q> <urn:s:{}> .\n", (i * 7) % 60))
+        .collect::<String>();
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    fn fallbacks(plan: &sparkles_core::sparql::CursorPlan, out: &mut Vec<bool>) {
+        if plan.materializes {
+            out.push(plan.children.iter().any(|c| c.has_materialization()));
+        }
+        for child in &plan.children {
+            fallbacks(child, out);
+        }
+    }
+    for q in [
+        "SELECT ?t (COUNT(*) AS ?n) WHERE { ?s <urn:p> ?o . ?s <urn:q> ?t } GROUP BY ?t HAVING (NOT EXISTS { ?t <urn:p> 3 })",
+        "SELECT ?s ?t WHERE { ?s <urn:p> ?o . ?s <urn:q> ?t FILTER NOT EXISTS { ?t <urn:p> 3 } }",
+        "SELECT ?s ?x WHERE { ?s <urn:p> ?o FILTER(?o < 20) ?s (<urn:q>/<urn:q>)+ ?x }",
+        "SELECT ?s ?x WHERE { { ?s <urn:q> ?t } UNION { ?t <urn:q> ?s } ?s (<urn:q>|^<urn:q>)* ?x }",
+    ] {
+        let expected = bag(query(s.snapshot(), q, &Default::default()).unwrap().rows());
+        for rows in [1, 2, 3, 4096] {
+            let opts = CursorOptions {
+                batch_rows: rows,
+                ..Default::default()
+            };
+            let c = select_cursor(s.snapshot(), q, &Default::default(), &opts).unwrap();
+            let mut found = Vec::new();
+            fallbacks(c.plan(), &mut found);
+            assert!(!found.is_empty(), "{q}");
+            assert!(found.iter().all(|nested| !nested), "{q}: {:?}", c.plan());
+            assert_eq!(bag(all(c)), expected, "{q}; {rows}");
+        }
+    }
+}
+
+/// Groups with several keys, expression arguments, DISTINCT and GROUP_CONCAT keep
+/// running state rather than falling back, and match eager answers, including errors,
+/// unbound keys and empty input.
+#[test]
+fn widened_incremental_groups_match_eager() {
+    let s = store(40);
+    let rows = "VALUES (?k ?j ?x ?y) { (1 1 1 \"a\") (1 1 1 \"b\") (1 2 2 \"a\") (UNDEF 2 3 \"c\") (2 UNDEF \"x\" <urn:i>) (2 UNDEF 4 UNDEF) (1 1 UNDEF \"a\"@en) (UNDEF UNDEF 5 \"d\") (2 1 1 \"a\") (UNDEF 1 1 \"b\") }";
+    for q in [
+        format!("SELECT ?k ?j (COUNT(*) AS ?n) (SUM(?x) AS ?s) WHERE {{ {rows} }} GROUP BY ?k ?j"),
+        format!("SELECT ?k (SUM(?x * 2) AS ?s) (AVG(?x + 1) AS ?a) (MIN(STR(?y)) AS ?m) WHERE {{ {rows} }} GROUP BY ?k"),
+        format!("SELECT ?k (COUNT(DISTINCT ?x) AS ?c) (SUM(DISTINCT ?x) AS ?s) (COUNT(DISTINCT ?y) AS ?d) WHERE {{ {rows} }} GROUP BY ?k"),
+        format!("SELECT ?k (GROUP_CONCAT(?y) AS ?g) (GROUP_CONCAT(DISTINCT STR(?y); SEPARATOR=\"|\") AS ?h) WHERE {{ {rows} }} GROUP BY ?k"),
+        format!("SELECT (GROUP_CONCAT(?x; SEPARATOR=\",\") AS ?g) (SAMPLE(?x * 1) AS ?a) (MAX(?x) AS ?m) WHERE {{ {rows} }}"),
+        format!("SELECT ?j (COUNT(?x / 0) AS ?e) (SUM(?x / 0) AS ?f) WHERE {{ {rows} }} GROUP BY ?j"),
+        "SELECT ?k ?j (COUNT(*) AS ?n) (GROUP_CONCAT(?x) AS ?g) WHERE { VALUES (?k ?j ?x) {} } GROUP BY ?k ?j".into(),
+        "SELECT (COUNT(DISTINCT ?x) AS ?n) (GROUP_CONCAT(?x) AS ?g) (AVG(?x * 2) AS ?a) WHERE { VALUES ?x {} }".into(),
+        "SELECT ?s ?o (COUNT(*) AS ?n) WHERE { ?s <urn:p> ?o } GROUP BY ?s ?o HAVING (?o > 30)".into(),
+        "SELECT ?m (COUNT(?s) AS ?n) (SUM(?o) AS ?t) WHERE { ?s <urn:p> ?o BIND(?o - (?o / 5 - FLOOR(?o / 5)) * 5 AS ?r) } GROUP BY (FLOOR(?o / 10) AS ?m)".into(),
+    ] {
+        let expected = bag(query(s.snapshot(), &q, &Default::default()).unwrap().rows());
+        for cap in [1, 2, 3, 4096] {
+            let c = open(&s, &q, cap);
+            assert!(!c.plan().has_materialization(), "{q}");
+            assert_eq!(bag(all(c)), expected, "{q}; cap {cap}");
+        }
+    }
+}
+
+/// Counts per key, from the index statistics or from key runs, keep group state and
+/// emit it across batches without falling back, also over pending changes.
+#[test]
+fn group_count_scans_stream_their_counts() {
+    fn has(plan: &sparkles_core::sparql::CursorPlan, prefix: &str) -> bool {
+        plan.operator.operator.starts_with(prefix) || plan.children.iter().any(|c| has(c, prefix))
+    }
+    let s = store(50);
+    let data = (0..50)
+        .map(|i| format!("<urn:s:{}> <urn:q> <urn:s:{i}> .\n", i % 7))
+        .collect::<String>();
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    s.compact().unwrap();
+    let queries = [
+        "SELECT ?p (COUNT(*) AS ?c) WHERE { ?s ?p ?o } GROUP BY ?p",
+        "SELECT ?s (COUNT(*) AS ?c) WHERE { ?s <urn:q> ?o } GROUP BY ?s",
+        "SELECT ?o (COUNT(?s) AS ?c) WHERE { ?s <urn:q> ?o } GROUP BY ?o",
+    ];
+    for round in 0..2 {
+        for q in queries {
+            let expected = bag(query(s.snapshot(), q, &Default::default()).unwrap().rows());
+            for cap in [1, 2, 3, 4096] {
+                let c = open(&s, q, cap);
+                assert!(has(c.plan(), "GroupCount"), "{q}: {:?}", c.plan());
+                assert!(!c.plan().has_materialization());
+                assert_eq!(bag(all(c)), expected, "{q}; cap {cap}; round {round}");
+            }
+        }
+        sparkles_core::sparql::update::update(
+            &s,
+            "INSERT DATA { <urn:s:1> <urn:q> <urn:new> . <urn:s:9> <urn:q> <urn:s:1> } ; DELETE DATA { <urn:s:3> <urn:q> <urn:s:3> }",
+            &Default::default(),
+        )
+        .unwrap();
+    }
+}
+
+/// Transitive paths walk one start node at a time, from their own start nodes or from
+/// the rows of their input, and match eager answers under the strict policy, over
+/// pending changes and in named graphs.
+#[test]
+fn transitive_paths_stream_one_start_at_a_time() {
+    let s = store(30);
+    let data = (0..40)
+        .map(|i| {
+            format!(
+                "<urn:n:{i}> <urn:q> <urn:n:{}> .\n<urn:g:{}> {{ <urn:n:{i}> <urn:r> <urn:n:{}> }}\n",
+                (i * 7 + 3) % 40,
+                i % 3,
+                (i + 1) % 40
+            )
+        })
+        .collect::<String>();
+    s.load(&[Source::from_bytes(data.into_bytes(), RdfFormat::TriG, None)])
+        .unwrap();
+    s.compact().unwrap();
+    let queries = [
+        "SELECT ?s ?o WHERE { ?s <urn:q>+ ?o }",
+        "SELECT ?s ?o WHERE { ?s <urn:q>* ?o }",
+        "SELECT ?s WHERE { ?s <urn:q>+ ?s }",
+        "SELECT ?o WHERE { <urn:n:1> <urn:q>+ ?o }",
+        "SELECT ?s WHERE { ?s ^<urn:q>* <urn:n:2> }",
+        "SELECT ?g ?s ?o WHERE { GRAPH ?g { ?s <urn:r>+ ?o } }",
+        "SELECT ?s ?x WHERE { ?s <urn:p> ?o FILTER(?o < 5) ?s <urn:q>* ?x }",
+        "SELECT ?s ?o WHERE { ?s <urn:q>+ ?o } LIMIT 7",
+    ];
+    for round in 0..2 {
+        for q in queries {
+            let expected = bag(query(s.snapshot(), q, &Default::default()).unwrap().rows());
+            for cap in [1, 2, 5, 4096] {
+                let c = open(&s, q, cap);
+                assert!(!c.plan().has_materialization(), "{q}: {:?}", c.plan());
+                let got = bag(all(c));
+                if q.contains("LIMIT") {
+                    let full = "SELECT ?s ?o WHERE { ?s <urn:q>+ ?o }";
+                    let full = bag(query(s.snapshot(), full, &Default::default())
+                        .unwrap()
+                        .rows());
+                    assert_eq!(got.len(), expected.len(), "{q}; cap {cap}");
+                    assert!(got.iter().all(|r| full.contains(r)), "{q}; cap {cap}");
+                } else {
+                    assert_eq!(got, expected, "{q}; cap {cap}; round {round}");
+                }
+            }
+        }
+        sparkles_core::sparql::update::update(
+            &s,
+            "INSERT DATA { <urn:n:1> <urn:q> <urn:new> . <urn:new> <urn:q> <urn:n:2> . GRAPH <urn:g:0> { <urn:n:5> <urn:r> <urn:new> } } ; DELETE DATA { <urn:n:3> <urn:q> <urn:n:24> }",
+            &Default::default(),
+        )
+        .unwrap();
+    }
+}
+
+/// A count of a two-hop join over key runs reads its scans itself and counts as a
+/// scalar barrier rather than an eager fallback, also over pending changes.
+#[test]
+fn count_joins_from_key_runs_run_without_fallback() {
+    fn has(plan: &sparkles_core::sparql::CursorPlan, prefix: &str) -> bool {
+        plan.operator.operator.starts_with(prefix) || plan.children.iter().any(|c| has(c, prefix))
+    }
+    let s = store(20);
+    let data = (0..60)
+        .map(|i| format!("<urn:s:{}> <urn:k> <urn:s:{}> .\n", i % 13, (i * 5) % 17))
+        .collect::<String>();
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    s.compact().unwrap();
+    let q = "SELECT (COUNT(*) AS ?n) WHERE { ?a <urn:k> ?b . ?b <urn:k> ?c }";
+    for round in 0..2 {
+        let expected = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+        for cap in [1, 4096] {
+            let c = open(&s, q, cap);
+            if round == 0 {
+                assert!(has(c.plan(), "CountJoinFromRuns"), "{:?}", c.plan());
+            }
+            assert!(!c.plan().has_materialization());
+            assert_eq!(all(c), expected, "cap {cap}; round {round}");
+        }
+        sparkles_core::sparql::update::update(
+            &s,
+            "INSERT DATA { <urn:s:1> <urn:k> <urn:s:2> . <urn:s:2> <urn:k> <urn:s:1> } ; DELETE DATA { <urn:s:0> <urn:k> <urn:s:0> }",
+            &Default::default(),
+        )
+        .unwrap();
+    }
 }
 
 /// Values of every ORDER BY class, including dates with and without a timezone close

@@ -586,14 +586,34 @@ Merge joins resume both inputs across batches. Hash, cross, OPTIONAL, semi, anti
 MINUS joins first collect their build input into charged state. They then resume the
 probe input and the expansion of matching rows across batches, so neither the join's
 output nor its matching row pairs are materialized. All of these joins preserve
-duplicates and unbound compatibility. DISTINCT owns a charged key set. Eligible groups
-over plain variables keep aggregate state rather than input rows. Blocking sorts
-without LIMIT consume normal input batches even when the requested output prefix is
-small. They reserve their input, keys and reordering state, and they report their full-input
-barrier separately from eager fallback, so the strict policy admits them. Growing state
-fails explicitly when its reservation exceeds the budget, because disk spill is not
-implemented. Unsupported operators and EXISTS expressions remain visible barriers that
-run eagerly when first demanded, and the strict policy rejects them before that demand.
+duplicates and unbound compatibility. The hash join keys its build rows on the shared
+variable with the fewest unbound values in the built data, as eager execution does. A
+bound probe visits the build rows with its key and then the build rows that leave the
+key unbound, and an unbound probe visits every build row. The chains of row numbers are
+checked against their 32-bit width and charged with the build.
+
+Index joins, LET, UNFOLD, triple-term decomposition and transitive paths that start
+from their input rows run their eager kernel on one input batch at a time. The output
+of a batch is charged state that later pulls resume, so a batch that expands into many
+solutions still returns batches no larger than the caller asks for. The input demand
+follows the expansion seen so far. A transitive path without an input walks one start
+node at a time. It charges the start nodes it keeps and the set of nodes it has
+visited. DISTINCT owns a charged key set. Groups keep aggregate state rather than input
+rows for composite keys, expression arguments, DISTINCT aggregates, GROUP_CONCAT,
+SAMPLE and the statistical aggregates. Group counts read from the index or its
+statistics, and counts of two-hop joins over key runs, run as barriers that return
+their counts without an eager fallback. Blocking sorts without
+LIMIT consume normal input batches even when the requested output prefix is small. They reserve their input, keys and
+reordering state, and they report their full-input barrier separately from eager
+fallback, so the strict policy admits them. Growing state fails explicitly when its
+reservation exceeds the budget, because disk spill is not implemented.
+
+An operator without a cursor implementation materializes only itself. It reads its
+inputs from child cursors, or from exactly sized scans when an input is a plain scan,
+so the rest of the plan keeps streaming. A fallback drains its inputs in full before it
+runs, so a LIMIT above it does not stop those inputs early. EXISTS expressions,
+registered and fold aggregates, and COUNT(DISTINCT *) still run eagerly when first
+demanded, and the strict policy rejects them before that demand.
 
 Batch writers decode distinct base-vocabulary terms under charges for retained and
 reconstruction memory, and they skip the optional cache when memory is tight. BIND
@@ -632,10 +652,15 @@ this way preserves enabled result caches. Over HTTP, auto falls back to eager ex
 when the negotiated encoding is SPARQL Results Thrift, which has no cursor writer.
 
 The W3C SPARQL 1.0 and 1.1 query evaluation tests run through cursors at batch sizes
-of 1, 2, 3 and 4,096 rows and match the expected results. The 53 queries that need
-eager fallback are counted, and they run with fallback allowed. A seeded differential
-test compares cursor and eager answers at the same batch sizes over generated VALUES,
-scans, property path sequences, joins, OPTIONAL, MINUS and UNION with unbound columns.
+of 1, 2, 3 and 4,096 rows and match the expected results. The queries that need eager
+fallback are counted, and they run with fallback allowed. The count fell from 53 to 25
+when joins, expanding operators, groups, group counts and paths gained cursor
+implementations. Of the 25, fifteen filter with EXISTS, nine use a transitive path over
+a sequence or alternative, and one counts distinct rows with COUNT(DISTINCT *). A
+seeded differential test compares cursor and eager answers at the same batch sizes
+over generated VALUES, scans, property paths, joins, OPTIONAL, MINUS, UNION, filters,
+ordering, slicing, grouping and aggregates. It runs over a compacted base, pending
+changes, many small blocks and an access-restricted view.
 Correctness and resource gates passed across core, HTTP and the bindings. The benchmark
 refresh, which measures Sparkles only, covers 1.05M, 10.5M and full DBpedia, plus
 specialized suites and matched JVM controls.
@@ -685,24 +710,38 @@ other ordered and grouped queries, and 19 other queries in both modes. NOT EXIST
 exception at 3.6% slower in both modes. Its code path did not change, and it executed the
 same number of instructions in both builds, so the difference is code layout.
 
+The fallback work was measured on the 1.05M suite against the previous commit with
+both servers running at once, pinned to the same three cores with the result cache
+off. Requests alternated in A, B, B, A order and the change is the median of 41 paired
+ratios. Streaming expression aggregation (expr-agg-arg) fell from 10.5 to 4.6 ms,
+because its group no longer falls back. Streaming MINUS fell from 3.5 to 3.0 ms with
+the new hash join keys. Every other query in both modes stayed within 10% of the
+previous commit, including the paths, EXISTS filters, group counts and two-hop counts
+that changed mode. Among the 30 bench queries, the number with an eager fallback under
+streaming fell from 13 to 2. The two that remain are the EXISTS filters of exists-join
+and not-exists, and their inputs now stream into the filter. The machine was shared
+with other work during these runs, so the request-level interleaving is what keeps
+them comparable. Memory use is unchanged for the counts read from the index. The
+expanding operators and path walks hold the output of one input batch or one start
+node rather than the whole result. In exchange the hash index adds 4 bytes per build
+row and one map entry per distinct key to the charged build state.
+
 Disk spill, broader automatic selection and removing every remaining cost of complete
 responses are follow-up work. A review of the implementation found further follow-ups:
 
-- An operator without a cursor implementation runs its whole subtree eagerly, and that
-  fallback does not use the early stop that LIMIT gets in eager execution. The fallback
-  should eventually materialize only the unsupported operator and read its inputs from
-  child cursors. Prefix demand may pass only through operators that preserve the
-  required solutions, including OFFSET and callback effects. The absence of ORDER alone
-  is not enough. Sharing kernels and accounting is incremental work. Replacing eager
-  execution with cursor collection is subject to the existing performance gates.
-- Index joins already run per input table, so they are candidates for streaming instead
-  of fallback. Because a batch can expand into many solutions, the operator needs charged
-  fan-out state and resumable output before it counts as bounded.
-- The streaming hash join picks its key from the plan's certainty alone and scans the
-  build side for every probe row otherwise. It should check the built data for unbound
-  values, as eager execution does. Bound probes must also match unbound build rows,
-  and an unbound probe must consider all compatible build rows. Compact row chains need
-  checked index-width limits, charges and duplicate/OPTIONAL/MINUS coverage.
+- FILTER EXISTS and NOT EXISTS are the most frequent remaining fallback. Evaluating them
+  per input batch needs the subplan to run under the cursor's charges. It also needs a
+  per-batch choice between a key set and per-row evaluation that does not fall to
+  unmemoized per-row work when batches are small.
+- A fallback drains its inputs in full. Passing LIMIT demand into a fallback's inputs
+  needs a proof for each operator that a prefix of its input yields the required
+  solutions, including OFFSET and callback effects. The absence of ORDER alone is not
+  enough.
+- A transitive path over a sequence or alternative reads its edge input from a child
+  cursor but materializes its own output. Walking it one start node at a time needs the
+  edge relation as charged state.
+- COUNT(DISTINCT *) and registered aggregates need running state of their own before
+  their groups stop falling back.
 - Sort order travels as a claim on each batch. It should be a property of the operator,
   checked at batch boundaries in debug builds.
 - Profile bounded coalescing, parallel batch decoding and one-batch prefetch in the
@@ -716,9 +755,6 @@ responses are follow-up work. A review of the implementation found further follo
 - Explicit streaming over HTTP should send its first bytes sooner than after 1 MiB.
   Earlier response commitment needs explicit truncated-body behavior for later errors,
   bounded admission of slow streaming bodies and documented transfer deadlines.
-- The differential test should cover filters, ordering, slicing, grouping, pending
-  changes, multiple blocks and access-restricted views. This extends the combined
-  generated matrix alongside existing focused tests and W3C cursor coverage.
 
 These are follow-up proposals, not measured speedups or a change to the delivered
 defaults. Strengthened tests and ordering invariants precede the operator changes,
