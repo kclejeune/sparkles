@@ -107,6 +107,17 @@ impl Reader {
     }
 }
 
+/// `ASK` whether `?t` occurs in a triple of the reader's view, as subject, predicate or
+/// object.
+pub(crate) fn exists_term(r: &Reader) -> String {
+    format!(
+        "ASK {{ {{ {} }} UNION {{ {} }} UNION {{ {} }} }}",
+        r.quads("?t ?p ?o", &[]),
+        r.quads("?s ?p ?t", &[]),
+        r.quads("?s ?t ?o", &[]),
+    )
+}
+
 /// A term of a `VALUES` block, serialized by oxrdf (validated and escaped), never
 /// copied from input text. Blank nodes cannot appear in `VALUES`.
 pub(crate) fn values_term(t: &Term) -> Option<String> {

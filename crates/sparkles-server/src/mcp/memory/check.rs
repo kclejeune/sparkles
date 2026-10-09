@@ -2,7 +2,7 @@
 //! dataset, without running the query.
 
 use super::text::{edit_distance, words};
-use super::{RDF_TYPE, Reader, local_name};
+use super::{RDF_TYPE, Reader, exists_term, local_name};
 use crate::mcp::Outcome;
 use crate::mcp::errors::{ToolError, syntax_summary};
 use crate::mcp::render::{Prefixes, Terms};
@@ -667,8 +667,9 @@ impl Tools<'_> {
                 Some(super::super::tools::remaining(deadline).map_err(|e| ctx.engine(e))?);
             let (_, plan) = sparkles::sparql::explain(r.snap.clone(), &a.query, &opts)
                 .map_err(|e| ctx.engine(e))?;
+            // a view restricted by grants sees no estimates (-1)
             let root = plan.estimated_rows;
-            estimated = Some(root.max(0.0).round() as u64);
+            estimated = (root >= 0.0).then(|| root.round() as u64);
             for w in crate::mcp::tools::plan_warnings(&plan, &parsed, 100.min(self.cfg().max_rows))
             {
                 issues.push(Issue {
@@ -845,16 +846,6 @@ fn exists_class(r: &Reader) -> String {
         "ASK {{ {{ {} }} UNION {{ {} VALUES ?k {{ <http://www.w3.org/2000/01/rdf-schema#Class> <http://www.w3.org/2002/07/owl#Class> }} }} }}",
         r.quads("?s a ?c", &[]),
         r.quads("?c a ?k", &[]),
-    )
-}
-
-/// Whether `?t` occurs in a triple of the view.
-fn exists_term(r: &Reader) -> String {
-    format!(
-        "ASK {{ {{ {} }} UNION {{ {} }} UNION {{ {} }} }}",
-        r.quads("?t ?p ?o", &[]),
-        r.quads("?s ?p ?t", &[]),
-        r.quads("?s ?t ?o", &[]),
     )
 }
 

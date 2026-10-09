@@ -1578,6 +1578,67 @@ mod auth {
         }
     }
 
+    /// explain_query through graph grants (C12): a term that occurs only in a hidden
+    /// graph is reported as an absent one is, and a view without estimates shows none
+    /// and still warns about a missing LIMIT.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn explain_query_follows_graph_grants() {
+        use crate::http::router_tests::auth::graphs::{DATA, users};
+        let s = authed(&[], &[], &users());
+        let ds = s.state.attach("graphs", DbType::Mem, None).unwrap();
+        ds.store
+            .load(&[Source::from_bytes(
+                DATA.as_bytes().to_vec(),
+                oxrdfio::RdfFormat::TriG,
+                None,
+            )])
+            .unwrap();
+        let explain = |user: &'static str, query: String| {
+            let app = s.app.clone();
+            async move {
+                tool(
+                    &app,
+                    "explain_query",
+                    json!({"dataset": "graphs", "query": query}),
+                    &[("authorization", &b(user))],
+                )
+                .await
+            }
+        };
+        // ex:b1 occurs only in http://ex/b/1
+        let term = |t: &str| format!("SELECT ?s WHERE {{ ?s <http://ex/q> <{t}> }} LIMIT 5");
+        let full = explain("gfull", term("http://ex/b1")).await;
+        assert_eq!(full["structuredContent"]["warnings"], json!([]), "{full}");
+        let hidden = explain("gra", term("http://ex/b1")).await;
+        let absent = explain("gra", term("http://ex/zz")).await;
+        let warning = |r: &J, t: &str| {
+            let w = &r["structuredContent"]["warnings"];
+            assert_eq!(w.as_array().map(Vec::len), Some(1), "{r}");
+            assert_eq!(w[0]["code"], "unknown-term", "{r}");
+            w[0]["message"].as_str().unwrap().replace(t, "T")
+        };
+        assert_eq!(warning(&hidden, "ex:b1"), warning(&absent, "ex:zz"));
+        // estimates: a number for the full view, null for the restricted one, which
+        // still hears about the missing LIMIT
+        let q = "SELECT ?s ?o WHERE { ?s <http://ex/p> ?o }".to_string();
+        let full = explain("gfull", q.clone()).await;
+        assert!(
+            full["structuredContent"]["estimatedRows"].is_u64(),
+            "{full}"
+        );
+        let r = explain("gra", q).await;
+        let sc = &r["structuredContent"];
+        assert!(sc["estimatedRows"].is_null(), "{r}");
+        assert!(sc["plan"].as_str().unwrap().contains("est=?"), "{r}");
+        let codes: Vec<&str> = sc["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|w| w["code"].as_str().unwrap())
+            .collect();
+        assert_eq!(codes, ["no-limit"], "{r}");
+    }
+
     /// The memory tools of C17 §6 through graph grants (C12): checks, candidates,
     /// facts and citations come from the caller's view only, and a term that exists
     /// only in a hidden graph is reported as an absent one is.

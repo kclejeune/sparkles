@@ -1076,6 +1076,24 @@ impl Tools<'_> {
             .map_err(|e| ctx.engine(e))?;
         let (algebra, plan) =
             sparql::explain(snap.clone(), &a.query, &opts).map_err(|e| ctx.engine(e))?;
+        // A caller whose grants or protections hide some data must not learn from the
+        // dictionary that a term occurs there, so its terms are looked up in its view.
+        let view = self
+            .call
+            .principal
+            .view(&ds.name, crate::auth::Endpoint::Query)
+            .is_some()
+            .then(|| {
+                let mut opts = opts.clone();
+                opts.union_default_graph = Some(false);
+                opts.default_graph_extra.clear();
+                super::memory::Reader {
+                    snap: snap.clone(),
+                    opts,
+                    deadline: self.call.arrived + timeout,
+                    reasoning,
+                }
+            });
         let mut lines = String::new();
         plan_lines(&plan, 0, &mut lines);
         // the planner's own notes first (spatial filters not pushed down, …)
@@ -1089,11 +1107,29 @@ impl Tools<'_> {
         constant_terms(pattern(&parsed), &mut consts);
         let mut seen = BTreeSet::new();
         let mut terms = Terms::new(&prefixes, 200);
+        let mut lookups = 0;
         for t in consts {
             if warnings.len() >= 10 {
                 break;
             }
-            if !seen.insert(t.to_string()) || snap.lookup_term(&t).is_some() {
+            if !seen.insert(t.to_string()) {
+                continue;
+            }
+            let known = match (snap.lookup_term(&t), &view) {
+                (None, _) => false,
+                (Some(_), None) => true,
+                // past the lookups, an unchecked term gets no warning
+                (Some(_), Some(_)) if lookups >= 20 => true,
+                (Some(_), Some(r)) => {
+                    lookups += 1;
+                    r.ask(
+                        &super::memory::exists_term(r),
+                        vec![("t".into(), t.clone())],
+                    )
+                    .map_err(|e| ctx.engine(e))?
+                }
+            };
+            if known {
                 continue;
             }
             warnings.push(json!({
@@ -1122,7 +1158,8 @@ impl Tools<'_> {
             "dataset": ds.name,
             "commit": snap.commit,
             "queryType": kind,
-            "estimatedRows": root.max(0.0).round() as u64,
+            // null when the caller's view hides the estimates
+            "estimatedRows": (root >= 0.0).then(|| root.round() as u64),
             "plan": lines.trim_end(),
             "warnings": warnings,
         });
@@ -1571,10 +1608,12 @@ fn plan_lines(p: &PlanInfo, depth: usize, out: &mut String) {
         out.push(' ');
         out.push_str(&p.description.replace(['\n', '\r'], " "));
     }
-    out.push_str(&format!(
-        " est={}",
-        p.estimated_rows.max(0.0).round() as u64
-    ));
+    // a view restricted by grants sees no estimates (-1)
+    if p.estimated_rows < 0.0 {
+        out.push_str(" est=?");
+    } else {
+        out.push_str(&format!(" est={}", p.estimated_rows.round() as u64));
+    }
     let cols: Vec<String> = p.columns.iter().map(|c| format!("?{c}")).collect();
     out.push_str(&format!(" [{}]\n", cols.join(" ")));
     for c in &p.children {
@@ -1590,15 +1629,22 @@ pub(super) fn plan_warnings(
 ) -> Vec<(&'static str, String)> {
     let mut out = Vec::new();
     let root = plan.estimated_rows;
+    // a view restricted by grants sees no estimates (-1): any query without a LIMIT
+    // may be large
+    let hidden = root < 0.0;
     if matches!(query_type(parsed), "SELECT" | "CONSTRUCT")
         && !has_limit(pattern(parsed))
-        && root > 10_000.0
+        && (hidden || root > 10_000.0)
     {
+        let size = if hidden {
+            "No LIMIT, and no estimate is available for this view".to_string()
+        } else {
+            format!("No LIMIT and about {} result rows estimated", approx(root))
+        };
         out.push((
             "no-limit",
             format!(
-                "No LIMIT and about {} result rows estimated; sparql_query returns only the first {default_rows}. Add LIMIT or aggregate with COUNT/GROUP BY.",
-                approx(root),
+                "{size}; sparql_query returns only the first {default_rows}. Add LIMIT or aggregate with COUNT/GROUP BY."
             ),
         ));
     }

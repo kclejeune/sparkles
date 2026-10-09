@@ -277,7 +277,7 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
             Some(
                 json!({"type":"object","required":["dataset","commit","queryType","estimatedRows","plan","warnings"],"properties":{
                 "dataset":{"type":"string"},"commit":{"type":"integer"},"queryType":{"type":"string"},
-                "estimatedRows":{"type":"integer"},"plan":{"type":"string"},"algebra":{"type":"string"},
+                "estimatedRows":{"type":["integer","null"]},"plan":{"type":"string"},"algebra":{"type":"string"},
                 "warnings":{"type":"array","items":{"type":"object","required":["code","message"],"properties":{
                     "code":{"enum":["unknown-term","no-limit","large-estimate","service-disabled"]},
                     "message":{"type":"string"}}}}}}),
