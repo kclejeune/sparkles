@@ -4,7 +4,8 @@
 // "Similar"), signs the user in, and hands the details to the tests through environment
 // variables (inherited by the workers). A second server without auth (the default
 // `sparkles serve`) starts with only an in-memory dataset the operator declares, a
-// settings file and a backup config that lets its API register repositories under a
+// settings file that also locks a model provider's endpoint, a model configuration with
+// a declared key, and a backup config that lets its API register repositories under a
 // temporary directory. The returned function is the global teardown.
 //
 // SPARKLES_BIN selects the binary (default: ../target/debug/sparkles, which serves ui/build
@@ -27,7 +28,16 @@ import {
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { DATASET, DATA, DECLARED_DATASET, PASSWORD, SETTINGS, USER } from './data';
+import {
+  DATASET,
+  DATA,
+  DECLARED_DATASET,
+  DECLARED_KEY,
+  MODELS,
+  PASSWORD,
+  SETTINGS,
+  USER,
+} from './data';
 
 const UI_DIR = resolve(import.meta.dirname, '../..');
 
@@ -216,11 +226,27 @@ server = ["server-admin"]
     // the operator declares, which the UI does not offer to delete
     const settings = join(dir, 'conf', 'settings.json');
     writeFileSync(settings, JSON.stringify(SETTINGS));
+    // a model configuration with a declared key, for the server page's Models section
+    const models = join(dir, 'conf', 'models.json');
+    writeFileSync(models, JSON.stringify(MODELS));
+    const key = join(dir, 'conf', 'anthropic.key');
+    writeFileSync(key, DECLARED_KEY, { mode: 0o600 });
     const openServer = await serve(
       bin,
       join(dir, 'open-data'),
       join(dir, 'open-server.log'),
-      ['--backup-config', backupConfig, '--settings', settings, '--mem', DECLARED_DATASET],
+      [
+        '--backup-config',
+        backupConfig,
+        '--settings',
+        settings,
+        '--mem',
+        DECLARED_DATASET,
+        '--model-config',
+        models,
+        '--model-secret',
+        `anthropic=file:${key}`,
+      ],
       1,
     );
     open = openServer.child;

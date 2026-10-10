@@ -37,6 +37,18 @@ open('the Settings tab shows sources, locks and resets', async ({ page, request 
   await expect(history).toHaveAttribute('data-source', 'runtime');
   const k = await (await request.get(`/$/settings/${SETTINGS_DATASET}/assistant`)).json();
   expect(k.runtime).toEqual({ historyDays: 7 });
+  expect(k.overrides).toEqual([{ path: 'historyDays', declared: 30, runtime: 7 }]);
+  // the change overrides the declared value, which the row and the section name
+  await expect(history.getByText('overrides server config')).toBeVisible();
+  await expect(history.getByText('server config: 30')).toBeVisible();
+  await expect(page.getByTestId('overrides-assistant')).toContainText(
+    '1 field overrides the server config',
+  );
+  await page.setViewportSize({ width: 1280, height: 2000 });
+  await page
+    .getByTestId('settings-assistant')
+    .screenshot({ path: '../target/settings-overrides.png' });
+  await page.setViewportSize({ width: 1280, height: 720 });
 
   // a change someone else made in the meantime: the save is refused and the section reloads
   await row(page, 'rowsForSummary').getByRole('textbox').fill('20');
@@ -52,10 +64,34 @@ open('the Settings tab shows sources, locks and resets', async ({ page, request 
   await expect(row(page, 'deadlineSecs').getByRole('textbox')).toHaveValue('60');
   await expect(row(page, 'rowsForSummary').getByRole('textbox')).toHaveValue('');
 
+  // a field without a declared value resets to its default
+  await expect(row(page, 'deadlineSecs').getByRole('button', { name: /to default$/ })).toHaveText(
+    'Reset to default',
+  );
   // the reset brings back the declared value
-  await history.getByRole('button', { name: 'Reset Keep questions (days)' }).click();
+  await history
+    .getByRole('button', { name: 'Use server config for Keep questions (days)' })
+    .click();
   await expect(history).toHaveAttribute('data-source', 'declared');
   await expect(history.getByRole('textbox')).toHaveValue('30');
+  await expect(page.getByTestId('overrides-assistant')).toHaveCount(0);
+
+  // Use server config for all clears the overrides and keeps the other changes
+  const both = await request.patch(`/$/settings/${SETTINGS_DATASET}/assistant`, {
+    data: { historyDays: 5 },
+  });
+  expect(both.ok()).toBe(true);
+  await page
+    .getByTestId('settings-assistant')
+    .getByRole('button', { name: 'Reload Assistant' })
+    .click();
+  await page.getByRole('button', { name: 'Use server config for all' }).click();
+  const dialog = page.getByRole('dialog', { name: 'Use the server config for these fields?' });
+  await expect(dialog).toContainText('historyDays');
+  await dialog.getByRole('button', { name: 'Use server config' }).click();
+  await expect(history).toHaveAttribute('data-source', 'declared');
+  const after = await (await request.get(`/$/settings/${SETTINGS_DATASET}/assistant`)).json();
+  expect(after.runtime).toEqual({ deadlineSecs: 60 });
 
   // the runtime layer as JSON: a change of the locked field is refused and highlighted
   const panel = page.getByTestId('settings-assistant');

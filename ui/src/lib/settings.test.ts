@@ -10,13 +10,18 @@ import {
   formOf,
   formPatch,
   fromForm,
+  overridesOf,
+  overridesSummary,
   parsePath,
   patchKind,
   pathString,
   readKind,
+  resetFields,
   resetKind,
+  resetText,
   runtimePatch,
   sourceText,
+  valueText,
   writeFailure,
   type FieldDef,
   type SettingsKind,
@@ -80,10 +85,49 @@ describe('field sources', () => {
     expect(sourceText(fieldInfo(k, 'enabled'))?.label).toBe('server config');
     expect(sourceText(fieldInfo(k, 'historyDays'))?.label).toBe('changed');
     expect(sourceText(fieldInfo(k, 'ask'))).toBeNull();
-    // a runtime value over a declared one names the value it overrides
+    // a runtime value over a declared one names the value it overrides (from the layers,
+    // for a server without `overrides`)
     const over = kind({ declared: { historyDays: 30 } });
     expect(fieldInfo(over, 'historyDays').overrides).toBe(30);
-    expect(sourceText(fieldInfo(over, 'historyDays'))?.title).toMatch(/overrides 30/);
+    expect(sourceText(fieldInfo(over, 'historyDays'))).toMatchObject({
+      label: 'overrides server config',
+      title: expect.stringMatching(/configuration \(30\) is not used/),
+    });
+    // a runtime value equal to the declared one overrides nothing
+    const same = kind({ declared: { historyDays: 7 } });
+    expect(fieldInfo(same, 'historyDays').overrides).toBeUndefined();
+    expect(sourceText(fieldInfo(same, 'historyDays'))?.label).toBe('changed');
+  });
+
+  it('reads the overrides of the answer, at the field and below it', () => {
+    const k = kind({
+      declared: { historyDays: 30, sendByProvider: { claude: 'rows' } },
+      runtime: { historyDays: 7, sendByProvider: { claude: 'schema' } },
+      sources: { historyDays: 'runtime', 'sendByProvider.claude': 'runtime' },
+      overrides: [
+        { path: 'historyDays', declared: 30, runtime: 7 },
+        { path: 'sendByProvider.claude', declared: 'rows', runtime: 'schema' },
+      ],
+      locked: [],
+      overridden: [],
+    });
+    expect(fieldInfo(k, 'historyDays')).toMatchObject({ overrides: 30, hasDeclared: true });
+    expect(fieldInfo(k, 'sendByProvider').overrides).toEqual({ claude: 'rows' });
+    // `overrides` is what counts: an empty list overrides nothing
+    const none = kind({ declared: { historyDays: 30 }, overrides: [] });
+    expect(fieldInfo(none, 'historyDays').overrides).toBeUndefined();
+  });
+
+  it('names the reset by what the field goes back to', () => {
+    const k = kind({ declared: { historyDays: 30 }, overridden: [], locked: [] });
+    expect(resetText(fieldInfo(k, 'historyDays')).text).toBe('Use server config');
+    expect(resetText(fieldInfo(k, 'budget.perRequest')).text).toBe('Reset to default');
+    expect(resetText(fieldInfo(kind(), 'send')).text).toBe('Remove change');
+    expect(overridesSummary(1)).toBe('1 field overrides the server config');
+    expect(overridesSummary(2)).toBe('2 fields override the server config');
+    expect(valueText('schema')).toBe('"schema"');
+    expect(valueText({ a: 'x'.repeat(100) }, 20)).toHaveLength(20);
+    expect(overridesOf(null)).toEqual([]);
   });
 
   it('marks a locked field and the runtime value its lock ignores', () => {
@@ -271,6 +315,27 @@ describe('the settings routes', () => {
     await resetKind(url);
     expect(calls[3].url).toBe(url);
     expect(new Headers(calls[3].init.headers).has('If-Match')).toBe(false);
+  });
+
+  it('resets fields one after another, each with the ETag of the answer before', async () => {
+    let n = 0;
+    const calls: { url: string; init: RequestInit }[] = [];
+    vi.stubGlobal('fetch', async (url: string, init: RequestInit = {}) => {
+      calls.push({ url, init });
+      n++;
+      return new Response(JSON.stringify(kind({ etag: `"e${n}"` })), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    });
+    const url = '/$/server/settings/models';
+    const k = await resetFields(url, ['roles.draft', 'providers.local'], '"e0"');
+    expect(k.etag).toBe('"e2"');
+    expect(calls.map((c) => c.url)).toEqual([
+      `${url}?field=roles.draft`,
+      `${url}?field=providers.local`,
+    ]);
+    expect(calls.map((c) => new Headers(c.init.headers).get('If-Match'))).toEqual(['"e0"', '"e1"']);
   });
 
   it('raises the 409 of a lock with its fields', async () => {

@@ -2,8 +2,10 @@
   // One row of a layered settings form: the field's name and source on the left, its
   // control and a line of help on the right. A field that a refused write named is
   // highlighted.
+  // A runtime value that replaces a value of the server's configuration shows that value
+  // under the control.
   import type { Snippet } from 'svelte';
-  import type { FieldInfo } from '$lib/settings';
+  import { valueText, type FieldInfo } from '$lib/settings';
   import FieldSource from './FieldSource.svelte';
 
   let {
@@ -43,6 +45,7 @@
   class:locked={info.locked}
   data-field={info.path}
   data-source={info.locked ? 'locked' : info.source}
+  data-overrides={info.overrides !== undefined ? '' : undefined}
 >
   <div class="name">
     <label for={id}>{label}</label>
@@ -51,6 +54,11 @@
   </div>
   <div class="control">
     {@render children()}
+    {#if info.overrides !== undefined}
+      <p class="note declared" title={JSON.stringify(info.overrides, null, 2)}>
+        server config: <code>{valueText(info.overrides)}</code>
+      </p>
+    {/if}
     {#if conflict}
       <p class="note bad">
         The operator locked this field in the server's settings file, so the change was refused.
@@ -110,6 +118,15 @@
   }
   .note.bad {
     color: var(--danger);
+  }
+  .note.declared {
+    color: var(--text-2);
+    overflow-wrap: anywhere;
+  }
+  .note.declared code {
+    font-family: var(--font-mono);
+    font-size: var(--fs-xs);
+    color: var(--text);
   }
   @media (max-width: 760px) {
     .setting {

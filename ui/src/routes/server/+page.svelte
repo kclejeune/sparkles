@@ -8,6 +8,7 @@
   import { fmtSeconds, hitRatio, requestRows, type RequestRow } from '$lib/metrics';
   import { poll } from '$lib/poll';
   import Icon from '$components/Icon.svelte';
+  import ModelsSettings from '$components/ModelsSettings.svelte';
   import TaskList from '$components/TaskList.svelte';
 
   /** Delta or write-ahead log size past which the Readiness panel offers compaction. */
@@ -495,6 +496,11 @@
         </tbody>
       </table>
     </section>
+  {/if}
+
+  <!-- the model configuration and its keys: server administrators only, once the caller is known -->
+  {#if auth.loaded && auth.hasServer('server-admin')}
+    <ModelsSettings />
   {/if}
 
   <section class="panel">

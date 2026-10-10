@@ -24,7 +24,31 @@ export const SETTINGS = {
       locked: ['assistant.send'],
     },
   },
+  // the Models section: the operator keeps claude's endpoint
+  server: { locked: ['models.providers.claude.endpoint'] },
 };
+
+/**
+ * The model configuration of the server without auth (`--model-config`). Listing the
+ * providers contacts none of them, and the tests call none.
+ */
+export const MODELS = {
+  models: {
+    providers: {
+      claude: {
+        kind: 'anthropic',
+        endpoint: 'https://api.anthropic.com',
+        apiKey: { secret: 'anthropic' },
+        budget: { tokensPerDay: 1000 },
+      },
+      local: { kind: 'openai', endpoint: 'http://127.0.0.1:9/v1' },
+    },
+    roles: { draft: [{ provider: 'local', model: 'm' }] },
+  },
+};
+
+/** The declared key of `anthropic` (`--model-secret anthropic=file:…`), a dummy. */
+export const DECLARED_KEY = 'declared-e2e-key-not-real';
 
 const PREFIXES = `@prefix ex: <${EX}> .
 @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
