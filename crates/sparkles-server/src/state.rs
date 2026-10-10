@@ -533,7 +533,7 @@ impl AppState {
             mcp: None,
             volatile: Default::default(),
             models: Default::default(),
-            settings: Default::default(),
+            settings: crate::settings::Settings::in_dir(data_dir),
             asks: Default::default(),
             #[cfg(feature = "mcp")]
             ingest: Default::default(),

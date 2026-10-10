@@ -9,11 +9,23 @@
 //! take their value from the declared layers whatever the runtime layer says.
 //!
 //! Every feature reads its settings through [`effective`], never from the file.
+//!
+//! The server-wide `models` kind of §11 resolves the same way, with the model
+//! configuration of `--model-config` as its declared layer, `<dataDir>/models.json` as
+//! its runtime layer and the locks of the settings file's `server.locked`
+//! ([`server`]). The runtime values of model secrets live in `<dataDir>/secrets`
+//! ([`secrets`]).
 
 pub mod http;
 pub mod merge;
+pub mod secrets;
+pub mod server;
+#[cfg(test)]
+mod server_tests;
 #[cfg(test)]
 mod tests;
+
+pub use server::MODELS;
 
 use crate::models::Models;
 use crate::state::{AppState, Dataset};
@@ -48,9 +60,7 @@ pub trait Typed: Serialize + DeserializeOwned + Default {
 pub enum Scope {
     /// one object per dataset, in the dataset's directory
     Dataset,
-    /// one object for the server, kept by the server rather than a dataset; no kind
-    /// registered so far has it
-    #[allow(dead_code)]
+    /// one object for the server, kept in the data directory (`models`)
     Server,
 }
 
@@ -58,10 +68,14 @@ pub enum Scope {
 pub struct Kind {
     pub name: &'static str,
     pub scope: Scope,
-    /// the file in the dataset's directory that keeps the runtime layer
+    /// the file in the dataset's directory, or the data directory for a server-wide
+    /// kind, that keeps the runtime layer
     pub file: &'static str,
     /// the kind's top-level members
     pub members: &'static [&'static str],
+    /// maps whose members a `PATCH` with `null` removes even when the declared layers
+    /// define them, by storing `null` in the runtime layer (the providers of `models`)
+    removable: &'static [&'static str],
     /// whether the file holds members of its own besides the kind's (`ingest.json`
     /// keeps its profiles)
     shared: bool,
@@ -104,6 +118,7 @@ pub static ASSISTANT: Kind = Kind {
         "historyDays",
         "routing",
     ],
+    removable: &[],
     shared: false,
     defaults: defaults_of::<crate::assistant::AssistantSettings>,
     normalize: normalize_as::<crate::assistant::AssistantSettings>,
@@ -122,6 +137,7 @@ pub static MEMORY: Kind = Kind {
         "consolidation",
         "retention",
     ],
+    removable: &[],
     shared: false,
     defaults: defaults_of::<crate::assist::MemorySettings>,
     normalize: normalize_as::<crate::assist::MemorySettings>,
@@ -133,17 +149,25 @@ pub static INGEST: Kind = Kind {
     scope: Scope::Dataset,
     file: INGEST_FILE,
     members: &["keepText", "confirmTokens", "autoConfidence"],
+    removable: &[],
     shared: true,
     defaults: defaults_of::<IngestFields>,
     normalize: normalize_as::<IngestFields>,
     check: check_as::<IngestFields>,
 };
 
-/// Every kind, in the order the answers list them.
+/// Every dataset-wide kind, in the order the answers list them.
 pub static KINDS: [&Kind; 3] = [&ASSISTANT, &MEMORY, &INGEST];
+
+/// Every server-wide kind (§11).
+pub static SERVER_KINDS: [&Kind; 1] = [&MODELS];
 
 pub fn kind(name: &str) -> Option<&'static Kind> {
     KINDS.iter().copied().find(|k| k.name == name)
+}
+
+pub fn server_kind(name: &str) -> Option<&'static Kind> {
+    SERVER_KINDS.iter().copied().find(|k| k.name == name)
 }
 
 /// The file of ingest profiles and settings, of which the `ingest` kind holds the
@@ -298,13 +322,30 @@ impl Declared {
     }
 
     /// The locked fields of the server-wide `kind` (`server.locked`).
-    #[allow(dead_code)]
     pub fn server_locked(&self, kind: &Kind) -> Vec<Vec<String>> {
+        let mut out: Vec<Vec<String>> = Vec::new();
+        for (k, p) in &self.server_locked {
+            if k == kind.name && !out.contains(p) {
+                out.push(p.clone());
+            }
+        }
+        out
+    }
+
+    /// Whether `server.locked` locks the secret `name`, so that its declared source
+    /// applies and the API cannot store a value for it (§11.2).
+    pub fn secret_locked(&self, name: &str) -> bool {
         self.server_locked
             .iter()
-            .filter(|(k, _)| k == kind.name)
-            .map(|(_, p)| p.clone())
-            .collect()
+            .any(|(k, p)| k == "secrets" && p.len() == 1 && p[0] == name)
+    }
+
+    /// The secret names of `server.locked`.
+    pub fn locked_secrets(&self) -> impl Iterator<Item = &str> {
+        self.server_locked
+            .iter()
+            .filter(|(k, p)| k == "secrets" && p.len() == 1)
+            .map(|(_, p)| p[0].as_str())
     }
 
     /// The fields of `kind` locked for `dataset`.
@@ -382,6 +423,7 @@ fn parse_server(v: &Value) -> Result<Vec<(String, Vec<String>)>, String> {
                 ));
             }
             let root = p.remove(0);
+            server::check_lock(&root, &p).map_err(|e| format!("locked: {s:?}: {e}"))?;
             out.push((root, p));
         }
     }
@@ -579,6 +621,17 @@ impl Resolved {
         })
     }
 
+    /// The answer of `GET /$/server/settings/{kind}`: the members of [`json`](Self::json)
+    /// with `scope: "server"` in place of the dataset.
+    pub fn json_server(&self) -> Value {
+        let mut v = self.json("");
+        if let Some(m) = v.as_object_mut() {
+            m.remove("dataset");
+            m.insert("scope".into(), "server".into());
+        }
+        v
+    }
+
     /// The effective object as the kind's type: the defaults when it does not read,
     /// which is logged. An object that reads but does not validate, such as one whose
     /// role names a provider the server no longer has, is used as it is, and the
@@ -615,6 +668,8 @@ pub struct Settings {
     models_status: Mutex<FileStatus>,
     /// the write locks, by dataset (`None` for a server-wide kind) and kind
     locks: Mutex<HashMap<LockKey, Arc<Mutex<()>>>>,
+    /// the layers of the server-wide kinds and the runtime secrets (§11)
+    pub server: server::ServerLayers,
 }
 
 fn now() -> String {
@@ -630,8 +685,18 @@ pub fn read_file(path: &Path, providers: Providers) -> anyhow::Result<Declared> 
 }
 
 impl Settings {
+    /// No settings file, with the runtime layers of the server-wide kinds and the
+    /// runtime secrets in the data directory `dir`.
+    pub fn in_dir(dir: &Path) -> Settings {
+        let mut s = Settings::default();
+        s.server.set_dir(dir);
+        s
+    }
+
     /// The settings of `serve --settings FILE`, checked against `models`; a file that
     /// does not read or check fails the start.
+    /// (`serve` reads it with [`server::start`], which also reads the models.)
+    #[cfg(test)]
     pub fn load(path: &Path, models: Option<&Models>) -> anyhow::Result<Settings> {
         let d = read_file(path, Providers::Checked(models))?;
         let s = Settings {
@@ -657,6 +722,8 @@ impl Settings {
 
     /// Read the settings file again. A file that does not read or check is logged and
     /// the previous one kept.
+    /// (SIGHUP reads it with [`server::reload`], which also reads the models.)
+    #[cfg(test)]
     pub fn reload(&self, models: Option<&Models>) -> Result<(), String> {
         let Some(path) = &self.file else {
             return Ok(());
@@ -730,6 +797,7 @@ impl Settings {
         out["declared"] = d.dataset_names().cloned().collect::<Vec<_>>().into();
         out["unmatched"] = unmatched.into();
         out["kinds"] = KINDS.map(|k| k.name).to_vec().into();
+        out["serverKinds"] = SERVER_KINDS.map(|k| k.name).to_vec().into();
         out["models"] = file(&self.models_file, &self.models_status.lock());
         out
     }
@@ -856,28 +924,17 @@ pub fn spawn_reload_on_sighup(st: Arc<AppState>, models: crate::models::ModelArg
     });
 }
 
-/// What SIGHUP does (see [`spawn_reload_on_sighup`]).
+/// What SIGHUP does (see [`spawn_reload_on_sighup`]): the model configuration, the
+/// runtime layer of `models`, then the settings file, whose `server.locked` applies to
+/// the models and whose dataset entries are checked against them ([`server::reload`]).
 pub fn reload(st: &AppState, models: &crate::models::ModelArgs) {
-    if models.model_config.is_some() {
-        match models.load(st.outbound.clone()) {
-            Ok(m) => {
-                st.set_models(m);
-                st.settings.models_reloaded(Ok(()));
-                tracing::info!("model configuration reloaded");
-            }
-            Err(e) => {
-                let msg = format!("{e:#}");
-                tracing::error!("model configuration not reloaded, the previous one stays: {msg}");
-                st.settings.models_reloaded(Err(msg));
-            }
-        }
-    }
-    let m = st.models();
-    let _ = st.settings.reload(m.as_deref());
+    server::reload(st, models);
     log_invalid(st);
 }
 
-/// `sparkles settings check FILE [--model-config FILE]` (§8).
+/// `sparkles settings check FILE [--model-config FILE]` (§8): the file, and with the
+/// model configuration the dataset entries' providers and the locks of `server.locked`
+/// (§11.4).
 pub fn check_file(path: &Path, model_config: Option<&Path>) -> anyhow::Result<()> {
     let models = model_config
         .map(|p| -> anyhow::Result<Models> {
@@ -890,6 +947,13 @@ pub fn check_file(path: &Path, model_config: Option<&Path>) -> anyhow::Result<()
         None => Providers::Unchecked,
     };
     let d = read_file(path, providers)?;
+    // the form of `server.locked` is checked with the file; against the model
+    // configuration, a lock that names nothing it defines is reported
+    if let Some(m) = &models {
+        for w in server::lock_warnings(&d, &m.config) {
+            eprintln!("warning: {}: {w}", path.display());
+        }
+    }
     println!(
         "{}: valid ({} dataset entr{})",
         path.display(),
