@@ -169,15 +169,15 @@ off and every engine's answers checked before timing.
 | 10.5M triples | Sparkles | Best of the others |
 |---|---|---|
 | Bulk load | **3.9 s** | QLever 9.7 s |
-| 28 benchmark queries | **Fastest on all 28** | QLever, 3.9× slower by the median |
-| WatDiv, 20 templates | **4.84 ms** geometric mean | Fuseki 14.2 ms |
+| 28 benchmark queries | **Fastest on 27 of 28**, a median 3.9× faster than QLever | Fluree's `star-lookup` lead is within 10% |
+| WatDiv, 20 templates | **4.84 ms** geometric mean | Fluree 7.41 ms |
 | Throughput, 16 clients | **241 q/s** | QLever 92 q/s |
 | Durable commit of one new literal | 1.28 ms | **Oxigraph 0.93 ms**, without synchronizing |
 | Server memory after the run | 840 MiB, 379 MiB of it block cache | **QLever 653 MiB** |
 
 On English DBpedia, 1.24 billion triples, Sparkles loads in 480 s against QLever's
-1,674 s, and is faster than QLever on all 29 warm queries both answer and on 29 of 31
-cold ones. The bindings are faster than TDB2, pyoxigraph and Oxigraph's JavaScript
+1,674 s and Fluree's 2,919 s. It is faster than QLever on all 29 warm queries both
+answer and on 29 of 31 cold ones, and faster than Fluree on every cold query. The bindings are faster than TDB2, pyoxigraph and Oxigraph's JavaScript
 package on most of the same queries, and slower on some small lookups.
 
 Sparkles uses more memory than QLever in exchange for this speed, mostly for a 1 GiB
@@ -191,6 +191,7 @@ tradeoff and every case where Sparkles loses.
 |---|---|
 | [Apache Jena / Fuseki](https://jena.apache.org/) | The same protocols, endpoints, admin API, CLI model and ARQ extensions, on sorted columnar indexes. Reasoning is materialized, apart from RDFS on read, and there is no ontology API or JavaScript functions. |
 | [QLever](https://github.com/ad-freiburg/qlever) | The same index and execution architecture, plus exact term identity, MVCC updates, the Graph Store Protocol, history, reasoning and validation. QLever is built for larger data and uses less memory. |
+| [Fluree](https://github.com/fluree/db) | Both keep history and branches. Sparkles adds full W3C SPARQL conformance and Fuseki compatibility, and has no policies stored in the data or clustering. |
 | [Oxigraph](https://github.com/oxigraph/oxigraph) | Sparkles uses Oxigraph's parsers and SPARQL parser with its own storage and planner. Sparkles synchronizes each commit, which makes single writes slower than Oxigraph's defaults. There is no WebAssembly build. |
 
 [docs/COMPARISON.md](docs/COMPARISON.md) lists the gaps per engine and where Sparkles
@@ -253,7 +254,7 @@ merges, the Ask bar, and agent memory.
 | [docs/USAGE.md](docs/USAGE.md) | The server and CLI, backups, MCP, the libraries and bindings, Docker and NixOS. |
 | [docs/API.md](docs/API.md) | The HTTP API: Fuseki's endpoints and the `/$/` extensions. |
 | [docs/openapi.json](docs/openapi.json) | The OpenAPI 3.1 description the server serves at `/$/openapi.json`. |
-| [docs/COMPARISON.md](docs/COMPARISON.md) | Feature gaps against Jena/Fuseki, QLever and Oxigraph, and departures from Jena and QLever. |
+| [docs/COMPARISON.md](docs/COMPARISON.md) | Feature gaps against Jena/Fuseki, QLever, Fluree and Oxigraph, and departures from Jena and QLever. |
 | [docs/BENCHMARKS.md](docs/BENCHMARKS.md) | Query, load, write, bindings and memory measurements against other engines, and how to reproduce them. |
 | [docs/editors.md](docs/editors.md) | Formatter and language-server setups for editors. |
 | [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | Building, mise tasks, tests, Nix and third-party licenses. |

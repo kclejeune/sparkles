@@ -2,7 +2,8 @@
 
 This page lists what Sparkles implements, area by area, and the known gaps.
 [API.md](API.md) documents the HTTP details and [USAGE.md](USAGE.md) the command line
-and the bindings. [COMPARISON.md](COMPARISON.md) compares the gaps with other engines, and
+and the bindings. [COMPARISON.md](COMPARISON.md) compares the gaps with Jena/Fuseki,
+QLever, Fluree and Oxigraph, and
 [BENCHMARKS.md](BENCHMARKS.md) has the performance figures. The design specs in
 [specs/](specs/README.md) explain why each larger feature is built the way it is.
 
