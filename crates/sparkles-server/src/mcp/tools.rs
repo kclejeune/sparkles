@@ -127,6 +127,9 @@ fn dispatch(t: &Tools, name: &str, args: Map<String, Value>) -> Result<Outcome, 
         "memory_promote" => t.memory_promote(args),
         "memory_relink" => t.memory_relink(args),
         "memory_edit" => t.memory_edit(args),
+        // the maintenance tasks of C18 Phase 5, never offered as tools
+        "memory_consolidation_scan" => t.memory_consolidation_scan(args),
+        "memory_retention_scan" => t.memory_retention_scan(args),
         // a stored query of a dataset (`<dataset>__<query>`)
         name => t.stored_query(name, args),
     }

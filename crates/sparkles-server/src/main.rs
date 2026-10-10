@@ -2668,6 +2668,9 @@ fn run() -> Result<()> {
                 };
                 // ask history past its retention is deleted once an hour (C18 §6.4)
                 assistant::spawn_pruning(st.clone());
+                // scheduled consolidation and retention of agent memory (C18 §8.3, §8.4)
+                #[cfg(feature = "mcp")]
+                ingest::maintain::spawn_schedule(st.clone());
                 // the metrics listener ends with the runtime, after the main one
                 if let Some(maddr) = &metrics_addr {
                     let l = tokio::net::TcpListener::bind(maddr)

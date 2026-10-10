@@ -22,6 +22,7 @@ mod csv;
 mod extract;
 mod html;
 pub mod http;
+pub mod maintain;
 #[cfg(feature = "pdf")]
 mod pdf;
 pub mod pipeline;
@@ -190,6 +191,8 @@ impl Default for PdfRuntime {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
     Queued,
+    /// a maintenance task reads the memory it works on
+    Scanning,
     Converting,
     Registering,
     /// the estimate is above the dataset's threshold: waiting for `confirm`
@@ -208,6 +211,7 @@ impl Status {
     pub fn as_str(self) -> &'static str {
         match self {
             Status::Queued => "queued",
+            Status::Scanning => "scanning",
             Status::Converting => "converting",
             Status::Registering => "registering",
             Status::AwaitingConfirmation => "awaiting-confirmation",

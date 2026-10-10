@@ -130,7 +130,7 @@ fn visible(st: &AppState, p: &Principal, ds: &str, id: &str) -> ApiResult<Arc<Ta
     })
 }
 
-fn request_id(headers: &HeaderMap) -> String {
+pub(crate) fn request_id(headers: &HeaderMap) -> String {
     headers
         .get(&crate::obs::X_REQUEST_ID)
         .and_then(|v| v.to_str().ok())
@@ -330,7 +330,7 @@ async fn start(
         .into_response())
 }
 
-fn urlencode(s: &str) -> String {
+pub(crate) fn urlencode(s: &str) -> String {
     percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).to_string()
 }
 

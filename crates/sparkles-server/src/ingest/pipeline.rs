@@ -986,16 +986,35 @@ fn review_branch(
         return Ok(b.clone());
     }
     let s = slug(title.unwrap_or("document"));
+    numbered_branch(
+        r,
+        ds,
+        &|agent| match agent {
+            Some(a) => format!("proposals.{a}.ingest-{s}"),
+            None => format!("ingest.{s}"),
+        },
+        &note,
+    )
+}
+
+/// Create the first free branch `<stem>-<n>`, where the stem depends on whether the
+/// caller is an agent of `memory.json`, whose grants cover only its `proposals.{agent}.`
+/// branches.
+pub(crate) fn numbered_branch(
+    r: &Run,
+    ds: &Arc<crate::state::Dataset>,
+    stem_for: &dyn Fn(Option<&str>) -> String,
+    note: &str,
+) -> Result<String, Failed> {
+    let st = &r.ctx.server.state;
+    let create = |name: &str| r.tool("create_branch", json!({ "name": name, "note": note }), None);
     let settings = crate::assist::memory_settings(st, ds);
     let caller = r.ctx.principal.caller();
     let agent = std::iter::once(caller.user.clone())
         .flatten()
         .chain(caller.roles.iter().cloned())
         .find(|n| settings.agents.contains_key(n));
-    let stem = match agent {
-        Some(a) => format!("proposals.{a}.ingest-{s}"),
-        None => format!("ingest.{s}"),
-    };
+    let stem = stem_for(agent.as_deref());
     let existing: std::collections::BTreeSet<String> = ds
         .store
         .branches()

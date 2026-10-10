@@ -64,6 +64,112 @@ pub struct MemorySettings {
     /// the imports of harness memory (§8.10.2)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub imports: Option<Imports>,
+    /// the consolidation pass of §8.3, on request or on a schedule
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consolidation: Option<Consolidation>,
+    /// the retention of session graphs of §8.4, off without it
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention: Option<Retention>,
+}
+
+/// How a consolidation pass writes its proposals (§8.3).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConsolidationMode {
+    /// on a review branch that a person merges from the inbox
+    #[default]
+    Branch,
+    /// merged into `main` when every fact passes its checks, else left on the branch
+    Auto,
+}
+
+/// `consolidation` of `memory.json` (§8.3).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct Consolidation {
+    /// how often the server runs a pass, such as `1d`; without it a pass runs only on
+    /// request
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub every: Option<String>,
+    #[serde(default)]
+    pub mode: ConsolidationMode,
+    /// the distinct sources that must assert a fact before it is consolidated
+    #[serde(default = "default_min_sources")]
+    pub min_sources: u32,
+}
+
+fn default_min_sources() -> u32 {
+    2
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// `retention` of `memory.json` (§8.4): session graphs older than `after` are deleted.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct Retention {
+    /// the age of a graph's newest fact after which it is deleted, such as `365d`
+    pub after: String,
+    /// IRI patterns with `*` of the session graphs (default: the graphs that
+    /// `agentGraphs` matches and whose IRI holds `/sessions/`)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub graphs: Vec<String>,
+    /// delete only graphs whose facts are all asserted in a reviewed graph too
+    #[serde(default = "default_true")]
+    pub require_consolidated: bool,
+    /// how often the server applies it, `1d` by default
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub every: Option<String>,
+}
+
+impl Retention {
+    /// Whether `graph`, an agent graph, is a session graph that retention may delete.
+    #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
+    pub fn covers(&self, graph: &str) -> bool {
+        if self.graphs.is_empty() {
+            graph.contains("/sessions/")
+        } else {
+            self.graphs.iter().any(|p| crate::auth::glob(p, graph))
+        }
+    }
+}
+
+/// The shortest schedule of a maintenance task.
+const MIN_EVERY_DAYS: f64 = 1.0 / 24.0;
+
+fn check_every(what: &str, every: Option<&str>) -> Result<(), String> {
+    if let Some(e) = every {
+        match duration_days(e) {
+            Some(d) if d >= MIN_EVERY_DAYS => {}
+            _ => {
+                return Err(format!(
+                    "{what}.every: {e:?} is not a duration of at least 1h, such as 1d or 12h"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A duration such as `90d`, `12h`, `2w` or `1y` in days: a positive number and one of
+/// the units `s`, `m`, `h`, `d`, `w` or `y` (365 days). `None` when it does not parse.
+pub fn duration_days(s: &str) -> Option<f64> {
+    let s = s.trim();
+    let unit = s.chars().last()?;
+    let n: f64 = s[..s.len() - unit.len_utf8()].trim().parse().ok()?;
+    let per_day = match unit {
+        's' => 86_400.0,
+        'm' => 1_440.0,
+        'h' => 24.0,
+        'd' => 1.0,
+        'w' => 1.0 / 7.0,
+        'y' => 1.0 / 365.0,
+        _ => return None,
+    };
+    let days = n / per_day;
+    (days.is_finite() && days > 0.0).then_some(days)
 }
 
 /// Who extracts facts from imported prose (§8.10.2).
@@ -131,6 +237,43 @@ impl MemorySettings {
         }
         if let Some(im) = &self.imports {
             im.validate(self)?;
+        }
+        if let Some(c) = &self.consolidation {
+            check_every("consolidation", c.every.as_deref())?;
+            if !(2..=100).contains(&c.min_sources) {
+                return Err("consolidation.minSources: a number from 2 to 100".into());
+            }
+            if self.consolidated_graph.is_none() || self.agent_graphs.is_empty() {
+                return Err(
+                    "consolidation needs agentGraphs and a consolidatedGraph to write to".into(),
+                );
+            }
+        }
+        if let Some(r) = &self.retention {
+            check_every("retention", r.every.as_deref())?;
+            if duration_days(&r.after).is_none_or(|d| d < 1.0) {
+                return Err(format!(
+                    "retention.after: {:?} is not a duration of at least 1d, such as 365d",
+                    r.after
+                ));
+            }
+            if r.graphs.len() > MAX_AGENT_GRAPHS {
+                return Err(format!(
+                    "retention.graphs: at most {MAX_AGENT_GRAPHS} patterns"
+                ));
+            }
+            for g in &r.graphs {
+                if g.is_empty() || !iri_like(g) {
+                    return Err(format!(
+                        "retention.graphs: {g:?} is not a graph IRI or an IRI pattern with *"
+                    ));
+                }
+            }
+            if self.agent_graphs.is_empty() {
+                return Err(
+                    "retention deletes session graphs of agent memory: set agentGraphs".into(),
+                );
+            }
         }
         for name in self.agents.keys() {
             if name.is_empty() || name.len() > 200 {

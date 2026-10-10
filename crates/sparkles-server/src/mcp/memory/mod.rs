@@ -20,6 +20,7 @@ mod diagnose;
 pub(crate) mod inbox;
 pub(crate) mod ingest;
 mod link;
+mod maintain;
 pub(crate) mod policy;
 mod recall;
 pub(crate) mod review;
@@ -194,25 +195,7 @@ pub(crate) fn graphs_arg(
         .collect()
 }
 
-/// Whether a term is a vector literal, which no tool shows.
-/// A duration such as `90d`, `12h`, `2w` or `1y` in days: a positive number and one of
-/// the units `s`, `m`, `h`, `d`, `w` or `y` (365 days). `None` when it does not parse.
-pub fn duration_days(s: &str) -> Option<f64> {
-    let s = s.trim();
-    let unit = s.chars().last()?;
-    let n: f64 = s[..s.len() - unit.len_utf8()].trim().parse().ok()?;
-    let per_day = match unit {
-        's' => 86_400.0,
-        'm' => 1_440.0,
-        'h' => 24.0,
-        'd' => 1.0,
-        'w' => 1.0 / 7.0,
-        'y' => 1.0 / 365.0,
-        _ => return None,
-    };
-    let days = n / per_day;
-    (days.is_finite() && days > 0.0).then_some(days)
-}
+pub(crate) use crate::assist::duration_days;
 
 /// Days since an `xsd:dateTime` lexical form, or `None` when it does not parse.
 pub(crate) fn age_days(t: &str, now: chrono::DateTime<chrono::Utc>) -> Option<f64> {
@@ -220,6 +203,7 @@ pub(crate) fn age_days(t: &str, now: chrono::DateTime<chrono::Utc>) -> Option<f6
     Some(((now - at.with_timezone(&chrono::Utc)).num_seconds().max(0) as f64) / 86400.0)
 }
 
+/// Whether a term is a vector literal, which no tool shows.
 pub(crate) fn is_vector(t: &Term) -> bool {
     matches!(t, Term::Literal(l) if sparkles::vector::is_datatype(l.datatype().as_str()))
 }

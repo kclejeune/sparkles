@@ -92,6 +92,10 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/memory/{ds}/reject", &["POST"]),
     ("/$/memory/{ds}/relink", &["POST"]),
     ("/$/memory/{ds}/edit", &["POST"]),
+    // consolidation and retention of agent memory (C18 §8.3, §8.4)
+    ("/$/memory/{ds}/consolidate", &["POST"]),
+    ("/$/memory/{ds}/retention", &["POST"]),
+    ("/$/memory/{ds}/maintenance", &["GET"]),
     // ingest settings and profiles (C18 §7.4)
     ("/$/ingest/{ds}/profiles", &["GET"]),
     ("/$/ingest/{ds}/settings", &["PUT"]),
@@ -289,6 +293,10 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/memory/{ds}/reject"
         | "/$/memory/{ds}/relink"
         | "/$/memory/{ds}/edit" => Dataset(Read),
+        // a consolidation writes through the tools as its caller; `auto` needs admin
+        "/$/memory/{ds}/consolidate" | "/$/memory/{ds}/maintenance" => Dataset(Read),
+        // retention deletes graphs
+        "/$/memory/{ds}/retention" => Dataset(Admin),
         "/$/ingest/{ds}/profiles" | "/$/ingest/{ds}/profiles/{name}" if get => Dataset(Read),
         "/$/ingest/{ds}/settings" | "/$/ingest/{ds}/profiles/{name}" => Dataset(Admin),
         // a task writes through the tools as its caller, which check the grants on the

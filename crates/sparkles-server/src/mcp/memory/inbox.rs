@@ -38,6 +38,9 @@ pub(crate) fn review_kind(name: &str) -> Option<&'static str> {
         Some("ingest")
     } else if name.starts_with("review.") {
         Some("review")
+    } else if name.starts_with("consolidation.") {
+        // a pass of the server's consolidation task (§8.3)
+        Some("consolidation")
     } else if name.starts_with("proposals.") || name.starts_with("proposals-") {
         if name.ends_with(".inbox") {
             Some("inbox")
@@ -91,7 +94,7 @@ impl ReifiedFact {
 }
 
 /// Memory bookkeeping that is never a fact to review.
-fn bookkeeping(p: &NamedNode) -> bool {
+pub(crate) fn bookkeeping(p: &NamedNode) -> bool {
     let p = p.as_str();
     p.starts_with(PROV) || p.starts_with(SPK) || p == RDF_REIFIES
 }
@@ -261,7 +264,7 @@ const DCT: &str = "http://purl.org/dc/terms/";
 
 /// The graphs of `r` that assert each triple, by triple key (`s p o`), for the triples
 /// of `facts`.
-fn asserting_graphs(
+pub(crate) fn asserting_graphs(
     r: &Reader,
     facts: &[ReifiedFact],
 ) -> Result<HashMap<String, BTreeSet<String>>, Error> {
@@ -1417,7 +1420,10 @@ impl FactRef {
 
 /// The graphs each of `graphs` names with `mem:copyOf`: an exported copy and its
 /// original.
-fn copy_links(r: &Reader, graphs: &[NamedNode]) -> Result<HashMap<String, HashSet<String>>, Error> {
+pub(crate) fn copy_links(
+    r: &Reader,
+    graphs: &[NamedNode],
+) -> Result<HashMap<String, HashSet<String>>, Error> {
     let mut out: HashMap<String, HashSet<String>> = HashMap::new();
     for chunk in graphs.chunks(200) {
         let q = format!(
