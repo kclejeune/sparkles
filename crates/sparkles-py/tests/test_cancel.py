@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import _thread
+import os
 import signal
+import socket
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -53,7 +55,7 @@ def later(seconds: float, f: Callable[[], object]) -> threading.Thread:
 
 
 @contextmanager
-def ctrl_c_after(seconds: float) -> Iterator[None]:
+def ctrl_c_after(seconds: float, send: Callable[[], object] = _thread.interrupt_main) -> Iterator[None]:
     """Send the main thread a SIGINT, as Ctrl-C does, after `seconds`. The handler
     raises KeyboardInterrupt only inside the block, so a late signal cannot stop the
     test run."""
@@ -65,7 +67,7 @@ def ctrl_c_after(seconds: float) -> Iterator[None]:
             raise KeyboardInterrupt
 
     old = signal.signal(signal.SIGINT, handler)
-    t = later(seconds, _thread.interrupt_main)
+    t = later(seconds, send)
     try:
         yield
     finally:
@@ -93,6 +95,49 @@ def test_ctrl_c_interrupts_a_query(big: Dataset) -> None:
         big.query(ENDLESS)
     # the dataset is usable afterwards
     assert big.ask("ASK { ?s ?p ?o }")
+
+
+def test_sigint_interrupts_a_query(big: Dataset) -> None:
+    # the signal itself, as a terminal sends it, and not interrupt_main's direct call
+    with ctrl_c_after(0.2, lambda: os.kill(os.getpid(), signal.SIGINT)), pytest.raises(KeyboardInterrupt):
+        big.query(ENDLESS)
+    assert big.ask("ASK { ?s ?p ?o }")
+
+
+def test_ctrl_c_interrupts_a_query_while_another_wakeup_fd_is_set(big: Dataset) -> None:
+    # asyncio keeps its own wakeup descriptor, and the query then runs on the helper thread
+    a, b = socket.socketpair()
+    a.setblocking(False)
+    old = signal.set_wakeup_fd(a.fileno())
+    try:
+        with ctrl_c_after(0.2), pytest.raises(KeyboardInterrupt):
+            big.query(ENDLESS)
+        assert signal.set_wakeup_fd(a.fileno()) == a.fileno()
+    finally:
+        signal.set_wakeup_fd(old)
+        a.close()
+        b.close()
+
+
+def test_a_signal_whose_handler_returns_lets_the_query_finish(big: Dataset) -> None:
+    calls = []
+
+    def handler(signum: int, frame: FrameType | None) -> None:
+        calls.append(signum)
+
+    old = signal.signal(signal.SIGUSR1, handler)
+    try:
+        t = later(0.05, lambda: os.kill(os.getpid(), signal.SIGUSR1))
+        r = big.query(
+            "SELECT (COUNT(*) AS ?n) WHERE { ?a <http://ex.org/p> ?x . ?b <http://ex.org/p> ?y FILTER(?x < ?y) }"
+        )
+        t.join()
+    finally:
+        signal.signal(signal.SIGUSR1, old)
+    assert [row[0].value for row in r] == [str(1500 * 1499 // 2)]
+    # the handler ran, or the signal came after the query
+    assert calls in ([signal.SIGUSR1], [])
+    assert signal.set_wakeup_fd(-1) == -1
 
 
 def test_ctrl_c_interrupts_an_update(big: Dataset) -> None:
