@@ -95,7 +95,7 @@ pub use keyset::KeySet;
 use oxrdf::{BlankNode, GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use parking_lot::{Mutex, MutexGuard};
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Write};
 use std::ops::Bound;
@@ -1105,6 +1105,12 @@ pub const DEFAULT_CHANGE_LOG_MAX_BYTES: u64 = 1 << 30;
 /// Default of [`StoreOptions::wal_prealloc_bytes`].
 pub const DEFAULT_WAL_PREALLOC_BYTES: u64 = 4 << 20;
 
+/// The file of the prefix names that a dataset's runtime layer removes (spec C20 §3.2).
+pub const REMOVED_PREFIXES_FILE: &str = "prefixes-removed.json";
+
+/// Whether loaded data may bind a prefix name (spec C20 §3.4).
+pub type PrefixFilter = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
 /// Default of [`StoreOptions::max_prefixes`].
 pub const DEFAULT_MAX_PREFIXES: usize = 1000;
 /// Longest prefix name, in bytes.
@@ -1243,6 +1249,11 @@ pub struct Store {
     cache: Arc<BlockCache>,
     results: Arc<crate::sparql::cache::ResultCache>,
     prefixes: Mutex<BTreeMap<String, String>>,
+    /// the prefix names the runtime layer removes (spec C20 §3.2), kept in
+    /// `prefixes-removed.json`; a name is never both bound and removed
+    removed_prefixes: Mutex<BTreeSet<String>>,
+    /// which prefix names loaded data may bind (spec C20 §3.4), set by the server
+    prefix_filter: Mutex<Option<PrefixFilter>>,
     /// exclusive OS lock on `<root>/sparkles.lock` (TDB2 `tdb.lock`), held while open
     _lock: Option<File>,
     dataset_id: uuid::Uuid,
@@ -1421,6 +1432,8 @@ impl Store {
             cache,
             results,
             prefixes: Mutex::new(prefixes),
+            removed_prefixes: Mutex::new(BTreeSet::new()),
+            prefix_filter: Mutex::new(None),
             _lock: None,
             dataset_id,
             forked_mem: forked_from,
@@ -1583,6 +1596,10 @@ impl Store {
         {
             prefixes = p;
         }
+        let removed_prefixes: BTreeSet<String> = std::fs::read(root.join(REMOVED_PREFIXES_FILE))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
         // The commit the generation's base index holds. A database from an older version
         // has no dataset.json yet: it gets a baseline root commit after replay.
         let known_id = commit::read_dataset_file(root)?;
@@ -1779,6 +1796,8 @@ impl Store {
             cache,
             results,
             prefixes: Mutex::new(prefixes),
+            removed_prefixes: Mutex::new(removed_prefixes),
+            prefix_filter: Mutex::new(None),
             _lock: Some(lock),
             dataset_id,
             forked_mem: None,
@@ -3237,22 +3256,29 @@ impl Store {
         self.prefixes.lock().clone()
     }
 
-    /// Add the prefixes of loaded data, keeping the ones already defined. Past
-    /// [`StoreOptions::max_prefixes`], or with a name or IRI past its length limit, a
-    /// prefix is left out (the data is not refused over its prefixes).
+    /// Add the prefixes of loaded data, keeping the ones already defined. A name that the
+    /// runtime layer removes, or that the [prefix filter](Self::set_prefix_filter) keeps
+    /// for the settings, is left out. Past [`StoreOptions::max_prefixes`], or with a name
+    /// or IRI past its length limit, a prefix is left out too (the data is not refused
+    /// over its prefixes).
     pub fn add_prefixes(&self, p: BTreeMap<String, String>) -> Result<()> {
         crate::sparql::extensions::check_family(self.owner_dataset_id())?;
         if p.is_empty() {
             return Ok(());
         }
+        let filter = self.prefix_filter.lock().clone();
+        let removed = self.removed_prefixes.lock();
         let mut cur = self.prefixes.lock();
         let before = cur.len();
         let mut skipped = 0usize;
         for (k, v) in p {
-            if cur.contains_key(&k) {
+            if cur.contains_key(&k)
+                || removed.contains(&k)
+                || filter.as_ref().is_some_and(|f| !f(&k))
+            {
                 continue;
             }
-            if self.prefixes_full(cur.len())
+            if self.prefixes_full(cur.len() + removed.len())
                 || k.len() > MAX_PREFIX_NAME_BYTES
                 || v.len() > MAX_PREFIX_IRI_BYTES
             {
@@ -3279,38 +3305,39 @@ impl Store {
         Ok(())
     }
 
-    /// Set (or replace) one prefix. Prefixes are metadata: no commit is made. A new
-    /// prefix past [`StoreOptions::max_prefixes`] is refused.
+    /// Set (or replace) one prefix, and clear a removal of its name. Prefixes are
+    /// metadata: no commit is made. A new prefix past [`StoreOptions::max_prefixes`] is
+    /// refused.
     pub fn set_prefix(&self, prefix: &str, iri: &str) -> Result<()> {
         crate::sparql::extensions::check_family(self.owner_dataset_id())?;
-        if prefix.len() > MAX_PREFIX_NAME_BYTES || !valid_prefix_name(prefix) {
-            return Err(Error::invalid(format!("invalid prefix name {prefix:?}")));
-        }
-        if iri.len() > MAX_PREFIX_IRI_BYTES {
-            return Err(Error::invalid(format!(
-                "prefix IRI longer than {MAX_PREFIX_IRI_BYTES} bytes"
-            )));
-        }
-        oxrdf::NamedNode::new(iri)
-            .map_err(|e| Error::invalid(format!("invalid IRI {iri:?}: {e}")))?;
+        check_prefix(prefix, iri)?;
+        let mut removed = self.removed_prefixes.lock();
         let mut cur = self.prefixes.lock();
-        if cur.get(prefix).map(String::as_str) == Some(iri) {
+        if cur.get(prefix).map(String::as_str) == Some(iri) && !removed.contains(prefix) {
             return Ok(());
         }
-        if !cur.contains_key(prefix) && self.prefixes_full(cur.len()) {
+        let grows = !cur.contains_key(prefix) && !removed.contains(prefix);
+        if grows && self.prefixes_full(cur.len() + removed.len()) {
             return Err(Error::invalid(format!(
                 "the dataset has {} prefixes, the most allowed; remove one first",
-                cur.len()
+                cur.len() + removed.len()
             )));
         }
         let mut next = cur.clone();
         next.insert(prefix.to_string(), iri.to_string());
+        if removed.contains(prefix) {
+            let mut r = removed.clone();
+            r.remove(prefix);
+            self.save_removed_prefixes(&r)?;
+            *removed = r;
+        }
         self.save_prefixes(&next)?;
         *cur = next;
         Ok(())
     }
 
-    /// Remove one prefix; returns whether it was defined.
+    /// Remove one prefix binding; returns whether it was bound. A removal of the name
+    /// (spec C20) is left as it is.
     pub fn remove_prefix(&self, prefix: &str) -> Result<bool> {
         crate::sparql::extensions::check_family(self.owner_dataset_id())?;
         let mut cur = self.prefixes.lock();
@@ -3324,9 +3351,87 @@ impl Store {
         Ok(true)
     }
 
+    /// The prefix names the runtime layer removes (spec C20 §3.2).
+    pub fn removed_prefixes(&self) -> BTreeSet<String> {
+        self.removed_prefixes.lock().clone()
+    }
+
+    /// Replace the runtime layer of the prefixes: the bindings and the removed names
+    /// (spec C20 §3.2). A name in both is refused, and so are names and IRIs that
+    /// [`set_prefix`](Self::set_prefix) refuses, and a layer of more than
+    /// [`StoreOptions::max_prefixes`] entries.
+    pub fn set_prefix_layer(
+        &self,
+        bindings: BTreeMap<String, String>,
+        removed: BTreeSet<String>,
+    ) -> Result<()> {
+        crate::sparql::extensions::check_family(self.owner_dataset_id())?;
+        for (p, iri) in &bindings {
+            check_prefix(p, iri)?;
+            if removed.contains(p) {
+                return Err(Error::invalid(format!(
+                    "the prefix {p:?} is both bound and removed"
+                )));
+            }
+        }
+        for p in &removed {
+            if p.len() > MAX_PREFIX_NAME_BYTES || !valid_prefix_name(p) {
+                return Err(Error::invalid(format!("invalid prefix name {p:?}")));
+            }
+        }
+        let n = bindings.len() + removed.len();
+        if self.opts.max_prefixes > 0 && n > self.opts.max_prefixes {
+            return Err(Error::invalid(format!(
+                "{n} prefixes and removals are more than the {} allowed",
+                self.opts.max_prefixes
+            )));
+        }
+        let mut cur_removed = self.removed_prefixes.lock();
+        let mut cur = self.prefixes.lock();
+        if *cur_removed != removed {
+            self.save_removed_prefixes(&removed)?;
+            *cur_removed = removed;
+        }
+        if *cur != bindings {
+            self.save_prefixes(&bindings)?;
+            *cur = bindings;
+        }
+        Ok(())
+    }
+
+    /// Set which prefix names loaded data may bind (spec C20 §3.4): the server keeps the
+    /// names its settings file declares or locks for the dataset.
+    pub fn set_prefix_filter(&self, filter: Option<PrefixFilter>) {
+        *self.prefix_filter.lock() = filter;
+    }
+
+    /// Whether loaded data may bind `prefix`: it is not removed and the filter allows it.
+    pub(crate) fn data_may_bind(&self, prefix: &str) -> bool {
+        if self.removed_prefixes.lock().contains(prefix) {
+            return false;
+        }
+        let filter = self.prefix_filter.lock().clone();
+        filter.is_none_or(|f| f(prefix))
+    }
+
     /// Whether `n` prefixes leave no room for another.
     fn prefixes_full(&self, n: usize) -> bool {
         self.opts.max_prefixes > 0 && n >= self.opts.max_prefixes
+    }
+
+    fn save_removed_prefixes(&self, p: &BTreeSet<String>) -> Result<()> {
+        if let Some(root) = &self.root {
+            let path = root.join(REMOVED_PREFIXES_FILE);
+            if p.is_empty() {
+                match std::fs::remove_file(&path) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+                    _ => {}
+                }
+            } else {
+                write_atomic(&path, &serde_json::to_vec_pretty(p).unwrap())?;
+            }
+        }
+        Ok(())
     }
 
     fn save_prefixes(&self, p: &BTreeMap<String, String>) -> Result<()> {
@@ -5568,8 +5673,23 @@ fn estimated_quads(sources: &[Source]) -> u64 {
     bytes / 80
 }
 
+/// A prefix binding as [`Store::set_prefix`] accepts it: a valid name and an absolute
+/// IRI, within their length limits.
+pub fn check_prefix(prefix: &str, iri: &str) -> Result<()> {
+    if prefix.len() > MAX_PREFIX_NAME_BYTES || !valid_prefix_name(prefix) {
+        return Err(Error::invalid(format!("invalid prefix name {prefix:?}")));
+    }
+    if iri.len() > MAX_PREFIX_IRI_BYTES {
+        return Err(Error::invalid(format!(
+            "prefix IRI longer than {MAX_PREFIX_IRI_BYTES} bytes"
+        )));
+    }
+    oxrdf::NamedNode::new(iri).map_err(|e| Error::invalid(format!("invalid IRI {iri:?}: {e}")))?;
+    Ok(())
+}
+
 /// A Turtle prefix name (`PN_PREFIX`, ASCII subset), or the empty prefix.
-fn valid_prefix_name(p: &str) -> bool {
+pub fn valid_prefix_name(p: &str) -> bool {
     let b = p.as_bytes();
     p.is_empty()
         || (b[0].is_ascii_alphabetic()

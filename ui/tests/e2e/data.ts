@@ -12,6 +12,12 @@ export const DECLARED_DATASET = 'declared-e2e';
 /** A dataset the settings tests create; the settings file declares values for it. */
 export const SETTINGS_DATASET = 'settings-e2e';
 
+/** The dataset whose prefixes the settings file declares and locks (spec C20). */
+export const PREFIXES_DATASET = 'prefixes-e2e';
+export const KCLJ = 'https://kclj.io/sparkles/';
+/** The dataset the query editor's completion runs on, apart from the one the Settings test changes. */
+export const PREFIXES_QUERY_DATASET = 'prefixes-query-e2e';
+
 /** The settings file of the server without auth (`--settings`). */
 export const SETTINGS = {
   datasets: {
@@ -23,6 +29,16 @@ export const SETTINGS = {
       },
       locked: ['assistant.send'],
     },
+    [PREFIXES_DATASET]: {
+      prefixes: {
+        kclj: KCLJ,
+        notes: 'https://kclj.io/sparkles/memory/notes/',
+        fixed: 'https://kclj.io/fixed/',
+        mem: 'https://example.org/mem#',
+      },
+      locked: ['prefixes.fixed'],
+    },
+    [PREFIXES_QUERY_DATASET]: { prefixes: { kclj: KCLJ } },
   },
   // the Models section: the operator keeps claude's endpoint
   server: { locked: ['models.providers.claude.endpoint'] },

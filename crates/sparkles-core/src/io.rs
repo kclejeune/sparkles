@@ -772,6 +772,30 @@ pub fn standard_prefixes() -> BTreeMap<String, String> {
     .collect()
 }
 
+/// The namespaces Sparkles defines or serves itself: its vector functions, history and
+/// path search, the agent memory vocabulary, the assembler of the JVM bindings, and
+/// Jena's full-text search.
+pub const SPARKLES_PREFIXES: [(&str, &str); 6] = [
+    ("spk", "urn:x-sparkles:"),
+    ("hist", "urn:x-sparkles:history#"),
+    ("path", "urn:x-sparkles:path#"),
+    ("mem", "urn:x-sparkles:mem:"),
+    ("sparkles", "urn:x-sparkles:assembler#"),
+    ("text", "http://jena.apache.org/text#"),
+];
+
+/// The well-known prefixes of spec C20 §3.1: [`standard_prefixes`] and
+/// [`SPARKLES_PREFIXES`]. They are the first layer of a dataset's effective prefixes.
+pub fn well_known_prefixes() -> BTreeMap<String, String> {
+    let mut m = standard_prefixes();
+    m.extend(
+        SPARKLES_PREFIXES
+            .iter()
+            .map(|(a, b)| (a.to_string(), b.to_string())),
+    );
+    m
+}
+
 /// A syntax that [`check_data`] reads: one of oxrdfio's, or one of Jena's that
 /// [`crate::jena_formats`] reads.
 #[derive(Clone, Copy, Debug, PartialEq)]

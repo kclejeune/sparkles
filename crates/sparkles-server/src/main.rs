@@ -2220,6 +2220,8 @@ fn open_for_write(
 fn run() -> Result<()> {
     let cli = Cli::parse();
     branch_cmd::set_branch(cli.branch.clone());
+    // the declared prefixes count against it too (spec C20 §4)
+    settings::prefixes::set_max(cli.max_prefixes);
     // The commands that work on a branch of a database.
     let branch_capable = matches!(
         &cli.cmd,

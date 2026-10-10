@@ -532,18 +532,20 @@ converts documents into facts with cited spans and puts document-derived proposa
 on review branches. Agent assertions can be immediately usable while marked
 unreviewed. Neither workflow bypasses normal access checks or write guards.
 
-Layered settings currently cover assistant, memory and ingestion configuration.
-Built-in defaults, operator-wide defaults, dataset declarations and runtime patches
-merge in order. Locks keep declared values authoritative. Responses explain sources,
-locks and overrides. Server-wide model settings and write-only secrets extend this
+Layered settings currently cover assistant, memory, ingestion and prefix
+configuration. Built-in defaults, operator-wide defaults, dataset declarations and
+runtime patches merge in order. Locks keep declared values authoritative. Responses
+explain sources, locks and overrides. Declared prefixes
+([C20](specs/C20-declared-prefixes.md)) start from the well-known prefixes, and the
+store's own bindings form their runtime layer, so prefixes of loaded data never
+replace a declared one. Server-wide model settings and write-only secrets extend this
 registry, with `sparkles settings --global`, `sparkles secrets` and the Models section
 of the server page as their CLI and UI. Outbound notifications
 ([C21](specs/C21-outbound-notifications.md)) are a third server-wide kind. A single
 delivery worker posts signed webhooks and ntfy messages through the outbound policy
 when agent memory waits for review, a backup policy fails or a model budget runs out.
-Dataset
-administration handles also expose engine settings. The process's layered registry
-is a separate concern, not a universal wrapper around every stored setting.
+Dataset administration handles also expose engine settings. The process's layered
+registry is a separate concern, not a universal wrapper around every stored setting.
 
 Observability follows these boundaries: the server owns request IDs, access logs,
 Prometheus metrics and OpenTelemetry export, while the engine accepts budgets,

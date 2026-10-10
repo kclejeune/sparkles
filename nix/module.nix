@@ -412,7 +412,11 @@ in
         {
           defaults = {
             assistant.enabled = true;
-            locked = [ "assistant.send" ];
+            prefixes = {
+              kclj = "https://kclj.io/sparkles/";
+              memory = "https://kclj.io/sparkles/memory/";
+            };
+            locked = [ "assistant.send" "prefixes.kclj" ];
           };
           datasets.slurp = {
             assistant = { ingest = true; send = "documents"; };
@@ -426,6 +430,12 @@ in
         dataset, `datasets.<name>` to one dataset by name, and a `locked` list in
         either fixes fields so that they cannot be changed at runtime. The top-level
         `server.locked` list is accepted for locks of server-wide settings.
+
+        `prefixes` declares namespace prefixes, as a map from a name to an IRI. The
+        query editor and `sparkles lsp` complete them, results are written with them,
+        and `GET /$/prefixes/{ds}` lists them. A dataset admin can add, change and
+        remove prefixes at runtime unless a lock such as `prefixes.kclj` keeps them, and
+        prefixes of loaded data never replace a declared one.
 
         `server.notifications` declares outbound notifications to webhooks and ntfy
         topics (`docs/USAGE.md`, Sending notifications). Channels name their

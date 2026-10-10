@@ -438,13 +438,22 @@ impl Store {
         if ops.is_empty() {
             return Ok((0, 0));
         }
+        // a name the settings keep, or one the runtime layer removes, is left alone, as
+        // for the prefixes of loaded data (spec C20 §3.4)
+        let kept: std::collections::BTreeSet<&str> = ops
+            .iter()
+            .filter_map(|op| match op {
+                PrefixOp::Set(p, _) if !self.data_may_bind(p) => Some(p.as_str()),
+                _ => None,
+            })
+            .collect();
         let mut cur = self.prefixes.lock();
         let mut next = cur.clone();
         let (mut set, mut removed) = (0, 0);
         for op in ops {
             match op {
                 PrefixOp::Set(p, iri) => {
-                    if next.get(p) == Some(iri) {
+                    if next.get(p) == Some(iri) || kept.contains(p.as_str()) {
                         continue;
                     }
                     if !next.contains_key(p) && self.prefixes_full(next.len()) {

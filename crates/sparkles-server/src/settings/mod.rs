@@ -18,6 +18,9 @@
 
 pub mod http;
 pub mod merge;
+#[cfg(test)]
+mod prefix_tests;
+pub mod prefixes;
 pub mod secrets;
 pub mod server;
 #[cfg(test)]
@@ -25,6 +28,7 @@ mod server_tests;
 #[cfg(test)]
 mod tests;
 
+pub use prefixes::PREFIXES;
 pub use server::MODELS;
 
 use crate::models::Models;
@@ -158,7 +162,7 @@ pub static INGEST: Kind = Kind {
 };
 
 /// Every dataset-wide kind, in the order the answers list them.
-pub static KINDS: [&Kind; 3] = [&ASSISTANT, &MEMORY, &INGEST];
+pub static KINDS: [&Kind; 4] = [&ASSISTANT, &MEMORY, &INGEST, &PREFIXES];
 
 /// The server-wide `notifications` kind (spec C21 §5): channels, routes and delivery,
 /// declared in the settings file's `server.notifications` and kept at runtime in
@@ -273,7 +277,7 @@ impl Declared {
     /// object it declares, for `defaults` alone and for each dataset.
     pub fn parse(text: &str, providers: Providers) -> Result<Declared, String> {
         let v: Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
-        if let Some(f) = forbidden_member(&v) {
+        if let Some(f) = forbidden_member(&without_prefixes(&v)) {
             return Err(format!(
                 "{f} is not allowed: providers are defined in the server's model configuration only"
             ));
@@ -412,6 +416,23 @@ impl Declared {
     }
 }
 
+/// A settings file without its prefixes, whose names may be any word, for the check of
+/// `endpoint` and `apiKey` members.
+fn without_prefixes(v: &Value) -> Value {
+    let mut v = v.clone();
+    if let Some(d) = v.get_mut("defaults").and_then(Value::as_object_mut) {
+        d.remove(prefixes::NAME);
+    }
+    if let Some(m) = v.get_mut("datasets").and_then(Value::as_object_mut) {
+        for e in m.values_mut() {
+            if let Some(e) = e.as_object_mut() {
+                e.remove(prefixes::NAME);
+            }
+        }
+    }
+    v
+}
+
 fn parse_entry(v: &Value) -> Result<Entry, String> {
     let Value::Object(m) = v else {
         return Err("an object of settings kinds and locked".into());
@@ -495,6 +516,10 @@ fn parse_server(v: &Value) -> Result<ServerEntry, String> {
 fn parse_lock(s: &str) -> Result<(&'static str, Vec<String>), String> {
     let bad = || format!("locked: {s:?} is not a field such as \"assistant.send\"");
     let mut p = parse_path(s).ok_or_else(bad)?;
+    // `prefixes` locks every prefix, and `prefixes.NAME` one (spec C20 §3.3)
+    if p.len() == 1 && p[0] == prefixes::NAME {
+        return Ok((PREFIXES.name, Vec::new()));
+    }
     if p.len() < 2 {
         return Err(bad());
     }
@@ -504,7 +529,13 @@ fn parse_lock(s: &str) -> Result<(&'static str, Vec<String>), String> {
             KINDS.map(|k| k.name).join(", ")
         )
     })?;
-    if !k.members.contains(&p[1].as_str()) {
+    if prefixes::is(k) {
+        if p.len() != 2 || !prefixes::valid_name(&p[1]) {
+            return Err(format!(
+                "locked: {s:?} is not a prefix such as \"prefixes.ex\""
+            ));
+        }
+    } else if !k.members.contains(&p[1].as_str()) {
         return Err(format!("locked: {} has no member {:?}", k.name, p[1]));
     }
     p.remove(0);
@@ -735,6 +766,7 @@ impl Resolved {
             },
             "etag": self.etag,
         })
+        .tap_warnings(self)
     }
 
     /// The answer of `GET /$/server/settings/{kind}`: the members of [`json`](Self::json)
@@ -762,6 +794,25 @@ impl Resolved {
 
 // ----------------------------------------------------------------- the state ------
 
+trait TapWarnings {
+    fn tap_warnings(self, r: &Resolved) -> Self;
+}
+
+impl TapWarnings for Value {
+    /// The prefixes kind's answer has `warnings` (spec C20 §4.1).
+    fn tap_warnings(mut self, r: &Resolved) -> Value {
+        if prefixes::is(r.kind)
+            && let Some(m) = self.as_object_mut()
+        {
+            m.insert(
+                "warnings".into(),
+                Value::Array(prefixes::warnings(&r.effective)),
+            );
+        }
+        self
+    }
+}
+
 /// A dataset (`None` for a server-wide kind) and a kind.
 type LockKey = (Option<String>, &'static str);
 
@@ -777,7 +828,9 @@ struct FileStatus {
 pub struct Settings {
     /// `serve --settings`
     file: Option<PathBuf>,
-    declared: ArcSwap<Declared>,
+    /// shared with the stores' prefix filters ([`prefixes::filter`]), so a start keeps
+    /// the handle and a reload swaps what it holds
+    declared: Arc<ArcSwap<Declared>>,
     status: Mutex<FileStatus>,
     /// `--model-config` and its reads (§7)
     models_file: Option<PathBuf>,
@@ -817,7 +870,7 @@ impl Settings {
         let d = read_file(path, Providers::Checked(models))?;
         let s = Settings {
             file: Some(path.to_path_buf()),
-            declared: ArcSwap::from_pointee(d),
+            declared: Arc::new(ArcSwap::from_pointee(d)),
             ..Default::default()
         };
         s.status.lock().read_at = Some(now());
@@ -834,6 +887,12 @@ impl Settings {
 
     pub fn declared(&self) -> Arc<Declared> {
         self.declared.load_full()
+    }
+
+    /// The store's filter for the prefixes that loaded data brings to the dataset
+    /// `name` (spec C20 §3.4).
+    pub fn prefix_filter(&self, name: &str) -> sparkles::store::PrefixFilter {
+        prefixes::filter(self.declared.clone(), name.to_string())
     }
 
     /// Read the settings file again. A file that does not read or check is logged and
@@ -930,6 +989,9 @@ fn main_of(ds: &Dataset) -> Option<Arc<Dataset>> {
 pub fn runtime(st: &AppState, ds: &Dataset, kind: &Kind) -> anyhow::Result<Value> {
     let main = main_of(ds);
     let ds = main.as_deref().unwrap_or(ds);
+    if prefixes::is(kind) {
+        return Ok(prefixes::runtime_layer(ds));
+    }
     let v = crate::assist::read_file(st, ds, kind.file)?;
     Ok(match v {
         None => Value::Object(Map::new()),
@@ -953,6 +1015,9 @@ pub fn store_runtime(
 ) -> anyhow::Result<()> {
     let main = main_of(ds);
     let ds = main.as_deref().unwrap_or(ds);
+    if prefixes::is(kind) {
+        return Ok(prefixes::store_layer(ds, layer)?);
+    }
     let mut m = match layer {
         Value::Object(m) => m.clone(),
         _ => Map::new(),
@@ -1070,6 +1135,9 @@ pub fn check_file(path: &Path, model_config: Option<&Path>) -> anyhow::Result<()
         for w in server::lock_warnings(&d, &m.config) {
             eprintln!("warning: {}: {w}", path.display());
         }
+    }
+    for w in prefixes::file_warnings(&d) {
+        eprintln!("warning: {}: {w}", path.display());
     }
     println!(
         "{}: valid ({} dataset entr{})",

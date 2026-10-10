@@ -2,12 +2,13 @@
 //! directory, the nearest one wins, files are never merged, and the flags override it.
 //! Every value goes through [`options::set`], like the flags and the HTTP options. The
 //! file's `[lint]` table sets the severity of `sparkles lint`'s rules
-//! ([`LintOptions::set`]).
+//! ([`LintOptions::set`]). Its `[prefixes]` and `[lsp]` tables are read by `sparkles lsp`
+//! for completion ([`Editor`], spec C20 §8), and the formatter only checks them.
 
 use sparkles_fmt::Options;
 use sparkles_fmt::lint::LintOptions;
 use sparkles_fmt::options::{self, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -23,25 +24,46 @@ pub struct Config {
     pub options: Result<Options, String>,
     /// the `[lint]` table's rule levels
     pub lint: Result<LintOptions, String>,
+    /// the `[prefixes]` and `[lsp]` tables
+    pub editor: Result<Editor, String>,
+}
+
+/// What `sparkles lsp` reads from a config file besides the options: the `[prefixes]`
+/// table, and the dataset of the `[lsp]` table whose prefixes it asks a server for.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Editor {
+    /// prefix name to IRI
+    pub prefixes: BTreeMap<String, String>,
+    /// the `[lsp]` table's `server` and `dataset`
+    pub server: Option<ServerSource>,
+}
+
+/// A server's dataset whose effective prefixes the language server reads (C20 §8.1).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ServerSource {
+    pub server: String,
+    pub dataset: String,
 }
 
 impl Config {
     /// Read and check `path`, naming it `shown` in messages.
     pub fn load(path: &Path, shown: &Path) -> Config {
-        let (options, lint) = match std::fs::read_to_string(path) {
+        let (options, lint, editor) = match std::fs::read_to_string(path) {
             Ok(text) => (
                 parse(&text).map_err(|e| e.render(shown)),
                 parse_lint(&text).map_err(|e| e.render(shown)),
+                parse_editor(&text).map_err(|e| e.render(shown)),
             ),
             Err(e) => {
                 let m = format!("{}: error: {}", shown.display(), super::report::io(&e));
-                (Err(m.clone()), Err(m))
+                (Err(m.clone()), Err(m.clone()), Err(m))
             }
         };
         Config {
             path: shown.to_path_buf(),
             options,
             lint,
+            editor,
         }
     }
 }
@@ -86,6 +108,15 @@ pub(crate) fn lint_for_dir(dir: &Path) -> Result<LintOptions, String> {
     match discover(Path::new(""), &mut HashMap::new(), dir) {
         None => Ok(LintOptions::default()),
         Some(c) => c.lint.clone(),
+    }
+}
+
+/// The `[prefixes]` and `[lsp]` tables for a file in `dir`, as [`options_for_dir`] finds
+/// its options.
+pub(crate) fn editor_for_dir(dir: &Path) -> Result<Editor, String> {
+    match discover(Path::new(""), &mut HashMap::new(), dir) {
+        None => Ok(Editor::default()),
+        Some(c) => c.editor.clone(),
     }
 }
 
@@ -147,9 +178,9 @@ impl ConfigError {
     }
 }
 
-/// The options of a config file's text, over the defaults.
-pub fn parse(text: &str) -> Result<Options, ConfigError> {
-    let table: toml::Table = text.parse().map_err(|e: toml::de::Error| {
+/// A config file's text as a TOML table.
+fn toml_table(text: &str) -> Result<toml::Table, ConfigError> {
+    text.parse().map_err(|e: toml::de::Error| {
         let (line, column) = e
             .span()
             .map_or((0, 0), |s| sparkles_fmt::line_col(text, s.start));
@@ -158,11 +189,20 @@ pub fn parse(text: &str) -> Result<Options, ConfigError> {
             line,
             column,
         }
-    })?;
+    })
+}
+
+/// The options of a config file's text, over the defaults. The `[prefixes]` and `[lsp]`
+/// tables are checked here too, so that a mistake in them fails `sparkles fmt` as it
+/// fails the language server.
+pub fn parse(text: &str) -> Result<Options, ConfigError> {
+    let table = toml_table(text)?;
+    editor_of(&table)?;
     let mut o = Options::default();
     for (key, value) in table {
-        // `sparkles lint`'s table ([`parse_lint`])
-        if key == "lint" && value.is_table() {
+        // the tables of `sparkles lint` ([`parse_lint`]) and of the language server
+        // ([`parse_editor`])
+        if matches!(key.as_str(), "lint" | "prefixes" | "lsp") && value.is_table() {
             continue;
         }
         let bad = |message: String| {
@@ -196,16 +236,7 @@ pub fn parse(text: &str) -> Result<Options, ConfigError> {
 /// The `[lint]` table of a config file's text: `rule = "error" | "warning" | "info" |
 /// "hint" | "off"`, over the rules' defaults.
 pub fn parse_lint(text: &str) -> Result<LintOptions, ConfigError> {
-    let table: toml::Table = text.parse().map_err(|e: toml::de::Error| {
-        let (line, column) = e
-            .span()
-            .map_or((0, 0), |s| sparkles_fmt::line_col(text, s.start));
-        ConfigError::Toml {
-            message: e.message().trim_end().to_string(),
-            line,
-            column,
-        }
-    })?;
+    let table = toml_table(text)?;
     let mut o = LintOptions::default();
     let Some(lint) = table.get("lint") else {
         return Ok(o);
@@ -237,6 +268,81 @@ pub fn parse_lint(text: &str) -> Result<LintOptions, ConfigError> {
         })?;
     }
     Ok(o)
+}
+
+/// The `[prefixes]` and `[lsp]` tables of a config file's text (C20 §8).
+pub fn parse_editor(text: &str) -> Result<Editor, ConfigError> {
+    editor_of(&toml_table(text)?)
+}
+
+fn editor_of(table: &toml::Table) -> Result<Editor, ConfigError> {
+    let bad = |key: &str, message: &str| {
+        ConfigError::Option(options::OptionError {
+            key: key.to_string(),
+            message: message.to_string(),
+        })
+    };
+    let mut e = Editor::default();
+    if let Some(p) = table.get("prefixes") {
+        let p = p.as_table().ok_or_else(|| {
+            bad(
+                "prefixes",
+                "expected a table of prefix names and IRIs, such as ex = \"http://example.org/\"",
+            )
+        })?;
+        for (name, iri) in p {
+            let key = format!("prefixes.{name}");
+            if !valid_prefix_name(name) {
+                return Err(bad(
+                    &key,
+                    "not a prefix name, which is a letter followed by letters, digits, _, - or . and does not end in .",
+                ));
+            }
+            let iri = iri
+                .as_str()
+                .ok_or_else(|| bad(&key, "expected an IRI as a string"))?;
+            if let Err(err) = oxiri::Iri::parse(iri) {
+                return Err(bad(&key, &format!("not an absolute IRI: {err}")));
+            }
+            e.prefixes.insert(name.clone(), iri.to_string());
+        }
+    }
+    if let Some(l) = table.get("lsp") {
+        let l = l
+            .as_table()
+            .ok_or_else(|| bad("lsp", "expected a table with server and dataset"))?;
+        let (mut server, mut dataset) = (None, None);
+        for (k, v) in l {
+            let key = format!("lsp.{k}");
+            let v = v
+                .as_str()
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| bad(&key, "expected a non-empty string"))?;
+            match k.as_str() {
+                "server" => server = Some(v.to_string()),
+                "dataset" => dataset = Some(v.to_string()),
+                _ => return Err(bad(&key, "unknown key, the table holds server and dataset")),
+            }
+        }
+        e.server = match (server, dataset) {
+            (Some(server), Some(dataset)) => Some(ServerSource { server, dataset }),
+            (None, None) => None,
+            (Some(_), None) => return Err(bad("lsp.dataset", "missing, server needs a dataset")),
+            (None, Some(_)) => return Err(bad("lsp.server", "missing, dataset needs a server")),
+        };
+    }
+    Ok(e)
+}
+
+/// A SPARQL `PN_PREFIX` in its ASCII subset, or the empty name, as a dataset's prefixes
+/// accept.
+pub(crate) fn valid_prefix_name(p: &str) -> bool {
+    let b = p.as_bytes();
+    p.is_empty()
+        || (b[0].is_ascii_alphabetic()
+            && b.iter()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.'))
+            && !p.ends_with('.'))
 }
 
 /// `[["rdf", "rdfs"], ["ex"]]`
@@ -453,6 +559,39 @@ mod tests {
         assert!(lint_err("lint = 3").contains("lint: expected a table"));
         // a `lint` key that is not a table is still the formatter's error
         assert!(parse("lint = 3").is_err());
+    }
+
+    #[test]
+    fn the_prefixes_and_lsp_tables() {
+        let text = "line-width = 80\n[prefixes]\nkclj = \"https://kclj.io/sparkles/\"\n\"\" = \"http://example.org/\"\n[lsp]\nserver = \"https://sparkles.example.org\"\ndataset = \"slurp\"\n";
+        // the formatter and the lint skip the tables
+        assert_eq!(parse(text).unwrap().line_width, 80);
+        assert_eq!(parse_lint(text).unwrap(), LintOptions::default());
+        let e = parse_editor(text).unwrap();
+        assert_eq!(e.prefixes["kclj"], "https://kclj.io/sparkles/");
+        assert_eq!(e.prefixes[""], "http://example.org/");
+        assert_eq!(
+            e.server,
+            Some(ServerSource {
+                server: "https://sparkles.example.org".into(),
+                dataset: "slurp".into()
+            })
+        );
+        assert_eq!(parse_editor("").unwrap(), Editor::default());
+        let err = |t: &str| {
+            parse(t)
+                .unwrap_err()
+                .render(Path::new("dir/.sparklesfmt.toml"))
+        };
+        assert!(
+            err("[prefixes]\n\"bad name\" = \"http://x/\"")
+                .starts_with("dir/.sparklesfmt.toml: error: prefixes.bad name: not a prefix name")
+        );
+        assert!(err("[prefixes]\nex = \"relative/\"").contains("prefixes.ex: not an absolute IRI"));
+        assert!(err("[prefixes]\nex = 1").contains("prefixes.ex: expected an IRI"));
+        assert!(err("prefixes = 1").contains("prefixes: expected a table"));
+        assert!(err("[lsp]\nserver = \"https://x\"").contains("lsp.dataset: missing"));
+        assert!(err("[lsp]\nport = \"1\"").contains("lsp.port: unknown key"));
     }
 
     #[test]

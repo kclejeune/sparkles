@@ -673,6 +673,10 @@ impl AppState {
         dataset
             .store()
             .set_guard_observer(Some(validation_metrics.clone()));
+        // loaded data does not bind the prefixes the settings file keeps (spec C20 §3.4)
+        dataset
+            .store()
+            .set_prefix_filter(Some(self.settings.prefix_filter(name)));
         Arc::new(Dataset {
             name: name.to_string(),
             kind,

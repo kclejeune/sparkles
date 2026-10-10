@@ -10943,6 +10943,37 @@
         ],
         "type": "object"
       },
+      "PrefixWarning": {
+        "additionalProperties": false,
+        "description": "A prefix whose name is well-known but whose IRI differs (spec C20).",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#settings"
+        },
+        "properties": {
+          "iri": {
+            "description": "The IRI the dataset binds it to.",
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "prefix": {
+            "description": "The prefix name.",
+            "type": "string"
+          },
+          "wellKnown": {
+            "description": "The well-known IRI of the name.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "prefix",
+          "iri",
+          "wellKnown",
+          "message"
+        ],
+        "type": "object"
+      },
       "Prefixes": {
         "properties": {
           "prefixes": {
@@ -13285,7 +13316,8 @@
             "enum": [
               "assistant",
               "memory",
-              "ingest"
+              "ingest",
+              "prefixes"
             ],
             "type": "string"
           },
@@ -13342,6 +13374,13 @@
               "valid"
             ],
             "type": "object"
+          },
+          "warnings": {
+            "description": "The `prefixes` kind only: the prefixes that shadow a well-known prefix with another IRI.",
+            "items": {
+              "$ref": "#/components/schemas/PrefixWarning"
+            },
+            "type": "array"
           }
         },
         "required": [
@@ -24586,7 +24625,7 @@
     },
     "/$/prefixes/{ds}": {
       "get": {
-        "description": "The dataset's prefixes plus well-known ones.",
+        "description": "The dataset's effective prefixes: the well-known ones, the prefixes the settings file declares and the dataset's own, as the `prefixes` settings kind computes them.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#datasets-admin"
         },
@@ -28291,7 +28330,7 @@
               }
             }
           },
-          "description": "Fields of the kind: `AssistantSettings`, `MemorySettings` or `IngestSettingsRequest`.",
+          "description": "Fields of the kind: `AssistantSettings`, `MemorySettings`, `IngestSettingsRequest`, or for `prefixes` a map from prefix names to IRIs.",
           "required": true
         },
         "responses": {
@@ -28381,7 +28420,7 @@
               }
             }
           },
-          "description": "Fields of the kind: `AssistantSettings`, `MemorySettings` or `IngestSettingsRequest`.",
+          "description": "Fields of the kind: `AssistantSettings`, `MemorySettings`, `IngestSettingsRequest`, or for `prefixes` a map from prefix names to IRIs.",
           "required": true
         },
         "responses": {
@@ -34260,6 +34299,7 @@
     },
     "/{ds}/prefixes": {
       "delete": {
+        "description": "Removes a stored binding. For a name the settings file declares, it also stores a removal, so the declared prefix stops applying until a settings reset. A locked name is a `409` with `locked-by-config`, and a name neither stored nor declared is a `404`.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#datasets-admin"
         },
@@ -34291,6 +34331,9 @@
           "404": {
             "$ref": "#/components/responses/NotFound"
           },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
           "default": {
             "$ref": "#/components/responses/Error"
           }
@@ -34320,7 +34363,7 @@
         "x-sparkles-permission": "write"
       },
       "get": {
-        "description": "Fuseki's prefixes service: `prefix=p` returns one binding (`404` if unbound), `uri=u` the prefixes of an IRI, and neither all of them.",
+        "description": "Fuseki's prefixes service on the stored prefixes, the runtime layer of the `prefixes` settings kind: `prefix=p` returns one binding (`404` if unbound), `uri=u` the prefixes of an IRI, and neither all of them. Declared and well-known prefixes are at `/$/prefixes/{ds}`.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#datasets-admin"
         },
@@ -34387,7 +34430,7 @@
         "x-sparkles-permission": "read"
       },
       "post": {
-        "description": "Binds `prefix` to `uri`, given in the query, a form or a JSON body.",
+        "description": "Binds `prefix` to `uri`, given in the query, a form or a JSON body, in the runtime layer of the `prefixes` settings kind, and clears a removal of the name. A name the settings file locks is a `409` with `locked-by-config`.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#datasets-admin"
         },
@@ -34452,6 +34495,9 @@
           "404": {
             "$ref": "#/components/responses/NotFound"
           },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
           "default": {
             "$ref": "#/components/responses/Error"
           }
@@ -34481,7 +34527,7 @@
         "x-sparkles-permission": "write"
       },
       "put": {
-        "description": "Binds `prefix` to `uri`, given in the query, a form or a JSON body.",
+        "description": "Binds `prefix` to `uri`, given in the query, a form or a JSON body, in the runtime layer of the `prefixes` settings kind, and clears a removal of the name. A name the settings file locks is a `409` with `locked-by-config`.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#datasets-admin"
         },
@@ -34545,6 +34591,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
           },
           "default": {
             "$ref": "#/components/responses/Error"

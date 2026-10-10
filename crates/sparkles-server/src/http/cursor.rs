@@ -21,6 +21,8 @@ pub(super) struct Request {
     pub rdf_format: OutFormat,
     pub native_graph: bool,
     pub execution: ExecutionMode,
+    /// the declared and runtime prefixes, for graph results (spec C20 §5)
+    pub prefixes: std::collections::BTreeMap<String, String>,
 }
 
 /// The mode actually run for a request. Automatic execution falls back to eager
@@ -48,6 +50,7 @@ pub(super) async fn run(ds: Arc<Dataset>, request: Request) -> ApiResult {
         rdf_format,
         native_graph,
         execution,
+        prefixes: prefix_map,
     } = request;
     let execution = effective_mode(execution, thrift);
     let at = history::at_param(&params)?;
@@ -79,7 +82,6 @@ pub(super) async fn run(ds: Arc<Dataset>, request: Request) -> ApiResult {
         } else {
             format.media_type()
         };
-    let prefix_map = ds.store.prefixes();
     let prefixes = prefix_map
         .iter()
         .map(|(a, b)| (a.clone(), b.clone()))

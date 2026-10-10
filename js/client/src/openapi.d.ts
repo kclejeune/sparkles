@@ -1660,7 +1660,7 @@ export interface paths {
         };
         /**
          * Prefixes of a dataset
-         * @description The dataset's prefixes plus well-known ones.
+         * @description The dataset's effective prefixes: the well-known ones, the prefixes the settings file declares and the dataset's own, as the `prefixes` settings kind computes them.
          */
         get: operations["getAllPrefixes"];
         put?: never;
@@ -3126,20 +3126,23 @@ export interface paths {
         };
         /**
          * Read prefixes
-         * @description Fuseki's prefixes service: `prefix=p` returns one binding (`404` if unbound), `uri=u` the prefixes of an IRI, and neither all of them.
+         * @description Fuseki's prefixes service on the stored prefixes, the runtime layer of the `prefixes` settings kind: `prefix=p` returns one binding (`404` if unbound), `uri=u` the prefixes of an IRI, and neither all of them. Declared and well-known prefixes are at `/$/prefixes/{ds}`.
          */
         get: operations["getPrefixes"];
         /**
          * Bind a prefix
-         * @description Binds `prefix` to `uri`, given in the query, a form or a JSON body.
+         * @description Binds `prefix` to `uri`, given in the query, a form or a JSON body, in the runtime layer of the `prefixes` settings kind, and clears a removal of the name. A name the settings file locks is a `409` with `locked-by-config`.
          */
         put: operations["putPrefix"];
         /**
          * Bind a prefix
-         * @description Binds `prefix` to `uri`, given in the query, a form or a JSON body.
+         * @description Binds `prefix` to `uri`, given in the query, a form or a JSON body, in the runtime layer of the `prefixes` settings kind, and clears a removal of the name. A name the settings file locks is a `409` with `locked-by-config`.
          */
         post: operations["addPrefix"];
-        /** Remove a prefix */
+        /**
+         * Remove a prefix
+         * @description Removes a stored binding. For a name the settings file declares, it also stores a removal, so the declared prefix stops applying until a settings reset. A locked name is a `409` with `locked-by-config`, and a name neither stored nor declared is a `404`.
+         */
         delete: operations["deletePrefix"];
         options?: never;
         head?: never;
@@ -6370,6 +6373,16 @@ export interface components {
             prefix: string;
             uri: string;
         };
+        /** @description A prefix whose name is well-known but whose IRI differs (spec C20). */
+        PrefixWarning: {
+            /** @description The IRI the dataset binds it to. */
+            iri: string;
+            message: string;
+            /** @description The prefix name. */
+            prefix: string;
+            /** @description The well-known IRI of the name. */
+            wellKnown: string;
+        };
         Prefixes: {
             prefixes: {
                 [key: string]: string;
@@ -7090,7 +7103,7 @@ export interface components {
             /** @description The entity tag of the runtime layer, as in the `ETag` header. */
             etag: string;
             /** @enum {string} */
-            kind: "assistant" | "memory" | "ingest";
+            kind: "assistant" | "memory" | "ingest" | "prefixes";
             /** @description The fields the settings file locks. */
             locked: string[];
             /** @description Locked fields whose runtime value is kept in the file but ignored. */
@@ -7109,6 +7122,8 @@ export interface components {
                 error?: string;
                 valid: boolean;
             };
+            /** @description The `prefixes` kind only: the prefixes that shadow a well-known prefix with another IRI. */
+            warnings?: components["schemas"]["PrefixWarning"][];
         };
         /** @description A runtime value that is used in place of a different declared value. A reset of `path` brings the declared value back. */
         SettingsOverride: {
@@ -13813,7 +13828,7 @@ export interface operations {
             };
             cookie?: never;
         };
-        /** @description Fields of the kind: `AssistantSettings`, `MemorySettings` or `IngestSettingsRequest`. */
+        /** @description Fields of the kind: `AssistantSettings`, `MemorySettings`, `IngestSettingsRequest`, or for `prefixes` a map from prefix names to IRIs. */
         requestBody: {
             content: {
                 "application/json": Record<string, never>;
@@ -13891,7 +13906,7 @@ export interface operations {
             };
             cookie?: never;
         };
-        /** @description Fields of the kind: `AssistantSettings`, `MemorySettings` or `IngestSettingsRequest`. */
+        /** @description Fields of the kind: `AssistantSettings`, `MemorySettings`, `IngestSettingsRequest`, or for `prefixes` a map from prefix names to IRIs. */
         requestBody: {
             content: {
                 "application/json": Record<string, never>;
@@ -16627,6 +16642,7 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
             default: components["responses"]["Error"];
         };
     };
@@ -16666,6 +16682,7 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
             default: components["responses"]["Error"];
         };
     };
@@ -16694,6 +16711,7 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
             default: components["responses"]["Error"];
         };
     };

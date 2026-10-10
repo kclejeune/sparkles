@@ -1415,7 +1415,7 @@ fn settings(put: &mut dyn FnMut(&str, J)) {
                 ],
                 json!({
                     "dataset": string(),
-                    "kind": string_enum(&["assistant", "memory", "ingest"]),
+                    "kind": string_enum(&["assistant", "memory", "ingest", "prefixes"]),
                     "effective": any_object("The effective object: the built-in defaults, the declared values and the runtime layer merged, with the locked fields from the settings file."),
                     "declared": any_object("The settings file's `defaults` and dataset entry for this kind, merged."),
                     "runtime": any_object("The runtime layer: the fields changed through the API. `null` removes a declared member."),
@@ -1425,9 +1425,26 @@ fn settings(put: &mut dyn FnMut(&str, J)) {
                     "overrides": with_desc(array(sref("SettingsOverride")), "The runtime values used in place of a different value of the settings file, one entry per field. Locked fields are left out, since their runtime value is ignored."),
                     "status": closed(&["valid"], json!({ "valid": boolean(), "error": string() })),
                     "etag": with_desc(string(), "The entity tag of the runtime layer, as in the `ETag` header."),
+                    "warnings": with_desc(array(sref("PrefixWarning")), "The `prefixes` kind only: the prefixes that shadow a well-known prefix with another IRI."),
                 }),
             ),
             "One settings kind of a dataset with its layers and sources.",
+            "settings",
+        ),
+    );
+    put(
+        "PrefixWarning",
+        doc(
+            closed(
+                &["prefix", "iri", "wellKnown", "message"],
+                json!({
+                    "prefix": with_desc(string(), "The prefix name."),
+                    "iri": with_desc(string(), "The IRI the dataset binds it to."),
+                    "wellKnown": with_desc(string(), "The well-known IRI of the name."),
+                    "message": string(),
+                }),
+            ),
+            "A prefix whose name is well-known but whose IRI differs (spec C20).",
             "settings",
         ),
     );

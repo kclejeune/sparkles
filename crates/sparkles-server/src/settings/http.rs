@@ -90,6 +90,7 @@ fn body_object(body: &[u8], kind: &Kind) -> ApiResult<Value> {
         return Err(bad("the body must be a JSON object"));
     }
     if kind.scope == super::Scope::Dataset
+        && !super::prefixes::is(kind)
         && let Some(f) = forbidden_member(&v)
     {
         return Err(bad(format!(
@@ -148,6 +149,17 @@ pub(crate) fn plan(
                     }
                 }
             }
+            // the prefixes kind is such a map itself (spec C20 §3)
+            if super::prefixes::is(kind)
+                && let Value::Object(members) = &p
+            {
+                for (name, v) in members {
+                    let path = [name.clone()];
+                    if v.is_null() && at(&cur.base, &path).is_some() {
+                        set_at(&mut new, &path, Value::Null);
+                    }
+                }
+            }
             new
         }
         Op::Put(mut body) => {
@@ -188,7 +200,12 @@ pub(crate) fn plan(
     let mut refused = Vec::new();
     for l in &cur.locked {
         if at(&after, l) == at(&base, l) {
-            remove_at(&mut new, l);
+            if l.is_empty() {
+                // a lock of the whole kind (`prefixes`)
+                new = Value::Object(Map::new());
+            } else {
+                remove_at(&mut new, l);
+            }
             continue;
         }
         if at(&after, l) == at(&before, l) {
@@ -197,20 +214,37 @@ pub(crate) fn plan(
         refused.push(path_string(l));
     }
     if !refused.is_empty() {
-        return Err(err_body(
-            StatusCode::CONFLICT,
-            json!({
-                "error": format!(
-                    "the settings file locks {} of {} for {owner}",
-                    refused.join(", "),
-                    kind.name
-                ),
-                "code": "locked-by-config",
-                "fields": refused,
-            }),
-        ));
+        return Err(locked_error_of(kind.name, &refused, owner));
     }
     Ok(new)
+}
+
+/// The `409` of a write to locked fields of `kind`.
+fn locked_error_of(kind: &str, fields: &[String], owner: &str) -> crate::http::ApiError {
+    let shown: Vec<&str> = fields
+        .iter()
+        .map(|f| if f.is_empty() { kind } else { f.as_str() })
+        .collect();
+    err_body(
+        StatusCode::CONFLICT,
+        json!({
+            "error": format!(
+                "the settings file locks {} of {kind} for {owner}",
+                shown.join(", "),
+            ),
+            "code": "locked-by-config",
+            "fields": fields,
+        }),
+    )
+}
+
+/// The `409` of a write to locked prefixes (spec C20 §5).
+pub(crate) fn locked_error(prefixes: &[String], owner: &str) -> crate::http::ApiError {
+    let fields: Vec<String> = prefixes
+        .iter()
+        .map(|p| path_string(std::slice::from_ref(p)))
+        .collect();
+    locked_error_of(super::prefixes::NAME, &fields, owner)
 }
 
 fn server_kind_of(name: &str) -> ApiResult<&'static Kind> {
@@ -267,8 +301,22 @@ pub async fn write(
         if let Err(e) = &r.status {
             return Err(bad(format!("{}: {e}", kind.name)));
         }
+        if super::prefixes::is(kind) {
+            let n = super::prefixes::entries(&r.runtime);
+            let max = st.store_opts.max_prefixes;
+            if max > 0 && n > max && n > super::prefixes::entries(&cur.runtime) {
+                return Err(bad(format!(
+                    "the dataset would have {n} prefixes and removals, more than the {max} allowed; remove one first"
+                )));
+            }
+        }
         if r.runtime != cur.runtime {
-            store_runtime(&st, &ds, kind, &r.runtime).map_err(internal)?;
+            store_runtime(&st, &ds, kind, &r.runtime).map_err(|e| {
+                match e.downcast_ref::<sparkles::Error>() {
+                    Some(sparkles::Error::Invalid(m)) => bad(m.clone()),
+                    _ => internal(e),
+                }
+            })?;
         }
         Ok(r)
     })

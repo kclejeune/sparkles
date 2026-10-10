@@ -1211,6 +1211,7 @@ pub(crate) async fn run_query(
         let rdf_format = rdf_format(&params, &headers, false);
         let native_graph = params_wants_sparkles(&headers);
         opts.initial_bindings = bindings;
+        let prefixes = crate::settings::prefixes::bound(&st, &ds);
         return cursor::run(
             ds,
             cursor::Request {
@@ -1225,13 +1226,14 @@ pub(crate) async fn run_query(
                 rdf_format,
                 native_graph,
                 execution,
+                prefixes,
             },
         )
         .await;
     }
     let rfmt = rdf_format(&params, &headers, false);
     let send = params.get("send").and_then(|s| s.parse::<usize>().ok());
-    let prefixes = ds.store.prefixes();
+    let prefixes = crate::settings::prefixes::bound(&st, &ds);
     let with_extra = !opts.default_graph_extra.is_empty();
     let at = history::at_param(&params)?;
     let timeout = opts.timeout;
@@ -2642,7 +2644,7 @@ async fn graph_body(
     let counted = quads.clone();
     // an export reads every block once: keep the blocks queries use cached
     let snap = snap.without_cache_fill();
-    let prefixes = ds.store.prefixes();
+    let prefixes = crate::settings::prefixes::bound(&st, &ds);
     let write = move |w: &mut LimitedWriter<stream::SwitchWriter>| -> sparkles::Result<()> {
         let mut s = GraphOut::new(fmt, prefixes, w);
         let (perm, prefix) = match what {
@@ -3865,14 +3867,17 @@ async fn clear_cache(State(st): St, Path(name): Path<String>) -> ApiResult<Json<
 
 async fn prefixes(State(st): St, Path(name): Path<String>) -> ApiResult<Json<J>> {
     let ds = dataset(&st, &name)?;
-    let mut p = sparkles::io::standard_prefixes();
-    p.extend(ds.store.prefixes());
-    Ok(Json(json!({ "prefixes": p })))
+    // the effective prefixes: well-known, declared and runtime (spec C20 §5)
+    Ok(Json(
+        json!({ "prefixes": crate::settings::prefixes::effective(&st, &ds) }),
+    ))
 }
 
-/// `/{ds}/prefixes`, after Fuseki's prefixes service. GET: `?prefix=` → its IRI,
-/// `?uri=` → the prefixes bound to it, neither → all stored prefixes. POST / PUT with
-/// `prefix` and `uri` (query, form or JSON body) sets one; DELETE `?prefix=` removes one.
+/// `/{ds}/prefixes`, after Fuseki's prefixes service, on the runtime layer of the
+/// prefixes (spec C20 §5). GET: `?prefix=` → its stored IRI, `?uri=` → the stored
+/// prefixes bound to it, neither → all stored prefixes. POST / PUT with `prefix` and
+/// `uri` (query, form or JSON body) sets one; DELETE `?prefix=` removes one, and a
+/// prefix the settings file declares stays removed. A locked prefix is a `409`.
 async fn dataset_prefixes(
     State(st): St,
     Path(name): Path<String>,
@@ -3927,12 +3932,19 @@ async fn dataset_prefixes(
         Method::POST | Method::PUT => {
             let p = prefix.ok_or_else(|| missing("prefix"))?;
             let u = iri.ok_or_else(|| missing("uri"))?;
-            ds.store.set_prefix(&p, &u)?;
+            use crate::settings::prefixes::{FusekiWrite, fuseki_write};
+            fuseki_write(
+                st.clone(),
+                ds.clone(),
+                FusekiWrite::Set(p.clone(), u.clone()),
+            )
+            .await?;
             Ok(Json(json!({ "prefix": p, "uri": u })).into_response())
         }
         Method::DELETE => {
             let p = prefix.ok_or_else(|| missing("prefix"))?;
-            if ds.store.remove_prefix(&p)? {
+            use crate::settings::prefixes::{FusekiWrite, fuseki_write};
+            if fuseki_write(st.clone(), ds.clone(), FusekiWrite::Remove(p.clone())).await? {
                 Ok(StatusCode::NO_CONTENT.into_response())
             } else {
                 Err(err(StatusCode::NOT_FOUND, format!("no prefix '{p}'")))
@@ -4716,7 +4728,7 @@ async fn shacl(
     // prefixes
     let target = params
         .get("target")
-        .map(|t| shacl_target(t, &ds.store.prefixes()))
+        .map(|t| shacl_target(t, &crate::settings::prefixes::bound(&st, &ds)))
         .transpose()?;
     let rfmt = match params.get("format") {
         Some(f) => ReportFormat::from_name(f).ok_or_else(|| {
