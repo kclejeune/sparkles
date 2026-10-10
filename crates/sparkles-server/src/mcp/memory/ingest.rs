@@ -499,6 +499,7 @@ pub(crate) enum SpanCheck {
 /// The span check: the span lies inside the rendition, and the quote, when given, is
 /// the passage at the span after whitespace folding. A rendition whose text is not
 /// kept is checked by its length alone and needs a quote.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn check_span(
     rends: &mut Renditions,
     r: &Reader,

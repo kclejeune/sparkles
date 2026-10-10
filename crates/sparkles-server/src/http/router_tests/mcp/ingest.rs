@@ -24,7 +24,9 @@ const ORG: &str = r#"@prefix ex:     <http://example.org/> .
 "#;
 
 const NOTES: &str = "https://example.org/notes/standup";
+#[cfg(feature = "auth")]
 const SESSION: &str = "https://example.org/memory/agents/agent-7/sessions/s1";
+#[cfg(feature = "auth")]
 const CONSOLIDATED: &str = "https://example.org/memory/consolidated";
 const MEMBER_OF: &str = "http://www.w3.org/ns/org#memberOf";
 
@@ -52,6 +54,7 @@ fn note(with_ana: bool) -> String {
     t
 }
 
+#[cfg(feature = "auth")]
 fn char_offset(text: &str, needle: &str) -> (usize, usize) {
     let b = text.find(needle).unwrap();
     let a = text[..b].chars().count();

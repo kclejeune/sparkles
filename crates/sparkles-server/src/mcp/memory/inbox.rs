@@ -51,6 +51,19 @@ pub(crate) fn review_kind(name: &str) -> Option<&'static str> {
     }
 }
 
+/// The guard's dry run: whether it found violations, and the (focus, path) pairs it
+/// reported.
+type GuardVerdict = (bool, HashSet<(String, Option<String>)>);
+
+/// A session graph of the inbox: its facts, first and last times, and principals.
+type SessionGroup = (
+    NamedNode,
+    Vec<Value>,
+    Option<String>,
+    Option<String>,
+    BTreeSet<String>,
+);
+
 /// One fact read through a reifier.
 #[derive(Clone)]
 pub(crate) struct ReifiedFact {
@@ -582,7 +595,7 @@ fn guard_failures(
     target: &NamedNode,
     facts: &[&ReifiedFact],
     deadline: Instant,
-) -> Option<(bool, HashSet<(String, Option<String>)>)> {
+) -> Option<GuardVerdict> {
     if facts.is_empty() {
         return Some((false, HashSet::new()));
     }
@@ -654,10 +667,7 @@ fn guard_failures(
     }
 }
 
-fn guard_signal(
-    f: &ReifiedFact,
-    verdict: &Option<(bool, HashSet<(String, Option<String>)>)>,
-) -> &'static str {
+fn guard_signal(f: &ReifiedFact, verdict: &Option<GuardVerdict>) -> &'static str {
     match verdict {
         None => "unchecked",
         Some((_, fails)) => {
@@ -765,13 +775,7 @@ impl Tools<'_> {
         }
         let labels = std::mem::take(&mut ck.labels);
         // grouped by session graph, oldest first
-        let mut groups: Vec<(
-            NamedNode,
-            Vec<Value>,
-            Option<String>,
-            Option<String>,
-            BTreeSet<String>,
-        )> = Vec::new();
+        let mut groups: Vec<SessionGroup> = Vec::new();
         for (f, s) in facts.iter().zip(&sigs) {
             let i = match groups.iter().position(|(g, ..)| *g == f.g) {
                 Some(i) => i,
