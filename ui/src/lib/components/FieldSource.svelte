@@ -1,9 +1,11 @@
 <script lang="ts">
   // Where a settings field's value comes from (C19 §10): a label for a value of the
-  // server's settings file, a lock for a field the operator locked, a marker and a reset
-  // for a value changed at runtime, and a warning for a runtime value a lock ignores.
-  // Any layered settings form uses it, for a dataset's kinds or the server's.
-  import { sourceText, type FieldInfo } from '$lib/settings';
+  // server's configuration, a lock for a field the operator locked, a marker and a reset
+  // for a value changed at runtime, and a warning for a runtime value a lock ignores. A
+  // runtime value that replaces a declared one says that it overrides the server config,
+  // and its reset is "Use server config". Any layered settings form uses it, for a
+  // dataset's kinds or the server's.
+  import { resetText, sourceText, type FieldInfo } from '$lib/settings';
   import Icon from './Icon.svelte';
 
   let {
@@ -24,6 +26,14 @@
   } = $props();
 
   const text = $derived(sourceText(info));
+  const reset = $derived(resetText(info));
+  const resetName = $derived(
+    info.overridden
+      ? `Remove the ignored change of ${label}`
+      : info.hasDeclared
+        ? `Use server config for ${label}`
+        : `Reset ${label} to default`,
+  );
   const ignored = $derived(
     info.ignored === undefined ? '' : ` (${JSON.stringify(info.ignored)})`.slice(0, 120),
   );
@@ -31,7 +41,11 @@
 
 <span class="sources" data-source={info.locked ? 'locked' : info.source}>
   {#if text}
-    <span class="src {info.locked ? 'locked' : info.source}" title={text.title}>
+    <span
+      class="src {info.locked ? 'locked' : info.source}"
+      class:overrides={info.overrides !== undefined}
+      title={text.title}
+    >
       {#if info.locked}<Icon name="lock" size={11} />{:else if info.source === 'runtime'}<i
           class="dot"
         ></i>{/if}
@@ -57,11 +71,9 @@
       type="button"
       class="btn ghost sm reset"
       disabled={busy}
-      aria-label="Reset {label}"
-      title={info.overridden
-        ? 'Remove the ignored runtime value'
-        : "Remove the change, so the field takes the value of the server's settings file or the default"}
-      onclick={onreset}><Icon name="refresh" size={11} /> Reset</button
+      aria-label={resetName}
+      title={reset.title}
+      onclick={onreset}><Icon name="refresh" size={11} /> {reset.text}</button
     >
   {/if}
 </span>
@@ -86,6 +98,12 @@
   }
   .src.runtime {
     color: var(--spark-ink);
+  }
+  .src.overrides {
+    color: var(--warn);
+  }
+  .src.overrides .dot {
+    background: var(--warn);
   }
   .src.locked {
     color: var(--text-2);

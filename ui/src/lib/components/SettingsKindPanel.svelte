@@ -13,11 +13,15 @@
     fieldInfo,
     formOf,
     formPatch,
+    overridesOf,
+    overridesSummary,
     patchKind,
     readKind,
+    resetFields,
     resetKind,
     runtimePatch,
     runtimeText,
+    valueText,
     writeFailure,
     type FieldDef,
     type FormValues,
@@ -34,9 +38,12 @@
     fields,
     canEdit = false,
     forbiddenText = 'Changing these settings needs admin on the dataset.',
+    declaredName = "the server's settings file",
     groupExtra,
     onchange,
   }: {
+    /** Where the declared layer comes from, in words. */
+    declaredName?: string;
     title: string;
     /** What the kind covers, in a line. */
     text?: string;
@@ -70,8 +77,11 @@
   let jsonText = $state('');
   let jsonError = $state<string | null>(null);
   let resetAllOpen = $state(false);
+  let useConfigOpen = $state(false);
 
   const editable = $derived(canEdit && !forbidden);
+  /** The runtime values that replace a value of the server's configuration. */
+  const overrides = $derived(overridesOf(k));
   const dirty = $derived(dirtyFields(fields, initial, form));
   const jsonDirty = $derived(k != null && jsonText !== runtimeText(k));
   const runtimeCount = $derived(k ? Object.keys(k.runtime ?? {}).length : 0);
@@ -188,6 +198,20 @@
       resetAllOpen = false;
   }
 
+  /** Clear only the runtime values that override the server's configuration. */
+  async function useConfigForAll() {
+    const fields = overrides.map((o) => o.path);
+    if (
+      await write(
+        `The ${lower} settings use the server config for ${fields.length} field${fields.length === 1 ? '' : 's'}`,
+        (etag) => resetFields(url, fields, etag),
+      )
+    )
+      useConfigOpen = false;
+    // the resets before a refused one were made, so the section shows what is left
+    else await load();
+  }
+
   async function saveJson() {
     if (!k) return;
     const r = runtimePatch(k, jsonText);
@@ -247,6 +271,25 @@
           <strong>The effective {lower} settings are not valid.</strong>
           {k.status.error ?? ''} The features that read them treat the problem as a missing provider or
           setting until it is fixed.
+        </div>
+      {/if}
+      {#if overrides.length}
+        <div class="overrides-bar" data-testid="overrides-{slug}">
+          <Icon name="layers" size={13} />
+          <span
+            title={overrides
+              .map(
+                (o) =>
+                  `${o.path}: ${valueText(o.runtime, 40)} in place of ${valueText(o.declared, 40)}`,
+              )
+              .join('\n')}>{overridesSummary(overrides.length)}</span
+          >
+          <span class="spacer"></span>
+          {#if editable}
+            <button class="btn sm" disabled={busy} onclick={() => (useConfigOpen = true)}
+              >Use server config for all</button
+            >
+          {/if}
         </div>
       {/if}
       <form onsubmit={save} aria-label="{title} settings form">
@@ -369,7 +412,7 @@
               readonly={!editable}></textarea>
           </label>
           <div class="field">
-            <span>From the server's settings file</span>
+            <span>From {declaredName}</span>
             <span class="faint small">
               {k.locked.length
                 ? `Locked: ${k.locked.join(', ')}.`
@@ -403,7 +446,7 @@
 <Modal bind:open={resetAllOpen} title="Reset the {lower} settings?">
   <p>
     This removes every change made at runtime to the {lower} settings, so each field takes the value of
-    the server's settings file or the default.
+    {declaredName} or the default.
   </p>
   {#if k}<pre class="declared">{runtimeText(k)}</pre>{/if}
   {#snippet actions()}
@@ -414,9 +457,61 @@
   {/snippet}
 </Modal>
 
+<Modal bind:open={useConfigOpen} title="Use the server config for these fields?" width={520}>
+  <p>
+    These {lower} fields were changed at runtime and override the server's configuration. Their runtime
+    values are removed, so each field takes the server config's value again. Other changes stay.
+  </p>
+  <table class="data overrides-list">
+    <thead><tr><th>Field</th><th>Now</th><th>Server config</th></tr></thead>
+    <tbody>
+      {#each overrides as o (o.path)}
+        <tr>
+          <td class="mono">{o.path}</td>
+          <td class="mono" title={JSON.stringify(o.runtime)}
+            >{o.runtime === null ? 'removed' : valueText(o.runtime, 40)}</td
+          >
+          <td class="mono" title={JSON.stringify(o.declared)}>{valueText(o.declared, 40)}</td>
+        </tr>
+      {/each}
+    </tbody>
+  </table>
+  {#snippet actions()}
+    <button class="btn" onclick={() => (useConfigOpen = false)}>Cancel</button>
+    <button class="btn primary" disabled={busy} onclick={useConfigForAll}>
+      {#if busy}<span class="spinner"></span>{/if} Use server config
+    </button>
+  {/snippet}
+</Modal>
+
 <style>
   .kind {
     min-width: 0;
+  }
+  .overrides-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 8px;
+    margin: 0 0 10px;
+    padding: 6px 10px;
+    border-radius: var(--r);
+    border: 1px solid color-mix(in srgb, var(--warn) 40%, transparent);
+    background: color-mix(in srgb, var(--warn) 8%, transparent);
+    font-size: var(--fs-sm);
+    color: var(--text);
+  }
+  .overrides-bar :global(svg) {
+    color: var(--warn);
+  }
+  .overrides-list {
+    margin: 8px 0 0;
+    font-size: var(--fs-sm);
+  }
+  .overrides-list td.mono {
+    font-family: var(--font-mono);
+    font-size: var(--fs-xs);
+    overflow-wrap: anywhere;
   }
   .intro {
     max-width: 72ch;

@@ -623,7 +623,10 @@ implementation landed.
   docs/API.md and the Sparkles UI code only (2026-10-10), with no new UI dependency.
   The server side of Phase 4, the `models` kind, the runtime secrets and the `/$/server`
   routes, followed on the same day from the spec and the Sparkles code. They add no
-  runtime dependency. The CLI, UI and NixOS parts of Phase 4 are not built.
+  runtime dependency. The CLI, UI and NixOS parts of Phase 4, with the `overrides`
+  member of each settings answer, followed on the same day from the spec, docs/API.md
+  and the Sparkles code only. They add no dependency, and the CLI's hidden prompt uses
+  the `rpassword` crate that `sparkles auth` already uses.
 - **Rejected** (spec §12):
   - model configuration only in the operator's file;
   - returning stored keys to administrators;

@@ -24,9 +24,15 @@ struct Server {
 impl Server {
     /// Start on the first free port of 47400–47419, with its log in `log`.
     fn start(data: &Path, extra: &[&str], log: &Path) -> Server {
-        let port = (47400..47420)
+        Server::start_in(data, extra, log, 47400..47420)
+    }
+
+    /// Start on the first free port of `ports`, with its log in `log`.
+    fn start_in(data: &Path, extra: &[&str], log: &Path, ports: std::ops::Range<u16>) -> Server {
+        let port = ports
+            .clone()
             .find(|p| TcpListener::bind(("127.0.0.1", *p)).is_ok())
-            .expect("a free port in 47400-47419");
+            .unwrap_or_else(|| panic!("a free port in {ports:?}"));
         let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -285,4 +291,267 @@ fn server_settings_restart_reload_and_log() {
         text.contains("roles.summarize"),
         "the changed fields are not logged"
     );
+}
+
+/// The output of a CLI run.
+struct Out {
+    code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
+impl Out {
+    fn ok(self) -> Out {
+        assert_eq!(self.code, Some(0), "{}\n{}", self.stdout, self.stderr);
+        self
+    }
+
+    fn json(&self) -> J {
+        serde_json::from_str(&self.stdout)
+            .unwrap_or_else(|e| panic!("{e}: {}\n{}", self.stdout, self.stderr))
+    }
+}
+
+/// Run the CLI against `s` with `stdin` piped in, so that it is not a terminal.
+fn cli(s: &Server, home: &Path, args: &[&str], stdin: &str) -> Out {
+    let mut c = Command::new(BIN);
+    c.args(args)
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("XDG_STATE_HOME", home.join("state"))
+        .env("SPARKLES_SERVER", format!("http://127.0.0.1:{}", s.port))
+        .env_remove("SPARKLES_TOKEN")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = c.spawn().unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin.as_bytes())
+        .unwrap();
+    let o = child.wait_with_output().unwrap();
+    Out {
+        code: o.status.code(),
+        stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
+    }
+}
+
+/// The line of `out` whose first word is `field`.
+fn line(out: &str, field: &str) -> String {
+    out.lines()
+        .find(|l| l.split_whitespace().next() == Some(field))
+        .unwrap_or_else(|| panic!("{field} in {out}"))
+        .to_string()
+}
+
+/// `sparkles settings --global` on the `models` kind (a locked endpoint, a budget, a
+/// role list that overrides the declared one, `diff` and `reset`) and `sparkles secrets
+/// list|set|unset`, with a check that the key reaches neither the CLI's output nor the
+/// server's log.
+#[test]
+fn global_settings_and_secrets_commands() {
+    const CLI_KEY: &str = "cli-runtime-key-c19-4321";
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let data = dir.path().join("data");
+    let cfg = dir.path().join("models.json");
+    let settings = dir.path().join("settings.json");
+    let key_file = dir.path().join("gw.key");
+    let log = dir.path().join("server.log");
+    let (mock_port, seen) = mock();
+    std::fs::write(&cfg, models(mock_port, false).to_string()).unwrap();
+    std::fs::write(&key_file, DECLARED_KEY).unwrap();
+    std::fs::write(
+        &settings,
+        json!({ "server": { "locked": ["models.providers.gw.endpoint"] } }).to_string(),
+    )
+    .unwrap();
+    let secret = format!("gw=file:{}", key_file.display());
+    let s = Server::start_in(
+        &data,
+        &[
+            "--model-config",
+            cfg.to_str().unwrap(),
+            "--model-secret",
+            &secret,
+            "--settings",
+            settings.to_str().unwrap(),
+            "--outbound-allow-private",
+        ],
+        &log,
+        47600..47620,
+    );
+    let mut outputs: Vec<String> = Vec::new();
+    let mut run = |args: &[&str], stdin: &str| {
+        let o = cli(&s, &home, args, stdin);
+        outputs.push(format!("{}\n{}", o.stdout, o.stderr));
+        o
+    };
+
+    // get --global: every field with its source, the lock among them
+    let o = run(&["settings", "get", "--global"], "").ok();
+    assert!(o.stdout.starts_with("models on the server"), "{}", o.stdout);
+    assert!(line(&o.stdout, "providers.gw.endpoint").contains("locked"));
+    assert!(line(&o.stdout, "providers.gw.kind").contains("declared"));
+    let j = run(&["settings", "get", "--global", "models", "--json"], "")
+        .ok()
+        .json();
+    assert_eq!(j["scope"], "server");
+    assert_eq!(j["overrides"], json!([]));
+
+    // set --global: a budget and a role list; the locked endpoint is refused
+    let o = run(
+        &[
+            "settings",
+            "set",
+            "--global",
+            "models.providers.gw.budget.tokensPerDay=5000",
+            r#"models.roles.draft=[{"provider":"gw","model":"m2"}]"#,
+        ],
+        "",
+    )
+    .ok();
+    assert!(
+        o.stdout
+            .contains("models.providers.gw.budget.tokensPerDay = 5000  (runtime)"),
+        "{}",
+        o.stdout
+    );
+    let o = run(
+        &[
+            "settings",
+            "set",
+            "--global",
+            "models.providers.gw.endpoint=http://127.0.0.1:1/v1",
+        ],
+        "",
+    );
+    assert_eq!(o.code, Some(1));
+    assert!(
+        o.stderr.contains("locks providers.gw.endpoint"),
+        "{}",
+        o.stderr
+    );
+    // the role list now overrides the declared one, and get says so
+    let o = run(&["settings", "get", "--global", "models"], "").ok();
+    let draft = line(&o.stdout, "roles.draft");
+    assert!(
+        draft.contains(r#"runtime, overrides declared [{"model":"m","provider":"gw"}]"#),
+        "{draft}"
+    );
+    let o = run(&["settings", "get", "--global", "--layer", "runtime"], "").ok();
+    assert!(
+        line(&o.stdout, "roles.draft").contains("(overrides declared"),
+        "{}",
+        o.stdout
+    );
+    // diff --global lists both changes
+    let o = run(&["settings", "diff", "--global"], "").ok();
+    assert!(
+        o.stdout.contains(
+            r#"server models.roles.draft: runtime [{"model":"m2","provider":"gw"}], declared [{"model":"m","provider":"gw"}]"#
+        ),
+        "{}",
+        o.stdout
+    );
+    assert!(
+        o.stdout.contains(
+            "server models.providers.gw.budget.tokensPerDay: runtime 5000, default unset"
+        ),
+        "{}",
+        o.stdout
+    );
+    // reset --global says which value applies now
+    let o = run(&["settings", "reset", "--global", "models.roles.draft"], "").ok();
+    assert!(
+        o.stdout.contains(
+            r#"models.roles.draft on the server = [{"model":"m","provider":"gw"}], the declared value applies"#
+        ),
+        "{}",
+        o.stdout
+    );
+    let o = run(
+        &[
+            "settings",
+            "reset",
+            "--global",
+            "models.providers.gw.budget.tokensPerDay",
+        ],
+        "",
+    )
+    .ok();
+    assert!(
+        o.stdout.contains("= unset, the default applies"),
+        "{}",
+        o.stdout
+    );
+    // the dataset form names --global for a server-wide kind
+    let o = run(&["settings", "get", "models"], "");
+    assert_eq!(o.code, Some(1));
+    assert!(o.stderr.contains("--global"), "{}", o.stderr);
+
+    // secrets: list, set from standard input, unset
+    let o = run(&["secrets", "list"], "").ok();
+    let gw = line(&o.stdout, "gw");
+    assert!(gw.contains("declared"), "{}", o.stdout);
+    let o = run(&["secrets", "set", "gw"], &format!("{CLI_KEY}\n")).ok();
+    assert!(
+        o.stdout.contains("stored a runtime value for secret gw"),
+        "{}",
+        o.stdout
+    );
+    assert!(
+        o.stdout
+            .contains("the runtime value applies, in place of the declared source; used by gw"),
+        "{}",
+        o.stdout
+    );
+    let (st, v) = s.call("POST", "/$/models/gw/test", Some(json!({ "model": "m" })));
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(
+        seen.lock().unwrap().last().cloned().unwrap_or_default(),
+        format!("Bearer {CLI_KEY}")
+    );
+    let j = run(&["secrets", "list", "--json"], "").ok().json();
+    let gw = &j["secrets"][0];
+    assert_eq!(gw["source"], "runtime", "{j}");
+    assert!(gw["setAt"].is_string(), "{j}");
+    assert_eq!(gw["overridden"], false);
+    assert_eq!(gw["providers"], json!(["gw"]));
+    let o = run(&["secrets", "list"], "").ok();
+    assert!(
+        line(&o.stdout, "gw").contains("overrides the declared source"),
+        "{}",
+        o.stdout
+    );
+    // an empty value and a bad name are refused before anything is sent
+    let o = run(&["secrets", "set", "gw"], "\n");
+    assert_eq!(o.code, Some(1));
+    assert!(o.stderr.contains("no value"), "{}", o.stderr);
+    let o = run(&["secrets", "set", ".bad"], "x\n");
+    assert_eq!(o.code, Some(1));
+    let o = run(&["secrets", "unset", "gw"], "").ok();
+    assert!(
+        o.stdout.contains("the declared source applies; used by gw"),
+        "{}",
+        o.stdout
+    );
+    let (_, v) = s.call("GET", "/$/server/secrets", None);
+    assert_eq!(v["secrets"][0]["source"], "declared", "{v}");
+    drop(s);
+
+    // the key is in no output of the CLI and not in the server's log
+    for out in &outputs {
+        assert!(
+            !out.contains(CLI_KEY),
+            "the key is in the CLI's output: {out}"
+        );
+    }
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert!(!text.contains(CLI_KEY), "the key is in the server's log");
+    assert!(text.contains("secret_set"), "no secret_set in the log");
 }

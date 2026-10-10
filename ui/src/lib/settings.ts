@@ -15,9 +15,13 @@ export type FieldSource = 'default' | 'declared' | 'runtime' | 'locked';
 /** A JSON object, as the settings routes hold them. */
 export type JsonObject = { [k: string]: unknown };
 
-/** `GET /$/settings/{ds}/{kind}`. */
+/** A runtime value used in place of a different value of the server's configuration. */
+export type SettingsOverride = { path: string; declared: unknown; runtime: unknown };
+
+/** `GET /$/settings/{ds}/{kind}`, and `GET /$/server/settings/{kind}` with `scope`. */
 export type SettingsKind = {
   dataset?: string;
+  scope?: 'server';
   kind: string;
   effective: JsonObject;
   declared: JsonObject;
@@ -26,6 +30,8 @@ export type SettingsKind = {
   sources: Record<string, FieldSource>;
   locked: string[];
   overridden: string[];
+  /** The runtime values that replace a declared value (absent from older servers). */
+  overrides?: SettingsOverride[];
   status: { valid: boolean; error?: string };
   etag: string;
 };
@@ -183,7 +189,9 @@ export type FieldInfo = {
   overridden: boolean;
   /** The runtime value a lock ignores, when the field has one. */
   ignored?: unknown;
-  /** The value of the server's settings file that a runtime value overrides. */
+  /** The server's configuration sets the field, so a reset brings its value back. */
+  hasDeclared: boolean;
+  /** The value of the server's configuration that a runtime value overrides. */
   overrides?: unknown;
 };
 
@@ -209,13 +217,34 @@ export function fieldInfo(k: SettingsKind, path: string): FieldInfo {
     if (source == null || source === 'default')
       source = runtime ? 'runtime' : covers(k.declared, p) ? 'declared' : (source ?? 'default');
   }
-  const info: FieldInfo = { path, source, locked, partlyLocked, runtime, overridden };
+  const hasDeclared = covers(k.declared, p);
+  const info: FieldInfo = { path, source, locked, partlyLocked, runtime, overridden, hasDeclared };
   if (overridden && runtime) info.ignored = getAt(k.runtime, p);
-  if (source === 'runtime') {
-    const d = getAt(k.declared, p);
+  if (!locked && runtime) {
+    const d = overriddenValue(k, p);
     if (d !== undefined) info.overrides = d;
   }
   return info;
+}
+
+/**
+ * The declared value that the runtime values at or below `p` replace, from the answer's
+ * `overrides`. A server without `overrides` is answered from the layers.
+ */
+function overriddenValue(k: SettingsKind, p: string[]): unknown {
+  if (!k.overrides) {
+    const d = getAt(k.declared, p);
+    return d !== undefined && !deepEqual(d, getAt(k.runtime, p)) ? d : undefined;
+  }
+  const hits = k.overrides.filter((o) => {
+    const op = parsePath(o.path);
+    return startsWith(op, p) || startsWith(p, op);
+  });
+  if (hits.length === 0) return undefined;
+  if (hits.length === 1 && deepEqual(parsePath(hits[0].path), p)) return hits[0].declared;
+  // the declared object of a field whose members are overridden, or the declared value
+  // above the field that a runtime object replaces
+  return getAt(k.declared, p) ?? hits[0].declared;
 }
 
 /** Words for a source, as a row's label and tooltip say it. */
@@ -224,26 +253,80 @@ export function sourceText(f: FieldInfo): { label: string; title: string } | nul
     return {
       label: 'locked',
       title:
-        "The operator locked this field in the server's settings file, so it cannot be changed here.",
+        "The operator locked this field in the server's configuration, so it cannot be changed here.",
     };
   switch (f.source) {
     case 'declared':
       return {
         label: 'server config',
         title:
-          "The value comes from the server's settings file. A change here overrides it until it is reset.",
+          "The value comes from the server's configuration. A change here overrides it until it is reset.",
       };
     case 'runtime':
-      return {
-        label: 'changed',
-        title:
-          f.overrides === undefined
-            ? 'The value was changed here or through the API. Reset it to go back to the default.'
-            : `The value was changed here or through the API, and overrides ${JSON.stringify(f.overrides)} from the server's settings file. Reset it to go back to that value.`,
-      };
+      return f.overrides === undefined
+        ? {
+            label: 'changed',
+            title: f.hasDeclared
+              ? "The value was changed here or through the API. It equals the server's configuration."
+              : 'The value was changed here or through the API. Reset it to go back to the default.',
+          }
+        : {
+            label: 'overrides server config',
+            title: `The value was changed here or through the API, so the server's configuration (${valueText(f.overrides)}) is not used. Use the server config to go back to it.`,
+          };
     default:
       return null;
   }
+}
+
+/** The words of a field's reset button: what the field goes back to. */
+export function resetText(f: FieldInfo): { text: string; title: string } {
+  if (f.overridden)
+    return {
+      text: 'Remove change',
+      title: 'Remove the runtime value that the lock ignores',
+    };
+  if (f.hasDeclared)
+    return {
+      text: 'Use server config',
+      title: "Remove the change, so the field takes the value of the server's configuration",
+    };
+  return {
+    text: 'Reset to default',
+    title: 'Remove the change, so the field takes its built-in default',
+  };
+}
+
+/** A value in one line, shortened to `max` characters. */
+export function valueText(v: unknown, max = 80): string {
+  const s = v === undefined ? 'unset' : JSON.stringify(v);
+  return s.length > max ? `${s.slice(0, max - 1)}…` : s;
+}
+
+/** The overrides of a kind: none for a server that predates them. */
+export const overridesOf = (k: SettingsKind | null | undefined) => k?.overrides ?? [];
+
+/** "2 fields override the server config". */
+export function overridesSummary(n: number): string {
+  return n === 1 ? '1 field overrides the server config' : `${n} fields override the server config`;
+}
+
+/**
+ * Clear the runtime values of `fields`, one `DELETE ?field=` after another, each with the
+ * `ETag` of the answer before it. The answer is the kind after the last one.
+ */
+export async function resetFields(
+  url: string,
+  fields: readonly string[],
+  etag?: string | null,
+): Promise<SettingsKind> {
+  let k: SettingsKind | null = null;
+  let tag = etag;
+  for (const f of fields) {
+    k = await resetKind(url, f, tag);
+    tag = k.etag;
+  }
+  return k ?? readKind(url);
 }
 
 // --- form fields ---------------------------------------------------------------------
@@ -302,7 +385,8 @@ export function fromForm(def: FieldDef, f: string | boolean): { ok: unknown } | 
   if (def.type === 'bool') return { ok: f === true };
   const t = String(f).trim();
   if (t === '') {
-    if (def.type === 'lines') return { ok: [] };
+    // an optional list left empty is unset, as `allowedModels` is
+    if (def.type === 'lines') return def.optional ? { ok: undefined } : { ok: [] };
     if (def.type === 'json' || def.optional || def.type === 'enum') return { ok: undefined };
     return { error: `${def.label} needs a value` };
   }

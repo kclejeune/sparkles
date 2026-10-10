@@ -425,6 +425,72 @@ async fn a13_locked_fields() {
     );
 }
 
+/// `overrides` of the `models` kind: a changed budget, a removed provider and a role
+/// list, each with the declared value it replaces, and a reset that brings the declared
+/// value back. A locked field's ignored runtime value is not an override.
+#[tokio::test(flavor = "multi_thread")]
+async fn overrides_of_the_models_kind() {
+    let f = fixture(declared_models("http://127.0.0.1:9/v1"), None, true);
+    let (s, v, _) = send(
+        &f.app,
+        "PATCH",
+        MODELS_URI,
+        Some(json!({
+            "providers": {
+                "claude": {"budget": {"tokensPerDay": 7}, "concurrency": 2},
+                "local": null
+            },
+            "roles": {"draft": [{"provider": "claude", "model": "c"}]}
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["scope"], "server");
+    let local =
+        json!({"kind": "openai", "endpoint": "http://127.0.0.1:9/v1", "apiKey": {"secret": "gw"}});
+    assert_eq!(
+        v["overrides"],
+        json!([
+            {"path": "providers.claude.budget.tokensPerDay", "declared": 1000, "runtime": 7},
+            {"path": "providers.local", "declared": local, "runtime": null},
+            {"path": "roles.draft", "declared": [{"provider": "local", "model": "m"}],
+             "runtime": [{"provider": "claude", "model": "c"}]},
+        ])
+    );
+    assert_eq!(v["sources"]["providers.claude.concurrency"], "runtime");
+    let (s, v, _) = send(
+        &f.app,
+        "DELETE",
+        &format!("{MODELS_URI}?field=providers.claude.budget.tokensPerDay"),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(
+        v["sources"]["providers.claude.budget.tokensPerDay"],
+        "declared"
+    );
+    assert_eq!(v["overrides"].as_array().unwrap().len(), 2, "{v}");
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("data")).unwrap();
+    std::fs::write(
+        dir.path().join("data").join(server::MODELS_FILE),
+        json!({"roles": {"draft": [{"provider": "claude", "model": "c"}]}}).to_string(),
+    )
+    .unwrap();
+    let (_st, app) = open(
+        dir.path(),
+        &declared_models("http://127.0.0.1:9/v1"),
+        Some(&json!({"server": {"locked": ["models.roles.draft"]}})),
+        &[],
+        true,
+    );
+    let (_, v, _) = send(&app, "GET", MODELS_URI, None).await;
+    assert_eq!(v["overridden"], json!(["roles.draft"]), "{v}");
+    assert_eq!(v["overrides"], json!([]));
+}
+
 /// A dataset's role list that names a provider removed at runtime is reported in the
 /// dataset's status.
 #[tokio::test(flavor = "multi_thread")]

@@ -425,10 +425,45 @@ fn settings_commands() {
     assert_eq!(o.code, Some(1));
     assert!(o.stderr.contains("locks send"), "{}", o.stderr);
 
-    // reset: one field, then a whole kind
+    // get names the declared value that a runtime value overrides
+    let o = run(&["settings", "get", "demo", "assistant"]).ok();
+    let history = o
+        .stdout
+        .lines()
+        .find(|l| l.split_whitespace().next() == Some("historyDays"))
+        .unwrap_or_default();
+    assert!(
+        history.contains("runtime, overrides declared 30") && history.ends_with("12"),
+        "{}",
+        o.stdout
+    );
+    let j = run(&["settings", "get", "demo", "assistant", "--json"])
+        .ok()
+        .json();
+    assert_eq!(
+        j["overrides"],
+        json!([{"path": "historyDays", "declared": 30, "runtime": 12}])
+    );
+
+    // reset: one field, then a whole kind, each saying which value applies now
     let o = run(&["settings", "reset", "demo", "assistant.historyDays"]).ok();
-    assert!(o.stdout.contains("= 30  (declared)"), "{}", o.stdout);
-    run(&["settings", "reset", "demo", "memory"]).ok();
+    assert!(
+        o.stdout
+            .contains("assistant.historyDays on /demo = 30, the declared value applies"),
+        "{}",
+        o.stdout
+    );
+    let o = run(&["settings", "reset", "demo", "memory"]).ok();
+    assert!(
+        o.stdout.contains("memory on /demo: runtime layer cleared"),
+        "{}",
+        o.stdout
+    );
+    assert!(
+        o.stdout.contains("consolidatedGraph") && o.stdout.contains("the default applies"),
+        "{}",
+        o.stdout
+    );
     let (_, v) = s.call("GET", "/$/settings/demo/memory", None);
     assert_eq!(v["runtime"], json!({}));
 
