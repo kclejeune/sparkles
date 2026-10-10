@@ -4342,6 +4342,22 @@ impl Store {
         crate::vocab::add_sparse_index(dir).map(Some)
     }
 
+    /// Write the numeric column (`vocab.num`) of the current generation when it has
+    /// none, because an older version built it. The store opened next uses it. Returns
+    /// the number of values in it, or `None` when the generation already has one or the
+    /// store is in memory.
+    pub fn add_numeric_column(&self) -> Result<Option<u64>> {
+        let _w = self.guarded_writer();
+        let snap = self.snapshot();
+        let Some(dir) = snap.generation.dir.as_ref() else {
+            return Ok(None);
+        };
+        if dir.join(crate::vocab::numeric::FILE).exists() {
+            return Ok(None);
+        }
+        crate::vocab::add_numeric_column(dir).map(Some)
+    }
+
     pub fn disk_bytes(&self) -> u64 {
         match &self.root {
             Some(r) => dir_size(r),

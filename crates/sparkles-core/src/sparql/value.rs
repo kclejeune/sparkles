@@ -58,6 +58,15 @@ const INTEGER_DERIVED: &[&str] = &[
     "http://www.w3.org/2001/XMLSchema#unsignedByte",
 ];
 
+/// Whether [`Value::from_typed`] gives a number for some lexical form of `dt`.
+pub(crate) fn numeric_datatype(dt: &str) -> bool {
+    dt == xsd::INTEGER.as_str()
+        || dt == xsd::DECIMAL.as_str()
+        || dt == xsd::DOUBLE.as_str()
+        || dt == xsd::FLOAT.as_str()
+        || INTEGER_DERIVED.contains(&dt)
+}
+
 impl Value {
     pub fn from_term(t: &Term) -> Value {
         match t {
@@ -370,6 +379,43 @@ pub fn arith(op: NumOp, a: &Value, b: &Value) -> EvalResult<Value> {
             })
         }
     })
+}
+
+/// A numeric constant prepared for many comparisons: its value in each type that
+/// [`num_cmp`] promotes it to, converted once. [`NumConst::cmp`] gives `num_cmp(x, c)`.
+#[derive(Clone, Copy, Debug)]
+pub struct NumConst {
+    c: Num,
+    rank: u8,
+    decimal: Option<Decimal>,
+    float: Float,
+    double: Double,
+}
+
+impl NumConst {
+    pub fn new(c: Num) -> NumConst {
+        NumConst {
+            c,
+            rank: c.rank(),
+            decimal: c.to_decimal(),
+            float: c.to_float(),
+            double: c.to_double(),
+        }
+    }
+
+    /// `num_cmp(x, c)`.
+    #[inline]
+    pub fn cmp(&self, x: Num) -> Option<Ordering> {
+        match x.rank().max(self.rank) {
+            0 => match (x, self.c) {
+                (Num::Integer(x), Num::Integer(y)) => x.partial_cmp(&y),
+                _ => None,
+            },
+            1 => x.to_decimal()?.partial_cmp(&self.decimal?),
+            2 => x.to_float().partial_cmp(&self.float),
+            _ => x.to_double().partial_cmp(&self.double),
+        }
+    }
 }
 
 fn num_cmp(a: Num, b: Num) -> Option<Ordering> {

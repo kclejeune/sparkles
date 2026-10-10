@@ -1321,6 +1321,14 @@ impl Ctx {
             Tag::DateTime | Tag::Date => id::inline_to_literal(id).map(|l| Value::from_literal(&l)),
             Tag::BNode => Some(Value::BNode(bnode_for(id).as_str().into())),
             _ => {
+                // a number of the base vocabulary from its numeric column, without
+                // decoding the key (the same value, see `crate::vocab::numeric`)
+                if id.tag() == Tag::Vocab
+                    && let Some(num) = self.snap.generation.vocab.numeric()
+                    && let Some(v) = num.get(id.payload()).value()
+                {
+                    return Some(v);
+                }
                 // Inline scalars need no retained cache or RDF round trip. Only
                 // dictionary/local values bypass the uncharged eager cache.
                 if self.is_cursor() {
