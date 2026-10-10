@@ -1,0 +1,7 @@
+# the smallest install: no authentication, inside the cluster only
+server:
+  allowOpenNetwork: true
+settings:
+  defaults:
+    assistant:
+      enabled: false

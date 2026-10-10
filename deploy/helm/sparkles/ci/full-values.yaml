@@ -1,0 +1,48 @@
+# every configuration file, auth inline, backup from an existing Secret, an Ingress
+server:
+  publicHosts: [sparkles.internal]
+restartOnConfigChange: true
+settings:
+  defaults:
+    assistant:
+      enabled: false
+rateLimits:
+  classes:
+    query:
+      rate: 100/s
+      burst: 200
+models:
+  config:
+    models:
+      providers:
+        gw:
+          kind: openai
+          endpoint: https://api.example.org/v1
+          apiKey:
+            secret: gw
+  secrets:
+    gw:
+      secretName: model-keys
+      key: gw
+    other:
+      secretName: model-keys
+      key: other
+auth:
+  enabled: true
+  config: |
+    [users.admin]
+    password = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$aGFzaGhhc2hoYXNoaGFzaA"
+    roles = ["admin"]
+backup:
+  enabled: true
+  existingSecret: sparkles-backup
+ingress:
+  enabled: true
+  className: nginx
+  hosts:
+    - host: sparql.example.org
+      paths:
+        - path: /
+          pathType: Prefix
+podDisruptionBudget:
+  enabled: true

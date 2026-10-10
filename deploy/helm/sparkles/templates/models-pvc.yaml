@@ -1,0 +1,20 @@
+{{- if and .Values.models.persistence.enabled (not .Values.models.persistence.existingClaim) (has .Values.models.delivery (list "download" "pull" "imageCopy")) }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "sparkles.fullname" . }}-models
+  labels:
+    {{- include "sparkles.labels" . | nindent 4 }}
+  annotations:
+    # the downloaded models outlive an uninstall, like the data volume
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    {{- toYaml .Values.models.persistence.accessModes | nindent 4 }}
+  {{- with .Values.models.persistence.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.models.persistence.size }}
+{{- end }}

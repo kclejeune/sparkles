@@ -1,0 +1,12 @@
+# models fetched by an init container into a volume of their own
+server:
+  allowOpenNetwork: true
+models:
+  delivery: pull
+  manifest:
+    models:
+      - repo: Qwen/Qwen3-Embedding-0.6B
+        revision: 0123456789abcdef0123456789abcdef01234567
+  persistence:
+    enabled: true
+    size: 5Gi

@@ -525,6 +525,14 @@ run = "cargo build --release -p sparkles-server"
 description = "Build the Docker image of compose.yaml (Dockerfile: UI, formatter WebAssembly and release binary); SPARKLES_BUILD_JOBS=N caps the compile jobs; not part of ci"
 run = "docker compose build"
 
+[tasks."helm:test"]
+description = "Lint the Helm chart (deploy/helm/sparkles) with each ci/*-values.yaml and check the rendered manifests; needs helm and yq; not part of ci"
+run = "scripts/helm-template-test.sh"
+
+[tasks."helm:smoke"]
+description = "Install the Helm chart into a kind cluster with a locally built image, run a query and check a ConfigMap reload; needs docker, kind, kubectl and helm; not part of ci"
+run = "scripts/helm-smoke.sh"
+
 [tasks.licenses]
 description = "Regenerate THIRD_PARTY_LICENSES.md (the crates the binary links, from Cargo.lock) and THIRD_PARTY_LICENSES-UI.md (the npm packages in the UI bundle, written by the UI build)"
 depends = ["ui:build"]

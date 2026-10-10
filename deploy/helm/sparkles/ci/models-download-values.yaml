@@ -1,0 +1,7 @@
+# the server downloads pinned models itself, into a volume of their own
+server:
+  allowOpenNetwork: true
+models:
+  delivery: download
+  persistence:
+    enabled: true
