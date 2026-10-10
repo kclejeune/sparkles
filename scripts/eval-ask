@@ -18,10 +18,11 @@ The report has a row per pair and role, with accuracy overall and by the complex
 bucket of §5.5 (`simple` under 4, `medium` under 8, `complex` from 8), the share of
 answers that matched the schema without a retry, the median and 95th-percentile latency
 per call, tokens and estimated cost per question and per correct answer, and a cascade
-row. The cascade is simulated from the per-pair runs: a question goes to the next pair
-when the earlier one fails in a way the server observes (a provider error, a query that
-still fails its check, or no rows), as the escalation of §5.5 would move it, and the
-row gives the share answered by each pair.
+row. With two or more pairs, the cascade row comes from a real run of the escalation of
+§5.5. Every question is asked once more with the pairs, in the order given, as the
+draft, repair and summarize lists of a copy of the model configuration. The pipeline
+then moves a step to the next pair on the signals it verifies, and the row gives the
+share of answers each pair wrote, the escalations by signal, the accuracy and the cost.
 
 Reports are written outside the repository, to --out or a new directory under the
 system's temporary directory: `report.md`, `report.json` and the raw answers in
@@ -148,12 +149,14 @@ class Runner:
             self.gold_cache[q["id"]] = g
         return g
 
-    def ask(self, pair, q):
+    def ask(self, pair, q, config=None):
+        """One answer: by `pair` in every role, or by the role lists of `config`."""
         cmd = [self.args.sparkles, "ask", "--data", str(self.data), "--text"]
         cmd += [self.qset.get("dataset", "data"), q["question"], "--json"]
-        for role in ("draft", "repair", "summarize"):
-            cmd += ["--pair", f"{role}={pair}"]
-        cmd += ["--model-config", self.args.model_config]
+        if pair is not None:
+            for role in ("draft", "repair", "summarize"):
+                cmd += ["--pair", f"{role}={pair}"]
+        cmd += ["--model-config", config or self.args.model_config]
         for s in self.args.model_secret:
             cmd += ["--model-secret", s]
         started = time.monotonic()
@@ -184,11 +187,6 @@ class Runner:
         if gold is None or got is None:
             return False, (0.0, 0.0, 0.0)
         return gold == got, prf(gold, got)
-
-
-def observed_failure(out):
-    """What the server itself sees as a failure (the signals of §5.5)."""
-    return out.get("outcome") in ("error", "failed", "empty")
 
 
 def steps(out, role):
@@ -268,21 +266,39 @@ def summarize_pair(pair, qs, answers, scores):
     return rows
 
 
-def cascade(pairs, qs, runs):
+def cascade_config(args, pairs, out_dir):
+    """A copy of the model configuration whose role lists are `pairs` in order."""
+    cfg = json.loads(pathlib.Path(args.model_config).read_text())
+    lst = [{"provider": p.split("/", 1)[0], "model": p.split("/", 1)[1]} for p in pairs]
+    roles = cfg.setdefault("models", {}).setdefault("roles", {})
+    for role in ("draft", "repair", "summarize"):
+        roles[role] = lst
+    path = out_dir / "cascade-models.json"
+    path.write_text(json.dumps(cfg, indent=1))
+    return str(path)
+
+
+def cascade(pairs, qs, answers, scores):
+    """The cascade row from real escalation runs: who wrote each answer, and why it moved."""
     answered_by = {p: 0 for p in pairs}
-    correct = 0
-    cost = 0.0
-    for i, q in enumerate(qs):
-        chosen = pairs[-1]
-        for p in pairs:
-            a = runs[p]["answers"][i]
-            cost += a.get("usage", {}).get("estimatedCost", 0) or 0
-            if not observed_failure(a):
-                chosen = p
-                break
-        answered_by[chosen] += 1
-        correct += runs[chosen]["scores"][i][0]
+    answered_by["none"] = 0
+    signals = {}
+    moved = 0
+    for a in answers:
+        u = a.get("usage", {})
+        ab = u.get("answeredBy") or {}
+        who = f"{ab.get('provider')}/{ab.get('model')}" if ab else "none"
+        answered_by[who if who in answered_by else "none"] += 1
+        esc = u.get("escalations") or []
+        moved += bool(esc)
+        for e in esc:
+            key = f"{e.get('role')} {e.get('signal')}"
+            signals[key] = signals.get(key, 0) + 1
+    if not answered_by["none"]:
+        del answered_by["none"]
     n = len(qs)
+    cost = sum(a.get("usage", {}).get("estimatedCost", 0) or 0 for a in answers)
+    correct = sum(1 for s in scores if s[0])
     answerable = [i for i, q in enumerate(qs) if q["kind"] == "answerable"]
     return {
         "pair": " > ".join(pairs),
@@ -290,6 +306,8 @@ def cascade(pairs, qs, runs):
         "questions": n,
         "accuracy": round(correct / n, 3) if n else None,
         "answeredBy": {p: round(c / n, 3) for p, c in answered_by.items()},
+        "escalated": round(moved / n, 3) if n else None,
+        "escalations": signals,
         "costPerQuestion": round(cost / n, 6) if n else None,
         "costPerCorrect": round(cost / correct, 6) if correct else None,
         "answerable": len(answerable),
@@ -328,6 +346,12 @@ def markdown(report):
             f"| {c['pair']} | cascade | {fmt(c['accuracy'])} | answered by: {fmt(c['answeredBy'])} | – | – | – | – | "
             f"{fmt(c['costPerQuestion'])} | {fmt(c['costPerCorrect'])} |"
         )
+    if c:
+        lines += [
+            "",
+            f"The cascade escalated {fmt(c['escalated'])} of the questions. Escalations by role and signal: "
+            f"{fmt(c['escalations'])}.",
+        ]
     lines += ["", "Draft rows also report:", ""]
     for r in report["rows"]:
         if r["role"] == "draft":
@@ -361,13 +385,24 @@ def run_matrix(args):
         )
         print(f"eval-ask: {pair}: {sum(s[0] for s in scores)}/{len(qs)} correct", file=sys.stderr)
     rows = [r for p in args.pair for r in summarize_pair(p, qs, runs[p]["answers"], runs[p]["scores"])]
+    casc = None
+    if len(args.pair) > 1:
+        cfg = cascade_config(args, args.pair, out_dir)
+        with concurrent.futures.ThreadPoolExecutor(args.jobs) as ex:
+            answers = list(ex.map(lambda q: runner.ask(None, q, cfg), qs))
+        scores = [runner.score(q, a) for q, a in zip(qs, answers)]
+        (out_dir / "answers" / "cascade.json").write_text(
+            json.dumps([{"id": q["id"], "correct": s[0], "answer": a} for q, a, s in zip(qs, answers, scores)], indent=1)
+        )
+        casc = cascade(args.pair, qs, answers, scores)
+        print(f"eval-ask: cascade: {sum(s[0] for s in scores)}/{len(qs)} correct", file=sys.stderr)
     report = {
         "set": str(args.set),
         "questions": len(qs),
         "started": time.strftime("%Y-%m-%d %H:%M:%S"),
         "pairs": args.pair,
         "rows": rows,
-        "cascade": cascade(args.pair, qs, runs) if len(args.pair) > 1 else None,
+        "cascade": casc,
     }
     (out_dir / "report.json").write_text(json.dumps(report, indent=1))
     (out_dir / "report.md").write_text(markdown(report))
@@ -465,7 +500,9 @@ def self_test(args):
     assert oracle["costPerQuestion"] > 0 and oracle["costPerCorrect"] > 0, oracle
     assert rows[("mock/weak", "draft")]["accuracy"] < 0.2, rows[("mock/weak", "draft")]
     c = report["cascade"]
-    assert abs(sum(c["answeredBy"].values()) - 1) < 0.01 and min(c["answeredBy"].values()) > 0, c
+    assert abs(sum(c["answeredBy"].values()) - 1) < 0.01, c
+    assert c["answeredBy"].get("mock/weak", 0) > 0 and c["answeredBy"].get("mock/oracle", 0) > 0, c
+    assert c["escalated"] > 0 and any(k.endswith("check-failed") for k in c["escalations"]), c
     assert c["accuracy"] > rows[("mock/weak", "draft")]["accuracy"], c
     assert rows[("mock/weak", "repair")]["calls"] > 0, rows[("mock/weak", "repair")]
     assert (out_dir / "report.md").read_text().count("| mock/") >= 6
