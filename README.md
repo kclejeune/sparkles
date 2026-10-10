@@ -15,7 +15,7 @@ Rust, Python, JVM and JavaScript APIs, a Fuseki-compatible server and CLI, and a
 > reviewed by the maintainer. The W3C conformance suites and differential tests are the
 > main safeguard, but expect bugs. Issues and bug reports are welcome.
 
-![The query editor with a SPARQL query and its results](docs/images/query.png)
+![A CONSTRUCT query's results drawn as a graph of people, who they know and where they work, with one person's neighborhood highlighted](docs/images/graph.png)
 
 ## Why Sparkles
 
@@ -230,11 +230,11 @@ merges, the Ask bar, and agent memory.
     <td>A merge preview with a conflict to resolve</td>
   </tr>
   <tr>
-    <td><img src="docs/images/graph.png" alt="Query results drawn as a node and edge graph"></td>
+    <td><img src="docs/images/query.png" alt="The query editor with a SPARQL query and its results"></td>
     <td><img src="docs/images/explore.png" alt="The resource explorer showing one resource's properties and links"></td>
   </tr>
   <tr>
-    <td>Results as a graph</td>
+    <td>The query editor and its results</td>
     <td>The resource explorer</td>
   </tr>
   <tr>
