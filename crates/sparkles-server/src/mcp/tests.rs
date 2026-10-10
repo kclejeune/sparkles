@@ -543,6 +543,8 @@ fn expected_input_schemas() -> Vec<(&'static str, Value)> {
             json!({"type":"object","additionalProperties":false,"properties":{
                 "dataset": ds,
                 "graphs": {"type":"array","items":{"type":"string"},"maxItems":20,"description":"Only sources in these graphs"},
+                "graphPrefix": {"type":"string","description":"Only sources in graphs whose IRI starts with this, such as an import base"},
+                "needsExtraction": {"type":"boolean","default":false,"description":"Only sources whose current rendition no extraction has cited yet"},
                 "limit": {"type":"integer","minimum":1,"maximum":200,"default":50},
                 "atCommit": {"type":"integer","minimum":0},
                 "timeoutSeconds": to}}),

@@ -1076,7 +1076,7 @@ impl Tools<'_> {
                 rend_iris.insert(r.to_string());
             }
         }
-        for s in super::ingest::list_sources(&br, &[], 50).map_err(eng)? {
+        for s in super::ingest::list_sources(&br, &[], 50, None).map_err(eng)? {
             let fresh = !main
                 .ask(
                     &format!(
