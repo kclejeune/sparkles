@@ -254,6 +254,11 @@ pub fn router(state: Arc<AppState>) -> Router {
     // model providers, memory settings and suggested examples (C18)
     let app = app.merge(crate::models::http::routes());
     let app = app.merge(crate::assist::routes());
+    // assistant settings, ask history and usage (C18 §3.5, §5.5, §6.4)
+    let app = app.merge(crate::assistant::routes());
+    // the asking pipeline (C18 §5)
+    #[cfg(feature = "mcp")]
+    let app = app.merge(crate::ask::http::routes());
     // backup repositories, per-dataset backups and backup policies
     #[cfg(feature = "backup")]
     let app = app.merge(crate::backup::http::routes());

@@ -1,7 +1,8 @@
-// The HTTP calls of C18 Phase 1: checking a query, diagnosing an empty result, recalling
-// memory, the memory settings and the suggested examples of stored queries.
+// The HTTP calls of C18: checking a query, diagnosing an empty result, recalling memory,
+// the memory settings, the suggested examples of stored queries, and from Phase 2 asking
+// the server a question, the assistant settings and the history of asked questions.
 
-import { json, request } from './api';
+import { json, normalizeResult, request, type SparklesResult } from './api';
 
 const enc = encodeURIComponent;
 
@@ -81,6 +82,8 @@ export type Diagnosis = {
   };
   steps: { kind: string; text: string; solutions: boolean | null }[];
   complete: boolean;
+  /** Where the fault most likely lies (Phase 2). */
+  verdict?: 'query' | 'data' | 'unknown';
   message: string;
   prefixes: Record<string, string>;
 };
@@ -211,4 +214,246 @@ export async function suggestions(ds: string, signal?: AbortSignal): Promise<Sug
 
 export async function deleteSuggestion(ds: string, id: string): Promise<void> {
   await request(`/$/queries/${enc(ds)}/suggestions?id=${enc(id)}`, { method: 'DELETE' });
+}
+
+// --- asking the server (Phase 2) ------------------------------------------------------
+
+/** A provider and model. */
+export type Pair = { provider: string; model: string };
+
+/** What `GET /$/assistant/{ds}` says about asking. */
+export type AssistantStatus = {
+  models: boolean;
+  historyDays: number;
+  ask: boolean;
+  reason?: string;
+  draft?: Pair[];
+  /** Whether an answer can carry a summary. */
+  summary?: boolean;
+};
+
+/** A dataset's `assistant.json` with the server's `status`. */
+export type AssistantSettings = {
+  enabled?: boolean;
+  ask?: boolean;
+  send?: 'schema' | 'rows' | 'documents';
+  historyDays?: number;
+  status?: AssistantStatus;
+  [k: string]: unknown;
+};
+
+export const assistantSettings = (ds: string, signal?: AbortSignal) =>
+  json<AssistantSettings>(`/$/assistant/${enc(ds)}`, { signal, cache: 'no-store' });
+
+/** The body of `POST /{ds}/ask`. */
+export type AskRequest = {
+  question: string;
+  context?: { question: string; query: string }[];
+  clarification?: { id: string; value: string };
+  at?: string;
+  branch?: string;
+  reasoning?: boolean;
+  run?: boolean;
+  summary?: boolean;
+  maxRows?: number;
+  tryHarder?: string;
+  reviewedOnly?: boolean;
+  query?: string;
+};
+
+/** The draft's graph variables for the graph view, with or without `?`. */
+export type AskGraph = { subject: string; predicate?: string; object: string };
+
+export type AskDraft = {
+  attempt: number;
+  role: string;
+  provider: string;
+  model: string;
+  query: string;
+  explanation?: string;
+  assumptions?: string[];
+  graph?: AskGraph | null;
+};
+
+export type AskClarify = {
+  id: string;
+  question: string;
+  choices: { label: string; value: string }[];
+};
+
+/** The checked query, and from a run its rows in the form `/{ds}/sparql` gives the UI. */
+export type AskResult = {
+  query?: string;
+  explanation?: string;
+  assumptions?: string[];
+  terms?: CheckTerm[];
+  issues?: CheckIssue[];
+  graph?: AskGraph | null;
+  commit?: number;
+  attempt?: number;
+  verdict?: 'query' | 'data' | 'unknown';
+  limitAdded?: boolean;
+  results?: SparklesResult;
+};
+
+export type AskSummary = {
+  text: string;
+  citations: number[];
+  rowsSent?: number;
+  provider?: string;
+  model?: string;
+  uncited?: boolean;
+};
+
+export type AskStep = {
+  role: string;
+  provider: string;
+  model: string;
+  outcome: string;
+  latencyMs?: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  signal?: string;
+};
+
+export type AskEscalation = { role: string; from: Pair; to: Pair; signal: string };
+
+export type AskUsage = {
+  outcome?: string;
+  askId?: string;
+  inputTokens?: number;
+  outputTokens?: number;
+  estimatedCost?: number;
+  steps?: AskStep[];
+  escalations?: AskEscalation[];
+  answeredBy?: Pair & { role: string };
+  tryHarder?: boolean;
+  smallModel?: boolean;
+  level?: string;
+  notes?: string[];
+};
+
+export type AskError = { code: string; message: string; result?: AskResult; resetAt?: string };
+
+/** One server-sent event of an ask. */
+export type AskEvent =
+  | { event: 'ground'; data: Record<string, unknown> }
+  | { event: 'clarify'; data: AskClarify }
+  | { event: 'draft'; data: AskDraft }
+  | { event: 'escalate'; data: AskEscalation }
+  | { event: 'check'; data: CheckResult }
+  | { event: 'run'; data: { attempt: number; rows?: number; error?: AskError } }
+  | {
+      event: 'diagnosis';
+      data: { attempt?: number; kind?: string; text?: string } & Partial<Diagnosis>;
+    }
+  | { event: 'result'; data: AskResult }
+  | { event: 'summary'; data: AskSummary }
+  | { event: 'usage'; data: AskUsage }
+  | { event: 'error'; data: AskError };
+
+/**
+ * Splits a server-sent event stream into events as its text arrives. Comments and
+ * keep-alives are skipped, and an event's `data` lines are joined with newlines.
+ */
+export class SseParser {
+  private buf = '';
+  push(text: string): { event: string; data: string }[] {
+    this.buf += text.replace(/\r\n?/g, '\n');
+    const out: { event: string; data: string }[] = [];
+    let end: number;
+    while ((end = this.buf.indexOf('\n\n')) >= 0) {
+      const block = this.buf.slice(0, end);
+      this.buf = this.buf.slice(end + 2);
+      let event = 'message';
+      const data: string[] = [];
+      for (const line of block.split('\n')) {
+        if (!line || line.startsWith(':')) continue;
+        const i = line.indexOf(':');
+        const field = i < 0 ? line : line.slice(0, i);
+        const value = i < 0 ? '' : line.slice(i + 1).replace(/^ /, '');
+        if (field === 'event') event = value;
+        else if (field === 'data') data.push(value);
+      }
+      if (data.length) out.push({ event, data: data.join('\n') });
+    }
+    return out;
+  }
+}
+
+/**
+ * `POST /{ds}/ask` over server-sent events. It calls `on` for each event as it arrives
+ * and resolves when the stream ends. A refusal before the stream starts, such as
+ * `no-assistant` or `budget-exceeded`, rejects with the `ApiError`.
+ */
+export async function askStream(
+  ds: string,
+  body: AskRequest,
+  on: (e: AskEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const res = await request(`/${enc(ds)}/ask`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+    body: JSON.stringify(body),
+    signal,
+  });
+  const parser = new SseParser();
+  const deliver = (text: string) => {
+    for (const { event, data } of parser.push(text)) {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(data);
+      } catch {
+        continue;
+      }
+      if (event === 'result') {
+        const r = parsed as AskResult;
+        if (r.results) r.results = normalizeResult(r.results);
+      }
+      on({ event, data: parsed } as AskEvent);
+    }
+  };
+  const reader = res.body?.getReader();
+  if (!reader) {
+    deliver((await res.text()) + '\n\n');
+    return;
+  }
+  const dec = new TextDecoder();
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    deliver(dec.decode(value, { stream: true }));
+  }
+  deliver(dec.decode() + '\n\n');
+}
+
+/** One entry of the caller's server-side history. */
+export type AskRecord = {
+  id: string;
+  at: string;
+  question: string;
+  query?: string;
+  commit?: number;
+  result: string;
+  outcome: 'none' | 'accepted' | 'edited' | 'rejected';
+  note?: string;
+};
+
+export async function askHistory(ds: string, signal?: AbortSignal): Promise<AskRecord[]> {
+  const body = await json<{ asks: AskRecord[] }>(`/$/asks/${enc(ds)}?limit=50`, {
+    signal,
+    cache: 'no-store',
+  });
+  return body?.asks ?? [];
+}
+
+export async function deleteAsk(ds: string, id?: string): Promise<void> {
+  await request(`/$/asks/${enc(ds)}${id ? `?id=${enc(id)}` : ''}`, { method: 'DELETE' });
+}
+
+export type Feedback = 'accepted' | 'edited' | 'rejected';
+
+export async function askFeedback(ds: string, id: string, outcome: Feedback): Promise<void> {
+  await request(`/$/asks/${enc(ds)}/${enc(id)}/feedback`, post({ outcome }));
 }

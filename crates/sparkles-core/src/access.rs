@@ -60,6 +60,9 @@ pub struct GraphRule {
     /// blank-node graph names are in the set (only in a rule made by
     /// [`Graphs::without_iri`] from every graph)
     pub blank_nodes: bool,
+    /// IRI patterns with `*` that are never in the set, whatever else names them
+    /// (made by [`Graphs::without_pattern`])
+    pub excluded: Vec<String>,
 }
 
 impl GraphRule {
@@ -85,7 +88,12 @@ impl GraphRule {
     }
 
     fn normalize(&mut self) {
-        for v in [&mut self.iris, &mut self.patterns, &mut self.protected] {
+        for v in [
+            &mut self.iris,
+            &mut self.patterns,
+            &mut self.protected,
+            &mut self.excluded,
+        ] {
             v.sort_unstable();
             v.dedup();
         }
@@ -98,11 +106,15 @@ impl GraphRule {
         self.iris.extend(other.iris.iter().cloned());
         self.patterns.extend(other.patterns.iter().cloned());
         self.protected.extend(other.protected.iter().cloned());
+        self.excluded.extend(other.excluded.iter().cloned());
         self.normalize();
     }
 
     /// Whether the named graph `iri` is in the set.
     pub fn matches_iri(&self, iri: &str) -> bool {
+        if self.excluded.iter().any(|p| glob(p, iri)) {
+            return false;
+        }
         if self.iris.binary_search_by(|x| x.as_str().cmp(iri)).is_ok() {
             return true;
         }
@@ -180,6 +192,23 @@ impl Graphs {
         };
         r.iris.retain(|x| x != iri);
         r.protected.push(iri.to_string());
+        r.normalize();
+        Graphs::Only(r)
+    }
+
+    /// The set without the named graphs that `pattern` (an IRI, or an IRI pattern with
+    /// `*`) matches, even where the set names them exactly.
+    pub fn without_pattern(&self, pattern: &str) -> Graphs {
+        let mut r = match self {
+            Graphs::All => GraphRule {
+                default_graph: true,
+                patterns: vec!["*".into()],
+                blank_nodes: true,
+                ..Default::default()
+            },
+            Graphs::Only(r) => r.clone(),
+        };
+        r.excluded.push(pattern.to_string());
         r.normalize();
         Graphs::Only(r)
     }

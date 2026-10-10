@@ -8,6 +8,7 @@ mod alloc;
 #[cfg(feature = "mcp")]
 mod ask;
 mod assist;
+mod assistant;
 mod auth;
 #[cfg(feature = "backup")]
 mod backup;
@@ -878,6 +879,10 @@ enum Cmd {
         outbound: outbound::OutboundArgs,
         #[command(flatten)]
         models: models::ModelArgs,
+        /// How many days each principal's ask history is kept, for datasets whose
+        /// assistant settings do not say (0: no history; spec C18 §6.4)
+        #[arg(long, value_name = "DAYS", default_value_t = assistant::DEFAULT_HISTORY_DAYS)]
+        ask_history_days: u32,
         /// A secret vector indexes may name as their embedding API key, read from an
         /// environment variable or a file when a request is made: NAME=env:VARIABLE or
         /// NAME=file:PATH (repeatable)
@@ -2264,6 +2269,7 @@ fn run() -> Result<()> {
             no_embedding,
             outbound,
             models,
+            ask_history_days,
             load_dir,
             idle_release_ms,
             mut text,
@@ -2438,6 +2444,7 @@ fn run() -> Result<()> {
             });
             st.file_loads = outbound::file_loads(load_dir.as_deref(), &data)?;
             st.models = models.load(st.outbound.clone())?;
+            st.asks.history_days = ask_history_days;
             st.schema_max_entries = schema_max_entries;
             #[cfg(feature = "shex")]
             {
@@ -2637,6 +2644,8 @@ fn run() -> Result<()> {
                     ),
                     Some(_) => None,
                 };
+                // ask history past its retention is deleted once an hour (C18 §6.4)
+                assistant::spawn_pruning(st.clone());
                 // the metrics listener ends with the runtime, after the main one
                 if let Some(maddr) = &metrics_addr {
                     let l = tokio::net::TcpListener::bind(maddr)

@@ -240,6 +240,10 @@ function labelOf(store, iri) {
 const notInferred = (q) => q.graph.termType !== 'NamedNode' || q.graph.value !== INFERRED;
 
 /** `POST /{ds}/check`. */
+export function checkQuery(ds, body) {
+  return check(ds, body);
+}
+
 function check(ds, body) {
   const query = String(body.query ?? '');
   const prefixes = { ...ds.prefixes, ...declared(query) };

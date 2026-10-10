@@ -2,11 +2,26 @@
 // Save as example proposes for constant entities, the local Asked history and the words
 // for an empty result.
 
-import type { CheckIssue, CheckResult, CheckTerm, Diagnosis } from './ask-api';
+import type {
+  AskClarify,
+  AskEvent,
+  AskGraph,
+  AskRecord,
+  AskSummary,
+  AskUsage,
+  CheckIssue,
+  CheckResult,
+  CheckTerm,
+  Diagnosis,
+  Feedback,
+} from './ask-api';
 import { compactIri, localName, type Prefixes } from './compact';
 import { fmtInt } from './format';
 import { load, save } from './storage';
 import { queryVariables, RESERVED } from './stored-queries';
+
+/** An earlier question of a conversation, with the query that answered it. */
+export type Turn = { question: string; query: string };
 
 /** The question of a tab, with what the agent said about its query. */
 export type TabQuestion = {
@@ -15,6 +30,19 @@ export type TabQuestion = {
   assumptions?: string[];
   /** The query as the link or the history gave it; an edit makes the tab's query differ. */
   original: string;
+  // what an ask of the server adds (Phase 2)
+  /** The server's id of the ask, for feedback and Try harder. */
+  askId?: string;
+  /** The earlier turns this question was asked with. */
+  context?: Turn[];
+  summary?: AskSummary;
+  usage?: AskUsage;
+  clarify?: AskClarify;
+  /** Why the ask ended without an answer, in words. */
+  failure?: string;
+  graph?: AskGraph | null;
+  /** The feedback sent for the answer. */
+  feedback?: Feedback;
 };
 
 /** The last check of a tab's query, kept with the text it checked. */
@@ -302,4 +330,170 @@ export function isEmptyResult(r: {
   if (r.queryType === 'ASK') return r.boolean === false;
   if (r.queryType === 'SELECT') return (r.rows?.length ?? 0) === 0;
   return false;
+}
+
+// --- the Ask bar (Phase 2) ------------------------------------------------------------
+
+/** How an ask ends: with the checked query to read first, or with rows and a summary. */
+export type RunMode = 'preview' | 'run';
+
+/** What the Ask bar remembers per principal. */
+export type AskPrefs = { mode: RunMode; summaryCollapsed: boolean };
+
+export const askPrefsKey = (principal: string | null | undefined) =>
+  `sparkles.askPrefs.${principal || 'local'}`;
+
+export function loadAskPrefs(principal: string | null | undefined): AskPrefs {
+  const v = load<Partial<AskPrefs> | null>(askPrefsKey(principal), null);
+  return {
+    mode: v?.mode === 'run' ? 'run' : 'preview',
+    summaryCollapsed: v?.summaryCollapsed === true,
+  };
+}
+
+export function saveAskPrefs(principal: string | null | undefined, p: AskPrefs): void {
+  save(askPrefsKey(principal), p);
+}
+
+/** The most earlier turns a follow-up carries. */
+export const MAX_TURNS = 5;
+
+/**
+ * The context of a follow-up asked in a tab: the tab's own earlier turns and its answered
+ * question, the last 5. A tab without an answered question gives none.
+ */
+export function followUpContext(q: TabQuestion | undefined, query: string): Turn[] {
+  if (!q?.question || !q.askId || !query.trim()) return [];
+  return [...(q.context ?? []), { question: q.question, query }].slice(-MAX_TURNS);
+}
+
+/** What the step indicator says while the server works, after `e` arrived. */
+export function nextStep(e: AskEvent, o: { run: boolean; summary: boolean }): string | null {
+  switch (e.event) {
+    case 'ground':
+      return 'Writing a query';
+    case 'escalate':
+      return `Asking ${e.data.to.model}`;
+    case 'draft':
+      return 'Checking';
+    case 'check':
+      return e.data.ok ? (o.run ? 'Running' : 'Finishing') : 'Repairing';
+    case 'run':
+      return e.data.error || !e.data.rows ? 'Looking for what matched nothing' : 'Finishing';
+    case 'diagnosis':
+      return `Repairing (${Math.min(e.data.attempt ?? 1, 2)} of 2)`;
+    case 'result':
+      return o.run && o.summary && e.data.results ? 'Summarizing' : 'Finishing';
+    default:
+      return null;
+  }
+}
+
+/** The step indicator's first words, before any event arrives. */
+export const FIRST_STEP = 'Finding entities';
+
+/** A piece of a summary's text: plain text, or a marker that cites rows (1-based). */
+export type SummaryPart = { text: string; rows?: number[] };
+
+/**
+ * The summary's text cut at its `[n]` markers. A marker may name one row, a range such as
+ * `[1–4]` or a list such as `[1, 3]`. Only the rows in `citations` are kept, and a marker
+ * with none left stays plain text.
+ */
+export function summaryParts(text: string, citations: number[]): SummaryPart[] {
+  const cited = new Set(citations);
+  const out: SummaryPart[] = [];
+  let last = 0;
+  for (const m of text.matchAll(/\[(\d+(?:\s*[-–]\s*\d+)?(?:\s*,\s*\d+(?:\s*[-–]\s*\d+)?)*)\]/g)) {
+    const rows: number[] = [];
+    for (const part of m[1].split(',')) {
+      const [a, b] = part.split(/[-–]/).map((x) => parseInt(x.trim(), 10));
+      const hi = b != null && b >= a && b - a < 1000 ? b : a;
+      for (let n = a; n <= hi; n++) if (cited.has(n)) rows.push(n);
+    }
+    if (!rows.length) continue;
+    if (m.index! > last) out.push({ text: text.slice(last, m.index) });
+    out.push({ text: m[0], rows });
+    last = m.index! + m[0].length;
+  }
+  if (last < text.length) out.push({ text: text.slice(last) });
+  return out;
+}
+
+/** The label under a summary: `generated · cites 4 of 12 rows`. */
+export function summaryLabel(s: AskSummary, rows: number): string {
+  const n = new Set(s.citations).size;
+  if (!n) return 'generated · cites no row';
+  return `generated · cites ${fmtInt(n)} of ${plural(rows, 'row')}`;
+}
+
+/** The words the UI shows for an ask that ended without an answer (§6.5). */
+export function askFailure(code: string, message?: string, resetAt?: string): string {
+  switch (code) {
+    case 'provider-unavailable':
+    case 'provider-auth':
+    case 'provider-rejected':
+    case 'timeout':
+    case 'deadline':
+      return 'The model provider is not responding.';
+    case 'budget-exceeded': {
+      const at = resetAt ? new Date(resetAt) : null;
+      const when = at && !isNaN(at.getTime()) ? ` It resets at ${at.toLocaleString()}.` : '';
+      return `This dataset's question budget for today is used up.${when}`;
+    }
+    case 'no-valid-query':
+    case 'invalid-output':
+      return 'Sparkles could not write a valid query for this question.';
+    case 'unanswerable':
+      return 'The data does not seem to describe this.';
+    case 'no-assistant':
+      return message ?? 'This dataset has no assistant.';
+    case 'no-later-pair':
+      return 'No stronger model is configured for this dataset.';
+    case 'cancelled':
+      return 'The question was stopped.';
+    default:
+      return message ?? 'The question could not be answered.';
+  }
+}
+
+/** Graph pickers from a draft's `graph` variables, when the result has those columns. */
+export function graphColumns(
+  g: AskGraph | null | undefined,
+  vars: string[],
+): { s: string; p: string; o: string } | null {
+  if (!g) return null;
+  const v = (x: string | undefined) => (x ?? '').replace(/^[?$]/, '');
+  const s = v(g.subject);
+  const o = v(g.object);
+  const p = v(g.predicate);
+  if (!vars.includes(s) || !vars.includes(o)) return null;
+  return { s, p: vars.includes(p) ? p : '', o };
+}
+
+/** Who wrote the final query, such as `local · qwen3:8b`. */
+export function answeredBy(u: AskUsage | undefined): string | null {
+  const a = u?.answeredBy;
+  return a ? `${a.provider} · ${a.model}` : null;
+}
+
+/** The routing record in lines, for the tooltip of the model name. */
+export function routingLines(u: AskUsage | undefined): string[] {
+  const out: string[] = [];
+  for (const s of u?.steps ?? []) {
+    const tail = [s.outcome, s.latencyMs != null ? `${fmtInt(s.latencyMs)} ms` : '', s.signal ?? '']
+      .filter(Boolean)
+      .join(', ');
+    out.push(`${s.role}: ${s.provider} · ${s.model} (${tail})`);
+  }
+  for (const e of u?.escalations ?? [])
+    out.push(`${e.role} moved from ${e.from.model} to ${e.to.model} (${e.signal})`);
+  return out;
+}
+
+/** The server-side history in the form of the local Asked list. */
+export function askedFromRecords(records: AskRecord[]): (Asked & { id: string })[] {
+  return records
+    .filter((r) => r.question && r.query)
+    .map((r) => ({ id: r.id, question: r.question, query: r.query!, at: r.at }));
 }

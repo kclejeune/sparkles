@@ -1207,7 +1207,7 @@ export async function select(
   );
 }
 
-function normalizeResult(r: SparklesResult): SparklesResult {
+export function normalizeResult(r: SparklesResult): SparklesResult {
   // Be lenient about variable names with a leading '?' and missing meta.
   if (r.vars) r.vars = r.vars.map((v) => v.replace(/^[?$]/, ''));
   r.meta ??= {

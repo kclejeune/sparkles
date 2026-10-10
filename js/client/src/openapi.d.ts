@@ -4,6 +4,74 @@
  */
 
 export interface paths {
+    "/$/asks/{ds}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List your asked questions
+         * @description The caller's own asks on the dataset, newest first, kept for `historyDays`. An entry holds the question, the final query, the commit, the feedback and the routing record, never rows or summaries.
+         */
+        get: operations["listAsks"];
+        put?: never;
+        post?: never;
+        /**
+         * Forget your asked questions
+         * @description Removes the caller's entries, or the one entry `id` names.
+         */
+        delete: operations["deleteAsks"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/asks/{ds}/{id}/feedback": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Give feedback on an answer
+         * @description Records `accepted`, `edited` or `rejected` for one of the caller's asks, in the routing counters and, when history is kept, in its entry.
+         */
+        post: operations["askFeedback"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/assistant/{ds}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get the assistant settings
+         * @description The dataset's `assistant.json` with a `status` that says whether asking works, and why not when it does not.
+         */
+        get: operations["getAssistantSettings"];
+        /**
+         * Set the assistant settings
+         * @description Replaces the dataset's `assistant.json`. Providers and models must be ones the server configuration names, and an `endpoint` or `apiKey` anywhere is refused.
+         */
+        put: operations["putAssistantSettings"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/auth/cli/authorize": {
         parameters: {
             query?: never;
@@ -1115,6 +1183,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/$/models/usage": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Model usage by dataset
+         * @description The routing counters of the last `days` days by dataset: asks, answers by role, pair and feedback, escalations by role and signal, feedback by complexity bucket, and tokens with the estimated cost by pair. The counters live in memory and start again when the server restarts.
+         */
+        get: operations["modelUsage"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/models/{name}/test": {
         parameters: {
             query?: never;
@@ -2205,6 +2293,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/{ds}/ask": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Ask a question
+         * @description Runs the pipeline of spec C18 with the dataset's model pairs. It grounds the question, drafts a query, checks and runs it, repairs it after a failure, escalates to a later pair on a verified signal, and summarizes the rows when the dataset sends rows. The answer streams as server-sent events, one JSON object per event, unless `Accept` names `application/json` without `text/event-stream`. Needs `read` and counts as a query for rate limits.
+         */
+        post: operations["askQuestion"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/{ds}/changes": {
         parameters: {
             query?: never;
@@ -2718,6 +2826,175 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** @description Feedback on an answer. */
+        AskFeedback: {
+            /** @description At most 1000 characters. */
+            note?: string;
+            /** @enum {string} */
+            outcome: "accepted" | "edited" | "rejected";
+        };
+        /** @description The caller's asked questions, newest first. */
+        AskHistory: {
+            asks: {
+                /** Format: date-time */
+                at: string;
+                commit?: number;
+                id: string;
+                note?: string;
+                /** @enum {string} */
+                outcome: "none" | "accepted" | "edited" | "rejected";
+                principal: string;
+                query?: string;
+                question: string;
+                /** @description The pipeline's outcome. */
+                result: string;
+                /** @description The complexity, steps, escalations, answering pair and tokens. */
+                routing: {
+                    [key: string]: unknown;
+                };
+            }[];
+            dataset: string;
+            historyDays: number;
+        };
+        /** @description A question for the dataset. */
+        AskRequest: {
+            /** @description A commit or time to read, as for `/{ds}/sparql`. */
+            at?: unknown;
+            branch?: string;
+            /** @description The chosen value of a `clarify` event, as `{id, value}` or as the value alone. */
+            clarification?: {
+                id?: string;
+                value: string;
+            } | string;
+            /** @description Earlier turns of the conversation, at most 5. */
+            context?: {
+                query: string;
+                question: string;
+            }[];
+            /** @description The rows returned in `result`, 1000 by default. */
+            maxRows?: number;
+            /** @description A query to check, run and summarize without drafting, for **Summarize again** after an edit. */
+            query?: string;
+            /** @description At most 2000 characters. */
+            question: string;
+            reasoning?: boolean;
+            /** @description Hide the agent memory graphs of the dataset from the query. */
+            reviewedOnly?: boolean;
+            /** @description Whether to run the checked query. `true` by default. */
+            run?: boolean;
+            /** @description Whether to summarize the rows. `true` by default when the dataset sends rows. */
+            summary?: boolean;
+            /** @description The id of an earlier ask of the caller. Drafting starts at the pair after the one that drafted it. */
+            tryHarder?: string;
+        };
+        /** @description The whole answer of an ask in the JSON form. */
+        AskResult: {
+            attempts?: {
+                [key: string]: unknown;
+            }[];
+            /** @description `{id, question, choices: [{label, value}]}`. */
+            clarify?: {
+                [key: string]: unknown;
+            };
+            dataset: string;
+            error?: {
+                code: string;
+                message: string;
+            };
+            notes?: string[];
+            /** @enum {string} */
+            outcome: "answered" | "empty" | "checked" | "not-run" | "clarify" | "unanswerable" | "failed" | "error";
+            question: string;
+            /** @description The checked query with `explanation`, `assumptions`, `terms`, `graph`, `commit`, `attempt`, `verdict` and `results` in the `application/x-sparkles+json` form. */
+            result?: {
+                [key: string]: unknown;
+            };
+            summary?: {
+                citations: number[];
+                model?: string;
+                provider?: string;
+                rowsSent?: number;
+                text: string;
+            };
+            /** @description `askId`, the tokens and estimated cost, `complexity`, the `steps` with their pairs and signals, `escalations`, `draftPair`, `answeredBy` and `tryHarder`. */
+            usage: {
+                [key: string]: unknown;
+            };
+        };
+        /** @description The assistant settings of a dataset. */
+        AssistantSettings: {
+            /** @description Whether `POST /{ds}/ask` is enabled. `true` by default. */
+            ask?: boolean;
+            budget?: {
+                perDatasetPerDay?: number;
+                perPrincipalPerDay?: number;
+                perRequest?: number;
+            };
+            /** @description The time an ask may take, 120 seconds by default. */
+            deadlineSecs?: number;
+            /** @description Whether the dataset has an assistant. `false` by default. */
+            enabled?: boolean;
+            explain?: boolean;
+            /** @description The days an asked question is kept. 0 keeps nothing. */
+            historyDays?: number;
+            ingest?: boolean;
+            optimize?: boolean;
+            /** @description Role lists that replace the server's for this dataset. */
+            roles?: {
+                draft?: {
+                    model: string;
+                    provider: string;
+                }[];
+                explain?: {
+                    model: string;
+                    provider: string;
+                }[];
+                extract?: {
+                    model: string;
+                    provider: string;
+                }[];
+                optimize?: {
+                    model: string;
+                    provider: string;
+                }[];
+                repair?: {
+                    model: string;
+                    provider: string;
+                }[];
+                summarize?: {
+                    model: string;
+                    provider: string;
+                }[];
+            };
+            /** @description `complexityThreshold` and `exampleScore` of the escalation rules. */
+            routing?: {
+                [key: string]: unknown;
+            };
+            /** @description The rows sent to the summary, 50 by default. */
+            rowsForSummary?: number;
+            /**
+             * @description What may leave the server. `schema` by default.
+             * @enum {string}
+             */
+            send?: "schema" | "rows" | "documents";
+            /** @description A lower `send` level for some providers. */
+            sendByProvider?: {
+                [key: string]: "schema" | "rows" | "documents";
+            };
+            /** @description Answered by the server and ignored in a `PUT`. */
+            status?: {
+                ask: boolean;
+                draft?: {
+                    model: string;
+                    provider: string;
+                }[];
+                historyDays: number;
+                models: boolean;
+                reason?: string;
+                /** @description Whether an answer can carry a summary. */
+                summary?: boolean;
+            };
+        };
         AuthConfig: {
             cli?: {
                 authorizeUrl?: string;
@@ -3572,6 +3849,11 @@ export interface components {
             }[];
             /** @description Parts of the query the diagnosis does not cut, such as MINUS. */
             unchecked?: string[];
+            /**
+             * @description For an empty result: `query` when a check issue explains the first element without solutions, `data` when the query is well formed for the data and the data holds no match, `unknown` otherwise.
+             * @enum {string}
+             */
+            verdict?: "query" | "data" | "unknown";
         };
         /** @description OWL 2 RL inconsistency checks and their findings. */
         DiagnosticsReport: {
@@ -4343,6 +4625,26 @@ export interface components {
             requests: number;
             /** @description Whether the answer came at a structured level. */
             structuredOutput: boolean;
+        };
+        /** @description The routing counters by dataset. */
+        ModelUsage: {
+            datasets: {
+                answers?: {
+                    [key: string]: unknown;
+                }[];
+                asks: number;
+                dataset: string;
+                escalations?: {
+                    [key: string]: unknown;
+                }[];
+                outcomes?: {
+                    [key: string]: unknown;
+                }[];
+                tokens?: {
+                    [key: string]: unknown;
+                }[];
+            }[];
+            days: number;
         };
         /** @description A named snapshot: the commit it pins and its expiry. */
         NamedSnapshot: {
@@ -6295,6 +6597,155 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    listAsks: {
+        parameters: {
+            query?: {
+                /** @description The most entries listed. */
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The entries. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AskHistory"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    deleteAsks: {
+        parameters: {
+            query?: {
+                /** @description The entry to remove. All of the caller's entries without it. */
+                id?: string;
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Removed. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    askFeedback: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The id of the task, token or lock. */
+                id: components["parameters"]["id"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AskFeedback"];
+            };
+        };
+        responses: {
+            /** @description Recorded. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getAssistantSettings: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The settings and their status. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AssistantSettings"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    putAssistantSettings: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AssistantSettings"];
+            };
+        };
+        responses: {
+            /** @description The stored settings and their status. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AssistantSettings"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
     authorizeCli: {
         parameters: {
             query?: never;
@@ -8933,6 +9384,33 @@ export interface operations {
                     "application/json": components["schemas"]["ModelProviders"];
                 };
             };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    modelUsage: {
+        parameters: {
+            query?: {
+                /** @description The days counted, today included. */
+                days?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The counters. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModelUsage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             default: components["responses"]["Error"];
@@ -11992,6 +12470,41 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    askQuestion: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AskRequest"];
+            };
+        };
+        responses: {
+            /** @description The events `ground`, `clarify`, `draft`, `escalate`, `check`, `run`, `diagnosis`, `result`, `summary`, `error` and finally `usage`, or the whole answer as one object. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AskResult"];
+                    "text/event-stream": string;
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            429: components["responses"]["TooManyRequests"];
             default: components["responses"]["Error"];
         };
     };

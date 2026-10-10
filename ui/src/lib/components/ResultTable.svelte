@@ -11,11 +11,20 @@
     rows,
     prefixes,
     onopen,
+    cited,
+    highlight = null,
+    onhover,
   }: {
     vars: string[];
     rows: (Term | null)[][];
     prefixes: PrefixMap;
     onopen?: (iri: string) => void;
+    /** Rows a summary cites (0-based), marked in the number column. */
+    cited?: ReadonlySet<number>;
+    /** A row to scroll to and highlight (0-based). */
+    highlight?: { row: number } | null;
+    /** The row under the pointer (0-based), or null when it leaves the rows. */
+    onhover?: (row: number | null) => void;
   } = $props();
 
   const ROW_H = 26;
@@ -56,6 +65,17 @@
 
   const order = $derived(sortedOrder(rows, sort, prefixes));
 
+  // scroll a highlighted row into the middle of the view
+  $effect(() => {
+    const h = highlight;
+    if (!h || !scroller) return;
+    const pos = order.indexOf(h.row);
+    if (pos < 0) return;
+    const top = Math.max(0, pos * ROW_H - viewportH / 2 + ROW_H);
+    scroller.scrollTop = top;
+    scrollTop = top;
+  });
+
   const start = $derived(Math.max(0, Math.floor(scrollTop / ROW_H) - OVERSCAN));
   const end = $derived(
     Math.min(rows.length, Math.ceil((scrollTop + viewportH) / ROW_H) + OVERSCAN),
@@ -85,6 +105,23 @@
     } catch (e) {
       toasts.error('Could not copy', e);
     }
+  }
+
+  /** Reports the row under the pointer to `onhover`. */
+  function hovering(el: HTMLElement) {
+    const cb = onhover;
+    if (!cb) return;
+    const over = (e: PointerEvent) => {
+      const ri = (e.target as HTMLElement).closest?.('[data-ri]')?.getAttribute('data-ri');
+      cb(ri == null ? null : Number(ri));
+    };
+    const leave = () => cb(null);
+    el.addEventListener('pointerover', over);
+    el.addEventListener('pointerleave', leave);
+    return () => {
+      el.removeEventListener('pointerover', over);
+      el.removeEventListener('pointerleave', leave);
+    };
   }
 
   // Column resizing
@@ -136,17 +173,28 @@
     {/each}
     <div class="cell filler"></div>
   </div>
-  <div class="body" style:height="{rows.length * ROW_H}px" style:min-width="{totalW}px">
+  <div
+    class="body"
+    style:height="{rows.length * ROW_H}px"
+    style:min-width="{totalW}px"
+    {@attach hovering}
+  >
     <div class="window" style:transform="translateY({start * ROW_H}px)">
       {#each visible as ri, k (ri)}
         {@const row = rows[ri]}
         <div
           class="tr"
           class:odd={(start + k) % 2 === 1}
+          class:hl={highlight?.row === ri}
           style:grid-template-columns={template}
           role="row"
+          aria-selected={highlight?.row === ri ? true : undefined}
+          data-ri={ri}
         >
-          <div class="cell rn" role="rowheader">{ri + 1}</div>
+          <div class="cell rn" class:cited={cited?.has(ri)} role="rowheader">
+            {#if cited?.has(ri)}<span class="cite-mark" title="Cited by the summary">◂</span
+              >{/if}{ri + 1}
+          </div>
           {#each row as term, c (c)}
             <div class="cell td" role="gridcell">
               <span class="val"><TermView {term} {prefixes} {onopen} /></span>
@@ -206,6 +254,17 @@
   }
   .tr:hover {
     background: var(--hover);
+  }
+  .tr.hl,
+  .tr.hl .rn {
+    background: color-mix(in srgb, var(--iri) 16%, var(--surface));
+  }
+  .rn.cited {
+    color: var(--iri);
+    font-weight: 600;
+  }
+  .cite-mark {
+    margin-right: 3px;
   }
   .cell {
     position: relative;

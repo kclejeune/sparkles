@@ -44,6 +44,8 @@ without a migration path, so keep backups of anything you cannot regenerate.
   * [Handing a query to the web UI](#handing-a-query-to-the-web-ui)
   * [Agent memory grants](#agent-memory-grants)
 * [Asking questions with a model](#asking-questions-with-a-model)
+  * [Escalation](#escalation)
+  * [The Ask bar](#the-ask-bar)
   * [Measuring models](#measuring-models)
 * [Embedding the library](#embedding-the-library)
 * [Python](#python)
@@ -2368,9 +2370,13 @@ sparkles ask --loc ./data/org org "Which team has the most members?" \
 
 The first argument after the options is the dataset's name and the second the question.
 `--data FILE…` asks over files loaded into memory instead of a database, and `--text`
-indexes them for full-text search. Each role uses the first pair of its list, and
-`--pair ROLE=PROVIDER/MODEL` forces one, such as `--pair draft=claude/claude-sonnet-5`.
-A role without a list is off, except `repair`, which uses the draft's pair. The output
+indexes them for full-text search. Each role starts with the first pair of its list and
+moves to the next pair when the command sees that pair fail, as described under
+[Escalation](#escalation). `--pair ROLE=PROVIDER/MODEL` forces one pair for a role, such
+as `--pair draft=claude/claude-sonnet-5`, and `--try-harder N` starts the draft at the
+pair after position `N`. A role without a list is off, except `repair`, which uses the
+draft list. With `--loc`, the command also reads the dataset's `assistant.json`, so its
+role lists and routing settings apply as they do in the server. The output
 gives the query, the explanation and assumptions, the first rows, the summary and the
 tokens used. `--json` prints one JSON object with every attempt, the result, the
 summary and the usage of each model call, and `--events` prints each step as a JSON line
@@ -2384,13 +2390,73 @@ tokens gets the 30 classes and 60 predicates that match the question best and tw
 stored examples, and under 8,192 the rows are shown without a summary. A model that
 cannot return JSON answers in plain text with a fenced query, and the output says so.
 
+### Escalation
+
+A role's list goes from the cheapest pair to the strongest. A step moves to the next
+pair only on a signal the server checks for itself.
+
+- `check-failed` means that a repaired draft still fails its check or its run.
+- `empty-query` means that a repaired draft still returns no rows and `why_empty` says
+  the query is at fault.
+- `provider-failure` means that a call timed out, was refused, or gave output that does
+  not match the schema after its retry.
+- `complexity` means that the first draft, the closest stored example or the previous
+  question's query is complex.
+- `try-harder` means that the person asked to **Try harder**.
+
+A role moves at most twice per question, and a question allows at most two failed calls.
+An empty result whose `why_empty` verdict is `data` ends the question at once, because
+another model cannot find rows that do not exist. The `usage` of every answer lists each
+model step with its pair and signal, so the answer shows which model wrote the final
+query.
+
+### The Ask bar
+
+When a dataset has an assistant, the query page shows an **Ask** bar above the tabs. A
+dataset admin turns the assistant on with its settings, which name what may leave the
+server and may override the server's role lists:
+
+```sh
+curl -X PUT http://localhost:3030/$/assistant/org -H 'Content-Type: application/json' \
+  -d '{"enabled": true, "send": "rows", "sendByProvider": {"claude": "schema"}}'
+```
+
+With `send: "schema"`, the default, models see the schema, examples, labels and queries
+but never a result row, so answers come without a summary. `rows` also sends up to 50
+rows for the summary, and `sendByProvider` keeps a hosted provider at a lower level than
+a local one. [API.md](API.md#assistant-settings) lists every setting.
+
+A question opens in a new tab. In **Preview first**, the default, the tab shows the
+question, the explanation, the assumptions and the checked query, and **Run** runs it.
+In **Run, then show**, the tab opens with the rows and a summary. The page remembers the
+mode for each person. While the server works, the bar names the step, such as "Writing
+a query" or "Repairing (1 of 2)", and **Stop** cancels it.
+
+The rows use the same table, graph, map and plan views as any query. Each `[n]` in the
+summary selects row `n` of the table, and a row under the pointer lights the markers
+that cite it. A question whose draft names graph variables opens in the graph view with
+those columns picked. When a name in the question matches several entities, the tab
+asks which one is meant. Editing the query clears the summary, and **Summarize again**
+summarizes the rows of the edited query.
+
+Under the result, the bar names the model that wrote the final query, and its tooltip
+lists every step. **Correct** and **Not correct** tell the server how the answer did,
+and **Try harder** asks again from the next model of the draft list. A question asked
+in a tab that holds an answer is a follow-up and carries the earlier question and query,
+until **New question** starts over. The server keeps each person's questions for
+`historyDays`, 30 by default, and the **Asked** list in the Saved menu shows them.
+Explore's search box offers **Ask a question…**, which takes the search text to the Ask
+bar.
+
 ### Measuring models
 
 `scripts/eval-ask` runs `sparkles ask` for each pair on a question set and reports, for
 each pair and role, the accuracy overall and by complexity, the share of answers that
 matched the schema without a retry, the latency per call, and the tokens and estimated
-cost per question and per correct answer. It also reports a cascade of the pairs in the
-order given, with the share of questions each pair answered.
+cost per question and per correct answer. With two or more pairs, it also asks every
+question again with the pairs as the role lists, in the order given, and reports the
+cascade's accuracy and cost, the share of answers each pair wrote, and the escalations
+by signal.
 
 ```sh
 scripts/eval-ask --model-config models.json --model-secret anthropic=env:ANTHROPIC_API_KEY \

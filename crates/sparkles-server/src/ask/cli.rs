@@ -36,10 +36,15 @@ pub struct AskArgs {
     pub dataset: String,
     /// The question, at most 2000 characters
     pub question: String,
-    /// Force a pair for one role, as ROLE=PROVIDER/MODEL (repeatable); the other roles
-    /// use the first pair of their list in --model-config
+    /// Force a pair for one role, as ROLE=PROVIDER/MODEL (repeatable). The role then
+    /// uses that pair alone and never escalates; the other roles use their lists, from
+    /// the database's assistant.json over --model-config, and escalate (spec C18 §5.5)
     #[arg(long = "pair", value_name = "ROLE=PROVIDER/MODEL")]
     pub pairs: Vec<String>,
+    /// The answer of an earlier run to try harder on: its draft pair's index in the
+    /// draft list (the `draftPair` of its usage); the draft starts at the next pair
+    #[arg(long, value_name = "INDEX")]
+    pub try_harder: Option<usize>,
     #[command(flatten)]
     pub models: ModelArgs,
     #[command(flatten)]
@@ -125,6 +130,20 @@ pub fn run_cli(args: AskArgs, store_opts: StoreOptions) -> Result<()> {
             );
         }
     }
+    // a database's assistant.json: its role overrides and routing, as the server reads them
+    let settings = match &args.loc {
+        Some(path) => crate::assistant::settings_at(path)?,
+        None => None,
+    }
+    .unwrap_or_default();
+    if let Err(e) =
+        crate::assistant::AssistantSettings::parse(&serde_json::to_vec(&settings)?, Some(&models))
+    {
+        bail!("assistant.json: {e}");
+    }
+    let lists = crate::assistant::lists(&models, &settings);
+    let routing = settings.routing.clone().unwrap_or_default();
+    let model_routing = models.config.routing.clone().unwrap_or_default();
     let timeout = Duration::from_secs_f64(args.timeout);
     let mut st = AppState::standalone(store_opts, timeout);
     st.read_only = true;
@@ -170,6 +189,16 @@ pub fn run_cli(args: AskArgs, store_opts: StoreOptions) -> Result<()> {
         max_rows: args.max_rows,
         deadline: Duration::from_secs_f64(args.deadline),
         max_tokens: args.max_tokens,
+        lists: Some(lists),
+        draft_start: args.try_harder.map(|i| i + 1),
+        complexity_threshold: routing
+            .complexity_threshold
+            .or(model_routing.complexity_threshold)
+            .unwrap_or(super::DEFAULT_COMPLEXITY_THRESHOLD),
+        example_score: routing
+            .example_score
+            .or(model_routing.example_score)
+            .unwrap_or(super::DEFAULT_EXAMPLE_SCORE),
         ..AskOptions::default()
     };
     let events = args.events;
