@@ -1694,17 +1694,21 @@ impl Operator {
     }
 
     fn describe(&self, ctx: &Ctx) -> CursorPlan {
-        // The subtree an eager kernel runs itself, in the shape of its eager plan.
-        fn eager(mut operator: PlanInfo, reason: &str) -> CursorPlan {
+        // The subtree an eager kernel runs itself, in the shape of its eager plan. A
+        // fallback materializes it, while a scalar kernel reads its scans as runs.
+        fn eager(mut operator: PlanInfo, reason: &str, materializes: bool) -> CursorPlan {
             let children = std::mem::take(&mut operator.children);
             CursorPlan {
                 operator,
-                materializes: true,
-                full_input_before_output: true,
-                growing_state: true,
+                materializes,
+                full_input_before_output: materializes,
+                growing_state: materializes,
                 complete: false,
                 reason: Some(reason.into()),
-                children: children.into_iter().map(|c| eager(c, reason)).collect(),
+                children: children
+                    .into_iter()
+                    .map(|c| eager(c, reason, materializes))
+                    .collect(),
             }
         }
         let described = |node: &Node| {
@@ -1721,11 +1725,11 @@ impl Operator {
                 ..
             } => described(node)
                 .into_iter()
-                .map(|c| eager(c, "inside an eager fallback subtree"))
+                .map(|c| eager(c, "inside an eager fallback subtree", true))
                 .collect(),
             State::Scalar(node) if !node.children.is_empty() => described(node)
                 .into_iter()
-                .map(|c| eager(c, "read by its parent"))
+                .map(|c| eager(c, "read by its parent", false))
                 .collect(),
             _ => self.children.iter().map(|c| c.describe(ctx)).collect(),
         };
