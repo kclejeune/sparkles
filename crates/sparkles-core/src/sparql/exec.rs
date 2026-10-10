@@ -3579,7 +3579,7 @@ fn order_by(
             .collect();
         ids.sort_unstable();
         ids.dedup();
-        ctx.snap.generation.vocab.prefetch_sorted(&ids);
+        ctx.snap.generation.vocab.prefetch_values(&ids);
     }
     let mut notes = Vec::new();
     let mut cursor_candidate_charge = None;

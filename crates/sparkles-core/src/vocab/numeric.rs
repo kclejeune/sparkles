@@ -57,6 +57,9 @@ const VALUED_BITS: u64 = 0x8888_8888_8888_8888;
 const HINT_CHUNK: usize = 16 << 10;
 /// Chunks this close are asked for in one request.
 const HINT_GAP: usize = 4;
+/// Chunks touching at least one in this many chunks of their span are asked for as the
+/// whole span.
+const DENSE: usize = 4;
 
 pub const NOT_NUMERIC: u8 = 0;
 pub const UNKNOWN: u8 = 1;
@@ -295,13 +298,8 @@ impl NumColumn {
     /// pass makes no system call, and a cold one finds its pages read by a few large
     /// requests rather than one fault per page.
     fn advise(&self, ranges: impl Iterator<Item = (usize, usize)>) {
-        let mut cur: Option<(usize, usize)> = None;
-        let flush = |c: Option<(usize, usize)>| {
-            if let Some((s, e)) = c {
-                self.bytes.will_need(s * HINT_CHUNK, e * HINT_CHUNK);
-            }
-        };
         let len = self.bytes.as_slice().len();
+        let mut fresh = Vec::new();
         for (s, e) in ranges {
             let (c0, c1) = (s / HINT_CHUNK, e.min(len).div_ceil(HINT_CHUNK));
             for c in c0..c1 {
@@ -309,16 +307,31 @@ impl NumColumn {
                 if word.load(Relaxed) & bit != 0 || word.fetch_or(bit, Relaxed) & bit != 0 {
                     continue;
                 }
-                cur = match cur {
-                    Some((cs, ce)) if c >= cs && c <= ce + HINT_GAP => Some((cs, ce.max(c + 1))),
-                    other => {
-                        flush(other);
-                        Some((c, c + 1))
-                    }
-                };
+                fresh.push(c);
             }
         }
-        flush(cur);
+        let (Some(&first), Some(&last)) = (fresh.first(), fresh.last()) else {
+            return;
+        };
+        // When the chunks cover a good part of their span, one request for the whole
+        // span reads faster than many small ones, at the cost of the gaps between them.
+        let gap = if fresh.len() * DENSE >= last + 1 - first {
+            usize::MAX
+        } else {
+            HINT_GAP
+        };
+        let mut cur = (first, first + 1);
+        for &c in &fresh[1..] {
+            if c >= cur.0 && c <= cur.1.saturating_add(gap) {
+                cur.1 = cur.1.max(c + 1);
+            } else {
+                self.bytes
+                    .will_need(cur.0 * HINT_CHUNK, (cur.1 * HINT_CHUNK).min(len));
+                cur = (c, c + 1);
+            }
+        }
+        self.bytes
+            .will_need(cur.0 * HINT_CHUNK, (cur.1 * HINT_CHUNK).min(len));
     }
 
     /// What the column says about each of `ids` (best sorted ascending), reading a cold

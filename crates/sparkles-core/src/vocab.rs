@@ -650,6 +650,27 @@ impl Vocab {
         );
     }
 
+    /// Read ahead what evaluating these ids' values reads (ids sorted ascending): with a
+    /// numeric column, the column's pages of the numbers, read now in two rounds of large
+    /// requests (see [`numeric::NumColumn::get_many`]), and the front-coded blocks of the
+    /// other terms, asked for as in [`Vocab::prefetch_sorted`].
+    pub fn prefetch_values(&self, ids: &[u64]) {
+        let Some(num) = &self.num else {
+            return self.prefetch_sorted(ids);
+        };
+        if !crate::index::io_hints() {
+            return;
+        }
+        let found = num.get_many(ids);
+        let rest: Vec<u64> = ids
+            .iter()
+            .zip(found)
+            .filter(|(_, n)| n.value().is_none())
+            .map(|(&id, _)| id)
+            .collect();
+        self.prefetch_sorted(&rest);
+    }
+
     /// Overlap the vocabulary reads of a medium-sized result decoded in row order.
     /// With a sparse index, use its in-memory offsets and hint each group once, as
     /// `find` does. Warm requests then avoid sorting their cells or repeating hints.
