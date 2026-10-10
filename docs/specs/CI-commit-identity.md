@@ -1024,6 +1024,19 @@ directory sync. A release that reads only up to reader 3 then refuses the databa
 `sparkles dump` and a load. `sparkles check` names the format, the chunk count and the
 preallocated bytes in the `delta-vocabulary` summary.
 
+A dry run of a bulk write builds its preview from the terms in memory and leaves the
+file alone, so it neither rewrites a legacy file nor raises the reader.
+
+A directional run on a Namespace 8x16 instance compared this change with the commit
+before it on the 1.05M-triple store. It ran 8 interleaved rounds of 5,000 serial churn
+updates, a fresh store copy and server for each round and arm. Literal inserts, which
+add a term, took a median of 0.529 ms against 0.796 ms before, and their 90th
+percentile fell from 1.219 ms to 0.869 ms. Before the change they cost 0.22 to 0.26 ms
+more than inserts of known IRIs in every round. After it they cost at most 0.03 ms more.
+Single-triple updates that add no term did not change, at a mean of 0.615 ms against
+0.618 ms. The instance's virtual disk is write through and reports no FUA, so the
+direct write saves the journal commit there but not a cache flush.
+
 **Tests.** Unit tests in `vocab/delta.rs` cover syncs only when terms were added, chunks
 after the header with a zero tail, a legacy file read and rewritten at the first write,
 a rollback past a written chunk, and a branch's own file after its linked prefix.
