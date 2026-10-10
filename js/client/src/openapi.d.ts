@@ -2918,6 +2918,30 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/{ds}/sources": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List registered sources
+         * @description The MCP tool `list_sources` as the caller: the sources in the graphs the caller can read, with their current rendition, chunk and fact counts, and whether the rendition still needs extraction. Needs `read` and counts as a query.
+         */
+        get: operations["listSources"];
+        put?: never;
+        /**
+         * Register a source document
+         * @description The MCP tool `register_source` as the caller. Needs `write` on the graph and counts as an update. With `original` the file's bytes are kept beside the normalized text, `reanchor` moves the facts that cite the previous rendition to the new text, and `reanchorFrom` copies the facts of a renamed file's source. In a graph under the dataset's import base, a text that matches a secret pattern is refused with 422 `secret-detected`, the pattern's name and the offset. `sparkles memory import` calls it.
+         */
+        post: operations["registerSource"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/{ds}/sparql": {
         parameters: {
             query?: never;
@@ -5858,6 +5882,62 @@ export interface components {
             dataset: string;
             datasetId: string;
         };
+        /** @description The arguments of `register_source` without `dataset`. */
+        RegisterSourceRequest: {
+            dryRun?: boolean;
+            /** @description The media type of the original document (default `text/plain`). */
+            format?: string;
+            /** @description The named graph of the source and its facts (default: the source's IRI). */
+            graph?: string;
+            /** @description The source's IRI (default: a `urn:uuid` minted from the text). */
+            iri?: string;
+            message?: string;
+            /** @description The file's bytes in base64 when the text is their normalized form. They are kept so an export can write the file back unchanged, and their SHA-256 becomes the digest. */
+            original?: string;
+            profile?: string;
+            /** @description Give each fact that cites the previous rendition a span in the new text where its quote occurs once, and retract the others. */
+            reanchor?: boolean;
+            /** @description An earlier source whose facts are copied into this source's graph where their quotes occur in this text. */
+            reanchorFrom?: string;
+            /** @description The document as text or Markdown, at most 2 MiB. */
+            text: string;
+            timeoutSeconds?: number;
+            title?: string;
+        };
+        /** @description What `register_source` stored. */
+        RegisterSourceResult: {
+            alreadyRegistered: boolean;
+            branch?: string;
+            chunks: {
+                end: number;
+                index: number;
+                iri: string;
+                start: number;
+                text?: string;
+            }[];
+            commit?: number;
+            committed: boolean;
+            copied?: number;
+            dataset: string;
+            digest: string;
+            elapsedMs?: number;
+            graph: string;
+            head?: number;
+            length: number;
+            originalKept?: boolean;
+            /** @description The prefixes the compact terms use. */
+            prefixes?: {
+                [key: string]: unknown;
+            };
+            previousRendition?: string;
+            profile?: string;
+            reanchored?: number;
+            rendition: string;
+            retracted?: number;
+            source: string;
+            staleFacts?: number;
+            textKept?: boolean;
+        };
         /** @description The facts to retract, at most 500. */
         RejectRequest: {
             /** @description The review branch the facts are on (default: main). */
@@ -6262,6 +6342,31 @@ export interface components {
             note?: string;
             /** @description Keep the snapshot materialized. */
             warm?: boolean | string;
+        };
+        /** @description The sources `list_sources` found. */
+        SourceList: {
+            branch?: string;
+            commit: number;
+            dataset: string;
+            /** @description The prefixes the compact terms use. */
+            prefixes?: {
+                [key: string]: unknown;
+            };
+            sources: {
+                chunks: number;
+                digest?: string;
+                facts: number;
+                format?: string;
+                graph: string;
+                invalidatedAt?: string;
+                lastIngestion?: string;
+                length?: number;
+                needsExtraction?: boolean;
+                rendition: string;
+                source: string;
+                title?: string;
+            }[];
+            truncated: boolean;
         };
         /** @description `application/x-sparkles+json`, the UI's result format. */
         SparklesResult: {
@@ -15298,6 +15403,81 @@ export interface operations {
             408: components["responses"]["Timeout"];
             501: components["responses"]["NotImplemented"];
             507: components["responses"]["InsufficientStorage"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listSources: {
+        parameters: {
+            query?: {
+                /** @description Only sources in this graph; repeat for several, up to 20. */
+                graph?: string;
+                /** @description Only sources in graphs whose IRI starts with this. */
+                graphPrefix?: string;
+                /** @description Only sources whose current rendition no extraction has cited. */
+                needsExtraction?: boolean;
+                /** @description The most sources listed. */
+                limit?: number;
+                /** @description Read at this commit. */
+                atCommit?: number;
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The sources. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SourceList"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            default: components["responses"]["Error"];
+        };
+    };
+    registerSource: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RegisterSourceRequest"];
+            };
+        };
+        responses: {
+            /** @description The source and its rendition. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RegisterSourceResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            409: components["responses"]["Conflict"];
+            422: components["responses"]["Unprocessable"];
             default: components["responses"]["Error"];
         };
     };

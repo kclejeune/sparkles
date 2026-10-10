@@ -698,6 +698,8 @@ fn entries() -> Vec<(&'static str, Entry)> {
         server_only!("recallFacts", Mcp),
         server_only!("diagnoseQuery", Mcp),
         server_only!("assertFacts", Mcp),
+        server_only!("registerSource", Mcp),
+        server_only!("listSources", Mcp),
         server_only!("memoryBrief", Mcp),
         // C18 Phase 3: the review inbox and its actions run the memory tools; ingest
         // profiles live beside the dataset like the memory settings
