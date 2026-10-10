@@ -46,6 +46,8 @@ mod memory_cmd;
 // the pipeline that uses most of the model clients (`ask`) needs the `mcp` feature
 #[cfg_attr(not(feature = "mcp"), allow(dead_code, unused_imports))]
 mod models;
+mod notify;
+mod notify_cmd;
 mod obs;
 mod openapi;
 mod otel;
@@ -1437,6 +1439,9 @@ enum Cmd {
     /// Runtime values of model secrets on a running server: list them, store one from
     /// standard input or a prompt that does not echo, or remove one
     Secrets(secrets_cmd::SecretsArgs),
+    /// Outbound notifications on a running server: their delivery status, and a test
+    /// send to one channel
+    Notify(notify_cmd::NotifyArgs),
     /// Manage datasets in a stopped server's catalog or on a running server
     Dataset {
         #[command(subcommand)]
@@ -2689,6 +2694,8 @@ fn run() -> Result<()> {
                 };
                 // ask history past its retention is deleted once an hour (C18 §6.4)
                 assistant::spawn_pruning(st.clone());
+                // the lasting conditions of outbound notifications (C21 §6.4)
+                notify::events::spawn(st.clone());
                 // scheduled consolidation and retention of agent memory (C18 §8.3, §8.4)
                 #[cfg(feature = "mcp")]
                 ingest::maintain::spawn_schedule(st.clone());
@@ -3396,6 +3403,7 @@ fn run() -> Result<()> {
         Cmd::Quota(args) => quota_cmd::run(args, opts),
         Cmd::Settings(args) => settings_cmd::run(args),
         Cmd::Secrets(args) => secrets_cmd::run(args),
+        Cmd::Notify(args) => notify_cmd::run(args),
         Cmd::Dataset { cmd } => dataset_cmd::run(cmd, opts),
         Cmd::Compaction(args) => compaction_cmd::run(args, opts),
         #[cfg(feature = "auth")]

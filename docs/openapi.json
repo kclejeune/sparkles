@@ -44,6 +44,15 @@
           "type": "integer"
         }
       },
+      "channel": {
+        "description": "The name of a notification channel.",
+        "in": "path",
+        "name": "channel",
+        "required": true,
+        "schema": {
+          "type": "string"
+        }
+      },
       "commitMessage": {
         "description": "The commit message of the write, at most 1024 bytes of UTF-8. RFC 8187 extended values are accepted.",
         "in": "header",
@@ -225,7 +234,7 @@
         }
       },
       "kind": {
-        "description": "The settings kind: `assistant`, `memory` or `ingest` of a dataset, or `models` of the server.",
+        "description": "The settings kind: `assistant`, `memory` or `ingest` of a dataset, or `models` or `notifications` of the server.",
         "in": "path",
         "name": "kind",
         "required": true,
@@ -234,7 +243,8 @@
             "assistant",
             "memory",
             "ingest",
-            "models"
+            "models",
+            "notifications"
           ],
           "type": "string"
         }
@@ -507,6 +517,16 @@
       }
     },
     "responses": {
+      "BadGateway": {
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        },
+        "description": "A server the request contacts on the caller's behalf failed or was refused, such as a notification channel."
+      },
       "BadRequest": {
         "content": {
           "application/json": {
@@ -9882,6 +9902,240 @@
         ],
         "type": "object"
       },
+      "NotificationStatus": {
+        "description": "Whether notifications are on, each channel's last success and failure, the conditions notified and the recent deliveries.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#notifications"
+        },
+        "properties": {
+          "active": {
+            "items": {
+              "properties": {
+                "count": {
+                  "type": "integer"
+                },
+                "dataset": {
+                  "oneOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "event": {
+                  "type": "string"
+                },
+                "first": {
+                  "type": "string"
+                },
+                "key": {
+                  "type": "string"
+                },
+                "last": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "key",
+                "event",
+                "first",
+                "last",
+                "count"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "channels": {
+            "items": {
+              "properties": {
+                "failed": {
+                  "description": "Deliveries that failed, were refused or were dropped since the start.",
+                  "type": "integer"
+                },
+                "lastFailure": {
+                  "oneOf": [
+                    {
+                      "properties": {
+                        "at": {
+                          "type": "string"
+                        },
+                        "error": {
+                          "description": "Why a delivery failed. It never holds a secret.",
+                          "type": "string"
+                        },
+                        "event": {
+                          "type": "string"
+                        },
+                        "id": {
+                          "type": "string"
+                        },
+                        "status": {
+                          "description": "The HTTP status of a delivery.",
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "at",
+                        "event"
+                      ],
+                      "type": "object"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "lastSuccess": {
+                  "oneOf": [
+                    {
+                      "properties": {
+                        "at": {
+                          "type": "string"
+                        },
+                        "error": {
+                          "description": "Why a delivery failed. It never holds a secret.",
+                          "type": "string"
+                        },
+                        "event": {
+                          "type": "string"
+                        },
+                        "id": {
+                          "type": "string"
+                        },
+                        "status": {
+                          "description": "The HTTP status of a delivery.",
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "at",
+                        "event"
+                      ],
+                      "type": "object"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "name": {
+                  "type": "string"
+                },
+                "secrets": {
+                  "description": "The secrets the channel names.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "sent": {
+                  "description": "Deliveries that succeeded since the start.",
+                  "type": "integer"
+                },
+                "target": {
+                  "description": "Where the channel delivers, without credentials.",
+                  "type": "string"
+                },
+                "type": {
+                  "enum": [
+                    "webhook",
+                    "ntfy"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "name",
+                "type",
+                "target",
+                "secrets",
+                "lastSuccess",
+                "lastFailure",
+                "sent",
+                "failed"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "queued": {
+            "description": "Deliveries waiting in the queue.",
+            "type": "integer"
+          },
+          "recent": {
+            "items": {
+              "additionalProperties": true,
+              "description": "A delivery: `at`, `id`, `event`, `channel`, `result` (`ok`, `failed`, `refused` or `dropped`), `attempts`, and `status` or `error`.",
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "routes": {
+            "additionalProperties": true,
+            "description": "The routes from event types to channels.",
+            "type": "object"
+          }
+        },
+        "required": [
+          "enabled",
+          "channels",
+          "routes",
+          "queued",
+          "active",
+          "recent"
+        ],
+        "type": "object"
+      },
+      "NotificationTest": {
+        "description": "A test notification that the channel accepted.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#notifications"
+        },
+        "properties": {
+          "channel": {
+            "type": "string"
+          },
+          "id": {
+            "description": "The envelope's id.",
+            "type": "string"
+          },
+          "latencyMs": {
+            "type": "integer"
+          },
+          "result": {
+            "enum": [
+              "ok"
+            ],
+            "type": "string"
+          },
+          "status": {
+            "description": "The HTTP status the channel answered.",
+            "type": "integer"
+          },
+          "type": {
+            "enum": [
+              "webhook",
+              "ntfy"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "channel",
+          "type",
+          "result",
+          "status",
+          "id",
+          "latencyMs"
+        ],
+        "type": "object"
+      },
       "OAuthError": {
         "properties": {
           "error": {
@@ -12623,6 +12877,13 @@
           "secrets": {
             "items": {
               "properties": {
+                "channels": {
+                  "description": "The notification channels that name the secret (spec C21).",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
                 "declared": {
                   "description": "Whether `--model-secret` names the secret.",
                   "type": "boolean"
@@ -23884,6 +24145,105 @@
         "x-sparkles-permission": "server-admin"
       }
     },
+    "/$/notifications": {
+      "get": {
+        "description": "Whether outbound notifications are on, each channel with its target, its last success and its last failure, the routes, the length of the queue, the conditions that were notified and the last 50 deliveries. The counters start empty at each start. Needs server `admin`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#notifications"
+        },
+        "operationId": "getNotifications",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotificationStatus"
+                }
+              }
+            },
+            "description": "The status."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Get the status of notifications",
+        "tags": [
+          "Server"
+        ],
+        "x-sparkles-permission": "server-admin"
+      }
+    },
+    "/$/notifications/test/{channel}": {
+      "post": {
+        "description": "Sends a `notification.test` envelope to the channel now, in one attempt, whether or not notifications are on. A failure is a `502` with the code `delivery-failed`, or `outbound-refused` when the outbound policy refuses the channel. Needs server `admin`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#notifications"
+        },
+        "operationId": "testNotification",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/channel"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotificationTest"
+                }
+              }
+            },
+            "description": "The channel accepted the notification."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "502": {
+            "$ref": "#/components/responses/BadGateway"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Send a test notification",
+        "tags": [
+          "Server"
+        ],
+        "x-sparkles-permission": "server-admin"
+      }
+    },
     "/$/openapi.json": {
       "get": {
         "externalDocs": {
@@ -27336,7 +27696,7 @@
         "x-sparkles-permission": "server-admin"
       },
       "get": {
-        "description": "The model configuration (`models`): the effective object, the declared configuration of `--model-config`, the runtime layer, the source of each field, the fields `server.locked` locks and whether the effective object is valid. The `ETag` names the runtime layer. Needs server `admin`.",
+        "description": "The model configuration (`models`) or the notifications (`notifications`): the effective object, the declared layer (`--model-config`, or the settings file's `server.notifications`), the runtime layer, the source of each field, the fields `server.locked` locks and whether the effective object is valid. The `ETag` names the runtime layer. Needs server `admin`.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#server-settings"
         },
@@ -27403,7 +27763,7 @@
               }
             }
           },
-          "description": "Fields of the model configuration: `providers`, `roles` and `routing`.",
+          "description": "Fields of the kind: `providers`, `roles` and `routing` of `models`, or `enabled`, `server`, `baseUrl`, `repeatEvery`, `channels`, `routes` and `delivery` of `notifications`.",
           "required": true
         },
         "responses": {
@@ -27490,7 +27850,7 @@
               }
             }
           },
-          "description": "Fields of the model configuration: `providers`, `roles` and `routing`.",
+          "description": "Fields of the kind: `providers`, `roles` and `routing` of `models`, or `enabled`, `server`, `baseUrl`, `repeatEvery`, `channels`, `routes` and `delivery` of `notifications`.",
           "required": true
         },
         "responses": {

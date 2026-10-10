@@ -1712,6 +1712,7 @@ pub fn render_prometheus(st: &AppState) -> String {
     crate::http::history::metrics(st, &mut o);
     crate::http::branches::metrics(st, &mut o);
     crate::assistant::metrics(st, &mut o);
+    crate::notify::metrics(st, &mut o);
     #[cfg(feature = "mcp")]
     crate::mcp::branches::metrics(&mut o);
     if let Some(rss) = resident_bytes() {

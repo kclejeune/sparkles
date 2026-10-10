@@ -291,7 +291,7 @@ async fn models_layers_and_routes() {
     assert_eq!(v["code"], "unknown-kind");
     // the status lists the server-wide kinds
     let (_, v, _) = send(&f.app, "GET", "/$/settings", None).await;
-    assert_eq!(v["serverKinds"], json!(["models"]));
+    assert_eq!(v["serverKinds"], json!(["models", "notifications"]));
 }
 
 /// The checks of the model configuration apply to the effective object.

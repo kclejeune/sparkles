@@ -1556,6 +1556,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/$/notifications": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get the status of notifications
+         * @description Whether outbound notifications are on, each channel with its target, its last success and its last failure, the routes, the length of the queue, the conditions that were notified and the last 50 deliveries. The counters start empty at each start. Needs server `admin`.
+         */
+        get: operations["getNotifications"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/notifications/test/{channel}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Send a test notification
+         * @description Sends a `notification.test` envelope to the channel now, in one attempt, whether or not notifications are on. A failure is a `502` with the code `delivery-failed`, or `outbound-refused` when the outbound policy refuses the channel. Needs server `admin`.
+         */
+        post: operations["testNotification"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/openapi.json": {
         parameters: {
             query?: never;
@@ -2233,7 +2273,7 @@ export interface paths {
         };
         /**
          * Get a server settings kind
-         * @description The model configuration (`models`): the effective object, the declared configuration of `--model-config`, the runtime layer, the source of each field, the fields `server.locked` locks and whether the effective object is valid. The `ETag` names the runtime layer. Needs server `admin`.
+         * @description The model configuration (`models`) or the notifications (`notifications`): the effective object, the declared layer (`--model-config`, or the settings file's `server.notifications`), the runtime layer, the source of each field, the fields `server.locked` locks and whether the effective object is valid. The `ETag` names the runtime layer. Needs server `admin`.
          */
         get: operations["getServerSettings"];
         /**
@@ -5980,6 +6020,71 @@ export interface components {
             /** @description Kept materialized. */
             warm: boolean;
         };
+        /** @description Whether notifications are on, each channel's last success and failure, the conditions notified and the recent deliveries. */
+        NotificationStatus: {
+            active: {
+                count: number;
+                dataset?: string | null;
+                event: string;
+                first: string;
+                key: string;
+                last: string;
+            }[];
+            channels: {
+                /** @description Deliveries that failed, were refused or were dropped since the start. */
+                failed: number;
+                lastFailure: {
+                    at: string;
+                    /** @description Why a delivery failed. It never holds a secret. */
+                    error?: string;
+                    event: string;
+                    id?: string;
+                    /** @description The HTTP status of a delivery. */
+                    status?: number;
+                } | null;
+                lastSuccess: {
+                    at: string;
+                    /** @description Why a delivery failed. It never holds a secret. */
+                    error?: string;
+                    event: string;
+                    id?: string;
+                    /** @description The HTTP status of a delivery. */
+                    status?: number;
+                } | null;
+                name: string;
+                /** @description The secrets the channel names. */
+                secrets: string[];
+                /** @description Deliveries that succeeded since the start. */
+                sent: number;
+                /** @description Where the channel delivers, without credentials. */
+                target: string;
+                /** @enum {string} */
+                type: "webhook" | "ntfy";
+            }[];
+            enabled: boolean;
+            /** @description Deliveries waiting in the queue. */
+            queued: number;
+            recent: {
+                [key: string]: unknown;
+            }[];
+            /** @description The routes from event types to channels. */
+            routes: {
+                [key: string]: unknown;
+            };
+        };
+        /** @description A test notification that the channel accepted. */
+        NotificationTest: {
+            channel: string;
+            /** @description The envelope's id. */
+            id: string;
+            latencyMs: number;
+            /** @enum {string} */
+            result: "ok";
+            /** @description The HTTP status the channel answered. */
+            status: number;
+            /** @enum {string} */
+            type: "webhook" | "ntfy";
+        };
         OAuthError: {
             /**
              * @example authorization_pending
@@ -6840,6 +6945,8 @@ export interface components {
         /** @description The model secrets. A value is never returned. */
         SecretList: {
             secrets: {
+                /** @description The notification channels that name the secret (spec C21). */
+                channels?: string[];
                 /** @description Whether `--model-secret` names the secret. */
                 declared: boolean;
                 /** @description Whether `server.locked` names `secrets.NAME`, so that only the declared source applies. */
@@ -7850,6 +7957,15 @@ export interface components {
         };
     };
     responses: {
+        /** @description A server the request contacts on the caller's behalf failed or was refused, such as a notification channel. */
+        BadGateway: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
         /** @description A parse error, a bad parameter or a malformed body. */
         BadRequest: {
             headers: {
@@ -8102,6 +8218,8 @@ export interface components {
         branch: string;
         /** @description With `dryRun`: list up to this many changed quads. */
         changes: number;
+        /** @description The name of a notification channel. */
+        channel: string;
         /** @description The commit message of the write, at most 1024 bytes of UTF-8. RFC 8187 extended values are accepted. */
         commitMessage: string;
         /** @description The `next` of the previous page. Send the same selection with it. */
@@ -8142,8 +8260,8 @@ export interface components {
         ifMatch: string;
         /** @description Entity tags, or `*`. */
         ifNoneMatch: string;
-        /** @description The settings kind: `assistant`, `memory` or `ingest` of a dataset, or `models` of the server. */
-        kind: "assistant" | "memory" | "ingest" | "models";
+        /** @description The settings kind: `assistant`, `memory` or `ingest` of a dataset, or `models` or `notifications` of the server. */
+        kind: "assistant" | "memory" | "ingest" | "models" | "notifications";
         /** @description The page size. */
         limit: number;
         /** @description A lower budget of the serialized result, in MiB. */
@@ -11713,6 +11831,57 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    getNotifications: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The status. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NotificationStatus"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    testNotification: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The name of a notification channel. */
+                channel: components["parameters"]["channel"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The channel accepted the notification. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NotificationTest"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            502: components["responses"]["BadGateway"];
+            default: components["responses"]["Error"];
+        };
+    };
     openapiJson: {
         parameters: {
             query?: never;
@@ -13362,7 +13531,7 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description The settings kind: `assistant`, `memory` or `ingest` of a dataset, or `models` of the server. */
+                /** @description The settings kind: `assistant`, `memory` or `ingest` of a dataset, or `models` or `notifications` of the server. */
                 kind: components["parameters"]["kind"];
             };
             cookie?: never;
@@ -13392,12 +13561,12 @@ export interface operations {
                 "If-Match"?: string;
             };
             path: {
-                /** @description The settings kind: `assistant`, `memory` or `ingest` of a dataset, or `models` of the server. */
+                /** @description The settings kind: `assistant`, `memory` or `ingest` of a dataset, or `models` or `notifications` of the server. */
                 kind: components["parameters"]["kind"];
             };
             cookie?: never;
         };
-        /** @description Fields of the model configuration: `providers`, `roles` and `routing`. */
+        /** @description Fields of the kind: `providers`, `roles` and `routing` of `models`, or `enabled`, `server`, `baseUrl`, `repeatEvery`, `channels`, `routes` and `delivery` of `notifications`. */
         requestBody: {
             content: {
                 "application/json": Record<string, never>;
@@ -13433,7 +13602,7 @@ export interface operations {
                 "If-Match"?: string;
             };
             path: {
-                /** @description The settings kind: `assistant`, `memory` or `ingest` of a dataset, or `models` of the server. */
+                /** @description The settings kind: `assistant`, `memory` or `ingest` of a dataset, or `models` or `notifications` of the server. */
                 kind: components["parameters"]["kind"];
             };
             cookie?: never;
@@ -13466,12 +13635,12 @@ export interface operations {
                 "If-Match"?: string;
             };
             path: {
-                /** @description The settings kind: `assistant`, `memory` or `ingest` of a dataset, or `models` of the server. */
+                /** @description The settings kind: `assistant`, `memory` or `ingest` of a dataset, or `models` or `notifications` of the server. */
                 kind: components["parameters"]["kind"];
             };
             cookie?: never;
         };
-        /** @description Fields of the model configuration: `providers`, `roles` and `routing`. */
+        /** @description Fields of the kind: `providers`, `roles` and `routing` of `models`, or `enabled`, `server`, `baseUrl`, `repeatEvery`, `channels`, `routes` and `delivery` of `notifications`. */
         requestBody: {
             content: {
                 "application/json": Record<string, never>;
@@ -13553,7 +13722,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The settings kind: `assistant`, `memory` or `ingest` of a dataset, or `models` of the server. */
+                /** @description The settings kind: `assistant`, `memory` or `ingest` of a dataset, or `models` or `notifications` of the server. */
                 kind: components["parameters"]["kind"];
             };
             cookie?: never;
@@ -13585,7 +13754,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The settings kind: `assistant`, `memory` or `ingest` of a dataset, or `models` of the server. */
+                /** @description The settings kind: `assistant`, `memory` or `ingest` of a dataset, or `models` or `notifications` of the server. */
                 kind: components["parameters"]["kind"];
             };
             cookie?: never;
@@ -13628,7 +13797,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The settings kind: `assistant`, `memory` or `ingest` of a dataset, or `models` of the server. */
+                /** @description The settings kind: `assistant`, `memory` or `ingest` of a dataset, or `models` or `notifications` of the server. */
                 kind: components["parameters"]["kind"];
             };
             cookie?: never;
@@ -13663,7 +13832,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The settings kind: `assistant`, `memory` or `ingest` of a dataset, or `models` of the server. */
+                /** @description The settings kind: `assistant`, `memory` or `ingest` of a dataset, or `models` or `notifications` of the server. */
                 kind: components["parameters"]["kind"];
             };
             cookie?: never;

@@ -70,6 +70,24 @@ pub struct MemorySettings {
     /// the retention of session graphs of §8.4, off without it
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retention: Option<Retention>,
+    /// notifications about review branches that wait (spec C21 §5.4)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<ReviewNotice>,
+}
+
+/// `review` of `memory.json` (spec C21 §5.4): when the server tells the operator's
+/// channels that review branches wait.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ReviewNotice {
+    /// the age of the oldest open review branch at which `memory.review.pending` fires,
+    /// such as `2d`; without it the dataset sends none
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify_after: Option<String>,
+    /// the shortest time between two notifications about the dataset (default: the
+    /// `repeatEvery` of the server's `notifications` settings)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat_every: Option<String>,
 }
 
 /// How a consolidation pass writes its proposals (§8.3).
@@ -278,6 +296,20 @@ impl MemorySettings {
         for name in self.agents.keys() {
             if name.is_empty() || name.len() > 200 {
                 return Err(format!("agents: invalid agent name {name:?}"));
+            }
+        }
+        if let Some(r) = &self.review {
+            for (field, v) in [
+                ("review.notifyAfter", &r.notify_after),
+                ("review.repeatEvery", &r.repeat_every),
+            ] {
+                if let Some(d) = v
+                    && duration_days(d).is_none_or(|x| x < MIN_EVERY_DAYS)
+                {
+                    return Err(format!(
+                        "{field}: {d:?} is not a duration of at least 1h, such as 2d or 12h"
+                    ));
+                }
             }
         }
         Ok(())

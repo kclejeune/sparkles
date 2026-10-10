@@ -1506,12 +1506,85 @@ fn server_settings(put: &mut dyn FnMut(&str, J)) {
                             "setAt": with_desc(or_null(string()), "When the runtime value was stored."),
                             "overridden": with_desc(boolean(), "A runtime value is stored but the lock ignores it."),
                             "providers": with_desc(strings(), "The providers whose `apiKey` names the secret."),
+                            "channels": with_desc(strings(), "The notification channels that name the secret (spec C21)."),
                         }),
                     )),
                 }),
             ),
             "The model secrets. A value is never returned.",
             "model-secrets",
+        ),
+    );
+    let delivery = || {
+        or_null(obj(
+            &["at", "event"],
+            json!({
+                "at": string(),
+                "event": string(),
+                "id": string(),
+                "status": with_desc(int(), "The HTTP status of a delivery."),
+                "error": with_desc(string(), "Why a delivery failed. It never holds a secret."),
+            }),
+        ))
+    };
+    put(
+        "NotificationStatus",
+        doc(
+            obj(
+                &[
+                    "enabled", "channels", "routes", "queued", "active", "recent",
+                ],
+                json!({
+                    "enabled": boolean(),
+                    "channels": array(obj(
+                        &["name", "type", "target", "secrets", "lastSuccess", "lastFailure", "sent", "failed"],
+                        json!({
+                            "name": string(),
+                            "type": string_enum(&["webhook", "ntfy"]),
+                            "target": with_desc(string(), "Where the channel delivers, without credentials."),
+                            "secrets": with_desc(strings(), "The secrets the channel names."),
+                            "lastSuccess": delivery(),
+                            "lastFailure": delivery(),
+                            "sent": with_desc(int(), "Deliveries that succeeded since the start."),
+                            "failed": with_desc(int(), "Deliveries that failed, were refused or were dropped since the start."),
+                        }),
+                    )),
+                    "routes": any_object("The routes from event types to channels."),
+                    "queued": with_desc(int(), "Deliveries waiting in the queue."),
+                    "active": array(obj(
+                        &["key", "event", "first", "last", "count"],
+                        json!({
+                            "key": string(),
+                            "event": string(),
+                            "dataset": or_null(string()),
+                            "first": string(),
+                            "last": string(),
+                            "count": int(),
+                        }),
+                    )),
+                    "recent": array(any_object("A delivery: `at`, `id`, `event`, `channel`, `result` (`ok`, `failed`, `refused` or `dropped`), `attempts`, and `status` or `error`.")),
+                }),
+            ),
+            "Whether notifications are on, each channel's last success and failure, the conditions notified and the recent deliveries.",
+            "notifications",
+        ),
+    );
+    put(
+        "NotificationTest",
+        doc(
+            obj(
+                &["channel", "type", "result", "status", "id", "latencyMs"],
+                json!({
+                    "channel": string(),
+                    "type": string_enum(&["webhook", "ntfy"]),
+                    "result": string_enum(&["ok"]),
+                    "status": with_desc(int(), "The HTTP status the channel answered."),
+                    "id": with_desc(string(), "The envelope's id."),
+                    "latencyMs": int(),
+                }),
+            ),
+            "A test notification that the channel accepted.",
+            "notifications",
         ),
     );
     put(

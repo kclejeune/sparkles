@@ -740,7 +740,7 @@ impl Run<'_> {
             tracing::info!(target: "sparkles::backup", policy = p.name.as_str(), run = %run.id,
                 result = result_str(run.result), ok, "policy run finished");
         }
-        {
+        let failures = {
             let mut inner = pols.inner.lock();
             let s = inner.state.policies.entry(p.name.clone()).or_default();
             match run.result {
@@ -751,9 +751,21 @@ impl Run<'_> {
                 RunResult::Partial | RunResult::Failed => s.consecutive_failures += 1,
                 RunResult::Skipped => {}
             }
+            let failures = s.consecutive_failures;
             pols.save_state(&inner);
             pols.record(&mut inner, run.clone());
-        }
+            failures
+        };
+        // tell the operator's channels (spec C21 §3.1)
+        crate::notify::events::backup_run(
+            self.st,
+            &p.name,
+            &p.repository,
+            result_str(run.result),
+            &serde_json::to_value(&run).unwrap_or_default(),
+            u64::from(failures),
+            finished,
+        );
         self.h.set_detail(serde_json::to_value(&run)?);
         if cancelled {
             return Err(BackupError::cancelled().into());
