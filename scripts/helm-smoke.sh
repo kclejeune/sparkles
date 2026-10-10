@@ -7,8 +7,9 @@
 #   scripts/helm-smoke.sh [IMAGE]
 #
 # IMAGE defaults to sparkles:smoke, built from the Dockerfile unless SKIP_BUILD=1 says it
-# exists. Needs docker, kind, kubectl and helm. KIND_CLUSTER names the cluster (default
-# sparkles-smoke); one the script creates is deleted at the end unless KEEP_CLUSTER=1.
+# exists. Needs docker, kind, kubectl and helm. KIND names the kind binary (default kind),
+# and KIND_CLUSTER names the cluster (default sparkles-smoke). A cluster the script
+# creates is deleted at the end unless KEEP_CLUSTER=1.
 # The query goes through `kubectl port-forward` on SMOKE_PORT (default 48080).
 set -euo pipefail
 
@@ -19,7 +20,8 @@ ns=sparkles-smoke
 release=smoke
 root="$(cd "$(dirname "$0")/.." && pwd)"
 
-for tool in docker kind kubectl helm curl; do
+kind=${KIND:-kind}
+for tool in docker "$kind" kubectl helm curl; do
   command -v "$tool" > /dev/null || {
     echo "helm-smoke: $tool is not installed" >&2
     exit 2
@@ -31,7 +33,7 @@ pf=""
 cleanup() {
   if [[ -n $pf ]]; then kill "$pf" 2> /dev/null || true; fi
   if ((created)) && [[ -z ${KEEP_CLUSTER:-} ]]; then
-    kind delete cluster --name "$cluster" > /dev/null 2>&1 || true
+    "$kind" delete cluster --name "$cluster" > /dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT
@@ -39,14 +41,14 @@ trap cleanup EXIT
 if [[ -z ${SKIP_BUILD:-} ]]; then
   docker build -t "$image" "$root"
 fi
-if ! kind get clusters 2> /dev/null | grep -qx "$cluster"; then
-  kind create cluster --name "$cluster" --wait 120s
+if ! "$kind" get clusters 2> /dev/null | grep -qx "$cluster"; then
+  "$kind" create cluster --name "$cluster" --wait 120s
   created=1
 fi
 kctx="kind-$cluster"
 k() { kubectl --context "$kctx" -n "$ns" "$@"; }
 
-kind load docker-image "$image" --name "$cluster"
+"$kind" load docker-image "$image" --name "$cluster"
 kubectl --context "$kctx" create namespace "$ns" --dry-run=client -o yaml |
   kubectl --context "$kctx" apply -f - > /dev/null
 

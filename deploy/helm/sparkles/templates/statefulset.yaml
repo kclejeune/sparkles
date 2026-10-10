@@ -86,10 +86,13 @@ spec:
             - /etc/sparkles/config/models-manifest.json
             - --dir
             - {{ .Values.models.mountPath }}
-          {{- with .Values.server.extraEnv }}
           env:
+            # the root filesystem is read-only; any cache a download keeps goes to /tmp
+            - name: HOME
+              value: /tmp
+            {{- with .Values.server.extraEnv }}
             {{- toYaml . | nindent 12 }}
-          {{- end }}
+            {{- end }}
           {{- with .Values.server.extraEnvFrom }}
           envFrom:
             {{- toYaml . | nindent 12 }}
