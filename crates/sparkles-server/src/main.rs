@@ -60,6 +60,8 @@ mod rdfs;
 mod reasoning;
 #[cfg(feature = "auth")]
 mod remote;
+mod settings;
+mod settings_cmd;
 #[cfg(feature = "shacl")]
 mod shacl;
 mod shex_cmd;
@@ -885,6 +887,11 @@ enum Cmd {
         outbound: outbound::OutboundArgs,
         #[command(flatten)]
         models: models::ModelArgs,
+        /// Declared dataset settings, as JSON (spec C19 §5): defaults and per-dataset
+        /// values of the assistant, memory and ingest settings, and the fields that cannot
+        /// be changed at runtime. Read again on SIGHUP, together with --model-config
+        #[arg(long, value_name = "FILE")]
+        settings: Option<PathBuf>,
         #[cfg(feature = "mcp")]
         #[command(flatten)]
         ingest: ingest::IngestServeArgs,
@@ -1422,6 +1429,8 @@ enum Cmd {
     /// The storage quota of a persistent dataset: print it, set it (--max-mb), or go
     /// back to the default (--default)
     Quota(quota_cmd::QuotaArgs),
+    /// Layered dataset settings: check a settings file of serve --settings
+    Settings(settings_cmd::SettingsArgs),
     /// Manage datasets in a stopped server's catalog or on a running server
     Dataset {
         #[command(subcommand)]
@@ -2287,6 +2296,7 @@ fn run() -> Result<()> {
             no_embedding,
             outbound,
             models,
+            settings,
             #[cfg(feature = "mcp")]
             ingest,
             ask_history_days,
@@ -2463,7 +2473,11 @@ fn run() -> Result<()> {
                 secrets: vector_cmd::parse_secrets(&embedding_secret)?,
             });
             st.file_loads = outbound::file_loads(load_dir.as_deref(), &data)?;
-            st.models = models.load(st.outbound.clone())?;
+            st.set_models(models.load(st.outbound.clone())?);
+            if let Some(path) = &settings {
+                st.settings = settings::Settings::load(path, st.models().as_deref())?;
+            }
+            st.settings.set_models_file(models.model_config.clone());
             #[cfg(feature = "mcp")]
             {
                 st.ingest = ingest::Runtime::new(&ingest);
@@ -2731,6 +2745,8 @@ fn run() -> Result<()> {
                 // every dataset was opened before the listener was bound
                 st.set_phase(obs::Phase::Ready);
                 auth::spawn_reload_on_sighup(&st);
+                #[cfg(unix)]
+                settings::spawn_reload_on_sighup(st.clone(), models);
                 let st2 = st.clone();
                 let app = http::router(st.clone());
                 let (draining_tx, draining) = tokio::sync::oneshot::channel();
@@ -3370,6 +3386,7 @@ fn run() -> Result<()> {
         #[cfg(any(feature = "shacl", feature = "shex"))]
         Cmd::Validation(args) => validation_cmd::run(args, opts),
         Cmd::Quota(args) => quota_cmd::run(args, opts),
+        Cmd::Settings(args) => settings_cmd::run(args),
         Cmd::Dataset { cmd } => dataset_cmd::run(cmd, opts),
         Cmd::Compaction(args) => compaction_cmd::run(args, opts),
         #[cfg(feature = "auth")]

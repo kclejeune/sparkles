@@ -37,14 +37,14 @@ fn app(url: Option<&str>, n: usize) -> (Arc<AppState>, Router) {
                                       "allowedModels": ["m"] } },
             "roles": { "explain": [ { "provider": "mock", "model": "m" } ] },
         });
-        st.models = Some(Arc::new(Models::new(
+        st.models = arc_swap::ArcSwapOption::from_pointee(Models::new(
             ModelsConfig::parse(&cfg.to_string()).unwrap(),
             Default::default(),
             sparkles::outbound::OutboundPolicy {
                 allow_private: true,
                 ..Default::default()
             },
-        )));
+        ));
     }
     let st = Arc::new(st);
     let ds = st.attach("org", DbType::Mem, None).unwrap();

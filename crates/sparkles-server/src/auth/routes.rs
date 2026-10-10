@@ -107,6 +107,13 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/ingest/{ds}/{task}/approve", &["POST"]),
     // assistant settings and the caller's own ask history (C18 §3.5, §6.4)
     ("/$/assistant/{ds}", &["GET", "PUT"]),
+    // layered dataset settings (C19 §6)
+    ("/$/settings", &["GET"]),
+    ("/$/settings/{ds}", &["GET"]),
+    (
+        "/$/settings/{ds}/{kind}",
+        &["GET", "PUT", "PATCH", "DELETE"],
+    ),
     ("/$/asks/{ds}", &["GET", "DELETE"]),
     ("/$/asks/{ds}/{id}/feedback", &["POST"]),
     ("/$/queries/{ds}/{name}", &["GET", "PUT", "DELETE"]),
@@ -309,6 +316,11 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/ingest/{ds}/{task}/approve" => Dataset(Read),
         "/$/assistant/{ds}" if get => Dataset(Read),
         "/$/assistant/{ds}" => Dataset(Admin),
+        // the settings file and the model configuration are the operator's
+        "/$/settings" => Server(ServerPerm::ServerAdmin),
+        "/$/settings/{ds}" => Dataset(Read),
+        "/$/settings/{ds}/{kind}" if get => Dataset(Read),
+        "/$/settings/{ds}/{kind}" => Dataset(Admin),
         // only the caller's own entries, whatever its role (C18 §6.4)
         "/$/asks/{ds}" | "/$/asks/{ds}/{id}/feedback" => Dataset(Read),
         // endpoints, models, budgets and the secret names of the operator's providers

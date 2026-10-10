@@ -44,14 +44,14 @@ fn app(urls: Option<[&str; 2]>) -> (Arc<AppState>, Router) {
         let cfg = json!({ "providers": providers, "roles": {
             "extract": [{ "provider": "cheap", "model": "m" }, { "provider": "top", "model": "m" }]
         }});
-        st.models = Some(Arc::new(Models::new(
+        st.models = arc_swap::ArcSwapOption::from_pointee(Models::new(
             ModelsConfig::parse(&cfg.to_string()).unwrap(),
             Default::default(),
             sparkles::outbound::OutboundPolicy {
                 allow_private: true,
                 ..Default::default()
             },
-        )));
+        ));
     }
     let st = Arc::new(st);
     let ds = st.attach("org", DbType::Mem, None).unwrap();

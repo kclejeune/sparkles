@@ -254,6 +254,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     // model providers, memory settings and suggested examples (C18)
     let app = app.merge(crate::models::http::routes());
     let app = app.merge(crate::assist::routes());
+    let app = app.merge(crate::settings::http::routes());
     // assistant settings, ask history and usage (C18 §3.5, §5.5, §6.4)
     let app = app.merge(crate::assistant::routes());
     // the asking pipeline (C18 §5)
@@ -558,7 +559,6 @@ pub(crate) fn err_code(status: StatusCode, code: &str, msg: impl Into<String>) -
 }
 
 /// An error with a JSON body of the caller's making (it must hold `error`).
-#[cfg(feature = "mcp")]
 pub(crate) fn err_body(status: StatusCode, body: J) -> ApiError {
     ApiError(status, body)
 }
@@ -3336,6 +3336,8 @@ fn dataset_info(st: &AppState, ds: &Dataset) -> J {
         "text": text_summary(ds),
         "geo": crate::geo::summary(ds),
         "rdfs": crate::rdfs::info_json(ds),
+        // attached by --loc or --mem: the operator removes it, not the API
+        "declared": ds.ephemeral,
     });
     // a clone: where it was forked from
     if let Some(f) = ds.store.forked_from() {
@@ -3789,6 +3791,17 @@ async fn rename_dataset(
 async fn delete_dataset(State(st): St, Path(name): Path<String>) -> ApiResult {
     if st.read_only {
         return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
+    }
+    // the operator declared it on the command line, and the next start would attach it
+    // again (spec C19 §5.1)
+    if st.get(&name).is_some_and(|ds| ds.ephemeral) {
+        return Err(err_code(
+            StatusCode::CONFLICT,
+            "declared-dataset",
+            format!(
+                "dataset /{name} is declared in the server's configuration (--loc or --mem); remove it there instead"
+            ),
+        ));
     }
     let st2 = st.clone();
     let n = name.clone();

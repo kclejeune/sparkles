@@ -305,8 +305,11 @@ pub struct AppState {
     pub mcp: Option<Arc<crate::mcp::http::HttpConf>>,
     /// the C18 files of in-memory datasets (`assist`)
     pub volatile: crate::assist::Volatile,
-    /// the model providers and role lists (`serve --model-config`, spec C18 §3.4)
-    pub models: Option<Arc<crate::models::Models>>,
+    /// the model providers and role lists (`serve --model-config`, spec C18 §3.4),
+    /// replaced on SIGHUP (spec C19 §7); read them with [`models`](Self::models)
+    pub models: arc_swap::ArcSwapOption<crate::models::Models>,
+    /// the declared settings file (`serve --settings`, spec C19 §5)
+    pub settings: crate::settings::Settings,
     /// recent asks, usage counts and daily token counts (spec C18 §5.5)
     pub asks: crate::assistant::Runtime,
     /// ingestion tasks and the PDF workers (spec C18 Phase 4)
@@ -529,7 +532,8 @@ impl AppState {
             #[cfg(feature = "mcp")]
             mcp: None,
             volatile: Default::default(),
-            models: None,
+            models: Default::default(),
+            settings: Default::default(),
             asks: Default::default(),
             #[cfg(feature = "mcp")]
             ingest: Default::default(),
@@ -577,7 +581,8 @@ impl AppState {
             #[cfg(feature = "mcp")]
             mcp: None,
             volatile: Default::default(),
-            models: None,
+            models: Default::default(),
+            settings: Default::default(),
             asks: Default::default(),
             #[cfg(feature = "mcp")]
             ingest: Default::default(),
@@ -590,6 +595,16 @@ impl AppState {
             allow_unvalidated_writes: false,
             http_compression: Default::default(),
         }
+    }
+
+    /// The model providers of this moment. A request keeps the ones it started with
+    /// when a reload replaces them.
+    pub fn models(&self) -> Option<Arc<crate::models::Models>> {
+        self.models.load_full()
+    }
+
+    pub fn set_models(&self, m: Option<Arc<crate::models::Models>>) {
+        self.models.store(m);
     }
 
     /// The object of branch `branch` of dataset `main` (`main` itself for `main`),
@@ -822,6 +837,7 @@ impl AppState {
             Ok(deleted) => {
                 if deleted {
                     self.metrics.forget(name);
+                    self.volatile.forget(name);
                 }
                 Ok(deleted)
             }
@@ -883,6 +899,7 @@ impl AppState {
             Ok(ds) => {
                 drop(ds);
                 self.metrics.rename(from, to);
+                self.volatile.rename(from, to);
                 self.compaction.rename(from, to);
                 if let Some(auto) = &self.auto_reason {
                     auto.rename(from, to);

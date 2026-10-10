@@ -129,7 +129,7 @@ async fn ask_route(
     if let Err(why) = assistant::ask_status(&st, &settings) {
         return Err(err_code(StatusCode::NOT_FOUND, "no-assistant", why));
     }
-    let Some(models) = st.models.clone() else {
+    let Some(models) = st.models() else {
         return Err(err_code(
             StatusCode::NOT_FOUND,
             "no-assistant",

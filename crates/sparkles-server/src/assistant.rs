@@ -16,6 +16,7 @@ use crate::assist::{read_file, write_file};
 use crate::auth::Principal;
 use crate::http::{AdminBody, ApiResult, blocking, dataset, err, err_code};
 use crate::models::{Models, Pair, Role};
+use crate::settings::{Providers, Typed};
 use crate::state::{AppState, Dataset};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -134,45 +135,26 @@ impl Default for AssistantSettings {
     }
 }
 
-/// Members that would point a key at an endpoint, refused anywhere in a body.
-const FORBIDDEN: &[&str] = &["endpoint", "apiKey"];
-
-fn forbidden_member(v: &Value) -> Option<&'static str> {
-    match v {
-        Value::Object(m) => m.iter().find_map(|(k, v)| {
-            FORBIDDEN
-                .iter()
-                .find(|f| **f == k)
-                .copied()
-                .or_else(|| forbidden_member(v))
-        }),
-        Value::Array(a) => a.iter().find_map(forbidden_member),
-        _ => None,
-    }
-}
-
 impl AssistantSettings {
-    /// Parse a `PUT` body: refuse `endpoint` and `apiKey` anywhere, unknown members and
-    /// roles, and providers or models the server does not allow (§3.5). A `status`
-    /// member, which `GET` adds, is ignored.
-    pub fn parse(body: &[u8], models: Option<&Models>) -> Result<AssistantSettings, String> {
-        let mut v: Value = serde_json::from_slice(body).map_err(|e| e.to_string())?;
-        if let Some(f) = forbidden_member(&v) {
-            return Err(format!(
-                "{f} is not allowed: providers are defined in the server's model configuration only"
-            ));
-        }
-        if let Some(m) = v.as_object_mut() {
-            m.remove("status");
-        }
-        let s: AssistantSettings = serde_json::from_value(v).map_err(|e| e.to_string())?;
-        s.validate(models)?;
-        Ok(s)
-    }
-
-    fn validate(&self, models: Option<&Models>) -> Result<(), String> {
+    /// The checks of §3.5: providers and models the server allows, and the ranges of the
+    /// numbers. Without the model configuration (`Providers::Unchecked`) the providers
+    /// are not checked.
+    pub fn validate(&self, providers: Providers) -> Result<(), String> {
+        let check = match providers {
+            Providers::Unchecked => None,
+            Providers::Checked(m) => Some(m),
+        };
         for (role, list) in &self.roles {
             for p in list {
+                if p.max_output_tokens == Some(0) {
+                    return Err(format!(
+                        "roles.{}: maxOutputTokens must be at least 1",
+                        role.as_str()
+                    ));
+                }
+                let Some(models) = check else {
+                    continue;
+                };
                 let Some(m) = models else {
                     return Err(format!(
                         "roles.{}: this server defines no model provider",
@@ -194,16 +176,12 @@ impl AssistantSettings {
                         p.model
                     ));
                 }
-                if p.max_output_tokens == Some(0) {
-                    return Err(format!(
-                        "roles.{}: maxOutputTokens must be at least 1",
-                        role.as_str()
-                    ));
-                }
             }
         }
         for name in self.send_by_provider.keys() {
-            if models.and_then(|m| m.provider(name)).is_none() {
+            if let Some(models) = check
+                && models.and_then(|m| m.provider(name)).is_none()
+            {
                 return Err(format!(
                     "sendByProvider: the server defines no provider named {name:?}"
                 ));
@@ -250,33 +228,21 @@ impl AssistantSettings {
     }
 }
 
-/// The settings of a dataset (the defaults without a file, or with one that cannot be
-/// read, which is logged).
-pub fn settings(st: &AppState, ds: &Dataset) -> AssistantSettings {
-    match read_file(st, ds, ASSISTANT_FILE) {
-        Ok(Some(v)) => serde_json::from_value(v).unwrap_or_else(|e| {
-            tracing::warn!(dataset = %ds.name, "{ASSISTANT_FILE}: {e}");
-            AssistantSettings::default()
-        }),
-        Ok(None) => AssistantSettings::default(),
-        Err(e) => {
-            tracing::warn!(dataset = %ds.name, "{e:#}");
-            AssistantSettings::default()
-        }
+impl Typed for AssistantSettings {
+    fn validate(&self, providers: Providers) -> Result<(), String> {
+        AssistantSettings::validate(self, providers)
     }
+}
+
+/// The effective settings of a dataset (spec C19 §4).
+pub fn settings(st: &AppState, ds: &Dataset) -> AssistantSettings {
+    crate::settings::effective(st, ds, &crate::settings::ASSISTANT)
 }
 
 /// The settings of a database directory for `sparkles ask --loc`.
 #[cfg(feature = "mcp")]
 pub fn settings_at(dir: &std::path::Path) -> anyhow::Result<Option<AssistantSettings>> {
-    use anyhow::Context;
-    match std::fs::read(dir.join(ASSISTANT_FILE)) {
-        Ok(b) => Ok(Some(serde_json::from_slice(&b).with_context(|| {
-            format!("{ASSISTANT_FILE} of {}", dir.display())
-        })?)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e).with_context(|| format!("reading {ASSISTANT_FILE}")),
-    }
+    crate::settings::effective_at(dir, &crate::settings::ASSISTANT)
 }
 
 /// The role lists of a dataset (§3.5, §3.7): its overrides over the server's lists, with
@@ -295,7 +261,7 @@ pub fn ask_status(st: &AppState, s: &AssistantSettings) -> Result<(), &'static s
     if !cfg!(feature = "mcp") {
         return Err("this server is built without the mcp feature, which asking needs");
     }
-    let Some(m) = &st.models else {
+    let Some(m) = st.models() else {
         return Err("this server has no model providers (serve --model-config)");
     };
     if !s.enabled {
@@ -929,13 +895,13 @@ pub fn routes() -> Router<Arc<AppState>> {
 fn settings_json(st: &AppState, s: &AssistantSettings) -> Value {
     let mut v = serde_json::to_value(s).unwrap_or_default();
     let mut status = json!({
-        "models": st.models.is_some(),
+        "models": st.models().is_some(),
         "historyDays": s.history_days(st),
     });
     match ask_status(st, s) {
         Ok(()) => {
             status["ask"] = true.into();
-            if let Some(m) = &st.models {
+            if let Some(m) = st.models() {
                 let draft = s
                     .roles
                     .get(&Role::Draft)
@@ -966,21 +932,24 @@ async fn get_settings(State(st): St, Path(name): Path<String>) -> ApiResult<Json
     Ok(Json(settings_json(&st, &settings(&st, &ds))))
 }
 
+/// `PUT /$/assistant/{ds}`: the `PUT` of `/$/settings/{ds}/assistant`, with the
+/// answer of `GET`.
 async fn put_settings(
     State(st): St,
     Path(name): Path<String>,
+    headers: axum::http::HeaderMap,
     AdminBody(body): AdminBody,
 ) -> ApiResult<Json<Value>> {
     let ds = dataset(&st, &name)?;
-    let s = AssistantSettings::parse(&body, st.models.as_deref())
-        .map_err(|m| err_code(StatusCode::BAD_REQUEST, "bad-settings", m))?;
-    let v = serde_json::to_value(&s).unwrap_or_default();
-    blocking(move || {
-        write_file(&st, &ds, ASSISTANT_FILE, &v)
-            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
-        Ok(Json(settings_json(&st, &s)))
-    })
-    .await
+    let r = crate::settings::http::write(
+        st.clone(),
+        ds.clone(),
+        &crate::settings::ASSISTANT,
+        crate::settings::http::Write::Put(body),
+        &headers,
+    )
+    .await?;
+    Ok(Json(settings_json(&st, &r.typed(&ds.name))))
 }
 
 #[derive(Deserialize, Default)]

@@ -382,13 +382,13 @@ async fn the_routes() {
         }
     });
     let mut st = state();
-    st.models = Some(Arc::new(models(
+    st.models = arc_swap::ArcSwapOption::from_pointee(models(
         json!({
             "gw": { "kind": "openai", "endpoint": mock.url(), "apiKey": {"secret": "gw"}, "models": {"m1": {}} },
             "gone": { "kind": "openai", "endpoint": mock.url(), "apiKey": {"secret": "nothing"} }
         }),
         &[("gw", "env:SPARKLES_TEST_MODEL_KEY_ROUTES")],
-    )));
+    ));
     let app = crate::http::router(Arc::new(st));
     let (s, b) = send(
         app.clone(),

@@ -96,7 +96,8 @@ impl Tools<'_> {
         started: Instant,
     ) -> Option<model::Written> {
         let st = &self.server.state;
-        let models = st.models.as_ref()?;
+        let models = st.models()?;
+        let models: &crate::models::Models = &models;
         let settings = crate::assistant::settings(st, ds);
         let me = self.call.principal.id();
         // a daily cap that is used up refuses the call before it is made (§3.5)
@@ -253,7 +254,7 @@ pub(crate) fn sparql_explain(
     let st = &server.state;
     let settings = crate::assistant::settings(st, &ds);
     let describe =
-        b.describe.unwrap_or(settings.enabled && settings.explain) && st.models.is_some();
+        b.describe.unwrap_or(settings.enabled && settings.explain) && st.models().is_some();
     let w = if describe {
         t.explain_with_model(&ds, &b.query, &built, stop.as_ref(), started)
     } else {

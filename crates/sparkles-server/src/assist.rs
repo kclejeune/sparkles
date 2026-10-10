@@ -212,7 +212,7 @@ impl MemorySettings {
             .any(|p| crate::auth::glob(p, graph))
     }
 
-    fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), String> {
         if self.agent_graphs.len() > MAX_AGENT_GRAPHS {
             return Err(format!("agentGraphs: at most {MAX_AGENT_GRAPHS} patterns"));
         }
@@ -355,20 +355,49 @@ pub(crate) fn write_file(st: &AppState, ds: &Dataset, file: &'static str, v: &Va
     }
 }
 
-/// The memory settings of a dataset (the defaults without a file, or with one that
-/// cannot be read, which is logged).
-pub fn memory_settings(st: &AppState, ds: &Dataset) -> MemorySettings {
-    match read_file(st, ds, MEMORY_FILE) {
-        Ok(Some(v)) => serde_json::from_value(v).unwrap_or_else(|e| {
-            tracing::warn!(dataset = %ds.name, "{MEMORY_FILE}: {e}");
-            MemorySettings::default()
-        }),
-        Ok(None) => MemorySettings::default(),
-        Err(e) => {
-            tracing::warn!(dataset = %ds.name, "{e:#}");
-            MemorySettings::default()
+/// Remove a dataset's file (nothing when there is none).
+pub(crate) fn remove_file(st: &AppState, ds: &Dataset, file: &'static str) -> Result<()> {
+    match ds.store.root() {
+        Some(root) => match std::fs::remove_file(root.join(file)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                Err(e).with_context(|| format!("removing {file} of {}", ds.name))
+            }
+            _ => Ok(()),
+        },
+        None => {
+            st.volatile.0.lock().remove(&(ds.name.clone(), file));
+            Ok(())
         }
     }
+}
+
+impl Volatile {
+    /// Carry the files of an in-memory dataset over to its new name.
+    pub fn rename(&self, from: &str, to: &str) {
+        let mut m = self.0.lock();
+        let keys: Vec<_> = m.keys().filter(|k| k.0 == from).cloned().collect();
+        for k in keys {
+            if let Some(v) = m.remove(&k) {
+                m.insert((to.to_string(), k.1), v);
+            }
+        }
+    }
+
+    /// Forget the files of a deleted in-memory dataset.
+    pub fn forget(&self, name: &str) {
+        self.0.lock().retain(|k, _| k.0 != name);
+    }
+}
+
+impl crate::settings::Typed for MemorySettings {
+    fn validate(&self, _: crate::settings::Providers) -> Result<(), String> {
+        MemorySettings::validate(self)
+    }
+}
+
+/// The effective memory settings of a dataset (spec C19 §4).
+pub fn memory_settings(st: &AppState, ds: &Dataset) -> MemorySettings {
+    crate::settings::effective(st, ds, &crate::settings::MEMORY)
 }
 
 pub fn routes() -> Router<Arc<AppState>> {
@@ -389,22 +418,24 @@ async fn get_memory(State(st): St, Path(name): Path<String>) -> ApiResult<Json<V
     ))
 }
 
+/// `PUT /$/memory/{ds}`: the `PUT` of `/$/settings/{ds}/memory`, with the answer of
+/// `GET`.
 async fn put_memory(
     State(st): St,
     Path(name): Path<String>,
+    headers: axum::http::HeaderMap,
     AdminBody(body): AdminBody,
 ) -> ApiResult<Json<Value>> {
     let ds = dataset(&st, &name)?;
-    let s: MemorySettings =
-        serde_json::from_slice(&body).map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
-    s.validate().map_err(|m| err(StatusCode::BAD_REQUEST, m))?;
-    let v = serde_json::to_value(&s).unwrap_or_default();
-    blocking(move || {
-        write_file(&st, &ds, MEMORY_FILE, &v)
-            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
-        Ok(Json(v))
-    })
-    .await
+    let r = crate::settings::http::write(
+        st,
+        ds,
+        &crate::settings::MEMORY,
+        crate::settings::http::Write::Put(body),
+        &headers,
+    )
+    .await?;
+    Ok(Json(r.effective))
 }
 
 /// One suggested example.

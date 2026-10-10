@@ -61,7 +61,7 @@ fn app(urls: [&str; 3], roles: Value) -> (Arc<AppState>, Router) {
         },
     );
     let mut st = AppState::standalone(Default::default(), Duration::from_secs(30));
-    st.models = Some(Arc::new(models));
+    st.models = arc_swap::ArcSwapOption::from_pointee(models);
     st.limits.max_result_bytes = None;
     let st = Arc::new(st);
     let ds = st.attach("org", DbType::Mem, None).unwrap();

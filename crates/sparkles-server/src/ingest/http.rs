@@ -385,7 +385,7 @@ fn spawn(
         }
         let cfg = crate::mcp::rest::config(&st, crate::mcp::rest::Mode::Write);
         let server = crate::mcp::McpServer::new(st.clone(), cfg);
-        let models = st.models.clone();
+        let models = st.models();
         let ctx = Ctx {
             server: &server,
             models: models.as_deref(),

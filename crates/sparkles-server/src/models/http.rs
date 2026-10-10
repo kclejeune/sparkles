@@ -23,7 +23,7 @@ pub fn routes() -> Router<Arc<AppState>> {
 
 /// The providers and role lists; an empty listing without `--model-config`.
 async fn list(State(st): St) -> Json<Value> {
-    Json(match &st.models {
+    Json(match st.models() {
         Some(m) => {
             let mut v = m.describe();
             v["configured"] = true.into();
@@ -46,7 +46,7 @@ async fn test(
     Path(name): Path<String>,
     AdminBody(body): AdminBody,
 ) -> ApiResult<Json<Value>> {
-    let Some(models) = st.models.clone() else {
+    let Some(models) = st.models() else {
         return Err(err_code(
             StatusCode::NOT_FOUND,
             "no-models",

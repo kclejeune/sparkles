@@ -136,9 +136,7 @@ pub fn run_cli(args: AskArgs, store_opts: StoreOptions) -> Result<()> {
         None => None,
     }
     .unwrap_or_default();
-    if let Err(e) =
-        crate::assistant::AssistantSettings::parse(&serde_json::to_vec(&settings)?, Some(&models))
-    {
+    if let Err(e) = settings.validate(crate::settings::Providers::Checked(Some(&models))) {
         bail!("assistant.json: {e}");
     }
     let lists = crate::assistant::lists(&models, &settings);

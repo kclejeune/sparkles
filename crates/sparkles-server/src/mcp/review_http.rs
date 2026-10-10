@@ -14,7 +14,7 @@
 //! `assert_facts` or the guard as the request's principal, so the grants on the graphs
 //! and branches it touches decide, as they do for an agent.
 
-use super::memory::ingest::{INGEST_FILE, IngestSettings, ProfileSpec, ingest_settings};
+use super::memory::ingest::{INGEST_FILE, MAX_PROFILES, ProfileSpec, ingest_settings, profiles};
 use super::rest::{Mode, config, tool_error};
 use super::{Call, McpServer, Outcome};
 use crate::auth::Principal;
@@ -27,6 +27,7 @@ use axum::routing::{get, post, put};
 use axum::{Extension, Json, Router};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
@@ -186,14 +187,31 @@ action!(edit, "memory_edit");
 
 // --- ingest settings ----------------------------------------------------------------
 
-/// Serializes the read-modify-write of ingest settings.
-static INGEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-fn store(st: &AppState, ds: &crate::state::Dataset, s: &IngestSettings) -> ApiResult<()> {
-    s.validate().map_err(|m| err(StatusCode::BAD_REQUEST, m))?;
-    let v = serde_json::to_value(s).unwrap_or_default();
-    crate::assist::write_file(st, ds, INGEST_FILE, &v)
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))
+/// Replace the profiles of `ingest.json` and keep its settings members. The caller holds
+/// the lock that serializes writes to the dataset's ingest settings.
+fn store_profiles(
+    st: &AppState,
+    ds: &crate::state::Dataset,
+    profiles: &BTreeMap<String, ProfileSpec>,
+) -> ApiResult<()> {
+    let internal = |e: anyhow::Error| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"));
+    let mut m = match crate::assist::read_file(st, ds, INGEST_FILE).map_err(internal)? {
+        Some(Value::Object(m)) => m,
+        _ => Map::new(),
+    };
+    if profiles.is_empty() {
+        m.remove("profiles");
+    } else {
+        m.insert(
+            "profiles".into(),
+            serde_json::to_value(profiles).unwrap_or_default(),
+        );
+    }
+    if m.is_empty() {
+        crate::assist::remove_file(st, ds, INGEST_FILE).map_err(internal)
+    } else {
+        crate::assist::write_file(st, ds, INGEST_FILE, &Value::Object(m)).map_err(internal)
+    }
 }
 
 fn main_dataset(st: &AppState, name: &str) -> ApiResult<Arc<crate::state::Dataset>> {
@@ -222,59 +240,35 @@ async fn list_profiles(
     })))
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct SettingsBody {
-    keep_text: Option<bool>,
-    /// `null` restores the default
-    #[serde(default, deserialize_with = "some")]
-    confirm_tokens: Option<Option<u64>>,
-    #[serde(default, deserialize_with = "some")]
-    auto_confidence: Option<Option<f64>>,
-}
-
-/// A member that is present, `null` included.
-fn some<'de, T: Deserialize<'de>, D: serde::Deserializer<'de>>(
-    d: D,
-) -> Result<Option<Option<T>>, D::Error> {
-    Option::<T>::deserialize(d).map(Some)
-}
-
+/// `PUT /$/ingest/{ds}/settings`: the `PATCH` of `/$/settings/{ds}/ingest`, so a member
+/// left out keeps its value and `null` falls back to the declared value or the default.
 async fn put_settings(
     State(st): State<Arc<AppState>>,
     Path(name): Path<String>,
+    headers: HeaderMap,
     AdminBody(body): AdminBody,
 ) -> ApiResult<Json<Value>> {
     if st.read_only {
         return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
     }
     let ds = main_dataset(&st, &name)?;
-    let b: SettingsBody =
-        serde_json::from_slice(&body).map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
-    blocking(move || {
-        let _g = INGEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let mut s = ingest_settings(&st, &ds);
-        if let Some(k) = b.keep_text {
-            s.keep_text = k;
-        }
-        if let Some(c) = b.confirm_tokens {
-            s.confirm_tokens = c;
-        }
-        if let Some(c) = b.auto_confidence {
-            s.auto_confidence = c;
-        }
-        s.validate().map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
-        store(&st, &ds, &s)?;
-        let mut out = json!({"dataset": ds.name, "keepText": s.keep_text});
-        if let Some(c) = s.confirm_tokens {
-            out["confirmTokens"] = c.into();
-        }
-        if let Some(c) = s.auto_confidence {
-            out["autoConfidence"] = c.into();
-        }
-        Ok(Json(out))
-    })
-    .await
+    let r = crate::settings::http::write(
+        st.clone(),
+        ds.clone(),
+        &crate::settings::INGEST,
+        crate::settings::http::Write::Patch(body),
+        &headers,
+    )
+    .await?;
+    let f: crate::settings::IngestFields = r.typed(&ds.name);
+    let mut out = json!({"dataset": ds.name, "keepText": f.keep_text});
+    if let Some(c) = f.confirm_tokens {
+        out["confirmTokens"] = c.into();
+    }
+    if let Some(c) = f.auto_confidence {
+        out["autoConfidence"] = c.into();
+    }
+    Ok(Json(out))
 }
 
 fn profile_name(n: &str) -> ApiResult<()> {
@@ -320,10 +314,17 @@ async fn put_profile(
     spec.validate()
         .map_err(|m| err(StatusCode::BAD_REQUEST, format!("profile {profile}: {m}")))?;
     blocking(move || {
-        let _g = INGEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let mut s = ingest_settings(&st, &ds);
-        s.profiles.insert(profile, spec.clone());
-        store(&st, &ds, &s)?;
+        let lock = st.settings.write_lock(&ds.name, &crate::settings::INGEST);
+        let _g = lock.lock();
+        let mut list = profiles(&st, &ds);
+        list.insert(profile, spec.clone());
+        if list.len() > MAX_PROFILES {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                format!("at most {MAX_PROFILES} profiles"),
+            ));
+        }
+        store_profiles(&st, &ds, &list)?;
         Ok(Json(serde_json::to_value(&spec).unwrap_or_default()))
     })
     .await
@@ -339,15 +340,16 @@ async fn delete_profile(
     let ds = main_dataset(&st, &name)?;
     profile_name(&profile)?;
     blocking(move || {
-        let _g = INGEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let mut s = ingest_settings(&st, &ds);
-        if s.profiles.remove(&profile).is_none() {
+        let lock = st.settings.write_lock(&ds.name, &crate::settings::INGEST);
+        let _g = lock.lock();
+        let mut list = profiles(&st, &ds);
+        if list.remove(&profile).is_none() {
             return Err(err(
                 StatusCode::NOT_FOUND,
                 format!("no profile {profile} in dataset {}", ds.name),
             ));
         }
-        store(&st, &ds, &s)?;
+        store_profiles(&st, &ds, &list)?;
         Ok(StatusCode::NO_CONTENT.into_response())
     })
     .await

@@ -34,7 +34,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 /// The per-dataset file of ingest profiles and settings.
-pub const INGEST_FILE: &str = "ingest.json";
+pub use crate::settings::INGEST_FILE;
 /// The largest text of one source, in bytes (§7.1).
 pub const MAX_TEXT_BYTES: usize = 2 << 20;
 /// Chunks aim at about 1,000 tokens: at most this many code points.
@@ -48,7 +48,7 @@ const MAX_SOURCES: u64 = 200;
 /// The most sources `list_sources` reads before its `needsExtraction` filter.
 const MAX_FILTERED: usize = 5000;
 /// The most profiles a dataset keeps.
-const MAX_PROFILES: usize = 50;
+pub const MAX_PROFILES: usize = 50;
 /// The most classes and predicates an explicit profile lists.
 const MAX_PROFILE_TERMS: usize = 2000;
 
@@ -173,6 +173,9 @@ impl ProfileSpec {
 }
 
 impl IngestSettings {
+    /// The checks of the whole file; the routes check the settings members through the
+    /// `ingest` settings kind and each profile on its own.
+    #[cfg(test)]
     pub fn validate(&self) -> Result<(), String> {
         if self
             .auto_confidence
@@ -195,20 +198,35 @@ impl IngestSettings {
     }
 }
 
-/// The ingest settings of a dataset (the defaults without a file, or with one that
-/// cannot be read, which is logged).
+/// The ingest settings of a dataset: the effective settings members of spec C19 §4,
+/// and the profiles of `ingest.json`, which a profile that cannot be read leaves out
+/// (logged).
 pub fn ingest_settings(st: &AppState, ds: &Dataset) -> IngestSettings {
+    let f: crate::settings::IngestFields =
+        crate::settings::effective(st, ds, &crate::settings::INGEST);
+    IngestSettings {
+        keep_text: f.keep_text,
+        profiles: profiles(st, ds),
+        confirm_tokens: f.confirm_tokens,
+        auto_confidence: f.auto_confidence,
+    }
+}
+
+/// The profiles of `ingest.json`, which the `ingest` settings kind leaves out.
+pub fn profiles(st: &AppState, ds: &Dataset) -> BTreeMap<String, ProfileSpec> {
     let main = ds.main();
     let main: &Dataset = main.as_deref().unwrap_or(ds);
     match crate::assist::read_file(st, main, INGEST_FILE) {
-        Ok(Some(v)) => serde_json::from_value(v).unwrap_or_else(|e| {
-            tracing::warn!(dataset = %ds.name, "{INGEST_FILE}: {e}");
-            IngestSettings::default()
-        }),
-        Ok(None) => IngestSettings::default(),
+        Ok(Some(v)) => serde_json::from_value(v.get("profiles").cloned().unwrap_or(Value::Null))
+            .map(Option::unwrap_or_default)
+            .unwrap_or_else(|e| {
+                tracing::warn!(dataset = %ds.name, "{INGEST_FILE}: profiles: {e}");
+                BTreeMap::new()
+            }),
+        Ok(None) => BTreeMap::new(),
         Err(e) => {
             tracing::warn!(dataset = %ds.name, "{e:#}");
-            IngestSettings::default()
+            BTreeMap::new()
         }
     }
 }
