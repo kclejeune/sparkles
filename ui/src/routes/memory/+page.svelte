@@ -26,6 +26,7 @@
   import { LatestRun } from '$lib/supersede';
   import Icon from '$components/Icon.svelte';
   import InboxPanel from '$components/InboxPanel.svelte';
+  import { reviewCounts } from '$lib/review-count.svelte';
   import IngestSettings from '$components/IngestSettings.svelte';
   import RecallView from '$components/RecallView.svelte';
   import TermView from '$components/TermView.svelte';
@@ -227,7 +228,14 @@
     </div>
     {#if tab === 'inbox'}
       {#key ds}
-        <InboxPanel {ds} oncount={(n) => (inboxCount = n)} />
+        <InboxPanel
+          {ds}
+          oncount={(n) => {
+            // the sidebar's badge follows the reviewer's actions
+            if (inboxCount != null && n !== inboxCount) void reviewCounts.refresh(ds);
+            inboxCount = n;
+          }}
+        />
       {/key}
     {:else}
       <section class="card" aria-label="Search memory">

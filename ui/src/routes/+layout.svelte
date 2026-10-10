@@ -10,6 +10,8 @@
   import { fmtCompact } from '$lib/format';
   import { poll } from '$lib/poll';
   import Icon from '$components/Icon.svelte';
+  import ReviewBadge from '$components/ReviewBadge.svelte';
+  import { reviewCounts } from '$lib/review-count.svelte';
   import Toasts from '$components/Toasts.svelte';
   import UserMenu from '$components/UserMenu.svelte';
 
@@ -33,6 +35,14 @@
   ]);
 
   const currentInfo = $derived(app.datasets.find((d) => d.name === app.current));
+  // the open review items of the current dataset, on the Memory entry
+  const review = $derived(reviewCounts.of(app.current));
+  $effect(() => {
+    const ds = app.current;
+    if (!ds || bare) return;
+    const p = poll(() => reviewCounts.refresh(ds), { interval: 60_000 });
+    return () => p.stop();
+  });
   // sign-in and CLI approval pages render without the sidebar
   const bare = $derived(/^\/ui\/(login|cli)(\/|$)/.test(page.url.pathname));
 
@@ -138,6 +148,7 @@
         >
           <Icon name={item.icon} size={16} />
           <span>{item.label}</span>
+          {#if item.href === '/memory'}<ReviewBadge counts={review} />{/if}
         </a>
       {/each}
     </nav>
@@ -339,6 +350,9 @@
     width: 3px;
     border-radius: 0 2px 2px 0;
     background: var(--spark);
+  }
+  nav a :global(.review-badge) {
+    margin-left: auto;
   }
   nav a.active :global(.icon) {
     color: var(--spark-ink);
