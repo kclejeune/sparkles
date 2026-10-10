@@ -1,4 +1,10 @@
 //! Node-API bridge. Shared globals contain Rust-only values, never JavaScript handles.
+/// The library's own allocations go to mimalloc when the feature is on. The host runtime keeps
+/// its own heap, so this changes only the native side's allocations.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod admin;
 #[cfg(feature = "backup")]
 mod backups;
