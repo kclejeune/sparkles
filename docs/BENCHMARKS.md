@@ -1143,6 +1143,8 @@ adds nothing here.
 **The result cache** answers repeated queries from memory, up to 512 MiB per dataset
 (`--result-cache-mb`). It was off in every run on this page.
 
+<a id="streaming-execution"></a>
+
 **Eager execution** materializes each operator's result within the query's row and memory
 budgets. Opt-in streaming execution returns bounded batches and charges growing operator
 state to the budget, while sorts and some operators still need their full input. These
