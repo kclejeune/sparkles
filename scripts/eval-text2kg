@@ -1,0 +1,563 @@
+#!/usr/bin/env python3
+"""The Text2KGBench run of C18 §11.2: server-side extraction against a fixed ontology.
+
+    scripts/eval-text2kg --data DIR --model-config models.json --pair PROVIDER/MODEL ...
+                         [--model-secret NAME=env:VAR ...] [--ontology ID ...]
+                         [--limit N] [--sparkles BIN] [--out DIR]
+    scripts/eval-text2kg --self-test [--sparkles BIN] [--out DIR]
+
+Text2KGBench (Mihindukulasooriya et al., ISWC 2023) gives, for each domain of its
+Wikidata-TekGen and DBpedia-WebNLG parts, an ontology and test sentences with gold
+triples. `--data` is a directory of that layout, such as `data/wikidata_tekgen` of the
+benchmark's repository, which this script never downloads:
+
+- `ontologies/*_ontology.json`: `{"id", "title", "concepts": [{"qid", "label"}],
+  "relations": [{"pid", "label", "domain", "range"}]}`, where `domain` and `range` name a
+  concept by its `qid` or its label.
+- `ground_truth/*_ground_truth.jsonl`: one object per sentence, `{"id", "sent",
+  "triples": [{"sub", "rel", "obj"}]}`. A file belongs to the ontology whose `id` its
+  name starts with, after an optional `ont_`.
+
+For each pair, the script loads every ontology into its own database as classes and
+properties with labels, domains and ranges, stores one ingest profile per ontology, and
+serves the databases with `sparkles serve` on a loopback port. The pair becomes the
+dataset's `extract` list, and each sentence is one `POST /$/ingest/{ds}` with that
+profile, which proposes facts on a review branch. The script reads each branch through
+`GET /$/memory/{ds}/review/{branch}` and turns its facts back into labelled triples: the
+subject's and object's labels, the relation's label and a literal's value. The type and
+label that declare a new entity are not triples.
+
+The metrics are those of Text2KGBench, with labels compared after case folding and
+collapsing punctuation and spaces.
+
+- Precision, recall and F1 per sentence, averaged over the sentences, and the same
+  counted over all triples.
+- Ontology conformance, the share of proposed triples whose relation is in the
+  ontology. The extraction's schema lists only the profile's predicates, so anything
+  below 1 is a defect of the server.
+- Subject and object hallucination, the share of proposed triples whose subject or
+  object does not occur in the sentence.
+- Tokens and estimated cost per sentence, from each task's usage.
+
+Reports are written outside the repository, to `--out` or a new directory under the
+system's temporary directory: `report.md` and `report.json`.
+
+`--self-test` writes a small benchmark of its own in the same layout, starts a mock
+provider that speaks the OpenAI protocol with the models `oracle` and `weak`, and runs
+both. The oracle answers the gold triples with the sentence as the quote and must score
+1 on precision, recall, F1 and conformance with no hallucination. The weak model drops a
+triple from each sentence with more than one and invents the object of each sentence
+with one, and must score lower on each. It needs no key and makes no network call outside the loopback interface.
+"""
+
+import argparse
+import json
+import pathlib
+import re
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+BASE = "http://text2kgbench.example/"
+RDF_TYPE = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>"
+RDFS_LABEL = "<http://www.w3.org/2000/01/rdf-schema#label>"
+LIT = re.compile(r'^"(.*)"(?:@[A-Za-z0-9-]+|\^\^<[^>]*>)?$', re.S)
+
+
+# --- the benchmark ---------------------------------------------------------------------
+
+
+def slug(s):
+    return re.sub(r"[^A-Za-z0-9]+", "_", s).strip("_") or "x"
+
+
+def norm(s):
+    s = unicodedata.normalize("NFKC", s or "").casefold()
+    return " ".join(re.sub(r"[^\w]+", " ", s).split())
+
+
+def load_benchmark(data, only, limit):
+    """The ontologies of `data` with their sentences: {id: {"ontology", "sentences"}}."""
+    data = pathlib.Path(data)
+    onts = {}
+    for f in sorted(data.rglob("*_ontology.json")):
+        o = json.loads(f.read_text())
+        oid = o.get("id") or f.name.removesuffix("_ontology.json")
+        onts[oid] = {"ontology": o, "sentences": []}
+    for f in sorted(data.rglob("*_ground_truth.jsonl")):
+        stem = f.name.removesuffix("_ground_truth.jsonl")
+        match = [
+            k for k in onts
+            if stem == k or stem.startswith(k + "_") or stem.removeprefix("ont_").startswith(k.removeprefix("ont_"))
+        ]
+        if not match:
+            print(f"eval-text2kg: no ontology for {f}", file=sys.stderr)
+            continue
+        oid = max(match, key=len)
+        for line in f.read_text().splitlines():
+            if line.strip():
+                onts[oid]["sentences"].append(json.loads(line))
+    if only:
+        onts = {k: v for k, v in onts.items() if k in only}
+    for v in onts.values():
+        if limit:
+            v["sentences"] = v["sentences"][:limit]
+    return {k: v for k, v in onts.items() if v["sentences"]}
+
+
+def terms(oid, o):
+    """The IRIs of an ontology's concepts and relations, by id and by label."""
+    concepts = {}
+    for c in o.get("concepts", []):
+        iri = f"{BASE}{slug(oid)}/class/{slug(c.get('qid') or c['label'])}"
+        concepts[c.get("qid") or c["label"]] = (iri, c["label"])
+        concepts.setdefault(c["label"], (iri, c["label"]))
+    relations = {}
+    for r in o.get("relations", []):
+        iri = f"{BASE}{slug(oid)}/rel/{slug(r.get('pid') or r['label'])}"
+        relations[iri] = r
+    return concepts, relations
+
+
+def esc(s):
+    return s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
+def turtle(oid, o):
+    concepts, relations = terms(oid, o)
+    out = [
+        "@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .",
+        "@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .",
+        "@prefix owl: <http://www.w3.org/2002/07/owl#> .",
+        "",
+    ]
+    for iri, label in sorted(set(concepts.values())):
+        out.append(f'<{iri}> a owl:Class ; rdfs:label "{esc(label)}"@en .')
+    for iri, r in relations.items():
+        line = f'<{iri}> a rdf:Property ; rdfs:label "{esc(r["label"])}"@en'
+        for k, p in (("domain", "rdfs:domain"), ("range", "rdfs:range")):
+            c = concepts.get(r.get(k) or "")
+            if c:
+                line += f" ; {p} <{c[0]}>"
+        out.append(line + " .")
+    return "\n".join(out) + "\n"
+
+
+def profile(oid, o):
+    concepts, relations = terms(oid, o)
+    return {
+        "classes": sorted({iri for iri, _ in concepts.values()}),
+        "predicates": list(relations),
+    }
+
+
+# --- a server --------------------------------------------------------------------------
+
+
+class Client:
+    def __init__(self, base):
+        self.base = base.rstrip("/")
+
+    def request(self, method, path, body=None):
+        h = {"Accept": "application/json"}
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode()
+            h["Content-Type"] = "application/json"
+        req = urllib.request.Request(self.base + path, data=data, method=method, headers=h)
+        try:
+            with urllib.request.urlopen(req, timeout=120) as r:
+                raw = r.read().decode()
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(f"{method} {path}: {e.code} {e.read().decode()[:500]}") from None
+        return json.loads(raw) if raw.strip() else None
+
+
+def free_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def serve(args, dbs, tmp):
+    port = free_port()
+    cmd = [args.sparkles, "serve", "--port", str(port), "--data", str(tmp / "data"),
+           "--outbound-allow-private", "--model-config", args.model_config]
+    for name, db in dbs.items():
+        cmd += ["--loc", f"{name}={db}"]
+    for s in args.model_secret:
+        cmd += ["--model-secret", s]
+    proc = subprocess.Popen(cmd, stdout=open(tmp / "serve.log", "w"), stderr=subprocess.STDOUT)
+    client = Client(f"http://127.0.0.1:{port}")
+    for _ in range(300):
+        try:
+            with urllib.request.urlopen(f"{client.base}/$/ping", timeout=5):
+                return proc, client
+        except Exception:
+            if proc.poll() is not None:
+                sys.exit(f"eval-text2kg: sparkles serve exited; see {tmp / 'serve.log'}")
+            time.sleep(0.2)
+    proc.terminate()
+    sys.exit("eval-text2kg: sparkles serve did not answer")
+
+
+def ingest(client, ds, oid, sent, deadline):
+    """One sentence through the server: the task as it ended."""
+    q = urllib.parse.quote
+    t = client.request("POST", f"/$/ingest/{q(ds)}", {
+        "text": sent["sent"],
+        "format": "text/plain",
+        "title": sent.get("id"),
+        "profile": slug(oid),
+        "mode": "branch",
+        "confirm": True,
+        "deadlineSeconds": deadline,
+    })
+    tid = t["id"]
+    while t.get("status") not in ("done", "failed", "cancelled"):
+        t = client.request("GET", f"/$/ingest/{q(ds)}/{q(tid)}?wait=30")
+    return t
+
+
+def triples(review, relations):
+    """A review branch's facts as (subject, relation, object) labels."""
+    out = []
+    for f in review.get("facts", []):
+        if f["p"] in (RDF_TYPE, RDFS_LABEL):
+            continue
+        rel = relations.get(f["p"].strip("<>"))
+        rel_label = rel["label"] if rel else f["p"].strip("<>").rsplit("/", 1)[-1]
+        m = LIT.match(f["o"])
+        obj = m.group(1) if m else f.get("oLabel") or f["o"].strip("<>").rsplit("/", 1)[-1]
+        sub = f.get("sLabel") or f["s"].strip("<>").rsplit("/", 1)[-1]
+        out.append({"sub": sub, "rel": rel_label, "obj": obj, "known": rel is not None})
+    return out
+
+
+# --- scoring ---------------------------------------------------------------------------
+
+
+def score_sentence(sent, got):
+    gold = {(norm(t["sub"]), norm(t["rel"]), norm(t["obj"])) for t in sent.get("triples", [])}
+    pred = {(norm(t["sub"]), norm(t["rel"]), norm(t["obj"])) for t in got}
+    tp = len(gold & pred)
+    text = norm(sent["sent"])
+    return {
+        "tp": tp,
+        "gold": len(gold),
+        "pred": len(pred),
+        "conforming": sum(1 for t in got if t["known"]),
+        "subjectHallucinated": sum(1 for t in got if norm(t["sub"]) not in text),
+        "objectHallucinated": sum(1 for t in got if norm(t["obj"]) not in text),
+        "proposed": len(got),
+    }
+
+
+def prf(tp, gold, pred):
+    p = tp / pred if pred else (1.0 if not gold else 0.0)
+    r = tp / gold if gold else 1.0
+    f = 2 * p * r / (p + r) if p + r else 0.0
+    return p, r, f
+
+
+def summarize(rows):
+    n = len(rows)
+    macro = [prf(x["tp"], x["gold"], x["pred"]) for x in rows]
+    tp = sum(x["tp"] for x in rows)
+    gold = sum(x["gold"] for x in rows)
+    pred = sum(x["pred"] for x in rows)
+    proposed = sum(x["proposed"] for x in rows)
+    tokens = sum(x["tokens"] for x in rows)
+    costs = [x["cost"] for x in rows if x["cost"] is not None]
+    micro = prf(tp, gold, pred)
+    return {
+        "sentences": n,
+        "failed": sum(1 for x in rows if x["status"] != "done"),
+        "precision": sum(m[0] for m in macro) / n if n else None,
+        "recall": sum(m[1] for m in macro) / n if n else None,
+        "f1": sum(m[2] for m in macro) / n if n else None,
+        "microPrecision": micro[0],
+        "microRecall": micro[1],
+        "microF1": micro[2],
+        "conformance": sum(x["conforming"] for x in rows) / proposed if proposed else 1.0,
+        "subjectHallucination": sum(x["subjectHallucinated"] for x in rows) / proposed if proposed else 0.0,
+        "objectHallucination": sum(x["objectHallucinated"] for x in rows) / proposed if proposed else 0.0,
+        "tokensPerSentence": tokens / n if n else 0,
+        "costPerSentence": sum(costs) / n if costs and n else None,
+    }
+
+
+def fmt(v):
+    if v is None:
+        return "–"
+    if isinstance(v, float):
+        return f"{v:.3f}"
+    return str(v)
+
+
+COLUMNS = ["sentences", "failed", "precision", "recall", "f1", "microF1", "conformance",
+           "subjectHallucination", "objectHallucination", "tokensPerSentence", "costPerSentence"]
+
+
+def write_report(out, report):
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "report.json").write_text(json.dumps(report, indent=1))
+    lines = ["# Text2KGBench", "", "| Pair | Ontology | " + " | ".join(COLUMNS) + " |",
+             "|---|---|" + "---|" * len(COLUMNS)]
+    for pair, run in report["pairs"].items():
+        for oid, s in list(run["byOntology"].items()) + [("all", run["overall"])]:
+            lines.append(f"| {pair} | {oid} | " + " | ".join(fmt(s[c]) for c in COLUMNS) + " |")
+    (out / "report.md").write_text("\n".join(lines) + "\n")
+    return out / "report.md"
+
+
+# --- a run -----------------------------------------------------------------------------
+
+
+def run(args, bench, out):
+    tmp = pathlib.Path(tempfile.mkdtemp(prefix="sparkles-eval-text2kg-"))
+    dbs = {}
+    for i, pair in enumerate(args.pair):
+        ttl = tmp / f"ontologies-{i}.ttl"
+        ttl.write_text("".join(turtle(oid, v["ontology"]) for oid, v in bench.items()))
+        db = tmp / f"t2k{i}"
+        subprocess.run([args.sparkles, "load", "--loc", str(db), str(ttl)], check=True,
+                       stdout=subprocess.DEVNULL)
+        dbs[f"t2k{i}"] = db
+    proc, client = serve(args, dbs, tmp)
+    report = {"pairs": {}}
+    try:
+        for i, pair in enumerate(args.pair):
+            ds = f"t2k{i}"
+            provider, _, model = pair.partition("/")
+            client.request("PUT", f"/$/assistant/{ds}", {
+                "enabled": True, "ingest": True, "send": "documents",
+                "roles": {"extract": [{"provider": provider, "model": model}]},
+            })
+            for oid, v in bench.items():
+                client.request("PUT", f"/$/ingest/{ds}/profiles/{slug(oid)}", profile(oid, v["ontology"]))
+            by_ont = {}
+            rows_all = []
+            for oid, v in bench.items():
+                _, relations = terms(oid, v["ontology"])
+                rows = []
+                for sent in v["sentences"]:
+                    t = ingest(client, ds, oid, sent, args.deadline)
+                    got = []
+                    branch = (t.get("result") or {}).get("branch")
+                    if t.get("status") == "done" and branch:
+                        review = client.request(
+                            "GET",
+                            f"/$/memory/{ds}/review/{urllib.parse.quote(branch, safe='')}?limit=500",
+                        )
+                        got = triples(review, relations)
+                    elif t.get("status") != "done":
+                        print(f"eval-text2kg: {pair} {sent.get('id')}: {t.get('error')}", file=sys.stderr)
+                    row = score_sentence(sent, got)
+                    usage = t.get("usage") or {}
+                    row.update({
+                        "id": sent.get("id"),
+                        "status": t.get("status"),
+                        "tokens": usage.get("inputTokens", 0) + usage.get("outputTokens", 0),
+                        "cost": usage.get("estimatedCost"),
+                    })
+                    rows.append(row)
+                by_ont[oid] = summarize(rows)
+                rows_all += rows
+            report["pairs"][pair] = {"byOntology": by_ont, "overall": summarize(rows_all), "sentences": rows_all}
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    md = write_report(out, report)
+    print(md.read_text())
+    print(f"eval-text2kg: report in {out}", file=sys.stderr)
+    return report
+
+
+# --- the self-test ---------------------------------------------------------------------
+
+FIXTURE_ONTOLOGY = {
+    "id": "ont_1_book",
+    "title": "Book ontology",
+    "concepts": [
+        {"qid": "Q1", "label": "book"},
+        {"qid": "Q2", "label": "human"},
+        {"qid": "Q3", "label": "city"},
+        {"qid": "Q4", "label": "year"},
+    ],
+    "relations": [
+        {"pid": "P1", "label": "author", "domain": "Q1", "range": "Q2"},
+        {"pid": "P2", "label": "place of birth", "domain": "Q2", "range": "Q3"},
+        {"pid": "P3", "label": "publication year", "domain": "Q1", "range": "Q4"},
+    ],
+}
+
+FIXTURE_SENTENCES = [
+    ("The Quiet Harbour is a novel by Mara Venn, published in 1998.",
+     [("The Quiet Harbour", "author", "Mara Venn"), ("The Quiet Harbour", "publication year", "1998")]),
+    ("Mara Venn was born in Lisbon.", [("Mara Venn", "place of birth", "Lisbon")]),
+    ("Tomas Ide wrote Salt Lines, which appeared in 2004.",
+     [("Salt Lines", "author", "Tomas Ide"), ("Salt Lines", "publication year", "2004")]),
+    ("Born in Oslo, Tomas Ide later moved abroad.", [("Tomas Ide", "place of birth", "Oslo")]),
+]
+
+
+def write_fixture(d):
+    (d / "ontologies").mkdir(parents=True)
+    (d / "ground_truth").mkdir()
+    (d / "ontologies" / "1_book_ontology.json").write_text(json.dumps(FIXTURE_ONTOLOGY))
+    lines = [
+        json.dumps({"id": f"ont_1_book_test_{i + 1}", "sent": s,
+                    "triples": [{"sub": a, "rel": b, "obj": c} for a, b, c in ts]})
+        for i, (s, ts) in enumerate(FIXTURE_SENTENCES)
+    ]
+    (d / "ground_truth" / "ont_1_book_ground_truth.jsonl").write_text("\n".join(lines) + "\n")
+
+
+class MockProvider(BaseHTTPRequestHandler):
+    """An OpenAI-protocol provider: `oracle` answers the gold triples, `weak` errs."""
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers.get("content-length", 0))) or b"{}")
+        prompt = "\n".join(m.get("content") or "" for m in body.get("messages", []))
+        text = prompt.split("Text:\n<<<\n", 1)[-1].split("\n>>>", 1)[0]
+        schema = (((body.get("response_format") or {}).get("json_schema") or {}).get("schema") or {})
+        props = schema.get("properties", {})
+        p_enum = props.get("facts", {}).get("items", {}).get("properties", {}).get("p", {}).get("enum", [])
+        c_enum = props.get("mentions", {}).get("items", {}).get("properties", {}).get("type", {}).get("enum", [])
+
+        def pick(values, kind, ident):
+            for v in values:
+                if v.strip("<>").endswith(f"/{kind}/{ident}"):
+                    return v
+            return values[0] if values else ""
+
+        rels = {r["label"]: r for r in FIXTURE_ONTOLOGY["relations"]}
+        mentions, facts, keys = [], [], {}
+
+        def mention(name, cls):
+            if (name, cls) not in keys:
+                keys[(name, cls)] = f"m{len(keys)}"
+                mentions.append({"key": keys[(name, cls)], "text": name, "type": pick(c_enum, "class", cls)})
+            return keys[(name, cls)]
+
+        for sent, ts in FIXTURE_SENTENCES:
+            if sent not in text:
+                continue
+            ts = list(ts)
+            if body.get("model") == "weak":
+                if len(ts) > 1:
+                    ts = ts[:-1]
+                else:
+                    a, b, _ = ts[0]
+                    ts[0] = (a, b, "Unnamed Person" if b != "place of birth" else "Atlantis")
+            for a, b, c in ts:
+                r = rels[b]
+                f = {"s": mention(a, r["domain"]), "p": pick(p_enum, "rel", r["pid"]), "o": "",
+                     "literal": "", "datatype": "", "lang": "", "quote": sent, "confidence": 0.9}
+                if c.isdigit():
+                    f["literal"] = c
+                else:
+                    f["o"] = mention(c, r["range"])
+                facts.append(f)
+        out = json.dumps({
+            "choices": [{"message": {"role": "assistant",
+                                     "content": json.dumps({"mentions": mentions, "facts": facts})},
+                         "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": len(prompt) // 4, "completion_tokens": 60},
+        }).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(out)))
+        self.end_headers()
+        self.wfile.write(out)
+
+
+def self_test(args):
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), MockProvider)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    tmp = pathlib.Path(tempfile.mkdtemp(prefix="sparkles-eval-text2kg-self-test-"))
+    write_fixture(tmp / "bench")
+    cfg = {"models": {"providers": {"mock": {
+        "kind": "openai",
+        "endpoint": f"http://127.0.0.1:{srv.server_address[1]}",
+        "structuredOutput": "json-schema",
+        "models": {
+            "oracle": {"pricing": {"inputPerMTok": 1.0, "outputPerMTok": 5.0}},
+            "weak": {"pricing": {"inputPerMTok": 0.1, "outputPerMTok": 0.5}},
+        },
+    }}}}
+    (tmp / "models.json").write_text(json.dumps(cfg))
+    args.model_config = str(tmp / "models.json")
+    args.pair = ["mock/oracle", "mock/weak"]
+    bench = load_benchmark(tmp / "bench", None, None)
+    report = run(args, bench, pathlib.Path(args.out) if args.out else tmp / "report")
+    srv.shutdown()
+    o = report["pairs"]["mock/oracle"]["overall"]
+    w = report["pairs"]["mock/weak"]["overall"]
+    checks = [
+        ("every sentence ran", o["failed"] == 0 and w["failed"] == 0),
+        ("oracle precision is 1", o["precision"] == 1.0),
+        ("oracle recall is 1", o["recall"] == 1.0),
+        ("oracle F1 is 1", o["f1"] == 1.0),
+        ("oracle conforms", o["conformance"] == 1.0),
+        ("oracle does not hallucinate", o["subjectHallucination"] == 0 and o["objectHallucination"] == 0),
+        ("costs are counted", (o["costPerSentence"] or 0) > 0 and o["tokensPerSentence"] > 0),
+        ("weak precision is lower", w["precision"] < o["precision"]),
+        ("weak recall is lower", w["recall"] < o["recall"]),
+        ("weak hallucinates objects", w["objectHallucination"] > 0),
+    ]
+    failed = [n for n, ok in checks if not ok]
+    if failed:
+        print("eval-text2kg: self-test failed: " + ", ".join(failed), file=sys.stderr)
+        print(json.dumps({"oracle": o, "weak": w}, indent=1), file=sys.stderr)
+        sys.exit(1)
+    print("eval-text2kg: self-test passed", file=sys.stderr)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--data")
+    ap.add_argument("--model-config")
+    ap.add_argument("--model-secret", action="append", default=[])
+    ap.add_argument("--pair", action="append", default=[], help="PROVIDER/MODEL; each runs on its own")
+    ap.add_argument("--ontology", action="append", default=[], help="an ontology id to run")
+    ap.add_argument("--limit", type=int, help="the first N sentences of each ontology")
+    ap.add_argument("--deadline", type=float, default=120)
+    ap.add_argument("--sparkles", default=str(ROOT / "target" / "release" / "sparkles"))
+    ap.add_argument("--out")
+    ap.add_argument("--self-test", action="store_true")
+    args = ap.parse_args()
+    if not pathlib.Path(args.sparkles).exists():
+        alt = ROOT / "target" / "debug" / "sparkles"
+        if not alt.exists():
+            sys.exit(f"eval-text2kg: no sparkles binary at {args.sparkles}; build it or pass --sparkles")
+        args.sparkles = str(alt)
+    if args.self_test:
+        return self_test(args)
+    if not (args.data and args.model_config and args.pair):
+        ap.error("--data, --model-config and at least one --pair are required, or --self-test")
+    bench = load_benchmark(args.data, set(args.ontology), args.limit)
+    if not bench:
+        sys.exit(f"eval-text2kg: no ontology with sentences under {args.data}")
+    out = pathlib.Path(args.out) if args.out else pathlib.Path(tempfile.mkdtemp(prefix="sparkles-eval-text2kg-"))
+    run(args, bench, out)
+
+
+if __name__ == "__main__":
+    main()

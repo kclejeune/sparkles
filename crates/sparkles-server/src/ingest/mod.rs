@@ -55,7 +55,7 @@ pub const MAX_ACTIVE: usize = 32;
 
 /// `serve` flags of ingestion.
 #[derive(clap::Args, Clone, Debug, Default)]
-pub struct ServeArgs {
+pub struct IngestServeArgs {
     /// How many PDF conversions may run at once; a conversion that overruns its
     /// deadline keeps its slot until it ends (spec C18 §7.1.1)
     #[arg(long, value_name = "N", default_value_t = DEFAULT_PDF_WORKERS)]
@@ -421,7 +421,7 @@ pub struct Runtime {
 }
 
 impl Runtime {
-    pub fn new(args: &ServeArgs) -> Runtime {
+    pub fn new(args: &IngestServeArgs) -> Runtime {
         Runtime {
             pdf: Arc::new(PdfRuntime::new(args.pdf_workers, args.ocr.config())),
             tasks: Mutex::default(),

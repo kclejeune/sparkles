@@ -885,7 +885,7 @@ enum Cmd {
         models: models::ModelArgs,
         #[cfg(feature = "mcp")]
         #[command(flatten)]
-        ingest: ingest::ServeArgs,
+        ingest: ingest::IngestServeArgs,
         /// How many days each principal's ask history is kept, for datasets whose
         /// assistant settings do not say (0: no history; spec C18 §6.4)
         #[arg(long, value_name = "DAYS", default_value_t = assistant::DEFAULT_HISTORY_DAYS)]

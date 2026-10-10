@@ -109,7 +109,7 @@ pub fn run_cli(args: IngestArgs, store_opts: StoreOptions) -> Result<()> {
     let timeout = Duration::from_secs_f64(args.deadline.min(3600.0));
     let mut st = AppState::standalone(store_opts, timeout);
     st.outbound = args.outbound.policy()?;
-    st.ingest = super::Runtime::new(&super::ServeArgs {
+    st.ingest = super::Runtime::new(&super::IngestServeArgs {
         pdf_workers: 1,
         ocr: args.ocr.clone(),
     });
