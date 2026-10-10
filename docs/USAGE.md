@@ -45,6 +45,7 @@ without a migration path, so keep backups of anything you cannot regenerate.
   * [Agent memory grants](#agent-memory-grants)
 * [Agent memory](#agent-memory)
 * [Asking questions with a model](#asking-questions-with-a-model)
+  * [The Settings tab](#the-settings-tab)
   * [Escalation](#escalation)
   * [The Ask bar](#the-ask-bar)
   * [Measuring models](#measuring-models)
@@ -2577,7 +2578,10 @@ rows go to the `summarize` providers for summaries, and the output says so. An o
 who wants no document text to leave the server locks `assistant.send` in the settings
 file, and `memory init` then reports the lock. On NixOS,
 [`services.sparkles.settings`](#declarative-dataset-settings) declares the settings
-file.
+file. In the web UI, a dataset admin turns them on in the dataset page's **Settings**
+tab, which [The Settings tab](#the-settings-tab) describes. The UI's **Ingest** section
+uploads documents and configures source retention and ingest profiles, but it does not
+turn on the assistant.
 
 **Configuration gap.** The UI has no editor for the dataset's assistant settings.
 Its **Ingest** section uploads documents and configures source retention and ingest
@@ -2706,6 +2710,12 @@ the commands print the task or the server's answer.
 The commands call `POST /$/memory/{ds}/consolidate`, `POST /$/memory/{ds}/retention`
 and `GET /$/memory/{ds}/maintenance`, which answer with a task under `/$/ingest/{ds}`
 for the two passes. [Memory maintenance](API.md#memory-maintenance) describes them.
+
+In the web UI, the memory section of the dataset's **Settings** tab sets the schedules
+and shows, for consolidation and for retention, when the last pass ran, how it ended
+and when the next scheduled pass is due. A dataset admin can start either pass with
+**Run now** and follow its progress. Retention first runs a dry run and asks for a
+confirmation that lists the session graphs it would delete.
 
 `recall` takes `recency`, a half-life such as `"90d"`, that ranks recent facts and facts
 that several graphs assert first. Old facts are never deleted for their age alone.
@@ -2882,6 +2892,29 @@ server's settings file locks the field, is reported, the other datasets are stil
 patched, and the exit status is 1. Datasets created later do not get the values, which
 is what the settings file of `--settings` is for.
 
+### The Settings tab
+
+The dataset page of the web UI has a **Settings** tab with a section for the assistant,
+memory and ingest settings. Each section has a form for the common fields and, under
+**Advanced**, an editor for the whole runtime layer as JSON, next to the values of the
+settings file. Role lists, routing and secret patterns are edited there.
+
+Each field shows where its value comes from. A value from the settings file is labeled
+"server config". A field the settings file locks shows a lock and cannot be changed.
+A value changed at runtime is marked "changed" and has a **Reset** button that removes
+it, so the field takes the value of the settings file or the default again. When a lock
+ignores a runtime value stored before the lock, the field says that the change is
+ignored. **Reset all** removes every runtime change of a kind, and the section shows
+when the effective settings are not valid.
+
+Saving sends only the fields that changed, with the `ETag` the section read. When
+someone else changed the settings in the meantime, the server refuses the save, and the
+section reloads and says so. A change to a locked field is refused and the field is
+highlighted. Users without `admin` on the dataset see the tab read-only.
+
+The memory section also shows memory maintenance, which
+[Maintaining agent memory](#maintaining-agent-memory) describes.
+
 ### Escalation
 
 A role's list goes from the cheapest pair to the strongest. A step moves to the next
@@ -2905,7 +2938,7 @@ query.
 ### The Ask bar
 
 When a dataset has an assistant, the query page shows an **Ask** bar above the tabs.
-The settings file of the [previous section](#turning-on-the-assistant-in-the-server)
+The settings file of [Turning on the assistant in the server](#turning-on-the-assistant-in-the-server)
 turns the assistant on for every dataset. A dataset admin can also turn it on for one
 dataset with its settings, which name what may leave the server and may override the
 server's role lists:

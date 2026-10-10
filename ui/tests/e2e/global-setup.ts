@@ -3,8 +3,9 @@
 // token. It loads a small dataset (labels, comments for full-text search, vectors for
 // "Similar"), signs the user in, and hands the details to the tests through environment
 // variables (inherited by the workers). A second server without auth (the default
-// `sparkles serve`) starts empty, with a backup config that lets its API register
-// repositories under a temporary directory. The returned function is the global teardown.
+// `sparkles serve`) starts with only an in-memory dataset the operator declares, a
+// settings file and a backup config that lets its API register repositories under a
+// temporary directory. The returned function is the global teardown.
 //
 // SPARKLES_BIN selects the binary (default: ../target/debug/sparkles, which serves ui/build
 // from disk); SPARKLES_E2E_KEEP=1 keeps the data directory and server log;
@@ -26,7 +27,7 @@ import {
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { DATASET, DATA, PASSWORD, USER } from './data';
+import { DATASET, DATA, DECLARED_DATASET, PASSWORD, SETTINGS, USER } from './data';
 
 const UI_DIR = resolve(import.meta.dirname, '../..');
 
@@ -211,11 +212,15 @@ server = ["server-admin"]
     writeFileSync(backupConfig, `version = 1\n\n[api]\nfs_roots = [${JSON.stringify(repos)}]\n`, {
       mode: 0o600,
     });
+    // declared settings (C19) for the dataset the settings tests create, and a dataset
+    // the operator declares, which the UI does not offer to delete
+    const settings = join(dir, 'conf', 'settings.json');
+    writeFileSync(settings, JSON.stringify(SETTINGS));
     const openServer = await serve(
       bin,
       join(dir, 'open-data'),
       join(dir, 'open-server.log'),
-      ['--backup-config', backupConfig],
+      ['--backup-config', backupConfig, '--settings', settings, '--mem', DECLARED_DATASET],
       1,
     );
     open = openServer.child;

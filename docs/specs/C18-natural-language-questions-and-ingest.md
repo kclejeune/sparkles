@@ -4658,16 +4658,19 @@ none.
   and it reads only agent graphs, so a curated graph is never deleted.
 - The sync waits for its extractions only with `--loc`. Against a server it reports the
   task ids and returns.
-- There is no UI for consolidation or retention. The inbox shows the consolidation
-  branch, and the routes and settings cover the rest. The CLI gap was closed later on
-  2026-10-10, with the work on [C19](C19-layered-settings.md)'s command line.
-  `sparkles memory consolidate` and `sparkles memory retention` start a pass, wait for
-  its task and print its result, with `--dry-run`, `--no-wait` and the members of the
-  route bodies as flags. `sparkles memory maintenance` prints the settings, the last
-  scheduled run of each pass with the outcome of its task, and the next run. The
-  schedules are memory settings, which `sparkles settings set` changes.
-  `crates/sparkles-server/tests/cli_settings.rs` covers the commands in
-  `memory_init_and_maintenance`.
+- There was no command and no UI for consolidation or retention when Phase 5 landed.
+  The inbox shows the consolidation branch, and the routes and settings covered the
+  rest. Both gaps were closed later on 2026-10-10 by the work on
+  [C19](C19-layered-settings.md). `sparkles memory consolidate` and
+  `sparkles memory retention` start a pass, wait for its task and print its result,
+  with `--dry-run`, `--no-wait` and the members of the route bodies as flags.
+  `sparkles memory maintenance` prints the settings, the last scheduled run of each pass
+  with the outcome of its task, and the next run. The schedules are memory settings,
+  which `sparkles settings set` changes. `crates/sparkles-server/tests/cli_settings.rs`
+  covers the commands in `memory_init_and_maintenance`. In the UI, the memory section of
+  the dataset page's Settings tab shows each job's last run, its outcome and the next
+  scheduled run, and offers Run now to dataset admins, with a dry run and a confirmation
+  before retention deletes anything.
 
 **Tests.** `crates/sparkles-server/src/ingest/tests.rs` covers A78 in
 `consolidation_task`, with the dry run, the branch and its inbox kind, a scheduled pass

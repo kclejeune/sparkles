@@ -2,6 +2,7 @@
   import { resolve } from '$app/paths';
   import { goto } from '$app/navigation';
   import { onMount } from 'svelte';
+  import * as api from '$lib/api';
   import { app } from '$lib/app.svelte';
   import { auth } from '$lib/auth.svelte';
   import { fmtInt, fmtRelative } from '$lib/format';
@@ -27,7 +28,7 @@
 
 <svelte:head><title>Datasets | Sparkles</title></svelte:head>
 
-<div class="page">
+<div class="page page-container">
   <header class="head">
     <div>
       <h1>Datasets</h1>
@@ -82,6 +83,7 @@
                 <td>
                   <a class="name" href={detail(d.name)}>{d.name}</a>
                   {#if d.name === app.current}<span class="badge spark">selected</span>{/if}
+                  {#if d.declared}<span class="badge" title={api.DECLARED_TEXT}>declared</span>{/if}
                 </td>
                 <td><span class="badge">{d.type === 'mem' ? 'in-memory' : 'persistent'}</span></td>
                 <td class="num">{fmtInt(d.quads)}</td>
@@ -105,24 +107,27 @@
                 </td>
                 <td><span class="mono faint">{d.endpoints?.query ?? `/${d.name}/sparql`}</span></td>
                 <td class="actions">
-                  <button
-                    class="btn sm"
-                    onclick={() => {
-                      app.setDataset(d.name);
-                      goto(resolve('/query'));
-                    }}><Icon name="query" size={13} /> Query</button
-                  >
-                  <a class="btn sm" href={detail(d.name)}>Details</a>
-                  {#if auth.can(d.name, 'admin')}
+                  <div class="cell-actions">
                     <button
-                      class="btn sm icon danger"
-                      aria-label="Delete {d.name}"
-                      title="Delete {d.name}"
-                      onclick={() => (deleteTarget = d.name)}
+                      class="btn sm"
+                      onclick={() => {
+                        app.setDataset(d.name);
+                        goto(resolve('/query'));
+                      }}><Icon name="query" size={13} /> Query</button
                     >
-                      <Icon name="trash" size={13} />
-                    </button>
-                  {/if}
+                    <a class="btn sm" href={detail(d.name)}>Details</a>
+                    {#if auth.can(d.name, 'admin')}
+                      <button
+                        class="btn sm icon danger"
+                        aria-label="Delete {d.name}"
+                        title={d.declared ? api.DECLARED_TEXT : `Delete ${d.name}`}
+                        disabled={d.declared === true}
+                        onclick={() => (deleteTarget = d.name)}
+                      >
+                        <Icon name="trash" size={13} />
+                      </button>
+                    {/if}
+                  </div>
                 </td>
               </tr>
             {/each}
@@ -143,11 +148,7 @@
 <style>
   .page {
     padding: 24px 28px 40px;
-    display: grid;
-    grid-template-columns: minmax(0, 1fr);
     gap: 18px;
-    max-width: 1200px;
-    width: 100%;
   }
   .head {
     display: flex;
@@ -166,9 +167,6 @@
   .actions {
     text-align: right;
     white-space: nowrap;
-  }
-  .actions > * + * {
-    margin-left: 4px;
   }
   a.btn {
     text-decoration: none;

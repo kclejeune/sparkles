@@ -1,6 +1,6 @@
 # C19: Layered dataset settings
 
-> **Status:** implemented in part (Phases 1 and 2)
+> **Status:** implemented in part (Phases 1, 2 and 3)
 >
 > **Phases:** Phase 1 is the server: settings kinds, the declared layer, layered
 > resolution, locks, the `/$/settings` routes and reloading on SIGHUP. Phase 2 is the
@@ -451,9 +451,7 @@ to replace or remove a runtime value.
 
 ## Outcome
 
-Phase 1 landed on 2026-10-10, and both parts of Phase 2, the NixOS module and the
-command line, later the same day. Phases 3 and 4 are not built, so the UI has no
-settings tab.
+Phases 1, 2 and 3 landed on 2026-10-10. Phase 4 is not built.
 
 The server has a registry of three dataset-scoped kinds, `assistant`, `memory` and
 `ingest`. The `ingest` kind holds the settings members of `ingest.json`, and the
@@ -608,3 +606,59 @@ These points differ from the design or settle what it left open.
 - The same work added `sparkles memory consolidate`, `sparkles memory retention` and
   `sparkles memory maintenance` for the maintenance routes of C18 Phase 5, which had no
   command.
+
+### Phase 3
+
+The dataset page has two tabs, **Overview** with the panels it had before and
+**Settings**, which `?tab=settings` opens. The Settings tab has a section for each kind.
+A section has a form for the common fields of §10, grouped by topic, and under
+**Advanced** an editor of the runtime layer as JSON beside the declared layer and the
+locked fields. Saving the editor sends the merge patch from the old runtime layer to the
+new one, so a member removed from the text is reset.
+
+Each field shows its source. A declared value is labeled "server config", a locked
+field has a lock and a disabled control, a runtime value is marked "changed" with a
+reset that sends `DELETE ?field=`, and a field in `overridden` says that its change is
+ignored and offers the reset as well. A field whose own source is `default` but that a
+layer sets below it, such as a map, takes the strongest source of its leaves. A runtime
+value over a declared one names the declared value in its tooltip. An invalid `status`
+shows its error above the form.
+
+A save sends a `PATCH` of the fields whose form value changed, with `If-Match`. An
+emptied optional field sends `null`, and a map field sends only its changed members. A
+`412` reloads the section and shows a toast, a `409` with `locked-by-config`
+highlights the named fields, a `400` shows the server's message, and a `403` turns the
+section read-only. The tab is read-only for callers without dataset `admin`, which the
+UI reads from `/$/whoami` as its other panels do. The source labels, locks and resets
+are the components `FieldSource`, `SettingRow` and `SettingsKindPanel`, which take a
+kind's URL and its field list, so Phase 4 can use them for `models`.
+
+The datasets list marks declared datasets and disables their delete button with an
+explanation, as does the dataset page. A `409` with `declared-dataset` shows the same
+explanation in the delete dialog.
+
+These points differ from the design or settle what it left open.
+
+- The tab also covers memory maintenance from C18 Phase 5, which had routes and no UI.
+  The memory section shows each job's last run, outcome and next scheduled run, and
+  offers **Run now** to dataset admins. Retention runs a dry run first and asks for a
+  confirmation that lists the graphs it would delete. Maintenance passes are tasks of
+  the ingestion registry, not of `/$/tasks`, so the section follows them through
+  `/$/ingest/{ds}/{task}` with its own progress bar instead of `TaskProgress`. The
+  last run is the newest pass the server still knows, dry runs left out, or else the
+  scheduled pass of `/$/memory/{ds}/maintenance`.
+- The JSON editor cannot store a `null` in the runtime layer, since a `null` in a merge
+  patch removes a value. Removing a declared member of a map still needs a `PUT`.
+- The settings routes do not check the server's read-only flag, so the tab allows
+  changes on a read-only server. Run now is disabled there, since maintenance is
+  refused.
+- No Rust code changed.
+- The documentation and status lines were merged with the Phase 2 work, which
+  landed in parallel.
+
+`ui/src/lib/settings.test.ts` and `ui/src/lib/maintenance.test.ts` test the path,
+source, patch and error logic and the routes' requests. `ui/tests/e2e/settings.spec.ts`
+runs against a server started with a settings file and a declared dataset. It checks
+the locked and declared fields, a save and its reset, a stale save after another
+client's change, a refused change of a locked field, a consolidation run, the read-only
+tab of a user without admin, and the disabled delete of the declared dataset.

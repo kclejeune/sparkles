@@ -263,7 +263,7 @@
 
 <svelte:head><title>Merge {source} into {target} | Sparkles</title></svelte:head>
 
-<div class="page">
+<div class="page page-container">
   <nav class="crumbs">
     <a href={resolve('/datasets')}>Datasets</a><Icon name="chevron" size={12} /><a
       href={resolve('/datasets/[name]', { name })}>{name}</a
@@ -594,11 +594,7 @@
 <style>
   .page {
     padding: 18px 28px 40px;
-    display: grid;
-    grid-template-columns: minmax(0, 1fr);
     gap: 16px;
-    max-width: 1320px;
-    width: 100%;
   }
   .crumbs {
     display: flex;

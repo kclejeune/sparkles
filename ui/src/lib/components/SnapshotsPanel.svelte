@@ -252,21 +252,23 @@
                 <td title={s.created}>{fmtRelative(s.created)}</td>
                 <td class="note">{s.note ?? ''}</td>
                 <td class="actions">
-                  <button
-                    class="btn ghost sm"
-                    title="Query the dataset at this snapshot"
-                    disabled={!s.reconstructable}
-                    onclick={() => queryAt(s.ref)}><Icon name="query" size={12} /> Query</button
-                  >
-                  {#if canEdit}
+                  <div class="cell-actions">
                     <button
-                      class="btn ghost icon sm"
-                      aria-label="Delete snapshot {s.name}"
-                      title="Delete"
-                      disabled={busy}
-                      onclick={() => remove(s)}><Icon name="trash" size={12} /></button
+                      class="btn ghost sm"
+                      title="Query the dataset at this snapshot"
+                      disabled={!s.reconstructable}
+                      onclick={() => queryAt(s.ref)}><Icon name="query" size={12} /> Query</button
                     >
-                  {/if}
+                    {#if canEdit}
+                      <button
+                        class="btn ghost icon sm"
+                        aria-label="Delete snapshot {s.name}"
+                        title="Delete"
+                        disabled={busy}
+                        onclick={() => remove(s)}><Icon name="trash" size={12} /></button
+                      >
+                    {/if}
+                  </div>
                 </td>
               </tr>
             {/each}

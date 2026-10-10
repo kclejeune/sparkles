@@ -280,11 +280,12 @@ other RDF stores have and Sparkles does not.
 * **Assistant configuration.** Dataset assistant settings, including `enabled`,
   `ingest` and `send: "documents"`, can be declared for every dataset or by name in the
   settings file of `serve --settings`, which can also lock them, and changed through
-  `/$/settings/{dataset}/assistant` or `sparkles settings`. `sparkles memory init`
-  turns on ingestion for the fields that still have their default. The NixOS module
-  declares the settings file with `services.sparkles.settings`, checks it at build time
-  and reloads the server when it changes. The UI has no editor for assistant settings,
-  and its ingestion controls do not turn on assistant ingestion. Provider endpoints and
+  `/$/settings/{dataset}/assistant`, `sparkles settings` or the dataset page's Settings
+  tab, which shows each field's source, locks and resets. `sparkles memory init` turns
+  on ingestion for the fields that still have their default. The NixOS module declares
+  the settings file with `services.sparkles.settings`, checks it at build time and
+  reloads the server when it changes. The UI's ingestion controls do not turn on
+  assistant ingestion. Provider endpoints and
   keys also have no UI editor and remain operator-controlled through `--model-config`
   and `--model-secret`, or the NixOS module's `services.sparkles.models` options. See
   [USAGE.md](USAGE.md#ingesting-documents-in-the-server) for the setup routes.

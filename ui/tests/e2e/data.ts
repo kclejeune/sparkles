@@ -6,6 +6,26 @@ export const PASSWORD = 'correct horse battery staple';
 
 export const EX = 'http://example.org/e2e/';
 
+/** The dataset the server without auth is started with (`--mem`), so it is declared. */
+export const DECLARED_DATASET = 'declared-e2e';
+
+/** A dataset the settings tests create; the settings file declares values for it. */
+export const SETTINGS_DATASET = 'settings-e2e';
+
+/** The settings file of the server without auth (`--settings`). */
+export const SETTINGS = {
+  datasets: {
+    [SETTINGS_DATASET]: {
+      assistant: { historyDays: 30, send: 'schema' },
+      memory: {
+        agentGraphs: ['urn:x-sparkles:e2e/agents/*'],
+        consolidatedGraph: 'urn:x-sparkles:e2e/consolidated',
+      },
+      locked: ['assistant.send'],
+    },
+  },
+};
+
 const PREFIXES = `@prefix ex: <${EX}> .
 @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
 @prefix spk: <urn:x-sparkles:> .

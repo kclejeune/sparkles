@@ -1,0 +1,266 @@
+// The common fields of a dataset's settings kinds, as docs/API.md describes them. The
+// Settings tab shows these as a form, and the rest of a kind (role lists, routing, secret
+// patterns) through the editor of its runtime layer.
+
+import type { DatasetKind, FieldDef } from './settings';
+
+const SEND = ['schema', 'rows', 'documents'] as const;
+
+export const ASSISTANT_FIELDS: readonly FieldDef[] = [
+  {
+    path: 'enabled',
+    group: 'Features',
+    label: 'Assistant',
+    type: 'bool',
+    fallback: false,
+    help: 'Whether the dataset has an assistant.',
+  },
+  {
+    path: 'ask',
+    group: 'Features',
+    label: 'Questions',
+    type: 'bool',
+    fallback: true,
+    help: 'Whether people can ask questions in words (POST /{ds}/ask).',
+  },
+  {
+    path: 'ingest',
+    group: 'Features',
+    label: 'Server ingestion',
+    type: 'bool',
+    fallback: false,
+    help: 'Whether the server extracts facts from documents itself.',
+  },
+  { path: 'explain', group: 'Features', label: 'Explain', type: 'bool', fallback: false },
+  { path: 'optimize', group: 'Features', label: 'Optimize', type: 'bool', fallback: false },
+  {
+    path: 'send',
+    group: 'Sending',
+    label: 'What may leave the server',
+    type: 'enum',
+    options: SEND,
+    help: 'schema sends the vocabulary, rows also sends result rows for summaries, and documents also sends document text for ingestion.',
+  },
+  {
+    path: 'sendByProvider',
+    group: 'Sending',
+    label: 'Lower level per provider',
+    type: 'json',
+    placeholder: '{ "claude": "schema" }',
+    help: 'A provider and the highest send level it may receive.',
+  },
+  {
+    path: 'rowsForSummary',
+    group: 'Sending',
+    label: 'Rows sent to a summary',
+    type: 'int',
+    min: 0,
+    optional: true,
+    fallback: 50,
+  },
+  {
+    path: 'budget.perRequest',
+    group: 'Limits',
+    label: 'Tokens per request',
+    type: 'int',
+    min: 1,
+    optional: true,
+    fallback: 50000,
+  },
+  {
+    path: 'budget.perPrincipalPerDay',
+    group: 'Limits',
+    label: 'Tokens per person per day',
+    type: 'int',
+    min: 1,
+    optional: true,
+    placeholder: 'no cap',
+  },
+  {
+    path: 'budget.perDatasetPerDay',
+    group: 'Limits',
+    label: 'Tokens per dataset per day',
+    type: 'int',
+    min: 1,
+    optional: true,
+    placeholder: 'no cap',
+  },
+  {
+    path: 'deadlineSecs',
+    group: 'Limits',
+    label: 'Deadline (seconds)',
+    type: 'number',
+    min: 0,
+    optional: true,
+    fallback: 120,
+  },
+  {
+    path: 'historyDays',
+    group: 'Limits',
+    label: 'Keep questions (days)',
+    type: 'int',
+    min: 0,
+    optional: true,
+    placeholder: "server's default",
+    help: '0 keeps nothing. Without a value, the server option --ask-history-days applies.',
+  },
+];
+
+export const MEMORY_FIELDS: readonly FieldDef[] = [
+  {
+    path: 'agentGraphs',
+    group: 'Graphs',
+    label: 'Agent graphs',
+    type: 'lines',
+    placeholder: 'https://example.org/memory/agents/*',
+    help: 'Graph IRIs or patterns with *, one per line. Facts only these graphs assert are unreviewed.',
+  },
+  {
+    path: 'consolidatedGraph',
+    group: 'Graphs',
+    label: 'Consolidated graph',
+    type: 'text',
+    optional: true,
+    placeholder: 'https://example.org/memory/consolidated',
+  },
+  {
+    path: 'agents',
+    group: 'Graphs',
+    label: 'Agents',
+    type: 'json',
+    placeholder: '{ "agent-7": { "conversationFacts": "immediate" } }',
+    help: 'Per agent, whether conversation facts are written at once (immediate) or for review.',
+  },
+  {
+    path: 'imports.base',
+    group: 'Imports',
+    label: 'Import graphs base',
+    type: 'text',
+    optional: true,
+    placeholder: 'https://example.org/memory/import/',
+    help: 'The prefix of every import graph. Agent graphs must cover it.',
+  },
+  {
+    path: 'imports.extract',
+    group: 'Imports',
+    label: 'Who extracts imported prose',
+    type: 'enum',
+    options: ['agent', 'server', 'none'],
+    optional: true,
+  },
+  {
+    path: 'imports.transcripts',
+    group: 'Imports',
+    label: 'Import transcripts',
+    type: 'bool',
+    fallback: false,
+  },
+  {
+    path: 'consolidation.every',
+    group: 'Consolidation',
+    label: 'Consolidate every',
+    type: 'text',
+    optional: true,
+    placeholder: 'on request only',
+    help: 'A duration of at least 1h, such as 1d.',
+  },
+  {
+    path: 'consolidation.mode',
+    group: 'Consolidation',
+    label: 'Consolidation mode',
+    type: 'enum',
+    options: ['branch', 'auto'],
+    optional: true,
+  },
+  {
+    path: 'consolidation.minSources',
+    group: 'Consolidation',
+    label: 'Sources a fact needs',
+    type: 'int',
+    min: 2,
+    max: 100,
+    optional: true,
+    fallback: 2,
+  },
+  {
+    path: 'retention.after',
+    group: 'Retention',
+    label: 'Delete session graphs after',
+    type: 'text',
+    optional: true,
+    placeholder: 'never',
+    help: 'A duration of at least 1d, such as 365d.',
+  },
+  {
+    path: 'retention.graphs',
+    group: 'Retention',
+    label: 'Session graphs',
+    type: 'lines',
+    placeholder: 'graphs whose IRI holds /sessions/',
+  },
+  {
+    path: 'retention.requireConsolidated',
+    group: 'Retention',
+    label: 'Only consolidated graphs',
+    type: 'bool',
+    fallback: true,
+    help: 'Delete only graphs whose facts a reviewed graph also asserts.',
+  },
+  {
+    path: 'retention.every',
+    group: 'Retention',
+    label: 'Apply retention every',
+    type: 'text',
+    optional: true,
+    fallback: '1d',
+  },
+];
+
+export const INGEST_FIELDS: readonly FieldDef[] = [
+  {
+    path: 'keepText',
+    label: 'Keep the text of sources',
+    type: 'bool',
+    fallback: true,
+    help: 'Without it, sources keep only their digest and length, and every fact needs a quote.',
+  },
+  {
+    path: 'confirmTokens',
+    label: 'Confirm above (tokens)',
+    type: 'int',
+    min: 0,
+    optional: true,
+    fallback: 200000,
+    help: 'The estimate above which an ingestion waits for a confirmation.',
+  },
+  {
+    path: 'autoConfidence',
+    label: 'Confidence for auto mode',
+    type: 'number',
+    min: 0,
+    max: 1,
+    optional: true,
+    fallback: 0.8,
+  },
+];
+
+export const DATASET_FIELDS: Record<DatasetKind, readonly FieldDef[]> = {
+  assistant: ASSISTANT_FIELDS,
+  memory: MEMORY_FIELDS,
+  ingest: INGEST_FIELDS,
+};
+
+export const KIND_TITLES: Record<DatasetKind, { title: string; text: string }> = {
+  assistant: {
+    title: 'Assistant',
+    text: 'Questions in words, summaries and server ingestion, and what may be sent to a model.',
+  },
+  memory: {
+    title: 'Memory',
+    text: 'The graphs that hold agent memory, imports, consolidation and retention.',
+  },
+  ingest: {
+    title: 'Ingest',
+    text: 'What the dataset keeps of ingested documents, and when an ingestion asks first.',
+  },
+};

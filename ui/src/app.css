@@ -401,6 +401,30 @@ label.field {
   gap: 8px;
 }
 
+/* A page's content: one column that fills the content area at every width. Pages set
+   their own padding and gap; only inner elements with long prose or a single-column
+   form cap their width. */
+.page-container {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-content: start;
+  width: 100%;
+  min-width: 0;
+}
+
+/* The buttons and links at the end of a table row, right-aligned on one line. A link
+   and a button are both inline-flex, so in a text-aligned cell their baselines differ;
+   a flex row centers them. */
+.cell-actions {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 4px;
+}
+a.btn {
+  text-decoration: none;
+}
+
 .badge {
   display: inline-flex;
   align-items: center;

@@ -227,18 +227,21 @@
               {:else}<span class="faint">—</span>{/if}
             </td>
             <td class="actions">
-              {#if canAdmin(x)}
-                <button class="btn sm" onclick={() => dialogs?.show('restore', x)}>Restore</button>
-                <button class="btn sm" onclick={() => dialogs?.show('verify', x)}>Verify</button>
-                {#if !readonlyRepos.includes(x.repository)}
-                  <button
-                    class="btn sm icon danger"
-                    onclick={() => dialogs?.show('delete', x)}
-                    aria-label="Delete {x.name}"
-                    title="Delete {x.name}"><Icon name="trash" size={12} /></button
+              <div class="cell-actions">
+                {#if canAdmin(x)}
+                  <button class="btn sm" onclick={() => dialogs?.show('restore', x)}>Restore</button
                   >
+                  <button class="btn sm" onclick={() => dialogs?.show('verify', x)}>Verify</button>
+                  {#if !readonlyRepos.includes(x.repository)}
+                    <button
+                      class="btn sm icon danger"
+                      onclick={() => dialogs?.show('delete', x)}
+                      aria-label="Delete {x.name}"
+                      title="Delete {x.name}"><Icon name="trash" size={12} /></button
+                    >
+                  {/if}
                 {/if}
-              {/if}
+              </div>
             </td>
           </tr>
         {:else}
@@ -325,9 +328,6 @@
   .actions {
     text-align: right;
     white-space: nowrap;
-  }
-  .actions > * + * {
-    margin-left: 4px;
   }
   .more {
     margin: 6px 10px 10px;

@@ -323,43 +323,45 @@
                 {/if}
               </td>
               <td class="actions">
-                {#if canMerge && b.name !== MAIN}
-                  <button
-                    class="btn ghost sm"
-                    aria-label="Merge {b.name}"
-                    title="Merge {b.name} into {b.upstream ?? MAIN}"
-                    onclick={() => askMerge(b)}><Icon name="merge" size={12} /> Merge</button
-                  >
-                {/if}
-                {#if canEdit}
-                  <button
-                    class="btn ghost icon sm"
-                    aria-label="Protect {b.name}"
-                    title={b.protected
-                      ? 'Unprotect: accept updates, uploads and loads again'
-                      : 'Protect: take changes through merges only'}
-                    aria-pressed={b.protected}
-                    disabled={busy}
-                    onclick={() => setProtected(b, !b.protected)}
-                    ><Icon name="lock" size={12} /></button
-                  >
-                  {#if b.name !== MAIN}
+                <div class="cell-actions">
+                  {#if canMerge && b.name !== MAIN}
                     <button
                       class="btn ghost sm"
-                      aria-label="Rename branch {b.name}"
-                      disabled={busy}
-                      onclick={() => (renaming = { branch: b, name: b.name, error: null })}
-                      >Rename</button
-                    >
-                    <button
-                      class="btn ghost icon sm"
-                      aria-label="Delete branch {b.name}"
-                      title="Delete"
-                      disabled={busy}
-                      onclick={() => askDelete(b)}><Icon name="trash" size={12} /></button
+                      aria-label="Merge {b.name}"
+                      title="Merge {b.name} into {b.upstream ?? MAIN}"
+                      onclick={() => askMerge(b)}><Icon name="merge" size={12} /> Merge</button
                     >
                   {/if}
-                {/if}
+                  {#if canEdit}
+                    <button
+                      class="btn ghost icon sm"
+                      aria-label="Protect {b.name}"
+                      title={b.protected
+                        ? 'Unprotect: accept updates, uploads and loads again'
+                        : 'Protect: take changes through merges only'}
+                      aria-pressed={b.protected}
+                      disabled={busy}
+                      onclick={() => setProtected(b, !b.protected)}
+                      ><Icon name="lock" size={12} /></button
+                    >
+                    {#if b.name !== MAIN}
+                      <button
+                        class="btn ghost sm"
+                        aria-label="Rename branch {b.name}"
+                        disabled={busy}
+                        onclick={() => (renaming = { branch: b, name: b.name, error: null })}
+                        >Rename</button
+                      >
+                      <button
+                        class="btn ghost icon sm"
+                        aria-label="Delete branch {b.name}"
+                        title="Delete"
+                        disabled={busy}
+                        onclick={() => askDelete(b)}><Icon name="trash" size={12} /></button
+                      >
+                    {/if}
+                  {/if}
+                </div>
               </td>
             </tr>
           {/each}
