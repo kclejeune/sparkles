@@ -519,18 +519,10 @@
     });
   }
 
-  /** Open a question with its query in a new tab (or the untouched first one). */
+  /** Open a question with its query in a new tab. */
   function openQuestion(q: TabQuestion, query: string) {
-    const title = q.question ? questionTitle(q.question) : undefined;
-    const cur = active;
-    if (!cur.query.trim() || (cur.query === DEFAULT_QUERY && !cur.ask && !cur.stored)) {
-      cur.query = query;
-      cur.title = title ?? cur.title;
-      cur.ask = q;
-    } else {
-      addTab(query, title);
-      active.ask = q;
-    }
+    addTab(query, q.question ? questionTitle(q.question) : undefined);
+    active.ask = q;
   }
 
   function openAsked(a: Asked) {
