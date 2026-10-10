@@ -637,6 +637,26 @@ implementation landed.
   - creating datasets from the settings file;
   - recreating a deleted declared dataset at the next start.
 
+## Outbound notifications
+
+- **Spec:** [`C21-outbound-notifications.md`](C21-outbound-notifications.md), written on
+  2026-10-10 from:
+  - the public documentation of ntfy's publish API, the Standard Webhooks
+    specification, the CloudEvents specification and Prometheus Alertmanager's webhook
+    receiver and `repeat_interval`;
+  - RFC 2104 and RFC 4231 (HMAC), and RFC 9110 on `Retry-After`;
+  - for the email channel of Phase 2, RFC 5321, RFC 5322, RFC 3207, RFC 4954, RFC 6409
+    and RFC 8314;
+  - the Sparkles code and specs C18, C19 and F05.
+- **Rejected** (spec §13):
+  - notifications through Alertmanager only;
+  - a configuration file of its own;
+  - inline tokens and signing keys;
+  - routes as a list of rules;
+  - retrying forever, and a queue kept on disk;
+  - payloads in the formats of chat services;
+  - channels chosen by dataset admins.
+
 ## Compression codecs
 
 - **Spec:** [`X01-compression-codecs.md`](X01-compression-codecs.md), written on
