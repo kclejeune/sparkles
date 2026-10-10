@@ -942,6 +942,7 @@ fn list_all_sources(conn: &Conn, base: &str) -> Result<Vec<Value>, CmdError> {
             }
         }
     }
+    let needs = needs_extraction(conn, base)?;
     let mut out = Vec::new();
     for r in &rows {
         let Some(g) = val(r, "g") else { continue };
@@ -969,10 +970,30 @@ fn list_all_sources(conn: &Conn, base: &str) -> Result<Vec<Value>, CmdError> {
             "extractedFacts": prose,
             "redactions": val(r, "red").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0),
             "deleted": val(r, "inv"),
-            "needsExtraction": prose == 0 && val(r, "inv").is_none() && !g.ends_with("/index"),
+            "needsExtraction": needs.contains(&g),
         }));
     }
     Ok(out)
+}
+
+/// The graphs under `base` whose current rendition no extraction cites yet, from
+/// `GET /{ds}/sources?needsExtraction=true`, which applies the server's rule of §8.10.5.
+fn needs_extraction(
+    conn: &Conn,
+    base: &str,
+) -> Result<std::collections::HashSet<String>, CmdError> {
+    let j = conn.get_json(&format!(
+        "/{}/sources?graphPrefix={}&needsExtraction=true&limit=200",
+        enc(&conn.dataset),
+        enc(base)
+    ))?;
+    Ok(j["sources"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|s| s["graph"].as_str())
+        .map(|g| g.trim_start_matches('<').trim_end_matches('>').to_string())
+        .collect())
 }
 
 fn structural_predicates() -> Vec<String> {
@@ -1004,6 +1025,7 @@ fn structural_predicates() -> Vec<String> {
         "appliesTo",
         "imports",
         "alwaysApply",
+        "copyOf",
     ] {
         v.push(vocab::mem(l));
     }

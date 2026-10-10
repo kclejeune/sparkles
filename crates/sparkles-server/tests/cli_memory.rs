@@ -476,6 +476,57 @@ fn memory_import_sync_and_brief() {
         stdout(&o)
     );
 
+    // A62: an agent extracts two prose facts that cite spans of the rendition
+    let rend = s.select(&format!(
+        "SELECT ?r WHERE {{ GRAPH <{g}> {{ <{g}> <urn:x-sparkles:rendition> ?r }} }}"
+    ));
+    assert_eq!(rend.len(), 1, "{rend:?}");
+    let rend = rend[0]["r"]["value"].as_str().unwrap().to_string();
+    let text = std::fs::read_to_string(f.memdir().join("staging-db.md")).unwrap();
+    let span = |q: &str| {
+        let at = text.find(q).unwrap();
+        let a = text[..at].chars().count();
+        json!({ "rendition": rend, "start": a, "end": a + q.chars().count() })
+    };
+    let src = mem_json(&f, &s, "ana", &["sources", "--needs-extraction"]);
+    assert!(
+        src["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x["source"] == g.as_str()),
+        "the import's own facts are not an extraction: {src:#}"
+    );
+    s.update(
+        "INSERT DATA { GRAPH <https://example.org/vocab> { \
+         <http://example.org/host> a <http://www.w3.org/1999/02/22-rdf-syntax-ns#Property> . \
+         <http://example.org/port> a <http://www.w3.org/1999/02/22-rdf-syntax-ns#Property> . \
+         <http://example.org/indent> a <http://www.w3.org/1999/02/22-rdf-syntax-ns#Property> } }",
+    );
+    let args = f.dir.path().join("extract.json");
+    std::fs::write(
+        &args,
+        json!({ "graph": g, "allowUnknownIris": true, "agent": { "name": "extract-skill" },
+                "facts": [
+                    { "s": format!("<{m}>"), "p": "<http://example.org/host>", "o": "\"db.staging\"",
+                      "quote": "The staging DB is at db.staging", "span": span("The staging DB is at db.staging") },
+                    { "s": format!("<{m}>"), "p": "<http://example.org/port>", "o": "\"5433\"",
+                      "quote": "port 5433", "span": span("port 5433") } ] })
+        .to_string(),
+    )
+    .unwrap();
+    let a = mem_json(&f, &s, "ana", &["assert", "--file", args.to_str().unwrap()]);
+    assert_eq!(a["committed"], true, "{a:#}");
+    let src = mem_json(&f, &s, "ana", &["sources", "--needs-extraction"]);
+    assert!(
+        !src["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x["source"] == g.as_str()),
+        "{src:#}"
+    );
+
     // A62: an edit replaces the description and supersedes the old value
     f.write_mem(
         "staging-db.md",
@@ -486,6 +537,23 @@ fn memory_import_sync_and_brief() {
     let r = report(&sy, "staging-db.md");
     assert_eq!(r["status"], "edited", "{sy:#}");
     assert!(r["replaced"].as_u64().unwrap() >= 1);
+    // the fact quoting the unchanged sentence gains a reifier with its new span, and the
+    // one quoting "port 5433" is retracted
+    assert!(r["reanchored"].as_u64().unwrap() >= 1, "{sy:#}");
+    assert!(r["retracted"].as_u64().unwrap() >= 1, "{sy:#}");
+    let rend2 = s.select(&format!(
+        "SELECT ?r WHERE {{ GRAPH <{g}> {{ <{g}> <urn:x-sparkles:rendition> ?r }} }}"
+    ));
+    let rend2 = rend2[0]["r"]["value"].as_str().unwrap().to_string();
+    assert_ne!(rend2, rend);
+    assert!(s.ask(&format!(
+        "ASK {{ GRAPH <{g}> {{ <{m}> <http://example.org/host> \"db.staging\" . \
+         ?r <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> <<( <{m}> <http://example.org/host> \"db.staging\" )>> ; \
+         <http://www.w3.org/ns/prov#wasDerivedFrom> ?span FILTER(STRSTARTS(STR(?span), \"{rend2}#char=\")) }} }}"
+    )));
+    assert!(!s.ask(&format!(
+        "ASK {{ GRAPH <{g}> {{ <{m}> <http://example.org/port> ?o }} }}"
+    )));
     // the new rendition with its re-anchoring, then the structural diff
     assert_eq!(s.head(), head + 2, "two commits");
     assert!(s.ask(&format!(
@@ -523,7 +591,30 @@ fn memory_import_sync_and_brief() {
     assert!(!s.ask(&format!(
         "ASK {{ GRAPH <{g}> {{ <{m}> <urn:x-sparkles:mem:filePath> \"staging-db.md\" }} }}"
     )));
-    // renaming a rule without frontmatter, bytes unchanged, is a rename
+    // renaming a rule without frontmatter, bytes unchanged, is a rename that copies its
+    // prose facts
+    let rule_g = format!("{G}/instructions/.claude.rules.style.md");
+    let rule = s.select(&format!(
+        "SELECT ?r WHERE {{ GRAPH ?g {{ ?g <urn:x-sparkles:rendition> ?r ; <urn:x-sparkles:mem:filePath> ?fp FILTER(STRENDS(?fp, \"style.md\")) }} }}"
+    ));
+    assert_eq!(rule.len(), 1, "{rule:?} {rule_g}");
+    let rule_rend = rule[0]["r"]["value"].as_str().unwrap().to_string();
+    let rule_graph = s.select(&format!(
+        "SELECT ?g WHERE {{ GRAPH ?g {{ ?g <urn:x-sparkles:rendition> <{rule_rend}> }} }}"
+    ))[0]["g"]["value"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    std::fs::write(
+        &args,
+        json!({ "graph": rule_graph, "allowUnknownIris": true,
+                "facts": [ { "s": "<https://example.org/style>", "p": "<http://example.org/indent>", "o": "\"four spaces\"",
+                             "quote": "four spaces", "span": { "rendition": rule_rend, "start": 4, "end": 15 } } ] })
+        .to_string(),
+    )
+    .unwrap();
+    let a = mem_json(&f, &s, "ana", &["assert", "--file", args.to_str().unwrap()]);
+    assert_eq!(a["committed"], true, "{a:#}");
     std::fs::rename(
         p.to_string() + "/.claude/rules/style.md",
         p.to_string() + "/.claude/rules/formatting.md",
@@ -532,7 +623,14 @@ fn memory_import_sync_and_brief() {
     let sy = mem_json(&f, &s, "ana", &["sync", "claude-code", "--project", p]);
     let r = report(&sy, "formatting.md");
     assert_eq!(r["status"], "renamed", "{sy:#}");
+    assert_eq!(r["copied"], 1, "{sy:#}");
     let new_g = r["graph"].as_str().unwrap().to_string();
+    assert!(s.ask(&format!(
+        "ASK {{ GRAPH <{new_g}> {{ <https://example.org/style> <http://example.org/indent> \"four spaces\" }} }}"
+    )));
+    assert!(!s.ask(&format!(
+        "ASK {{ GRAPH <{rule_graph}> {{ <https://example.org/style> <http://example.org/indent> ?o }} }}"
+    )));
     let old = sy["files"]
         .as_array()
         .unwrap()
@@ -778,6 +876,10 @@ fn memory_import_sync_and_brief() {
     )));
     assert!(!s.ask(&format!(
         "ASK {{ GRAPH <{g}> {{ <{m}> <http://www.w3.org/2000/01/rdf-schema#label> ?l }} }}"
+    )));
+    // the prose facts go too
+    assert!(!s.ask(&format!(
+        "ASK {{ GRAPH <{g}> {{ <{m}> <http://example.org/host> ?o }} }}"
     )));
     assert!(s.ask(&format!(
         "ASK {{ GRAPH <{g}> {{ ?r <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> <<( <{m}> <http://www.w3.org/2000/01/rdf-schema#label> \"staging-db\" )>> ; <http://www.w3.org/ns/prov#wasInvalidatedBy> ?a }} }}"
