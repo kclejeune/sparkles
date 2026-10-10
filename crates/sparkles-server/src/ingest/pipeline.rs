@@ -394,7 +394,7 @@ fn run_inner(r: &mut Run, req: &Request) -> Result<Value, Failed> {
         auto_confidence: ingest.auto_confidence.unwrap_or(DEFAULT_AUTO_CONFIDENCE),
     };
     // 2. the estimate, before anything is written
-    let chunks = crate::mcp::memory::ingest::chunk_bounds(&converted.text);
+    let chunks = crate::mcp::memory::ingest::chunk_bounds(&converted.text, false);
     let vocab = if extract {
         Some(super::extract::Vocabulary::read(r, &profile)?)
     } else {

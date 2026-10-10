@@ -898,6 +898,90 @@ fn imports(put: &mut dyn FnMut(&str, J)) {
             "importing-agent-memory",
         ),
     );
+    let chunk = obj(
+        &["iri", "index", "start", "end"],
+        json!({ "iri": string(), "index": int(), "start": int(), "end": int(), "text": string() }),
+    );
+    put(
+        "RegisterSourceRequest",
+        doc(
+            closed(
+                &["text"],
+                json!({
+                    "graph": with_desc(string(), "The named graph of the source and its facts (default: the source's IRI)."),
+                    "iri": with_desc(string(), "The source's IRI (default: a `urn:uuid` minted from the text)."),
+                    "title": string(),
+                    "format": with_desc(string(), "The media type of the original document (default `text/plain`)."),
+                    "text": with_desc(string(), "The document as text or Markdown, at most 2 MiB."),
+                    "profile": string(),
+                    "message": string(),
+                    "dryRun": boolean(),
+                    "original": with_desc(string(), "The file's bytes in base64 when the text is their normalized form. They are kept so an export can write the file back unchanged, and their SHA-256 becomes the digest."),
+                    "reanchor": with_desc(boolean(), "Give each fact that cites the previous rendition a span in the new text where its quote occurs once, and retract the others."),
+                    "reanchorFrom": with_desc(string(), "An earlier source whose facts are copied into this source's graph where their quotes occur in this text."),
+                    "timeoutSeconds": num(),
+                }),
+            ),
+            "The arguments of `register_source` without `dataset`.",
+            "importing-agent-memory",
+        ),
+    );
+    put(
+        "RegisterSourceResult",
+        doc(
+            obj(
+                &[
+                    "dataset",
+                    "graph",
+                    "source",
+                    "rendition",
+                    "digest",
+                    "length",
+                    "alreadyRegistered",
+                    "committed",
+                    "chunks",
+                ],
+                json!({
+                    "dataset": string(), "branch": string(), "graph": string(),
+                    "source": string(), "rendition": string(), "digest": string(),
+                    "length": int(), "alreadyRegistered": boolean(), "committed": boolean(),
+                    "commit": int(), "head": int(), "textKept": boolean(), "profile": string(),
+                    "previousRendition": string(), "staleFacts": int(), "originalKept": boolean(),
+                    "reanchored": int(), "retracted": int(), "copied": int(),
+                    "chunks": array(chunk),
+                    "elapsedMs": num(),
+                    "prefixes": any_object("The prefixes the compact terms use."),
+                }),
+            ),
+            "What `register_source` stored.",
+            "importing-agent-memory",
+        ),
+    );
+    put(
+        "SourceList",
+        doc(
+            obj(
+                &["dataset", "commit", "sources", "truncated"],
+                json!({
+                    "dataset": string(), "branch": string(), "commit": int(),
+                    "sources": array(obj(
+                        &["source", "graph", "rendition", "chunks", "facts"],
+                        json!({
+                            "source": string(), "graph": string(), "title": string(),
+                            "format": string(), "digest": string(), "rendition": string(),
+                            "length": int(), "chunks": int(), "facts": int(),
+                            "lastIngestion": string(), "needsExtraction": boolean(),
+                            "invalidatedAt": string(),
+                        }),
+                    )),
+                    "truncated": boolean(),
+                    "prefixes": any_object("The prefixes the compact terms use."),
+                }),
+            ),
+            "The sources `list_sources` found.",
+            "importing-agent-memory",
+        ),
+    );
     put(
         "BriefRequest",
         doc(

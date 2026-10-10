@@ -2115,6 +2115,26 @@ fn assist(p: &mut Paths) {
             .errors(&[400, 403, 404, 408, 409, 422]),
     );
     p.add(
+        op(POST, "/{ds}/sources", "registerSource", "SPARQL", "Register a source document")
+            .doc("The MCP tool `register_source` as the caller. Needs `write` on the graph and counts as an update. With `original` the file's bytes are kept beside the normalized text, `reanchor` moves the facts that cite the previous rendition to the new text, and `reanchorFrom` copies the facts of a renamed file's source. In a graph under the dataset's import base, a text that matches a secret pattern is refused with 422 `secret-detected`, the pattern's name and the offset. `sparkles memory import` calls it.")
+            .see("importing-agent-memory")
+            .json_body(true, "RegisterSourceRequest")
+            .json("200", "The source and its rendition.", "RegisterSourceResult")
+            .errors(&[400, 403, 404, 408, 409, 422]),
+    );
+    p.add(
+        op(GET, "/{ds}/sources", "listSources", "SPARQL", "List registered sources")
+            .doc("The MCP tool `list_sources` as the caller: the sources in the graphs the caller can read, with their current rendition, chunk and fact counts, and whether the rendition still needs extraction. Needs `read` and counts as a query.")
+            .see("importing-agent-memory")
+            .query("graph", s(), "Only sources in this graph; repeat for several, up to 20.")
+            .query("graphPrefix", s(), "Only sources in graphs whose IRI starts with this.")
+            .query("needsExtraction", boolean(), "Only sources whose current rendition no extraction has cited.")
+            .query("limit", json!({ "type": "integer", "minimum": 1, "maximum": 500, "default": 50 }), "The most sources listed.")
+            .query("atCommit", int(), "Read at this commit.")
+            .json("200", "The sources.", "SourceList")
+            .errors(&[400, 403, 404, 408]),
+    );
+    p.add(
         op(POST, "/{ds}/memory/brief", "memoryBrief", "SPARQL", "Brief what the graph knows")
             .doc("The brief of C18 §8.10.9 for a project's import graphs, an entity or a recall query: reviewed facts by default, ranked by age and corroboration, bounded in facts and characters, with a citation per source.")
             .see("importing-agent-memory")

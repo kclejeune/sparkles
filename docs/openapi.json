@@ -11030,6 +11030,176 @@
         ],
         "type": "object"
       },
+      "RegisterSourceRequest": {
+        "additionalProperties": false,
+        "description": "The arguments of `register_source` without `dataset`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#importing-agent-memory"
+        },
+        "properties": {
+          "dryRun": {
+            "type": "boolean"
+          },
+          "format": {
+            "description": "The media type of the original document (default `text/plain`).",
+            "type": "string"
+          },
+          "graph": {
+            "description": "The named graph of the source and its facts (default: the source's IRI).",
+            "type": "string"
+          },
+          "iri": {
+            "description": "The source's IRI (default: a `urn:uuid` minted from the text).",
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "original": {
+            "description": "The file's bytes in base64 when the text is their normalized form. They are kept so an export can write the file back unchanged, and their SHA-256 becomes the digest.",
+            "type": "string"
+          },
+          "profile": {
+            "type": "string"
+          },
+          "reanchor": {
+            "description": "Give each fact that cites the previous rendition a span in the new text where its quote occurs once, and retract the others.",
+            "type": "boolean"
+          },
+          "reanchorFrom": {
+            "description": "An earlier source whose facts are copied into this source's graph where their quotes occur in this text.",
+            "type": "string"
+          },
+          "text": {
+            "description": "The document as text or Markdown, at most 2 MiB.",
+            "type": "string"
+          },
+          "timeoutSeconds": {
+            "type": "number"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "type": "object"
+      },
+      "RegisterSourceResult": {
+        "description": "What `register_source` stored.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#importing-agent-memory"
+        },
+        "properties": {
+          "alreadyRegistered": {
+            "type": "boolean"
+          },
+          "branch": {
+            "type": "string"
+          },
+          "chunks": {
+            "items": {
+              "properties": {
+                "end": {
+                  "type": "integer"
+                },
+                "index": {
+                  "type": "integer"
+                },
+                "iri": {
+                  "type": "string"
+                },
+                "start": {
+                  "type": "integer"
+                },
+                "text": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "iri",
+                "index",
+                "start",
+                "end"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "commit": {
+            "type": "integer"
+          },
+          "committed": {
+            "type": "boolean"
+          },
+          "copied": {
+            "type": "integer"
+          },
+          "dataset": {
+            "type": "string"
+          },
+          "digest": {
+            "type": "string"
+          },
+          "elapsedMs": {
+            "type": "number"
+          },
+          "graph": {
+            "type": "string"
+          },
+          "head": {
+            "type": "integer"
+          },
+          "length": {
+            "type": "integer"
+          },
+          "originalKept": {
+            "type": "boolean"
+          },
+          "prefixes": {
+            "additionalProperties": true,
+            "description": "The prefixes the compact terms use.",
+            "type": "object"
+          },
+          "previousRendition": {
+            "type": "string"
+          },
+          "profile": {
+            "type": "string"
+          },
+          "reanchored": {
+            "type": "integer"
+          },
+          "rendition": {
+            "type": "string"
+          },
+          "retracted": {
+            "type": "integer"
+          },
+          "source": {
+            "type": "string"
+          },
+          "staleFacts": {
+            "type": "integer"
+          },
+          "textKept": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "dataset",
+          "graph",
+          "source",
+          "rendition",
+          "digest",
+          "length",
+          "alreadyRegistered",
+          "committed",
+          "chunks"
+        ],
+        "type": "object"
+      },
       "RejectRequest": {
         "additionalProperties": false,
         "description": "The facts to retract, at most 500.",
@@ -12444,6 +12614,89 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "SourceList": {
+        "description": "The sources `list_sources` found.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#importing-agent-memory"
+        },
+        "properties": {
+          "branch": {
+            "type": "string"
+          },
+          "commit": {
+            "type": "integer"
+          },
+          "dataset": {
+            "type": "string"
+          },
+          "prefixes": {
+            "additionalProperties": true,
+            "description": "The prefixes the compact terms use.",
+            "type": "object"
+          },
+          "sources": {
+            "items": {
+              "properties": {
+                "chunks": {
+                  "type": "integer"
+                },
+                "digest": {
+                  "type": "string"
+                },
+                "facts": {
+                  "type": "integer"
+                },
+                "format": {
+                  "type": "string"
+                },
+                "graph": {
+                  "type": "string"
+                },
+                "invalidatedAt": {
+                  "type": "string"
+                },
+                "lastIngestion": {
+                  "type": "string"
+                },
+                "length": {
+                  "type": "integer"
+                },
+                "needsExtraction": {
+                  "type": "boolean"
+                },
+                "rendition": {
+                  "type": "string"
+                },
+                "source": {
+                  "type": "string"
+                },
+                "title": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "source",
+                "graph",
+                "rendition",
+                "chunks",
+                "facts"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "dataset",
+          "commit",
+          "sources",
+          "truncated"
+        ],
         "type": "object"
       },
       "SparklesResult": {
@@ -32706,6 +32959,180 @@
           "Validation"
         ],
         "x-sparkles-permission": "read"
+      }
+    },
+    "/{ds}/sources": {
+      "get": {
+        "description": "The MCP tool `list_sources` as the caller: the sources in the graphs the caller can read, with their current rendition, chunk and fact counts, and whether the rendition still needs extraction. Needs `read` and counts as a query.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#importing-agent-memory"
+        },
+        "operationId": "listSources",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "description": "Only sources in this graph; repeat for several, up to 20.",
+            "in": "query",
+            "name": "graph",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only sources in graphs whose IRI starts with this.",
+            "in": "query",
+            "name": "graphPrefix",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only sources whose current rendition no extraction has cited.",
+            "in": "query",
+            "name": "needsExtraction",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "The most sources listed.",
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "default": 50,
+              "maximum": 500,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Read at this commit.",
+            "in": "query",
+            "name": "atCommit",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SourceList"
+                }
+              }
+            },
+            "description": "The sources."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "List registered sources",
+        "tags": [
+          "SPARQL"
+        ],
+        "x-sparkles-permission": "read"
+      },
+      "post": {
+        "description": "The MCP tool `register_source` as the caller. Needs `write` on the graph and counts as an update. With `original` the file's bytes are kept beside the normalized text, `reanchor` moves the facts that cite the previous rendition to the new text, and `reanchorFrom` copies the facts of a renamed file's source. In a graph under the dataset's import base, a text that matches a secret pattern is refused with 422 `secret-detected`, the pattern's name and the offset. `sparkles memory import` calls it.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#importing-agent-memory"
+        },
+        "operationId": "registerSource",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RegisterSourceRequest"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RegisterSourceResult"
+                }
+              }
+            },
+            "description": "The source and its rendition."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Register a source document",
+        "tags": [
+          "SPARQL"
+        ],
+        "x-sparkles-permission": "write"
       }
     },
     "/{ds}/sparql": {

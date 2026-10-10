@@ -75,7 +75,8 @@ toml = { version = "1", optional = true }
 zeroize = { version = "1", optional = true }
 jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs"], optional = true }
 reqwest = { workspace = true, optional = true }
-# `sparkles memory`: the harness adapters, and tower's `oneshot` for `--loc`
+# `sparkles memory`: the harness adapters, and tower's `oneshot` for `--loc`; the MCP
+# server uses their redaction patterns for the `secret-detected` check of `register_source`
 sparkles-memory-import = { workspace = true, optional = true }
 tower = { version = "0.5", features = ["util"], optional = true }
 rpassword = { version = "7", optional = true }
@@ -152,7 +153,7 @@ auth = [
 # native TLS: `serve --tls-cert FILE --tls-key FILE`
 tls = ["dep:rustls", "dep:tokio-rustls"]
 # Model Context Protocol server for LLM agents (`sparkles mcp` on stdio, `serve --mcp`)
-mcp = ["dep:rmcp", "dep:tokio-util"]
+mcp = ["dep:rmcp", "dep:tokio-util", "dep:sparkles-memory-import"]
 # `sparkles memory`: import coding agents' memory and instruction files, sync them, and
 # print the brief (C18 §10.1); `--loc` serves the database in the process
 memory = ["mcp", "auth", "dep:sparkles-memory-import", "dep:tower"]

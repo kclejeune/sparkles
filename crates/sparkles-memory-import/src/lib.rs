@@ -21,7 +21,7 @@ pub mod vocab;
 
 mod adapters;
 
-pub use adapters::{Request, Roots, Scan, Skipped, scan};
+pub use adapters::{Request, Roots, Scan, Skipped, norm_name, scan};
 pub use ids::Ctx;
 pub use project::Project;
 
@@ -116,6 +116,8 @@ pub enum FileKind {
     Memory,
     Index,
     Instructions,
+    /// a session transcript, which the command line reads (§8.10.7)
+    Transcript,
 }
 
 impl FileKind {
@@ -124,6 +126,7 @@ impl FileKind {
             FileKind::Memory => "memory",
             FileKind::Index => "index",
             FileKind::Instructions => "instructions",
+            FileKind::Transcript => "transcript",
         }
     }
 }
@@ -245,4 +248,55 @@ pub struct FileImport {
     pub redactions: Vec<String>,
     /// the structural facts, the source's description included
     pub facts: Vec<Fact>,
+    /// the file's text after redaction: the text `register_source` receives
+    pub text: String,
+}
+
+/// The first line of a file that `sparkles memory export --sources` converted from
+/// another source: `<!-- sparkles:copy-of <IRI> exported DATE -->`. An import of the
+/// file records `mem:copyOf` that IRI, so the copy does not count as a second source.
+pub const COPY_OF: &str = "<!-- sparkles:copy-of ";
+
+/// The sources a converted file names in its leading copy comments, with each line. The
+/// comments come first, or right after the frontmatter of a file that has one.
+pub fn copies_of(text: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut lines = text.lines().peekable();
+    if lines.peek().is_some_and(|l| l.trim_end() == "---") {
+        lines.next();
+        for l in lines.by_ref() {
+            if l.trim_end() == "---" {
+                break;
+            }
+        }
+    }
+    for line in lines {
+        let t = line.trim();
+        let Some(rest) = t.strip_prefix(COPY_OF) else {
+            break;
+        };
+        if let Some(r) = rest.strip_prefix('<')
+            && let Some((iri, _)) = r.split_once('>')
+            && !iri.is_empty()
+            && !iri.contains(char::is_whitespace)
+        {
+            out.push((iri.to_string(), t.to_string()));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copy_comments() {
+        let t = "<!-- sparkles:copy-of <urn:a> exported 2026-10-10 -->\n<!-- sparkles:copy-of <urn:b> exported 2026-10-10 -->\n## a\n<!-- sparkles:copy-of <urn:c> -->\n";
+        let c: Vec<String> = copies_of(t).into_iter().map(|(i, _)| i).collect();
+        assert_eq!(c, ["urn:a", "urn:b"]);
+        let t = "---\nname: x\n---\n<!-- sparkles:copy-of <urn:a> exported 2026-10-10 -->\nbody\n";
+        assert_eq!(copies_of(t).len(), 1);
+        assert!(copies_of("body\n<!-- sparkles:copy-of <urn:a> -->\n").is_empty());
+    }
 }
