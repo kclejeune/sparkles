@@ -4185,6 +4185,7 @@ dependencies = [
  "sparkles-client",
  "sparkles-fmt",
  "sparkles-graphql",
+ "sparkles-memory-import",
  "sparkles-reasoner",
  "sparkles-shacl",
  "sparkles-shex",

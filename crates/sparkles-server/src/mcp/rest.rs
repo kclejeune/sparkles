@@ -156,6 +156,7 @@ pub(crate) fn tool_error(e: &super::errors::ToolError) -> crate::http::ApiError 
 }
 
 /// Run `tool` with the body's arguments and `{ds}`.
+#[allow(clippy::too_many_arguments)]
 async fn run(
     tool: &str,
     State(st): State<Arc<AppState>>,
