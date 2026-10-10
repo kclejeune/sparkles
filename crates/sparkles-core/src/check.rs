@@ -1186,14 +1186,39 @@ impl Checker<'_> {
                 return;
             }
         };
-        // a writer syncs a commit's new delta terms together with its WAL records, so
-        // after a crash only commits that were not durable yet can name terms that
+        // a writer writes a commit's new delta terms at the same time as its WAL records,
+        // so after a crash only commits that were not durable yet can name terms that
         // delta.vocab lacks (a torn tail). Counted again now, it covers every commit
-        // before them.
-        let dvocab_len = match std::fs::read(dir.join("delta.vocab")) {
+        // before them. On a live store the last commit's terms can still be on their
+        // way: the file is read again a few times before they count as missing.
+        let terms = || match std::fs::read(dir.join("delta.vocab")) {
             Ok(b) => parse_delta(&b).ok().map(|p| p.keys.len() as u64),
             Err(_) => self.dvocab_len,
         };
+        let named = buf
+            .as_chunks::<WAL_REC>()
+            .0
+            .iter()
+            .filter(|r| matches!(r[0], WAL_INSERT | WAL_DELETE))
+            .flat_map(|r| {
+                (0..4).map(move |j| {
+                    Id(u64::from_le_bytes(
+                        r[1 + j * 8..9 + j * 8].try_into().unwrap(),
+                    ))
+                })
+            })
+            .filter(|id| id.tag() == Tag::Delta)
+            .map(|id| id.payload() + 1)
+            .max()
+            .unwrap_or(0);
+        let mut dvocab_len = terms();
+        for _ in 0..4 {
+            if dvocab_len.is_none_or(|n| n >= named) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            dvocab_len = terms();
+        }
         // the commit the base holds; a generation without commit.json starts a baseline
         let base_seq = self.base.map(|b| b.seq);
         let base_ts = self.base.map_or(i64::MIN, |b| b.timestamp_ms);
