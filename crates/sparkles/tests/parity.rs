@@ -736,6 +736,13 @@ fn entries() -> Vec<(&'static str, Entry)> {
         server_only!("explainQuery", Mcp),
         server_only!("getAssistantSettings", Process),
         server_only!("putAssistantSettings", Process),
+        // C19: the layered settings come from the server's settings file
+        server_only!("getSettingsStatus", Process),
+        server_only!("getDatasetSettings", Process),
+        server_only!("getSettings", Process),
+        server_only!("patchSettings", Process),
+        server_only!("putSettings", Process),
+        server_only!("resetSettings", Process),
         server_only!("listAsks", Process),
         server_only!("deleteAsks", Process),
         server_only!("askFeedback", Process),
