@@ -1,6 +1,6 @@
 //! The subcommands of `sparkles memory`.
 
-use super::conn::{CmdError, Conn, enc, val};
+use super::conn::{CmdError, Conn, Resp, enc, val};
 use super::sync::{self, Cache, Lock, SyncOpts};
 use super::transcripts;
 use super::{
@@ -162,7 +162,45 @@ pub fn dispatch(args: MemoryArgs, opts: StoreOptions) -> Result<i32, CmdError> {
         MemoryCmd::Init {
             import_base,
             no_shapes,
-        } => init(&env, import_base, no_shapes),
+            no_ingest,
+        } => init(&env, import_base, no_shapes, no_ingest),
+        MemoryCmd::Consolidate {
+            mode,
+            min_sources,
+            dry_run,
+            message,
+            task,
+        } => {
+            let conn = env.connect()?;
+            let (j, t) =
+                super::maintain::consolidate(&conn, mode, min_sources, dry_run, message, &task)?;
+            env.out(&j, || t);
+            Ok(0)
+        }
+        MemoryCmd::Retention {
+            after,
+            graphs,
+            require_consolidated,
+            no_require_consolidated,
+            dry_run,
+            task,
+        } => {
+            let conn = env.connect()?;
+            let require = match (require_consolidated, no_require_consolidated) {
+                (true, _) => Some(true),
+                (_, true) => Some(false),
+                _ => None,
+            };
+            let (j, t) = super::maintain::retention(&conn, after, graphs, require, dry_run, &task)?;
+            env.out(&j, || t);
+            Ok(0)
+        }
+        MemoryCmd::Maintenance => {
+            let conn = env.connect()?;
+            let (j, t) = super::maintain::maintenance(&conn)?;
+            env.out(&j, || t);
+            Ok(0)
+        }
         MemoryCmd::Import { flags } => import(&env, flags, false, None),
         MemoryCmd::Sync {
             flags,
@@ -383,7 +421,12 @@ fn gsp_put(conn: &Conn, graph: &str, turtle: &str) -> Result<(), CmdError> {
     Ok(())
 }
 
-fn init(env: &Env, import_base: Option<String>, no_shapes: bool) -> Result<i32, CmdError> {
+fn init(
+    env: &Env,
+    import_base: Option<String>,
+    no_shapes: bool,
+    no_ingest: bool,
+) -> Result<i32, CmdError> {
     let conn = env.connect()?;
     gsp_put(&conn, vocab::VOCAB_GRAPH, vocab::VOCAB_TTL)?;
     let mut settings = conn.memory_settings()?;
@@ -413,6 +456,11 @@ fn init(env: &Env, import_base: Option<String>, no_shapes: bool) -> Result<i32, 
     } else {
         install_shapes(&conn)
     };
+    let assistant = if no_ingest {
+        json!({ "status": "skipped", "reason": "--no-ingest" })
+    } else {
+        enable_ingest(&conn)
+    };
     let out = json!({
         "dataset": conn.dataset,
         "vocabulary": vocab::VOCAB_GRAPH,
@@ -420,20 +468,223 @@ fn init(env: &Env, import_base: Option<String>, no_shapes: bool) -> Result<i32, 
         "agentGraphs": settings["agentGraphs"],
         "settingsChanged": changed,
         "shapes": shapes,
+        "assistant": assistant,
     });
     env.out(&out, || {
         format!(
-            "vocabulary written to <{}>\nimport base {base} ({})\nshapes: {}{}",
+            "vocabulary written to <{}>\nimport base {base} ({})\nshapes: {}{}\n{}",
             vocab::VOCAB_GRAPH,
             if changed { "set" } else { "unchanged" },
             shapes["status"].as_str().unwrap_or(""),
             shapes["reason"]
                 .as_str()
                 .map(|r| format!(" ({r})"))
-                .unwrap_or_default()
+                .unwrap_or_default(),
+            ingest_text(&assistant)
         )
     });
     Ok(0)
+}
+
+/// The assistant fields that server-side ingestion needs (spec C19 §8.1).
+fn ingest_fields() -> [(&'static str, Value); 3] {
+    [
+        ("enabled", json!(true)),
+        ("ingest", json!(true)),
+        ("send", json!("documents")),
+    ]
+}
+
+/// Turn on server-side ingestion: set each field of [`ingest_fields`] whose source is
+/// `default`, and leave declared, runtime and locked fields as they are. The answer
+/// lists what changed, what stayed with its source, and the providers of the effective
+/// `extract` role. A failure is reported in the answer and does not fail `init`.
+fn enable_ingest(conn: &Conn) -> Value {
+    let path = format!("/$/settings/{}/assistant", enc(&conn.dataset));
+    let failed = |e: CmdError| json!({ "status": "failed", "error": e.message, "code": e.code });
+    // a write between the read and the PATCH is a 412: read again
+    let mut tries = 0;
+    let (cur, patch) = loop {
+        tries += 1;
+        let cur = match conn
+            .send("GET", &path, &[("accept", "application/json")], Vec::new())
+            .and_then(Resp::check)
+        {
+            Ok(r) => r,
+            Err(e) => return failed(e),
+        };
+        let etag = cur.header("etag").unwrap_or("*").to_string();
+        let cur = match cur.json() {
+            Ok(v) => v,
+            Err(e) => return failed(e),
+        };
+        let mut patch = json!({});
+        for (f, wanted) in ingest_fields() {
+            if cur["sources"][f] == "default" && cur["effective"][f] != wanted {
+                patch[f] = wanted;
+            }
+        }
+        if patch.as_object().is_some_and(|m| m.is_empty()) {
+            break (cur, patch);
+        }
+        let r = match conn.send(
+            "PATCH",
+            &path,
+            &[
+                ("content-type", "application/json"),
+                ("accept", "application/json"),
+                ("if-match", &etag),
+            ],
+            serde_json::to_vec(&patch).unwrap_or_default(),
+        ) {
+            Ok(r) => r,
+            Err(e) => return failed(e),
+        };
+        if r.status == 412 && tries < 3 {
+            continue;
+        }
+        match r.check().and_then(|r| r.json()) {
+            Ok(v) => break (v, patch),
+            Err(e) => return failed(e),
+        }
+    };
+    let mut changed = Vec::new();
+    let mut unchanged = Vec::new();
+    for (f, _) in ingest_fields() {
+        if patch.get(f).is_some() {
+            changed.push(json!({ "field": f, "value": cur["effective"][f] }));
+        } else {
+            unchanged.push(json!({
+                "field": f,
+                "value": cur["effective"][f],
+                "source": cur["sources"][f],
+            }));
+        }
+    }
+    let eff = &cur["effective"];
+    let send_of = |provider: &str| -> Value {
+        match &eff["sendByProvider"][provider] {
+            Value::Null => eff["send"].clone(),
+            v => v.clone(),
+        }
+    };
+    // the dataset's own extract list, else the server's
+    let mut extract = json!({});
+    let pairs = if let Some(l) = eff["roles"]["extract"].as_array() {
+        extract["source"] = "dataset".into();
+        Some(l.clone())
+    } else {
+        extract["source"] = "server".into();
+        match conn.get_json("/$/models") {
+            Ok(m) if m["configured"] == false => {
+                extract["note"] = "the server has no model configuration".into();
+                Some(Vec::new())
+            }
+            Ok(m) => Some(
+                m["roles"]["extract"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+            Err(e) => {
+                extract["note"] =
+                    format!("cannot read the server's role lists: {}", e.message).into();
+                None
+            }
+        }
+    };
+    if let Some(pairs) = pairs {
+        extract["providers"] = pairs
+            .iter()
+            .map(|p| {
+                let name = p["provider"].as_str().unwrap_or("");
+                json!({ "provider": name, "model": p["model"], "send": send_of(name) })
+            })
+            .collect::<Vec<_>>()
+            .into();
+    }
+    let mut out = json!({
+        "status": if changed.is_empty() { "unchanged" } else { "changed" },
+        "changed": changed,
+        "unchanged": unchanged,
+        "extract": extract,
+    });
+    if eff["send"] == "documents" {
+        out["note"] =
+            "send: documents also lets result rows go to the summarize providers for summaries"
+                .into();
+    }
+    out
+}
+
+/// The text of [`enable_ingest`]'s answer.
+fn ingest_text(a: &Value) -> String {
+    match a["status"].as_str() {
+        Some("skipped") => return "assistant: left alone (--no-ingest)".into(),
+        Some("failed") => {
+            return format!(
+                "assistant: not changed: {}",
+                a["error"].as_str().unwrap_or("")
+            );
+        }
+        _ => {}
+    }
+    let mut lines = Vec::new();
+    let fields = |key: &str| a[key].as_array().cloned().unwrap_or_default();
+    let changed: Vec<String> = fields("changed")
+        .iter()
+        .map(|c| format!("{} = {}", c["field"].as_str().unwrap_or(""), c["value"]))
+        .collect();
+    if !changed.is_empty() {
+        lines.push(format!("assistant: set {}", changed.join(", ")));
+    }
+    for u in fields("unchanged") {
+        let why = match u["source"].as_str().unwrap_or("") {
+            "locked" => "locked by the server's settings file",
+            "declared" => "declared in the server's settings file",
+            "runtime" => "set at runtime",
+            s => s,
+        }
+        .to_string();
+        lines.push(format!(
+            "assistant: left {} at {} ({why})",
+            u["field"].as_str().unwrap_or(""),
+            u["value"]
+        ));
+    }
+    let x = &a["extract"];
+    let mut ex = match x["providers"].as_array() {
+        Some(ps) if !ps.is_empty() => {
+            let list: Vec<String> = ps
+                .iter()
+                .map(|p| {
+                    let mut s = format!(
+                        "{}/{}",
+                        p["provider"].as_str().unwrap_or(""),
+                        p["model"].as_str().unwrap_or("")
+                    );
+                    if p["send"] != "documents" {
+                        s.push_str(&format!(" (send {}, so no document text)", p["send"]));
+                    }
+                    s
+                })
+                .collect();
+            format!(
+                "extract providers that receive document text: {}",
+                list.join(", ")
+            )
+        }
+        Some(_) => "extract providers: none, so the server cannot ingest yet".to_string(),
+        None => "extract providers: unknown".to_string(),
+    };
+    if let Some(n) = x["note"].as_str() {
+        ex.push_str(&format!(" ({n})"));
+    }
+    lines.push(ex);
+    if let Some(n) = a["note"].as_str() {
+        lines.push(format!("note: {n}"));
+    }
+    lines.join("\n")
 }
 
 /// Add the memory shapes to the guard: a new guard warns over the union graph, and an
