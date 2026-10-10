@@ -45,6 +45,7 @@ without a migration path, so keep backups of anything you cannot regenerate.
   * [Agent memory grants](#agent-memory-grants)
 * [Agent memory](#agent-memory)
 * [Asking questions with a model](#asking-questions-with-a-model)
+  * [The Settings tab](#the-settings-tab)
   * [Escalation](#escalation)
   * [The Ask bar](#the-ask-bar)
   * [Measuring models](#measuring-models)
@@ -2563,13 +2564,14 @@ datasets by name:
 }
 ```
 
-**Configuration gap.** The current UI has no editor for the dataset's assistant
-settings, and the CLI has no assistant-settings command. On NixOS,
+**Configuration gap.** A dataset admin can turn these settings on in the **Settings**
+tab of the dataset page in the web UI, which [The Settings tab](#the-settings-tab)
+describes. The CLI has no assistant-settings command. On NixOS,
 [`services.sparkles.datasetSettings`](#declarative-dataset-settings) provisions them.
-The UI's **Ingest** section uploads documents and configures source
-retention and ingest profiles; it does not enable the assistant or permit sending
-documents to a model. `sparkles memory init` prepares the memory vocabulary, import
-settings and validation shapes, but does not enable assistant ingestion either.
+The UI's **Ingest** section uploads documents and configures source retention and
+ingest profiles, but it does not enable the assistant or permit sending documents to a
+model. `sparkles memory init` prepares the memory vocabulary, import settings and
+validation shapes, but does not enable assistant ingestion either.
 
 Without a settings file, configure the dataset through
 `PATCH /$/settings/{dataset}/assistant` as below. The server keeps the fields changed
@@ -2686,6 +2688,12 @@ A scheduled consolidation writes nothing while the last one's branch waits for r
 `POST /$/memory/{ds}/consolidate` and `POST /$/memory/{ds}/retention` run a pass now and
 answer with a task under `/$/ingest/{ds}`. `dryRun` reports what a pass would do.
 `GET /$/memory/{ds}/maintenance` shows the settings, the last task and the next run.
+
+In the web UI, the memory section of the dataset's **Settings** tab sets the schedules
+and shows, for consolidation and for retention, when the last pass ran, how it ended
+and when the next scheduled pass is due. A dataset admin can start either pass with
+**Run now** and follow its progress. Retention first runs a dry run and asks for a
+confirmation that lists the session graphs it would delete.
 
 `recall` takes `recency`, a half-life such as `"90d"`, that ranks recent facts and facts
 that several graphs assert first. Old facts are never deleted for their age alone.
@@ -2816,6 +2824,29 @@ configuration again. A file that does not validate is logged and the server keep
 previous one, while at start it fails the start. `GET /$/settings` reports when each
 file was read and the last reload error.
 
+### The Settings tab
+
+The dataset page of the web UI has a **Settings** tab with a section for the assistant,
+memory and ingest settings. Each section has a form for the common fields and, under
+**Advanced**, an editor for the whole runtime layer as JSON, next to the values of the
+settings file. Role lists, routing and secret patterns are edited there.
+
+Each field shows where its value comes from. A value from the settings file is labeled
+"server config". A field the settings file locks shows a lock and cannot be changed.
+A value changed at runtime is marked "changed" and has a **Reset** button that removes
+it, so the field takes the value of the settings file or the default again. When a lock
+ignores a runtime value stored before the lock, the field says that the change is
+ignored. **Reset all** removes every runtime change of a kind, and the section shows
+when the effective settings are not valid.
+
+Saving sends only the fields that changed, with the `ETag` the section read. When
+someone else changed the settings in the meantime, the server refuses the save, and the
+section reloads and says so. A change to a locked field is refused and the field is
+highlighted. Users without `admin` on the dataset see the tab read-only.
+
+The memory section also shows memory maintenance, which
+[Maintaining agent memory](#maintaining-agent-memory) describes.
+
 ### Escalation
 
 A role's list goes from the cheapest pair to the strongest. A step moves to the next
@@ -2839,7 +2870,7 @@ query.
 ### The Ask bar
 
 When a dataset has an assistant, the query page shows an **Ask** bar above the tabs.
-The settings file of the [previous section](#turning-on-the-assistant-in-the-server)
+The settings file of [Turning on the assistant in the server](#turning-on-the-assistant-in-the-server)
 turns the assistant on for every dataset. A dataset admin can also turn it on for one
 dataset with its settings, which name what may leave the server and may override the
 server's role lists:

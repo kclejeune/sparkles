@@ -282,8 +282,9 @@ other RDF stores have and Sparkles does not.
   settings file of `serve --settings`, which can also lock them, and changed through
   `/$/settings/{dataset}/assistant`. The NixOS module provisions assistant
   and memory settings through `services.sparkles.datasetSettings`, including settings
-  for datasets created through the UI/API. There is no UI editor or dedicated CLI
-  command for assistant settings. The UI's ingestion controls and
+  for datasets created through the UI/API. The dataset page's Settings tab edits them,
+  with each field's source, locks and resets, but there is no dedicated CLI command for
+  assistant settings. The UI's ingestion controls and
   `sparkles memory init` do not enable assistant ingestion. Provider endpoints and
   keys also have no UI editor and remain operator-controlled through `--model-config`
   and `--model-secret`, or the NixOS module's `services.sparkles.models` options. See

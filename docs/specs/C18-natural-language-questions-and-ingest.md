@@ -4658,8 +4658,12 @@ none.
   and it reads only agent graphs, so a curated graph is never deleted.
 - The sync waits for its extractions only with `--loc`. Against a server it reports the
   task ids and returns.
-- There is no UI and no `sparkles memory` command for consolidation or retention. The
-  inbox shows the consolidation branch, and the routes and settings cover the rest.
+- There is no `sparkles memory` command for consolidation or retention. The inbox
+  shows the consolidation branch, and the routes and settings cover the rest. The UI
+  had no controls for them when Phase 5 landed. The Settings tab of C19 Phase 3 added
+  them: the memory section shows each job's last run, its outcome and the next
+  scheduled run, and offers Run now to dataset admins, with a dry run and a
+  confirmation before retention deletes anything.
 
 **Tests.** `crates/sparkles-server/src/ingest/tests.rs` covers A78 in
 `consolidation_task`, with the dry run, the branch and its inbox kind, a scheduled pass

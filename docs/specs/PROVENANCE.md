@@ -618,7 +618,9 @@ implementation landed.
   - the NixOS manual's guidance on settings options and secrets;
   - the Sparkles code and specs C09, C17, C18 and F11.
 - **Implementation:** Phase 1 from the spec plus Sparkles code only (2026-10-10). It adds
-  no runtime dependency. Phases 2, 3 and 4 are not built.
+  no runtime dependency. Phase 3, the UI's Settings tab with the controls of memory
+  maintenance, from the spec, docs/API.md and the Sparkles UI code only (2026-10-10),
+  with no new UI dependency. Phases 2 and 4 are not built.
 - **Rejected** (spec §12):
   - model configuration only in the operator's file;
   - returning stored keys to administrators;
