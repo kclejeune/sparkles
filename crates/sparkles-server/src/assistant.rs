@@ -8,6 +8,10 @@
 //! endpoint or a key. A principal sees only its own history, whatever its role: a
 //! question can hold personal or confidential text. Admins see counts only.
 
+// Without `mcp` there is no `POST /{ds}/ask`, so the parts only it uses go unused, while
+// the settings, history and usage routes stay.
+#![cfg_attr(not(feature = "mcp"), allow(dead_code))]
+
 use crate::assist::{read_file, write_file};
 use crate::auth::Principal;
 use crate::http::{AdminBody, ApiResult, blocking, dataset, err, err_code};

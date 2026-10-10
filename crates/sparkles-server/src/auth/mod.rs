@@ -746,6 +746,7 @@ impl Principal {
 
     /// This principal with the graphs that `patterns` match hidden from its reads, in
     /// every dataset, whatever its grants say.
+    #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
     pub fn hiding_graphs(mut self, patterns: &[String]) -> Principal {
         self.hidden = (!patterns.is_empty()).then(|| patterns.into());
         self
