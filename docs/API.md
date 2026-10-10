@@ -9054,8 +9054,10 @@ review branches the caller may read, newest first, with the facts each proposes 
 when more wait), without the inbox's signals. It counts every minute with the
 maintenance schedule, also on a read-only server, and right after a successful
 `assert_facts`, `sparql_update`, `merge_branch`, `delete_branch`, inbox action, merge
-or branch deletion on the dataset. A count whose dataset head, branches and memory
-settings did not change since the last one reads nothing.
+or branch deletion on the dataset. The maintenance answer, the brief and the resource
+count first when the dataset changed since the last count, and the metrics show the
+last count. A count whose dataset head, branches and memory settings did not change
+since the last one reads nothing.
 
 The same counts appear as the metrics `sparkles_memory_review_pending` and
 `sparkles_memory_review_oldest_seconds` (see [Metrics](#metrics)), in the brief of

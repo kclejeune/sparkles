@@ -10,8 +10,9 @@
 //! commit, its branches and its memory settings. The maintenance tick refreshes every
 //! dataset with memory settings once a minute, and the tools that change the inbox
 //! (`assert_facts`, the reviewer's actions, merges and branch deletions) refresh their
-//! dataset on a thread of their own. A refresh whose fingerprint did not change reads
-//! nothing.
+//! dataset on a thread of their own. The maintenance answer, the brief and the resource
+//! read refresh their dataset first. A refresh whose fingerprint did not change reads
+//! nothing, and the metrics read the kept counts only.
 //!
 //! A fact's age is the time of its reifier. A fact without one, such as an imported
 //! memory, is as old as the time the server first counted its graph, which is kept in the
@@ -202,9 +203,11 @@ pub(crate) fn refresh(st: &Arc<AppState>, ds: &Arc<Dataset>) -> Option<Arc<Count
     }
 }
 
-/// The counts of `ds`: those kept, else a count now.
+/// The counts of `ds` for a reader of the maintenance answer, the brief or the resource:
+/// those kept while their fingerprint holds, else a count now, so that a reader never
+/// sees counts older than the dataset (the metrics read the kept counts only).
 pub(crate) fn current(st: &Arc<AppState>, ds: &Arc<Dataset>) -> Option<Arc<Counts>> {
-    st.ingest.review.get(&ds.name).or_else(|| refresh(st, ds))
+    refresh(st, ds)
 }
 
 /// Refresh every dataset, and forget the datasets that are gone (the maintenance tick).
