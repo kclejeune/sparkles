@@ -417,8 +417,8 @@ async fn delete_kind(
 // ------------------------------------------------------ server-wide kinds (§11.3) ------
 
 async fn get_server(State(st): St, Path(kind): Path<String>) -> ApiResult<Response> {
-    let _ = server_kind_of(&kind)?;
-    blocking(move || Ok(with_etag_server(&super::server::resolved(&st)))).await
+    let kind = server_kind_of(&kind)?;
+    blocking(move || Ok(with_etag_server(&super::server::resolved_kind(&st, kind)))).await
 }
 
 async fn put_server(

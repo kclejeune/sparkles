@@ -72,6 +72,7 @@ pub fn check_lock(root: &str, p: &[String]) -> Result<(), String> {
             }
             crate::models::check_secret_name(&p[0])
         }
+        "notifications" => crate::notify::config::check_lock(p),
         _ => {
             let top = p[0].as_str();
             if !MODELS.members.contains(&top) {
@@ -125,14 +126,19 @@ pub fn lock_warnings(d: &Declared, cfg: &ModelsConfig) -> Vec<String> {
             ));
         }
     }
+    let channels: Vec<String> = d
+        .server_value(&super::NOTIFICATIONS)
+        .map(crate::notify::config::secret_names)
+        .unwrap_or_default();
     for name in d.locked_secrets() {
         let used = cfg
             .providers
             .values()
-            .any(|p| p.api_key.as_ref().is_some_and(|k| k.secret == name));
+            .any(|p| p.api_key.as_ref().is_some_and(|k| k.secret == name))
+            || channels.iter().any(|c| c == name);
         if !used {
             out.push(format!(
-                "server.locked: secrets.{name} names a secret that no provider of the model configuration uses"
+                "server.locked: secrets.{name} names a secret that no provider of the model configuration and no declared notification channel uses"
             ));
         }
     }
@@ -151,6 +157,8 @@ pub struct ServerLayers {
     sources: Mutex<BTreeMap<String, SecretSource>>,
     /// the runtime layer, as kept in `<dataDir>/models.json`
     runtime: Mutex<Value>,
+    /// the runtime layers of the other server-wide kinds (`notifications`), by kind
+    others: Mutex<BTreeMap<&'static str, Value>>,
     /// the data directory (`None`: the runtime layer lives in the process, and no
     /// secret can be stored)
     dir: Option<PathBuf>,
@@ -241,6 +249,63 @@ impl ServerLayers {
         Ok(())
     }
 
+    /// The runtime layer of a server-wide kind other than `models` (an empty object
+    /// before one is read).
+    pub fn runtime_of(&self, kind: &Kind) -> Value {
+        self.others
+            .lock()
+            .get(kind.name)
+            .cloned()
+            .unwrap_or_else(|| Value::Object(Map::new()))
+    }
+
+    /// Read the runtime layers of the server-wide kinds other than `models` from their
+    /// files. A file that does not read is reported, and its kind keeps the layer it
+    /// had.
+    fn load_others(&self) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let Some(dir) = &self.dir else {
+            return Ok(());
+        };
+        for kind in super::SERVER_KINDS {
+            if kind.name == MODELS.name {
+                continue;
+            }
+            let path = dir.join(kind.file);
+            let v = match std::fs::read(&path) {
+                Ok(b) => serde_json::from_slice::<Value>(&b)
+                    .with_context(|| format!("{} is not JSON", path.display()))?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Value::Object(Map::new()),
+                Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+            };
+            if !v.is_object() {
+                anyhow::bail!("{} is not a JSON object", path.display());
+            }
+            self.others.lock().insert(kind.name, v);
+        }
+        Ok(())
+    }
+
+    /// Replace the runtime layer of a server-wide kind other than `models`, in its file
+    /// first. An empty layer removes the file.
+    fn store_other(&self, kind: &'static Kind, v: &Value) -> std::io::Result<()> {
+        if let Some(dir) = &self.dir {
+            let path = dir.join(kind.file);
+            if v.as_object().is_none_or(Map::is_empty) {
+                match std::fs::remove_file(&path) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+                    _ => {}
+                }
+            } else {
+                let mut bytes = serde_json::to_vec_pretty(v).unwrap_or_default();
+                bytes.push(b'\n');
+                super::secrets::write_atomic(&path, &bytes, 0o644)?;
+            }
+        }
+        self.others.lock().insert(kind.name, v.clone());
+        Ok(())
+    }
+
     /// Whether anything configures models: `--model-config` or a runtime layer.
     fn configured(&self, runtime: &Value) -> bool {
         self.declared.lock().is_some() || runtime.as_object().is_some_and(|m| !m.is_empty())
@@ -260,9 +325,40 @@ fn resolve_models(st: &AppState, d: &Declared, runtime: Value) -> Resolved {
     )
 }
 
-/// The `models` kind as it stands, for `GET /$/server/settings/models`.
-pub fn resolved(st: &AppState) -> Resolved {
-    resolve_models(st, &st.settings.declared(), st.settings.server.runtime())
+/// A server-wide kind other than `models` with the locks of `d`: its built-in defaults,
+/// the settings file's `server.<kind>` and its runtime layer (spec C21 §5.2).
+fn resolve_other(kind: &'static Kind, d: &Declared, runtime: Value) -> Resolved {
+    let layers: Vec<&Value> = d.server_value(kind).into_iter().collect();
+    resolve_layers(
+        kind,
+        &layers,
+        d.server_locked(kind),
+        runtime,
+        Providers::Unchecked,
+    )
+}
+
+/// The layers of the server-wide `kind` with the runtime layer `runtime`.
+fn resolve_kind(st: &AppState, kind: &'static Kind, d: &Declared, runtime: Value) -> Resolved {
+    if kind.name == MODELS.name {
+        resolve_models(st, d, runtime)
+    } else {
+        resolve_other(kind, d, runtime)
+    }
+}
+
+/// The runtime layer of the server-wide `kind`.
+fn runtime_kind(st: &AppState, kind: &Kind) -> Value {
+    if kind.name == MODELS.name {
+        st.settings.server.runtime()
+    } else {
+        st.settings.server.runtime_of(kind)
+    }
+}
+
+/// The server-wide `kind` as it stands, for `GET /$/server/settings/{kind}`.
+pub fn resolved_kind(st: &AppState, kind: &'static Kind) -> Resolved {
+    resolve_kind(st, kind, &st.settings.declared(), runtime_kind(st, kind))
 }
 
 /// The secret sources in force: the declared ones, with each runtime value that `d`
@@ -351,6 +447,7 @@ pub fn start(st: &mut AppState, settings: Option<&Path>, args: &ModelArgs) -> an
     s.server.set_dir(&st.data_dir.clone());
     s.server.load_declared(args)?;
     s.server.load_runtime()?;
+    s.server.load_others()?;
     s.set_models_file(args.model_config.clone());
     st.settings = s;
     let d = st.settings.declared();
@@ -388,6 +485,11 @@ pub fn reload(st: &AppState, args: &ModelArgs) {
         let msg = format!("{e:#}");
         tracing::error!("runtime model settings not reloaded, the previous ones stay: {msg}");
         outcome = outcome.and(Err(msg));
+    }
+    if let Err(e) = settings.server.load_others() {
+        tracing::error!(
+            "runtime notification settings not reloaded, the previous ones stay: {e:#}"
+        );
     }
     let previous = settings.declared();
     let candidate = settings
@@ -488,22 +590,29 @@ pub async fn write(
         let lock = st.settings.write_lock("", kind);
         let _g = lock.lock();
         let d = st.settings.declared();
-        let cur = resolve_models(&st, &d, st.settings.server.runtime());
+        let cur = resolve_kind(&st, kind, &d, runtime_kind(&st, kind));
         let new = plan(&cur, op, if_match.as_deref(), "the server")?;
-        let r = resolve_models(&st, &d, new);
+        let r = resolve_kind(&st, kind, &d, new);
         if let Err(e) = &r.status {
             return Err(bad(format!("{}: {e}", kind.name)));
         }
         if r.runtime == cur.runtime {
             return Ok(r);
         }
-        st.settings.server.store_runtime(&r.runtime).map_err(|e| {
+        let stored = if kind.name == MODELS.name {
+            st.settings.server.store_runtime(&r.runtime)
+        } else {
+            st.settings.server.store_other(kind, &r.runtime)
+        };
+        stored.map_err(|e| {
             err(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("cannot store {MODELS_FILE}: {e}"),
+                format!("cannot store {}: {e}", kind.file),
             )
         })?;
-        if let Err(e) = apply_with(&st, &d) {
+        if kind.name == MODELS.name
+            && let Err(e) = apply_with(&st, &d)
+        {
             tracing::error!("model configuration not rebuilt: {e}");
         }
         let fields = changed(&cur.effective, &r.effective);

@@ -198,11 +198,13 @@ async fn list(State(st): St) -> ApiResult<Json<Value>> {
                 }
             }
         }
+        let channels = crate::notify::secret_users(&st);
         let names: BTreeSet<String> = declared
             .keys()
             .cloned()
             .chain(stored.keys().cloned())
             .chain(users.keys().cloned())
+            .chain(channels.keys().cloned())
             .chain(d.locked_secrets().map(str::to_string))
             .collect();
         let secrets: Vec<Value> = names
@@ -225,6 +227,7 @@ async fn list(State(st): St) -> ApiResult<Json<Value>> {
                     "setAt": set.map(rfc3339),
                     "overridden": set.is_some() && locked,
                     "providers": users.get(&name).cloned().unwrap_or_default(),
+                    "channels": channels.get(&name).cloned().unwrap_or_default(),
                 })
             })
             .collect();

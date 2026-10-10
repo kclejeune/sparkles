@@ -136,6 +136,7 @@ pub static MEMORY: Kind = Kind {
         "imports",
         "consolidation",
         "retention",
+        "review",
     ],
     removable: &[],
     shared: false,
@@ -159,8 +160,23 @@ pub static INGEST: Kind = Kind {
 /// Every dataset-wide kind, in the order the answers list them.
 pub static KINDS: [&Kind; 3] = [&ASSISTANT, &MEMORY, &INGEST];
 
+/// The server-wide `notifications` kind (spec C21 §5): channels, routes and delivery,
+/// declared in the settings file's `server.notifications` and kept at runtime in
+/// `<dataDir>/notifications.json`.
+pub static NOTIFICATIONS: Kind = Kind {
+    name: "notifications",
+    scope: Scope::Server,
+    file: crate::notify::config::NOTIFICATIONS_FILE,
+    members: crate::notify::config::MEMBERS,
+    removable: &["channels"],
+    shared: false,
+    defaults: crate::notify::config::defaults,
+    normalize: crate::notify::config::normalize,
+    check: crate::notify::config::check,
+};
+
 /// Every server-wide kind (§11).
-pub static SERVER_KINDS: [&Kind; 1] = [&MODELS];
+pub static SERVER_KINDS: [&Kind; 2] = [&MODELS, &NOTIFICATIONS];
 
 pub fn kind(name: &str) -> Option<&'static Kind> {
     KINDS.iter().copied().find(|k| k.name == name)
@@ -243,11 +259,14 @@ pub struct Declared {
     /// `server.locked`: the locked fields of server-wide kinds, such as
     /// `models.providers.claude.endpoint` or `secrets.anthropic`, as (root, field)
     server_locked: Vec<(String, Vec<String>)>,
+    /// the declared layers of the server-wide kinds that the settings file holds
+    /// (`server.notifications`), by kind
+    server_values: BTreeMap<&'static str, Value>,
 }
 
 /// The names that `server.locked` may start with: the server-wide kinds and the
-/// secrets of the model configuration.
-const SERVER_LOCK_ROOTS: &[&str] = &["models", "secrets"];
+/// secrets of the model configuration and the notification channels.
+const SERVER_LOCK_ROOTS: &[&str] = &["models", "notifications", "secrets"];
 
 impl Declared {
     /// Read a settings file: its form, the members it may hold, and every effective
@@ -279,7 +298,8 @@ impl Declared {
                     }
                 }
                 "server" => {
-                    d.server_locked = parse_server(&v).map_err(|e| format!("server: {e}"))?
+                    (d.server_locked, d.server_values) =
+                        parse_server(&v).map_err(|e| format!("server: {e}"))?
                 }
                 other => {
                     return Err(format!(
@@ -293,6 +313,19 @@ impl Declared {
     }
 
     fn validate(&self, providers: Providers) -> Result<(), String> {
+        for (name, v) in &self.server_values {
+            let Some(k) = server_kind(name) else { continue };
+            let r = resolve_layers(
+                k,
+                &[v],
+                self.server_locked(k),
+                Value::Object(Map::new()),
+                providers,
+            );
+            if let Err(e) = r.status {
+                return Err(format!("server.{name}: {e}"));
+            }
+        }
         let names = std::iter::once(None).chain(self.datasets.keys().map(Some));
         for name in names {
             for k in KINDS {
@@ -338,6 +371,11 @@ impl Declared {
             }
         }
         out
+    }
+
+    /// The declared layer of the server-wide `kind` that the settings file holds.
+    pub fn server_value(&self, kind: &Kind) -> Option<&Value> {
+        self.server_values.get(kind.name)
     }
 
     /// Whether `server.locked` locks the secret `name`, so that its declared source
@@ -406,15 +444,30 @@ fn parse_entry(v: &Value) -> Result<Entry, String> {
     Ok(e)
 }
 
-/// `server`: only `locked`, whose fields start with a server-wide kind or `secrets`.
-fn parse_server(v: &Value) -> Result<Vec<(String, Vec<String>)>, String> {
+/// The locks and the declared server-wide kinds of `server`.
+type ServerEntry = (Vec<(String, Vec<String>)>, BTreeMap<&'static str, Value>);
+
+/// `server`: `locked`, whose fields start with a server-wide kind or `secrets`, and the
+/// declared layer of `notifications` (spec C21 §5.2). The `models` kind is declared by
+/// `--model-config`, not here.
+fn parse_server(v: &Value) -> Result<ServerEntry, String> {
     let Value::Object(m) = v else {
-        return Err("an object with locked".into());
+        return Err("an object with locked and notifications".into());
     };
     let mut out = Vec::new();
+    let mut values = BTreeMap::new();
     for (k, v) in m {
+        if k == NOTIFICATIONS.name {
+            if !v.is_object() {
+                return Err(format!("{k}: an object"));
+            }
+            values.insert(NOTIFICATIONS.name, v.clone());
+            continue;
+        }
         if k != "locked" {
-            return Err(format!("unknown member {k:?}: server holds locked"));
+            return Err(format!(
+                "unknown member {k:?}: server holds locked and notifications"
+            ));
         }
         let list = v
             .as_array()
@@ -435,7 +488,7 @@ fn parse_server(v: &Value) -> Result<Vec<(String, Vec<String>)>, String> {
             out.push((root, p));
         }
     }
-    Ok(out)
+    Ok((out, values))
 }
 
 /// A locked field, such as `assistant.send` (§4.1).

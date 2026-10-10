@@ -109,15 +109,20 @@ mod remote {
             .find(|s| s["name"] == name)
     }
 
+    /// The providers and the notification channels that use a secret.
     fn providers(s: &J) -> Vec<String> {
-        s["providers"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|p| p.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default()
+        let names = |k: &str, prefix: &str| -> Vec<String> {
+            s[k].as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|p| p.as_str().map(|p| format!("{prefix}{p}")))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let mut out = names("providers", "");
+        out.extend(names("channels", "channel "));
+        out
     }
 
     /// What the source of a secret means, in a few words.
@@ -129,7 +134,7 @@ mod remote {
             out.push("overrides the declared source".to_string());
         }
         if s["source"] == "missing" && !providers(s).is_empty() {
-            out.push("no key: its providers cannot be called".to_string());
+            out.push("no value: its providers and channels cannot use it".to_string());
         }
         out.join("; ")
     }
@@ -164,7 +169,7 @@ mod remote {
             println!("no secrets: no provider names a key and none is stored");
             return Ok(());
         }
-        let head = ["NAME", "SOURCE", "LOCKED", "SET AT", "PROVIDERS", ""];
+        let head = ["NAME", "SOURCE", "LOCKED", "SET AT", "USED BY", ""];
         let mut w = head.map(str::len);
         for row in &rows {
             for (i, c) in row.iter().enumerate() {
@@ -256,7 +261,7 @@ mod remote {
         };
         let p = providers(s);
         let used = if p.is_empty() {
-            "no provider uses it yet".to_string()
+            "no provider or channel uses it yet".to_string()
         } else {
             format!("used by {}", p.join(", "))
         };

@@ -312,6 +312,9 @@ pub struct AppState {
     pub settings: crate::settings::Settings,
     /// recent asks, usage counts and daily token counts (spec C18 §5.5)
     pub asks: crate::assistant::Runtime,
+    /// the queue, the conditions and the delivery status of outbound notifications
+    /// (spec C21)
+    pub notifier: crate::notify::Notifier,
     /// ingestion tasks and the PDF workers (spec C18 Phase 4)
     #[cfg(feature = "mcp")]
     pub ingest: crate::ingest::Runtime,
@@ -535,6 +538,7 @@ impl AppState {
             models: Default::default(),
             settings: crate::settings::Settings::in_dir(data_dir),
             asks: Default::default(),
+            notifier: Default::default(),
             #[cfg(feature = "mcp")]
             ingest: Default::default(),
         };
@@ -584,6 +588,7 @@ impl AppState {
             models: Default::default(),
             settings: Default::default(),
             asks: Default::default(),
+            notifier: Default::default(),
             #[cfg(feature = "mcp")]
             ingest: Default::default(),
             rate_limit: None,
