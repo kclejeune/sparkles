@@ -1,6 +1,7 @@
 # Model settings, runtime credential references and module validation without a VM.
 { pkgs, sparkles }:
 let
+  inherit (pkgs) lib;
   evaluate =
     extra:
     (import "${pkgs.path}/nixos/lib/eval-config.nix" {
@@ -85,6 +86,15 @@ let
     };
   };
   plain = evaluate { };
+  # the model store of local embedding models (spec F12)
+  downloading = evaluate {
+    services.sparkles.models = {
+      dir = "/srv/models";
+      download = "on";
+    };
+  };
+  readOnlyStore = evaluate { services.sparkles.models.dir = "/srv/ro-models"; };
+  serviceOf = c: c.systemd.services.sparkles.serviceConfig;
   invalid = map (models: evaluate { services.sparkles.models = models; }) [
     {
       inherit settings;
@@ -125,6 +135,14 @@ assert failures configured == [ ];
 assert failures wrapped == [ ];
 assert failures external == [ ];
 assert failures plain == [ ];
+assert failures downloading == [ ];
+assert lib.hasInfix "--models-dir /srv/models --models-download on"
+  (serviceOf downloading).ExecStart;
+assert lib.elem "/srv/models" (serviceOf downloading).ReadWritePaths;
+assert lib.elem "/srv/ro-models" (serviceOf readOnlyStore).ReadOnlyPaths;
+assert !(lib.elem "/srv/ro-models" (serviceOf readOnlyStore).ReadWritePaths);
+assert !(lib.hasInfix "--models-download" (serviceOf readOnlyStore).ExecStart);
+assert !(lib.hasInfix "--models-dir" (serviceOf plain).ExecStart);
 assert builtins.all (config: failures config != [ ]) invalid;
 assert !(plain.environment.etc ? "sparkles/models.json");
 assert !(external.environment.etc ? "sparkles/models.json");

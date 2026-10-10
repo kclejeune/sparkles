@@ -2269,7 +2269,10 @@ export type EmbeddingApiKey = { secret: string } | { env: string } | { file: str
 
 /** `VectorIndexConfig.embedding`: which literals are embedded, and by which endpoint. */
 export type EmbeddingConfig = {
-  url: string;
+  /** The endpoint, unless `provider` names one of the model configuration. */
+  url?: string;
+  /** A provider of the model configuration (`local`, `openai` or `ollama` kind). */
+  provider?: string;
   model: string;
   apiKey?: EmbeddingApiKey;
   sendDimensions?: boolean;
@@ -2315,6 +2318,31 @@ export type EmbeddingStatus = {
   lastBatch?: { at: string; inputs: number; ms: number };
   /** The index's embedding configuration (it names secrets, never holds keys). */
   config: EmbeddingConfig;
+  /** The local model that `config.provider` names, when it is of the local kind. */
+  local?: LocalModelStatus;
+};
+
+/** A model of a `local` provider and its state in the server (spec F12). */
+export type LocalModelStatus = {
+  provider: string;
+  model: string;
+  state: 'absent' | 'downloading' | 'present' | 'unloaded' | 'loading' | 'loaded';
+  /** Whether this build has the local runtime (cargo feature embed-local). */
+  runtime: boolean;
+  repo?: string;
+  revision?: string;
+  path?: string;
+  dtype: string;
+  threads: number;
+  idleUnloadSecs: number;
+  arch?: string;
+  dimension?: number;
+  /** The weights' size in memory while loaded. */
+  weightBytes?: number;
+  texts?: number;
+  queued?: number;
+  lastError?: string;
+  downloadError?: string;
 };
 
 export type VectorIndexStatus = {

@@ -873,4 +873,61 @@ mod tests {
         assert_eq!(Pair::parse("x"), None);
         assert_eq!(Pair::parse("/m"), None);
     }
+
+    #[test]
+    fn the_local_kind() {
+        let rev = "1110a243fdf4706b3f48f1d95db1a4f5529b4d41";
+        let parse = |models: serde_json::Value| {
+            let v = serde_json::json!({ "providers": { "emb": { "kind": "local", "models": models } } });
+            ModelsConfig::parse(&v.to_string()).map_err(|e| format!("{e:#}"))
+        };
+        let c = parse(serde_json::json!({
+            "minilm": { "repo": "sentence-transformers/all-MiniLM-L6-v2", "revision": rev,
+                        "threads": 2, "idleUnloadSecs": 60 },
+            "qwen": { "path": "/models/qwen3", "dtype": "bf16", "dimensions": 256,
+                      "queryPrefix": "Query: ", "documentPrefix": "" }
+        }))
+        .unwrap();
+        let p = &c.providers["emb"];
+        assert_eq!(p.kind, Kind::Local);
+        assert!(p.endpoint.is_empty());
+        let e = |m: serde_json::Value| parse(m).unwrap_err();
+        assert!(
+            e(serde_json::json!({ "m": { "repo": "a/b", "revision": "main" } }))
+                .contains("40-character")
+        );
+        assert!(e(serde_json::json!({ "m": { "repo": "a/b" } })).contains("repo and revision"));
+        assert!(
+            e(serde_json::json!({ "m": { "repo": "a/b", "revision": rev, "path": "/x" } }))
+                .contains("repo and revision")
+        );
+        assert!(e(serde_json::json!({ "m": { "path": "rel/x" } })).contains("absolute"));
+        assert!(e(serde_json::json!({ "m": { "path": "/x", "dtype": "f16" } })).contains("dtype"));
+        assert!(e(serde_json::json!({ "m": { "path": "/x", "threads": 0 } })).contains("threads"));
+        assert!(
+            e(serde_json::json!({ "m": { "path": "/x", "dimensions": 0 } })).contains("dimensions")
+        );
+        // the local kind takes no endpoint or key
+        let v = serde_json::json!({ "providers": { "emb": { "kind": "local",
+            "endpoint": "http://127.0.0.1:1", "models": {} } } });
+        assert!(
+            format!("{:#}", ModelsConfig::parse(&v.to_string()).unwrap_err())
+                .contains("no endpoint")
+        );
+        // local members on another kind are refused
+        let v = serde_json::json!({ "providers": { "gw": { "kind": "openai",
+            "endpoint": "https://x.example/v1", "models": { "m": { "dtype": "f32" } } } } });
+        assert!(
+            format!("{:#}", ModelsConfig::parse(&v.to_string()).unwrap_err())
+                .contains("local kind only")
+        );
+        // a role cannot name a local provider
+        let v = serde_json::json!({ "providers": { "emb": { "kind": "local",
+            "models": { "m": { "path": "/x" } } } },
+            "roles": { "draft": [ { "provider": "emb", "model": "m" } ] } });
+        assert!(
+            format!("{:#}", ModelsConfig::parse(&v.to_string()).unwrap_err())
+                .contains("does not answer prompts")
+        );
+    }
 }

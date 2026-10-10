@@ -482,3 +482,96 @@ impl Providers for ServerProviders {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::Models;
+    use sparkles::store::StoreOptions;
+
+    const REV: &str = "1110a243fdf4706b3f48f1d95db1a4f5529b4d41";
+
+    /// A server state with an openai provider, a local provider and the providers
+    /// attached, as `serve` builds them.
+    fn setup(dir: &Path) -> (Arc<AppState>, ServerProviders) {
+        let key = dir.join("key");
+        std::fs::write(&key, "sk-gw\n").unwrap();
+        let cfg = ModelsConfig::parse(
+            &json!({ "providers": {
+                "gw": { "kind": "openai", "endpoint": "http://127.0.0.1:48012/v1",
+                        "apiKey": { "secret": "gw" } },
+                "emb": { "kind": "local", "threads": 3,
+                         "models": { "minilm": { "repo": "org/minilm", "revision": REV } } }
+            } })
+            .to_string(),
+        )
+        .unwrap();
+        let secrets = [(
+            "gw".to_string(),
+            format!("file:{}", key.display()).parse().unwrap(),
+        )]
+        .into();
+        let mut st = AppState::new(dir, StoreOptions::default(), Duration::from_secs(30)).unwrap();
+        let local = Arc::new(LocalModels::new(
+            dir.join("models"),
+            Download::Off,
+            OutboundPolicy::default(),
+        ));
+        st.local_models = Some(local.clone());
+        let st = Arc::new(st);
+        st.set_models(Some(Arc::new(Models::new(
+            cfg,
+            secrets,
+            OutboundPolicy::default(),
+        ))));
+        let p = ServerProviders::new(local);
+        p.attach(&st);
+        (st, p)
+    }
+
+    #[test]
+    fn providers_resolve() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (st, p) = setup(tmp.path());
+        match p.resolve("gw", "text-embedding-3-small").unwrap() {
+            Target::Remote { url, bearer } => {
+                assert_eq!(url, "http://127.0.0.1:48012/v1/embeddings");
+                assert_eq!(bearer.as_deref(), Some("sk-gw"));
+            }
+            Target::Local(_) => panic!("gw is remote"),
+        }
+        let e = |r: Result<Target, CallError>| match r {
+            Err(CallError::Fatal(m)) => m,
+            Err(other) => panic!("{other:?}"),
+            Ok(_) => panic!("resolved"),
+        };
+        assert!(e(p.resolve("nope", "m")).contains("nope"));
+        assert!(e(p.resolve("emb", "other")).contains("other"));
+        let m = e(p.resolve("emb", "minilm"));
+        if cfg!(feature = "embed-local") {
+            assert!(m.contains("sparkles models pull org/minilm@"), "{m}");
+        } else {
+            assert!(m.contains("embed-local"), "{m}");
+        }
+
+        // the state of the local model for GET /$/models
+        let local = st.local_models.as_ref().unwrap();
+        let models = st.models().unwrap();
+        let d = local.describe(&models.config);
+        assert_eq!(d.as_array().unwrap().len(), 1);
+        assert_eq!(d[0]["state"], "absent");
+        assert_eq!(d[0]["threads"], 3, "the provider's defaults apply");
+        assert_eq!(d[0]["repo"], "org/minilm");
+
+        // a snapshot in the store is present
+        let snap = tmp.path().join("models/org/minilm").join(REV);
+        std::fs::create_dir_all(&snap).unwrap();
+        std::fs::write(
+            snap.join(sparkles_modelstore::MANIFEST),
+            json!({ "repo": "org/minilm", "revision": REV, "files": [] }).to_string(),
+        )
+        .unwrap();
+        let d = local.describe_one(&models.config, "emb", "minilm").unwrap();
+        assert_eq!(d["state"], "present");
+    }
+}

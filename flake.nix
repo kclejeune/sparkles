@@ -31,7 +31,8 @@
           };
         nixosModules.sparkles = self.nixosModules.default;
 
-        # Adds `sparkles`, `sparkles-cli`, `sparkles-ui` and `sparkles-fmt-wasm` to a package set.
+        # Adds `sparkles`, `sparkles-cli`, `sparkles-ui`, `sparkles-fmt-wasm` and the
+        # `sparkles-model-snapshots` helper to a package set.
         overlays.default =
           final: prev:
           let
@@ -46,6 +47,7 @@
             sparkles-fmt-wasm = fmtWasm;
             sparkles-ui = ui;
             sparkles = final.callPackage ./nix/package.nix { inherit craneLib ui; };
+            sparkles-model-snapshots = final.callPackage ./nix/model-snapshots.nix { };
             sparkles-cli = final.callPackage ./nix/package.nix {
               inherit craneLib;
               ui = null;
@@ -112,6 +114,10 @@
             sparkles-node = node.packages;
             default = self'.packages.sparkles;
           };
+
+          # `modelSnapshots { manifests = [ ./model.sparkles-manifest.json ]; }` builds a
+          # read-only model store for `--models-dir` from pinned snapshot manifests (F12)
+          legacyPackages.modelSnapshots = pkgs.callPackage ./nix/model-snapshots.nix { };
 
           apps.default = {
             type = "app";

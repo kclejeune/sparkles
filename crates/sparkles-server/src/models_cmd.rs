@@ -302,6 +302,11 @@ fn pull(
 ) -> Result<(SnapshotId, PathBuf, bool)> {
     sparkles_modelstore::check_repo(&e.repo)?;
     let revision = e.revision.clone().unwrap_or_else(|| "main".into());
+    if !allow_unpinned && !is_pinned(&revision) {
+        bail!(
+            "{revision:?} is not a full 40-character commit; pin the model, or pass --allow-unpinned to record the commit the Hub names"
+        );
+    }
     // a pinned snapshot already in the store needs no request
     if is_pinned(&revision) {
         let id = SnapshotId {
