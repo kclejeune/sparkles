@@ -637,6 +637,23 @@ implementation landed.
   - creating datasets from the settings file;
   - recreating a deleted declared dataset at the next start.
 
+## Declared prefixes
+
+- **Spec:** [`C20-declared-prefixes.md`](C20-declared-prefixes.md), written on 2026-10-10
+  from:
+  - the SPARQL 1.1 Query grammar, RDF 1.1 Turtle and RFC 7396;
+  - the Language Server Protocol 3.17;
+  - the public documentation of Fuseki's prefixes service;
+  - the Sparkles code and specs C19, X02 and X04.
+- **Implementation:** not built.
+- **Rejected** (spec §10):
+  - a separate NixOS option for prefixes;
+  - removals stored as `null` in `prefixes.json`;
+  - effective prefixes at `GET /{ds}/prefixes`;
+  - refusing a declared prefix that shadows a well-known one;
+  - adding the dataset's prefixes to queries;
+  - a language server that always asks a server.
+
 ## Compression codecs
 
 - **Spec:** [`X01-compression-codecs.md`](X01-compression-codecs.md), written on
