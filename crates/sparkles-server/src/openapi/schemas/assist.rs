@@ -464,6 +464,255 @@ fn memory(put: &mut dyn FnMut(&str, J)) {
         ),
     );
     imports(put);
+    review(put);
+}
+
+/// The review inbox, branch review, reviewer actions and ingest profiles (C18 Phase 3).
+fn review(put: &mut dyn FnMut(&str, J)) {
+    let fact_ref = closed(
+        &["s", "p", "o", "graph"],
+        json!({
+            "s": string(), "p": string(),
+            "o": with_desc(string(), "The object in N-Triples form, as the inbox lists it."),
+            "graph": string(),
+        }),
+    );
+    let signal = string_enum(&["pass", "fail", "none", "unchecked"]);
+    let fact = obj(
+        &["s", "p", "o", "graph", "status", "reifiers"],
+        json!({
+            "s": string(), "p": string(), "o": string(), "graph": string(),
+            "shown": any_object("The terms in compact form."),
+            "sLabel": string(), "oLabel": string(),
+            "status": string_enum(&["unreviewed", "proposed", "reviewed"]),
+            "reifiers": strings(),
+            "time": string(), "confidence": string(), "quote": string(),
+            "by": string(), "agent": string(),
+            "span": obj(&["rendition", "start", "end"], json!({ "rendition": string(), "start": int(), "end": int() })),
+            "signals": obj(&["span", "link", "guard", "corroboration"], json!({
+                "span": signal.clone(), "link": signal.clone(), "guard": signal.clone(), "corroboration": signal,
+            })),
+            "passes": with_desc(boolean(), "Whether the span, link and guard signals pass."),
+            "candidates": array(obj(&["iri"], json!({ "iri": string(), "shown": string(), "label": string() }))),
+            "notes": strings(),
+        }),
+    );
+    let branch = obj(
+        &["name", "kind", "ahead", "behind"],
+        json!({
+            "name": string(),
+            "kind": string_enum(&["ingest", "review", "inbox", "consolidation", "proposal"]),
+            "ahead": int(), "behind": int(),
+            "created": string(), "modified": string(), "note": string(), "creator": string(),
+            "facts": with_desc(int(), "The facts the branch proposes."),
+            "retracts": with_desc(int(), "The facts of main the branch retracts."),
+        }),
+    );
+    put(
+        "MemoryInbox",
+        doc(
+            obj(
+                &[
+                    "dataset",
+                    "commit",
+                    "sessions",
+                    "branches",
+                    "open",
+                    "truncated",
+                ],
+                json!({
+                    "dataset": string(), "commit": int(),
+                    "agentGraphs": strings(),
+                    "target": with_desc(string(), "The consolidated graph that promotions write to by default."),
+                    "sessions": array(obj(&["graph", "facts"], json!({
+                        "graph": string(), "shown": string(), "by": strings(),
+                        "first": string(), "last": string(),
+                        "facts": array(fact.clone()),
+                    }))),
+                    "branches": array(branch),
+                    "open": with_desc(int(), "Unreviewed facts plus open review branches."),
+                    "truncated": boolean(),
+                    "prefixes": any_object("The prefixes the compact terms use."),
+                }),
+            ),
+            "Everything that waits for a person: unreviewed session facts with their signals, by session, and the open review branches.",
+            "review-inbox",
+        ),
+    );
+    put(
+        "BranchReview",
+        doc(
+            obj(
+                &[
+                    "dataset", "branch", "facts", "retracts", "entities", "sources",
+                ],
+                json!({
+                    "dataset": string(), "branch": string(), "kind": string(),
+                    "base": int(), "head": int(), "ahead": int(), "behind": int(),
+                    "note": string(), "creator": string(),
+                    "facts": array(fact.clone()),
+                    "retracts": array(fact),
+                    "rejected": with_desc(int(), "Facts made and retracted on the branch."),
+                    "entities": array(obj(&["iri", "types", "candidates"], json!({
+                        "iri": string(), "shown": string(), "label": string(), "types": strings(),
+                        "candidates": array(obj(&["iri"], json!({ "iri": string(), "shown": string(), "label": string() }))),
+                    }))),
+                    "sources": array(obj(&["rendition", "length"], json!({
+                        "rendition": string(), "source": string(), "title": string(), "format": string(),
+                        "length": int(), "text": string(), "textOmitted": boolean(),
+                    }))),
+                    "prefixes": any_object("The prefixes the compact terms use."),
+                }),
+            ),
+            "What a review branch proposes and retracts, its new entities and the text of the sources it cites.",
+            "review-inbox",
+        ),
+    );
+    put(
+        "PromoteRequest",
+        doc(
+            closed(
+                &["facts"],
+                json!({
+                    "facts": array(fact_ref.clone()),
+                    "target": with_desc(string(), "The graph to promote into (default: `consolidatedGraph`)."),
+                    "branch": with_desc(string(), "An open review branch to add the facts to (default: a new `review.{person}.{date}-{n}`)."),
+                    "message": string(),
+                    "timeoutSeconds": num(),
+                }),
+            ),
+            "The facts to promote, at most 500.",
+            "review-inbox",
+        ),
+    );
+    put(
+        "PromoteResult",
+        doc(
+            obj(
+                &["dataset", "branch", "target", "promoted", "committed"],
+                json!({
+                    "dataset": string(), "branch": string(), "target": string(),
+                    "promoted": int(), "commit": int(), "committed": boolean(),
+                }),
+            ),
+            "The review branch that holds the promoted facts, for the merge page.",
+            "review-inbox",
+        ),
+    );
+    put(
+        "RejectRequest",
+        doc(
+            closed(
+                &["facts"],
+                json!({
+                    "facts": array(fact_ref.clone()),
+                    "branch": with_desc(string(), "The review branch the facts are on (default: main)."),
+                    "reason": with_desc(string(), "Added to the commit message, at most 500 characters."),
+                    "timeoutSeconds": num(),
+                }),
+            ),
+            "The facts to retract, at most 500.",
+            "review-inbox",
+        ),
+    );
+    put(
+        "RejectResult",
+        doc(
+            obj(
+                &["dataset", "branch", "rejected", "commits"],
+                json!({
+                    "dataset": string(), "branch": string(), "rejected": int(),
+                    "commits": array(any_object("The result of `assert_facts` for one graph.")),
+                }),
+            ),
+            "The retractions, one commit per graph.",
+            "review-inbox",
+        ),
+    );
+    put(
+        "RelinkRequest",
+        doc(
+            closed(
+                &["branch", "from", "to"],
+                json!({
+                    "branch": string(),
+                    "from": with_desc(string(), "The new entity's IRI."),
+                    "to": with_desc(string(), "The existing entity's IRI."),
+                    "timeoutSeconds": num(),
+                }),
+            ),
+            "**Use existing**: name an existing entity instead of a new one on a review branch.",
+            "review-inbox",
+        ),
+    );
+    put(
+        "EditFactRequest",
+        doc(
+            closed(
+                &["fact", "o"],
+                json!({
+                    "fact": fact_ref,
+                    "o": with_desc(string(), "The new object, as `assert_facts` takes it."),
+                    "branch": with_desc(string(), "The review branch the fact is on (default: main)."),
+                    "timeoutSeconds": num(),
+                }),
+            ),
+            "**Edit value**: replace a fact's object, with the new reifier derived from the old one.",
+            "review-inbox",
+        ),
+    );
+    put(
+        "MemoryWriteResult",
+        doc(
+            obj(
+                &["dataset"],
+                json!({
+                    "dataset": string(), "branch": string(), "committed": boolean(),
+                    "commit": int(), "inserted": int(), "deleted": int(),
+                }),
+            ),
+            "The commit of a reviewer's change.",
+            "review-inbox",
+        ),
+    );
+    let profile = closed(
+        &[],
+        json!({
+            "classes": with_desc(strings(), "The classes new entities may have (default: the classes with instances or a declaration)."),
+            "predicates": with_desc(strings(), "The predicates facts may use (default: those with triples or a declaration)."),
+            "shapes": with_desc(string(), "Extra SHACL shapes in Turtle."),
+            "labelPredicate": string(),
+            "language": with_desc(string(), "A BCP 47 language tag for new labels."),
+            "vocabulary": with_desc(string(), "A graph whose classes and properties are offered."),
+        }),
+    );
+    put(
+        "IngestProfile",
+        doc(profile.clone(), "An ingest profile.", "ingest-profiles"),
+    );
+    put(
+        "IngestProfiles",
+        doc(
+            obj(
+                &["dataset", "keepText", "profiles"],
+                json!({
+                    "dataset": string(),
+                    "keepText": with_desc(boolean(), "Whether sources keep their text as chunks."),
+                    "profiles": { "type": "object", "additionalProperties": profile },
+                }),
+            ),
+            "The ingest settings of a dataset.",
+            "ingest-profiles",
+        ),
+    );
+    put(
+        "IngestSettingsRequest",
+        doc(
+            closed(&["keepText"], json!({ "keepText": boolean() })),
+            "Whether sources keep their text.",
+            "ingest-profiles",
+        ),
+    );
 }
 
 /// `POST /{ds}/facts` and `POST /{ds}/memory/brief` (C18 Phase 3m-a).
@@ -476,6 +725,10 @@ fn imports(put: &mut dyn FnMut(&str, J)) {
             "mode": string_enum(&["add", "replace"]),
             "confidence": num(),
             "quote": with_desc(string(), "At most 1000 characters."),
+            "span": with_desc(closed(&["rendition", "start", "end"], json!({
+                "rendition": string(), "start": int(), "end": int(),
+            })), "The passage of a registered source that supports the fact, in code points of its rendition."),
+            "derivedFrom": with_desc(strings(), "Reifiers of existing facts this fact rests on, at most 20."),
         }),
     );
     let retract = json!({ "oneOf": [
@@ -507,6 +760,7 @@ fn imports(put: &mut dyn FnMut(&str, J)) {
                     "ifHead": int(),
                     "timeoutSeconds": num(),
                     "branch": with_desc(string(), "Write on this branch instead of main."),
+                    "retractStale": with_desc(string(), "A rendition of `register_source`. The facts of the graph that cite only earlier renditions of its source, and that this call does not assert again, are retracted."),
                 }),
             ),
             "The arguments of `assert_facts` without `dataset`.",
@@ -535,6 +789,7 @@ fn imports(put: &mut dyn FnMut(&str, J)) {
                     "validation": any_object("The guard's report."),
                     "dryRun": any_object("A dry run's preview."),
                     "elapsedMs": num(),
+                    "notice": with_desc(string(), "Set when the review policy wrote the facts to the agent's inbox branch."),
                     "prefixes": any_object("The prefixes the compact terms use."),
                 }),
             ),

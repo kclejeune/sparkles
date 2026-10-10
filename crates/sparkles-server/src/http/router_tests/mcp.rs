@@ -10,6 +10,7 @@ use axum::http::HeaderMap;
 use clap::Parser;
 use serde_json::json;
 
+mod ingest;
 mod memory_writes;
 
 const FIXTURE: &str = r#"@prefix ex:   <http://ex.org/> .

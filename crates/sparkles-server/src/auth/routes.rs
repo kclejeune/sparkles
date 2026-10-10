@@ -84,6 +84,18 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/queries/{ds}/suggestions", &["GET", "POST", "DELETE"]),
     // memory settings (C18 §8.8)
     ("/$/memory/{ds}", &["GET", "PUT"]),
+    // the review inbox, branch review and reviewer actions (C18 §7.10, §8.9): the
+    // actions write through the tools, which check the graphs and branches they touch
+    ("/$/memory/{ds}/inbox", &["GET"]),
+    ("/$/memory/{ds}/review/{name}", &["GET"]),
+    ("/$/memory/{ds}/promote", &["POST"]),
+    ("/$/memory/{ds}/reject", &["POST"]),
+    ("/$/memory/{ds}/relink", &["POST"]),
+    ("/$/memory/{ds}/edit", &["POST"]),
+    // ingest settings and profiles (C18 §7.4)
+    ("/$/ingest/{ds}/profiles", &["GET"]),
+    ("/$/ingest/{ds}/settings", &["PUT"]),
+    ("/$/ingest/{ds}/profiles/{name}", &["GET", "PUT", "DELETE"]),
     // assistant settings and the caller's own ask history (C18 §3.5, §6.4)
     ("/$/assistant/{ds}", &["GET", "PUT"]),
     ("/$/asks/{ds}", &["GET", "DELETE"]),
@@ -264,6 +276,14 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         "/$/queries/{ds}/suggestions" => Dataset(Admin),
         "/$/memory/{ds}" if get => Dataset(Read),
         "/$/memory/{ds}" => Dataset(Admin),
+        "/$/memory/{ds}/inbox"
+        | "/$/memory/{ds}/review/{name}"
+        | "/$/memory/{ds}/promote"
+        | "/$/memory/{ds}/reject"
+        | "/$/memory/{ds}/relink"
+        | "/$/memory/{ds}/edit" => Dataset(Read),
+        "/$/ingest/{ds}/profiles" | "/$/ingest/{ds}/profiles/{name}" if get => Dataset(Read),
+        "/$/ingest/{ds}/settings" | "/$/ingest/{ds}/profiles/{name}" => Dataset(Admin),
         "/$/assistant/{ds}" if get => Dataset(Read),
         "/$/assistant/{ds}" => Dataset(Admin),
         // only the caller's own entries, whatever its role (C18 §6.4)

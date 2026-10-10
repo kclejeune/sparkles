@@ -354,7 +354,6 @@ pub(crate) fn parse_span(iri: &str) -> Option<(&str, usize, usize)> {
 
 /// A rendition as the caller's view holds it.
 pub(crate) struct Rendition {
-    pub iri: NamedNode,
     pub length: usize,
     /// the chunks with their text, in order (empty when the text is not kept)
     pub chunks: Vec<(usize, usize, String)>,
@@ -460,7 +459,6 @@ pub(crate) fn read_rendition(r: &Reader, rend: &NamedNode) -> Result<Option<Rend
         }
     }
     Ok(Some(Rendition {
-        iri: rend.clone(),
         length,
         chunks,
         sources,
@@ -1714,7 +1712,6 @@ mod tests {
         );
         assert!(digest("x").starts_with("sha256:2d711642"));
         let r = Rendition {
-            iri: iri("urn:x"),
             length: 10,
             chunks: vec![(0, 4, "abcd".into()), (4, 10, "efghij".into())],
             sources: Vec::new(),

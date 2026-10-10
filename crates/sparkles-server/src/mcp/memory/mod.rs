@@ -17,10 +17,12 @@ mod assert;
 mod brief;
 mod check;
 mod diagnose;
+pub(crate) mod inbox;
 pub(crate) mod ingest;
 mod link;
 pub(crate) mod policy;
 mod recall;
+pub(crate) mod review;
 mod similar;
 pub(crate) mod text;
 

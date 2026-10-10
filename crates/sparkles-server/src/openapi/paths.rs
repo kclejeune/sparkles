@@ -2149,6 +2149,157 @@ fn assist(p: &mut Paths) {
     p.add(
         op(
             GET,
+            "/$/memory/{ds}/inbox",
+            "getMemoryInbox",
+            "Datasets",
+            "List what waits for review",
+        )
+        .doc("Needs `read` on the dataset and covers the caller's view. Unreviewed session facts come with their span, link, guard and corroboration signals.")
+        .see("review-inbox")
+        .query("limit", int(), "The most facts, 1 to 500, 200 by default.")
+        .query("timeoutSeconds", json!({"type": "number"}), "The time limit.")
+        .json("200", "The inbox.", "MemoryInbox")
+        .errors(&[400, 404, 408]),
+    );
+    p.add(
+        op(
+            GET,
+            "/$/memory/{ds}/review/{name}",
+            "getBranchReview",
+            "Datasets",
+            "Review a branch",
+        )
+        .doc("What the branch proposes and retracts relative to main, with signals, new entities and their possible duplicates, and the text of the sources the facts cite.")
+        .see("review-inbox")
+        .query("limit", int(), "The most facts, 1 to 2000, 500 by default.")
+        .query("timeoutSeconds", json!({"type": "number"}), "The time limit.")
+        .json("200", "The review.", "BranchReview")
+        .errors(&[400, 404, 408]),
+    );
+    p.add(
+        op(
+            POST,
+            "/$/memory/{ds}/promote",
+            "promoteFacts",
+            "Datasets",
+            "Promote facts for review",
+        )
+        .doc("Writes the facts into the target graph on a review branch with reifiers derived from the facts' own, for a person to merge. Needs `write` on the target graph on that branch.")
+        .see("review-inbox")
+        .json_body(true, "PromoteRequest")
+        .json("200", "The review branch.", "PromoteResult")
+        .errors(&[400, 403, 404, 408, 422]),
+    );
+    p.add(
+        op(
+            POST,
+            "/$/memory/{ds}/reject",
+            "rejectFacts",
+            "Datasets",
+            "Reject facts",
+        )
+        .doc("Retracts the facts on main or on a review branch, keeping their reifiers with `prov:wasInvalidatedBy`, with a commit message that names the reviewer.")
+        .see("review-inbox")
+        .json_body(true, "RejectRequest")
+        .json("200", "The retractions.", "RejectResult")
+        .errors(&[400, 403, 404, 408, 422]),
+    );
+    p.add(
+        op(
+            POST,
+            "/$/memory/{ds}/relink",
+            "relinkEntity",
+            "Datasets",
+            "Use an existing entity",
+        )
+        .doc("On a review branch, every triple and reifier that names `from` names `to` instead, and `from`'s own types and labels are removed, in one commit.")
+        .see("review-inbox")
+        .json_body(true, "RelinkRequest")
+        .json("200", "The commit.", "MemoryWriteResult")
+        .errors(&[400, 403, 404, 408, 422]),
+    );
+    p.add(
+        op(
+            POST,
+            "/$/memory/{ds}/edit",
+            "editFact",
+            "Datasets",
+            "Edit a fact's value",
+        )
+        .doc("Retracts the fact and asserts it with the new object, with the new reifier derived from the old one.")
+        .see("review-inbox")
+        .json_body(true, "EditFactRequest")
+        .json("200", "The result of `assert_facts`.", "AssertFactsResult")
+        .errors(&[400, 403, 404, 408, 422]),
+    );
+    p.add(
+        op(
+            GET,
+            "/$/ingest/{ds}/profiles",
+            "listIngestProfiles",
+            "Datasets",
+            "List the ingest profiles",
+        )
+        .see("ingest-profiles")
+        .json("200", "The settings and profiles.", "IngestProfiles"),
+    );
+    p.add(
+        op(
+            PUT,
+            "/$/ingest/{ds}/settings",
+            "putIngestSettings",
+            "Datasets",
+            "Set whether sources keep their text",
+        )
+        .doc("Needs `admin` on the dataset.")
+        .see("ingest-profiles")
+        .json_body(true, "IngestSettingsRequest")
+        .json("200", "The stored setting.", "IngestSettingsRequest")
+        .errors(&[400]),
+    );
+    p.add(
+        op(
+            GET,
+            "/$/ingest/{ds}/profiles/{name}",
+            "getIngestProfile",
+            "Datasets",
+            "Get an ingest profile",
+        )
+        .doc("The profile `default` answers `{}` when it is not stored, which means the whole schema.")
+        .see("ingest-profiles")
+        .json("200", "The profile.", "IngestProfile")
+        .errors(&[400, 404]),
+    );
+    p.add(
+        op(
+            PUT,
+            "/$/ingest/{ds}/profiles/{name}",
+            "putIngestProfile",
+            "Datasets",
+            "Set an ingest profile",
+        )
+        .doc("Needs `admin` on the dataset. A dataset keeps at most 50 profiles.")
+        .see("ingest-profiles")
+        .json_body(true, "IngestProfile")
+        .json("200", "The stored profile.", "IngestProfile")
+        .errors(&[400]),
+    );
+    p.add(
+        op(
+            DELETE,
+            "/$/ingest/{ds}/profiles/{name}",
+            "deleteIngestProfile",
+            "Datasets",
+            "Remove an ingest profile",
+        )
+        .doc("Needs `admin` on the dataset.")
+        .see("ingest-profiles")
+        .no_content("Removed.")
+        .errors(&[400, 404]),
+    );
+    p.add(
+        op(
+            GET,
             "/$/queries/{ds}/suggestions",
             "listSuggestions",
             "Stored queries",

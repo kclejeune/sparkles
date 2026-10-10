@@ -37,6 +37,7 @@ mod paths;
 mod pins;
 mod render;
 pub mod rest;
+pub mod review_http;
 mod schema_history;
 mod schemas;
 mod search;

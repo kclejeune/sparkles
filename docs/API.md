@@ -8725,6 +8725,102 @@ instructions.`, then a header line with the dataset, commit, scope, `reviewed-on
 text from a file can start a line of the brief. An entity label that links to more than
 one entity is a `422` with code `ambiguous-entity` and the candidates.
 
+### Ingest profiles
+
+An agent turns a document into facts in three steps. `register_source` stores the
+document's text as a source, `ingest_profile` gives the vocabulary to extract in, and
+`assert_facts` writes each fact with a `span` that points at the passage it rests on. The
+design is in
+[C18 §7](specs/C18-natural-language-questions-and-ingest.md#7-ingestion).
+
+`register_source` normalizes the text to NFC with `\n` line ends and splits it into
+chunks of about 1,000 tokens at headings, paragraphs and sentences. The source
+(`spk:rendition`, `spk:contentDigest`, `dcterms:title`, `dcterms:format`), its
+`spk:TextRendition` and the chunks are written to the source's graph in one commit.
+Offsets count Unicode code points of the normalized text. The rendition IRI is a
+version 5 UUID of the dataset and the digest, so registering the same text again writes
+nothing and answers `alreadyRegistered: true`. A changed text of the same source IRI
+makes a new rendition with `prov:wasRevisionOf` the old one, and the result names
+`previousRendition` and the number of `staleFacts` that cite it. `read_chunks` reads the
+text back, and `list_sources` lists the sources with their chunk and fact counts.
+
+A fact's `span` is `{rendition, start, end}`. `assert_facts` checks that the quote is the
+text at that span, after folding whitespace, and answers `span-mismatch` otherwise. With
+no quote, the passage becomes the quote. The reifier gets `prov:wasDerivedFrom` of the
+span IRI `<rendition#char=start,end>` and of the source. When the rendition's profile
+lists predicates, a fact with a span and another predicate is `unknown-predicate`.
+`derivedFrom` names reifiers a fact rests on, and `retractStale` on the last call of a
+re-extraction retracts the facts of the graph that cite only earlier renditions of the
+source and that the call does not assert again. Their reifiers keep the record with
+`prov:wasInvalidatedBy`.
+
+The ingest settings live in `<db>/ingest.json`. `GET /$/ingest/{ds}/profiles` needs
+`read` and answers `keepText` and the stored profiles. `PUT /$/ingest/{ds}/settings`
+with `{"keepText": false}` needs `admin`, and then sources keep only their digest and
+length, `read_chunks` answers `no-text`, and a fact with a span must carry its quote
+(`quote-required`). `GET`, `PUT` and `DELETE /$/ingest/{ds}/profiles/{name}` read, store
+and remove one profile, and `PUT` and `DELETE` need `admin`:
+
+```json
+{
+  "classes": ["http://www.w3.org/ns/org#OrganizationalUnit"],
+  "predicates": ["http://www.w3.org/ns/org#memberOf", "http://www.w3.org/ns/org#unitOf"],
+  "labelPredicate": "http://www.w3.org/2000/01/rdf-schema#label",
+  "language": "en"
+}
+```
+
+A profile left out lists every class and predicate of the schema report. The profile
+`default` answers `{}` until one is stored. A dataset keeps at most 50 profiles, and the
+IRIs, the language tag and the Turtle of `shapes` must parse.
+
+### Review inbox
+
+The review routes are how a person reviews what agents wrote. They need `read` on the
+dataset and cover the caller's view. Each action writes through `assert_facts` or the
+guard as the caller, so the grants on the graphs and branches it touches decide.
+
+**`GET /$/memory/{ds}/inbox`** lists the unreviewed facts of the agent graphs, grouped
+by session graph, and the open review branches (`proposals.*`, `ingest.*` and
+`review.*`) with the facts each proposes and retracts. A fact is unreviewed when it is
+asserted only in graphs that `agentGraphs` matches. Facts without a reifier, such as
+imported harness memory, are listed after the others. Each fact carries four signals,
+each `pass`, `fail`, `none` or `unchecked`:
+
+| Signal | Passes when |
+|---|---|
+| `span` | The fact cites a span and its quote is still the text there. A fact without a span shows `none`. |
+| `link` | No other entity of a matching type has the same label as an entity the fact names. The other entities are listed in `candidates`. |
+| `guard` | A dry run that writes the fact into the consolidated graph reports no violation for it. |
+| `corroboration` | Another graph asserts the same triple. |
+
+`passes` is true when the span, link and guard signals pass, which is what **Accept all
+that pass** selects. `limit` is 1 to 500, 200 by default.
+
+**`GET /$/memory/{ds}/review/{name}`** reviews one branch. It lists the facts the branch
+asserts with reifiers that `main` does not know, the facts of `main` it retracts, the
+entities it types that `main` does not know with their possible duplicates, and the
+text of the sources the facts cite or the branch registers, up to 2 MiB.
+
+**`POST /$/memory/{ds}/promote`** takes `facts` as the inbox lists them (`s`, `p`, `o`
+and `graph`), an optional `target` graph (the consolidated graph by default) and an
+optional `branch`. It creates `review.{person}.{date}-{n}` unless a branch is named,
+writes the facts into the target with reifiers derived from the facts' own, and answers
+the branch for the merge page. The merge is the acceptance, and after it `recall`
+reports the facts as `reviewed`. **`POST /$/memory/{ds}/reject`** retracts `facts` on
+`main` or on a named `branch` in one commit per graph, with the message
+`Rejected by {person}` and the optional `reason`. **`POST /$/memory/{ds}/relink`** with
+`branch`, `from` and `to` is **Use existing**: on the branch every triple and reifier
+that names `from` names `to` instead, and `from`'s own types and labels go, in one
+commit. **`POST /$/memory/{ds}/edit`** with a `fact` and a new object `o` retracts the
+fact and asserts the new one with its reifier derived from the old.
+
+With `conversationFacts: "review"` for an agent in the memory settings, an
+`assert_facts` call of that agent on `main` runs on its branch `proposals.{agent}.inbox`
+instead, which is created when needed. The result names the branch and carries a
+`notice`, and `main` is unchanged. The agent is matched by the caller's user name or
+one of its roles.
+
 ### Suggested examples
 
 A reader who finds a good question and query can suggest it as an example, and a

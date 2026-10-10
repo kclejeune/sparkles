@@ -118,6 +118,13 @@ fn dispatch(t: &Tools, name: &str, args: Map<String, Value>) -> Result<Outcome, 
         "delete_branch" => t.delete_branch(args),
         // `POST /{ds}/memory/brief`, never offered as a tool
         "memory_brief" => t.memory_brief(args),
+        // the review routes of C18 §7.10 and §8.9, never offered as tools
+        "memory_inbox" => t.memory_inbox(args),
+        "memory_review" => t.memory_review(args),
+        "memory_reject" => t.memory_reject(args),
+        "memory_promote" => t.memory_promote(args),
+        "memory_relink" => t.memory_relink(args),
+        "memory_edit" => t.memory_edit(args),
         // a stored query of a dataset (`<dataset>__<query>`)
         name => t.stored_query(name, args),
     }
