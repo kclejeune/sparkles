@@ -53,10 +53,20 @@ import {
   type NativeResult,
   type NativeTransaction,
 } from './native.js';
+import { TermCache } from './terms.js';
 const transactionContext = new AsyncLocalStorage<ReadonlySet<string>>();
+/** The term numbering of each native dataset, which every wrapper of it must share. */
+const termCaches = new WeakMap<NativeDataset, TermCache>();
+function termsOf(handle: NativeDataset) {
+  let terms = termCaches.get(handle);
+  if (!terms) termCaches.set(handle, (terms = new TermCache()));
+  return terms;
+}
 const defaults = { batchSize: 1024, batchBytes: 1 << 20 };
 /** rows of a match's first batch when it is computed on the JavaScript thread */
 const INLINE_ROWS = 16;
+/** quads per request of `addAll` */
+const ADD_BATCH = 4096;
 /** the information of a quad scan, which `info()` would only repeat */
 const scanInfo = { type: 'quads' };
 export interface EngineConfiguration {
@@ -426,6 +436,7 @@ export class Dataset extends Queryable {
   private results = new Set<{ close(): Promise<void> }>();
   private family: string;
   private administration: Administration;
+  /** @internal */ readonly terms: TermCache;
   private constructor(
     private handle: NativeDataset,
     public readonly path: string | null,
@@ -433,6 +444,7 @@ export class Dataset extends Queryable {
     family?: string,
   ) {
     super();
+    this.terms = termsOf(handle);
     this.id = handle.identity();
     this.family = family ?? this.id;
     this.administration = new Administration(
@@ -906,13 +918,22 @@ export class Dataset extends Queryable {
       // In memory, the scan and a first batch of a few rows take less time than a round
       // trip through the addon's pool, so they run here; later batches use the pool.
       this.check();
-      let handle: NativeResult | null;
+      let found: NativeBatch | NativeResult | null;
       try {
-        handle = this.handle.matchedNow(pattern(s, p, o, g), INLINE_ROWS, defaults.batchBytes);
+        const { text, data } = this.terms.pattern(s, p, o, g);
+        try {
+          found = this.handle.matchedTerms(text, data, INLINE_ROWS, defaults.batchBytes);
+        } catch (e) {
+          this.terms.forget();
+          throw e;
+        }
       } catch (e) {
         return deferredQuads(Promise.reject(nativeError(e)));
       }
-      if (handle) return deferredQuads(this.result(handle, {}, scanInfo) as QuadsResult);
+      // a match that the first batch holds whole needs no result object
+      if (found && 'data' in found)
+        return readyQuads(decodeQuads(found), () => this.closing || this.closed);
+      if (found) return deferredQuads(this.result(found, {}, scanInfo) as QuadsResult);
     }
     return deferredQuads(this.matchOnPool(s, p, o, g));
   }
@@ -930,14 +951,15 @@ export class Dataset extends Queryable {
     if (this.path === null) {
       // In memory, a lookup takes microseconds, so it runs on this thread.
       this.check();
+      const { text, data } = this.terms.encode([quad]);
+      let found: boolean | null;
       try {
-        const found = this.handle.containsNow(
-          pattern(quad.subject, quad.predicate, quad.object, quad.graph),
-        );
-        if (found !== null) return found;
+        found = this.handle.containsTerms(text, data);
       } catch (e) {
+        this.terms.forget();
         throw nativeError(e);
       }
+      if (found !== null) return found;
     }
     for await (const _ of this.match(quad.subject, quad.predicate, quad.object, quad.graph))
       return true;
@@ -952,34 +974,16 @@ export class Dataset extends Queryable {
     return value;
   }
   async addAll(quads: Iterable<RDF.Quad> | AsyncIterable<RDF.Quad>, options: UpdateOptions = {}) {
-    return this.transaction(async (tx) => {
-      let inserted = 0n;
-      let batch: RDF.Quad[] = [];
-      for await (const q of quads) {
-        batch.push(q);
-        if (batch.length >= 4096) {
-          inserted += await tx.addBatch(batch);
-          batch = [];
-        }
-      }
-      if (batch.length) inserted += await tx.addBatch(batch);
-      return inserted;
-    }, options).then(({ value, receipt }) => ({ inserted: value, receipt }));
+    return this.transaction((tx) => tx.addAll(quads), options).then(({ value, receipt }) => ({
+      inserted: value,
+      receipt,
+    }));
   }
   async replace(quads: Iterable<RDF.Quad> | AsyncIterable<RDF.Quad>, options: UpdateOptions = {}) {
     const { value, receipt } = await this.transaction(async (tx) => {
       let deleted = 0n;
       for await (const q of tx.match()) if (await tx.delete(q)) deleted++;
-      let inserted = 0n;
-      let batch: RDF.Quad[] = [];
-      for await (const q of quads) {
-        batch.push(q);
-        if (batch.length === 4096) {
-          inserted += await tx.addBatch(batch);
-          batch = [];
-        }
-      }
-      if (batch.length) inserted += await tx.addBatch(batch);
+      const inserted = await tx.addAll(quads);
       return { inserted, deleted };
     }, options);
     return { ...value, receipt };
@@ -1288,6 +1292,50 @@ function inputChunks(
   };
 }
 
+/** The quads of a batch in the binary form that `wireTerms` describes. */
+function decodeQuads({ text, data }: NativeBatch, f?: RDF.DataFactory): RDF.Quad[] {
+  const entries = data[0];
+  const rows = data[1];
+  const decode = wireTerms(text, data, f);
+  const make = f ?? factory;
+  const out: RDF.Quad[] = new Array(rows);
+  for (let r = 0, cell = 4 + 4 * entries; r < rows; r++, cell += 4)
+    out[r] = make.quad(
+      decode(data[cell]) as RDF.Quad_Subject,
+      decode(data[cell + 1]) as RDF.Quad_Predicate,
+      decode(data[cell + 2]) as RDF.Quad_Object,
+      decode(data[cell + 3]) as RDF.Quad_Graph,
+    );
+  return out;
+}
+
+/** The quads of a match that are all decoded already; none once the dataset closes. */
+function readyQuads(quads: RDF.Quad[], closed: () => boolean) {
+  return {
+    [Symbol.asyncIterator](): AsyncIterator<RDF.Quad> {
+      let i = 0;
+      return {
+        next: () =>
+          Promise.resolve(
+            i < quads.length && !closed()
+              ? { done: false, value: quads[i++] }
+              : ({ done: true, value: undefined } as IteratorResult<RDF.Quad>),
+          ),
+        return: () => {
+          i = quads.length;
+          return Promise.resolve({ done: true, value: undefined });
+        },
+      };
+    },
+    async toArray() {
+      return quads.slice();
+    },
+    toStream() {
+      return Readable.from(this);
+    },
+  };
+}
+
 /**
  * The quads of a match. Each iteration reads the one result, and a result that is ready
  * hands its items out without waiting for a promise first.
@@ -1320,6 +1368,8 @@ export class Transaction extends Queryable {
   private ending?: Promise<unknown>;
   private tokens = new Set<any>();
   private requests: Promise<unknown> = Promise.resolve();
+  /** requests queued in `requests` and not settled, which a write must not overtake */
+  private inflight = 0;
   private timer?: ReturnType<typeof setTimeout>;
   private results = new Set<{ close(): Promise<void> }>();
   private interrupt!: (reason: unknown) => void;
@@ -1371,6 +1421,7 @@ export class Transaction extends Queryable {
       return f(token!);
     });
     this.requests = request.catch(() => {});
+    this.inflight++;
     try {
       const value = await request;
       if (options.signal?.aborted) throw options.signal.reason;
@@ -1381,9 +1432,38 @@ export class Transaction extends Queryable {
       if (timedOut) throw new QueryTimeoutError();
       throw nativeError(e);
     } finally {
+      this.inflight--;
       if (timer) clearTimeout(timer);
       options.signal?.removeEventListener('abort', abort);
       if (token) this.tokens.delete(token);
+    }
+  }
+  /**
+   * Insert or remove quads. When no earlier request is pending, the quads go to the addon
+   * at once, which on a dataset in memory usually applies them before it returns, so
+   * a single add costs no promise round trip through the queue.
+   */
+  private write(insert: boolean, quads: readonly RDF.Quad[]): Promise<number> {
+    if (this.inflight > 0) return this.call({}, () => this.writeNow(insert, quads));
+    if (this.ended) return Promise.reject(new InvalidInputError('Transaction has ended'));
+    let r: number | Promise<number>;
+    try {
+      r = this.writeNow(insert, quads);
+    } catch (e) {
+      return Promise.reject(nativeError(e));
+    }
+    if (typeof r === 'number') return Promise.resolve(r);
+    // the transaction's thread answers later: later requests queue behind this one
+    return this.call({}, () => r);
+  }
+  private writeNow(insert: boolean, quads: readonly RDF.Quad[]) {
+    const terms = this.ds.terms;
+    const { text, data } = terms.encode(quads);
+    try {
+      return this.handle.write(insert, text, data);
+    } catch (e) {
+      terms.forget();
+      throw e;
     }
   }
   protected override result(
@@ -1424,20 +1504,37 @@ export class Transaction extends Queryable {
       ),
     );
   }
+  /** Add an array of quads in one request; the number that were not there. */
   async addBatch(quads: RDF.Quad[]) {
-    const r = await this.call<string>({}, () =>
-      this.handle.apply(JSON.stringify(quads.map((q) => [true, encodeTerm(q)]))),
-    );
-    return BigInt(JSON.parse(r).inserted);
+    return BigInt(await this.write(true, quads));
+  }
+  /**
+   * Add the quads of an array, an iterable or an async iterable, in requests of up to 4096
+   * quads; the number that were not there.
+   */
+  async addAll(quads: Iterable<RDF.Quad> | AsyncIterable<RDF.Quad>) {
+    let inserted = 0;
+    if (Array.isArray(quads)) {
+      for (let i = 0; i < quads.length; i += ADD_BATCH)
+        inserted += await this.write(true, quads.slice(i, i + ADD_BATCH));
+      return BigInt(inserted);
+    }
+    let batch: RDF.Quad[] = [];
+    for await (const q of quads) {
+      batch.push(q);
+      if (batch.length >= ADD_BATCH) {
+        inserted += await this.write(true, batch);
+        batch = [];
+      }
+    }
+    if (batch.length) inserted += await this.write(true, batch);
+    return BigInt(inserted);
   }
   async add(quad: RDF.Quad) {
-    return (await this.addBatch([quad])) > 0n;
+    return (await this.write(true, [quad])) > 0;
   }
   async delete(quad: RDF.Quad) {
-    const r = await this.call<string>({}, () =>
-      this.handle.apply(JSON.stringify([[false, encodeTerm(quad)]])),
-    );
-    return BigInt(JSON.parse(r).deleted) > 0n;
+    return (await this.write(false, [quad])) > 0;
   }
   match(s?: RDF.Term | null, p?: RDF.Term | null, o?: RDF.Term | null, g?: RDF.Term | null) {
     return deferredQuads(

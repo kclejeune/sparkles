@@ -40,6 +40,7 @@ pub(crate) fn wrap(ds: Dataset, options: Value, read_only: bool) -> NativeDatase
     NativeDataset {
         shared: Mutex::new(Some(shared)),
         read_only,
+        handles: Default::default(),
     }
 }
 pub(crate) fn shared_for_path(

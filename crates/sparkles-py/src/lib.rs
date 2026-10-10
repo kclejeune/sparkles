@@ -2,6 +2,12 @@
 //! (spec `docs/specs/P01-python-bindings.md`). `python/sparkles/__init__.py` re-exports
 //! it and defines the exception classes.
 
+/// The library's own allocations go to mimalloc when the feature is on. The host runtime keeps
+/// its own heap, so this changes only the native side's allocations.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod admin;
 mod backups;
 mod branches;
