@@ -339,7 +339,7 @@ pub async fn fuseki_write(
         FusekiWrite::Remove(p) => {
             if locked_value(&declared, &target.name, p).is_some() {
                 return Err(super::http::locked_error(
-                    &[p.clone()],
+                    std::slice::from_ref(p),
                     &format!("/{}", target.name),
                 ));
             }

@@ -342,9 +342,11 @@ pub fn start(st: &mut AppState, settings: Option<&Path>, args: &ModelArgs) -> an
     let declared = settings
         .map(|p| read_file(p, Providers::Unchecked))
         .transpose()?;
-    let mut s = super::Settings::default();
     // the stores' prefix filters hold the handle, so it is kept
-    s.declared = st.settings.declared.clone();
+    let mut s = super::Settings {
+        declared: st.settings.declared.clone(),
+        ..Default::default()
+    };
     if let (Some(path), Some(d)) = (settings, declared) {
         s.file = Some(path.to_path_buf());
         s.declared.store(Arc::new(d));
