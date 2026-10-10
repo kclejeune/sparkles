@@ -923,6 +923,31 @@ datasets = {{ mem = "read" }}
             "SELECT ?o WHERE { GRAPH ?g { ex:kai schema:status ?o } }",
         );
         assert_eq!(on, [["\"away\"".to_string()]]);
+        // the agent reads its pending fact on the branch as proposed
+        let r = call(
+            &s,
+            "agent-7",
+            "recall",
+            json!({"seeds": ["ex:kai"], "hops": 0, "format": "json", "branch": "proposals.agent-7.inbox"}),
+        )
+        .await;
+        let text: J = serde_json::from_str(r["content"][0]["text"].as_str().unwrap()).unwrap();
+        let away = text["entities"][0]["facts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["o"] == "\"away\"")
+            .unwrap_or_else(|| panic!("{text}"))
+            .clone();
+        assert_eq!(away["status"], "proposed", "{text}");
+        let label = text["entities"][0]["facts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["p"] == "rdfs:label")
+            .unwrap()
+            .clone();
+        assert_eq!(label["status"], "reviewed", "{text}");
         // the owner is not an agent under review
         let r = call(
             &s,

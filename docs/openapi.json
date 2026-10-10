@@ -10429,7 +10429,8 @@
             "items": {
               "enum": [
                 "reviewed",
-                "unreviewed"
+                "unreviewed",
+                "proposed"
               ],
               "type": "string"
             },

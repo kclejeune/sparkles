@@ -5790,7 +5790,7 @@ export interface components {
             seedLimit?: number;
             /** @description Entity IRIs to start from. */
             seeds?: string[];
-            statuses?: ("reviewed" | "unreviewed")[];
+            statuses?: ("reviewed" | "unreviewed" | "proposed")[];
             /** @description At most the server's query timeout. 30 by default. */
             timeoutSeconds?: number;
             /** @description Class IRIs that seeds found by search must have. */

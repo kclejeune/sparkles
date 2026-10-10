@@ -334,7 +334,7 @@ fn tools(put: &mut dyn FnMut(&str, J)) {
                     "maxTriples": int(),
                     "maxBytes": int(),
                     "includeSuperseded": boolean(),
-                    "statuses": array(string_enum(&["reviewed", "unreviewed"])),
+                    "statuses": array(string_enum(&["reviewed", "unreviewed", "proposed"])),
                     "unreviewedWeight": num(),
                     "format": with_desc(string_enum(&["json"]), "Always `json` here."),
                 })),
