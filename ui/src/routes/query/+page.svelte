@@ -1,7 +1,8 @@
 <script lang="ts">
-  import { goto } from '$app/navigation';
+  import { goto, replaceState } from '$app/navigation';
+  import { page } from '$app/state';
   import { resolve } from '$app/paths';
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import * as api from '$lib/api';
   import { app, toasts } from '$lib/app.svelte';
   import { auth } from '$lib/auth.svelte';
@@ -27,6 +28,7 @@
   import Modal from '$components/Modal.svelte';
   import ResultTable from '$components/ResultTable.svelte';
   import SparqlEditor from '$components/SparqlEditor.svelte';
+  import QuestionHeader from '$components/QuestionHeader.svelte';
   import {
     buildDefinition,
     formDefaults,
@@ -40,9 +42,38 @@
     type FormValue,
     type ParamRow,
   } from '$lib/stored-queries';
+  import * as askApi from '$lib/ask-api';
+  import {
+    applyProposals,
+    emptyExplanation,
+    hasQuestion,
+    isEmptyResult,
+    isNotAQuery,
+    loadAsked,
+    nameFromQuestion,
+    proposeParameters,
+    questionTitle,
+    rememberAsked,
+    UPDATE_REFUSAL,
+    type Asked,
+    type Proposal,
+    type TabCheck,
+    type TabQuestion,
+  } from '$lib/ask';
+  import { askPayload, decodeHandoff, type Handoff } from '$lib/handoff';
+  import { parseCompact } from '$lib/compact';
+  import TermView from '$components/TermView.svelte';
 
-  /** A query tab; `stored` names the saved query it was opened from. */
-  type QTab = { id: string; title: string; query: string; stored?: string };
+  /**
+   * A query tab; `stored` names the saved query it was opened from, and `ask` holds the
+   * question it answers when it came from a handoff link or the Asked history.
+   */
+  type QTab = { id: string; title: string; query: string; stored?: string; ask?: TabQuestion };
+  /** The diagnosis of an empty result, fetched after the result is shown. */
+  type EmptyDiagnosis =
+    | { state: 'loading' }
+    | { state: 'done'; d: askApi.Diagnosis }
+    | { state: 'error' };
   type View = 'table' | 'graph' | 'map' | 'plan' | 'raw' | 'explain';
   type Outcome = {
     status: 'running' | 'done' | 'error';
@@ -60,6 +91,7 @@
     startedAt: number;
     elapsed?: number;
     controller?: AbortController;
+    diagnosis?: EmptyDiagnosis;
   };
 
   const DEFAULT_QUERY = EXAMPLES[0].query;
@@ -269,15 +301,34 @@
   let saveDescription = $state('');
   let saveRows = $state<(ParamRow & { use: boolean })[]>([]);
   let saving = $state(false);
+  /**
+   * Save as example: the question stored with the query, the parameters proposed for its
+   * constant entities, the text they are replaced in, and the suggestion being promoted.
+   */
+  let example = $state<{
+    question: string;
+    base: string;
+    prefixes: Record<string, string>;
+    proposals: (Proposal & { use: boolean })[];
+    suggestion?: string;
+  } | null>(null);
+  const exampleRows = $derived(
+    (example?.proposals ?? [])
+      .filter((p) => p.use)
+      .map((p) => ({
+        name: p.name,
+        type: 'iri' as const,
+        default: p.iri,
+        description: p.label ?? p.term,
+      })),
+  );
   const saveIssues = $derived(
-    saveProblems(
-      saveName,
-      saveRows.filter((r) => r.use),
-    ),
+    saveProblems(saveName, [...saveRows.filter((r) => r.use), ...exampleRows]),
   );
 
   function openSave() {
     savedOpen = false;
+    example = null;
     const d = activeStored;
     saveName = active.stored ?? '';
     saveDescription = d?.description ?? '';
@@ -294,24 +345,87 @@
     saveOpen = true;
   }
 
+  /**
+   * Open the save dialog for a question and its query (§4.6): the question as the first
+   * example question, the explanation as the description, and a parameter proposed for
+   * each constant entity with a type, bound to that entity by default.
+   */
+  async function openSaveExample(
+    src: { question: string; query: string; explanation?: string },
+    known?: askApi.CheckResult,
+    suggestion?: string,
+  ) {
+    savedOpen = false;
+    const name = ds;
+    if (!name) return;
+    let checked = known?.terms ? known : undefined;
+    if (!checked) {
+      try {
+        checked = await askApi.checkQuery(onBranch(name, branch), src.query, {
+          terms: true,
+          reasoning: reasoningFor(name),
+        });
+      } catch {
+        // without terms nothing is proposed, and the dialog still opens
+      }
+    }
+    const prefixes = { ...app.prefixes(name), ...(checked?.prefixes ?? {}) };
+    example = {
+      question: src.question,
+      base: src.query,
+      prefixes,
+      proposals: proposeParameters(src.query, checked?.terms, prefixes).map((p) => ({
+        ...p,
+        use: true,
+      })),
+      suggestion,
+    };
+    saveName = nameFromQuestion(src.question);
+    saveDescription = src.explanation ?? '';
+    saveRows = queryVariables(src.query).map((v) => ({
+      name: v,
+      use: false,
+      type: 'string',
+      default: '',
+      description: '',
+    }));
+    saveOpen = true;
+  }
+
   async function saveStored() {
     if (!ds || saveIssues.length) return;
     saving = true;
-    const def = buildDefinition(
-      active.query,
-      saveDescription,
-      saveRows.filter((r) => r.use),
-    );
+    const ex = example;
+    const rows = [...saveRows.filter((r) => r.use), ...exampleRows];
+    const text = ex
+      ? applyProposals(
+          ex.base,
+          ex.proposals.filter((p) => p.use),
+          ex.prefixes,
+        )
+      : active.query;
+    const def = buildDefinition(text, saveDescription, rows, ex ? [ex.question] : []);
     try {
       const r = await api.putStoredQuery(ds, saveName, def);
       storedDefs[`${ds}/${saveName}`] = r;
-      active.stored = saveName;
-      forms[activeId] = formDefaults(r.parameters);
+      if (!ex) {
+        active.stored = saveName;
+        forms[activeId] = formDefaults(r.parameters);
+      }
       saveOpen = false;
       toasts.push(
         'success',
         r.changed ? `Saved ${saveName} (version ${r.version.version})` : `${saveName} is unchanged`,
       );
+      if (ex?.suggestion) {
+        try {
+          await askApi.deleteSuggestion(ds, ex.suggestion);
+        } catch (e) {
+          toasts.error('The query is saved, but the suggestion could not be removed', e);
+        }
+        void loadSuggestions(ds);
+      }
+      example = null;
       void loadSaved(ds);
     } catch (e) {
       if (e instanceof api.ApiError && e.status === 403)
@@ -328,6 +442,210 @@
       void app.loadVocab(ds);
     }
   });
+
+  // --- questions (C18) ------------------------------------------------------------
+
+  /** Suggested examples, listed for dataset admins only. */
+  let suggestionList = $state<askApi.Suggestion[]>([]);
+  let suggestionsError = $state<string | null>(null);
+
+  async function loadSuggestions(name: string) {
+    try {
+      const list = await askApi.suggestions(name);
+      if (ds === name) {
+        suggestionList = list;
+        suggestionsError = null;
+      }
+    } catch (e) {
+      if (ds === name) {
+        suggestionList = [];
+        suggestionsError =
+          e instanceof api.ApiError && e.status === 404 ? null : api.errorMessage(e);
+      }
+    }
+  }
+  $effect(() => {
+    const name = ds;
+    suggestionList = [];
+    if (name && savedOpen && canAdmin) void loadSuggestions(name);
+  });
+
+  async function dismissSuggestion(s: askApi.Suggestion) {
+    if (!ds) return;
+    try {
+      await askApi.deleteSuggestion(ds, s.id);
+      suggestionList = suggestionList.filter((x) => x.id !== s.id);
+      toasts.push('success', 'Dismissed the suggestion');
+    } catch (e) {
+      toasts.error('Could not dismiss the suggestion', e);
+    }
+  }
+
+  async function suggestExample() {
+    const q = active.ask;
+    if (!ds || !q?.question) return;
+    try {
+      await askApi.suggestExample(ds, {
+        question: q.question,
+        query: active.query,
+        ...(q.explanation ? { explanation: q.explanation } : {}),
+      });
+      toasts.push(
+        'success',
+        'Suggested as an example',
+        `An admin of /${ds} can store it as a saved query.`,
+      );
+    } catch (e) {
+      toasts.error('Could not suggest the example', e);
+    }
+  }
+
+  /** The signed-in principal, which keys the local Asked history. */
+  const principal = $derived(auth.enabled ? (auth.who?.principal.name ?? null) : null);
+  /** The questions asked in this browser for the dataset, newest first. */
+  let askedList = $state<Asked[]>([]);
+  $effect(() => {
+    if (savedOpen && ds) askedList = loadAsked(ds, principal);
+  });
+
+  function remember(name: string, q: TabQuestion, query: string) {
+    if (!q.question) return;
+    askedList = rememberAsked(name, principal, {
+      question: q.question,
+      query,
+      ...(q.explanation ? { explanation: q.explanation } : {}),
+      ...(q.assumptions?.length ? { assumptions: q.assumptions } : {}),
+      at: new Date().toISOString(),
+    });
+  }
+
+  /** Open a question with its query in a new tab (or the untouched first one). */
+  function openQuestion(q: TabQuestion, query: string) {
+    const title = q.question ? questionTitle(q.question) : undefined;
+    const cur = active;
+    if (!cur.query.trim() || (cur.query === DEFAULT_QUERY && !cur.ask && !cur.stored)) {
+      cur.query = query;
+      cur.title = title ?? cur.title;
+      cur.ask = q;
+    } else {
+      addTab(query, title);
+      active.ask = q;
+    }
+  }
+
+  function openAsked(a: Asked) {
+    savedOpen = false;
+    openQuestion(
+      {
+        question: a.question,
+        explanation: a.explanation,
+        assumptions: a.assumptions,
+        original: a.query,
+      },
+      a.query,
+    );
+  }
+
+  // the check of a tab with a question: its terms, issues and estimated rows, refreshed a
+  // moment after the query stops changing
+  let checks = $state<Record<string, TabCheck>>({});
+  let checking = $state<Record<string, boolean>>({});
+  const checkSeq: Record<string, number> = {};
+
+  async function runCheck(tabId: string, text: string, dsTarget: string, dsName: string) {
+    const seq = (checkSeq[tabId] = (checkSeq[tabId] ?? 0) + 1);
+    checking[tabId] = true;
+    let at: string | undefined;
+    try {
+      at = normalizeAt(app.queryAt) ?? undefined;
+    } catch {
+      at = undefined;
+    }
+    let next: TabCheck;
+    try {
+      const result = await askApi.checkQuery(dsTarget, text, {
+        terms: true,
+        explain: true,
+        reasoning: reasoningFor(dsName),
+        at,
+      });
+      next = { text, result };
+    } catch (e) {
+      next = { text, error: api.errorMessage(e) };
+    }
+    if (checkSeq[tabId] !== seq) return;
+    checks[tabId] = next;
+    checking[tabId] = false;
+  }
+
+  $effect(() => {
+    const t = active;
+    const q = t.ask;
+    const text = t.query;
+    const name = ds;
+    const dsTarget = target;
+    if (!hasQuestion(q) || !name || !dsTarget || !text.trim()) return;
+    const prev = untrack(() => checks[t.id]);
+    if (prev?.text === text) return;
+    const timer = setTimeout(() => void runCheck(t.id, text, dsTarget, name), prev ? 1200 : 0);
+    return () => clearTimeout(timer);
+  });
+
+  /** A refusal of a handoff link, shown until dismissed. */
+  let linkNotice = $state<string | null>(null);
+
+  /** Open a handoff link's payload (`#ask=`): re-check it, never run it. */
+  async function openHandoff(h: Handoff) {
+    const name = h.dataset;
+    if (app.datasets.some((d) => d.name === name) || !app.datasetsLoaded) app.setDataset(name);
+    if (h.branch) app.queryBranch = h.branch === MAIN ? '' : h.branch;
+    if (h.atCommit != null) app.queryAt = `commit:${h.atCommit}`;
+    const q: TabQuestion = {
+      question: h.question,
+      explanation: h.explanation,
+      assumptions: h.assumptions,
+      original: h.query,
+    };
+    // an update never reaches the editor, whatever the server says about it
+    if (queryKind(h.query) === 'UPDATE') {
+      refuseLink();
+      return;
+    }
+    let check: TabCheck;
+    try {
+      const result = await askApi.checkQuery(onBranch(name, branchParam(h.branch ?? '')), h.query, {
+        terms: true,
+        explain: true,
+        reasoning: reasoningFor(name),
+        ...(h.atCommit != null ? { atCommit: h.atCommit } : {}),
+      });
+      if (isNotAQuery(result)) {
+        refuseLink();
+        return;
+      }
+      check = { text: h.query, result };
+    } catch (e) {
+      check = { text: h.query, error: api.errorMessage(e) };
+    }
+    openQuestion(q, h.query);
+    checks[activeId] = check;
+    remember(name, q, h.query);
+  }
+
+  /** Remove the fragment from the address without a navigation. */
+  function dropFragment() {
+    const url = location.pathname + location.search;
+    try {
+      replaceState(url, page.state);
+    } catch {
+      history.replaceState(history.state, '', url);
+    }
+  }
+
+  function refuseLink() {
+    linkNotice = UPDATE_REFUSAL;
+    addTab('', 'Refused link');
+  }
 
   function newId() {
     return Math.random().toString(36).slice(2, 10);
@@ -346,6 +664,7 @@
     if (i < 0) return;
     outcomes[id]?.controller?.abort();
     delete outcomes[id];
+    delete checks[id];
     editor?.forget(id);
     tabs.splice(i, 1);
     if (!tabs.length) tabs.push({ id: newId(), title: 'Query 1', query: DEFAULT_QUERY });
@@ -570,6 +889,9 @@
           reasoning,
         };
         autoPickColumns(result);
+        // an empty result gets a diagnosis, after the result is on screen
+        if (!stored && isEmptyResult(result))
+          void diagnose(tabId, started, dsTarget, text, at, reasoning);
       }
     } catch (e) {
       if (!owns()) return;
@@ -589,6 +911,28 @@
       if (e instanceof api.ApiError && e.line && tabId === activeId)
         editor?.showError(e.line, e.column);
     }
+  }
+
+  /** Ask the server why a query had no solutions (`/sparql/diagnose`), as the run asked. */
+  async function diagnose(
+    tabId: string,
+    started: number,
+    dsTarget: string,
+    text: string,
+    at: string | undefined,
+    reasoning: boolean | undefined,
+  ) {
+    const mine = () => outcomes[tabId]?.startedAt === started && outcomes[tabId]?.status === 'done';
+    if (!mine()) return;
+    outcomes[tabId].diagnosis = { state: 'loading' };
+    let next: EmptyDiagnosis;
+    try {
+      const d = await askApi.diagnoseQuery(dsTarget, text, { reasoning, at });
+      next = { state: 'done', d };
+    } catch {
+      next = { state: 'error' };
+    }
+    if (mine()) outcomes[tabId].diagnosis = next;
   }
 
   async function runExplain() {
@@ -817,9 +1161,20 @@
 
   onMount(() => {
     if (app.pendingQuery) {
-      const { query, title } = app.pendingQuery;
+      const { query, title, question } = app.pendingQuery;
       app.pendingQuery = null;
       addTab(query, title);
+      if (question) active.ask = question;
+    }
+    // a handoff link: read the fragment once and drop it, so a reload does not open it again
+    const payload = askPayload(location.hash);
+    if (payload != null) {
+      dropFragment();
+      try {
+        void openHandoff(decodeHandoff(payload));
+      } catch (e) {
+        linkNotice = (e as Error).message;
+      }
     }
     const onKey = (e: KeyboardEvent) => {
       if (
@@ -902,6 +1257,47 @@
     </button>
   </div>
 
+  <!-- the question of the tab, between the tab strip and the editor -->
+  <div class="qhead-slot">
+    {#if linkNotice}
+      <div class="notice warn link-notice" role="alert">
+        <Icon name="alert" size={14} />
+        <span>{linkNotice}</span>
+        <span class="spacer"></span>
+        <button
+          class="btn ghost icon sm"
+          aria-label="Dismiss"
+          title="Dismiss"
+          onclick={() => (linkNotice = null)}><Icon name="x" size={12} /></button
+        >
+      </div>
+    {/if}
+    {#if hasQuestion(active.ask)}
+      <QuestionHeader
+        q={active.ask}
+        check={checks[activeId]}
+        edited={active.query !== active.ask.original}
+        checking={!!checking[activeId]}
+        {prefixes}
+        {canAdmin}
+        onrecheck={() => ds && target && void runCheck(activeId, active.query, target, ds)}
+        onopen={openIri}
+        onsave={() =>
+          active.ask &&
+          void openSaveExample(
+            {
+              question: active.ask.question ?? '',
+              query: active.query,
+              explanation: active.ask.explanation,
+            },
+            checks[activeId]?.text === active.query ? checks[activeId]?.result : undefined,
+          )}
+        onsuggest={() => void suggestExample()}
+        onclose={() => (active.ask = undefined)}
+      />
+    {/if}
+  </div>
+
   <!-- toolbar -->
   <div class="toolbar">
     <span class="kind" data-kind={kind ?? ''}>{kind ?? 'SPARQL'}</span>
@@ -972,6 +1368,53 @@
             <span class="faint">A named query with typed parameters, for HTTP, MCP and the CLI</span
             >
           </button>
+          {#if askedList.length}
+            <div class="menu-head faint small" role="presentation">Asked</div>
+            <div class="menu-scroll" role="group" aria-label="Asked">
+              {#each askedList as a (a.question + a.at)}
+                <button
+                  role="menuitem"
+                  class="menu-item"
+                  title={a.query}
+                  onclick={() => openAsked(a)}
+                >
+                  <span>{a.question}</span>
+                  <span class="faint mono small one-line">{a.query.replace(/\s+/g, ' ')}</span>
+                </button>
+              {/each}
+            </div>
+          {/if}
+          {#if canAdmin}
+            <div class="menu-head faint small" role="presentation">Suggestions</div>
+            <div class="menu-scroll" role="group" aria-label="Suggestions">
+              {#each suggestionList as s (s.id)}
+                <div class="suggestion">
+                  <span class="s-text" title={s.query}
+                    >{s.question}
+                    <span class="faint small">by {s.by}</span></span
+                  >
+                  <span class="s-actions">
+                    <button
+                      class="btn sm"
+                      onclick={() =>
+                        void openSaveExample(
+                          { question: s.question, query: s.query, explanation: s.explanation },
+                          undefined,
+                          s.id,
+                        )}>Promote</button
+                    >
+                    <button class="btn ghost sm" onclick={() => void dismissSuggestion(s)}
+                      >Dismiss</button
+                    >
+                  </span>
+                </div>
+              {:else}
+                <p class="faint small menu-note">
+                  {suggestionsError ?? 'No suggested examples.'}
+                </p>
+              {/each}
+            </div>
+          {/if}
         </div>
       {/if}
     </div>
@@ -1425,6 +1868,7 @@
               <div class="ask">
                 <span class="ask-val" class:yes={r.boolean}>{r.boolean ? 'true' : 'false'}</span>
                 <span class="faint">ASK result</span>
+                {@render emptyWhy(outcome.diagnosis)}
               </div>
             {:else if r.triples}
               {#if r.triples.length}
@@ -1442,10 +1886,15 @@
             {:else}
               <div class="empty">
                 <p>No results.</p>
-                <p class="faint">
-                  The pattern matched nothing in <strong>{outcome.ds}</strong>. Check IRIs and
-                  prefixes, or try the Explain view.
-                </p>
+                {#if outcome.diagnosis?.state === 'done' && outcome.diagnosis.d.empty}
+                  {@render emptyWhy(outcome.diagnosis)}
+                {:else}
+                  <p class="faint">
+                    The pattern matched nothing in <strong>{outcome.ds}</strong>. Check IRIs and
+                    prefixes, or try the Explain view.
+                  </p>
+                  {@render emptyWhy(outcome.diagnosis)}
+                {/if}
               </div>
             {/if}
           {:else if outcome.view === 'graph'}
@@ -1549,10 +1998,46 @@
   </section>
 </div>
 
-<Modal bind:open={saveOpen} title="Save as a stored query" width={560}>
+{#snippet emptyWhy(diag: EmptyDiagnosis | undefined)}
+  {#if diag?.state === 'loading'}
+    <p class="faint small"><span class="spinner"></span> Looking for what matched nothing…</p>
+  {:else if diag?.state === 'done'}
+    {@const why = emptyExplanation(diag.d)}
+    {#if why}
+      {@const dp = { ...prefixes, ...diag.d.prefixes }}
+      <div class="why" role="note" aria-label="Why the result is empty">
+        <p><strong>{why.headline}</strong></p>
+        <p class="muted">{why.message}</p>
+        {#if why.first}
+          <p class="small">
+            <span class="faint">First {why.first.kind} without solutions</span>
+            <code class="mono">{why.first.text}</code>
+          </p>
+          {#if why.first.missing.length}
+            <p class="small">
+              <span class="faint">Not in the data you can read:</span>
+              {#each why.first.missing as m, i (m)}{#if i},
+                {/if}<span class="mono"><TermView term={parseCompact(m, dp)} prefixes={dp} /></span
+                >{/each}
+            </p>
+          {/if}
+          {#each why.first.issues as issue, i (i)}
+            <p class="small warn-text"><Icon name="alert" size={12} /> {issue}</p>
+          {/each}
+        {/if}
+      </div>
+    {/if}
+  {/if}
+{/snippet}
+
+<Modal
+  bind:open={saveOpen}
+  title={example ? 'Save as example' : 'Save as a stored query'}
+  width={560}
+>
   <p class="muted small">
-    The editor's query is stored on the server for /{ds}. Runs bind each parameter to one value of
-    its type, so a value never changes the query. It is also an MCP tool.
+    {example ? 'The query' : "The editor's query"} is stored on the server for /{ds}. Runs bind each
+    parameter to one value of its type, so a value never changes the query. It is also an MCP tool.
   </p>
   <div class="save-form">
     <label class="field">
@@ -1563,6 +2048,29 @@
       <span class="small">Description</span>
       <input class="input" bind:value={saveDescription} placeholder="What the query answers" />
     </label>
+    {#if example}
+      <label class="field">
+        <span class="small">Example question</span>
+        <input class="input" bind:value={example.question} placeholder="The question it answers" />
+      </label>
+      {#if example.proposals.length}
+        <div class="small">Proposed parameters</div>
+        <div class="param-rows proposals" aria-label="Proposed parameters">
+          {#each example.proposals as p (p.iri)}
+            <label class="row small">
+              <input type="checkbox" bind:checked={p.use} />
+              <span class="mono">?{p.name}</span>
+            </label>
+            <span class="faint small">iri</span>
+            <span class="small proposal-value" title={p.iri}
+              ><span class="mono">{p.term}</span>{#if p.label}
+                <span class="faint">"{p.label}"</span>{/if}
+              <span class="faint">· {p.type}</span></span
+            >
+          {/each}
+        </div>
+      {/if}
+    {/if}
     {#if saveRows.length}
       <div class="small">Parameters</div>
       <div class="param-rows">
@@ -1597,7 +2105,7 @@
   .page {
     flex: 1;
     display: grid;
-    grid-template-rows: auto auto var(--editor-h) 7px minmax(0, 1fr);
+    grid-template-rows: auto auto auto var(--editor-h) 7px minmax(0, 1fr);
     /* without an explicit column, wide content (long editor lines, the plan table)
        stretches the grid past the viewport and the toolbar's Run button is clipped */
     grid-template-columns: minmax(0, 1fr);
@@ -1789,6 +2297,65 @@
   .save-form {
     display: grid;
     gap: 10px;
+  }
+  .qhead-slot {
+    min-width: 0;
+  }
+  .link-notice {
+    border-bottom: 1px solid var(--border);
+  }
+  .menu-head {
+    padding: 8px 8px 2px;
+    border-top: 1px solid var(--border);
+    margin-top: 4px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .menu-scroll {
+    display: grid;
+    max-height: 240px;
+    overflow: auto;
+  }
+  .one-line {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .suggestion {
+    display: grid;
+    gap: 4px;
+    padding: 6px 8px;
+    border-radius: 4px;
+  }
+  .suggestion:hover {
+    background: var(--hover);
+  }
+  .s-text {
+    font-weight: 500;
+    overflow-wrap: anywhere;
+  }
+  .s-actions {
+    display: flex;
+    gap: 4px;
+  }
+  .proposal-value {
+    overflow-wrap: anywhere;
+  }
+  .why {
+    display: grid;
+    gap: 4px;
+    max-width: 640px;
+    text-align: left;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--r);
+    background: var(--surface-2);
+  }
+  .why p {
+    margin: 0;
+  }
+  .warn-text {
+    color: var(--warn);
   }
   .field {
     display: grid;
@@ -2090,7 +2657,7 @@
        screen: they get a fixed share of it, and the page scrolls down to them */
     .page {
       height: auto;
-      grid-template-rows: auto auto min(var(--editor-h), 40vh) 7px max(320px, 70vh);
+      grid-template-rows: auto auto auto min(var(--editor-h), 40vh) 7px max(320px, 70vh);
     }
     .toolbar {
       position: relative;

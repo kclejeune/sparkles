@@ -22,6 +22,7 @@ import {
   resolveBranch,
 } from './branches.mjs';
 import { handleDescribe } from './describe.mjs';
+import { handleAsk, isAdmin, ORG_MEMORY, ORG_PREFIXES, orgTrig, whoamiFor } from './memory.mjs';
 import { geoQuery, handleGeo } from './geo.mjs';
 import { handleVector, seedVectors, touchPacked, vectorIndexFor } from './vector.mjs';
 import { PREFIXES, buildTurtle, provenanceTrig, scratchTurtle, vectorTurtle } from './data.mjs';
@@ -184,6 +185,14 @@ function seedHistory(ds) {
   scratch.baseQuads = scratch.store.size;
   addCommit(scratch, 'upload', scratch.store.size, 0, { bulk: true });
   seedVectors(datasets);
+  // an organisation with agent memory (mock/memory.mjs), and a scratchpad branch to review
+  const org = makeDataset('org', 'persistent');
+  org.prefixes = { ...ORG_PREFIXES };
+  org.store.load(orgTrig, { format: 'application/trig' });
+  org.baseQuads = org.store.size;
+  org.memory = ORG_MEMORY;
+  addCommit(org, 'upload', org.store.size, 0, { bulk: true });
+  createBranch(org, { name: 'scratch-s2', note: 'agent-7 scratchpad' });
   // a branch of foaf two commits ahead of main
   const dev = createBranch(foaf, { name: 'dev', note: 'schema migration' }).branch;
   for (const u of [
@@ -1977,6 +1986,8 @@ const server = http.createServer(async (req, res) => {
         });
       }
     }
+    // questions, checks and agent memory (mock/memory.mjs)
+    if (await handleAsk(req, res, url, seg, { datasets, send, fail, readBody })) return;
     // branches and merges (mock/branches.mjs)
     if (
       await handleBranches(req, res, url, seg, {
@@ -2099,15 +2110,19 @@ const server = http.createServer(async (req, res) => {
         }
         // the mock runs open, like a server without --auth-config
         case 'whoami':
-          return send(res, 200, {
-            authEnabled: false,
-            principal: { kind: 'local' },
-            method: 'none',
-            server: ['server-admin'],
-            datasets: Object.fromEntries([...datasets.keys()].map((n) => [n, 'admin'])),
-            canMintTokens: false,
-            logout: false,
-          });
+          return send(
+            res,
+            200,
+            whoamiFor(req, [...datasets.keys()]) ?? {
+              authEnabled: false,
+              principal: { kind: 'local' },
+              method: 'none',
+              server: ['server-admin'],
+              datasets: Object.fromEntries([...datasets.keys()].map((n) => [n, 'admin'])),
+              canMintTokens: false,
+              logout: false,
+            },
+          );
         case 'auth':
           if (name === 'config') return send(res, 200, { enabled: false });
           return fail(res, 404, 'not found');
@@ -2294,6 +2309,8 @@ const server = http.createServer(async (req, res) => {
             const q = store.get(extra);
             return q ? send(res, 200, q) : fail(res, 404, `no stored query '${extra}' in /${name}`);
           }
+          if (req.method !== 'GET' && !isAdmin(req))
+            return fail(res, 403, `admin access to /${name} needed`);
           if (req.method === 'PUT') {
             const def = JSON.parse((await readBody(req)).toString() || '{}');
             const prev = store.get(extra);
