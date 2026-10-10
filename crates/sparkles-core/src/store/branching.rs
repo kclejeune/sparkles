@@ -1861,7 +1861,6 @@ impl Store {
         let mut state = (*store.snapshot()).clone();
         state.dataset_id = self.owner_dataset_id();
         state.delta = snap.delta.clone();
-        state.delta_stats = snap.delta_stats.clone();
         state.version = snap.version;
         state.commit = root.seq;
         state.cache = set.cache.clone();

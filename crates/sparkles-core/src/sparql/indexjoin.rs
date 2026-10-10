@@ -847,7 +847,7 @@ fn clusters(ctx: &Ctx, perm: Perm, ranges: &Ranges) -> (Vec<(usize, usize)>, usi
             b0 <= c1
                 && !(delta && {
                     let gap = (Bound::Excluded(prev), Bound::Excluded(lo));
-                    ins.range(gap).next().is_some() || del.range(gap).next().is_some()
+                    ins.intersects(gap) || del.intersects(gap)
                 })
         });
         match &mut cur {
@@ -1063,14 +1063,36 @@ fn read_ranges_gallop(
             ctx.check_output(total(out), width)?;
         }
         let (lo, hi) = ranges.get(r);
+        b = gallop_to(b, metas.len(), |x| metas[x].last < lo);
+        if delta && (b == metas.len() || metas[b].first > hi) {
+            // no base block reaches the range, so no deletion is in it either: its rows
+            // are the delta's inserted keys, read straight from the delta
+            let mut last: Option<(usize, Key)> = None;
+            let mut it = ins.range(lo..=hi);
+            let mut first = true;
+            loop {
+                let run = it.next_run();
+                if run.is_empty() {
+                    break;
+                }
+                // one seek for a range the delta holds keys in, as a merging scan counts
+                stats.seeks += first as usize;
+                first = false;
+                stats.rows += run.len();
+                seen += run.len();
+                for k in run {
+                    push_row(rule, ranges, cols, k, r, &mut last, out);
+                }
+            }
+            continue;
+        }
         if delta && {
             let rng = (Bound::Included(lo), Bound::Included(hi));
-            ins.range(rng).next().is_some() || del.range(rng).next().is_some()
+            ins.intersects(rng) || del.intersects(rng)
         } {
             read_ranges(ctx, perm, ranges, &[(r, r + 1)], cols, rule, out, stats)?;
             continue;
         }
-        b = gallop_to(b, metas.len(), |x| metas[x].last < lo);
         let d = ranges.depth(r);
         let t = ranges.part(r);
         let mut last: Option<(usize, Key)> = None;

@@ -187,7 +187,7 @@ fn block_of(blocks: &[BlockMeta], mut b: usize, k: &Key) -> usize {
     b
 }
 
-fn plan_perm(idx: &PermIndex, ins: &OrdSet<Key>, del: &OrdSet<Key>) -> Vec<Seg> {
+fn plan_perm(idx: &PermIndex, ins: &KeySet, del: &KeySet) -> Vec<Seg> {
     let blocks = &idx.blocks;
     if blocks.is_empty() {
         return match ins.len() {
@@ -278,8 +278,8 @@ fn rewrite(
     dir: &Path,
     idx: &PermIndex,
     segs: &[Seg],
-    ins: &OrdSet<Key>,
-    del: &OrdSet<Key>,
+    ins: &KeySet,
+    del: &KeySet,
     interrupt: &crate::builder::InterruptFn,
 ) -> Result<u64> {
     let mut w = PermWriter::create(dir, idx.perm)?;
@@ -453,7 +453,7 @@ pub(crate) fn write(
 }
 
 /// Inserted and deleted delta keys per distinct prefix of `len` columns.
-fn groups(ins: &OrdSet<Key>, del: &OrdSet<Key>, len: usize) -> BTreeMap<Key, (u64, u64)> {
+fn groups(ins: &KeySet, del: &KeySet, len: usize) -> BTreeMap<Key, (u64, u64)> {
     let mut m: BTreeMap<Key, (u64, u64)> = BTreeMap::new();
     let prefix = |k: &Key| pad(&k[..len], 0);
     for k in ins.iter() {

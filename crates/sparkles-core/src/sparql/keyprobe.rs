@@ -361,12 +361,8 @@ fn count_keys(
     let pi = spec.perm.index();
     let mut prefix = spec.prefix.clone();
     prefix.push(0);
-    let delta = Delta::range(&snap.delta.ins[pi], &spec.prefix)
-        .next()
-        .is_some()
-        || Delta::range(&snap.delta.del[pi], &spec.prefix)
-            .next()
-            .is_some();
+    let delta = Delta::count_prefix(&snap.delta.ins[pi], &spec.prefix) > 0
+        || Delta::count_prefix(&snap.delta.del[pi], &spec.prefix) > 0;
     // the key column, the one after the pattern's constants
     let kc = spec.prefix.len();
     let (plo, phi) = (pad(&spec.prefix, 0), pad(&spec.prefix, u64::MAX));
