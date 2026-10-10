@@ -117,12 +117,13 @@ pub fn valid_blob_id(s: &str) -> bool {
 }
 
 /// Files at the database root that a backup may hold.
-pub const ROOT_FILES: [&str; 16] = [
+pub const ROOT_FILES: [&str; 17] = [
     "CURRENT",
     "dataset.json",
     "commits.bin",
     "annotations.bin",
     "prefixes.json",
+    "prefixes-removed.json",
     "text.json",
     "geo.json",
     "vector.json",

@@ -904,6 +904,80 @@ fn in_memory_stores_keep_a_bounded_catalog() {
     );
 }
 
+/// The runtime layer of the prefixes (spec C20 §3.2): removals persist in their own file
+/// next to `prefixes.json`, which keeps its form, a binding clears a removal, and loaded
+/// data and RDF Patch rows skip removed names and the names the filter keeps.
+#[test]
+fn prefix_removals_and_the_filter() {
+    use std::collections::{BTreeMap, BTreeSet};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let map = |v: &[(&str, &str)]| -> BTreeMap<String, String> {
+        v.iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect()
+    };
+    {
+        let s = Store::open(&root, StoreOptions::default()).unwrap();
+        s.set_prefix_layer(
+            map(&[("ex", "http://ex.org/")]),
+            BTreeSet::from(["kclj".to_string()]),
+        )
+        .unwrap();
+        // a name both bound and removed, a bad name and a relative IRI are refused
+        assert!(
+            s.set_prefix_layer(map(&[("a", "http://a/")]), BTreeSet::from(["a".into()]))
+                .is_err()
+        );
+        assert!(
+            s.set_prefix_layer(map(&[("a b", "http://a/")]), BTreeSet::new())
+                .is_err()
+        );
+        assert!(
+            s.set_prefix_layer(map(&[("a", "rel")]), BTreeSet::new())
+                .is_err()
+        );
+        // loaded data does not bind a removed name or one the filter keeps
+        s.set_prefix_filter(Some(Arc::new(|p: &str| p != "memory")));
+        s.add_prefixes(map(&[
+            ("kclj", "http://other/"),
+            ("memory", "http://other/m/"),
+            ("foaf", "http://xmlns.com/foaf/0.1/"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            s.prefixes().keys().collect::<Vec<_>>(),
+            ["ex", "foaf"],
+            "removed and kept names are skipped"
+        );
+    }
+    // prefixes.json is still an object of strings
+    let j: BTreeMap<String, String> =
+        serde_json::from_slice(&std::fs::read(root.join("prefixes.json")).unwrap()).unwrap();
+    assert_eq!(j.len(), 2);
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    assert_eq!(s.removed_prefixes(), BTreeSet::from(["kclj".to_string()]));
+    // binding the name clears its removal, and the file goes once nothing is removed
+    s.set_prefix("kclj", "https://kclj.io/sparkles/").unwrap();
+    assert!(s.removed_prefixes().is_empty());
+    assert!(!root.join("prefixes-removed.json").exists());
+    // the cap counts bindings and removals together
+    let s = Store::in_memory(StoreOptions {
+        max_prefixes: 2,
+        ..Default::default()
+    });
+    s.set_prefix_layer(map(&[("a", "http://a/")]), BTreeSet::from(["b".into()]))
+        .unwrap();
+    assert!(s.set_prefix("c", "http://c/").is_err());
+    assert!(
+        s.set_prefix_layer(
+            map(&[("a", "http://a/"), ("c", "http://c/")]),
+            BTreeSet::from(["b".into()])
+        )
+        .is_err()
+    );
+}
+
 /// A dataset holds at most `max_prefixes` prefixes: a new one past it is refused, the
 /// prefixes of loaded data stop being added, and names and IRIs have a length limit.
 #[test]
