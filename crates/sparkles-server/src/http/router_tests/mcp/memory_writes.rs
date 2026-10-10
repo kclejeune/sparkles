@@ -551,6 +551,48 @@ async fn a16_tool_listing() {
             .get("branch")
             .is_none()
     );
+    // the instructions gain the writing step, and the agent_memory prompt sets out the
+    // loop of §2
+    let (_, init) = initialize(&s.app, &[]).await;
+    let text = init.rpc()["result"]["instructions"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        text.ends_with(
+            "Before writing, call link_entities, then write with assert_facts and dryRun first."
+        ),
+        "{text}"
+    );
+    let p = modern(
+        &s.app,
+        "prompts/get",
+        json!({"name": "agent_memory", "arguments": {"dataset": "mem"}}),
+        &[],
+    )
+    .await;
+    let text = p.rpc()["result"]["messages"][0]["content"]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for t in [
+        "recall",
+        "similar_queries",
+        "check_query",
+        "link_entities",
+        "assert_facts",
+        "ifHead",
+        "create_branch",
+    ] {
+        assert!(text.contains(t), "{t}: {text}");
+    }
+    let s = mem_server(&[]);
+    let (_, init) = initialize(&s.app, &[]).await;
+    let text = init.rpc()["result"]["instructions"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(!text.contains("assert_facts"), "{text}");
     // never on a read-only server
     let dir = tempfile::tempdir().unwrap();
     let mut st =

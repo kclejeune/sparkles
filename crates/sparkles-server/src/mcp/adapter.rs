@@ -192,6 +192,22 @@ fn result(outcome: Result<Outcome, ToolError>) -> CallToolResult {
     }
 }
 
+impl Adapter {
+    /// The server's instructions, with the writing step of C17 §5.8 when `assert_facts`
+    /// is offered.
+    fn instructions(&self) -> String {
+        if self.tools.iter().any(|t| t.name == "assert_facts") {
+            format!("{INSTRUCTIONS} {WRITE_INSTRUCTIONS}")
+        } else {
+            INSTRUCTIONS.to_string()
+        }
+    }
+}
+
+/// The sentence the instructions gain when `assert_facts` is offered.
+pub const WRITE_INSTRUCTIONS: &str =
+    "Before writing, call link_entities, then write with assert_facts and dryRun first.";
+
 fn context_error(e: ContextError) -> McpError {
     match e {
         ContextError::InvalidParams(m) => McpError::invalid_params(m, None),
@@ -214,7 +230,7 @@ impl ServerHandler for Adapter {
                 .build(),
         )
         .with_server_info(implementation())
-        .with_instructions(INSTRUCTIONS)
+        .with_instructions(self.instructions())
         // the newest version with an `initialize` handshake
         .with_protocol_version(ProtocolVersion::V_2025_11_25)
     }
