@@ -103,6 +103,7 @@
     align-content: start;
   }
   .note {
+    max-width: 72ch;
     margin: 0;
     font-size: var(--fs-sm);
     color: var(--text-3);

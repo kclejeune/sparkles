@@ -419,6 +419,7 @@
     min-width: 0;
   }
   .intro {
+    max-width: 72ch;
     margin: 0 0 8px;
     font-size: var(--fs-sm);
   }

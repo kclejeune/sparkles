@@ -564,7 +564,7 @@ ex:PersonShape a sh:NodeShape ;
 
 <svelte:head><title>{name} | Sparkles</title></svelte:head>
 
-<div class="page">
+<div class="page page-container">
   <nav class="crumbs">
     <a href={resolve('/datasets')}>Datasets</a><Icon name="chevron" size={12} /><span>{name}</span>
   </nav>
@@ -1560,11 +1560,7 @@ ex:PersonShape a sh:NodeShape ;
 <style>
   .page {
     padding: 18px 28px 40px;
-    display: grid;
-    grid-template-columns: minmax(0, 1fr);
     gap: 16px;
-    max-width: 1320px;
-    width: 100%;
   }
   .crumbs {
     display: flex;

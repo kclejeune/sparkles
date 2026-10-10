@@ -389,7 +389,7 @@
 
 <svelte:head><title>Similar | Sparkles</title></svelte:head>
 
-<div class="page">
+<div class="page page-container">
   <header class="head">
     <div>
       <h1>Similar</h1>
@@ -668,22 +668,24 @@
                       >{vectorLabel(h.vector)}</td
                     >
                     <td class="acts">
-                      {#if h.term.type === 'uri'}
-                        {@const iri = h.term.value}
-                        <a
-                          class="btn sm ghost icon"
-                          href={exploreHref(iri)}
-                          title="Open in Explore"
-                          aria-label="Open {shortLabel(iri, prefixes)} in Explore"
-                          ><Icon name="explore" size={13} /></a
-                        >
-                        <button
-                          class="btn sm ghost icon"
-                          title="Search from here"
-                          aria-label="Search from {shortLabel(iri, prefixes)}"
-                          onclick={() => searchFrom(iri)}><Icon name="target" size={13} /></button
-                        >
-                      {/if}
+                      <div class="cell-actions">
+                        {#if h.term.type === 'uri'}
+                          {@const iri = h.term.value}
+                          <a
+                            class="btn sm ghost icon"
+                            href={exploreHref(iri)}
+                            title="Open in Explore"
+                            aria-label="Open {shortLabel(iri, prefixes)} in Explore"
+                            ><Icon name="explore" size={13} /></a
+                          >
+                          <button
+                            class="btn sm ghost icon"
+                            title="Search from here"
+                            aria-label="Search from {shortLabel(iri, prefixes)}"
+                            onclick={() => searchFrom(iri)}><Icon name="target" size={13} /></button
+                          >
+                        {/if}
+                      </div>
                     </td>
                   </tr>
                 {/each}
@@ -724,11 +726,7 @@
 <style>
   .page {
     padding: 24px 28px 40px;
-    display: grid;
-    grid-template-columns: minmax(0, 1fr);
     gap: 18px;
-    max-width: 1280px;
-    width: 100%;
   }
   .head {
     display: flex;

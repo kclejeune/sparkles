@@ -231,25 +231,27 @@
               </label>
             </td>
             <td class="actions">
-              <button
-                class="btn sm"
-                onclick={() => run(p)}
-                disabled={readOnly || busy[p.name]}
-                title={readOnly ? 'The server is read-only: policies do not run' : undefined}
-                >Run now</button
-              >
-              <button class="btn sm" onclick={() => previewRetention(p)}>Retention</button>
-              <button class="btn sm ghost" onclick={() => open(p)}
-                >{p.source === 'config' ? 'View' : 'Edit'}</button
-              >
-              {#if p.source === 'api' && !readOnly}
+              <div class="cell-actions">
                 <button
-                  class="btn sm icon danger"
-                  onclick={() => remove(p)}
-                  aria-label="Delete {p.name}"
-                  title="Delete {p.name}"><Icon name="trash" size={12} /></button
+                  class="btn sm"
+                  onclick={() => run(p)}
+                  disabled={readOnly || busy[p.name]}
+                  title={readOnly ? 'The server is read-only: policies do not run' : undefined}
+                  >Run now</button
                 >
-              {/if}
+                <button class="btn sm" onclick={() => previewRetention(p)}>Retention</button>
+                <button class="btn sm ghost" onclick={() => open(p)}
+                  >{p.source === 'config' ? 'View' : 'Edit'}</button
+                >
+                {#if p.source === 'api' && !readOnly}
+                  <button
+                    class="btn sm icon danger"
+                    onclick={() => remove(p)}
+                    aria-label="Delete {p.name}"
+                    title="Delete {p.name}"><Icon name="trash" size={12} /></button
+                  >
+                {/if}
+              </div>
             </td>
           </tr>
         {:else}
@@ -371,9 +373,6 @@
   .actions {
     text-align: right;
     white-space: nowrap;
-  }
-  .actions > * + * {
-    margin-left: 4px;
   }
   .switch {
     position: relative;

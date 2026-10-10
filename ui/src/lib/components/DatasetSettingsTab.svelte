@@ -112,13 +112,16 @@
 </div>
 
 <style>
+  /* the kinds side by side once two fit, so a wide screen is used */
   .settings-tab {
     display: grid;
-    grid-template-columns: minmax(0, 1fr);
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 680px), 1fr));
+    align-items: start;
     gap: 16px;
-    max-width: 980px;
   }
   .intro {
+    grid-column: 1 / -1;
+    max-width: 90ch;
     display: flex;
     flex-wrap: wrap;
     align-items: center;

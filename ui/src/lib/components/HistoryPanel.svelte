@@ -386,19 +386,21 @@
                 </td>
                 <td class="num">{fmtInt(c.quads)}</td>
                 <td class="row-actions">
-                  <button
-                    class="btn ghost sm"
-                    title="Show what this commit changed"
-                    disabled={c.seq === 0}
-                    onclick={() => showDiff(c)}>Diff</button
-                  >
-                  <button
-                    class="btn ghost icon sm"
-                    aria-label="Query at commit {c.seq}"
-                    title="Query the dataset at this commit"
-                    disabled={!readable(c)}
-                    onclick={() => queryAt(c)}><Icon name="query" size={12} /></button
-                  >
+                  <div class="cell-actions">
+                    <button
+                      class="btn ghost sm"
+                      title="Show what this commit changed"
+                      disabled={c.seq === 0}
+                      onclick={() => showDiff(c)}>Diff</button
+                    >
+                    <button
+                      class="btn ghost icon sm"
+                      aria-label="Query at commit {c.seq}"
+                      title="Query the dataset at this commit"
+                      disabled={!readable(c)}
+                      onclick={() => queryAt(c)}><Icon name="query" size={12} /></button
+                    >
+                  </div>
                 </td>
               </tr>
             {/each}
