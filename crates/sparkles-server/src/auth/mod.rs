@@ -345,6 +345,7 @@ impl Grants {
 
     /// Whether calls on `ds` may use the server's model providers where a tool makes
     /// that optional (C18 §9.6): with a grant that says so, or as an admin of `ds`.
+    #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
     pub fn server_models(&self, ds: &str) -> bool {
         let name = split_branch(ds).0;
         self.level_for(ds, None) == Some(Level::Admin)
@@ -571,6 +572,7 @@ impl Access {
     }
 
     /// [`Grants::server_models`], for a principal whose scopes still reach `ds`.
+    #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
     pub fn server_models(&self, ds: &str) -> bool {
         self.level_for(ds, None).is_some() && self.grants.server_models(ds)
     }
@@ -896,6 +898,7 @@ impl Principal {
     /// Whether this principal may have the server's model providers write for it on
     /// `ds` when a tool makes that optional (the `serverModels` permission of C18 §9.6).
     /// The local principal of a server without auth may.
+    #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
     pub fn server_models(&self, ds: &str) -> bool {
         self.is_local() || self.access.server_models(&self.qualified(ds))
     }

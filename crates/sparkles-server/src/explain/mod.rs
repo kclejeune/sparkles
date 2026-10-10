@@ -16,7 +16,7 @@ pub mod model;
 mod tests;
 
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 /// The most nodes a plan given to `/{ds}/sparql/explain` may have.
 pub const MAX_NODES: usize = 10_000;
@@ -836,6 +836,7 @@ pub fn add_findings(plan: &Plan, notes: &mut Vec<Note>, findings: &[Finding]) {
 }
 
 /// The variables a message names, such as `?a` and `?b`.
+#[cfg_attr(not(feature = "fmt"), allow(dead_code))]
 pub fn vars_in(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let chars = text.char_indices().peekable();
@@ -1326,7 +1327,7 @@ fn lint_findings(query: &str) -> Vec<Finding> {
             severity: d.severity.name().to_string(),
             message: d.message.clone(),
             vars: vars_in(&d.message),
-            range: json!({
+            range: serde_json::json!({
                 "line": d.line,
                 "column": d.column,
                 "endLine": d.end_line,
