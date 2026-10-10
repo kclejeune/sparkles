@@ -9090,8 +9090,12 @@ The operator defines model providers in a JSON file passed to `serve --model-con
 Each provider has a name, a kind (`ollama`, `openai` for any endpoint that speaks the
 OpenAI chat protocol, or `anthropic`), an endpoint, and optionally the name of a secret
 that holds its API key. Keys are read from `--model-secret NAME=env:VARIABLE` or
-`--model-secret NAME=file:PATH` at each request. No route returns a key, and no route
-can create a provider or change its endpoint.
+`--model-secret NAME=file:PATH` at each request. A server administrator can also
+change the configuration at runtime through [Server settings](#server-settings),
+including providers and their endpoints, and store a key through
+[Model secrets](#model-secrets), unless the settings file locks the field or the
+secret. No route returns a key. Users with `admin` on a dataset only choose among the
+configured providers by name.
 
 ```json
 {
@@ -9136,11 +9140,13 @@ Anthropic), then a plain JSON mode, then plain text with the answer in a fenced 
 The detected level is remembered until the server restarts or the pair is tested again.
 An answer that does not match the schema is retried once with the errors.
 
-**`GET /$/models`** (server admin) lists the providers with their kind, endpoint,
-status and models, and the role lists. A provider's `status` is `secret-missing` when
-its secret cannot be read. Each model shows its configured and detected
-structured-output level and the outcome of its last call. Without `--model-config`, the
-answer is `{"configured": false, "providers": [], "roles": {}}`.
+**`GET /$/models`** (server admin) lists the providers of the effective configuration
+with their kind, endpoint, status and models, and the role lists. A provider's `status`
+is `secret-missing` when its secret cannot be read, and its `apiKey` names the secret
+with its `source`, which is `declared`, `runtime` or `missing`. Each model shows its configured and detected
+structured-output level and the outcome of its last call. When neither `--model-config`
+nor the runtime layer configures models, the answer is
+`{"configured": false, "providers": [], "roles": {}}`.
 
 **`POST /$/models/{name}/test`** (server admin) sends a short prompt to one model of
 the provider. The optional body is `{"model": ..., "timeoutSeconds": ...}`, and the
@@ -9374,20 +9380,22 @@ value from the declared layers, and the API cannot change it. A dataset entry th
 a field locked in `defaults` keeps it locked at its own value. An entry whose name
 matches no dataset applies as soon as a dataset with that name is created, and a
 renamed dataset takes the entry of its new name. The file must not contain `endpoint`
-or `apiKey` members anywhere. A top-level `server` member may hold `locked` fields of
-server-wide settings that start with `models` or `secrets`, which no kind uses so far.
+or `apiKey` members anywhere. A top-level `server` member holds the `locked` fields of
+the server-wide settings, which start with `models` or `secrets`, as
+[Server settings](#server-settings) describes.
 
 The server reads the file at start, where a file that does not validate fails the
 start, and again on SIGHUP, where such a file is logged and the previous one kept. The
 model configuration of `--model-config` is read again on the same signal, and requests
 in flight keep the configuration they started with. `sparkles settings check FILE
-[--model-config FILE]` validates a file without a server, and the other subcommands of
-`sparkles settings` use the routes below
+[--model-config FILE]` validates a file without a server. With the model configuration,
+it also reports a lock of `server.locked` that names a provider the configuration does
+not define or a secret that no provider uses. The other subcommands of `sparkles settings` use the routes below
 ([USAGE.md](USAGE.md#changing-dataset-settings-from-the-command-line)).
 
 | Method | Path | Needs | Effect |
 |---|---|---|---|
-| GET | `/$/settings` | `server-admin` | The settings file's `path`, `readAt`, the last reload `error` and `errorAt`, the `declared` dataset names, the `unmatched` names that match no dataset, the `kinds`, and the same report for the model configuration under `models`. |
+| GET | `/$/settings` | `server-admin` | The settings file's `path`, `readAt`, the last reload `error` and `errorAt`, the `declared` dataset names, the `unmatched` names that match no dataset, the dataset-wide `kinds`, the `serverKinds`, and the same report for the model configuration under `models`. |
 | GET | `/$/settings/{ds}` | `read` | `{dataset, kinds}`, with each kind as below. |
 | GET | `/$/settings/{ds}/{kind}` | `read` | The kind, with an `ETag` of its runtime layer. |
 | PATCH | `/$/settings/{ds}/{kind}` | `admin` | Merges the body into the runtime layer as RFC 7396 says. `null` removes a runtime value, so the field falls back to the declared value or the default. |
@@ -9424,7 +9432,106 @@ Writes take `If-Match` with the `etag`, and a mismatch is `412` with the code
 would change a locked field is `409` with the code `locked-by-config` and the locked
 `fields`, and one that restates the locked value stores nothing for it. A write whose
 effective object is not valid, or a body with an `endpoint` or `apiKey` member anywhere,
-is `400` with the code `bad-settings`. An unknown kind is `404` with `unknown-kind`.
+is `400` with the code `bad-settings`. An unknown kind is `404` with `unknown-kind`. A
+read-only server (`serve --read-only`) refuses every settings write with `403`, the
+older `PUT /$/assistant/{ds}`, `PUT /$/memory/{ds}` and `PUT /$/ingest/{ds}/settings`
+included.
+
+### Server settings
+
+The model configuration is the server-wide settings kind `models`. Its effective value
+is computed from three layers, and a later layer overrides an earlier one.
+
+1. The built-in defaults, which define no provider and no role list.
+2. The model configuration of `serve --model-config`.
+3. The runtime layer, which holds the fields changed through the API. It is kept in
+   `<dataDir>/models.json`.
+
+The layers merge as for a dataset's settings. Providers are objects keyed by name, so a
+change adds or changes one provider member by member. A `PATCH` with `null` for a
+provider that `--model-config` defines removes it, and the runtime layer keeps the
+`null`. A `DELETE` with `?field=providers.NAME` brings the declared provider back. Each
+role list is one field, and so is a provider's `allowedModels`. Without
+`--model-config`, a runtime layer alone configures the models.
+
+The effective configuration is checked as `--model-config` is. Headers that carry
+credentials are refused, and so are endpoints with credentials, a query or a fragment,
+an `apiKey` that is not `{"secret": NAME}`, and role lists that name a provider the
+configuration lacks or a model it does not allow. Requests to a provider still go
+through the outbound policy, so a provider on a private address needs
+`--outbound-allow-private`. A change takes effect for requests that start after it.
+Requests in flight keep the configuration they started with, and the tokens a provider
+has counted today carry over. A dataset's role list that names a provider removed at
+runtime makes that dataset's `assistant` settings invalid, and its `status` says why.
+
+The settings file locks server-wide fields under `server`:
+
+```json
+{
+  "server": {
+    "locked": [
+      "models.providers.claude.endpoint",
+      "models.providers.local",
+      "models.roles.draft",
+      "models.routing",
+      "secrets.anthropic"
+    ]
+  }
+}
+```
+
+A field may name a member of `models`, a provider, a member of a provider, a role list
+or a routing setting. A lock on a whole provider fixes every field of it and keeps it
+from being removed, and a lock on a provider that `--model-config` does not define
+keeps it from being added. A field that names an unknown member, role or routing
+setting fails the settings file. A runtime value of a locked field is kept but ignored,
+and the answer lists it in `overridden`. `secrets.NAME` locks a secret, as
+[Model secrets](#model-secrets) describes.
+
+| Method | Path | Needs | Effect |
+|---|---|---|---|
+| GET | `/$/server/settings/{kind}` | `server-admin` | The kind, with an `ETag` of its runtime layer. |
+| PATCH | `/$/server/settings/{kind}` | `server-admin` | Merges the body into the runtime layer. |
+| PUT | `/$/server/settings/{kind}` | `server-admin` | Makes the effective object equal to the body, with `null` in the runtime layer for a declared provider that the body leaves out. |
+| DELETE | `/$/server/settings/{kind}[?field=PATH]` | `server-admin` | Clears the runtime layer, or one field of it. |
+
+The answer has the members of a dataset's kind, with `scope: "server"` in place of
+`dataset`. `If-Match`, `412`, `409` with `locked-by-config`, `400` with `bad-settings`
+and `404` with `unknown-kind` work as for a dataset's settings. A body may name
+endpoints and secrets here, unlike a dataset's settings, but never a key's value.
+
+Every change is logged at INFO under the `sparkles::audit` target as the event
+`server_settings_changed`, with the `kind`, the `operation`, the changed `fields` as
+dotted paths and the `principal`.
+
+### Model secrets
+
+A provider names its key with `apiKey.secret`. A secret has two possible sources. The
+declared source is `--model-secret NAME=env:VARIABLE` or `NAME=file:PATH`. The runtime
+source is a value that a server administrator stores through the API, and it overrides
+the declared source unless the settings file locks `secrets.NAME`. A secret's name has
+1 to 128 letters, digits, `_`, `-` and `.`, and does not start with `.` or `-`. The same
+rule applies to `--model-secret` names and to `apiKey.secret`.
+
+A runtime value is kept in `<dataDir>/secrets/NAME` with mode 0600, in a directory with
+mode 0700, and is written to a temporary file and renamed into place. The files are not
+encrypted. An operator who does not want keys on disk locks the secrets in the settings
+file.
+
+| Method | Path | Needs | Effect |
+|---|---|---|---|
+| GET | `/$/server/secrets` | `server-admin` | `{secrets}`, each with its `name`, `source` (`declared`, `runtime` or `missing`), whether a `declared` source exists, whether it is `locked`, `setAt` for a runtime value, `overridden` when a lock ignores a stored value, and the `providers` that use it. |
+| PUT | `/$/server/secrets/{name}` | `server-admin` | Stores a runtime value from `{"value": "..."}`, `204`. |
+| DELETE | `/$/server/secrets/{name}` | `server-admin` | Removes the runtime value, so the declared source applies again, `204` whether or not there was one. |
+
+No answer and no log line carries a value. A body that is not `{"value": "..."}` with a
+non-empty string without line breaks is `400` with the code `bad-secret`, and the error
+does not quote the body. A bad name is `400` with `bad-secret-name`, and a locked secret
+is `409` with `locked-by-config` and `fields`. A server without a data directory answers
+a `PUT` with `409` and `no-data-directory`. A change rebuilds the model configuration,
+so the next request reads the new key. Each change is logged at INFO under
+`sparkles::audit` as `secret_set` or `secret_removed`, with the secret's name and the
+`principal`.
 
 ### Ask history
 

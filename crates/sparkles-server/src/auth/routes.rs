@@ -114,6 +114,13 @@ pub const ROUTES: &[(&str, &[&str])] = &[
         "/$/settings/{ds}/{kind}",
         &["GET", "PUT", "PATCH", "DELETE"],
     ),
+    // server-wide settings and runtime secrets (C19 §11)
+    (
+        "/$/server/settings/{kind}",
+        &["GET", "PUT", "PATCH", "DELETE"],
+    ),
+    ("/$/server/secrets", &["GET"]),
+    ("/$/server/secrets/{name}", &["PUT", "DELETE"]),
     ("/$/asks/{ds}", &["GET", "DELETE"]),
     ("/$/asks/{ds}/{id}/feedback", &["POST"]),
     ("/$/queries/{ds}/{name}", &["GET", "PUT", "DELETE"]),
@@ -148,7 +155,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/lint", &["POST"]),
     // MCP (`serve --mcp`): every message is checked against the caller's datasets
     ("/$/mcp", &["*"]),
-    // model providers (spec C18 §3.4): defined by `serve --model-config` only
+    // model providers (spec C18 §3.4): `serve --model-config` and the `models` settings
     ("/$/models", &["GET"]),
     ("/$/models/{name}/test", &["POST"]),
     ("/$/models/usage", &["GET"]),
@@ -321,6 +328,10 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         "/$/settings/{ds}" => Dataset(Read),
         "/$/settings/{ds}/{kind}" if get => Dataset(Read),
         "/$/settings/{ds}/{kind}" => Dataset(Admin),
+        // the model configuration and its keys: the server's outbound connections
+        "/$/server/settings/{kind}" | "/$/server/secrets" | "/$/server/secrets/{name}" => {
+            Server(ServerPerm::ServerAdmin)
+        }
         // only the caller's own entries, whatever its role (C18 §6.4)
         "/$/asks/{ds}" | "/$/asks/{ds}/{id}/feedback" => Dataset(Read),
         // endpoints, models, budgets and the secret names of the operator's providers

@@ -621,7 +621,9 @@ implementation landed.
   manual's documentation of `specialisation` and `reloadTriggers` only (2026-10-10).
   Phase 3, the UI's Settings tab with the controls of memory maintenance, from the spec,
   docs/API.md and the Sparkles UI code only (2026-10-10), with no new UI dependency.
-  They add no runtime dependency. Phase 4 is not built.
+  The server side of Phase 4, the `models` kind, the runtime secrets and the `/$/server`
+  routes, followed on the same day from the spec and the Sparkles code. They add no
+  runtime dependency. The CLI, UI and NixOS parts of Phase 4 are not built.
 - **Rejected** (spec §12):
   - model configuration only in the operator's file;
   - returning stored keys to administrators;

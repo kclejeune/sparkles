@@ -219,9 +219,11 @@ pub fn flush(st: &AppState) {
 pub fn spawn_reload_on_sighup(st: &Arc<AppState>) {
     #[cfg(all(unix, feature = "auth"))]
     if let Some(auth) = st.auth.clone() {
+        // registered before the task starts, so that no SIGHUP after this call is missed
+        use tokio::signal::unix::{SignalKind, signal};
+        let hup = signal(SignalKind::hangup());
         tokio::spawn(async move {
-            use tokio::signal::unix::{SignalKind, signal};
-            let Ok(mut hup) = signal(SignalKind::hangup()) else {
+            let Ok(mut hup) = hup else {
                 tracing::warn!("cannot listen for SIGHUP: auth reload disabled");
                 return;
             };

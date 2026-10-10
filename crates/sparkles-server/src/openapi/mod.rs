@@ -486,14 +486,14 @@ fn parameters() -> Map<String, J> {
         "name",
         path(
             "name",
-            "The name of the stored query, snapshot, vector index, branch or ingest profile.",
+            "The name of the stored query, snapshot, vector index, branch, ingest profile or model secret.",
         ),
     );
     let mut kind = path(
         "kind",
-        "The settings kind: `assistant`, `memory` or `ingest`.",
+        "The settings kind: `assistant`, `memory` or `ingest` of a dataset, or `models` of the server.",
     );
-    kind["schema"]["enum"] = json!(["assistant", "memory", "ingest"]);
+    kind["schema"]["enum"] = json!(["assistant", "memory", "ingest", "models"]);
     put("kind", kind);
     put("id", path("id", "The id of the task, token or lock."));
     put("task", path("task", "The id of the ingestion task."));

@@ -11,13 +11,22 @@
 //!
 //! The older routes `PUT /$/assistant/{ds}`, `PUT /$/memory/{ds}` and
 //! `PUT /$/ingest/{ds}/settings` go through [`write`] too.
+//!
+//! The server-wide kinds of §11.3 have the same four methods at
+//! `/$/server/settings/{kind}` (server `admin`), through [`super::server::write`], and
+//! the runtime secrets of §11.2 are at `/$/server/secrets` ([`super::secrets`]).
 
 use super::merge::{
     at, diff, forbidden_member, merged, parse_path, path_string, prune, remove_at, set_at,
 };
-use super::{KINDS, Kind, Providers, Resolved, kind, resolve, runtime, store_runtime};
+use super::{
+    KINDS, Kind, Providers, Resolved, SERVER_KINDS, kind, resolve, runtime, server_kind,
+    store_runtime,
+};
+use crate::auth::Principal;
 use crate::http::{AdminBody, ApiResult, blocking, dataset, err, err_body, err_code};
 use crate::state::{AppState, Dataset};
+use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
@@ -41,6 +50,14 @@ pub fn routes() -> Router<Arc<AppState>> {
                 .patch(patch_kind)
                 .delete(delete_kind),
         )
+        .route(
+            "/$/server/settings/{kind}",
+            get(get_server)
+                .put(put_server)
+                .patch(patch_server)
+                .delete(delete_server),
+        )
+        .merge(super::secrets::routes())
 }
 
 /// A change to a kind's runtime layer.
@@ -60,17 +77,21 @@ pub(crate) enum Op {
     Delete(Option<Vec<String>>),
 }
 
-fn bad(msg: impl Into<String>) -> crate::http::ApiError {
+pub(crate) fn bad(msg: impl Into<String>) -> crate::http::ApiError {
     err_code(StatusCode::BAD_REQUEST, "bad-settings", msg)
 }
 
-fn body_object(body: &[u8]) -> ApiResult<Value> {
+/// The body of a write as a JSON object. Only the model configuration (`models`) may
+/// name endpoints and key references.
+fn body_object(body: &[u8], kind: &Kind) -> ApiResult<Value> {
     let v: Value =
         serde_json::from_slice(body).map_err(|e| bad(format!("the body is not JSON: {e}")))?;
     if !v.is_object() {
         return Err(bad("the body must be a JSON object"));
     }
-    if let Some(f) = forbidden_member(&v) {
+    if kind.scope == super::Scope::Dataset
+        && let Some(f) = forbidden_member(&v)
+    {
         return Err(bad(format!(
             "{f} is not allowed: providers are defined in the server's model configuration only"
         )));
@@ -112,7 +133,23 @@ pub(crate) fn plan(
         ));
     }
     let mut new = match op {
-        Op::Patch(p) => merged(&cur.runtime, &p),
+        Op::Patch(p) => {
+            let mut new = merged(&cur.runtime, &p);
+            // `null` for a member of a removable map that the declared layers define
+            // removes it: the runtime layer keeps the `null`
+            for m in kind.removable {
+                let Some(Value::Object(members)) = p.get(*m) else {
+                    continue;
+                };
+                for (name, v) in members {
+                    let path = [m.to_string(), name.clone()];
+                    if v.is_null() && at(&cur.base, &path).is_some() {
+                        set_at(&mut new, &path, Value::Null);
+                    }
+                }
+            }
+            new
+        }
         Op::Put(mut body) => {
             if kind.name == "assistant"
                 && let Some(m) = body.as_object_mut()
@@ -146,11 +183,11 @@ pub(crate) fn plan(
     let after = merged(&cur.base, &new);
     let mut refused = Vec::new();
     for l in &cur.locked {
-        if at(&after, l) == at(&before, l) {
-            continue;
-        }
         if at(&after, l) == at(&cur.base, l) {
             remove_at(&mut new, l);
+            continue;
+        }
+        if at(&after, l) == at(&before, l) {
             continue;
         }
         refused.push(path_string(l));
@@ -170,6 +207,19 @@ pub(crate) fn plan(
         ));
     }
     Ok(new)
+}
+
+fn server_kind_of(name: &str) -> ApiResult<&'static Kind> {
+    server_kind(name).ok_or_else(|| {
+        err_code(
+            StatusCode::NOT_FOUND,
+            "unknown-kind",
+            format!(
+                "no server settings kind {name:?}; the kinds are {}",
+                SERVER_KINDS.map(|k| k.name).join(", ")
+            ),
+        )
+    })
 }
 
 fn kind_of(name: &str) -> ApiResult<&'static Kind> {
@@ -195,20 +245,9 @@ pub async fn write(
     w: Write,
     headers: &HeaderMap,
 ) -> ApiResult<Resolved> {
-    let if_match = headers
-        .get(header::IF_MATCH)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
-    let op = match w {
-        Write::Put(b) => Op::Put(body_object(&b)?),
-        Write::Patch(b) => Op::Patch(body_object(&b)?),
-        Write::Delete(None) => Op::Delete(None),
-        Write::Delete(Some(f)) => Op::Delete(Some(parse_path(&f).ok_or_else(|| {
-            bad(format!(
-                "{f:?} is not a field such as send or budget.perRequest"
-            ))
-        })?)),
-    };
+    refuse_read_only(&st)?;
+    let if_match = if_match(headers);
+    let op = op_of(w, kind)?;
     blocking(move || {
         let internal = |e: anyhow::Error| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"));
         let lock = st.settings.write_lock(&ds.name, kind);
@@ -232,12 +271,55 @@ pub async fn write(
     .await
 }
 
+/// A settings write on a read-only server (`serve --read-only`) is refused as other
+/// admin writes are.
+pub(crate) fn refuse_read_only(st: &AppState) -> ApiResult<()> {
+    if st.read_only {
+        return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
+    }
+    Ok(())
+}
+
+/// The `If-Match` value of a write.
+pub(crate) fn if_match(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(header::IF_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+}
+
+/// A write with its body read.
+pub(crate) fn op_of(w: Write, kind: &Kind) -> ApiResult<Op> {
+    Ok(match w {
+        Write::Put(b) => Op::Put(body_object(&b, kind)?),
+        Write::Patch(b) => Op::Patch(body_object(&b, kind)?),
+        Write::Delete(None) => Op::Delete(None),
+        Write::Delete(Some(f)) => Op::Delete(Some(parse_path(&f).ok_or_else(|| {
+            bad(format!(
+                "{f:?} is not a field such as send or budget.perRequest"
+            ))
+        })?)),
+    })
+}
+
 fn with_etag(r: &Resolved, dataset: &str) -> Response {
-    let mut resp = Json(r.json(dataset)).into_response();
-    if let Ok(v) = HeaderValue::from_str(&r.etag) {
+    tagged(Json(r.json(dataset)).into_response(), &r.etag)
+}
+
+fn tagged(mut resp: Response, etag: &str) -> Response {
+    if let Ok(v) = HeaderValue::from_str(etag) {
         resp.headers_mut().insert(header::ETAG, v);
     }
     resp
+}
+
+fn with_etag_server(r: &Resolved) -> Response {
+    tagged(Json(r.json_server()).into_response(), &r.etag)
+}
+
+/// The principal's log name, for the audit records.
+pub(crate) fn who(p: Option<Extension<Principal>>) -> String {
+    p.map_or_else(|| "local".into(), |Extension(p)| p.id())
 }
 
 async fn status(State(st): St) -> Json<Value> {
@@ -326,4 +408,53 @@ async fn delete_kind(
     let kind = kind_of(&kind)?;
     let r = write(st, ds.clone(), kind, Write::Delete(q.field), &headers).await?;
     Ok(with_etag(&r, &ds.name))
+}
+
+// ------------------------------------------------------ server-wide kinds (§11.3) ------
+
+async fn get_server(State(st): St, Path(kind): Path<String>) -> ApiResult<Response> {
+    let _ = server_kind_of(&kind)?;
+    blocking(move || Ok(with_etag_server(&super::server::resolved(&st)))).await
+}
+
+async fn put_server(
+    State(st): St,
+    Path(kind): Path<String>,
+    p: Option<Extension<Principal>>,
+    headers: HeaderMap,
+    AdminBody(body): AdminBody,
+) -> ApiResult<Response> {
+    let kind = server_kind_of(&kind)?;
+    let r = super::server::write(st, kind, Write::Put(body), &headers, who(p)).await?;
+    Ok(with_etag_server(&r))
+}
+
+async fn patch_server(
+    State(st): St,
+    Path(kind): Path<String>,
+    p: Option<Extension<Principal>>,
+    headers: HeaderMap,
+    AdminBody(body): AdminBody,
+) -> ApiResult<Response> {
+    let kind = server_kind_of(&kind)?;
+    let r = super::server::write(st, kind, Write::Patch(body), &headers, who(p)).await?;
+    Ok(with_etag_server(&r))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServerFieldParam {
+    field: Option<String>,
+}
+
+async fn delete_server(
+    State(st): St,
+    Path(kind): Path<String>,
+    p: Option<Extension<Principal>>,
+    headers: HeaderMap,
+    Query(q): Query<ServerFieldParam>,
+) -> ApiResult<Response> {
+    let kind = server_kind_of(&kind)?;
+    let r = super::server::write(st, kind, Write::Delete(q.field), &headers, who(p)).await?;
+    Ok(with_etag_server(&r))
 }

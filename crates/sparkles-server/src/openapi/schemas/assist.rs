@@ -648,6 +648,7 @@ fn maintenance(put: &mut dyn FnMut(&str, J)) {
 
 fn memory(put: &mut dyn FnMut(&str, J)) {
     settings(put);
+    server_settings(put);
     put(
         "MemorySettings",
         doc(
@@ -1258,7 +1259,7 @@ fn models(put: &mut dyn FnMut(&str, J)) {
             "status": with_desc(string_enum(&["ok", "secret-missing"]), "`secret-missing` when the named key cannot be read."),
             "concurrency": int(),
             "models": array(model),
-            "apiKey": with_desc(obj(&["secret"], json!({ "secret": string() })), "The name of the secret that holds the key. The key itself is never returned."),
+            "apiKey": with_desc(obj(&["secret", "source"], json!({ "secret": string(), "source": with_desc(string_enum(&["declared", "runtime", "missing"]), "Where the key comes from: `--model-secret`, a value stored through `PUT /$/server/secrets/{name}`, or nowhere.") })), "The name of the secret that holds the key and its source. The key itself is never returned."),
             "allowedModels": strings(),
             "requestsPerMinute": int(),
             "budget": obj(&["tokensPerDay", "usedToday"], json!({ "tokensPerDay": int(), "usedToday": int() })),
@@ -1406,6 +1407,7 @@ fn settings(put: &mut dyn FnMut(&str, J)) {
         "declared",
         "unmatched",
         "kinds",
+        "serverKinds",
         "models"
     ]);
     status["properties"]["declared"] =
@@ -1415,6 +1417,10 @@ fn settings(put: &mut dyn FnMut(&str, J)) {
         "Declared names that match no dataset. Their entries apply when such a dataset is created.",
     );
     status["properties"]["kinds"] = strings();
+    status["properties"]["serverKinds"] = with_desc(
+        strings(),
+        "The server-wide kinds of `/$/server/settings/{kind}`.",
+    );
     status["properties"]["models"] = with_desc(
         file,
         "The model configuration of `--model-config`, which SIGHUP reads again too.",
@@ -1425,6 +1431,79 @@ fn settings(put: &mut dyn FnMut(&str, J)) {
             status,
             "The settings file of `serve --settings` and its reads.",
             "settings",
+        ),
+    );
+}
+
+/// The server-wide settings and runtime secrets of spec C19 §11.
+fn server_settings(put: &mut dyn FnMut(&str, J)) {
+    let source = string_enum(&["default", "declared", "runtime", "locked"]);
+    put(
+        "ServerSettingsKind",
+        doc(
+            obj(
+                &[
+                    "scope",
+                    "kind",
+                    "effective",
+                    "declared",
+                    "runtime",
+                    "sources",
+                    "locked",
+                    "overridden",
+                    "status",
+                    "etag",
+                ],
+                json!({
+                    "scope": string_enum(&["server"]),
+                    "kind": string_enum(&["models"]),
+                    "effective": any_object("The effective model configuration: `providers`, `roles` and `routing`, from the built-in defaults, `--model-config` and the runtime layer, with the locked fields from the declared configuration."),
+                    "declared": any_object("The model configuration of `--model-config`."),
+                    "runtime": any_object("The runtime layer kept in `<dataDir>/models.json`. `null` for a provider removes a declared provider."),
+                    "sources": { "type": "object", "description": "The source of each field of `effective`, by dotted path such as `providers.claude.endpoint`.", "additionalProperties": source },
+                    "locked": with_desc(strings(), "The fields that `server.locked` of the settings file locks, without the `models.` prefix."),
+                    "overridden": with_desc(strings(), "Locked fields whose runtime value is kept but ignored."),
+                    "status": closed(&["valid"], json!({ "valid": boolean(), "error": string() })),
+                    "etag": with_desc(string(), "The entity tag of the runtime layer, as in the `ETag` header."),
+                }),
+            ),
+            "A server-wide settings kind with its layers and sources.",
+            "server-settings",
+        ),
+    );
+    put(
+        "SecretList",
+        doc(
+            obj(
+                &["secrets"],
+                json!({
+                    "secrets": array(obj(
+                        &["name", "source", "declared", "locked", "setAt", "overridden", "providers"],
+                        json!({
+                            "name": string(),
+                            "source": with_desc(string_enum(&["declared", "runtime", "missing"]), "The source in force: a stored value, `--model-secret`, or none."),
+                            "declared": with_desc(boolean(), "Whether `--model-secret` names the secret."),
+                            "locked": with_desc(boolean(), "Whether `server.locked` names `secrets.NAME`, so that only the declared source applies."),
+                            "setAt": with_desc(or_null(string()), "When the runtime value was stored."),
+                            "overridden": with_desc(boolean(), "A runtime value is stored but the lock ignores it."),
+                            "providers": with_desc(strings(), "The providers whose `apiKey` names the secret."),
+                        }),
+                    )),
+                }),
+            ),
+            "The model secrets. A value is never returned.",
+            "model-secrets",
+        ),
+    );
+    put(
+        "SecretValue",
+        doc(
+            obj(
+                &["value"],
+                json!({ "value": with_desc(string(), "The key. It is stored and never returned.") }),
+            ),
+            "The value of a model secret.",
+            "model-secrets",
         ),
     );
 }

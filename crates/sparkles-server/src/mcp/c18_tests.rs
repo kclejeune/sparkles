@@ -291,7 +291,6 @@ async fn recall_statuses() {
             None,
         )])
         .unwrap();
-    let app = crate::http::router(server.state.clone());
     let mut c = Client::start(server.clone());
     let ana = "http://example.org/resource/ana";
     // without memory settings, no status
@@ -304,13 +303,14 @@ async fn recall_statuses() {
     )
     .unwrap();
     assert!(s["entities"][0]["facts"][0].get("status").is_none(), "{s}");
-    let (status, _) = put(
-        &app,
-        "/$/memory/org",
-        &json!({"agentGraphs": ["https://example.org/memory/agents/*"]}).to_string(),
+    // the fixture is a read-only server, which refuses settings writes through the API
+    crate::settings::store_runtime(
+        &server.state,
+        &ds,
+        &crate::settings::MEMORY,
+        &json!({"agentGraphs": ["https://example.org/memory/agents/*"]}),
     )
-    .await;
-    assert_eq!(status, 200);
+    .unwrap();
     let s: Value = serde_json::from_str(
         &c.text(
             "recall",
@@ -436,20 +436,6 @@ async fn recall_recency() {
             .await;
         assert_eq!(e["code"], "bad-argument", "{bad}");
     }
-}
-
-async fn put(app: &axum::Router, path: &str, body: &str) -> (u16, Value) {
-    use tower::ServiceExt;
-    let req = axum::http::Request::put(path)
-        .header("content-type", "application/json")
-        .body(axum::body::Body::from(body.to_string()))
-        .unwrap();
-    let res = app.clone().oneshot(req).await.unwrap();
-    let status = res.status().as_u16();
-    let b = axum::body::to_bytes(res.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    (status, serde_json::from_slice(&b).unwrap_or(Value::Null))
 }
 
 async fn post(app: &axum::Router, path: &str, body: &str) -> (u16, Value) {

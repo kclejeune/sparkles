@@ -1,7 +1,9 @@
 //! The model configuration of spec C18 §3.4 and §3.7: named providers with their
 //! endpoint, key reference and limits, and the ordered provider and model pairs of each
-//! role. It comes only from the operator (`--model-config FILE`), never from an HTTP
-//! request, so nobody can point a configured key at an endpoint of their choice.
+//! role. The operator declares it with `--model-config FILE`, and server administrators
+//! may change it through `/$/server/settings/models` (spec C19 §11) unless the settings
+//! file locks the fields. Users with `admin` on a dataset only choose among the providers
+//! by name, so they cannot point a configured key at an endpoint of their choice.
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -316,7 +318,7 @@ pub struct ModelsConfig {
 }
 
 /// The members a provider may have: its own and the model defaults it flattens.
-const PROVIDER_MEMBERS: &[&str] = &[
+pub const PROVIDER_MEMBERS: &[&str] = &[
     "kind",
     "endpoint",
     "apiKey",
@@ -355,6 +357,47 @@ fn known_members(cfg: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
+/// Refuse an `apiKey` that is not `{"secret": NAME}` without quoting it, since a key's
+/// value pasted there must not reach an error message.
+fn key_references(cfg: &serde_json::Value) -> Result<()> {
+    if let Some(ps) = cfg.get("providers").and_then(|p| p.as_object()) {
+        for (name, p) in ps {
+            let Some(k) = p.get("apiKey") else {
+                continue;
+            };
+            let ok = k.is_null()
+                || k.as_object().is_some_and(|o| {
+                    o.len() == 1 && o.get("secret").is_some_and(serde_json::Value::is_string)
+                });
+            if !ok {
+                bail!(
+                    "provider {name}: apiKey must be {{\"secret\": NAME}}; a key's value is stored with PUT /$/server/secrets/{{name}} or --model-secret"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether `name` may name a secret (`--model-secret NAME=…`, `apiKey.secret` and the
+/// files of runtime secrets): 1 to 128 letters, digits, `_`, `-` and `.`, not starting
+/// with `.` or `-`.
+pub fn check_secret_name(name: &str) -> std::result::Result<(), String> {
+    let ok = !name.is_empty()
+        && name.len() <= 128
+        && name
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.'))
+        && !name.starts_with(['.', '-']);
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "secret name {name:?}: use 1 to 128 letters, digits, '_', '-' and '.', not starting with '.' or '-'"
+        ))
+    }
+}
+
 /// A configuration file: `{"models": {...}}`, as §3.4 writes it, or the inner object.
 #[derive(Deserialize)]
 #[serde(untagged)]
@@ -370,6 +413,7 @@ impl ModelsConfig {
         // the object has a `models` member, and report that form's error
         let v: serde_json::Value = serde_json::from_str(text).context("not JSON")?;
         known_members(v.get("models").unwrap_or(&v))?;
+        key_references(v.get("models").unwrap_or(&v))?;
         let cfg = if v.get("models").is_some() {
             match serde_json::from_value::<File>(v.clone()) {
                 Ok(File::Wrapped { models }) | Ok(File::Bare(models)) => models,
@@ -384,10 +428,45 @@ impl ModelsConfig {
 
     /// Read and check `path`.
     pub fn load(path: &std::path::Path) -> Result<ModelsConfig> {
+        Ok(ModelsConfig::load_value(path)?.0)
+    }
+
+    /// Read and check `path`, and answer the configuration with its JSON object, the
+    /// inner object of the wrapped form (the declared layer of spec C19 §11.1).
+    pub fn load_value(path: &std::path::Path) -> Result<(ModelsConfig, serde_json::Value)> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("cannot read {}", path.display()))?;
-        ModelsConfig::parse(&text)
-            .with_context(|| format!("model configuration {}", path.display()))
+        let read = || -> Result<(ModelsConfig, serde_json::Value)> {
+            let cfg = ModelsConfig::parse(&text)?;
+            let v: serde_json::Value = serde_json::from_str(&text)?;
+            let inner = match v {
+                serde_json::Value::Object(mut m) if m.contains_key("models") => {
+                    m.remove("models").unwrap_or_default()
+                }
+                v => v,
+            };
+            Ok((cfg, inner))
+        };
+        read().with_context(|| format!("model configuration {}", path.display()))
+    }
+
+    /// Check the bare form of a configuration, as the `models` settings kind holds it:
+    /// only `providers`, `roles` and `routing` at the top.
+    pub fn from_value(v: &serde_json::Value) -> Result<ModelsConfig> {
+        let Some(m) = v.as_object() else {
+            bail!("the model configuration must be a JSON object");
+        };
+        if let Some(k) = m
+            .keys()
+            .find(|k| !matches!(k.as_str(), "providers" | "roles" | "routing"))
+        {
+            bail!("unknown field `{k}`, expected one of providers, roles, routing");
+        }
+        known_members(v)?;
+        key_references(v)?;
+        let cfg: ModelsConfig = serde_json::from_value(v.clone())?;
+        cfg.validate()?;
+        Ok(cfg)
     }
 
     /// The checks of §3.4 and §3.7.
@@ -401,10 +480,12 @@ impl ModelsConfig {
                 bail!("provider name {name:?}: use letters, digits, '_', '-' and '.'");
             }
             check_endpoint(&p.endpoint).with_context(|| format!("provider {name}"))?;
-            if let Some(k) = &p.api_key
-                && k.secret.is_empty()
-            {
-                bail!("provider {name}: apiKey names an empty secret");
+            if let Some(k) = &p.api_key {
+                if k.secret.is_empty() {
+                    bail!("provider {name}: apiKey names an empty secret");
+                }
+                check_secret_name(&k.secret)
+                    .map_err(|e| anyhow::anyhow!("provider {name}: apiKey: {e}"))?;
             }
             for (h, v) in &p.headers {
                 let lower = h.to_ascii_lowercase();
@@ -631,7 +712,13 @@ mod tests {
             bad(r#"{"providers.gateway.endpoint": "https://user:pw@x.example/v1"}"#)
                 .contains("credentials")
         );
-        assert!(bad(r#"{"providers.gateway.apiKey": "sk-123"}"#).contains("invalid type"));
+        // a key's value pasted as apiKey is refused without being quoted
+        let e = bad(r#"{"providers.gateway.apiKey": "sk-123"}"#);
+        assert!(e.contains("apiKey must be"), "{e}");
+        assert!(!e.contains("sk-123"), "{e}");
+        let e = bad(r#"{"providers.gateway.apiKey": {"secret": "gw", "value": "sk-123"}}"#);
+        assert!(!e.contains("sk-123"), "{e}");
+        assert!(bad(r#"{"providers.gateway.apiKey": {"secret": "../x"}}"#).contains("secret name"));
         assert!(
             bad(r#"{"providers.gateway.headers": {"Authorization": "Bearer x"}}"#)
                 .contains("carries a key")
