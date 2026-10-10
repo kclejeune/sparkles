@@ -172,7 +172,7 @@ open('the Models section edits providers, roles and keys', async ({ page, reques
   await panel.getByRole('button', { name: 'Save', exact: true }).click();
   await ask.getByRole('checkbox').check();
   await turnOff.click();
-  await expect(page.getByText('Saved the model configuration settings')).toBeVisible();
+  await expect(ask).toHaveCount(0);
   await expect(providers.locator('[data-provider=oai]')).toContainText('unverified');
   const listed = (await (await request.get('/$/models')).json()).providers.find(
     (p: { name: string }) => p.name === 'oai',
