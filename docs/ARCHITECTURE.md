@@ -537,7 +537,11 @@ Built-in defaults, operator-wide defaults, dataset declarations and runtime patc
 merge in order. Locks keep declared values authoritative. Responses explain sources,
 locks and overrides. Server-wide model settings and write-only secrets extend this
 registry, with `sparkles settings --global`, `sparkles secrets` and the Models section
-of the server page as their CLI and UI. Dataset
+of the server page as their CLI and UI. Outbound notifications
+([C21](specs/C21-outbound-notifications.md)) are a third server-wide kind. A single
+delivery worker posts signed webhooks and ntfy messages through the outbound policy
+when agent memory waits for review, a backup policy fails or a model budget runs out.
+Dataset
 administration handles also expose engine settings. The process's layered registry
 is a separate concern, not a universal wrapper around every stored setting.
 
