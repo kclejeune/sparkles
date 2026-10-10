@@ -3312,6 +3312,18 @@ fn decode_sorted(vocab: &crate::vocab::Vocab, uniq: &[u64]) -> Vec<Value> {
     let Some(num) = vocab.numeric() else {
         return decode(uniq);
     };
+    if !uniq.iter().any(|&id| num.may_hold(id)) {
+        return decode(uniq);
+    }
+    if (2..=1 << 16).contains(&uniq.len()) {
+        // the keys of the ids outside the column's segments are read meanwhile
+        let keys: Vec<u64> = uniq
+            .iter()
+            .copied()
+            .filter(|&id| !num.may_hold(id))
+            .collect();
+        vocab.prefetch_sorted(&keys);
+    }
     let from_column: Vec<Option<Value>> = uniq
         .par_chunks(4096)
         .flat_map_iter(|chunk| num.get_many(chunk).into_iter().map(|n| n.value()))

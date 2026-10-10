@@ -661,8 +661,12 @@ impl Vocab {
         if !crate::index::io_hints() {
             return;
         }
-        let found = num.get_many(ids);
-        let rest: Vec<u64> = ids
+        // The keys of the ids outside the column's segments are read while the column
+        // answers for the others.
+        let (maybe, keys): (Vec<u64>, Vec<u64>) = ids.iter().partition(|&&id| num.may_hold(id));
+        self.prefetch_sorted(&keys);
+        let found = num.get_many(&maybe);
+        let rest: Vec<u64> = maybe
             .iter()
             .zip(found)
             .filter(|(_, n)| n.value().is_none())

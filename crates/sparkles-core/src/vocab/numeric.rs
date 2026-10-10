@@ -277,6 +277,13 @@ impl NumColumn {
         self.segments.len()
     }
 
+    /// Whether base id `id` may be a number. The answer costs no read: an id outside
+    /// every segment is not one.
+    #[inline]
+    pub fn may_hold(&self, id: u64) -> bool {
+        self.position(id).is_some()
+    }
+
     /// The position of base id `id` in the kinds, if it is inside a segment.
     #[inline]
     fn position(&self, id: u64) -> Option<u64> {
