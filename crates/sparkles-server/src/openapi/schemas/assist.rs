@@ -633,14 +633,56 @@ fn maintenance(put: &mut dyn FnMut(&str, J)) {
             "nextRun": with_desc(string(), "When the next scheduled task starts, or `due`. Absent without a schedule."),
         }),
     );
+    let kind = obj(
+        &["open"],
+        json!({
+            "open": int(),
+            "oldest": with_desc(string(), "When the oldest open item of the kind arrived."),
+        }),
+    );
+    put(
+        "ReviewCounts",
+        doc(
+            obj(
+                &["open", "kinds", "branches", "truncated", "updated"],
+                json!({
+                    "open": with_desc(int(), "Open items: unreviewed facts, and open review branches counted once each."),
+                    "oldest": with_desc(string(), "When the oldest open item arrived. Absent when nothing is open."),
+                    "kinds": {
+                        "type": "object",
+                        "description": "The kinds with open items: `session`, `import`, `consolidation`, `ingest`, `review`, `inbox` or `proposal`.",
+                        "additionalProperties": kind,
+                    },
+                    "branches": array(obj(
+                        &["name", "kind", "created"],
+                        json!({
+                            "name": string(),
+                            "kind": string(),
+                            "created": string(),
+                            "facts": with_desc(int(), "The facts the branch proposes, for the 10 newest branches."),
+                        }),
+                    )),
+                    "truncated": with_desc(boolean(), "More than 5,000 unreviewed facts wait, and the count stopped there."),
+                    "updated": with_desc(string(), "When the server last counted."),
+                }),
+            ),
+            "The open items of a dataset's memory review inbox, as the server last counted them.",
+            "memory-maintenance",
+        ),
+    );
     put(
         "MaintenanceStatus",
         doc(
             obj(
                 &["dataset", "consolidation", "retention"],
-                json!({ "dataset": string(), "consolidation": entry.clone(), "retention": entry }),
+                json!({
+                    "dataset": string(),
+                    "consolidation": entry.clone(),
+                    "retention": entry,
+                    "review": sref("ReviewCounts"),
+                }),
             ),
-            "The schedules of consolidation and retention.",
+            "The schedules of consolidation and retention, and for a caller with `write` on a dataset with memory settings, the open items of its review inbox.",
             "memory-maintenance",
         ),
     );
@@ -1200,9 +1242,10 @@ fn imports(put: &mut dyn FnMut(&str, J)) {
                     "facts": array(any_object("One fact with its citations.")),
                     "citations": array(any_object("One source of the facts.")),
                     "prefixes": any_object("The prefixes the compact terms use."),
+                    "review": sref("ReviewCounts"),
                 }),
             ),
-            "The brief of a project, an entity or a session.",
+            "The brief of a project, an entity or a session. For a caller with `write` on the dataset, `review` and the `# review:` lines of `text` say what waits for review.",
             "importing-agent-memory",
         ),
     );
