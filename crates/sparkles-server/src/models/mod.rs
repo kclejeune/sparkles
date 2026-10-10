@@ -26,12 +26,14 @@ mod config;
 pub mod http;
 #[cfg(test)]
 pub(crate) mod mock;
+#[cfg(any(feature = "auth", test))]
+pub mod presets;
 mod structured;
 
 pub use client::{CallError, ChatRequest, Message};
 pub use config::{
     DEFAULT_CONTEXT_TOKENS, Kind, Level, ModelsConfig, PROVIDER_MEMBERS, Pair, ProviderConfig,
-    Role, Routing, check_secret_name,
+    Role, Routing, TLS_MEMBERS, check_secret_name,
 };
 #[cfg(test)]
 pub use structured::validate;
@@ -300,6 +302,15 @@ impl Models {
                 )
             })
             .collect();
+        for (name, p) in &config.providers {
+            if p.insecure() {
+                tracing::warn!(
+                    target: "sparkles::models",
+                    "provider {name}: tls.insecureSkipVerify is on, so its certificate is not checked and anyone on the network path to {} can read the API key and the prompts sent to it",
+                    p.endpoint
+                );
+            }
+        }
         Models {
             config,
             secrets,
@@ -339,7 +350,7 @@ impl Models {
             }
         }
         let same = |provider: &str| match (self.provider(provider), old.provider(provider)) {
-            (Some(a), Some(b)) => a.kind == b.kind && a.endpoint == b.endpoint,
+            (Some(a), Some(b)) => a.kind == b.kind && a.endpoint == b.endpoint && a.tls == b.tls,
             _ => false,
         };
         let mut levels = self.levels.lock();
@@ -371,27 +382,62 @@ impl Models {
         self.provider(&pair.provider).map(|p| p.model(&pair.model))
     }
 
-    /// The key of provider `name`, read now: `Ok(None)` when it names none.
-    fn key(&self, p: &ProviderConfig) -> Result<Option<String>, String> {
-        let Some(r) = &p.api_key else {
-            return Ok(None);
-        };
-        let read = match self.secrets.get(&r.secret) {
-            None => return Err(format!("no model secret named {:?} is defined", r.secret)),
-            Some(SecretSource::Env(v)) => std::env::var(v).map_err(|_| {
-                format!(
-                    "the environment variable of secret {:?} is not set",
-                    r.secret
-                )
-            }),
+    /// The value of secret `name`, read now and trimmed.
+    fn read_secret(&self, name: &str) -> Result<String, String> {
+        let read = match self.secrets.get(name) {
+            None => return Err(format!("no model secret named {name:?} is defined")),
+            Some(SecretSource::Env(v)) => std::env::var(v)
+                .map_err(|_| format!("the environment variable of secret {name:?} is not set")),
             Some(SecretSource::File(path)) => std::fs::read_to_string(path)
-                .map_err(|_| format!("the file of secret {:?} cannot be read", r.secret)),
+                .map_err(|_| format!("the file of secret {name:?} cannot be read")),
         }?;
         let k = read.trim().to_string();
         if k.is_empty() {
-            return Err(format!("secret {:?} is empty", r.secret));
+            return Err(format!("secret {name:?} is empty"));
         }
-        Ok(Some(k))
+        Ok(k)
+    }
+
+    /// The key of provider `name`, read now: `Ok(None)` when it names none.
+    fn key(&self, p: &ProviderConfig) -> Result<Option<String>, String> {
+        match &p.api_key {
+            None => Ok(None),
+            Some(r) => self.read_secret(&r.secret).map(Some),
+        }
+    }
+
+    /// The TLS options of a provider's requests, its CA certificate read now from its
+    /// file or secret and checked to hold a certificate.
+    fn tls(&self, p: &ProviderConfig) -> Result<sparkles::outbound::TlsOptions, String> {
+        let Some(t) = &p.tls else {
+            return Ok(Default::default());
+        };
+        let extra_roots_pem = match &t.ca_cert {
+            None => None,
+            Some(c) => {
+                let (pem, what) = match (&c.file, &c.secret) {
+                    (Some(f), _) => (
+                        std::fs::read(f)
+                            .map_err(|_| format!("tls.caCert: the file {f:?} cannot be read"))?,
+                        format!("the file {f:?}"),
+                    ),
+                    (None, Some(s)) => (
+                        self.read_secret(s)
+                            .map_err(|e| format!("tls.caCert: {e}"))?
+                            .into_bytes(),
+                        format!("secret {s:?}"),
+                    ),
+                    (None, None) => return Err("tls.caCert names no source".into()),
+                };
+                sparkles::outbound::check_pem_bundle(&pem)
+                    .map_err(|e| format!("tls.caCert: {what}: {e}"))?;
+                Some(pem)
+            }
+        };
+        Ok(sparkles::outbound::TlsOptions {
+            extra_roots_pem,
+            insecure_skip_verify: t.insecure_skip_verify,
+        })
     }
 
     /// The level a pair is called at first, and the levels to try after it when the
@@ -469,14 +515,24 @@ impl Models {
                 return fail(StepError::Call(CallError::Secret(m)), rec);
             }
         };
+        let tls = match self.tls(p) {
+            Ok(t) => t,
+            Err(m) => {
+                let m = format!("provider {}: {m}", pair.provider);
+                self.note(pair, false, Some(m.clone()));
+                return fail(StepError::Call(CallError::Tls(m)), rec);
+            }
+        };
         let m = p.model(&pair.model);
         let pricing = m.pricing;
-        // the provider's own connect timeout
+        // the provider's own connect timeout and certificate checks; the destination
+        // checks of the policy stay as they are
         let outbound = sparkles::outbound::OutboundPolicy {
             connect_timeout: Duration::from_secs_f64(
                 p.connect_timeout_secs
                     .unwrap_or(config::DEFAULT_CONNECT_TIMEOUT_SECS),
             ),
+            tls,
             ..self.outbound.clone()
         };
         let started = Instant::now();
@@ -782,6 +838,33 @@ impl Models {
                 }
                 if let Some(a) = &p.allowed_models {
                     j["allowedModels"] = json!(a);
+                }
+                j["unverified"] = p.insecure().into();
+                if let Some(t) = &p.tls {
+                    let mut x = json!({
+                        "verification": if t.insecure_skip_verify {
+                            "off"
+                        } else if t.ca_cert.is_some() {
+                            "custom-ca"
+                        } else {
+                            "system"
+                        },
+                    });
+                    if let Some(c) = &t.ca_cert {
+                        let mut cj = serde_json::to_value(c).unwrap_or_default();
+                        if let Some(s) = &c.secret {
+                            cj["source"] = self.secret_source(s).into();
+                        }
+                        match self.tls(p) {
+                            Ok(_) => cj["status"] = "ok".into(),
+                            Err(m) => {
+                                cj["status"] = "unreadable".into();
+                                cj["message"] = m.into();
+                            }
+                        }
+                        x["caCert"] = cj;
+                    }
+                    j["tls"] = x;
                 }
                 if let Some(r) = p.requests_per_minute {
                     j["requestsPerMinute"] = r.into();

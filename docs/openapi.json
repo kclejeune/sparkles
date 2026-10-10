@@ -9472,6 +9472,63 @@
                     "secret-missing"
                   ],
                   "type": "string"
+                },
+                "tls": {
+                  "description": "The provider's TLS options, present when its configuration has `tls`.",
+                  "properties": {
+                    "caCert": {
+                      "description": "The CA certificate reference of `tls.caCert`. The certificate itself is not returned.",
+                      "properties": {
+                        "file": {
+                          "type": "string"
+                        },
+                        "message": {
+                          "type": "string"
+                        },
+                        "secret": {
+                          "type": "string"
+                        },
+                        "source": {
+                          "description": "For a secret, where its value comes from.",
+                          "enum": [
+                            "declared",
+                            "runtime",
+                            "missing"
+                          ],
+                          "type": "string"
+                        },
+                        "status": {
+                          "description": "`unreadable` when the file or secret cannot be read or holds no PEM certificate.",
+                          "enum": [
+                            "ok",
+                            "unreadable"
+                          ],
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "status"
+                      ],
+                      "type": "object"
+                    },
+                    "verification": {
+                      "description": "How the provider's certificate is checked: against the system roots, against them and `tls.caCert`, or not at all.",
+                      "enum": [
+                        "system",
+                        "custom-ca",
+                        "off"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "verification"
+                  ],
+                  "type": "object"
+                },
+                "unverified": {
+                  "description": "True when `tls.insecureSkipVerify` turns certificate verification off for the provider.",
+                  "type": "boolean"
                 }
               },
               "required": [
@@ -12639,7 +12696,7 @@
                   "type": "boolean"
                 },
                 "providers": {
-                  "description": "The providers whose `apiKey` names the secret.",
+                  "description": "The providers whose `apiKey` or `tls.caCert` names the secret.",
                   "items": {
                     "type": "string"
                   },

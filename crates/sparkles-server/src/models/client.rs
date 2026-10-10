@@ -84,6 +84,8 @@ pub enum CallError {
     Invalid(String),
     /// the named secret is not defined, or cannot be read
     Secret(String),
+    /// the provider's `tls.caCert` cannot be read or holds no certificate
+    Tls(String),
 }
 
 impl CallError {
@@ -96,6 +98,7 @@ impl CallError {
             CallError::Refusal(_) => "refusal",
             CallError::Invalid(_) => "invalid-output",
             CallError::Secret(_) => "secret-missing",
+            CallError::Tls(_) => "tls-config",
         }
     }
 }
@@ -108,7 +111,8 @@ impl std::fmt::Display for CallError {
             | CallError::Auth(m)
             | CallError::Refusal(m)
             | CallError::Invalid(m)
-            | CallError::Secret(m) => f.write_str(m),
+            | CallError::Secret(m)
+            | CallError::Tls(m) => f.write_str(m),
             CallError::Rejected(s, m) => write!(f, "{m} (status {s})"),
         }
     }

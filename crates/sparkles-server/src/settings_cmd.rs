@@ -51,18 +51,27 @@ enum SettingsCmd {
         global: bool,
     },
     /// Change fields of the runtime layer: one PATCH per kind. A value is read as JSON,
-    /// else as a string, and null removes the runtime value
+    /// else as a string, and null removes the runtime value. With --global --preset NAME
+    /// PROVIDER, add the model provider PROVIDER from a preset, with FIELD=VALUE
+    /// assignments of the provider's own members in place of the preset's
     Set {
-        /// The dataset; with --global, the first assignment
+        /// The dataset; with --global, the first assignment; with --preset, the name of
+        /// the new provider
         #[arg(value_name = "DS", required_unless_present = "global")]
         dataset: Option<String>,
         /// Such as assistant.send=documents or assistant.budget.perRequest=80000, or
-        /// with --global models.providers.claude.budget.tokensPerDay=500000
+        /// with --global models.providers.claude.budget.tokensPerDay=500000, or with
+        /// --preset endpoint=https://proxy.example or apiKey.secret=team-key
         #[arg(value_name = "KIND.FIELD=VALUE", required_unless_present = "global")]
         assignments: Vec<String>,
         /// Change the server-wide settings (needs server-admin)
         #[arg(long)]
         global: bool,
+        /// Add a model provider from a preset: anthropic, openai or ollama (needs
+        /// --global). An OpenAI-compatible gateway has no preset; set its kind and
+        /// endpoint as fields instead
+        #[arg(long, value_name = "NAME", requires = "global")]
+        preset: Option<String>,
     },
     /// Edit the runtime layer of a kind in $VISUAL or $EDITOR and send the changes with
     /// If-Match
@@ -362,6 +371,18 @@ mod remote {
                 dataset,
                 assignments,
                 global,
+                preset: Some(preset),
+            } if global => {
+                let name = dataset.context(
+                    "name the new provider, as in: sparkles settings set --global --preset anthropic claude",
+                )?;
+                add_preset(&c, &preset, &name, &assignments)
+            }
+            SettingsCmd::Set {
+                dataset,
+                assignments,
+                global,
+                ..
             } => {
                 if global {
                     let all: Vec<String> = dataset.into_iter().chain(assignments).collect();
@@ -660,6 +681,69 @@ mod remote {
                 Owner::Server => v["scope"] = "server".into(),
             }
             c.print_json(&v)?;
+        }
+        Ok(())
+    }
+
+    /// `set --global --preset NAME PROVIDER [FIELD=VALUE…]`: add a provider from a
+    /// preset, refused when one of that name exists, with `If-Match` so that a provider
+    /// added meanwhile is not overwritten.
+    fn add_preset(c: &Client, preset: &str, name: &str, assignments: &[String]) -> Result<()> {
+        use crate::models::presets::{PRESETS, preset as find};
+        let Some(p) = find(preset) else {
+            let names: Vec<&str> = PRESETS.iter().map(|p| p.name).collect();
+            bail!(
+                "no preset named {preset:?}; use {}. An OpenAI-compatible gateway has no preset: set models.providers.NAME.kind=openai and its endpoint",
+                names.join(", ")
+            );
+        };
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+        {
+            bail!("provider name {name:?}: use letters, digits, '_', '-' and '.'");
+        }
+        let mut provider = p.provider();
+        for a in assignments {
+            let Some((lhs, value)) = a.split_once('=') else {
+                bail!("{a:?} is not FIELD=VALUE, such as endpoint=https://proxy.example");
+            };
+            let field = parse_path(lhs)
+                .filter(|f| !f.is_empty())
+                .with_context(|| format!("{lhs:?} is not a field of a provider"))?;
+            set_at(&mut provider, &field, parse_value(value));
+        }
+        let owner = Owner::Server;
+        let cur = c.get(&owner, Some(SERVER_KIND))?;
+        if at(&cur.body["effective"], &["providers".into(), name.into()]).is_some() {
+            bail!(
+                "a provider named {name} exists; change its fields with: sparkles settings set --global models.providers.{name}.FIELD=VALUE"
+            );
+        }
+        let patch = json!({ "providers": { name: provider } });
+        let a = c.call(
+            Method::PATCH,
+            &owner.path(Some(SERVER_KIND)),
+            cur.etag.as_deref(),
+            Some(&patch),
+        )?;
+        let a = c
+            .ok(a, &owner)
+            .with_context(|| format!("provider {name} from preset {preset}"))?;
+        if c.json {
+            return c.print_json(&json!({ "kinds": { SERVER_KIND: a.body }, "scope": "server" }));
+        }
+        let added = at(&a.body["effective"], &["providers".into(), name.into()])
+            .cloned()
+            .unwrap_or(J::Null);
+        println!("added provider {name} from preset {preset}:");
+        for f in leaves(&added) {
+            let v = at(&added, &f).cloned().unwrap_or(J::Null);
+            println!("  {}  {}", path_string(&f), show(&v));
+        }
+        if let Some(s) = added["apiKey"]["secret"].as_str() {
+            println!("set its key with: sparkles secrets set {s}");
         }
         Ok(())
     }
