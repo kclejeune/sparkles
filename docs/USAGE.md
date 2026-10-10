@@ -465,7 +465,7 @@ happens to materialized inferences, and the limits.
 | `--embedding-secret NAME=SOURCE` | | A secret that vector indexes may name as their embedding API key: `NAME=env:VARIABLE` or `NAME=file:PATH`, read when a request is made. Repeatable. See [Embeddings computed on write](#embeddings-computed-on-write). |
 | `--no-embedding` | | Compute no embeddings. No worker sends text to a provider, and searches cannot pass text. The configurations are kept. |
 | `--wal-prealloc-kb N` | `4096` | The most a write-ahead log grows ahead of its commits at once, as zero bytes written and synced in advance; `0` means each commit appends to the file. A commit that overwrites preallocated bytes syncs them without a file-system journal commit, which on ext4 and XFS is faster and no longer waits behind other files' writeback. On Linux, a commit of up to 64 KiB that lands inside preallocated space is written with `O_DIRECT` and `O_DSYNC`, which the device can complete as a forced-unit-access write instead of a full cache flush. The update vocabulary `delta.vocab` grows the same way, by up to 1 MiB at a time, and a commit that adds terms writes them as one checksummed chunk with `O_DIRECT` and `O_DSYNC` at the same time as its log records, so it no longer waits for a journal commit either. A file system that refuses direct I/O falls back to buffered writes and `fdatasync`, and the hidden `--no-wal-direct-writes` flag forces that path for both files. The log ends at its last commit and the vocabulary at its last chunk for readers, backups and the quota, and a close trims the zeros. A global flag. |
-| `--max-prefixes N` | `1000` | Prefixes per dataset; `0` means unlimited. A global flag. A new prefix past the limit is refused with `400`, and loaded data stops adding its prefixes. |
+| `--max-prefixes N` | `1000` | Prefixes per dataset; `0` means unlimited. A global flag. A new prefix past the limit is refused with `400`, and loaded data stops adding its prefixes. Declared prefixes count toward the limit, and well-known ones do not. |
 | `--reason-cache-triples N` | `10000000` | The largest closure of a materialization that a dataset keeps in memory, so that the next re-run or automatic run updates it incrementally. A closure takes about 135 bytes per triple. With `0`, a run reads the closure back from a persistent dataset, and an in-memory dataset runs in full. |
 
 `sparkles serve --help` lists the other options. They include `--read-only`,
@@ -2817,8 +2817,8 @@ The file can also declare values for one dataset by name, under `datasets`:
 ```
 
 An entry for a name that matches no dataset waits, and applies as soon as a dataset
-with that name is created. The file holds the `assistant`, `memory` and `ingest`
-settings that [API.md](API.md#settings) describes. It must not contain `endpoint` or
+with that name is created. The file holds the `assistant`, `memory`, `ingest` and
+`prefixes` settings that [API.md](API.md#settings) describes. It must not contain `endpoint` or
 `apiKey` members, since only the model configuration names providers and keys.
 
 A declared value is a default. A dataset admin can change any field that is not
@@ -2936,6 +2936,62 @@ highlighted. Users without `admin` on the dataset see the tab read-only.
 
 The memory section also shows memory maintenance, which
 [Maintaining agent memory](#maintaining-agent-memory) describes.
+
+### Declared prefixes
+
+A dataset's prefixes are a settings kind, `prefixes`, with the same layers as the other
+settings. The well-known prefixes such as `rdf`, `xsd`, `spk` and `mem` are its
+defaults, the settings file declares more, and the prefixes the dataset stores are its
+runtime layer. A settings file can declare prefixes for every dataset and lock some of
+them:
+
+```json
+{
+  "defaults": {
+    "prefixes": {
+      "kclj": "https://kclj.io/sparkles/",
+      "memory": "https://kclj.io/sparkles/memory/"
+    },
+    "locked": ["prefixes.kclj"]
+  },
+  "datasets": {
+    "slurp": { "prefixes": { "notes": "https://kclj.io/sparkles/memory/notes/" } }
+  }
+}
+```
+
+Every dataset then has `kclj:` and `memory:`, including datasets created later, and
+`slurp` has `notes:` as well. `GET /$/prefixes/{ds}` lists the effective prefixes, the
+query editor completes them, and query results and Graph Store answers are written with
+them. A query still declares the prefixes it uses, and the editor adds the `PREFIX` line
+when you complete a prefixed name.
+
+A dataset admin changes the prefixes with `sparkles settings`, the Settings tab or the
+older `/{ds}/prefixes` routes:
+
+```sh
+sparkles settings set slurp prefixes.ex=https://example.org/
+sparkles settings set slurp prefixes.memory=null    # remove a declared prefix
+sparkles settings reset slurp prefixes.memory       # bring it back
+sparkles settings get slurp prefixes
+sparkles settings check settings.json --max-prefixes 1000
+```
+
+Removing a declared or well-known prefix is kept across restarts until a reset brings
+the declared value back. A locked prefix cannot be changed or removed, and the server
+answers `409` with the code `locked-by-config`. Data you load adds the prefixes it
+declares, but never replaces a declared or locked prefix and never brings back a
+removed one.
+
+A declared prefix whose name is well-known but whose IRI differs, such as `mem` bound to
+`https://example.org/mem#`, is allowed. `sparkles settings check` prints a warning for
+it, and the Settings tab shows the warning next to the prefix. The **Prefixes** section
+of the Settings tab lists every prefix with its source, which is `well-known`,
+`server config`, `changed`, `locked` or `removed`, and adds, edits, deletes and resets
+them.
+
+`GET /{ds}/prefixes` still answers only the stored prefixes, as Fuseki's prefixes
+service does. [API.md](API.md#prefixes) describes the kind, its limits and its answers.
 
 ### Changing models and keys at runtime
 
@@ -4909,14 +4965,21 @@ including datasets created later through the API or the UI and in-memory dataset
 `datasets.<name>` declares values for one dataset by name, and a `locked` list in
 either fixes fields so that nobody can change them at runtime. The values use the
 field names of the [assistant](API.md#assistant-settings),
-[memory](API.md#memory-settings) and ingest settings in API.md:
+[memory](API.md#memory-settings), ingest and [prefixes](API.md#prefixes) settings in
+API.md:
 
 ```nix
 services.sparkles.settings = {
   defaults = {
     assistant.enabled = true;
-    # no dataset admin can let result rows or document text leave the server
-    locked = [ "assistant.send" ];
+    # every dataset completes and writes these prefixes
+    prefixes = {
+      kclj = "https://kclj.io/sparkles/";
+      memory = "https://kclj.io/sparkles/memory/";
+    };
+    # no dataset admin can let result rows or document text leave the server,
+    # or rebind kclj:
+    locked = [ "assistant.send" "prefixes.kclj" ];
   };
   # slurp may be declared in `datasets` or created later through the UI or the API
   datasets.slurp = {

@@ -602,10 +602,10 @@ per-dataset form and no concurrency caps. `preauth=off` turns it off.
 | GET    | `/$/tasks/{id}`              | `Task` |
 | DELETE | `/$/tasks/{id}`              | *Extension.* Cancels a task that accepts cancellation: a queued task, a clone until it is in place, an N-Quads backup, or a reasoning run. Returns `202` with the `Task`, which ends `cancelled`. Other tasks and finished ones get `409 {code: "not-cancellable"}`. Needs `admin` on the task's dataset, or `server-admin` for a server-wide task. |
 | POST   | `/$/cache/clear/{ds}`        | *Extension (no Fuseki equivalent).* Drops the dataset's cached query results and its cached remote SERVICE results ([SERVICE options](#service-options-loop-bulk-and-cache)). Returns `{ "cleared": number /* entries */, "bytes": number, "serviceCleared": number, "serviceBytes": number }`. |
-| GET    | `/$/prefixes/{ds}`           | `{ "prefixes": { "rdf": "http://…#", … } }`: the dataset's prefixes plus well-known ones. |
-| GET    | `/{ds}/prefixes`             | Modelled on Fuseki's prefixes service. `?prefix=p` returns `{ prefix, uri }`, or `404` if `p` is unbound. `?uri=u` returns `{ uri, prefixes: [...] }`. With neither, the response is `{ prefixes: {...} }` with the stored prefixes only. |
-| POST/PUT | `/{ds}/prefixes`           | Binds `prefix` to `uri`, given in the query, a form or a JSON body `{prefix, uri}`. Names may be up to 256 bytes and IRIs up to 4096. An invalid name or IRI is a `400`. So is a new prefix once the dataset has `--max-prefixes` (1000) of them. Replacing an existing binding is fine. Prefixes of loaded data are added up to the same limit. Prefixes are metadata, so no commit is made. |
-| DELETE | `/{ds}/prefixes?prefix=p`    | Removes a binding. Returns `204`, or `404` if the prefix is unbound. |
+| GET    | `/$/prefixes/{ds}`           | `{ "prefixes": { "rdf": "http://…#", … } }`: the dataset's effective prefixes, which are the well-known ones, the prefixes the settings file declares and the dataset's own, as the [prefixes kind](#prefixes) computes them. |
+| GET    | `/{ds}/prefixes`             | Modelled on Fuseki's prefixes service. `?prefix=p` returns `{ prefix, uri }`, or `404` if `p` is unbound. `?uri=u` returns `{ uri, prefixes: [...] }`. With neither, the response is `{ prefixes: {...} }` with the stored prefixes only. Declared and well-known prefixes are not listed here, and `?prefix=` and `?uri=` look only at the stored ones. |
+| POST/PUT | `/{ds}/prefixes`           | Binds `prefix` to `uri`, given in the query, a form or a JSON body `{prefix, uri}`, in the runtime layer of the [prefixes kind](#prefixes), and clears a removal of the name. Names may be up to 256 bytes and IRIs up to 4096, and the IRI must be absolute. An invalid name or IRI is a `400`. So is a new prefix once the dataset has `--max-prefixes` (1000) of them, counting removals. Replacing an existing binding is fine. A name the settings file locks is a `409` with the code `locked-by-config`, unless the binding restates the locked IRI. Prefixes of loaded data are added up to the same limit, and they skip names the settings file declares or locks and names the dataset removed. Prefixes are metadata, so no commit is made. |
+| DELETE | `/{ds}/prefixes?prefix=p`    | Removes a stored binding and returns `204`. For a name the settings file declares, it also stores a removal, so the declared prefix stops applying until a settings reset of the name. A locked name is a `409` with `locked-by-config`. A name that is neither stored nor declared, or is already removed, is a `404`. |
 
 ```ts
 type DatasetInfo = {
@@ -9340,7 +9340,7 @@ possible, and the history days in force. A `status` member in a `PUT` is ignored
 
 ### Settings
 
-A dataset's `assistant`, `memory` and `ingest` settings are settings kinds. The
+A dataset's `assistant`, `memory`, `ingest` and `prefixes` settings are settings kinds. The
 effective value of a kind is computed from four layers, and a later layer overrides an
 earlier one.
 
@@ -9443,6 +9443,68 @@ is `400` with the code `bad-settings`. An unknown kind is `404` with `unknown-ki
 read-only server (`serve --read-only`) refuses every settings write with `403`, the
 older `PUT /$/assistant/{ds}`, `PUT /$/memory/{ds}` and `PUT /$/ingest/{ds}/settings`
 included.
+
+#### Prefixes
+
+The `prefixes` kind holds a dataset's namespace prefixes, as a map from a prefix name
+to an IRI. Each name is a field. Its built-in defaults are the well-known prefixes,
+which are `rdf`, `rdfs`, `owl`, `xsd`, `dc`, `dcterms`, `foaf`, `skos`, `schema`, `sh`,
+`prov` and `text`, and the namespaces Sparkles defines: `spk` (`urn:x-sparkles:`),
+`hist` (`urn:x-sparkles:history#`), `path` (`urn:x-sparkles:path#`), `mem`
+(`urn:x-sparkles:mem:`) and `sparkles` (`urn:x-sparkles:assembler#`). The settings file
+declares more in `defaults.prefixes` and `datasets.<name>.prefixes`:
+
+```json
+{
+  "defaults": {
+    "prefixes": {
+      "kclj": "https://kclj.io/sparkles/",
+      "memory": "https://kclj.io/sparkles/memory/"
+    },
+    "locked": ["prefixes.kclj"]
+  }
+}
+```
+
+The runtime layer is the prefixes the dataset stores, the same ones that
+`/{ds}/prefixes` reads and changes and that loaded data adds. They stay in
+`prefixes.json`. A runtime `null` removes a declared or well-known prefix. The server
+keeps the removed names in `prefixes-removed.json`, so the removal survives restarts,
+and `DELETE /$/settings/{ds}/prefixes?field=NAME` brings the declared or well-known IRI
+back. `PUT` removes every prefix that the body leaves out. A clone or a branch does not
+copy removals.
+
+`locked` takes `prefixes.NAME` for one prefix or `prefixes` for the whole kind. A locked
+name keeps its declared or well-known IRI, or stays unbound when no layer binds it. The
+answer lists a lock of the whole kind as the empty path `""`. Loaded data never binds a
+name that the settings file declares or locks, or a name the runtime layer removes, and
+neither do the `PA` rows of an RDF Patch.
+
+A name is a SPARQL `PN_PREFIX` in ASCII, or the empty name, of at most 256 bytes. An
+IRI is absolute and at most 4096 bytes. A write that would give the dataset more than
+`--max-prefixes` prefixes besides the well-known ones, or more runtime bindings and
+removals together, is a `400`. A settings file that breaks these rules fails
+`sparkles settings check` and the start, and `settings check` takes `--max-prefixes`.
+
+A prefix whose name is well-known but whose IRI differs shadows the well-known one. The
+settings allow it and report it. The kind's answer has a `warnings` member, and
+`sparkles settings check` prints the same warnings for the file:
+
+```json
+"warnings": [
+  {
+    "prefix": "mem",
+    "iri": "https://example.org/mem#",
+    "wellKnown": "urn:x-sparkles:mem:",
+    "message": "mem: is bound to <https://example.org/mem#>, which shadows the well-known mem: <urn:x-sparkles:mem:>"
+  }
+]
+```
+
+`GET /$/prefixes/{ds}` answers the effective prefixes. Query results, Graph Store
+answers and SHACL reports are written with the declared and runtime prefixes, without
+the well-known layer. The schema summary, MCP's prefixes resource and the assistant still
+read the stored prefixes with the well-known ones.
 
 ### Server settings
 
