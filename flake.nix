@@ -31,6 +31,16 @@
           };
         nixosModules.sparkles = self.nixosModules.default;
 
+        # `programs.sparkles` for Home Manager: the client's config files and agent hooks.
+        # `homeModules` is the name Home Manager's own flake-parts module uses.
+        homeModules.default =
+          { lib, pkgs, ... }:
+          {
+            imports = [ ./nix/home-module.nix ];
+            programs.sparkles.package = lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.sparkles;
+          };
+        homeModules.sparkles = self.homeModules.default;
+
         # Adds `sparkles`, `sparkles-cli`, `sparkles-ui` and `sparkles-fmt-wasm` to a package set.
         overlays.default =
           final: prev:
@@ -217,6 +227,11 @@
             nixos-module = pkgs.testers.runNixOSTest (import ./nix/test.nix { inherit self; });
             # the module without a VM; the settings check of the build needs the CLI
             nixos-settings = import ./nix/settings-test.nix {
+              inherit pkgs;
+              sparkles = self'.packages.sparkles-cli;
+            };
+            # the Home Manager module's files, read back by the CLI
+            home-module = import ./nix/home-module-test.nix {
               inherit pkgs;
               sparkles = self'.packages.sparkles-cli;
             };
