@@ -60,6 +60,7 @@ mod rdfs;
 mod reasoning;
 #[cfg(feature = "auth")]
 mod remote;
+mod secrets_cmd;
 mod settings;
 mod settings_cmd;
 #[cfg(feature = "shacl")]
@@ -1433,6 +1434,9 @@ enum Cmd {
     /// Layered dataset settings: read and change them on a server, apply or check a
     /// settings file of serve --settings
     Settings(settings_cmd::SettingsArgs),
+    /// Runtime values of model secrets on a running server: list them, store one from
+    /// standard input or a prompt that does not echo, or remove one
+    Secrets(secrets_cmd::SecretsArgs),
     /// Manage datasets in a stopped server's catalog or on a running server
     Dataset {
         #[command(subcommand)]
@@ -3391,6 +3395,7 @@ fn run() -> Result<()> {
         Cmd::Validation(args) => validation_cmd::run(args, opts),
         Cmd::Quota(args) => quota_cmd::run(args, opts),
         Cmd::Settings(args) => settings_cmd::run(args),
+        Cmd::Secrets(args) => secrets_cmd::run(args),
         Cmd::Dataset { cmd } => dataset_cmd::run(cmd, opts),
         Cmd::Compaction(args) => compaction_cmd::run(args, opts),
         #[cfg(feature = "auth")]
