@@ -1310,6 +1310,13 @@ impl Ctx {
         Ok((size as u64).saturating_mul(8).saturating_add(128))
     }
 
+    /// The value of a base vocabulary id from the numeric column, when it holds one.
+    /// Kept out of line so that [`Ctx::value`] stays small for the ids it decodes.
+    #[inline(never)]
+    fn column_value(&self, payload: u64) -> Option<Value> {
+        self.snap.generation.vocab.numeric()?.get(payload).value()
+    }
+
     /// Decode an id into a value, with a per-query cache.
     pub fn value(&self, id: Id) -> Option<Value> {
         match id.tag() {
@@ -1324,8 +1331,7 @@ impl Ctx {
                 // a number of the base vocabulary from its numeric column, without
                 // decoding the key (the same value, see `crate::vocab::numeric`)
                 if id.tag() == Tag::Vocab
-                    && let Some(num) = self.snap.generation.vocab.numeric()
-                    && let Some(v) = num.get(id.payload()).value()
+                    && let Some(v) = self.column_value(id.payload())
                 {
                     return Some(v);
                 }
