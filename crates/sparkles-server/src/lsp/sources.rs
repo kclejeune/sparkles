@@ -15,6 +15,7 @@ use std::sync::Arc;
 #[derive(Clone, Debug)]
 enum Fetch {
     Pending,
+    #[cfg_attr(not(feature = "auth"), allow(dead_code))]
     Done(BTreeMap<String, String>),
     Failed,
 }
