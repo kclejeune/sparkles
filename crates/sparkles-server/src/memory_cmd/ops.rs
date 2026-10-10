@@ -2122,7 +2122,7 @@ fn inbox_items(conn: &Conn, flt: &InboxFilter) -> Result<(Vec<Item>, Vec<Value>,
     let j = conn.get_json(&format!(
         "/$/memory/{}/inbox?limit={}",
         enc(&conn.dataset),
-        flt.limit.clamp(1, 2000)
+        flt.limit.clamp(1, 500)
     ))?;
     let base = conn.memory_settings()?["imports"]["base"]
         .as_str()
@@ -2368,7 +2368,7 @@ fn promote(
     }
     let conn = env.connect()?;
     let flt = InboxFilter {
-        limit: 2000,
+        limit: 500,
         ..Default::default()
     };
     let (items, _, _) = inbox_items(&conn, &flt)?;
@@ -2412,7 +2412,7 @@ fn reject(env: &Env, ids: Vec<String>, message: Option<String>) -> Result<i32, C
     }
     let conn = env.connect()?;
     let flt = InboxFilter {
-        limit: 2000,
+        limit: 500,
         ..Default::default()
     };
     let (items, _, _) = inbox_items(&conn, &flt)?;
@@ -2704,6 +2704,7 @@ fn export(env: &Env, a: ExportArgs) -> Result<i32, CmdError> {
     // what to write: path under --out, bytes, the sources it holds, and how
     let mut files: Vec<(String, Vec<u8>, Vec<String>, &'static str, bool)> = Vec::new();
     let mut fragment: Vec<&Stored> = Vec::new();
+    let mut agents: Vec<&Stored> = Vec::new();
     for s in &sources {
         if s.harness == a.to {
             files.push((
@@ -2740,10 +2741,16 @@ fn export(env: &Env, a: ExportArgs) -> Result<i32, CmdError> {
                 ));
             }
             (_, to) => {
+                let name = instruction_name(&s.path, to);
+                if to == "codex" && name == "AGENTS.md" {
+                    // the project's AGENTS.md also holds the memory sections
+                    agents.push(s);
+                    continue;
+                }
                 let mut t = copy_comment(&s.graph, &date);
                 t.push_str(&String::from_utf8_lossy(&s.bytes));
                 files.push((
-                    instruction_name(&s.path, to),
+                    name,
                     t.into_bytes(),
                     vec![s.graph.clone()],
                     "converted",
@@ -2752,8 +2759,9 @@ fn export(env: &Env, a: ExportArgs) -> Result<i32, CmdError> {
             }
         }
     }
-    if !fragment.is_empty() {
-        // §8.10.10: one AGENTS.md fragment with a section per memory in index order
+    if !fragment.is_empty() || !agents.is_empty() {
+        // §8.10.10: one AGENTS.md fragment with a section per memory in index order,
+        // after the text of the instruction file it replaces
         fragment.sort_by(|x, y| {
             (x.position.is_none(), x.position, &x.path).cmp(&(
                 y.position.is_none(),
@@ -2762,8 +2770,15 @@ fn export(env: &Env, a: ExportArgs) -> Result<i32, CmdError> {
             ))
         });
         let mut t = String::new();
-        for s in &fragment {
+        for s in agents.iter().chain(&fragment) {
             t.push_str(&copy_comment(&s.graph, &date));
+        }
+        for s in &agents {
+            t.push('\n');
+            t.push_str(&String::from_utf8_lossy(&s.bytes));
+            if !t.ends_with('\n') {
+                t.push('\n');
+            }
         }
         for s in &fragment {
             let (name, description, kind, body) = memory_parts(s);
@@ -2783,16 +2798,15 @@ fn export(env: &Env, a: ExportArgs) -> Result<i32, CmdError> {
                 t.push('\n');
             }
         }
-        let name = if files.iter().any(|f| f.0 == "AGENTS.md") {
-            "AGENTS.memory.md"
-        } else {
-            "AGENTS.md"
-        };
-        let redacted = fragment.iter().any(|s| s.redacted);
+        let redacted = agents.iter().chain(&fragment).any(|s| s.redacted);
         files.push((
-            name.into(),
+            "AGENTS.md".into(),
             t.into_bytes(),
-            fragment.iter().map(|s| s.graph.clone()).collect(),
+            agents
+                .iter()
+                .chain(&fragment)
+                .map(|s| s.graph.clone())
+                .collect(),
             "converted",
             redacted,
         ));

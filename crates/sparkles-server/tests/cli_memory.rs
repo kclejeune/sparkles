@@ -1,6 +1,6 @@
-//! `sparkles memory` (C18 Phase 3m-a) as the real binary against a real server with
-//! authentication, on fixture harness directories: the acceptance examples A59 to A65
-//! and A68 to A77 that the import, the brief and the commands cover.
+//! `sparkles memory` as the real binary against a real server with authentication, on
+//! fixture harness directories: the acceptance examples A59 to A77 that the import, the
+//! transcripts, the brief, the review commands and the export cover.
 #![cfg(feature = "memory")]
 
 use serde_json::{Value, json};
@@ -175,6 +175,8 @@ fn template(home: &Path, agent: &str) -> String {
             "--import",
             "--import-base",
             BASE,
+            "--curated",
+            "https://example.org/memory/consolidated",
         ])
         .output()
         .unwrap();
@@ -1086,6 +1088,449 @@ fn memory_import_sync_and_brief() {
     let o = sync(&["--if-reachable"]);
     assert_eq!(o.status.code(), Some(0));
     assert!(stdout(&o).is_empty());
+}
+
+/// A Claude Code transcript line.
+fn cc_line(role: &str, at: chrono::DateTime<chrono::Utc>, content: Value) -> String {
+    json!({
+        "type": role, "sessionId": "s1", "cwd": "/w", "gitBranch": "main", "version": "2.1.0",
+        "timestamp": at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "message": { "role": role, "model": "claude-test", "content": content },
+    })
+    .to_string()
+}
+
+impl Server {
+    /// `GET` or `PUT` JSON as `who`.
+    fn json(&self, who: &str, method: &str, path: &str, body: Option<&Value>) -> (u16, Value) {
+        let c = reqwest::blocking::Client::new();
+        let mut r = c
+            .request(
+                reqwest::Method::from_bytes(method.as_bytes()).unwrap(),
+                format!("{}{path}", self.url),
+            )
+            .bearer_auth(self.token(who));
+        if let Some(b) = body {
+            r = r
+                .header("content-type", "application/json")
+                .body(b.to_string());
+        }
+        let r = r.send().unwrap();
+        let status = r.status().as_u16();
+        let text = r.text().unwrap();
+        (
+            status,
+            serde_json::from_str(&text).unwrap_or(Value::String(text)),
+        )
+    }
+}
+
+/// A66, A67, A75 and A76: transcripts with their opt-ins and redaction, the server's
+/// secret check, export with its copies, and promotion and rejection from the terminal.
+#[test]
+fn memory_transcripts_review_and_export() {
+    let s = start_server(&["--mem", DS]);
+    let f = Fixture::new();
+    let p = f.project();
+    let p = p.to_str().unwrap();
+    mem_json(&f, &s, "admin", &["init", "--import-base", BASE]);
+    let (st, mut settings) = s.json("admin", "GET", &format!("/$/memory/{DS}"), None);
+    assert_eq!(st, 200);
+    settings["consolidatedGraph"] = "https://example.org/memory/consolidated".into();
+    let (st, _) = s.json("admin", "PUT", &format!("/$/memory/{DS}"), Some(&settings));
+    assert_eq!(st, 200);
+    let imp = mem_json(&f, &s, "ana", &["import", "claude-code", "--project", p]);
+    assert_eq!(imp["failed"], 0, "{imp:#}");
+
+    // a finished session with a token, thinking and a tool call
+    let projdir = f.memdir().parent().unwrap().to_path_buf();
+    let token = format!("ghp_{}", "a".repeat(36));
+    let t0 = chrono::Utc::now() - chrono::Duration::hours(2);
+    let sec = |n: i64| t0 + chrono::Duration::seconds(n);
+    let lines = [
+        cc_line("user", sec(0), json!(format!("Deploy with {token} please"))),
+        cc_line(
+            "assistant",
+            sec(1),
+            json!([{ "type": "thinking", "thinking": "private reasoning" },
+                                            { "type": "text", "text": "Deploying now." },
+                                            { "type": "tool_use", "name": "Write",
+                                              "input": { "file_path": f.memdir().join("staging-db.md"), "content": "x" } }]),
+        ),
+        cc_line(
+            "user",
+            sec(2),
+            json!([{ "type": "tool_result", "tool_use_id": "t1", "content": "tool output here" }]),
+        ),
+        cc_line(
+            "assistant",
+            sec(3),
+            json!([{ "type": "text", "text": "Done." }]),
+        ),
+        cc_line("user", sec(4), json!("Thanks")),
+        cc_line(
+            "assistant",
+            sec(5),
+            json!([{ "type": "text", "text": "You are welcome." }]),
+        ),
+    ];
+    std::fs::write(projdir.join("s1.jsonl"), lines.join("\n") + "\n").unwrap();
+
+    // A66: without imports.transcripts no transcript is read, and the output says why
+    let sy = mem_json(
+        &f,
+        &s,
+        "ana",
+        &["sync", "claude-code", "--project", p, "--transcripts"],
+    );
+    assert!(
+        sy["notes"]
+            .to_string()
+            .contains("imports.transcripts is off"),
+        "{sy:#}"
+    );
+    assert!(!sy["files"].to_string().contains("s1.jsonl"), "{sy:#}");
+    settings["imports"]["transcripts"] = true.into();
+    let (st, _) = s.json("admin", "PUT", &format!("/$/memory/{DS}"), Some(&settings));
+    assert_eq!(st, 200);
+    // the dataset allows them, but the project is not opted in
+    let sy = mem_json(&f, &s, "ana", &["sync", "claude-code", "--project", p]);
+    assert!(!sy["files"].to_string().contains("s1.jsonl"), "{sy:#}");
+    let sy = mem_json(
+        &f,
+        &s,
+        "ana",
+        &["sync", "claude-code", "--project", p, "--transcripts"],
+    );
+    let r = report(&sy, "s1.jsonl");
+    assert_eq!(r["status"], "new", "{sy:#}");
+    assert_eq!(r["kind"], "transcript");
+    assert_eq!(r["redactions"], json!(["github-token"]), "{sy:#}");
+    let sg = format!("{G}/sessions/s1");
+    assert_eq!(r["graph"], sg.as_str());
+    let chunks: Vec<String> = s
+        .select(&format!(
+            "SELECT ?t WHERE {{ GRAPH <{sg}> {{ <{sg}> <urn:x-sparkles:rendition> ?r . ?c <urn:x-sparkles:chunkOf> ?r ; <urn:x-sparkles:start> ?a ; <urn:x-sparkles:text> ?t }} }} ORDER BY ?a"
+        ))
+        .iter()
+        .map(|r| r["t"]["value"].as_str().unwrap().to_string())
+        .collect();
+    let all = chunks.concat();
+    assert!(all.contains("[redacted:github-token]"), "{all}");
+    assert!(!all.contains("ghp_"), "{all}");
+    assert!(s.ask(&format!(
+        "ASK {{ GRAPH <{sg}> {{ <{sg}> <urn:x-sparkles:mem:redactions> 1 . \
+         ?x a <urn:x-sparkles:mem:Session> ; <urn:x-sparkles:mem:sessionId> \"s1\" ; <urn:x-sparkles:mem:model> \"claude-test\" . \
+         <{G}/memory/staging-db> <http://www.w3.org/ns/prov#wasGeneratedBy> ?x }} }}"
+    )));
+    // A67: one chunk per turn, and no thinking, tool call or tool result
+    assert_eq!(chunks.len(), 4, "{chunks:#?}");
+    assert_eq!(
+        chunks.iter().filter(|c| c.starts_with("## user")).count(),
+        2
+    );
+    assert_eq!(
+        chunks
+            .iter()
+            .filter(|c| c.starts_with("## assistant"))
+            .count(),
+        2
+    );
+    for x in ["private reasoning", "tool output here", "Write"] {
+        assert!(!all.contains(x), "{x}: {all}");
+    }
+    // A66: a request that bypasses the CLI is refused, without the token in the answer
+    let (st, e) = s.json(
+        "ana",
+        "POST",
+        &format!("/{DS}/sources"),
+        Some(
+            &json!({ "graph": format!("{G}/sessions/raw"), "format": "text/markdown",
+                      "text": format!("## user\n\nuse {token}\n") }),
+        ),
+    );
+    assert_eq!(st, 422, "{e:#}");
+    assert_eq!(e["code"], "secret-detected");
+    assert_eq!(e["pattern"], "github-token");
+    assert_eq!(e["offset"], 13);
+    assert!(!e.to_string().contains(&token));
+
+    // A67: 5 MiB of text in three parts of at most 2 MiB
+    let big: Vec<String> = (0..60i64)
+        .map(|i| {
+            let role = if i % 2 == 0 { "user" } else { "assistant" };
+            let text = format!("turn {i} {}", "lorem ipsum ".repeat(7500));
+            let content = if role == "user" {
+                json!(text)
+            } else {
+                json!([{ "type": "text", "text": text }])
+            };
+            cc_line(role, sec(10 + i), content).replace("\"s1\"", "\"s2\"")
+        })
+        .collect();
+    std::fs::write(projdir.join("s2.jsonl"), big.join("\n") + "\n").unwrap();
+    // A67: a session in progress is skipped, unless the session end hook names it
+    let now = chrono::Utc::now() - chrono::Duration::minutes(2);
+    let recent = [
+        cc_line("user", now, json!("Is it on?")),
+        cc_line(
+            "assistant",
+            now,
+            json!([{ "type": "text", "text": "Yes." }]),
+        ),
+    ]
+    .join("\n")
+    .replace("\"s1\"", "\"s3\"");
+    std::fs::write(projdir.join("s3.jsonl"), recent + "\n").unwrap();
+    let sy = mem_json(
+        &f,
+        &s,
+        "ana",
+        &["sync", "claude-code", "--project", p, "--transcripts"],
+    );
+    assert_eq!(report(&sy, "s1.jsonl")["status"], "unchanged", "{sy:#}");
+    assert_eq!(report(&sy, "s2.jsonl")["status"], "new", "{sy:#}");
+    let r3 = report(&sy, "s3.jsonl");
+    assert_eq!(r3["status"], "skipped", "{sy:#}");
+    assert!(r3["reason"].as_str().unwrap().contains("in progress"));
+    let g2 = format!("{G}/sessions/s2");
+    let parts = s.select(&format!(
+        "SELECT ?src ?n WHERE {{ GRAPH <{g2}> {{ ?src <urn:x-sparkles:rendition> ?r . ?r <urn:x-sparkles:length> ?n }} }}"
+    ));
+    let mut srcs: Vec<String> = parts
+        .iter()
+        .map(|r| r["src"]["value"].as_str().unwrap().to_string())
+        .collect();
+    srcs.sort();
+    assert_eq!(
+        srcs,
+        [g2.clone(), format!("{g2}/part-2"), format!("{g2}/part-3")]
+    );
+    for r in &parts {
+        let n: u64 = r["n"]["value"].as_str().unwrap().parse().unwrap();
+        assert!(n <= 2 << 20, "{n}");
+    }
+    let mut c = f
+        .cmd()
+        .env("SPARKLES_SERVER", &s.url)
+        .env("SPARKLES_TOKEN", s.token("ana"))
+        .env("SPARKLES_MEMORY_DATASET", DS)
+        .args([
+            "memory",
+            "sync",
+            "--from-hook",
+            "claude-code",
+            "--transcripts",
+            "--json",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let input = json!({ "cwd": p, "hook_event_name": "SessionEnd", "session_id": "s3",
+                        "transcript_path": projdir.join("s3.jsonl") });
+    c.stdin
+        .take()
+        .unwrap()
+        .write_all(input.to_string().as_bytes())
+        .unwrap();
+    let o = c.wait_with_output().unwrap();
+    assert!(o.status.success(), "{}", stdout(&o));
+    let j: Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(report(&j, "s3.jsonl")["status"], "new", "{j:#}");
+    // the extraction skill's listing leaves out nothing it should see
+    let st = mem_json(&f, &s, "ana", &["status", "--project", p]);
+    assert_eq!(st["transcripts"]["imported"], 3, "{st:#}");
+
+    // A75: export --sources to the same harness writes byte-identical files
+    let out2 = f.dir.path().join("export-cc");
+    let o2 = out2.to_str().unwrap();
+    let ex = mem_json(
+        &f,
+        &s,
+        "ana",
+        &[
+            "export",
+            "--sources",
+            "--to",
+            "claude-code",
+            "--out",
+            o2,
+            "--project",
+            p,
+        ],
+    );
+    for name in ["staging-db.md", "MEMORY.md"] {
+        assert_eq!(
+            std::fs::read(out2.join(name)).unwrap(),
+            std::fs::read(f.memdir().join(name)).unwrap(),
+            "{name}: {ex:#}"
+        );
+    }
+    assert!(
+        !ex.to_string().contains("sessions/"),
+        "transcripts are not exported: {ex:#}"
+    );
+    let again = mem(
+        &f,
+        &s,
+        "ana",
+        &[
+            "export",
+            "--sources",
+            "--to",
+            "claude-code",
+            "--out",
+            o2,
+            "--project",
+            p,
+            "--json",
+        ],
+    );
+    assert_eq!(again.status.code(), Some(1));
+    let e: Value = serde_json::from_slice(&again.stdout).unwrap();
+    assert_eq!(e["code"], "exists", "{e:#}");
+    mem_json(
+        &f,
+        &s,
+        "ana",
+        &[
+            "export",
+            "--sources",
+            "--to",
+            "claude-code",
+            "--out",
+            o2,
+            "--project",
+            p,
+            "--force",
+        ],
+    );
+    // to Codex: an AGENTS.md fragment that starts with the copy comment
+    let out3 = f.dir.path().join("other");
+    std::fs::create_dir_all(&out3).unwrap();
+    let o3 = out3.to_str().unwrap();
+    mem_json(
+        &f,
+        &s,
+        "ana",
+        &[
+            "export",
+            "--sources",
+            "--to",
+            "codex",
+            "--out",
+            o3,
+            "--project",
+            p,
+            "--harness",
+            "claude-code",
+        ],
+    );
+    let agents = std::fs::read_to_string(out3.join("AGENTS.md")).unwrap();
+    assert!(agents.starts_with("<!-- sparkles:copy-of <"), "{agents}");
+    assert!(agents.contains("\n## staging-db\n"), "{agents}");
+    assert!(
+        agents.contains("The staging database runs on port 5433 (reference)"),
+        "{agents}"
+    );
+    // imported as Codex instructions, the fragment records mem:copyOf its sources
+    let sy = mem_json(&f, &s, "ana", &["sync", "codex", "--project", o3]);
+    assert_eq!(report(&sy, "AGENTS.md")["status"], "new", "{sy:#}");
+    assert!(s.ask(&format!(
+        "ASK {{ GRAPH ?g {{ ?g <urn:x-sparkles:mem:copyOf> <{G}/memory/staging-db> }} }}"
+    )));
+
+    // A76: agent-7 syncs, and its promotion lands on a branch it may write, then fails
+    // at the merge
+    let sy = mem_json(&f, &s, "agent-7", &["sync", "claude-code", "--project", p]);
+    assert_eq!(sy["failed"], 0, "{sy:#}");
+    let inbox = mem_json(
+        &f,
+        &s,
+        "agent-7",
+        &["inbox", "--kind", "import", "--limit", "500"],
+    );
+    let own = format!("{BASE}agent-7/");
+    let item = inbox["facts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| {
+            x["graph"].as_str().unwrap().starts_with(&own)
+                && x["p"] == "<http://schema.org/description>"
+        })
+        .unwrap_or_else(|| panic!("{inbox:#}"))
+        .clone();
+    let id = item["id"].as_str().unwrap();
+    let o = mem(&f, &s, "agent-7", &["promote", id, "--merge", "--json"]);
+    assert_eq!(o.status.code(), Some(1), "{}", stdout(&o));
+    let e: Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(e["code"], "forbidden", "{e:#}");
+    let branch = e["detail"]["branch"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{e:#}"));
+    assert!(branch.starts_with("proposals.agent-7.review-"), "{branch}");
+    // ana rejects one of her imported facts in one commit that names her
+    let inbox = mem_json(
+        &f,
+        &s,
+        "ana",
+        &["inbox", "--kind", "import", "--limit", "500"],
+    );
+    let mine = format!("{BASE}ana/");
+    let item = inbox["facts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| {
+            x["graph"].as_str().unwrap().starts_with(&mine)
+                && x["p"] == "<http://schema.org/description>"
+        })
+        .unwrap_or_else(|| panic!("{inbox:#}"))
+        .clone();
+    let head = s.head();
+    let rj = mem_json(
+        &f,
+        &s,
+        "ana",
+        &[
+            "reject",
+            item["id"].as_str().unwrap(),
+            "--message",
+            "out of date",
+        ],
+    );
+    assert_eq!(rj["rejected"], 1, "{rj:#}");
+    assert_eq!(s.head(), head + 1, "one commit");
+    let (_, c) = s.json(
+        "admin",
+        "GET",
+        &format!("/$/commits/{DS}/{}", head + 1),
+        None,
+    );
+    assert!(
+        c.to_string().contains("Rejected by ana: out of date"),
+        "{c:#}"
+    );
+    // review: one choice per line
+    let mut c = f
+        .cmd()
+        .env("SPARKLES_SERVER", &s.url)
+        .env("SPARKLES_TOKEN", s.token("ana"))
+        .env("SPARKLES_MEMORY_DATASET", DS)
+        .args(["memory", "review", "--kind", "import", "--json"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    c.stdin.take().unwrap().write_all(b"s\nq\n").unwrap();
+    let o = c.wait_with_output().unwrap();
+    assert!(o.status.success(), "{}", stderr(&o));
+    let j: Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(j["promoted"], 0);
+    assert_eq!(j["rejected"], 0);
 }
 
 /// `--loc`: a database no server holds is served in the process, and one a server holds
