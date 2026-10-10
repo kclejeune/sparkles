@@ -611,9 +611,41 @@ reservation exceeds the budget, because disk spill is not implemented.
 An operator without a cursor implementation materializes only itself. It reads its
 inputs from child cursors, or from exactly sized scans when an input is a plain scan,
 so the rest of the plan keeps streaming. A fallback drains its inputs in full before it
-runs, so a LIMIT above it does not stop those inputs early. EXISTS expressions,
-registered and fold aggregates, and COUNT(DISTINCT *) still run eagerly when first
-demanded, and the strict policy rejects them before that demand.
+runs, so a LIMIT above it does not stop those inputs early. Registered and fold
+aggregates still run eagerly when first demanded, and the strict policy rejects them
+before that demand. A registered aggregate runs one accumulator per group whose
+callbacks see the rows in input order, and a fold needs the rows of its group in order,
+so neither has running state that a cursor group can hold.
+
+EXISTS runs inside the cursor wherever it appears, in FILTER, BIND, ORDER BY, OPTIONAL
+conditions and aggregate arguments. The first batches that reach an EXISTS collect the
+distinct outer keys as retained state. Once they hold as many keys as the pattern's
+estimated cost divided by the cost of one evaluation per row, the pattern runs as a
+child cursor under the query's charges and fills a key set. Each batch of the pattern
+is charged before its keys enter the set, and later outer batches probe the set. When
+the outer rows have fewer distinct keys than that, or the key set does not fit the
+budget, each distinct outer key is evaluated once and its answer is kept in a memo. The
+memo is charged per entry. It stops growing at an eighth of the memory budget, or when
+less than a quarter of the budget remains, so that it cannot exhaust the query's
+memory. A variable that only a FILTER inside the EXISTS reads still forces evaluation
+per row, as it does in eager execution.
+
+A transitive path over a sequence or alternative reads its edge relation from a child
+cursor into charged adjacency maps on first demand. Without a bound input it then walks
+one start node at a time from the sorted sources of those edges. With a bound input it
+expands one input batch at a time. COUNT(DISTINCT *) keeps a charged set of the
+distinct rows of each group. Local LATERAL subqueries and the ARQ property functions
+run their eager kernel on one input batch at a time, like the other expanding
+operators, so a LIMIT above them stops their input early. Remote LATERAL, SERVICE,
+registered property functions and the search and spatial operators still drain their
+inputs. Their answers for a prefix of the input depend on a remote endpoint or on
+callbacks, so the cursor cannot prove that the prefix is enough.
+
+MINUS and semi and anti joins run as a forward merge when their only shared variable is
+bound on every row of both inputs and both inputs keep their order on it. A left row
+passes on the presence of its key on the right, so the merge holds no runs, and the
+right input reads only the key column. A COUNT over such a join counts the passing rows
+without building them.
 
 Batch writers decode distinct base-vocabulary terms under charges for retained and
 reconstruction memory, and they skip the optional cache when memory is tight. BIND
@@ -655,12 +687,19 @@ The W3C SPARQL 1.0 and 1.1 query evaluation tests run through cursors at batch s
 of 1, 2, 3 and 4,096 rows and match the expected results. The queries that need eager
 fallback are counted, and they run with fallback allowed. The count fell from 53 to 25
 when joins, expanding operators, groups, group counts and paths gained cursor
-implementations. Of the 25, fifteen filter with EXISTS, nine use a transitive path over
-a sequence or alternative, and one counts distinct rows with COUNT(DISTINCT *). A
-seeded differential test compares cursor and eager answers at the same batch sizes
-over generated VALUES, scans, property paths, joins, OPTIONAL, MINUS, UNION, filters,
-ordering, slicing, grouping and aggregates. It runs over a compacted base, pending
-changes, many small blocks and an access-restricted view.
+implementations. Fifteen of the 25 filtered with EXISTS, nine used a transitive path
+over a sequence or alternative, and one counted distinct rows with COUNT(DISTINCT *).
+With those three in the cursor, no W3C query needs an eager fallback at any of the four
+batch sizes, and all 508 evaluated tests still pass in every cursor variant. A seeded
+differential test compares cursor and eager answers at the same batch sizes over
+generated VALUES, scans, property paths, joins, OPTIONAL, MINUS, UNION, filters,
+ordering, slicing, grouping and aggregates. It also generates EXISTS and NOT EXISTS in
+filters, BIND, OPTIONAL conditions, ORDER BY and aggregate arguments, transitive paths
+over sequences and alternatives, COUNT(DISTINCT *) and LATERAL subqueries with ORDER
+BY and LIMIT. It runs over a compacted base, pending changes, many small blocks and an
+access-restricted view. Across 1,500 generated seeds every query with EXISTS, a
+transitive path over a sequence or alternative, COUNT(DISTINCT *) or LATERAL streams
+under the strict policy.
 Correctness and resource gates passed across core, HTTP and the bindings. The benchmark
 refresh, which measures Sparkles only, covers 1.05M, 10.5M and full DBpedia, plus
 specialized suites and matched JVM controls.
@@ -726,29 +765,83 @@ expanding operators and path walks hold the output of one input batch or one sta
 node rather than the whole result. In exchange the hash index adds 4 bytes per build
 row and one map entry per distinct key to the charged build state.
 
+Those two EXISTS filters now stream as well, so no bench query needs an eager fallback
+under streaming. The work was measured on Namespace instances with `mise run
+bench:nsc`, whose `--execution` option now sets the mode of each side. Each run starts
+fresh servers pinned to one core in four A, B, B, A rounds of 20 timed requests per
+query and server, with one Rayon worker and no result cache. The times below are client
+wall times, which include serialization. Against streaming on the starting commit,
+streaming on the final code had a geometric mean 7.8% lower at 1.05M and 14.1% lower at
+10.5M. At 10.5M optional-chain fell from 448 to 198 ms, order-by-full from 1,615 to 917
+ms, distinct-join from 59 to 32 ms and star-join from 87 to 46 ms. The exists-join query
+changed by +1.6% and not-exists by -21%, so evaluating EXISTS inside the cursor is not
+slower than the eager fallback it replaces.
+
+Profiles of the queries that were slower in streaming found five costs in the cursor
+engine and its writer. The HTTP writer of an explicit streaming response read the clock
+on every write to check the deadline. Serializers write a few bytes at a time, so those
+clock reads took 36% of the full ordering query. The writer now checks cancellation on
+every write and the deadline when its buffer crosses a 16 KiB mark and before it sends a
+chunk, and the cursor still checks its deadline every 1,024 rows. The merge join left
+its loop over loaded batches for every run of duplicate keys and built a resumable pair
+for it. Runs that end inside their batches now join directly. The hash join walked a
+state machine and filled a one-row predicate table for every candidate even without a
+predicate. It now joins whole probe rows in one pass when every build row binds the
+key. The streamed EXISTS key set grew from empty and rehashed, which took a fifth of the
+NOT EXISTS query. It is now sized for the pattern's estimate when a quarter of the
+remaining budget covers it. MINUS over two inputs ordered on their one shared key used
+the hash join. It now runs as the merge described above and decides each batch with the
+branch-free lower-bound zipper of eager MINUS. The comparisons with the starting commit
+ran before these last two changes, which affect only MINUS, semi and anti joins and
+hash joins.
+
+Before this work, streaming against eager on the same commit had a geometric mean of
++14.9% at 1.05M, with minus, optional-chain, distinct-join, star-join and order-by-full
+between 41% and 145% slower. On the final code the geometric mean is +0.9% at 1.05M and
++6.9% at 10.5M. Streaming is faster for range-topk, order-by-full, expr-agg-arg and
+expr-order-key. At 1.05M it stays more than 10% slower for group-avg, distinct-join,
+minus and regex-iri, and for several queries under a millisecond. Those small queries
+moved by as much as 36% between two servers running the same binary in an A/A control,
+so their differences are within the noise of the instance. At 10.5M optional-chain is
+35% slower, group-avg 28%, minus and expr-bind-group 22%, and the EXISTS filters 11% to
+13%. The execution time of optional-chain at 10.5M is more than twice the eager time,
+so its hash join is the largest remaining gap. An earlier run at 10.5M on an instance
+with ten times the usual steal time was discarded. Profiles of group-avg and
+distinct-join show the same leading costs in both modes, with the cursor's group and
+merge join taking about the share that eager execution's kernels take. Eager execution
+did not change. Against the starting commit its geometric mean was +1.1% at 1.05M and
+-0.6% at 10.5M, and an interleaved local run of the queries with the largest shifts
+stayed within 2%.
+
 Disk spill, broader automatic selection and removing every remaining cost of complete
 responses are follow-up work. A review of the implementation found further follow-ups:
 
-- FILTER EXISTS and NOT EXISTS are the most frequent remaining fallback. Evaluating them
-  per input batch needs the subplan to run under the cursor's charges. It also needs a
-  per-batch choice between a key set and per-row evaluation that does not fall to
-  unmemoized per-row work when batches are small.
-- A fallback drains its inputs in full. Passing LIMIT demand into a fallback's inputs
-  needs a proof for each operator that a prefix of its input yields the required
-  solutions, including OFFSET and callback effects. The absence of ORDER alone is not
-  enough.
-- A transitive path over a sequence or alternative reads its edge input from a child
-  cursor but materializes its own output. Walking it one start node at a time needs the
-  edge relation as charged state.
-- COUNT(DISTINCT *) and registered aggregates need running state of their own before
-  their groups stop falling back.
+- A fallback drains its inputs in full. Local LATERAL and the ARQ property functions
+  now stream per input batch, so LIMIT reaches their inputs. Passing LIMIT demand into
+  the inputs of the remaining fallbacks, which are remote LATERAL, SERVICE, registered
+  property functions and the search and spatial operators, needs a proof for each of
+  them that a prefix of its input yields the required solutions. That proof must cover
+  OFFSET and the effects of callbacks and remote requests. The absence of ORDER alone
+  is not enough.
+- The group-avg, distinct-join and minus queries remain 10% to 15% slower in streaming
+  at 1.05M, and optional-chain, group-avg, minus and expr-bind-group are 22% to 35%
+  slower at 10.5M. Their profiles do not single out one cost, so closing the gap needs
+  grouping and join kernels that work on whole batches the way the eager kernels work
+  on whole tables. The hash join's per-row chain walk is the first candidate, because
+  the eager join builds its pairs and gathers each output column in one pass.
+- Registered and fold aggregates need running state of their own before their groups
+  stop falling back. A registered aggregate's callbacks must keep seeing one group's
+  rows in input order, and a fold needs its group's rows in order.
 - Sort order travels as a claim on each batch. It should be a property of the operator,
   checked at batch boundaries in debug builds.
-- Profile bounded coalescing, parallel batch decoding and one-batch prefetch in the
-  result writer. The serial decoding mechanism is established, but its contribution
-  to the remaining throughput difference needs measurement. All overlapping input,
-  decoded and transport state must remain charged, cancellable and bounded under
-  slow consumers. Extra producer work must respect callback ownership.
+- Measure parallel batch decoding and one-batch prefetch in the result writer. With
+  the deadline read once per 16 KiB, profiles of the streaming and eager writers for
+  the full ordering and the 500,000-row TSV export share their leading costs, which are
+  sorting the cell IDs, decoding the vocabulary and the serializer itself. Parallel
+  decoding can help only with more than one Rayon worker, and the Namespace benchmark
+  runs with one. All overlapping input, decoded and transport state must remain
+  charged, cancellable and bounded under slow consumers. Extra producer work must
+  respect callback ownership.
 - Extend charged scan sharing and selective decoding to untouched block ranges of
   snapshots with pending changes. The merged scanner already emits untouched base
   blocks, but inserts, deletes and access-control masks must still be applied.

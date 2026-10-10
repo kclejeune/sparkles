@@ -1275,6 +1275,14 @@ TopK, expression ordering, substring filtering and TSV output remain slower, whi
 why automatic selection does not choose streaming for them. A lower first-batch time
 does not imply a faster complete response.
 
+A later comparison over HTTP ran on Namespace instances on 2026-10-09, with one Rayon
+worker, the native JSON format and fresh servers in interleaved A, B, B, A rounds. No
+bench query needed an eager fallback in streaming mode. Across the bench queries,
+streaming had a geometric mean of client wall time 0.9% above eager execution at 1.05M
+and +6.9% at 10.5M. Range TopK and expression ordering were faster in streaming in
+that comparison. The [X05 outcome](specs/X05-streaming-query-execution.md#outcome)
+lists the queries that remain slower and the costs that were removed.
+
 ## What the benchmark does not cover
 
 * **Larger scale.** The largest dataset measured is English DBpedia at 1.24 billion
