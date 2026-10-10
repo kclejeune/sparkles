@@ -2552,6 +2552,38 @@ enable ingestion in the dataset's assistant settings with `"ingest": true` and
 `"send": "documents"`, so that the document's text may go to the provider. The section
 [Asking questions with a model](#asking-questions-with-a-model) describes both files.
 
+**Configuration gap.** The current UI has no editor for the dataset's assistant
+settings, and the CLI has no assistant-settings command. On NixOS,
+[`services.sparkles.datasetSettings`](#declarative-dataset-settings) provisions them.
+The UI's **Ingest** section uploads documents and configures source
+retention and ingest profiles; it does not enable the assistant or permit sending
+documents to a model. `sparkles memory init` prepares the memory vocabulary, import
+settings and validation shapes, but does not enable assistant ingestion either.
+
+Configure the dataset through `PUT /$/assistant/{dataset}` as below, or provision
+`assistant.json` in a persistent dataset's database directory with:
+
+```json
+{ "enabled": true, "ingest": true, "send": "documents" }
+```
+
+With the default server data directory, a persistent dataset created through the UI
+or API stores this file at `/var/lib/sparkles/databases/{dataset}/assistant.json`.
+A Nix-declared dataset with no explicit `path` uses
+`/var/lib/sparkles/declarative/{dataset}/assistant.json`. The server reads these
+settings for each operation. They are separate from the provider file of
+`--model-config` and the client's `~/.config/sparkles/memory.toml`.
+The NixOS module can generate and install the file through `datasetSettings`, but
+no additional Nix file is required when configuring the dataset through the API.
+A deployment that reinstalls the file replaces later runtime settings changes.
+
+The localhost example below assumes a server without authentication. On an
+authenticated server, the `PUT` needs a bearer token with dataset `admin` permission;
+an existing browser session additionally needs its CSRF token. See
+[Assistant settings](API.md#assistant-settings) for the complete settings and access
+requirements. A `PUT` replaces the settings, so read and merge existing settings
+first when changing a configured dataset.
+
 ```bash
 sparkles serve --loc org=/data/org --model-config models.json \
   --model-secret anthropic=env:ANTHROPIC_API_KEY
@@ -4463,6 +4495,115 @@ services.sparkles = {
   };
 };
 ```
+
+### Model providers and credentials
+
+`services.sparkles.models.settings` generates the operator's model configuration
+and passes it to the server. Use the JSON field names from
+[Model providers](API.md#model-providers), including provider defaults, per-model
+options, ordered role lists and routing settings:
+
+```nix
+services.sparkles.models = {
+  settings = {
+    providers.claude = {
+      kind = "anthropic";
+      endpoint = "https://api.anthropic.com";
+      apiKey.secret = "anthropic";
+      contextTokens = 100000;
+      maxOutputTokens = 4096;
+    };
+    roles = {
+      draft = [ { provider = "claude"; model = "claude-haiku-5-5"; } ];
+      extract = [ {
+        provider = "claude";
+        model = "claude-sonnet-5-5";
+        maxOutputTokens = 8192;
+      } ];
+    };
+  };
+  secrets.anthropic.file = config.sops.secrets."anthropic-api-key".path;
+};
+
+sops.secrets."anthropic-api-key" = {
+  owner = config.services.sparkles.user;
+  group = config.services.sparkles.group;
+  mode = "0400";
+};
+```
+
+Settings are generated as `/etc/sparkles/models.json`, and changing them restarts
+the service. The bare object above and the JSON schema's `models` wrapper are both
+supported. Alternatively, use `models.configFile` with an absolute path to an
+existing JSON file; it is mutually exclusive with `models.settings`. Restart the
+service after changing an external file's contents. With both options `null`, the
+module supplies no model configuration.
+
+`models.secrets.<name>` supplies the source for `apiKey.secret = "<name>"`. Set
+exactly one of `file` (an absolute path outside the Nix store) or `environment`
+(an environment variable's name). File credentials are reread at each request,
+so a sops-nix or agenix rotation does not require a restart. The file must be
+readable by the service user within its sandbox; home and temporary directories
+are hidden. For an environment source, provide the variable at runtime through
+`systemd.services.sparkles.serviceConfig.EnvironmentFile`, and restart after
+updating that file.
+
+Only credential references belong in Nix: generated settings are in the Nix store.
+The module does not copy key files into the store or read their contents during
+evaluation. Do not place API keys in settings, headers or Nix service environment
+values. The server validates the model schema at startup. Remove corresponding
+`--model-config` and `--model-secret` arguments from `extraArgs` when migrating to
+these options.
+
+### Declarative dataset settings
+
+`services.sparkles.datasetSettings.<name>` provisions `assistant.json` and
+`memory.json` for a persistent dataset. It does not create or register the dataset.
+Each member is a JSON object using the corresponding
+[assistant](API.md#assistant-settings) or [memory](API.md#memory-settings) schema:
+
+```nix
+services.sparkles = {
+  # wiki is declared here; slurp will be created through the UI or API.
+  datasets.wiki = { };
+  datasetSettings = {
+    wiki.assistant = { enabled = true; send = "rows"; };
+    slurp = {
+      assistant = {
+        enabled = true;
+        ingest = true;
+        send = "documents";
+      };
+      memory = {
+        agentGraphs = [ "urn:x-sparkles:import/*" ];
+        imports = { base = "urn:x-sparkles:import/"; extract = "server"; };
+      };
+    };
+  };
+};
+```
+
+Names also declared in `datasets` use their configured database directory, including
+an explicit `datasets.<name>.path`, and receive settings before the first open.
+Other names use `dataDir/databases/<name>` and receive settings on a service start
+after the UI/API creates their persistent database. Missing or uninitialized
+databases are skipped without creating directories, so creating the dataset through
+the UI/API still works; restart Sparkles once after creating it to apply the settings.
+Declared in-memory datasets are rejected because their settings have no file storage.
+
+Files are copied from generated JSON as the service user with mode 0600. Changes to
+the declarations restart the service, and every service start replaces the managed
+files in full, including changes made through the API since the last start. `null`
+or an omitted member leaves that file unmanaged. Removing a declaration leaves its
+last contents in place; it does not reset the dataset's settings.
+
+The values are JSON objects rather than a second schema maintained by the module;
+use the field names and values in `API.md`. This provisions settings only: the model
+providers and secrets use [`services.sparkles.models`](#model-providers-and-credentials),
+and `sparkles memory init` still installs the memory vocabulary and
+validation shapes when importing harness memory.
+
+### Shutdown
 
 When the service stops, requests in flight get `shutdownGrace` seconds (default 20) to
 finish before they are cancelled. The unit's `TimeoutStopSec` is `shutdownGrace + 15`,

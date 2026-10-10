@@ -215,6 +215,8 @@
                   touch $out
                 '';
             nixos-module = pkgs.testers.runNixOSTest (import ./nix/test.nix { inherit self; });
+            nixos-dataset-settings = import ./nix/dataset-settings-test.nix { inherit pkgs; };
+            nixos-models = import ./nix/models-test.nix { inherit pkgs; };
             # the jar built offline, with Jena's contract tests, the binding's own tests and
             # the Java sample's tests as its check phase
             jvm-bindings = jvm.check;

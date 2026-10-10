@@ -22,6 +22,15 @@ let
   rateLimits = cfg.rateLimits;
   rateLimitsFile = "/etc/sparkles/rate-limits.json";
 
+  modelSettingsFile = "/etc/sparkles/models.json";
+  modelConfigFile = if cfg.models.settings != null then modelSettingsFile else cfg.models.configFile;
+  modelSecretArgs = lib.concatLists (
+    lib.mapAttrsToList (name: secret: [
+      "--model-secret"
+      "${name}=${if secret.file != null then "file:${secret.file}" else "env:${secret.environment}"}"
+    ]) cfg.models.secrets
+  );
+
   # behind the bundled nginx the client address comes from its X-Forwarded-For, for the
   # rate limits and for the limits of authentication (on whenever auth is): the server
   # trusts the addresses nginx connects from, or the Unix socket
@@ -56,6 +65,56 @@ let
     ];
 
   datasetPath = name: ds: if ds.path != null then ds.path else "${cfg.dataDir}/declarative/${name}";
+
+  validDatasetName =
+    name:
+    builtins.match "[A-Za-z0-9_.-]+" name != null
+    && !lib.elem name [
+      "ui"
+      "."
+      ".."
+    ];
+
+  # Settings do not declare a dataset. Declared persistent datasets may receive
+  # files before their first open; catalog-managed datasets must already exist.
+  datasetSettingFiles = lib.concatLists (
+    lib.mapAttrsToList (
+      name: settings:
+      let
+        declared = builtins.hasAttr name cfg.datasets;
+        directory =
+          if declared then datasetPath name cfg.datasets.${name} else "${cfg.dataDir}/databases/${name}";
+      in
+      lib.concatMap
+        (
+          kind:
+          lib.optional (settings.${kind} != null) {
+            inherit name declared directory;
+            file = "${kind}.json";
+            source = json.generate "sparkles-${name}-${kind}.json" settings.${kind};
+          }
+        )
+        [
+          "assistant"
+          "memory"
+        ]
+    ) cfg.datasetSettings
+  );
+
+  datasetSettingsScript = lib.concatMapStringsSep "\n" (
+    f:
+    let
+      install = "${pkgs.coreutils}/bin/install -m 0600 -- ${f.source} ${lib.escapeShellArg "${f.directory}/${f.file}"}";
+    in
+    if f.declared then
+      install
+    else
+      ''
+        if [ -f ${lib.escapeShellArg "${f.directory}/CURRENT"} ]; then
+          ${install}
+        fi
+      ''
+  ) datasetSettingFiles;
 
   # the `compaction.auto` options that pass a value, and their flags
   autoCompactFlags = {
@@ -127,6 +186,11 @@ let
     "--auth-config"
     cfg.auth.configFile
   ]
+  ++ lib.optionals (modelConfigFile != null) [
+    "--model-config"
+    modelConfigFile
+  ]
+  ++ modelSecretArgs
   ++ lib.optionals (cfg.backup.configFile != null) [
     "--backup-config"
     cfg.backup.configFile
@@ -341,6 +405,55 @@ in
       );
     };
 
+    datasetSettings = mkOption {
+      default = { };
+      example = lib.literalExpression ''
+        {
+          slurp.assistant = {
+            enabled = true;
+            ingest = true;
+            send = "documents";
+          };
+          slurp.memory = {
+            agentGraphs = [ "urn:x-sparkles:import/*" ];
+            imports = { base = "urn:x-sparkles:import/"; extract = "server"; };
+          };
+        }
+      '';
+      description = ''
+        Static settings for persistent datasets, keyed by dataset name. This does
+        not create or register datasets. Names in {option}`datasets` use that
+        dataset's directory, including an explicit `path`; other names target
+        UI/API-created datasets in {option}`dataDir`/databases/<name>.
+
+        Declared datasets receive their settings before the first server start.
+        UI/API-created datasets receive them on a service start after creation;
+        absent databases are skipped without creating directories. In-memory
+        datasets cannot have file-based settings.
+
+        These files replace runtime settings on each service start. Changes restart
+        the service. Removing a declaration stops managing the file but leaves its
+        last contents in place. Values use the JSON objects documented in
+        `docs/API.md`; provider endpoints and credential references belong in
+        {option}`models`, not these settings.
+      '';
+      type = types.attrsOf (
+        types.submodule {
+          options = lib.genAttrs [ "assistant" "memory" ] (
+            kind:
+            mkOption {
+              type = types.nullOr (types.attrsOf json.type);
+              default = null;
+              description = ''
+                The dataset's `${kind}.json` object, installed as the service user
+                with mode 0600. `null` leaves the existing runtime file alone.
+              '';
+            }
+          );
+        }
+      );
+    };
+
     queryTimeout = mkOption {
       type = types.ints.positive;
       default = 60;
@@ -441,6 +554,94 @@ in
         by the service user. `systemctl reload sparkles` re-reads it. Without it the
         server is open.
       '';
+    };
+
+    models = {
+      settings = mkOption {
+        type = types.nullOr (types.attrsOf json.type);
+        default = null;
+        example = lib.literalExpression ''
+          {
+            providers.claude = {
+              kind = "anthropic";
+              endpoint = "https://api.anthropic.com";
+              apiKey.secret = "anthropic";
+            };
+            roles.draft = [ { provider = "claude"; model = "claude-haiku-5-5"; } ];
+          }
+        '';
+        description = ''
+          Operator-controlled model providers, role lists and routing settings,
+          using the JSON schema in `docs/API.md`, Model providers. The module
+          generates `/etc/sparkles/models.json`, passes it as `--model-config`, and
+          restarts the service when it changes. Both the bare object with
+          `providers`, `roles` and `routing` and the `models` wrapper are accepted
+          by the server. Omitted fields retain the server's defaults.
+
+          This JSON is stored in the Nix store. API keys must be named with
+          `apiKey.secret` and supplied through {option}`models.secrets`;
+          never put secret values in the settings. Use either this option or
+          {option}`models.configFile`. `null` leaves model configuration unmanaged.
+        '';
+      };
+
+      configFile = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "/etc/sparkles/custom-models.json";
+        description = ''
+          An existing JSON file passed as `--model-config`, as an alternative to
+          {option}`models.settings`. It must be an absolute path readable by the
+          service user. The file contains provider endpoints and credential names,
+          not API keys. Changes to a file at the same path require a service restart.
+        '';
+      };
+
+      secrets = mkOption {
+        default = { };
+        example = lib.literalExpression ''
+          {
+            anthropic.file = config.sops.secrets."anthropic-api-key".path;
+            openai.environment = "OPENAI_API_KEY";
+          }
+        '';
+        description = ''
+          Credential sources keyed by the names used in providers' `apiKey.secret`.
+          Each entry generates `--model-secret NAME=file:PATH` or
+          `--model-secret NAME=env:VARIABLE`. Set exactly one source per entry.
+          These options contain references only, never key values.
+        '';
+        type = types.attrsOf (
+          types.submodule {
+            options = {
+              file = mkOption {
+                type = types.nullOr types.str;
+                default = null;
+                example = "/run/secrets/anthropic-api-key";
+                description = ''
+                  An absolute credential file outside the Nix store, readable by
+                  the service user, such as a sops-nix or agenix secret owned by
+                  {option}`services.sparkles.user`. The server reads it at each
+                  request, so rotating its contents requires no restart. The
+                  service's sandbox hides home and temporary directories.
+                '';
+              };
+              environment = mkOption {
+                type = types.nullOr types.str;
+                default = null;
+                example = "ANTHROPIC_API_KEY";
+                description = ''
+                  The name of an environment variable holding the credential.
+                  Supply its value at runtime, for example with
+                  `systemd.services.sparkles.serviceConfig.EnvironmentFile`;
+                  never put the value in Nix's service environment. Updating an
+                  environment file requires restarting the service.
+                '';
+              };
+            };
+          }
+        );
+      };
     };
 
     backup = {
@@ -749,10 +950,48 @@ in
   config = mkIf cfg.enable {
     assertions = [
       {
-        assertion = lib.all (name: builtins.match "[A-Za-z0-9_.-]+" name != null && name != "ui") (
-          lib.attrNames cfg.datasets
+        assertion = lib.all validDatasetName (lib.attrNames cfg.datasets);
+        message = "services.sparkles.datasets: names must match [A-Za-z0-9_.-]+ and must not be `ui`, `.` or `..`.";
+      }
+      {
+        assertion = lib.all validDatasetName (lib.attrNames cfg.datasetSettings);
+        message = "services.sparkles.datasetSettings: names must match [A-Za-z0-9_.-]+ and must not be `ui`, `.` or `..`.";
+      }
+      {
+        assertion = lib.all (
+          f: !f.declared || cfg.datasets.${f.name}.type == "persistent"
+        ) datasetSettingFiles;
+        message = "services.sparkles.datasetSettings: file-based settings cannot target in-memory datasets.";
+      }
+      {
+        assertion = cfg.models.settings == null || cfg.models.configFile == null;
+        message = "services.sparkles.models: set either settings or configFile, not both.";
+      }
+      {
+        assertion = cfg.models.configFile == null || lib.hasPrefix "/" cfg.models.configFile;
+        message = "services.sparkles.models.configFile must be an absolute path.";
+      }
+      {
+        assertion = lib.all (name: name != "" && !lib.hasInfix "=" name) (lib.attrNames cfg.models.secrets);
+        message = "services.sparkles.models.secrets: names must be nonempty and must not contain `=`.";
+      }
+      {
+        assertion = lib.all (s: (s.file != null) != (s.environment != null)) (
+          lib.attrValues cfg.models.secrets
         );
-        message = "services.sparkles.datasets: names must match [A-Za-z0-9_.-]+ and must not be `ui`.";
+        message = "services.sparkles.models.secrets: set exactly one of file or environment for each credential.";
+      }
+      {
+        assertion = lib.all (
+          s: s.file == null || (lib.hasPrefix "/" s.file && !lib.hasPrefix "/nix/store" s.file)
+        ) (lib.attrValues cfg.models.secrets);
+        message = "services.sparkles.models.secrets: credential files must be absolute paths outside the Nix store.";
+      }
+      {
+        assertion = lib.all (
+          s: s.environment == null || builtins.match "[A-Za-z_][A-Za-z0-9_]*" s.environment != null
+        ) (lib.attrValues cfg.models.secrets);
+        message = "services.sparkles.models.secrets: environment must name a valid environment variable.";
       }
       {
         assertion =
@@ -852,6 +1091,10 @@ in
       source = json.generate "sparkles-rate-limits.json" rateLimits;
     };
 
+    environment.etc."sparkles/models.json" = mkIf (cfg.models.settings != null) {
+      source = json.generate "sparkles-models.json" cfg.models.settings;
+    };
+
     networking.firewall.allowedTCPPorts = lib.optional cfg.openFirewall cfg.port;
 
     systemd.tmpfiles.settings."10-sparkles" = lib.listToAttrs (
@@ -885,6 +1128,10 @@ in
       reloadTriggers = lib.optional (
         rateLimits != null
       ) config.environment.etc."sparkles/rate-limits.json".source;
+      restartTriggers =
+        map (f: f.source) datasetSettingFiles
+        ++ lib.optional (cfg.models.settings != null) config.environment.etc."sparkles/models.json".source;
+      preStart = mkIf (datasetSettingFiles != [ ]) (lib.mkAfter datasetSettingsScript);
       serviceConfig = {
         # re-reads the rate-limit, auth and backup configurations and the TLS certificate
         # (without any, SIGHUP would stop the server)

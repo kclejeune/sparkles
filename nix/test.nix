@@ -17,7 +17,64 @@
         enable = true;
         datasets = {
           demo = { };
+          archive.path = "/srv/sparkles-archive";
           scratch.type = "mem";
+        };
+        datasetSettings = {
+          demo = {
+            assistant = {
+              enabled = true;
+              ingest = true;
+              send = "documents";
+            };
+            memory = {
+              agentGraphs = [ "urn:x-sparkles:import/*" ];
+            };
+          };
+          archive.assistant = {
+            enabled = true;
+            send = "rows";
+          };
+          later.assistant = {
+            enabled = true;
+            ingest = true;
+            send = "documents";
+          };
+        };
+        models = {
+          settings = {
+            providers = {
+              claude = {
+                kind = "anthropic";
+                endpoint = "https://api.anthropic.com";
+                apiKey.secret = "anthropic";
+              };
+              gateway = {
+                kind = "openai";
+                endpoint = "https://api.openai.com/v1";
+                apiKey.secret = "openai";
+              };
+            };
+            roles = {
+              draft = [
+                {
+                  provider = "claude";
+                  model = "claude-haiku-5-5";
+                }
+              ];
+              extract = [
+                {
+                  provider = "claude";
+                  model = "claude-sonnet-5-5";
+                  maxOutputTokens = 8192;
+                }
+              ];
+            };
+          };
+          secrets = {
+            anthropic.file = "/var/lib/sparkles/test-model-key";
+            openai.environment = "TEST_OPENAI_API_KEY";
+          };
         };
         nginx = {
           enable = true;
@@ -35,6 +92,8 @@
           idleSeconds = 0;
         };
       };
+      # Dummy credentials only: listing providers does not contact their endpoints.
+      systemd.services.sparkles.environment.TEST_OPENAI_API_KEY = "dummy-openai-key";
       environment.etc."sparkles/backup.toml" = {
         mode = "0400";
         user = "sparkles";
@@ -127,6 +186,36 @@
     machine.wait_for_unit("nginx.service")
 
     base = "http://sparkles.test"
+    models = json.loads(machine.succeed(f"curl -sf {base}/\\$/models"))
+    assert models["configured"], models
+    providers = {p["name"]: p for p in models["providers"]}
+    assert providers["claude"]["status"] == "secret-missing", providers
+    assert providers["gateway"]["status"] == "ok", providers
+    assert models["roles"]["extract"][0]["maxOutputTokens"] == 8192, models
+    machine.succeed("install -o sparkles -g sparkles -m 0400 /dev/null /var/lib/sparkles/test-model-key")
+    machine.succeed("printf '%s' dummy-anthropic-key > /var/lib/sparkles/test-model-key")
+    models = json.loads(machine.succeed(f"curl -sf {base}/\\$/models"))
+    assert next(p for p in models["providers"] if p["name"] == "claude")["status"] == "ok", models
+    assert "dummy-anthropic-key" not in json.dumps(models) and "dummy-openai-key" not in json.dumps(models), models
+    machine.succeed("truncate -s 0 /var/lib/sparkles/test-model-key")
+    models = json.loads(machine.succeed(f"curl -sf {base}/\\$/models"))
+    assert next(p for p in models["providers"] if p["name"] == "claude")["status"] == "secret-missing", models
+    # Declared datasets receive settings before their first open. A settings-only
+    # declaration must not block subsequent creation through the catalog API.
+    assistant = json.loads(machine.succeed(f"curl -sf {base}/\\$/assistant/demo"))
+    assert assistant["enabled"] and assistant["ingest"] and assistant["send"] == "documents", assistant
+    memory = json.loads(machine.succeed(f"curl -sf {base}/\\$/memory/demo"))
+    assert memory["agentGraphs"] == ["urn:x-sparkles:import/*"], memory
+    assistant = json.loads(machine.succeed(f"curl -sf {base}/\\$/assistant/archive"))
+    assert assistant["enabled"] and assistant["send"] == "rows", assistant
+    machine.succeed("test ! -e /var/lib/sparkles/databases/later")
+    post_json(machine, f"{base}/\\$/datasets", {"dbName": "later", "dbType": "persistent"})
+    assistant = json.loads(machine.succeed(f"curl -sf {base}/\\$/assistant/later"))
+    assert not assistant["enabled"], assistant
+    machine.succeed(
+        f"curl -sf -X PUT {base}/\\$/assistant/demo -H 'Content-Type: application/json' "
+        + "-d '{\"enabled\":false}'"
+    )
     machine.succeed(f"curl -sf {base}/\\$/ping")
     # a name the server is not known by (a DNS-rebinding page) is refused
     code = machine.succeed(
@@ -159,6 +248,11 @@
     machine.succeed(f"curl -sf {base}/scratch/update --data-urlencode 'update=INSERT DATA {{ <urn:m> <urn:p> 1 }}'")
     machine.systemctl("restart sparkles.service")
     machine.wait_for_open_port(3030)
+    for name in ["demo", "later"]:
+        assistant = json.loads(machine.succeed(f"curl -sf {base}/\\$/assistant/{name}"))
+        assert assistant["enabled"] and assistant["ingest"] and assistant["send"] == "documents", assistant
+    machine.succeed("test $(stat -c %a /var/lib/sparkles/databases/later/assistant.json) = 600")
+    machine.succeed("test $(stat -c %U /var/lib/sparkles/databases/later/assistant.json) = sparkles")
     out = machine.succeed(
         f"curl -sf {base}/demo/sparql -H 'Accept: text/csv' --data-urlencode "
         + "'query=SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }'"

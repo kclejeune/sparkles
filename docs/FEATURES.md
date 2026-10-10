@@ -202,7 +202,8 @@ The formatter and linter check their own output and serve the command line, the 
 * Formatting in the browser. The UI's query and shapes editors use a WebAssembly build of the formatter (`sparkles-fmt-wasm`). They fall back to `POST /$/format` when the build has no module or the module fails. The module is optional for `mise run ui:build` (build it with `mise run ui:wasm`) and always included in the Nix `sparkles` and `sparkles-ui` packages (see [ui/README.md](../ui/README.md#formatting-in-the-browser)).
 ## Known gaps
 
-These are features that other RDF stores have and Sparkles does not.
+These are implementation limits, missing configuration controls, and features that
+other RDF stores have and Sparkles does not.
 [COMPARISON.md](COMPARISON.md) covers each engine, and
 [BENCHMARKS.md](BENCHMARKS.md#where-sparkles-loses) covers performance.
 
@@ -275,6 +276,16 @@ These are features that other RDF stores have and Sparkles does not.
   data, and protections hide triples, not the IRIs that visible triples mention. Backups
   cover individual datasets. There is no whole-server backup, and encryption keys for
   backup repositories cannot be managed through the API, Vault or a cloud KMS.
+* **Assistant configuration.** Dataset assistant settings, including `enabled`,
+  `ingest` and `send: "documents"`, can be set through `PUT /$/assistant/{dataset}`
+  or a persistent database's `assistant.json`. The NixOS module provisions assistant
+  and memory settings through `services.sparkles.datasetSettings`, including settings
+  for datasets created through the UI/API. There is no UI editor or dedicated CLI
+  command for assistant settings. The UI's ingestion controls and
+  `sparkles memory init` do not enable assistant ingestion. Provider endpoints and
+  keys also have no UI editor and remain operator-controlled through `--model-config`
+  and `--model-secret`, or the NixOS module's `services.sparkles.models` options. See
+  [USAGE.md](USAGE.md#ingesting-documents-in-the-server) for the setup routes.
 * **Agents.** Agent memory imports transcripts only from Claude Code and Codex, and
   redaction finds only the secrets its patterns describe. The server converts Markdown, HTML and PDF documents, but not
   office formats, images or audio. Scanned PDF pages need a build with `pdf-ocr` and
