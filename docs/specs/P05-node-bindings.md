@@ -178,10 +178,12 @@ The crate has the features of the Python crate, with the same defaults: `reasoni
 is missing throws `UnsupportedError` that names the feature, and `FEATURES` lists the
 build's features.
 
-The addon uses the system allocator, as the Python extension does. Rust's global
-allocator in a `cdylib` covers only the addon's own allocations, so mimalloc would not
-change how Node.js allocates. It could still pay off on musl, whose allocator is slow
-under threads. Open question 4 decides it after the Phase 1 benchmark.
+The addon uses the system allocator by default. The `mimalloc` feature makes mimalloc
+the global allocator of the addon's own allocations. Rust's global allocator in a
+`cdylib` covers only the addon, so the feature does not change how Node.js allocates.
+The binding benchmark found no speed difference on glibc and a peak RSS about 18% higher
+with it, so it stays off (see the Outcome). It could still pay off on musl, whose
+allocator is slow under threads.
 
 ## 3. The engine API
 
@@ -571,7 +573,11 @@ package does the same with three additions for the event loop.
 2. **Each `tx` method is a message.** `tx.add` sends a request to the transaction's
    thread and returns a promise for the answer. Between messages the thread waits on its
    channel and the JavaScript thread is free. `tx.match` and `tx.select` return their
-   results in batches, like the dataset's methods.
+   results in batches, like the dataset's methods. On a dataset in memory, a write that
+   finds the transaction's thread idle, with no earlier request pending, runs on the
+   JavaScript thread instead. The thread lends its transaction while it waits, and the
+   write borrows it under a lock, so the write applies at once and in order, and the
+   guard never leaves its thread.
 3. **A callback cannot deadlock on its own transaction.** A write on the dataset from
    inside the callback would wait in the queue behind the transaction that is waiting for
    the callback. The binding runs the callback inside an `AsyncLocalStorage` context that
@@ -678,7 +684,11 @@ thread for every distinct term, used or not. Phase 1 builds the lazy form and me
 both on the benchmark of §11. Open question 2 records the choice.
 
 Quads from `match` and `construct` use the same encoding with four columns. Inputs go the
-other way as arrays of terms, which `addAll` sends to the addon in chunks of 4096 quads.
+other way in the same binary form, one string of term text and one `Uint32Array`, and
+`addAll` sends them in chunks of 4096 quads. Each dataset keeps a table of up to 65,536
+IRIs and literals it has sent, on both sides of the boundary, so a term it has sent
+before crosses as a number and the addon reuses its engine id. Blank nodes are never
+numbered, because their identity depends on the transaction.
 
 ### 6.3 Other data factories
 
@@ -1364,3 +1374,52 @@ the binding is now faster than it on every fine-grained call. Adds remain about 
 slower than N3.js. Each still crosses to the transaction's thread and back, as §5.4
 requires, and about two thirds of its time goes to the JSON encoding of the operation
 and to the insert.
+
+**Terms by number and writes on the JavaScript thread (2026-10-09).** A third round went
+after the calls that were still slower than N3.js. Five changes followed.
+
+* A request from JavaScript to the addon now uses the binary form of §6.2 in place of
+  JSON. `TermCache` in the engine package numbers each IRI and literal it sends, up to
+  65,536 per dataset, and the addon keeps the engine id of each number. A term sent
+  before crosses as one number, and the addon skips both decoding it and looking it up.
+  The table holds about 100 bytes per term on each side, so about 6.5 MB per side when
+  full. When it is full, or when a request fails, both sides clear it. A transaction that
+  rolls back, or a commit that fails, invalidates the cached ids, because the engine may
+  hand those ids out again.
+* On a dataset in memory, `tx.add`, `tx.delete` and `tx.addAll` run on the JavaScript
+  thread when the transaction's thread is idle and no earlier request is pending. The
+  facade's transaction worker lends its transaction through a pointer under a mutex while
+  it waits on its channel, and takes it back before it handles the next message, so the
+  guard of §5.4 never leaves its thread. A write that finds the worker busy, a pending
+  request or a dataset on disk goes through the worker as before. Each write still
+  applies at once, so no write is buffered. A panic in a write made this way marks the
+  transaction broken, and its commit fails.
+* `tx.addAll` is a method of its own that sends 4,096 quads per call, and it accepts an
+  async iterable. `ds.addAll` and `ds.replace` use it.
+* `has()` and `match()` on a dataset in memory send their pattern through the term table,
+  and the addon answers `has()` with one lookup of engine ids in the indexes. The arguments
+  are borrowed views of the JavaScript arrays, so the addon makes no reference to them.
+* A result batch of at most 4,096 words is copied into a new `ArrayBuffer`, which V8
+  frees without calling back into the addon. A larger batch is still handed over without
+  a copy. Text that is all ASCII becomes a JavaScript string through
+  `napi_create_string_latin1`.
+
+A cache of decoded literal strings per result was not built. The batch's term table
+already decodes each distinct term once, and the small reads that remain slow, such as
+`(s p ?)`, return one batch, so such a cache would never be hit.
+
+The comparison ran A/B/B/A in fresh processes pinned to six cores of an 8-vCPU AMD EPYC
+instance on Namespace, at 105,000 triples, with four process medians per arm. Figures
+before and after the round are below, with N3.js's `Store` from the same run in
+brackets. A single add in a transaction went from 26 to 7.6 µs [5.1], `addAll` from 13
+to 7.0 µs per quad [5.8], `has()` from 4.5 to 1.9 µs [1.3], the first object of
+`(s p ?)` from 13.5 to 6.5 µs [8.0], `(s ? ?)` from 24 to 12 µs per subject [21],
+`(? p o)` from 3.8 to 2.5 ms [2.4], and iterating every quad from 102 to 59 ms [123].
+Adds are now 1.2 to 1.5 times N3.js's time and `has()` 1.5 times. The rest of an add is
+the insert into the engine's delta and the promise that `await` resolves. The small
+`VALUES` query, at one query per sample, varied from 0.55 to 2.0 ms between processes of
+the same arm, so its medians say nothing about this round. The Oxigraph package ran ten
+times slower on this instance than in the previous round, so its figures are left out.
+
+The `mimalloc` feature made no measurable difference to any case and raised the peak RSS
+of the benchmark process from 359 to 425 MiB, so the addon keeps the system allocator.

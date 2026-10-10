@@ -64,7 +64,9 @@ sparkles serve --data ./data --port 3030   # UI at http://localhost:3030/ui/
 
 The server and CLI use [mimalloc](https://github.com/microsoft/mimalloc) as their
 allocator. It comes from the `mimalloc` cargo feature of `sparkles-server`, which is on
-by default. The `sparkles` library leaves the choice of allocator to its embedder. Once
+by default. The `sparkles` library leaves the choice of allocator to its embedder. The
+Python extension and the JVM library use mimalloc for their own allocations by default,
+and the Node.js addon uses the system allocator. Once
 no request has been active for `--idle-release-ms` (default 1000 ms), `sparkles serve`
 hands free heap memory back to the OS. The interval counts from the end of the last
 request, so requests that keep arriving, even with short gaps, never meet a release. A build with
