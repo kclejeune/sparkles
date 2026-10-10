@@ -645,7 +645,9 @@ implementation landed.
   - the Language Server Protocol 3.17;
   - the public documentation of Fuseki's prefixes service;
   - the Sparkles code and specs C19, X02 and X04.
-- **Implementation:** not built.
+- **Implementation:** from the spec, docs/API.md, the public documentation of Fuseki's
+  prefixes service and the Sparkles code only (2026-10-10). The language server's
+  completion follows the Language Server Protocol 3.17. It adds no dependency.
 - **Rejected** (spec §10):
   - a separate NixOS option for prefixes;
   - removals stored as `null` in `prefixes.json`;

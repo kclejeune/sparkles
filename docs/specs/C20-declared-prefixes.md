@@ -1,6 +1,6 @@
 # C20: Declared prefixes
 
-> **Status:** specified
+> **Status:** implemented
 >
 > **Phases:** one phase. It covers the `prefixes` settings kind with its layers, locks
 > and removals, the Fuseki-style prefixes routes on the runtime layer, warnings for
@@ -320,3 +320,47 @@ checks that a runtime write to the locked one is refused with `409`.
 - The Sparkles code and specs C19, X02 and X04.
 
 ## Outcome
+
+The whole design landed on 2026-10-10 in one phase. The `prefixes` kind joins the
+registry of C19 next to `assistant`, `memory` and `ingest`. Its built-in defaults are
+the seventeen prefixes of §3.1, its declared layers come from the settings file, and its
+runtime layer is the store's bindings with a `null` for each removed name. The settings
+routes, `sparkles settings`, the UI's Settings tab, the NixOS module and its tests, and
+`sparkles lsp` work as §4 to §9 describe. The tests cover A1 to A10 across the store's
+tests, the server's unit tests, a test of `sparkles settings` against a server process
+with a restart, the UI's end-to-end tests, the tests of `sparkles lsp`, and the NixOS
+build and VM tests.
+
+These points differ from the design or settle what it left open.
+
+- The answer of the kind lists a lock of the whole kind as the empty path `""` in
+  `locked`, since its path has no members.
+- A `DELETE /{ds}/prefixes?prefix=p` for a well-known name that the dataset does not
+  store is a `404`, as before. A well-known prefix is removed through the settings
+  routes, `sparkles settings` or the UI.
+- The `PA` rows of an RDF Patch skip the declared, locked and removed names, as loaded
+  data does, and `PD` removes only a runtime binding.
+- `--max-prefixes` counts the effective prefixes that differ from the well-known ones,
+  and separately the runtime bindings and removals together. The global flag sets the
+  limit for `sparkles settings check` as well.
+- A clone or a branch does not copy `prefixes-removed.json`, as §3.2 says, and a backup
+  holds it.
+- The query editor needed no change. It already completed the prefixes of
+  `/$/prefixes/{ds}` and inserted their `PREFIX` lines, and that route now answers the
+  effective prefixes.
+- The schema summary, the MCP prefixes resource and tools, the assistant and the SHACL
+  shape drafts still read the stored prefixes with the well-known ones, and not the
+  declared layers. Query results, Graph Store answers and SHACL report targets use the
+  declared and runtime prefixes as §5 says.
+- `sparkles lsp` reads the server of the `[lsp]` table when the first document that uses
+  the config file opens, not at process start, since the config file is found per
+  document. The read happens once per server and dataset for the session.
+- A `[prefixes]` or `[lsp]` table that does not validate is a config error of
+  `sparkles fmt` too, as other mistakes in the file are, and `sparkles lint` ignores the
+  tables.
+- The quick fix that declares a known prefix is not part of `source.fixAll.sparkles`,
+  because its IRI comes from the configuration and not from the document.
+- Plain `http` to a host other than loopback is refused for the `[lsp]` server, and the
+  language server never falls back to `SPARKLES_SERVER` or the default server of the
+  credentials file.
+
