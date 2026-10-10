@@ -251,6 +251,7 @@ fn error_response(status: u16) -> &'static str {
         422 => "Unprocessable",
         429 => "TooManyRequests",
         501 => "NotImplemented",
+        502 => "BadGateway",
         503 => "Unavailable",
         507 => "InsufficientStorage",
         _ => panic!("no error response for {status}"),
@@ -420,6 +421,12 @@ fn error_responses() -> Map<String, J> {
         ),
     );
     put(
+        "BadGateway",
+        err(
+            "A server the request contacts on the caller's behalf failed or was refused, such as a notification channel.",
+        ),
+    );
+    put(
         "MethodNotAllowed",
         err("The method is not allowed here, such as an update sent with GET."),
     );
@@ -491,11 +498,15 @@ fn parameters() -> Map<String, J> {
     );
     let mut kind = path(
         "kind",
-        "The settings kind: `assistant`, `memory` or `ingest` of a dataset, or `models` of the server.",
+        "The settings kind: `assistant`, `memory` or `ingest` of a dataset, or `models` or `notifications` of the server.",
     );
-    kind["schema"]["enum"] = json!(["assistant", "memory", "ingest", "models"]);
+    kind["schema"]["enum"] = json!(["assistant", "memory", "ingest", "models", "notifications"]);
     put("kind", kind);
     put("id", path("id", "The id of the task, token or lock."));
+    put(
+        "channel",
+        path("channel", "The name of a notification channel."),
+    );
     put("task", path("task", "The id of the ingestion task."));
     put("repo", path("repo", "The backup repository."));
     put("backup", path("backup", "The backup's id."));

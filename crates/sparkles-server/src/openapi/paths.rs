@@ -2612,7 +2612,7 @@ fn assist(p: &mut Paths) {
     let server_body = |o: super::Op| {
         o.body(
             true,
-            "Fields of the model configuration: `providers`, `roles` and `routing`.",
+            "Fields of the kind: `providers`, `roles` and `routing` of `models`, or `enabled`, `server`, `baseUrl`, `repeatEvery`, `channels`, `routes` and `delivery` of `notifications`.",
             json!({ "application/json": { "schema": { "type": "object" } } }),
         )
         .header(
@@ -2625,7 +2625,7 @@ fn assist(p: &mut Paths) {
     };
     p.add(
         op(GET, "/$/server/settings/{kind}", "getServerSettings", "Server", "Get a server settings kind")
-            .doc("The model configuration (`models`): the effective object, the declared configuration of `--model-config`, the runtime layer, the source of each field, the fields `server.locked` locks and whether the effective object is valid. The `ETag` names the runtime layer. Needs server `admin`.")
+            .doc("The model configuration (`models`) or the notifications (`notifications`): the effective object, the declared layer (`--model-config`, or the settings file's `server.notifications`), the runtime layer, the source of each field, the fields `server.locked` locks and whether the effective object is valid. The `ETag` names the runtime layer. Needs server `admin`.")
             .see("server-settings")
             .json("200", "The kind.", "ServerSettingsKind")
             .errors(&[404]),
@@ -2669,6 +2669,19 @@ fn assist(p: &mut Paths) {
             .see("model-secrets")
             .no_content("Removed, or there was no runtime value.")
             .errors(&[400]),
+    );
+    p.add(
+        op(GET, "/$/notifications", "getNotifications", "Server", "Get the status of notifications")
+            .doc("Whether outbound notifications are on, each channel with its target, its last success and its last failure, the routes, the length of the queue, the conditions that were notified and the last 50 deliveries. The counters start empty at each start. Needs server `admin`.")
+            .see("notifications")
+            .json("200", "The status.", "NotificationStatus"),
+    );
+    p.add(
+        op(POST, "/$/notifications/test/{channel}", "testNotification", "Server", "Send a test notification")
+            .doc("Sends a `notification.test` envelope to the channel now, in one attempt, whether or not notifications are on. A failure is a `502` with the code `delivery-failed`, or `outbound-refused` when the outbound policy refuses the channel. Needs server `admin`.")
+            .see("notifications")
+            .json("200", "The channel accepted the notification.", "NotificationTest")
+            .errors(&[404, 502]),
     );
     p.add(
         op(GET, "/$/asks/{ds}", "listAsks", tag, "List your asked questions")
