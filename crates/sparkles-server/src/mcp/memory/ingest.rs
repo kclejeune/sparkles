@@ -2085,7 +2085,7 @@ pub(crate) fn list_sources(
             r.quads_in(
                 &format!(
                     "?r <{RDF_REIFIES}> ?t ; <{PROV}wasDerivedFrom> ?span ; <{PROV}wasGeneratedBy> ?act \
-                     FILTER(isIRI(?span) && STRSTARTS(STR(?span), CONCAT(STR(?rend), \"#char=\"))) \
+                     FILTER(isIRI(?span) && CONTAINS(STR(?span), \"#char=\")) BIND(IRI(STRBEFORE(STR(?span), \"#char=\")) AS ?rend) \
                      FILTER NOT EXISTS {{ ?r <{PROV}wasInvalidatedBy> ?x }} \
                      FILTER NOT EXISTS {{ ?act a <{SPK}Reanchoring> }} \
                      FILTER NOT EXISTS {{ ?act <{PROV}wasAssociatedWith> ?sa . ?sa <{RDFS_LABEL}> ?n FILTER(STRSTARTS(STR(?n), \"{IMPORT_AGENT}\")) }}"

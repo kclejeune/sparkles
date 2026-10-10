@@ -1014,4 +1014,243 @@ datasets = {{ mem = "read" }}
         assert_eq!(b["kind"], "inbox", "{b}");
         assert_eq!(b["facts"], 1, "{b}");
     }
+
+    /// A62, A64 and A66 at the routes: `POST /{ds}/sources` refuses a secret in an import
+    /// graph, keeps the original bytes, re-anchors the facts of a changed source and moves
+    /// them to a renamed one; `GET /{ds}/sources` lists what still needs extraction.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a62_a64_a66_sources_routes() {
+        use base64::Engine;
+        let s = authed();
+        let base = "https://example.org/memory/agents/agent-7/imports/";
+        memory_settings(
+            &s,
+            json!({"imports": {"base": base,
+                   "secretPatterns": [{"name": "acme-key", "regex": "acme_[0-9]{6}"}]}}),
+        )
+        .await;
+        let r = http(
+            &s,
+            "owner",
+            "PUT",
+            "/$/ingest/mem/profiles/default",
+            Some(json!({"predicates": [MEMBER_OF, "http://schema.org/status"]})),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+        let g1 = format!("{base}claude-code/app/memory/team");
+        let g2 = format!("{base}claude-code/app/memory/people");
+        // A66: a secret in an import graph is refused with its pattern and offset only
+        let token = format!("ghp_{}", "x".repeat(36));
+        let body = |graph: &str, text: &str| json!({"graph": graph, "iri": graph, "format": "text/markdown", "text": text});
+        let r = http(
+            &s,
+            "agent-7",
+            "POST",
+            "/mem/sources",
+            Some(body(&g1, &format!("# Team\n\nuse {token}\n"))),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", r.text());
+        let j = r.json();
+        assert_eq!(j["code"], "secret-detected", "{j}");
+        assert_eq!(j["pattern"], "github-token", "{j}");
+        assert_eq!(j["offset"], 12, "{j}");
+        assert!(!r.text().contains(&token), "{}", r.text());
+        let r = http(
+            &s,
+            "agent-7",
+            "POST",
+            "/mem/sources",
+            Some(body(&g1, "# Team\n\nkey acme_123456\n")),
+        )
+        .await;
+        assert_eq!(r.json()["pattern"], "acme-key", "{}", r.text());
+        // a redacted text passes, and graphs outside the import base are not checked
+        let r = http(
+            &s,
+            "agent-7",
+            "POST",
+            "/mem/sources",
+            Some(body(&g1, "# Team\n\nuse [redacted:github-token]\n")),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+        let r = http(
+            &s,
+            "agent-7",
+            "POST",
+            "/mem/sources",
+            Some(body(
+                "https://example.org/memory/agents/agent-7/scratch",
+                &format!("use {token}"),
+            )),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+        // the original bytes are kept and digested when they differ from the text
+        let v1 = "# Team\r\n\r\nAna moved to the payments team this week.\r\n\r\nKai is on leave until Friday.\r\n";
+        let text1 = v1.replace("\r\n", "\n");
+        let mut b1 = body(&g1, &text1);
+        b1["original"] = base64::engine::general_purpose::STANDARD.encode(v1).into();
+        let r = http(&s, "agent-7", "POST", "/mem/sources", Some(b1)).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+        let out = r.json();
+        assert_eq!(out["originalKept"], true, "{out}");
+        assert_eq!(
+            out["digest"],
+            {
+                use sha2::Digest;
+                format!(
+                    "sha256:{}",
+                    sha2::Sha256::digest(v1.as_bytes())
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>()
+                )
+            },
+            "{out}"
+        );
+        let rend1 = out["rendition"]
+            .as_str()
+            .unwrap()
+            .trim_matches(['<', '>'])
+            .to_string();
+        // an original that is not the text's bytes is refused
+        let mut bad = body(&g1, "# Other\n");
+        bad["original"] = base64::engine::general_purpose::STANDARD.encode(v1).into();
+        let r = http(&s, "agent-7", "POST", "/mem/sources", Some(bad)).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+        // A62 needsExtraction: nothing cites the rendition yet
+        let list = |q: &'static str| {
+            let s = &s;
+            async move {
+                let r = http(
+                    s,
+                    "agent-7",
+                    "GET",
+                    &format!("/mem/sources?graphPrefix={}&{q}", urlencoding(base)),
+                    None,
+                )
+                .await;
+                assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+                r.json()
+            }
+        };
+        let j = list("needsExtraction=true").await;
+        assert!(
+            j["sources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|x| x["graph"] == format!("<{g1}>")),
+            "{j}"
+        );
+        let span = |text: &str, q: &str, rend: &str| {
+            let (a, e) = char_offset(text, q);
+            json!({"rendition": rend, "start": a, "end": e})
+        };
+        let r = call(
+            &s,
+            "agent-7",
+            "assert_facts",
+            json!({"graph": g1, "agent": {"name": "notes-bot"},
+                   "facts": [{"s": "ex:ana", "p": "org:memberOf", "o": "ex:payments",
+                              "quote": "Ana moved to the payments team", "span": span(&text1, "Ana moved to the payments team", &rend1)},
+                             {"s": "ex:kai", "p": "schema:status", "o": "\"on leave\"",
+                              "quote": "Kai is on leave", "span": span(&text1, "Kai is on leave", &rend1)}]}),
+        )
+        .await;
+        assert_eq!(r["isError"], false, "{r}");
+        let j = list("needsExtraction=true").await;
+        assert!(
+            !j["sources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|x| x["graph"] == format!("<{g1}>")),
+            "{j}"
+        );
+        let j = list("limit=10").await;
+        let one = j["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["graph"] == format!("<{g1}>"))
+            .cloned()
+            .unwrap();
+        assert_eq!(one["needsExtraction"], false, "{one}");
+        let r = http(&s, "agent-7", "GET", "/mem/sources?bogus=1", None).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+        // A62: the changed file keeps the cited sentence and drops the other
+        let text2 = "# Team\n\nNews first.\n\nAna moved to the payments team this week.\n";
+        let mut b2 = body(&g1, text2);
+        b2["reanchor"] = true.into();
+        let r = http(&s, "agent-7", "POST", "/mem/sources", Some(b2)).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+        let out = r.json();
+        assert_eq!(out["reanchored"], 1, "{out}");
+        assert_eq!(out["retracted"], 1, "{out}");
+        let rend2 = out["rendition"]
+            .as_str()
+            .unwrap()
+            .trim_matches(['<', '>'])
+            .to_string();
+        let (a, e) = char_offset(text2, "Ana moved to the payments team");
+        let cited = rows(
+            &s,
+            None,
+            &format!(
+                "SELECT ?d WHERE {{ GRAPH <{g1}> {{ ?r rdf:reifies <<( ex:ana org:memberOf ex:payments )>> ; prov:wasDerivedFrom ?d FILTER(STRSTARTS(STR(?d), \"{rend2}\")) }} }}"
+            ),
+        );
+        assert_eq!(cited, [[format!("<{rend2}#char={a},{e}>")]]);
+        assert!(
+            rows(
+                &s,
+                None,
+                &format!("ASK {{ GRAPH <{g1}> {{ ex:kai schema:status \"on leave\" }} }}")
+            )
+            .is_empty()
+                || rows(
+                    &s,
+                    None,
+                    &format!("SELECT ?o WHERE {{ GRAPH <{g1}> {{ ex:kai schema:status ?o }} }}")
+                )
+                .is_empty()
+        );
+        // re-anchored citations are not an extraction of the new rendition
+        let j = list("needsExtraction=true").await;
+        assert!(
+            j["sources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|x| x["graph"] == format!("<{g1}>")),
+            "{j}"
+        );
+        // A64: the renamed file takes the facts of the old one
+        let mut b3 = body(&g2, text2);
+        b3["reanchorFrom"] = g1.clone().into();
+        let r = http(&s, "agent-7", "POST", "/mem/sources", Some(b3)).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+        assert_eq!(r.json()["copied"], 1, "{}", r.text());
+        let moved = rows(
+            &s,
+            None,
+            &format!(
+                "SELECT ?d WHERE {{ GRAPH <{g2}> {{ ?r rdf:reifies <<( ex:ana org:memberOf ex:payments )>> ; prov:wasDerivedFrom ?d FILTER(CONTAINS(STR(?d), \"#char=\")) }} }}"
+            ),
+        );
+        assert_eq!(moved.len(), 1, "{moved:?}");
+        // a reader may list but not register
+        let r = http(&s, "reader", "POST", "/mem/sources", Some(body(&g1, "x"))).await;
+        assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+        let r = http(&s, "reader", "GET", "/mem/sources", None).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    }
+
+    fn urlencoding(s: &str) -> String {
+        form_urlencoded::byte_serialize(s.as_bytes()).collect()
+    }
 }
