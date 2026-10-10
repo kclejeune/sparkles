@@ -1,5 +1,5 @@
 # Model settings, runtime credential references and module validation without a VM.
-{ pkgs }:
+{ pkgs, sparkles }:
 let
   evaluate =
     extra:
@@ -13,7 +13,7 @@ let
           boot.isContainer = true;
           services.sparkles = {
             enable = true;
-            package = pkgs.hello;
+            package = sparkles;
           };
         }
         extra
@@ -112,8 +112,11 @@ let
       wrappedSource = wrapped.environment.etc."sparkles/models.json".source;
       command = configured.systemd.services.sparkles.serviceConfig.ExecStart;
       externalCommand = external.systemd.services.sparkles.serviceConfig.ExecStart;
-      triggers = map toString configured.systemd.services.sparkles.restartTriggers;
-      externalTriggers = external.systemd.services.sparkles.restartTriggers;
+      settingsSource = configured.environment.etc."sparkles/settings.json".source;
+      triggers = map toString configured.systemd.services.sparkles.reloadTriggers;
+      externalTriggers = map toString external.systemd.services.sparkles.reloadTriggers;
+      externalSettings = external.environment.etc."sparkles/settings.json".source;
+      reload = configured.systemd.services.sparkles.serviceConfig.ExecReload;
       plainCommand = plain.systemd.services.sparkles.serviceConfig.ExecStart;
     }
   );
@@ -125,6 +128,9 @@ assert failures plain == [ ];
 assert builtins.all (config: failures config != [ ]) invalid;
 assert !(plain.environment.etc ? "sparkles/models.json");
 assert !(external.environment.etc ? "sparkles/models.json");
+# a change of the model settings reloads the server instead of restarting it
+assert configured.systemd.services.sparkles.restartTriggers == [ ];
+assert external.systemd.services.sparkles.restartTriggers == [ ];
 assert plain.systemd.services.sparkles.restartTriggers == [ ];
 pkgs.runCommand "sparkles-models-test" { nativeBuildInputs = [ pkgs.python3 ]; } ''
   python3 - ${fixture} <<'PY'
@@ -136,8 +142,9 @@ pkgs.runCommand "sparkles-models-test" { nativeBuildInputs = [ pkgs.python3 ]; }
   fixture = json.loads(pathlib.Path(sys.argv[1]).read_text())
   assert json.loads(pathlib.Path(fixture["source"]).read_text()) == fixture["settings"]
   assert json.loads(pathlib.Path(fixture["wrappedSource"]).read_text()) == {"models": fixture["settings"]}
-  assert fixture["triggers"] == [fixture["source"]]
-  assert fixture["externalTriggers"] == []
+  assert fixture["triggers"] == [fixture["settingsSource"], fixture["source"]], fixture["triggers"]
+  assert fixture["externalTriggers"] == [fixture["externalSettings"]], fixture["externalTriggers"]
+  assert fixture["reload"].endswith(" $MAINPID"), fixture["reload"]
 
   def values(command, flag):
       args = shlex.split(command)

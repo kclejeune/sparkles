@@ -75,46 +75,41 @@ let
       ".."
     ];
 
-  # Settings do not declare a dataset. Declared persistent datasets may receive
-  # files before their first open; catalog-managed datasets must already exist.
-  datasetSettingFiles = lib.concatLists (
-    lib.mapAttrsToList (
-      name: settings:
-      let
-        declared = builtins.hasAttr name cfg.datasets;
-        directory =
-          if declared then datasetPath name cfg.datasets.${name} else "${cfg.dataDir}/databases/${name}";
-      in
-      lib.concatMap
-        (
-          kind:
-          lib.optional (settings.${kind} != null) {
-            inherit name declared directory;
-            file = "${kind}.json";
-            source = json.generate "sparkles-${name}-${kind}.json" settings.${kind};
-          }
-        )
-        [
-          "assistant"
-          "memory"
-        ]
-    ) cfg.datasetSettings
-  );
-
-  datasetSettingsScript = lib.concatMapStringsSep "\n" (
-    f:
-    let
-      install = "${pkgs.coreutils}/bin/install -m 0600 -- ${f.source} ${lib.escapeShellArg "${f.directory}/${f.file}"}";
-    in
-    if f.declared then
-      install
+  # The settings file of `serve --settings`. The build runs the server's own
+  # `sparkles settings check` on it, with the generated model configuration when there
+  # is one, so a wrong value fails the build. The check reads only these two files.
+  settingsFile = "/etc/sparkles/settings.json";
+  settingsUnchecked = json.generate "sparkles-settings.json" cfg.settings;
+  modelsSource = json.generate "sparkles-models.json" cfg.models.settings;
+  settingsSource =
+    if pkgs.stdenv.buildPlatform.canExecute pkgs.stdenv.hostPlatform then
+      pkgs.runCommand "sparkles-settings.json" { } ''
+        ${lib.getExe cfg.package} settings check ${settingsUnchecked} ${
+          lib.optionalString (cfg.models.settings != null) "--model-config ${modelsSource}"
+        }
+        cp ${settingsUnchecked} $out
+      ''
     else
-      ''
-        if [ -f ${lib.escapeShellArg "${f.directory}/CURRENT"} ]; then
-          ${install}
-        fi
-      ''
-  ) datasetSettingFiles;
+      settingsUnchecked;
+  settingsDatasets =
+    if lib.isAttrs (cfg.settings.datasets or null) then lib.attrNames cfg.settings.datasets else [ ];
+
+  # SIGHUP reloads the settings, the model configuration, the rate limits, the auth and
+  # backup configurations and the TLS certificate. The server catches it once it has
+  # opened its datasets, and before that the signal would stop it. A reload during the
+  # start therefore waits until the main process catches SIGHUP.
+  reloadScript = pkgs.writeShellScript "sparkles-reload" ''
+    pid=$1
+    for _ in $(${pkgs.coreutils}/bin/seq 800); do
+      mask=$(${pkgs.gnused}/bin/sed -n 's/^SigCgt:[[:space:]]*//p' "/proc/$pid/status") || exit 1
+      case $mask in
+        *[13579bdfBDF]) exec ${pkgs.coreutils}/bin/kill -HUP "$pid" ;;
+      esac
+      ${pkgs.coreutils}/bin/sleep 0.1
+    done
+    echo "sparkles: the server does not catch SIGHUP yet, so it was not reloaded" >&2
+    exit 1
+  '';
 
   # the `compaction.auto` options that pass a value, and their flags
   autoCompactFlags = {
@@ -185,6 +180,11 @@ let
   ++ lib.optionals (cfg.auth.configFile != null) [
     "--auth-config"
     cfg.auth.configFile
+  ]
+  # always passed, so that declaring settings later reloads instead of restarting
+  ++ [
+    "--settings"
+    settingsFile
   ]
   ++ lib.optionals (modelConfigFile != null) [
     "--model-config"
@@ -405,53 +405,45 @@ in
       );
     };
 
-    datasetSettings = mkOption {
+    settings = mkOption {
+      type = types.attrsOf json.type;
       default = { };
       example = lib.literalExpression ''
         {
-          slurp.assistant = {
-            enabled = true;
-            ingest = true;
-            send = "documents";
+          defaults = {
+            assistant.enabled = true;
+            locked = [ "assistant.send" ];
           };
-          slurp.memory = {
-            agentGraphs = [ "urn:x-sparkles:import/*" ];
-            imports = { base = "urn:x-sparkles:import/"; extract = "server"; };
+          datasets.slurp = {
+            assistant = { ingest = true; send = "documents"; };
+            memory.agentGraphs = [ "urn:x-sparkles:import/*" ];
           };
         }
       '';
       description = ''
-        Static settings for persistent datasets, keyed by dataset name. This does
-        not create or register datasets. Names in {option}`datasets` use that
-        dataset's directory, including an explicit `path`; other names target
-        UI/API-created datasets in {option}`dataDir`/databases/<name>.
+        Declared dataset settings, in the format of the settings file that the
+        Settings section of `docs/API.md` describes. `defaults` applies to every
+        dataset, `datasets.<name>` to one dataset by name, and a `locked` list in
+        either fixes fields so that they cannot be changed at runtime. The top-level
+        `server.locked` list is accepted for locks of server-wide settings.
 
-        Declared datasets receive their settings before the first server start.
-        UI/API-created datasets receive them on a service start after creation;
-        absent databases are skipped without creating directories. In-memory
-        datasets cannot have file-based settings.
+        The assistant stays off until a setting turns it on, even with
+        {option}`models` configured. `defaults.assistant.enabled = true` turns it on
+        for every dataset, including datasets created later through the API or the
+        UI and in-memory datasets.
 
-        These files replace runtime settings on each service start. Changes restart
-        the service. Removing a declaration stops managing the file but leaves its
-        last contents in place. Values use the JSON objects documented in
-        `docs/API.md`; provider endpoints and credential references belong in
-        {option}`models`, not these settings.
+        A declared value is a default. A dataset admin can change any field that is
+        not locked through the API, the CLI or the UI, and the change is kept across
+        restarts and reloads. This option does not create datasets, and an entry for a
+        name that matches no dataset applies as soon as such a dataset is created.
+
+        The module generates `/etc/sparkles/settings.json` and passes it as
+        `--settings`. A change reloads the service (SIGHUP) instead of restarting it.
+        The build runs `sparkles settings check` on the file, together with the
+        generated {option}`models.settings` when they are set, so a wrong value fails
+        the build. The file must not contain `endpoint` or `apiKey` members, which
+        belong in {option}`models`.
       '';
-      type = types.attrsOf (
-        types.submodule {
-          options = lib.genAttrs [ "assistant" "memory" ] (
-            kind:
-            mkOption {
-              type = types.nullOr (types.attrsOf json.type);
-              default = null;
-              description = ''
-                The dataset's `${kind}.json` object, installed as the service user
-                with mode 0600. `null` leaves the existing runtime file alone.
-              '';
-            }
-          );
-        }
-      );
     };
 
     queryTimeout = mkOption {
@@ -574,7 +566,9 @@ in
           Operator-controlled model providers, role lists and routing settings,
           using the JSON schema in `docs/API.md`, Model providers. The module
           generates `/etc/sparkles/models.json`, passes it as `--model-config`, and
-          restarts the service when it changes. Both the bare object with
+          reloads the service (SIGHUP) when it changes, without a restart. Requests
+          in flight keep the configuration they started with. The build checks
+          {option}`settings` against it. Both the bare object with
           `providers`, `roles` and `routing` and the `models` wrapper are accepted
           by the server. Omitted fields retain the server's defaults.
 
@@ -593,7 +587,8 @@ in
           An existing JSON file passed as `--model-config`, as an alternative to
           {option}`models.settings`. It must be an absolute path readable by the
           service user. The file contains provider endpoints and credential names,
-          not API keys. Changes to a file at the same path require a service restart.
+          not API keys. `systemctl reload sparkles` reads the file again. The build
+          does not check {option}`settings` against this file.
         '';
       };
 
@@ -954,14 +949,8 @@ in
         message = "services.sparkles.datasets: names must match [A-Za-z0-9_.-]+ and must not be `ui`, `.` or `..`.";
       }
       {
-        assertion = lib.all validDatasetName (lib.attrNames cfg.datasetSettings);
-        message = "services.sparkles.datasetSettings: names must match [A-Za-z0-9_.-]+ and must not be `ui`, `.` or `..`.";
-      }
-      {
-        assertion = lib.all (
-          f: !f.declared || cfg.datasets.${f.name}.type == "persistent"
-        ) datasetSettingFiles;
-        message = "services.sparkles.datasetSettings: file-based settings cannot target in-memory datasets.";
+        assertion = lib.all validDatasetName settingsDatasets;
+        message = "services.sparkles.settings.datasets: names must match [A-Za-z0-9_.-]+ and must not be `ui`, `.` or `..`.";
       }
       {
         assertion = cfg.models.settings == null || cfg.models.configFile == null;
@@ -1092,8 +1081,10 @@ in
     };
 
     environment.etc."sparkles/models.json" = mkIf (cfg.models.settings != null) {
-      source = json.generate "sparkles-models.json" cfg.models.settings;
+      source = modelsSource;
     };
+
+    environment.etc."sparkles/settings.json".source = settingsSource;
 
     networking.firewall.allowedTCPPorts = lib.optional cfg.openFirewall cfg.port;
 
@@ -1125,19 +1116,16 @@ in
         }
         // cfg.otel.environment
       );
-      reloadTriggers = lib.optional (
-        rateLimits != null
-      ) config.environment.etc."sparkles/rate-limits.json".source;
-      restartTriggers =
-        map (f: f.source) datasetSettingFiles
-        ++ lib.optional (cfg.models.settings != null) config.environment.etc."sparkles/models.json".source;
-      preStart = mkIf (datasetSettingFiles != [ ]) (lib.mkAfter datasetSettingsScript);
+      # the server reads these files again on SIGHUP, so a change reloads it
+      reloadTriggers = [
+        config.environment.etc."sparkles/settings.json".source
+      ]
+      ++ lib.optional (cfg.models.settings != null) config.environment.etc."sparkles/models.json".source
+      ++ lib.optional (rateLimits != null) config.environment.etc."sparkles/rate-limits.json".source;
       serviceConfig = {
-        # re-reads the rate-limit, auth and backup configurations and the TLS certificate
-        # (without any, SIGHUP would stop the server)
-        ExecReload = mkIf (
-          rateLimits != null || cfg.auth.configFile != null || cfg.backup.configFile != null || tls
-        ) "${pkgs.coreutils}/bin/kill -HUP $MAINPID";
+        # re-reads the settings, the model configuration, the rate-limit, auth and backup
+        # configurations and the TLS certificate
+        ExecReload = "${reloadScript} $MAINPID";
         ExecStart = lib.escapeShellArgs ([ (lib.getExe cfg.package) ] ++ args);
         RuntimeDirectory = mkIf (
           cfg.unixSocket != null && lib.hasPrefix "/run/sparkles/" cfg.unixSocket

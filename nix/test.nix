@@ -4,7 +4,10 @@
 # (node `authed`), it serves HTTP/1.1 and HTTP/2 over TLS, nginx proxies to it over https,
 # and it tells clients behind nginx apart for the failed-login budget. The automatic
 # compaction and clone options reach the server: a policy on one node, compaction turned
-# off on the other.
+# off on the other. The declared settings apply to declared, in-memory and later
+# datasets, runtime changes survive a reload and a restart, locks and declared datasets
+# are refused at runtime, and a switch to other settings and model roles reloads the
+# server without restarting it.
 { self }:
 {
   name = "sparkles";
@@ -20,25 +23,24 @@
           archive.path = "/srv/sparkles-archive";
           scratch.type = "mem";
         };
-        datasetSettings = {
-          demo = {
-            assistant = {
-              enabled = true;
-              ingest = true;
-              send = "documents";
-            };
-            memory = {
-              agentGraphs = [ "urn:x-sparkles:import/*" ];
-            };
+        # the assistant on for every dataset with `send` locked, and entries by name for
+        # a declared dataset, an in-memory one and one that the API creates later
+        settings = {
+          defaults = {
+            assistant.enabled = true;
+            locked = [ "assistant.send" ];
           };
-          archive.assistant = {
-            enabled = true;
-            send = "rows";
-          };
-          later.assistant = {
-            enabled = true;
-            ingest = true;
-            send = "documents";
+          datasets = {
+            demo = {
+              assistant = {
+                ingest = true;
+                send = "documents";
+                historyDays = 30;
+              };
+              memory.agentGraphs = [ "urn:x-sparkles:import/*" ];
+            };
+            scratch.assistant.historyDays = 3;
+            later.assistant.historyDays = 14;
           };
         };
         models = {
@@ -108,6 +110,18 @@
       networking.hosts."127.0.0.1" = [ "sparkles.test" ];
       # commits keep --min-free-disk-mb (1 GiB) free on the data disk
       virtualisation.diskSize = 3072;
+
+      # a change of the declared settings and of the model settings, which a switch to
+      # this configuration applies with a reload
+      specialisation.changed.configuration = {
+        services.sparkles.settings.datasets.archive.assistant.historyDays = 9;
+        services.sparkles.models.settings.roles.summarize = [
+          {
+            provider = "gateway";
+            model = "gpt-5-mini";
+          }
+        ];
+      };
     };
 
   # the same behind nginx, with authentication and native TLS (the test certificate of the
@@ -200,22 +214,68 @@
     machine.succeed("truncate -s 0 /var/lib/sparkles/test-model-key")
     models = json.loads(machine.succeed(f"curl -sf {base}/\\$/models"))
     assert next(p for p in models["providers"] if p["name"] == "claude")["status"] == "secret-missing", models
-    # Declared datasets receive settings before their first open. A settings-only
-    # declaration must not block subsequent creation through the catalog API.
-    assistant = json.loads(machine.succeed(f"curl -sf {base}/\\$/assistant/demo"))
-    assert assistant["enabled"] and assistant["ingest"] and assistant["send"] == "documents", assistant
-    memory = json.loads(machine.succeed(f"curl -sf {base}/\\$/memory/demo"))
-    assert memory["agentGraphs"] == ["urn:x-sparkles:import/*"], memory
-    assistant = json.loads(machine.succeed(f"curl -sf {base}/\\$/assistant/archive"))
-    assert assistant["enabled"] and assistant["send"] == "rows", assistant
+    # the declared settings: `defaults` for every dataset, an entry by name, a lock
+    def kind(ds, k="assistant"):
+        return json.loads(machine.succeed(f"curl -sf {base}/\\$/settings/{ds}/{k}"))
+
+    def request(method, url, body=None):
+        data = f"-H 'Content-Type: application/json' -d '{json.dumps(body)}'" if body is not None else ""
+        out = machine.succeed(f"curl -s -X {method} -w '\\n%{{http_code}}' {data} '{url}'")
+        text, code = out.rsplit("\n", 1)
+        return int(code), (json.loads(text) if text.strip() else None)
+
+    a = kind("demo")
+    assert a["effective"]["enabled"] and a["effective"]["ingest"], a
+    assert a["effective"]["send"] == "documents" and a["effective"]["historyDays"] == 30, a
+    assert a["sources"]["enabled"] == "declared" and a["sources"]["historyDays"] == "declared", a
+    assert a["sources"]["send"] == "locked" and a["locked"] == ["send"], a
+    m = kind("demo", "memory")
+    assert m["effective"]["agentGraphs"] == ["urn:x-sparkles:import/*"], m
+    assert m["sources"]["agentGraphs"] == "declared", m
+    # the legacy route answers the effective object
+    legacy = json.loads(machine.succeed(f"curl -sf {base}/\\$/assistant/demo"))
+    assert legacy["enabled"] and legacy["send"] == "documents", legacy
+    # a dataset without an entry gets the defaults, with `send` locked at its default
+    a = kind("archive")
+    assert a["effective"]["enabled"] and a["sources"]["enabled"] == "declared", a
+    assert a["effective"]["send"] == "schema" and a["sources"]["send"] == "locked", a
+    # an in-memory dataset gets its declared values too (A5)
+    a = kind("scratch")
+    assert a["effective"]["historyDays"] == 3 and a["sources"]["historyDays"] == "declared", a
+    assert a["effective"]["enabled"] and a["sources"]["enabled"] == "declared", a
+    # a dataset that the API creates after the start gets its entry without a restart (A1)
     machine.succeed("test ! -e /var/lib/sparkles/databases/later")
     post_json(machine, f"{base}/\\$/datasets", {"dbName": "later", "dbType": "persistent"})
-    assistant = json.loads(machine.succeed(f"curl -sf {base}/\\$/assistant/later"))
-    assert not assistant["enabled"], assistant
-    machine.succeed(
-        f"curl -sf -X PUT {base}/\\$/assistant/demo -H 'Content-Type: application/json' "
-        + "-d '{\"enabled\":false}'"
-    )
+    a = kind("later")
+    assert a["effective"]["historyDays"] == 14 and a["sources"]["historyDays"] == "declared", a
+    assert a["effective"]["enabled"] and a["sources"]["enabled"] == "declared", a
+    # the module writes nothing into the dataset directories
+    machine.succeed("test ! -e /var/lib/sparkles/declarative/demo/assistant.json")
+    machine.succeed("test ! -e /var/lib/sparkles/databases/later/assistant.json")
+
+    # a runtime change overrides a declared value (A2), and a locked field is refused
+    code, body = request("PATCH", f"{base}/$/settings/demo/assistant", {"historyDays": 7})
+    assert code == 200, (code, body)
+    code, body = request("PATCH", f"{base}/$/settings/demo/assistant", {"send": "rows"})
+    assert code == 409 and body["code"] == "locked-by-config", (code, body)
+    code, body = request("PATCH", f"{base}/$/settings/later/assistant", {"send": "rows"})
+    assert code == 409 and body["code"] == "locked-by-config", (code, body)
+    code, body = request("PATCH", f"{base}/$/settings/later/assistant", {"enabled": False})
+    assert code == 200, (code, body)
+    a = kind("demo")
+    assert a["effective"]["historyDays"] == 7 and a["sources"]["historyDays"] == "runtime", a
+    # the operator's datasets cannot be deleted through the API (A9)
+    code, body = request("DELETE", f"{base}/$/datasets/demo")
+    assert code == 409 and body["code"] == "declared-dataset", (code, body)
+    code, body = request("DELETE", f"{base}/$/datasets/scratch")
+    assert code == 409 and body["code"] == "declared-dataset", (code, body)
+    # the runtime values survive a reload
+    pid = machine.succeed("systemctl show -p MainPID --value sparkles.service").strip()
+    machine.succeed("systemctl reload sparkles.service")
+    assert machine.succeed("systemctl show -p MainPID --value sparkles.service").strip() == pid
+    a = kind("demo")
+    assert a["effective"]["historyDays"] == 7 and a["sources"]["historyDays"] == "runtime", a
+    assert not kind("later")["effective"]["enabled"]
     machine.succeed(f"curl -sf {base}/\\$/ping")
     # a name the server is not known by (a DNS-rebinding page) is refused
     code = machine.succeed(
@@ -247,12 +307,22 @@
     # persistent data survives a restart, the in-memory dataset does not
     machine.succeed(f"curl -sf {base}/scratch/update --data-urlencode 'update=INSERT DATA {{ <urn:m> <urn:p> 1 }}'")
     machine.systemctl("restart sparkles.service")
+    # a reload during the start waits for the server instead of stopping it
+    pid = machine.succeed("systemctl show -p MainPID --value sparkles.service").strip()
+    machine.succeed("systemctl reload sparkles.service")
     machine.wait_for_open_port(3030)
-    for name in ["demo", "later"]:
-        assistant = json.loads(machine.succeed(f"curl -sf {base}/\\$/assistant/{name}"))
-        assert assistant["enabled"] and assistant["ingest"] and assistant["send"] == "documents", assistant
-    machine.succeed("test $(stat -c %a /var/lib/sparkles/databases/later/assistant.json) = 600")
-    machine.succeed("test $(stat -c %U /var/lib/sparkles/databases/later/assistant.json) = sparkles")
+    assert machine.succeed("systemctl show -p MainPID --value sparkles.service").strip() == pid
+    # the runtime values survive a restart, and clearing one brings the declared value back
+    a = kind("demo")
+    assert a["effective"]["historyDays"] == 7 and a["sources"]["historyDays"] == "runtime", a
+    a = kind("later")
+    assert not a["effective"]["enabled"] and a["sources"]["enabled"] == "runtime", a
+    code, body = request("DELETE", f"{base}/$/settings/demo/assistant?field=historyDays")
+    assert code == 200, (code, body)
+    a = kind("demo")
+    assert a["effective"]["historyDays"] == 30 and a["sources"]["historyDays"] == "declared", a
+    # the in-memory dataset starts with its declared values again
+    assert kind("scratch")["effective"]["historyDays"] == 3
     out = machine.succeed(
         f"curl -sf {base}/demo/sparql -H 'Accept: text/csv' --data-urlencode "
         + "'query=SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }'"
@@ -263,6 +333,33 @@
         + "'query=SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }'"
     )
     assert last_value(out) == "0", out
+
+    # a switch to a configuration with other settings and model roles reloads the
+    # server without a restart (A10), and keeps the runtime values
+    pid = machine.succeed("systemctl show -p MainPID --value sparkles.service").strip()
+    assert kind("archive")["effective"].get("historyDays") in (None, 30)
+    roles = json.loads(machine.succeed(f"curl -sf {base}/\\$/models"))["roles"]
+    assert roles.get("summarize") in (None, []), roles
+    out = machine.succeed(
+        "/run/current-system/specialisation/changed/bin/switch-to-configuration test 2>&1"
+    )
+    def units(verb):
+        return [
+            line for line in out.splitlines()
+            if line.startswith(f"{verb} the following units:") and "sparkles.service" in line
+        ]
+
+    assert units("reloading"), out
+    assert not units("restarting") and not units("stopping"), out
+    machine.wait_until_succeeds(
+        f"curl -sf {base}/\\$/settings/archive/assistant | grep -q '\"historyDays\":9'"
+    )
+    assert machine.succeed("systemctl show -p MainPID --value sparkles.service").strip() == pid
+    a = kind("archive")
+    assert a["sources"]["historyDays"] == "declared", a
+    models = json.loads(machine.succeed(f"curl -sf {base}/\\$/models"))
+    assert models["roles"]["summarize"][0]["provider"] == "gateway", models
+    assert not kind("later")["effective"]["enabled"]
 
     # a backup into the fs repository of the backup config, restored as a new dataset
     repos = json.loads(machine.succeed(f"curl -sf {base}/\\$/repositories"))
