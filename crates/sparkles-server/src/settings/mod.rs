@@ -18,6 +18,8 @@
 
 pub mod http;
 pub mod merge;
+#[cfg(test)]
+mod prefix_tests;
 pub mod prefixes;
 pub mod secrets;
 pub mod server;
