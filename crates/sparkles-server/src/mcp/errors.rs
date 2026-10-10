@@ -18,6 +18,9 @@ pub struct ToolError {
     pub hint: Option<String>,
     /// the exceeded budget (`memory`, `rows`)
     pub budget: Option<&'static str>,
+    /// details of the failure, such as every failed check of `assert_facts`: sent as
+    /// JSON after the message and in `_meta`
+    pub data: Option<Value>,
 }
 
 impl ToolError {
@@ -28,7 +31,13 @@ impl ToolError {
             message: message.into(),
             hint: None,
             budget: None,
+            data: None,
         }
+    }
+
+    pub fn data(mut self, data: Value) -> ToolError {
+        self.data = Some(data);
+        self
     }
 
     pub fn hint(mut self, hint: impl Into<String>) -> ToolError {
@@ -48,19 +57,27 @@ impl ToolError {
         )
     }
 
-    /// `"<message>\nHint: <hint>"`
+    /// `"<message>\nHint: <hint>"`, then the data as compact JSON on a line of its own
     pub fn text(&self) -> String {
-        match &self.hint {
+        let mut t = match &self.hint {
             Some(h) => format!("{}\nHint: {h}", self.message),
             None => self.message.clone(),
+        };
+        if let Some(d) = &self.data {
+            t.push('\n');
+            t.push_str(&d.to_string());
         }
+        t
     }
 
-    /// `{code, status, budget?}`
+    /// `{code, status, budget?, data?}`
     pub fn meta(&self) -> Value {
         let mut m = json!({ "code": self.code, "status": self.status });
         if let Some(b) = self.budget {
             m["budget"] = b.into();
+        }
+        if let Some(d) = &self.data {
+            m["data"] = d.clone();
         }
         m
     }
@@ -159,6 +176,8 @@ impl ErrorContext<'_> {
             Error::HistoryGone(g) => ToolError::new("unknown-commit", 410, g.message.clone())
                 .hint("the dataset no longer keeps that state; see list_commits"),
             Error::HistoryUnsupported(m) => ToolError::new("unknown-commit", 410, m),
+            // the branch API's errors keep their codes (`no-such-branch`, `head-moved`, …)
+            Error::Branch(b) => ToolError::new(b.code, b.status(), b.message.clone()),
             Error::Cancelled => ToolError::new("internal", 500, "call cancelled: server shutting down"),
             e => {
                 tracing::error!(request_id = self.request_id, "MCP tool call failed: {e}");

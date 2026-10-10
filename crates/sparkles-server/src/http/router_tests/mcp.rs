@@ -526,8 +526,7 @@ async fn a27_update_is_opt_in() {
     let s = open(&["--mcp-allow-update"], false);
     let r = modern(&s.app, "tools/list", json!({}), &[]).await;
     let tools = r.rpc()["result"]["tools"].as_array().unwrap().clone();
-    let last = tools.last().unwrap();
-    assert_eq!(last["name"], "sparql_update");
+    let last = tools.iter().find(|t| t["name"] == "sparql_update").unwrap();
     assert_eq!(last["annotations"]["destructiveHint"], true);
     assert_eq!(last["annotations"]["readOnlyHint"], false);
     let r = tool(

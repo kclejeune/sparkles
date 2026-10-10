@@ -25,7 +25,13 @@ static MERGES: std::sync::LazyLock<
     parking_lot::Mutex<std::collections::BTreeMap<String, MergeCounts>>,
 > = std::sync::LazyLock::new(Default::default);
 
-fn count_merge(st: &AppState, ds: &str, result: &'static str, r: Option<&MergeReport>, secs: f64) {
+pub(crate) fn count_merge(
+    st: &AppState,
+    ds: &str,
+    result: &'static str,
+    r: Option<&MergeReport>,
+    secs: f64,
+) {
     let mut m = MERGES.lock();
     let c = m.entry(st.metrics.dataset_label(Some(ds))).or_default();
     *c.results.entry(result).or_default() += 1;
@@ -535,6 +541,7 @@ pub(crate) fn branch_json(b: &BranchInfo) -> J {
             "generation": b.storage.generation,
         },
         "broken": b.broken,
+        "scratch": b.scratch.as_ref().map(|s| json!({ "creator": s.creator })),
     })
 }
 
@@ -1007,7 +1014,7 @@ fn merge_options(st: &AppState, v: &J, preview: bool) -> ApiResult<MergeAsk> {
     })
 }
 
-fn merge_json(r: &MergeReport, stale: Option<bool>) -> J {
+pub(crate) fn merge_json(r: &MergeReport, stale: Option<bool>) -> J {
     let side = |c: &NamedCommitRef| json!({ "branch": c.branch, "seq": c.seq });
     let commit = r.commit.as_ref().filter(|rc| rc.committed).map(|rc| {
         let mut j = json!(sparkles::commit::AnnotatedCommit {
@@ -1489,7 +1496,7 @@ fn start_task(
 }
 
 /// Count a merge's outcome in the merge metrics.
-fn count_outcome(st: &AppState, name: &str, out: &MergeOutcome, secs: f64) {
+pub(crate) fn count_outcome(st: &AppState, name: &str, out: &MergeOutcome, secs: f64) {
     match out {
         MergeOutcome::Conflicts(c) => {
             let mut m = MERGES.lock();

@@ -43,7 +43,7 @@ struct CheckArgs {
 
 /// How a literal meets the objects of a predicate.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Meet {
+pub(super) enum Meet {
     /// as the object of a triple pattern: term equality
     Pattern,
     /// compared in a FILTER: value comparison
@@ -196,7 +196,7 @@ fn dedup(v: &mut Vec<NamedNode>) {
 }
 
 /// One suggested term.
-struct Suggestion {
+pub(super) struct Suggestion {
     iri: String,
     label: Option<String>,
     count: u64,
@@ -204,7 +204,7 @@ struct Suggestion {
 }
 
 impl Suggestion {
-    fn json(&self, terms: &mut Terms) -> Value {
+    pub(super) fn json(&self, terms: &mut Terms) -> Value {
         let mut s = json!({ "term": terms.iri(&self.iri), "count": self.count, "why": self.why });
         if let Some(l) = &self.label {
             s["label"] = l.clone().into();
@@ -216,7 +216,7 @@ impl Suggestion {
 /// The candidates that resemble `unknown`, best first: the same local name in another
 /// namespace, then a small edit distance between the local names' words, then a label
 /// whose words hold the local name's words. Ties go to the most used.
-fn suggestions<'a>(
+pub(super) fn suggestions<'a>(
     unknown: &str,
     candidates: impl Iterator<Item = (&'a str, &'a [sparkles::schema::Lit], u64)>,
     max: usize,
@@ -337,13 +337,13 @@ fn locate(query: &str, iri: &str, prefixes: &BTreeMap<String, String>) -> Option
 }
 
 /// An issue of the result.
-struct Issue {
-    code: &'static str,
-    error: bool,
-    message: String,
-    term: Option<String>,
-    at: Option<(usize, usize)>,
-    suggestions: Vec<Value>,
+pub(super) struct Issue {
+    pub code: &'static str,
+    pub error: bool,
+    pub message: String,
+    pub term: Option<String>,
+    pub at: Option<(usize, usize)>,
+    pub suggestions: Vec<Value>,
 }
 
 impl Issue {
@@ -817,14 +817,20 @@ fn projection(p: &GraphPattern) -> Option<(&[spargebra::term::Variable], &GraphP
     }
 }
 
-fn predicate<'r>(rep: &'r SchemaReport, iri: &str) -> Option<&'r sparkles::schema::PredicateEntry> {
+pub(super) fn predicate<'r>(
+    rep: &'r SchemaReport,
+    iri: &str,
+) -> Option<&'r sparkles::schema::PredicateEntry> {
     rep.predicates
         .binary_search_by(|e| e.iri.as_str().cmp(iri))
         .ok()
         .map(|i| &rep.predicates[i])
 }
 
-fn class<'r>(rep: &'r SchemaReport, iri: &str) -> Option<&'r sparkles::schema::ClassEntry> {
+pub(super) fn class<'r>(
+    rep: &'r SchemaReport,
+    iri: &str,
+) -> Option<&'r sparkles::schema::ClassEntry> {
     rep.classes
         .binary_search_by(|e| e.iri.as_str().cmp(iri))
         .ok()
@@ -832,7 +838,7 @@ fn class<'r>(rep: &'r SchemaReport, iri: &str) -> Option<&'r sparkles::schema::C
 }
 
 /// Whether `?pp` has a triple in the view, or is declared a property there.
-fn exists_predicate(r: &Reader) -> String {
+pub(super) fn exists_predicate(r: &Reader) -> String {
     format!(
         "ASK {{ {{ {} }} UNION {{ {} VALUES ?k {{ <http://www.w3.org/1999/02/22-rdf-syntax-ns#Property> <http://www.w3.org/2002/07/owl#ObjectProperty> <http://www.w3.org/2002/07/owl#DatatypeProperty> <http://www.w3.org/2002/07/owl#AnnotationProperty> }} }} }}",
         r.quads("?s ?pp ?o", &[]),
@@ -841,7 +847,7 @@ fn exists_predicate(r: &Reader) -> String {
 }
 
 /// Whether `?c` has an instance in the view, or is declared a class there.
-fn exists_class(r: &Reader) -> String {
+pub(super) fn exists_class(r: &Reader) -> String {
     format!(
         "ASK {{ {{ {} }} UNION {{ {} VALUES ?k {{ <http://www.w3.org/2000/01/rdf-schema#Class> <http://www.w3.org/2002/07/owl#Class> }} }} }}",
         r.quads("?s a ?c", &[]),
@@ -852,7 +858,7 @@ fn exists_class(r: &Reader) -> String {
 /// A literal that cannot match the objects of `p`: a simple literal where every object
 /// has a language tag (`language-tag`), or a datatype none of the objects has
 /// (`datatype-mismatch`; in a FILTER, numbers compare with numbers of any type).
-fn literal_issue(
+pub(super) fn literal_issue(
     p: &NamedNode,
     l: &Literal,
     meet: Meet,

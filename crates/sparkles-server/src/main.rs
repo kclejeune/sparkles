@@ -283,7 +283,7 @@ enum SnapshotCmd {
 }
 
 /// `90s`, `30m`, `12h`, `7d`, `2w`, or plain seconds, to milliseconds.
-fn parse_duration_ms(s: &str) -> Result<u64> {
+pub(crate) fn parse_duration_ms(s: &str) -> Result<u64> {
     let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
     let (num, unit) = s.split_at(split);
     let n: u64 = num
@@ -2659,6 +2659,13 @@ fn run() -> Result<()> {
                 // pin expiry, scheduled pins, and history that ages out of the window
                 if !st.read_only {
                     http::history::spawn_tick(st.clone(), Duration::from_secs(60));
+                }
+                // expiry of the scratch branches that MCP agents leave behind
+                #[cfg(feature = "mcp")]
+                if !st.read_only
+                    && let Some(ttl) = st.mcp.as_ref().and_then(|m| m.cfg.scratch_ttl)
+                {
+                    mcp::branches::spawn_expiry(st.clone(), ttl);
                 }
                 if let Some(rl) = &st.rate_limit {
                     ratelimit::spawn_sweeper(rl.clone(), Duration::from_secs(60));

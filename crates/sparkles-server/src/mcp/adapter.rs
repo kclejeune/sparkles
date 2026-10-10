@@ -122,6 +122,11 @@ impl Adapter {
                     .open_world(t.open_world);
                 if t.destructive {
                     a = a.destructive(true).idempotent(false);
+                } else if !t.read_only {
+                    // writes that lose no record: assert_facts, create_branch
+                    a = a
+                        .destructive(false)
+                        .idempotent(super::branches::IDEMPOTENT.contains(&t.name));
                 }
                 tool.annotations = Some(a);
                 tool

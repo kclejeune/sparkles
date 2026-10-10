@@ -549,9 +549,23 @@ async fn a03_tool_list() {
             "validate_shex",
             #[cfg(feature = "fmt")]
             "format",
+            "list_branches",
         ]
     );
-    let expected = expected_input_schemas();
+    let mut expected = expected_input_schemas();
+    // every tool that reads a dataset also takes `branch` (C17 §5.7)
+    let br = json!({"type":"string","pattern":"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$","description":"Work on this branch of the dataset instead of main (see list_branches). Your grants apply on the branch as they do on main."});
+    for (_, schema) in &mut expected {
+        if let Some(props) = schema["properties"].as_object_mut()
+            && props.contains_key("dataset")
+        {
+            props.insert("branch".into(), br.clone());
+        }
+    }
+    expected.push((
+        "list_branches",
+        json!({"type":"object","additionalProperties":false,"properties":{"dataset": expected[1].1["properties"]["dataset"].clone()}}),
+    ));
     assert_eq!(expected.len(), tools.len());
     for ((name, schema), tool) in expected.into_iter().zip(tools) {
         assert_eq!(tool["name"], name);

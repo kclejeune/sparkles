@@ -32,10 +32,20 @@ pub fn run(
     args: Map<String, Value>,
     call: &Call,
 ) -> Result<Outcome, ToolError> {
+    // `branch` (C17 Phase 1c): the call runs on that branch, with the caller's grants
+    // checked there
+    let mut args = args;
+    let on_branch = super::branches::branch_call(server, name, &mut args, call)?;
+    let call = on_branch.as_ref().unwrap_or(call);
     let t = Tools { server, call };
     if call.cancel.load(Ordering::Relaxed) {
         return Err(t.ctx(&[], 0.0).engine(Error::Cancelled));
     }
+    let out = dispatch(&t, name, args);
+    super::branches::name_branch(out, call)
+}
+
+fn dispatch(t: &Tools, name: &str, args: Map<String, Value>) -> Result<Outcome, ToolError> {
     match name {
         "list_datasets" => t.list_datasets(args),
         "describe_schema" => t.describe_schema(args),
@@ -63,6 +73,11 @@ pub fn run(
         "link_entities" => t.link_entities(args),
         "recall" => t.recall(args),
         "sparql_update" => t.sparql_update(args),
+        "assert_facts" => t.assert_facts(args),
+        "list_branches" => t.list_branches(args),
+        "create_branch" => t.create_branch(args),
+        "merge_branch" => t.merge_branch(args),
+        "delete_branch" => t.delete_branch(args),
         // a stored query of a dataset (`<dataset>__<query>`)
         name => t.stored_query(name, args),
     }
@@ -428,7 +443,7 @@ impl Tools<'_> {
 
     /// The dataset the call names, among those its principal may read.
     pub(super) fn dataset(&self, name: Option<&str>) -> Result<Arc<Dataset>, ToolError> {
-        self.server.dataset(&self.call.principal, name)
+        self.server.dataset_on_branch(&self.call.principal, name)
     }
 
     /// The snapshot a call reads: the state `atCommit` or `at` selects (see

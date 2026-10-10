@@ -13,6 +13,7 @@
 //! reads more than its caps (C17 §7) allow, and every query runs under the call's
 //! deadline, memory budget and row limit.
 
+mod assert;
 mod check;
 mod link;
 mod recall;
@@ -261,4 +262,9 @@ impl Tools<'_> {
         )
         .map(Some)
     }
+}
+
+/// The definition of `assert_facts`.
+pub(crate) fn assert_tool(cfg: &super::McpConfig) -> [super::schemas::ToolDef; 1] {
+    assert::tool_def(cfg)
 }

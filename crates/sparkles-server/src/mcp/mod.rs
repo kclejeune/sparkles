@@ -10,6 +10,7 @@
 //! off unless allowed, and the default tool set cannot write.
 
 mod adapter;
+pub(crate) mod branches;
 #[cfg(feature = "auth")]
 mod bridge;
 mod complete;
@@ -173,6 +174,8 @@ pub struct McpConfig {
     /// how long a tool call of a client that supports tasks may run before it becomes a
     /// task that the client polls
     pub task_after: Duration,
+    /// delete scratch branches idle for longer than this (`None`: never)
+    pub scratch_ttl: Option<Duration>,
 }
 
 impl Default for McpConfig {
@@ -190,6 +193,7 @@ impl Default for McpConfig {
             stored_queries: true,
             watch_interval: Duration::from_secs(2),
             task_after: Duration::from_secs(2),
+            scratch_ttl: None,
         }
     }
 }
@@ -274,8 +278,8 @@ impl McpServer {
         let tools = schemas::tools(&cfg)
             .into_iter()
             .filter(|t| !cfg.disabled.contains(t.name))
-            // a read-only server never offers the write tool
-            .filter(|t| !(read_only && t.name == "sparql_update"))
+            // a read-only server never offers the write tools
+            .filter(|t| !(read_only && branches::WRITE_TOOLS.contains(&t.name)))
             .collect();
         McpServer {
             state,
@@ -313,12 +317,25 @@ impl McpServer {
                 .any(|ds| p.can(&ds.name, Level::Write))
     }
 
+    /// Whether `p` may write to some branch of a dataset it can see, which the other
+    /// write tools (`assert_facts` and the branch tools) need to be listed.
+    pub fn may_write_somewhere(&self, p: &Principal) -> bool {
+        self.state.datasets().values().any(|ds| {
+            self.exposed(&ds.name)
+                && p.level_any_branch(&ds.name)
+                    .is_some_and(|l| l >= Level::Write)
+        })
+    }
+
     /// Whether `p` may call the offered tool `name`: the write tool needs a dataset
     /// `p` may write to, and `graphql_query` one with a GraphQL schema that `p` may
     /// query. Tool listings leave out the others.
     pub fn allows(&self, p: &Principal, name: &str) -> bool {
         match name {
             "sparql_update" => self.may_update(p),
+            n if branches::WRITE_TOOLS.contains(&n) => {
+                self.offers(n) && self.may_write_somewhere(p)
+            }
             #[cfg(feature = "graphql")]
             "graphql_query" => self.graphql_available(p),
             _ => true,
@@ -366,7 +383,7 @@ impl McpServer {
     /// Whether `p` may call the tool `name`: an offered tool (the write tool checks for
     /// itself which datasets `p` may write to) or one of its stored queries.
     pub fn known(&self, p: &Principal, name: &str) -> bool {
-        (self.offers(name) && (name == "sparql_update" || self.allows(p, name)))
+        (self.offers(name) && (branches::WRITE_TOOLS.contains(&name) || self.allows(p, name)))
             || self.stored_tool(p, name).is_some()
     }
 

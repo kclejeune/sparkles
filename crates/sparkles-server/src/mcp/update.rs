@@ -46,7 +46,7 @@ struct UpdateArgs {
 /// `ifHead`: the write goes ahead only while commit `expected` is the dataset's head.
 /// The store checks it with the writer lock held, so that no other commit can come
 /// between the check and the write, as for an HTTP `If-Match`.
-fn if_head(expected: u64) -> Precondition {
+pub(super) fn if_head(expected: u64) -> Precondition {
     Precondition::new(move |head: &Snapshot| {
         if head.commit == expected {
             Ok(())
@@ -298,7 +298,7 @@ impl Tools<'_> {
 
     /// The commit message: the `message` argument, else the HTTP request's
     /// `Sparkles-Commit-Message` header, checked like the HTTP API's.
-    fn commit_message(&self, arg: Option<&str>) -> Result<Option<Arc<str>>, ToolError> {
+    pub(super) fn commit_message(&self, arg: Option<&str>) -> Result<Option<Arc<str>>, ToolError> {
         match arg {
             Some(m) => sparkles::annotations::validate_message(m)
                 .map_err(|e| ToolError::bad_argument(format!("message: {e}"))),
@@ -314,7 +314,7 @@ impl Tools<'_> {
 /// `changes` changed quads as rendered terms, and the checks the write would meet. A
 /// rejected or refused update is a result here, not a tool error, so that an agent can
 /// read the findings and revise the update.
-fn preview_json(
+pub(super) fn preview_json(
     dataset: &str,
     p: &sparkles::preview::Preview,
     prefixes: &Prefixes,

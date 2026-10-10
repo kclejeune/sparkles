@@ -37,6 +37,7 @@ pub fn all_tools() -> Vec<&'static str> {
         v.push("graphql_query");
     }
     v.push("sparql_update");
+    v.extend(super::branches::TOOLS_AFTER_UPDATE);
     v
 }
 
@@ -52,7 +53,7 @@ pub struct ToolDef {
     pub destructive: bool,
 }
 
-fn ds() -> Value {
+pub(super) fn ds() -> Value {
     json!({"type":"string","pattern":"^[A-Za-z0-9_.-]+$","description":"Dataset name from list_datasets. Optional when there is exactly one dataset."})
 }
 
@@ -65,12 +66,12 @@ pub(super) fn at_sel() -> Value {
     json!({"type":["integer","string"],"description":"Read a past state of the dataset: a commit number, `commit:N`, `time:<RFC 3339>` (the last commit at or before that instant), `snapshot:<name>` (a named snapshot) or `head`. The dataset must still keep that state (see list_commits). Not with atCommit."})
 }
 
-fn rs() -> Value {
+pub(super) fn rs() -> Value {
     json!({"type":"boolean","description":"Include materialized inferences (default: true when the dataset has them)."})
 }
 
 /// `timeoutSeconds`, with the server's maximum inlined.
-fn to(cfg: &McpConfig) -> Value {
+pub(super) fn to(cfg: &McpConfig) -> Value {
     json!({"type":"number","exclusiveMinimum":0,"maximum":cfg.max_timeout_secs(),"default":cfg.default_timeout_secs()})
 }
 
@@ -79,7 +80,7 @@ fn nullable(ty: &str) -> Value {
     json!({ "type": [ty, "null"] })
 }
 
-fn strings() -> Value {
+pub(super) fn strings() -> Value {
     json!({"type":"array","items":{"type":"string"}})
 }
 
@@ -93,7 +94,7 @@ fn max_results(cfg: &McpConfig) -> Value {
     json!({"type":"integer","minimum":1,"maximum":cfg.max_rows,"default":20.min(cfg.max_rows)})
 }
 
-fn prefixes() -> Value {
+pub(super) fn prefixes() -> Value {
     json!({"type":"object","additionalProperties":{"type":"string"},"description":"The dataset prefixes used in this result"})
 }
 
@@ -645,7 +646,10 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
         },
     ]
     .into_iter()
+    .chain(super::memory::assert_tool(cfg))
+    .chain(super::branches::tool_defs(cfg))
     .filter(|t| all_tools().contains(&t.name))
-    .filter(|t| t.name != "sparql_update" || cfg.allow_update)
+    .filter(|t| !super::branches::WRITE_TOOLS.contains(&t.name) || cfg.allow_update)
+    .map(super::branches::with_branch_argument)
     .collect()
 }

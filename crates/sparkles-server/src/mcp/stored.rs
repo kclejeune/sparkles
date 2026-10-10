@@ -140,6 +140,9 @@ impl StoredTool {
             // a parameter of the same name wins
             props.entry(k.to_string()).or_insert(v);
         }
+        if !props.contains_key("branch") {
+            super::branches::stored_branch_property(&mut props);
+        }
         let mut s = json!({"type":"object","additionalProperties":false,"properties":props});
         if !required.is_empty() {
             s["required"] = Value::Array(required);
