@@ -56,8 +56,9 @@ on top of the second:
   dataset, graph and triple, stored queries, GraphQL, Prometheus metrics, an OpenAPI
   description, a Docker image and a NixOS module.
 * **Agents.** An MCP server whose tools run with the caller's grants, an Ask bar that
-  drafts, checks and runs a query from a question in plain language, and agent memory
-  stored as reviewable graphs.
+  drafts, checks and runs a query from a question in plain language, ingestion that
+  turns Markdown, HTML and PDF documents into cited facts on a review branch, and agent
+  memory stored as reviewable graphs.
 * **Tooling.** A `sparkles` CLI with equivalents of Jena's `tdb2.*`, `arq` and file
   tools, a formatter and linter for SPARQL and RDF, and a language server for editors.
 

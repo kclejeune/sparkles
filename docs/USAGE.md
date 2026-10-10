@@ -2458,6 +2458,67 @@ linking accuracy, the duplicate rate and the span failures of
 `scripts/eval-ingest --self-test` runs it against a local server with a scripted agent
 and needs no model.
 
+### Ingesting documents in the server
+
+The server can ingest a document without an agent when it has a model for the
+`extract` role. Start it with a model configuration whose `roles` list `extract`, and
+enable ingestion in the dataset's assistant settings with `"ingest": true` and
+`"send": "documents"`, so that the document's text may go to the provider. The section
+[Asking questions with a model](#asking-questions-with-a-model) describes both files.
+
+```bash
+sparkles serve --loc org=/data/org --model-config models.json \
+  --model-secret anthropic=env:ANTHROPIC_API_KEY
+curl -X PUT -H 'Content-Type: application/json' \
+  -d '{"enabled": true, "ingest": true, "send": "documents"}' \
+  http://localhost:3030/$/assistant/org
+curl -F file=@standup.md http://localhost:3030/$/ingest/org
+```
+
+The last request answers with a task. `GET /$/ingest/org/{task}?wait=30` waits for it
+and reports its status, the model calls it made and their estimated cost, and in the
+end the review branch, such as `ingest.standup-1`, with the number of facts proposed and
+of entities linked and created. The review page of that branch shows each fact next to
+its passage. A task whose estimate is above the dataset's `confirmTokens` waits for
+`POST /$/ingest/org/{task}/confirm`, and `mode=preview` holds the facts in the task
+until `POST /$/ingest/org/{task}/approve`. Without a model, or with `extract=false`, the
+task registers the text on the branch and proposes no facts.
+
+On the dataset page of the web UI, the **Ingest** section uploads a document with the
+same options, shows the task's progress, asks for the confirmation or the approval when
+the task waits for one, and links to the review page. A CSV or TSV file gets a CSVW
+mapping draft there instead, which the **Upload** section takes with a dry run first.
+
+PDF documents need a build with the `pdf` feature, which is on by default. Each page
+of the text starts with a `<!-- Page N -->` marker, and the review page shows the page
+of each fact. A scanned page fails the task with `needs-ocr` and the list of pages.
+`allowPartial=true` ingests the readable pages and records the others as left out. A
+server built with `--features pdf-ocr` reads scanned pages with the PP-OCR models in the
+directory of `--pdf-ocr-models`. It loads PDFium from `--pdfium-lib` and ONNX Runtime
+from `--onnxruntime-lib`, or from their usual library paths, and never downloads a model.
+`--pdf-workers` (2 by default) limits the conversions that run at once.
+
+`sparkles ingest` runs the same steps on a database directory while no server holds it,
+one file after another, and prints each result:
+
+```bash
+sparkles ingest --loc /data/org org notes/standup.md report.pdf \
+  --model-config models.json --pair anthropic/claude-haiku-4-5 --confirm
+sparkles ingest --loc /data/org org people.csv --json > draft.json
+```
+
+`--pair` replaces the dataset's `extract` list and can repeat, in escalation order.
+`--mode`, `--branch`, `--profile`, `--graph`, `--title`, `--format`, `--allow-partial`,
+`--no-extract` and `--base` are the options of the HTTP request, and `--json` prints one
+JSON object per file.
+
+`scripts/eval-text2kg` runs Text2KGBench through the server. It takes the directory of
+one of the benchmark's parts, a model configuration and the pairs to measure, loads each
+ontology with an ingest profile of its own, ingests every test sentence, and reports
+precision, recall, F1, ontology conformance, hallucination and cost per sentence.
+`scripts/eval-text2kg --self-test` runs it on a small benchmark of its own against a
+mock provider and needs no key.
+
 ## Asking questions with a model
 
 `sparkles ask` answers a question about a database with a language model. It grounds

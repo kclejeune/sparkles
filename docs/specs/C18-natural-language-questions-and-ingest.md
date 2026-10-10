@@ -1,9 +1,9 @@
 # C18: Questions and ingestion in natural language
 
-> **Status:** implemented in part (Phases 1, 2, 3 and 3m-a)
+> **Status:** implemented in part (Phases 1, 2, 3, 3m-a and 4)
 >
 > **Phases:** Phases 1 and 2 shipped on 2026-10-09, without the measured runs of the
-> model matrix on the public sets. Phases 3 and 3m-a shipped on 2026-10-10. Phase 1 lets an
+> model matrix on the public sets. Phases 3, 3m-a and 4 shipped on 2026-10-10. Phase 1 lets an
 > agent connected over MCP hand the query it wrote for a question to the web UI, where a
 > person reads, edits and runs it, and adds
 > a memory browser that shows each fact's source, passage and history. It also adds
@@ -31,6 +31,8 @@
 > [Usage: Ingesting documents and reviewing memory](../USAGE.md#ingesting-documents-and-reviewing-memory) ·
 > [API: Ingest profiles](../API.md#ingest-profiles) ·
 > [API: Review inbox](../API.md#review-inbox) ·
+> [Usage: Ingesting documents in the server](../USAGE.md#ingesting-documents-in-the-server) ·
+> [API: Ingestion](../API.md#ingestion) ·
 > [Features](../FEATURES.md)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
@@ -3823,8 +3825,9 @@ for her principal. The memory directory belongs to a project whose remote is
 
 **Phase 1 delivered on 2026-10-09.** The matrix has not been run with real models, and
 the public sets of §11.1 are not converted, so the targets of §11.3 and the measured role
-lists of §11.4 are still open. Phase 2 followed on the same day and Phases 3m-a and 3
-on 2026-10-10. They are recorded below, and Phases 2b, 3m-b and 4 to 6 are not built.
+lists of §11.4 are still open. Phase 2 followed on the same day, and Phases 3m-a, 3
+and 4 on 2026-10-10. They are recorded below, and Phases 2b, 3m-b, 5 and 6 are not
+built.
 
 - **Model providers.** The server's `models` module holds the three kinds of §3.4 with
   their request and response formats, named secrets read at each request from
@@ -4215,3 +4218,105 @@ prompt, with `ingest_profile`'s JSON Schema as its structured output, and its re
 appear on the review page and in `scripts/eval-ingest` unchanged. Phase 5's maintenance
 can run `consolidate_memory` on a schedule and use the inbox signals to rank what it
 proposes.
+
+**Phase 4 delivered on 2026-10-10.** A person uploads a document in the UI, or posts it
+to the server, and reviews the facts the server proposes on a branch without an agent.
+Every test runs against mock providers, and Text2KGBench has run only with the script's
+own small benchmark and mock models, because a real run needs the operator's keys.
+
+- **Conversion.** The `ingest` module converts plain text and Markdown as they are,
+  HTML to Markdown from its first `<main>` or `<article>` or its body without scripts,
+  navigation and forms, and PDF to Markdown with pdf-inspector 1.25.2 (MIT), pinned
+  exactly, behind the `pdf` feature, which is on by default. Each PDF page starts with a
+  `<!-- Page N -->` marker, and `register_converted`, an internal variant of
+  `register_source`, writes the page starts as `spk:pageStart`, OCR pages as
+  `spk:ocrPage` and left-out pages as `spk:omittedPage` on the rendition. A page that
+  pdf-inspector classifies as needing OCR fails the task with `needs-ocr` and every page
+  with its reasons, unless `allowPartial` registers the other pages (A54, A55). The
+  `pdf-ocr` feature, off by default, turns on pdf-inspector's OCR with the models in
+  `--pdf-ocr-models`, PDFium from `--pdfium-lib` and ONNX Runtime loaded at run time
+  from `--onnxruntime-lib`. It never downloads a model. `--pdf-workers` bounds the
+  conversions that run at once. Conversion is deterministic, so the same PDF gives the
+  same digest and rendition IRI (A56).
+- **Tasks.** `POST /$/ingest/{ds}` takes a multipart upload, JSON text or a URL fetched
+  through the outbound policy, and answers `202` with a task. `GET /$/ingest/{ds}` lists
+  the caller's tasks and the server's capabilities, `GET /$/ingest/{ds}/{task}` with
+  `?wait=` reports the status, progress, estimate, usage and result, and `DELETE`
+  cancels. A task is visible to the principal that started it and to dataset admins.
+  Finished tasks stay for seven days, at most 500 are kept and 32 run at once.
+- **Extraction.** The task reads the ingest profile, estimates the tokens and cost of
+  the extraction from the chunks and the first pair's pricing, and waits for
+  `POST …/confirm` above the dataset's `confirmTokens`, 200,000 by default. Each chunk
+  is one call of the `extract` role with the 400 characters before it as context and a
+  strict schema whose class and predicate members are the profile's enumerations, so a
+  predicate outside the profile is never proposed (A9). A chunk whose call fails moves
+  to the next pair of the role's list, and the usage records the escalation. The
+  model's mentions are de-duplicated by name and class and linked with
+  `link_entities`. An exact match becomes the existing IRI, an ambiguous one a new
+  entity with its candidates, and the rest new entities. The facts are written with
+  `assert_facts` in batches with an idempotency key, and a dry run first drops the facts
+  that would fail and sets `distinctFrom` on possible duplicates.
+- **Review modes.** `branch` writes on `ingest.<slug>-<n>`, `preview` keeps the
+  proposals in the task until `POST …/approve` writes them, and `auto` merges into
+  `main` when every fact passed, no entity is ambiguous, the guard found nothing and
+  every confidence reaches the dataset's `autoConfidence`, 0.8 by default. Otherwise it
+  leaves the branch and says why in `autoFallback`. The ingest settings gain
+  `confirmTokens` and `autoConfidence`.
+- **Tables.** A CSV or TSV file gets a CSVW mapping draft from one model call with the
+  header and 20 sample rows, checked by the C05 parser and converted in full for the
+  row and triple counts, with the triples of the first 100 rows. Nothing is written,
+  and the UI hands the mapping to `POST /{ds}/upload` with a dry run first (A18).
+  Without a model the draft is the default mapping.
+- **CLI.** `sparkles ingest --loc DB DATASET FILE…` runs the same pipeline on a
+  database, file by file, with `--pair` instead of the dataset's list, and prints text
+  or JSON.
+- **UI.** The dataset page has an Ingest section that uploads a document with its mode,
+  profile and options, shows the task's status and estimate, asks for the confirmation
+  or the approval, lists the pages that need OCR with **Ingest the readable pages**, and
+  links to the review page. A table's draft is shown with its counts and goes to the
+  Upload section. The review page shows the page of each cited fact and the pages left
+  out or read by OCR.
+- **Evaluation.** `scripts/eval-text2kg` loads each Text2KGBench ontology as classes and
+  properties with an ingest profile, ingests every test sentence through the server,
+  and reports Text2KGBench's precision, recall, F1, ontology conformance and
+  hallucination with tokens and cost per sentence. Its self-test scores an oracle mock
+  model at 1 and a weak one at 0.5 precision and 0.25 recall on a benchmark of four
+  sentences.
+
+**Deviations and additions in Phase 4.**
+
+- The model gives each fact's quote, and the server finds the quote in the chunk, first
+  exactly and then with whitespace folded, to compute the span. A fact whose quote is
+  not in the text is dropped with `span-mismatch` before any write.
+- The extraction schema is a strict variant of `ingest_profile`'s, with every member
+  required and empty strings for absent ones, because the strict mode of the `openai`
+  kind accepts no optional member, as for `Draft` in Phase 1.
+- Ingestion keeps its own task registry with confirmation and approval states rather
+  than the MCP tasks extension, because a task waits for a person.
+- The routes need `read` on the dataset, and every write goes through the tools as the
+  caller, which enforce the write grants. `auto` needs `admin`.
+- A CSV draft mints IRIs for the values of IRI columns under `base` and does not link
+  them to existing entities.
+- The Ingest section is on the dataset page next to Upload, and the Ingest card of the
+  Memory page keeps the settings.
+- `sparkles serve` panicked in debug builds when two flattened argument structs shared
+  the name `ServeArgs`. The ingestion flags are now `IngestServeArgs`.
+
+**Tests.** `crates/sparkles-server/src/ingest/tests.rs` runs the routes against mock
+providers. `a54_pdf_pages_and_spans`, `a55_needs_ocr` and
+`a56_conversion_is_deterministic` cover A54 to A56 with PDFs written by
+`ingest/fixtures.rs`, and `a56_without_pdf_feature` the refusal without `pdf`.
+`a9_profile_enum_and_escalation` covers the second half of A9 and escalation, and
+`a18_csv_mapping_draft` covers A18 with 10,000 rows, at most two model requests and a
+dry-run upload of 20,000 triples. `markdown_without_a_provider_registers_on_a_branch`,
+`html_upload_keeps_the_main_content`, `confirmation_and_cancel`,
+`preview_approve_and_auto` and `ocr_without_models_fails` cover the rest. The converters
+and the draft have unit tests. `ui/tests/mock/ingest.spec.ts` runs the Ingest section
+and the review page's pages against the mock server, and `ui/src/lib/review.test.ts`
+checks the page of an offset.
+
+**What Phase 5 builds on.** The task registry of `ingest::Runtime`, with its progress,
+usage, confirmation and cancellation, can run consolidation as a server task. The
+extraction's batching, idempotency keys and dry-run fixes are the pattern for writing
+consolidated facts, and the `auto` checks are a model for a maintenance task that
+merges only what passes.
