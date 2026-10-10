@@ -47,8 +47,8 @@ on top of the second:
   extensions and function libraries, federated `SERVICE` and query plans. Every query
   runs within memory, row and work budgets.
 * **Search.** Full-text search through Jena's `text:query` with BM25 ranking, vector
-  similarity with HNSW and embeddings computed on write, path search, and GeoSPARQL 1.1
-  with a spatial index.
+  similarity with HNSW and embeddings computed on write by a provider or a local model,
+  path search, and GeoSPARQL 1.1 with a spatial index.
 * **Reasoning and validation.** RDFS, OWL 2 RL and Jena rules kept current as data
   changes, SHACL and ShEx validation on request or on every write, and a schema report
   with exact counts.

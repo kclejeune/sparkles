@@ -559,6 +559,14 @@ endpoint with its key and to a local model that embeds queries apart from docume
 the rules of `provider` against `url` and `apiKey`, and the error of an environment
 without providers.
 
+A manual run checked the whole path. `modelSnapshots` built a store for
+all-MiniLM-L6-v2 from the manifest that `sparkles models pull` had written, and
+`sparkles models verify` accepted it. A release server with the feature read that
+read-only store, listed the model as `present` and a model of an absent snapshot as
+`absent`, embedded two labels for an index that names the provider, and ranked "A man
+is playing a guitar." first (0.67) for the search text "someone strumming a guitar",
+with 188 MB resident.
+
 **Deferred.**
 
 * The Models section of the UI's settings does not show the local models' state. The
