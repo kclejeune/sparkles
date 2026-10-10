@@ -11,7 +11,7 @@
 //!
 //! [`Delta`]: super::Delta
 
-use crate::index::Key;
+use crate::index::{Key, pad};
 use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 
@@ -114,17 +114,31 @@ impl Node {
         }
     }
 
-    /// Insert `k`, which is not in the tree. Returns the right half when the node splits.
-    fn insert(&mut self, k: Key) -> Option<Option<Node>> {
+    /// Insert `k`: `None` when it is already in the tree, else the right half of the
+    /// node when it splits. `shares` is set to whether another key of the tree has the
+    /// first `n` columns of `k`, when the keys next to it in its leaf tell (it is left
+    /// `None` when `k` lands at an end of its leaf and the other neighbour differs).
+    fn insert(&mut self, k: Key, n: usize, shares: &mut Option<bool>) -> Option<Option<Node>> {
         match self {
             Node::Leaf(v) => {
                 let at = v.binary_search(&k).err()?;
                 v.insert(at, k);
+                let same = |x: &Key| x[..n] == k[..n];
+                let before = at.checked_sub(1).map(|i| &v[i]);
+                let after = v.get(at + 1);
+                *shares = if before.is_some_and(same) || after.is_some_and(same) {
+                    Some(true)
+                } else if before.is_some() && after.is_some() {
+                    // the keys with a prefix are consecutive
+                    Some(false)
+                } else {
+                    None
+                };
                 Some((v.len() > LEAF_CAP).then(|| Node::Leaf(v.split_off(v.len() / 2))))
             }
             Node::Branch(b) => {
                 let i = b.route(&k);
-                let split = Arc::make_mut(&mut b.children[i]).insert(k)?;
+                let split = Arc::make_mut(&mut b.children[i]).insert(k, n, shares)?;
                 match split {
                     None => {
                         b.counts[i] += 1;
@@ -256,14 +270,29 @@ impl KeySet {
     /// on its path that a clone shares even when the key is already there: the delta's
     /// writer inserts keys that are mostly new.
     pub fn insert(&mut self, k: Key) -> bool {
+        self.insert_at(k, 0, &mut None).is_some()
+    }
+
+    /// Insert `k`: `None` if it was in the set, else whether another key of the set
+    /// starts with the first `n` columns of `k`. That is mostly read off the keys next
+    /// to `k` in its leaf, so it seldom costs more than the insert.
+    pub fn insert_sharing(&mut self, k: Key, n: usize) -> Option<bool> {
+        let mut shares = None;
+        self.insert_at(k, n, &mut shares)?;
+        Some(shares.unwrap_or_else(|| {
+            let prefix = &k[..n];
+            self.count_between(&pad(prefix, 0), &pad(prefix, u64::MAX)) > 1
+        }))
+    }
+
+    fn insert_at(&mut self, k: Key, n: usize, shares: &mut Option<bool>) -> Option<()> {
         let Some(root) = self.root.as_mut() else {
             self.root = Some(Arc::new(Node::Leaf(vec![k])));
             self.len = 1;
-            return true;
+            *shares = Some(false);
+            return Some(());
         };
-        let Some(split) = Arc::make_mut(root).insert(k) else {
-            return false;
-        };
+        let split = Arc::make_mut(root).insert(k, n, shares)?;
         self.len += 1;
         if let Some(right) = split {
             let left = self.root.take().expect("the root is set");
@@ -273,7 +302,7 @@ impl KeySet {
                 children: vec![left, Arc::new(right)],
             })));
         }
-        true
+        Some(())
     }
 
     /// Remove `k`; true if it was in the set. An absent key copies no node.
@@ -323,31 +352,31 @@ impl KeySet {
 
     /// Whether a key lies in `range`: one descent, cheaper than starting an iterator.
     pub fn intersects(&self, range: impl RangeBounds<Key>) -> bool {
-        let Some(mut n) = self.root.as_deref() else {
-            return false;
+        let first = match range.start_bound() {
+            Bound::Unbounded => self.first_where(|_| false),
+            Bound::Included(k) => self.first_where(|x| x < k),
+            Bound::Excluded(k) => self.first_where(|x| x <= k),
         };
-        let after_start = |x: &Key| match range.start_bound() {
+        first.is_some_and(|f| match range.end_bound() {
             Bound::Unbounded => true,
-            Bound::Included(k) => x >= k,
-            Bound::Excluded(k) => x > k,
-        };
-        // the first key from the start of the range
-        let first = loop {
+            Bound::Included(h) => f <= h,
+            Bound::Excluded(h) => f < h,
+        })
+    }
+
+    /// The first key for which `before` is false (`before` holds for a prefix of the
+    /// keys in order).
+    #[inline]
+    fn first_where(&self, before: impl Fn(&Key) -> bool) -> Option<&Key> {
+        let mut n = self.root.as_deref()?;
+        loop {
             match n {
-                Node::Leaf(v) => match v.get(v.partition_point(|x| !after_start(x))) {
-                    Some(k) => break k,
-                    None => return false,
-                },
-                Node::Branch(b) => match b.lasts.partition_point(|l| !after_start(l)) {
-                    i if i == b.children.len() => return false,
-                    i => n = &b.children[i],
-                },
+                Node::Leaf(v) => return v.get(v.partition_point(&before)),
+                Node::Branch(b) => {
+                    let i = b.lasts.partition_point(&before);
+                    n = b.children.get(i)?;
+                }
             }
-        };
-        match range.end_bound() {
-            Bound::Unbounded => true,
-            Bound::Included(h) => first <= h,
-            Bound::Excluded(h) => first < h,
         }
     }
 
@@ -644,7 +673,16 @@ mod tests {
                 // phases that grow the set, then shrink it to nothing and grow it again
                 let grow = (round / 5_000) % 2 == 0;
                 let insert = rng.next() % 10 < if grow { 8 } else { 2 };
-                if insert {
+                if insert && round % 3 == 0 {
+                    // insert_sharing: whether another key has the first one or two columns
+                    let n = 1 + round % 2;
+                    let others = m
+                        .range(pad(&k[..n], 0)..=pad(&k[..n], u64::MAX))
+                        .any(|x| *x != k);
+                    let want = (!m.contains(&k)).then_some(others);
+                    assert_eq!(s.insert_sharing(k, n), want);
+                    m.insert(k);
+                } else if insert {
                     assert_eq!(s.insert(k), m.insert(k));
                 } else {
                     assert_eq!(s.remove(&k), m.remove(&k));
