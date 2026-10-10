@@ -1547,7 +1547,9 @@ single-use-variable = "off"
 ```
 
 `sparkles lsp` publishes the same findings in editors and offers the safe fixes as quick
-fixes ([editors.md](editors.md)). The UI's query editor lints while you type, and its
+fixes ([editors.md](editors.md)). The same file's `[prefixes]` and `[lsp]` tables give
+`sparkles lsp` the prefixes it completes and declares, and the formatter and the lint only
+check them ([editors.md](editors.md#prefixes)). The UI's query editor lints while you type, and its
 Format menu fixes the safe findings. `POST /$/lint` is the HTTP form
 ([API.md](API.md#linting)).
 

@@ -13,7 +13,8 @@ An editor can format SPARQL, and the other languages `sparkles fmt` formats, in 
   and stdout. It formats documents and publishes syntax errors, the formatter's warnings
   and the findings of `sparkles lint` as diagnostics while you type. It handles
   `textDocument/formatting`, `textDocument/rangeFormatting`, which formats the whole
-  document, and `textDocument/codeAction` for the lint's safe fixes.
+  document, `textDocument/codeAction` for the lint's safe fixes, and
+  `textDocument/completion` for prefixes.
 
 Both need the `sparkles` binary on the `PATH`, built with the `fmt` feature (on by
 default).
@@ -53,7 +54,12 @@ nothing. The server provides:
 - **Quick fixes.** A lint finding with a safe fix (`unused-prefix`, `language-tag-case`,
   `redundant-datatype`) offers it as a `quickfix` code action. The `source.fixAll.sparkles`
   action applies every safe fix at once, as `sparkles lint --fix` does, and only when the
-  result means the same as the document.
+  result means the same as the document. An `undefined-prefix` finding for a prefix the
+  server knows offers a quick fix that adds its declaration. `source.fixAll.sparkles`
+  leaves that one out, because the IRI comes from the configuration and not from the
+  document.
+- **Completion.** In SPARQL, Turtle and TriG documents the server completes prefixes, as
+  [Prefixes](#prefixes) describes.
 - **Options.** Options come only from `.sparklesfmt.toml`. The server uses the file
   nearest to the document, found the way `sparkles fmt` finds it, and reads it again on
   every request, so an edit to it applies at once. Documents that are not files, such as
@@ -70,6 +76,63 @@ nothing. The server provides:
 
 The server exits with status 0 after `shutdown` and `exit`, and with status 1 when the
 client exits or disconnects without `shutdown`.
+
+### Prefixes
+
+The server completes the prefixes it knows. After `PREFIX` or `@prefix` it offers the
+whole declaration of each prefix the document does not declare yet, such as
+`kclj: <https://kclj.io/sparkles/>`, with the closing ` .` after `@prefix`. Where a
+prefixed name starts, it offers the prefix names, such as `kclj:`. Accepting a name whose
+prefix the document does not declare also adds the declaration after the last `PREFIX`,
+`BASE`, `@prefix` or `@base` line at the top of the document, or at its start when there
+is none. A SPARQL document gets `PREFIX kclj: <…>`. A Turtle or TriG document gets
+`@prefix kclj: <…> .` when it already uses `@prefix`, and the `PREFIX` form otherwise.
+Nothing is offered inside IRIs, strings and comments, or after `?` and `$`.
+
+The known prefixes come from three sources. A later source wins when two bind the same
+name.
+
+1. The well-known prefixes that every Sparkles server knows, such as `rdf`, `xsd`,
+   `schema`, `prov` and the `mem` vocabulary of agent memory.
+2. A dataset on a Sparkles server, when the config file's `[lsp]` table names one.
+3. The `[prefixes]` table of the config file.
+
+Both tables live in the `.sparklesfmt.toml` nearest to the document, the same file that
+holds the formatter's options and the `[lint]` table. The formatter and `sparkles lint`
+check both tables and otherwise ignore them.
+
+```toml
+[prefixes]
+kclj = "https://kclj.io/sparkles/"
+memory = "https://kclj.io/sparkles/memory/"
+
+[lsp]
+server = "https://sparkles.example.org"
+dataset = "slurp"
+```
+
+A prefix name is a letter followed by letters, digits, `_`, `-` and `.`, and it does not
+end in `.`. The empty name `""` is allowed too. Each IRI must be absolute. A mistake in
+either table is a config error, which the server reports as a `config` diagnostic and
+`sparkles fmt` reports as an error.
+
+With `server` and `dataset` set, the server reads the dataset's prefixes from
+`GET /$/prefixes/{dataset}`, which answers the prefixes in force on that dataset,
+including the ones the server's settings file declares. It takes the token from
+`SPARKLES_TOKEN`, or else from the credentials that `sparkles auth login` saved for that
+server. Plain `http` is refused for hosts other than loopback. The read happens once per
+server and dataset, in the background, when a document that uses the config file opens.
+Completion does not wait for it. A failed read is logged to the server's standard error,
+and completion goes on with the other sources. Without an `[lsp]` table the language
+server never contacts a server, and it never falls back to `SPARKLES_SERVER` or the
+default server of the credentials file. A build without the `auth` feature logs that it
+ignores the table.
+
+Config files are found by walking up from the document's directory, so a
+`~/.sparklesfmt.toml` acts as the user-wide file for every document under the home
+directory that has no nearer config file. Config files are never merged, so a project's
+own `.sparklesfmt.toml` replaces the user-wide one and needs its own `[prefixes]` and
+`[lsp]` tables.
 
 ### Neovim (0.11 or later)
 

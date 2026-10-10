@@ -804,3 +804,279 @@ fn lint_findings_and_fixes() {
     assert_eq!(p["diagnostics"], json!([]), "{p}");
     assert_eq!(c.shutdown(), Some(0));
 }
+
+/// The completion items at byte `at` of the open document `uri` holding `text`.
+fn completions(c: &mut Client, uri: &str, text: &str, at: usize) -> Vec<Value> {
+    let r = c.request(
+        "textDocument/completion",
+        json!({"textDocument": {"uri": uri}, "position": position_of(text, at, true)}),
+    );
+    r["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{r}"))
+        .clone()
+}
+
+/// `text` with a completion item's edits applied.
+fn accept(text: &str, item: &Value) -> String {
+    let mut edits = vec![item["textEdit"].clone()];
+    if let Some(more) = item["additionalTextEdits"].as_array() {
+        edits.extend(more.iter().cloned());
+    }
+    apply(text, &Value::Array(edits), true)
+}
+
+fn item<'a>(items: &'a [Value], label: &str) -> &'a Value {
+    items
+        .iter()
+        .find(|i| i["label"] == label)
+        .unwrap_or_else(|| panic!("no {label} in {items:?}"))
+}
+
+const KCLJ: &str = "https://kclj.io/sparkles/";
+
+#[test]
+fn prefix_completion_and_the_undefined_prefix_fix() {
+    let d = tempfile::tempdir().unwrap();
+    std::fs::write(
+        d.path().join(".sparklesfmt.toml"),
+        format!("line-width = 100\n[prefixes]\nkclj = \"{KCLJ}\"\n"),
+    )
+    .unwrap();
+    let mut c = Client::start(d.path(), &[]);
+    let caps = c.initialize(&["utf-16"]);
+    assert!(
+        caps["capabilities"]["completionProvider"].is_object(),
+        "{caps}"
+    );
+
+    // a prefix name in a query: the declaration comes with it
+    let uri = uri(&d.path().join("q.rq"));
+    let q = "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\nSELECT * { ?s kc ?o }\n";
+    c.open(&uri, "sparql", q);
+    let at = q.find("kc").unwrap() + 2;
+    let items = completions(&mut c, &uri, q, at);
+    let k = item(&items, "kclj:");
+    assert_eq!(k["detail"], KCLJ);
+    assert_eq!(
+        accept(q, k),
+        format!(
+            "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\nPREFIX kclj: <{KCLJ}>\nSELECT * {{ ?s kclj: ?o }}\n"
+        )
+    );
+    // a declared prefix inserts nothing more, and the well-known prefixes are known
+    assert!(item(&items, "rdf:")["additionalTextEdits"].is_null());
+    assert_eq!(item(&items, "mem:")["detail"], "urn:x-sparkles:mem:");
+
+    // after PREFIX: the declarations not written yet
+    let q2 = "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\nPREFIX ";
+    c.change(&uri, 2, q2);
+    let items = completions(&mut c, &uri, q2, q2.len());
+    assert!(items.iter().all(|i| i["label"] != "rdf:"), "{items:?}");
+    assert_eq!(
+        accept(q2, item(&items, "kclj:")),
+        format!("PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\nPREFIX kclj: <{KCLJ}>")
+    );
+
+    // inside an IRI, nothing
+    let q3 = "SELECT * { <http://ex/kc> ?p ?o }";
+    c.change(&uri, 3, q3);
+    let at = q3.find("kc").unwrap() + 2;
+    assert!(completions(&mut c, &uri, q3, at).is_empty());
+
+    // the quick fix for an undefined known prefix, and none for an unknown one
+    let q4 = "SELECT * { ?s kclj:name ?o ; nope:x ?y }\n";
+    c.change(&uri, 4, q4);
+    // the diagnostics of the earlier versions may still be queued
+    let mut p = c.diagnostics(&uri);
+    while p["version"] != 4 {
+        p = c.diagnostics(&uri);
+    }
+    let undefined: Vec<Value> = p["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|d| d["code"] == "undefined-prefix")
+        .cloned()
+        .collect();
+    assert_eq!(undefined.len(), 2, "{p}");
+    let r = c.request(
+        "textDocument/codeAction",
+        json!({"textDocument": {"uri": uri},
+               "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 40}},
+               "context": {"diagnostics": undefined, "only": ["quickfix"]}}),
+    );
+    let actions = r["result"].as_array().unwrap();
+    assert_eq!(actions.len(), 1, "{r}");
+    assert_eq!(actions[0]["title"], format!("Declare kclj: as <{KCLJ}>"));
+    assert_eq!(
+        apply(q4, &actions[0]["edit"]["changes"][&uri], true),
+        format!("PREFIX kclj: <{KCLJ}>\n{q4}")
+    );
+
+    // Turtle that uses @prefix keeps its style
+    let ttl = uri.replace("q.rq", "d.ttl");
+    let t = "@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n\n<a> kc <b> .\n";
+    c.open(&ttl, "turtle", t);
+    let at = t.find("kc").unwrap() + 2;
+    let items = completions(&mut c, &ttl, t, at);
+    assert_eq!(
+        accept(t, item(&items, "kclj:")),
+        format!(
+            "@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n@prefix kclj: <{KCLJ}> .\n\n<a> kclj: <b> .\n"
+        )
+    );
+    assert_eq!(c.shutdown(), Some(0));
+
+    // the formatter and the lint accept a config file with the tables
+    let formatted = fmt_cli(d.path(), &d.path().join("x.rq"), "select * {?s ?p ?o}");
+    assert!(formatted.starts_with("SELECT *"), "{formatted}");
+    std::fs::write(d.path().join("x.rq"), formatted).unwrap();
+    let o = Command::new(BIN)
+        .args(["lint", "x.rq"])
+        .current_dir(d.path())
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{o:?}");
+}
+
+#[test]
+fn a_bad_prefixes_table_is_a_config_error() {
+    let d = tempfile::tempdir().unwrap();
+    std::fs::write(
+        d.path().join(".sparklesfmt.toml"),
+        "[prefixes]\nex = \"not absolute\"\n",
+    )
+    .unwrap();
+    let mut c = Client::start(d.path(), &[]);
+    c.initialize(&["utf-16"]);
+    let uri = uri(&d.path().join("q.rq"));
+    c.open(&uri, "sparql", "SELECT * {}\n");
+    let p = c.diagnostics(&uri);
+    let config = p["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["code"] == "config")
+        .unwrap_or_else(|| panic!("{p}"))
+        .clone();
+    assert!(
+        config["message"]
+            .as_str()
+            .unwrap()
+            .contains("prefixes.ex: not an absolute IRI"),
+        "{config}"
+    );
+    assert_eq!(c.shutdown(), Some(0));
+}
+
+/// A server that answers every request with prefixes and sends the request line and
+/// `Authorization` header it saw down the channel.
+#[cfg(feature = "auth")]
+fn prefix_server(port: u16) -> mpsc::Receiver<String> {
+    let l = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for s in l.incoming() {
+            let Ok(mut s) = s else { return };
+            let mut r = BufReader::new(s.try_clone().unwrap());
+            let mut request = String::new();
+            let mut auth = String::new();
+            loop {
+                let mut line = String::new();
+                if r.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                if request.is_empty() {
+                    request = line.trim_end().to_string();
+                }
+                if line.to_ascii_lowercase().starts_with("authorization:") {
+                    auth = line["authorization:".len()..].trim().to_string();
+                }
+            }
+            let _ = tx.send(format!("{request} | {auth}"));
+            let body = r#"{"prefixes":{"srv":"https://srv.example.org/ns#","kclj":"https://from-server/"}}"#;
+            let _ = write!(
+                s,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    rx
+}
+
+#[cfg(feature = "auth")]
+#[test]
+fn prefixes_from_a_server_dataset() {
+    let port = 47731;
+    let seen = prefix_server(port);
+    let d = tempfile::tempdir().unwrap();
+    std::fs::write(
+        d.path().join(".sparklesfmt.toml"),
+        format!(
+            "[prefixes]\nkclj = \"{KCLJ}\"\n[lsp]\nserver = \"http://127.0.0.1:{port}\"\ndataset = \"my ds\"\n"
+        ),
+    )
+    .unwrap();
+    let home = d.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    let home = home.to_str().unwrap();
+    let mut c = Client::start(
+        d.path(),
+        &[
+            ("SPARKLES_TOKEN", "t0ken"),
+            ("HOME", home),
+            ("XDG_CONFIG_HOME", home),
+        ],
+    );
+    c.initialize(&["utf-16"]);
+    let uri = uri(&d.path().join("q.rq"));
+    let q = "SELECT * { ?s s ?o }";
+    c.open(&uri, "sparql", q);
+    let at = q.find(" s ").unwrap() + 2;
+    // the read runs in the background: ask until its prefixes appear
+    let mut items = Vec::new();
+    for _ in 0..100 {
+        items = completions(&mut c, &uri, q, at);
+        if items.iter().any(|i| i["label"] == "srv:") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        item(&items, "srv:")["detail"],
+        "https://srv.example.org/ns#"
+    );
+    // the config file's table wins over the server
+    assert_eq!(item(&items, "kclj:")["detail"], KCLJ);
+    let req = seen.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(req, "GET /$/prefixes/my%20ds HTTP/1.1 | Bearer t0ken");
+    // one read per server and dataset
+    assert!(seen.try_recv().is_err());
+    assert_eq!(c.shutdown(), Some(0));
+}
+
+#[test]
+fn an_unreachable_server_does_not_block_completion() {
+    let d = tempfile::tempdir().unwrap();
+    // nothing listens on this port
+    std::fs::write(
+        d.path().join(".sparklesfmt.toml"),
+        format!(
+            "[prefixes]\nkclj = \"{KCLJ}\"\n[lsp]\nserver = \"http://127.0.0.1:47732\"\ndataset = \"ds\"\n"
+        ),
+    )
+    .unwrap();
+    let mut c = Client::start(d.path(), &[("SPARKLES_TOKEN", "t")]);
+    c.initialize(&["utf-16"]);
+    let uri = uri(&d.path().join("q.rq"));
+    let q = "SELECT * { ?s kc ?o }";
+    c.open(&uri, "sparql", q);
+    let at = q.find("kc").unwrap() + 2;
+    let start = std::time::Instant::now();
+    let items = completions(&mut c, &uri, q, at);
+    assert!(start.elapsed() < Duration::from_secs(5));
+    assert_eq!(item(&items, "kclj:")["detail"], KCLJ);
+    assert_eq!(c.shutdown(), Some(0));
+}
