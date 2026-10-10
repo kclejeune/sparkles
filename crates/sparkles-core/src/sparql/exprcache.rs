@@ -1190,15 +1190,13 @@ fn cursor_values(
     let mut positions: Vec<usize> = (lo..hi).collect();
     // numbers from the numeric column: only the other terms are decoded
     if let Some(num) = ctx.snap.generation.vocab.numeric()
-        && let (Some(&first), Some(&last)) = (payloads.first(), payloads.last())
+        && !payloads.is_empty()
     {
-        num.will_need(first, last);
+        let found = num.get_many(&payloads);
+        ctx.check()?;
         let (mut rest, mut rest_at) = (Vec::new(), Vec::new());
-        for (i, (&p, &pos)) in payloads.iter().zip(&positions).enumerate() {
-            if i.is_multiple_of(1024) {
-                ctx.check()?;
-            }
-            match num.get(p).value() {
+        for ((&p, &pos), n) in payloads.iter().zip(&positions).zip(found) {
+            match n.value() {
                 Some(v) => vals[pos] = Some(v),
                 None => {
                     rest.push(p);

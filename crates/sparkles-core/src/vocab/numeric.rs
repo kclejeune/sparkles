@@ -44,6 +44,7 @@ use crate::sparql::value::Value;
 use std::fs::File;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 /// The column's file name in a generation directory.
 pub const FILE: &str = "vocab.num";
@@ -52,6 +53,10 @@ const HEADER: usize = 32;
 /// Ids per rank entry: eight words of kinds, one cache line.
 const RANK_IDS: u64 = 128;
 const VALUED_BITS: u64 = 0x8888_8888_8888_8888;
+/// Read-ahead hints are given once per chunk of this many bytes.
+const HINT_CHUNK: usize = 16 << 10;
+/// Chunks this close are asked for in one request.
+const HINT_GAP: usize = 4;
 
 pub const NOT_NUMERIC: u8 = 0;
 pub const UNKNOWN: u8 = 1;
@@ -162,6 +167,8 @@ pub fn classify(key: &[u8]) -> (u8, u64) {
 /// A memory-mapped `vocab.num`.
 pub struct NumColumn {
     bytes: Bytes,
+    /// one bit per [`HINT_CHUNK`]: read ahead was asked for
+    hinted: Box<[AtomicU64]>,
     covered: u64,
     count: u64,
     rank: usize,
@@ -209,7 +216,11 @@ impl NumColumn {
             return None;
         }
         let (rank, values, _) = layout(covered, count);
+        let chunks = b.len().div_ceil(HINT_CHUNK);
         Some(NumColumn {
+            hinted: (0..chunks.div_ceil(64))
+                .map(|_| AtomicU64::new(0))
+                .collect(),
             bytes,
             covered,
             count,
@@ -278,33 +289,80 @@ impl NumColumn {
         }
     }
 
-    /// Ask for the pages that hold ids `lo..=hi` to be read ahead (see
-    /// [`crate::index::io_hints`]). A pass over sorted ids then finds its pages read by
-    /// a few large requests rather than one fault per page.
-    pub fn will_need(&self, lo: u64, hi: u64) {
-        let hi = hi.min(self.covered.saturating_sub(1));
-        if lo > hi {
-            return;
-        }
-        let (k0, k1) = (
-            HEADER + (lo / 16) as usize * 8,
-            HEADER + (hi / 16 + 1) as usize * 8,
-        );
-        self.bytes.will_need(k0, k1);
-        let (g0, g1) = ((lo / RANK_IDS) as usize, (hi / RANK_IDS) as usize);
-        self.bytes
-            .will_need(self.rank + g0 * 4, self.rank + g1 * 4 + 4);
-        let v0 = self.rank_at(g0);
-        // the values up to the next group's first one, or to the end
-        let v1 = if (g1 as u64 + 1) * RANK_IDS < self.covered {
-            self.rank_at(g1 + 1)
-        } else {
-            self.count
+    /// Ask once, in the life of the mapping, for each [`HINT_CHUNK`] of the file that
+    /// `ranges` (byte ranges in ascending order) touch to be read ahead (see
+    /// [`crate::index::io_hints`]). Nearby chunks are asked for in one request. A warm
+    /// pass makes no system call, and a cold one finds its pages read by a few large
+    /// requests rather than one fault per page.
+    fn advise(&self, ranges: impl Iterator<Item = (usize, usize)>) {
+        let mut cur: Option<(usize, usize)> = None;
+        let flush = |c: Option<(usize, usize)>| {
+            if let Some((s, e)) = c {
+                self.bytes.will_need(s * HINT_CHUNK, e * HINT_CHUNK);
+            }
         };
-        self.bytes.will_need(
-            self.values + v0 as usize * 8,
-            self.values + v1.max(v0) as usize * 8,
-        );
+        let len = self.bytes.as_slice().len();
+        for (s, e) in ranges {
+            let (c0, c1) = (s / HINT_CHUNK, e.min(len).div_ceil(HINT_CHUNK));
+            for c in c0..c1 {
+                let (word, bit) = (&self.hinted[c / 64], 1u64 << (c % 64));
+                if word.load(Relaxed) & bit != 0 || word.fetch_or(bit, Relaxed) & bit != 0 {
+                    continue;
+                }
+                cur = match cur {
+                    Some((cs, ce)) if c >= cs && c <= ce + HINT_GAP => Some((cs, ce.max(c + 1))),
+                    other => {
+                        flush(other);
+                        Some((c, c + 1))
+                    }
+                };
+            }
+        }
+        flush(cur);
+    }
+
+    /// What the column says about each of `ids` (best sorted ascending), reading a cold
+    /// column in two rounds of large requests: first the kinds and rank entries of the
+    /// ids, then the values they point to.
+    pub fn get_many(&self, ids: &[u64]) -> Vec<Numeric> {
+        let hints = crate::index::io_hints() && ids.len() > 1;
+        if hints {
+            let inside = || ids.iter().copied().filter(|&id| id < self.covered);
+            self.advise(inside().map(|id| {
+                let first = (id / RANK_IDS) * RANK_IDS / 16;
+                (
+                    HEADER + first as usize * 8,
+                    HEADER + (id / 16 + 1) as usize * 8,
+                )
+            }));
+            self.advise(inside().map(|id| {
+                let at = self.rank + (id / RANK_IDS) as usize * 4;
+                (at, at + 4)
+            }));
+        }
+        let located: Vec<(u8, u64)> = ids.iter().map(|&id| self.locate(id)).collect();
+        if hints {
+            self.advise(
+                located
+                    .iter()
+                    .filter(|&&(k, r)| k & 8 != 0 && r < self.count)
+                    .map(|&(_, r)| {
+                        let at = self.values + r as usize * 8;
+                        (at, at + 8)
+                    }),
+            );
+        }
+        let b = self.bytes.as_slice();
+        located
+            .into_iter()
+            .map(|(k, r)| match k {
+                NOT_NUMERIC => Numeric::NotNumeric,
+                k if k & 8 != 0 && r < self.count => {
+                    Numeric::of(k, word(b, self.values + r as usize * 8))
+                }
+                _ => Numeric::Unknown,
+            })
+            .collect()
     }
 }
 
@@ -666,7 +724,13 @@ pub(crate) mod tests {
         // an IRI, and ids past the end
         assert_eq!(num.get(v.len() - 1), Numeric::NotNumeric);
         assert_eq!(num.get(v.len() + 5), Numeric::NotNumeric);
-        num.will_need(0, v.len());
+        let all: Vec<u64> = (0..v.len() + 3).collect();
+        // compared as text: NaN is not equal to itself
+        let show = |n: &[Numeric]| format!("{n:?}");
+        assert_eq!(
+            show(&num.get_many(&all)),
+            show(&all.iter().map(|&i| num.get(i)).collect::<Vec<_>>())
+        );
     }
 
     #[test]

@@ -1754,20 +1754,12 @@ pub(super) fn apply_range_filter(
         return Ok(());
     };
     let col = &t.cols[c];
-    let (mut lo, mut hi) = (u64::MAX, 0);
-    for id in col.iter().filter(|id| id.tag() == Tag::Vocab) {
-        lo = lo.min(id.payload());
-        hi = hi.max(id.payload());
-    }
-    if lo <= hi {
-        num.will_need(lo, hi);
-    }
     use super::value::Num;
     let test = |x: Id, v: Num| atoms.iter().all(|a| a.holds(x, v));
     // `Some(passes)`, or `None` for the generic filter
-    let decide = |x: Id| -> Option<bool> {
-        match x.tag() {
-            Tag::Vocab => match num.get(x.payload()) {
+    let decide = |x: Id, n: Option<Numeric>| -> Option<bool> {
+        match (x.tag(), n) {
+            (Tag::Vocab, Some(n)) => match n {
                 Numeric::NotNumeric => Some(false),
                 Numeric::Unknown => None,
                 Numeric::Integer(i) => Some(test(x, Num::Integer(i.into()))),
@@ -1775,21 +1767,47 @@ pub(super) fn apply_range_filter(
                 Numeric::Float(f) => Some(test(x, Num::Float(f.into()))),
                 Numeric::Double(d) => Some(test(x, Num::Double(d.into()))),
             },
-            Tag::Int | Tag::Double | Tag::Decimal => ctx
+            (Tag::Int | Tag::Double | Tag::Decimal, _) => ctx
                 .value(x)
                 .and_then(|v| Num::of(&v).ok())
                 .map(|v| test(x, v)),
             _ => None,
         }
     };
-    // runs of one id (the scan's sorted column) are decided once
+    // the distinct vocabulary ids of a run of rows read from the column at once, and
+    // runs of one id (the scan's sorted column) decided once
     let chunk = |ids: &[Id]| -> Vec<Option<bool>> {
+        let mut vocab: Vec<u64> = ids
+            .iter()
+            .filter(|x| x.tag() == Tag::Vocab)
+            .map(|x| x.payload())
+            .collect();
+        // already sorted when the column is the scan's sorted column
+        if !vocab.is_sorted() {
+            vocab.sort_unstable();
+        }
+        vocab.dedup();
+        let found = num.get_many(&vocab);
+        let mut at = 0;
         let mut last: Option<(Id, Option<bool>)> = None;
         ids.iter()
             .map(|&x| match last {
                 Some((l, d)) if l == x => d,
                 _ => {
-                    let d = decide(x);
+                    let n = if x.tag() == Tag::Vocab {
+                        let p = x.payload();
+                        if vocab.get(at) != Some(&p) {
+                            at = if vocab.get(at + 1) == Some(&p) {
+                                at + 1
+                            } else {
+                                vocab.binary_search(&p).unwrap_or(at)
+                            };
+                        }
+                        found.get(at).copied()
+                    } else {
+                        None
+                    };
+                    let d = decide(x, n);
                     last = Some((x, d));
                     d
                 }
@@ -3294,12 +3312,9 @@ fn decode_sorted(vocab: &crate::vocab::Vocab, uniq: &[u64]) -> Vec<Value> {
     let Some(num) = vocab.numeric() else {
         return decode(uniq);
     };
-    if let (Some(&lo), Some(&hi)) = (uniq.first(), uniq.last()) {
-        num.will_need(lo, hi);
-    }
     let from_column: Vec<Option<Value>> = uniq
         .par_chunks(4096)
-        .flat_map_iter(|chunk| chunk.iter().map(|&p| num.get(p).value()))
+        .flat_map_iter(|chunk| num.get_many(chunk).into_iter().map(|n| n.value()))
         .collect();
     let rest: Vec<u64> = uniq
         .iter()
