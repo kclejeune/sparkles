@@ -80,6 +80,10 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/geo/{ds}/rebuild", &["POST"]),
     ("/$/geo/convert", &["POST"]),
     ("/$/queries/{ds}", &["GET"]),
+    // suggested examples (C18 §4.6): readers suggest, admins list and remove
+    ("/$/queries/{ds}/suggestions", &["GET", "POST", "DELETE"]),
+    // memory settings (C18 §8.8)
+    ("/$/memory/{ds}", &["GET", "PUT"]),
     ("/$/queries/{ds}/{name}", &["GET", "PUT", "DELETE"]),
     ("/$/queries/{ds}/{name}/versions", &["GET"]),
     ("/{ds}/queries/{name}", &["GET", "POST"]),
@@ -158,6 +162,10 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     // RDF Patch: POST and PATCH apply, OPTIONS lists them, the others are 405
     ("/{ds}/patch", &["*"]),
     ("/{ds}/explain", &["GET", "POST"]),
+    // the memory tools over HTTP (feature `mcp`, spec C18 §10)
+    ("/{ds}/check", &["POST"]),
+    ("/{ds}/recall", &["POST"]),
+    ("/{ds}/sparql/diagnose", &["POST"]),
     ("/{ds}/text", &["GET", "POST"]),
     ("/{ds}/diff", &["GET"]),
     ("/{ds}/changes", &["GET"]),
@@ -242,6 +250,10 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         // a pure computation over the request's literals
         "/$/geo/convert" => Caller,
         "/$/metrics" => Server(ServerPerm::Metrics),
+        "/$/queries/{ds}/suggestions" if *method == Method::POST => Dataset(Read),
+        "/$/queries/{ds}/suggestions" => Dataset(Admin),
+        "/$/memory/{ds}" if get => Dataset(Read),
+        "/$/memory/{ds}" => Dataset(Admin),
         // endpoints, models, budgets and the secret names of the operator's providers
         "/$/models" | "/$/models/{name}/test" => Server(ServerPerm::ServerAdmin),
         "/$/datasets" if get => Caller,
@@ -278,6 +290,9 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/{ds}/sparql"
         | "/{ds}/query"
         | "/{ds}/explain"
+        | "/{ds}/check"
+        | "/{ds}/recall"
+        | "/{ds}/sparql/diagnose"
         | "/{ds}/text"
         | "/{ds}/diff"
         | "/{ds}/changes"
@@ -392,6 +407,9 @@ pub fn endpoint(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) ->
         "/{ds}/sparql"
         | "/{ds}/query"
         | "/{ds}/explain"
+        | "/{ds}/check"
+        | "/{ds}/recall"
+        | "/{ds}/sparql/diagnose"
         | "/{ds}/text"
         | "/{ds}/geo"
         | "/{ds}/queries/{name}" => Endpoint::Query,

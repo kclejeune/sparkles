@@ -14,6 +14,7 @@
 //! deadline, memory budget and row limit.
 
 mod check;
+mod diagnose;
 mod link;
 mod recall;
 mod similar;

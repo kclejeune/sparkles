@@ -165,6 +165,7 @@ impl ServeArgs {
                 datasets: self.mcp_dataset.clone(),
                 stored_queries: !self.mcp_no_stored_queries,
                 task_after: std::time::Duration::from_millis(self.mcp_task_after_ms),
+                http: true,
                 ..McpConfig::default()
             },
             max_sessions: self.mcp_max_sessions,

@@ -2070,6 +2070,100 @@ fn format_and_mcp(p: &mut Paths) {
 }
 
 fn assist(p: &mut Paths) {
+    let tool = |route: &'static str, id: &str, summary: &str, d: &str, req: &str, res: &str| {
+        op(POST, route, id, "SPARQL", summary)
+            .doc(d)
+            .see("checking-and-explaining-queries")
+            .body(
+                true,
+                "",
+                json!({ "application/json": { "schema": sref(req) } }),
+            )
+            .json("200", "The result.", res)
+            .errors(&[400, 404, 408])
+    };
+    p.add(tool(
+        "/{ds}/check",
+        "checkQuery",
+        "Check a query against the schema",
+        "The MCP tool `check_query` as the caller, over the caller's view. With `terms`, every constant IRI of the query is listed with its kind, label, count and whether it occurs.",
+        "CheckRequest",
+        "CheckResult",
+    ));
+    p.add(tool(
+        "/{ds}/sparql/diagnose",
+        "diagnoseQuery",
+        "Explain an empty result",
+        "The MCP tool `why_empty`: each triple pattern alone, then the patterns joined in order with the filters, each an ASK under a tenth of the timeout. The answer names the first pattern, join or filter without solutions.",
+        "DiagnoseRequest",
+        "Diagnosis",
+    ));
+    p.add(tool(
+        "/{ds}/recall",
+        "recallFacts",
+        "Recall facts",
+        "The MCP tool `recall` in its JSON format: the facts around the seeds or the entities a search finds, with citations and, when the dataset names agent memory graphs, the review status of each fact.",
+        "RecallRequest",
+        "RecallResult",
+    ));
+    p.add(
+        op(
+            GET,
+            "/$/memory/{ds}",
+            "getMemorySettings",
+            "Datasets",
+            "Get the memory settings",
+        )
+        .see("memory-settings")
+        .json("200", "The settings, or the defaults.", "MemorySettings"),
+    );
+    p.add(
+        op(
+            PUT,
+            "/$/memory/{ds}",
+            "putMemorySettings",
+            "Datasets",
+            "Set the memory settings",
+        )
+        .see("memory-settings")
+        .json_body(true, "MemorySettings")
+        .json("200", "The stored settings.", "MemorySettings")
+        .errors(&[400]),
+    );
+    p.add(
+        op(
+            GET,
+            "/$/queries/{ds}/suggestions",
+            "listSuggestions",
+            "Stored queries",
+            "List suggested examples",
+        )
+        .doc("Needs `admin` on the dataset.")
+        .see("suggested-examples")
+        .json("200", "The suggestions, newest first.", "SuggestionList"),
+    );
+    p.add(
+        op(
+            POST,
+            "/$/queries/{ds}/suggestions",
+            "suggestExample",
+            "Stored queries",
+            "Suggest an example",
+        )
+        .doc("Needs `read` on the dataset. A dataset keeps at most 500 suggestions.")
+        .see("suggested-examples")
+        .json_body(true, "SuggestRequest")
+        .json("201", "The suggestion.", "Suggestion")
+        .errors(&[400, 409]),
+    );
+    p.add(
+        op(DELETE, "/$/queries/{ds}/suggestions", "deleteSuggestion", "Stored queries", "Remove a suggested example")
+            .doc("Needs `admin` on the dataset. Promoting a suggestion is a `PUT` of the stored query and then this call.")
+            .see("suggested-examples")
+            .query_req("id", s(), "The suggestion's id.")
+            .no_content("Removed.")
+            .errors(&[404]),
+    );
     let tag = "Models";
     p.add(
         op(GET, "/$/models", "listModelProviders", tag, "List model providers")

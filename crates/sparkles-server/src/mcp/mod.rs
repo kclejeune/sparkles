@@ -35,9 +35,11 @@ mod notify;
 mod paths;
 mod pins;
 mod render;
+pub mod rest;
 mod schema_history;
 mod schemas;
 mod search;
+mod share;
 mod stored;
 mod tasks;
 mod tools;
@@ -145,6 +147,10 @@ pub struct McpArgs {
     /// task that the client polls, in milliseconds
     #[arg(long, value_name = "MS", default_value_t = 2000)]
     pub task_after_ms: u64,
+    /// The base URL of a Sparkles server whose UI the share_query tool links to, such
+    /// as https://sparql.example.org (without it the tool is not offered)
+    #[arg(long, value_name = "URL")]
+    pub ui_url: Option<String>,
 }
 
 /// Limits and switches of the MCP tools.
@@ -173,6 +179,10 @@ pub struct McpConfig {
     /// how long a tool call of a client that supports tasks may run before it becomes a
     /// task that the client polls
     pub task_after: Duration,
+    /// the base URL of the UI that `share_query` links to (`sparkles mcp --ui-url`)
+    pub ui_url: Option<String>,
+    /// tools served over HTTP, where `share_query` links to the request's own host
+    pub http: bool,
 }
 
 impl Default for McpConfig {
@@ -190,6 +200,8 @@ impl Default for McpConfig {
             stored_queries: true,
             watch_interval: Duration::from_secs(2),
             task_after: Duration::from_secs(2),
+            ui_url: None,
+            http: false,
         }
     }
 }
@@ -276,6 +288,8 @@ impl McpServer {
             .filter(|t| !cfg.disabled.contains(t.name))
             // a read-only server never offers the write tool
             .filter(|t| !(read_only && t.name == "sparql_update"))
+            // links need the address of the UI
+            .filter(|t| t.name != "share_query" || cfg.http || cfg.ui_url.is_some())
             .collect();
         McpServer {
             state,
@@ -529,6 +543,12 @@ pub fn run(args: McpArgs, store_opts: StoreOptions) -> Result<()> {
         datasets: Vec::new(),
         stored_queries: !args.no_stored_queries,
         task_after: Duration::from_millis(args.task_after_ms),
+        ui_url: match args.ui_url {
+            Some(u) if !(u.starts_with("http://") || u.starts_with("https://")) => {
+                bail!("--ui-url {u}: expected an http or https URL")
+            }
+            u => u,
+        },
         ..McpConfig::default()
     };
     let server = McpServer::new(st, cfg);

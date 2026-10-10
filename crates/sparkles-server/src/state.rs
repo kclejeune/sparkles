@@ -303,10 +303,8 @@ pub struct AppState {
     /// the MCP endpoint `/$/mcp` (`serve --mcp`); `None`: not mounted
     #[cfg(feature = "mcp")]
     pub mcp: Option<Arc<crate::mcp::http::HttpConf>>,
-    /// the tools behind `/{ds}/check`, `/{ds}/recall` and `/{ds}/sparql/diagnose`, built
-    /// on first use (spec C18)
-    #[cfg(feature = "mcp")]
-    pub http_tools: std::sync::OnceLock<crate::mcp::McpServer>,
+    /// the C18 files of in-memory datasets (`assist`)
+    pub volatile: crate::assist::Volatile,
     /// the model providers and role lists (`serve --model-config`, spec C18 §3.4)
     pub models: Option<Arc<crate::models::Models>>,
 }
@@ -525,8 +523,7 @@ impl AppState {
             format: FormatConf::default(),
             #[cfg(feature = "mcp")]
             mcp: None,
-            #[cfg(feature = "mcp")]
-            http_tools: std::sync::OnceLock::new(),
+            volatile: Default::default(),
             models: None,
         };
         Ok(state)
@@ -571,8 +568,7 @@ impl AppState {
             format: FormatConf::default(),
             #[cfg(feature = "mcp")]
             mcp: None,
-            #[cfg(feature = "mcp")]
-            http_tools: std::sync::OnceLock::new(),
+            volatile: Default::default(),
             models: None,
             rate_limit: None,
             auth: None,

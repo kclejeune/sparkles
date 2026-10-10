@@ -1916,6 +1916,197 @@
         ],
         "type": "object"
       },
+      "CheckRequest": {
+        "additionalProperties": false,
+        "description": "The arguments of `check_query` without `dataset`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#checking-and-explaining-queries"
+        },
+        "properties": {
+          "at": {
+            "description": "A commit number, `commit:N`, `time:<RFC 3339>`, `snapshot:<name>` or `head`.",
+            "type": [
+              "integer",
+              "string"
+            ]
+          },
+          "atCommit": {
+            "description": "Read the snapshot of this commit.",
+            "type": "integer"
+          },
+          "explain": {
+            "description": "Add the plan's estimated rows and its warnings.",
+            "type": "boolean"
+          },
+          "maxSuggestions": {
+            "description": "Suggestions per issue, 0 to 10. 3 by default.",
+            "type": "integer"
+          },
+          "query": {
+            "description": "A SPARQL query. The dataset's prefixes are predeclared.",
+            "type": "string"
+          },
+          "reasoning": {
+            "description": "Include materialized inferences (default: true when the dataset has them).",
+            "type": "boolean"
+          },
+          "terms": {
+            "description": "List every constant IRI of the query.",
+            "type": "boolean"
+          },
+          "timeoutSeconds": {
+            "description": "At most the server's query timeout. 30 by default.",
+            "type": "number"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "CheckResult": {
+        "description": "The issues of a query, and with `terms` the terms it uses.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#checking-and-explaining-queries"
+        },
+        "properties": {
+          "commit": {
+            "type": "integer"
+          },
+          "dataset": {
+            "type": "string"
+          },
+          "estimatedRows": {
+            "type": "number"
+          },
+          "issues": {
+            "items": {
+              "properties": {
+                "code": {
+                  "type": "string"
+                },
+                "column": {
+                  "type": "integer"
+                },
+                "line": {
+                  "type": "integer"
+                },
+                "message": {
+                  "type": "string"
+                },
+                "severity": {
+                  "enum": [
+                    "error",
+                    "warning"
+                  ],
+                  "type": "string"
+                },
+                "suggestions": {
+                  "items": {
+                    "properties": {
+                      "count": {
+                        "type": "integer"
+                      },
+                      "label": {
+                        "type": "string"
+                      },
+                      "term": {
+                        "type": "string"
+                      },
+                      "why": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "term",
+                      "count",
+                      "why"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "term": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "code",
+                "severity",
+                "message"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "ok": {
+            "description": "False when an issue is an error.",
+            "type": "boolean"
+          },
+          "prefixes": {
+            "additionalProperties": true,
+            "description": "The prefixes the compact terms use.",
+            "type": "object"
+          },
+          "terms": {
+            "items": {
+              "properties": {
+                "count": {
+                  "description": "Instances of a class, or triples of a property, in the caller's view.",
+                  "type": "integer"
+                },
+                "iri": {
+                  "type": "string"
+                },
+                "kind": {
+                  "enum": [
+                    "class",
+                    "property",
+                    "entity"
+                  ],
+                  "type": "string"
+                },
+                "label": {
+                  "type": "string"
+                },
+                "occurs": {
+                  "description": "Whether the term occurs in the caller's view. Null when the check did not look it up.",
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "term": {
+                  "description": "The IRI, compacted with `prefixes`.",
+                  "type": "string"
+                },
+                "types": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "term",
+                "iri",
+                "kind",
+                "occurs"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "dataset",
+          "commit",
+          "ok",
+          "issues",
+          "prefixes"
+        ],
+        "type": "object"
+      },
       "ClassEntry": {
         "additionalProperties": true,
         "properties": {
@@ -3537,6 +3728,229 @@
           "verification_uri",
           "expires_in",
           "interval"
+        ],
+        "type": "object"
+      },
+      "DiagnoseRequest": {
+        "additionalProperties": false,
+        "description": "The arguments of `why_empty` without `dataset`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#checking-and-explaining-queries"
+        },
+        "properties": {
+          "at": {
+            "description": "A commit number, `commit:N`, `time:<RFC 3339>`, `snapshot:<name>` or `head`.",
+            "type": [
+              "integer",
+              "string"
+            ]
+          },
+          "atCommit": {
+            "description": "Read the snapshot of this commit.",
+            "type": "integer"
+          },
+          "query": {
+            "description": "The query that returned no rows.",
+            "type": "string"
+          },
+          "reasoning": {
+            "description": "Include materialized inferences (default: true when the dataset has them).",
+            "type": "boolean"
+          },
+          "timeoutSeconds": {
+            "description": "At most the server's query timeout. 30 by default.",
+            "type": "number"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "Diagnosis": {
+        "description": "Why a query has no solutions: the first pattern, join or filter without any.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#checking-and-explaining-queries"
+        },
+        "properties": {
+          "commit": {
+            "type": "integer"
+          },
+          "complete": {
+            "description": "Whether every check finished and every part was checked.",
+            "type": "boolean"
+          },
+          "dataset": {
+            "type": "string"
+          },
+          "empty": {
+            "description": "Whether the query has no solutions. Null when the check ran out of time.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "first": {
+            "properties": {
+              "column": {
+                "type": "integer"
+              },
+              "constants": {
+                "items": {
+                  "properties": {
+                    "occurs": {
+                      "type": "boolean"
+                    },
+                    "term": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "term",
+                    "occurs"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "issues": {
+                "items": {
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "column": {
+                      "type": "integer"
+                    },
+                    "line": {
+                      "type": "integer"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "severity": {
+                      "enum": [
+                        "error",
+                        "warning"
+                      ],
+                      "type": "string"
+                    },
+                    "suggestions": {
+                      "items": {
+                        "properties": {
+                          "count": {
+                            "type": "integer"
+                          },
+                          "label": {
+                            "type": "string"
+                          },
+                          "term": {
+                            "type": "string"
+                          },
+                          "why": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "term",
+                          "count",
+                          "why"
+                        ],
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "term": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "severity",
+                    "message"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "kind": {
+                "enum": [
+                  "pattern",
+                  "join",
+                  "filter"
+                ],
+                "type": "string"
+              },
+              "line": {
+                "type": "integer"
+              },
+              "text": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "text",
+              "constants",
+              "issues"
+            ],
+            "type": "object"
+          },
+          "message": {
+            "type": "string"
+          },
+          "prefixes": {
+            "additionalProperties": true,
+            "description": "The prefixes the compact terms use.",
+            "type": "object"
+          },
+          "steps": {
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "pattern",
+                    "join",
+                    "filter"
+                  ],
+                  "type": "string"
+                },
+                "solutions": {
+                  "description": "Null when the check ran out of time.",
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "text": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "text",
+                "solutions"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "unchecked": {
+            "description": "Parts of the query the diagnosis does not cut, such as MINUS.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "dataset",
+          "commit",
+          "empty",
+          "steps",
+          "complete",
+          "message",
+          "prefixes"
         ],
         "type": "object"
       },
@@ -5343,6 +5757,44 @@
         "required": [
           "redirect"
         ],
+        "type": "object"
+      },
+      "MemorySettings": {
+        "additionalProperties": false,
+        "description": "The memory settings of a dataset.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#memory-settings"
+        },
+        "properties": {
+          "agentGraphs": {
+            "description": "Graph IRIs or `*` patterns of agent memory. Facts asserted only there are unreviewed.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "agents": {
+            "additionalProperties": {
+              "additionalProperties": false,
+              "properties": {
+                "conversationFacts": {
+                  "enum": [
+                    "immediate",
+                    "review"
+                  ],
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            },
+            "description": "Per-agent policies by agent name.",
+            "type": "object"
+          },
+          "consolidatedGraph": {
+            "description": "The graph that promoted facts are written to.",
+            "type": "string"
+          }
+        },
         "type": "object"
       },
       "MergeRequest": {
@@ -7716,6 +8168,314 @@
         ],
         "type": "object"
       },
+      "RecallRequest": {
+        "additionalProperties": false,
+        "description": "The arguments of `recall` without `dataset`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#checking-and-explaining-queries"
+        },
+        "properties": {
+          "at": {
+            "description": "A commit number, `commit:N`, `time:<RFC 3339>`, `snapshot:<name>` or `head`.",
+            "type": [
+              "integer",
+              "string"
+            ]
+          },
+          "atCommit": {
+            "description": "Read the snapshot of this commit.",
+            "type": "integer"
+          },
+          "format": {
+            "description": "Always `json` here.",
+            "enum": [
+              "json"
+            ],
+            "type": "string"
+          },
+          "graphs": {
+            "description": "Graph IRIs to read, or `default`.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "hops": {
+            "type": "integer"
+          },
+          "includeSuperseded": {
+            "type": "boolean"
+          },
+          "maxBytes": {
+            "type": "integer"
+          },
+          "maxTriples": {
+            "type": "integer"
+          },
+          "query": {
+            "description": "The question or the words to search for. Give query, seeds or both.",
+            "type": "string"
+          },
+          "reasoning": {
+            "description": "Include materialized inferences (default: true when the dataset has them).",
+            "type": "boolean"
+          },
+          "seedLimit": {
+            "type": "integer"
+          },
+          "seeds": {
+            "description": "Entity IRIs to start from.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "statuses": {
+            "items": {
+              "enum": [
+                "reviewed",
+                "unreviewed"
+              ],
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "timeoutSeconds": {
+            "description": "At most the server's query timeout. 30 by default.",
+            "type": "number"
+          },
+          "types": {
+            "description": "Class IRIs that seeds found by search must have.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "unreviewedWeight": {
+            "type": "number"
+          }
+        },
+        "type": "object"
+      },
+      "RecallResult": {
+        "description": "The facts around the seeds, with a citation for each.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#checking-and-explaining-queries"
+        },
+        "properties": {
+          "citations": {
+            "items": {
+              "properties": {
+                "at": {
+                  "type": "string"
+                },
+                "by": {
+                  "type": "string"
+                },
+                "confidence": {
+                  "type": "string"
+                },
+                "graph": {
+                  "type": "string"
+                },
+                "id": {
+                  "type": "integer"
+                },
+                "quote": {
+                  "type": "string"
+                },
+                "reifier": {
+                  "type": "string"
+                },
+                "source": {
+                  "type": "string"
+                },
+                "status": {
+                  "enum": [
+                    "reviewed",
+                    "unreviewed"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "graph"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "commit": {
+            "type": "integer"
+          },
+          "conflicts": {
+            "items": {
+              "properties": {
+                "p": {
+                  "type": "string"
+                },
+                "s": {
+                  "type": "string"
+                },
+                "values": {
+                  "items": {
+                    "properties": {
+                      "citation": {
+                        "type": "integer"
+                      },
+                      "o": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "o",
+                      "citation"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "s",
+                "p",
+                "values"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "dataset": {
+            "type": "string"
+          },
+          "entities": {
+            "items": {
+              "properties": {
+                "facts": {
+                  "items": {
+                    "properties": {
+                      "citation": {
+                        "type": "integer"
+                      },
+                      "o": {
+                        "type": "string"
+                      },
+                      "p": {
+                        "type": "string"
+                      },
+                      "s": {
+                        "type": "string"
+                      },
+                      "status": {
+                        "enum": [
+                          "reviewed",
+                          "unreviewed"
+                        ],
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "s",
+                      "p",
+                      "o",
+                      "citation"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "hop": {
+                  "type": "integer"
+                },
+                "iri": {
+                  "type": "string"
+                },
+                "label": {
+                  "type": "string"
+                },
+                "seed": {
+                  "type": "integer"
+                },
+                "types": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "iri",
+                "types",
+                "hop",
+                "facts"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "prefixes": {
+            "additionalProperties": true,
+            "description": "The prefixes the compact terms use.",
+            "type": "object"
+          },
+          "superseded": {
+            "items": {
+              "properties": {
+                "at": {
+                  "type": "string"
+                },
+                "graph": {
+                  "type": "string"
+                },
+                "invalidatedAt": {
+                  "type": "string"
+                },
+                "o": {
+                  "type": "string"
+                },
+                "p": {
+                  "type": "string"
+                },
+                "reifier": {
+                  "type": "string"
+                },
+                "replacedBy": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "s": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "s",
+                "p",
+                "o",
+                "graph",
+                "reifier"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "dataset",
+          "commit",
+          "entities",
+          "citations",
+          "conflicts",
+          "truncated",
+          "prefixes"
+        ],
+        "type": "object"
+      },
       "Receipt": {
         "properties": {
           "commit": {
@@ -9428,6 +10188,119 @@
           "dataset",
           "name",
           "versions"
+        ],
+        "type": "object"
+      },
+      "SuggestRequest": {
+        "additionalProperties": false,
+        "description": "A question and the query that answers it.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#suggested-examples"
+        },
+        "properties": {
+          "explanation": {
+            "description": "At most 400 characters.",
+            "type": "string"
+          },
+          "query": {
+            "description": "A SPARQL query of at most 65,536 characters.",
+            "type": "string"
+          },
+          "question": {
+            "description": "At most 2000 characters.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "question",
+          "query"
+        ],
+        "type": "object"
+      },
+      "Suggestion": {
+        "description": "A suggested example.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#suggested-examples"
+        },
+        "properties": {
+          "at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "by": {
+            "description": "The principal who suggested it.",
+            "type": "string"
+          },
+          "explanation": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "query": {
+            "type": "string"
+          },
+          "question": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "question",
+          "query",
+          "by",
+          "at"
+        ],
+        "type": "object"
+      },
+      "SuggestionList": {
+        "description": "The suggested examples, newest first.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#suggested-examples"
+        },
+        "properties": {
+          "dataset": {
+            "type": "string"
+          },
+          "suggestions": {
+            "items": {
+              "properties": {
+                "at": {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                "by": {
+                  "description": "The principal who suggested it.",
+                  "type": "string"
+                },
+                "explanation": {
+                  "type": "string"
+                },
+                "id": {
+                  "type": "string"
+                },
+                "query": {
+                  "type": "string"
+                },
+                "question": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "question",
+                "query",
+                "by",
+                "at"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "dataset",
+          "suggestions"
         ],
         "type": "object"
       },
@@ -16789,6 +17662,120 @@
         "x-sparkles-permission": "any caller"
       }
     },
+    "/$/memory/{ds}": {
+      "get": {
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#memory-settings"
+        },
+        "operationId": "getMemorySettings",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemorySettings"
+                }
+              }
+            },
+            "description": "The settings, or the defaults."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Get the memory settings",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "read"
+      },
+      "put": {
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#memory-settings"
+        },
+        "operationId": "putMemorySettings",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MemorySettings"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemorySettings"
+                }
+              }
+            },
+            "description": "The stored settings."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Set the memory settings",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "admin"
+      }
+    },
     "/$/merge/{ds}": {
       "get": {
         "description": "What merging `source` into `target` would do: the merge base, the changes and the conflicts. Nothing is written, and conflicts do not fail the request.",
@@ -17464,6 +18451,186 @@
           }
         },
         "summary": "List stored queries",
+        "tags": [
+          "Stored queries"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
+    "/$/queries/{ds}/suggestions": {
+      "delete": {
+        "description": "Needs `admin` on the dataset. Promoting a suggestion is a `PUT` of the stored query and then this call.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#suggested-examples"
+        },
+        "operationId": "deleteSuggestion",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "description": "The suggestion's id.",
+            "in": "query",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Remove a suggested example",
+        "tags": [
+          "Stored queries"
+        ],
+        "x-sparkles-permission": "admin"
+      },
+      "get": {
+        "description": "Needs `admin` on the dataset.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#suggested-examples"
+        },
+        "operationId": "listSuggestions",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuggestionList"
+                }
+              }
+            },
+            "description": "The suggestions, newest first."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "List suggested examples",
+        "tags": [
+          "Stored queries"
+        ],
+        "x-sparkles-permission": "admin"
+      },
+      "post": {
+        "description": "Needs `read` on the dataset. A dataset keeps at most 500 suggestions.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#suggested-examples"
+        },
+        "operationId": "suggestExample",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SuggestRequest"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Suggestion"
+                }
+              }
+            },
+            "description": "The suggestion."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Suggest an example",
         "tags": [
           "Stored queries"
         ],
@@ -23502,6 +24669,84 @@
         "x-sparkles-permission": "read"
       }
     },
+    "/{ds}/check": {
+      "post": {
+        "description": "The MCP tool `check_query` as the caller, over the caller's view. With `terms`, every constant IRI of the query is listed with its kind, label, count and whether it occurs.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#checking-and-explaining-queries"
+        },
+        "operationId": "checkQuery",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CheckRequest"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CheckResult"
+                }
+              }
+            },
+            "description": "The result."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Check a query against the schema",
+        "tags": [
+          "SPARQL"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
     "/{ds}/data": {
       "delete": {
         "externalDocs": {
@@ -26655,6 +27900,84 @@
         "x-sparkles-permission": "read"
       }
     },
+    "/{ds}/recall": {
+      "post": {
+        "description": "The MCP tool `recall` in its JSON format: the facts around the seeds or the entities a search finds, with citations and, when the dataset names agent memory graphs, the review status of each fact.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#checking-and-explaining-queries"
+        },
+        "operationId": "recallFacts",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecallRequest"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecallResult"
+                }
+              }
+            },
+            "description": "The result."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Recall facts",
+        "tags": [
+          "SPARQL"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
     "/{ds}/shacl": {
       "post": {
         "description": "Validates a data graph of the dataset against the shapes graph in the body, as Fuseki's `/{ds}/shacl` does. The report answers `200` whether or not the data conforms.",
@@ -27260,6 +28583,84 @@
           }
         ],
         "summary": "Run a SPARQL query (POST)",
+        "tags": [
+          "SPARQL"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
+    "/{ds}/sparql/diagnose": {
+      "post": {
+        "description": "The MCP tool `why_empty`: each triple pattern alone, then the patterns joined in order with the filters, each an ASK under a tenth of the timeout. The answer names the first pattern, join or filter without solutions.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#checking-and-explaining-queries"
+        },
+        "operationId": "diagnoseQuery",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DiagnoseRequest"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Diagnosis"
+                }
+              }
+            },
+            "description": "The result."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Explain an empty result",
         "tags": [
           "SPARQL"
         ],

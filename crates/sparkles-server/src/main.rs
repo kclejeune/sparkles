@@ -5,6 +5,7 @@
 //! validate|parse`).
 
 mod alloc;
+mod assist;
 mod auth;
 #[cfg(feature = "backup")]
 mod backup;

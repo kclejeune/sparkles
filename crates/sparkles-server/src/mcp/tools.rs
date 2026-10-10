@@ -62,6 +62,8 @@ pub fn run(
         "similar_queries" => t.similar_queries(args),
         "link_entities" => t.link_entities(args),
         "recall" => t.recall(args),
+        "why_empty" => t.why_empty(args),
+        "share_query" => t.share_query(args),
         "sparql_update" => t.sparql_update(args),
         // a stored query of a dataset (`<dataset>__<query>`)
         name => t.stored_query(name, args),
@@ -538,7 +540,7 @@ impl Tools<'_> {
     }
 
     /// Parse a query, telling SPARQL Update apart from a syntax error.
-    fn parse_query(
+    pub(crate) fn parse_query(
         &self,
         q: &str,
         prefixes: &BTreeMap<String, String>,
