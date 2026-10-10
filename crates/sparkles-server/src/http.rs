@@ -259,6 +259,9 @@ pub fn router(state: Arc<AppState>) -> Router {
     // the asking pipeline (C18 §5)
     #[cfg(feature = "mcp")]
     let app = app.merge(crate::ask::http::routes());
+    // the explanation of a query (C18 §6.6)
+    #[cfg(feature = "mcp")]
+    let app = app.merge(crate::explain::http::routes());
     // backup repositories, per-dataset backups and backup policies
     #[cfg(feature = "backup")]
     let app = app.merge(crate::backup::http::routes());

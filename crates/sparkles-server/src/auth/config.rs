@@ -39,6 +39,10 @@ pub struct GrantCfg {
     /// branch names and `*` patterns the grant covers; absent: every branch
     #[serde(default)]
     pub branches: Option<Vec<String>>,
+    /// whether calls on the dataset may use the server's model providers where a tool
+    /// makes that optional, such as `explain_query` with `useServerModel` (C18 §9.6)
+    #[serde(default)]
+    pub server_models: bool,
 }
 
 /// `[[protections]]`: triples of a dataset that only grants lifting the protection
@@ -203,6 +207,7 @@ impl GrantCfg {
             }),
             lifts: self.lifts.clone(),
             branches: self.branches.clone(),
+            server_models: self.server_models,
         }
     }
 }
@@ -317,6 +322,7 @@ fn restricted_warnings(
 ) {
     for g in grants {
         if g.lifts.is_empty()
+            && !g.server_models
             && datasets
                 .iter()
                 .any(|(p, l)| *l >= g.level && (p == "*" || p == &g.dataset))

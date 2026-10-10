@@ -18,6 +18,7 @@ mod context;
 mod draft;
 mod elicit;
 pub(crate) mod errors;
+pub(crate) mod explain;
 #[cfg(feature = "fmt")]
 mod format;
 #[cfg(feature = "graphql")]

@@ -345,6 +345,10 @@ fn expected_input_schemas() -> Vec<(&'static str, Value)> {
             json!({"type":"object","additionalProperties":false,"required":["query"],"properties":{
                 "dataset": ds, "query": {"type":"string","minLength":1,"maxLength":65536},
                 "includeAlgebra": {"type":"boolean","default":false},
+                "profile": {"enum":["estimate","run"],"default":"estimate","description":"estimate plans without running; run runs the query read-only under timeoutSeconds and explains the executed plan"},
+                "notes": {"type":"boolean","default":false,"description":"Add nodes, notes and asks (the explanation of C18 §6.6), and start each plan line with its node id"},
+                "timeoutSeconds": {"type":"number","exclusiveMinimum":0,"maximum":60,"default":30,"description":"The deadline of a run"},
+                "useServerModel": {"type":"boolean","default":false,"description":"Have the server's explain model rewrite asks and notes as prose. Needs the serverModels permission, and its tokens count against your budget. You can write the prose yourself from notes and asks instead."},
                 "reasoning": rs, "atCommit": at, "at": sel}}),
         ),
         (

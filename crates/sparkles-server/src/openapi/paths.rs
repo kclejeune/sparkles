@@ -2371,6 +2371,21 @@ fn assist(p: &mut Paths) {
             .errors(&[400, 404, 409, 429]),
     );
     p.add(
+        op(POST, "/{ds}/sparql/explain", "explainQuery", tag, "Explain a query")
+            .doc("The plan of a query with node ids, notes on the operators that matter, and a description of what the query asks (spec C18 §6.6). `profile` plans, runs read-only, or reads a plan the client gives, such as the plan in the error body of a query that a budget stopped. The notes and a template description need no model. When the dataset enables `explain`, its `explain` role rewrites them as prose, checked against the plan. The answer streams as server-sent events unless `Accept` names `application/json` without `text/event-stream`. Needs `read` and counts as a query for rate limits.")
+            .see("explaining-a-query")
+            .json_body(true, "ExplainRequest")
+            .resp(
+                "200",
+                "The events `plan`, `notes`, `explanation`, `usage` when a model was called, and `error`, or the whole explanation as one object.",
+                Some(json!({
+                    "text/event-stream": text(),
+                    "application/json": { "schema": sref("ExplainResult") },
+                })),
+            )
+            .errors(&[400, 403, 404, 408, 413, 507]),
+    );
+    p.add(
         op(GET, "/$/assistant/{ds}", "getAssistantSettings", "Datasets", "Get the assistant settings")
             .doc("The dataset's `assistant.json` with a `status` that says whether asking works, and why not when it does not.")
             .see("assistant-settings")

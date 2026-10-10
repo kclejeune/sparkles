@@ -8,6 +8,103 @@ pub(super) fn put_all(put: &mut dyn FnMut(&str, J)) {
     tools(put);
     memory(put);
     asking(put);
+    explaining(put);
+}
+
+fn explaining(put: &mut dyn FnMut(&str, J)) {
+    put(
+        "ExplainRequest",
+        doc(
+            closed(
+                &["query"],
+                json!({
+                    "query": with_desc(string(), "Any query form. An update is refused with `not-a-query`."),
+                    "profile": with_desc(string_enum(&["estimate", "run", "given"]), "`estimate`, the default, plans without running. `run` runs the query read-only as the caller and counts its rows without returning them. `given` explains `plan`."),
+                    "plan": {
+                        "description": "With `profile: \"given\"`, the plan the client received, at most 10,000 nodes and 2 MiB.",
+                        "oneOf": [sref("PlanNode"), sref("CursorPlan")],
+                    },
+                    "commit": with_desc(int(), "With `profile: \"given\"`, the commit of that plan."),
+                    "error": any_object("With `profile: \"given\"`, the error body of the run that stopped, which names the budget."),
+                    "describe": with_desc(boolean(), "Whether to call the `explain` role. `true` by default when the dataset enables `explain`."),
+                    "timeoutSeconds": with_desc(num(), "The deadline of a run, 30 by default."),
+                    "at": { "description": "A commit or time to read, as for `/{ds}/sparql`." },
+                    "branch": string(),
+                    "reasoning": boolean(),
+                }),
+            ),
+            "A query to explain.",
+            "explaining-a-query",
+        ),
+    );
+    let note = obj(
+        &["node", "code", "severity", "text", "source"],
+        json!({
+            "node": or_null(string()),
+            "code": string(),
+            "severity": string_enum(&["high", "warning", "info"]),
+            "text": string(),
+            "source": string_enum(&["explain", "planner", "lint", "schema", "model"]),
+            "range": any_object("The editor range of a lint finding that names no node."),
+        }),
+    );
+    let sentence = obj(
+        &["text", "nodes"],
+        json!({ "text": string(), "nodes": strings() }),
+    );
+    put(
+        "ExplainResult",
+        doc(
+            obj(
+                &[
+                    "dataset",
+                    "queryType",
+                    "profile",
+                    "executed",
+                    "plan",
+                    "nodes",
+                    "notes",
+                    "explanation",
+                ],
+                json!({
+                    "dataset": string(),
+                    "commit": or_null(int()),
+                    "branch": string(),
+                    "queryType": string(),
+                    "profile": string_enum(&["estimate", "run", "given"]),
+                    "executed": with_desc(boolean(), "Whether the plan has actual counts."),
+                    "plan": { "oneOf": [sref("PlanNode"), sref("CursorPlan")] },
+                    "estimatedRows": or_null(num()),
+                    "rows": with_desc(int(), "After a run that finished, its rows."),
+                    "elapsedMs": num(),
+                    "stop": any_object("The budget that stopped the query: `budget`, `limit` and `elapsedMs`."),
+                    "error": any_object("The error body of a run that a budget stopped."),
+                    "warnings": array(obj(&["code", "message"], json!({ "code": string(), "message": string() }))),
+                    "nodes": array(any_object("One operator: `id`, `operator`, `description`, `columns`, `estimatedRows` (null when hidden), `estimatedCost`, `actualRows`, `timeMs`, `selfMs`, `complete`, `partial`, `skipped`, `stoppedEarly`, `cached`, `runs` and `pushedFilters`.")),
+                    "notes": array(note.clone()),
+                    "shownNotes": with_desc(int(), "How many notes to show before **More**."),
+                    "hiddenEstimates": boolean(),
+                    "explanation": obj(
+                        &["source", "asks", "notes"],
+                        json!({
+                            "source": string_enum(&["template", "model"]),
+                            "asks": array(sentence.clone()),
+                            "notes": array(note),
+                            "provider": string(),
+                            "model": string(),
+                            "dropped": int(),
+                            "replaced": int(),
+                            "template": obj(&["asks"], json!({ "asks": array(sentence) })),
+                            "fallback": { "description": "Why the template text is shown although a model was asked." },
+                        }),
+                    ),
+                    "usage": any_object("The model calls: tokens, `modelCalls`, `failedCalls` and `steps`."),
+                }),
+            ),
+            "The explanation in the JSON form: the members of the `plan` and `notes` events, and the `explanation` and `usage` events as members.",
+            "explaining-a-query",
+        ),
+    );
 }
 
 fn asking(put: &mut dyn FnMut(&str, J)) {

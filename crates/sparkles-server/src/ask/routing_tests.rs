@@ -408,6 +408,7 @@ fn a16_hidden_graphs_stay_hidden() {
             graphs: Some(vec!["https://example.org/public".into()]),
             endpoints: None,
             lifts: Vec::new(),
+            server_models: false,
             branches: None,
         }],
         ..Default::default()

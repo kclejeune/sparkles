@@ -6789,6 +6789,29 @@ also lists the warnings that came up while it ran:
 * `geo-crs-unsupported`: a geometry in an EPSG CRS that the build refused, with the
   reason.
 
+Every node of a returned plan has an `id`, the path of child indexes from the root, such
+as `0.1.2`. A `CursorPlan` node and its operator share the id. Ids are valid only for
+the plan of the same response. The estimated plan of `/{ds}/explain` and the plan of an
+executed query have the same shape, so an `ASK` has its `Slice` root and a `CONSTRUCT`
+or `DESCRIBE` has a `CONSTRUCT` or `DESCRIBE` root in both. A node can also carry these
+members.
+
+| Member | Meaning |
+|---|---|
+| `skipped` | Why the node did not run, such as "the left side produced no rows". Its rows are `-1` and its time is 0. |
+| `stoppedEarly` | A `LIMIT`, `ASK` or `EXISTS` stopped the node once it had enough rows. |
+| `runs` | How often the node ran when a `LIMIT` made the executor grow its input in rounds. Its time spans every round, and its children add up their rounds too. |
+| `cached` | The node's result came from the result cache. Its children are the subtree the result was computed from, each `skipped`. |
+| `pushedFilters` | The filters a range scan or an index join applies itself. |
+| `estimateGuessed` | The estimate is a constant guess, as for `SERVICE`. |
+| `complete` | `false` on the nodes whose counts a failure cut short. |
+
+A query that a budget or its timeout stopped answers with its error as before. In the
+`application/x-sparkles+json` format the error body also carries `plan`, the plan as it
+stood when the query stopped, and `commit`. The nodes that were still running have
+`complete: false`, and their counts are those reached so far. The UI's **Explain why**
+sends that plan to `/{ds}/sparql/explain`.
+
 ## Compression
 
 The design and its rationale are in [X01 Compression codecs](specs/X01-compression-codecs.md).
@@ -7316,6 +7339,18 @@ grants that apply, and writes the graphs of those at `write`. One grant without 
 covers every graph at its level. A `write` grant also gives `read` on its graphs, so a
 principal never writes a graph it cannot read. `admin` covers the whole dataset and is
 granted only under `datasets`.
+
+A grant with `server_models = true` also gives the `serverModels` permission on its
+datasets. The MCP tool `explain_query` uses the server's model providers only with
+`useServerModel: true`, and only for a caller with that permission. Admins of a dataset
+have it, and so does the local principal of a server without authentication.
+
+```toml
+[[tokens.grants]]
+dataset = "org"
+level = "read"
+server_models = true
+```
 
 `endpoints` lists the services a grant applies to:
 
@@ -8045,7 +8080,7 @@ open-world when SERVICE is allowed. The common arguments are:
 | `diff_schema` | `from` (a commit, or `time:…` / `snapshot:…`), `to` (the head), `graph`, `reasoning`, `limit` (50, at most 500 entries per list), `timeoutSeconds` | `{dataset, from, to, graph, reasoning, counts, report: [Change], classes: {added: [iri], removed: [iri], changed: [{iri, changes: [Change]}]}, predicates: {…}, truncated, prefixes}`: the [schema diff](#schema-diffs) between two readable states. `404` for a commit beyond the head and `410` for one whose history is gone. |
 | `draft_shapes` | `graph`, `language` (`shacl`\|`shex`), `shapesFormat` (`turtle`\|`shaclc`, for SHACL), `support` (1), `classes` (IRIs), `minInstances` (1), `maxIn` (10), `maxCount` (1), `closed` (false), `timeoutSeconds` (30). `reasoning` defaults to false here. | `{dataset, commit, graph, support, language, totals, shapes: [{class, shape, instances, properties, constraints, excluding: [{path, component, excluded}]}], shapesFormat?, shacl? \| shex?, shapeMap?}`: the [drafted shapes](#drafted-shapes) of the caller's visible graphs, as SHACL in Turtle or SHACLC, or as ShExC with its shape map. `excluding` lists the constraints that reject existing instances. Nothing is installed. |
 | `sparql_query` | `query` (required), `format` (`table`\|`json`), `maxRows` (100), `maxBytes` (65536), `maxTermChars` (500), `offset`, `exactTotal` (true), `timeoutSeconds` (30) | One text block: a table or a JSON document (below). No `structuredContent`. |
-| `explain_query` | `query` (required), `includeAlgebra` | `{dataset, commit, queryType, estimatedRows, plan, algebra?, warnings: [{code, message}]}`. `plan` has one line per operator, `<operator> <description> est=<rows> [<columns>]`, indented by depth. The warnings are `unknown-term` (a constant IRI or literal of a triple pattern that the dataset does not contain), `no-limit` (no top-level LIMIT, and over 10,000 rows estimated), `large-estimate` (an intermediate result over 50M rows) and `service-disabled`. For a caller whose graph grants or triple protections hide data, `unknown-term` looks terms up in the caller's view, so a term that occurs only in hidden data is reported as an absent one is. Such a caller sees no estimates, so `estimatedRows` is `null`, the plan shows `est=?`, there is no `large-estimate`, and `no-limit` applies to every query without a LIMIT. |
+| `explain_query` | `query` (required), `includeAlgebra`, `profile`, `notes`, `timeoutSeconds`, `useServerModel` | `{dataset, commit, queryType, estimatedRows, plan, algebra?, warnings: [{code, message}]}`. `plan` has one line per operator, `<operator> <description> est=<rows> [<columns>]`, indented by depth. With `profile: "run"`, the query runs read-only under `timeoutSeconds` (30 by default), its rows are counted in `rows` without being returned, and a run that a budget stopped is explained from its partial plan with the budget in `error`. With `notes: true`, each line starts with the node id and adds `act=` and `ms=` after a run, and the result adds `nodes`, `notes` and `asks` as `POST /{ds}/sparql/explain` defines them, with `source: "template"`. The tool never calls the server's model providers unless `useServerModel` is `true`, which needs the `serverModels` permission and fails with `server-model-not-allowed` otherwise. Its prose then replaces `asks` and the notes' text with `source: "model"`, and its tokens are charged to the caller. The warnings are `unknown-term` (a constant IRI or literal of a triple pattern that the dataset does not contain), `no-limit` (no top-level LIMIT, and over 10,000 rows estimated), `large-estimate` (an intermediate result over 50M rows) and `service-disabled`. For a caller whose graph grants or triple protections hide data, `unknown-term` looks terms up in the caller's view, so a term that occurs only in hidden data is reported as an absent one is. Such a caller sees no estimates, so `estimatedRows` is `null`, the plan shows `est=?`, there is no `large-estimate`, and `no-limit` applies to every query without a LIMIT. |
 | `describe_resource` | `iri` (required), `direction` (`both`\|`outgoing`\|`incoming`), `maxTriples` (50 per direction, ≤ 500), `lang` (`en`), `mode` (`cbd`\|`scbd`\|`outgoing`) | `{dataset, commit, iri, exists, label?, types, outgoing?, incoming?, description?, prefixes}`. Each side is `{total, predicates: [{p, count}], predicatesTotal, triples: [{p, o, oLabel?}` or `{s, sLabel?, p}], truncated}`. Triples are sampled round-robin by predicate, so a hub's largest predicate does not hide the others. With `mode`, `description` is `{mode, triples: ["s p o"], truncated}`: the resource's [DESCRIBE](#describe) in that mode, at most `maxTriples` triples. |
 | `find_paths` | `source` and `target` (IRIs; at least one), `predicates` (≤ 20 IRIs; default all), `algorithm` (`shortest`\|`allShortest`\|`kShortest`\|`all`), `direction` (`forward`\|`backward`\|`both`), `minLength`, `maxLength`, `k`, `limit` (10, ≤ 100), `maxVisited`, `weight` (an IRI), `defaultWeight`, `graph` (`default` or a named graph IRI), `timeoutSeconds` (30) | `{dataset, commit, algorithm, paths: [{source, target, length, cost, edges: ["s p o"]}], limited, edgesTruncated, prefixes}`: a [path search](#path-search) as `SERVICE path:search` runs it. With one end, the paths to or from every node it connects to, at most `limit`. At most 2000 edges are returned in all. A malformed search is `syntax`, with the `path:search` message. |
 | `list_commits` | `limit` (10, ≤ 100), `before` | `{dataset, head, firstRetained, complete, commits: [{seq, timestamp, kind, inserted, deleted, quads}], next: {before} \| null, readable: [{from, to}], snapshots: [{name, commit}]}`. `readable` lists the commits whose state `at` and `atCommit` can read, and `snapshots` the 20 newest named snapshots. |
@@ -8992,6 +9027,74 @@ feedback by complexity bucket, and the tokens with their estimated cost by pair.
 live in memory and start again with the server. `/$/metrics` carries the same counts as
 `sparkles_ask_total`, `sparkles_ask_answers`, `sparkles_ask_escalations_total`,
 `sparkles_ask_tokens_total` and `sparkles_ask_estimated_cost_total`.
+
+### Explaining a query
+
+**`POST /{ds}/sparql/explain`** explains a query from its plan. It needs `read` on the
+dataset, it counts as a query for rate limits, and it exists in builds with the `mcp`
+feature. The answer names each operator by its node id and gives notes on the operators
+that matter and a description of what the query asks. The notes and a template
+description are computed without a model. When the dataset's assistant enables
+`explain`, the `explain` role rewrites them as prose, and the server checks that prose
+against the plan. The explanation never reads result rows.
+
+```json
+{ "query": "SELECT ?name WHERE { ?p ex:memberOf ?team ; ex:name ?name FILTER(regex(?name, \"^Ana\")) }", "profile": "run" }
+```
+
+| Member | Meaning |
+|---|---|
+| `query` | Required. Any query form. An update is refused with `not-a-query`. |
+| `profile` | `estimate`, the default, plans without running. `run` runs the query read-only as the caller under the caller's budgets, counts the rows without returning them, and explains the executed plan. `given` explains the plan in `plan`. |
+| `plan`, `commit`, `error` | With `profile: "given"`, the plan the client received for this query, its commit, and the error body of the run when a budget stopped it. The plan may be a `PlanNode` or a `CursorPlan` tree of at most 10,000 nodes and 2 MiB. Its text is treated as data. |
+| `describe` | Whether to call the `explain` role. The default is `true` when the dataset enables `explain`. |
+| `timeoutSeconds` | The deadline of a run, 30 by default and at most the server's maximum. |
+| `at`, `branch`, `reasoning` | As for `/{ds}/sparql`. |
+
+The answer is a stream of server-sent events, so the notes arrive before the model has
+answered.
+
+| Event | Data |
+|---|---|
+| `plan` | `{dataset, commit, queryType, profile, executed, plan, warnings}`, with `estimatedRows` for an estimate or a run, `rows` and `elapsedMs` after a run, and `stop` and `error` when a budget stopped the query. |
+| `notes` | `{nodes, notes, shownNotes, hiddenEstimates}`. `nodes` holds each operator's id, operator, description, estimated and actual rows, total and own time, and whether its counts are complete or `partial`. |
+| `explanation` | `{source, asks, notes}`. `source` is `template` or `model`. `asks` holds one to four sentences, each `{text, nodes}`. Model text also names its `provider` and `model`, counts what the checks `dropped` and `replaced`, and keeps the template's `asks` in `template`. |
+| `usage` | The model calls, when the role was called. |
+| `error` | `{error, code, status}` of a request that fails after the stream started. |
+
+A client that sends `Accept: application/json` without `text/event-stream` gets one
+object with the members of `plan` and `notes` and the `explanation` and `usage`
+members.
+
+Each note has a node id, or `null` for a note on the whole query, a `code`, a
+`severity` (`high`, `warning` or `info`), a sentence, and its `source`.
+
+| Code | When |
+|---|---|
+| `budget` | The query stopped at a budget or its timeout. It comes first. |
+| `dominant` | The node with the largest own time, at least 20% of the total. After a row or memory budget stopped the query, the node with the most rows. Before a run, the node with the largest share of estimated cost. |
+| `misestimate` | Actual and estimated rows differ ten times or more. |
+| `blowup` | A join's output is ten times larger than its larger input. |
+| `late-filter` | A filter keeps under 1% of at least 10,000 rows. |
+| `large-sort` | A sort, group or distinct reads over a million rows. |
+| `open-path` | A transitive path has neither end bound. |
+| `skipped` | A node did not run, with the plan's reason. |
+| `stopped-early` | A node stopped once it had enough rows. |
+| `hidden-estimates` | The caller's view hides estimates. |
+
+The planner's warnings follow with `source: "planner"`. In builds with the `fmt`
+feature, the lint findings of the query that are errors or warnings follow with
+`source: "lint"`. A finding is placed on the node whose columns hold the variables it
+names, and otherwise carries the editor `range` instead of a node. The notes are
+ordered by severity and then by the node's share of the time, and `shownNotes` says how
+many to show before **More**.
+
+The `explain` role answers with `{asks: [{text, nodes}], notes: [{node, text}]}`. A
+sentence or note that cites a node the plan lacks is dropped. A note that states a
+number its node's facts do not contain, after rounding, is replaced by the
+deterministic note. When no sentence survives, the answer shows the template text with
+the reason in `fallback`. The tokens are charged to the caller and the dataset as for
+an ask, and the calls appear in `GET /$/models/usage` under the role `explain`.
 
 ### Assistant settings
 
