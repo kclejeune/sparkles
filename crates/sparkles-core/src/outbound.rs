@@ -845,6 +845,28 @@ pub fn fetch_bytes(
     Ok((bytes, content_type))
 }
 
+/// GET `url` through `policy` with `headers` and return the status with the body as a
+/// stream, under the policy's response ceiling and `timeout` (at most the policy's). Any
+/// status is an answer; a refused destination or a network failure is a [`Failure`].
+/// Model downloads (spec F12) use it with a policy whose ceiling and timeout fit
+/// files of several gigabytes.
+pub fn get_stream(
+    policy: &OutboundPolicy,
+    url: &str,
+    headers: &[(&str, &str)],
+    timeout: Duration,
+) -> Result<(u16, Box<dyn Read + Send>), Failure> {
+    let budget = RequestBudget::new(policy);
+    let resp = policy.send(&budget, url, timeout, |client, u| {
+        let mut rb = client.get(u);
+        for (k, v) in headers {
+            rb = rb.header(*k, *v);
+        }
+        rb
+    })?;
+    Ok((resp.status.as_u16(), Box::new(resp.body)))
+}
+
 /// The answer of [`post_json`]: the status, the `Retry-After` header and the body.
 pub struct Posted {
     pub status: reqwest::StatusCode,

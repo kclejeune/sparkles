@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { ApiError, type PlanNode, type Term, type VectorIndexStatus } from './api';
+import {
+  ApiError,
+  type PlanNode,
+  type LocalModelStatus,
+  type Term,
+  type VectorIndexStatus,
+} from './api';
 import { displayTerm } from './rdf';
 import {
   abbreviateVector,
@@ -13,6 +19,8 @@ import {
   indexForm,
   isVectorLiteral,
   literalText,
+  localModelClass,
+  localModelTitle,
   metricInfo,
   needsBuild,
   overlayShare,
@@ -374,6 +382,39 @@ describe('embedding settings', () => {
         '{"url":"http://x/","model":"m","predicates":["http://p"],"apiKey":{"secret":"k"}}',
       ).config?.apiKey,
     ).toEqual({ secret: 'k' });
+    // a provider of the model configuration instead of a URL
+    expect(
+      parseEmbedding('{"provider":"emb","model":"minilm","predicates":["http://p"]}').config
+        ?.provider,
+    ).toBe('emb');
+    expect(
+      parseEmbedding('{"provider":"emb","url":"http://x/","model":"m","predicates":[]}').error,
+    ).toMatch(/not both/);
+    expect(
+      parseEmbedding('{"provider":"emb","model":"m","predicates":[],"apiKey":{"secret":"k"}}')
+        .error,
+    ).toMatch(/apiKey/);
+  });
+
+  it('describes a local model', () => {
+    const m: LocalModelStatus = {
+      provider: 'emb',
+      model: 'minilm',
+      state: 'loaded',
+      runtime: true,
+      repo: 'sentence-transformers/all-MiniLM-L6-v2',
+      revision: '1110a243fdf4706b3f48f1d95db1a4f5529b4d41',
+      dtype: 'f32',
+      threads: 2,
+      idleUnloadSecs: 600,
+      weightBytes: 90_900_000,
+    };
+    expect(localModelClass(m)).toBe('ok');
+    expect(localModelTitle(m)).toMatch(/all-MiniLM-L6-v2@1110a243fdf4.*91 MB/);
+    expect(localModelClass({ ...m, state: 'absent' })).toBe('danger');
+    expect(localModelClass({ ...m, runtime: false })).toBe('danger');
+    expect(localModelTitle({ ...m, runtime: false })).toMatch(/embed-local/);
+    expect(localModelClass({ ...m, state: 'downloading' })).toBe('warn');
   });
 
   it('describes the worker', () => {

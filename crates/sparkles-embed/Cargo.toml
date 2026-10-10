@@ -1,0 +1,38 @@
+[package]
+name = "sparkles-embed"
+description = "Local text embeddings for Sparkles with Candle: sentence-transformers snapshots, BERT-family and Qwen3 encoders, on a dedicated thread pool"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sparkles-modelstore.workspace = true
+# pure-Rust tensors and the BERT-family models; CPU only, no accelerator features. 0.9.2
+# rather than 0.10 or 0.11, which depend on tokenizers 0.22 with Oniguruma for GGUF files
+candle-core = "0.9.2"
+candle-nn = "0.9.2"
+candle-transformers = "0.9.2"
+# Hugging Face tokenizers with the pure-Rust regex engine: no Oniguruma (C), no C++ suffix
+# arrays (esaxx), no HTTP client and no progress bars
+tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+rayon.workspace = true
+parking_lot.workspace = true
+
+# lowers the nice value of the inference threads
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile.workspace = true
+# the HTTP client of the benchmark example's downloads
+reqwest.workspace = true
+# the server's allocator, so the benchmark's memory figures match a server's
+mimalloc = "0.1.52"
+libmimalloc-sys = { version = "0.1.49", features = ["extended"] }
+
+[[example]]
+name = "embed-bench"
+path = "examples/embed_bench.rs"

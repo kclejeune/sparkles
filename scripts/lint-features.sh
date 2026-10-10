@@ -29,6 +29,7 @@ server=(
   graphql
   pdf
   pdf-ocr
+  embed-local
   "mcp,shacl"
   "mcp,shex"
   "mcp,fmt"

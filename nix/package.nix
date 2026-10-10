@@ -18,8 +18,10 @@
   installShellFiles,
   makeBinaryWrapper,
   ui ? null,
-  # extra cargo features of sparkles-server, such as [ "pdf-ocr" ]
-  features ? [ ],
+  # cargo features of sparkles-server on top of its defaults: the local embedding
+  # runtime of spec F12 by default, which adds about 5 MB to the binary and runs nothing
+  # until a local provider is configured; [ ] leaves it out
+  features ? [ "embed-local" ],
 }:
 let
   featureArgs = lib.optionalString (

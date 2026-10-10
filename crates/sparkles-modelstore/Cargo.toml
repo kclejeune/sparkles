@@ -1,0 +1,17 @@
+[package]
+name = "sparkles-modelstore"
+description = "A verified store of model files for Sparkles: local snapshot directories and pinned Hugging Face Hub downloads"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+percent-encoding.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

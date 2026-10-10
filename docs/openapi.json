@@ -9330,6 +9330,107 @@
             "description": "Whether the server runs with `--model-config`.",
             "type": "boolean"
           },
+          "local": {
+            "items": {
+              "properties": {
+                "arch": {
+                  "type": "string"
+                },
+                "dimension": {
+                  "type": "integer"
+                },
+                "downloadError": {
+                  "type": "string"
+                },
+                "dtype": {
+                  "enum": [
+                    "f32",
+                    "bf16"
+                  ],
+                  "type": "string"
+                },
+                "idleUnloadSecs": {
+                  "type": "integer"
+                },
+                "lastError": {
+                  "type": "string"
+                },
+                "loads": {
+                  "type": "integer"
+                },
+                "maxTokens": {
+                  "type": "integer"
+                },
+                "model": {
+                  "type": "string"
+                },
+                "path": {
+                  "type": "string"
+                },
+                "provider": {
+                  "type": "string"
+                },
+                "queued": {
+                  "type": "integer"
+                },
+                "repo": {
+                  "type": "string"
+                },
+                "revision": {
+                  "type": "string"
+                },
+                "runtime": {
+                  "description": "Whether the build has the local runtime (cargo feature `embed-local`).",
+                  "type": "boolean"
+                },
+                "state": {
+                  "enum": [
+                    "absent",
+                    "downloading",
+                    "present",
+                    "loading",
+                    "loaded",
+                    "unloaded"
+                  ],
+                  "type": "string"
+                },
+                "texts": {
+                  "type": "integer"
+                },
+                "threads": {
+                  "type": "integer"
+                },
+                "unloads": {
+                  "type": "integer"
+                },
+                "weightBytes": {
+                  "oneOf": [
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "provider",
+                "model",
+                "dtype",
+                "threads",
+                "idleUnloadSecs",
+                "runtime",
+                "state"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "modelsDir": {
+            "description": "The model store of local models (spec F12).",
+            "type": "string"
+          },
           "providers": {
             "items": {
               "properties": {
@@ -9380,13 +9481,15 @@
                   "type": "integer"
                 },
                 "endpoint": {
+                  "description": "Empty for the local kind.",
                   "type": "string"
                 },
                 "kind": {
                   "enum": [
                     "ollama",
                     "openai",
-                    "anthropic"
+                    "anthropic",
+                    "local"
                   ],
                   "type": "string"
                 },
@@ -15934,6 +16037,10 @@
                 },
                 "type": "array"
               },
+              "provider": {
+                "description": "A provider of the model configuration, instead of `url` and `apiKey`.",
+                "type": "string"
+              },
               "query": {
                 "type": "string"
               },
@@ -15956,11 +16063,11 @@
                 "type": "integer"
               },
               "url": {
+                "description": "The endpoint. Required unless `provider` is set.",
                 "type": "string"
               }
             },
             "required": [
-              "url",
               "model"
             ],
             "type": "object"
@@ -16112,6 +16219,10 @@
                     },
                     "type": "array"
                   },
+                  "provider": {
+                    "description": "A provider of the model configuration, instead of `url` and `apiKey`.",
+                    "type": "string"
+                  },
                   "query": {
                     "type": "string"
                   },
@@ -16134,11 +16245,11 @@
                     "type": "integer"
                   },
                   "url": {
+                    "description": "The endpoint. Required unless `provider` is set.",
                     "type": "string"
                   }
                 },
                 "required": [
-                  "url",
                   "model"
                 ],
                 "type": "object"
@@ -16190,6 +16301,11 @@
                   "at",
                   "message"
                 ],
+                "type": "object"
+              },
+              "local": {
+                "additionalProperties": true,
+                "description": "For a provider of the local kind, the model's entry of `local` in `GET /$/models`.",
                 "type": "object"
               },
               "model": {

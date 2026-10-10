@@ -80,6 +80,7 @@ impl EmbedRun {
             enabled: true,
             outbound: self.outbound.local_policy()?,
             secrets: parse_secrets(&self.embedding_secret)?,
+            providers: None,
         })
     }
 

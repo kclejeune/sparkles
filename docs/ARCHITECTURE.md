@@ -444,7 +444,7 @@ share one maintenance strategy.
 |---|---|---|
 | Full-text | Tantivy documents keyed by quad term keys. Jena's `text:query`, BM25 and highlighting | Writes stage documents in the commit path. Segment commits and checkpoints are deferred. Searches reconcile candidates with their snapshot. WAL recovery catches up or rebuilds the index. Historical search is unsupported. |
 | Vectors | Packed vectors and optional HNSW per generation. Exact delta overlay and `spk:vectorSearch` | Base builds run in the background and exact search remains available while HNSW builds. Compaction rebuilds the graph. Explicit approximate search trades recall for speed. Eligible ordinary cosine and dot-product top-k rewrites stay exact. |
-| Embeddings | Workers prepare source inputs, call an external provider, then apply vectors as ordinary commits | Provider latency stays outside the original write. Apply rechecks changed inputs, stale work is discarded, and embedding commits do not schedule themselves. Catch-up and freshness are visible. |
+| Embeddings | Workers prepare source inputs, call an external provider or a local model on its own thread pool ([F12](specs/F12-local-embeddings.md)), then apply vectors as ordinary commits | Provider latency stays outside the original write. Apply rechecks changed inputs, stale work is discarded, and embedding commits do not schedule themselves. Catch-up and freshness are visible. |
 | Spatial | Parsed geometry column, packed R-tree base and snapshot overlays. GeoSPARQL and Jena spatial functions | Range, spatial-join and nearest-neighbor plans use the index. Index failure falls back to query evaluation without it. Rebuild restores acceleration. Compaction prebuilds geometry state to shorten its final switch. |
 | Schema | Exact observed class and predicate counts, graph scope, declarations and SHACL constraints | Reports can be maintained from changes and compared across commits. Draft shapes describe observations. Installing a write guard makes them an enforced contract. |
 | Inference | RDFS, OWL 2 RL and Jena rules materialized through semi-naive forward chaining. RDFS also available on read | Materialized runs record their source state and publish inferred data through guarded writes. Incremental maintenance falls back to a full run for unsupported rules or unavailable history. Stale inferences are reported rather than silently represented as current. |
@@ -479,8 +479,8 @@ Sources: [text lifecycle](../crates/sparkles-core/src/text.rs),
 [C05](specs/C05-tabular-imports.md), [C08](specs/C08-inference-freshness.md),
 [F03](specs/F03-full-text-search.md), [F04](specs/F04-vector-search.md),
 [F07](specs/F07-path-search.md), [F08](specs/F08-embeddings-on-write.md),
-[G01](specs/G01-geosparql.md), [G02](specs/G02-shex.md), and
-[G03](specs/G03-shaclc.md).
+[F12](specs/F12-local-embeddings.md), [G01](specs/G01-geosparql.md),
+[G02](specs/G02-shex.md), and [G03](specs/G03-shaclc.md).
 
 ## Server policy, agents and tooling reuse the engine
 

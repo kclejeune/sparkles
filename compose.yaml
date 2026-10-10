@@ -18,11 +18,11 @@
 #   RUST_LOG             log filter (default: the server's own, as below)
 #   SPARKLES_LOG_FORMAT  text or json (default text)
 #   SPARKLES_BUILD_JOBS  parallel compile jobs of the image build (default: all cores)
-#   SPARKLES_FEATURES    extra cargo features of the image build (default: none)
+#   SPARKLES_FEATURES    cargo features of the image build (default: embed-local)
 
 x-build-args: &build-args
   BUILD_JOBS: ${SPARKLES_BUILD_JOBS:-}
-  FEATURES: ${SPARKLES_FEATURES:-}
+  FEATURES: ${SPARKLES_FEATURES-embed-local}
 
 x-server: &server
   environment:
@@ -34,6 +34,9 @@ x-server: &server
     # never publish the port more widely without it.
     SPARKLES_ALLOW_OPEN_NETWORK: "1"
     # SPARKLES_BACKUP_CONFIG: /etc/sparkles/backup.toml
+    # The model store of local embedding models, which the models-pull profile fills.
+    # An empty store costs nothing until a local provider names a model.
+    SPARKLES_MODELS_DIR: /models
   ports:
     - "127.0.0.1:${SPARKLES_PORT:-3030}:3030"
   restart: unless-stopped
@@ -80,9 +83,6 @@ services:
       # (without --auth-config, other names than IP addresses and localhost get 421):
       # - --public-host
       # - sparql.example.org
-      # The models that the models-pull profile fetched, on a build with `sparkles models`:
-      # - --models-dir
-      # - /models
       # Reload the files above when they change, as on SIGHUP:
       # - --watch-config
     volumes:
@@ -93,8 +93,7 @@ services:
       # (docs/USAGE.md#backup-repositories):
       # - ./backups:/backups
       # - ./backup.toml:/etc/sparkles/backup.toml:ro
-      # The model store that the models-pull profile fills (with --models-dir above):
-      # - sparkles-models:/models:ro
+      - sparkles-models:/models:ro
 
   # The OCR variant (`--target ocr`): PDFium and ONNX Runtime in the image, the PP-OCR
   # models from ./ocr-models. Run it instead of `sparkles`, never beside it, since both
@@ -122,10 +121,10 @@ services:
     volumes:
       - sparkles-data:/data
       - ./ocr-models:/ocr-models:ro
+      - sparkles-models:/models:ro
 
   # A one-shot fetch of the pinned model snapshots of ./models-manifest.json into the
   # `sparkles-models` volume. Snapshots already present and verified need no network.
-  # Needs a build with the `sparkles models` subcommand.
   models-pull:
     profiles: [models-pull]
     build:

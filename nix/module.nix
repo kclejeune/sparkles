@@ -191,6 +191,14 @@ let
     modelConfigFile
   ]
   ++ modelSecretArgs
+  ++ lib.optionals (cfg.models.dir != null) [
+    "--models-dir"
+    (toString cfg.models.dir)
+  ]
+  ++ lib.optionals (cfg.models.download != "off") [
+    "--models-download"
+    cfg.models.download
+  ]
   ++ lib.optionals (cfg.backup.configFile != null) [
     "--backup-config"
     cfg.backup.configFile
@@ -292,7 +300,15 @@ let
     )) "${cfg.dataDir}/declarative"
     ++ lib.mapAttrsToList datasetPath persistent
     ++ fsRoots
+    ++ lib.optional (modelsDirOutside && cfg.models.download == "on") modelsDir
   );
+
+  # a model store outside the Nix store and the data directory needs a sandbox path
+  modelsDir = if cfg.models.dir == null then null else toString cfg.models.dir;
+  modelsDirOutside =
+    modelsDir != null
+    && !lib.hasPrefix builtins.storeDir modelsDir
+    && !lib.hasPrefix "${cfg.dataDir}/" modelsDir;
 
   tls = cfg.tls.certFile != null;
 
@@ -666,6 +682,39 @@ in
             };
           }
         );
+      };
+
+      dir = mkOption {
+        type = types.nullOr (types.either types.path types.str);
+        default = null;
+        example = lib.literalExpression ''
+          sparkles.legacyPackages.''${pkgs.stdenv.hostPlatform.system}.modelSnapshots {
+            manifests = [ ./minilm.sparkles-manifest.json ];
+          }
+        '';
+        description = ''
+          The model store that `local` providers read their snapshots from, passed as
+          `--models-dir`. The default `null` uses `''${dataDir}/models`. The store may
+          be read-only, such as a Nix store path built with the flake's
+          `legacyPackages.<system>.modelSnapshots` helper (`docs/USAGE.md`, Local embedding
+          models). A directory outside the Nix store and {option}`dataDir` is added to
+          the service's read-only paths, or to its writable paths when
+          {option}`models.download` is `on`.
+        '';
+      };
+
+      download = mkOption {
+        type = types.enum [
+          "off"
+          "on"
+        ];
+        default = "off";
+        description = ''
+          Whether the server may download a pinned snapshot that a `local` provider
+          names and the store lacks, passed as `--models-download`. With `off` the
+          server reads only what the store holds. Downloads need a writable store and
+          go through the outbound policy.
+        '';
       };
     };
 
@@ -1167,7 +1216,9 @@ in
         StateDirectory = mkIf (cfg.dataDir == "/var/lib/sparkles") "sparkles";
         StateDirectoryMode = "0750";
         ReadWritePaths = writablePaths;
-        ReadOnlyPaths = lib.optional (loadDir != null) loadDir;
+        ReadOnlyPaths =
+          lib.optional (loadDir != null) loadDir
+          ++ lib.optional (modelsDirOutside && cfg.models.download == "off") modelsDir;
         Restart = "on-failure";
         RestartSec = 5;
         # the grace period for requests in flight, then up to 5 s for cancelled ones to

@@ -20,8 +20,11 @@
 # directories between builds, so a rebuild compiles only the crates that changed. Pass
 # `--build-arg BUILD_JOBS=N` to cap the parallel compile jobs on a busy machine.
 #
-# `--build-arg FEATURES="a b"` adds cargo features of sparkles-server to the server builds,
-# and `--build-arg NO_DEFAULT_FEATURES=1` starts them from no features at all.
+# `--build-arg FEATURES="a b"` sets the cargo features of sparkles-server that the server
+# builds add to its defaults. It defaults to `embed-local`, the local embedding runtime,
+# which adds about 5 MB and runs nothing until a local provider is configured, and
+# `--build-arg FEATURES=` leaves it out. `--build-arg NO_DEFAULT_FEATURES=1` starts from
+# no default features at all.
 # `docker build --target ocr -t sparkles:ocr .` builds the OCR variant. Its server finds
 # PDFium and ONNX Runtime through PDFIUM_LIB_PATH and ORT_DYLIB_PATH, and OCR is on when
 # `--pdf-ocr-models DIR` names a directory of PP-OCR models, usually a mounted volume.
@@ -102,7 +105,7 @@ ARG BUILD_JOBS
 # the binary's 450 MB. The image drops them and keeps the symbol table, so backtraces
 # still name functions; `--build-arg KEEP_DEBUGINFO=1` keeps the line tables too.
 ARG KEEP_DEBUGINFO
-ARG FEATURES
+ARG FEATURES=embed-local
 ARG NO_DEFAULT_FEATURES
 # the server embeds ui/build at compile time (crates/sparkles-server/src/ui.rs)
 COPY --from=ui /src/ui/build ui/build
@@ -119,7 +122,7 @@ RUN --mount=type=cache,id=sparkles-cargo-registry,target=/usr/local/cargo/regist
 FROM sources AS server-ocr
 ARG BUILD_JOBS
 ARG KEEP_DEBUGINFO
-ARG FEATURES
+ARG FEATURES=embed-local
 ARG NO_DEFAULT_FEATURES
 COPY --from=ui /src/ui/build ui/build
 RUN --mount=type=cache,id=sparkles-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \

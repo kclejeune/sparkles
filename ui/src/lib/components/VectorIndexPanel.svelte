@@ -20,6 +20,8 @@
     embeddingProgress,
     embeddingStateClass,
     fmtRecall,
+    localModelClass,
+    localModelTitle,
     indexConfig,
     indexForm,
     metricInfo,
@@ -511,6 +513,12 @@
                 <span class="embedding">
                   <span class="badge {embeddingStateClass(em.state)}">{em.state}</span>
                   <span class="mono small" title="The provider's endpoint">{em.endpoint}</span>
+                  {#if em.local}
+                    <span
+                      class="badge {localModelClass(em.local)}"
+                      title={localModelTitle(em.local)}>{em.local.state}</span
+                    >
+                  {/if}
                   <span class="faint">· {embeddingProgress(em)}</span>
                   {#if em.scan}
                     <span
@@ -801,7 +809,7 @@
     <label class="field">
       Embedding <span class="faint"
         >(optional JSON: compute the vectors from the dataset's text with an OpenAI-compatible
-        endpoint)</span
+        endpoint, or name a provider of the model configuration)</span
       >
       <textarea
         class="input mono embedding-json"
@@ -812,8 +820,8 @@
         aria-invalid={!!errors.embedding}></textarea>
       {#if errors.embedding}<span class="bad">{errors.embedding}</span>{/if}
       <span class="faint small"
-        >The text of the selected literals is sent to this endpoint after each commit. Leave it
-        empty when you load the vectors yourself.</span
+        >The text of the selected literals is sent to this endpoint, or embedded by the local model,
+        after each commit. Leave it empty when you load the vectors yourself.</span
       >
     </label>
     <p class="faint small">

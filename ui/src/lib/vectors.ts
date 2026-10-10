@@ -420,10 +420,19 @@ export function parseEmbedding(
     return { config: null, error: `Not JSON: ${(e as Error).message}` };
   }
   if (!v || typeof v !== 'object' || Array.isArray(v))
-    return { config: null, error: 'A JSON object with url, model and predicates or query' };
+    return {
+      config: null,
+      error: 'A JSON object with url or provider, model and predicates or query',
+    };
   const o = v as Record<string, unknown>;
-  if (typeof o.url !== 'string' || !/^https?:\/\/\S+$/.test(o.url))
-    return { config: null, error: 'url: an http(s) URL' };
+  if (o.provider != null) {
+    if (typeof o.provider !== 'string' || !o.provider)
+      return { config: null, error: 'provider: a provider of the model configuration' };
+    if (o.url != null) return { config: null, error: 'url: give url or provider, not both' };
+    if (o.apiKey != null)
+      return { config: null, error: "apiKey: a provider's key comes from its configuration" };
+  } else if (typeof o.url !== 'string' || !/^https?:\/\/\S+$/.test(o.url))
+    return { config: null, error: 'url: an http(s) URL, or name a provider' };
   if (typeof o.model !== 'string' || !o.model) return { config: null, error: 'model: required' };
   if (o.predicates == null && o.query == null)
     return { config: null, error: 'predicates or query: name the text to embed' };
@@ -433,6 +442,27 @@ export function parseEmbedding(
       error: 'apiKey: {"secret": NAME}, a secret the server defines with --embedding-secret',
     };
   return { config: o as api.EmbeddingConfig, error: null };
+}
+
+/** The badge class of a local model's state. */
+export function localModelClass(m: api.LocalModelStatus): string {
+  if (!m.runtime || m.lastError || m.downloadError || m.state === 'absent') return 'danger';
+  return m.state === 'loaded' || m.state === 'unloaded' || m.state === 'present' ? 'ok' : 'warn';
+}
+
+/** A tooltip on a local model's state: its source, its memory and what is wrong. */
+export function localModelTitle(m: api.LocalModelStatus): string {
+  const source = m.path ?? `${m.repo}@${m.revision?.slice(0, 12)}`;
+  const parts = [
+    `Local model ${m.provider}/${m.model} from ${source}, ${m.dtype}, ${m.threads} threads`,
+  ];
+  if (m.weightBytes) parts.push(`${(m.weightBytes / 1e6).toFixed(0)} MB of weights in memory`);
+  if (m.state === 'unloaded') parts.push(`unloaded after ${m.idleUnloadSecs} s idle`);
+  if (!m.runtime) parts.push('this build has no local runtime (cargo feature embed-local)');
+  if (m.state === 'absent') parts.push('not in the model store; run sparkles models pull');
+  if (m.downloadError) parts.push(`download failed: ${m.downloadError}`);
+  if (m.lastError) parts.push(m.lastError);
+  return parts.join('. ');
 }
 
 /** The badge class of an embedding state. */

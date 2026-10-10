@@ -5873,6 +5873,33 @@ export interface components {
         ModelProviders: {
             /** @description Whether the server runs with `--model-config`. */
             configured: boolean;
+            local?: {
+                arch?: string;
+                dimension?: number;
+                downloadError?: string;
+                /** @enum {string} */
+                dtype: "f32" | "bf16";
+                idleUnloadSecs: number;
+                lastError?: string;
+                loads?: number;
+                maxTokens?: number;
+                model: string;
+                path?: string;
+                provider: string;
+                queued?: number;
+                repo?: string;
+                revision?: string;
+                /** @description Whether the build has the local runtime (cargo feature `embed-local`). */
+                runtime: boolean;
+                /** @enum {string} */
+                state: "absent" | "downloading" | "present" | "loading" | "loaded" | "unloaded";
+                texts?: number;
+                threads: number;
+                unloads?: number;
+                weightBytes?: number | null;
+            }[];
+            /** @description The model store of local models (spec F12). */
+            modelsDir?: string;
             providers: {
                 allowedModels?: string[];
                 /** @description The name of the secret that holds the key and its source. The key itself is never returned. */
@@ -5889,9 +5916,10 @@ export interface components {
                     usedToday: number;
                 };
                 concurrency: number;
+                /** @description Empty for the local kind. */
                 endpoint: string;
                 /** @enum {string} */
-                kind: "ollama" | "openai" | "anthropic";
+                kind: "ollama" | "openai" | "anthropic" | "local";
                 models: {
                     contextTokens: number;
                     detected?: ("auto" | "json-schema" | "json-object" | "tool" | "text") | null;
@@ -7826,6 +7854,8 @@ export interface components {
                 maxRetries?: number;
                 model: string;
                 predicates?: string[];
+                /** @description A provider of the model configuration, instead of `url` and `apiKey`. */
+                provider?: string;
                 query?: string;
                 queryPrefix?: string;
                 queryText?: boolean;
@@ -7833,7 +7863,8 @@ export interface components {
                 sendDimensions?: boolean;
                 timeoutSecs?: number;
                 tokensPerMinute?: number;
-                url: string;
+                /** @description The endpoint. Required unless `provider` is set. */
+                url?: string;
             };
             exactThreshold?: number;
             hnsw?: false | {
@@ -7877,6 +7908,8 @@ export interface components {
                     maxRetries?: number;
                     model: string;
                     predicates?: string[];
+                    /** @description A provider of the model configuration, instead of `url` and `apiKey`. */
+                    provider?: string;
                     query?: string;
                     queryPrefix?: string;
                     queryText?: boolean;
@@ -7884,7 +7917,8 @@ export interface components {
                     sendDimensions?: boolean;
                     timeoutSecs?: number;
                     tokensPerMinute?: number;
-                    url: string;
+                    /** @description The endpoint. Required unless `provider` is set. */
+                    url?: string;
                 };
                 embedded?: number;
                 endpoint: string;
@@ -7899,6 +7933,10 @@ export interface components {
                     at: string;
                     message: string;
                     subject?: string;
+                };
+                /** @description For a provider of the local kind, the model's entry of `local` in `GET /$/models`. */
+                local?: {
+                    [key: string]: unknown;
                 };
                 model: string;
                 requests?: number;

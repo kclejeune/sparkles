@@ -560,6 +560,7 @@ impl Batch {
                 &self.emb,
                 self.dimension,
                 chunk,
+                false,
                 &Waits { sleep },
                 &mut requests,
             ) {

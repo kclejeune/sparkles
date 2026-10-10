@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Write THIRD_PARTY_LICENSES.md: the license and NOTICE files of every crate the
 `sparkles` binary links (the normal dependencies of sparkles-server with its default
-features, on every platform the flake builds for), from `cargo metadata`. Without an OUT
+features and the opt-in features in OPT_IN, on every platform the flake builds for), from
+`cargo metadata`. Without an OUT
 argument it also writes crates/sparkles-py/THIRD_PARTY_LICENSES.md for the Python wheel and
 jvm/sparkles-jena/THIRD_PARTY_LICENSES.md for the JVM library's native part and
 js/engine/THIRD_PARTY_LICENSES.md for the Node addon, each from its own workspace and
@@ -26,6 +27,10 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # what ships: the server binary on the platforms of flake.nix, and the formatter's
 # WebAssembly module the UI embeds
+# opt-in features of sparkles-server whose crates are listed too, so that a build with
+# them ships complete notices (the local embedding runtime of spec F12)
+OPT_IN = ["sparkles-server/embed-local"]
+
 ROOTS = [
     (
         "sparkles-server",
@@ -245,7 +250,9 @@ DATA_NOTICES = {
 
 def metadata(target, manifest=os.path.join(ROOT, "Cargo.toml"), locked=True):
     """`cargo metadata` for a platform. Without `locked`, cargo may add what the
-    manifest needs to its lock file first."""
+    manifest needs to its lock file first. The workspace's own manifest resolves the
+    opt-in features too."""
+    features = ["--features", ",".join(OPT_IN)] if manifest == os.path.join(ROOT, "Cargo.toml") else []
     out = subprocess.run(
         [
             "cargo",
@@ -257,6 +264,7 @@ def metadata(target, manifest=os.path.join(ROOT, "Cargo.toml"), locked=True):
             target,
             "--manifest-path",
             manifest,
+            *features,
         ],
         check=True,
         capture_output=True,
@@ -360,7 +368,8 @@ def fence(text):
 BINARY_INTRO = (
     "The `sparkles` binary links the crates below (the dependencies of `sparkles-server` "
     "on Linux and macOS, and of `sparkles-fmt-wasm`, the formatter's WebAssembly module "
-    "in the web UI). Their licenses and notices follow, each text once, with the crates "
+    "in the web UI). The list includes the crates of the opt-in `embed-local` feature, "
+    "which the default build leaves out. Their licenses and notices follow, each text once, with the crates "
     "that ship it. The binary also includes EPSG-derived coordinate reference system "
     "definitions, whose terms of use are under Data notices.\n"
 )

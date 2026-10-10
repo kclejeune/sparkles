@@ -102,6 +102,10 @@ lsp-types = { workspace = true, optional = true }
 # PDF conversion for ingestion (feature `pdf`, spec C18 §7.1.1): an exact pin, because a
 # new version can change the Markdown and with it the offsets of stored renditions
 pdf-inspector = { version = "=1.25.2", default-features = false, optional = true }
+# the model store (spec F12): `sparkles models` and `serve --models-dir`; local embedding
+# models with Candle under the feature `embed-local`
+sparkles-modelstore.workspace = true
+sparkles-embed = { workspace = true, optional = true }
 
 # malloc_trim (glibc), and statvfs for the free-space guard of spooled request bodies
 [target.'cfg(unix)'.dependencies]
@@ -166,6 +170,10 @@ pdf = ["mcp", "dep:pdf-inspector"]
 # fusion compiles only under its `ocr` feature, which also builds its model downloader;
 # conversion sets the offline policy, so the downloader is never used
 pdf-ocr = ["pdf", "pdf-inspector/ocr"]
+# local embedding models run in the process with Candle (spec F12): the `local` provider
+# kind of the model configuration. Off by default; without it an index that uses a local
+# provider fails with a clear error, and `sparkles models` still manages the store
+embed-local = ["dep:sparkles-embed"]
 # backup repositories on a filesystem or S3: `/$/repositories`, `/$/backups/{ds}`,
 # `/$/backup-policies`, `sparkles repo …`, `sparkles backup create|list|restore|…`
 backup = ["dep:sparkles-backup", "dep:toml", "sparkles/backup"]

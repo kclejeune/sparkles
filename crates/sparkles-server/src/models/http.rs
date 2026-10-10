@@ -28,6 +28,11 @@ async fn list(State(st): St) -> Json<Value> {
         Some(m) => {
             let mut v = m.describe();
             v["configured"] = true.into();
+            // the local embedding models and their state (spec F12)
+            if let Some(l) = &st.local_models {
+                v["local"] = l.describe(&m.config);
+                v["modelsDir"] = l.dir().display().to_string().into();
+            }
             v
         }
         None => json!({ "configured": false, "providers": [], "roles": {} }),

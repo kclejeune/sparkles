@@ -41,7 +41,8 @@
           };
         homeModules.sparkles = self.homeModules.default;
 
-        # Adds `sparkles`, `sparkles-cli`, `sparkles-ui` and `sparkles-fmt-wasm` to a package set.
+        # Adds `sparkles`, `sparkles-cli`, `sparkles-ui`, `sparkles-fmt-wasm` and the
+        # `sparkles-model-snapshots` helper to a package set.
         overlays.default =
           final: prev:
           let
@@ -56,6 +57,7 @@
             sparkles-fmt-wasm = fmtWasm;
             sparkles-ui = ui;
             sparkles = final.callPackage ./nix/package.nix { inherit craneLib ui; };
+            sparkles-model-snapshots = final.callPackage ./nix/model-snapshots.nix { };
             sparkles-cli = final.callPackage ./nix/package.nix {
               inherit craneLib;
               ui = null;
@@ -111,12 +113,15 @@
               inherit craneLib;
               ui = null;
             };
-            # the server built with PDF OCR (`pdf-ocr`); PDFium and ONNX Runtime come from
+            # the server built with PDF OCR (`pdf-ocr`) and local embeddings; PDFium and ONNX Runtime come from
             # the image or the host at run time
             sparkles-ocr = pkgs.callPackage ./nix/package.nix {
               inherit craneLib;
               ui = self'.packages.sparkles-ui;
-              features = [ "pdf-ocr" ];
+              features = [
+                "embed-local"
+                "pdf-ocr"
+              ];
             };
             # the Python bindings (crates/sparkles-py) for nixpkgs' python3
             sparkles-py = pkgs.callPackage ./nix/python.nix { inherit rustPlatform; };
@@ -137,6 +142,10 @@
               ocr = true;
             };
           };
+
+          # `modelSnapshots { manifests = [ ./model.sparkles-manifest.json ]; }` builds a
+          # read-only model store for `--models-dir` from pinned snapshot manifests (F12)
+          legacyPackages.modelSnapshots = pkgs.callPackage ./nix/model-snapshots.nix { };
 
           apps.default = {
             type = "app";

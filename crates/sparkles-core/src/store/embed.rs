@@ -1120,6 +1120,13 @@ pub fn embed_texts(
         ));
     }
     let identity = emb.identity(cfg.dimension);
+    // a provider's model may prompt queries differently from documents (spec F12), so
+    // the vector of a query text is cached apart from that of the same stored text
+    let identity = if query && emb.provider.is_some() {
+        identity ^ 0x7175_6572_7900_0000
+    } else {
+        identity
+    };
     let inputs: Vec<String> = texts
         .iter()
         .map(|t| {
@@ -1152,6 +1159,7 @@ pub fn embed_texts(
             emb,
             cfg.dimension,
             &batch,
+            query,
             &Waits { sleep: &sleep },
             &mut n,
         );

@@ -139,9 +139,16 @@ impl Chunking {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EmbeddingConfig {
-    /// the embeddings endpoint (OpenAI's `POST /v1/embeddings` protocol)
+    /// the embeddings endpoint (OpenAI's `POST /v1/embeddings` protocol); empty when
+    /// `provider` names one
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub url: String,
-    /// the `model` of each request
+    /// a provider of the server's model configuration (spec F12 §6), instead of `url`
+    /// and `apiKey`: an `openai` or `ollama` provider's endpoint and key, or a `local`
+    /// model run in the process
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// the `model` of each request, or the provider's model
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<ApiKey>,
@@ -202,6 +209,7 @@ impl EmbeddingConfig {
     pub fn new(url: &str, model: &str) -> EmbeddingConfig {
         EmbeddingConfig {
             url: url.into(),
+            provider: None,
             model: model.into(),
             api_key: None,
             send_dimensions: false,
@@ -233,12 +241,28 @@ impl EmbeddingConfig {
     /// field (`embedding.…`).
     pub fn validate(&self, index_predicate: &str) -> Result<()> {
         let bad = |m: String| Err(Error::invalid(format!("embedding.{m}")));
-        match reqwest::Url::parse(&self.url) {
-            Ok(u) if !u.username().is_empty() || u.password().is_some() => {
-                return bad("url: credentials go in apiKey, not in the URL".into());
+        if let Some(p) = &self.provider {
+            if !self.url.is_empty() {
+                return bad("provider: give a provider or a url, not both".into());
             }
-            Ok(u) if matches!(u.scheme(), "http" | "https") && u.host_str().is_some() => {}
-            _ => return bad(format!("url: {:?} is not an http(s) URL", self.url)),
+            if self.api_key.is_some() {
+                return bad("apiKey: a provider's key comes from the model configuration".into());
+            }
+            let ok = !p.is_empty()
+                && p.len() <= 128
+                && p.bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.'));
+            if !ok {
+                return bad(format!("provider: {p:?} is not a provider name"));
+            }
+        } else {
+            match reqwest::Url::parse(&self.url) {
+                Ok(u) if !u.username().is_empty() || u.password().is_some() => {
+                    return bad("url: credentials go in apiKey, not in the URL".into());
+                }
+                Ok(u) if matches!(u.scheme(), "http" | "https") && u.host_str().is_some() => {}
+                _ => return bad(format!("url: {:?} is not an http(s) URL", self.url)),
+            }
         }
         if self.model.is_empty() || self.model.len() > 256 {
             return bad("model: 1 to 256 bytes".into());
@@ -345,12 +369,30 @@ impl EmbeddingConfig {
     /// `dimension`: a different identity embeds every input again. The URL, key, batch
     /// and rate settings are not part of it, and the prefixes are part of each input.
     pub fn identity(&self, dimension: usize) -> u64 {
-        let key = serde_json::json!([1, self.model, dimension, self.send_dimensions, self.combine]);
+        let key = match &self.provider {
+            None => {
+                serde_json::json!([1, self.model, dimension, self.send_dimensions, self.combine])
+            }
+            Some(p) => {
+                serde_json::json!([
+                    2,
+                    p,
+                    self.model,
+                    dimension,
+                    self.send_dimensions,
+                    self.combine
+                ])
+            }
+        };
         super::fnv(&serde_json::to_vec(&key).expect("serializable"))
     }
 
-    /// The URL without credentials, query or fragment (for status and logs).
+    /// The URL without credentials, query or fragment (for status and logs), or
+    /// `provider:NAME`.
     pub fn endpoint(&self) -> String {
+        if let Some(p) = &self.provider {
+            return format!("provider:{p}");
+        }
         reqwest::Url::parse(&self.url).map_or_else(
             |_| String::new(),
             |mut u| {

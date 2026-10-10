@@ -460,6 +460,13 @@ text's bytes, with an index `docs` on `ex:emb`, dimension 8, embedding `rdfs:lab
   llama.cpp's server and Text Embeddings Inference run the same models locally behind
   the OpenAI protocol, so the provider route covers local models without them. The
   binary-size cost of either crate was not measured.
+
+  *Superseded by [F12](F12-local-embeddings.md).* On 2026-10-10 the maintainer decided
+  to run local embedding models in the server after all. F12 adds a Candle runtime
+  behind the opt-in build feature `embed-local`, on its own thread pool at a lower
+  priority, with model files from a pinned and verified store that a Nix build can
+  provide. The provider route of this spec stays, and an index can now name a provider
+  of the model configuration instead of a URL.
 - **One vector per subject always** (Weaviate's default). Labels in several languages
   and several labels per subject are common in RDF, so the default is one vector per
   literal, and `combine` gives the document-style alternative.

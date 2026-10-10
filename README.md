@@ -154,7 +154,8 @@ optimization mechanisms and implemented decisions across the design specs.
 * **Query.** Passes the SPARQL 1.1 and 1.2 W3C suites, with Jena ARQ extensions,
   federated `SERVICE`, query plans and execution budgets.
 * **Search.** Jena-compatible full-text search, HNSW vector similarity, embeddings
-  computed on write, path search and indexed GeoSPARQL 1.1.
+  computed on write by a provider or a local model, path search and indexed GeoSPARQL
+  1.1.
 * **Reasoning and validation.** Incremental RDFS, OWL 2 RL and Jena rules, SHACL and
   ShEx validation, and schema reports.
 * **Server.** Fuseki endpoints and administration, authentication and access control,
