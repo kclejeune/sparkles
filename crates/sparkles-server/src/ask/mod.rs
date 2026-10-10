@@ -323,7 +323,7 @@ impl Asking<'_, '_> {
                 .collect();
             if small {
                 // stable: the size order breaks ties
-                v.sort_by(|a, b| b.0.cmp(&a.0));
+                v.sort_by_key(|a| std::cmp::Reverse(a.0));
             }
             v.into_iter().take(max).map(|(_, e)| e).collect()
         };
@@ -494,7 +494,7 @@ impl Asking<'_, '_> {
                     (a.value, a.level)
                 }
                 Err(f) => {
-                    self.steps.push(f.record);
+                    self.steps.push(*f.record);
                     let code = match f.error {
                         StepError::Budget(_) => "budget-exceeded",
                         StepError::Deadline => "timeout",
@@ -756,7 +756,7 @@ impl Asking<'_, '_> {
             Err(f) => {
                 self.notes
                     .push(format!("the summary failed: {}", f.error.message()));
-                self.steps.push(f.record);
+                self.steps.push(*f.record);
                 None
             }
             Ok(a) => {
@@ -1155,18 +1155,17 @@ fn mentions(q: &str) -> Vec<String> {
         let ends = |t: &str| t.ends_with("'s") || t.ends_with("’s") || t.ends_with('.');
         while j < tokens.len() && !ends(tokens[j - 1]) {
             let n = clean(tokens[j]);
-            if capital(&n) && !OPENERS.contains(&n.to_lowercase().as_str()) {
-                run.push(n);
-                j += 1;
-            } else if LINKS.contains(&n.to_lowercase().as_str())
+            let lower = n.to_lowercase();
+            let name = capital(&n) && !OPENERS.contains(&lower.as_str());
+            // a linking word joins two capitalized words, as in "Guido van Rossum"
+            let link = LINKS.contains(&lower.as_str())
                 && j + 1 < tokens.len()
-                && capital(&clean(tokens[j + 1]))
-            {
-                run.push(n);
-                j += 1;
-            } else {
+                && capital(&clean(tokens[j + 1]));
+            if !(name || link) {
                 break;
             }
+            run.push(n);
+            j += 1;
         }
         let m = run.join(" ");
         if !out.contains(&m) {

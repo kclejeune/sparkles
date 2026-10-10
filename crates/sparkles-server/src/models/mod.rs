@@ -150,7 +150,8 @@ pub struct Answer {
 #[derive(Debug)]
 pub struct Failure {
     pub error: StepError,
-    pub record: StepRecord,
+    /// boxed, so that a `Result` with a failure stays small
+    pub record: Box<StepRecord>,
 }
 
 /// The cause of a [`Failure`].
@@ -390,7 +391,10 @@ impl Models {
         };
         let fail = |error: StepError, mut rec: StepRecord| {
             rec.outcome = error.code().to_string();
-            Err(Failure { error, record: rec })
+            Err(Failure {
+                error,
+                record: Box::new(rec),
+            })
         };
         let (Some(p), Some(rt)) = (
             self.provider(&pair.provider),
