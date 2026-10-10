@@ -265,6 +265,52 @@ async fn ingest_settings_and_read_tools() {
     assert_eq!(r.status, StatusCode::NO_CONTENT);
 }
 
+/// The ingest and consolidation workflows as prompts.
+#[tokio::test(flavor = "multi_thread")]
+async fn ingest_and_consolidation_prompts() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut st =
+        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap();
+    st.mcp = Some(conf(&st, &["--mcp-allow-update"]));
+    let state = Arc::new(st);
+    attach_org(&state);
+    let app = router(state);
+    for (name, args, words) in [
+        (
+            "ingest_document",
+            json!({"dataset": "mem", "profile": "notes"}),
+            &[
+                "register_source",
+                "ingest_profile with name notes",
+                "read_chunks",
+                "span",
+                "retractStale",
+                "Never merge",
+            ][..],
+        ),
+        (
+            "consolidate_memory",
+            json!({"dataset": "mem"}),
+            &["derivedFrom", "owl:sameAs", "conflicting", "Never merge"][..],
+        ),
+    ] {
+        let r = modern(
+            &app,
+            "prompts/get",
+            json!({"name": name, "arguments": args}),
+            &[],
+        )
+        .await;
+        let text = r.rpc()["result"]["messages"][0]["content"]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{}", r.body))
+            .to_string();
+        for w in words {
+            assert!(text.contains(w), "{name}: {w}: {text}");
+        }
+    }
+}
+
 /// A33: a client that declares elicitation chooses between the candidates; one
 /// without gets `possible-duplicate`.
 #[tokio::test(flavor = "multi_thread")]

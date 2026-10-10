@@ -801,7 +801,9 @@ async fn a28_resources_and_prompts() {
             "run_stored_query",
             "ask_graph",
             "explain_term",
-            "agent_memory"
+            "agent_memory",
+            "ingest_document",
+            "consolidate_memory"
         ]
     );
     let r = modern(
