@@ -230,10 +230,12 @@ pub fn spawn_reload(certs: Arc<Certs>) {
             }
         }
     });
+    // registered before the task starts, so that no SIGHUP after this call is missed
+    #[cfg(unix)]
+    let hup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup());
     #[cfg(unix)]
     tokio::spawn(async move {
-        use tokio::signal::unix::{SignalKind, signal};
-        let Ok(mut hup) = signal(SignalKind::hangup()) else {
+        let Ok(mut hup) = hup else {
             tracing::warn!("cannot listen for SIGHUP: TLS certificate reload on signal disabled");
             return;
         };
