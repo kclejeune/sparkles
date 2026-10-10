@@ -1,9 +1,9 @@
 # C18: Questions and ingestion in natural language
 
-> **Status:** implemented in part (Phases 1, 2, 3, 3m-a, 3m-b and 4)
+> **Status:** implemented in part (Phases 1, 2, 3, 3m-a, 3m-b, 4 and 5)
 >
 > **Phases:** Phases 1 and 2 shipped on 2026-10-09, without the measured runs of the
-> model matrix on the public sets. Phases 3, 3m-a, 3m-b and 4 shipped on 2026-10-10. Phase 1 lets an
+> model matrix on the public sets. Phases 3, 3m-a, 3m-b, 4 and 5 shipped on 2026-10-10. Phase 1 lets an
 > agent connected over MCP hand the query it wrote for a question to the web UI, where a
 > person reads, edits and runs it, and adds
 > a memory browser that shows each fact's source, passage and history. It also adds
@@ -33,6 +33,8 @@
 > [API: Review inbox](../API.md#review-inbox) ·
 > [Usage: Ingesting documents in the server](../USAGE.md#ingesting-documents-in-the-server) ·
 > [API: Ingestion](../API.md#ingestion) ·
+> [API: Memory maintenance](../API.md#memory-maintenance) ·
+> [Usage: Maintaining agent memory](../USAGE.md#maintaining-agent-memory) ·
 > [Features](../FEATURES.md)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
@@ -3709,6 +3711,28 @@ for her principal. The memory directory belongs to a project whose remote is
   --json` prints one object per line. A sync that cannot reach the server exits 75, and
   with `--if-reachable` it exits 0. `sparkles memory sync --loc DB` on a database that a
   running server holds fails with the store's `locked` error.
+- **A78.** Two session graphs of `agent-7` assert `ex:ana org:memberOf ex:payments`. A
+  third asserts another fact, and a fact that a reviewed graph also asserts appears in
+  one of them. `POST /$/memory/org/consolidate` with `dryRun` reports only the first
+  fact, with two sources and two reifiers in `derivedFrom`, and lists a new entity
+  labeled "Payments team" as a possible duplicate of the existing one. Without
+  `dryRun` the task proposes the fact on `consolidation.YYYYMMDD-1` in the
+  consolidated graph, and the inbox lists the branch as a consolidation. A scheduled
+  pass while that branch is open writes nothing. In `auto` mode the fact is merged, and
+  the next pass finds nothing to consolidate.
+- **A79.** Three entities match a `recall` search equally. One fact was written in 2020,
+  one today, and one today in two graphs. Without `recency` they rank in the search's
+  order. With `"recency": "30d"` the fact in two graphs ranks first and the 2020 fact
+  last. `"90"`, `"-3d"` and `"0d"` fail with `bad-argument`.
+- **A80.** With a retention of `after: "365d"`, a session graph from 2020 whose fact is
+  also in a reviewed graph is deleted, a 2020 session graph with an unconsolidated fact
+  and a session graph from this year stay, and a graph outside the patterns is never
+  read. A dry run lists the same decisions and deletes nothing.
+- **A81.** With `imports.extract: "server"`, `sparkles memory sync` after an edit of a
+  memory file starts one extraction of that file's source through the `extract` role
+  and reports it. In `memory` mode the facts land on `main` in the import graph,
+  unreviewed, and the source no longer needs extraction. A graph that is not an agent's
+  fails with `not-agent-memory`.
 
 ## 16. Sources
 
@@ -3827,7 +3851,7 @@ for her principal. The memory directory belongs to a project whose remote is
 **Phase 1 delivered on 2026-10-09.** The matrix has not been run with real models, and
 the public sets of §11.1 are not converted, so the targets of §11.3 and the measured role
 lists of §11.4 are still open. Phase 2 followed on the same day, and Phases 3m-a, 3,
-3m-b and 4 on 2026-10-10. They are recorded below, and Phases 2b, 5 and 6 are not
+3m-b, 4 and 5 on 2026-10-10. They are recorded below, and Phases 2b and 6 are not
 built.
 
 - **Model providers.** The server's `models` module holds the three kinds of §3.4 with
@@ -4315,7 +4339,8 @@ back. Every test runs on fixture directories against a local server, with no mod
 - `reject` calls `POST /$/memory/{ds}/reject` of Phase 3 rather than `POST /{ds}/facts`,
   so the terminal and the inbox's **Reject selected** write the same commit message.
 - With `imports.extract: "server"`, the import reports the setting and starts no
-  extraction. Extraction inside the server is Phase 4's.
+  extraction. Extraction inside the server is Phase 4's. Phase 5 builds it: a sync now
+  starts a server extraction for each changed memory file, as recorded below.
 
 **Tests.** `http/router_tests/mcp/ingest.rs` covers the sources routes in
 `a62_a64_a66_sources_routes`: the secret check with a built-in and a custom pattern,
@@ -4422,8 +4447,8 @@ own small benchmark and mock models, because a real run needs the operator's key
 - An import with `imports.extract: "server"` still only reports the setting. The
   pipeline extracts from a document it registers itself and stops with
   `already-registered` for a text whose rendition exists, so the import's sources need
-  an entry point that extracts from an existing rendition. That entry point is not
-  built.
+  an entry point that extracts from an existing rendition. Phase 5 builds that entry
+  point, `source` on `POST /$/ingest/{ds}`, and the sync that calls it.
 - `sparkles serve` panicked in debug builds when two flattened argument structs shared
   the name `ServeArgs`. The ingestion flags are now `IngestServeArgs`.
 
@@ -4445,3 +4470,80 @@ usage, confirmation and cancellation, can run consolidation as a server task. Th
 extraction's batching, idempotency keys and dry-run fixes are the pattern for writing
 consolidated facts, and the `auto` checks are a model for a maintenance task that
 merges only what passes.
+
+**Phase 5 delivered on 2026-10-10.** Memory that many sessions write is consolidated by
+a server task, ranked by recency on request, and trimmed by an optional retention of old
+session graphs. The import's `imports.extract: "server"` setting, left open by 3m-b and
+Phase 4, now starts extractions in the server. Every test runs against mock providers or
+none.
+
+- **Consolidation.** `POST /$/memory/{ds}/consolidate` starts a task in the ingest
+  runtime and answers `202` with a `Location` under `/$/ingest/{ds}/{task}`. The task
+  reads every agent graph through the internal `memory_consolidation_scan` tool. It
+  groups the facts by triple, counts distinct sources with the copy rule of the brief,
+  and keeps the facts that at least `minSources` graphs assert, 2 by default, and that
+  no reviewed graph asserts yet. Structural facts of the `mem:`, `spk:` and `prov:`
+  vocabularies are left out. It lists duplicate entities through `link_entities` and
+  conflicts through `recall`, and writes the repeated facts into the dataset's
+  `consolidatedGraph` on `consolidation.{date}-{n}` with `assert_facts`. Each fact has a
+  reifier whose `prov:wasDerivedFrom` lists the session reifiers, up to 20. The writes
+  go in batches of 200 with an idempotency key and up to three dry runs that drop the
+  facts that would fail. In `auto` mode, which needs `admin`, the branch is merged when
+  every fact passed, with the same checks as ingestion's `auto`. An agent under the
+  template of §8.6 writes on `proposals.{agent}.consolidate-{date}-{n}` instead. The
+  inbox lists the branch with the kind `consolidation`.
+- **Recency.** `recall` takes `recency`, a half-life such as `"90d"`. The found seeds,
+  at most four times the limit and at least 20, are multiplied by
+  `0.5 ^ (age / halfLife)` and by `1 + log2(sources)`, where `sources` counts the graphs
+  that assert one of the seed's facts, with a copy counted once.
+- **Retention.** `POST /$/memory/{ds}/retention` needs `admin` and deletes, with one
+  `DROP GRAPH` commit each, the agent graphs that match the retention's patterns, whose
+  newest recorded time is older than `after`, and, with `requireConsolidated`, whose
+  facts all appear in a reviewed graph. Without patterns it covers graphs whose IRI
+  contains `/sessions/`. A dry run lists each graph with the reason it stays.
+- **Settings and schedule.** `memory.json` gains `consolidation` with `every`, `mode`
+  and `minSources`, and `retention` with `after`, `graphs`, `requireConsolidated` and
+  `every`. A schedule checks every minute, starts the passes that are due as the server
+  itself, and records the last run of each in `maintenance.json` beside the dataset.
+  `GET /$/memory/{ds}/maintenance` reports the settings, the last task and the next run.
+  Both are off until the settings name them.
+- **Extraction of a registered source.** `POST /$/ingest/{ds}` takes `source`, the IRI of
+  a registered source or its graph, instead of a file, text or URL. The task reads the
+  source's live rendition with `read_chunks` and runs the `extract` role on it. The new
+  `memory` mode writes the facts on `main` into the source's own graph, which must be an
+  agent graph, so they are unreviewed memory like the import's other facts. `sparkles
+  memory sync`, when the dataset's `imports.extract` or `--extract` is `server`, starts
+  one such task for each new, edited or renamed memory file that needs extraction and
+  reports the tasks under `extractions`. With `--loc` it waits for each task.
+
+**Deviations and additions in Phase 5.**
+
+- Consolidation calls no model. Repeated facts are found by their triples, duplicates
+  by `link_entities` and conflicts by `recall`, so a pass costs no tokens.
+- A pass reads every agent graph and leaves out the facts a reviewed graph asserts,
+  rather than reading only the session graphs written since the last pass. The result
+  is the same after a merge, and a rejected proposal is proposed again by the next pass.
+- A scheduled pass writes nothing while an earlier `consolidation.*` branch waits for
+  review, and reports `pending-review`.
+- Scheduled tasks run as the server's local principal, because no person starts them.
+- The age that `recency` uses is the newest `prov:generatedAtTime` among the live
+  reifiers of the seed's facts, rather than among the reifiers of the facts that
+  matched, because a search hit names an entity more often than a fact. A seed with no
+  time has age 0.
+- Retention keeps graphs with no recorded time and graphs with more than 5,000 facts,
+  and it reads only agent graphs, so a curated graph is never deleted.
+- The sync waits for its extractions only with `--loc`. Against a server it reports the
+  task ids and returns.
+- There is no UI and no `sparkles memory` command for consolidation or retention. The
+  inbox shows the consolidation branch, and the routes and settings cover the rest.
+
+**Tests.** `crates/sparkles-server/src/ingest/tests.rs` covers A78 in
+`consolidation_task`, with the dry run, the branch and its inbox kind, a scheduled pass
+that waits, `auto`, an empty next pass and bad settings, A80 in `retention_task`, with
+a missing setting, the kept and deleted graphs, a dry run, a scheduled pass and a bad
+`after`, and the server half of A81 in `extraction_of_a_registered_source`, with
+`memory` mode, `not-agent-memory`, `branch` mode on any source, `unknown-source` and the
+argument checks. `mcp/c18_tests.rs` covers A79 in `recall_recency`, and
+`crates/sparkles-server/tests/cli_memory.rs` covers the sync half of A81 in
+`memory_loc`, where an edited memory file starts one extraction that fails with
+`no-model` because the fixture has no provider.

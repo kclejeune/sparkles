@@ -8055,7 +8055,7 @@ open-world when SERVICE is allowed. The common arguments are:
 | `check_query` | `query` (required, ≤ 65536 characters), `explain` (false), `maxSuggestions` (3, ≤ 10), `terms` (false), `timeoutSeconds` (30) | `{dataset, commit, ok, issues: [{code, severity, message, term?, line?, column?, suggestions?: [{term, label?, count, why}]}], estimatedRows?, terms?, prefixes}`. With `terms`, `terms` lists every constant IRI of the query as `{term, iri, kind, label?, count?, types?, occurs}`, where `kind` is `class`, `property` or `entity` and `occurs` is `null` when the check did not look the term up. The query is parsed and compared with the caller's view without running it. The errors are `syntax` (with line and column), `not-a-query` (an update), `unknown-predicate` and `unknown-class`. The warnings are `unknown-term`, `class-mismatch`, `datatype-mismatch`, `language-tag` and `unbound-projection`, and with `explain` also `no-limit` and `large-estimate` and the plan's `estimatedRows`, which is left out when the caller's view hides the estimates. `ok` is false only when an issue is an error. A suggestion's `why` is `same-local-name`, `edit-distance` or `label` for an unknown term, `class-profile`, `datatype` or `language-tag` for a mismatch, and `same-name`, `namespace` or `edit-distance` for an undefined prefix. |
 | `similar_queries` | `question` (required, ≤ 2000 characters), `k` (5, ≤ 20), `withText` (true), `embeddingIndex` (a vector index name), `timeoutSeconds` (30) | `{dataset, queries: [{name, tool?, description?, score, matchedBy, parameters: [{name, type, required, description?}], questions?, query?}], ranking, prefixes}`. The [stored queries](#stored-queries) the caller may run whose `mcp` is not `false`, ranked by BM25 over their description, parameters, the words of their IRIs and their `questions`. When the dataset has one vector index whose provider embeds query text, or `embeddingIndex` names one, the cosine similarity of embeddings is fused with BM25 by reciprocal rank (k = 60) and `ranking` is `hybrid`. If the provider fails, the ranking falls back to `text`. `tool` is the query's MCP tool name. |
 | `link_entities` | `mentions` (required, 1–20 of `{text (≤ 200 characters), types? (≤ 5 class IRIs), context? (≤ 500 characters)}`), `k` (5, ≤ 20), `labelPredicates` (≤ 20 IRIs, by default the label predicates of `describe_resource` and `skos:altLabel`), `graphs` (≤ 20 IRIs or `default`), `timeoutSeconds` (30) | `{dataset, commit, mentions: [{text, verdict, candidates: [{iri, label?, altLabels?, types, score, typeMatch, matchedBy, sameAs?, triples}]}], search: {text, vector}, prefixes}`. Candidates come from exact label matches, labels equal after case folding and collapsing white space, `text:query` over the label predicates the full-text index covers, and `spk:vectorSearch` with the mention and its context on a vector index that embeds labels. `verdict` is `exact`, `ambiguous`, `candidates` or `none`, and it is advice. Candidates of a type in `types`, or of a subclass, come first. `triples` holds up to 5 sampled outgoing triples, and `sameAs` the other candidates linked by `owl:sameAs` or `skos:exactMatch`. `search` says which indexes took part. |
-| `recall` | `query` (≤ 2000 characters) or `seeds` (≤ 20 IRIs) or both, `types` (≤ 5 class IRIs), `graphs` (≤ 20 IRIs or `default`), `hops` (1, ≤ 2), `seedLimit` (10, ≤ 50), `maxTriples` (150, ≤ 1000), `maxBytes` (32768, ≤ `--mcp-max-bytes`), `includeSuperseded` (false), `statuses` (both), `unreviewedWeight` (0.7), `format` (`text`\|`json`), `timeoutSeconds` (30) | One text block: the facts around the seeds with their citations, described below. No `structuredContent`. |
+| `recall` | `query` (≤ 2000 characters) or `seeds` (≤ 20 IRIs) or both, `types` (≤ 5 class IRIs), `graphs` (≤ 20 IRIs or `default`), `hops` (1, ≤ 2), `seedLimit` (10, ≤ 50), `maxTriples` (150, ≤ 1000), `maxBytes` (32768, ≤ `--mcp-max-bytes`), `includeSuperseded` (false), `statuses` (both), `unreviewedWeight` (0.7), `recency` (a half-life such as `90d`), `format` (`text`\|`json`), `timeoutSeconds` (30) | One text block: the facts around the seeds with their citations, described below. No `structuredContent`. |
 | `why_empty` | `query` (required, ≤ 65536 characters), `timeoutSeconds` (30) | `{dataset, commit, empty, first?, steps, unchecked?, complete, message, prefixes}`, described in [Checking and explaining queries](#checking-and-explaining-queries). |
 | `share_query` | `query` (required, ≤ 65536 characters), `question` (≤ 2000 characters), `explanation` (≤ 400 characters), `assumptions` (≤ 5), `branch`, `atCommit` | `{url, dataset, commit, ok, issues, prefixes}`. The link opens the query in a new tab of the UI's query page with the question header. The query is checked and never run. Listed only when the server knows the UI's address, which is the request's own host over HTTP and `--ui-url` over stdio. A payload over 32 KiB is refused with `too-large`, and an update with `not-a-query`. |
 | `validate_shacl` | `shapes` (required: a shapes graph in Turtle, ≤ 1 MiB), `shapesFormat` (`turtle` or `shaclc`), `graph` (`default`\|`union`\|IRI), `maxResults` (20, ≤ `--mcp-max-rows`), `timeoutSeconds` (30) | `{dataset, commit, reasoning, conforms, total, bySeverity: {violation, warning, info}, results: [{focus, path?, value?, shape, constraint, severity, message?}], truncated, prefixes}`: the validation of [`/{ds}/shacl`](#shacl-validation). The most severe results come first, then results are ordered by shape and focus node. `severity` is `Violation`, `Warning` or `Info`. SHACL 1.2 `Debug` and `Trace` count as info. A complex `path` is a SPARQL property path. Only in builds with the `shacl` feature. |
@@ -8676,7 +8676,12 @@ of the JSON format carries `status`, and the text format marks unreviewed facts 
 that the branch asserts and `main` does not is `proposed`, and the text format marks it
 with ` proposed`. The `statuses` argument keeps only the
 listed statuses, and `unreviewedWeight` (0 to 1, 0.7 by default) multiplies the score of
-the seeds a search finds when all their facts are unreviewed. Superseded entries name
+the seeds a search finds when all their facts are unreviewed. `recency`, a half-life
+such as `90d`, `12h`, `2w` or `1y`, multiplies the score of each seed a search finds by
+`0.5 ^ (age / halfLife)` and by `1 + log2(sources)`. The age is that of the newest
+`prov:generatedAtTime` among the reifiers of the seed's facts, and `sources` is the
+largest number of graphs that assert one of them, with a copy and its original counted
+once. Superseded entries name
 the reifiers that revise them in `replacedBy`. A dataset without `agentGraphs` reports
 no status.
 
@@ -8701,7 +8706,9 @@ facts are unreviewed until a person promotes them. `secretPatterns` adds redacti
 patterns to the built-in ones, and each regex must compile. `transcripts` (off by
 default) lets the people who opt in import their session transcripts. `extract` is
 `agent` (the default), `server` or `none`, and says who extracts facts from the prose
-of imported files. A file's graph is
+of imported files. With `server`, each `sparkles memory sync` starts a server extraction
+of every new, edited or renamed file that needs one, with `source` and `mode: "memory"`
+on [`POST /$/ingest/{ds}`](#ingestion), and reports the tasks under `extractions`. A file's graph is
 `<base><principal>/<harness>/<project>/memory/<name>`, `…/index` for Claude Code's
 `MEMORY.md`, `…/instructions/<path>`, or `…/sessions/<id>` for a transcript. The
 project is the git remote as `github.com.acme.shop`, or `user` for user-scope files.
@@ -8840,7 +8847,8 @@ curl -H 'Content-Type: application/json' \
 |---|---|
 | `format` | The media type, when the file name or content does not say it. |
 | `title`, `iri`, `graph`, `profile`, `message` | As `register_source` takes them. A `url` is the source's IRI by default. |
-| `mode` | `branch` (the default) writes on `ingest.<slug>-<n>`, or `proposals.<agent>.ingest-<slug>-<n>` for an agent of the memory settings. `preview` writes nothing until an approval. `auto` merges into `main` when every check passes and needs `admin`. |
+| `mode` | `branch` (the default) writes on `ingest.<slug>-<n>`, or `proposals.<agent>.ingest-<slug>-<n>` for an agent of the memory settings. `preview` writes nothing until an approval. `auto` merges into `main` when every check passes and needs `admin`. `memory` needs `source` and writes the facts on `main` into the source's graph, which must be an agent graph (`not-agent-memory` otherwise), so they are unreviewed memory. A `source` cannot be previewed. |
+| `source` | The IRI of a registered source, or of its graph, to extract from instead of a new document. The task reads the source's live rendition with `read_chunks`. It cannot be combined with `file`, `text` or `url`, and fails with `unknown-source` (`404`) when no live source matches. |
 | `branch` | The review branch to use instead. |
 | `allowPartial` | Register the readable pages of a PDF that needs OCR, and record the other pages. |
 | `extract` | Extract facts. By default the server extracts when the dataset's assistant settings enable `ingest` and some pair of the `extract` role may receive documents (`send: "documents"`). |
@@ -8887,7 +8895,7 @@ new entity with the candidates as `distinctFrom`. A dry run of `assert_facts` dr
 facts it rejects before the write, and the result lists them under `failed`.
 
 **`GET /$/ingest/{ds}/{task}`** answers the task's `status` (`queued`, `converting`,
-`registering`, `awaiting-confirmation`, `extracting`, `linking`, `writing`,
+`registering`, `scanning`, `awaiting-confirmation`, `extracting`, `linking`, `writing`,
 `awaiting-approval`, `done`, `failed` or `cancelled`), `progress`, `estimate`, `usage`
 and `result` or `error`. `?wait=SECONDS` holds the answer until the task ends or waits
 for the caller, for at most 60 seconds. A task is visible to the principal that started
@@ -8905,6 +8913,65 @@ no conflict. Otherwise it keeps the branch and gives the reason as `autoFallback
 
 The review page's sources carry `pages` with each page's number and start, and
 `ocrPages` and `omittedPages`, so the UI shows the page of each fact.
+
+### Memory maintenance
+
+Two tasks keep agent memory compact: consolidation, which asserts the facts that many
+agent graphs repeat once in the consolidated graph, and retention, which deletes old
+session graphs. Both run in the ingestion task registry, so `GET /$/ingest/{ds}/{task}`
+reports them, with `input.kind` set to `consolidation` or `retention`. They work on the
+dataset's `main` branch only. The design is in
+[C18 §8.3 and §8.4](specs/C18-natural-language-questions-and-ingest.md#83-consolidation).
+
+| Method | Path | Access | Meaning |
+|---|---|---|---|
+| POST | `/$/memory/{ds}/consolidate` | `read`, and `admin` for `auto` | Starts a consolidation pass and answers `202` with the task and a `Location` header. The body is `{ mode?, minSources?, dryRun?, message?, deadlineSeconds? }`, and the mode and `minSources` default to the settings. |
+| POST | `/$/memory/{ds}/retention` | `admin` | Starts a retention pass and answers `202` with the task. The body is `{ after?, graphs?, requireConsolidated?, dryRun?, deadlineSeconds? }`, and each member defaults to the settings. Without a retention setting `after` is required, or the answer is `400` with `no-retention`. |
+| GET | `/$/memory/{ds}/maintenance` | `read` | `{ dataset, consolidation, retention }`, each with the `settings`, and `lastRun`, `lastTask` and `nextRun` (a time, or `due`) once a schedule applies. |
+
+The settings live in the dataset's memory settings:
+
+```json
+{
+  "agentGraphs": ["https://example.org/memory/agents/*"],
+  "consolidatedGraph": "https://example.org/memory/consolidated",
+  "consolidation": { "every": "1d", "mode": "branch", "minSources": 2 },
+  "retention": { "after": "365d", "graphs": ["https://example.org/memory/agents/*/sessions/*"],
+                 "requireConsolidated": true, "every": "1d" }
+}
+```
+
+`consolidation` needs `agentGraphs` and `consolidatedGraph`. `every` is a duration of at
+least `1h` and, when present, schedules the pass. `mode` is `branch` (the default) or
+`auto`, and `minSources` is from 2 to 100. `retention` needs `agentGraphs`. `after` is a
+duration of at least `1d`, `graphs` holds IRI patterns with `*` (graphs whose IRI
+contains `/sessions/` by default), and `every` is `1d` by default. The server looks
+every minute and starts each pass whose `every` has passed since its last run, as the
+server itself, and records the last run in `<db>/maintenance.json`.
+
+A consolidation pass reads the facts of every agent graph, up to 5,000 graphs and 20,000
+facts, and leaves out the structural facts of the `mem:`, `spk:` and `prov:`
+vocabularies and the facts a reviewed graph already asserts. A fact that at least
+`minSources` distinct graphs assert, counting a copy and its original once, is
+repeated. The pass lists entities that `link_entities` finds with the same label and a
+matching type as `duplicates`, and facts that `recall` reports as conflicting as
+`conflicts`. It writes the repeated facts with `assert_facts` into the consolidated
+graph on `consolidation.{date}-{n}`, or `proposals.{agent}.consolidate-{date}-{n}` for
+an agent of the memory settings, each with a reifier whose `prov:wasDerivedFrom` names up
+to 20 session reifiers. In `auto` mode it merges the branch when every fact passed and
+the merge preview has no conflict. The result's `outcome` is `proposed`, `merged`,
+`dry-run`, `nothing-to-consolidate`, `no-facts` or, for a scheduled pass while an earlier
+`consolidation.*` branch is open, `pending-review`. The inbox lists the branch with the
+kind `consolidation`.
+
+A retention pass looks at the agent graphs that match its patterns. A graph's age is
+that of its newest `xsd:dateTime` under a `prov:`, `mem:`, `dcterms:modified` or
+`dcterms:created` predicate. A graph older than `after` is deleted with
+`DROP SILENT GRAPH`, one commit per graph, unless `requireConsolidated` is on and one of
+its facts appears in no reviewed graph. The result lists each graph with `delete: true`
+or the reason it stays: `recent`, `no-time`, `unconsolidated` or `too-many-facts` (more
+than 5,000). The `outcome` is `deleted`, `dry-run` or `nothing-to-delete`. A deleted
+graph stays in history and backups.
 
 ### Review inbox
 
