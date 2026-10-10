@@ -93,6 +93,9 @@ struct RecallArgs {
     timeout_seconds: Option<f64>,
     statuses: Option<Vec<Status>>,
     unreviewed_weight: Option<f64>,
+    /// a half-life such as `90d`: found seeds rank by the age of their newest fact and
+    /// the number of graphs that assert their facts (C18 §8.4)
+    recency: Option<String>,
 }
 
 /// One quad of the view.
@@ -200,6 +203,12 @@ impl Tools<'_> {
                 "unreviewedWeight must be between 0 and 1",
             ));
         }
+        let half_life = match a.recency.as_deref() {
+            None => None,
+            Some(h) => Some(super::duration_days(h).ok_or_else(|| {
+                ToolError::bad_argument("recency is a half-life such as 90d, 12h, 2w or 1y")
+            })?),
+        };
         let timeout = self.timeout(a.timeout_seconds)?;
         let ds = self.dataset(a.dataset.as_deref())?;
         let memory = crate::assist::memory_settings(&self.server.state, &ds);
@@ -238,6 +247,7 @@ impl Tools<'_> {
                 seed_limit,
                 !seeds_given.is_empty(),
                 weigh,
+                half_life,
                 &ctx,
             )? {
                 if !seeds.iter().any(|(t, _)| *t == found.0) {
@@ -439,6 +449,7 @@ impl Tools<'_> {
         limit: usize,
         have_seeds: bool,
         weigh: Option<(&crate::assist::MemorySettings, f64)>,
+        half_life: Option<f64>,
         ctx: &ErrorContext,
     ) -> Result<Vec<(Term, Option<Fact>)>, ToolError> {
         let eng = |e| ctx.engine(e);
@@ -532,6 +543,20 @@ impl Tools<'_> {
             for (s, score) in &mut hits {
                 if seen.contains(s.as_str()) && !reviewed.contains(s.as_str()) {
                     *score *= w;
+                }
+            }
+        }
+        // C18 §8.4: recent facts and facts that several graphs assert rank first
+        if let Some(h) = half_life
+            && !hits.is_empty()
+        {
+            hits.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            hits.truncate((4 * limit).max(20));
+            let subjects: Vec<NamedNode> = hits.iter().map(|(s, _)| iri(s)).collect();
+            let factors = recency_factors(r, &subjects, graphs, h).map_err(eng)?;
+            for (s, score) in &mut hits {
+                if let Some(f) = factors.get(s.as_str()) {
+                    *score *= f;
                 }
             }
         }
@@ -1027,6 +1052,128 @@ fn rank_terms(hits: impl Iterator<Item = (NamedNode, f64)>) -> HashMap<String, u
     best.iter()
         .map(|(s, &v)| (s.clone(), 1 + scores.iter().filter(|&&o| o > v).count()))
         .collect()
+}
+
+/// Rows the recency factor reads per subject at most.
+const RECENCY_ROWS: usize = 200;
+
+/// The recency factor of each subject (C18 §8.4): `0.5 ^ (age / halfLife)`, where the
+/// age is that of the newest `prov:generatedAtTime` among the live reifiers of the
+/// subject's facts, times `1 + log2(sources)`, where `sources` is the largest number of
+/// graphs that assert one of its facts. A graph that is `mem:copyOf` another graph
+/// asserting the same fact does not count. A hit that is a reifier is weighed by the
+/// fact it reifies. Subjects without reified facts keep their age factor of 1.
+fn recency_factors(
+    r: &Reader,
+    subjects: &[NamedNode],
+    graphs: &[NamedNode],
+    half_life: f64,
+) -> Result<HashMap<String, f64>, Error> {
+    let mut out: HashMap<String, f64> = HashMap::new();
+    if subjects.is_empty() {
+        return Ok(out);
+    }
+    // a reifier hit stands for its triple's subject
+    let reified = reified_by(r, subjects, graphs)?;
+    let subject_of = |s: &NamedNode| -> Option<Term> {
+        match reified.get(s.as_str()) {
+            Some(f) => Some(f.s.clone()),
+            None => Some(Term::NamedNode(s.clone())),
+        }
+    };
+    let terms: Vec<Term> = {
+        let mut seen = HashSet::new();
+        subjects
+            .iter()
+            .filter_map(subject_of)
+            .filter(|t| seen.insert(t.to_string()))
+            .collect()
+    };
+    let values: Vec<String> = terms.iter().filter_map(values_term).collect();
+    if values.is_empty() {
+        return Ok(out);
+    }
+    let vals = format!("VALUES ?s {{ {} }}", values.join(" "));
+    // the graphs of each fact
+    let q = format!(
+        "SELECT ?s ?p ?o ?g WHERE {{ {vals} {} FILTER(!isTRIPLE(?o)) }} LIMIT {}",
+        r.quads("?s ?p ?o", graphs),
+        values.len() * RECENCY_ROWS
+    );
+    let mut fact_graphs: HashMap<String, (String, HashSet<String>)> = HashMap::new();
+    let mut all_graphs: HashSet<String> = HashSet::new();
+    for row in r.rows(&q, Vec::new())? {
+        if let [Some(s), Some(p), Some(o), Some(Term::NamedNode(g))] = row.as_slice() {
+            all_graphs.insert(g.as_str().to_string());
+            fact_graphs
+                .entry(format!("{s} {p} {o}"))
+                .or_insert_with(|| (s.to_string(), HashSet::new()))
+                .1
+                .insert(g.as_str().to_string());
+        }
+    }
+    // a copy and its original count as one source
+    let mut copies: HashMap<String, HashSet<String>> = HashMap::new();
+    let gs: Vec<NamedNode> = all_graphs.iter().map(|g| iri(g)).collect();
+    for chunk in gs.chunks(200) {
+        let q = format!(
+            "SELECT ?g ?o WHERE {{ {} GRAPH ?g {{ ?g <urn:x-sparkles:mem:copyOf> ?o }} }}",
+            super::values_iris("g", chunk)
+        );
+        for row in r.rows(&q, Vec::new())? {
+            if let [Some(Term::NamedNode(g)), Some(Term::NamedNode(o))] = row.as_slice() {
+                copies
+                    .entry(g.as_str().to_string())
+                    .or_default()
+                    .insert(o.as_str().to_string());
+            }
+        }
+    }
+    let mut sources: HashMap<String, usize> = HashMap::new();
+    for (s, gs) in fact_graphs.values() {
+        let n = gs
+            .iter()
+            .filter(|g| {
+                !copies
+                    .get(*g)
+                    .is_some_and(|o| gs.iter().any(|h| h != *g && o.contains(h)))
+            })
+            .count()
+            .max(1);
+        let e = sources.entry(s.clone()).or_insert(1);
+        *e = (*e).max(n);
+    }
+    // the newest time of each subject's live reifiers
+    let q = format!(
+        "SELECT ?s (MAX(?t) AS ?at) WHERE {{ {vals} {} }} GROUP BY ?s",
+        r.quads(
+            &format!(
+                "?r <{RDF_REIFIES}> <<( ?s ?p ?o )>> ; <{PROV}generatedAtTime> ?t \
+                 FILTER NOT EXISTS {{ ?r <{PROV}wasInvalidatedBy> ?x }}"
+            ),
+            graphs
+        )
+    );
+    let now = chrono::Utc::now();
+    let mut ages: HashMap<String, f64> = HashMap::new();
+    for row in r.rows(&q, Vec::new())? {
+        if let [Some(s), Some(Term::Literal(t))] = row.as_slice()
+            && let Some(a) = super::age_days(t.value(), now)
+        {
+            ages.insert(s.to_string(), a);
+        }
+    }
+    for s in subjects {
+        let Some(t) = subject_of(s) else { continue };
+        let key = t.to_string();
+        let age = ages.get(&key).copied().unwrap_or(0.0);
+        let n = sources.get(&key).copied().unwrap_or(1);
+        out.insert(
+            s.as_str().to_string(),
+            0.5f64.powf(age / half_life) * (1.0 + (n as f64).log2()),
+        );
+    }
+    Ok(out)
 }
 
 /// The triples `?r rdf:reifies <<( s p o )>>` of the hit subjects that are reifiers,

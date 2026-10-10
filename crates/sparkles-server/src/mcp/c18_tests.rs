@@ -361,6 +361,83 @@ async fn recall_statuses() {
     assert_eq!(meta["code"], "bad-argument");
 }
 
+/// C18 §8.4 (Phase 5): with `recency`, found seeds rank by the age of their newest
+/// fact and by how many graphs assert their facts; a bad half-life is refused.
+#[cfg(feature = "text")]
+#[tokio::test(flavor = "multi_thread")]
+async fn recall_recency() {
+    let server = org(McpConfig::default());
+    let ds = server.state.get("org").unwrap();
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let fact = |g: &str, s: &str, label: &str, at: &str| {
+        format!(
+            r#"<https://example.org/memory/agents/a/sessions/{g}> {{
+  <http://example.org/resource/{s}> <http://www.w3.org/2000/01/rdf-schema#label> "{label}" .
+  <urn:r-{g}-{s}> <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> <<( <http://example.org/resource/{s}> <http://www.w3.org/2000/01/rdf-schema#label> "{label}" )>> ;
+     <http://www.w3.org/ns/prov#generatedAtTime> "{at}"^^<http://www.w3.org/2001/XMLSchema#dateTime> .
+}}
+"#
+        )
+    };
+    let trig = [
+        fact("s1", "aaa", "zephyr project aaa", "2020-01-01T00:00:00Z"),
+        fact("s2", "bbb", "zephyr project bbb", &now),
+        fact("s3", "ccc", "zephyr project ccc", &now),
+        fact("s4", "ccc", "zephyr project ccc", &now),
+    ]
+    .concat();
+    ds.store
+        .load(&[sparkles::io::Source::from_bytes(
+            trig.into_bytes(),
+            RdfFormat::TriG,
+            None,
+        )])
+        .unwrap();
+    ds.store
+        .enable_text(sparkles::text::TextConfig::default())
+        .unwrap();
+    let mut c = Client::start(server.clone());
+    let order = |s: &Value| -> Vec<String> {
+        let mut seeds: Vec<(u64, String)> = s["entities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| Some((e["seed"].as_u64()?, e["iri"].as_str()?.to_string())))
+            .collect();
+        seeds.sort();
+        seeds.into_iter().map(|(_, i)| i).collect()
+    };
+    let plain: Value = serde_json::from_str(
+        &c.text(
+            "recall",
+            json!({"query": "zephyr", "format": "json", "hops": 0}),
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(order(&plain), ["res:aaa", "res:bbb", "res:ccc"], "{plain}");
+    let ranked: Value = serde_json::from_str(
+        &c.text(
+            "recall",
+            json!({"query": "zephyr", "format": "json", "hops": 0, "recency": "30d"}),
+        )
+        .await,
+    )
+    .unwrap();
+    // two graphs first, then the recent fact, then the one from 2020
+    assert_eq!(
+        order(&ranked),
+        ["res:ccc", "res:bbb", "res:aaa"],
+        "{ranked}"
+    );
+    for bad in ["90", "x", "-3d", "0d"] {
+        let (_, e) = c
+            .error("recall", json!({"query": "zephyr", "recency": bad}))
+            .await;
+        assert_eq!(e["code"], "bad-argument", "{bad}");
+    }
+}
+
 async fn put(app: &axum::Router, path: &str, body: &str) -> (u16, Value) {
     use tower::ServiceExt;
     let req = axum::http::Request::put(path)

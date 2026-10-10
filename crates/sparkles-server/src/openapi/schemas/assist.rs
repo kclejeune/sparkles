@@ -427,6 +427,7 @@ fn tools(put: &mut dyn FnMut(&str, J)) {
                     "includeSuperseded": boolean(),
                     "statuses": array(string_enum(&["reviewed", "unreviewed", "proposed"])),
                     "unreviewedWeight": num(),
+                    "recency": with_desc(string(), "A half-life such as `90d` (units s, m, h, d, w, y). Found seeds rank by the age of their newest fact and by how many graphs assert their facts."),
                     "format": with_desc(string_enum(&["json"]), "Always `json` here."),
                 })),
             ),
