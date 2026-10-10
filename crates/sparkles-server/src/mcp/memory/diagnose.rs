@@ -538,6 +538,7 @@ impl Tools<'_> {
                     s.text
                 ),
             };
+            out["verdict"] = verdict(&f).into();
             out["first"] = f;
         } else if complete {
             message = "Every pattern, join and filter has solutions, so the empty result comes from a part the check does not cut.".into();
@@ -547,9 +548,46 @@ impl Tools<'_> {
         if !unchecked.is_empty() {
             out["unchecked"] = json!(unchecked);
         }
+        if out.get("verdict").is_none() {
+            out["verdict"] = "unknown".into();
+        }
         out["complete"] = complete.into();
         out["message"] = message.into();
         out["prefixes"] = json!(terms.used());
         Ok(Outcome::Structured(out))
+    }
+}
+
+/// The verdict of §4.2 on the first element without solutions. `query` when a check
+/// issue explains it, such as a language tag, a datatype, a class or an unknown term
+/// with a suggestion. `data` when the query is well formed for the data and the data
+/// holds no match: the element is a join or a filter over patterns that all match, or
+/// a pattern with a constant that does not occur and has no suggestion, so that a
+/// hidden graph and a missing term look the same. `unknown` otherwise.
+pub(crate) fn verdict(first: &Value) -> &'static str {
+    let explains = |i: &Value| {
+        let unknown = i["code"]
+            .as_str()
+            .is_some_and(|c| c.starts_with("unknown-"));
+        let suggested = i["suggestions"].as_array().is_some_and(|s| !s.is_empty());
+        !unknown || suggested
+    };
+    if first["issues"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(explains)
+    {
+        return "query";
+    }
+    let absent = first["constants"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|c| c["occurs"] == false);
+    match first["kind"].as_str() {
+        Some("join" | "filter") if !absent => "data",
+        Some("pattern") if absent => "data",
+        _ => "unknown",
     }
 }

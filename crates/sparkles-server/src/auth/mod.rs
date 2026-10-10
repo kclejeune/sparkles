@@ -676,6 +676,9 @@ pub struct Principal {
     pub info: Arc<PrincipalInfo>,
     /// the branch the request chose: dataset names without one are checked on it
     pub branch: Option<Arc<str>>,
+    /// graph IRIs or `*` patterns hidden from this principal's reads on top of its
+    /// grants (`reviewedOnly` of `POST /{ds}/ask` hides agent memory)
+    hidden: Option<Arc<[String]>>,
 }
 
 impl std::fmt::Debug for Principal {
@@ -701,6 +704,7 @@ impl Principal {
             })),
             info: Arc::default(),
             branch: None,
+            hidden: None,
         });
         LOCAL.clone()
     }
@@ -713,6 +717,7 @@ impl Principal {
             access: Arc::new(access),
             info: Arc::default(),
             branch: None,
+            hidden: None,
         }
     }
 
@@ -737,6 +742,13 @@ impl Principal {
     /// Only an interactive principal may approve CLI logins.
     pub fn is_interactive(&self) -> bool {
         self.is_ambient()
+    }
+
+    /// This principal with the graphs that `patterns` match hidden from its reads, in
+    /// every dataset, whatever its grants say.
+    pub fn hiding_graphs(mut self, patterns: &[String]) -> Principal {
+        self.hidden = (!patterns.is_empty()).then(|| patterns.into());
+        self
     }
 
     /// This principal for a request that chose branch `branch`.
@@ -781,12 +793,20 @@ impl Principal {
     /// The graphs of `ds` this principal reads and writes through endpoint `e`, when
     /// its grants do not cover every graph (`None` otherwise, and always without auth).
     pub fn view(&self, ds: &str, e: Endpoint) -> Option<Arc<sparkles::access::GraphAccess>> {
-        if self.is_local() {
-            return None;
+        let view = if self.is_local() {
+            None
+        } else {
+            self.access.view(&self.qualified(ds), e, self.caller())
+        };
+        let Some(hidden) = &self.hidden else {
+            return view.map(Arc::new);
+        };
+        let mut v = view.unwrap_or_else(sparkles::access::GraphAccess::all);
+        for p in hidden.iter() {
+            v.read = v.read.without_pattern(p);
+            v.write = v.write.without_pattern(p);
         }
-        self.access
-            .view(&self.qualified(ds), e, self.caller())
-            .map(Arc::new)
+        Some(Arc::new(v))
     }
 
     /// What a protection's pattern may know of this caller: its name (the owner's for
