@@ -997,7 +997,7 @@ fn admin(p: &mut Paths) {
             "Datasets",
             "Prefixes of a dataset",
         )
-        .doc("The dataset's prefixes plus well-known ones.")
+        .doc("The dataset's effective prefixes: the well-known ones, the prefixes the settings file declares and the dataset's own, as the `prefixes` settings kind computes them.")
         .see("datasets-admin")
         .json("200", "The prefixes.", "Prefixes"),
     );
@@ -2572,7 +2572,7 @@ fn assist(p: &mut Paths) {
     let kind_body = |o: super::Op| {
         o.body(
             true,
-            "Fields of the kind: `AssistantSettings`, `MemorySettings` or `IngestSettingsRequest`.",
+            "Fields of the kind: `AssistantSettings`, `MemorySettings`, `IngestSettingsRequest`, or for `prefixes` a map from prefix names to IRIs.",
             json!({ "application/json": { "schema": { "type": "object" } } }),
         )
         .header(
@@ -3504,7 +3504,7 @@ fn protocol(p: &mut Paths) {
     );
     p.add(
         op(GET, "/{ds}/prefixes", "getPrefixes", "Datasets", "Read prefixes")
-            .doc("Fuseki's prefixes service: `prefix=p` returns one binding (`404` if unbound), `uri=u` the prefixes of an IRI, and neither all of them.")
+            .doc("Fuseki's prefixes service on the stored prefixes, the runtime layer of the `prefixes` settings kind: `prefix=p` returns one binding (`404` if unbound), `uri=u` the prefixes of an IRI, and neither all of them. Declared and well-known prefixes are at `/$/prefixes/{ds}`.")
             .see("datasets-admin")
             .query("prefix", s(), "A prefix name.")
             .query("uri", s(), "A namespace IRI.")
@@ -3517,7 +3517,7 @@ fn protocol(p: &mut Paths) {
     for (m, id) in [(POST, "addPrefix"), (PUT, "putPrefix")] {
         p.add(
             op(m, "/{ds}/prefixes", id, "Datasets", "Bind a prefix")
-                .doc("Binds `prefix` to `uri`, given in the query, a form or a JSON body.")
+                .doc("Binds `prefix` to `uri`, given in the query, a form or a JSON body, in the runtime layer of the `prefixes` settings kind, and clears a removal of the name. A name the settings file locks is a `409` with `locked-by-config`.")
                 .see("datasets-admin")
                 .query("prefix", s(), "The prefix name.")
                 .query("uri", s(), "The namespace IRI.")
@@ -3530,7 +3530,7 @@ fn protocol(p: &mut Paths) {
                     }),
                 )
                 .json("200", "The binding.", "PrefixBinding")
-                .errors(&[400]),
+                .errors(&[400, 409]),
         );
     }
     p.add(
@@ -3541,9 +3541,11 @@ fn protocol(p: &mut Paths) {
             "Datasets",
             "Remove a prefix",
         )
+        .doc("Removes a stored binding. For a name the settings file declares, it also stores a removal, so the declared prefix stops applying until a settings reset. A locked name is a `409` with `locked-by-config`, and a name neither stored nor declared is a `404`.")
         .see("datasets-admin")
         .query_req("prefix", s(), "The prefix name.")
-        .no_content("Removed."),
+        .no_content("Removed.")
+        .errors(&[404, 409]),
     );
     graph_store(
         p,
