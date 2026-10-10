@@ -119,6 +119,13 @@ let
         settings.defaults.assistant.sendByProvider.nosuch = "schema";
       };
     };
+    # a server lock whose path names no field of the models kind
+    serverLock = refused "server-lock" {
+      services.sparkles = {
+        models.settings = models;
+        settings.server.locked = [ "models.providers.claude.endpont" ];
+      };
+    };
   };
   # without model settings, the check does not know the providers and accepts it
   unchecked = evaluate {

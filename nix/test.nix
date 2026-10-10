@@ -6,7 +6,8 @@
 # compaction and clone options reach the server: a policy on one node, compaction turned
 # off on the other. The declared settings apply to declared, in-memory and later
 # datasets, runtime changes survive a reload and a restart, locks and declared datasets
-# are refused at runtime, and a switch to other settings and model roles reloads the
+# are refused at runtime, a locked model provider field is refused while the CLI changes
+# another one, and a switch to other settings and model roles reloads the
 # server without restarting it.
 { self }:
 {
@@ -42,6 +43,8 @@
             scratch.assistant.historyDays = 3;
             later.assistant.historyDays = 14;
           };
+          # the operator keeps claude's endpoint, and admins change the rest of the models
+          server.locked = [ "models.providers.claude.endpoint" ];
         };
         models = {
           settings = {
@@ -269,6 +272,30 @@
     assert code == 409 and body["code"] == "declared-dataset", (code, body)
     code, body = request("DELETE", f"{base}/$/datasets/scratch")
     assert code == 409 and body["code"] == "declared-dataset", (code, body)
+    # the locked endpoint of a declared provider is refused, and a budget for it is a
+    # runtime change made with the CLI
+    code, body = request(
+        "PATCH",
+        f"{base}/$/server/settings/models",
+        {"providers": {"claude": {"endpoint": "https://llm.example"}}},
+    )
+    assert code == 409 and body["code"] == "locked-by-config", (code, body)
+    cli = f"sparkles settings set --server {base} --insecure-http --global"
+    out = machine.succeed(
+        f"{cli} models.providers.claude.budget.tokensPerDay=5000 2>&1"
+    )
+    assert "tokensPerDay" in out, out
+    err = machine.fail(
+        f"{cli} models.providers.claude.endpoint=https://llm.example 2>&1"
+    )
+    assert "locked" in err, err
+
+    def budget():
+        m = json.loads(machine.succeed(f"curl -sf {base}/\\$/server/settings/models"))
+        return m["effective"]["providers"]["claude"].get("budget", {}).get("tokensPerDay"), m
+
+    tokens, m = budget()
+    assert tokens == 5000 and m["sources"]["providers.claude.budget.tokensPerDay"] == "runtime", m
     # the runtime values survive a reload
     pid = machine.succeed("systemctl show -p MainPID --value sparkles.service").strip()
     machine.succeed("systemctl reload sparkles.service")
@@ -276,6 +303,7 @@
     a = kind("demo")
     assert a["effective"]["historyDays"] == 7 and a["sources"]["historyDays"] == "runtime", a
     assert not kind("later")["effective"]["enabled"]
+    assert budget()[0] == 5000
     machine.succeed(f"curl -sf {base}/\\$/ping")
     # a name the server is not known by (a DNS-rebinding page) is refused
     code = machine.succeed(
@@ -360,6 +388,9 @@
     models = json.loads(machine.succeed(f"curl -sf {base}/\\$/models"))
     assert models["roles"]["summarize"][0]["provider"] == "gateway", models
     assert not kind("later")["effective"]["enabled"]
+    # the runtime budget stays over the switched model configuration
+    tokens, m = budget()
+    assert tokens == 5000 and m["sources"]["providers.claude.endpoint"] == "locked", m
 
     # a backup into the fs repository of the backup config, restored as a new dataset
     repos = json.loads(machine.succeed(f"curl -sf {base}/\\$/repositories"))
