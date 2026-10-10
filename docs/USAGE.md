@@ -2414,6 +2414,50 @@ or one line per sync with `sync --watch`. The exit status is 0 when done, 1 on a
 error, 2 on a usage error, 3 when some files failed, and 75 when the server cannot be
 reached.
 
+### Ingesting documents and reviewing memory
+
+An agent connected over MCP turns a document into facts that cite the passage each one
+comes from. The `ingest_document` prompt gives it the steps. It creates a branch such as
+`proposals.agent-7.ingest-standup-1`, registers the text with `register_source`, reads
+the vocabulary with `ingest_profile` and the text with `read_chunks`, and writes each
+fact with `assert_facts` and a `span` of the passage. The server checks that the quote
+is the text at that span. Registering a changed version of the same document makes a
+new rendition, and the agent's last `assert_facts` call with `retractStale` retracts
+the facts that the new text no longer supports. The `consolidate_memory` prompt runs a
+consolidation pass over session graphs on a branch in the same way. The tools and
+routes are in [API.md](API.md#ingest-profiles).
+
+The Memory page of the web UI has an **Ingest** card where a dataset admin chooses
+whether sources keep their text and edits the ingest profiles, which name the classes
+and predicates an agent may extract.
+
+The **Inbox** tab of the Memory page is where a person reviews what agents wrote. It
+lists the unreviewed facts of the agent graphs by session, each with its span, link,
+guard and corroboration signals, and the open review branches. **Accept all that
+pass** selects the facts whose span, link and guard checks pass, whatever their
+confidence. **Promote selected** writes the selected facts into the consolidated graph
+on a new branch `review.{person}.{date}-{n}` and opens its merge page, and the merge
+makes them reviewed. **Reject selected** retracts them with a message that names the
+reviewer and the optional reason.
+
+Each review branch opens on its own page at `/ui/datasets/{name}/review/{branch}`. The
+page shows the source text with the cited passages highlighted, the facts the branch
+proposes with their signals, the facts of `main` it retracts, and the entities it
+would create with their possible duplicates. **Use existing** makes the branch name an
+existing entity instead of a new one, **Edit value** replaces a fact's object, and
+**Reject** retracts a fact on the branch. **Merge** opens the merge preview.
+
+With `conversationFacts: "review"` for an agent in the memory settings, that agent's
+writes to `main` land on its branch `proposals.{agent}.inbox` and wait in the inbox.
+`recall` on a review branch reports the facts only that branch asserts as `proposed`.
+
+`scripts/eval-ingest` scores an ingestion of the labelled sample in
+`testsuite/ingest/sample.json` against its gold facts, with fact precision and recall,
+linking accuracy, the duplicate rate and the span failures of
+[C18 §11.2](specs/C18-natural-language-questions-and-ingest.md#112-ingestion).
+`scripts/eval-ingest --self-test` runs it against a local server with a scripted agent
+and needs no model.
+
 ## Asking questions with a model
 
 `sparkles ask` answers a question about a database with a language model. It grounds

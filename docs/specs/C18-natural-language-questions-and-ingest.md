@@ -1,9 +1,9 @@
 # C18: Questions and ingestion in natural language
 
-> **Status:** implemented in part (Phases 1, 2 and 3m-a)
+> **Status:** implemented in part (Phases 1, 2, 3 and 3m-a)
 >
 > **Phases:** Phases 1 and 2 shipped on 2026-10-09, without the measured runs of the
-> model matrix on the public sets. Phase 3m-a shipped on 2026-10-10. Phase 1 lets an
+> model matrix on the public sets. Phases 3 and 3m-a shipped on 2026-10-10. Phase 1 lets an
 > agent connected over MCP hand the query it wrote for a question to the web UI, where a
 > person reads, edits and runs it, and adds
 > a memory browser that shows each fact's source, passage and history. It also adds
@@ -28,6 +28,9 @@
 > [Usage: The Ask bar](../USAGE.md#the-ask-bar) ·
 > [Usage: Agent memory](../USAGE.md#agent-memory) ·
 > [API: Importing agent memory](../API.md#importing-agent-memory) ·
+> [Usage: Ingesting documents and reviewing memory](../USAGE.md#ingesting-documents-and-reviewing-memory) ·
+> [API: Ingest profiles](../API.md#ingest-profiles) ·
+> [API: Review inbox](../API.md#review-inbox) ·
 > [Features](../FEATURES.md)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
@@ -3820,8 +3823,8 @@ for her principal. The memory directory belongs to a project whose remote is
 
 **Phase 1 delivered on 2026-10-09.** The matrix has not been run with real models, and
 the public sets of §11.1 are not converted, so the targets of §11.3 and the measured role
-lists of §11.4 are still open. Phase 2 followed on the same day and Phase 3m-a on
-2026-10-10. Both are recorded below, and Phases 2b, 3, 3m-b and 4 to 6 are not built.
+lists of §11.4 are still open. Phase 2 followed on the same day and Phases 3m-a and 3
+on 2026-10-10. They are recorded below, and Phases 2b, 3m-b and 4 to 6 are not built.
 
 - **Model providers.** The server's `models` module holds the three kinds of §3.4 with
   their request and response formats, named secrets read at each request from
@@ -4086,3 +4089,129 @@ and re-anchoring need. `memory_brief` and the
 `sparkles memory` dispatcher has room for `inbox`, `review`, `promote`, `reject` and
 `export`. The import graphs match `agentGraphs`, so the review inbox of Phase 3 sees
 every imported fact as unreviewed.
+
+**Phase 3 delivered on 2026-10-10.** An agent turns a document into facts that cite
+their passages on a proposal branch, and a person reviews ingestions, proposals and
+unreviewed session facts in one inbox and promotes or rejects them. Every test runs
+without a model, and the ingestion evaluation has run only with scripted agents.
+
+- **Sources and spans.** `register_source` normalizes the text to NFC with `\n` line
+  ends, splits it into chunks at headings, paragraphs and sentences, and writes the
+  source, its `spk:TextRendition` and the chunks of §7.2 to the source's graph in one
+  commit. The rendition IRI is a version 5 UUID of the dataset and the digest, so the
+  same text writes nothing again. A changed text makes a new rendition with
+  `prov:wasRevisionOf` the old one, and the result names `previousRendition` and the
+  number of `staleFacts`. `read_chunks` and `list_sources` read the sources back.
+  `assert_facts` takes `span` on a fact, checks that the quote is the text there after
+  folding whitespace, fills in a missing quote from the text, and derives the reifier
+  from the span IRI `<rendition#char=start,end>` and the source. It also takes
+  `derivedFrom` and `retractStale` (A7, A8, A11).
+- **Ingest profiles.** `ingest_profile` answers the classes and predicates of a named
+  profile, or of the whole schema report, with a JSON Schema for an extraction whose
+  class and predicate members are enumerations. A fact with a span and a predicate the
+  rendition's profile does not list is `unknown-predicate` (A9). `<db>/ingest.json`
+  keeps `keepText` and up to 50 profiles, and `GET /$/ingest/{ds}/profiles`,
+  `PUT /$/ingest/{ds}/settings` and `GET`, `PUT` and `DELETE
+  /$/ingest/{ds}/profiles/{name}` manage them. With `keepText: false` a source keeps
+  only its digest and length, `read_chunks` answers `no-text`, and a fact with a span
+  needs its quote.
+- **The review inbox.** `GET /$/memory/{ds}/inbox` lists the facts asserted only in
+  agent graphs by session graph, each with the span, link, guard and corroboration
+  signals of §8.9 and `passes`, and the open review branches with the facts they
+  propose and retract. Facts without a reifier, such as imported harness memory, are
+  listed too. `GET /$/memory/{ds}/review/{name}` reviews one branch with its proposed
+  facts, retractions, new entities with their candidates, and the text of the cited
+  sources. `POST /$/memory/{ds}/promote`, `reject`, `relink` and `edit` are **Promote
+  selected**, **Reject**, **Use existing** and **Edit value**, and each writes as the
+  caller through `assert_facts` or a SPARQL update (A10, A29).
+- **Policy and status.** With `conversationFacts: "review"`, an agent's `assert_facts`
+  on `main` runs on `proposals.{agent}.inbox`, which is created when needed, and the
+  result carries a `notice` (A31). `recall` on a branch other than `main` reports the
+  facts that only the branch asserts as `proposed`.
+- **Elicitation.** A client of revision `2026-07-28` that declares elicitation gets an
+  `input_required` result from `assert_facts` when every error is
+  `possible-duplicate`. The form has one enumeration per new entity with the candidates
+  and "a new entity", and the retried call uses the chosen IRI or sets `distinctFrom`
+  (A33).
+- **Agent workflows.** The `ingest_document` prompt gives the steps of an ingestion on
+  a proposal branch, and `consolidate_memory` those of a consolidation pass that
+  asserts repeated session facts into the consolidated graph with `derivedFrom` and
+  lists duplicates and conflicts for a person. Both stop before the merge.
+- **The web UI.** The Memory page has an Inbox tab with the sessions, signals and
+  branches, **Accept all that pass** with the corroboration checkbox, **Promote
+  selected** into a target graph, which opens the merge page of the new review branch,
+  and **Reject selected** with a reason (A32). The review page at
+  `/ui/datasets/{name}/review/{branch}` shows the source text with the cited passages
+  highlighted, the proposed facts with their signals, the retractions and the new
+  entities, with **Use existing**, **Edit value**, **Reject** and **Merge**. An Ingest
+  card on the Memory page edits `keepText` and the profiles. The mock server answers
+  every new route.
+- **Evaluation.** `testsuite/ingest/sample.json` holds 20 short documents about the
+  organisation of `testsuite/ask/org.ttl` with 39 gold facts, their quotes and 5 new
+  entities. `scripts/eval-ingest` reads the ingest and proposal branches of a server
+  through the review route and reports fact precision and recall, linking accuracy,
+  the duplicate rate, span failures, guard rejections and tokens per 1,000 characters
+  from an agent's log. `--self-test` runs a scripted `oracle` agent, which scores 1 on
+  precision, recall and linking, and a `weak` agent that misquotes a quarter of its
+  facts, mints a duplicate team and changes some dates. The weak agent scores 0.97
+  precision, 0.74 recall, 0.78 linking, 16.7 duplicates per 100 new entities and 23%
+  span failures.
+
+**Deviations and additions in Phase 3.**
+
+- Re-ingestion is driven by the agent. The server does not compare two extractions
+  itself, because Phase 3 has no extraction in the server. The last `assert_facts` call
+  of a re-extraction names the new rendition in `retractStale`, and the server then
+  retracts the facts of the graph that cite only earlier renditions and that the call
+  does not assert again. A fact that the new extraction cites again stays.
+- Review branches are `review.{person}.{yyyymmdd}-{n}`, because branch names cannot
+  hold a slash. The person is the caller's user name, or `local` on an open server.
+- `promote`, `reject`, `relink` and `edit` are HTTP routes for the UI in Phase 3, which
+  pulls `POST /$/memory/{ds}/promote` forward from 3m-b. The `sparkles memory` commands
+  `inbox`, `review`, `promote` and `reject` remain in 3m-b and can call these routes.
+  Acceptance is the merge itself, so the review page has no accept button per fact, and
+  keeping a new entity is the default, so it has no **Keep new**.
+- The link signal compares labels exactly or after normalization and needs a matching
+  type, as `possible-duplicate` does. The corroboration signal passes when any other
+  graph asserts the triple, whatever its source.
+- A fact counts as proposed on a branch when the branch asserts it with a reifier that
+  `main` does not know, and as retracted when its reifier is invalidated on the branch
+  and still live on `main`. Merged branches, with no commit ahead, leave the inbox.
+- Facts without a reifier are promoted with a new reifier and no `derivedFrom`.
+- The elicitation form titles each candidate with its IRI and the field with the new
+  entity's label. Only `assert_facts` elicits, because `register_source` mints no
+  entity. Clients of older revisions get `possible-duplicate`, since only `2026-07-28`
+  has `input_required`.
+- The Ingest section of §7.10 is a card on the Memory page. The upload that the dataset
+  page's Ingest section would hold comes with Phase 4.
+- The second half of A9, an extraction with structured output that never proposes
+  `ex:leads`, needs the extraction of Phase 4.
+- The sample holds Markdown and plain text only. HTML and PDF documents join it with
+  the conversions of Phase 4, and review effort and cost need a person and a model, so
+  the report leaves them out.
+- `GET /$/ingest/{ds}/profiles`, `PUT /$/ingest/{ds}/settings`,
+  `GET /$/memory/{ds}/review/{name}` and the routes of `reject`, `relink` and `edit` are
+  additions to the table of §10.3.
+
+**Tests.** `http/router_tests/mcp/ingest.rs` covers A7 to A11 in
+`a7_to_a11_ingest_review_and_reingest`, A29 and the inbox side of A32 in
+`a29_a32_inbox_promote_and_reject`, A31 in `a31_review_policy_holds_conversation_facts`,
+which also checks the `proposed` status, and A33 in `a33_elicitation_for_possible_duplicates`
+with the unit tests of `mcp/elicit.rs`. `ingest_settings_and_read_tools` covers the
+settings routes, `keepText` and the read tools, and `ingest_and_consolidation_prompts`
+the prompts. `ui/src/lib/review.test.ts` checks the selection of A32 and the span
+segments, and `ui/tests/mock/review.spec.ts` runs the inbox, the review page and the
+Ingest card against the mock. `ingest_sample_matches_the_demo_data` keeps the sample
+consistent with `org.ttl`.
+
+**What 3m-b, Phase 4 and Phase 5 build on.** `register_source` and `list_sources` are
+the operations behind `POST` and `GET /{ds}/sources`, and the import graphs' IRIs can
+become source IRIs whose digest already matches. Spans, `retractStale` and the
+`previousRendition` of a changed text are what re-anchoring needs. The `sparkles memory`
+commands `inbox`, `review`, `promote` and `reject` can call the routes of the review
+inbox, which already treat imported facts as unreviewed. Phase 4's extraction can fill
+an ingest branch through the same `assert_facts` calls as the `ingest_document`
+prompt, with `ingest_profile`'s JSON Schema as its structured output, and its results
+appear on the review page and in `scripts/eval-ingest` unchanged. Phase 5's maintenance
+can run `consolidate_memory` on a schedule and use the inbox signals to rank what it
+proposes.
