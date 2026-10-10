@@ -29,6 +29,7 @@ mod embed;
 mod geo;
 mod group;
 mod history_query;
+pub mod keyset;
 mod link;
 mod mem_history;
 #[cfg(test)]
@@ -90,7 +91,7 @@ use crate::index::{Block, BlockCache, Key, Perm, PermIndex, pad};
 use crate::io::Source;
 use crate::vocab::{DeltaVocab, Vocab};
 use arc_swap::ArcSwap;
-use imbl::OrdSet;
+pub use keyset::KeySet;
 use oxrdf::{BlankNode, GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use parking_lot::{Mutex, MutexGuard};
 use std::borrow::Cow;
@@ -242,8 +243,8 @@ impl Generation {
 /// Inserted / deleted quads per permutation (keys in permutation order).
 #[derive(Clone, Default)]
 pub struct Delta {
-    pub ins: [OrdSet<Key>; 7],
-    pub del: [OrdSet<Key>; 7],
+    pub ins: [KeySet; 7],
+    pub del: [KeySet; 7],
 }
 
 impl Delta {
@@ -257,14 +258,15 @@ impl Delta {
         self.ins[0].is_empty() && self.del[0].is_empty()
     }
     /// The keys of `set` that start with `prefix`, in order.
-    pub(crate) fn range<'a>(
-        set: &'a OrdSet<Key>,
-        prefix: &[u64],
-    ) -> impl Iterator<Item = &'a Key> + 'a {
+    pub(crate) fn range<'a>(set: &'a KeySet, prefix: &[u64]) -> impl Iterator<Item = &'a Key> + 'a {
         Self::key_range(set, pad(prefix, 0), pad(prefix, u64::MAX))
     }
-    fn key_range(set: &OrdSet<Key>, lo: Key, hi: Key) -> impl Iterator<Item = &Key> + '_ {
-        set.range((Bound::Included(lo), Bound::Included(hi)))
+    pub(crate) fn key_range(set: &KeySet, lo: Key, hi: Key) -> crate::store::keyset::Iter<'_> {
+        set.range(lo..=hi)
+    }
+    /// The number of keys of `set` that start with `prefix` (two tree descents).
+    pub(crate) fn count_prefix(set: &KeySet, prefix: &[u64]) -> u64 {
+        set.count_between(&pad(prefix, 0), &pad(prefix, u64::MAX)) as u64
     }
 }
 
@@ -568,9 +570,7 @@ impl Snapshot {
                 None => Bound::Unbounded,
             };
             let to = Bound::Included(base.blocks[b].last);
-            if ins_set.range((from, to)).next().is_some()
-                || del_set.range((from, to)).next().is_some()
-            {
+            if ins_set.intersects((from, to)) || del_set.intersects((from, to)) {
                 crate::index::ALL_COLS
             } else {
                 mask
@@ -660,12 +660,7 @@ impl Snapshot {
         use rayon::prelude::*;
         let pi = perm.index();
         let touched = |&(lo, hi): &(Key, Key)| {
-            Delta::key_range(&self.delta.ins[pi], lo, hi)
-                .next()
-                .is_some()
-                || Delta::key_range(&self.delta.del[pi], lo, hi)
-                    .next()
-                    .is_some()
+            self.delta.ins[pi].intersects(lo..=hi) || self.delta.del[pi].intersects(lo..=hi)
         };
         if ranges.iter().any(touched) {
             return Ok(None);
@@ -722,8 +717,8 @@ impl Snapshot {
     pub fn count(&self, perm: Perm, prefix: &[u64]) -> Result<u64> {
         let base = self.perm(perm).count(&self.cache, prefix)?;
         let pi = perm.index();
-        let ins = Delta::range(&self.delta.ins[pi], prefix).count() as u64;
-        let del = Delta::range(&self.delta.del[pi], prefix).count() as u64;
+        let ins = Delta::count_prefix(&self.delta.ins[pi], prefix);
+        let del = Delta::count_prefix(&self.delta.del[pi], prefix);
         Ok((base + ins).saturating_sub(del))
     }
 
@@ -734,18 +729,15 @@ impl Snapshot {
         if self.delta.is_empty() {
             return base;
         }
-        let ins = Delta::range(&self.delta.ins[pi], prefix)
-            .take(10_000)
-            .count() as u64;
-        base + ins
+        base + Delta::count_prefix(&self.delta.ins[pi], prefix)
     }
 
     /// Exact number of quads with keys in `[lo, hi]` (at most two block decodes).
     pub fn count_between(&self, perm: Perm, lo: Key, hi: Key) -> Result<u64> {
         let base = self.perm(perm).count_between(&self.cache, &lo, &hi)?;
         let pi = perm.index();
-        let ins = Delta::key_range(&self.delta.ins[pi], lo, hi).count() as u64;
-        let del = Delta::key_range(&self.delta.del[pi], lo, hi).count() as u64;
+        let ins = self.delta.ins[pi].count_between(&lo, &hi) as u64;
+        let del = self.delta.del[pi].count_between(&lo, &hi) as u64;
         Ok((base + ins).saturating_sub(del))
     }
 

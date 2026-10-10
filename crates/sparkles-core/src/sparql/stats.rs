@@ -25,8 +25,8 @@ use super::plan::GraphFilter;
 use crate::builder::Stats;
 use crate::error::Result;
 use crate::index::{ALL_COLS, Block, ColMask, Key, Perm, PermIndex, bound_cols, pad};
+use crate::store::KeySet;
 use crate::store::{Delta, Snapshot};
-use imbl::OrdSet;
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
@@ -255,11 +255,10 @@ pub fn exact_counts(
     }
     let pi = key.perm.index();
     let room = (budget.saturating_sub(work) / per_quad) as usize;
-    let changes = Delta::range(&snap.delta.ins[pi], &key.prefix)
-        .chain(Delta::range(&snap.delta.del[pi], &key.prefix))
-        .take(room.saturating_add(1))
-        .count();
-    work = work.saturating_add((changes as u64).saturating_mul(per_quad));
+    let changes = (Delta::count_prefix(&snap.delta.ins[pi], &key.prefix)
+        + Delta::count_prefix(&snap.delta.del[pi], &key.prefix))
+    .min(room.saturating_add(1) as u64);
+    work = work.saturating_add(changes.saturating_mul(per_quad));
     if work > budget {
         return Ok(None);
     }
@@ -511,7 +510,7 @@ impl<'a> Prober<'a> {
     /// Whether a base quad of a read graph has a key starting with `x`, leaving out the
     /// quads in `deleted` when given. Every quad read before the answer is a quad of an
     /// unread graph or a deleted one, so a probe costs no more than those quads.
-    fn holds(&mut self, x: &[u64], deleted: Option<&OrdSet<Key>>) -> Result<bool> {
+    fn holds(&mut self, x: &[u64], deleted: Option<&KeySet>) -> Result<bool> {
         let (lo, hi) = (pad(x, 0), pad(x, u64::MAX));
         let (b0, b1) = self.idx.key_block_range(&lo, &hi);
         let mut mask = bound_cols(&lo, &hi);

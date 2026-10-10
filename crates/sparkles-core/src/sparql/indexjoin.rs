@@ -847,7 +847,7 @@ fn clusters(ctx: &Ctx, perm: Perm, ranges: &Ranges) -> (Vec<(usize, usize)>, usi
             b0 <= c1
                 && !(delta && {
                     let gap = (Bound::Excluded(prev), Bound::Excluded(lo));
-                    ins.range(gap).next().is_some() || del.range(gap).next().is_some()
+                    ins.intersects(gap) || del.intersects(gap)
                 })
         });
         match &mut cur {
@@ -1065,7 +1065,7 @@ fn read_ranges_gallop(
         let (lo, hi) = ranges.get(r);
         if delta && {
             let rng = (Bound::Included(lo), Bound::Included(hi));
-            ins.range(rng).next().is_some() || del.range(rng).next().is_some()
+            ins.intersects(rng) || del.intersects(rng)
         } {
             read_ranges(ctx, perm, ranges, &[(r, r + 1)], cols, rule, out, stats)?;
             continue;

@@ -219,9 +219,8 @@ pub(super) fn masked(
 pub fn apply(snap: &Snapshot, hidden: Vec<Key>, key: String) -> Snapshot {
     use rayon::prelude::*;
     let spo = Perm::Spo.index();
-    let (from_ins, from_base): (Vec<Key>, Vec<Key>) = hidden
-        .iter()
-        .partition(|k| snap.delta.ins[spo].contains(*k));
+    let (from_ins, from_base): (Vec<Key>, Vec<Key>) =
+        hidden.iter().partition(|k| snap.delta.ins[spo].contains(k));
     let sets: Vec<_> = Perm::ALL
         .par_iter()
         .map(|&p| {
