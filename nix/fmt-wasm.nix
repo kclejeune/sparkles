@@ -14,6 +14,7 @@
   rustPlatform,
   buildWasmBindgenCli,
   fetchCrate,
+  removeReferencesTo,
 }:
 let
   version = (lib.importTOML ../Cargo.toml).workspace.package.version;
@@ -98,11 +99,19 @@ craneLib.mkCargoDerivation (
   // {
     inherit cargoArtifacts src;
 
-    nativeBuildInputs = [ wasm-bindgen-cli ];
+    nativeBuildInputs = [
+      wasm-bindgen-cli
+      removeReferencesTo
+    ];
 
     # the script writes the module and its bindings to $out
     buildPhaseCargoCommand = ''bash scripts/build-fmt-wasm.sh "$out"'';
     installPhaseCommand = "";
+    # The module's panic messages name the vendored sources' store paths, which would
+    # pull every crate's sources into the closure of the UI and of the server package.
+    postInstall = ''
+      find "$out" -type f -exec remove-references-to -t ${commonArgs.cargoVendorDir} '{}' +
+    '';
     doInstallCargoArtifacts = false;
 
     passthru = { inherit cargoArtifacts; };
