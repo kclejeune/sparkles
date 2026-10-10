@@ -19,16 +19,12 @@ use std::sync::Arc;
 const LEAF_CAP: usize = 64;
 /// Most children of a branch.
 const BRANCH_CAP: usize = 32;
-/// Deeper than any tree of `u64::MAX` keys gets with these capacities.
-const MAX_DEPTH: usize = 16;
 
-#[derive(Clone)]
 enum Node {
     Leaf(Vec<Key>),
     Branch(Branch),
 }
 
-#[derive(Clone)]
 struct Branch {
     children: Vec<Arc<Node>>,
     /// the largest key under each child
@@ -37,7 +33,48 @@ struct Branch {
     counts: Vec<usize>,
 }
 
+/// A copy of `v` with room for one entry more than a node of capacity `cap` holds, so
+/// that the insert that overflows it does not grow the allocation (a vector that grows
+/// doubles, and a leaf would keep that room after its split).
+fn with_room<T: Clone>(v: &[T], cap: usize) -> Vec<T> {
+    let mut out = Vec::with_capacity(cap + 1);
+    out.extend_from_slice(v);
+    out
+}
+
+/// The entries of `v` from `at` on, moved to a vector with room as [`with_room`] gives.
+fn split_with_room<T>(v: &mut Vec<T>, at: usize, cap: usize) -> Vec<T> {
+    let mut right = Vec::with_capacity(cap + 1);
+    right.extend(v.drain(at..));
+    v.shrink_to(cap + 1);
+    right
+}
+
+impl Clone for Node {
+    /// A copy of a node for a write, with room for the write's insert.
+    fn clone(&self) -> Node {
+        match self {
+            Node::Leaf(v) => Node::Leaf(with_room(v, LEAF_CAP)),
+            Node::Branch(b) => Node::Branch(Branch {
+                children: with_room(&b.children, BRANCH_CAP),
+                lasts: with_room(&b.lasts, BRANCH_CAP),
+                counts: with_room(&b.counts, BRANCH_CAP),
+            }),
+        }
+    }
+}
+
 impl Branch {
+    /// The right half of a branch that holds more than its capacity.
+    fn split(&mut self) -> Branch {
+        let at = self.children.len() / 2;
+        Branch {
+            children: split_with_room(&mut self.children, at, BRANCH_CAP),
+            lasts: split_with_room(&mut self.lasts, at, BRANCH_CAP),
+            counts: split_with_room(&mut self.counts, at, BRANCH_CAP),
+        }
+    }
+
     /// The child whose range holds `k`: the first whose largest key is not less than
     /// `k`, or the last child.
     #[inline]
@@ -134,7 +171,10 @@ impl Node {
                 } else {
                     None
                 };
-                Some((v.len() > LEAF_CAP).then(|| Node::Leaf(v.split_off(v.len() / 2))))
+                Some((v.len() > LEAF_CAP).then(|| {
+                    let at = v.len() / 2;
+                    Node::Leaf(split_with_room(v, at, LEAF_CAP))
+                }))
             }
             Node::Branch(b) => {
                 let i = b.route(&k);
@@ -155,14 +195,7 @@ impl Node {
                         b.children.insert(i + 1, Arc::new(right));
                     }
                 }
-                Some((b.children.len() > BRANCH_CAP).then(|| {
-                    let at = b.children.len() / 2;
-                    Node::Branch(Branch {
-                        children: b.children.split_off(at),
-                        lasts: b.lasts.split_off(at),
-                        counts: b.counts.split_off(at),
-                    })
-                }))
+                Some((b.children.len() > BRANCH_CAP).then(|| Node::Branch(b.split())))
             }
         }
     }
@@ -213,20 +246,14 @@ fn rebalance(b: &mut Branch, j: usize, cap: usize) {
     let split = match (left, right) {
         (Node::Leaf(l), Node::Leaf(r)) => {
             l.extend(r);
-            (l.len() > cap).then(|| Node::Leaf(l.split_off(l.len() / 2)))
+            let at = l.len() / 2;
+            (l.len() > cap).then(|| Node::Leaf(split_with_room(l, at, cap)))
         }
         (Node::Branch(l), Node::Branch(r)) => {
             l.children.extend(r.children);
             l.lasts.extend(r.lasts);
             l.counts.extend(r.counts);
-            (l.children.len() > cap).then(|| {
-                let at = l.children.len() / 2;
-                Node::Branch(Branch {
-                    children: l.children.split_off(at),
-                    lasts: l.lasts.split_off(at),
-                    counts: l.counts.split_off(at),
-                })
-            })
+            (l.children.len() > cap).then(|| Node::Branch(l.split()))
         }
         _ => unreachable!("siblings are at the same level"),
     };
@@ -287,7 +314,7 @@ impl KeySet {
 
     fn insert_at(&mut self, k: Key, n: usize, shares: &mut Option<bool>) -> Option<()> {
         let Some(root) = self.root.as_mut() else {
-            self.root = Some(Arc::new(Node::Leaf(vec![k])));
+            self.root = Some(Arc::new(Node::Leaf(with_room(&[k], LEAF_CAP))));
             self.len = 1;
             *shares = Some(false);
             return Some(());
@@ -388,46 +415,22 @@ impl KeySet {
     /// The keys in `range`, in order.
     pub fn range(&self, range: impl RangeBounds<Key>) -> Iter<'_> {
         let mut it = Iter {
-            stack: [(&[][..], 0); MAX_DEPTH],
-            depth: 0,
+            root: self.root.as_deref(),
             leaf: &[],
             pos: 0,
             hi: range.end_bound().cloned(),
         };
-        let Some(root) = &self.root else {
-            return it;
+        let found = match (it.root, range.start_bound()) {
+            (None, _) => None,
+            (Some(r), Bound::Unbounded) => seek(r, |_| false),
+            (Some(r), Bound::Included(k)) => seek(r, |x| x < k),
+            (Some(r), Bound::Excluded(k)) => seek(r, |x| x <= k),
         };
-        // descend to the leaf of the first key in the range, keeping the path
-        let mut n: &Node = root;
-        loop {
-            match n {
-                Node::Leaf(v) => {
-                    it.leaf = v;
-                    it.pos = match range.start_bound() {
-                        Bound::Unbounded => 0,
-                        Bound::Included(k) => v.partition_point(|x| x < k),
-                        Bound::Excluded(k) => v.partition_point(|x| x <= k),
-                    };
-                    return it;
-                }
-                Node::Branch(b) => {
-                    let i = match range.start_bound() {
-                        Bound::Unbounded => 0,
-                        Bound::Included(k) => b.lasts.partition_point(|l| l < k),
-                        Bound::Excluded(k) => b.lasts.partition_point(|l| l <= k),
-                    };
-                    if i == b.children.len() {
-                        // every key is before the range (only the root's descent can
-                        // find this: a child taken holds a key not less than the start)
-                        it.depth = 0;
-                        return it;
-                    }
-                    it.stack[it.depth] = (&b.children, i);
-                    it.depth += 1;
-                    n = &b.children[i];
-                }
-            }
+        match found {
+            Some((leaf, pos)) => (it.leaf, it.pos) = (leaf, pos),
+            None => it.root = None,
         }
+        it
     }
 
     pub fn first(&self) -> Option<&Key> {
@@ -473,12 +476,28 @@ impl<'a> IntoIterator for &'a KeySet {
     }
 }
 
-/// The keys of a [`KeySet`] range, in order.
+/// The leaf of the first key of the tree under `n` for which `before` is false, and the
+/// key's position in it (`before` holds for a prefix of the keys in order). `None` when
+/// it holds for every key.
+fn seek(mut n: &Node, before: impl Fn(&Key) -> bool) -> Option<(&[Key], usize)> {
+    loop {
+        match n {
+            Node::Leaf(v) => {
+                let pos = v.partition_point(&before);
+                return (pos < v.len()).then_some((&v[..], pos));
+            }
+            Node::Branch(b) => n = b.children.get(b.lasts.partition_point(&before))?,
+        }
+    }
+}
+
+/// The keys of a [`KeySet`] range, in order. It keeps no path: the next leaf is found by
+/// a descent from the root past the last key of the current one, which costs a few
+/// binary searches per leaf of up to 64 keys.
 #[derive(Clone)]
 pub struct Iter<'a> {
-    /// the children of each branch on the path to the current leaf, and the index taken
-    stack: [(&'a [Arc<Node>], usize); MAX_DEPTH],
-    depth: usize,
+    /// the tree's root, `None` once the range is done
+    root: Option<&'a Node>,
     leaf: &'a [Key],
     pos: usize,
     hi: Bound<Key>,
@@ -487,34 +506,26 @@ pub struct Iter<'a> {
 impl<'a> Iter<'a> {
     /// Move to the first key of the next leaf; false at the end of the tree.
     fn next_leaf(&mut self) -> bool {
-        // the deepest branch with a child after the one taken
-        loop {
-            if self.depth == 0 {
-                return false;
+        let next = match (self.root, self.leaf.last()) {
+            (Some(r), Some(last)) => seek(r, |x| x <= last),
+            _ => None,
+        };
+        match next {
+            Some((leaf, pos)) => {
+                (self.leaf, self.pos) = (leaf, pos);
+                true
             }
-            let (children, i) = &mut self.stack[self.depth - 1];
-            if *i + 1 < children.len() {
-                *i += 1;
-                break;
-            }
-            self.depth -= 1;
-        }
-        let (children, i) = self.stack[self.depth - 1];
-        let mut n: &'a Node = &children[i];
-        loop {
-            match n {
-                Node::Leaf(v) => {
-                    self.leaf = v;
-                    self.pos = 0;
-                    return true;
-                }
-                Node::Branch(b) => {
-                    self.stack[self.depth] = (&b.children, 0);
-                    self.depth += 1;
-                    n = &b.children[0];
-                }
+            None => {
+                self.end();
+                false
             }
         }
+    }
+
+    fn end(&mut self) {
+        self.root = None;
+        self.leaf = &[];
+        self.pos = 0;
     }
 
     #[inline]
@@ -530,8 +541,6 @@ impl<'a> Iter<'a> {
     /// the end), consumed.
     pub fn next_run(&mut self) -> &'a [Key] {
         if self.pos >= self.leaf.len() && !self.next_leaf() {
-            self.leaf = &[];
-            self.pos = 0;
             return &[];
         }
         let rest = &self.leaf[self.pos..];
@@ -542,9 +551,7 @@ impl<'a> Iter<'a> {
         };
         if n < rest.len() {
             // the range ends in this leaf
-            self.leaf = &[];
-            self.pos = 0;
-            self.depth = 0;
+            self.end();
         } else {
             self.pos = self.leaf.len();
         }
@@ -558,15 +565,11 @@ impl<'a> Iterator for Iter<'a> {
     #[inline]
     fn next(&mut self) -> Option<&'a Key> {
         if self.pos >= self.leaf.len() && !self.next_leaf() {
-            self.leaf = &[];
-            self.pos = 0;
             return None;
         }
         let k = &self.leaf[self.pos];
         if !self.before_end(k) {
-            self.leaf = &[];
-            self.pos = 0;
-            self.depth = 0;
+            self.end();
             return None;
         }
         self.pos += 1;
