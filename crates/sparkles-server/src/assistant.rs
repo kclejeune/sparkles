@@ -406,6 +406,58 @@ impl Runtime {
             .or_default() += tokens;
     }
 
+    /// Count the model calls of a step outside an ask, such as an explanation (C18
+    /// §6.6): its tokens against the dataset and `principal`, and its answer and tokens
+    /// in the usage counts under `role`. It is not counted as an ask.
+    pub fn charge(&self, dataset: &str, principal: &str, role: &str, usage: &Value) {
+        let steps = usage["steps"].as_array().cloned().unwrap_or_default();
+        let tokens: u64 = steps
+            .iter()
+            .map(|s| {
+                s["inputTokens"].as_u64().unwrap_or(0) + s["outputTokens"].as_u64().unwrap_or(0)
+            })
+            .sum();
+        self.add_tokens(dataset, principal, tokens);
+        tracing::info!(
+            target: "sparkles::models",
+            dataset,
+            principal,
+            role,
+            tokens,
+            calls = steps.len(),
+            "model calls charged"
+        );
+        let add = |c: &mut Counts| {
+            for s in &steps {
+                let pair = (
+                    s["provider"].as_str().unwrap_or("").to_string(),
+                    s["model"].as_str().unwrap_or("").to_string(),
+                );
+                if s["outcome"] == "ok" {
+                    *c.answers
+                        .entry((
+                            role.to_string(),
+                            pair.0.clone(),
+                            pair.1.clone(),
+                            "none".into(),
+                        ))
+                        .or_default() += 1;
+                }
+                let t = c.tokens.entry(pair).or_default();
+                t.0 += s["inputTokens"].as_u64().unwrap_or(0);
+                t.1 += s["outputTokens"].as_u64().unwrap_or(0);
+                t.2 += s["estimatedCost"].as_f64().unwrap_or(0.0);
+            }
+        };
+        {
+            let mut u = self.usage.lock();
+            let d = today();
+            u.retain(|k, _| k.0 + USAGE_DAYS > d);
+            add(u.entry((d, dataset.to_string())).or_default());
+        }
+        add(self.totals.lock().entry(dataset.to_string()).or_default());
+    }
+
     pub fn recent(&self, id: &str) -> Option<Recent> {
         self.recent.lock().0.get(id).cloned()
     }

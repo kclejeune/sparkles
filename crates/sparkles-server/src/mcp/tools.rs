@@ -430,15 +430,37 @@ pub(super) struct SparqlQueryArgs {
     at: Option<Value>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct ExplainArgs {
-    dataset: Option<String>,
-    query: String,
-    include_algebra: Option<bool>,
-    reasoning: Option<bool>,
-    at_commit: Option<u64>,
-    at: Option<Value>,
+pub(super) struct ExplainArgs {
+    pub(super) dataset: Option<String>,
+    pub(super) query: String,
+    pub(super) include_algebra: Option<bool>,
+    pub(super) reasoning: Option<bool>,
+    pub(super) at_commit: Option<u64>,
+    pub(super) at: Option<Value>,
+    /// `estimate` or `run` (C18 §9.6)
+    pub(super) profile: Option<String>,
+    pub(super) notes: Option<bool>,
+    pub(super) timeout_seconds: Option<f64>,
+    pub(super) use_server_model: Option<bool>,
+}
+
+/// What [`Tools::explain_core`] found: the members every explanation shares and the
+/// plan it explains.
+pub(super) struct ExplainCore {
+    /// `dataset`, `commit`, `queryType`, `estimatedRows`, `warnings`, and after a run
+    /// `rows`, `elapsedMs` and the `error` of a run that a budget stopped
+    pub(super) out: Value,
+    /// the engine's plan, which a given plan does not have
+    pub(super) plan: Option<PlanInfo>,
+    /// the plan as `PlanNode` (or a given `CursorPlan`) JSON, with node ids
+    pub(super) plan_json: Value,
+    /// the budget that stopped a run
+    pub(super) stop: Option<crate::explain::Stop>,
+    /// the error body of a run that a budget stopped
+    pub(super) error: Option<Value>,
+    pub(super) prefixes: Vec<(String, String)>,
 }
 
 #[derive(Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -1137,16 +1159,32 @@ impl Tools<'_> {
 
     // ------------------------------------------------------------- explain_query ------
 
-    fn explain_query(&self, args: Map<String, Value>) -> Result<Outcome, ToolError> {
-        let a: ExplainArgs = parse(args)?;
+    /// The plan of `explain_query` and `POST /{ds}/sparql/explain` (C18 §6.6, §9.6):
+    /// the estimated plan with its warnings, or with `run` the plan of a read-only run,
+    /// partial when a budget stopped it, or with `given` the client's plan.
+    pub(super) fn explain_core(
+        &self,
+        a: &ExplainArgs,
+        given: Option<Value>,
+    ) -> Result<ExplainCore, ToolError> {
         query_text(&a.query)?;
         let ds = self.dataset(a.dataset.as_deref())?;
         let prefix_map = dataset_prefixes(&ds);
         let prefixes = Prefixes::new(&prefix_map);
         let names = prefixes.names();
-        let timeout = self.cfg().default_timeout();
+        let profile = a.profile.as_deref().unwrap_or("estimate");
+        let run = profile == "run";
+        // a run has its own deadline, within the server's maximum
+        let timeout = if run {
+            let max = self.cfg().max_timeout;
+            match a.timeout_seconds {
+                Some(s) => self.timeout(Some(s))?,
+                None => Duration::from_secs(super::super::explain::RUN_TIMEOUT_SECS).min(max),
+            }
+        } else {
+            self.cfg().default_timeout()
+        };
         let ctx = self.ctx(&names, timeout.as_secs_f64());
-        let snap = self.snapshot(&ds, a.at_commit, a.at.as_ref(), self.call.arrived + timeout)?;
         let reasoning = Self::reasoning(&ds, a.reasoning);
         let parsed = self.parse_query(&a.query, &prefix_map, &ctx)?;
         let opts = self
@@ -1158,6 +1196,24 @@ impl Tools<'_> {
                 &prefix_map,
             )
             .map_err(|e| ctx.engine(e))?;
+        let kind = query_type(&parsed);
+        // a given plan is explained as it is, with the commit the client names
+        if let Some(plan) = given {
+            return Ok(ExplainCore {
+                out: json!({
+                    "dataset": ds.name,
+                    "commit": a.at_commit,
+                    "queryType": kind,
+                    "warnings": [],
+                }),
+                plan: None,
+                plan_json: plan,
+                stop: None,
+                error: None,
+                prefixes: prefix_vec(&prefix_map),
+            });
+        }
+        let snap = self.snapshot(&ds, a.at_commit, a.at.as_ref(), self.call.arrived + timeout)?;
         let (algebra, plan) =
             sparql::explain(snap.clone(), &a.query, &opts).map_err(|e| ctx.engine(e))?;
         // A caller whose grants or protections hide some data must not learn from the
@@ -1178,8 +1234,6 @@ impl Tools<'_> {
                     reasoning,
                 }
             });
-        let mut lines = String::new();
-        plan_lines(&plan, 0, &mut lines);
         // the planner's own notes first (spatial filters not pushed down, …)
         let mut warnings: Vec<Value> = plan
             .warnings
@@ -1226,7 +1280,6 @@ impl Tools<'_> {
             }));
         }
         let root = plan.estimated_rows;
-        let kind = query_type(&parsed);
         for (code, message) in plan_warnings(&plan, &parsed, 100.min(self.cfg().max_rows)) {
             warnings.push(json!({ "code": code, "message": message }));
         }
@@ -1244,13 +1297,59 @@ impl Tools<'_> {
             "queryType": kind,
             // null when the caller's view hides the estimates
             "estimatedRows": (root >= 0.0).then(|| root.round() as u64),
-            "plan": lines.trim_end(),
             "warnings": warnings,
         });
         if a.include_algebra.unwrap_or(false) {
             out["algebra"] = cut_marked(algebra, 8192).into();
         }
-        Ok(Outcome::Structured(out))
+        if !run {
+            return Ok(ExplainCore {
+                plan_json: serde_json::to_value(&plan).unwrap_or_default(),
+                plan: Some(plan),
+                out,
+                stop: None,
+                error: None,
+                prefixes: prefix_vec(&prefix_map),
+            });
+        }
+        // the run: read-only, as the caller, its rows counted and dropped
+        let started = Instant::now();
+        let (plan, stop, error) = match sparql::query_with_plan(snap.clone(), &a.query, &opts) {
+            Ok(r) => {
+                out["rows"] = (r.len() as u64).into();
+                (r.plan, None, None)
+            }
+            Err(f) => {
+                let stop = crate::explain::Stop::of_error(&f.error, Some(timeout.as_secs_f64()))
+                    .map(|mut s| {
+                        s.elapsed_ms = Some(started.elapsed().as_secs_f64() * 1000.0);
+                        s
+                    });
+                let e = ctx.engine(f.error);
+                // a failure that is not a budget is the call's error
+                let Some(plan) = f.plan.filter(|_| stop.is_some()) else {
+                    return Err(e);
+                };
+                let mut body = json!({ "error": e.message, "code": e.code });
+                if let Some(b) = e.budget {
+                    body["budget"] = b.into();
+                }
+                (plan, stop, Some(body))
+            }
+        };
+        out["elapsedMs"] =
+            ((started.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0).into();
+        if let Some(e) = &error {
+            out["error"] = e.clone();
+        }
+        Ok(ExplainCore {
+            plan_json: serde_json::to_value(&plan).unwrap_or_default(),
+            plan: Some(plan),
+            out,
+            stop,
+            error,
+            prefixes: prefix_vec(&prefix_map),
+        })
     }
 
     // --------------------------------------------------------- describe_resource ------
@@ -1685,7 +1784,7 @@ fn predicate_json(p: &PredicateEntry, terms: &mut Terms) -> Value {
 }
 
 /// `<operator> <description> est=<rows> [<columns>]`, two spaces per depth.
-fn plan_lines(p: &PlanInfo, depth: usize, out: &mut String) {
+pub(super) fn plan_lines(p: &PlanInfo, depth: usize, out: &mut String) {
     out.push_str(&"  ".repeat(depth));
     out.push_str(&p.operator);
     if !p.description.is_empty() {

@@ -79,8 +79,11 @@ pub(super) fn map_rows<T: Send>(
 }
 
 /// Executed operator tree with runtime information (QLever `RuntimeInformation`).
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
+///
+/// A written node carries an `id`, the path of child indexes from the root (`0`, `0.1`,
+/// `0.1.2`), which is computed when the tree is serialized. An id is only valid for the
+/// plan it was written with (spec C18 §6.6.1).
+#[derive(Clone, Debug, Default)]
 pub struct PlanInfo {
     pub operator: String,
     pub description: String,
@@ -93,14 +96,138 @@ pub struct PlanInfo {
     pub cached: bool,
     pub children: Vec<PlanInfo>,
     /// operator counters (spatial operators: candidates, refined, matched, …)
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub counters: Option<serde_json::Map<String, serde_json::Value>>,
     /// notes about the plan (root only)
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<super::ctx::PlanWarning>,
+    /// What the node says beyond its counts (see [`PlanInfo::fidelity`]). Few nodes
+    /// have any, so it is boxed to keep the plan of a node that simply ran small: every
+    /// operator builds one and returns it up the tree.
+    pub fidelity: Option<Box<PlanFidelity>>,
+}
+
+/// What a plan node says beyond its counts (spec C18 §6.6.5).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PlanFidelity {
+    /// Why the operator never ran, when it did not. Its counts are then `-1` rows and
+    /// 0 ms, and the reason holds for its whole subtree.
+    pub skipped: Option<String>,
+    /// It ran only until a `LIMIT`, `ASK` or `EXISTS` had enough rows.
+    pub stopped_early: bool,
+    /// Its counts stop where a failure, such as a spent budget, stopped the query.
+    /// Written as `complete: false`.
+    pub incomplete: bool,
+    /// How many more times than once it ran, because a parent reran it with a larger
+    /// budget (`LIMIT` without `ORDER BY`) or once per batch (spatial k nearest). Its
+    /// time and its children's add up over the runs, and its rows are the last run's.
+    /// Written as `runs`, the number of runs, when it ran more than once.
+    pub reruns: u32,
+    /// The filter conjuncts that a scan or an index join tests itself and that have no
+    /// node of their own.
+    pub pushed_filters: Vec<String>,
+    /// The estimate is a fixed guess rather than a statistic (`SERVICE`).
+    pub estimate_guessed: bool,
+}
+
+static NO_FIDELITY: PlanFidelity = PlanFidelity {
+    skipped: None,
+    stopped_early: false,
+    incomplete: false,
+    reruns: 0,
+    pushed_filters: Vec::new(),
+    estimate_guessed: false,
+};
+
+impl Serialize for PlanInfo {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        self.with_id("0").serialize(s)
+    }
+}
+
+/// A [`PlanInfo`] written as the node `id` of its plan, with its children as `id.0`,
+/// `id.1` and so on.
+pub struct PlanWithId<'a> {
+    info: &'a PlanInfo,
+    id: std::borrow::Cow<'a, str>,
+}
+
+impl Serialize for PlanWithId<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        struct Children<'a>(&'a [PlanInfo], &'a str);
+        impl Serialize for Children<'_> {
+            fn serialize<S: serde::Serializer>(
+                &self,
+                s: S,
+            ) -> std::result::Result<S::Ok, S::Error> {
+                s.collect_seq(
+                    self.0
+                        .iter()
+                        .enumerate()
+                        .map(|(i, c)| c.with_id(format!("{}.{i}", self.1))),
+                )
+            }
+        }
+        let mut m = s.serialize_map(None)?;
+        self.info.serialize_members(&self.id, &mut m)?;
+        m.serialize_entry("children", &Children(&self.info.children, &self.id))?;
+        m.end()
+    }
 }
 
 impl PlanInfo {
+    /// This node written as the node `id` of its plan.
+    pub fn with_id<'a>(&'a self, id: impl Into<std::borrow::Cow<'a, str>>) -> PlanWithId<'a> {
+        PlanWithId {
+            info: self,
+            id: id.into(),
+        }
+    }
+
+    /// Write `id` and every member except `children`, for a caller that writes the
+    /// children in its own form (the operator of a [`CursorPlan`](super::CursorPlan)).
+    pub(super) fn serialize_members<M: serde::ser::SerializeMap>(
+        &self,
+        id: &str,
+        m: &mut M,
+    ) -> std::result::Result<(), M::Error> {
+        m.serialize_entry("id", id)?;
+        m.serialize_entry("operator", &self.operator)?;
+        m.serialize_entry("description", &self.description)?;
+        m.serialize_entry("columns", &self.columns)?;
+        m.serialize_entry("sortedOn", &self.sorted_on)?;
+        m.serialize_entry("estimatedRows", &self.estimated_rows)?;
+        m.serialize_entry("estimatedCost", &self.estimated_cost)?;
+        m.serialize_entry("actualRows", &self.actual_rows)?;
+        m.serialize_entry("timeMs", &self.time_ms)?;
+        m.serialize_entry("cached", &self.cached)?;
+        if let Some(c) = &self.counters {
+            m.serialize_entry("counters", c)?;
+        }
+        if !self.warnings.is_empty() {
+            m.serialize_entry("warnings", &self.warnings)?;
+        }
+        let f = self.fidelity();
+        if let Some(r) = &f.skipped {
+            m.serialize_entry("skipped", r)?;
+        }
+        if f.stopped_early {
+            m.serialize_entry("stoppedEarly", &true)?;
+        }
+        if f.incomplete {
+            m.serialize_entry("complete", &false)?;
+        }
+        if f.reruns > 0 {
+            m.serialize_entry("runs", &(u64::from(f.reruns) + 1))?;
+        }
+        if !f.pushed_filters.is_empty() {
+            m.serialize_entry("pushedFilters", &f.pushed_filters)?;
+        }
+        if f.estimate_guessed {
+            m.serialize_entry("estimateGuessed", &true)?;
+        }
+        Ok(())
+    }
+
     /// Remove what the plan tells about graphs a graph view does not read: estimates
     /// (from statistics of every graph), the quads of unread graphs that statistics
     /// notes count, and operator counters (a spatial index counts candidates of every
@@ -119,6 +246,107 @@ impl PlanInfo {
         for c in &mut self.children {
             c.redact();
         }
+    }
+
+    /// What this node says beyond its counts: whether it was skipped, stopped early,
+    /// rerun or left incomplete, and the filters it applied itself.
+    pub fn fidelity(&self) -> &PlanFidelity {
+        self.fidelity.as_deref().unwrap_or(&NO_FIDELITY)
+    }
+
+    /// [`PlanInfo::fidelity`], to change.
+    pub fn fidelity_mut(&mut self) -> &mut PlanFidelity {
+        self.fidelity.get_or_insert_default()
+    }
+
+    /// This node and its subtree marked as never run, for `why`.
+    pub(super) fn skip(mut self, why: &str) -> PlanInfo {
+        fn mark(i: &mut PlanInfo, why: &str) {
+            i.fidelity_mut().skipped = Some(why.to_string());
+            i.actual_rows = -1;
+            i.time_ms = 0.0;
+            for c in &mut i.children {
+                mark(c, why);
+            }
+        }
+        mark(&mut self, why);
+        self
+    }
+
+    /// The node `id` (`0`, `0.1`, …) of this plan, when it has one.
+    pub fn node(&self, id: &str) -> Option<&PlanInfo> {
+        let mut parts = id.split('.');
+        if parts.next()? != "0" {
+            return None;
+        }
+        let mut n = self;
+        for p in parts {
+            n = n.children.get(p.parse::<usize>().ok()?)?;
+        }
+        Some(n)
+    }
+
+    /// `next` after this earlier run of the same node: times add up, the counts are
+    /// the last run's, and children of the same shape merge pairwise.
+    pub(super) fn merge_run(self, mut next: PlanInfo) -> PlanInfo {
+        next.time_ms += self.time_ms;
+        let reruns = self.fidelity().reruns;
+        let f = next.fidelity_mut();
+        f.reruns = f.reruns.saturating_add(reruns).saturating_add(1);
+        if self.children.len() == next.children.len()
+            && self
+                .children
+                .iter()
+                .zip(&next.children)
+                .all(|(a, b)| a.operator == b.operator)
+        {
+            let children = std::mem::take(&mut next.children);
+            next.children = self
+                .children
+                .into_iter()
+                .zip(children)
+                .map(
+                    |(a, b)| match (&a.fidelity().skipped, &b.fidelity().skipped) {
+                        // only the earlier run ran it
+                        (None, Some(_)) => a,
+                        (Some(_), _) => b,
+                        (None, None) => a.merge_run(b),
+                    },
+                )
+                .collect();
+        }
+        next
+    }
+}
+
+/// What the plan of `n` says beyond its counts before it runs: the filters it tests
+/// itself, as text, and whether its estimate is a guess. Most nodes have neither.
+#[inline]
+fn node_fidelity(ctx: &Ctx, n: &Node) -> Option<Box<PlanFidelity>> {
+    #[cold]
+    #[inline(never)]
+    fn of(ctx: &Ctx, n: &Node) -> Option<Box<PlanFidelity>> {
+        let pushed_filters: Vec<String> = match &n.kind {
+            Kind::RangeScan(_, range) => range.filter.iter().map(|e| e.display(ctx)).collect(),
+            Kind::IndexJoin(spec) => spec
+                .probes
+                .iter()
+                .flat_map(|p| p.filter.iter().map(|e| e.display(ctx)))
+                .collect(),
+            _ => Vec::new(),
+        };
+        let estimate_guessed = matches!(n.kind, Kind::Service { .. });
+        (estimate_guessed || !pushed_filters.is_empty()).then(|| {
+            Box::new(PlanFidelity {
+                pushed_filters,
+                estimate_guessed,
+                ..Default::default()
+            })
+        })
+    }
+    match &n.kind {
+        Kind::RangeScan(..) | Kind::IndexJoin(_) | Kind::Service { .. } => of(ctx, n),
+        _ => None,
     }
 }
 
@@ -139,18 +367,30 @@ pub fn describe(ctx: &Ctx, n: &Node) -> PlanInfo {
         estimated_rows: n.est.round(),
         estimated_cost: n.cost.round(),
         actual_rows: -1,
-        time_ms: 0.0,
-        cached: false,
-        children: n.children.iter().map(|c| describe(ctx, c)).collect(),
-        counters: None,
-        warnings: Vec::new(),
+        children: described_children(ctx, n),
+        fidelity: node_fidelity(ctx, n),
+        ..Default::default()
     }
 }
+
+/// The children of `n`'s description. An ordered top-k shows the plan it falls back
+/// to as its only child, so that its tree has the same shape whether that plan ran or
+/// not.
+fn described_children(ctx: &Ctx, n: &Node) -> Vec<PlanInfo> {
+    match &n.kind {
+        Kind::OrderedTopK(spec) => vec![describe(ctx, &spec.fallback)],
+        _ => n.children.iter().map(|c| describe(ctx, c)).collect(),
+    }
+}
+
+/// Why the right side of a join did not run.
+const LEFT_EMPTY: &str = "the left side produced no rows";
 
 /// Execute with the result cache: subtrees that are cheap to recompute (leaf scans and
 /// value tables) bypass it; everything else is looked up and stored.
 pub fn execute(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
-    ctx.check()?;
+    ctx.check()
+        .inspect_err(|_| fail(ctx, n, Instant::now(), Vec::new()))?;
     let results = &ctx.snap.results;
     let cacheable = ctx.use_cache
         && results.enabled()
@@ -183,7 +423,11 @@ pub fn execute(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
             info.actual_rows = t.len() as i64;
             info.time_ms = start.elapsed().as_secs_f64() * 1000.0;
             info.cached = true;
-            info.children.clear();
+            // the subtree it was computed from, which did not run this time
+            info.children = std::mem::take(&mut info.children)
+                .into_iter()
+                .map(|c| c.skip("the result of a parent was read from the result cache"))
+                .collect();
             return Ok((t, info));
         }
     }
@@ -227,9 +471,97 @@ pub(super) fn execute_with_inputs(
     execute_node(ctx, n, Some(inputs))
 }
 
-fn execute_node(ctx: &Ctx, n: &Node, mut inputs: Option<Inputs<'_>>) -> Result<(Table, PlanInfo)> {
+fn execute_node(ctx: &Ctx, n: &Node, inputs: Option<Inputs<'_>>) -> Result<(Table, PlanInfo)> {
     let start = Instant::now();
-    let mut infos = Vec::new();
+    let mut failing = Failing {
+        ctx,
+        n,
+        start,
+        infos: Vec::new(),
+        armed: true,
+    };
+    // The result goes straight to the caller, and the guard keeps the plan only when
+    // `run_node` returns an error, so the success path pays nothing for it.
+    run_node(
+        ctx,
+        n,
+        inputs,
+        start,
+        &mut failing.infos,
+        &mut failing.armed,
+    )
+}
+
+/// Keeps the plan of a node that failed, as far as it ran (see [`fail`]), when it is
+/// dropped while still armed: `run_node` disarms it just before it succeeds.
+struct Failing<'a> {
+    ctx: &'a Ctx,
+    n: &'a Node,
+    start: Instant,
+    infos: Vec<PlanInfo>,
+    armed: bool,
+}
+
+impl Drop for Failing<'_> {
+    fn drop(&mut self) {
+        if self.armed && !std::thread::panicking() {
+            fail(
+                self.ctx,
+                self.n,
+                self.start,
+                std::mem::take(&mut self.infos),
+            );
+        }
+    }
+}
+
+/// Keep the plan of `n`, which failed after `start` with its first children's plans in
+/// `infos`, for its parent (see [`fail_at`]).
+#[cold]
+fn fail(ctx: &Ctx, n: &Node, start: Instant, infos: Vec<PlanInfo>) {
+    fail_at(ctx, n, start, infos.into_iter().enumerate().collect());
+}
+
+/// Keep the plan of `n`, which failed after `start`, for its parent: the children in
+/// `known` by index, the partial plan of a child that failed, and the others marked as
+/// never run. The node's own counts are unknown, and it is marked incomplete.
+#[cold]
+fn fail_at(ctx: &Ctx, n: &Node, start: Instant, mut known: Vec<(usize, PlanInfo)>) {
+    let mut info = describe(ctx, n);
+    info.time_ms = start.elapsed().as_secs_f64() * 1000.0;
+    info.fidelity_mut().incomplete = true;
+    for (i, c) in n.children.iter().enumerate() {
+        if !known.iter().any(|(k, _)| *k == i)
+            && let Some(p) = ctx.take_failed(c)
+        {
+            known.push((i, p));
+        }
+    }
+    let described = std::mem::take(&mut info.children);
+    info.children = described
+        .into_iter()
+        .enumerate()
+        .map(|(i, d)| match known.iter().position(|(k, _)| *k == i) {
+            Some(at) => known.swap_remove(at).1,
+            None => d.skip("the query stopped before it ran"),
+        })
+        .collect();
+    if ctx.graphs.is_some() {
+        info.redact();
+    }
+    ctx.set_failed(n, info);
+}
+
+// One caller: inlined so that the success path returns its table and plan directly.
+#[inline(always)]
+fn run_node(
+    ctx: &Ctx,
+    n: &Node,
+    mut inputs: Option<Inputs<'_>>,
+    start: Instant,
+    infos: &mut Vec<PlanInfo>,
+    failing: &mut bool,
+) -> Result<(Table, PlanInfo)> {
     // the children's tables count against the memory budget until this operator is done
     let held = ctx.charge(0)?;
     let mut child = |i: usize, infos: &mut Vec<PlanInfo>| -> Result<Table> {
@@ -260,6 +592,7 @@ fn execute_node(ctx: &Ctx, n: &Node, mut inputs: Option<Inputs<'_>>) -> Result<(
         Kind::OrderedTopK(spec) => match ordered_topk(ctx, spec, &n.vars)? {
             Some((t, read)) => {
                 note = Some(format!("[read {read} rows]"));
+                infos.push(describe(ctx, &spec.fallback).skip("the ordered index answered"));
                 t
             }
             None => {
@@ -318,9 +651,9 @@ fn execute_node(ctx: &Ctx, n: &Node, mut inputs: Option<Inputs<'_>>) -> Result<(
             t
         }
         Kind::Join { algo, .. } => {
-            let l = child(0, &mut infos)?;
+            let l = child(0, infos)?;
             if l.is_empty() {
-                infos.push(describe(ctx, &n.children[1]));
+                infos.push(describe(ctx, &n.children[1]).skip(LEFT_EMPTY));
                 Table::empty(n.vars.clone())
             } else {
                 let r = match text_pushdown(ctx, &l, &n.children[1])? {
@@ -329,7 +662,7 @@ fn execute_node(ctx: &Ctx, n: &Node, mut inputs: Option<Inputs<'_>>) -> Result<(
                         held.add(r.mem_bytes())?;
                         r
                     }
-                    None => child(1, &mut infos)?,
+                    None => child(1, infos)?,
                 };
                 match algo {
                     JoinAlgo::Cross => cross(ctx, &l, &r)?,
@@ -365,12 +698,12 @@ fn execute_node(ctx: &Ctx, n: &Node, mut inputs: Option<Inputs<'_>>) -> Result<(
             t
         }
         Kind::CountJoin { algo, var } => {
-            let l = child(0, &mut infos)?;
+            let l = child(0, infos)?;
             let r = if l.is_empty() {
-                infos.push(describe(ctx, &n.children[1]));
+                infos.push(describe(ctx, &n.children[1]).skip(LEFT_EMPTY));
                 Table::empty(n.children[1].vars.clone())
             } else {
-                child(1, &mut infos)?
+                child(1, infos)?
             };
             let c = if l.is_empty() || r.is_empty() {
                 0
@@ -382,35 +715,35 @@ fn execute_node(ctx: &Ctx, n: &Node, mut inputs: Option<Inputs<'_>>) -> Result<(
             t
         }
         Kind::Unpack { t, parts } => {
-            let input = child(0, &mut infos)?;
+            let input = child(0, infos)?;
             unpack(ctx, input, *t, parts, &n.vars)?
         }
         Kind::IndexJoin(spec) => {
-            let l = child(0, &mut infos)?;
+            let l = child(0, infos)?;
             let (t, stats) = super::indexjoin::run(ctx, spec, &l, &n.vars)?;
             note = Some(stats.note());
             counters = Some(stats.counters());
             t
         }
         Kind::LeftJoin { expr } => {
-            let l = child(0, &mut infos)?;
-            let r = child(1, &mut infos)?;
+            let l = child(0, infos)?;
+            let r = child(1, infos)?;
             left_join(ctx, &l, &r, expr.as_ref(), &mut note)?
         }
         Kind::Minus => {
-            let l = child(0, &mut infos)?;
-            let r = child(1, &mut infos)?;
+            let l = child(0, infos)?;
+            let r = child(1, infos)?;
             minus(ctx, l, &r, &mut note)?
         }
         Kind::HalfJoin { anti } => {
-            let l = child(0, &mut infos)?;
-            let r = child(1, &mut infos)?;
+            let l = child(0, infos)?;
+            let r = child(1, infos)?;
             half_join(ctx, l, &r, *anti)?
         }
         Kind::Union => {
             let mut out = Table::new(n.vars.clone());
             for i in 0..n.children.len() {
-                out.append(child(i, &mut infos)?);
+                out.append(child(i, infos)?);
                 ctx.check_output(out.len(), out.width())?;
             }
             out
@@ -430,7 +763,7 @@ fn execute_node(ctx: &Ctx, n: &Node, mut inputs: Option<Inputs<'_>>) -> Result<(
                     held.add(r.table.mem_bytes())?;
                     (r.table, r.rest, Some(r.note))
                 }
-                None => (child(0, &mut infos)?, es.clone(), None),
+                None => (child(0, infos)?, es.clone(), None),
             };
             expr_report = apply_filter(ctx, &mut t, &rest)?;
             (note, counters) = super::exists::explain(ctx, es);
@@ -443,7 +776,7 @@ fn execute_node(ctx: &Ctx, n: &Node, mut inputs: Option<Inputs<'_>>) -> Result<(
             t
         }
         Kind::Extend(v, e) => {
-            let mut t = child(0, &mut infos)?;
+            let mut t = child(0, infos)?;
             ctx.check_output(t.len(), 1)?;
             let col = compute_column(ctx, &t, e, &mut expr_report)?;
             t.vars.push(*v);
@@ -451,30 +784,30 @@ fn execute_node(ctx: &Ctx, n: &Node, mut inputs: Option<Inputs<'_>>) -> Result<(
             t
         }
         Kind::Assign(v, e) => {
-            let mut t = child(0, &mut infos)?;
+            let mut t = child(0, infos)?;
             let col = compute_column(ctx, &t, e, &mut expr_report)?;
             assign(ctx, &mut t, *v, col)?;
             t
         }
         Kind::Unfold { expr, var, second } => {
-            let t = child(0, &mut infos)?;
+            let t = child(0, infos)?;
             unfold(ctx, &t, expr, *var, *second, &mut expr_report)?
         }
         Kind::Sort(vars) => {
-            let mut t = child(0, &mut infos)?;
+            let mut t = child(0, infos)?;
             // sorting copies the rows
             ctx.check_output(t.len(), t.width())?;
             t.sort_by_vars(vars);
             t
         }
         Kind::OrderBy { keys, limit } => {
-            let t = child(0, &mut infos)?;
+            let t = child(0, infos)?;
             let (t, pre) = order_by(ctx, t, keys, *limit, &mut expr_report)?;
             note = pre;
             t
         }
-        Kind::Project(vars) => child(0, &mut infos)?.project(vars),
-        Kind::Distinct => distinct(child(0, &mut infos)?),
+        Kind::Project(vars) => child(0, infos)?.project(vars),
+        Kind::Distinct => distinct(child(0, infos)?),
         Kind::Slice {
             offset,
             limit: Some(limit),
@@ -486,9 +819,9 @@ fn execute_node(ctx: &Ctx, n: &Node, mut inputs: Option<Inputs<'_>>) -> Result<(
             held.add(t.mem_bytes())?;
             t.slice(*offset, Some(*limit))
         }
-        Kind::Slice { offset, limit } => child(0, &mut infos)?.slice(*offset, *limit),
+        Kind::Slice { offset, limit } => child(0, infos)?.slice(*offset, *limit),
         Kind::Group { keys, aggs } => {
-            let t = child(0, &mut infos)?;
+            let t = child(0, infos)?;
             group(ctx, &t, keys, aggs, &mut expr_report)?
         }
         Kind::Path {
@@ -497,7 +830,7 @@ fn execute_node(ctx: &Ctx, n: &Node, mut inputs: Option<Inputs<'_>>) -> Result<(
         } => {
             let mut inputs = Vec::new();
             for i in 0..n.children.len() {
-                inputs.push(child(i, &mut infos)?);
+                inputs.push(child(i, infos)?);
             }
             let (t, sweeps) = path(ctx, spec, *bound_from_left, inputs, &n.vars)?;
             if sweeps > 0 {
@@ -508,7 +841,7 @@ fn execute_node(ctx: &Ctx, n: &Node, mut inputs: Option<Inputs<'_>>) -> Result<(
             t
         }
         Kind::Lateral(spec) if spec.service.is_some() => {
-            let l = child(0, &mut infos)?;
+            let l = child(0, infos)?;
             let rl = spec.service.as_deref().expect("a remote loop");
             let (t, st) = super::enhancer::run_remote(ctx, spec, rl, &l, &n.vars)?;
             note = Some(format!(
@@ -532,7 +865,7 @@ fn execute_node(ctx: &Ctx, n: &Node, mut inputs: Option<Inputs<'_>>) -> Result<(
             t
         }
         Kind::Lateral(spec) => {
-            let l = child(0, &mut infos)?;
+            let l = child(0, infos)?;
             let (t, groups, solutions) = super::lateral::run(ctx, spec, &l, &n.vars)?;
             note = Some(format!("[{groups} groups evaluated]"));
             let mut c = Counters::new();
@@ -542,18 +875,18 @@ fn execute_node(ctx: &Ctx, n: &Node, mut inputs: Option<Inputs<'_>>) -> Result<(
             t
         }
         Kind::RegisteredProperty(spec) => {
-            let input = child(0, &mut infos)?;
+            let input = child(0, infos)?;
             super::propertyext::run(ctx, spec, &input, &n.vars)?
         }
         Kind::PropertyFn(spec) => {
             let input = match n.children.len() {
                 0 => None,
-                _ => Some(child(0, &mut infos)?),
+                _ => Some(child(0, infos)?),
             };
             super::arqpf::run(ctx, spec, input.as_ref(), &n.vars)?
         }
         Kind::TextSearch(spec) if !n.children.is_empty() => {
-            let input = child(0, &mut infos)?;
+            let input = child(0, infos)?;
             let (t, c) = text_bound(ctx, spec, &input, &mut note)?;
             counters = Some(c);
             t
@@ -570,7 +903,7 @@ fn execute_node(ctx: &Ctx, n: &Node, mut inputs: Option<Inputs<'_>>) -> Result<(
             };
             match searched {
                 Some((t, c)) => {
-                    infos.push(describe(ctx, &n.children[0]));
+                    infos.push(describe(ctx, &n.children[0]).skip("the vector index answered"));
                     counters = Some(c);
                     t
                 }
@@ -579,14 +912,14 @@ fn execute_node(ctx: &Ctx, n: &Node, mut inputs: Option<Inputs<'_>>) -> Result<(
                         "[fewer than {} rows have a score: ran the generic plan]",
                         spec.k
                     ));
-                    child(0, &mut infos)?
+                    child(0, infos)?
                 }
             }
         }
         Kind::VectorSearch(spec) => {
             let input = match n.children.len() {
                 0 => None,
-                _ => Some(child(0, &mut infos)?),
+                _ => Some(child(0, infos)?),
             };
             let (t, c) = vector_search(ctx, spec, input, &n.vars)?;
             counters = Some(c);
@@ -597,10 +930,10 @@ fn execute_node(ctx: &Ctx, n: &Node, mut inputs: Option<Inputs<'_>>) -> Result<(
             let reads_input = n.children.len() > spec.edge_pattern.is_some() as usize;
             let input = match reads_input {
                 false => None,
-                true => Some(child(0, &mut infos)?),
+                true => Some(child(0, infos)?),
             };
             let edges = match spec.edge_pattern {
-                Some(_) => Some(child(n.children.len() - 1, &mut infos)?),
+                Some(_) => Some(child(n.children.len() - 1, infos)?),
                 None => None,
             };
             let (t, c) = super::pathsearch::run(ctx, spec, input, edges, &n.vars)?;
@@ -610,12 +943,12 @@ fn execute_node(ctx: &Ctx, n: &Node, mut inputs: Option<Inputs<'_>>) -> Result<(
         Kind::HistoryChanges(spec) => {
             let input = match n.children.len() {
                 0 => None,
-                _ => Some(child(0, &mut infos)?),
+                _ => Some(child(0, infos)?),
             };
             super::history_svc::run(ctx, spec, input.as_ref(), &n.vars)?
         }
         Kind::HybridSearch(spec) if !n.children.is_empty() => {
-            let input = child(0, &mut infos)?;
+            let input = child(0, infos)?;
             let (t, c) = super::hybrid::search_bound(ctx, spec, &input, &mut note)?;
             counters = Some(c);
             t
@@ -633,7 +966,7 @@ fn execute_node(ctx: &Ctx, n: &Node, mut inputs: Option<Inputs<'_>>) -> Result<(
         Kind::SpatialPf(spec) => {
             let input = match n.children.len() {
                 0 => None,
-                _ => Some(child(0, &mut infos)?),
+                _ => Some(child(0, infos)?),
             };
             let (t, c) = spatial_pf(ctx, spec, input, &n.vars)?;
             counters = Some(c);
@@ -642,7 +975,7 @@ fn execute_node(ctx: &Ctx, n: &Node, mut inputs: Option<Inputs<'_>>) -> Result<(
         Kind::SpatialJoin(spec) => {
             let mut inputs = Vec::with_capacity(n.children.len());
             for i in 0..n.children.len() {
-                inputs.push(child(i, &mut infos)?);
+                inputs.push(child(i, infos)?);
             }
             let (t, c) = spatial_join(ctx, spec, inputs, &n.vars)?;
             counters = Some(c);
@@ -651,7 +984,14 @@ fn execute_node(ctx: &Ctx, n: &Node, mut inputs: Option<Inputs<'_>>) -> Result<(
         Kind::SpatialKnn(spec) => {
             // the template runs once per batch of candidates
             let (t, c, runs) = spatial_knn(ctx, spec, &n.children[0], &n.vars)?;
-            infos.extend(runs);
+            // one node for the template, its runs added up
+            infos.push(
+                runs.into_iter()
+                    .reduce(PlanInfo::merge_run)
+                    .unwrap_or_else(|| {
+                        describe(ctx, &n.children[0]).skip("no candidate needed it")
+                    }),
+            );
             counters = Some(c);
             t
         }
@@ -703,6 +1043,7 @@ fn execute_node(ctx: &Ctx, n: &Node, mut inputs: Option<Inputs<'_>>) -> Result<(
     ctx.check_output(table.len(), table.width())?;
     ctx.produced(table.len())?;
     let info = PlanInfo {
+        fidelity: node_fidelity(ctx, n),
         operator: n.operator().to_string(),
         description: match note {
             Some(x) => format!("{} {x}", n.desc),
@@ -715,10 +1056,11 @@ fn execute_node(ctx: &Ctx, n: &Node, mut inputs: Option<Inputs<'_>>) -> Result<(
         actual_rows: table.len() as i64,
         time_ms: start.elapsed().as_secs_f64() * 1000.0,
         cached: false,
-        children: infos,
+        children: std::mem::take(infos),
         counters,
         warnings: Vec::new(),
     };
+    *failing = false;
     Ok((table, info))
 }
 
@@ -1457,11 +1799,18 @@ fn scan(ctx: &Ctx, spec: &ScanSpec, vars: &[VarId]) -> Result<Table> {
 }
 
 /// Apply a row-preserving / row-reducing unary operator to its input.
-pub(super) fn apply_unary(
+pub(super) fn apply_unary(ctx: &Ctx, n: &Node, t: Table, report: &mut ExprReport) -> Result<Table> {
+    apply_unary_noted(ctx, n, t, report, &mut None, &mut None)
+}
+
+/// [`apply_unary`] with the note and counters an index join reports.
+fn apply_unary_noted(
     ctx: &Ctx,
     n: &Node,
     mut t: Table,
     report: &mut ExprReport,
+    note: &mut Option<String>,
+    counters: &mut Option<Counters>,
 ) -> Result<Table> {
     Ok(match &n.kind {
         Kind::Filter(exprs) => {
@@ -1477,7 +1826,12 @@ pub(super) fn apply_unary(
         Kind::Project(vars) => t.project(vars),
         Kind::Unpack { t: tv, parts } => unpack(ctx, t, *tv, parts, &n.vars)?,
         Kind::Distinct => distinct(t),
-        Kind::IndexJoin(spec) => super::indexjoin::run(ctx, spec, &t, &n.vars)?.0,
+        Kind::IndexJoin(spec) => {
+            let (t, stats) = super::indexjoin::run(ctx, spec, &t, &n.vars)?;
+            *note = Some(stats.note());
+            *counters = Some(stats.counters());
+            t
+        }
         _ => unreachable!("not a unary streaming operator"),
     })
 }
@@ -1508,8 +1862,28 @@ pub(super) fn apply_blocking(
 /// output re-run with a geometrically growing input budget until they have enough rows.
 /// Returns `(table, info, complete)`; `complete` means no further rows exist.
 fn execute_limited(ctx: &Ctx, n: &Node, want: usize) -> Result<(Table, PlanInfo, bool)> {
-    ctx.check()?;
+    ctx.check()
+        .inspect_err(|_| fail(ctx, n, Instant::now(), Vec::new()))?;
     let start = Instant::now();
+    let mut done = Vec::new();
+    run_limited(ctx, n, want, start, &mut done).inspect_err(|_| {
+        match ctx.take_failed(n) {
+            // `execute` ran the node and recorded its failure
+            Some(own) => ctx.set_failed(n, own),
+            None => fail_at(ctx, n, start, done),
+        }
+    })
+}
+
+/// [`execute_limited`] after its first check. Children whose plans are final before a
+/// failure go to `done` with their index.
+fn run_limited(
+    ctx: &Ctx,
+    n: &Node,
+    want: usize,
+    start: Instant,
+    done: &mut Vec<(usize, PlanInfo)>,
+) -> Result<(Table, PlanInfo, bool)> {
     let finish = |t: Table, children: Vec<PlanInfo>, complete: bool| {
         ctx.produced(t.len())?;
         let mut info = describe(ctx, n);
@@ -1518,6 +1892,7 @@ fn execute_limited(ctx: &Ctx, n: &Node, want: usize) -> Result<(Table, PlanInfo,
         info.time_ms = start.elapsed().as_secs_f64() * 1000.0;
         if !complete {
             info.description = format!("{} [stopped early]", info.description);
+            info.fidelity_mut().stopped_early = true;
         }
         Ok((t, info, complete))
     };
@@ -1533,14 +1908,35 @@ fn execute_limited(ctx: &Ctx, n: &Node, want: usize) -> Result<(Table, PlanInfo,
         | Kind::Distinct
         | Kind::IndexJoin(_) => {
             let mut budget = want.max(64);
+            // the child's runs so far, added up
+            let mut runs: Option<PlanInfo> = None;
             loop {
                 let (input, cinfo, complete) = execute_limited(ctx, &n.children[0], budget)?;
+                let cinfo = match runs.take() {
+                    Some(earlier) => earlier.merge_run(cinfo),
+                    None => cinfo,
+                };
                 let mut report = ExprReport::default();
-                let out = apply_unary(ctx, n, input, &mut report)?;
+                let mut note = None;
+                let mut counters = None;
+                let out =
+                    match apply_unary_noted(ctx, n, input, &mut report, &mut note, &mut counters) {
+                        Ok(out) => out,
+                        Err(e) => {
+                            done.push((0, cinfo));
+                            return Err(e);
+                        }
+                    };
                 if out.len() >= want || complete {
                     let (t, mut info, complete) = finish(out, vec![cinfo], complete)?;
                     if let Kind::Filter(exprs) = &n.kind {
                         super::exists::annotate(ctx, &mut info, exprs);
+                    }
+                    if let Some(x) = note {
+                        info.description = format!("{} {x}", info.description);
+                    }
+                    if counters.is_some() {
+                        info.counters = merge_counters(info.counters.take(), counters);
                     }
                     if let Some(x) = report.note() {
                         info.description = format!("{} {x}", info.description);
@@ -1548,6 +1944,7 @@ fn execute_limited(ctx: &Ctx, n: &Node, want: usize) -> Result<(Table, PlanInfo,
                     }
                     return Ok((t, info, complete));
                 }
+                runs = Some(cinfo);
                 budget = budget.saturating_mul(8);
             }
         }
@@ -1563,11 +1960,30 @@ fn execute_limited(ctx: &Ctx, n: &Node, want: usize) -> Result<(Table, PlanInfo,
             if other.is_empty() {
                 let mut e = Table::empty(n.vars.clone());
                 e.sorted.clear();
-                return finish(e, vec![describe(ctx, &n.children[lim]), oinfo], true);
+                let skipped =
+                    describe(ctx, &n.children[lim]).skip("the other side produced no rows");
+                let infos = if lim == 0 {
+                    vec![skipped, oinfo]
+                } else {
+                    vec![oinfo, skipped]
+                };
+                return finish(e, infos, true);
             }
             let mut budget = want.max(64);
+            let mut runs: Option<PlanInfo> = None;
             loop {
-                let (part, pinfo, complete) = execute_limited(ctx, &n.children[lim], budget)?;
+                let (part, pinfo, complete) = match execute_limited(ctx, &n.children[lim], budget) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        // the other side ran
+                        done.push((1 - lim, oinfo));
+                        return Err(e);
+                    }
+                };
+                let pinfo = match runs.take() {
+                    Some(earlier) => earlier.merge_run(pinfo),
+                    None => pinfo,
+                };
                 let (l, r) = if lim == 0 {
                     (&part, &other)
                 } else {
@@ -1586,25 +2002,31 @@ fn execute_limited(ctx: &Ctx, n: &Node, want: usize) -> Result<(Table, PlanInfo,
                     };
                     return finish(out, infos, complete);
                 }
+                runs = Some(pinfo);
                 budget = budget.saturating_mul(8);
             }
         }
         Kind::Union => {
             let mut out = Table::new(n.vars.clone());
-            let mut infos = Vec::new();
             let mut complete = true;
             for (i, c) in n.children.iter().enumerate() {
                 if out.len() >= want {
                     complete = false;
-                    infos.extend(n.children[i..].iter().map(|c| describe(ctx, c)));
+                    done.extend(n.children[i..].iter().enumerate().map(|(k, c)| {
+                        (
+                            i + k,
+                            describe(ctx, c).skip("earlier branches met the limit"),
+                        )
+                    }));
                     break;
                 }
                 let (t, info, c_complete) = execute_limited(ctx, c, want - out.len())?;
                 complete &= c_complete;
-                infos.push(info);
+                done.push((i, info));
                 out.append(t);
                 ctx.check_output(out.len(), out.width())?;
             }
+            let infos = std::mem::take(done).into_iter().map(|(_, i)| i).collect();
             finish(out, infos, complete)
         }
         Kind::Slice {

@@ -192,6 +192,8 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/{ds}/check", &["POST"]),
     ("/{ds}/recall", &["POST"]),
     ("/{ds}/sparql/diagnose", &["POST"]),
+    // the explanation of a query (feature `mcp`, spec C18 §6.6)
+    ("/{ds}/sparql/explain", &["POST"]),
     // the asking pipeline (feature `mcp`, spec C18 §5)
     ("/{ds}/ask", &["POST"]),
     // `assert_facts` and the memory brief over HTTP (C18 Phase 3m-a)
@@ -350,6 +352,7 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/{ds}/check"
         | "/{ds}/recall"
         | "/{ds}/sparql/diagnose"
+        | "/{ds}/sparql/explain"
         | "/{ds}/ask"
         | "/{ds}/text"
         | "/{ds}/diff"
@@ -471,6 +474,7 @@ pub fn endpoint(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) ->
         | "/{ds}/check"
         | "/{ds}/recall"
         | "/{ds}/sparql/diagnose"
+        | "/{ds}/sparql/explain"
         | "/{ds}/ask"
         | "/{ds}/memory/brief"
         | "/{ds}/text"

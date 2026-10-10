@@ -733,6 +733,7 @@ fn entries() -> Vec<(&'static str, Entry)> {
         server_only!("suggestExample", Process),
         server_only!("deleteSuggestion", Process),
         server_only!("askQuestion", Mcp),
+        server_only!("explainQuery", Mcp),
         server_only!("getAssistantSettings", Process),
         server_only!("putAssistantSettings", Process),
         server_only!("listAsks", Process),

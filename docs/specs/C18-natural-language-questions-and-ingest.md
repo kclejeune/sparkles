@@ -1,9 +1,9 @@
 # C18: Questions and ingestion in natural language
 
-> **Status:** implemented in part (Phases 1, 2, 3, 3m-a, 3m-b, 4 and 5)
+> **Status:** implemented in part (Phases 1, 2, 2b, 3, 3m-a, 3m-b, 4 and 5)
 >
 > **Phases:** Phases 1 and 2 shipped on 2026-10-09, without the measured runs of the
-> model matrix on the public sets. Phases 3, 3m-a, 3m-b, 4 and 5 shipped on 2026-10-10. Phase 1 lets an
+> model matrix on the public sets. Phases 2b, 3, 3m-a, 3m-b, 4 and 5 shipped on 2026-10-10. Phase 1 lets an
 > agent connected over MCP hand the query it wrote for a question to the web UI, where a
 > person reads, edits and runs it, and adds
 > a memory browser that shows each fact's source, passage and history. It also adds
@@ -26,6 +26,8 @@
 > [Usage: Asking questions with a model](../USAGE.md#asking-questions-with-a-model) ·
 > [Usage: Handing a query to the web UI](../USAGE.md#handing-a-query-to-the-web-ui) ·
 > [Usage: The Ask bar](../USAGE.md#the-ask-bar) ·
+> [Usage: Explaining a query](../USAGE.md#explaining-a-query) ·
+> [API: Explaining a query](../API.md#explaining-a-query) ·
 > [Usage: Agent memory](../USAGE.md#agent-memory) ·
 > [API: Importing agent memory](../API.md#importing-agent-memory) ·
 > [Usage: Ingesting documents and reviewing memory](../USAGE.md#ingesting-documents-and-reviewing-memory) ·
@@ -3851,7 +3853,7 @@ for her principal. The memory directory belongs to a project whose remote is
 **Phase 1 delivered on 2026-10-09.** The matrix has not been run with real models, and
 the public sets of §11.1 are not converted, so the targets of §11.3 and the measured role
 lists of §11.4 are still open. Phase 2 followed on the same day, and Phases 3m-a, 3,
-3m-b, 4 and 5 on 2026-10-10. They are recorded below, and Phases 2b and 6 are not
+3m-b, 4, 2b and 5 on 2026-10-10. They are recorded below, and Phase 6 is not
 built.
 
 - **Model providers.** The server's `models` module holds the three kinds of §3.4 with
@@ -4470,6 +4472,128 @@ usage, confirmation and cancellation, can run consolidation as a server task. Th
 extraction's batching, idempotency keys and dry-run fixes are the pattern for writing
 consolidated facts, and the `auto` checks are a model for a maintenance task that
 merges only what passes.
+
+**Phase 2b delivered on 2026-10-10.** A person sees what any query asks and why it is
+slow, with each sentence and note pointing at the operator it is about, with or without
+a model. Every test runs against mock providers.
+
+**Plan fidelity (§6.6.5).** The engine's plans now match what runs.
+
+1. `PlanInfo` and `CursorPlan` write an `id` on every node, the path of child indexes,
+   computed when the plan is serialized. `/{ds}/explain` wraps an `ASK` in its `Slice`
+   and gives `CONSTRUCT` and `DESCRIBE` their root, as execution does. A cache hit keeps
+   the subtree it was computed from, each node `skipped`. `IndexTopK` always lists its
+   fallback, skipped when the ordered index answered. `SpatialKnn` adds its batches into
+   one child. A streamed `CountJoinFromRuns` lists the scans it reads. A test checks
+   that the estimated and executed shapes agree for each query form.
+2. A node that never ran says why in `skipped`. That covers both sides of a join whose
+   other side is empty, `CountJoin`, `Union` branches after a `LIMIT` was met, the
+   vector search and top-k fallbacks, and a nearest-neighbour batch no candidate needed.
+3. Under `LIMIT`, `ASK` and `EXISTS`, the children add up their rounds with
+   `PlanInfo::merge_run`, and the node reports `runs` and `stoppedEarly`. An `IndexJoin`
+   inside a pipeline keeps its note and counters.
+4. The streaming executor labels a merge join that runs as a hash join `HashJoin`, with
+   a note. A fallback subtree reports the rows it emitted, with the table's size in the
+   `materializedRows` counter. A node that a `LIMIT` stopped in a completed query is
+   `stoppedEarly`, the plan refreshes descriptions and counters as it runs, and the
+   error path of a shared pull refreshes the plan.
+5. The eager `CONSTRUCT` and `DESCRIBE` stage has a timed root node. Filters pushed into
+   a range scan or an index join are listed in `pushedFilters`, and `SERVICE`'s
+   constant estimate carries `estimateGuessed`.
+6. A query stopped by a budget or its timeout keeps its plan. `sparql::query_with_plan`
+   and `execute_query_with_plan` return a `Failed` with the error and the plan as it
+   stood, whose unfinished nodes have `complete: false`. Each failing node records its
+   partial plan in the execution context, and its parent places it. The error body of
+   the `application/x-sparkles+json` format carries `plan` and `commit` on both the eager
+   and the streaming path.
+7. `explain_query` already showed a hidden estimate as `est=?` and `null`. Its node facts
+   now report `estimatedRows: null`, and a `hidden-estimates` note says why. `PlanView`
+   no longer counts a hidden `-1` as a misestimate and reads `CursorPlan` trees.
+8. The new facts cost the operators nothing measurable. They live in a boxed
+   `PlanFidelity` that most nodes leave empty, so `PlanInfo` grows by one pointer, and
+   the failure hook is a drop guard that only acts when an operator returns an error.
+   A first version that kept them inline and wrapped every operator's result ran about
+   2,500 more instructions per execution of the smallest benchmark queries, which was
+   34% more in `exec::execute` for `distinct-obj` and 15 to 20% of its time. In callgrind counts against the main branch, the final
+   version runs 2.2% more instructions in `exec::execute` for `distinct-obj`, 1.8% for
+   `predicate-counts` and the same count for `path-plus`.
+
+- **Notes and the description.** The server's `explain` module reads a `PlanNode` or
+  `CursorPlan` tree as node facts and computes the notes of §6.6.2 with a severity, the
+  budget first and then by share of time. Lint findings of X04 are placed on the node
+  whose columns hold the variables they name, or carry their editor range. The template
+  description writes one to four sentences from the scans, paths, joins, optional
+  parts, filters, exclusions, grouping, order, distinct and limit, each citing its
+  nodes.
+- **The explain role.** The prompt holds the query, one line per node with its id and
+  figures, the notes and the template text, and no rows. The answer's sentences and
+  notes must cite nodes of the plan, and a note's numbers must be among its node's facts
+  within rounding, or the note keeps the computed text. When no sentence survives, the
+  template is shown with the reason. The calls are charged to the caller and the dataset
+  and counted under the role `explain` in `GET /$/models/usage`.
+- **The endpoint.** `POST /{ds}/sparql/explain` runs as the caller with the HTTP tools'
+  limits, needs `read` and counts as a query. It streams `plan`, `notes`, `explanation`,
+  `usage` and `error`, or answers one object for `Accept: application/json`.
+- **MCP.** `explain_query` without the new arguments answers as before. `profile: "run"`
+  runs read-only under `timeoutSeconds` and explains a stopped run from its partial
+  plan. `notes: true` adds `nodes`, `notes`, `asks` and `source`, and starts each plan
+  line with the node id. `useServerModel: true` needs the new `serverModels` permission,
+  a grant flag `server_models` that admins of a dataset and the local principal also
+  have, and fails with `server-model-not-allowed` before any call otherwise.
+- **UI.** `PlanView` uses the server's ids and shows hidden estimates, skipped and
+  stopped nodes, reruns, materializing streamed operators, partial counts with their
+  legend, and the notes' severity marks. The **Explanation** switch opens the panel
+  beside the tree for an estimated plan or a run's plan, with links that select,
+  expand and scroll to a node, hover highlighting in both directions, and **Show
+  template text** for model text. A failed query whose error carries a plan offers
+  **Explain why**, which opens that plan with the panel.
+
+**Deviations and additions of Phase 2b.**
+
+- `EXISTS` bodies, the inner plans of `Lateral`, `REDUCED` and the remote side of
+  `SERVICE` still have no node of their own. A filter's counters describe its `EXISTS`
+  test, `REDUCED` does no work, and the remote side runs elsewhere.
+- The template names terms by their local names and the dataset's prefixes rather than
+  by the labels of the terms list, so it reads "?p memberOf ?team" rather than "people
+  who are members of".
+- Schema findings of `check_query` are not added as notes. The planner's warnings and
+  the lint findings are.
+- After a row or memory budget, `dominant` names the node with the most rows, because
+  the plan carries no estimated memory per node.
+- `POST /{ds}/sparql/explain` takes an `error` member with `profile: "given"`, the error
+  body of the stopped run, so the server knows the budget. It also takes
+  `timeoutSeconds` for a run.
+- The MCP result writes the description's origin as a top-level `source` beside `asks`,
+  with `provider`, `model` and `usage` after a model call. `useServerModel` implies
+  `notes`.
+- The UI asks about the plan it shows with `profile: "given"`, so the tree and the notes
+  always agree. The panel's ending with **Optimize** and the C01 limits to raise is
+  left to Phase 6.
+- A44's dominant hash join is tested with a given plan, since the timing of a real run
+  is not deterministic. Its run part checks ids, notes and the template on a real run.
+  A46 uses a timeout of 0.3 seconds to keep the test short.
+
+**Tests.** `crates/sparkles-core/src/sparql/plan_fidelity_tests.rs` covers ids, skipped
+nodes, reruns, cache hits, the shapes of each query form, pushed filters, failed
+queries and streamed plans. `crates/sparkles-server/src/explain/tests.rs` covers the
+notes, the template, partial counts, hidden estimates, streamed plans and the model
+checks. `crates/sparkles-server/src/explain/http_tests.rs` covers A44 in
+`a44_a_run_is_explained_without_a_model`, A45 in
+`a45_model_text_is_checked_against_the_plan`, A46 in
+`a46_a_timeout_is_explained_from_its_partial_plan`, A47 in
+`a47_explain_query_with_notes_and_a_run` and A57 in `a57_server_models_need_the_grant`.
+`ui/tests/mock/explain.spec.ts` covers **Explain why** and A48, and
+`ui/src/lib/explain.test.ts` the plan reading and marks.
+
+**What the plan cache and Phase 6 build on.** Node ids are computed from the tree's
+shape when a plan is serialized, so a cached plan needs no stored ids. The partial plan
+of a failure lives in the execution context (`Ctx::failed`), which belongs to one
+execution. `exec::describe` redacts for the context's graph view, so a cached
+description must be redacted per view. Phase 6 can read an executed plan with
+`explain::Plan::read`, pair the timings of two plans by node id when their shapes
+agree, use the `dominant` and `misestimate` notes to choose rewrites, and check model
+text with the same `grounded` test. `optimize_query`'s `useServerModel` can use the
+`serverModels` permission as it is.
 
 **Phase 5 delivered on 2026-10-10.** Memory that many sessions write is consolidated by
 a server task, ranked by recency on request, and trimmed by an optional retention of old

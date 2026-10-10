@@ -142,6 +142,7 @@ pub fn classify(
         | "/{ds}/check"
         | "/{ds}/recall"
         | "/{ds}/sparql/diagnose"
+        | "/{ds}/sparql/explain"
         | "/{ds}/ask"
         | "/{ds}/memory/brief"
         | "/{ds}/shacl"

@@ -87,6 +87,9 @@ pub(super) async fn run(ds: Arc<Dataset>, request: Request) -> ApiResult {
     let control = stream::StreamControl::new(cursor.cancellation_token(), cursor.deadline());
     let completed: Arc<parking_lot::Mutex<Option<CursorStats>>> = Default::default();
     let stats_slot = completed.clone();
+    // the plan as it stood when a native JSON stream failed before its first byte
+    let failed_plan: Arc<parking_lot::Mutex<Option<serde_json::Value>>> = Default::default();
+    let plan_slot = failed_plan.clone();
     let deferred = DeferredReport::default();
     let final_report = deferred.clone();
     let waits = control.clone();
@@ -153,6 +156,13 @@ pub(super) async fn run(ds: Arc<Dataset>, request: Request) -> ApiResult {
                 }
             }
             .map_err(|e| writer.classify(e));
+            if result.is_err() && (format == SolutionsFormat::Sparkles || native_graph) {
+                *plan_slot.lock() = match &cursor {
+                    QueryExecution::Select(c) => serde_json::to_value(c.plan()).ok(),
+                    QueryExecution::Graph(c) => serde_json::to_value(c.plan()).ok(),
+                    _ => None,
+                };
+            }
             *stats_slot.lock() = Some(cursor.stats());
             result.map(|_| ())
         },
@@ -194,7 +204,12 @@ pub(super) async fn run(ds: Arc<Dataset>, request: Request) -> ApiResult {
     let serialized = match serialized {
         Ok(serialized) => serialized,
         Err(error) => {
-            let mut response = with_timeout(error, timeout).into_response();
+            let mut error = with_timeout(error, timeout);
+            if let (Some(plan), Some(body)) = (failed_plan.lock().take(), error.1.as_object_mut()) {
+                body.insert("plan".into(), plan);
+                body.insert("commit".into(), seq.into());
+            }
+            let mut response = error.into_response();
             response.extensions_mut().insert(deferred);
             return Ok(response);
         }

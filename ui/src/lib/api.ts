@@ -376,6 +376,35 @@ export type PlanNode = {
   counters?: Record<string, number | string | boolean>;
   /** Notes about the plan (root only). */
   warnings?: PlanWarning[];
+  /** The node id, the path of child indexes from the root (`0.1.2`). */
+  id?: string;
+  /** Why the node did not run. */
+  skipped?: string;
+  /** A `LIMIT`, `ASK` or `EXISTS` stopped it once it had enough rows. */
+  stoppedEarly?: boolean;
+  /** `false` when a failure cut its counts short. */
+  complete?: boolean;
+  /** How often it ran, when more than once. */
+  runs?: number;
+  /** Filters a range scan or index join applies itself. */
+  pushedFilters?: string[];
+  /** The estimate is a constant guess (`SERVICE`). */
+  estimateGuessed?: boolean;
+  /** From a streamed plan: whether the operator materializes its input, and why. */
+  materializes?: boolean;
+  reason?: string | null;
+};
+
+/** A node of a streamed plan (`meta.plan` of a streamed result). */
+export type CursorPlan = {
+  id?: string;
+  operator: PlanNode;
+  materializes: boolean;
+  fullInputBeforeOutput: boolean;
+  growingState: boolean;
+  complete: boolean;
+  reason?: string | null;
+  children: CursorPlan[];
 };
 
 /** `geo-not-pushed`, `geo-index-building`, `geo-not-built`, … */
@@ -1207,9 +1236,42 @@ export async function select(
   );
 }
 
+export function isCursorPlan(p: PlanNode | CursorPlan): p is CursorPlan {
+  return typeof (p as CursorPlan).operator === 'object' && (p as CursorPlan).operator !== null;
+}
+
+/**
+ * A plan as `PlanView` reads it: a streamed `CursorPlan` becomes a `PlanNode` tree that
+ * keeps `complete`, `materializes` and the reason, and every node gets its id.
+ */
+export function planOf(p: PlanNode | CursorPlan, id = '0'): PlanNode {
+  if (isCursorPlan(p)) {
+    const op = p.operator;
+    return {
+      ...op,
+      columns: op.columns ?? [],
+      sortedOn: op.sortedOn ?? [],
+      id: p.id ?? op.id ?? id,
+      complete: op.complete === false ? false : p.complete,
+      materializes: p.materializes,
+      reason: p.reason ?? null,
+      children: p.children.map((c, i) => planOf(c, `${id}.${i}`)),
+    };
+  }
+  return {
+    ...p,
+    columns: p.columns ?? [],
+    sortedOn: p.sortedOn ?? [],
+    id: p.id ?? id,
+    children: (p.children ?? []).map((c, i) => planOf(c, `${id}.${i}`)),
+  };
+}
+
 export function normalizeResult(r: SparklesResult): SparklesResult {
   // Be lenient about variable names with a leading '?' and missing meta.
   if (r.vars) r.vars = r.vars.map((v) => v.replace(/^[?$]/, ''));
+  // a streamed result's plan is read like an eager one
+  if (r.meta?.plan) r.meta.plan = planOf(r.meta.plan as PlanNode | CursorPlan);
   r.meta ??= {
     totalRows: r.rows?.length ?? r.triples?.length ?? 0,
     sentRows: r.rows?.length ?? r.triples?.length ?? 0,

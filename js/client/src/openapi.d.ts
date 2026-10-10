@@ -3131,6 +3131,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/{ds}/sparql/explain": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Explain a query
+         * @description The plan of a query with node ids, notes on the operators that matter, and a description of what the query asks (spec C18 §6.6). `profile` plans, runs read-only, or reads a plan the client gives, such as the plan in the error body of a query that a budget stopped. The notes and a template description need no model. When the dataset enables `explain`, its `explain` role rewrites them as prose, checked against the plan. The answer streams as server-sent events unless `Accept` names `application/json` without `text/event-stream`. Needs `read` and counts as a query for rate limits.
+         */
+        post: operations["explainQuery"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/{ds}/text": {
         parameters: {
             query?: never;
@@ -4356,6 +4376,8 @@ export interface components {
             complete: boolean;
             fullInputBeforeOutput: boolean;
             growingState: boolean;
+            /** @description The node id, the same as the operator's. */
+            id?: string;
             materializes: boolean;
             operator: components["schemas"]["PlanNode"];
             reason?: string | null;
@@ -4709,6 +4731,116 @@ export interface components {
             /** @description The algebra in SSE. */
             algebra: string;
             plan: components["schemas"]["PlanNode"];
+        };
+        /** @description A query to explain. */
+        ExplainRequest: {
+            /** @description A commit or time to read, as for `/{ds}/sparql`. */
+            at?: unknown;
+            branch?: string;
+            /** @description With `profile: "given"`, the commit of that plan. */
+            commit?: number;
+            /** @description Whether to call the `explain` role. `true` by default when the dataset enables `explain`. */
+            describe?: boolean;
+            /** @description With `profile: "given"`, the error body of the run that stopped, which names the budget. */
+            error?: {
+                [key: string]: unknown;
+            };
+            /** @description With `profile: "given"`, the plan the client received, at most 10,000 nodes and 2 MiB. */
+            plan?: components["schemas"]["PlanNode"] | components["schemas"]["CursorPlan"];
+            /**
+             * @description `estimate`, the default, plans without running. `run` runs the query read-only as the caller and counts its rows without returning them. `given` explains `plan`.
+             * @enum {string}
+             */
+            profile?: "estimate" | "run" | "given";
+            /** @description Any query form. An update is refused with `not-a-query`. */
+            query: string;
+            reasoning?: boolean;
+            /** @description The deadline of a run, 30 by default. */
+            timeoutSeconds?: number;
+        };
+        /** @description The explanation in the JSON form: the members of the `plan` and `notes` events, and the `explanation` and `usage` events as members. */
+        ExplainResult: {
+            branch?: string;
+            commit?: number | null;
+            dataset: string;
+            elapsedMs?: number;
+            /** @description The error body of a run that a budget stopped. */
+            error?: {
+                [key: string]: unknown;
+            };
+            estimatedRows?: number | null;
+            /** @description Whether the plan has actual counts. */
+            executed: boolean;
+            explanation: {
+                asks: {
+                    nodes: string[];
+                    text: string;
+                }[];
+                dropped?: number;
+                /** @description Why the template text is shown although a model was asked. */
+                fallback?: unknown;
+                model?: string;
+                notes: {
+                    code: string;
+                    node: string | null;
+                    /** @description The editor range of a lint finding that names no node. */
+                    range?: {
+                        [key: string]: unknown;
+                    };
+                    /** @enum {string} */
+                    severity: "high" | "warning" | "info";
+                    /** @enum {string} */
+                    source: "explain" | "planner" | "lint" | "schema" | "model";
+                    text: string;
+                }[];
+                provider?: string;
+                replaced?: number;
+                /** @enum {string} */
+                source: "template" | "model";
+                template?: {
+                    asks: {
+                        nodes: string[];
+                        text: string;
+                    }[];
+                };
+            };
+            hiddenEstimates?: boolean;
+            nodes: {
+                [key: string]: unknown;
+            }[];
+            notes: {
+                code: string;
+                node: string | null;
+                /** @description The editor range of a lint finding that names no node. */
+                range?: {
+                    [key: string]: unknown;
+                };
+                /** @enum {string} */
+                severity: "high" | "warning" | "info";
+                /** @enum {string} */
+                source: "explain" | "planner" | "lint" | "schema" | "model";
+                text: string;
+            }[];
+            plan: components["schemas"]["PlanNode"] | components["schemas"]["CursorPlan"];
+            /** @enum {string} */
+            profile: "estimate" | "run" | "given";
+            queryType: string;
+            /** @description After a run that finished, its rows. */
+            rows?: number;
+            /** @description How many notes to show before **More**. */
+            shownNotes?: number;
+            /** @description The budget that stopped the query: `budget`, `limit` and `elapsedMs`. */
+            stop?: {
+                [key: string]: unknown;
+            };
+            /** @description The model calls: tokens, `modelCalls`, `failedCalls` and `steps`. */
+            usage?: {
+                [key: string]: unknown;
+            };
+            warnings?: {
+                code: string;
+                message: string;
+            }[];
         };
         /** @enum {string} */
         FormatLanguage: "sparql" | "turtle" | "trig" | "ntriples" | "nquads" | "jsonld";
@@ -5732,16 +5864,33 @@ export interface components {
             resolutions?: Record<string, never>[];
         };
         PlanNode: {
+            /** @description `-1` when the node did not run. */
             actualRows?: number;
+            /** @description The result came from the result cache. The children are the subtree it was computed from, each `skipped`. */
             cached?: boolean;
             children: components["schemas"]["PlanNode"][];
             columns?: string[];
+            /** @description `false` on the nodes whose counts a failure cut short. */
+            complete?: boolean;
             counters?: Record<string, never>;
             description: string;
+            /** @description The estimate is a constant guess, as for `SERVICE`. */
+            estimateGuessed?: boolean;
             estimatedCost?: number;
+            /** @description `-1` when the caller's view hides estimates. */
             estimatedRows?: number;
+            /** @description The node id: the path of child indexes from the root, such as `0.1.2`. Valid only within the plan of the same response. */
+            id?: string;
             operator: string;
+            pushedFilters?: string[];
+            /** @description How often the node ran, when more than once. Its counts are of the last run and its time spans all of them. */
+            runs?: number;
+            /** @description Why the node did not run, such as an empty left side of a join. */
+            skipped?: string;
             sortedOn?: string[];
+            /** @description A `LIMIT`, `ASK` or `EXISTS` stopped the node once it had enough rows. */
+            stoppedEarly?: boolean;
+            /** @description Inclusive of the children. */
             timeMs?: number;
             warnings?: {
                 code: string;
@@ -16286,6 +16435,42 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             408: components["responses"]["Timeout"];
+            default: components["responses"]["Error"];
+        };
+    };
+    explainQuery: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ExplainRequest"];
+            };
+        };
+        responses: {
+            /** @description The events `plan`, `notes`, `explanation`, `usage` when a model was called, and `error`, or the whole explanation as one object. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExplainResult"];
+                    "text/event-stream": string;
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            413: components["responses"]["PayloadTooLarge"];
+            507: components["responses"]["InsufficientStorage"];
             default: components["responses"]["Error"];
         };
     };

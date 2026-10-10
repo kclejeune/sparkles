@@ -4823,6 +4823,10 @@
           "growingState": {
             "type": "boolean"
           },
+          "id": {
+            "description": "The node id, the same as the operator's.",
+            "type": "string"
+          },
           "materializes": {
             "type": "boolean"
           },
@@ -6103,6 +6107,384 @@
         "required": [
           "algebra",
           "plan"
+        ],
+        "type": "object"
+      },
+      "ExplainRequest": {
+        "additionalProperties": false,
+        "description": "A query to explain.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#explaining-a-query"
+        },
+        "properties": {
+          "at": {
+            "description": "A commit or time to read, as for `/{ds}/sparql`."
+          },
+          "branch": {
+            "type": "string"
+          },
+          "commit": {
+            "description": "With `profile: \"given\"`, the commit of that plan.",
+            "type": "integer"
+          },
+          "describe": {
+            "description": "Whether to call the `explain` role. `true` by default when the dataset enables `explain`.",
+            "type": "boolean"
+          },
+          "error": {
+            "additionalProperties": true,
+            "description": "With `profile: \"given\"`, the error body of the run that stopped, which names the budget.",
+            "type": "object"
+          },
+          "plan": {
+            "description": "With `profile: \"given\"`, the plan the client received, at most 10,000 nodes and 2 MiB.",
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/PlanNode"
+              },
+              {
+                "$ref": "#/components/schemas/CursorPlan"
+              }
+            ]
+          },
+          "profile": {
+            "description": "`estimate`, the default, plans without running. `run` runs the query read-only as the caller and counts its rows without returning them. `given` explains `plan`.",
+            "enum": [
+              "estimate",
+              "run",
+              "given"
+            ],
+            "type": "string"
+          },
+          "query": {
+            "description": "Any query form. An update is refused with `not-a-query`.",
+            "type": "string"
+          },
+          "reasoning": {
+            "type": "boolean"
+          },
+          "timeoutSeconds": {
+            "description": "The deadline of a run, 30 by default.",
+            "type": "number"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "ExplainResult": {
+        "description": "The explanation in the JSON form: the members of the `plan` and `notes` events, and the `explanation` and `usage` events as members.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#explaining-a-query"
+        },
+        "properties": {
+          "branch": {
+            "type": "string"
+          },
+          "commit": {
+            "oneOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "dataset": {
+            "type": "string"
+          },
+          "elapsedMs": {
+            "type": "number"
+          },
+          "error": {
+            "additionalProperties": true,
+            "description": "The error body of a run that a budget stopped.",
+            "type": "object"
+          },
+          "estimatedRows": {
+            "oneOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "executed": {
+            "description": "Whether the plan has actual counts.",
+            "type": "boolean"
+          },
+          "explanation": {
+            "properties": {
+              "asks": {
+                "items": {
+                  "properties": {
+                    "nodes": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "text": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "text",
+                    "nodes"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "dropped": {
+                "type": "integer"
+              },
+              "fallback": {
+                "description": "Why the template text is shown although a model was asked."
+              },
+              "model": {
+                "type": "string"
+              },
+              "notes": {
+                "items": {
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "node": {
+                      "oneOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "range": {
+                      "additionalProperties": true,
+                      "description": "The editor range of a lint finding that names no node.",
+                      "type": "object"
+                    },
+                    "severity": {
+                      "enum": [
+                        "high",
+                        "warning",
+                        "info"
+                      ],
+                      "type": "string"
+                    },
+                    "source": {
+                      "enum": [
+                        "explain",
+                        "planner",
+                        "lint",
+                        "schema",
+                        "model"
+                      ],
+                      "type": "string"
+                    },
+                    "text": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "node",
+                    "code",
+                    "severity",
+                    "text",
+                    "source"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "provider": {
+                "type": "string"
+              },
+              "replaced": {
+                "type": "integer"
+              },
+              "source": {
+                "enum": [
+                  "template",
+                  "model"
+                ],
+                "type": "string"
+              },
+              "template": {
+                "properties": {
+                  "asks": {
+                    "items": {
+                      "properties": {
+                        "nodes": {
+                          "items": {
+                            "type": "string"
+                          },
+                          "type": "array"
+                        },
+                        "text": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "text",
+                        "nodes"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "asks"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "source",
+              "asks",
+              "notes"
+            ],
+            "type": "object"
+          },
+          "hiddenEstimates": {
+            "type": "boolean"
+          },
+          "nodes": {
+            "items": {
+              "additionalProperties": true,
+              "description": "One operator: `id`, `operator`, `description`, `columns`, `estimatedRows` (null when hidden), `estimatedCost`, `actualRows`, `timeMs`, `selfMs`, `complete`, `partial`, `skipped`, `stoppedEarly`, `cached`, `runs` and `pushedFilters`.",
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "notes": {
+            "items": {
+              "properties": {
+                "code": {
+                  "type": "string"
+                },
+                "node": {
+                  "oneOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "range": {
+                  "additionalProperties": true,
+                  "description": "The editor range of a lint finding that names no node.",
+                  "type": "object"
+                },
+                "severity": {
+                  "enum": [
+                    "high",
+                    "warning",
+                    "info"
+                  ],
+                  "type": "string"
+                },
+                "source": {
+                  "enum": [
+                    "explain",
+                    "planner",
+                    "lint",
+                    "schema",
+                    "model"
+                  ],
+                  "type": "string"
+                },
+                "text": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "node",
+                "code",
+                "severity",
+                "text",
+                "source"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "plan": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/PlanNode"
+              },
+              {
+                "$ref": "#/components/schemas/CursorPlan"
+              }
+            ]
+          },
+          "profile": {
+            "enum": [
+              "estimate",
+              "run",
+              "given"
+            ],
+            "type": "string"
+          },
+          "queryType": {
+            "type": "string"
+          },
+          "rows": {
+            "description": "After a run that finished, its rows.",
+            "type": "integer"
+          },
+          "shownNotes": {
+            "description": "How many notes to show before **More**.",
+            "type": "integer"
+          },
+          "stop": {
+            "additionalProperties": true,
+            "description": "The budget that stopped the query: `budget`, `limit` and `elapsedMs`.",
+            "type": "object"
+          },
+          "usage": {
+            "additionalProperties": true,
+            "description": "The model calls: tokens, `modelCalls`, `failedCalls` and `steps`.",
+            "type": "object"
+          },
+          "warnings": {
+            "items": {
+              "properties": {
+                "code": {
+                  "type": "string"
+                },
+                "message": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "code",
+                "message"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "dataset",
+          "queryType",
+          "profile",
+          "executed",
+          "plan",
+          "nodes",
+          "notes",
+          "explanation"
         ],
         "type": "object"
       },
@@ -9574,9 +9956,11 @@
         "additionalProperties": true,
         "properties": {
           "actualRows": {
+            "description": "`-1` when the node did not run.",
             "type": "number"
           },
           "cached": {
+            "description": "The result came from the result cache. The children are the subtree it was computed from, each `skipped`.",
             "type": "boolean"
           },
           "children": {
@@ -9591,19 +9975,46 @@
             },
             "type": "array"
           },
+          "complete": {
+            "description": "`false` on the nodes whose counts a failure cut short.",
+            "type": "boolean"
+          },
           "counters": {
             "type": "object"
           },
           "description": {
             "type": "string"
           },
+          "estimateGuessed": {
+            "description": "The estimate is a constant guess, as for `SERVICE`.",
+            "type": "boolean"
+          },
           "estimatedCost": {
             "type": "number"
           },
           "estimatedRows": {
+            "description": "`-1` when the caller's view hides estimates.",
             "type": "number"
           },
+          "id": {
+            "description": "The node id: the path of child indexes from the root, such as `0.1.2`. Valid only within the plan of the same response.",
+            "type": "string"
+          },
           "operator": {
+            "type": "string"
+          },
+          "pushedFilters": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "runs": {
+            "description": "How often the node ran, when more than once. Its counts are of the last run and its time spans all of them.",
+            "type": "integer"
+          },
+          "skipped": {
+            "description": "Why the node did not run, such as an empty left side of a join.",
             "type": "string"
           },
           "sortedOn": {
@@ -9612,7 +10023,12 @@
             },
             "type": "array"
           },
+          "stoppedEarly": {
+            "description": "A `LIMIT`, `ASK` or `EXISTS` stopped the node once it had enough rows.",
+            "type": "boolean"
+          },
           "timeMs": {
+            "description": "Inclusive of the children.",
             "type": "number"
           },
           "warnings": {
@@ -33876,6 +34292,95 @@
         "summary": "Explain an empty result",
         "tags": [
           "SPARQL"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
+    "/{ds}/sparql/explain": {
+      "post": {
+        "description": "The plan of a query with node ids, notes on the operators that matter, and a description of what the query asks (spec C18 §6.6). `profile` plans, runs read-only, or reads a plan the client gives, such as the plan in the error body of a query that a budget stopped. The notes and a template description need no model. When the dataset enables `explain`, its `explain` role rewrites them as prose, checked against the plan. The answer streams as server-sent events unless `Accept` names `application/json` without `text/event-stream`. Needs `read` and counts as a query for rate limits.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#explaining-a-query"
+        },
+        "operationId": "explainQuery",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExplainRequest"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExplainResult"
+                }
+              },
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "The events `plan`, `notes`, `explanation`, `usage` when a model was called, and `error`, or the whole explanation as one object."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Explain a query",
+        "tags": [
+          "Assistant"
         ],
         "x-sparkles-permission": "read"
       }

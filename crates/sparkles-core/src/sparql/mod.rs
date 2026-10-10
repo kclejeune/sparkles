@@ -55,7 +55,7 @@ pub use cursor::{
     GraphBatch, GraphCursor, MaterializedResult, QueryBatch, QueryCursor, QueryExecution,
     ask_streaming, graph_cursor, query_cursor, query_execution, select_cursor,
 };
-pub use exec::PlanInfo;
+pub use exec::{PlanFidelity, PlanInfo};
 
 /// `s` in Unicode Normalization Form C, as `fn:normalize-unicode` gives it.
 pub fn nfc(s: &str) -> String {
@@ -536,10 +536,34 @@ fn split(
 
 /// Execute a SPARQL query against a snapshot.
 pub fn query(snap: Arc<Snapshot>, q: &str, opts: &QueryOptions) -> Result<QueryResult> {
+    query_with_plan(snap, q, opts).map_err(|f| f.error)
+}
+
+/// A query that failed, with its plan as far as it ran when the failure came while it
+/// ran (spec C18 §6.6.5). The nodes whose counts stop at the failure are marked
+/// incomplete.
+#[derive(Debug)]
+pub struct Failed {
+    pub error: Error,
+    pub plan: Option<PlanInfo>,
+}
+
+impl From<Error> for Box<Failed> {
+    fn from(error: Error) -> Self {
+        Box::new(Failed { error, plan: None })
+    }
+}
+
+/// [`query`], with the plan of a query that failed while it ran.
+pub fn query_with_plan(
+    snap: Arc<Snapshot>,
+    q: &str,
+    opts: &QueryOptions,
+) -> std::result::Result<QueryResult, Box<Failed>> {
     let t0 = Instant::now();
     let parsed = parse_query(q, opts.base_iri.as_deref(), &opts.prefixes)?;
     let parse_ms = t0.elapsed().as_secs_f64() * 1000.0;
-    let mut r = execute_query(snap, &parsed, opts, parse_ms)?;
+    let mut r = execute_query_with_plan(snap, &parsed, opts, parse_ms)?;
     if r.kind == QueryKind::Select {
         select_star_order(q, &mut r);
     }
@@ -592,6 +616,16 @@ pub fn execute_query(
     opts: &QueryOptions,
     parse_ms: f64,
 ) -> Result<QueryResult> {
+    execute_query_with_plan(snap, parsed, opts, parse_ms).map_err(|f| f.error)
+}
+
+/// [`execute_query`], with the plan of a query that failed while it ran.
+pub fn execute_query_with_plan(
+    snap: Arc<Snapshot>,
+    parsed: &Query,
+    opts: &QueryOptions,
+    parse_ms: f64,
+) -> std::result::Result<QueryResult, Box<Failed>> {
     let depth = depth::check_query(parsed)?;
     depth::with_stack(depth, || execute_parsed(snap, parsed, opts, parse_ms))
 }
@@ -689,7 +723,7 @@ fn execute_parsed(
     parsed: &Query,
     opts: &QueryOptions,
     parse_ms: f64,
-) -> Result<QueryResult> {
+) -> std::result::Result<QueryResult, Box<Failed>> {
     let t1 = Instant::now();
     let prepared = prepare_query(snap, parsed, opts, None, None)?;
     let plan_ms = t1.elapsed().as_secs_f64() * 1000.0;
@@ -702,7 +736,7 @@ fn execute_prepared(
     parse_ms: f64,
     plan_ms: f64,
     prepared: PreparedQuery,
-) -> Result<QueryResult> {
+) -> std::result::Result<QueryResult, Box<Failed>> {
     let PreparedQuery {
         ctx,
         node,
@@ -712,7 +746,23 @@ fn execute_prepared(
     } = prepared;
     let (_, dataset, _) = split(parsed);
     let t2 = Instant::now();
-    let (table, mut plan) = exec::execute(&ctx, &node)?;
+    // the plan of a failed query as far as it ran, under the root of a graph query
+    let failed = |error: Error, plan: Option<PlanInfo>, stage: Option<Instant>| {
+        let mut plan = plan.or_else(|| ctx.failed_plan());
+        if let Some(p) = &mut plan {
+            if matches!(kind, QueryKind::Construct | QueryKind::Describe) {
+                let mut root = graph_root(kind, std::mem::take(p), stage.unwrap_or(t2));
+                root.fidelity_mut().incomplete = true;
+                *p = root;
+            }
+            p.warnings = ctx.warnings();
+        }
+        Box::new(Failed { error, plan })
+    };
+    let (table, mut plan) = match exec::execute(&ctx, &node) {
+        Ok(r) => r,
+        Err(e) => return Err(failed(e, None, None)),
+    };
     plan.warnings = ctx.warnings();
     if ctx.graphs.is_some() {
         plan.redact();
@@ -759,7 +809,14 @@ fn execute_prepared(
             graph_templates,
             ..
         } => {
-            (result.triples, result.quads) = construct(&ctx, &table, template, graph_templates)?;
+            let stage = Instant::now();
+            let where_plan = std::mem::take(&mut result.plan);
+            match construct(&ctx, &table, template, graph_templates) {
+                Ok(t) => (result.triples, result.quads) = t,
+                Err(e) => return Err(failed(e, Some(where_plan), Some(stage))),
+            }
+            result.plan = graph_root(kind, where_plan, stage);
+            result.plan.actual_rows = (result.triples.len() + result.quads.len()) as i64;
         }
         Query::Describe { .. } => {
             // a dataset the query or the protocol gave, or the inference overlay
@@ -767,9 +824,16 @@ fn execute_prepared(
                 || !opts.default_graph_uris.is_empty()
                 || !opts.named_graph_uris.is_empty()
                 || !opts.default_graph_extra.is_empty();
-            let d = describe::describe(&ctx, &table, &opts.describe, explicit)?;
+            let stage = Instant::now();
+            let where_plan = std::mem::take(&mut result.plan);
+            let d = match describe::describe(&ctx, &table, &opts.describe, explicit) {
+                Ok(d) => d,
+                Err(e) => return Err(failed(e, Some(where_plan), Some(stage))),
+            };
             result.triples = d.triples;
             result.describe_truncated = d.truncated;
+            result.plan = graph_root(kind, where_plan, stage);
+            result.plan.actual_rows = result.triples.len() as i64;
             result.plan.warnings = ctx.warnings();
         }
     }
@@ -782,8 +846,36 @@ fn execute_prepared(
     };
     result.mem_peak_bytes = ctx.mem_peak();
     result.rows_produced = ctx.rows_produced();
-    ctx.check()?;
+    if let Err(error) = ctx.check() {
+        let plan = Some(std::mem::take(&mut result.plan));
+        return Err(Box::new(Failed { error, plan }));
+    }
     Ok(result)
+}
+
+/// The root of a graph query's plan: the `CONSTRUCT` or `DESCRIBE` stage over the plan
+/// of its `WHERE` clause, timed from `stage`. Streaming graph cursors have the same
+/// root, so both plans have the same shape (spec C18 §6.6.5).
+fn graph_root(kind: QueryKind, mut where_plan: PlanInfo, stage: Instant) -> PlanInfo {
+    let warnings = std::mem::take(&mut where_plan.warnings);
+    let stage_ms = stage.elapsed().as_secs_f64() * 1000.0;
+    PlanInfo {
+        operator: format!("{kind:?}").to_uppercase(),
+        columns: vec!["s".into(), "p".into(), "o".into(), "g".into()],
+        estimated_rows: where_plan.estimated_rows,
+        estimated_cost: where_plan.estimated_cost,
+        actual_rows: -1,
+        time_ms: where_plan.time_ms + stage_ms,
+        warnings,
+        fidelity: where_plan.fidelity().incomplete.then(|| {
+            Box::new(PlanFidelity {
+                incomplete: true,
+                ..Default::default()
+            })
+        }),
+        children: vec![where_plan],
+        ..Default::default()
+    }
 }
 
 fn project_vars(gp: &GraphPattern, ctx: &Ctx) -> Option<Vec<table::VarId>> {
@@ -810,9 +902,28 @@ pub fn explain(snap: Arc<Snapshot>, q: &str, opts: &QueryOptions) -> Result<(Str
         crate::geo::validate_query(pattern, &mut |w| ctx.warn(w))?;
         let mut planner = Planner::new(&ctx);
         planner.source = Some(&parsed);
-        let pattern = rdfs::apply(&ctx, pattern);
+        // the shape that execution plans: ASK as a slice of one solution
+        let kind = match &parsed {
+            Query::Select { .. } => QueryKind::Select,
+            Query::Ask { .. } => QueryKind::Ask,
+            Query::Construct { .. } => QueryKind::Construct,
+            Query::Describe { .. } => QueryKind::Describe,
+        };
+        let pattern = match kind {
+            QueryKind::Ask => GraphPattern::Slice {
+                inner: Box::new(pattern.clone()),
+                start: 0,
+                length: Some(1),
+            },
+            _ => pattern.clone(),
+        };
+        let pattern = rdfs::apply(&ctx, &pattern);
         let node = planner.plan(&pattern, &ActiveGraph::Default, Vec::new())?;
         let mut info = exec::describe(&ctx, &node);
+        if matches!(kind, QueryKind::Construct | QueryKind::Describe) {
+            info = graph_root(kind, info, Instant::now());
+            info.time_ms = 0.0;
+        }
         info.warnings = ctx.warnings();
         if ctx.graphs.is_some() {
             info.redact();
@@ -1084,6 +1195,8 @@ mod joinorder_tests;
 mod keyprobe_tests;
 #[cfg(test)]
 mod opt_tests;
+#[cfg(test)]
+mod plan_fidelity_tests;
 #[cfg(test)]
 mod sample_tests;
 #[cfg(test)]

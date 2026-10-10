@@ -362,7 +362,7 @@ fn spatial_work_is_summed_over_the_plan() {
         cached: false,
         children,
         counters: counters.map(|c| c.as_object().unwrap().clone()),
-        warnings: Vec::new(),
+        ..Default::default()
     };
     assert_eq!(crate::geo::plan_work(&node(None, vec![])), None);
     let scan = |c: u64| {

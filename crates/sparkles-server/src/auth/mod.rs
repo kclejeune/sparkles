@@ -238,6 +238,8 @@ pub struct Restricted {
     pub lifts: Vec<String>,
     /// branch names and `*` patterns; `None` is every branch
     pub branches: Option<Vec<String>>,
+    /// the `serverModels` permission of C18 §9.6
+    pub server_models: bool,
 }
 
 impl Restricted {
@@ -339,6 +341,18 @@ impl Grants {
 
     pub fn has(&self, p: ServerPerm) -> bool {
         self.server.contains(&ServerPerm::ServerAdmin) || self.server.contains(&p)
+    }
+
+    /// Whether calls on `ds` may use the server's model providers where a tool makes
+    /// that optional (C18 §9.6): with a grant that says so, or as an admin of `ds`.
+    #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
+    pub fn server_models(&self, ds: &str) -> bool {
+        let name = split_branch(ds).0;
+        self.level_for(ds, None) == Some(Level::Admin)
+            || self
+                .restricted
+                .iter()
+                .any(|r| r.server_models && glob(&r.dataset, name))
     }
 
     /// The graphs of `ds` where the grants of at least `min` reach through endpoint `e`
@@ -555,6 +569,12 @@ impl Access {
 
     pub fn has(&self, p: ServerPerm) -> bool {
         self.grants.has(p) && self.scopes.iter().all(|s| s.has(p))
+    }
+
+    /// [`Grants::server_models`], for a principal whose scopes still reach `ds`.
+    #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
+    pub fn server_models(&self, ds: &str) -> bool {
+        self.level_for(ds, None).is_some() && self.grants.server_models(ds)
     }
 }
 
@@ -873,6 +893,14 @@ impl Principal {
     /// `server-admin` implies every server permission.
     pub fn has(&self, p: ServerPerm) -> bool {
         self.access.has(p)
+    }
+
+    /// Whether this principal may have the server's model providers write for it on
+    /// `ds` when a tool makes that optional (the `serverModels` permission of C18 §9.6).
+    /// The local principal of a server without auth may.
+    #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
+    pub fn server_models(&self, ds: &str) -> bool {
+        self.is_local() || self.access.server_models(&self.qualified(ds))
     }
 
     /// A stable key for this principal (its log name, `local` without auth): what rate

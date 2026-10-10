@@ -1,14 +1,39 @@
 <script lang="ts">
-  import type { PlanNode } from '$lib/api';
+  import { tick, type Snippet } from 'svelte';
+  import { planOf, type CursorPlan, type PlanNode } from '$lib/api';
+  import type { Severity } from '$lib/explain';
   import { fmtCompact, fmtInt, fmtMs } from '$lib/format';
   import { shorten, type PrefixMap } from '$lib/rdf';
   import Icon from './Icon.svelte';
 
   let {
-    plan,
+    plan: given,
     executed = true,
     prefixes = {},
-  }: { plan: PlanNode; executed?: boolean; prefixes?: PrefixMap } = $props();
+    selected = null,
+    marks = new Map(),
+    lit = null,
+    onhover,
+    onselect,
+    toolbar,
+  }: {
+    /** An eager `PlanNode` tree or a streamed `CursorPlan` tree. */
+    plan: PlanNode | CursorPlan;
+    executed?: boolean;
+    prefixes?: PrefixMap;
+    /** The node to select, expand the path to and scroll into view. */
+    selected?: string | null;
+    /** The severity of each node's notes, shown as a mark before its name. */
+    marks?: Map<string, Severity>;
+    /** Nodes to highlight, such as those a hovered sentence cites. */
+    lit?: Set<string> | null;
+    onhover?: (id: string | null) => void;
+    onselect?: (id: string) => void;
+    /** More controls at the end of the toolbar. */
+    toolbar?: Snippet;
+  } = $props();
+
+  const plan = $derived(planOf(given));
 
   /**
    * Operator description for display: `<iri>` as a prefixed name where a prefix matches,
@@ -39,7 +64,8 @@
 
   const all = $derived.by(() => {
     const out: Flat[] = [];
-    const walk = (n: PlanNode, id: string, depth: number, last: boolean[]) => {
+    const walk = (n: PlanNode, derived: string, depth: number, last: boolean[]) => {
+      const id = n.id ?? derived;
       out.push({ node: n, id, depth, self: selfTime(n), hasKids: n.children.length > 0, last });
       n.children.forEach((c, i) =>
         walk(c, `${id}.${i}`, depth + 1, [...last, i === n.children.length - 1]),
@@ -72,9 +98,13 @@
     collapsed = next;
   }
 
-  /** Ratio of actual to estimated rows; flags big misestimates. */
+  /**
+   * Ratio of actual to estimated rows; flags big misestimates. A hidden estimate (`-1`),
+   * a node that stopped early or did not run, and partial counts are not misestimates.
+   */
   function misestimate(n: PlanNode): number | null {
-    if (!executed || n.actualRows < 0) return null;
+    if (!executed || n.actualRows < 0 || n.estimatedRows < 0) return null;
+    if (n.stoppedEarly || n.skipped || n.complete === false) return null;
     const a = Math.max(n.actualRows, 1);
     const e = Math.max(n.estimatedRows, 1);
     const r = a > e ? a / e : e / a;
@@ -102,6 +132,26 @@
     return out;
   });
   const depth = $derived(Math.max(...boxes.map((b) => b.depth)) + 1);
+
+  /** Counts that a failure cut short. */
+  const partial = (n: PlanNode) =>
+    executed && n.complete === false && n.actualRows >= 0 && !n.skipped;
+  const anyPartial = $derived(all.some((r) => partial(r.node)));
+  const MARK: Record<Severity, string> = { high: '●', warning: '⚠', info: 'ⓘ' };
+
+  let tree = $state<HTMLElement | undefined>();
+  // selecting a node expands the path to it and scrolls it into view
+  $effect(() => {
+    const id = selected;
+    if (!id) return;
+    mode = 'tree';
+    const open = [...collapsed].filter((c) => !(id === c || id.startsWith(c + '.')));
+    if (open.length !== collapsed.size) collapsed = new Set(open);
+    void tick().then(() => {
+      const el = tree?.querySelector<HTMLElement>(`[data-node="${CSS.escape(id)}"]`);
+      el?.scrollIntoView?.({ block: 'nearest' });
+    });
+  });
   const hoveredNode = $derived(all.find((r) => r.id === hovered)?.node ?? null);
 </script>
 
@@ -129,13 +179,17 @@
     {#if executed}
       <span class="legend"><span class="sw hot0"></span>slowest self time</span>
       <span class="legend"><span class="sw mis"></span>estimate off ≥10×</span>
+      {#if anyPartial}<span class="legend" title="Counted until the query stopped"
+          ><sup>p</sup> partial, counted until the query stopped</span
+        >{/if}
     {:else}
       <span class="faint">Not executed: widths show estimated cost</span>
     {/if}
+    {#if toolbar}{@render toolbar()}{/if}
   </div>
 
   {#if mode === 'tree'}
-    <div class="tree scroll">
+    <div class="tree scroll" bind:this={tree}>
       <div class="thead" class:est={!executed}>
         <span>Operator</span>
         <span class="num">Est. rows</span>
@@ -149,7 +203,21 @@
       {#each rows as r (r.id)}
         {@const h = hot.get(r.id)}
         {@const mis = misestimate(r.node)}
-        <div class="tr" class:hot={h != null} class:est={!executed} data-rank={h}>
+        {@const mark = marks.get(r.id)}
+        <div
+          class="tr"
+          class:hot={h != null}
+          class:est={!executed}
+          class:selected={selected === r.id}
+          class:lit={lit?.has(r.id)}
+          data-rank={h}
+          data-node={r.id}
+          role="group"
+          aria-label="{r.node.operator} {r.id}"
+          aria-current={selected === r.id ? 'true' : undefined}
+          onmouseenter={() => onhover?.(r.id)}
+          onmouseleave={() => onhover?.(null)}
+        >
           <div class="op" style:padding-left="{r.depth * 18 + 6}px">
             {#each r.last as isLast, d (d)}
               <span
@@ -170,21 +238,47 @@
             {:else}
               <span class="twisty-space"></span>
             {/if}
-            <span class="name">{r.node.operator}</span>
+            {#if mark}<span class="mark {mark}" title="{mark} note">{MARK[mark]}</span>{/if}
+            <button class="name" onclick={() => onselect?.(r.id)} title="Node {r.id}"
+              >{r.node.operator}</button
+            >
             <span class="desc" title={r.node.description}>{desc(r.node.description)}</span>
             {#if r.node.cached}<span class="badge ok" title="Served from the result cache"
                 >cached</span
               >{/if}
+            {#if r.node.skipped}<span class="badge" title={r.node.skipped}>skipped</span>{/if}
+            {#if r.node.stoppedEarly}<span
+                class="badge"
+                title="Stopped once it had enough rows for a LIMIT, ASK or EXISTS"
+                >stopped early</span
+              >{/if}
+            {#if r.node.runs && r.node.runs > 1}<span
+                class="badge"
+                title="Ran {r.node.runs} times as the executor grew its input">×{r.node.runs}</span
+              >{/if}
+            {#if r.node.materializes}<span
+                class="badge"
+                title={r.node.reason ?? 'Reads its whole input before its first row'}
+                >materializes</span
+              >{/if}
             {#if h != null}<span class="badge spark">#{h + 1} slowest</span>{/if}
           </div>
-          <span class="num faint">{fmtCompact(r.node.estimatedRows)}</span>
+          {#if r.node.estimatedRows < 0}
+            <span class="num faint" title="Estimates are hidden for your view">hidden</span>
+          {:else}
+            <span class="num faint" title={r.node.estimateGuessed ? 'A constant guess' : undefined}
+              >{r.node.estimateGuessed ? '~' : ''}{fmtCompact(r.node.estimatedRows)}</span
+            >
+          {/if}
           {#if executed}
             <span
               class="num"
               class:mis={mis != null}
               title={mis ? `Off by ${mis.toFixed(0)}× vs estimate` : undefined}
             >
-              {r.node.actualRows < 0 ? '—' : fmtInt(r.node.actualRows)}
+              {r.node.actualRows < 0 ? '—' : fmtInt(r.node.actualRows)}{#if partial(r.node)}<sup
+                  title="Partial: counted until the query stopped">p</sup
+                >{/if}
             </span>
             <span class="num">{fmtMs(r.self)}</span>
             <span class="num faint">{fmtMs(r.node.timeMs)}</span>
@@ -321,6 +415,27 @@
   .tr:hover {
     background: var(--hover);
   }
+  .tr.lit {
+    background: color-mix(in srgb, var(--iri) 12%, transparent);
+  }
+  .tr.selected {
+    background: color-mix(in srgb, var(--iri) 18%, transparent);
+    box-shadow: inset 3px 0 0 var(--iri);
+  }
+  .mark {
+    flex: none;
+    font-size: 12px;
+    line-height: 1;
+  }
+  .mark.high {
+    color: var(--danger);
+  }
+  .mark.warning {
+    color: var(--warn, var(--spark));
+  }
+  .mark.info {
+    color: var(--text-3);
+  }
   .tr.hot {
     background: color-mix(in srgb, var(--spark) 9%, transparent);
     box-shadow: inset 3px 0 0 var(--spark);
@@ -375,8 +490,14 @@
     flex: none;
   }
   .name {
+    all: unset;
     font-weight: 600;
     white-space: nowrap;
+    cursor: pointer;
+  }
+  .name:hover,
+  .name:focus-visible {
+    text-decoration: underline;
   }
   .desc {
     font-family: var(--font-mono);

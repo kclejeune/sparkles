@@ -298,18 +298,46 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
         read(
             "explain_query",
             "Explain a SPARQL query",
-            "Show the query plan with estimated row counts, without running the query, plus warnings such as unknown IRIs or a missing LIMIT.",
+            "Show the query plan with estimated row counts, without running the query, plus warnings such as unknown IRIs or a missing LIMIT. With profile run, run the query read-only, count its rows without returning them and show the executed plan, partial when a budget stopped it. With notes, add each operator's facts by node id, notes on the operators that matter (the slowest, misestimates, blowups, skipped nodes, the budget that stopped a run) and a plain description of what the query asks, all computed without a model.",
             json!({"type":"object","additionalProperties":false,"required":["query"],"properties":{
                 "dataset": ds(), "query": {"type":"string","minLength":1,"maxLength":65536},
                 "includeAlgebra": {"type":"boolean","default":false},
+                "profile": {"enum":["estimate","run"],"default":"estimate","description":"estimate plans without running; run runs the query read-only under timeoutSeconds and explains the executed plan"},
+                "notes": {"type":"boolean","default":false,"description":"Add nodes, notes and asks (the explanation of C18 §6.6), and start each plan line with its node id"},
+                "timeoutSeconds": {"type":"number","exclusiveMinimum":0,"maximum":cfg.max_timeout_secs(),
+                    "default":super::number(cfg.max_timeout.as_secs_f64().min(crate::explain::RUN_TIMEOUT_SECS as f64)),"description":"The deadline of a run"},
+                "useServerModel": {"type":"boolean","default":false,"description":"Have the server's explain model rewrite asks and notes as prose. Needs the serverModels permission, and its tokens count against your budget. You can write the prose yourself from notes and asks instead."},
                 "reasoning": rs(), "atCommit": at(), "at": at_sel()}}),
             Some(
                 json!({"type":"object","required":["dataset","commit","queryType","estimatedRows","plan","warnings"],"properties":{
                 "dataset":{"type":"string"},"commit":{"type":"integer"},"queryType":{"type":"string"},
                 "estimatedRows":{"type":["integer","null"]},"plan":{"type":"string"},"algebra":{"type":"string"},
                 "warnings":{"type":"array","items":{"type":"object","required":["code","message"],"properties":{
-                    "code":{"enum":["unknown-term","no-limit","large-estimate","service-disabled"]},
-                    "message":{"type":"string"}}}}}}),
+                    "code":{"type":"string","description":"unknown-term, no-limit, large-estimate, service-disabled, or a code of the planner such as geo-not-pushed"},
+                    "message":{"type":"string"}}}},
+                "rows":{"type":"integer","description":"After a run that finished, the number of result rows"},
+                "elapsedMs":{"type":"number"},
+                "error":{"type":"object","description":"The error of a run that a budget stopped; the plan is then partial","properties":{
+                    "error":{"type":"string"},"code":{"type":"string"},"budget":{"type":"string"}}},
+                "nodes":{"type":"array","items":{"type":"object","required":["id","operator","description","estimatedRows","timeMs","selfMs","complete"],"properties":{
+                    "id":{"type":"string"},"operator":{"type":"string"},"description":{"type":"string"},
+                    "columns":strings(),
+                    "estimatedRows":{"type":["number","null"],"description":"null when your view hides estimates"},
+                    "estimatedCost":{"type":["number","null"]},
+                    "actualRows":{"type":["integer","null"]},"timeMs":{"type":"number"},"selfMs":{"type":"number"},
+                    "complete":{"type":"boolean"},"partial":{"type":"boolean"},"skipped":{"type":"string"},
+                    "stoppedEarly":{"type":"boolean"},"cached":{"type":"boolean"},"runs":{"type":"integer"},
+                    "pushedFilters":strings()}}},
+                "notes":{"type":"array","items":{"type":"object","required":["node","code","severity","text","source"],"properties":{
+                    "node":{"type":["string","null"],"description":"The node id, or null for a note on the whole query"},
+                    "code":{"type":"string"},"severity":{"enum":["high","warning","info"]},"text":{"type":"string"},
+                    "source":{"enum":["explain","planner","lint","schema","model"]},"range":{"type":"object"}}}},
+                "asks":{"type":"array","items":{"type":"object","required":["text","nodes"],"properties":{
+                    "text":{"type":"string"},"nodes":strings()}}},
+                "source":{"enum":["template","model"]},
+                "provider":{"type":"string"},"model":{"type":"string"},
+                "fallback":{},
+                "usage":{"type":"object"}}}),
             ),
         ),
         read(
