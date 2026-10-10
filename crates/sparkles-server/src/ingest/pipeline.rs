@@ -32,6 +32,9 @@ pub enum Mode {
     Preview,
     /// written to `main` when every check passes, else as `branch`
     Auto,
+    /// a registered source of agent memory: its facts are written on `main` into the
+    /// source's graph, which `agentGraphs` matches, so they are unreviewed (§8.10.5)
+    Memory,
 }
 
 impl Mode {
@@ -40,6 +43,7 @@ impl Mode {
             "branch" => Some(Mode::Branch),
             "preview" => Some(Mode::Preview),
             "auto" => Some(Mode::Auto),
+            "memory" => Some(Mode::Memory),
             _ => None,
         }
     }
@@ -49,6 +53,7 @@ impl Mode {
             Mode::Branch => "branch",
             Mode::Preview => "preview",
             Mode::Auto => "auto",
+            Mode::Memory => "memory",
         }
     }
 }
@@ -85,6 +90,8 @@ pub struct Request {
     pub message: Option<String>,
     /// the extract role's pairs, instead of the dataset's (`sparkles ingest --pair`)
     pub pairs: Vec<Pair>,
+    /// extract from this registered source, named by its graph, instead of `bytes`
+    pub source: Option<String>,
 }
 
 /// Where a run reports progress and waits for its confirmation.
@@ -325,6 +332,15 @@ pub(crate) struct Limits {
 }
 
 fn run_inner(r: &mut Run, req: &Request) -> Result<Value, Failed> {
+    if let Some(src) = &req.source {
+        return run_existing(r, req, src);
+    }
+    if req.mode == Mode::Memory {
+        return Err(Failed::new(
+            "bad-argument",
+            "memory mode extracts a registered source: name it with source",
+        ));
+    }
     let ctx = r.ctx;
     let st = &ctx.server.state;
     let ds = ctx
@@ -401,23 +417,17 @@ fn run_inner(r: &mut Run, req: &Request) -> Result<Value, Failed> {
         None
     };
     if let (Some(v), Some(models)) = (&vocab, ctx.models) {
-        let est = super::extract::estimate(models, &pairs, v, &converted.text, &chunks);
-        let mut e = est.clone();
-        e["threshold"] = limits.confirm_tokens.into();
-        let tokens = est["tokens"].as_u64().unwrap_or(0);
-        e["needsConfirmation"] = (tokens > limits.confirm_tokens).into();
-        ctx.progress.estimate(&e);
-        budget_check(st, &ds, &settings, ctx.principal)?;
-        if tokens > limits.confirm_tokens && !req.confirm && !ctx.progress.confirm() {
-            return Err(Failed(json!({
-                "code": if r.cancelled() { "cancelled" } else { "not-confirmed" },
-                "message": format!(
-                    "the extraction would take about {tokens} tokens, above the dataset's threshold of {}, and was not confirmed",
-                    limits.confirm_tokens
-                ),
-                "estimate": e,
-            })));
-        }
+        confirm_estimate(
+            r,
+            req,
+            models,
+            &pairs,
+            v,
+            &converted.text,
+            &chunks,
+            &limits,
+            (&ds, &settings),
+        )?;
     }
     r.check()?;
     // 3. registration, on the review branch (a preview writes nothing)
@@ -444,7 +454,7 @@ fn run_inner(r: &mut Run, req: &Request) -> Result<Value, Failed> {
     reg.insert("rendition".into(), rendition_extras(&converted));
     let base_head = ds.store.snapshot().commit;
     let branch = match req.mode {
-        Mode::Preview => None,
+        Mode::Preview | Mode::Memory => None,
         Mode::Branch | Mode::Auto => Some(review_branch(r, req, &ds, title.as_deref())?),
     };
     let registered = if req.mode == Mode::Preview {
@@ -493,12 +503,7 @@ fn run_inner(r: &mut Run, req: &Request) -> Result<Value, Failed> {
     });
     if let Some(b) = &branch {
         out["branch"] = b.clone().into();
-        out["review"] = format!(
-            "/ui/datasets/{}/review/{}",
-            percent_encoding::utf8_percent_encode(&ds.name, percent_encoding::NON_ALPHANUMERIC),
-            percent_encoding::utf8_percent_encode(b, percent_encoding::NON_ALPHANUMERIC)
-        )
-        .into();
+        out["review"] = review_link(&ds.name, b).into();
     }
     if let Some(c) = registered.get("commit") {
         out["commit"] = c.clone();
@@ -556,42 +561,308 @@ fn run_inner(r: &mut Run, req: &Request) -> Result<Value, Failed> {
         Mode::Auto => {
             let b = branch.as_deref().expect("auto has a branch");
             let message = format!("Ingest {}", title.as_deref().unwrap_or("a document"));
-            let mut why = auto_blocker(&proposals, &limits);
-            // the merge preview: the guard of main and conflicts keep the branch
-            let preview = if why.is_none() {
-                let p = r.tool(
-                    "merge_branch",
-                    json!({ "source": b, "message": message }),
-                    None,
-                )?;
-                if p["mergeable"] != true {
-                    why = Some("the merge preview found conflicts or guard findings".into());
-                }
-                Some(p)
-            } else {
-                None
-            };
-            match (why, preview) {
-                (None, Some(p)) => {
-                    let m = r.tool(
-                        "merge_branch",
-                        json!({ "source": b, "message": message, "dryRun": false,
-                                "expect": p["expect"] }),
-                        None,
-                    )?;
-                    let _ = r.tool("delete_branch", json!({ "name": b, "force": true }), None);
-                    out["outcome"] = "merged".into();
-                    out["merge"] = m;
-                    if let Some(o) = out.as_object_mut() {
-                        o.remove("review");
-                    }
-                }
-                (w, _) => {
-                    out["autoFallback"] = w.unwrap_or_default().into();
-                }
+            let why = auto_blocker(&proposals, &limits);
+            merge_if(r, b, &message, why, &mut out)?;
+        }
+        Mode::Branch | Mode::Memory => {}
+    }
+    ctx.progress.status(Status::Writing, 0.99, None);
+    Ok(out)
+}
+
+/// Estimate an extraction, report the estimate, check the dataset's daily budget, and
+/// wait for a confirmation when the estimate is above the dataset's threshold (§7.9).
+#[allow(clippy::too_many_arguments)]
+fn confirm_estimate(
+    r: &Run,
+    req: &Request,
+    models: &Models,
+    pairs: &[Pair],
+    v: &super::extract::Vocabulary,
+    text: &str,
+    chunks: &[(usize, usize)],
+    limits: &Limits,
+    (ds, settings): (&crate::state::Dataset, &crate::assistant::AssistantSettings),
+) -> Result<(), Failed> {
+    let ctx = r.ctx;
+    let est = super::extract::estimate(models, pairs, v, text, chunks);
+    let mut e = est.clone();
+    e["threshold"] = limits.confirm_tokens.into();
+    let tokens = est["tokens"].as_u64().unwrap_or(0);
+    e["needsConfirmation"] = (tokens > limits.confirm_tokens).into();
+    ctx.progress.estimate(&e);
+    budget_check(&ctx.server.state, ds, settings, ctx.principal)?;
+    if tokens > limits.confirm_tokens && !req.confirm && !ctx.progress.confirm() {
+        return Err(Failed(json!({
+            "code": if r.cancelled() { "cancelled" } else { "not-confirmed" },
+            "message": format!(
+                "the extraction would take about {tokens} tokens, above the dataset's threshold of {}, and was not confirmed",
+                limits.confirm_tokens
+            ),
+            "estimate": e,
+        })));
+    }
+    Ok(())
+}
+
+/// Merge `branch` into `main` when nothing blocks it and the merge preview finds no
+/// conflict or guard finding, then delete it. Otherwise say why in `autoFallback`.
+pub(crate) fn merge_if(
+    r: &Run,
+    branch: &str,
+    message: &str,
+    mut why: Option<String>,
+    out: &mut Value,
+) -> Result<(), Failed> {
+    // the merge preview: the guard of main and conflicts keep the branch
+    let preview = if why.is_none() {
+        let p = r.tool(
+            "merge_branch",
+            json!({ "source": branch, "message": message }),
+            None,
+        )?;
+        if p["mergeable"] != true {
+            why = Some("the merge preview found conflicts or guard findings".into());
+        }
+        Some(p)
+    } else {
+        None
+    };
+    match (why, preview) {
+        (None, Some(p)) => {
+            let m = r.tool(
+                "merge_branch",
+                json!({ "source": branch, "message": message, "dryRun": false,
+                        "expect": p["expect"] }),
+                None,
+            )?;
+            let _ = r.tool(
+                "delete_branch",
+                json!({ "name": branch, "force": true }),
+                None,
+            );
+            out["outcome"] = "merged".into();
+            out["merge"] = m;
+            if let Some(o) = out.as_object_mut() {
+                o.remove("review");
             }
         }
-        Mode::Branch => {}
+        (w, _) => {
+            out["autoFallback"] = w.unwrap_or_default().into();
+        }
+    }
+    Ok(())
+}
+
+/// An IRI as a tool returned it, `<…>` or a prefixed name of `prefixes`, made bare.
+pub(crate) fn expand_iri(s: &str, prefixes: &Value) -> String {
+    if let Some(x) = s.strip_prefix('<').and_then(|x| x.strip_suffix('>')) {
+        return x.to_string();
+    }
+    if let Some((p, local)) = s.split_once(':')
+        && let Some(ns) = prefixes[p].as_str()
+    {
+        return format!("{ns}{local}");
+    }
+    s.to_string()
+}
+
+/// The review page of a branch.
+fn review_link(ds: &str, branch: &str) -> String {
+    format!(
+        "/ui/datasets/{}/review/{}",
+        percent_encoding::utf8_percent_encode(ds, percent_encoding::NON_ALPHANUMERIC),
+        percent_encoding::utf8_percent_encode(branch, percent_encoding::NON_ALPHANUMERIC)
+    )
+}
+
+/// Extract facts from a source that is already registered, named by its graph (or by
+/// its IRI when that is its graph). The text of its current rendition goes through the
+/// estimate, the `extract` role, linking and `assert_facts` as an upload's does. An
+/// import of harness memory with `imports.extract: "server"` extracts its sources this
+/// way, in `memory` mode (§8.10.5).
+fn run_existing(r: &mut Run, req: &Request, source: &str) -> Result<Value, Failed> {
+    let ctx = r.ctx;
+    let st = &ctx.server.state;
+    let ds = ctx
+        .server
+        .dataset(ctx.principal, Some(&req.dataset))
+        .map_err(Failed::from)?;
+    if req.mode == Mode::Preview {
+        return Err(Failed::new(
+            "bad-argument",
+            "a registered source is extracted in branch, auto or memory mode",
+        ));
+    }
+    if req.mode == Mode::Auto && !ctx.principal.can(&ds.name, Level::Admin) {
+        return Err(Failed::new(
+            "forbidden",
+            "only an admin of the dataset may ingest in auto mode",
+        ));
+    }
+    let settings = crate::assistant::settings(st, &ds);
+    let pairs = if req.pairs.is_empty() {
+        extract_pairs(ctx.models, &settings)
+    } else {
+        req.pairs.clone()
+    };
+    let Some(models) = ctx.models.filter(|_| !pairs.is_empty()) else {
+        return Err(Failed::new(
+            "no-model",
+            "the dataset's ingestion has no provider and model in the extract role: enable ingest in its assistant settings, with a provider that may receive documents",
+        ));
+    };
+    // 1. the source and its current rendition
+    ctx.progress
+        .status(Status::Registering, 0.05, Some("reading the source".into()));
+    let listed = r.tool(
+        "list_sources",
+        json!({ "graphs": [format!("<{source}>")], "limit": 50 }),
+        None,
+    )?;
+    let prefixes = listed["prefixes"].clone();
+    let found = listed["sources"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|s| s.get("invalidatedAt").is_none())
+        .find(|s| {
+            let g = expand_iri(s["graph"].as_str().unwrap_or(""), &prefixes);
+            let i = expand_iri(s["source"].as_str().unwrap_or(""), &prefixes);
+            g == source || i == source
+        })
+        .cloned()
+        .ok_or_else(|| {
+            Failed(json!({
+                "code": "unknown-source",
+                "status": 404,
+                "message": format!("no live source you can read is registered in graph <{source}>"),
+            }))
+        })?;
+    let graph = expand_iri(found["graph"].as_str().unwrap_or(""), &prefixes);
+    let rendition = expand_iri(found["rendition"].as_str().unwrap_or(""), &prefixes);
+    let title = req
+        .title
+        .clone()
+        .or_else(|| found["title"].as_str().map(str::to_string));
+    if req.mode == Mode::Memory && !crate::assist::memory_settings(st, &ds).is_agent_graph(&graph) {
+        return Err(Failed::new(
+            "not-agent-memory",
+            format!(
+                "memory mode writes on main only into graphs that agentGraphs matches, and <{graph}> is not one: use branch mode"
+            ),
+        ));
+    }
+    // 2. the text, chunk by chunk
+    let mut text = String::new();
+    let mut chunks: Vec<(usize, usize)> = Vec::new();
+    let mut from = 0u64;
+    loop {
+        r.check()?;
+        let page = r.tool(
+            "read_chunks",
+            json!({ "rendition": format!("<{rendition}>"), "from": from, "count": 20 }),
+            None,
+        )?;
+        for c in page["chunks"].as_array().into_iter().flatten() {
+            let (Some(a), Some(b), Some(t)) =
+                (c["start"].as_u64(), c["end"].as_u64(), c["text"].as_str())
+            else {
+                continue;
+            };
+            let (a, b) = (a as usize, b as usize);
+            if a != chunks.last().map_or(0, |c| c.1) {
+                return Err(Failed::new(
+                    "no-text",
+                    "the rendition's chunks do not cover its text",
+                ));
+            }
+            text.push_str(t);
+            chunks.push((a, b));
+        }
+        match page["next"].as_u64() {
+            Some(n) if n > from => from = n,
+            _ => break,
+        }
+    }
+    let profile = req.profile.clone().unwrap_or_else(|| "default".into());
+    let ingest = crate::mcp::memory::ingest::ingest_settings(st, &ds);
+    let limits = Limits {
+        confirm_tokens: ingest.confirm_tokens.unwrap_or(DEFAULT_CONFIRM_TOKENS),
+        auto_confidence: ingest.auto_confidence.unwrap_or(DEFAULT_AUTO_CONFIDENCE),
+    };
+    let vocab = super::extract::Vocabulary::read(r, &profile)?;
+    confirm_estimate(
+        r,
+        req,
+        models,
+        &pairs,
+        &vocab,
+        &text,
+        &chunks,
+        &limits,
+        (&ds, &settings),
+    )?;
+    r.check()?;
+    // 3. the branch, unless the facts are agent memory written on main
+    let branch = match req.mode {
+        Mode::Memory | Mode::Preview => None,
+        Mode::Branch | Mode::Auto => Some(review_branch(r, req, &ds, title.as_deref())?),
+    };
+    let mut out = json!({
+        "outcome": "proposed",
+        "mode": req.mode.as_str(),
+        "source": found["source"],
+        "graph": graph,
+        "rendition": rendition,
+        "length": found["length"],
+        "chunks": chunks.len(),
+        "profile": profile,
+    });
+    if let Some(b) = &branch {
+        out["branch"] = b.clone().into();
+        out["review"] = review_link(&ds.name, b).into();
+    }
+    let converted = Converted {
+        text,
+        media_type: found["format"]
+            .as_str()
+            .unwrap_or("text/markdown")
+            .to_string(),
+        title: title.clone(),
+        page_starts: Vec::new(),
+        ocr_pages: Vec::new(),
+        omitted_pages: Vec::new(),
+        notes: Vec::new(),
+    };
+    let registered =
+        json!({ "rendition": format!("<{rendition}>"), "graph": format!("<{graph}>") });
+    let ex = match super::extract::extract(r, models, &pairs, &vocab, &converted.text, &chunks) {
+        Ok(ex) => ex,
+        Err(e) => {
+            discard_branch(r, req, branch.as_deref());
+            return Err(e);
+        }
+    };
+    let proposals = super::extract::propose(
+        r,
+        &vocab,
+        &ex,
+        &registered,
+        branch.as_deref(),
+        false,
+        &converted,
+    )?;
+    let facts_ok = proposals.summary["proposed"].as_u64().unwrap_or(0);
+    out["outcome"] = if facts_ok > 0 { "proposed" } else { "no-facts" }.into();
+    for (k, v) in proposals.summary.as_object().into_iter().flatten() {
+        out[k] = v.clone();
+    }
+    if req.mode == Mode::Auto {
+        let b = branch.as_deref().expect("auto has a branch");
+        let message = format!("Ingest {}", title.as_deref().unwrap_or("a source"));
+        let why = auto_blocker(&proposals, &limits);
+        merge_if(r, b, &message, why, &mut out)?;
     }
     ctx.progress.status(Status::Writing, 0.99, None);
     Ok(out)

@@ -819,3 +819,147 @@ async fn a18_csv_mapping_draft() {
     assert_eq!(d["dryRun"], true, "{d}");
     assert_eq!(d["commit"]["inserted"], 20_000, "{d}");
 }
+
+/// The extraction of a registered source (`source`), which `sparkles memory sync` starts
+/// with `imports.extract: "server"`: memory mode writes on main into an agent graph, and
+/// the source no longer needs extraction. Branch mode works on any source, and memory
+/// mode is refused outside agent memory and without a source.
+#[tokio::test]
+async fn extraction_of_a_registered_source() {
+    let m = proposals_mock();
+    let (_st, app) = app(Some([&m.url(), &m.url()]));
+    enable(&app).await;
+    let (s, v) = send(
+        &app,
+        req(
+            "PUT",
+            "/$/memory/org",
+            json!({ "agentGraphs": ["https://example.org/memory/import/*"] }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let g = "https://example.org/memory/import/ana/claude-code/app/memory/team";
+    let other = "https://example.org/notes/stand-up";
+    for (graph, text) in [
+        (g, NOTES),
+        (other, "# Other\n\nKai Berg leads the platform team.\n"),
+    ] {
+        let (s, v) = send(
+            &app,
+            req(
+                "POST",
+                "/org/sources",
+                json!({ "graph": graph, "iri": graph, "format": "text/markdown", "text": text }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+    }
+    let needs = |v: &Value, g: &str| {
+        v["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["graph"].as_str().unwrap().contains(g))
+            .unwrap_or_else(|| panic!("{v}"))["needsExtraction"]
+            .clone()
+    };
+    let (_, l) = send(&app, req("GET", "/org/sources", Value::Null)).await;
+    assert_eq!(needs(&l, "memory/team"), true, "{l}");
+    // memory mode: on main, in the source's graph
+    let v = ingest(
+        &app,
+        req(
+            "POST",
+            "/$/ingest/org",
+            json!({ "source": g, "mode": "memory" }),
+        ),
+    )
+    .await;
+    assert_eq!(v["status"], "done", "{v}");
+    let r = &v["result"];
+    assert_eq!(r["outcome"], "proposed", "{v}");
+    assert_eq!(r["mode"], "memory");
+    assert_eq!(r["proposed"], 1, "{v}");
+    assert!(r["branch"].is_null(), "{v}");
+    assert_eq!(v["input"]["source"], g);
+    assert!(
+        ask(
+            &app,
+            &format!("ASK {{ GRAPH <{g}> {{ <http://example.org/ana> <{MEMBER_OF}> ?t }} }}")
+        )
+        .await
+    );
+    let (_, l) = send(&app, req("GET", "/org/sources", Value::Null)).await;
+    assert_eq!(needs(&l, "memory/team"), false, "{l}");
+    // the fact is unreviewed: the inbox lists it
+    let (_, inbox) = send(&app, req("GET", "/$/memory/org/inbox", Value::Null)).await;
+    assert!(
+        inbox["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["graph"] == g),
+        "{inbox}"
+    );
+    // memory mode outside agent memory is refused; branch mode proposes on a branch
+    let v = ingest(
+        &app,
+        req(
+            "POST",
+            "/$/ingest/org",
+            json!({ "source": other, "mode": "memory" }),
+        ),
+    )
+    .await;
+    assert_eq!(v["error"]["code"], "not-agent-memory", "{v}");
+    let v = ingest(
+        &app,
+        req("POST", "/$/ingest/org", json!({ "source": other })),
+    )
+    .await;
+    assert_eq!(v["status"], "done", "{v}");
+    assert_eq!(v["result"]["outcome"], "proposed", "{v}");
+    let b = v["result"]["branch"].as_str().unwrap().to_string();
+    let rv = review(&app, &b).await;
+    assert!(
+        rv["facts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["quote"] == "Kai Berg leads the platform team."),
+        "{rv}"
+    );
+    // refusals
+    let v = ingest(
+        &app,
+        req(
+            "POST",
+            "/$/ingest/org",
+            json!({ "source": "https://example.org/none", "mode": "memory" }),
+        ),
+    )
+    .await;
+    assert_eq!(v["error"]["code"], "unknown-source", "{v}");
+    let (s, e) = send(
+        &app,
+        req(
+            "POST",
+            "/$/ingest/org",
+            json!({ "text": NOTES, "mode": "memory" }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+    let (s, e) = send(
+        &app,
+        req(
+            "POST",
+            "/$/ingest/org",
+            json!({ "text": NOTES, "source": g }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+}

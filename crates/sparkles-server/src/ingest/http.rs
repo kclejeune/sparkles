@@ -73,6 +73,8 @@ struct Options {
     base: Option<String>,
     message: Option<String>,
     deadline_seconds: Option<f64>,
+    /// extract from this registered source (its graph) instead of a document
+    source: Option<String>,
 }
 
 impl Options {
@@ -96,6 +98,7 @@ impl Options {
             "branch" => self.branch = v_opt,
             "base" => self.base = v_opt,
             "message" => self.message = v_opt,
+            "source" => self.source = v_opt,
             "allowPartial" => self.allow_partial = Some(flag(&v)?),
             "extract" => self.extract = Some(flag(&v)?),
             "confirm" => self.confirm = Some(flag(&v)?),
@@ -206,8 +209,20 @@ async fn start(
     }
     let mode = match o.mode.as_deref() {
         None => Mode::Branch,
-        Some(m) => Mode::parse(m).ok_or_else(|| bad("mode is branch, preview or auto"))?,
+        Some(m) => Mode::parse(m).ok_or_else(|| bad("mode is branch, preview, auto or memory"))?,
     };
+    if let Some(s) = &o.source {
+        if file.is_some() || o.text.is_some() || o.url.is_some() {
+            return Err(bad("send a source, or a document: not both"));
+        }
+        if oxrdf::NamedNode::new(s.as_str()).is_err() {
+            return Err(bad("source is the IRI of a registered source's graph"));
+        }
+    } else if mode == Mode::Memory {
+        return Err(bad(
+            "memory mode extracts a registered source: name it with source",
+        ));
+    }
     if let Some(b) = &o.branch
         && !sparkles::branch::valid_name(b)
     {
@@ -229,6 +244,7 @@ async fn start(
     };
     // the document: the file, the text, or the URL
     let (bytes, name, media_type, fetched) = match (file, o.text.take()) {
+        _ if o.source.is_some() => (Vec::new(), None, None, false),
         (Some(_), Some(_)) => return Err(bad("send a file or text, not both")),
         (Some((b, n, mt)), None) => {
             let mt = o.format.clone().or(mt).filter(|m| {
@@ -267,7 +283,9 @@ async fn start(
     if let Some(m) = &media_type {
         input["format"] = m.clone().into();
     }
-    if !fetched {
+    if let Some(s) = &o.source {
+        input["source"] = s.clone().into();
+    } else if !fetched {
         input["bytes"] = bytes.len().into();
     }
     let req = Request {
@@ -288,6 +306,7 @@ async fn start(
         base: o.base.clone(),
         message: o.message.clone(),
         pairs: Vec::new(),
+        source: o.source.clone(),
     };
     let task = Arc::new(Task::new(&ds, &p.id(), input));
     st.ingest

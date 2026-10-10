@@ -247,6 +247,12 @@ impl Conn {
         }
     }
 
+    /// Whether requests run in this process on a database directory, so a task the
+    /// server starts ends with the command.
+    pub fn is_local(&self) -> bool {
+        matches!(self.kind, Kind::Local { .. })
+    }
+
     /// One request. `path` starts with `/` and carries its encoded query string.
     pub fn send(
         &self,

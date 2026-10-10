@@ -97,8 +97,9 @@ pub struct ImportFlags {
     /// The transcript a session end hook named, imported even when it is recent
     #[arg(long, hide = true, value_name = "FILE")]
     pub transcript: Option<PathBuf>,
-    /// Who extracts facts from prose: agent (the skill, default), server or none. The
-    /// choice is recorded; extraction runs through the skill or the server's role.
+    /// Who extracts facts from prose: agent (the skill, default), server or none. With
+    /// server, the sync starts an extraction task on the server's extract role for each
+    /// memory or instruction file it wrote that needs one
     #[arg(long, value_parser = ["agent", "server", "none"])]
     pub extract: Option<String>,
     /// Extra redaction patterns: one `name regex` per line

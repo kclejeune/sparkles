@@ -742,6 +742,17 @@ fn import(
         }
     }
     drop(lock);
+    let extract = flags.extract.clone().unwrap_or_else(|| {
+        settings["imports"]["extract"]
+            .as_str()
+            .unwrap_or("agent")
+            .to_string()
+    });
+    let extractions = if extract == "server" && !flags.dry_run {
+        server_extraction(&conn, &ctx.base, &reports, &mut notes)
+    } else {
+        Vec::new()
+    };
     let failed = reports.iter().filter(|r| r.status == "failed").count();
     let changed = reports
         .iter()
@@ -752,12 +763,13 @@ fn import(
         "project": project.key,
         "principal": ctx.principal,
         "dryRun": flags.dry_run,
-        "extract": flags.extract.clone().unwrap_or_else(|| settings["imports"]["extract"].as_str().unwrap_or("agent").to_string()),
+        "extract": extract,
         "runs": runs,
         "files": reports,
         "changed": changed,
         "failed": failed,
         "transcripts": with_transcripts,
+        "extractions": extractions,
         "notes": notes,
     });
     if quiet != Some(true) || failed > 0 {
@@ -766,11 +778,97 @@ fn import(
             if lines.is_empty() {
                 lines.push(format!("{}: no files found", project.key));
             }
+            for e in &extractions {
+                lines.push(format!(
+                    "extraction {} {}{}",
+                    e["graph"].as_str().unwrap_or(""),
+                    e["status"].as_str().unwrap_or(""),
+                    e["proposed"]
+                        .as_u64()
+                        .map(|n| format!(" ({n} facts)"))
+                        .unwrap_or_default()
+                ));
+            }
             lines.extend(notes.iter().map(|n| format!("note: {n}")));
             lines.join("\n")
         });
     }
     Ok(if failed > 0 { EXIT_PARTIAL } else { 0 })
+}
+
+/// The longest a sync on a database directory waits for its extractions, which end with
+/// the command.
+const LOCAL_EXTRACTION_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// With `imports.extract: "server"`: start an extraction task on the server for each
+/// memory or instruction file this sync wrote whose source needs extraction (§8.10.5).
+/// The task writes the facts into the file's graph on `main` (`memory` mode), so they
+/// are unreviewed like the rest of the import. Transcripts are never extracted here.
+/// A server runs the tasks after the command returns; a database directory runs them
+/// in this process, so the command waits for them.
+fn server_extraction(
+    conn: &Conn,
+    base: &str,
+    reports: &[sync::FileReport],
+    notes: &mut Vec<String>,
+) -> Vec<Value> {
+    let written: Vec<&str> = reports
+        .iter()
+        .filter(|r| matches!(r.status.as_str(), "new" | "edited" | "renamed"))
+        .filter(|r| r.kind != "transcript" && !r.graph.contains("/sessions/"))
+        .map(|r| r.graph.as_str())
+        .collect();
+    if written.is_empty() {
+        return Vec::new();
+    }
+    let needs = match needs_extraction(conn, base) {
+        Ok(n) => n,
+        Err(e) => {
+            notes.push(format!("no extraction was started: {}", e.message));
+            return Vec::new();
+        }
+    };
+    let mut out = Vec::new();
+    for g in written.into_iter().filter(|g| needs.contains(*g)) {
+        let body = json!({ "source": g, "mode": "memory" });
+        let started = conn
+            .post_json(&format!("/$/ingest/{}", enc(&conn.dataset)), &body)
+            .and_then(|r| r.check())
+            .and_then(|r| r.json());
+        let task = match started {
+            Ok(t) => t,
+            Err(e) => {
+                out.push(json!({ "graph": g, "status": "failed", "error": e.message }));
+                continue;
+            }
+        };
+        let id = task["id"].as_str().unwrap_or("").to_string();
+        let mut t = task;
+        if conn.is_local() {
+            let until = std::time::Instant::now() + LOCAL_EXTRACTION_WAIT;
+            while matches!(
+                t["status"].as_str(),
+                Some(
+                    "queued" | "converting" | "registering" | "extracting" | "linking" | "writing"
+                )
+            ) && std::time::Instant::now() < until
+            {
+                match conn.get_json(&format!("/$/ingest/{}/{id}?wait=30", enc(&conn.dataset))) {
+                    Ok(v) => t = v,
+                    Err(_) => break,
+                }
+            }
+        }
+        let mut e = json!({ "graph": g, "task": id, "status": t["status"] });
+        if let Some(n) = t["result"]["proposed"].as_u64() {
+            e["proposed"] = n.into();
+        }
+        if let Some(err) = t["error"].get("code") {
+            e["error"] = err.clone();
+        }
+        out.push(e);
+    }
+    out
 }
 
 /// The instruction files of §8.10.1 by name.
