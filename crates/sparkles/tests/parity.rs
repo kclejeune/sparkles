@@ -751,6 +751,9 @@ fn entries() -> Vec<(&'static str, Entry)> {
         server_only!("listSecrets", Process),
         server_only!("putSecret", Process),
         server_only!("deleteSecret", Process),
+        // C21: outbound notifications are a server-wide settings kind with its own worker
+        server_only!("getNotifications", Process),
+        server_only!("testNotification", Process),
         server_only!("listAsks", Process),
         server_only!("deleteAsks", Process),
         server_only!("askFeedback", Process),
