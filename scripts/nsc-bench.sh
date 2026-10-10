@@ -130,7 +130,10 @@ binary() {
       echo "building $ref ($sha); log: $OUT/logs/build-$v.log"
       rm -rf "${CACHE:?}/src/$sha"
       mkdir -p "$CACHE/src/$sha" "$CACHE/bin/$sha"
-      git -C "$ROOT" archive "$sha" | tar -x -C "$CACHE/src/$sha"
+      # -m gives the files the time of extraction. Cargo shares artifacts between source
+      # trees in the shared target directory and compares mtimes, and an archive keeps
+      # the commit time, which can be older than an earlier build of another revision.
+      git -C "$ROOT" archive "$sha" | tar -x -m -C "$CACHE/src/$sha"
       # the server embeds ui/build; its build script writes a placeholder, but does not
       # rerun for a second source tree in the shared target directory
       mkdir -p "$CACHE/src/$sha/ui/build"
