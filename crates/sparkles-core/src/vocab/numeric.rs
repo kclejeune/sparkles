@@ -32,6 +32,10 @@
 //! generation without one (built by an older version) decodes its numbers from the
 //! vocabulary, as before.
 //!
+//! The kinds and the rank are read into memory at open when they take at most
+//! [`RESIDENT`] bytes (4.3 MB for DBpedia), so a lookup reads only the page of its value.
+//! The values stay memory-mapped.
+//!
 //! Layout, little-endian:
 //!
 //! ```text
