@@ -1,4 +1,4 @@
-import { expect, test } from './fixtures';
+import { expect, open, test } from './fixtures';
 import { DATASET, EX } from './data';
 
 test('the query page runs a query and shows the results', async ({ page }) => {
@@ -83,4 +83,40 @@ test('the dataset page shows the commit history', async ({ page }) => {
   await expect(commits.first()).toBeVisible();
   expect(await commits.count()).toBeGreaterThanOrEqual(2);
   await expect(history.locator('.ins').first()).toContainText('+');
+});
+
+open('a badge counts what waits in the memory review inbox', async ({ page, request }) => {
+  const ds = 'review-e2e';
+  const agents = 'https://example.org/e2e/memory/agents/';
+  let r = await request.post('/$/datasets', { data: { dbName: ds, dbType: 'mem' } });
+  expect(r.ok(), await r.text()).toBe(true);
+  // the facts below name known entities and a known predicate
+  r = await request.post(`/${ds}/update`, {
+    headers: { 'Content-Type': 'application/sparql-update' },
+    data: `INSERT DATA { GRAPH <${EX}people> { <${EX}ada> <${EX}knows> <${EX}charles> . <${EX}grace> a <${EX}Person> } }`,
+  });
+  expect(r.ok(), await r.text()).toBe(true);
+  r = await request.put(`/$/memory/${ds}`, {
+    data: { agentGraphs: [`${agents}*`], consolidatedGraph: 'https://example.org/e2e/memory/ok' },
+  });
+  expect(r.ok(), await r.text()).toBe(true);
+  r = await request.post(`/${ds}/facts`, {
+    data: {
+      graph: `<${agents}agent-7/sessions/s1>`,
+      facts: [{ s: `<${EX}ada>`, p: `<${EX}knows>`, o: `<${EX}grace>` }],
+    },
+  });
+  expect(r.ok(), await r.text()).toBe(true);
+  await page.goto(`/ui/datasets/${ds}`);
+  const link = page.locator('a.review-link');
+  await expect(link.getByRole('img', { name: /^1 item waits for review/ })).toHaveText(
+    '1 to review',
+    { timeout: 15_000 },
+  );
+  await link.click();
+  await expect(page).toHaveURL(/\/ui\/memory\?ds=review-e2e&tab=inbox/);
+  // the sidebar's Memory entry counts the dataset the page shows
+  await expect(
+    page.getByRole('link', { name: /^Memory/ }).getByRole('img', { name: /waits for review/ }),
+  ).toHaveText('1');
 });

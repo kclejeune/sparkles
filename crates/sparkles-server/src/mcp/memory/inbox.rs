@@ -981,7 +981,7 @@ impl Tools<'_> {
         Ok((added, retracts, rejected))
     }
 
-    fn branch_counts(
+    pub(super) fn branch_counts(
         &self,
         ds: &Arc<Dataset>,
         b: &str,

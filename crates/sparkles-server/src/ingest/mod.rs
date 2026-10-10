@@ -426,6 +426,8 @@ impl Task {
 pub struct Runtime {
     pub pdf: Arc<PdfRuntime>,
     tasks: Mutex<BTreeMap<String, Arc<Task>>>,
+    /// the open items of each dataset's review inbox
+    pub review: crate::mcp::memory::pending::Registry,
 }
 
 impl Runtime {
@@ -433,6 +435,7 @@ impl Runtime {
         Runtime {
             pdf: Arc::new(PdfRuntime::new(args.pdf_workers, args.ocr.config())),
             tasks: Mutex::default(),
+            review: Default::default(),
         }
     }
 

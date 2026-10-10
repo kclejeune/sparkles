@@ -2720,6 +2720,53 @@ confirmation that lists the session graphs it would delete.
 `recall` takes `recency`, a half-life such as `"90d"`, that ranks recent facts and facts
 that several graphs assert first. Old facts are never deleted for their age alone.
 
+#### Noticing a forgotten review
+
+While a consolidation branch waits for review, scheduled consolidation only reports
+`pending-review`, and retention with `requireConsolidated` keeps every session graph
+whose facts no reviewed graph asserts. A review that nobody does therefore stalls both
+without an error. The server counts what waits in each dataset's inbox and reports it in
+four places.
+
+- The metrics `sparkles_memory_review_pending{dataset,kind}` and
+  `sparkles_memory_review_oldest_seconds{dataset,kind}` give the open items of each kind
+  and the age of the oldest. The kinds are `session` and `import` for unreviewed facts,
+  and the kinds of review branches (`consolidation`, `ingest`, `review`, `inbox` and
+  `proposal`), where a branch counts once.
+- `sparkles memory maintenance` prints the open items, how long the oldest has waited,
+  and the count of each kind. `GET /$/memory/{ds}/maintenance` has them in its `review`
+  member.
+- In the web UI, the **Memory** entry of the sidebar and the dataset page show a count
+  badge while something waits. The dataset page's badge opens the inbox.
+- The brief that `sparkles memory brief` prints at a session start has a `# review:` line
+  for each open review branch and each kind of unreviewed fact, such as
+  `# review: 3 consolidated facts on branch consolidation.2026-10-10-1 await review since
+  2026-10-10T03:00:00.000Z`. MCP clients can read and subscribe to
+  `sparkles://{ds}/memory/review`.
+
+Only datasets with memory settings report, and only to callers with `write` on the
+dataset. The server counts again every minute and right after the actions that change
+the inbox, such as an assertion, a promotion, a rejection or a merge. It reads at most
+5,000 unreviewed facts per dataset. A fact's age is the time its reifier records, and a
+fact without one, such as an imported memory, is as old as the time the server first
+counted its graph.
+
+A Prometheus rule that warns when a review has waited for more than two days:
+
+```yaml
+groups:
+  - name: sparkles-memory
+    rules:
+      - alert: SparklesMemoryReviewWaiting
+        expr: max by (dataset, kind) (sparkles_memory_review_oldest_seconds) > 2 * 86400
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.kind }} items in {{ $labels.dataset }} have waited for review for over 2 days"
+          description: "Run `sparkles memory inbox --dataset {{ $labels.dataset }}` or open the Memory page's Inbox."
+```
+
 ## Asking questions with a model
 
 `sparkles ask` answers a question about a database with a language model. It grounds

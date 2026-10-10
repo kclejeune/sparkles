@@ -993,6 +993,20 @@ pub(super) fn register_metrics(st: Arc<AppState>) {
             |j, f| per_dataset(j, f, |d| d["geo"]["rechecked"].as_f64()),
         ),
         (
+            "sparkles.memory.review.pending",
+            "{item}",
+            "Open items of the agent memory review inbox: unreviewed facts, or open review branches.",
+            Kind::Gauge,
+            |j, f| memory_review(j, f, "pending"),
+        ),
+        (
+            "sparkles.memory.review.oldest",
+            "s",
+            "Age of the oldest open item of the agent memory review inbox, 0 when none is open.",
+            Kind::Gauge,
+            |j, f| memory_review(j, f, "oldestSeconds"),
+        ),
+        (
             "sparkles.ready",
             "1",
             "Whether the server is ready to serve requests (1) or not (0).",
@@ -1059,6 +1073,19 @@ fn per_dataset(j: &J, f: &mut dyn FnMut(f64, Vec<KeyValue>), get: fn(&J) -> Opti
         if let Some(v) = get(d) {
             f(v, vec![KeyValue::new("dataset", str_of(&d["name"]))]);
         }
+    }
+}
+
+/// One value of each `memoryReview` series, by dataset and kind.
+fn memory_review(j: &J, f: &mut dyn FnMut(f64, Vec<KeyValue>), key: &str) {
+    for r in j["memoryReview"].as_array().into_iter().flatten() {
+        f(
+            r[key].as_f64().unwrap_or(0.0),
+            vec![
+                KeyValue::new("dataset", str_of(&r["dataset"])),
+                KeyValue::new("kind", str_of(&r["kind"])),
+            ],
+        );
     }
 }
 

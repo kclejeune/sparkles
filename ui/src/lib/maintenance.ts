@@ -23,11 +23,38 @@ export type MaintenanceEntry = {
   nextRun?: string;
 };
 
+/** The open items of a kind in the review inbox. */
+export type ReviewKindCount = { open: number; oldest?: string };
+
+/** The open items of the review inbox, as the server last counted them. */
+export type ReviewCounts = {
+  /** Unreviewed facts, and open review branches counted once each. */
+  open: number;
+  /** When the oldest open item arrived. */
+  oldest?: string;
+  /** By kind: `session`, `import`, `consolidation`, `ingest`, `review`, `inbox`, `proposal`. */
+  kinds: Record<string, ReviewKindCount>;
+  branches: { name: string; kind: string; created: string; facts?: number }[];
+  truncated: boolean;
+  updated: string;
+};
+
 export type MaintenanceStatus = {
   dataset: string;
   consolidation: MaintenanceEntry;
   retention: MaintenanceEntry;
+  /** For a caller who may review a dataset with memory settings. */
+  review?: ReviewCounts;
 };
+
+/** The accessible name of a review count badge. */
+export function reviewLabel(open: number, oldest?: string, now = Date.now()): string {
+  const items = `${fmtInt(open)} ${open === 1 ? 'item waits' : 'items wait'} for review`;
+  return oldest ? `${items}, the oldest ${fmtRelative(oldest, now)}` : items;
+}
+
+/** A count for a small badge: 99+ past 99. */
+export const badgeCount = (n: number) => (n > 99 ? '99+' : String(n));
 
 export const maintenanceStatus = (ds: string, signal?: AbortSignal) =>
   json<MaintenanceStatus>(`/$/memory/${enc(ds)}/maintenance`, { signal, cache: 'no-store' });

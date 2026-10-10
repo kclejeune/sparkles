@@ -720,6 +720,14 @@ fn memory_init_and_maintenance() {
         "{}",
         o.stdout
     );
+    // the consolidation branch waits for review
+    assert!(o.stdout.contains("\nreview: "), "{}", o.stdout);
+    assert!(
+        o.stdout.contains("\n  consolidation: 1 since "),
+        "{}",
+        o.stdout
+    );
     let j = mem("plain", &["maintenance", "--json"]).ok().json();
     assert_eq!(j["consolidation"]["nextRun"], "due", "{j:#}");
+    assert_eq!(j["review"]["kinds"]["consolidation"]["open"], 1, "{j:#}");
 }

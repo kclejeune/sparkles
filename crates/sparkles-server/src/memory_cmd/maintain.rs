@@ -225,5 +225,47 @@ pub fn maintenance(conn: &Conn) -> Result<(Value, String), CmdError> {
             t.push_str(&format!("\n  next run {next}"));
         }
     }
+    t.push_str(&review_text(&m["review"]));
     Ok((m, t))
+}
+
+/// The `review` member of the maintenance answer in lines: the open items, how long the
+/// oldest has waited, and each kind. Empty when the answer has none.
+pub(crate) fn review_text(r: &Value) -> String {
+    let Some(open) = r["open"].as_u64() else {
+        return String::new();
+    };
+    if open == 0 {
+        return "\nreview: nothing waits for review".into();
+    }
+    let mut t = format!("\nreview: {open} open");
+    if let Some(o) = r["oldest"].as_str() {
+        t.push_str(&format!(", the oldest since {o}"));
+        if let Ok(at) = chrono::DateTime::parse_from_rfc3339(o) {
+            let age = chrono::Utc::now() - at.with_timezone(&chrono::Utc);
+            t.push_str(&format!(" ({})", age_words(age.num_seconds())));
+        }
+    }
+    if r["truncated"] == true {
+        t.push_str(", counted up to the first 5000 facts");
+    }
+    for (kind, k) in r["kinds"].as_object().into_iter().flatten() {
+        t.push_str(&format!("\n  {kind}: {}", k["open"].as_u64().unwrap_or(0)));
+        if let Some(o) = k["oldest"].as_str() {
+            t.push_str(&format!(" since {o}"));
+        }
+    }
+    t
+}
+
+/// An age in seconds as days, hours or minutes.
+fn age_words(secs: i64) -> String {
+    let secs = secs.max(0);
+    if secs >= 86_400 {
+        format!("{} d", secs / 86_400)
+    } else if secs >= 3600 {
+        format!("{} h", secs / 3600)
+    } else {
+        format!("{} min", secs / 60)
+    }
 }

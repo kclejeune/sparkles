@@ -38,6 +38,8 @@
   import IngestPanel from '$components/IngestPanel.svelte';
   import SnapshotsPanel from '$components/SnapshotsPanel.svelte';
   import Icon from '$components/Icon.svelte';
+  import ReviewBadge from '$components/ReviewBadge.svelte';
+  import { reviewCounts } from '$lib/review-count.svelte';
   import ReasoningPanel from '$components/ReasoningPanel.svelte';
   import ShexPanel from '$components/ShexPanel.svelte';
   import SpatialIndexPanel from '$components/SpatialIndexPanel.svelte';
@@ -115,6 +117,13 @@
 
   // the page's tabs: the overview of the data, and the dataset's settings (`?tab=settings`)
   type Tab = 'overview' | 'settings';
+  // the open items of the memory review inbox, for a caller who may review them
+  const review = $derived(reviewCounts.of(name));
+  $effect(() => {
+    void refreshKick;
+    void reviewCounts.refresh(name);
+  });
+
   const TABS: { id: Tab; label: string; icon: string }[] = [
     { id: 'overview', label: 'Overview', icon: 'database' },
     { id: 'settings', label: 'Settings', icon: 'filter' },
@@ -592,6 +601,14 @@ ex:PersonShape a sh:NodeShape ;
       </div>
       <div class="row meta">
         {#if info}<span class="badge">{info.type === 'mem' ? 'in-memory' : 'persistent'}</span>{/if}
+        {#if review && review.open > 0}
+          <a
+            class="review-link"
+            href="{resolve('/memory')}?ds={encodeURIComponent(name)}&tab=inbox"
+            title="Open the memory review inbox"
+            ><ReviewBadge counts={review} text=" to review" /></a
+          >
+        {/if}
         {#if info?.reasoning}
           <span
             class="badge {info.reasoning.stale === false ? 'ok' : 'warn'}"
@@ -1558,6 +1575,9 @@ ex:PersonShape a sh:NodeShape ;
 />
 
 <style>
+  .review-link {
+    text-decoration: none;
+  }
   .page {
     padding: 18px 28px 40px;
     gap: 16px;

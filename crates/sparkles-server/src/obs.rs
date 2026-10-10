@@ -1715,6 +1715,8 @@ pub fn render_prometheus(st: &AppState) -> String {
     crate::notify::metrics(st, &mut o);
     #[cfg(feature = "mcp")]
     crate::mcp::branches::metrics(&mut o);
+    #[cfg(feature = "mcp")]
+    crate::mcp::memory::pending::metrics(st, &mut o);
     if let Some(rss) = resident_bytes() {
         family(
             &mut o,
@@ -1830,7 +1832,19 @@ pub fn metrics_json(st: &AppState) -> J {
         "active": active,
         "requests": requests,
         "datasets": datasets,
+        "memoryReview": memory_review(st),
     })
+}
+
+/// The open items of the agent memory review inboxes (`memoryReview`).
+fn memory_review(st: &AppState) -> J {
+    #[cfg(feature = "mcp")]
+    return crate::mcp::memory::pending::series_json(st);
+    #[cfg(not(feature = "mcp"))]
+    {
+        let _ = st;
+        J::Array(Vec::new())
+    }
 }
 
 /// `GET /$/metrics`: Prometheus text, or the JSON snapshot with `?format=json`.

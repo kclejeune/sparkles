@@ -21,6 +21,7 @@ pub(crate) mod inbox;
 pub(crate) mod ingest;
 mod link;
 mod maintain;
+pub(crate) mod pending;
 pub(crate) mod policy;
 mod recall;
 pub(crate) mod review;

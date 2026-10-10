@@ -767,17 +767,21 @@ pub fn tick(st: &Arc<AppState>) {
     }
 }
 
-/// Look for due maintenance once a minute (from `serve`).
+/// Look for due maintenance once a minute (from `serve`), and count what waits for
+/// review in each dataset's inbox. A read-only server counts and starts nothing.
 pub fn spawn_schedule(st: Arc<AppState>) {
-    if st.read_only {
-        return;
-    }
     tokio::spawn(async move {
         let mut t = tokio::time::interval(TICK);
         loop {
             t.tick().await;
             let st = st.clone();
-            let _ = tokio::task::spawn_blocking(move || tick(&st)).await;
+            let _ = tokio::task::spawn_blocking(move || {
+                if !st.read_only {
+                    tick(&st);
+                }
+                crate::mcp::memory::pending::refresh_all(&st);
+            })
+            .await;
         }
     });
 }
@@ -943,6 +947,7 @@ async fn post_retention(
 async fn get_maintenance(
     State(st): State<Arc<AppState>>,
     Path(ds): Path<String>,
+    Extension(p): Extension<Principal>,
 ) -> ApiResult<Json<Value>> {
     main_only()?;
     let d = crate::http::dataset(&st, &ds)?;
@@ -965,7 +970,13 @@ async fn get_maintenance(
     };
     let c = memory.consolidation.as_ref();
     let r = memory.retention.as_ref();
-    Ok(Json(json!({
+    // the open review items, for a caller who may review them
+    let review = {
+        let (st, d) = (st.clone(), d.clone());
+        crate::http::blocking(move || Ok(crate::mcp::memory::pending::review_json(&st, &d, &p)))
+            .await?
+    };
+    let mut out = json!({
         "dataset": d.name,
         "consolidation": entry(
             c.and_then(|c| c.every.as_deref()).and_then(crate::assist::duration_days),
@@ -977,5 +988,9 @@ async fn get_maintenance(
             sched.retention.as_ref(),
             serde_json::to_value(r).unwrap_or_default(),
         ),
-    })))
+    });
+    if let Some(v) = review {
+        out["review"] = v;
+    }
+    Ok(Json(out))
 }
