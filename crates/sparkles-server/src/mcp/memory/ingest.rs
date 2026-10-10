@@ -1748,4 +1748,39 @@ mod tests {
             "http://example.org/ontology#leads"
         ));
     }
+
+    /// The labelled sample of §11.2 stays consistent with the demo data: every quote
+    /// occurs in its document, every new entity is declared, and every existing entity
+    /// and predicate the gold facts name occurs in `testsuite/ask/org.ttl`.
+    #[test]
+    fn ingest_sample_matches_the_demo_data() {
+        let sample: Value =
+            serde_json::from_str(include_str!("../../../../../testsuite/ingest/sample.json"))
+                .unwrap();
+        let org = include_str!("../../../../../testsuite/ask/org.ttl");
+        let docs = sample["documents"].as_array().unwrap();
+        assert!(docs.len() >= 20, "{}", docs.len());
+        for d in docs {
+            let text = d["text"].as_str().unwrap();
+            let keys: Vec<&str> = d["entities"]
+                .as_array()
+                .map(|a| a.iter().map(|e| e["key"].as_str().unwrap()).collect())
+                .unwrap_or_default();
+            for f in d["facts"].as_array().unwrap() {
+                let quote = f["quote"].as_str().unwrap();
+                assert!(text.contains(quote), "{}: {quote}", d["id"]);
+                for t in ["s", "p", "o"].map(|k| f[k].as_str().unwrap()) {
+                    if t.starts_with("_:") {
+                        assert!(keys.contains(&t), "{}: {t} is not declared", d["id"]);
+                    } else if !t.starts_with('"') {
+                        assert!(
+                            org.contains(&format!("{t} ")) || org.contains(&format!("{t},")),
+                            "{}: {t} is not in org.ttl",
+                            d["id"]
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
