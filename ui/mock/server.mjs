@@ -24,6 +24,7 @@ import {
 import { handleDescribe } from './describe.mjs';
 import { handleAsk, isAdmin, ORG_MEMORY, ORG_PREFIXES, orgTrig, whoamiFor } from './memory.mjs';
 import { handleAssistant } from './assistant.mjs';
+import { handleExplain, timedOutPlan } from './explain.mjs';
 import { handleReview, INGEST_BRANCH } from './review.mjs';
 import { geoQuery, handleGeo } from './geo.mjs';
 import { handleVector, seedVectors, touchPacked, vectorIndexFor } from './vector.mjs';
@@ -1186,6 +1187,13 @@ async function handleQuery(req, res, ds, p) {
   const near = geoQuery(ds, query, Number(p.get('send') ?? Infinity), headCommit(ds).seq);
   if (near) return send(res, 200, near, 'application/x-sparkles+json', commitHeaders(ds));
   const accept = String(req.headers.accept ?? '');
+  // a query that a 2-second timeout stops, with its partial plan in the error body
+  if (/#\s*mock:timeout/.test(query) && accept.includes('application/x-sparkles+json'))
+    return fail(res, 408, 'the query did not finish within its 2 s timeout', {
+      timeoutSeconds: 2,
+      plan: timedOutPlan(plan(query, 1200, 2000, true)),
+      commit: headCommit(ds).seq,
+    });
   const t0 = performance.now();
   let result;
   try {
@@ -2037,6 +2045,7 @@ const server = http.createServer(async (req, res) => {
     if (await handleReview(req, res, seg, { datasets, send, fail, readBody, createBranch })) return;
     // questions, checks and agent memory (mock/memory.mjs)
     if (await handleAsk(req, res, url, seg, { datasets, send, fail, readBody })) return;
+    if (await handleExplain(req, res, url, seg, { datasets, send, fail, readBody })) return;
     // asking the server, the assistant settings and the history (mock/assistant.mjs)
     if (
       await handleAssistant(req, res, url, seg, {

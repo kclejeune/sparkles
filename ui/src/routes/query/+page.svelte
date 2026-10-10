@@ -23,7 +23,7 @@
   import GuardReportView from '$components/GuardReportView.svelte';
   import GraphView from '$components/GraphView.svelte';
   import Icon from '$components/Icon.svelte';
-  import PlanView from '$components/PlanView.svelte';
+  import ExplainedPlan from '$components/ExplainedPlan.svelte';
   import ResultMap from '$components/ResultMap.svelte';
   import Modal from '$components/Modal.svelte';
   import ResultTable from '$components/ResultTable.svelte';
@@ -106,6 +106,12 @@
     elapsed?: number;
     controller?: AbortController;
     diagnosis?: EmptyDiagnosis;
+    /** The text that ran, for the explanation of its plan (none for a stored query). */
+    query?: string;
+    /** The text of an **Explain** outcome. */
+    explainQuery?: string;
+    /** Whether **Explain why** is open on a failed query. */
+    whyOpen?: boolean;
   };
 
   const DEFAULT_QUERY = EXAMPLES[0].query;
@@ -1232,6 +1238,7 @@
           startedAt: started,
           elapsed,
           reasoning,
+          query: stored ? undefined : text,
         };
         autoPickColumns(result);
         // an empty result gets a diagnosis, after the result is on screen
@@ -1252,6 +1259,7 @@
         error: e as Error,
         view: 'table',
         startedAt: started,
+        query: stored ? undefined : text,
       };
       if (e instanceof api.ApiError && e.line && tabId === activeId)
         editor?.showError(e.line, e.column);
@@ -1311,7 +1319,13 @@
         reasoning: reasoningFor(dsName),
       });
       if (!owns()) return;
-      outcomes[tabId] = { ...base, status: 'done', explain: ex, view: 'explain' } as Outcome;
+      outcomes[tabId] = {
+        ...base,
+        status: 'done',
+        explain: ex,
+        view: 'explain',
+        explainQuery: text,
+      } as Outcome;
     } catch (e) {
       if (!owns()) return;
       outcomes[tabId] = {
@@ -2243,8 +2257,33 @@
               {#if err instanceof api.ApiError && err.requestId}
                 <div class="faint rid">Request <span class="mono">{err.requestId}</span></div>
               {/if}
+              {#if err instanceof api.ApiError && err.body?.plan && outcome.query}
+                <div>
+                  <button
+                    class="btn sm"
+                    aria-expanded={!!outcome.whyOpen}
+                    onclick={() => (outcome.whyOpen = !outcome.whyOpen)}
+                  >
+                    <Icon name="info" size={13} /> Explain why
+                  </button>
+                </div>
+              {/if}
             </div>
           </div>
+          {#if outcome.whyOpen && err instanceof api.ApiError && err.body?.plan}
+            {@const { plan: failedPlan, commit: failedCommit, ...failedBody } = err.body}
+            <div class="why-plan">
+              <ExplainedPlan
+                ds={onBranch(outcome.ds, outcome.branch)}
+                query={outcome.query}
+                plan={failedPlan as api.PlanNode}
+                commit={typeof failedCommit === 'number' ? failedCommit : undefined}
+                error={failedBody}
+                {prefixes}
+                open
+              />
+            </div>
+          {/if}
         {:else if outcome.updated}
           <div class="empty">
             <Icon name="check" size={22} />
@@ -2283,7 +2322,13 @@
                 <pre class="mono">{formatSse(outcome.explain.algebra)}</pre>
               </div>
               <div class="explain-plan">
-                <PlanView plan={outcome.explain.plan} executed={false} {prefixes} />
+                <ExplainedPlan
+                  ds={onBranch(outcome.ds, outcome.branch)}
+                  query={outcome.explainQuery}
+                  plan={outcome.explain.plan}
+                  executed={false}
+                  {prefixes}
+                />
               </div>
             </div>
           {:else}
@@ -2396,7 +2441,13 @@
             />
           {:else if outcome.view === 'plan'}
             {#if r.meta.plan}
-              <PlanView plan={r.meta.plan} {prefixes} />
+              <ExplainedPlan
+                ds={onBranch(outcome.ds, outcome.branch)}
+                query={outcome.query}
+                plan={r.meta.plan}
+                commit={r.meta.commit}
+                {prefixes}
+              />
             {:else}
               <div class="empty">The server did not return a plan for this query.</div>
             {/if}
@@ -3012,6 +3063,11 @@
   .pad {
     padding: 14px;
     flex: none !important;
+  }
+  .why-plan {
+    flex: 1;
+    min-height: 320px;
+    border-top: 1px solid var(--border);
   }
   .notice {
     display: flex;
