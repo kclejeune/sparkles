@@ -8796,8 +8796,8 @@ The answer is a stream of server-sent events. Each event's data is one JSON obje
 | `diagnosis` | The `why_empty` diagnosis that starts a repair, with its `verdict`. |
 | `result` | `{query, explanation, assumptions, terms, graph, commit, attempt, verdict, results}`. `results` has the `application/x-sparkles+json` form of `/{ds}/sparql`, with the rows, the plan and the timings. |
 | `summary` | `{text, citations, rowsSent, provider, model}`. Each `[n]` marker of `text` names a row of `results`, counted from 1. |
-| `error` | `{code, message}`, such as `no-model`, `provider-unavailable`, `budget-exceeded`, `timeout` or `unanswerable`. |
-| `usage` | The last event. It holds `askId`, the tokens, the estimated cost, the `complexity`, every model step with its pair, outcome and `signal`, the `escalations`, the `answeredBy` pair and `tryHarder`, which is `true` when the draft role has a later pair. |
+| `error` | `{code, message}`, such as `no-model`, `provider-unavailable`, `budget-exceeded` or `timeout`. A draft that says the data cannot answer ends with `unanswerable`, and a draft that still fails after its repairs ends with `no-valid-query` or the error of its last run. These two carry the last draft in `result`. |
+| `usage` | The last event. It holds the `outcome` of the ask, `askId`, the tokens, the estimated cost, the `complexity`, every model step with its pair, outcome and `signal`, the `escalations`, the `answeredBy` pair and `tryHarder`, which is `true` when the draft role has a later pair. |
 
 A client that sends `Accept: application/json` without `text/event-stream` gets one
 object instead. It holds `outcome`, `result`, `summary`, `clarify` or `error`, the

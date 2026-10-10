@@ -216,11 +216,38 @@ pub fn ask(
         answered_by: None,
     };
     let mut out = a.run();
+    // an event stream learns of the endings without their own event here
+    match out["outcome"].as_str() {
+        Some("unanswerable") => (a.on)(
+            "error",
+            &json!({
+                "code": "unanswerable",
+                "message": "The data does not seem to describe this.",
+                "result": out["result"],
+            }),
+        ),
+        Some("failed") => {
+            let mut e = out.get("error").cloned().unwrap_or_else(|| {
+                json!({
+                    "code": "no-valid-query",
+                    "message": "Sparkles could not write a valid query for this question.",
+                })
+            });
+            e["result"] = out["result"].clone();
+            (a.on)("error", &e);
+        }
+        Some("not-run") => (a.on)("result", &out["result"]),
+        _ => {}
+    }
     out["dataset"] = o.dataset.clone().into();
     out["question"] = o.question.clone().into();
     out["attempts"] = Value::Array(std::mem::take(&mut a.attempts));
     out["notes"] = json!(a.notes);
-    let usage = a.usage(started);
+    let mut usage = a.usage(started);
+    usage["outcome"] = out["outcome"].clone();
+    if !a.notes.is_empty() {
+        usage["notes"] = json!(a.notes);
+    }
     (a.on)("usage", &usage);
     out["usage"] = usage;
     out

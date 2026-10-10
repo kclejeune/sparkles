@@ -194,6 +194,23 @@ async fn a12_schema_only_streams_without_a_summary() {
     .await;
     assert_eq!(names(&ev), ["ground", "draft", "check", "result", "usage"]);
     assert!(find(&ev, "result")["results"].is_null());
+    assert_eq!(find(&ev, "usage")["outcome"], "checked");
+
+    // a draft without a query ends the stream with an `unanswerable` error
+    let m = scripted(vec![draft("")]);
+    let (_, other) = self::app(
+        [&m.url(), &m.url(), &m.url()],
+        json!({ "draft": [pair("cheap")] }),
+    );
+    put_settings(&other, json!({ "enabled": true })).await;
+    let ev = ask_sse(
+        &other,
+        json!({ "question": "What is the meaning of life?" }),
+    )
+    .await;
+    assert_eq!(names(&ev), ["ground", "draft", "error", "usage"], "{ev:?}");
+    assert_eq!(find(&ev, "error")["code"], "unanswerable");
+    assert_eq!(find(&ev, "usage")["outcome"], "unanswerable");
 }
 
 /// A42 and the summary's citations (A24): a provider that may not receive rows is
