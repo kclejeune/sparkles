@@ -110,7 +110,7 @@ fn a_join_whose_left_side_is_empty_skips_its_right_side() {
     .unwrap();
     let skipped: Vec<_> = nodes(&r.plan)
         .into_iter()
-        .filter(|n| n.skipped.is_some())
+        .filter(|n| n.fidelity().skipped.is_some())
         .collect();
     // an empty pattern may make the planner drop the join; when a join remains, its
     // right side says why it did not run
@@ -140,10 +140,10 @@ fn reruns_under_limit_add_up_and_say_they_stopped_early() {
         .iter()
         .find(|n| n.operator == "Filter")
         .expect("a filter node");
-    assert!(filter.stopped_early, "{:#?}", r.plan);
+    assert!(filter.fidelity().stopped_early, "{:#?}", r.plan);
     let child = &filter.children[0];
     assert!(
-        child.reruns > 0,
+        child.fidelity().reruns > 0,
         "the scan ran more than once: {:#?}",
         r.plan
     );
@@ -173,7 +173,7 @@ fn a_cache_hit_keeps_the_subtree_it_was_computed_from() {
         .find(|n| n.cached)
         .expect("a cache hit");
     assert!(!hit.children.is_empty(), "{:#?}", second.plan);
-    assert!(hit.children.iter().all(|c| c.skipped.is_some()));
+    assert!(hit.children.iter().all(|c| c.fidelity().skipped.is_some()));
     // the same shape as the run that filled the cache
     assert_eq!(shape(&first.plan), shape(&second.plan));
 }
@@ -213,7 +213,7 @@ fn pushed_range_filters_are_listed_on_their_scan() {
     .unwrap();
     let pushed: Vec<String> = nodes(&plan)
         .into_iter()
-        .flat_map(|n| n.pushed_filters.clone())
+        .flat_map(|n| n.fidelity().pushed_filters.clone())
         .collect();
     let j = serde_json::to_value(&plan).unwrap().to_string();
     if j.contains("IndexRangeScan") {
@@ -238,14 +238,14 @@ fn a_failed_query_keeps_its_plan_as_far_as_it_ran() {
     };
     assert!(matches!(f.error, Error::BudgetExceeded(_)), "{}", f.error);
     let plan = f.plan.expect("a partial plan");
-    assert!(plan.incomplete);
+    assert!(plan.fidelity().incomplete);
     let j = serde_json::to_value(&plan).unwrap();
     assert_eq!(j["complete"], false, "{j}");
     // some operator finished before the budget ran out, with its counts
     assert!(
         nodes(&plan)
             .iter()
-            .any(|n| !n.incomplete && n.actual_rows > 0),
+            .any(|n| !n.fidelity().incomplete && n.actual_rows > 0),
         "{plan:#?}"
     );
     // a deadline that passed before anything ran still has the plan
@@ -260,7 +260,7 @@ fn a_failed_query_keeps_its_plan_as_far_as_it_ran() {
         && let Some(plan) = f.plan
     {
         assert!(matches!(f.error, Error::Timeout), "{}", f.error);
-        assert!(plan.incomplete);
+        assert!(plan.fidelity().incomplete);
     }
 }
 

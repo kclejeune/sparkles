@@ -99,6 +99,15 @@ pub struct PlanInfo {
     pub counters: Option<serde_json::Map<String, serde_json::Value>>,
     /// notes about the plan (root only)
     pub warnings: Vec<super::ctx::PlanWarning>,
+    /// What the node says beyond its counts (see [`PlanInfo::fidelity`]). Few nodes
+    /// have any, so it is boxed to keep the plan of a node that simply ran small: every
+    /// operator builds one and returns it up the tree.
+    pub fidelity: Option<Box<PlanFidelity>>,
+}
+
+/// What a plan node says beyond its counts (spec C18 §6.6.5).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PlanFidelity {
     /// Why the operator never ran, when it did not. Its counts are then `-1` rows and
     /// 0 ms, and the reason holds for its whole subtree.
     pub skipped: Option<String>,
@@ -118,6 +127,15 @@ pub struct PlanInfo {
     /// The estimate is a fixed guess rather than a statistic (`SERVICE`).
     pub estimate_guessed: bool,
 }
+
+static NO_FIDELITY: PlanFidelity = PlanFidelity {
+    skipped: None,
+    stopped_early: false,
+    incomplete: false,
+    reruns: 0,
+    pushed_filters: Vec::new(),
+    estimate_guessed: false,
+};
 
 impl Serialize for PlanInfo {
     fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
@@ -188,22 +206,23 @@ impl PlanInfo {
         if !self.warnings.is_empty() {
             m.serialize_entry("warnings", &self.warnings)?;
         }
-        if let Some(r) = &self.skipped {
+        let f = self.fidelity();
+        if let Some(r) = &f.skipped {
             m.serialize_entry("skipped", r)?;
         }
-        if self.stopped_early {
+        if f.stopped_early {
             m.serialize_entry("stoppedEarly", &true)?;
         }
-        if self.incomplete {
+        if f.incomplete {
             m.serialize_entry("complete", &false)?;
         }
-        if self.reruns > 0 {
-            m.serialize_entry("runs", &(u64::from(self.reruns) + 1))?;
+        if f.reruns > 0 {
+            m.serialize_entry("runs", &(u64::from(f.reruns) + 1))?;
         }
-        if !self.pushed_filters.is_empty() {
-            m.serialize_entry("pushedFilters", &self.pushed_filters)?;
+        if !f.pushed_filters.is_empty() {
+            m.serialize_entry("pushedFilters", &f.pushed_filters)?;
         }
-        if self.estimate_guessed {
+        if f.estimate_guessed {
             m.serialize_entry("estimateGuessed", &true)?;
         }
         Ok(())
@@ -229,10 +248,21 @@ impl PlanInfo {
         }
     }
 
+    /// What this node says beyond its counts: whether it was skipped, stopped early,
+    /// rerun or left incomplete, and the filters it applied itself.
+    pub fn fidelity(&self) -> &PlanFidelity {
+        self.fidelity.as_deref().unwrap_or(&NO_FIDELITY)
+    }
+
+    /// [`PlanInfo::fidelity`], to change.
+    pub fn fidelity_mut(&mut self) -> &mut PlanFidelity {
+        self.fidelity.get_or_insert_default()
+    }
+
     /// This node and its subtree marked as never run, for `why`.
     pub(super) fn skip(mut self, why: &str) -> PlanInfo {
         fn mark(i: &mut PlanInfo, why: &str) {
-            i.skipped = Some(why.to_string());
+            i.fidelity_mut().skipped = Some(why.to_string());
             i.actual_rows = -1;
             i.time_ms = 0.0;
             for c in &mut i.children {
@@ -260,7 +290,9 @@ impl PlanInfo {
     /// the last run's, and children of the same shape merge pairwise.
     pub(super) fn merge_run(self, mut next: PlanInfo) -> PlanInfo {
         next.time_ms += self.time_ms;
-        next.reruns = next.reruns.saturating_add(self.reruns).saturating_add(1);
+        let reruns = self.fidelity().reruns;
+        let f = next.fidelity_mut();
+        f.reruns = f.reruns.saturating_add(reruns).saturating_add(1);
         if self.children.len() == next.children.len()
             && self
                 .children
@@ -273,28 +305,48 @@ impl PlanInfo {
                 .children
                 .into_iter()
                 .zip(children)
-                .map(|(a, b)| match (&a.skipped, &b.skipped) {
-                    // only the earlier run ran it
-                    (None, Some(_)) => a,
-                    (Some(_), _) => b,
-                    (None, None) => a.merge_run(b),
-                })
+                .map(
+                    |(a, b)| match (&a.fidelity().skipped, &b.fidelity().skipped) {
+                        // only the earlier run ran it
+                        (None, Some(_)) => a,
+                        (Some(_), _) => b,
+                        (None, None) => a.merge_run(b),
+                    },
+                )
                 .collect();
         }
         next
     }
 }
 
-/// The filters that `n` tests itself, as text (see [`PlanInfo::pushed_filters`]).
-fn pushed_filters(ctx: &Ctx, n: &Node) -> Vec<String> {
+/// What the plan of `n` says beyond its counts before it runs: the filters it tests
+/// itself, as text, and whether its estimate is a guess. Most nodes have neither.
+#[inline]
+fn node_fidelity(ctx: &Ctx, n: &Node) -> Option<Box<PlanFidelity>> {
+    #[cold]
+    #[inline(never)]
+    fn of(ctx: &Ctx, n: &Node) -> Option<Box<PlanFidelity>> {
+        let pushed_filters: Vec<String> = match &n.kind {
+            Kind::RangeScan(_, range) => range.filter.iter().map(|e| e.display(ctx)).collect(),
+            Kind::IndexJoin(spec) => spec
+                .probes
+                .iter()
+                .flat_map(|p| p.filter.iter().map(|e| e.display(ctx)))
+                .collect(),
+            _ => Vec::new(),
+        };
+        let estimate_guessed = matches!(n.kind, Kind::Service { .. });
+        (estimate_guessed || !pushed_filters.is_empty()).then(|| {
+            Box::new(PlanFidelity {
+                pushed_filters,
+                estimate_guessed,
+                ..Default::default()
+            })
+        })
+    }
     match &n.kind {
-        Kind::RangeScan(_, range) => range.filter.iter().map(|e| e.display(ctx)).collect(),
-        Kind::IndexJoin(spec) => spec
-            .probes
-            .iter()
-            .flat_map(|p| p.filter.iter().map(|e| e.display(ctx)))
-            .collect(),
-        _ => Vec::new(),
+        Kind::RangeScan(..) | Kind::IndexJoin(_) | Kind::Service { .. } => of(ctx, n),
+        _ => None,
     }
 }
 
@@ -316,8 +368,7 @@ pub fn describe(ctx: &Ctx, n: &Node) -> PlanInfo {
         estimated_cost: n.cost.round(),
         actual_rows: -1,
         children: described_children(ctx, n),
-        pushed_filters: pushed_filters(ctx, n),
-        estimate_guessed: matches!(n.kind, Kind::Service { .. }),
+        fidelity: node_fidelity(ctx, n),
         ..Default::default()
     }
 }
@@ -422,8 +473,46 @@ pub(super) fn execute_with_inputs(
 
 fn execute_node(ctx: &Ctx, n: &Node, inputs: Option<Inputs<'_>>) -> Result<(Table, PlanInfo)> {
     let start = Instant::now();
-    let mut infos = Vec::new();
-    run_node(ctx, n, inputs, start, &mut infos).inspect_err(|_| fail(ctx, n, start, infos))
+    let mut failing = Failing {
+        ctx,
+        n,
+        start,
+        infos: Vec::new(),
+        armed: true,
+    };
+    // The result goes straight to the caller, and the guard keeps the plan only when
+    // `run_node` returns an error, so the success path pays nothing for it.
+    run_node(
+        ctx,
+        n,
+        inputs,
+        start,
+        &mut failing.infos,
+        &mut failing.armed,
+    )
+}
+
+/// Keeps the plan of a node that failed, as far as it ran (see [`fail`]), when it is
+/// dropped while still armed: `run_node` disarms it just before it succeeds.
+struct Failing<'a> {
+    ctx: &'a Ctx,
+    n: &'a Node,
+    start: Instant,
+    infos: Vec<PlanInfo>,
+    armed: bool,
+}
+
+impl Drop for Failing<'_> {
+    fn drop(&mut self) {
+        if self.armed && !std::thread::panicking() {
+            fail(
+                self.ctx,
+                self.n,
+                self.start,
+                std::mem::take(&mut self.infos),
+            );
+        }
+    }
 }
 
 /// Keep the plan of `n`, which failed after `start` with its first children's plans in
@@ -440,7 +529,7 @@ fn fail(ctx: &Ctx, n: &Node, start: Instant, infos: Vec<PlanInfo>) {
 fn fail_at(ctx: &Ctx, n: &Node, start: Instant, mut known: Vec<(usize, PlanInfo)>) {
     let mut info = describe(ctx, n);
     info.time_ms = start.elapsed().as_secs_f64() * 1000.0;
-    info.incomplete = true;
+    info.fidelity_mut().incomplete = true;
     for (i, c) in n.children.iter().enumerate() {
         if !known.iter().any(|(k, _)| *k == i)
             && let Some(p) = ctx.take_failed(c)
@@ -463,12 +552,15 @@ fn fail_at(ctx: &Ctx, n: &Node, start: Instant, mut known: Vec<(usize, PlanInfo)
     ctx.set_failed(n, info);
 }
 
+// One caller: inlined so that the success path returns its table and plan directly.
+#[inline(always)]
 fn run_node(
     ctx: &Ctx,
     n: &Node,
     mut inputs: Option<Inputs<'_>>,
     start: Instant,
     infos: &mut Vec<PlanInfo>,
+    failing: &mut bool,
 ) -> Result<(Table, PlanInfo)> {
     // the children's tables count against the memory budget until this operator is done
     let held = ctx.charge(0)?;
@@ -951,8 +1043,7 @@ fn run_node(
     ctx.check_output(table.len(), table.width())?;
     ctx.produced(table.len())?;
     let info = PlanInfo {
-        pushed_filters: pushed_filters(ctx, n),
-        estimate_guessed: matches!(n.kind, Kind::Service { .. }),
+        fidelity: node_fidelity(ctx, n),
         operator: n.operator().to_string(),
         description: match note {
             Some(x) => format!("{} {x}", n.desc),
@@ -967,8 +1058,9 @@ fn run_node(
         cached: false,
         children: std::mem::take(infos),
         counters,
-        ..Default::default()
+        warnings: Vec::new(),
     };
+    *failing = false;
     Ok((table, info))
 }
 
@@ -1800,7 +1892,7 @@ fn run_limited(
         info.time_ms = start.elapsed().as_secs_f64() * 1000.0;
         if !complete {
             info.description = format!("{} [stopped early]", info.description);
-            info.stopped_early = true;
+            info.fidelity_mut().stopped_early = true;
         }
         Ok((t, info, complete))
     };

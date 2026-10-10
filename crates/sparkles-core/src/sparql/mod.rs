@@ -55,7 +55,7 @@ pub use cursor::{
     GraphBatch, GraphCursor, MaterializedResult, QueryBatch, QueryCursor, QueryExecution,
     ask_streaming, graph_cursor, query_cursor, query_execution, select_cursor,
 };
-pub use exec::PlanInfo;
+pub use exec::{PlanFidelity, PlanInfo};
 
 /// `s` in Unicode Normalization Form C, as `fn:normalize-unicode` gives it.
 pub fn nfc(s: &str) -> String {
@@ -752,7 +752,7 @@ fn execute_prepared(
         if let Some(p) = &mut plan {
             if matches!(kind, QueryKind::Construct | QueryKind::Describe) {
                 let mut root = graph_root(kind, std::mem::take(p), stage.unwrap_or(t2));
-                root.incomplete = true;
+                root.fidelity_mut().incomplete = true;
                 *p = root;
             }
             p.warnings = ctx.warnings();
@@ -867,7 +867,12 @@ fn graph_root(kind: QueryKind, mut where_plan: PlanInfo, stage: Instant) -> Plan
         actual_rows: -1,
         time_ms: where_plan.time_ms + stage_ms,
         warnings,
-        incomplete: where_plan.incomplete,
+        fidelity: where_plan.fidelity().incomplete.then(|| {
+            Box::new(PlanFidelity {
+                incomplete: true,
+                ..Default::default()
+            })
+        }),
         children: vec![where_plan],
         ..Default::default()
     }

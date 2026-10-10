@@ -1049,8 +1049,11 @@ impl QueryCursor {
         if status == CursorStatus::Complete {
             // the query finished: an operator that did not finish had enough rows
             fn stopped(p: &mut CursorPlan) {
-                if !p.complete && p.operator.actual_rows >= 0 && p.operator.skipped.is_none() {
-                    p.operator.stopped_early = true;
+                if !p.complete
+                    && p.operator.actual_rows >= 0
+                    && p.operator.fidelity().skipped.is_none()
+                {
+                    p.operator.fidelity_mut().stopped_early = true;
                 }
                 p.children.iter_mut().for_each(stopped);
             }
@@ -1765,9 +1768,7 @@ impl Operator {
                 plan.operator.description.clone_from(&info.description);
             }
             plan.operator.counters.clone_from(&info.counters);
-            plan.operator.skipped.clone_from(&info.skipped);
-            plan.operator.stopped_early = info.stopped_early;
-            plan.operator.reruns = info.reruns;
+            plan.operator.fidelity.clone_from(&info.fidelity);
             plan.operator.cached = info.cached;
             for (info, plan) in info.children.iter().zip(&mut plan.children) {
                 update(info, plan);
