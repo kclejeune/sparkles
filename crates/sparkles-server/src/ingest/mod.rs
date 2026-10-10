@@ -366,11 +366,15 @@ impl Task {
         }
     }
 
-    /// Wait until the task has ended or waits for its caller, at most `wait`.
+    /// Wait until the task has ended or waits for its caller, at most `wait`. A task
+    /// that was cancelled while it waited for confirmation is about to end, so this
+    /// waits for that.
     pub fn wait_settled(&self, wait: Duration) {
         let until = Instant::now() + wait;
         let mut s = self.state.lock();
-        while s.status.active() && s.status != Status::AwaitingConfirmation {
+        while s.status.active()
+            && (s.status != Status::AwaitingConfirmation || self.cancel.load(Ordering::Relaxed))
+        {
             if self.cv.wait_until(&mut s, until).timed_out() {
                 return;
             }
