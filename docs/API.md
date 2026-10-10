@@ -8699,13 +8699,42 @@ prefix of every import graph in `imports`:
 `base` is an IRI that ends in `/` or `#`, and `agentGraphs` must cover it, so imported
 facts are unreviewed until a person promotes them. `secretPatterns` adds redaction
 patterns to the built-in ones, and each regex must compile. `transcripts` (off by
-default) and `extract` (`agent`, `server` or `none`) are kept for the transcript import
-and the prose extraction of Phase 3m-b. A file's graph is
+default) lets the people who opt in import their session transcripts. `extract` is
+`agent` (the default), `server` or `none`, and says who extracts facts from the prose
+of imported files. A file's graph is
 `<base><principal>/<harness>/<project>/memory/<name>`, `…/index` for Claude Code's
-`MEMORY.md`, or `…/instructions/<path>`. The project is the git remote as
-`github.com.acme.shop`, or `user` for user-scope files. The graph IRI is also the
-source's IRI, and the source is described in its graph with `spk:contentDigest`,
-`mem:filePath`, `mem:harness`, `dcterms:modified` and `mem:redactions`.
+`MEMORY.md`, `…/instructions/<path>`, or `…/sessions/<id>` for a transcript. The
+project is the git remote as `github.com.acme.shop`, or `user` for user-scope files.
+The graph IRI is also the source's IRI. The import registers each file's text with
+`register_source`, so the graph holds the source, its rendition and chunks, and the
+structural facts cite the span of the line they came from. The source also carries
+`mem:filePath`, `mem:harness`, `dcterms:modified`, `mem:redactions` and, for a file
+exported from another source, `mem:copyOf` that source.
+
+**`POST /{ds}/sources`** runs `register_source` as the caller and **`GET /{ds}/sources`**
+runs `list_sources`. The POST body is the tool's arguments without `dataset`. It needs
+`write` on the source's graph and counts as an update. The GET takes `graph` (repeat
+for several), `graphPrefix`, `needsExtraction`, `limit` (at most 500) and `atCommit` as
+query parameters, needs `read` and counts as a query. Three arguments of
+`register_source` serve the import.
+
+| Argument | Meaning |
+|---|---|
+| `original` | The file's bytes in base64 when the text is their normalized form, such as a file with `\r\n` line ends. They are kept as `spk:originalContent`, their SHA-256 becomes the digest, and the result says `originalKept`. Bytes whose normalized form is not the text are a `400`. |
+| `reanchor` | For a changed text, the same commit gives each fact that cites the previous rendition a second reifier at the one place its quote occurs in the new text, and retracts with supersession the facts whose quote no longer occurs exactly once. The result counts `reanchored` and `retracted`. |
+| `reanchorFrom` | An earlier source, such as a renamed file's. Each fact that cites it and whose quote occurs in the new text is copied into the new graph with a reifier derived from the old one, and the result counts `copied`. It needs `write` on both graphs. |
+
+In a graph under `imports.base`, a text that matches a built-in secret pattern or one of
+`secretPatterns` is refused with a `422` and code `secret-detected`. The error names the
+pattern and the offset of the match, never the matched text, so a client that skipped
+redaction cannot store a secret the server recognizes. Pattern matching cannot find
+every secret.
+
+`list_sources` reports `needsExtraction` for each source. A rendition needs extraction
+until a fact cites a span of it through an activity that is neither a re-anchoring nor
+the import's own, whose agent is named `sparkles-import/<harness>`. With
+`needsExtraction=true` only those sources are listed, which is how the extraction skill
+of `sparkles memory setup` finds its work.
 
 **`POST /{ds}/facts`** runs `assert_facts` as the caller, with the same checks and
 results as the MCP tool. The body is the tool's arguments without `dataset`, and may

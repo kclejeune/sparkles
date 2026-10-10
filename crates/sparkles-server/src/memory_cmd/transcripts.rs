@@ -20,7 +20,7 @@ use super::conn::{CmdError, Conn, val};
 use super::sync::{self, Cache, CacheEntry, FileReport, RegisterText, SyncOpts, count, normalize};
 use serde_json::Value;
 use sparkles_memory_import::redact::{self, Pattern};
-use sparkles_memory_import::vocab::{self, MEM, XSD_DATETIME, XSD_INTEGER, mem};
+use sparkles_memory_import::vocab::{self, XSD_DATETIME, XSD_INTEGER, mem};
 use sparkles_memory_import::{Ctx, Fact, FileImport, FileKind, Harness, Obj, Project, Roots};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -872,7 +872,6 @@ fn session_facts(
             f.push(fact(g, vocab::PROV_GENERATED_BY, Obj::Iri(sess.clone())));
         }
     }
-    let _ = MEM;
     f
 }
 

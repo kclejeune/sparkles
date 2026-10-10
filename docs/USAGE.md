@@ -2384,18 +2384,33 @@ sparkles memory sources --needs-extraction
 sparkles memory brief --include-unreviewed
 sparkles memory recall --seed urn:uuid:…
 sparkles memory query --sparql q.rq --results csv
+sparkles memory inbox --kind import       # unreviewed facts with an id each
+sparkles memory review                    # promote, reject or skip one at a time
+sparkles memory export --sources --to codex --out ~/backup/shop
 sparkles memory forget --harness codex --yes
 ```
 
 The graph of a file is `<base><principal>/<harness>/<project>/memory/<name>`,
 `…/index` for `MEMORY.md`, or `…/instructions/<path>`, where the project is the git
-remote, such as `github.com.acme.shop`. Running `import` or `sync` again writes only
-what changed. An edit replaces single values such as the description, adds and
-retracts links, a moved file changes only its path, and a deleted file's facts are
-retracted while its source keeps the time it went. A file renamed with its bytes
-unchanged gets a new graph that `dcterms:replaces` the old one. Secrets that the
-built-in patterns, the dataset's `secretPatterns` or `--redact-patterns FILE` recognize
-are replaced by `[redacted:NAME]` before anything is parsed.
+remote, such as `github.com.acme.shop`. The import registers each file's text as the
+source of its graph, and every fact it writes cites the line it came from. Running
+`import` or `sync` again writes only what changed. An edit registers the new text and
+replaces single values such as the description, adds and retracts links, and moves
+the facts that cite the old text to the place their quote now occurs. A fact whose
+quote is gone is retracted. A moved file changes only its path, and a deleted file's
+facts are retracted while its source keeps its text and the time it went. A file
+renamed with its body unchanged gets a new graph that `dcterms:replaces` the old one,
+and the facts an agent extracted from it move along. Secrets that the built-in
+patterns, the dataset's `secretPatterns` or `--redact-patterns FILE` recognize are
+replaced by `[redacted:NAME]` before anything leaves the machine, and the server
+refuses a text under the import base in which it still finds one (`secret-detected`).
+Redaction is pattern matching and cannot find every secret.
+
+The prose of a memory becomes facts when an agent extracts them. `sparkles memory
+sources --needs-extraction` lists the files whose current text no extraction has cited
+yet, and the extraction skill that `setup` installs works through that list with the
+MCP tools. Facts an agent extracts are usable at once and unreviewed, like the import's
+own.
 
 `sparkles memory setup claude-code` prints the hooks, the extraction skill and, for
 Codex, the MCP entry of [C18 §10.4](specs/C18-natural-language-questions-and-ingest.md#104-harness-integration),
@@ -2407,6 +2422,68 @@ server cannot be reached. A harness without hooks can read a file that
 `sparkles memory brief --write AGENTS.sparkles.md` writes from a scheduler. The file
 starts with a generated marker, so no import reads it back, and `--write` refuses to
 overwrite a file without the marker.
+
+### Session transcripts
+
+Transcripts hold the most and the riskiest content, so they are imported only when
+both sides opt in. A dataset admin sets `imports.transcripts: true` in the memory
+settings, and the person names the project in `memory.toml` or passes `--transcripts`
+on one run:
+
+```toml
+transcripts = ["github.com/acme/shop"]
+```
+
+Each session becomes the source of the graph `…/sessions/<id>`, rendered as Markdown
+with one `## user` or `## assistant` heading per turn, so recall and full-text search
+can cite a turn. The graph describes the session with its id, branch, model, harness
+version and times, and links each memory file the session wrote to it with
+`prov:wasGeneratedBy`. By default only the text of the user's and the assistant's
+messages is kept. `--transcript-content tools` adds tool calls and the first 2,000
+characters of each tool result, and `--subagents` adds subagent transcripts. Thinking,
+reasoning and attachments are never kept, and every transcript passes the redaction
+step. A session longer than 2 MiB is split at turn boundaries into at most 8 parts.
+A sync imports at most 32 MiB of transcript text (`--max-transcript-bytes`), skips
+sessions older than `--since` (30 days by default), and skips a session whose last line
+is less than 10 minutes old unless the session's end hook named it. `status` warns about
+Claude Code transcripts that its `cleanupPeriodDays` will delete soon. `setup
+--transcripts` adds `--transcripts` to the session end hook.
+
+### Reviewing imported memory in the terminal
+
+`sparkles memory inbox` lists the review inbox with the signals of each fact and a short
+id per item, filtered by `--agent`, `--kind`, `--harness` and `--project`. `promote ID…`
+writes the chosen facts into the consolidated graph or `--into GRAPH` on a new review
+branch, prints the merge preview, and with `--merge` merges with the preview's heads as
+the expected ones. `--all-that-pass` picks every fact whose checks pass, and
+`--require-corroboration` also needs another source. `reject ID… --message TEXT`
+retracts facts in one commit whose message names the caller. `review` walks the inbox
+one fact at a time and asks to promote, reject, skip or open it in the web UI, then
+runs one promotion and one rejection for the choices. An agent that may not create
+`review.*` branches promotes onto its own `proposals.{agent}.review-{date}-{n}` branch
+instead, and the merge is left to a person.
+
+### Exporting memory
+
+`sparkles memory export --sources --to HARNESS --out DIR` writes the files the import
+stored, as a copy, for a backup or a move to another machine or harness. It writes
+only under `--out` and refuses to overwrite a file without `--force`. Transcripts are
+not exported.
+
+| Target | What is written |
+|---|---|
+| The harness the files came from | Each file at its stored path, byte for byte. A file whose secrets were redacted keeps the redaction markers and is listed as `redacted`. |
+| Claude Code memory to Codex | One `AGENTS.md` with the project's instruction text first and then a section per memory in index order, headed by the memory's name with its description and kind on the first line. |
+| Claude Code memory to `generic` | One Markdown file per memory with `name`, `description` and `type` in its frontmatter. |
+| Instruction files to another harness | The file under the other harness's name, such as `CLAUDE.md` to `AGENTS.md`. A rule's `paths` frontmatter is left out with a warning when the target does not read it. |
+
+A converted file starts with `<!-- sparkles:copy-of <iri> exported DATE -->` for each
+source it holds. When the copy is imported again, under another harness or on another
+machine, the import records `mem:copyOf` the original, from that comment or, for a
+byte-identical copy, from an equal digest. The brief and the inbox then count the copy
+and its original as one source when they weigh corroboration.
+
+### Local use and output
 
 `--loc DIR` opens a database that no server holds in the process instead, and acts as
 the operating-system user. Every command takes `--json` and prints one JSON document,
