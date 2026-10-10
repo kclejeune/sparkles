@@ -8,6 +8,97 @@ pub(super) fn put_all(put: &mut dyn FnMut(&str, J)) {
     tools(put);
     memory(put);
     asking(put);
+    ingestion(put);
+}
+
+/// `POST /$/ingest/{ds}` and its tasks (C18 Phase 4).
+fn ingestion(put: &mut dyn FnMut(&str, J)) {
+    let options = json!({
+        "format": with_desc(string(), "The media type of `text` or of the file, such as `text/html` or `application/pdf`."),
+        "name": with_desc(string(), "The file name, which may say the format."),
+        "url": with_desc(string(), "Where the document comes from; fetched through the outbound policy when there is no text or file, and the source's IRI by default."),
+        "title": string(),
+        "iri": with_desc(string(), "The source's IRI."),
+        "graph": with_desc(string(), "The named graph of the source and its facts."),
+        "profile": with_desc(string(), "The ingest profile (default `default`)."),
+        "mode": string_enum(&["branch", "preview", "auto"]),
+        "branch": with_desc(string(), "The review branch (default `ingest.<slug>-<n>`)."),
+        "allowPartial": with_desc(boolean(), "Register what can be read of a PDF that needs OCR, and record the other pages."),
+        "extract": with_desc(boolean(), "Extract facts with the `extract` role (default: when the dataset lets ingestion use a provider)."),
+        "confirm": with_desc(boolean(), "Confirm the estimate in advance."),
+        "base": with_desc(string(), "The namespace of a table's rows in its mapping draft."),
+        "message": with_desc(string(), "The commit message of the registration."),
+        "deadlineSeconds": with_desc(num(), "The task's deadline, 1 to 86400 seconds (3600 by default)."),
+    });
+    let mut json_body = options.clone();
+    json_body["text"] = with_desc(string(), "The document's text.");
+    put(
+        "IngestRequest",
+        doc(
+            closed(&[], json_body),
+            "An ingestion from text or a URL. A multipart request sends the document as its `file` part and these options as fields.",
+            "ingestion",
+        ),
+    );
+    let mut form = options;
+    form["file"] = json!({ "type": "string", "contentMediaType": "application/octet-stream" });
+    put(
+        "IngestForm",
+        doc(
+            closed(&["file"], form),
+            "An ingestion of an uploaded file, with the options of `IngestRequest` as fields.",
+            "ingestion",
+        ),
+    );
+    put(
+        "IngestTask",
+        doc(
+            obj(
+                &[
+                    "id",
+                    "dataset",
+                    "status",
+                    "progress",
+                    "createdAt",
+                    "updatedAt",
+                    "input",
+                    "usage",
+                ],
+                json!({
+                    "id": string(),
+                    "dataset": string(),
+                    "status": string_enum(&["queued", "converting", "registering", "awaiting-confirmation", "extracting", "linking", "writing", "awaiting-approval", "done", "failed", "cancelled"]),
+                    "progress": with_desc(num(), "From 0 to 1."),
+                    "message": string(),
+                    "createdAt": string(),
+                    "updatedAt": string(),
+                    "finishedAt": string(),
+                    "input": any_object("What was ingested: its name, format, size, URL and mode."),
+                    "estimate": any_object("The estimate of the extraction: chunks, tokens, the first pair, its estimated cost, the threshold and whether it needs a confirmation."),
+                    "usage": any_object("Model calls, tokens, estimated cost, escalations and the pair that answered each chunk."),
+                    "result": any_object("The outcome (`registered`, `proposed`, `no-facts`, `preview`, `merged`, `approved`, `already-registered` or `mapping-draft`), with the source, rendition, branch, pages, proposals, or a table's mapping draft and preview."),
+                    "error": any_object("The code and message of a failed task, such as `needs-ocr` with the pages that need OCR and their reasons."),
+                }),
+            ),
+            "An ingestion task with its progress, estimate, usage and result.",
+            "ingestion",
+        ),
+    );
+    put(
+        "IngestTaskList",
+        doc(
+            obj(
+                &["dataset", "tasks", "capabilities"],
+                json!({
+                    "dataset": string(),
+                    "tasks": array(sref("IngestTask")),
+                    "capabilities": obj(&["pdf", "ocr"], json!({ "pdf": boolean(), "ocr": boolean() })),
+                }),
+            ),
+            "The caller's ingestion tasks, newest first, and whether this server converts PDFs and reads scanned pages.",
+            "ingestion",
+        ),
+    );
 }
 
 fn asking(put: &mut dyn FnMut(&str, J)) {
@@ -560,6 +651,9 @@ fn review(put: &mut dyn FnMut(&str, J)) {
                     "sources": array(obj(&["rendition", "length"], json!({
                         "rendition": string(), "source": string(), "title": string(), "format": string(),
                         "length": int(), "text": string(), "textOmitted": boolean(),
+                        "pages": array(obj(&["page", "start"], json!({ "page": int(), "start": int() }))),
+                        "ocrPages": array(int()),
+                        "omittedPages": array(int()),
                     }))),
                     "prefixes": any_object("The prefixes the compact terms use."),
                 }),
@@ -708,8 +802,15 @@ fn review(put: &mut dyn FnMut(&str, J)) {
     put(
         "IngestSettingsRequest",
         doc(
-            closed(&["keepText"], json!({ "keepText": boolean() })),
-            "Whether sources keep their text.",
+            closed(
+                &[],
+                json!({
+                    "keepText": boolean(),
+                    "confirmTokens": with_desc(or_null(int()), "The estimate in tokens above which an ingestion waits for a confirmation (200000 by default)."),
+                    "autoConfidence": with_desc(or_null(num()), "The confidence that `auto` mode needs of every fact (0.8 by default)."),
+                }),
+            ),
+            "Whether sources keep their text, and the thresholds of ingestion. Members left out keep their value, and `null` restores a default.",
             "ingest-profiles",
         ),
     );

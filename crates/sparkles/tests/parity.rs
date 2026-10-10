@@ -712,6 +712,13 @@ fn entries() -> Vec<(&'static str, Entry)> {
         server_only!("getIngestProfile", Process),
         server_only!("putIngestProfile", Process),
         server_only!("deleteIngestProfile", Process),
+        // C18 Phase 4: ingestion runs as a task of the server process, with its providers
+        server_only!("startIngest", Process),
+        server_only!("listIngestTasks", Process),
+        server_only!("getIngestTask", Process),
+        server_only!("cancelIngestTask", Process),
+        server_only!("confirmIngestTask", Process),
+        server_only!("approveIngestTask", Process),
         server_only!("listModelProviders", Process),
         server_only!("testModelProvider", Process),
         server_only!("getMemorySettings", Process),

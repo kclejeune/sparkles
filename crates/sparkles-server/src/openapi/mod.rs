@@ -490,6 +490,7 @@ fn parameters() -> Map<String, J> {
         ),
     );
     put("id", path("id", "The id of the task, token or lock."));
+    put("task", path("task", "The id of the ingestion task."));
     put("repo", path("repo", "The backup repository."));
     put("backup", path("backup", "The backup's id."));
     put("policy", path("policy", "The backup policy."));

@@ -1053,6 +1053,30 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/$/ingest/{ds}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List ingestion tasks
+         * @description The caller's tasks, or every task for an admin of the dataset, without their usage. Finished tasks are kept for 7 days.
+         */
+        get: operations["listIngestTasks"];
+        put?: never;
+        /**
+         * Ingest a document
+         * @description Starts an ingestion task: converts the document, registers it as a source on a review branch, and extracts its facts with the `extract` role into proposals there. A CSV or TSV file gets a C05 mapping draft instead, and nothing is written. Needs `read` on the dataset; every write runs as the caller, so it needs what `register_source` and `assert_facts` need. A PDF that needs OCR on a server without it fails with `needs-ocr` and its pages.
+         */
+        post: operations["startIngest"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/ingest/{ds}/profiles": {
         parameters: {
             query?: never;
@@ -1107,11 +1131,75 @@ export interface paths {
         };
         get?: never;
         /**
-         * Set whether sources keep their text
+         * Set the ingest settings
          * @description Needs `admin` on the dataset.
          */
         put: operations["putIngestSettings"];
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/ingest/{ds}/{task}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read an ingestion task
+         * @description Visible to the principal that started it and to admins of the dataset.
+         */
+        get: operations["getIngestTask"];
+        put?: never;
+        post?: never;
+        /**
+         * Cancel or forget an ingestion task
+         * @description Cancels a running task (`202`), or forgets one that has ended (`204`). A cancelled task removes nothing it already wrote on its review branch.
+         */
+        delete: operations["cancelIngestTask"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/ingest/{ds}/{task}/approve": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Approve a preview
+         * @description Writes a preview's source and facts to `main` as the caller. Fails with `409` when `main` changed since the preview.
+         */
+        post: operations["approveIngestTask"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/ingest/{ds}/{task}/confirm": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Confirm an ingestion's estimate
+         * @description A task whose estimate is above the dataset's `confirmTokens` waits in `awaiting-confirmation` for this call.
+         */
+        post: operations["confirmIngestTask"];
         delete?: never;
         options?: never;
         head?: never;
@@ -3663,6 +3751,12 @@ export interface components {
             sources: {
                 format?: string;
                 length: number;
+                ocrPages?: number[];
+                omittedPages?: number[];
+                pages?: {
+                    page: number;
+                    start: number;
+                }[];
                 rendition: string;
                 source?: string;
                 text?: string;
@@ -4815,6 +4909,39 @@ export interface components {
             }[];
             snapshots: number;
         };
+        /** @description An ingestion of an uploaded file, with the options of `IngestRequest` as fields. */
+        IngestForm: {
+            /** @description Register what can be read of a PDF that needs OCR, and record the other pages. */
+            allowPartial?: boolean;
+            /** @description The namespace of a table's rows in its mapping draft. */
+            base?: string;
+            /** @description The review branch (default `ingest.<slug>-<n>`). */
+            branch?: string;
+            /** @description Confirm the estimate in advance. */
+            confirm?: boolean;
+            /** @description The task's deadline, 1 to 86400 seconds (3600 by default). */
+            deadlineSeconds?: number;
+            /** @description Extract facts with the `extract` role (default: when the dataset lets ingestion use a provider). */
+            extract?: boolean;
+            file: string;
+            /** @description The media type of `text` or of the file, such as `text/html` or `application/pdf`. */
+            format?: string;
+            /** @description The named graph of the source and its facts. */
+            graph?: string;
+            /** @description The source's IRI. */
+            iri?: string;
+            /** @description The commit message of the registration. */
+            message?: string;
+            /** @enum {string} */
+            mode?: "branch" | "preview" | "auto";
+            /** @description The file name, which may say the format. */
+            name?: string;
+            /** @description The ingest profile (default `default`). */
+            profile?: string;
+            title?: string;
+            /** @description Where the document comes from; fetched through the outbound policy when there is no text or file, and the source's IRI by default. */
+            url?: string;
+        };
         /** @description An ingest profile. */
         IngestProfile: {
             /** @description The classes new entities may have (default: the classes with instances or a declaration). */
@@ -4850,9 +4977,89 @@ export interface components {
                 };
             };
         };
-        /** @description Whether sources keep their text. */
+        /** @description An ingestion from text or a URL. A multipart request sends the document as its `file` part and these options as fields. */
+        IngestRequest: {
+            /** @description Register what can be read of a PDF that needs OCR, and record the other pages. */
+            allowPartial?: boolean;
+            /** @description The namespace of a table's rows in its mapping draft. */
+            base?: string;
+            /** @description The review branch (default `ingest.<slug>-<n>`). */
+            branch?: string;
+            /** @description Confirm the estimate in advance. */
+            confirm?: boolean;
+            /** @description The task's deadline, 1 to 86400 seconds (3600 by default). */
+            deadlineSeconds?: number;
+            /** @description Extract facts with the `extract` role (default: when the dataset lets ingestion use a provider). */
+            extract?: boolean;
+            /** @description The media type of `text` or of the file, such as `text/html` or `application/pdf`. */
+            format?: string;
+            /** @description The named graph of the source and its facts. */
+            graph?: string;
+            /** @description The source's IRI. */
+            iri?: string;
+            /** @description The commit message of the registration. */
+            message?: string;
+            /** @enum {string} */
+            mode?: "branch" | "preview" | "auto";
+            /** @description The file name, which may say the format. */
+            name?: string;
+            /** @description The ingest profile (default `default`). */
+            profile?: string;
+            /** @description The document's text. */
+            text?: string;
+            title?: string;
+            /** @description Where the document comes from; fetched through the outbound policy when there is no text or file, and the source's IRI by default. */
+            url?: string;
+        };
+        /** @description Whether sources keep their text, and the thresholds of ingestion. Members left out keep their value, and `null` restores a default. */
         IngestSettingsRequest: {
-            keepText: boolean;
+            /** @description The confidence that `auto` mode needs of every fact (0.8 by default). */
+            autoConfidence?: number | null;
+            /** @description The estimate in tokens above which an ingestion waits for a confirmation (200000 by default). */
+            confirmTokens?: number | null;
+            keepText?: boolean;
+        };
+        /** @description An ingestion task with its progress, estimate, usage and result. */
+        IngestTask: {
+            createdAt: string;
+            dataset: string;
+            /** @description The code and message of a failed task, such as `needs-ocr` with the pages that need OCR and their reasons. */
+            error?: {
+                [key: string]: unknown;
+            };
+            /** @description The estimate of the extraction: chunks, tokens, the first pair, its estimated cost, the threshold and whether it needs a confirmation. */
+            estimate?: {
+                [key: string]: unknown;
+            };
+            finishedAt?: string;
+            id: string;
+            /** @description What was ingested: its name, format, size, URL and mode. */
+            input: {
+                [key: string]: unknown;
+            };
+            message?: string;
+            /** @description From 0 to 1. */
+            progress: number;
+            /** @description The outcome (`registered`, `proposed`, `no-facts`, `preview`, `merged`, `approved`, `already-registered` or `mapping-draft`), with the source, rendition, branch, pages, proposals, or a table's mapping draft and preview. */
+            result?: {
+                [key: string]: unknown;
+            };
+            /** @enum {string} */
+            status: "queued" | "converting" | "registering" | "awaiting-confirmation" | "extracting" | "linking" | "writing" | "awaiting-approval" | "done" | "failed" | "cancelled";
+            updatedAt: string;
+            /** @description Model calls, tokens, estimated cost, escalations and the pair that answered each chunk. */
+            usage: {
+                [key: string]: unknown;
+            };
+        };
+        /** @description The caller's ingestion tasks, newest first, and whether this server converts PDFs and reads scanned pages. */
+        IngestTaskList: {
+            capabilities: {
+                ocr: boolean;
+                pdf: boolean;
+            };
+            dataset: string;
+            tasks: components["schemas"]["IngestTask"][];
         };
         /** @enum {string} */
         Level: "read" | "write" | "admin";
@@ -7273,6 +7480,8 @@ export interface components {
         repo: string;
         /** @description The most rows serialized. Eager native metadata reports the full total; streaming stops production at the prefix and reports a null total unless exhausted. */
         send: number;
+        /** @description The id of the ingestion task. */
+        task: string;
         /** @description Seconds. Capped at the server's `--max-timeout`. */
         timeout: number;
         /** @description The user code of a device login, such as `WDJB-MJHT`. */
@@ -9762,6 +9971,70 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    listIngestTasks: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The tasks. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IngestTaskList"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    startIngest: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        /** @description The document: a multipart upload, or JSON with text or a URL. */
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["IngestRequest"];
+                "multipart/form-data": components["schemas"]["IngestForm"];
+            };
+        };
+        responses: {
+            /** @description The task. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IngestTask"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            413: components["responses"]["PayloadTooLarge"];
+            415: components["responses"]["UnsupportedMediaType"];
+            429: components["responses"]["TooManyRequests"];
+            default: components["responses"]["Error"];
+        };
+    };
     listIngestProfiles: {
         parameters: {
             query?: never;
@@ -9910,6 +10183,135 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getIngestTask: {
+        parameters: {
+            query?: {
+                /** @description Hold the answer until the task ends or waits for the caller, at most 60 seconds. */
+                wait?: number;
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The id of the ingestion task. */
+                task: components["parameters"]["task"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The task. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IngestTask"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    cancelIngestTask: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The id of the ingestion task. */
+                task: components["parameters"]["task"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The task, cancelling. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IngestTask"];
+                };
+            };
+            /** @description Forgotten. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    approveIngestTask: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The id of the ingestion task. */
+                task: components["parameters"]["task"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The task. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IngestTask"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            422: components["responses"]["Unprocessable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    confirmIngestTask: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The id of the ingestion task. */
+                task: components["parameters"]["task"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The task. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IngestTask"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
             default: components["responses"]["Error"];
         };
     };

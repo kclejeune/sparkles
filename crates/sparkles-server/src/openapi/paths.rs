@@ -2249,13 +2249,104 @@ fn assist(p: &mut Paths) {
             "/$/ingest/{ds}/settings",
             "putIngestSettings",
             "Datasets",
-            "Set whether sources keep their text",
+            "Set the ingest settings",
         )
         .doc("Needs `admin` on the dataset.")
         .see("ingest-profiles")
         .json_body(true, "IngestSettingsRequest")
         .json("200", "The stored setting.", "IngestSettingsRequest")
         .errors(&[400]),
+    );
+    p.add(
+        op(
+            POST,
+            "/$/ingest/{ds}",
+            "startIngest",
+            "Datasets",
+            "Ingest a document",
+        )
+        .doc("Starts an ingestion task: converts the document, registers it as a source on a review branch, and extracts its facts with the `extract` role into proposals there. A CSV or TSV file gets a C05 mapping draft instead, and nothing is written. Needs `read` on the dataset; every write runs as the caller, so it needs what `register_source` and `assert_facts` need. A PDF that needs OCR on a server without it fails with `needs-ocr` and its pages.")
+        .see("ingestion")
+        .body(
+            true,
+            "The document: a multipart upload, or JSON with text or a URL.",
+            json!({
+                "multipart/form-data": { "schema": sref("IngestForm") },
+                "application/json": { "schema": sref("IngestRequest") },
+            }),
+        )
+        .json("202", "The task.", "IngestTask")
+        .errors(&[400, 403, 404, 413, 415, 429]),
+    );
+    p.add(
+        op(
+            GET,
+            "/$/ingest/{ds}",
+            "listIngestTasks",
+            "Datasets",
+            "List ingestion tasks",
+        )
+        .doc("The caller's tasks, or every task for an admin of the dataset, without their usage. Finished tasks are kept for 7 days.")
+        .see("ingestion")
+        .json("200", "The tasks.", "IngestTaskList"),
+    );
+    p.add(
+        op(
+            GET,
+            "/$/ingest/{ds}/{task}",
+            "getIngestTask",
+            "Datasets",
+            "Read an ingestion task",
+        )
+        .doc("Visible to the principal that started it and to admins of the dataset.")
+        .see("ingestion")
+        .query(
+            "wait",
+            json!({"type": "number"}),
+            "Hold the answer until the task ends or waits for the caller, at most 60 seconds.",
+        )
+        .json("200", "The task.", "IngestTask")
+        .errors(&[404]),
+    );
+    p.add(
+        op(
+            DELETE,
+            "/$/ingest/{ds}/{task}",
+            "cancelIngestTask",
+            "Datasets",
+            "Cancel or forget an ingestion task",
+        )
+        .doc("Cancels a running task (`202`), or forgets one that has ended (`204`). A cancelled task removes nothing it already wrote on its review branch.")
+        .see("ingestion")
+        .json("202", "The task, cancelling.", "IngestTask")
+        .no_content("Forgotten.")
+        .errors(&[404]),
+    );
+    p.add(
+        op(
+            POST,
+            "/$/ingest/{ds}/{task}/confirm",
+            "confirmIngestTask",
+            "Datasets",
+            "Confirm an ingestion's estimate",
+        )
+        .doc("A task whose estimate is above the dataset's `confirmTokens` waits in `awaiting-confirmation` for this call.")
+        .see("ingestion")
+        .json("200", "The task.", "IngestTask")
+        .errors(&[404, 409]),
+    );
+    p.add(
+        op(
+            POST,
+            "/$/ingest/{ds}/{task}/approve",
+            "approveIngestTask",
+            "Datasets",
+            "Approve a preview",
+        )
+        .doc("Writes a preview's source and facts to `main` as the caller. Fails with `409` when `main` changed since the preview.")
+        .see("ingestion")
+        .json("200", "The task.", "IngestTask")
+        .errors(&[403, 404, 409, 422]),
     );
     p.add(
         op(
