@@ -264,6 +264,48 @@ pub struct OutboundPolicy {
     /// `serviceBulkMaxBindingCount`).
     pub service_bulk_max: usize,
     pub resolver: Arc<dyn Resolver>,
+    /// How the requests check the certificates of `https` servers. The default trusts
+    /// the system's roots and verifies every certificate.
+    pub tls: TlsOptions,
+}
+
+/// The certificate checks of a policy's `https` requests, such as those of one model
+/// provider (spec C19 §11.6). They change only how a server's certificate is verified:
+/// every destination is still checked against the policy, and a redirect to another
+/// origin is refused while either option is set, so they never apply past the server
+/// they were given for.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct TlsOptions {
+    /// PEM certificates (one or a bundle) trusted in addition to the system's roots.
+    pub extra_roots_pem: Option<Vec<u8>>,
+    /// Accept any certificate. Whoever is on the network path can then read and change
+    /// the requests and their answers.
+    pub insecure_skip_verify: bool,
+}
+
+impl TlsOptions {
+    /// Whether either option is set.
+    pub fn is_custom(&self) -> bool {
+        self.extra_roots_pem.is_some() || self.insecure_skip_verify
+    }
+}
+
+impl fmt::Debug for TlsOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TlsOptions")
+            .field("extra_roots", &self.extra_roots_pem.is_some())
+            .field("insecure_skip_verify", &self.insecure_skip_verify)
+            .finish()
+    }
+}
+
+/// The number of certificates in a PEM text, or why it holds none that can be used.
+pub fn check_pem_bundle(pem: &[u8]) -> Result<usize, String> {
+    match reqwest::Certificate::from_pem_bundle(pem) {
+        Ok(c) if c.is_empty() => Err("it holds no PEM certificate".into()),
+        Ok(c) => Ok(c.len()),
+        Err(_) => Err("it is not a PEM certificate or bundle".into()),
+    }
 }
 
 impl Default for OutboundPolicy {
@@ -280,6 +322,7 @@ impl Default for OutboundPolicy {
             service_bulk_size: DEFAULT_SERVICE_BULK_SIZE,
             service_bulk_max: DEFAULT_SERVICE_BULK_MAX,
             resolver: Arc::new(SystemResolver),
+            tls: TlsOptions::default(),
         }
     }
 }
@@ -297,6 +340,7 @@ impl fmt::Debug for OutboundPolicy {
             .field("request_timeout", &self.request_timeout)
             .field("service_bulk_size", &self.service_bulk_size)
             .field("service_bulk_max", &self.service_bulk_max)
+            .field("tls", &self.tls)
             .finish_non_exhaustive()
     }
 }
@@ -567,7 +611,9 @@ impl OutboundPolicy {
                 if e.is_redirect() {
                     return Err(Failure::Failed(chain(&e)));
                 }
-                let what = if e.is_connect() {
+                let what = if e.is_connect() && chain(&e).contains("invalid peer certificate") {
+                    "cannot connect: the server's TLS certificate is not trusted"
+                } else if e.is_connect() {
                     "cannot connect"
                 } else {
                     "the request failed"
@@ -616,9 +662,24 @@ impl OutboundPolicy {
         failed: &Arc<Mutex<Option<Failure>>>,
     ) -> reqwest::Result<reqwest::blocking::Client> {
         let (p, slot, max) = (self.clone(), failed.clone(), self.max_redirects);
+        let custom = self.tls.is_custom();
         let redirect = reqwest::redirect::Policy::custom(move |a| {
             if a.previous().len() > max {
                 return a.error(format!("more than {max} redirects"));
+            }
+            // the TLS options were given for the first server only
+            if custom
+                && a.previous()
+                    .first()
+                    .is_some_and(|first| first.origin() != a.url().origin())
+            {
+                let m = format!(
+                    "redirect to {}: another server, while the TLS options are set for {}",
+                    a.url(),
+                    a.previous()[0].origin().ascii_serialization()
+                );
+                *slot.lock() = Some(Failure::Refused(m.clone()));
+                return a.error(m);
             }
             match p.check_parsed(a.url()) {
                 Ok(()) => a.follow(),
@@ -631,7 +692,7 @@ impl OutboundPolicy {
                 }
             }
         });
-        reqwest::blocking::Client::builder()
+        let mut b = reqwest::blocking::Client::builder()
             .connect_timeout(self.connect_timeout)
             .timeout(self.timeout)
             .redirect(redirect)
@@ -641,8 +702,14 @@ impl OutboundPolicy {
                 policy: self.clone(),
                 failed: failed.clone(),
             }))
-            .user_agent(concat!("sparkles/", env!("CARGO_PKG_VERSION")))
-            .build()
+            .user_agent(concat!("sparkles/", env!("CARGO_PKG_VERSION")));
+        if let Some(pem) = &self.tls.extra_roots_pem {
+            b = b.tls_certs_merge(reqwest::Certificate::from_pem_bundle(pem)?);
+        }
+        if self.tls.insecure_skip_verify {
+            b = b.tls_danger_accept_invalid_certs(true);
+        }
+        b.build()
     }
 }
 

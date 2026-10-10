@@ -120,6 +120,8 @@ fn locks_of_server_settings_are_checked() {
     assert!(bad(json!(["models.routing.x"])).contains("routing"));
     assert!(bad(json!(["secrets.a.b"])).contains("secret"));
     assert!(bad(json!(["secrets.../x"])).contains("secret"));
+    assert!(bad(json!(["models.providers.claude.tls.verify"])).contains("tls has no member"));
+    assert!(bad(json!(["models.providers.claude.tls.caCert.file"])).contains("one field"));
     let d = Declared::parse(
         &json!({"server": {"locked": [
             "models.providers.claude", "models.providers.local.endpoint",
@@ -422,6 +424,68 @@ async fn a13_locked_fields() {
     assert_eq!(
         f2.1.models().unwrap().provider("claude").unwrap().endpoint,
         "https://api.anthropic.com"
+    );
+}
+
+/// A lock on `tls.insecureSkipVerify` pins certificate checks on for a provider that
+/// the declared configuration leaves verified (§11.6), while its CA certificate can still
+/// change, and a CA certificate that is not a reference is a `400`.
+#[tokio::test(flavor = "multi_thread")]
+async fn locked_insecure_skip_verify() {
+    let f = fixture(
+        declared_models("http://127.0.0.1:9/v1"),
+        Some(json!({"server": {"locked": ["models.providers.claude.tls.insecureSkipVerify"]}})),
+        true,
+    );
+    for patch in [
+        json!({"providers": {"claude": {"tls": {"insecureSkipVerify": true}}}}),
+        json!({"providers": {"claude": {"tls": null}}}),
+    ] {
+        let (s, v, _) = send(&f.app, "PATCH", MODELS_URI, Some(patch.clone())).await;
+        if patch["providers"]["claude"]["tls"].is_null() {
+            // nothing declared and nothing stored: removing it changes nothing
+            assert_eq!(s, StatusCode::OK, "{patch}: {v}");
+            continue;
+        }
+        assert_eq!(s, StatusCode::CONFLICT, "{patch}: {v}");
+        assert_eq!(v["code"], "locked-by-config");
+        assert_eq!(
+            v["fields"],
+            json!(["providers.claude.tls.insecureSkipVerify"])
+        );
+    }
+    let (s, v, _) = send(
+        &f.app,
+        "PATCH",
+        MODELS_URI,
+        Some(json!({"providers": {"claude": {"tls": {"caCert": {"file": "/etc/ssl/internal-ca.pem"}}}}})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(
+        v["locked"],
+        json!(["providers.claude.tls.insecureSkipVerify"]),
+        "{v}"
+    );
+    assert!(
+        !f.st
+            .models()
+            .unwrap()
+            .provider("claude")
+            .unwrap()
+            .insecure()
+    );
+    let (s, v, _) = send(
+        &f.app,
+        "PATCH",
+        MODELS_URI,
+        Some(json!({"providers": {"claude": {"tls": {"caCert": "-----BEGIN CERTIFICATE-----"}}}})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert!(
+        v["error"].as_str().unwrap().contains("never written"),
+        "{v}"
     );
 }
 

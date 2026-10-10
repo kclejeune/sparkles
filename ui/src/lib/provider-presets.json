@@ -1,0 +1,26 @@
+[
+  {
+    "name": "anthropic",
+    "label": "Anthropic",
+    "kind": "anthropic",
+    "endpoint": "https://api.anthropic.com",
+    "secret": "anthropic",
+    "model": "claude-sonnet-5-5"
+  },
+  {
+    "name": "openai",
+    "label": "OpenAI",
+    "kind": "openai",
+    "endpoint": "https://api.openai.com/v1",
+    "secret": "openai",
+    "model": "gpt-5-mini"
+  },
+  {
+    "name": "ollama",
+    "label": "Ollama (local)",
+    "kind": "ollama",
+    "endpoint": "http://127.0.0.1:11434",
+    "secret": null,
+    "model": "qwen3:8b"
+  }
+]

@@ -5917,6 +5917,32 @@ export interface components {
                  * @enum {string}
                  */
                 status: "ok" | "secret-missing";
+                /** @description The provider's TLS options, present when its configuration has `tls`. */
+                tls?: {
+                    /** @description The CA certificate reference of `tls.caCert`. The certificate itself is not returned. */
+                    caCert?: {
+                        file?: string;
+                        message?: string;
+                        secret?: string;
+                        /**
+                         * @description For a secret, where its value comes from.
+                         * @enum {string}
+                         */
+                        source?: "declared" | "runtime" | "missing";
+                        /**
+                         * @description `unreadable` when the file or secret cannot be read or holds no PEM certificate.
+                         * @enum {string}
+                         */
+                        status: "ok" | "unreadable";
+                    };
+                    /**
+                     * @description How the provider's certificate is checked: against the system roots, against them and `tls.caCert`, or not at all.
+                     * @enum {string}
+                     */
+                    verification: "system" | "custom-ca" | "off";
+                };
+                /** @description True when `tls.insecureSkipVerify` turns certificate verification off for the provider. */
+                unverified?: boolean;
             }[];
             roles: {
                 draft?: {
@@ -6954,7 +6980,7 @@ export interface components {
                 name: string;
                 /** @description A runtime value is stored but the lock ignores it. */
                 overridden: boolean;
-                /** @description The providers whose `apiKey` names the secret. */
+                /** @description The providers whose `apiKey` or `tls.caCert` names the secret. */
                 providers: string[];
                 /** @description When the runtime value was stored. */
                 setAt: string | null;

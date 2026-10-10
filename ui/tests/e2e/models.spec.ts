@@ -132,6 +132,59 @@ open('the Models section edits providers, roles and keys', async ({ page, reques
     .getByRole('button', { name: 'Remove' })
     .click();
   await expect(gw2).toHaveCount(0);
+
+  // a preset fills the Add form, and its fields stay editable
+  await models.getByRole('button', { name: 'Add provider' }).click();
+  await add.getByLabel('Preset').selectOption('openai');
+  await expect(add.getByLabel('Protocol')).toHaveValue('openai');
+  await expect(add.getByLabel('Endpoint', { exact: true })).toHaveValue(
+    'https://api.openai.com/v1',
+  );
+  await expect(add.getByLabel('Key (secret name)')).toHaveValue('openai');
+  await expect(add.getByLabel('Model', { exact: true })).toHaveValue('gpt-5-mini');
+  await add.getByLabel('Name', { exact: true }).fill('oai');
+  await add.getByLabel('Key (secret name)').fill('oai-key');
+  await add.getByRole('button', { name: 'Add', exact: true }).click();
+  await expect(page.getByText('Added provider oai')).toBeVisible();
+  const oai = (await (await request.get('/$/server/settings/models')).json()).effective.providers
+    .oai;
+  expect(oai).toEqual({
+    kind: 'openai',
+    endpoint: 'https://api.openai.com/v1',
+    apiKey: { secret: 'oai-key' },
+    models: { 'gpt-5-mini': { structuredOutput: 'auto' } },
+  });
+
+  // turning certificate checks off needs the acknowledgement; Cancel sends nothing
+  const skip = row('providers.oai.tls.insecureSkipVerify').getByRole('checkbox');
+  await expect(skip).not.toBeChecked();
+  await skip.check();
+  await panel.getByRole('button', { name: 'Save', exact: true }).click();
+  const ask = page.getByRole('dialog', { name: 'Turn off certificate verification?' });
+  await expect(ask).toContainText('can be read');
+  const turnOff = ask.getByRole('button', { name: 'Turn off verification' });
+  await expect(turnOff).toBeDisabled();
+  await ask.getByRole('button', { name: 'Cancel' }).click();
+  await expect(ask).toHaveCount(0);
+  expect(
+    (await (await request.get('/$/server/settings/models')).json()).effective.providers.oai.tls,
+  ).toBeUndefined();
+  await panel.getByRole('button', { name: 'Save', exact: true }).click();
+  await ask.getByRole('checkbox').check();
+  await turnOff.click();
+  await expect(ask).toHaveCount(0);
+  await expect(providers.locator('[data-provider=oai]')).toContainText('unverified');
+  const listed = (await (await request.get('/$/models')).json()).providers.find(
+    (p: { name: string }) => p.name === 'oai',
+  );
+  expect(listed.unverified).toBe(true);
+  await panel.getByRole('button', { name: 'Remove provider oai' }).click();
+  await page
+    .getByRole('dialog', { name: 'Remove provider oai?' })
+    .getByRole('button', { name: 'Remove' })
+    .click();
+  await expect(providers.locator('[data-provider=oai]')).toHaveCount(0);
+
   const k = await (await request.get('/$/server/settings/models')).json();
   expect(k.runtime).toEqual({});
 });

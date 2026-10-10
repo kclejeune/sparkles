@@ -54,6 +54,12 @@ let
         kind = "ollama";
         endpoint = "http://127.0.0.1:11434";
       };
+      # an internal CA named by path, never inlined
+      internal = {
+        kind = "openai";
+        endpoint = "https://llm.internal.example/v1";
+        tls.caCert.file = "/etc/ssl/certs/internal-ca.pem";
+      };
     };
     roles = {
       draft = [

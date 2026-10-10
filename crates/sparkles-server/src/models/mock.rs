@@ -34,7 +34,13 @@ pub struct MockModel {
     port: u16,
     pub log: Arc<Mutex<Vec<Received>>>,
     stop: Arc<AtomicBool>,
+    https: bool,
 }
+
+/// The CA of the TLS mock's certificate (`CN=sparkles test CA`), as PEM. Its server
+/// certificate names `localhost` and `127.0.0.1`.
+#[cfg(feature = "tls")]
+pub const TEST_CA: &str = include_str!("../tls/testdata/ca.pem");
 
 impl MockModel {
     /// Start a mock whose answers come from `handler`, called with each request and
@@ -42,6 +48,64 @@ impl MockModel {
     pub fn start(
         handler: impl Fn(&Received, usize) -> (u16, Value) + Send + Sync + 'static,
     ) -> MockModel {
+        MockModel::listen(handler, None)
+    }
+
+    /// Start a mock that speaks HTTPS with a certificate that [`TEST_CA`] signed, which
+    /// no system trusts.
+    #[cfg(feature = "tls")]
+    pub fn start_tls(
+        handler: impl Fn(&Received, usize) -> (u16, Value) + Send + Sync + 'static,
+    ) -> MockModel {
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        let cert =
+            CertificateDer::from_pem_slice(include_bytes!("../tls/testdata/cert-a.pem")).unwrap();
+        let key =
+            PrivateKeyDer::from_pem_slice(include_bytes!("../tls/testdata/key-a.pem")).unwrap();
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key)
+        .unwrap();
+        MockModel::listen(handler, Some(Arc::new(config)))
+    }
+
+    #[cfg(feature = "tls")]
+    fn listen(
+        handler: impl Fn(&Received, usize) -> (u16, Value) + Send + Sync + 'static,
+        tls: Option<Arc<rustls::ServerConfig>>,
+    ) -> MockModel {
+        let https = tls.is_some();
+        MockModel::listen_with(handler, https, move |c, lg, h| match &tls {
+            None => serve(c, lg, h),
+            Some(cfg) => {
+                let Ok(conn) = rustls::ServerConnection::new(cfg.clone()) else {
+                    return;
+                };
+                // a client that refuses the certificate ends the handshake here
+                serve(rustls::StreamOwned::new(conn, c), lg, h)
+            }
+        })
+    }
+
+    #[cfg(not(feature = "tls"))]
+    fn listen(
+        handler: impl Fn(&Received, usize) -> (u16, Value) + Send + Sync + 'static,
+        _: Option<()>,
+    ) -> MockModel {
+        MockModel::listen_with(handler, false, serve)
+    }
+
+    fn listen_with(
+        handler: impl Fn(&Received, usize) -> (u16, Value) + Send + Sync + 'static,
+        https: bool,
+        conn: impl Fn(TcpStream, &Mutex<Vec<Received>>, &Handler) + Send + Sync + 'static,
+    ) -> MockModel {
+        let conn = Arc::new(conn);
         let l = TcpListener::bind("127.0.0.1:0").expect("binding the mock model");
         let port = l.local_addr().unwrap().port();
         let log: Arc<Mutex<Vec<Received>>> = Arc::default();
@@ -54,17 +118,23 @@ impl MockModel {
                     return;
                 }
                 if let Ok(c) = c {
-                    let (lg, h) = (lg.clone(), handler.clone());
-                    std::thread::spawn(move || serve(c, &lg, &*h));
+                    let (lg, h, conn) = (lg.clone(), handler.clone(), conn.clone());
+                    std::thread::spawn(move || conn(c, &lg, &*h));
                 }
             }
         });
-        MockModel { port, log, stop }
+        MockModel {
+            port,
+            log,
+            stop,
+            https,
+        }
     }
 
     /// The base URL (an endpoint for any kind).
     pub fn url(&self) -> String {
-        format!("http://127.0.0.1:{}", self.port)
+        let scheme = if self.https { "https" } else { "http" };
+        format!("{scheme}://127.0.0.1:{}", self.port)
     }
 
     pub fn requests(&self) -> Vec<Received> {
@@ -79,11 +149,8 @@ impl Drop for MockModel {
     }
 }
 
-fn serve(c: TcpStream, log: &Mutex<Vec<Received>>, handler: &Handler) {
-    let mut r = BufReader::new(match c.try_clone() {
-        Ok(c) => c,
-        Err(_) => return,
-    });
+fn serve(mut c: impl Read + Write, log: &Mutex<Vec<Received>>, handler: &Handler) {
+    let mut r = BufReader::new(&mut c);
     let mut line = String::new();
     if r.read_line(&mut line).is_err() {
         return;
@@ -108,6 +175,7 @@ fn serve(c: TcpStream, log: &Mutex<Vec<Received>>, handler: &Handler) {
     if r.read_exact(&mut body).is_err() {
         return;
     }
+    drop(r);
     let rec = Received {
         path,
         headers,
@@ -124,7 +192,6 @@ fn serve(c: TcpStream, log: &Mutex<Vec<Received>>, handler: &Handler) {
         "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nRetry-After: 0\r\nConnection: close\r\n\r\n",
         out.len()
     );
-    let mut c = c;
     let _ = c.write_all(resp.as_bytes());
     let _ = c.write_all(out.as_bytes());
     let _ = c.flush();

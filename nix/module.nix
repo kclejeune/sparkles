@@ -589,7 +589,11 @@ in
 
           This JSON is stored in the Nix store. API keys must be named with
           `apiKey.secret` and supplied through {option}`models.secrets`;
-          never put secret values in the settings. Use either this option or
+          never put secret values in the settings. A provider behind an internal
+          CA names its certificate by path, as in
+          `providers.internal.tls.caCert.file = "/etc/ssl/certs/internal-ca.pem"`,
+          or by a secret with `tls.caCert.secret`. The file must be readable by the
+          service user. Use either this option or
           {option}`models.configFile`. `null` leaves model configuration unmanaged.
         '';
       };

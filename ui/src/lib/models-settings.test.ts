@@ -1,10 +1,16 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   MODELS_URL,
+  PROVIDER_KINDS,
+  PROVIDER_PRESETS,
   deleteSecret,
+  enablesInsecure,
   groupProvider,
+  httpsProviders,
+  insecurePath,
   modelFields,
   newProviderPatch,
+  presetForm,
   providerGroup,
   providerNames,
   putSecret,
@@ -61,7 +67,11 @@ const models = (over: Partial<SettingsKind> = {}): SettingsKind => ({
   locked: ['providers.claude.endpoint'],
   overridden: [],
   overrides: [
-    { path: 'providers.claude.budget.tokensPerDay', declared: 1000, runtime: 7 },
+    {
+      path: 'providers.claude.budget.tokensPerDay',
+      declared: 1000,
+      runtime: 7,
+    },
     {
       path: 'providers.local',
       declared: { kind: 'openai', endpoint: 'http://127.0.0.1:9/v1' },
@@ -123,11 +133,20 @@ describe('the form of the models kind', () => {
 });
 
 describe('adding a provider', () => {
-  const input = { name: 'gateway', kind: 'openai', endpoint: 'https://llm.example/v1', secret: '' };
+  const input = {
+    name: 'gateway',
+    kind: 'openai',
+    endpoint: 'https://llm.example/v1',
+    secret: '',
+  };
 
   it('makes the merge patch of a new provider', () => {
     expect(newProviderPatch([], input)).toEqual({
-      patch: { providers: { gateway: { kind: 'openai', endpoint: 'https://llm.example/v1' } } },
+      patch: {
+        providers: {
+          gateway: { kind: 'openai', endpoint: 'https://llm.example/v1' },
+        },
+      },
     });
     expect(newProviderPatch([], { ...input, secret: 'gw' })).toEqual({
       patch: {
@@ -153,6 +172,118 @@ describe('adding a provider', () => {
   });
 });
 
+describe('presets', () => {
+  it('are the providers with well-known endpoints, and no generic gateway', () => {
+    expect(PROVIDER_PRESETS.map((p) => [p.name, p.kind, p.endpoint, p.secret])).toEqual([
+      ['anthropic', 'anthropic', 'https://api.anthropic.com', 'anthropic'],
+      ['openai', 'openai', 'https://api.openai.com/v1', 'openai'],
+      ['ollama', 'ollama', 'http://127.0.0.1:11434', null],
+    ]);
+    for (const p of PROVIDER_PRESETS) {
+      expect(p.model).not.toBe('');
+      expect(PROVIDER_KINDS).toContain(p.kind);
+    }
+  });
+
+  it('fill the Add form, and Custom empties it', () => {
+    expect(presetForm('anthropic')).toEqual({
+      name: 'anthropic',
+      kind: 'anthropic',
+      endpoint: 'https://api.anthropic.com',
+      secret: 'anthropic',
+      model: 'claude-sonnet-5-5',
+    });
+    expect(presetForm('ollama').secret).toBe('');
+    expect(presetForm('')).toEqual({
+      name: '',
+      kind: 'openai',
+      endpoint: '',
+      secret: '',
+      model: '',
+    });
+  });
+
+  it('give a provider the server accepts, with the edited fields and its model', () => {
+    const f = { ...presetForm('openai'), name: 'oai', secret: 'team-key' };
+    expect(newProviderPatch([], f)).toEqual({
+      patch: {
+        providers: {
+          oai: {
+            kind: 'openai',
+            endpoint: 'https://api.openai.com/v1',
+            apiKey: { secret: 'team-key' },
+            models: { 'gpt-5-mini': { structuredOutput: 'auto' } },
+          },
+        },
+      },
+    });
+    const local = presetForm('ollama');
+    expect(newProviderPatch([], { ...local, model: '' })).toEqual({
+      patch: {
+        providers: {
+          ollama: { kind: 'ollama', endpoint: 'http://127.0.0.1:11434' },
+        },
+      },
+    });
+  });
+});
+
+describe('TLS options', () => {
+  it('are fields of https providers only', () => {
+    const k = models();
+    expect(httpsProviders(k)).toEqual(['claude']);
+    const paths = modelFields(k).map((d) => d.path);
+    expect(paths).toContain('providers.claude.tls.caCert.file');
+    expect(paths).toContain('providers.claude.tls.caCert.secret');
+    expect(paths).toContain(insecurePath('claude'));
+    expect(paths).not.toContain(insecurePath('gw.internal'));
+    const skip = modelFields(k).find((d) => d.path === insecurePath('claude'))!;
+    expect(skip.type).toBe('bool');
+    // unchecked unless the configuration sets it
+    expect(formOf([skip], k.effective)[skip.path]).toBe(false);
+  });
+
+  it('need the acknowledgement only for a patch that turns verification off', () => {
+    const k = models();
+    const defs = modelFields(k);
+    const initial = formOf(defs, k.effective);
+    const on = formPatch(
+      defs,
+      initial,
+      { ...initial, [insecurePath('claude')]: true },
+      k.effective,
+    );
+    expect(on.patch).toEqual({
+      providers: { claude: { tls: { insecureSkipVerify: true } } },
+    });
+    expect(enablesInsecure(on.patch, k.effective)).toEqual(['claude']);
+    // the runtime JSON is checked the same way
+    expect(
+      enablesInsecure(
+        { providers: { 'gw.internal': { tls: { insecureSkipVerify: true } } } },
+        k.effective,
+      ),
+    ).toEqual(['gw.internal']);
+    // a CA, turning verification back on, and other changes need none
+    expect(
+      enablesInsecure(
+        { providers: { claude: { tls: { caCert: { file: '/etc/ca.pem' } } } } },
+        k.effective,
+      ),
+    ).toEqual([]);
+    expect(
+      enablesInsecure({ providers: { claude: { tls: { insecureSkipVerify: false } } } }, {}),
+    ).toEqual([]);
+    expect(enablesInsecure({ roles: {} }, k.effective)).toEqual([]);
+    expect(enablesInsecure({ providers: { claude: null } }, k.effective)).toEqual([]);
+    // a provider whose verification is off already
+    const off = {
+      providers: { claude: { tls: { insecureSkipVerify: true } } },
+    };
+    expect(enablesInsecure(off, off)).toEqual([]);
+  });
+});
+
 describe('keys', () => {
   afterEach(() => vi.unstubAllGlobals());
 
@@ -168,9 +299,16 @@ describe('keys', () => {
   });
 
   it('says whether a key is set and where it comes from', () => {
-    expect(secretState(secret())).toMatchObject({ set: true, label: 'server config' });
+    expect(secretState(secret())).toMatchObject({
+      set: true,
+      label: 'server config',
+    });
     expect(secretState(secret({ source: 'runtime', setAt: '2026-10-10T00:00:00Z' }))).toMatchObject(
-      { set: true, label: 'overrides server config', overrides: true },
+      {
+        set: true,
+        label: 'overrides server config',
+        overrides: true,
+      },
     );
     expect(secretState(secret({ source: 'runtime', declared: false }))).toMatchObject({
       label: 'set here',
@@ -191,7 +329,9 @@ describe('keys', () => {
     await putSecret('my key', 'sk-test');
     expect(calls[0].url).toBe('/$/server/secrets/my%20key');
     expect(calls[0].init.method).toBe('PUT');
-    expect(JSON.parse(String(calls[0].init.body))).toEqual({ value: 'sk-test' });
+    expect(JSON.parse(String(calls[0].init.body))).toEqual({
+      value: 'sk-test',
+    });
     await deleteSecret('anthropic');
     expect(calls[1]).toMatchObject({
       url: '/$/server/secrets/anthropic',

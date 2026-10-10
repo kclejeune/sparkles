@@ -190,11 +190,11 @@ async fn list(State(st): St) -> ApiResult<Json<Value>> {
         let mut users: BTreeMap<String, Vec<String>> = BTreeMap::new();
         if let Some(m) = st.models() {
             for (provider, p) in &m.config.providers {
-                if let Some(k) = &p.api_key {
-                    users
-                        .entry(k.secret.clone())
-                        .or_default()
-                        .push(provider.clone());
+                for name in p.secret_names() {
+                    let u = users.entry(name.to_string()).or_default();
+                    if !u.contains(provider) {
+                        u.push(provider.clone());
+                    }
                 }
             }
         }

@@ -1263,6 +1263,17 @@ fn models(put: &mut dyn FnMut(&str, J)) {
             "allowedModels": strings(),
             "requestsPerMinute": int(),
             "budget": obj(&["tokensPerDay", "usedToday"], json!({ "tokensPerDay": int(), "usedToday": int() })),
+            "unverified": with_desc(boolean(), "True when `tls.insecureSkipVerify` turns certificate verification off for the provider."),
+            "tls": with_desc(obj(&["verification"], json!({
+                "verification": with_desc(string_enum(&["system", "custom-ca", "off"]), "How the provider's certificate is checked: against the system roots, against them and `tls.caCert`, or not at all."),
+                "caCert": with_desc(obj(&["status"], json!({
+                    "file": string(),
+                    "secret": string(),
+                    "source": with_desc(string_enum(&["declared", "runtime", "missing"]), "For a secret, where its value comes from."),
+                    "status": with_desc(string_enum(&["ok", "unreadable"]), "`unreadable` when the file or secret cannot be read or holds no PEM certificate."),
+                    "message": string(),
+                })), "The CA certificate reference of `tls.caCert`. The certificate itself is not returned."),
+            })), "The provider's TLS options, present when its configuration has `tls`."),
         }),
     );
     let mut roles = Map::new();
@@ -1505,7 +1516,7 @@ fn server_settings(put: &mut dyn FnMut(&str, J)) {
                             "locked": with_desc(boolean(), "Whether `server.locked` names `secrets.NAME`, so that only the declared source applies."),
                             "setAt": with_desc(or_null(string()), "When the runtime value was stored."),
                             "overridden": with_desc(boolean(), "A runtime value is stored but the lock ignores it."),
-                            "providers": with_desc(strings(), "The providers whose `apiKey` names the secret."),
+                            "providers": with_desc(strings(), "The providers whose `apiKey` or `tls.caCert` names the secret."),
                             "channels": with_desc(strings(), "The notification channels that name the secret (spec C21)."),
                         }),
                     )),

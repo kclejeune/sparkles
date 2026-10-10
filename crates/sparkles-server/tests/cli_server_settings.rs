@@ -555,3 +555,147 @@ fn global_settings_and_secrets_commands() {
     assert!(!text.contains(CLI_KEY), "the key is in the server's log");
     assert!(text.contains("secret_set"), "no secret_set in the log");
 }
+
+/// `sparkles settings set --global --preset NAME PROVIDER [FIELD=VALUE…]` adds a
+/// provider from a preset with the assignments in place of the preset's fields, refuses
+/// a provider that exists and an unknown preset, and a provider with certificate checks
+/// off is reported as unverified and logged with a warning (spec C19 §11.5, §11.6).
+#[test]
+fn provider_presets_and_insecure_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let cfg = dir.path().join("models.json");
+    let log = dir.path().join("server.log");
+    std::fs::write(&cfg, models(9, false).to_string()).unwrap();
+    let s = Server::start_in(
+        &dir.path().join("data"),
+        &["--model-config", cfg.to_str().unwrap()],
+        &log,
+        47800..47820,
+    );
+    let run = |args: &[&str]| cli(&s, &home, args, "");
+    let provider = |name: &str| {
+        let (_, v) = s.call("GET", "/$/server/settings/models", None);
+        v["effective"]["providers"][name].clone()
+    };
+
+    let o = run(&[
+        "settings",
+        "set",
+        "--global",
+        "--preset",
+        "anthropic",
+        "claude",
+    ])
+    .ok();
+    assert!(
+        o.stdout
+            .contains("added provider claude from preset anthropic"),
+        "{}",
+        o.stdout
+    );
+    assert!(
+        o.stdout.contains("sparkles secrets set anthropic"),
+        "{}",
+        o.stdout
+    );
+    assert_eq!(
+        provider("claude"),
+        json!({
+            "kind": "anthropic", "endpoint": "https://api.anthropic.com",
+            "apiKey": { "secret": "anthropic" }, "models": { "claude-sonnet-5-5": { "structuredOutput": "auto" } }
+        })
+    );
+    // the assignments replace the preset's fields
+    run(&[
+        "settings",
+        "set",
+        "--global",
+        "--preset",
+        "openai",
+        "oai",
+        "endpoint=https://proxy.example/v1",
+        "apiKey.secret=team-key",
+        r#"models={"gpt-x":{"contextTokens":32768}}"#,
+    ])
+    .ok();
+    assert_eq!(
+        provider("oai"),
+        json!({
+            "kind": "openai", "endpoint": "https://proxy.example/v1",
+            "apiKey": { "secret": "team-key" }, "models": { "gpt-x": { "contextTokens": 32768 } }
+        })
+    );
+    let j = run(&[
+        "settings", "set", "--global", "--preset", "ollama", "local", "--json",
+    ])
+    .ok()
+    .json();
+    assert_eq!(
+        j["kinds"]["models"]["effective"]["providers"]["local"]["endpoint"],
+        "http://127.0.0.1:11434"
+    );
+    assert!(
+        j["kinds"]["models"]["effective"]["providers"]["local"]
+            .get("apiKey")
+            .is_none()
+    );
+
+    // refusals: a provider that exists, an unknown preset, tls on http, no --global
+    let o = run(&[
+        "settings",
+        "set",
+        "--global",
+        "--preset",
+        "anthropic",
+        "claude",
+    ]);
+    assert_eq!(o.code, Some(1));
+    assert!(
+        o.stderr.contains("a provider named claude exists"),
+        "{}",
+        o.stderr
+    );
+    let o = run(&["settings", "set", "--global", "--preset", "gateway", "gw2"]);
+    assert_eq!(o.code, Some(1));
+    assert!(o.stderr.contains("no preset named"), "{}", o.stderr);
+    let o = run(&[
+        "settings",
+        "set",
+        "--global",
+        "--preset",
+        "ollama",
+        "local2",
+        "tls.insecureSkipVerify=true",
+    ]);
+    assert_eq!(o.code, Some(1));
+    assert!(o.stderr.contains("https endpoints only"), "{}", o.stderr);
+    assert_eq!(provider("local2"), J::Null);
+    let o = run(&["settings", "set", "--preset", "ollama", "x"]);
+    assert_eq!(o.code, Some(2), "{}", o.stderr);
+
+    // certificate checks off: unverified in GET /$/models, and a warning in the log
+    run(&[
+        "settings",
+        "set",
+        "--global",
+        "models.providers.oai.tls.insecureSkipVerify=true",
+    ])
+    .ok();
+    let (_, v) = s.call("GET", "/$/models", None);
+    let oai = v["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "oai")
+        .cloned()
+        .unwrap();
+    assert_eq!(oai["unverified"], true, "{v}");
+    assert_eq!(oai["tls"]["verification"], "off", "{v}");
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        text.contains("provider oai: tls.insecureSkipVerify is on"),
+        "no warning in the log"
+    );
+}

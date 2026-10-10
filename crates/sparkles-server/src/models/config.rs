@@ -105,6 +105,29 @@ pub struct SecretRef {
     pub secret: String,
 }
 
+/// Where a provider's CA certificate comes from: `{"file": PATH}` or
+/// `{"secret": NAME}`. A certificate is never written into the configuration itself.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct CaCertRef {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<String>,
+}
+
+/// The TLS options of one provider (spec C19 §11.6): a CA certificate trusted in
+/// addition to the system's roots, or no certificate check at all.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct TlsConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_cert: Option<CaCertRef>,
+    /// accept any certificate from this provider
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub insecure_skip_verify: bool,
+}
+
 /// Prices per million tokens, for estimates only.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -175,6 +198,8 @@ pub struct ProviderConfig {
     pub headers: BTreeMap<String, String>,
     /// Anthropic: the `anthropic-version` header value
     pub version: Option<String>,
+    /// how the provider's certificate is checked (https endpoints only)
+    pub tls: Option<TlsConfig>,
     /// the defaults of this provider's models
     #[serde(flatten)]
     pub defaults: ModelOptions,
@@ -226,6 +251,21 @@ impl ProviderConfig {
                 .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS),
             num_ctx: o.num_ctx,
         }
+    }
+
+    /// Whether certificate checks are off for this provider.
+    pub fn insecure(&self) -> bool {
+        self.tls.as_ref().is_some_and(|t| t.insecure_skip_verify)
+    }
+
+    /// The names of the secrets the provider reads: its key's and its CA certificate's.
+    pub fn secret_names(&self) -> impl Iterator<Item = &str> {
+        self.api_key.iter().map(|k| k.secret.as_str()).chain(
+            self.tls
+                .as_ref()
+                .and_then(|t| t.ca_cert.as_ref())
+                .and_then(|c| c.secret.as_deref()),
+        )
     }
 
     /// Whether role lists may name `model` with this provider.
@@ -331,6 +371,7 @@ pub const PROVIDER_MEMBERS: &[&str] = &[
     "keepAlive",
     "headers",
     "version",
+    "tls",
     "contextTokens",
     "maxOutputTokens",
     "temperature",
@@ -379,6 +420,33 @@ fn key_references(cfg: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
+/// The members of a provider's `tls`.
+pub const TLS_MEMBERS: &[&str] = &["caCert", "insecureSkipVerify"];
+
+/// Refuse a `tls.caCert` that is not a reference with a message that says what to write
+/// instead, since a PEM text pasted there would otherwise meet serde's terse error.
+fn ca_cert_references(cfg: &serde_json::Value) -> Result<()> {
+    if let Some(ps) = cfg.get("providers").and_then(|p| p.as_object()) {
+        for (name, p) in ps {
+            let Some(c) = p.get("tls").and_then(|t| t.get("caCert")) else {
+                continue;
+            };
+            let ok = c.is_null()
+                || c.as_object().is_some_and(|o| {
+                    !o.is_empty()
+                        && o.iter()
+                            .all(|(k, v)| matches!(k.as_str(), "file" | "secret") && v.is_string())
+                });
+            if !ok {
+                bail!(
+                    "provider {name}: tls.caCert must be {{\"file\": PATH}} or {{\"secret\": NAME}}; the certificate itself is never written into the configuration"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Whether `name` may name a secret (`--model-secret NAME=…`, `apiKey.secret` and the
 /// files of runtime secrets): 1 to 128 letters, digits, `_`, `-` and `.`, not starting
 /// with `.` or `-`.
@@ -414,6 +482,7 @@ impl ModelsConfig {
         let v: serde_json::Value = serde_json::from_str(text).context("not JSON")?;
         known_members(v.get("models").unwrap_or(&v))?;
         key_references(v.get("models").unwrap_or(&v))?;
+        ca_cert_references(v.get("models").unwrap_or(&v))?;
         let cfg = if v.get("models").is_some() {
             match serde_json::from_value::<File>(v.clone()) {
                 Ok(File::Wrapped { models }) | Ok(File::Bare(models)) => models,
@@ -464,6 +533,7 @@ impl ModelsConfig {
         }
         known_members(v)?;
         key_references(v)?;
+        ca_cert_references(v)?;
         let cfg: ModelsConfig = serde_json::from_value(v.clone())?;
         cfg.validate()?;
         Ok(cfg)
@@ -502,6 +572,9 @@ impl ModelsConfig {
                 {
                     bail!("provider {name}: invalid header {h}");
                 }
+            }
+            if let Some(t) = &p.tls {
+                check_tls(t, &p.endpoint).with_context(|| format!("provider {name}"))?;
             }
             if p.keep_alive.is_some() && p.kind != Kind::Ollama {
                 bail!("provider {name}: keepAlive applies to the ollama kind only");
@@ -602,6 +675,31 @@ fn check_options(o: &ModelOptions) -> Result<()> {
             && p.output_per_m_tok >= 0.0)
     {
         bail!("pricing must hold non-negative numbers");
+    }
+    Ok(())
+}
+
+/// A provider's `tls`: options for an `https` endpoint only, and a CA certificate named
+/// by an absolute file path or a secret.
+fn check_tls(t: &TlsConfig, endpoint: &str) -> Result<()> {
+    let https = endpoint
+        .get(..8)
+        .is_some_and(|s| s.eq_ignore_ascii_case("https://"));
+    if (t.ca_cert.is_some() || t.insecure_skip_verify) && !https {
+        bail!("tls applies to https endpoints only, and {endpoint:?} is not one");
+    }
+    if let Some(c) = &t.ca_cert {
+        match (&c.file, &c.secret) {
+            (Some(f), None) => {
+                if !std::path::Path::new(f).is_absolute() {
+                    bail!("tls.caCert.file {f:?}: use an absolute path");
+                }
+            }
+            (None, Some(s)) => {
+                check_secret_name(s).map_err(|e| anyhow::anyhow!("tls.caCert: {e}"))?;
+            }
+            _ => bail!("tls.caCert names either a file or a secret"),
+        }
     }
     Ok(())
 }
@@ -730,6 +828,72 @@ mod tests {
         );
         assert!(bad(r#"{"providers.local.endpoint": "ftp://x"}"#).contains("http"));
         assert!(bad(r#"{"providers.local.apiKeys": {"secret": "x"}}"#).contains("unknown field"));
+    }
+
+    /// `tls`: https endpoints only, known members, and a CA certificate named by an
+    /// absolute file or a secret, never written in.
+    #[test]
+    fn tls_options() {
+        let with = |endpoint: &str, tls: serde_json::Value| {
+            let cfg = serde_json::json!({ "providers": { "p": {
+                "kind": "openai", "endpoint": endpoint, "tls": tls
+            } } });
+            ModelsConfig::from_value(&cfg).map_err(|e| format!("{e:#}"))
+        };
+        let https = "https://llm.internal.example/v1";
+        let c = with(
+            https,
+            serde_json::json!({ "caCert": { "file": "/etc/ssl/ca.pem" } }),
+        )
+        .unwrap();
+        let p = &c.providers["p"];
+        assert!(!p.insecure());
+        assert_eq!(p.secret_names().count(), 0);
+        let c = with(
+            https,
+            serde_json::json!({ "caCert": { "secret": "internal-ca" } }),
+        )
+        .unwrap();
+        assert_eq!(
+            c.providers["p"].secret_names().collect::<Vec<_>>(),
+            ["internal-ca"]
+        );
+        let c = with(https, serde_json::json!({ "insecureSkipVerify": true })).unwrap();
+        assert!(c.providers["p"].insecure());
+        // nothing to check on plain http
+        for tls in [
+            serde_json::json!({ "insecureSkipVerify": true }),
+            serde_json::json!({ "caCert": { "file": "/etc/ssl/ca.pem" } }),
+        ] {
+            let e = with("http://127.0.0.1:11434", tls).unwrap_err();
+            assert!(e.contains("https endpoints only"), "{e}");
+        }
+        // an empty or switched-off tls on http is harmless
+        with("http://127.0.0.1:11434", serde_json::json!({})).unwrap();
+        with(
+            "http://127.0.0.1:11434",
+            serde_json::json!({ "insecureSkipVerify": false }),
+        )
+        .unwrap();
+        // unknown members
+        let e = with(https, serde_json::json!({ "verify": false })).unwrap_err();
+        assert!(e.contains("unknown field"), "{e}");
+        // a PEM text, both sources, an unknown source, a relative path, a bad name
+        let pem = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----";
+        for (ca, want) in [
+            (serde_json::json!(pem), "never written"),
+            (serde_json::json!({ "pem": pem }), "never written"),
+            (
+                serde_json::json!({ "file": "/a.pem", "secret": "x" }),
+                "either a file or a secret",
+            ),
+            (serde_json::json!({ "file": "ca.pem" }), "absolute path"),
+            (serde_json::json!({ "secret": "../x" }), "secret name"),
+        ] {
+            let e = with(https, serde_json::json!({ "caCert": ca })).unwrap_err();
+            assert!(e.contains(want), "{ca}: {e}");
+            assert!(!e.contains("MIIB"), "{e}");
+        }
     }
 
     #[test]

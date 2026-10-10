@@ -3,7 +3,9 @@
   // providers with their status, a form to add one, the model configuration as a layered
   // settings kind with the same sources, locks and resets as a dataset's settings, and the
   // API keys. Keys are write-only. A key typed in Replace is read from the form when it is
-  // sent and never kept in the component's state.
+  // sent and never kept in the component's state. The Add form starts from a preset or from
+  // nothing. Turning a provider's certificate checks off needs an acknowledgement before
+  // the change is sent (C19 §11.6).
   import { onMount } from 'svelte';
   import * as api from '$lib/api';
   import { toasts } from '$lib/app.svelte';
@@ -11,12 +13,16 @@
   import {
     MODELS_URL,
     PROVIDER_KINDS,
+    PROVIDER_PRESETS,
     deleteSecret,
+    enablesInsecure,
+    httpsProviders,
     groupProvider,
     listSecrets,
     modelFields,
     modelsStatus,
     newProviderPatch,
+    presetForm,
     providerKinds,
     providerNames,
     putSecret,
@@ -32,6 +38,7 @@
     readKind,
     resetKind,
     writeFailure,
+    type JsonObject,
     type SettingsKind,
   } from '$lib/settings';
   import Icon from './Icon.svelte';
@@ -48,11 +55,18 @@
   let busy = $state(false);
 
   let addOpen = $state(false);
+  /** The preset the Add form started from, or '' for Custom. */
+  let addPreset = $state('');
   let addName = $state('');
   let addKind = $state<string>('openai');
   let addEndpoint = $state('');
   let addSecret = $state('');
+  let addModel = $state('');
   let addError = $state<string | null>(null);
+
+  /** The providers a pending write turns certificate checks off for, and its answer. */
+  let insecureAsk = $state<{ names: string[]; resolve: (ok: boolean) => void } | null>(null);
+  let insecureAck = $state(false);
 
   let removeProvider = $state<string | null>(null);
   /** The secret whose Replace form is open. */
@@ -62,7 +76,7 @@
   const fields = $derived(modelFields(kind));
   // the panel starts again when the providers or their protocols change, since its
   // form has a group of fields for each
-  const fieldsKey = $derived(JSON.stringify(providerKinds(kind)));
+  const fieldsKey = $derived(JSON.stringify([providerKinds(kind), httpsProviders(kind)]));
   const removed = $derived(removedProviders(kind));
 
   async function loadStatus() {
@@ -124,6 +138,37 @@
     }
   }
 
+  /** Fill the Add form from a preset, or empty it for Custom. */
+  function pickPreset(name: string) {
+    addPreset = name;
+    const f = presetForm(name);
+    // a name typed already stays, unless it is another preset's
+    if (!addName.trim() || PROVIDER_PRESETS.some((p) => p.name === addName.trim()))
+      addName = f.name;
+    addKind = f.kind;
+    addEndpoint = f.endpoint;
+    addSecret = f.secret;
+    addModel = f.model;
+    addError = null;
+  }
+
+  /**
+   * Before a write of the panel: a patch that turns certificate checks off for a provider
+   * is sent only after the acknowledgement in the dialog.
+   */
+  function confirmWrite(patch: JsonObject, effective: JsonObject): Promise<boolean> {
+    const names = enablesInsecure(patch, effective);
+    if (!names.length) return Promise.resolve(true);
+    insecureAck = false;
+    return new Promise((resolve) => (insecureAsk = { names, resolve }));
+  }
+
+  function answerInsecure(ok: boolean) {
+    insecureAsk?.resolve(ok && insecureAck);
+    insecureAsk = null;
+    insecureAck = false;
+  }
+
   async function addProvider(e: SubmitEvent) {
     e.preventDefault();
     const r = newProviderPatch(providerNames(kind), {
@@ -131,6 +176,7 @@
       kind: addKind,
       endpoint: addEndpoint,
       secret: addSecret,
+      model: addModel,
     });
     if ('error' in r) {
       addError = r.error;
@@ -144,7 +190,7 @@
       )
     ) {
       addOpen = false;
-      addName = addEndpoint = addSecret = '';
+      addName = addEndpoint = addSecret = addModel = addPreset = '';
     }
   }
 
@@ -251,6 +297,17 @@
       {#if addOpen}
         <form class="add" onsubmit={addProvider} aria-label="Add a provider">
           <label class="field"
+            >Preset
+            <select
+              class="select"
+              value={addPreset}
+              onchange={(e) => pickPreset(e.currentTarget.value)}
+            >
+              <option value="">Custom</option>
+              {#each PROVIDER_PRESETS as p (p.name)}<option value={p.name}>{p.label}</option>{/each}
+            </select>
+          </label>
+          <label class="field"
             >Name <input class="input mono" bind:value={addName} placeholder="gateway" /></label
           >
           <label class="field"
@@ -273,14 +330,19 @@
               placeholder="optional"
             /></label
           >
+          <label class="field"
+            >Model <input class="input mono" bind:value={addModel} placeholder="optional" /></label
+          >
           <div class="add-actions">
             <button type="button" class="btn sm" onclick={() => (addOpen = false)}>Cancel</button>
             <button class="btn primary sm" type="submit" disabled={busy}>Add</button>
           </div>
           {#if addError}<p class="bad small">{addError}</p>{/if}
           <p class="faint small">
-            The provider's other fields, its per-model options and the role lists that use it can be
-            set below once it is added, or in the runtime layer's JSON under Advanced.
+            A preset fills the fields for a provider with a well-known endpoint, and each stays
+            editable. An OpenAI-compatible gateway uses Custom with the openai protocol. The model
+            is added to the provider's models. Its other fields, TLS options and the role lists that
+            use it can be set below once it is added, or in the runtime layer's JSON under Advanced.
           </p>
         </form>
       {/if}
@@ -308,7 +370,22 @@
                 <tr data-provider={p.name}>
                   <td class="mono">{p.name}</td>
                   <td class="muted">{p.kind}</td>
-                  <td class="mono small">{p.endpoint}</td>
+                  <td class="mono small">
+                    {p.endpoint}
+                    {#if p.unverified}
+                      <span
+                        class="badge danger"
+                        title="Certificate verification is off for this provider (tls.insecureSkipVerify). Anyone on the network path can read its API key and prompts."
+                        ><Icon name="alert" size={11} /> unverified</span
+                      >
+                    {:else if p.tls?.caCert?.status === 'unreadable'}
+                      <span class="badge danger" title={p.tls.caCert.message}>CA unreadable</span>
+                    {:else if p.tls?.verification === 'custom-ca'}
+                      <span class="badge" title="Its certificate is checked against tls.caCert too"
+                        >custom CA</span
+                      >
+                    {/if}
+                  </td>
                   <td>
                     <span
                       class="badge {p.status === 'ok' ? 'ok' : 'danger'}"
@@ -368,6 +445,7 @@
         declaredName="the server's model configuration"
         forbiddenText="Changing the model configuration needs the server-admin permission, and the server must not be read-only."
         onchange={onKind}
+        {confirmWrite}
       >
         {#snippet groupExtra(group: string)}
           {@const name = groupProvider(group)}
@@ -500,6 +578,32 @@
     <button class="btn danger solid" disabled={busy} onclick={confirmRemoveProvider}>
       {#if busy}<span class="spinner"></span>{/if} Remove
     </button>
+  {/snippet}
+</Modal>
+
+<Modal
+  open={insecureAsk != null}
+  title="Turn off certificate verification?"
+  onclose={() => answerInsecure(false)}
+>
+  <p>
+    Without certificate verification for <span class="mono"
+      >{insecureAsk?.names.join(', ') ?? ''}</span
+    >, the server cannot tell the provider from anyone who intercepts the connection. The API key
+    and every prompt sent to the provider, which can hold data from your datasets, can then be read
+    and changed by anyone on the network path.
+  </p>
+  <p>Prefer a CA certificate (tls.caCert) for an internal CA or a self-signed certificate.</p>
+  <label class="ack">
+    <input type="checkbox" bind:checked={insecureAck} />
+    I understand that the API key and the prompts sent to this provider can be read by anyone on the network
+    path.
+  </label>
+  {#snippet actions()}
+    <button class="btn" onclick={() => answerInsecure(false)}>Cancel</button>
+    <button class="btn danger solid" disabled={!insecureAck} onclick={() => answerInsecure(true)}
+      >Turn off verification</button
+    >
   {/snippet}
 </Modal>
 
@@ -640,6 +744,15 @@
     flex-wrap: wrap;
     gap: 6px;
     align-items: center;
+  }
+  .ack {
+    display: flex;
+    gap: 8px;
+    align-items: flex-start;
+    font-weight: 500;
+  }
+  .ack input {
+    margin-top: 3px;
   }
   .replace .input {
     flex: 1 1 260px;

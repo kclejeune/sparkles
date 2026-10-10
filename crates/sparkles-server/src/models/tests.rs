@@ -467,3 +467,84 @@ async fn the_routes() {
         "no member points a provider anywhere"
     );
 }
+
+/// A provider whose certificate no system trusts (spec C19 §11.6): refused by default,
+/// reached with its CA as `tls.caCert` from a file or a secret, and reached with
+/// `insecureSkipVerify`, which `GET /$/models` reports as unverified. The outbound
+/// policy still applies with either option.
+#[cfg(feature = "tls")]
+#[test]
+fn provider_tls_options() {
+    let mock = MockModel::start_tls(|_, _| (200, mock::openai(r#"{"query":"ASK {}"}"#)));
+    let dir = tempfile::tempdir().unwrap();
+    let ca = dir.path().join("ca.pem");
+    std::fs::write(&ca, mock::TEST_CA).unwrap();
+    let not_pem = dir.path().join("not.pem");
+    std::fs::write(&not_pem, "not a certificate").unwrap();
+    let provider =
+        |tls: Value| json!({ "p": { "kind": "openai", "endpoint": mock.url(), "tls": tls } });
+
+    // the system roots alone: the handshake fails, and the message says why
+    let m = models(provider(json!({})), &[]);
+    let e = call(&m, "p").unwrap_err();
+    assert_eq!(e.error.code(), "provider-unavailable", "{:?}", e.error);
+    assert!(
+        e.error.message().contains("certificate is not trusted"),
+        "{}",
+        e.error.message()
+    );
+    assert_eq!(m.describe()["providers"][0]["unverified"], false);
+
+    // the CA from a file, then from a secret
+    let m = models(
+        provider(json!({ "caCert": { "file": ca.to_str().unwrap() } })),
+        &[],
+    );
+    call(&m, "p").unwrap();
+    let d = m.describe();
+    assert_eq!(d["providers"][0]["tls"]["verification"], "custom-ca", "{d}");
+    assert_eq!(d["providers"][0]["tls"]["caCert"]["status"], "ok", "{d}");
+    let secret = format!("file:{}", ca.display());
+    let m = models(
+        provider(json!({ "caCert": { "secret": "internal-ca" } })),
+        &[("internal-ca", &secret)],
+    );
+    call(&m, "p").unwrap();
+    assert_eq!(
+        m.describe()["providers"][0]["tls"]["caCert"]["source"],
+        "declared"
+    );
+
+    // a CA that cannot be read or is not PEM fails before any request
+    let n = mock.requests().len();
+    for tls in [
+        json!({ "caCert": { "file": dir.path().join("missing.pem").to_str().unwrap() } }),
+        json!({ "caCert": { "file": not_pem.to_str().unwrap() } }),
+        json!({ "caCert": { "secret": "nowhere" } }),
+    ] {
+        let m = models(provider(tls.clone()), &[]);
+        let e = call(&m, "p").unwrap_err();
+        assert_eq!(e.error.code(), "tls-config", "{tls}: {:?}", e.error);
+        assert_eq!(
+            m.describe()["providers"][0]["tls"]["caCert"]["status"],
+            "unreadable"
+        );
+    }
+    assert_eq!(mock.requests().len(), n);
+
+    // no check at all: reached, and reported as unverified
+    let m = models(provider(json!({ "insecureSkipVerify": true })), &[]);
+    call(&m, "p").unwrap();
+    let d = m.describe();
+    assert_eq!(d["providers"][0]["unverified"], true, "{d}");
+    assert_eq!(d["providers"][0]["tls"]["verification"], "off", "{d}");
+
+    // the outbound policy still refuses a loopback address it does not allow
+    let cfg = ModelsConfig::parse(
+        &json!({ "providers": provider(json!({ "insecureSkipVerify": true })) }).to_string(),
+    )
+    .unwrap();
+    let closed = Models::new(cfg, Default::default(), Default::default());
+    let e = call(&closed, "p").unwrap_err();
+    assert_eq!(e.error.code(), "outbound-refused", "{:?}", e.error);
+}

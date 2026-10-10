@@ -16,7 +16,7 @@ use super::http::{Op, Write, bad, if_match, op_of, plan};
 use super::merge::path_string;
 use super::{Declared, Kind, Providers, Resolved, Scope, read_file, resolve_layers};
 use crate::http::{ApiResult, blocking, err};
-use crate::models::{ModelArgs, Models, ModelsConfig, PROVIDER_MEMBERS, Role};
+use crate::models::{ModelArgs, Models, ModelsConfig, PROVIDER_MEMBERS, Role, TLS_MEMBERS};
 use crate::state::AppState;
 use axum::http::{HeaderMap, StatusCode};
 use parking_lot::Mutex;
@@ -88,6 +88,21 @@ pub fn check_lock(root: &str, p: &[String]) -> Result<(), String> {
                     {
                         return Err(format!("a provider has no member {m:?}"));
                     }
+                    if p.get(2).is_some_and(|m| m == "tls")
+                        && let Some(t) = p.get(3)
+                    {
+                        if !TLS_MEMBERS.contains(&t.as_str()) {
+                            return Err(format!(
+                                "tls has no member {t:?}; use {}",
+                                TLS_MEMBERS.join(", ")
+                            ));
+                        }
+                        if p.len() > 4 {
+                            return Err(format!(
+                                "tls.{t} is one field, such as models.providers.NAME.tls.{t}"
+                            ));
+                        }
+                    }
                 }
                 "roles" => {
                     if let Some(r) = p.get(1)
@@ -134,7 +149,7 @@ pub fn lock_warnings(d: &Declared, cfg: &ModelsConfig) -> Vec<String> {
         let used = cfg
             .providers
             .values()
-            .any(|p| p.api_key.as_ref().is_some_and(|k| k.secret == name))
+            .any(|p| p.secret_names().any(|s| s == name))
             || channels.iter().any(|c| c == name);
         if !used {
             out.push(format!(
