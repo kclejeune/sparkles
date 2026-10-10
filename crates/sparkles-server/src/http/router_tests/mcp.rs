@@ -752,7 +752,7 @@ async fn a28_resources_and_prompts() {
     assert_eq!(list["cacheScope"], "private");
     let r = modern(&s.app, "resources/templates/list", json!({}), &[]).await;
     let templates = r.rpc()["result"]["resourceTemplates"].clone();
-    assert_eq!(templates.as_array().unwrap().len(), 3, "{templates}");
+    assert_eq!(templates.as_array().unwrap().len(), 4, "{templates}");
     // the schema resource is the describe_schema summary
     let r = modern(
         &s.app,

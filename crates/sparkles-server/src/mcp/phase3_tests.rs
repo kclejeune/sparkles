@@ -731,3 +731,74 @@ async fn tasks_belong_to_their_caller() {
     assert!(tasks.get("bob", &task.task_id).is_err());
     assert!(tasks.cancel("bob", &task.task_id).is_err());
 }
+
+/// The resources a client lists.
+async fn resource_uris(c: &mut Client, id: u64) -> Vec<String> {
+    let r = c.request(id, "resources/list", json!({"_meta": m()})).await;
+    r["result"]["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x["uri"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// The memory review resource: listed for a dataset with memory settings, read as the
+/// open items of the inbox, and updated for a subscriber when a count changes.
+#[tokio::test(flavor = "multi_thread")]
+async fn memory_review_resource() {
+    let server = quick_server();
+    let ds = server.state.get("t").unwrap();
+    let uri = "sparkles://t/memory/review";
+    let load = |n: u32| {
+        let trig = format!(
+            "<https://example.org/memory/agents/a/sessions/s{n}> {{
+  <http://ex.org/ana> <http://ex.org/knows> <http://ex.org/p{n}> .
+  <urn:r{n}> <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> <<( <http://ex.org/ana> <http://ex.org/knows> <http://ex.org/p{n}> )>> ;
+     <http://www.w3.org/ns/prov#generatedAtTime> \"2026-10-08T12:00:00Z\"^^<http://www.w3.org/2001/XMLSchema#dateTime> .
+}}"
+        );
+        ds.store
+            .load(&[sparkles::io::Source::from_bytes(
+                trig.into_bytes(),
+                sparkles::io::RdfFormat::TriG,
+                None,
+            )])
+            .unwrap();
+    };
+    let mut c = Client::start(server.clone());
+    // without memory settings, no resource
+    assert!(!resource_uris(&mut c, 1).await.contains(&uri.to_string()));
+    crate::settings::store_runtime(
+        &server.state,
+        &ds,
+        &crate::settings::MEMORY,
+        &json!({"agentGraphs": ["https://example.org/memory/agents/*"]}),
+    )
+    .unwrap();
+    load(1);
+    super::memory::pending::refresh(&server.state, &ds);
+    assert!(resource_uris(&mut c, 2).await.contains(&uri.to_string()));
+    let r = c
+        .request(3, "resources/read", json!({"_meta": m(), "uri": uri}))
+        .await;
+    let v: Value =
+        serde_json::from_str(r["result"]["contents"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(v["open"], 1, "{v}");
+    assert_eq!(
+        v["kinds"]["session"]["oldest"], "2026-10-08T12:00:00.000Z",
+        "{v}"
+    );
+    // a subscriber hears of a new open item
+    c.send(
+        json!({"jsonrpc": "2.0", "id": 9, "method": "subscriptions/listen", "params": {
+        "_meta": m(), "notifications": {"resourceSubscriptions": [uri]}}}),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    load(2);
+    super::memory::pending::refresh(&server.state, &ds);
+    let n = next_change(&mut c).await;
+    assert_eq!(n["method"], "notifications/resources/updated", "{n}");
+    assert_eq!(n["params"]["uri"], uri);
+}
