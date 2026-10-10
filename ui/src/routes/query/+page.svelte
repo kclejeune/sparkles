@@ -29,6 +29,8 @@
   import ResultTable from '$components/ResultTable.svelte';
   import SparqlEditor from '$components/SparqlEditor.svelte';
   import QuestionHeader from '$components/QuestionHeader.svelte';
+  import AskBar from '$components/AskBar.svelte';
+  import AnswerSummary from '$components/AnswerSummary.svelte';
   import {
     buildDefinition,
     formDefaults,
@@ -44,6 +46,18 @@
   } from '$lib/stored-queries';
   import * as askApi from '$lib/ask-api';
   import {
+    answeredBy,
+    askedFromRecords,
+    askFailure,
+    FIRST_STEP,
+    followUpContext,
+    graphColumns,
+    loadAskPrefs,
+    nextStep,
+    routingLines,
+    saveAskPrefs,
+    type AskPrefs,
+    type Turn,
     applyProposals,
     emptyExplanation,
     hasQuestion,
@@ -538,6 +552,339 @@
     );
   }
 
+  // --- asking the server (C18 Phase 2) ----------------------------------------------
+
+  /** What the server says about asking this dataset; null without an assistant. */
+  let assistant = $state<askApi.AssistantStatus | null>(null);
+  $effect(() => {
+    const name = ds;
+    assistant = null;
+    if (!name) return;
+    const ctl = new AbortController();
+    askApi
+      .assistantSettings(name, ctl.signal)
+      .then((s) => {
+        if (ds === name) assistant = s?.status ?? null;
+      })
+      .catch(() => {});
+    return () => ctl.abort();
+  });
+  const canAsk = $derived(!!assistant?.ask);
+  const draftModel = $derived(
+    assistant?.draft?.length
+      ? `${assistant.draft[0].provider} · ${assistant.draft[0].model}`
+      : null,
+  );
+
+  let askPrefs = $state<AskPrefs>(loadAskPrefs(null));
+  let prefsFor: string | null | undefined = undefined;
+  $effect(() => {
+    const who = principal;
+    if (who === prefsFor) return;
+    prefsFor = who;
+    askPrefs = loadAskPrefs(who);
+  });
+  $effect(() => {
+    const p = { mode: askPrefs.mode, summaryCollapsed: askPrefs.summaryCollapsed };
+    untrack(() => saveAskPrefs(prefsFor, p));
+  });
+
+  let askText = $state('');
+  /** New question was pressed: the next ask carries no earlier turns. */
+  let fresh = $state(false);
+  /** The ask in progress: its tab, the step the server is on, and Stop. */
+  let asking = $state<{ tabId: string; step: string; controller: AbortController } | null>(null);
+  const askContext = $derived(fresh ? [] : followUpContext(active.ask, active.query));
+  let askBar: AskBar | undefined = $state();
+  /** The row under the pointer and the row a citation chose (0-based). */
+  let hoverRow = $state<number | null>(null);
+  let highlight = $state<{ row: number } | null>(null);
+
+  /**
+   * Ask the server. Without `tabId` the answer opens in a new tab. With it the tab is
+   * asked again, for a clarification, Try harder or Summarize again.
+   */
+  async function ask(o: {
+    question: string;
+    tabId?: string;
+    context?: Turn[];
+    clarification?: { id: string; value: string };
+    tryHarder?: string;
+    query?: string;
+    run?: boolean;
+  }) {
+    const name = ds;
+    if (!name) return;
+    let at: string | undefined;
+    try {
+      at = normalizeAt(app.queryAt) ?? undefined;
+    } catch (e) {
+      toasts.push('error', 'Invalid At', (e as Error).message);
+      return;
+    }
+    asking?.controller.abort();
+    let tabId = o.tabId;
+    const context = o.context ?? [];
+    if (!tabId) {
+      addTab('', questionTitle(o.question));
+      tabId = activeId;
+    }
+    const tab = tabs.find((t) => t.id === tabId);
+    if (!tab) return;
+    tab.ask = {
+      question: o.question,
+      original: o.query ?? tab.ask?.original ?? '',
+      ...(context.length ? { context } : {}),
+    };
+    if (!o.query) {
+      outcomes[tabId]?.controller?.abort();
+      delete outcomes[tabId];
+    }
+    const run = o.run ?? askPrefs.mode === 'run';
+    const summary = !!assistant?.summary;
+    const controller = new AbortController();
+    asking = { tabId, step: FIRST_STEP, controller };
+    // the state proxy, so that a later ask can tell it is no longer this one
+    const mine = asking;
+    const owns = claim(tabId);
+    let diagnosis: askApi.Diagnosis | undefined;
+    const started = performance.now();
+    const reasoning = reasoningFor(name);
+    const t = () => tabs.find((x) => x.id === tabId);
+    const q = () => t()?.ask;
+    const setText = (text: string | undefined) => {
+      const cur = t();
+      if (!cur || text == null) return;
+      cur.query = text;
+      if (cur.ask) cur.ask.original = text;
+    };
+    const on = (e: askApi.AskEvent) => {
+      if (asking !== mine) return;
+      const step = nextStep(e, { run, summary });
+      if (step) mine.step = step;
+      const a = q();
+      if (!a) return;
+      switch (e.event) {
+        case 'draft':
+          setText(e.data.query);
+          a.explanation = e.data.explanation || a.explanation;
+          a.assumptions = e.data.assumptions ?? a.assumptions;
+          break;
+        case 'clarify':
+          a.clarify = e.data;
+          break;
+        case 'diagnosis':
+          if (e.data.empty) diagnosis = e.data as askApi.Diagnosis;
+          break;
+        case 'result': {
+          const r = e.data;
+          setText(r.query);
+          if (r.explanation) a.explanation = r.explanation;
+          if (r.assumptions) a.assumptions = r.assumptions;
+          a.graph = r.graph ?? null;
+          if (r.results && owns()) {
+            const res = r.results;
+            const cols = graphColumns(r.graph, res.vars ?? []);
+            outcomes[tabId!] = {
+              status: 'done',
+              ds: name,
+              branch,
+              kind: res.queryType,
+              result: res,
+              view: cols ? 'graph' : defaultView(res),
+              startedAt: started,
+              elapsed: performance.now() - started,
+              reasoning,
+            };
+            if (cols) gCols = cols;
+            else autoPickColumns(res);
+            if (isEmptyResult(res)) {
+              if (diagnosis) outcomes[tabId!].diagnosis = { state: 'done', d: diagnosis };
+              else if (r.query)
+                void diagnose(tabId!, started, onBranch(name, branch), r.query, at, reasoning);
+            }
+          }
+          break;
+        }
+        case 'summary':
+          a.summary = e.data;
+          break;
+        case 'usage':
+          a.askId = e.data.askId;
+          a.usage = {
+            outcome: e.data.outcome,
+            askId: e.data.askId,
+            answeredBy: e.data.answeredBy,
+            steps: e.data.steps,
+            escalations: e.data.escalations,
+            tryHarder: e.data.tryHarder,
+            smallModel: e.data.smallModel,
+            notes: e.data.notes,
+          };
+          break;
+        case 'error':
+          a.failure = askFailure(e.data.code, e.data.message, e.data.resetAt);
+          if (e.data.result?.query) setText(e.data.result.query);
+          if (e.data.result?.explanation) a.explanation = e.data.result.explanation;
+          break;
+      }
+    };
+    try {
+      await askApi.askStream(
+        name,
+        {
+          question: o.question,
+          ...(context.length ? { context } : {}),
+          ...(o.clarification ? { clarification: o.clarification } : {}),
+          ...(o.tryHarder ? { tryHarder: o.tryHarder } : {}),
+          ...(o.query ? { query: o.query } : {}),
+          ...(at ? { at } : {}),
+          ...(branch ? { branch } : {}),
+          ...(reasoning != null ? { reasoning } : {}),
+          run,
+          maxRows: limit,
+        },
+        on,
+        controller.signal,
+      );
+    } catch (e) {
+      const a = q();
+      if (a && !(e instanceof DOMException && e.name === 'AbortError')) {
+        const err = e instanceof api.ApiError ? e : null;
+        a.failure = askFailure(
+          err?.code ?? '',
+          err?.message ?? api.errorMessage(e),
+          typeof err?.body?.resetAt === 'string' ? err.body.resetAt : undefined,
+        );
+      }
+    } finally {
+      if (asking === mine) asking = null;
+    }
+    const a = q();
+    const cur = t();
+    // the server keeps the question when the dataset has a history, else this browser does
+    if (a && cur?.query.trim() && !a.clarify && !assistant?.historyDays)
+      remember(name, a, cur.query);
+  }
+
+  function askQuestion() {
+    const question = askText.trim();
+    if (!question) return;
+    const context = fresh ? [] : followUpContext(active.ask, active.query);
+    fresh = false;
+    void ask({ question, context });
+  }
+
+  function newQuestion() {
+    fresh = true;
+    askText = '';
+    askBar?.focus();
+  }
+
+  function stopAsk() {
+    asking?.controller.abort();
+  }
+
+  /** Answer a clarification: the same tab asks again with the choice. */
+  function clarify(value: string) {
+    const a = active.ask;
+    if (!a?.question || !a.clarify) return;
+    void ask({
+      question: a.question,
+      tabId: activeId,
+      context: a.context,
+      clarification: { id: a.clarify.id, value },
+    });
+  }
+
+  function tryHarder() {
+    const a = active.ask;
+    if (!a?.question || !a.askId) return;
+    void ask({ question: a.question, tabId: activeId, context: a.context, tryHarder: a.askId });
+  }
+
+  /** A new summary of the edited query's rows. */
+  function summarizeAgain() {
+    const a = active.ask;
+    if (!a?.question || !active.query.trim()) return;
+    void ask({ question: a.question, tabId: activeId, query: active.query, run: true });
+  }
+
+  async function sendFeedback(outcome: askApi.Feedback) {
+    const a = active.ask;
+    const name = ds;
+    if (!a?.askId || !name) return;
+    try {
+      await askApi.askFeedback(name, a.askId, outcome);
+      a.feedback = outcome;
+    } catch (e) {
+      toasts.error('Could not send the feedback', e);
+    }
+  }
+
+  // an edit clears the summary, which described the old query
+  $effect(() => {
+    const a = active.ask;
+    if (a?.summary && active.query !== a.original) a.summary = undefined;
+  });
+  // a new result forgets the chosen row
+  $effect(() => {
+    void outcome?.result;
+    highlight = null;
+    hoverRow = null;
+  });
+
+  const answer = $derived(active.ask?.askId ? active.ask : undefined);
+  const askedAnswer = $derived(answeredBy(answer?.usage));
+  const showSummary = $derived(
+    !!answer?.summary &&
+      !!outcome?.result &&
+      outcome.view !== 'explain' &&
+      outcome.status === 'done',
+  );
+  const citedRows = $derived(new Set((answer?.summary?.citations ?? []).map((n) => n - 1)));
+
+  function cite(row: number) {
+    setView('table');
+    highlight = { row: row - 1 };
+  }
+
+  /** The server's history of the caller's questions, when the dataset keeps one. */
+  let serverAsked = $state<(Asked & { id: string })[] | null>(null);
+  $effect(() => {
+    const name = ds;
+    if (!savedOpen || !name || !assistant || !assistant.historyDays) {
+      serverAsked = null;
+      return;
+    }
+    const ctl = new AbortController();
+    askApi
+      .askHistory(name, ctl.signal)
+      .then((list) => {
+        if (ds === name) serverAsked = askedFromRecords(list);
+      })
+      .catch(() => (serverAsked = null));
+    return () => ctl.abort();
+  });
+
+  /** The questions of this browser that the server's history does not hold. */
+  const localAsked = $derived(
+    askedList.filter(
+      (a) => !serverAsked?.some((x) => x.question === a.question && x.query === a.query),
+    ),
+  );
+
+  async function forgetAsked(id: string) {
+    const name = ds;
+    if (!name) return;
+    try {
+      await askApi.deleteAsk(name, id);
+      serverAsked = serverAsked?.filter((a) => a.id !== id) ?? null;
+    } catch (e) {
+      toasts.error('Could not remove the question', e);
+    }
+  }
+
   // the check of a tab with a question: its terms, issues and estimated rows, refreshed a
   // moment after the query stops changing
   let checks = $state<Record<string, TabCheck>>({});
@@ -789,6 +1136,12 @@
     const dsTarget = onBranch(dsName, dsBranch);
     // capture the tab and its text before awaiting: the user may switch tabs meanwhile
     const tab = active;
+    // running an answer after an edit tells the server the answer was edited (§5.5)
+    const a = tab.ask;
+    if (!stored && a?.askId && !a.feedback && tab.query !== a.original) {
+      a.feedback = 'edited';
+      void askApi.askFeedback(dsName, a.askId, 'edited').catch(() => {});
+    }
     // format first when asked to; on any failure the query runs as written
     if (formatOnRun && !stored && tabId === activeId) await formatQuery(true);
     const original = tab.query;
@@ -1153,10 +1506,15 @@
 
   onMount(() => {
     if (app.pendingQuery) {
-      const { query, title, question } = app.pendingQuery;
+      const { query, title, question, ask: text } = app.pendingQuery;
       app.pendingQuery = null;
-      addTab(query, title);
-      if (question) active.ask = question;
+      if (text) {
+        askText = text;
+        queueMicrotask(() => askBar?.focus());
+      } else {
+        addTab(query, title);
+        if (question) active.ask = question;
+      }
     }
     // a handoff link: read the fragment once and drop it, so a reload does not open it again
     const payload = askPayload(location.hash);
@@ -1202,6 +1560,22 @@
 <svelte:head><title>Query | Sparkles</title></svelte:head>
 
 <div class="page" style:--editor-h="{editorH}px">
+  <!-- the Ask bar, when the dataset has an assistant -->
+  <div class="askbar-slot">
+    {#if canAsk}
+      <AskBar
+        bind:this={askBar}
+        bind:value={askText}
+        bind:mode={askPrefs.mode}
+        model={draftModel}
+        step={asking?.step ?? null}
+        context={askContext}
+        onask={askQuestion}
+        onstop={stopAsk}
+        onnew={newQuestion}
+      />
+    {/if}
+  </div>
   <!-- query tabs -->
   <div class="qtabs" role="tablist" aria-label="Query tabs">
     {#each tabs as t (t.id)}
@@ -1288,6 +1662,40 @@
         onclose={() => (active.ask = undefined)}
       />
     {/if}
+    {#if active.ask?.clarify && !(asking && asking.tabId === activeId)}
+      {@const c = active.ask.clarify}
+      <form
+        class="clarify"
+        aria-label="Clarify the question"
+        onsubmit={(e) => {
+          e.preventDefault();
+          const v = new FormData(e.currentTarget).get('choice');
+          if (typeof v === 'string') clarify(v);
+        }}
+      >
+        <p class="clarify-q">{c.question}</p>
+        <div class="choices" role="radiogroup" aria-label={c.question}>
+          {#each c.choices as ch, i (ch.value + i)}
+            <label><input type="radio" name="choice" value={ch.value} required /> {ch.label}</label>
+          {/each}
+        </div>
+        <button class="btn sm primary" type="submit">Continue</button>
+      </form>
+    {/if}
+    {#if active.ask?.failure && !(asking && asking.tabId === activeId)}
+      <div class="notice warn ask-failure" role="alert">
+        <Icon name="alert" size={14} />
+        <span>{active.ask.failure}</span>
+        <span class="spacer"></span>
+        <button
+          class="btn ghost icon sm"
+          aria-label="Dismiss"
+          title="Dismiss"
+          onclick={() => active.ask && (active.ask.failure = undefined)}
+          ><Icon name="x" size={12} /></button
+        >
+      </div>
+    {/if}
   </div>
 
   <!-- toolbar -->
@@ -1360,10 +1768,29 @@
             <span class="faint">A named query with typed parameters, for HTTP, MCP and the CLI</span
             >
           </button>
-          {#if askedList.length}
+          {#if serverAsked?.length || askedList.length}
             <div class="menu-head faint small" role="presentation">Asked</div>
             <div class="menu-scroll" role="group" aria-label="Asked">
-              {#each askedList as a (a.question + a.at)}
+              {#each serverAsked ?? [] as a (a.id)}
+                <div class="suggestion">
+                  <button
+                    role="menuitem"
+                    class="menu-item s-text"
+                    title={a.query}
+                    onclick={() => openAsked(a)}
+                  >
+                    <span>{a.question}</span>
+                    <span class="faint mono small one-line">{a.query.replace(/\s+/g, ' ')}</span>
+                  </button>
+                  <button
+                    class="btn ghost icon sm"
+                    aria-label="Forget this question"
+                    title="Remove it from your history on the server"
+                    onclick={() => void forgetAsked(a.id)}><Icon name="trash" size={12} /></button
+                  >
+                </div>
+              {/each}
+              {#each localAsked as a (a.question + a.at)}
                 <button
                   role="menuitem"
                   class="menu-item"
@@ -1621,6 +2048,15 @@
 
   <!-- results -->
   <section class="results" aria-label="Results">
+    {#if showSummary && answer?.summary && outcome?.result}
+      <AnswerSummary
+        summary={answer.summary}
+        rows={outcome.result.rows?.length ?? outcome.result.triples?.length ?? 0}
+        bind:collapsed={askPrefs.summaryCollapsed}
+        {hoverRow}
+        oncite={cite}
+      />
+    {/if}
     {#if !outcome}
       <div class="empty">
         <Icon name="query" size={22} />
@@ -1874,7 +2310,15 @@
                 <div class="empty">The query matched no triples.</div>
               {/if}
             {:else if r.rows && r.rows.length}
-              <ResultTable vars={r.vars ?? []} rows={r.rows} {prefixes} onopen={openIri} />
+              <ResultTable
+                vars={r.vars ?? []}
+                rows={r.rows}
+                {prefixes}
+                onopen={openIri}
+                cited={showSummary ? citedRows : undefined}
+                {highlight}
+                onhover={showSummary ? (row) => (hoverRow = row) : undefined}
+              />
             {:else}
               <div class="empty">
                 <p>No results.</p>
@@ -1984,6 +2428,51 @@
           {/if}
         {:else}
           <div class="empty"><span class="spinner"></span></div>
+        {/if}
+      </div>
+    {/if}
+    {#if answer && !(asking && asking.tabId === activeId)}
+      {@const u = answer.usage}
+      <div class="answer-bar small" aria-label="Answer feedback" role="group">
+        {#if askedAnswer}
+          <span
+            class="mono faint"
+            title={['The model that wrote the final query', ...routingLines(u)].join('\n')}
+            >{askedAnswer}</span
+          >
+          {#if u?.smallModel}<span class="badge" title="A model with a small context window"
+              >answered by a small model</span
+            >{/if}
+          {#if u?.escalations?.length}<span class="faint"
+              >{u.escalations.length} escalation{u.escalations.length === 1 ? '' : 's'}</span
+            >{/if}
+        {/if}
+        <span class="spacer"></span>
+        {#if answer.feedback}
+          <span class="faint">Feedback sent: {answer.feedback}</span>
+        {:else}
+          <button class="btn sm" onclick={() => void sendFeedback('accepted')}
+            ><Icon name="check" size={12} /> Correct</button
+          >
+          <button class="btn sm" onclick={() => void sendFeedback('rejected')}
+            ><Icon name="x" size={12} /> Not correct</button
+          >
+        {/if}
+        {#if u?.tryHarder}
+          <button
+            class="btn sm"
+            onclick={tryHarder}
+            title="Ask again, starting with the next model of the draft list"
+            ><Icon name="zap" size={12} /> Try harder</button
+          >
+        {/if}
+        {#if assistant?.summary && active.query !== answer.original && active.query.trim()}
+          <button
+            class="btn sm"
+            onclick={summarizeAgain}
+            title="Run the edited query and summarize its rows"
+            ><Icon name="sparkle" size={12} /> Summarize again</button
+          >
         {/if}
       </div>
     {/if}
@@ -2097,7 +2586,7 @@
   .page {
     flex: 1;
     display: grid;
-    grid-template-rows: auto auto auto var(--editor-h) 7px minmax(0, 1fr);
+    grid-template-rows: auto auto auto auto var(--editor-h) 7px minmax(0, 1fr);
     /* without an explicit column, wide content (long editor lines, the plan table)
        stretches the grid past the viewport and the toolbar's Run button is clipped */
     grid-template-columns: minmax(0, 1fr);
@@ -2290,8 +2779,47 @@
     display: grid;
     gap: 10px;
   }
-  .qhead-slot {
+  .qhead-slot,
+  .askbar-slot {
     min-width: 0;
+  }
+  .clarify {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 14px;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+    font-size: var(--fs-sm);
+  }
+  .clarify-q {
+    margin: 0;
+    font-weight: 600;
+    flex-basis: 100%;
+  }
+  .choices {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 14px;
+  }
+  .choices label {
+    display: inline-flex;
+    gap: 4px;
+    align-items: center;
+    cursor: pointer;
+  }
+  .ask-failure {
+    border-bottom: 1px solid var(--border);
+  }
+  .answer-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 10px;
+    padding: 6px 12px;
+    border-top: 1px solid var(--border);
+    background: var(--surface);
   }
   .link-notice {
     border-bottom: 1px solid var(--border);

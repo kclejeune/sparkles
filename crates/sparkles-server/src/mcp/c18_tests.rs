@@ -230,6 +230,8 @@ async fn why_empty() {
         "{s}"
     );
     assert_eq!(s["complete"], true);
+    // A37: a check issue explains the empty pattern
+    assert_eq!(s["verdict"], "query", "{s}");
     // every pattern matches alone, but not together
     let q = format!(
         "{PREFIXES}SELECT ?p {{ ?p ex:memberOf res:payments . ?p foaf:name \"Bo Chen\"@en }}"
@@ -238,6 +240,14 @@ async fn why_empty() {
     assert_eq!(s["first"]["kind"], "join", "{s}");
     assert_eq!(s["first"]["text"], "?p foaf:name \"Bo Chen\"@en");
     assert_eq!(s["steps"].as_array().unwrap().len(), 3, "{s}");
+    // A37: the query is well formed for the data, which holds no match
+    assert_eq!(s["verdict"], "data", "{s}");
+    // a term that occurs nowhere and has no suggestion looks like a hidden one
+    let q =
+        format!("{PREFIXES}SELECT ?p {{ ?p ex:memberOf <http://example.org/resource/zzz-none> }}");
+    let s = c.structured("why_empty", json!({"query": q})).await;
+    assert_eq!(s["first"]["kind"], "pattern", "{s}");
+    assert_eq!(s["verdict"], "data", "{s}");
     // a filter that removes everything
     let q = format!("{PREFIXES}SELECT ?n {{ ?p foaf:name ?n FILTER(STRSTARTS(?n, \"Z\")) }}");
     let s = c.structured("why_empty", json!({"query": q})).await;

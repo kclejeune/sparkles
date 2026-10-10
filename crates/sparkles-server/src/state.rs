@@ -307,6 +307,8 @@ pub struct AppState {
     pub volatile: crate::assist::Volatile,
     /// the model providers and role lists (`serve --model-config`, spec C18 §3.4)
     pub models: Option<Arc<crate::models::Models>>,
+    /// recent asks, usage counts and daily token counts (spec C18 §5.5)
+    pub asks: crate::assistant::Runtime,
 }
 
 /// Who may use `POST /$/format` (`serve --format-endpoint`).
@@ -525,6 +527,7 @@ impl AppState {
             mcp: None,
             volatile: Default::default(),
             models: None,
+            asks: Default::default(),
         };
         Ok(state)
     }
@@ -570,6 +573,7 @@ impl AppState {
             mcp: None,
             volatile: Default::default(),
             models: None,
+            asks: Default::default(),
             rate_limit: None,
             auth: None,
             cors_origins: Vec::new(),

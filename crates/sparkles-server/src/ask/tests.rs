@@ -11,7 +11,7 @@ use sparkles::io::{RdfFormat, Source};
 use sparkles::store::StoreOptions;
 use std::collections::VecDeque;
 
-const ORG: &str = r#"@prefix ex:   <http://example.org/ontology#> .
+pub(super) const ORG: &str = r#"@prefix ex:   <http://example.org/ontology#> .
 @prefix res:  <http://example.org/resource/> .
 @prefix foaf: <http://xmlns.com/foaf/0.1/> .
 @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
@@ -26,9 +26,9 @@ res:ana a ex:Person ; foaf:name "Ana Lima"@en ; ex:memberOf res:payments .
 res:bo a ex:Person ; foaf:name "Bo Chen"@en ; ex:memberOf res:platform .
 "#;
 
-const PREFIXES: &str = "PREFIX ex: <http://example.org/ontology#>\nPREFIX res: <http://example.org/resource/>\nPREFIX foaf: <http://xmlns.com/foaf/0.1/>\n";
+pub(super) const PREFIXES: &str = "PREFIX ex: <http://example.org/ontology#>\nPREFIX res: <http://example.org/resource/>\nPREFIX foaf: <http://xmlns.com/foaf/0.1/>\n";
 
-fn server(ttl: &str) -> McpServer {
+pub(super) fn server(ttl: &str) -> McpServer {
     let mut st = AppState::standalone(StoreOptions::default(), Duration::from_secs(30));
     st.read_only = true;
     st.limits.max_result_bytes = None;
@@ -61,7 +61,7 @@ fn models(url: &str, model: Value) -> Models {
     )
 }
 
-fn draft(q: &str) -> String {
+pub(super) fn draft(q: &str) -> String {
     json!({
         "query": q,
         "explanation": "It lists what was asked.",
@@ -72,7 +72,7 @@ fn draft(q: &str) -> String {
     .to_string()
 }
 
-fn is_summary(r: &Received) -> bool {
+pub(super) fn is_summary(r: &Received) -> bool {
     r.body.to_string().contains("rows of a query result")
 }
 
@@ -94,7 +94,7 @@ fn scripted(drafts: Vec<String>, summary: Value) -> MockModel {
     })
 }
 
-fn opts(question: &str) -> AskOptions {
+pub(super) fn opts(question: &str) -> AskOptions {
     AskOptions {
         dataset: "org".into(),
         question: question.into(),
@@ -149,9 +149,11 @@ fn answers_and_summarizes() {
         "{r:#}"
     );
     assert_eq!(
-        out["summary"],
-        json!({ "text": "Ana Lima is on the payments team [1]. So is someone else.", "citations": [1] })
+        out["summary"]["text"],
+        "Ana Lima is on the payments team [1]. So is someone else."
     );
+    assert_eq!(out["summary"]["citations"], json!([1]));
+    assert_eq!(out["summary"]["rowsSent"], 1);
     let reqs = mock.requests();
     assert_eq!(reqs.len(), 2);
     let d = mock::prompt_of(&reqs[0]);

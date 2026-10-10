@@ -7,6 +7,174 @@ pub(super) fn put_all(put: &mut dyn FnMut(&str, J)) {
     models(put);
     tools(put);
     memory(put);
+    asking(put);
+}
+
+fn asking(put: &mut dyn FnMut(&str, J)) {
+    let pair = obj(
+        &["provider", "model"],
+        json!({ "provider": string(), "model": string() }),
+    );
+    let send = string_enum(&["schema", "rows", "documents"]);
+    let turn = closed(
+        &["question", "query"],
+        json!({ "question": string(), "query": string() }),
+    );
+    let choice = closed(&["value"], json!({ "id": string(), "value": string() }));
+    put(
+        "AskRequest",
+        doc(
+            closed(
+                &["question"],
+                json!({
+                    "question": with_desc(string(), "At most 2000 characters."),
+                    "context": with_desc(array(turn), "Earlier turns of the conversation, at most 5."),
+                    "clarification": {
+                        "description": "The chosen value of a `clarify` event, as `{id, value}` or as the value alone.",
+                        "oneOf": [choice, string()],
+                    },
+                    "at": { "description": "A commit or time to read, as for `/{ds}/sparql`." },
+                    "branch": string(),
+                    "reasoning": boolean(),
+                    "run": with_desc(boolean(), "Whether to run the checked query. `true` by default."),
+                    "summary": with_desc(boolean(), "Whether to summarize the rows. `true` by default when the dataset sends rows."),
+                    "maxRows": with_desc(int(), "The rows returned in `result`, 1000 by default."),
+                    "tryHarder": with_desc(string(), "The id of an earlier ask of the caller. Drafting starts at the pair after the one that drafted it."),
+                    "reviewedOnly": with_desc(boolean(), "Hide the agent memory graphs of the dataset from the query."),
+                    "query": with_desc(string(), "A query to check, run and summarize without drafting, for **Summarize again** after an edit."),
+                }),
+            ),
+            "A question for the dataset.",
+            "asking-in-the-server",
+        ),
+    );
+    put(
+        "AskResult",
+        doc(
+            obj(
+                &["dataset", "question", "outcome", "usage"],
+                json!({
+                    "dataset": string(),
+                    "question": string(),
+                    "outcome": string_enum(&["answered", "empty", "checked", "not-run", "clarify", "unanswerable", "failed", "error"]),
+                    "result": any_object("The checked query with `explanation`, `assumptions`, `terms`, `graph`, `commit`, `attempt`, `verdict` and `results` in the `application/x-sparkles+json` form."),
+                    "summary": obj(&["text", "citations"], json!({ "text": string(), "citations": array(int()), "rowsSent": int(), "provider": string(), "model": string() })),
+                    "clarify": any_object("`{id, question, choices: [{label, value}]}`."),
+                    "error": obj(&["code", "message"], json!({ "code": string(), "message": string() })),
+                    "attempts": array(any_object("One draft with its check and run.")),
+                    "notes": strings(),
+                    "usage": any_object("`askId`, the tokens and estimated cost, `complexity`, the `steps` with their pairs and signals, `escalations`, `draftPair`, `answeredBy` and `tryHarder`."),
+                }),
+            ),
+            "The whole answer of an ask in the JSON form.",
+            "asking-in-the-server",
+        ),
+    );
+    let mut roles = Map::new();
+    for r in [
+        "draft",
+        "repair",
+        "summarize",
+        "extract",
+        "explain",
+        "optimize",
+    ] {
+        roles.insert(r.into(), array(pair.clone()));
+    }
+    put(
+        "AssistantSettings",
+        doc(
+            obj(
+                &[],
+                json!({
+                    "enabled": with_desc(boolean(), "Whether the dataset has an assistant. `false` by default."),
+                    "roles": { "type": "object", "description": "Role lists that replace the server's for this dataset.", "properties": J::Object(roles) },
+                    "ask": with_desc(boolean(), "Whether `POST /{ds}/ask` is enabled. `true` by default."),
+                    "explain": boolean(),
+                    "optimize": boolean(),
+                    "ingest": boolean(),
+                    "send": with_desc(send.clone(), "What may leave the server. `schema` by default."),
+                    "sendByProvider": { "type": "object", "description": "A lower `send` level for some providers.", "additionalProperties": send },
+                    "rowsForSummary": with_desc(int(), "The rows sent to the summary, 50 by default."),
+                    "budget": closed(&[], json!({ "perRequest": int(), "perPrincipalPerDay": int(), "perDatasetPerDay": int() })),
+                    "deadlineSecs": with_desc(num(), "The time an ask may take, 120 seconds by default."),
+                    "historyDays": with_desc(int(), "The days an asked question is kept. 0 keeps nothing."),
+                    "routing": any_object("`complexityThreshold` and `exampleScore` of the escalation rules."),
+                    "status": with_desc(obj(&["models", "historyDays", "ask"], json!({
+                        "models": boolean(),
+                        "historyDays": int(),
+                        "ask": boolean(),
+                        "reason": string(),
+                        "draft": array(pair.clone()),
+                        "summary": with_desc(boolean(), "Whether an answer can carry a summary."),
+                    })), "Answered by the server and ignored in a `PUT`."),
+                }),
+            ),
+            "The assistant settings of a dataset.",
+            "assistant-settings",
+        ),
+    );
+    put(
+        "AskHistory",
+        doc(
+            obj(
+                &["dataset", "historyDays", "asks"],
+                json!({
+                    "dataset": string(),
+                    "historyDays": int(),
+                    "asks": array(obj(&["id", "principal", "at", "question", "result", "outcome", "routing"], json!({
+                        "id": string(),
+                        "principal": string(),
+                        "at": { "type": "string", "format": "date-time" },
+                        "question": string(),
+                        "query": string(),
+                        "commit": int(),
+                        "result": with_desc(string(), "The pipeline's outcome."),
+                        "outcome": string_enum(&["none", "accepted", "edited", "rejected"]),
+                        "note": string(),
+                        "routing": any_object("The complexity, steps, escalations, answering pair and tokens."),
+                    }))),
+                }),
+            ),
+            "The caller's asked questions, newest first.",
+            "ask-history",
+        ),
+    );
+    put(
+        "AskFeedback",
+        doc(
+            closed(
+                &["outcome"],
+                json!({
+                    "outcome": string_enum(&["accepted", "edited", "rejected"]),
+                    "note": with_desc(string(), "At most 1000 characters."),
+                }),
+            ),
+            "Feedback on an answer.",
+            "ask-history",
+        ),
+    );
+    put(
+        "ModelUsage",
+        doc(
+            obj(
+                &["days", "datasets"],
+                json!({
+                    "days": int(),
+                    "datasets": array(obj(&["dataset", "asks"], json!({
+                        "dataset": string(),
+                        "asks": int(),
+                        "answers": array(any_object("`{role, provider, model, outcome, count}`.")),
+                        "escalations": array(any_object("`{role, signal, count}`.")),
+                        "outcomes": array(any_object("`{bucket, outcome, count}`.")),
+                        "tokens": array(any_object("`{provider, model, inputTokens, outputTokens, estimatedCost}`.")),
+                    }))),
+                }),
+            ),
+            "The routing counters by dataset.",
+            "asking-in-the-server",
+        ),
+    );
 }
 
 /// The members every tool body may hold to pick a state.
@@ -140,6 +308,7 @@ fn tools(put: &mut dyn FnMut(&str, J)) {
                         "issues": array(issue),
                     })),
                     "steps": array(step),
+                    "verdict": with_desc(string_enum(&["query", "data", "unknown"]), "For an empty result: `query` when a check issue explains the first element without solutions, `data` when the query is well formed for the data and the data holds no match, `unknown` otherwise."),
                     "unchecked": with_desc(strings(), "Parts of the query the diagnosis does not cut, such as MINUS."),
                     "complete": with_desc(boolean(), "Whether every check finished and every part was checked."),
                     "message": string(),

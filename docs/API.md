@@ -8569,8 +8569,10 @@ An unknown tool is a protocol error (`-32602`, "Unknown tool: NAME").
 ## Natural-language questions
 
 These routes support asking a dataset questions in plain language (spec C18). The
-model pipeline itself runs in `sparkles ask` and in agents over MCP. The server routes
-here check and explain queries, run memory recalls, and describe the model providers.
+model pipeline runs in the server under `POST /{ds}/ask`, in `sparkles ask` and in
+agents over MCP. The other routes here check and explain queries, run memory recalls,
+keep the assistant settings and the history of asked questions, and describe the model
+providers.
 
 ### Checking and explaining queries
 
@@ -8614,7 +8616,11 @@ about those constants, such as a `language-tag` warning. `steps` lists each chec
 `solutions` true, false, or null when the check ran out of time. OPTIONAL parts are not
 checked, because they cannot empty a result. MINUS, OFFSET, GROUP BY and SERVICE are
 named in `unchecked`, and `complete` is false when a part was not checked or a check ran
-out of time. The verdict of spec C18 §4.2 comes with the server pipeline.
+out of time. `verdict` says where the fault most likely lies. It is `query` when an
+issue of `check_query` explains the empty step, such as a missing language tag or an
+unknown term with a suggestion. Without such an issue, it is `data` for a join or
+filter whose constants all occur, and for a pattern with a constant that occurs nowhere
+in the view, because the data then has no answer. It is `unknown` otherwise.
 
 ```json
 {
@@ -8624,6 +8630,7 @@ out of time. The verdict of spec C18 §4.2 comes with the server pipeline.
     "constants": [ { "term": "foaf:name", "occurs": true }, { "term": "\"Ana Lima\"", "occurs": false } ],
     "issues": [ { "code": "language-tag", "severity": "warning", "message": "…", "term": "\"Ana Lima\"" } ]
   },
+  "verdict": "query",
   "steps": [ { "kind": "pattern", "text": "?p a ex:Person", "solutions": true },
              { "kind": "pattern", "text": "?p foaf:name \"Ana Lima\"", "solutions": false } ],
   "complete": true,
@@ -8748,3 +8755,129 @@ are `provider-unavailable`, `provider-auth`, `provider-rejected`, `refusal`,
 `invalid-output`, `secret-missing`, `budget-exceeded`, `outbound-refused`
 and `deadline`. An unknown provider is a `404` with code `unknown-provider`, and a
 server without providers answers `404` with code `no-models`.
+
+### Asking in the server
+
+**`POST /{ds}/ask`** answers a question with the model pairs of the dataset. It needs
+`read` on the dataset, it counts as a query for rate limits, and it exists in builds
+with the `mcp` feature. The pipeline grounds the question in stored examples, linked
+entities and schema terms. It then drafts a query, checks it, runs it, and repairs it
+up to twice with a diagnosis. When the dataset may send rows, it also summarizes the
+first rows. Every step runs as the caller over the caller's view, so a model never sees
+a term the caller cannot read.
+
+```json
+{ "question": "Who in the payments team joined most recently?", "maxRows": 100 }
+```
+
+| Member | Meaning |
+|---|---|
+| `question` | Required, at most 2000 characters. |
+| `context` | Up to 5 earlier turns of the conversation, each `{question, query}`, for follow-up questions. |
+| `clarification` | The answer to a `clarify` event, as `{id, value}` or as the value alone. |
+| `at`, `branch`, `reasoning` | As for `/{ds}/sparql`. |
+| `run` | `false` stops after the check with the checked query, for a preview. The default is `true`. |
+| `summary` | `false` skips the summary. A summary is only made when the dataset sends rows. |
+| `maxRows` | The rows of `result`, 1000 by default and at most the result cap of MCP. |
+| `tryHarder` | The id of an earlier ask of the caller. Drafting starts at the pair after the one that drafted it, and the earlier answer is marked `rejected`. |
+| `reviewedOnly` | `true` hides the agent memory graphs of the dataset's memory settings from every step. |
+| `query` | A query to check, run and summarize without a draft, for a query that the caller edited. |
+
+The answer is a stream of server-sent events. Each event's data is one JSON object.
+
+| Event | Data |
+|---|---|
+| `ground` | The examples, linked entities and schema terms used as context. |
+| `clarify` | `{id, question, choices: [{label, value}]}` for an ambiguous mention. The stream ends, and the client asks again with `clarification`. |
+| `draft` | `{attempt, role, provider, model, query, explanation, assumptions, graph}`. |
+| `escalate` | `{role, from: {provider, model}, to: {provider, model}, signal}`. |
+| `check` | The `check_query` result of the draft. |
+| `run` | `{attempt, commit, rows, truncated, elapsedMs}`, or the error. |
+| `diagnosis` | The `why_empty` diagnosis that starts a repair, with its `verdict`. |
+| `result` | `{query, explanation, assumptions, terms, graph, commit, attempt, verdict, results}`. `results` has the `application/x-sparkles+json` form of `/{ds}/sparql`, with the rows, the plan and the timings. |
+| `summary` | `{text, citations, rowsSent, provider, model}`. Each `[n]` marker of `text` names a row of `results`, counted from 1. |
+| `error` | `{code, message}`, such as `no-model`, `provider-unavailable`, `budget-exceeded` or `timeout`. A draft that says the data cannot answer ends with `unanswerable`, and a draft that still fails after its repairs ends with `no-valid-query` or the error of its last run. These two carry the last draft in `result`. |
+| `usage` | The last event. It holds the `outcome` of the ask, `askId`, the tokens, the estimated cost, the `complexity`, every model step with its pair, outcome and `signal`, the `escalations`, the `answeredBy` pair and `tryHarder`, which is `true` when the draft role has a later pair. |
+
+A client that sends `Accept: application/json` without `text/event-stream` gets one
+object instead. It holds `outcome`, `result`, `summary`, `clarify` or `error`, the
+`attempts`, and `usage`. An `error` answers with its status, such as `429` for
+`budget-exceeded` and `502` for `provider-unavailable`.
+
+The route answers `404` with code `no-assistant` when the server has no model
+providers, the dataset's assistant is not enabled, `ask` is off, or no pair answers the
+draft role. A request over a daily token cap of the dataset or the caller is a `429`
+with code `budget-exceeded` and the `resetAt` time, and no model is called. A
+`tryHarder` id that the caller did not ask is a `404` with code `unknown-ask`, and one
+whose draft pair was the last is a `409` with code `no-later-pair`.
+
+**Escalation.** Each role has an ordered list of pairs, cheapest first. A step moves to
+the next pair of its role on a signal the server has verified. The signals are
+`check-failed` when a repaired draft still fails the check, `empty-query` when a
+repaired draft is still empty and `why_empty` blames the query, `provider-failure` when
+a call times out, is refused or gives invalid output after its retry, `complexity` when
+the draft or the best example is complex, and `try-harder`. A role moves at most twice
+per ask. An empty result whose verdict is `data` ends the ask as an answer with no
+rows, without a repair.
+
+**`GET /$/models/usage?days=N`** (server admin) answers the routing counters of the
+last `N` days, 30 by default and at most 400, by dataset. The counters hold the asks,
+the answers by role, pair and feedback, the escalations by role and signal, the
+feedback by complexity bucket, and the tokens with their estimated cost by pair. They
+live in memory and start again with the server. `/$/metrics` carries the same counts as
+`sparkles_ask_total`, `sparkles_ask_answers`, `sparkles_ask_escalations_total`,
+`sparkles_ask_tokens_total` and `sparkles_ask_estimated_cost_total`.
+
+### Assistant settings
+
+A dataset's assistant settings are kept in `<db>/assistant.json` of a persistent
+dataset and in the process for an in-memory one. `GET /$/assistant/{ds}` needs `read`
+and `PUT /$/assistant/{ds}` needs `admin`.
+
+```json
+{
+  "enabled": true,
+  "roles": { "draft": [{ "provider": "local", "model": "qwen3:8b" }, { "provider": "claude", "model": "claude-sonnet-5" }] },
+  "send": "rows",
+  "sendByProvider": { "claude": "schema" },
+  "rowsForSummary": 50,
+  "budget": { "perRequest": 50000, "perPrincipalPerDay": 500000 },
+  "historyDays": 30
+}
+```
+
+| Member | Meaning |
+|---|---|
+| `enabled` | Whether the dataset has an assistant. The default is `false`. |
+| `roles` | Role lists that replace the server's lists for this dataset. Each pair must name a configured provider and a model it allows. |
+| `ask` | Whether `POST /{ds}/ask` is on. The default is `true`. |
+| `explain`, `optimize`, `ingest` | Switches for the later features of spec C18. |
+| `send` | What may leave the server: `schema` (the default), `rows` for summaries, or `documents` for ingestion. |
+| `sendByProvider` | A lower `send` level for a provider. A summary only goes to a pair whose provider may receive rows. |
+| `rowsForSummary` | The rows sent to the summary, 50 by default. |
+| `budget` | Token caps: `perRequest` (50,000 by default), `perPrincipalPerDay` and `perDatasetPerDay`. |
+| `deadlineSecs` | The time an ask may take, 120 seconds by default. |
+| `historyDays` | The days an asked question is kept. `0` keeps nothing. Without it, the server's `serve --ask-history-days` applies, 30 by default. |
+| `routing` | `complexityThreshold` and `exampleScore`, which override the server's routing settings. |
+
+A `PUT` with an `endpoint` or an `apiKey` anywhere is a `400`, because only the server
+configuration names endpoints and keys. The `GET` answer adds `status`, which says
+whether asking works (`ask`), why not (`reason`), the draft pairs, whether a summary is
+possible, and the history days in force. A `status` member in a `PUT` is ignored.
+
+### Ask history
+
+The server keeps each caller's asked questions for `historyDays` in
+`<db>/asks.json`. An entry holds the question, the final query, the commit, the
+outcome, the feedback and the routing record. Rows and summaries are never stored.
+Each caller sees and removes only their own entries.
+
+| Method and path | Needs | Effect |
+|---|---|---|
+| `GET /$/asks/{ds}?limit=N` | `read` | `{dataset, historyDays, asks}`, newest first, at most `N` (100 by default). |
+| `DELETE /$/asks/{ds}?id=ID` | `read` | Removes the caller's entry `ID`, or all of the caller's entries without `id`, `204`. An unknown `ID` is a `404` with code `unknown-ask`. |
+| `POST /$/asks/{ds}/{id}/feedback` | `read` | Records `{outcome, note?}` for one of the caller's asks, `204`. `outcome` is `accepted`, `edited` or `rejected`, and `note` holds at most 1000 characters. |
+
+Feedback also counts in the routing counters, so `GET /$/models/usage` shows how often
+each pair's answers were kept. It works for the recent asks of the process when history
+is off.

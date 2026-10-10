@@ -26,7 +26,9 @@ pub(crate) mod mock;
 mod structured;
 
 pub use client::{CallError, ChatRequest, Message};
-pub use config::{DEFAULT_CONTEXT_TOKENS, Kind, Level, ModelsConfig, Pair, ProviderConfig, Role};
+pub use config::{
+    DEFAULT_CONTEXT_TOKENS, Kind, Level, ModelsConfig, Pair, ProviderConfig, Role, Routing,
+};
 #[cfg(test)]
 pub use structured::validate;
 pub use structured::{OutputSchema, fenced};

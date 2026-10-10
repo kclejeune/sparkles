@@ -2179,6 +2179,77 @@ fn assist(p: &mut Paths) {
             .json("200", "The outcome.", "ModelTestResult")
             .errors(&[400, 404]),
     );
+    p.add(
+        op(GET, "/$/models/usage", "modelUsage", tag, "Model usage by dataset")
+            .doc("The routing counters of the last `days` days by dataset: asks, answers by role, pair and feedback, escalations by role and signal, feedback by complexity bucket, and tokens with the estimated cost by pair. The counters live in memory and start again when the server restarts.")
+            .see("asking-in-the-server")
+            .query("days", json!({ "type": "integer", "minimum": 1, "maximum": 400, "default": 30 }), "The days counted, today included.")
+            .json("200", "The counters.", "ModelUsage")
+            .errors(&[400]),
+    );
+    let tag = "Assistant";
+    p.add(
+        op(POST, "/{ds}/ask", "askQuestion", tag, "Ask a question")
+            .doc("Runs the pipeline of spec C18 with the dataset's model pairs. It grounds the question, drafts a query, checks and runs it, repairs it after a failure, escalates to a later pair on a verified signal, and summarizes the rows when the dataset sends rows. The answer streams as server-sent events, one JSON object per event, unless `Accept` names `application/json` without `text/event-stream`. Needs `read` and counts as a query for rate limits.")
+            .see("asking-in-the-server")
+            .json_body(true, "AskRequest")
+            .resp(
+                "200",
+                "The events `ground`, `clarify`, `draft`, `escalate`, `check`, `run`, `diagnosis`, `result`, `summary`, `error` and finally `usage`, or the whole answer as one object.",
+                Some(json!({
+                    "text/event-stream": text(),
+                    "application/json": { "schema": sref("AskResult") },
+                })),
+            )
+            .errors(&[400, 404, 409, 429]),
+    );
+    p.add(
+        op(GET, "/$/assistant/{ds}", "getAssistantSettings", "Datasets", "Get the assistant settings")
+            .doc("The dataset's `assistant.json` with a `status` that says whether asking works, and why not when it does not.")
+            .see("assistant-settings")
+            .json("200", "The settings and their status.", "AssistantSettings"),
+    );
+    p.add(
+        op(PUT, "/$/assistant/{ds}", "putAssistantSettings", "Datasets", "Set the assistant settings")
+            .doc("Replaces the dataset's `assistant.json`. Providers and models must be ones the server configuration names, and an `endpoint` or `apiKey` anywhere is refused.")
+            .see("assistant-settings")
+            .json_body(true, "AssistantSettings")
+            .json("200", "The stored settings and their status.", "AssistantSettings")
+            .errors(&[400]),
+    );
+    p.add(
+        op(GET, "/$/asks/{ds}", "listAsks", tag, "List your asked questions")
+            .doc("The caller's own asks on the dataset, newest first, kept for `historyDays`. An entry holds the question, the final query, the commit, the feedback and the routing record, never rows or summaries.")
+            .see("ask-history")
+            .query("limit", json!({ "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 }), "The most entries listed.")
+            .json("200", "The entries.", "AskHistory"),
+    );
+    p.add(
+        op(
+            DELETE,
+            "/$/asks/{ds}",
+            "deleteAsks",
+            tag,
+            "Forget your asked questions",
+        )
+        .doc("Removes the caller's entries, or the one entry `id` names.")
+        .see("ask-history")
+        .query(
+            "id",
+            s(),
+            "The entry to remove. All of the caller's entries without it.",
+        )
+        .no_content("Removed.")
+        .errors(&[404]),
+    );
+    p.add(
+        op(POST, "/$/asks/{ds}/{id}/feedback", "askFeedback", tag, "Give feedback on an answer")
+            .doc("Records `accepted`, `edited` or `rejected` for one of the caller's asks, in the routing counters and, when history is kept, in its entry.")
+            .see("ask-history")
+            .json_body(true, "AskFeedback")
+            .no_content("Recorded.")
+            .errors(&[400, 404]),
+    );
 }
 
 fn backups(p: &mut Paths) {

@@ -938,6 +938,11 @@ fn tags() -> J {
             "Model providers and the role lists of the question pipeline.",
             "model-providers"
         ),
+        t(
+            "Assistant",
+            "Asking a dataset questions in plain language, the history of asked questions and feedback.",
+            "asking-in-the-server"
+        ),
         t("OpenAPI", "This description.", "openapi-description"),
     ])
 }

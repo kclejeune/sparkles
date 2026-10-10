@@ -23,6 +23,7 @@ import {
 } from './branches.mjs';
 import { handleDescribe } from './describe.mjs';
 import { handleAsk, isAdmin, ORG_MEMORY, ORG_PREFIXES, orgTrig, whoamiFor } from './memory.mjs';
+import { handleAssistant } from './assistant.mjs';
 import { geoQuery, handleGeo } from './geo.mjs';
 import { handleVector, seedVectors, touchPacked, vectorIndexFor } from './vector.mjs';
 import { PREFIXES, buildTurtle, provenanceTrig, scratchTurtle, vectorTurtle } from './data.mjs';
@@ -1284,6 +1285,49 @@ async function handleQuery(req, res, ds, p) {
   );
 }
 
+/** A query's result in the form of `application/x-sparkles+json`, for the asks. */
+function sparklesResult(ds, query, cap = Infinity) {
+  const opts = queryOptions(ds, new URLSearchParams());
+  const t0 = performance.now();
+  const result = ds.store.query(query, opts);
+  const execMs = performance.now() - t0;
+  let body;
+  if (typeof result === 'boolean') body = { queryType: 'ASK', boolean: result, total: 1 };
+  else if (result.length && !(result[0] instanceof Map)) {
+    const triples = result.map((q) => [
+      termJson(q.subject),
+      termJson(q.predicate),
+      termJson(q.object),
+    ]);
+    body = { queryType: 'CONSTRUCT', triples: triples.slice(0, cap), total: triples.length };
+  } else {
+    const json = JSON.parse(
+      ds.store.query(query, { ...opts, results_format: 'application/sparql-results+json' }),
+    );
+    const vars = json.head.vars;
+    const rows = json.results.bindings.map((b) => vars.map((v) => b[v] ?? null));
+    body = { queryType: 'SELECT', vars, rows: rows.slice(0, cap), total: rows.length };
+  }
+  const { total, ...rest } = body;
+  return {
+    ...rest,
+    meta: {
+      totalRows: total,
+      sentRows: rest.rows?.length ?? rest.triples?.length ?? 1,
+      timing: {
+        parseMs: 0.1,
+        planMs: 0.2,
+        execMs: +execMs.toFixed(3),
+        serializeMs: 0.1,
+        totalMs: +(execMs + 0.4).toFixed(3),
+      },
+      plan: plan(query, total, execMs, true),
+      commit: headCommit(ds).seq,
+      datasetId: ds.id,
+    },
+  };
+}
+
 function handleUpdate(req, res, ds, p) {
   const update = p.get('update');
   if (!update) return fail(res, 400, 'Missing update parameter');
@@ -1988,6 +2032,17 @@ const server = http.createServer(async (req, res) => {
     }
     // questions, checks and agent memory (mock/memory.mjs)
     if (await handleAsk(req, res, url, seg, { datasets, send, fail, readBody })) return;
+    // asking the server, the assistant settings and the history (mock/assistant.mjs)
+    if (
+      await handleAssistant(req, res, url, seg, {
+        datasets,
+        send,
+        fail,
+        readBody,
+        sparklesResult,
+      })
+    )
+      return;
     // branches and merges (mock/branches.mjs)
     if (
       await handleBranches(req, res, url, seg, {

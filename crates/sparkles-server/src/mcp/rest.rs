@@ -31,7 +31,7 @@ pub fn routes() -> Router<Arc<AppState>> {
 
 /// The tools' limits over HTTP: those of `/$/mcp` when the server runs it, else the
 /// server's own query limits.
-fn config(st: &AppState) -> McpConfig {
+pub(crate) fn config(st: &AppState) -> McpConfig {
     let mut cfg = match &st.mcp {
         Some(conf) => conf.cfg.clone(),
         None => McpConfig {

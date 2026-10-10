@@ -19,8 +19,16 @@ class AppState {
   /** Local names of predicates and classes per dataset, for autocomplete. */
   vocab = $state<Record<string, string[]>>({});
 
-  /** A query another page wants opened in a new Query tab. */
-  pendingQuery = $state<{ query: string; title?: string; question?: TabQuestion } | null>(null);
+  /**
+   * A query another page wants opened in a new Query tab, or with `ask` a question for the
+   * Ask bar.
+   */
+  pendingQuery = $state<{
+    query: string;
+    title?: string;
+    question?: TabQuestion;
+    ask?: string;
+  } | null>(null);
 
   /** The state the Query page reads (`at=`): empty for the head. */
   queryAt = $state('');

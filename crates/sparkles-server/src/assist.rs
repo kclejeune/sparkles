@@ -103,7 +103,7 @@ impl MemorySettings {
     }
 }
 
-fn read_file(st: &AppState, ds: &Dataset, file: &'static str) -> Result<Option<Value>> {
+pub(crate) fn read_file(st: &AppState, ds: &Dataset, file: &'static str) -> Result<Option<Value>> {
     match ds.store.root() {
         Some(root) => match std::fs::read(root.join(file)) {
             Ok(b) => Ok(Some(
@@ -116,7 +116,7 @@ fn read_file(st: &AppState, ds: &Dataset, file: &'static str) -> Result<Option<V
     }
 }
 
-fn write_file(st: &AppState, ds: &Dataset, file: &'static str, v: &Value) -> Result<()> {
+pub(crate) fn write_file(st: &AppState, ds: &Dataset, file: &'static str, v: &Value) -> Result<()> {
     match ds.store.root() {
         Some(root) => {
             let bytes = serde_json::to_vec_pretty(v)?;

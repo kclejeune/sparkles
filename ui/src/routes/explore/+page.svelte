@@ -4,6 +4,7 @@
   import { page } from '$app/state';
   import { onMount, untrack } from 'svelte';
   import * as api from '$lib/api';
+  import { assistantSettings } from '$lib/ask-api';
   import type { Term } from '$lib/api';
   import { app, toasts } from '$lib/app.svelte';
   import * as ex from '$lib/explore';
@@ -39,6 +40,27 @@
 
   const ds = $derived(app.current);
   const prefixes = $derived(app.prefixes(ds));
+
+  /** Whether the dataset answers questions, for the search box's Ask hint (C18 §6.1). */
+  let canAsk = $state(false);
+  $effect(() => {
+    const name = ds;
+    canAsk = false;
+    if (!name) return;
+    const ctl = new AbortController();
+    assistantSettings(name, ctl.signal)
+      .then((s) => {
+        if (ds === name) canAsk = !!s?.status?.ask;
+      })
+      .catch(() => {});
+    return () => ctl.abort();
+  });
+
+  /** Take the search text to the query page's Ask bar. */
+  function askInQuery() {
+    app.pendingQuery = { query: '', ask: query.trim() };
+    goto(resolve('/query'));
+  }
 
   type Tab = 'graph' | 'schema' | 'search';
   const urlTab = page.url.searchParams.get('tab');
@@ -610,7 +632,9 @@
       <Icon name="search" size={15} />
       <input
         class="search-input"
-        placeholder={ds ? `Find a resource in ${ds} by label or IRI` : 'Choose a dataset first'}
+        placeholder={ds
+          ? `Find a resource in ${ds} by label or IRI${canAsk ? ', or ask a question' : ''}`
+          : 'Choose a dataset first'}
         bind:value={query}
         oninput={onSearchInput}
         onfocus={() => (searchOpen = true)}
@@ -646,6 +670,18 @@
               <div class="hit none">{searchErr ?? `Nothing matches “${query.trim()}”.`}</div>
             {/if}
           {/each}
+          {#if canAsk}
+            <button
+              role="option"
+              aria-selected="false"
+              class="hit ask-hint"
+              onclick={askInQuery}
+              title="Open the query page with this as a question"
+            >
+              <Icon name="sparkle" size={14} />
+              <span>Ask a question… <span class="faint">“{query.trim()}”</span></span>
+            </button>
+          {/if}
         </div>
       {/if}
     </div>
