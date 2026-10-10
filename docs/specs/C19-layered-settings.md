@@ -163,6 +163,12 @@ kept, so the entry applies as soon as a dataset with that name is created. Setti
 follow the name, so a renamed dataset loses its declared entry and gains the entry of
 its new name, if any.
 
+The assistant stays off by default, as in C18. Configuring model providers makes the
+assistant available, and each dataset still opts in. To turn it on for every dataset,
+including datasets created later, an operator declares `defaults.assistant.enabled` in
+the settings file and may lock it. The user docs and the NixOS module's documentation
+show this as the standard way to turn the assistant on for a server.
+
 The settings file must not contain `endpoint` or `apiKey` members anywhere, for the
 same reason as the assistant route: only the model configuration names endpoints and
 keys.
@@ -374,6 +380,11 @@ to replace or remove a runtime value.
   outbound connections with the operator, but it forces a restart or a redeploy for
   every change of a role list or a budget. Server administrators are trusted with the
   server, and the operator can still lock what must not change.
+- **Turning the assistant on whenever models are configured.** Even the `schema` level
+  of `send` sends entity labels from the data, and anyone with `read` can spend tokens.
+  A provider added at runtime would then turn assistants on across the server. A
+  variant that turned it on only when every `draft` provider is on loopback was also
+  declined in favor of one explicit setting.
 - **Returning stored keys to administrators.** A key that can be read back can leak
   through the UI, logs and backups of API answers. Keys are write-only, as in most
   services that hold credentials.

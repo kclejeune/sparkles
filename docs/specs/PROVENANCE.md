@@ -621,6 +621,7 @@ implementation landed.
 - **Rejected** (spec §12):
   - model configuration only in the operator's file;
   - returning stored keys to administrators;
+  - turning the assistant on whenever models are configured;
   - writing declared settings into the dataset files before each start;
   - declared values that always win, and runtime values that always win;
   - locks per settings kind;
