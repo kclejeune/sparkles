@@ -4,7 +4,7 @@ import { defineConfig, devices } from '@playwright/test';
 // not a test suite. The pages run against the mock backend, whose `org` dataset has agent
 // memory and whose assistant (mock/assistant.mjs) scripts the ask pipeline without a model.
 // It starts mock/server.mjs and `vite dev` on free ports, as playwright.mock.config.ts does,
-// and the spec in tests/screenshots-mock writes docs/images/*.png in the light theme.
+// and the spec in tests/screenshots-mock writes docs/images/*.png in the dark theme, like the other screenshots.
 const mockPort = (process.env.MOCK_SCREENSHOTS_PORT ??= String(
   20000 + Math.floor(Math.random() * 20000),
 ));
@@ -22,7 +22,7 @@ export default defineConfig({
     baseURL: `http://127.0.0.1:${uiPort}`,
     viewport: { width: 1440, height: 900 },
     deviceScaleFactor: 2,
-    colorScheme: 'light',
+    colorScheme: 'dark',
     locale: 'en-GB',
     timezoneId: 'UTC',
   },

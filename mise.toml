@@ -558,7 +558,7 @@ env = { SPARKLES_UPDATE_OPENAPI = "1" }
 run = "cargo test -p sparkles-server --bin sparkles openapi::tests::checked_in_copy_is_current"
 
 [tasks."docs:screenshots"]
-description = "The README's screenshots (docs/images/*.png): the release build serves the demo dataset of docs/demo on a free port for the dark-mode pages, the mock backend serves the light-mode branch and agent pages, Playwright drives the UI, oxipng shrinks the images (not part of ci)"
+description = "The README's screenshots (docs/images/*.png): the release build serves the demo dataset of docs/demo on a free port for the dark-mode pages, the mock backend serves the branch and agent pages, all in dark mode, Playwright drives the UI, oxipng shrinks the images (not part of ci)"
 depends = ["build", "ui:e2e:browsers"]
 dir = "ui"
 tools = { "github:shssoichiro/oxipng" = "10.2.1" }

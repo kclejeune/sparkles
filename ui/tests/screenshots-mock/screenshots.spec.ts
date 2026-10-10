@@ -1,4 +1,4 @@
-// The README's screenshots of branches and of the agent pages, in the light theme, against
+// The README's screenshots of branches and of the agent pages, in the dark theme, against
 // the mock backend that playwright.screenshots-mock.config.ts starts. The `org` dataset
 // gets a branch whose changes clash with main, so that the dataset page shows branches and
 // the commit graph and the merge page shows conflicts. The Ask bar runs the scripted
@@ -20,7 +20,7 @@ PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
 const test = base.extend({
   page: async ({ page }, use) => {
     await page.addInitScript((ds) => {
-      localStorage.setItem('sparkles.theme', 'light');
+      localStorage.setItem('sparkles.theme', 'dark');
       localStorage.setItem('sparkles.dataset', ds);
       localStorage.removeItem('sparkles.queryTabs');
     }, DATASET);
