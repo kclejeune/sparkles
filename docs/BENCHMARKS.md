@@ -734,6 +734,10 @@ this:
   66 KB at 10.5M and 8.4 MB of memory at 1.01B quads. Loads and compactions write it;
   `sparkles vocab-index` adds it to a database without one.
   `SPARKLES_SPARSE_VOCAB=off` disables its use.
+* A numeric column, `vocab.num`, holds the values of the numeric literals that the
+  vocabulary stores, so a range filter or sort over them reads 8 bytes per value
+  instead of a front-coded block. It reads ahead only the pages of the values it
+  needs. See [Numeric literals in the vocabulary](#numeric-literals-in-the-vocabulary).
 * An index join with up to 16,384 keys requests its blocks before decoding the first,
   allowing their reads to overlap (`prefetch_blocks` in
   `SPARKLES_DISABLE_OPTIMIZATIONS`).
@@ -1035,6 +1039,52 @@ datasets keep their snapshot numbers.
 and the system's I/O pressure before a load or query step. It warns when the last
 trim is more than two days old or less than 30% of the filesystem is free, and it
 samples pressure once per second while the steps run.
+
+### Numeric literals in the vocabulary
+
+Sparkles stores a number inline in its id only when its lexical form is canonical.
+DBpedia writes coordinates as `"48.8566"^^xsd:float` and many counts as `xsd:int` or
+`xsd:nonNegativeInteger`, so 2,057,247 of its numeric literals live in the vocabulary.
+A range filter, sort or aggregate over them used to decode the key of every candidate.
+The numeric column, `vocab.num`, now holds their exact values next to the vocabulary.
+The vocabulary sorts literals by lexical form, so numbers are not contiguous in it.
+The column keeps a 4-bit kind for every id in 132 segments that contain all numbers,
+8.06M of the 88.4M literal ids, and an 8-byte value for each number. A float keeps
+its `f32`, a double its `f64`, an integer its `i64` and a decimal an exact scale and
+mantissa. A decimal with too many digits is marked for decoding instead. The column
+costs 20.7 MB on disk beside an 8.0 GB `vocab.dat`, and its kinds and rank, 4.3 MB,
+stay in memory while the database is open. Writing it during the load had no
+measurable cost. The load took 480 s with a peak RSS of 6,059 MiB on 2026-10-09, and
+every other index file was byte-identical to the load of the same day without the
+column. `sparkles vocab-index` added it to that older index in 4.8 s.
+
+The following times were measured on `forge` on 2026-10-09 on the full DBpedia index,
+with the column against `SPARKLES_NUMERIC_COLUMN=off` in the same binary. Cold times are
+medians of 10 alternating rounds with a server restart and file-cache eviction before
+each query. Warm times are medians of 11 requests to one server. QLever's times are
+the retained references of 2026-10-03, because its index was no longer on the machine.
+`geo-avg`, `lat-order`, `pop-range`, `pop-topk` and `elev` are extra queries over
+`geo:lat`, `geo:long`, `dbo:populationTotal` and `dbo:elevation` that are not part of
+the suite. The cold rows of `pop-range` and `elev` come from a run of the same day
+with the earlier version of the column described at the end of this section.
+
+| 1.01B, ms | Cold, column | Cold, off | Warm, column | Warm, off | QLever cold | QLever warm |
+|---|---:|---:|---:|---:|---:|---:|
+| `geo-box` | **108** | 255 | **27.1** | 139.5 | 157.9 | 143.8 |
+| `country-population` | 29.0 | 28.2 | 2.8 | 3.2 | 45.6 | 19.6 |
+| `geo-avg` | **553** | 3,001 | **191** | 580 | | |
+| `lat-order` | **72** | 137 | **21.8** | 50.2 | | |
+| `pop-topk` | **41** | 90 | **9.3** | 20.7 | | |
+| `pop-range` | **43** | 65 | **7.8** | 17.2 | | |
+| `elev` | **41** | 54 | **6.7** | 14.0 | | |
+
+`people-no-birthdate`, `births-by-decade` and `label-regex` did not change. All 31
+suite queries and the five extra queries return identical answers with and without
+the column, and the suite's answers match the reference. A first version of the column
+read ahead whole spans of its value array, and a cold sort of a few hundred numbers
+such as `country-population` then read about 12 MB more than without it and took
+about 7 ms longer. The column now reads ahead page by page unless at least half of a
+span's pages are needed.
 
 ### Prefix filtering and large results
 

@@ -1366,3 +1366,211 @@ fn optimized_operators_obey_the_memory_budget() {
     }
     super::plan::FORCE_ORDERED_TOPK.with(|f| f.set(false));
 }
+
+// ------------------------------------------------------------ numeric column ------
+
+/// Rows as exact RDF terms, in result order.
+fn ordered(r: &QueryResult) -> Vec<String> {
+    r.rows()
+        .into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|t| t.map_or("UNDEF".to_string(), |t| t.to_string()))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect()
+}
+
+/// The rows of `q` read through a streaming cursor with small batches, in order.
+fn streamed(s: &Store, q: &str) -> Vec<String> {
+    let mut c = super::cursor::select_cursor(
+        s.snapshot(),
+        &format!("{PREFIXES}{q}"),
+        &QueryOptions {
+            no_cache: true,
+            ..Default::default()
+        },
+        &super::cursor::CursorOptions {
+            batch_rows: 97,
+            ..Default::default()
+        },
+    )
+    .unwrap_or_else(|e| panic!("{q}: {e}"));
+    let mut out = Vec::new();
+    while let Some(b) = c.next_batch().unwrap() {
+        for i in 0..b.len() {
+            out.push(
+                b.row(i)
+                    .unwrap()
+                    .into_iter()
+                    .map(|t| t.map_or("UNDEF".to_string(), |t| t.to_string()))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
+        }
+    }
+    out
+}
+
+fn numeric_column_queries() -> Vec<String> {
+    let mut q = Vec::new();
+    let thresholds = THRESHOLDS.iter().copied().chain([
+        "48",
+        "48.5",
+        "\"48.5\"^^xsd:float",
+        "\"48.50\"^^xsd:float",
+        "\"0048.5\"^^xsd:float",
+        "\"-0\"^^xsd:float",
+        "\"-INF\"^^xsd:float",
+        "9007199254740993",
+        "\"9007199254740993\"^^xsd:long",
+        "\"288230376151711744\"^^xsd:decimal",
+        "1e400",
+    ]);
+    for c in thresholds {
+        for op in [">", ">=", "<", "<=", "="] {
+            q.push(format!(
+                "SELECT ?s ?v WHERE {{ ?s ex:v ?v FILTER(?v {op} {c}) }}"
+            ));
+            q.push(format!(
+                "SELECT ?s ?v WHERE {{ ?s ex:v ?v FILTER({c} {op} ?v) }}"
+            ));
+        }
+    }
+    q.extend(
+        [
+            "SELECT ?s ?v WHERE { ?s ex:v ?v FILTER(?v > 48 && ?v < 49) }",
+            "SELECT ?s ?v WHERE { ?s ex:v ?v FILTER(?v > -1 && ?v <= 1.5 && ?v != 0) }",
+            "SELECT ?s WHERE { ?s ex:lat ?a ; ex:long ?b FILTER(?a > 48 && ?a < 49 && ?b > 2 && ?b < 3) }",
+            "SELECT (COUNT(*) AS ?n) WHERE { ?s ex:lat ?a ; ex:long ?b FILTER(?a > 48.0 && ?a < 49.0 && ?b > 2.0 && ?b < 3.0) }",
+            "SELECT ?s ?v WHERE { ?s ex:v ?v FILTER(isNumeric(?v)) } ORDER BY ?v ?s",
+            "SELECT ?s ?v WHERE { ?s ex:v ?v } ORDER BY DESC(?v) ?s",
+            "SELECT ?s ?v WHERE { ?s ex:v ?v } ORDER BY ?v LIMIT 25",
+            "SELECT ?s ?v WHERE { ?s ex:v ?v } ORDER BY DESC(?v) LIMIT 25",
+            "SELECT ?s ?v WHERE { ?s ex:v ?v FILTER(?v > 10) } ORDER BY ?v LIMIT 25",
+            "SELECT ?s ?a WHERE { ?s ex:lat ?a } ORDER BY DESC(?a) ?s LIMIT 30",
+            "SELECT (SUM(?v) AS ?x) (MIN(?v) AS ?y) (MAX(?v) AS ?z) (COUNT(?v) AS ?n) WHERE { ?s ex:v ?v FILTER(isNumeric(?v) && ?v > -1000 && ?v < 1000) }",
+            "SELECT (AVG(?a) AS ?x) (SUM(?b) AS ?y) WHERE { ?s ex:lat ?a ; ex:long ?b }",
+            "SELECT ?s ?w WHERE { ?s ex:v ?v BIND(?v * 2 AS ?w) FILTER(?w > 3) }",
+            "SELECT ?s WHERE { ?s ex:v ?v FILTER(?v + 1 > 10 || ?v = 0) }",
+            "SELECT ?s WHERE { ?s ex:v ?v FILTER(?v IN (48.5, 7, \"NaN\"^^xsd:double)) }",
+            "SELECT ?s WHERE { ?s ex:v ?v FILTER(!(?v < 5)) }",
+            "SELECT ?v (COUNT(?s) AS ?n) WHERE { ?s ex:v ?v FILTER(?v >= 0) } GROUP BY ?v",
+            "SELECT ?s (STR(?v) AS ?t) (DATATYPE(?v) AS ?d) WHERE { ?s ex:v ?v FILTER(?v > 100) }",
+        ]
+        .map(String::from),
+    );
+    q
+}
+
+/// FILTERs, ORDER BY, aggregates and expressions over numeric literals give the same
+/// answers, in the same order, with the numeric column and without it (decoding every
+/// key), eager and streamed, on edge values: NaN, infinities, signed zeros, huge
+/// decimals, integers past 2^53 and past `i64`, ill-typed numbers, mixed datatypes and
+/// strings that look like numbers.
+#[test]
+fn the_numeric_column_answers_as_decoding_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let mut ttl = String::from(
+        "@prefix ex: <http://ex.org/> . @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n",
+    );
+    let mut values = mixed_values();
+    values.extend(
+        crate::vocab::numeric::tests::edge_literals()
+            .iter()
+            .map(|t| t.to_string()),
+    );
+    for (i, v) in values.iter().enumerate() {
+        ttl.push_str(&format!("ex:s{i} ex:v {v} .\n"));
+    }
+    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut next = move || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    for i in 0..6000 {
+        let (a, b) = (next(), next());
+        // non-canonical floats like DBpedia's coordinates
+        let lat = format!("{}.{:04}0", 40 + a % 15, a % 10_000);
+        let long = format!("{}.{:04}", (b % 12) as i64 - 4, b % 10_000);
+        ttl.push_str(&format!(
+            "ex:p{i} ex:lat \"{lat}\"^^xsd:float ; ex:long \"{long}\"^^xsd:float .\n"
+        ));
+        let v = match a % 5 {
+            0 => format!("\"{}\"^^xsd:int", (b % 2000) as i64 - 1000),
+            1 => format!("\"{}.{}0\"^^xsd:decimal", b % 100, a % 1000),
+            2 => format!("\"0{}\"^^xsd:integer", b % 500),
+            3 => format!("\"{}e-1\"^^xsd:double", b % 1000),
+            _ => format!("\"{}.{}\"^^xsd:float", b % 100, a % 100),
+        };
+        ttl.push_str(&format!("ex:n{i} ex:v {v} .\n"));
+    }
+    let queries = numeric_column_queries();
+    let answers = |s: &Store| -> Vec<(Vec<String>, Vec<String>)> {
+        queries
+            .iter()
+            .map(|q| {
+                let eager = run(s, q, Optimizations::ALL);
+                let streamed = streamed(s, q);
+                let mut eager = ordered(&eager);
+                let mut streamed = streamed;
+                if !q.contains("ORDER BY") {
+                    eager.sort();
+                    streamed.sort();
+                }
+                (eager, streamed)
+            })
+            .collect()
+    };
+    let with = {
+        let s = Store::open(&root, StoreOptions::default()).unwrap();
+        load(&s, &ttl, RdfFormat::Turtle);
+        // numbers added by an update are delta terms, decoded from `delta.vocab`
+        update(
+            &s,
+            "INSERT DATA { ex:d1 ex:v \"48.25\"^^xsd:float . ex:d2 ex:v \"0049\"^^xsd:int . \
+             ex:d3 ex:v \"48.5\"^^xsd:decimal . ex:d4 ex:v \"NaN\"^^xsd:float . \
+             ex:d5 ex:v \"48.75x\"^^xsd:float . ex:d6 ex:lat \"48.5\"^^xsd:float ; \
+             ex:long \"2.50\"^^xsd:float }",
+        );
+        let snap = s.snapshot();
+        let num = snap.generation.vocab.numeric().expect("a numeric column");
+        assert!(num.count() > 10_000, "{}", num.count());
+        answers(&s)
+    };
+    // the same store without its column decodes every number from its key
+    let mut removed = 0;
+    for e in std::fs::read_dir(&root).unwrap() {
+        let p = e.unwrap().path().join(crate::vocab::numeric::FILE);
+        if p.exists() {
+            std::fs::remove_file(p).unwrap();
+            removed += 1;
+        }
+    }
+    assert_eq!(removed, 1);
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    assert!(s.snapshot().generation.vocab.numeric().is_none());
+    let without = answers(&s);
+    let mut nonempty = 0;
+    for ((q, a), b) in queries.iter().zip(&with).zip(&without) {
+        assert_eq!(a.0, b.0, "eager: {q}");
+        assert_eq!(a.1, b.1, "streamed: {q}");
+        assert_eq!(a.0.len(), a.1.len(), "eager and streamed: {q}");
+        nonempty += !a.0.is_empty() as usize;
+    }
+    assert!(
+        nonempty * 4 > queries.len() * 3,
+        "{nonempty} of {}",
+        queries.len()
+    );
+    // the column, added back
+    assert!(s.add_numeric_column().unwrap().unwrap() > 10_000);
+    drop(s);
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    assert!(s.snapshot().generation.vocab.numeric().is_some());
+    assert_eq!(answers(&s), with);
+}

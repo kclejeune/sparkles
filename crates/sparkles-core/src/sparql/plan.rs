@@ -3485,7 +3485,7 @@ fn prefix_rows(n: &Node, exprs: &[Expr], ctx: &Ctx) -> Option<(f64, usize)> {
 
 /// Comparison of the range variable with a numeric constant: `?v op c`.
 #[derive(Clone, Copy, PartialEq)]
-enum RangeOp {
+pub(super) enum RangeOp {
     Lt,
     Le,
     Gt,
@@ -3494,7 +3494,7 @@ enum RangeOp {
 }
 
 /// `?v op c` for a filter conjunct comparing variable `v` with a numeric literal.
-fn range_atom(e: &Expr, v: VarId, ctx: &Ctx) -> Option<(RangeOp, super::value::Value)> {
+pub(super) fn range_atom(e: &Expr, v: VarId, ctx: &Ctx) -> Option<(RangeOp, super::value::Value)> {
     use super::expr::CmpOp;
     let (a, b, op) = match e {
         Expr::Cmp(a, b, op) => (a, b, Some(*op)),

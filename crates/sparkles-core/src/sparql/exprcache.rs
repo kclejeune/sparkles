@@ -1182,14 +1182,35 @@ fn cursor_values(
     let mut vals = vec![None; unique.len()];
     let lo = unique.partition_point(|id| id.tag() < Tag::Vocab);
     let hi = lo + unique[lo..].partition_point(|id| id.tag() == Tag::Vocab);
-    let payloads = unique[lo..hi]
+    let mut payloads = unique[lo..hi]
         .iter()
         .map(|id| id.payload())
         .collect::<Vec<_>>();
+    // where each payload's value goes in `vals`
+    let mut positions: Vec<usize> = (lo..hi).collect();
+    // numbers from the numeric column: only the other terms are decoded
+    if let Some(num) = ctx.snap.generation.vocab.numeric()
+        && !payloads.is_empty()
+    {
+        let found = num.get_many(&payloads);
+        ctx.check()?;
+        let (mut rest, mut rest_at) = (Vec::new(), Vec::new());
+        for ((&p, &pos), n) in payloads.iter().zip(&positions).zip(found) {
+            match n.value() {
+                Some(v) => vals[pos] = Some(v),
+                None => {
+                    rest.push(p);
+                    rest_at.push(pos);
+                }
+            }
+        }
+        payloads = rest;
+        positions = rest_at;
+    }
     let scratch = ctx.charge(0)?;
     let mut reserved = 0;
     let mut bytes = base;
-    let mut at = lo;
+    let mut at = 0;
     let parallel_bytes = (payloads.len() as u64)
         .saturating_mul(std::mem::size_of::<Option<super::value::Value>>() as u64 * 2)
         .saturating_add(rayon::current_num_threads() as u64 * 2048);
@@ -1258,7 +1279,7 @@ fn cursor_values(
             })
             .collect::<Result<Vec<_>>>()?;
         for value in decoded.into_iter().flatten() {
-            vals[at] = value;
+            vals[positions[at]] = value;
             at += 1;
         }
     } else {
@@ -1278,7 +1299,7 @@ fn cursor_values(
                 if let Some(charge) = &mut charge {
                     charge.resize(bytes)?;
                 }
-                vals[at] = Some(super::value::Value::from_key(key));
+                vals[positions[at]] = Some(super::value::Value::from_key(key));
                 at += 1;
                 Ok::<_, crate::error::Error>(())
             },

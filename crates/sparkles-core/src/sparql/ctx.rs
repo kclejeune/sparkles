@@ -1310,6 +1310,13 @@ impl Ctx {
         Ok((size as u64).saturating_mul(8).saturating_add(128))
     }
 
+    /// The value of a base vocabulary id from the numeric column, when it holds one.
+    /// Kept out of line so that [`Ctx::value`] stays small for the ids it decodes.
+    #[inline(never)]
+    fn column_value(&self, payload: u64) -> Option<Value> {
+        self.snap.generation.vocab.numeric()?.get(payload).value()
+    }
+
     /// Decode an id into a value, with a per-query cache.
     pub fn value(&self, id: Id) -> Option<Value> {
         match id.tag() {
@@ -1321,6 +1328,13 @@ impl Ctx {
             Tag::DateTime | Tag::Date => id::inline_to_literal(id).map(|l| Value::from_literal(&l)),
             Tag::BNode => Some(Value::BNode(bnode_for(id).as_str().into())),
             _ => {
+                // a number of the base vocabulary from its numeric column, without
+                // decoding the key (the same value, see `crate::vocab::numeric`)
+                if id.tag() == Tag::Vocab
+                    && let Some(v) = self.column_value(id.payload())
+                {
+                    return Some(v);
+                }
                 // Inline scalars need no retained cache or RDF round trip. Only
                 // dictionary/local values bypass the uncharged eager cache.
                 if self.is_cursor() {
