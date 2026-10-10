@@ -237,15 +237,6 @@ fn triple_term(t: &Triple) -> String {
     format!("<<( {s} {} {} )>>", t.predicate, nt(&t.object))
 }
 
-fn triple_of(s: &Term, p: &NamedNode, o: &Term) -> Option<Triple> {
-    let s = match s {
-        Term::NamedNode(n) => NamedOrBlankNode::NamedNode(n.clone()),
-        Term::BlankNode(b) => NamedOrBlankNode::BlankNode(b.clone()),
-        _ => return None,
-    };
-    Some(Triple::new(s, p.clone(), o.clone()))
-}
-
 /// The update text's form of a graph: empty for the default graph.
 fn graph_block(g: &NamedNode, body: &str) -> String {
     if g.as_str() == DEFAULT_GRAPH {
@@ -1552,11 +1543,10 @@ impl Tools<'_> {
     }
 
     fn is_asserted(&self, r: &Reader, q: &Quad) -> Result<bool, Error> {
-        let Some(t) = triple_of(&q.s, &q.p, &q.o) else {
+        if !matches!(q.s, Term::NamedNode(_) | Term::BlankNode(_)) {
             return Ok(false);
-        };
+        }
         let pattern = format!("{} {} {}", nt(&q.s), q.p, nt(&q.o));
-        let _ = t;
         r.ask(
             &format!(
                 "ASK {{ {} }}",
