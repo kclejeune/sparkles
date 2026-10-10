@@ -13,7 +13,9 @@
 //! # Ok::<(), sparkles_embed::Error>(())
 //! ```
 
+mod lin;
 mod model;
+mod nomic;
 pub mod pooling;
 mod qwen3;
 pub mod snapshot;

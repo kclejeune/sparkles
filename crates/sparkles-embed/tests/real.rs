@@ -4,6 +4,7 @@
 //! ```sh
 //! SPARKLES_EMBED_MINILM=…/sentence-transformers/all-MiniLM-L6-v2/<rev> \
 //! SPARKLES_EMBED_QWEN3=…/Qwen/Qwen3-Embedding-0.6B/<rev> \
+//! SPARKLES_EMBED_NOMIC=…/nomic-ai/nomic-embed-text-v1.5/<rev> \
 //!   cargo test --release -p sparkles-embed --test real -- --ignored
 //! ```
 
@@ -91,4 +92,68 @@ fn qwen3_f32() {
 #[ignore]
 fn qwen3_bf16() {
     qwen3_card(Dtype::Bf16);
+}
+
+/// nomic-embed-text-v1.5 with the model card's task prefixes, which the snapshot does not
+/// declare. The first values of a query and a document vector were recorded from
+/// candle-transformers 0.11's `nomic_bert`, the reference this crate's encoder is checked
+/// against. bf16 weights must give the same cosine within 5e-3.
+fn nomic(dtype: Dtype) {
+    let Some(d) = dir("SPARKLES_EMBED_NOMIC") else {
+        return;
+    };
+    let mut spec = ModelSpec::new(d);
+    spec.dtype = dtype;
+    spec.query_prompt = Some("search_query: ".into());
+    spec.document_prompt = Some("search_document: ".into());
+    let e = Embedder::new(spec, Options::default()).unwrap();
+    assert_eq!(e.info().dimension, 768);
+    let q = e.embed(&["What is TSNE?"], Kind::Query).unwrap();
+    let d = e
+        .embed(
+            &["t-SNE is a statistical method for visualizing high-dimensional data."],
+            Kind::Document,
+        )
+        .unwrap();
+    let c = cosine(&q[0], &d[0]);
+    eprintln!("{dtype:?} query {:?}, cosine {c:.4}", &q[0][..6]);
+    let want_q = [
+        -0.08891342,
+        1.2341346,
+        -4.0468693,
+        -1.0364419,
+        0.85301375,
+        0.14920467,
+    ];
+    let want_d = [
+        0.30549204,
+        1.2516627,
+        -4.1372876,
+        -1.6681005,
+        0.61639684,
+        -0.05138422,
+    ];
+    if dtype == Dtype::F32 {
+        for (got, want) in [(&q[0], want_q), (&d[0], want_d)] {
+            for (g, w) in got.iter().zip(want) {
+                assert!((g - w).abs() < 2e-3, "{g} against {w}");
+            }
+        }
+        assert!((c - 0.7725).abs() < 1e-3, "cosine {c}");
+    } else {
+        assert!((c - 0.7725).abs() < 5e-3, "cosine {c}");
+    }
+    paraphrases(&e);
+}
+
+#[test]
+#[ignore]
+fn nomic_f32() {
+    nomic(Dtype::F32);
+}
+
+#[test]
+#[ignore]
+fn nomic_bf16() {
+    nomic(Dtype::Bf16);
 }

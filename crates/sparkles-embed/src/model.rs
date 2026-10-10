@@ -5,9 +5,10 @@ use std::time::Instant;
 
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
-use candle_transformers::models::{bert, nomic_bert, xlm_roberta};
+use candle_transformers::models::{bert, xlm_roberta};
 use tokenizers::{Tokenizer, TruncationDirection, TruncationParams, TruncationStrategy};
 
+use crate::nomic::{self, NomicEncoder};
 use crate::pooling::{normalize, pool, truncate};
 use crate::qwen3::{self, Qwen3Encoder};
 use crate::snapshot::{Arch, SnapshotConfig};
@@ -16,7 +17,7 @@ use crate::{Dtype, Error, Kind, Pooling, Result};
 enum Encoder {
     Bert(bert::BertModel),
     XlmRoberta(xlm_roberta::XLMRobertaModel),
-    Nomic(nomic_bert::NomicBertModel),
+    Nomic(NomicEncoder),
     Qwen3(Qwen3Encoder),
 }
 
@@ -117,9 +118,9 @@ impl Loaded {
                 Encoder::XlmRoberta(m)
             }
             Arch::NomicBert => {
-                let c: nomic_bert::Config = serde_json::from_value(cfg.config.clone())
+                let c: nomic::Config = serde_json::from_value(cfg.config.clone())
                     .map_err(|e| parse("nomic_bert", e))?;
-                Encoder::Nomic(nomic_bert::NomicBertModel::load(vb, &c).map_err(cerr)?)
+                Encoder::Nomic(NomicEncoder::load(&c, vb).map_err(cerr)?)
             }
             Arch::Qwen3 => {
                 let c: qwen3::Config =
@@ -190,7 +191,7 @@ impl Loaded {
         let out = match &self.encoder {
             Encoder::Bert(m) => m.forward(&ids_t, &types_t, Some(&mask_t)),
             Encoder::XlmRoberta(m) => m.forward(&ids_t, &mask_t, &types_t, None, None, None),
-            Encoder::Nomic(m) => m.forward(&ids_t, Some(&types_t), Some(&mask_t)),
+            Encoder::Nomic(m) => m.forward(&ids_t, &types_t, &mask),
             Encoder::Qwen3(m) => m.forward(&ids_t, &mask),
         }
         .map_err(cerr)?;
