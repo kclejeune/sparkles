@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { ReviewFact } from './review-api';
-import { factKey, passingKeys, segments, signalText } from './review';
+import { factKey, pageList, pageOf, passingKeys, segments, signalText } from './review';
 
 const fact = (o: string, signals: ReviewFact['signals'], confidence?: string): ReviewFact => ({
   s: '<http://example.org/ana>',
@@ -60,5 +60,29 @@ describe('signalText', () => {
     expect(signalText('link', 'fail', 2)).toBe('link: 2 candidates');
     expect(signalText('guard', 'pass')).toBe('guard ✓');
     expect(signalText('corroboration', 'none')).toBe('');
+  });
+});
+
+describe('pageOf', () => {
+  const pages = [
+    { page: 1, start: 0 },
+    { page: 2, start: 120 },
+    { page: 4, start: 300 },
+  ];
+  it('finds the page whose start is the last at or before the offset', () => {
+    expect(pageOf(pages, 0)).toBe(1);
+    expect(pageOf(pages, 119)).toBe(1);
+    expect(pageOf(pages, 120)).toBe(2);
+    expect(pageOf(pages, 299)).toBe(2);
+    expect(pageOf(pages, 1000)).toBe(4);
+  });
+  it('has no page without pages', () => {
+    expect(pageOf(undefined, 5)).toBeUndefined();
+    expect(pageOf([], 5)).toBeUndefined();
+  });
+  it('lists pages in words', () => {
+    expect(pageList([3])).toBe('3');
+    expect(pageList([3, 5])).toBe('3 and 5');
+    expect(pageList([1, 2, 4])).toBe('1, 2 and 4');
   });
 });

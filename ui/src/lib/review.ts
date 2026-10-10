@@ -87,6 +87,43 @@ export function segments(
 /** The IRI inside `<…>`, or the text as it is. */
 export const bare = (t: string) => (t.startsWith('<') && t.endsWith('>') ? t.slice(1, -1) : t);
 
+/**
+ * The page of a converted PDF that holds code point `offset`: the last page whose start
+ * is at or before it. `undefined` when the source has no pages.
+ */
+export function pageOf(
+  pages: { page: number; start: number }[] | undefined,
+  offset: number,
+): number | undefined {
+  let found: number | undefined;
+  for (const p of pages ?? []) {
+    if (p.start <= offset) found = p.page;
+    else break;
+  }
+  return found;
+}
+
+/** A list of page numbers as text: `3`, `3 and 5`, `1, 2 and 4`. */
+export function pageList(pages: number[]): string {
+  if (pages.length <= 1) return pages.join('');
+  return `${pages.slice(0, -1).join(', ')} and ${pages[pages.length - 1]}`;
+}
+
+/** The words of an ingestion's status. */
+export const INGEST_STATUS: Record<string, string> = {
+  queued: 'Queued',
+  converting: 'Converting',
+  registering: 'Registering the source',
+  'awaiting-confirmation': 'Waiting for your confirmation',
+  extracting: 'Extracting facts',
+  linking: 'Linking entities',
+  writing: 'Writing proposals',
+  'awaiting-approval': 'Waiting for your approval',
+  done: 'Done',
+  failed: 'Failed',
+  cancelled: 'Cancelled',
+};
+
 /** The review branch's page. */
 export const reviewHref = (base: string, ds: string, branch: string) =>
   `${base}/datasets/${encodeURIComponent(ds)}/review/${encodeURIComponent(branch)}`;

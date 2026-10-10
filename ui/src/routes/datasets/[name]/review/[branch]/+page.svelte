@@ -17,6 +17,8 @@
     bare,
     factKey,
     KIND_LABELS,
+    pageList,
+    pageOf,
     SIGNALS,
     segments,
     signalClass,
@@ -116,6 +118,13 @@
     });
   });
 
+  /** The page of a converted PDF that a fact's span starts on. */
+  const factPage = (f: review.ReviewFact) => {
+    if (!f.span || !data) return undefined;
+    const src = data.sources.find((s) => bare(s.rendition) === bare(f.span!.rendition));
+    return pageOf(src?.pages, f.span.start);
+  };
+
   const focusIndex = $derived(data?.facts.findIndex((f) => factKey(f) === focus) ?? -1);
   const term = (f: review.ReviewFact, which: 's' | 'o') =>
     (which === 's' ? f.sLabel : f.oLabel) ?? f.shown[which];
@@ -189,6 +198,9 @@
                     {/each}
                   {/if}
                   {#if f.confidence}<span class="faint small">confidence {f.confidence}</span>{/if}
+                  {#if factPage(f) != null}<span class="badge" title="The page of the quote"
+                      >page {factPage(f)}</span
+                    >{/if}
                   <span class="mono small faint">{f.shown.graph}</span>
                 </div>
                 {#if f.quote}<blockquote class="small">{f.quote}</blockquote>{/if}
@@ -309,6 +321,16 @@
               <span class="mono small faint">{t.src.source ?? t.src.rendition}</span>
             </div>
             <div class="panel-body">
+              {#if t.src.pages?.length}
+                <p class="faint small">
+                  {t.src.pages.length} page{t.src.pages.length === 1 ? '' : 's'}{t.src.omittedPages
+                    ?.length
+                    ? `. Page ${pageList(t.src.omittedPages)} could not be read without OCR and is left out`
+                    : ''}{t.src.ocrPages?.length
+                    ? `. Page ${pageList(t.src.ocrPages)} was read by OCR, so check its quotes`
+                    : ''}.
+                </p>
+              {/if}
               {#if t.pieces}
                 <pre class="source">{#each t.pieces as p (p.start)}{#if p.facts.length}<mark
                         class:focus={p.facts.includes(focusIndex)}
