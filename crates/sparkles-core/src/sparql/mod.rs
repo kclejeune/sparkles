@@ -56,6 +56,13 @@ pub use cursor::{
     ask_streaming, graph_cursor, query_cursor, query_execution, select_cursor,
 };
 pub use exec::PlanInfo;
+
+/// `s` in Unicode Normalization Form C, as `fn:normalize-unicode` gives it.
+pub fn nfc(s: &str) -> String {
+    icu_normalizer::ComposingNormalizerBorrowed::new_nfc()
+        .normalize(s)
+        .into_owned()
+}
 use oxrdf::{BlankNode, GraphName, NamedOrBlankNode, Quad, Term, Triple};
 use plan::{ActiveGraph, Planner};
 use rustc_hash::{FxHashMap, FxHashSet};

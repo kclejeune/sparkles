@@ -30,6 +30,9 @@ pub fn all_tools() -> Vec<&'static str> {
         "recall",
         "why_empty",
         "share_query",
+        "read_chunks",
+        "list_sources",
+        "ingest_profile",
     ]);
     if cfg!(feature = "shacl") {
         v.push("validate_shacl");
@@ -707,6 +710,7 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
     ]
     .into_iter()
     .chain(super::memory::assert_tool(cfg))
+    .chain(super::memory::ingest_tools(cfg))
     .chain(super::branches::tool_defs(cfg))
     .filter(|t| all_tools().contains(&t.name))
     .filter(|t| !super::branches::WRITE_TOOLS.contains(&t.name) || cfg.allow_update)

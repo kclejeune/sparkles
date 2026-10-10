@@ -37,11 +37,24 @@ pub fn run(
     let mut args = args;
     let on_branch = super::branches::branch_call(server, name, &mut args, call)?;
     let call = on_branch.as_ref().unwrap_or(call);
+    // C18 §8.8: an agent whose conversation facts wait for review writes on its branch
+    let held = match name {
+        "assert_facts" => super::memory::policy::redirect(server, &args, call)?,
+        _ => None,
+    };
+    let (call, notice) = match &held {
+        Some((c, n)) => (c, Some(n.as_str())),
+        None => (call, None),
+    };
     let t = Tools { server, call };
     if call.cancel.load(Ordering::Relaxed) {
         return Err(t.ctx(&[], 0.0).engine(Error::Cancelled));
     }
     let out = dispatch(&t, name, args);
+    let out = match notice {
+        Some(n) => super::memory::policy::with_notice(out, n),
+        None => out,
+    };
     super::branches::name_branch(out, call)
 }
 
@@ -95,6 +108,10 @@ fn dispatch(t: &Tools, name: &str, args: Map<String, Value>) -> Result<Outcome, 
         "share_query" => t.share_query(args),
         "sparql_update" => t.sparql_update(args),
         "assert_facts" => t.assert_facts(args),
+        "register_source" => t.register_source(args),
+        "read_chunks" => t.read_chunks(args),
+        "list_sources" => t.list_sources(args),
+        "ingest_profile" => t.ingest_profile(args),
         "list_branches" => t.list_branches(args),
         "create_branch" => t.create_branch(args),
         "merge_branch" => t.merge_branch(args),

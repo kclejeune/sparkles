@@ -37,17 +37,19 @@ use std::time::{Duration, Instant};
 /// The tools that write: offered only with `--mcp-allow-update` (`--allow-update` over
 /// stdio), never on a read-only server, and listed only for a caller who may write to
 /// some dataset.
-pub(crate) const WRITE_TOOLS: [&str; 5] = [
+pub(crate) const WRITE_TOOLS: [&str; 6] = [
     "sparql_update",
     "assert_facts",
+    "register_source",
     "create_branch",
     "merge_branch",
     "delete_branch",
 ];
 
 /// The tools listed after `sparql_update`, in `tools/list` order.
-pub(super) const TOOLS_AFTER_UPDATE: [&str; 5] = [
+pub(super) const TOOLS_AFTER_UPDATE: [&str; 6] = [
     "assert_facts",
+    "register_source",
     "list_branches",
     "create_branch",
     "merge_branch",
@@ -63,7 +65,7 @@ const BRANCH_TOOLS: [&str; 4] = [
 ];
 
 /// Write tools that a retry with the same arguments does not repeat.
-pub(super) const IDEMPOTENT: [&str; 1] = ["assert_facts"];
+pub(super) const IDEMPOTENT: [&str; 2] = ["assert_facts", "register_source"];
 
 /// The most changed quads a merge preview lists.
 const MAX_CHANGES: usize = 100;
