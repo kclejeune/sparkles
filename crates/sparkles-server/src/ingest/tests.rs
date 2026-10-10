@@ -1112,6 +1112,110 @@ async fn consolidation_task() {
     assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
 }
 
+/// The review signals: the open items of the inbox in the metrics, in the maintenance
+/// answer and in the brief, before a consolidation pass, while its branch waits and after
+/// its merge.
+#[tokio::test]
+async fn review_signals() {
+    use crate::mcp::memory::pending;
+    let (st, app) = app(None);
+    let gauge = |st: &Arc<AppState>, kind: &str| -> f64 {
+        let text = crate::obs::render_prometheus(st);
+        let line = format!("sparkles_memory_review_pending{{dataset=\"org\",kind=\"{kind}\"}} ");
+        text.lines()
+            .find_map(|l| l.strip_prefix(line.as_str()))
+            .unwrap_or_else(|| panic!("{line} missing in\n{text}"))
+            .parse()
+            .unwrap()
+    };
+    let oldest = |st: &Arc<AppState>, kind: &str| -> f64 {
+        let text = crate::obs::render_prometheus(st);
+        let line =
+            format!("sparkles_memory_review_oldest_seconds{{dataset=\"org\",kind=\"{kind}\"}} ");
+        text.lines()
+            .find_map(|l| l.strip_prefix(line.as_str()))
+            .unwrap_or_else(|| panic!("{line} missing in\n{text}"))
+            .parse()
+            .unwrap()
+    };
+    // a dataset without memory settings reports nothing
+    pending::refresh_all(&st);
+    assert!(!crate::obs::render_prometheus(&st).contains("sparkles_memory_review_pending"));
+    let (_, m) = send(&app, req("GET", "/$/memory/org/maintenance", Value::Null)).await;
+    assert!(m.get("review").is_none(), "{m}");
+    memory(&app, json!({})).await;
+    let fact = json!({ "s": "<http://example.org/ana>", "p": format!("<{MEMBER_OF}>"),
+                       "o": "<http://example.org/payments>" });
+    session(&app, "s1", json!({ "facts": [fact] })).await;
+    session(&app, "s2", json!({ "facts": [fact] })).await;
+    pending::refresh_all(&st);
+    assert_eq!(gauge(&st, "session"), 2.0);
+    assert_eq!(gauge(&st, "consolidation"), 0.0);
+    assert_eq!(oldest(&st, "consolidation"), 0.0);
+    assert!(oldest(&st, "session") >= 0.0);
+    let (s, m) = send(&app, req("GET", "/$/memory/org/maintenance", Value::Null)).await;
+    assert_eq!(s, StatusCode::OK, "{m}");
+    assert_eq!(m["review"]["open"], 2, "{m}");
+    assert_eq!(m["review"]["kinds"]["session"]["open"], 2, "{m}");
+    assert!(m["review"]["oldest"].is_string(), "{m}");
+    // a consolidation pass proposes the fact on a branch
+    let v = maintain(&app, "/$/memory/org/consolidate", json!({})).await;
+    assert_eq!(v["result"]["outcome"], "proposed", "{v}");
+    let b = v["result"]["branch"].as_str().unwrap().to_string();
+    pending::refresh_all(&st);
+    assert_eq!(gauge(&st, "consolidation"), 1.0);
+    assert!(oldest(&st, "consolidation") >= 0.0);
+    let (_, m) = send(&app, req("GET", "/$/memory/org/maintenance", Value::Null)).await;
+    assert_eq!(m["review"]["open"], 3, "{m}");
+    assert_eq!(m["review"]["branches"][0]["name"], b.as_str(), "{m}");
+    assert_eq!(m["review"]["branches"][0]["facts"], 1, "{m}");
+    // the brief says so
+    let (s, br) = send(
+        &app,
+        req(
+            "POST",
+            "/org/memory/brief",
+            json!({ "entity": "http://example.org/ana" }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{br}");
+    let text = br["text"].as_str().unwrap();
+    let line = format!("# review: 1 consolidated fact on branch {b} awaits review since ");
+    assert!(text.contains(&line), "{text}");
+    assert!(
+        text.contains("# review: 2 unreviewed session facts await review since "),
+        "{text}"
+    );
+    assert_eq!(br["review"]["open"], 3, "{br}");
+    // the merge empties the inbox
+    let (s, r) = send(
+        &app,
+        req(
+            "POST",
+            "/$/merge/org",
+            json!({ "source": b, "target": "main" }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{r}");
+    pending::refresh_all(&st);
+    assert_eq!(gauge(&st, "consolidation"), 0.0);
+    assert_eq!(gauge(&st, "session"), 0.0);
+    assert_eq!(oldest(&st, "session"), 0.0);
+    let (_, m) = send(&app, req("GET", "/$/memory/org/maintenance", Value::Null)).await;
+    assert_eq!(m["review"]["open"], 0, "{m}");
+    let snap = crate::obs::metrics_json(&st);
+    assert!(
+        snap["memoryReview"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["dataset"] == "org" && r["kind"] == "session" && r["pending"] == 0),
+        "{snap}"
+    );
+}
+
 /// C18 §8.4 (Phase 5): retention deletes session graphs whose newest fact is older than
 /// `after` and whose facts a reviewed graph asserts too; a graph with an unreviewed
 /// fact, a recent one and one outside the session pattern stay.
