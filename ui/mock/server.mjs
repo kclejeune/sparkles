@@ -24,6 +24,7 @@ import {
 import { handleDescribe } from './describe.mjs';
 import { handleAsk, isAdmin, ORG_MEMORY, ORG_PREFIXES, orgTrig, whoamiFor } from './memory.mjs';
 import { handleAssistant } from './assistant.mjs';
+import { handleReview, INGEST_BRANCH } from './review.mjs';
 import { geoQuery, handleGeo } from './geo.mjs';
 import { handleVector, seedVectors, touchPacked, vectorIndexFor } from './vector.mjs';
 import { PREFIXES, buildTurtle, provenanceTrig, scratchTurtle, vectorTurtle } from './data.mjs';
@@ -194,6 +195,8 @@ function seedHistory(ds) {
   org.memory = ORG_MEMORY;
   addCommit(org, 'upload', org.store.size, 0, { bulk: true });
   createBranch(org, { name: 'scratch-s2', note: 'agent-7 scratchpad' });
+  // an ingest branch with proposals to review (mock/review.mjs)
+  createBranch(org, { name: INGEST_BRANCH, note: 'Stand-up notes of 2026-10-08' });
   // a branch of foaf two commits ahead of main
   const dev = createBranch(foaf, { name: 'dev', note: 'schema migration' }).branch;
   for (const u of [
@@ -2030,6 +2033,8 @@ const server = http.createServer(async (req, res) => {
         });
       }
     }
+    // the review inbox, branch review and ingest settings (mock/review.mjs)
+    if (await handleReview(req, res, seg, { datasets, send, fail, readBody, createBranch })) return;
     // questions, checks and agent memory (mock/memory.mjs)
     if (await handleAsk(req, res, url, seg, { datasets, send, fail, readBody })) return;
     // asking the server, the assistant settings and the history (mock/assistant.mjs)

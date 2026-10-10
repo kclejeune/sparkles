@@ -10,6 +10,7 @@
   import * as api from '$lib/api';
   import type { Term } from '$lib/api';
   import { app } from '$lib/app.svelte';
+  import { auth } from '$lib/auth.svelte';
   import * as askApi from '$lib/ask-api';
   import { fmtInt } from '$lib/format';
   import {
@@ -25,6 +26,7 @@
   import { LatestRun } from '$lib/supersede';
   import Icon from '$components/Icon.svelte';
   import InboxPanel from '$components/InboxPanel.svelte';
+  import IngestSettings from '$components/IngestSettings.svelte';
   import RecallView from '$components/RecallView.svelte';
   import TermView from '$components/TermView.svelte';
 
@@ -389,6 +391,9 @@
             </dl>
           {/if}
         </section>
+        {#key ds}
+          <IngestSettings ds={ds ?? ''} canAdmin={auth.can(ds, 'admin')} />
+        {/key}
       </div>
     {/if}
   {/if}
