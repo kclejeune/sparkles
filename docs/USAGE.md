@@ -2565,7 +2565,7 @@ datasets by name:
 
 **Configuration gap.** The current UI has no editor for the dataset's assistant
 settings, and the CLI has no assistant-settings command. On NixOS,
-[`services.sparkles.datasetSettings`](#declarative-dataset-settings) provisions them.
+[`services.sparkles.settings`](#declarative-dataset-settings) declares them.
 The UI's **Ingest** section uploads documents and configures source
 retention and ingest profiles; it does not enable the assistant or permit sending
 documents to a model. `sparkles memory init` prepares the memory vocabulary, import
@@ -2815,6 +2815,10 @@ SIGHUP, or `systemctl reload sparkles`, reads the settings file and the model
 configuration again. A file that does not validate is logged and the server keeps the
 previous one, while at start it fails the start. `GET /$/settings` reports when each
 file was read and the last reload error.
+
+On NixOS, `services.sparkles.settings.defaults.assistant.enabled = true;` declares the
+same file, and the build checks it. The section
+[Declarative dataset settings](#declarative-dataset-settings) shows the option.
 
 ### Escalation
 
@@ -4610,12 +4614,13 @@ sops.secrets."anthropic-api-key" = {
 };
 ```
 
-Settings are generated as `/etc/sparkles/models.json`, and changing them restarts
-the service. The bare object above and the JSON schema's `models` wrapper are both
-supported. Alternatively, use `models.configFile` with an absolute path to an
-existing JSON file; it is mutually exclusive with `models.settings`. Restart the
-service after changing an external file's contents. With both options `null`, the
-module supplies no model configuration.
+The module generates the settings as `/etc/sparkles/models.json`. A change reloads
+the service with SIGHUP instead of restarting it, and requests in flight keep the
+configuration they started with. The bare object above and the JSON schema's `models`
+wrapper are both supported. `models.configFile` names an existing JSON file by its
+absolute path instead, and it cannot be combined with `models.settings`. After a
+change to that file's contents, `systemctl reload sparkles` reads it again. With both
+options `null`, the module supplies no model configuration.
 
 `models.secrets.<name>` supplies the source for `apiKey.secret = "<name>"`. Set
 exactly one of `file` (an absolute path outside the Nix store) or `environment`
@@ -4629,57 +4634,86 @@ updating that file.
 Only credential references belong in Nix: generated settings are in the Nix store.
 The module does not copy key files into the store or read their contents during
 evaluation. Do not place API keys in settings, headers or Nix service environment
-values. The server validates the model schema at startup. Remove corresponding
+values. The server validates the model schema at startup and on each reload, and a
+reload that does not validate is logged while the server keeps the previous
+configuration. Remove corresponding
 `--model-config` and `--model-secret` arguments from `extraArgs` when migrating to
 these options.
 
 ### Declarative dataset settings
 
-`services.sparkles.datasetSettings.<name>` provisions `assistant.json` and
-`memory.json` for a persistent dataset. It does not create or register the dataset.
-Each member is a JSON object using the corresponding
-[assistant](API.md#assistant-settings) or [memory](API.md#memory-settings) schema:
+The assistant stays off on every dataset until a setting turns it on, even when
+`services.sparkles.models` configures providers. The standard way to turn it on for
+the whole server is one line:
 
 ```nix
-services.sparkles = {
-  # wiki is declared here; slurp will be created through the UI or API.
-  datasets.wiki = { };
-  datasetSettings = {
-    wiki.assistant = { enabled = true; send = "rows"; };
-    slurp = {
-      assistant = {
-        enabled = true;
-        ingest = true;
-        send = "documents";
-      };
-      memory = {
-        agentGraphs = [ "urn:x-sparkles:import/*" ];
-        imports = { base = "urn:x-sparkles:import/"; extract = "server"; };
-      };
+services.sparkles.settings.defaults.assistant.enabled = true;
+```
+
+`services.sparkles.settings` holds the settings file that
+[Turning on the assistant in the server](#turning-on-the-assistant-in-the-server)
+describes, written as a Nix attribute set. `defaults` applies to every dataset,
+including datasets created later through the API or the UI and in-memory datasets.
+`datasets.<name>` declares values for one dataset by name, and a `locked` list in
+either fixes fields so that nobody can change them at runtime. The values use the
+field names of the [assistant](API.md#assistant-settings),
+[memory](API.md#memory-settings) and ingest settings in API.md:
+
+```nix
+services.sparkles.settings = {
+  defaults = {
+    assistant.enabled = true;
+    # no dataset admin can let result rows or document text leave the server
+    locked = [ "assistant.send" ];
+  };
+  # slurp may be declared in `datasets` or created later through the UI or the API
+  datasets.slurp = {
+    assistant = {
+      ingest = true;
+      send = "documents";
+    };
+    memory = {
+      agentGraphs = [ "urn:x-sparkles:import/*" ];
+      imports = { base = "urn:x-sparkles:import/"; extract = "server"; };
     };
   };
 };
 ```
 
-Names also declared in `datasets` use their configured database directory, including
-an explicit `datasets.<name>.path`, and receive settings before the first open.
-Other names use `dataDir/databases/<name>` and receive settings on a service start
-after the UI/API creates their persistent database. Missing or uninitialized
-databases are skipped without creating directories, so creating the dataset through
-the UI/API still works; restart Sparkles once after creating it to apply the settings.
-Declared in-memory datasets are rejected because their settings have no file storage.
+A dataset entry that sets a field locked in `defaults` keeps it locked at its own
+value, so `slurp` above sends documents while every other dataset stays at `schema`.
+The option does not create datasets. An entry whose name matches no dataset waits and
+applies as soon as a dataset with that name is created, without a restart.
 
-Files are copied from generated JSON as the service user with mode 0600. Changes to
-the declarations restart the service, and every service start replaces the managed
-files in full, including changes made through the API since the last start. `null`
-or an omitted member leaves that file unmanaged. Removing a declaration leaves its
-last contents in place; it does not reset the dataset's settings.
+A declared value is a default and not a fixed value. A dataset admin can change any
+field that is not locked through `PATCH /$/settings/{dataset}/{kind}` or the older
+routes such as `PUT /$/assistant/{dataset}` and the `PUT /$/ingest/{dataset}/settings`
+of the UI's Ingest card. The server keeps the change in the dataset's directory, or in the process for an
+in-memory dataset, and it overrides the declared value across reloads, restarts and
+new deployments. Clearing it with `DELETE /$/settings/{dataset}/{kind}?field=PATH`
+brings the declared value back. A change to a locked field is refused with `409` and
+the code `locked-by-config`. The module never writes into dataset directories.
 
-The values are JSON objects rather than a second schema maintained by the module;
-use the field names and values in `API.md`. This provisions settings only: the model
-providers and secrets use [`services.sparkles.models`](#model-providers-and-credentials),
-and `sparkles memory init` still installs the memory vocabulary and
-validation shapes when importing harness memory.
+The module generates `/etc/sparkles/settings.json` and passes it as `--settings`. A
+change to `services.sparkles.settings` or to `services.sparkles.models.settings`
+reloads the service with SIGHUP when the system switches, so the server keeps running
+and keeps its runtime values. A reload during the start waits until the server has
+opened its datasets.
+
+The build runs `sparkles settings check` on the generated file, together with the
+generated model configuration when `models.settings` is set, so a misspelled kind, a
+value the server does not accept, an `endpoint` or `apiKey` member, or a provider that
+the model configuration lacks fails `nixos-rebuild` before anything is deployed. The
+check reads only these two files and needs neither the network nor the data
+directory. With `models.configFile`, the build does not check providers, and the
+server reports a mismatch when it starts or reloads.
+
+Datasets declared in `services.sparkles.datasets` cannot be deleted through the API,
+which answers `409` with the code `declared-dataset`. Remove them from the module
+instead.
+
+`sparkles memory init` still installs the memory vocabulary and validation shapes when
+importing harness memory.
 
 ### Shutdown
 

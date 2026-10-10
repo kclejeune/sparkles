@@ -1,6 +1,6 @@
 # C19: Layered dataset settings
 
-> **Status:** implemented in part (Phase 1)
+> **Status:** implemented in part (Phase 1 and the NixOS module of Phase 2)
 >
 > **Phases:** Phase 1 is the server: settings kinds, the declared layer, layered
 > resolution, locks, the `/$/settings` routes and reloading on SIGHUP. Phase 2 is the
@@ -450,9 +450,9 @@ to replace or remove a runtime value.
 
 ## Outcome
 
-Phase 1 landed on 2026-10-10. Phases 2, 3 and 4 are not built. The `sparkles settings`
-command has only `check`, the UI has no settings tab, and `sparkles memory init` is
-unchanged.
+Phase 1 and the NixOS module of Phase 2 landed on 2026-10-10. The rest of Phase 2 and
+Phases 3 and 4 are not built. The `sparkles settings` command has only `check`, the UI
+has no settings tab, and `sparkles memory init` is unchanged.
 
 The server has a registry of three dataset-scoped kinds, `assistant`, `memory` and
 `ingest`. The `ingest` kind holds the settings members of `ingest.json`, and the
@@ -505,3 +505,46 @@ These points differ from the design or settle what it left open.
   dataset is deleted.
 - The new settings routes do not check the dataset's read-only flag. The legacy
   `PUT /$/ingest/{ds}/settings` keeps its check.
+
+### Phase 2: the NixOS module
+
+`services.sparkles.settings` holds the settings file of §5 as a free-form attribute set
+of JSON values, so `defaults`, `datasets.<name>`, the `locked` lists and
+`server.locked` all pass through unchanged, and lists from several modules are
+concatenated. The module generates `/etc/sparkles/settings.json`, passes `--settings`,
+and puts the file in `reloadTriggers`. The generated `models.json` moved from
+`restartTriggers` to `reloadTriggers`, and the module has no restart triggers left.
+`datasetSettings`, which copied files into dataset directories before each start, is
+gone, and with it the module's writes into dataset directories and the assertion that
+refused in-memory datasets. Names under `settings.datasets` must still match the
+module's rule for dataset names.
+
+The settings file is the output of a derivation that runs `sparkles settings check` on
+the generated JSON, with `--model-config` naming the generated model configuration when
+`services.sparkles.models.settings` is set, so a wrong value fails the system build.
+The check reads only the two files. A model configuration given with
+`models.configFile` is not available at build time, so the build then checks the
+settings without providers. When the build platform cannot run the host's binary, the
+module skips the check.
+
+The NixOS VM test `nixos-module` covers A1, A2, A5 and A9 through the module, the
+`409` of A3, and A10. It switches to a specialisation with another dataset entry and
+another role list, and checks that `switch-to-configuration` reloads the unit, that the
+main PID stays the same, and that both changes apply while the runtime values stay. It
+also reloads the service right after a restart and checks that the server keeps
+running. The check `nixos-settings` builds the module without a VM and uses
+`testers.testBuildFailure` to show that a bad `send`, an unknown kind, an `endpoint`
+member, an empty lock and a provider that the generated model configuration lacks each
+fail the build. `nixos-models` checks that the model configuration is a reload trigger
+and no longer a restart trigger.
+
+These points differ from the design or settle what it left open.
+
+- The module always passes `--settings`, with `{}` when nothing is declared. Adding
+  settings to a server that had none then changes only the file and reloads the server,
+  where a new flag would have restarted it.
+- `ExecReload` is set in every configuration, since the server now always catches
+  SIGHUP for the settings. The server installs its handlers only after it has opened
+  its datasets, and SIGHUP before that would stop it. The reload command therefore
+  waits until the main process's `SigCgt` mask in `/proc` shows SIGHUP as caught, for
+  up to 80 seconds, before it sends the signal.
