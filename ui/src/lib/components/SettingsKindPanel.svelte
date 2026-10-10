@@ -208,6 +208,8 @@
       )
     )
       useConfigOpen = false;
+    // the resets before a refused one were made, so the section shows what is left
+    else await load();
   }
 
   async function saveJson() {
