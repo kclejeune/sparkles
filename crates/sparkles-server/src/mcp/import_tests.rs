@@ -222,6 +222,47 @@ async fn brief_ranking_and_bounds() {
     assert_eq!(s, 400);
 }
 
+/// A70 with copies: a fact in a graph and in the graph's exported copy counts as one
+/// source, so it ranks with a fact of the same age in one graph.
+#[tokio::test(flavor = "multi_thread")]
+async fn brief_copy_does_not_corroborate() {
+    let area = format!("{BASE}kc/claude-code/github.com.acme.shop/");
+    let single = |g: &str| {
+        format!(
+            "<{g}> {{ <{g}> <urn:x-sparkles:contentDigest> \"sha256:1\" ; <urn:x-sparkles:mem:filePath> \"c.md\" ; <urn:x-sparkles:mem:harness> <urn:x-sparkles:mem:ClaudeCode> .\n\
+             <{g}#r> <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> <<( <urn:x> <urn:y> <urn:z> )>> .\n\
+             <urn:aaa> <http://schema.org/description> \"a single note\" . }}\n"
+        )
+    };
+    let first = |trig: String| async move {
+        let (_, app) = writable(&trig).await;
+        let (s, v) = send(
+            &app,
+            "POST",
+            "/org/memory/brief",
+            &json!({"scope": "project", "projectKey": "github.com/acme/shop", "includeUnreviewed": true, "halfLifeDays": 100000})
+                .to_string(),
+        )
+        .await;
+        assert_eq!(s, 200, "{v}");
+        let text = v["text"].as_str().unwrap().to_string();
+        text.lines()
+            .find(|l| l.contains("schema:description"))
+            .unwrap()
+            .to_string()
+    };
+    let base = ranked(0) + &single(&format!("{area}memory/c"));
+    // two graphs corroborate the fresh fact
+    let top = first(base.clone()).await;
+    assert!(top.contains("fresh corroborated"), "{top}");
+    // b is a copy of a: one source, and the tie goes to the lower subject
+    let copy = format!(
+        "<{area}memory/b> {{ <{area}memory/b> <urn:x-sparkles:mem:copyOf> <{area}memory/a> }}\n"
+    );
+    let top = first(base + &copy).await;
+    assert!(top.contains("a single note"), "{top}");
+}
+
 /// A68, A71: an entity by IRI, an ambiguous label refused with its candidates, and text
 /// that reads as instructions rendered as one escaped literal.
 #[tokio::test(flavor = "multi_thread")]
