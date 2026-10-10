@@ -1140,6 +1140,11 @@ impl Tools<'_> {
                     j["textOmitted"] = true.into();
                 }
             }
+            // the pages of a converted PDF (C18 §7.1.1)
+            let pages = super::ingest::RenditionExtras::read(&br, &iri(ri), &rd).map_err(eng)?;
+            for (k, v) in pages.as_object().into_iter().flatten() {
+                j[k] = v.clone();
+            }
             sources.push(j);
         }
         let labels = std::mem::take(&mut ck.labels);

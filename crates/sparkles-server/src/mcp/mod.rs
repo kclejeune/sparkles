@@ -32,11 +32,11 @@ fn graphql_on(_: &Principal, _: &Dataset) -> bool {
 }
 mod history;
 pub mod http;
-mod memory;
+pub(crate) mod memory;
 mod notify;
 mod paths;
 mod pins;
-mod render;
+pub(crate) mod render;
 pub mod rest;
 pub mod review_http;
 mod schema_history;

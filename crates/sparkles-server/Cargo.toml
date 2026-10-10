@@ -98,6 +98,9 @@ sparkles-graphql = { workspace = true, optional = true }
 # `sparkles lsp` (feature `fmt`): formatting and syntax diagnostics for editors over stdio
 lsp-server = { workspace = true, optional = true }
 lsp-types = { workspace = true, optional = true }
+# PDF conversion for ingestion (feature `pdf`, spec C18 §7.1.1): an exact pin, because a
+# new version can change the Markdown and with it the offsets of stored renditions
+pdf-inspector = { version = "=1.25.2", default-features = false, optional = true }
 
 # malloc_trim (glibc), and statvfs for the free-space guard of spooled request bodies
 [target.'cfg(unix)'.dependencies]
@@ -118,7 +121,7 @@ sparkles-fmt = { workspace = true, features = ["fault-injection"] }
 sparkles-client = { workspace = true, features = ["blocking"] }
 
 [features]
-default = ["reasoning", "shacl", "shex", "mimalloc", "text", "geo", "geo-epsg", "otel", "auth", "mcp", "memory", "backup", "fmt", "tls", "graphql"]
+default = ["reasoning", "shacl", "shex", "mimalloc", "text", "geo", "geo-epsg", "otel", "auth", "mcp", "memory", "backup", "fmt", "tls", "graphql", "pdf"]
 # RDFS / OWL RL / Jena-rules materialization (`/$/reason`, `sparkles infer`)
 reasoning = ["dep:sparkles-reasoner", "sparkles/reasoning"]
 # SHACL validation (`/{ds}/shacl`, `sparkles shacl`)
@@ -153,6 +156,13 @@ mcp = ["dep:rmcp", "dep:tokio-util"]
 # `sparkles memory`: import coding agents' memory and instruction files, sync them, and
 # print the brief (C18 §10.1); `--loc` serves the database in the process
 memory = ["mcp", "auth", "dep:sparkles-memory-import", "dep:tower"]
+# PDF conversion in ingestion (`POST /$/ingest/{ds}`, `sparkles ingest`) with pdf-inspector;
+# without it a PDF is refused with `unsupported-format` (spec C18 §7.1.1)
+pdf = ["mcp", "dep:pdf-inspector"]
+# OCR of scanned PDF pages: PDFium and ONNX Runtime loaded at run time from paths the
+# operator gives, with the PP-OCR models from a directory (`serve --pdf-ocr-models`); never
+# downloads a model. Off by default and not part of release builds
+pdf-ocr = ["pdf", "pdf-inspector/render-pdfium", "pdf-inspector/ocr-oar"]
 # backup repositories on a filesystem or S3: `/$/repositories`, `/$/backups/{ds}`,
 # `/$/backup-policies`, `sparkles repo …`, `sparkles backup create|list|restore|…`
 backup = ["dep:sparkles-backup", "dep:toml", "sparkles/backup"]

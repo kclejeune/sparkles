@@ -98,6 +98,13 @@ pub struct IngestSettings {
     pub keep_text: bool,
     #[serde(default)]
     pub profiles: BTreeMap<String, ProfileSpec>,
+    /// the estimate in tokens above which `POST /$/ingest` waits for a confirmation
+    /// (default 200000)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirm_tokens: Option<u64>,
+    /// the confidence that `auto` mode needs of every fact (default 0.8)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_confidence: Option<f64>,
 }
 
 impl Default for IngestSettings {
@@ -105,6 +112,8 @@ impl Default for IngestSettings {
         IngestSettings {
             keep_text: true,
             profiles: BTreeMap::new(),
+            confirm_tokens: None,
+            auto_confidence: None,
         }
     }
 }
@@ -163,6 +172,12 @@ impl ProfileSpec {
 
 impl IngestSettings {
     pub fn validate(&self) -> Result<(), String> {
+        if self
+            .auto_confidence
+            .is_some_and(|c| !(0.0..=1.0).contains(&c))
+        {
+            return Err("autoConfidence is between 0 and 1".into());
+        }
         if self.profiles.len() > MAX_PROFILES {
             return Err(format!("at most {MAX_PROFILES} profiles"));
         }
@@ -197,6 +212,114 @@ pub fn ingest_settings(st: &AppState, ds: &Dataset) -> IngestSettings {
 }
 
 // --- text -------------------------------------------------------------------------------
+
+/// What a conversion records on a rendition: the code point offset of each page's start,
+/// the pages read by OCR and the pages left out (spec C18 §7.1.1).
+#[derive(Default)]
+pub(crate) struct RenditionExtras {
+    pub page_starts: Vec<u64>,
+    pub ocr_pages: Vec<u64>,
+    pub omitted_pages: Vec<u64>,
+}
+
+impl RenditionExtras {
+    fn parse(v: &Value) -> Result<RenditionExtras, ToolError> {
+        let list = |k: &str| -> Result<Vec<u64>, ToolError> {
+            match v.get(k) {
+                None | Some(Value::Null) => Ok(Vec::new()),
+                Some(Value::Array(a)) if a.len() <= 100_000 => a
+                    .iter()
+                    .map(|x| {
+                        x.as_u64().ok_or_else(|| {
+                            ToolError::bad_argument(format!(
+                                "rendition.{k} holds non-negative integers"
+                            ))
+                        })
+                    })
+                    .collect(),
+                Some(_) => Err(ToolError::bad_argument(format!(
+                    "rendition.{k} is a list of at most 100000 integers"
+                ))),
+            }
+        };
+        if !v.is_object() {
+            return Err(ToolError::bad_argument("rendition is an object"));
+        }
+        Ok(RenditionExtras {
+            page_starts: list("pageStarts")?,
+            ocr_pages: list("ocrPages")?,
+            omitted_pages: list("omittedPages")?,
+        })
+    }
+
+    /// What a rendition records of its pages: `pages` with each page's number and start,
+    /// `ocrPages` and `omittedPages`, each left out when empty.
+    pub(crate) fn read(r: &Reader, rend: &NamedNode, rd: &Rendition) -> Result<Value, Error> {
+        let q = format!(
+            "SELECT ?p ?n WHERE {{ {} }}",
+            r.quads(
+                &format!(
+                    "VALUES ?p {{ <{SPK}pageStart> <{SPK}ocrPage> <{SPK}omittedPage> }} ?r ?p ?n"
+                ),
+                &[]
+            )
+        );
+        let mut starts: BTreeSet<u64> = BTreeSet::new();
+        let mut ocr: BTreeSet<u64> = BTreeSet::new();
+        let mut omitted: BTreeSet<u64> = BTreeSet::new();
+        for row in r.rows(&q, vec![("r".into(), rend.clone().into())])? {
+            if let [Some(Term::NamedNode(p)), Some(Term::Literal(n))] = row.as_slice()
+                && let Ok(n) = n.value().parse::<u64>()
+            {
+                match p.as_str().strip_prefix(SPK) {
+                    Some("pageStart") => starts.insert(n),
+                    Some("ocrPage") => ocr.insert(n),
+                    Some("omittedPage") => omitted.insert(n),
+                    _ => false,
+                };
+            }
+        }
+        let mut out = json!({});
+        if !starts.is_empty() {
+            let pages: Vec<Value> = starts
+                .iter()
+                .enumerate()
+                .map(|(i, s)| {
+                    let at = *s as usize;
+                    let page = rd
+                        .text(at, (at + 24).min(rd.length))
+                        .and_then(|t| crate::ingest::convert::marker_page(&t))
+                        .map_or(i as u64 + 1, u64::from);
+                    json!({ "page": page, "start": s })
+                })
+                .collect();
+            out["pages"] = pages.into();
+        }
+        if !ocr.is_empty() {
+            out["ocrPages"] = json!(ocr);
+        }
+        if !omitted.is_empty() {
+            out["omittedPages"] = json!(omitted);
+        }
+        Ok(out)
+    }
+
+    fn write(&self, ins: &mut String, rendition: &NamedNode) {
+        for (p, list) in [
+            ("pageStart", &self.page_starts),
+            ("ocrPage", &self.ocr_pages),
+            ("omittedPage", &self.omitted_pages),
+        ] {
+            for n in list {
+                let _ = writeln!(
+                    ins,
+                    "{rendition} <{SPK}{p}> {} .",
+                    literal(&n.to_string(), XSD_INTEGER)
+                );
+            }
+        }
+    }
+}
 
 /// The rendition of a text: NFC, with `\r\n` and `\r` folded to `\n`.
 pub(crate) fn normalize(text: &str) -> String {
@@ -762,6 +885,28 @@ fn bookkeeping(iri: &str) -> bool {
 
 impl Tools<'_> {
     pub(crate) fn register_source(&self, args: Map<String, Value>) -> Result<Outcome, ToolError> {
+        self.register_source_with(args, &RenditionExtras::default())
+    }
+
+    /// `register_source` for a converted document (`POST /$/ingest`): its arguments with
+    /// a `rendition` object of the page offsets, OCR pages and omitted pages of the
+    /// conversion, which the rendition records.
+    pub(crate) fn register_converted(
+        &self,
+        mut args: Map<String, Value>,
+    ) -> Result<Outcome, ToolError> {
+        let extras = match args.remove("rendition") {
+            Some(v) => RenditionExtras::parse(&v)?,
+            None => RenditionExtras::default(),
+        };
+        self.register_source_with(args, &extras)
+    }
+
+    fn register_source_with(
+        &self,
+        args: Map<String, Value>,
+        extras: &RenditionExtras,
+    ) -> Result<Outcome, ToolError> {
         let t0 = Instant::now();
         let a: RegisterArgs = parse(args)?;
         if a.text.len() > MAX_TEXT_BYTES {
@@ -1011,6 +1156,7 @@ impl Tools<'_> {
             let _ = write!(ins, " ; <{PROV}wasRevisionOf> {old}");
         }
         ins.push_str(" .\n");
+        extras.write(&mut ins, &rendition);
         if settings.keep_text {
             for (i, (s, e)) in bounds.iter().enumerate() {
                 let c = span_iri(rendition.as_str(), *s, *e);

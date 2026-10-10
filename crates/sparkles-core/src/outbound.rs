@@ -746,6 +746,19 @@ pub fn fetch_text(
     accept: &str,
 ) -> crate::Result<String> {
     let failed = |m: String| crate::Error::invalid(format!("GET {url}: {m}"));
+    let (bytes, _) = fetch_bytes(policy, budget, url, accept)?;
+    String::from_utf8(bytes).map_err(|_| failed("the response is not UTF-8".into()))
+}
+
+/// GET `url` through `policy` as [`fetch_text`] does, and return its body as bytes with
+/// the response's `Content-Type`.
+pub fn fetch_bytes(
+    policy: &OutboundPolicy,
+    budget: &Arc<RequestBudget>,
+    url: &str,
+    accept: &str,
+) -> crate::Result<(Vec<u8>, String)> {
+    let failed = |m: String| crate::Error::invalid(format!("GET {url}: {m}"));
     let resp = policy
         .send(budget, url, policy.timeout, |client, u| {
             client.get(u).header("Accept", accept)
@@ -754,6 +767,7 @@ pub fn fetch_text(
     if !resp.status.is_success() {
         return Err(failed(resp.status.to_string()));
     }
+    let content_type = resp.content_type.clone();
     let mut bytes = Vec::new();
     let mut body = resp.body;
     body.read_to_end(&mut bytes)
@@ -761,7 +775,7 @@ pub fn fetch_text(
             crate::Error::Io(e) => failed(e.to_string()),
             e => e,
         })?;
-    String::from_utf8(bytes).map_err(|_| failed("the response is not UTF-8".into()))
+    Ok((bytes, content_type))
 }
 
 /// The answer of [`post_json`]: the status, the `Retry-After` header and the body.

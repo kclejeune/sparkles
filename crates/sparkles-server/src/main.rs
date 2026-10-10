@@ -33,6 +33,8 @@ mod geo_index_cmd;
 #[cfg(feature = "graphql")]
 mod graphql;
 mod http;
+#[cfg(feature = "mcp")]
+mod ingest;
 #[cfg(feature = "fmt")]
 mod lsp;
 #[cfg(feature = "mcp")]
@@ -881,6 +883,9 @@ enum Cmd {
         outbound: outbound::OutboundArgs,
         #[command(flatten)]
         models: models::ModelArgs,
+        #[cfg(feature = "mcp")]
+        #[command(flatten)]
+        ingest: ingest::ServeArgs,
         /// How many days each principal's ask history is kept, for datasets whose
         /// assistant settings do not say (0: no history; spec C18 §6.4)
         #[arg(long, value_name = "DAYS", default_value_t = assistant::DEFAULT_HISTORY_DAYS)]
@@ -1176,6 +1181,11 @@ enum Cmd {
     /// the tokens used
     #[cfg(feature = "mcp")]
     Ask(ask::AskArgs),
+    /// Ingest documents into a database (C18 §7): convert Markdown, HTML and PDF, register
+    /// each as a source and propose its facts on a review branch, or draft a mapping for a
+    /// CSV or TSV file
+    #[cfg(feature = "mcp")]
+    Ingest(ingest::IngestArgs),
     /// Agent memory (C18 §10.1): import the memory and instruction files of coding agents,
     /// keep them in sync, and print the brief, recall, queries and facts
     #[cfg(feature = "memory")]
@@ -2275,6 +2285,8 @@ fn run() -> Result<()> {
             no_embedding,
             outbound,
             models,
+            #[cfg(feature = "mcp")]
+            ingest,
             ask_history_days,
             load_dir,
             idle_release_ms,
@@ -2450,6 +2462,10 @@ fn run() -> Result<()> {
             });
             st.file_loads = outbound::file_loads(load_dir.as_deref(), &data)?;
             st.models = models.load(st.outbound.clone())?;
+            #[cfg(feature = "mcp")]
+            {
+                st.ingest = ingest::Runtime::new(&ingest);
+            }
             st.asks.history_days = ask_history_days;
             st.schema_max_entries = schema_max_entries;
             #[cfg(feature = "shex")]
@@ -2799,6 +2815,8 @@ fn run() -> Result<()> {
         Cmd::Mcp(args) => mcp::run(args, opts),
         #[cfg(feature = "mcp")]
         Cmd::Ask(args) => ask::run_cli(args, opts),
+        #[cfg(feature = "mcp")]
+        Cmd::Ingest(args) => ingest::cli::run_cli(args, opts),
         #[cfg(feature = "memory")]
         Cmd::Memory(args) => memory_cmd::run(args, opts),
         #[cfg(feature = "fmt")]

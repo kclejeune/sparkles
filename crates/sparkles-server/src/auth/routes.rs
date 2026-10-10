@@ -96,6 +96,11 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/ingest/{ds}/profiles", &["GET"]),
     ("/$/ingest/{ds}/settings", &["PUT"]),
     ("/$/ingest/{ds}/profiles/{name}", &["GET", "PUT", "DELETE"]),
+    // ingestion tasks (C18 §10)
+    ("/$/ingest/{ds}", &["GET", "POST"]),
+    ("/$/ingest/{ds}/{task}", &["GET", "DELETE"]),
+    ("/$/ingest/{ds}/{task}/confirm", &["POST"]),
+    ("/$/ingest/{ds}/{task}/approve", &["POST"]),
     // assistant settings and the caller's own ask history (C18 §3.5, §6.4)
     ("/$/assistant/{ds}", &["GET", "PUT"]),
     ("/$/asks/{ds}", &["GET", "DELETE"]),
@@ -284,6 +289,12 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/memory/{ds}/edit" => Dataset(Read),
         "/$/ingest/{ds}/profiles" | "/$/ingest/{ds}/profiles/{name}" if get => Dataset(Read),
         "/$/ingest/{ds}/settings" | "/$/ingest/{ds}/profiles/{name}" => Dataset(Admin),
+        // a task writes through the tools as its caller, which check the grants on the
+        // graphs and branches; a task is visible to its owner and the dataset's admins
+        "/$/ingest/{ds}"
+        | "/$/ingest/{ds}/{task}"
+        | "/$/ingest/{ds}/{task}/confirm"
+        | "/$/ingest/{ds}/{task}/approve" => Dataset(Read),
         "/$/assistant/{ds}" if get => Dataset(Read),
         "/$/assistant/{ds}" => Dataset(Admin),
         // only the caller's own entries, whatever its role (C18 §6.4)

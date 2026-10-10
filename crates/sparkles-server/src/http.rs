@@ -271,6 +271,9 @@ pub fn router(state: Arc<AppState>) -> Router {
     // the review inbox, branch review and ingest profiles (C18 §7.10, §8.9)
     #[cfg(feature = "mcp")]
     let app = app.merge(crate::mcp::review_http::routes());
+    // ingestion tasks (C18 §7, §10)
+    #[cfg(feature = "mcp")]
+    let app = app.merge(crate::ingest::http::routes());
     // the MCP endpoint (`serve --mcp`)
     #[cfg(feature = "mcp")]
     let app = match crate::mcp::http::route(&state) {
