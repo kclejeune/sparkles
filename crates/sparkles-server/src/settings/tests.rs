@@ -339,6 +339,42 @@ async fn runtime_values_persist_and_reset() {
     assert!(v["readAt"].is_string());
 }
 
+/// A lock on a field the settings file leaves out holds its default, and restating
+/// that default is not a change.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lock_on_an_implied_default_accepts_restating_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("settings.json");
+    std::fs::write(
+        &f,
+        json!({
+            "defaults": {"locked": ["memory.retention.requireConsolidated"]},
+            "datasets": {"slurp": {"memory": {
+                "agentGraphs": ["urn:x:a/*"], "retention": {"after": "365d"}
+            }}}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let st = state(&dir.path().join("data"), Some(&f));
+    st.create("slurp", DbType::Persistent).unwrap();
+    let app = crate::http::router(st.clone());
+    let u = "/$/settings/slurp/memory";
+    let (_, v, _) = send(&app, req("GET", u, None)).await;
+    assert_eq!(
+        v["effective"]["retention"]["requireConsolidated"], true,
+        "{v}"
+    );
+    let body = json!({"retention": {"requireConsolidated": true}});
+    let (s, v, _) = send(&app, req("PATCH", u, Some(body))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["runtime"], json!({}), "{v}");
+    let body = json!({"retention": {"requireConsolidated": false}});
+    let (s, v, _) = send(&app, req("PATCH", u, Some(body))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    assert_eq!(v["code"], "locked-by-config");
+}
+
 /// A3, A7 and the semantics of `PUT`.
 #[tokio::test(flavor = "multi_thread")]
 async fn locks_preconditions_and_put() {

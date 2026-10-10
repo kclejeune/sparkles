@@ -297,6 +297,25 @@ fn daily_budget_and_cost() {
 }
 
 #[test]
+fn a_reload_shares_the_token_count_with_requests_on_the_old_config() {
+    let mock = MockModel::start(|_, _| (200, mock::ollama(r#"{"query":"ASK {}"}"#)));
+    let provider = json!({ "l": {
+        "kind": "ollama", "endpoint": mock.url(), "budget": {"tokensPerDay": 100},
+        "models": {"m1": {}}
+    } });
+    let old = models(provider.clone(), &[]);
+    call(&old, "l").unwrap();
+    let mut new = models(provider, &[]);
+    new.inherit(&old);
+    // a request that started before the reload finishes on the old configuration
+    call(&old, "l").unwrap();
+    call(&new, "l").unwrap();
+    // 15 tokens a call, three calls counted once
+    assert_eq!(new.describe()["providers"][0]["budget"]["usedToday"], 45);
+    assert_eq!(old.describe()["providers"][0]["budget"]["usedToday"], 45);
+}
+
+#[test]
 fn describe_lists_roles_and_models() {
     let cfg = ModelsConfig::parse(
         &json!({

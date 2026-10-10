@@ -34,6 +34,25 @@ pub fn merged(base: &Value, patch: &Value) -> Value {
     v
 }
 
+/// Two merge patches combined into one that applies both, `top` after `under`. Unlike
+/// [`merged`] it keeps a `null` of `top`, which still removes that member.
+pub fn overlaid(under: &Value, top: &Value) -> Value {
+    match (under, top) {
+        (Value::Object(u), Value::Object(t)) => {
+            let mut out = u.clone();
+            for (k, tv) in t {
+                let v = match out.get(k) {
+                    Some(uv) => overlaid(uv, tv),
+                    None => tv.clone(),
+                };
+                out.insert(k.clone(), v);
+            }
+            Value::Object(out)
+        }
+        _ => top.clone(),
+    }
+}
+
 /// The merge patch that turns `base` into `target`, or `None` when they are equal. A
 /// member of `base` that `target` lacks becomes `null`.
 pub fn diff(base: &Value, target: &Value) -> Option<Value> {
@@ -292,6 +311,17 @@ mod tests {
         assert!(starts_with(&p("a.b"), &p("a.b")));
         assert!(!starts_with(&p("a.bc"), &p("a.b")));
         assert!(!starts_with(&p("a"), &p("a.b")));
+    }
+
+    #[test]
+    fn overlaid_keeps_nulls() {
+        let u = json!({"a": 1, "b": {"c": 2, "d": 3}});
+        let t = json!({"a": null, "b": {"c": null, "e": 4}, "f": {"g": null}});
+        assert_eq!(
+            overlaid(&u, &t),
+            json!({"a": null, "b": {"c": null, "d": 3, "e": 4}, "f": {"g": null}})
+        );
+        assert_eq!(overlaid(&Value::Null, &t), t);
     }
 
     #[test]

@@ -153,7 +153,7 @@ pub fn retention(
                 "would be deleted".to_string()
             }
         } else {
-            format!("kept: {}", g["reason"].as_str().unwrap_or(""))
+            format!("kept: {}", g["kept"].as_str().unwrap_or(""))
         };
         t.push_str(&format!(
             "\n  {}  {what}",

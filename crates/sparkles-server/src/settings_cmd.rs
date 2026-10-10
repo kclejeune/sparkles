@@ -188,7 +188,9 @@ mod remote {
 mod remote {
     use super::{ConnArgs, Owner, SettingsCmd, enc, parse_value, split_target};
     use crate::remote::Remote;
-    use crate::settings::merge::{at, diff, leaves, merged, parse_path, path_string, set_at};
+    use crate::settings::merge::{
+        at, diff, leaves, merged, overlaid, parse_path, path_string, set_at,
+    };
     use anyhow::{Context, Result, bail};
     use reqwest::Method;
     use serde_json::{Map, Value as J, json};
@@ -800,7 +802,8 @@ mod remote {
             let mut kinds = defaults.clone();
             if let Some(e) = entries.get(name) {
                 for (k, v) in entry_kinds(e) {
-                    let m = merged(kinds.get(&k).unwrap_or(&J::Null), &v);
+                    // keep a `null`, which resets that field
+                    let m = overlaid(kinds.get(&k).unwrap_or(&J::Null), &v);
                     kinds.insert(k, m);
                 }
             }

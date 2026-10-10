@@ -461,6 +461,19 @@ fn settings_commands() {
     let (_, v) = s.call("GET", "/$/settings/other/assistant", None);
     assert_eq!(v["runtime"], json!({"explain": true, "historyDays": 3}));
     assert_eq!(v["locked"], json!(["send"]));
+    // a null in an entry resets that field, over a value the defaults give it too
+    std::fs::write(
+        &file,
+        json!({
+            "defaults": { "assistant": { "historyDays": 9 } },
+            "datasets": { "other": { "assistant": { "historyDays": null } } }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    run(&["settings", "apply", file.to_str().unwrap()]).ok();
+    let (_, v) = s.call("GET", "/$/settings/other/assistant", None);
+    assert_eq!(v["runtime"], json!({"explain": true}));
     // a patch that a lock refuses fails that dataset only
     std::fs::write(
         &file,
@@ -662,6 +675,8 @@ fn memory_init_and_maintenance() {
         "{}",
         o.stdout
     );
+    // the sessions written a moment ago are kept, and the output says why
+    assert!(o.stdout.contains("  kept: recent"), "{}", o.stdout);
     let o = mem("plain", &["maintenance"]).ok();
     assert!(o.stdout.contains("consolidation: every 1h"), "{}", o.stdout);
     assert!(o.stdout.contains("next run due"), "{}", o.stdout);

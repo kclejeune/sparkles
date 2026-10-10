@@ -179,11 +179,15 @@ pub(crate) fn plan(
     prune(&mut new);
     // a locked field: a write that leaves its value alone or restates it stores
     // nothing for it, and any other is refused (§4.1)
-    let before = merged(&cur.base, &cur.runtime);
-    let after = merged(&cur.base, &new);
+    // compared with defaults filled in, so restating a value the settings file
+    // implies (one it leaves out) is not a change
+    let norm = |v: Value| (kind.normalize)(&v).unwrap_or(v);
+    let base = norm(cur.base.clone());
+    let before = norm(merged(&cur.base, &cur.runtime));
+    let after = norm(merged(&cur.base, &new));
     let mut refused = Vec::new();
     for l in &cur.locked {
-        if at(&after, l) == at(&cur.base, l) {
+        if at(&after, l) == at(&base, l) {
             remove_at(&mut new, l);
             continue;
         }

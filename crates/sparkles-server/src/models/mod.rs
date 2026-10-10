@@ -235,8 +235,9 @@ struct Runtime {
     slots: Slots,
     /// the earliest time of the next request (`requestsPerMinute`)
     next: Mutex<Instant>,
-    /// (day number, tokens counted that day)
-    tokens: Mutex<(u64, u64)>,
+    /// (day number, tokens counted that day), shared with the configurations that
+    /// replace this one so requests still running on an old one keep counting
+    tokens: Arc<Mutex<(u64, u64)>>,
 }
 
 /// The last outcome of a pair, for `GET /$/models`.
@@ -294,7 +295,7 @@ impl Models {
                             cv: Condvar::new(),
                         },
                         next: Mutex::new(Instant::now()),
-                        tokens: Mutex::new((today(), 0)),
+                        tokens: Arc::new(Mutex::new((today(), 0))),
                     },
                 )
             })
@@ -326,14 +327,15 @@ impl Models {
         }
     }
 
-    /// Take over the state of `old`, the configuration this one replaces: the tokens
-    /// counted today, and for a provider whose kind and endpoint did not change, the
+    /// Take over the state of `old`, the configuration this one replaces: the token
+    /// counter of each provider, shared so that requests still running on `old` count
+    /// against the same budget, and for a provider whose kind and endpoint did not change, the
     /// detected levels and the last outcome of its pairs. Concurrency slots start
     /// empty, so requests that run on `old` do not count against the new slots.
-    pub fn inherit(&self, old: &Models) {
-        for (name, rt) in &self.runtime {
+    pub fn inherit(&mut self, old: &Models) {
+        for (name, rt) in &mut self.runtime {
             if let Some(o) = old.runtime.get(name) {
-                *rt.tokens.lock() = *o.tokens.lock();
+                rt.tokens = o.tokens.clone();
             }
         }
         let same = |provider: &str| match (self.provider(provider), old.provider(provider)) {
