@@ -54,7 +54,7 @@ on top of the second:
   with exact counts.
 * **Server.** Fuseki's endpoints and admin API with authentication, access control by
   dataset, graph and triple, stored queries, GraphQL, Prometheus metrics, an OpenAPI
-  description, a Docker image and a NixOS module.
+  description, a Docker image, a NixOS module and a Home Manager module.
 * **Agents.** An MCP server whose tools run with the caller's grants, an Ask bar that
   drafts, checks and runs a query from a question in plain language, ingestion that
   turns Markdown, HTML and PDF documents into cited facts on a review branch, and agent

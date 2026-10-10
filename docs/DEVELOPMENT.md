@@ -703,11 +703,14 @@ The flake is built on flake-parts, rust-overlay and crane, with the toolchain fr
       Java sample's tests offline;
     * `ui-licenses`, which checks that `THIRD_PARTY_LICENSES-UI.md` matches the UI build;
     * on Linux, a NixOS VM test of the module behind nginx;
+    * on Linux, `home-module`, which builds the Home Manager module's files for a test user
+      and checks that the CLI reads them;
     * on Linux, `ui-e2e`, which runs the Playwright UI tests against the release binary
       in nixpkgs' headless Chromium, inside the build sandbox on 127.0.0.1;
     * on Linux, `jena-clients`, which runs the Jena client tests against `sparkles-cli`
       with nixpkgs' `apache-jena` and JDK, inside the build sandbox;
-  * `nixosModules.default` (see [Deploying on NixOS](USAGE.md#deploying-on-nixos)).
+  * `nixosModules.default` (see [Deploying on NixOS](USAGE.md#deploying-on-nixos));
+  * `homeModules.default` (see [Home Manager](USAGE.md#home-manager)).
 
 ```sh
 nix run github:kclejeune/sparkles -- serve --data ./data

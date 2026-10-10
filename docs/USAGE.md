@@ -4,8 +4,8 @@ This guide covers operating the `sparkles` binary. It describes running the serv
 command-line tools, automatic compaction, the formatter and linter, backups, outbound
 requests, path search, integrity checks, the MCP server, embedding the library, the
 Python package, the JVM library for Apache Jena, the JavaScript packages, the Rust
-client, Docker and deploying on NixOS. [API.md](API.md) specifies the HTTP API.
-[DEVELOPMENT.md](DEVELOPMENT.md) covers building from source and testing.
+client, Docker, deploying on NixOS and the Home Manager module. [API.md](API.md)
+specifies the HTTP API. [DEVELOPMENT.md](DEVELOPMENT.md) covers building from source and testing.
 
 Sparkles is experimental. The on-disk format, HTTP API and CLI may change between commits
 without a migration path, so keep backups of anything you cannot regenerate.
@@ -63,6 +63,7 @@ without a migration path, so keep backups of anything you cannot regenerate.
 * [Rust client](#rust-client)
 * [Docker](#docker)
 * [Deploying on NixOS](#deploying-on-nixos)
+* [Home Manager](#home-manager)
 
 ## Running the server
 
@@ -4976,3 +4977,85 @@ which leaves time for the cancelled requests to stop and for the final flush.
 The CLI goes on the system path unless `installCli = false`. The server holds a lock on
 its databases, so stop the service before offline work such as `sparkles load` or
 `compact`, or use the HTTP API instead.
+
+## Home Manager
+
+The flake's `homeModules.default` provides `programs.sparkles`, which installs the CLI
+for one user and writes its configuration files. It is the client-side companion of the
+NixOS module, and the package defaults to the flake's build for the host. The output
+follows Home Manager's own name, `homeModules`. The flake has no home-manager input, so
+importing the module adds nothing to your lock file.
+
+```nix
+{
+  inputs.sparkles.url = "github:kclejeune/sparkles";
+  outputs = { home-manager, sparkles, ... }: {
+    homeConfigurations.me = home-manager.lib.homeManagerConfiguration {
+      # pkgs = …;
+      modules = [
+        sparkles.homeModules.default
+        {
+          programs.sparkles = {
+            enable = true;
+            server = "https://sparkles.example.lan";
+            memory.dataset = "slurp";
+          };
+        }
+      ];
+    };
+  };
+}
+```
+
+This replaces a hand-written `xdg.configFile."sparkles/memory.toml"`. The module writes
+these files:
+
+| Option | File | Read by |
+| --- | --- | --- |
+| `memory.server`, `memory.dataset`, `memory.settings` | `$XDG_CONFIG_HOME/sparkles/memory.toml` | `sparkles memory` |
+| `backup.settings` | `$XDG_CONFIG_HOME/sparkles/backup.toml` | `sparkles repo`, `sparkles backup` |
+| `fmt.settings` | `~/.sparklesfmt.toml` | `sparkles fmt`, `lint` and `lsp` |
+
+`memory.toml` is written only when `memory.dataset` or `memory.settings` is set.
+`memory.server` defaults to the top-level `server`. The CLI has no general default-server
+file, so `server` only feeds `memory.toml` and the Codex MCP entry described below. Other
+remote commands take `--server`, `SPARKLES_SERVER`, or the default server that
+`sparkles auth login` saves. `memory.settings` takes any other key of
+[`memory.toml`](#agent-memory), such as `skip-projects`, `transcripts`, `redact`,
+`claude-dir` or `codex-dir`, and is merged over `server` and `dataset`:
+
+```nix
+programs.sparkles.memory.settings = {
+  skip-projects = [ "github.com/acme/secret" ];
+  redact = [ { name = "internal-token"; regex = "itk_[A-Za-z0-9]{32}"; } ];
+};
+```
+
+`backup.settings` has the format of the [backup config file](API.md#backup-repositories).
+The generated file lands in the world-readable Nix store, so it may name environment
+variables and files that hold credentials but never the credentials themselves. The file
+is read-only, so `sparkles repo add` and `repo remove` cannot edit it. The CLI warns that
+the file is readable by others, which is expected for a file in the store.
+
+`fmt.settings` writes the formatter options and the `[lint]` table to
+`~/.sparklesfmt.toml`. The CLI uses the nearest config file above each input, so this
+one applies to every file under the home directory without a nearer one. A project's
+own `.sparklesfmt.toml` replaces it, since config files are never merged.
+
+The module never writes `credentials.toml`. `sparkles auth login` writes it, and it holds
+secrets the CLI rewrites when a token changes. Run `sparkles auth login` once per
+machine. A headless account can export `SPARKLES_TOKEN` instead, for example from a
+secret file in its shell profile.
+
+`memory.hooks.harnesses = [ "claude-code" "codex" ]` declares what
+`sparkles memory setup` would merge into the agents' settings. It needs Home Manager's
+`programs.claude-code` or `programs.codex` enabled. The module adds the memory hooks and
+the extraction skill there, and for Codex with a server it adds the Sparkles MCP server.
+`memory.hooks.briefOnly` keeps only the session start hook, and
+`memory.hooks.transcripts` imports each session's transcript at its end. The flake's
+`home-module` check compares these hooks with the CLI's own `setup` output.
+
+The package installs the bash, zsh and fish completions and the man pages. Home
+Manager's `programs.bash`, `programs.zsh` and `programs.fish` load completions from the
+profile when their completion support is on, and `programs.man` indexes the man pages, so
+the module needs no completion options of its own.
