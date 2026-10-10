@@ -1585,13 +1585,12 @@ struct Anchoring {
     copied: u64,
 }
 
+/// A reifier with its triple and quote.
+type Citing = (NamedNode, Box<oxrdf::Triple>, Option<String>);
+
 /// The live reifiers of `g` that cite a span of one of `olds`, with their triple and
 /// quote.
-fn citing(
-    r: &Reader,
-    g: &NamedNode,
-    olds: &BTreeSet<String>,
-) -> Result<Vec<(NamedNode, Box<oxrdf::Triple>, Option<String>)>, Error> {
+fn citing(r: &Reader, g: &NamedNode, olds: &BTreeSet<String>) -> Result<Vec<Citing>, Error> {
     let q = format!(
         "SELECT ?r ?t ?span ?q WHERE {{ {} }}",
         r.quads(

@@ -596,9 +596,9 @@ fn memory_import_sync_and_brief() {
     // renaming a rule without frontmatter, bytes unchanged, is a rename that copies its
     // prose facts
     let rule_g = format!("{G}/instructions/.claude.rules.style.md");
-    let rule = s.select(&format!(
-        "SELECT ?r WHERE {{ GRAPH ?g {{ ?g <urn:x-sparkles:rendition> ?r ; <urn:x-sparkles:mem:filePath> ?fp FILTER(STRENDS(?fp, \"style.md\")) }} }}"
-    ));
+    let rule = s.select(
+        "SELECT ?r WHERE { GRAPH ?g { ?g <urn:x-sparkles:rendition> ?r ; <urn:x-sparkles:mem:filePath> ?fp FILTER(STRENDS(?fp, \"style.md\")) } }",
+    );
     assert_eq!(rule.len(), 1, "{rule:?} {rule_g}");
     let rule_rend = rule[0]["r"]["value"].as_str().unwrap().to_string();
     let rule_graph = s.select(&format!(

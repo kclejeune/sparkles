@@ -2555,6 +2555,10 @@ fn copy_comment(graph: &str, date: &str) -> String {
     )
 }
 
+/// A file to export: its path under `--out`, its bytes, the sources it holds, how it was
+/// made, and whether a source was redacted.
+type ExportFile = (String, Vec<u8>, Vec<String>, &'static str, bool);
+
 /// A memory's name, description, kind and body from its text.
 fn memory_parts(s: &Stored) -> (String, Option<String>, Option<String>, String) {
     let text = String::from_utf8_lossy(&s.bytes).into_owned();
@@ -2703,7 +2707,7 @@ fn export(env: &Env, a: ExportArgs) -> Result<i32, CmdError> {
     }
     let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
     // what to write: path under --out, bytes, the sources it holds, and how
-    let mut files: Vec<(String, Vec<u8>, Vec<String>, &'static str, bool)> = Vec::new();
+    let mut files: Vec<ExportFile> = Vec::new();
     let mut fragment: Vec<&Stored> = Vec::new();
     let mut agents: Vec<&Stored> = Vec::new();
     let mut warnings: Vec<Value> = Vec::new();
