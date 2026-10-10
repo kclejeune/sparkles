@@ -50,7 +50,16 @@ export type DatasetInfo = {
   access?: Level;
   /** The number of branches, `main` included; absent on servers without branches. */
   branches?: number;
+  /**
+   * The operator started the server with the dataset (`--loc`, `--mem`), so it cannot be
+   * deleted through the API; absent on servers that predate it.
+   */
+  declared?: boolean;
 };
+
+/** Why a declared dataset offers no delete. */
+export const DECLARED_TEXT =
+  "The operator declared this dataset in the server's configuration. It is removed there, not here.";
 
 /** Per-request budgets of the server; 0 means unlimited. */
 export type Limits = {

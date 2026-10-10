@@ -68,7 +68,10 @@
       deleteTarget = null;
       ondeleted?.(target);
     } catch (err) {
-      error = api.errorMessage(err);
+      if (err instanceof api.ApiError && err.code === 'declared-dataset') {
+        error = api.DECLARED_TEXT;
+        void app.refreshDatasets();
+      } else error = api.errorMessage(err);
     } finally {
       busy = false;
     }

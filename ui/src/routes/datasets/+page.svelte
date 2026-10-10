@@ -2,6 +2,7 @@
   import { resolve } from '$app/paths';
   import { goto } from '$app/navigation';
   import { onMount } from 'svelte';
+  import * as api from '$lib/api';
   import { app } from '$lib/app.svelte';
   import { auth } from '$lib/auth.svelte';
   import { fmtInt, fmtRelative } from '$lib/format';
@@ -82,6 +83,7 @@
                 <td>
                   <a class="name" href={detail(d.name)}>{d.name}</a>
                   {#if d.name === app.current}<span class="badge spark">selected</span>{/if}
+                  {#if d.declared}<span class="badge" title={api.DECLARED_TEXT}>declared</span>{/if}
                 </td>
                 <td><span class="badge">{d.type === 'mem' ? 'in-memory' : 'persistent'}</span></td>
                 <td class="num">{fmtInt(d.quads)}</td>
@@ -117,7 +119,8 @@
                     <button
                       class="btn sm icon danger"
                       aria-label="Delete {d.name}"
-                      title="Delete {d.name}"
+                      title={d.declared ? api.DECLARED_TEXT : `Delete ${d.name}`}
+                      disabled={d.declared === true}
                       onclick={() => (deleteTarget = d.name)}
                     >
                       <Icon name="trash" size={13} />
