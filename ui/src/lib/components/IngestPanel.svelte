@@ -336,6 +336,7 @@
 <style>
   .ingest {
     display: grid;
+    grid-template-columns: minmax(0, 1fr);
     gap: 8px;
   }
   .row {
@@ -343,6 +344,16 @@
     flex-wrap: wrap;
     gap: 8px;
     align-items: center;
+    min-width: 0;
+  }
+  .row > label {
+    min-width: 0;
+    max-width: 100%;
+  }
+  input[type='file'],
+  select {
+    max-width: 100%;
+    min-width: 0;
   }
   .small {
     font-size: var(--fs-sm);
