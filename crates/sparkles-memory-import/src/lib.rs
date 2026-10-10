@@ -254,10 +254,20 @@ pub struct FileImport {
 /// file records `mem:copyOf` that IRI, so the copy does not count as a second source.
 pub const COPY_OF: &str = "<!-- sparkles:copy-of ";
 
-/// The sources a converted file names in its leading copy comments, with each line.
+/// The sources a converted file names in its leading copy comments, with each line. The
+/// comments come first, or right after the frontmatter of a file that has one.
 pub fn copies_of(text: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    for line in text.lines() {
+    let mut lines = text.lines().peekable();
+    if lines.peek().is_some_and(|l| l.trim_end() == "---") {
+        lines.next();
+        for l in lines.by_ref() {
+            if l.trim_end() == "---" {
+                break;
+            }
+        }
+    }
+    for line in lines {
         let t = line.trim();
         let Some(rest) = t.strip_prefix(COPY_OF) else {
             break;
@@ -271,4 +281,19 @@ pub fn copies_of(text: &str) -> Vec<(String, String)> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copy_comments() {
+        let t = "<!-- sparkles:copy-of <urn:a> exported 2026-10-10 -->\n<!-- sparkles:copy-of <urn:b> exported 2026-10-10 -->\n## a\n<!-- sparkles:copy-of <urn:c> -->\n";
+        let c: Vec<String> = copies_of(t).into_iter().map(|(i, _)| i).collect();
+        assert_eq!(c, ["urn:a", "urn:b"]);
+        let t = "---\nname: x\n---\n<!-- sparkles:copy-of <urn:a> exported 2026-10-10 -->\nbody\n";
+        assert_eq!(copies_of(t).len(), 1);
+        assert!(copies_of("body\n<!-- sparkles:copy-of <urn:a> -->\n").is_empty());
+    }
 }
