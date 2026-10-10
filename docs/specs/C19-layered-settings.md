@@ -1,6 +1,6 @@
 # C19: Layered dataset settings
 
-> **Status:** implemented in part (Phases 1, 2 and 3, and the server side of Phase 4)
+> **Status:** implemented
 >
 > **Phases:** Phase 1 is the server: settings kinds, the declared layer, layered
 > resolution, locks, the `/$/settings` routes and reloading on SIGHUP. Phase 2 is the
@@ -676,9 +676,8 @@ tab of a user without admin, and the disabled delete of the declared dataset.
 
 ### Phase 4, the server
 
-The server side of Phase 4 landed on 2026-10-10. The `sparkles settings --global` and
-`sparkles secrets` commands, the UI's Models section and the NixOS module's
-`settings.server.locked` are not built.
+The server side of Phase 4 landed on 2026-10-10. The CLI, the UI and the NixOS module
+followed on the same day, as the next section describes.
 
 The registry has a server-wide kind, `models`, whose declared layer is the file of
 `--model-config` and whose runtime layer is `<dataDir>/models.json`. It resolves
@@ -757,3 +756,81 @@ These points differ from the design or settle what it left open.
   first, and the auth and TLS listeners register before their tasks start. A reload
   sent as soon as the process catches SIGHUP therefore reaches each of them. The
   backup configuration registers its listener earlier in the start and is unchanged.
+
+### Phase 4, the CLI, UI and NixOS module
+
+The rest of Phase 4 landed on 2026-10-10, together with a change to every settings
+answer.
+
+Each answer of a dataset kind and of a server kind now has an `overrides` member, a list
+of `{path, declared, runtime}`. It names each runtime value that replaces a declared one,
+with both values, so that a client can show what a reset brings back without comparing
+the layers itself. The path is the runtime leaf, or the shorter path where the declared
+value is not an object, so a runtime `null` that removes a declared provider appears
+once as `providers.NAME` with `runtime: null`. Runtime values where nothing is declared
+are not listed, and neither are locked fields, which `overridden` already reports.
+docs/API.md, the OpenAPI document and the generated TypeScript client describe it.
+
+`sparkles settings get`, `set`, `edit`, `reset` and `diff` take `--global` in place of a
+dataset and work on the `models` kind at `/$/server/settings/models`. `get` prints a
+runtime value over a declared one as `runtime, overrides declared VALUE`, and a removed
+member as `(removed)`. `reset` prints the value that applies afterwards and whether it
+is the declared value, the default, the locked value or a runtime value further down,
+and a reset of a whole kind lists each field it reset. `diff` reads `overrides` and,
+without a dataset, covers the server kinds too. `apply` lists the file's
+`server.locked` and changes nothing at server scope. `sparkles secrets list`, `set NAME`
+and `unset NAME` manage runtime keys. `set` reads standard input when it is not a
+terminal and otherwise prompts with echo off, refuses an empty value, and never prints
+the value. `list` prints the name, source, lock, time of the runtime value, the
+providers that use the secret and whether the runtime value overrides the declared
+source, and `--json` prints the server's answer. `tests/cli_server_settings.rs` runs
+these commands against a server process and checks that the key appears in neither the
+CLI's output nor the server's log.
+
+The server page of the UI has a Models section for users with `server-admin`. It lists
+the providers from `GET /$/models` with their key status, adds a provider through a
+short form, and shows the `models` kind with the components of the Settings tab, with a
+group of fields for each provider, the role lists and routing, and the runtime layer as
+JSON under Advanced. A provider has a Remove button unless it or one of its fields is
+locked, and a declared provider removed at runtime is listed with Use server config.
+The API keys panel shows whether each secret is set and where its value comes from.
+Replace opens a password field whose value is read from the form when it is sent and
+never kept in the component's state. A runtime key over a declared one offers Use
+server config, and a key that exists only at runtime offers Remove runtime value.
+
+Every settings section, in the dataset tab and in the Models section, shows a runtime
+value over a declared one as "overrides server config" with `server config: VALUE`
+below the field and a reset labeled Use server config. A runtime value with no declared
+value has Reset to default. A section with overrides says how many there are and offers
+Use server config for all, which lists them in a dialog and removes them one `DELETE`
+at a time with the `ETag` of the previous answer. `ui/tests/e2e/models.spec.ts` and
+`settings.spec.ts` cover these against a server with a model configuration, a declared
+key and a locked endpoint.
+
+The NixOS module already passed `services.sparkles.settings.server.locked` through to
+the settings file, and the build's `sparkles settings check` already validated it with
+the generated model configuration. The VM test now locks a provider's endpoint, checks
+that a `PATCH` of it is refused with `409`, changes the provider's budget with
+`sparkles settings set --global`, and checks that the change survives a reload and a
+switch to another configuration. `nix/settings-test.nix` checks that a lock path naming
+no field fails the build.
+
+These points differ from the design or settle what it left open.
+
+- The flag is `--global` rather than `--server`, since `--server` already names the
+  server to connect to in every remote command. With `--global`, the first positional
+  argument is the kind for `get` and `edit`, an assignment for `set` and the field for
+  `reset`. When a dataset argument equals a server kind's name, the error suggests
+  `--global`.
+- `edit --global` and `get --global` default to the `models` kind, the only server kind.
+- Use server config for all removes the overrides one field at a time in the order of
+  `overrides`, which lists providers before role lists. A role list that names a
+  provider brought back by an earlier reset is then valid when its own reset runs. If a
+  reset in the middle is refused, the section shows the error and reloads, so it shows
+  the overrides that are left.
+- The UI keeps the Models section's form in step with the providers by building it again
+  when a provider is added, removed or changes protocol, so unsaved edits in other
+  fields are lost at that moment. Adding and removing a provider are separate writes and
+  do not wait for Save.
+- Runtime keys stay unencrypted in `<dataDir>/secrets` until F11 adds encryption at
+  rest. The UI's API keys panel says so.

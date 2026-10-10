@@ -9409,11 +9409,12 @@ A kind answers like this:
   "dataset": "org",
   "kind": "assistant",
   "effective": { "enabled": true, "send": "schema", "historyDays": 7, "ask": true },
-  "declared": { "enabled": true, "send": "schema" },
+  "declared": { "enabled": true, "send": "schema", "historyDays": 30 },
   "runtime": { "historyDays": 7, "send": "rows" },
   "sources": { "enabled": "declared", "send": "locked", "historyDays": "runtime", "ask": "default" },
   "locked": ["send"],
   "overridden": ["send"],
+  "overrides": [{ "path": "historyDays", "declared": 30, "runtime": 7 }],
   "status": { "valid": true },
   "etag": "\"4f1c2a9e0b7d3c5a8e21\""
 }
@@ -9422,7 +9423,13 @@ A kind answers like this:
 The example leaves out most members of `effective` and `sources`. Each field of
 `effective` has a source: `default`, `declared`, `runtime`, or `locked` for a field the
 settings file locks. `overridden` lists the locked fields whose runtime value stays in
-the file but is ignored, such as a value stored before the lock was added. `status`
+the file but is ignored, such as a value stored before the lock was added. `overrides`
+lists each runtime value that replaces a value of the settings file, with its dotted
+`path`, the `declared` value and the `runtime` one. The path is the runtime leaf, or the
+shorter path where the declared value is not an object, and a runtime `null` that
+removes a declared member appears with `runtime: null`. A runtime value where the
+settings file declares nothing is not listed, and neither is a locked field. Clients
+use it to show the value that a reset brings back. `status`
 says whether the effective object is valid and why not. It becomes invalid when a
 reload removes a provider that a role list names, and the feature then treats the
 provider as missing.
@@ -9499,6 +9506,10 @@ The answer has the members of a dataset's kind, with `scope: "server"` in place 
 `dataset`. `If-Match`, `412`, `409` with `locked-by-config`, `400` with `bad-settings`
 and `404` with `unknown-kind` work as for a dataset's settings. A body may name
 endpoints and secrets here, unlike a dataset's settings, but never a key's value.
+`overrides` names, for example, a budget changed at runtime with the budget of
+`--model-config`, and a declared provider removed at runtime as
+`{"path": "providers.local", "declared": {...}, "runtime": null}`.
+`sparkles settings --global` and the **Models** section of the UI use these routes.
 
 Every change is logged at INFO under the `sparkles::audit` target as the event
 `server_settings_changed`, with the `kind`, the `operation`, the changed `fields` as
@@ -9531,7 +9542,8 @@ is `409` with `locked-by-config` and `fields`. A server without a data directory
 a `PUT` with `409` and `no-data-directory`. A change rebuilds the model configuration,
 so the next request reads the new key. Each change is logged at INFO under
 `sparkles::audit` as `secret_set` or `secret_removed`, with the secret's name and the
-`principal`.
+`principal`. `sparkles secrets list`, `set NAME` and `unset NAME` use these routes, and
+`set` reads the value from standard input or a prompt that does not echo it.
 
 ### Ask history
 

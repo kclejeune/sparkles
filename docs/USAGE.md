@@ -2855,8 +2855,11 @@ sparkles settings apply settings.json
 
 `get` prints each field of the effective settings with its source, which is `default`,
 `declared`, `runtime` or `locked`, and marks a runtime value that a lock overrides.
-`--layer declared` and `--layer runtime` print one layer instead, and with `--json` only
-that layer's object.
+When a runtime value replaces a value of the settings file, the source names the
+declared value too, as in `runtime, overrides declared 30`. A provider or another
+member that the runtime layer removes is listed with `(removed)`. `--layer declared`
+and `--layer runtime` print one layer instead, and with `--json` only that layer's
+object.
 
 `set` takes `KIND.FIELD=VALUE` pairs and sends one `PATCH` per kind. A value is read as
 JSON when it parses, else as a string, so `assistant.send=documents` and
@@ -2872,11 +2875,29 @@ says where, and offers to open the editor again on the current settings. It offe
 same when the server refuses the edit as invalid or locked.
 
 `reset` removes the runtime value of one field, or the whole runtime layer of a kind,
-so that the declared value or the default applies again.
+so that the declared value or the default applies again. It prints the value that
+applies now and where it comes from, for example
+`assistant.historyDays on /org = 30, the declared value applies`. A reset of a whole kind
+lists each field it reset in the same way.
 
 `diff` lists the runtime values that differ from the declared value or, where the
 settings file declares nothing, from the built-in default. Without a dataset it covers
-every dataset the caller can see.
+every dataset the caller can see and the server-wide settings.
+
+With `--global`, the commands work on the server-wide `models` kind instead of a
+dataset, which needs the `server-admin` permission:
+
+```sh
+sparkles settings get --global                 # the model configuration and its sources
+sparkles settings set --global models.providers.claude.budget.tokensPerDay=200000
+sparkles settings edit --global
+sparkles settings reset --global models.providers.claude.budget
+sparkles settings diff --global
+```
+
+A field the settings file locks under `server.locked` is refused as it is for a dataset.
+`apply` lists the file's `server.locked` and changes nothing at server scope, since
+only the server's own settings file can lock a field.
 
 `apply` reads a file in the format of `--settings`, for a server that is started
 without one. It patches every dataset on the server with `defaults`, and each dataset
@@ -2896,11 +2917,17 @@ settings file. Role lists, routing and secret patterns are edited there.
 
 Each field shows where its value comes from. A value from the settings file is labeled
 "server config". A field the settings file locks shows a lock and cannot be changed.
-A value changed at runtime is marked "changed" and has a **Reset** button that removes
-it, so the field takes the value of the settings file or the default again. When a lock
-ignores a runtime value stored before the lock, the field says that the change is
-ignored. **Reset all** removes every runtime change of a kind, and the section shows
-when the effective settings are not valid.
+A value changed at runtime where the settings file declares nothing is marked "changed"
+and has a **Reset to default** button. A value changed at runtime over a value of the
+settings file is marked "overrides server config", shows that value below the field as
+`server config: 30`, and has a **Use server config** button that removes the change.
+When a lock ignores a runtime value stored before the lock, the field says that the
+change is ignored. **Reset all** removes every runtime change of a kind, and the section
+shows when the effective settings are not valid.
+
+A section with changes that override the settings file says how many fields do so, and
+its **Use server config for all** button lists them with both values and, once
+confirmed, removes those changes. The section's other runtime changes stay.
 
 Saving sends only the fields that changed, with the `ETag` the section read. When
 someone else changed the settings in the meantime, the server refuses the save, and the
@@ -2943,6 +2970,40 @@ secret with its source and the providers that use it, and `DELETE
 /$/server/secrets/gateway` removes the stored value so that the `--model-secret`
 source applies again. Reading the key from standard input, as above, keeps it out of
 the shell history and the process list.
+
+The CLI does the same with `sparkles settings --global`, described in
+[Changing dataset settings from the command line](#changing-dataset-settings-from-the-command-line),
+and `sparkles secrets`:
+
+```sh
+sparkles settings set --global models.providers.gateway.kind=openai \
+  models.providers.gateway.endpoint=https://llm.internal.example/v1 \
+  models.providers.gateway.apiKey.secret=gateway
+sparkles secrets set gateway < gateway.key   # or type it at the prompt
+sparkles secrets list
+sparkles secrets unset gateway
+```
+
+`sparkles secrets set NAME` reads the key from standard input when that is not a
+terminal, and otherwise asks for it without echoing it. It never takes the key from an
+argument or an environment variable, and it never prints it. `sparkles secrets list`
+prints each secret with its source, whether it is locked, when its runtime value was
+set, the providers that use it, and whether a runtime value overrides the declared
+source. `--json` prints the server's answer.
+
+The **Server** page of the web UI has a **Models** section for users with
+`server-admin`. It lists the providers with their protocol, endpoint and whether their
+key can be read, and has a form to add a provider. Below it, the model configuration is
+a form with a group of fields for each provider, the role lists and the routing, with the
+same sources, locks, resets and **Use server config for all** as the dataset's Settings
+tab, and the whole runtime layer as JSON under **Advanced**. A provider has a **Remove**
+button unless the operator locked it or one of its fields, and a declared provider
+removed at runtime is listed with a **Use server config** button that brings it back.
+The **API keys** panel lists each secret and whether it is set. **Replace** opens a
+password field, and the key typed there is sent once and is not kept in the page. A
+runtime key over a declared one is marked "overrides server config" and has a **Use
+server config** button, and a key that only exists at runtime has **Remove runtime
+value**.
 
 `GET /$/server/settings/models` answers the effective configuration with the source of
 each field, as for a dataset's settings. A `PATCH` with `null` for a provider removes
@@ -4784,7 +4845,43 @@ updating that file.
 The generated configuration is the declared layer. Server administrators can still
 change providers and store keys at runtime, as
 [Changing models and keys at runtime](#changing-models-and-keys-at-runtime) describes,
-unless `server.locked` in the settings file locks them.
+unless `services.sparkles.settings.server.locked` locks them. A common split declares
+the providers in Nix, locks the parts that the deployment owns, and lets administrators
+tune the rest with `sparkles settings --global`, `sparkles secrets` or the **Models**
+section of the UI:
+
+```nix
+services.sparkles = {
+  models = {
+    settings = {
+      providers.claude = {
+        kind = "anthropic";
+        endpoint = "https://api.anthropic.com";
+        apiKey.secret = "anthropic";
+        budget.tokensPerDay = 2000000;
+      };
+      roles.draft = [ { provider = "claude"; model = "claude-haiku-5-5"; } ];
+    };
+    secrets.anthropic.file = config.sops.secrets."anthropic-api-key".path;
+  };
+  # the endpoint, the routing and the key stay as deployed; budgets, models and
+  # role lists can change at runtime
+  settings.server.locked = [
+    "models.providers.claude.endpoint"
+    "models.routing"
+    "secrets.anthropic"
+  ];
+};
+```
+
+An administrator can then lower the budget with
+`sparkles settings set --global models.providers.claude.budget.tokensPerDay=500000`.
+The change is kept in the data directory and survives reloads, restarts and new
+deployments. A change of the endpoint is refused with `409` and the code
+`locked-by-config`, and `sparkles secrets set anthropic` is refused too, since the
+locked secret always reads its file. Locking `models.providers.claude` keeps the whole
+provider as declared, and the build refuses a lock path that names no field, such as
+`models.providers.claude.endpont`.
 
 Only credential references belong in Nix: generated settings are in the Nix store.
 The module does not copy key files into the store or read their contents during
