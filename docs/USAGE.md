@@ -43,6 +43,7 @@ without a migration path, so keep backups of anything you cannot regenerate.
 * [MCP server (LLM agents)](#mcp-server-llm-agents)
   * [Handing a query to the web UI](#handing-a-query-to-the-web-ui)
   * [Agent memory grants](#agent-memory-grants)
+* [Agent memory](#agent-memory)
 * [Asking questions with a model](#asking-questions-with-a-model)
   * [Measuring models](#measuring-models)
 * [Embedding the library](#embedding-the-library)
@@ -2324,6 +2325,86 @@ Paste the output into the auth configuration and give the agent's token or user
 branch names cannot hold a slash. `PUT /$/memory/{ds}` then names the agent graphs, so
 that `recall` marks the facts found only there as unreviewed
 ([API.md](API.md#memory-settings)).
+
+Add `--import --import-base IRI` to let the agent import harness memory as well. The
+template then also grants writes on `<base><agent>/*` on `main`, where `sparkles memory
+import` writes for that principal.
+
+## Agent memory
+
+`sparkles memory` imports the memory and instruction files of coding agents into a
+dataset, keeps them current, and prints a brief of what the graph knows when a session
+starts. It reads Claude Code's memory files, its `MEMORY.md` index and its `CLAUDE.md`
+files and rules, Codex's `AGENTS.md` files and generated memories, `GEMINI.md`, Cursor
+rules and GitHub Copilot's instructions. Each file becomes one named graph of facts,
+each with a reifier that quotes the line it came from. Imported facts are unreviewed
+until a person promotes them. The design is in
+[C18 §8.10](specs/C18-natural-language-questions-and-ingest.md#810-importing-memory-from-coding-agent-harnesses).
+
+The commands talk to a server with the token of `sparkles auth login` or
+`SPARKLES_TOKEN`. An administrator prepares the dataset once:
+
+```sh
+sparkles memory init --server https://sparql.example.org --dataset org \
+  --import-base https://example.org/memory/import/
+```
+
+`init` writes the vocabulary graph `urn:x-sparkles:vocab:mem`, sets `imports.base` and
+the matching `agentGraphs` entry in the memory settings, and adds the memory shapes to
+the write-time guard in `warn` mode. Each person then grants themselves, or is granted,
+the template of [Agent memory grants](#agent-memory-grants) with `--import`, and keeps
+the server and dataset in `~/.config/sparkles/memory.toml`:
+
+```toml
+server = "https://sparql.example.org"
+dataset = "org"
+skip-projects = ["github.com/acme/secret"]
+
+[[redact]]
+name = "internal-token"
+regex = "itk_[A-Za-z0-9]{32}"
+```
+
+From a project's directory:
+
+```sh
+sparkles memory import                    # every adapter whose files exist
+sparkles memory import claude-code --user-scope
+sparkles memory sync --dry-run            # what changed since the last import
+sparkles memory status                    # files against sources, unresolved links
+sparkles memory sources --needs-extraction
+sparkles memory brief --include-unreviewed
+sparkles memory recall --seed urn:uuid:…
+sparkles memory query --sparql q.rq --results csv
+sparkles memory forget --harness codex --yes
+```
+
+The graph of a file is `<base><principal>/<harness>/<project>/memory/<name>`,
+`…/index` for `MEMORY.md`, or `…/instructions/<path>`, where the project is the git
+remote, such as `github.com.acme.shop`. Running `import` or `sync` again writes only
+what changed. An edit replaces single values such as the description, adds and
+retracts links, a moved file changes only its path, and a deleted file's facts are
+retracted while its source keeps the time it went. A file renamed with its bytes
+unchanged gets a new graph that `dcterms:replaces` the old one. Secrets that the
+built-in patterns, the dataset's `secretPatterns` or `--redact-patterns FILE` recognize
+are replaced by `[redacted:NAME]` before anything is parsed.
+
+`sparkles memory setup claude-code` prints the hooks, the extraction skill and, for
+Codex, the MCP entry of [C18 §10.4](specs/C18-natural-language-questions-and-ingest.md#104-harness-integration),
+and `--write` merges them into `~/.claude/settings.json` (or `.claude/settings.json`
+with `--scope project`) or `~/.codex/hooks.json`. The hooks sync a memory file when
+Claude writes it, sync the project when a session ends, and print the brief when a
+session starts. A hook never fails a session, because `--if-reachable` exits 0 when the
+server cannot be reached. A harness without hooks can read a file that
+`sparkles memory brief --write AGENTS.sparkles.md` writes from a scheduler. The file
+starts with a generated marker, so no import reads it back, and `--write` refuses to
+overwrite a file without the marker.
+
+`--loc DIR` opens a database that no server holds in the process instead, and acts as
+the operating-system user. Every command takes `--json` and prints one JSON document,
+or one line per sync with `sync --watch`. The exit status is 0 when done, 1 on an
+error, 2 on a usage error, 3 when some files failed, and 75 when the server cannot be
+reached.
 
 ## Asking questions with a model
 
