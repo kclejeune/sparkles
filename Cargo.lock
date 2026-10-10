@@ -4093,6 +4093,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "sparkles-memory-import"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "regex",
+ "sha1",
+ "sha2",
+ "tempfile",
+ "uuid",
+]
+
+[[package]]
 name = "sparkles-reasoner"
 version = "0.1.0"
 dependencies = [
