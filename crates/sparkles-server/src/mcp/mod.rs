@@ -15,7 +15,7 @@ mod bridge;
 mod complete;
 mod context;
 mod draft;
-mod errors;
+pub(crate) mod errors;
 #[cfg(feature = "fmt")]
 mod format;
 #[cfg(feature = "graphql")]
@@ -42,7 +42,7 @@ mod search;
 mod share;
 mod stored;
 mod tasks;
-mod tools;
+pub(crate) mod tools;
 mod update;
 #[cfg(any(feature = "shacl", feature = "shex"))]
 mod validate;
@@ -375,6 +375,17 @@ impl McpServer {
             return Err(UnknownTool(name.to_string()));
         }
         Ok(self.run(name, args, call).await)
+    }
+
+    /// Run the tool `name` on this thread as `call.principal`, with no slot. The asking
+    /// pipeline (`crate::ask`) calls its tools this way from its own blocking thread.
+    pub(crate) fn run_now(
+        &self,
+        name: &str,
+        args: Map<String, Value>,
+        call: &Call,
+    ) -> Result<Outcome, ToolError> {
+        tools::run(self, name, args, call)
     }
 
     /// Whether `p` may call the tool `name`: an offered tool (the write tool checks for

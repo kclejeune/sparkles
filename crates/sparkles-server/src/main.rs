@@ -5,6 +5,8 @@
 //! validate|parse`).
 
 mod alloc;
+#[cfg(feature = "mcp")]
+mod ask;
 mod assist;
 mod auth;
 #[cfg(feature = "backup")]
@@ -1160,6 +1162,11 @@ enum Cmd {
     /// on stdin/stdout): read-only tools for schema discovery and bounded queries
     #[cfg(feature = "mcp")]
     Mcp(mcp::McpArgs),
+    /// Answer a question about a database with the configured models (C18 §4): ground,
+    /// draft, check, run, repair and summarize, printing the checked query, its rows and
+    /// the tokens used
+    #[cfg(feature = "mcp")]
+    Ask(ask::AskArgs),
     /// Format SPARQL, Turtle, TriG, N-Triples, N-Quads and JSON-LD: print, check (--check,
     /// -l) or rewrite (--write)
     #[cfg(feature = "fmt")]
@@ -2763,6 +2770,8 @@ fn run() -> Result<()> {
         }
         #[cfg(feature = "mcp")]
         Cmd::Mcp(args) => mcp::run(args, opts),
+        #[cfg(feature = "mcp")]
+        Cmd::Ask(args) => ask::run_cli(args, opts),
         #[cfg(feature = "fmt")]
         Cmd::Fmt(args) => fmt::run(args),
         #[cfg(feature = "fmt")]

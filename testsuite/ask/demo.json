@@ -1,0 +1,554 @@
+{
+ "description": "The demo question set of C18 §11.1 over the organisation graph that the UI's mock server loads (testsuite/ask/org.ttl, from ui/mock/data.mjs). Answerable questions have a gold query; clarify and unanswerable questions score the clarification and the refusal. complexity is the score of §5.5 for the gold query.",
+ "dataset": "org",
+ "data": "org.ttl",
+ "prefixes": {
+  "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+  "rdfs": "http://www.w3.org/2000/01/rdf-schema#",
+  "owl": "http://www.w3.org/2002/07/owl#",
+  "xsd": "http://www.w3.org/2001/XMLSchema#",
+  "foaf": "http://xmlns.com/foaf/0.1/",
+  "dcterms": "http://purl.org/dc/terms/",
+  "skos": "http://www.w3.org/2004/02/skos/core#",
+  "schema": "http://schema.org/",
+  "ex": "http://example.org/ontology#",
+  "res": "http://example.org/resource/"
+ },
+ "questions": [
+  {
+   "id": "lookup-01",
+   "kind": "answerable",
+   "category": "lookup",
+   "question": "How many people are in the dataset?",
+   "gold": "SELECT (COUNT(DISTINCT ?p) AS ?n) WHERE { ?p a ?cls . ?cls rdfs:subClassOf* ex:Person . }",
+   "complexity": 3
+  },
+  {
+   "id": "lookup-02",
+   "kind": "answerable",
+   "category": "lookup",
+   "question": "Which teams are there?",
+   "gold": "SELECT ?team ?label WHERE { ?team a ex:Team ; rdfs:label ?label }",
+   "complexity": 1
+  },
+  {
+   "id": "lookup-03",
+   "kind": "answerable",
+   "category": "lookup",
+   "question": "List the companies and the year each was founded.",
+   "gold": "SELECT ?company ?founded WHERE { ?company a ex:Company ; ex:founded ?founded }",
+   "complexity": 1
+  },
+  {
+   "id": "lookup-04",
+   "kind": "answerable",
+   "category": "lookup",
+   "question": "In which city is Tessellate based?",
+   "gold": "SELECT ?city WHERE { res:Tessellate ex:basedIn ?city }",
+   "complexity": 0
+  },
+  {
+   "id": "lookup-05",
+   "kind": "answerable",
+   "category": "lookup",
+   "question": "What is Ada Lovelace's email address?",
+   "gold": "SELECT ?mbox WHERE { res:Ada_Lovelace foaf:mbox ?mbox }",
+   "complexity": 0
+  },
+  {
+   "id": "lookup-06",
+   "kind": "answerable",
+   "category": "lookup",
+   "question": "How old is Grace Hopper?",
+   "gold": "SELECT ?age WHERE { res:Grace_Hopper foaf:age ?age }",
+   "complexity": 0
+  },
+  {
+   "id": "lookup-07",
+   "kind": "answerable",
+   "category": "lookup",
+   "question": "Which skills does Alan Turing have?",
+   "gold": "SELECT ?skill WHERE { res:Alan_Turing ex:hasSkill ?skill }",
+   "complexity": 0
+  },
+  {
+   "id": "lookup-08",
+   "kind": "answerable",
+   "category": "lookup",
+   "question": "Which projects does Barbara Liskov contribute to?",
+   "gold": "SELECT ?project WHERE { res:Barbara_Liskov ex:contributesTo ?project }",
+   "complexity": 0
+  },
+  {
+   "id": "lookup-09",
+   "kind": "answerable",
+   "category": "lookup",
+   "question": "Which team does Edsger Dijkstra belong to?",
+   "gold": "SELECT ?team WHERE { res:Edsger_Dijkstra ex:memberOf ?team }",
+   "complexity": 0
+  },
+  {
+   "id": "lookup-10",
+   "kind": "answerable",
+   "category": "lookup",
+   "question": "Which company does Margaret Hamilton work for?",
+   "gold": "SELECT ?company WHERE { res:Margaret_Hamilton ex:worksFor ?company }",
+   "complexity": 0
+  },
+  {
+   "id": "lookup-11",
+   "kind": "answerable",
+   "category": "lookup",
+   "question": "What is the country code of Kyoto?",
+   "gold": "SELECT ?country WHERE { res:Kyoto schema:addressCountry ?country }",
+   "complexity": 0
+  },
+  {
+   "id": "lookup-12",
+   "kind": "answerable",
+   "category": "lookup",
+   "question": "Which universities are there, and where is each based?",
+   "gold": "SELECT ?university ?city WHERE { ?university a ex:University ; ex:basedIn ?city }",
+   "complexity": 1
+  },
+  {
+   "id": "lookup-13",
+   "kind": "answerable",
+   "category": "lookup",
+   "question": "What is the description of the Delta Merge project?",
+   "gold": "SELECT ?description WHERE { res:project_Delta_Merge dcterms:description ?description }",
+   "complexity": 0
+  },
+  {
+   "id": "lookup-14",
+   "kind": "answerable",
+   "category": "lookup",
+   "question": "Is Linus Torvalds a manager?",
+   "gold": "ASK { res:Linus_Torvalds a ex:Manager }",
+   "complexity": 0
+  },
+  {
+   "id": "join-01",
+   "kind": "answerable",
+   "category": "join",
+   "question": "Who works for a company based in Berlin?",
+   "gold": "SELECT ?p WHERE { ?p ex:worksFor ?company . ?company ex:basedIn res:Berlin }",
+   "complexity": 1
+  },
+  {
+   "id": "join-02",
+   "kind": "answerable",
+   "category": "join",
+   "question": "Which people are members of the Storage team?",
+   "gold": "SELECT ?p WHERE { ?p ex:memberOf res:team_Storage }",
+   "complexity": 0
+  },
+  {
+   "id": "join-03",
+   "kind": "answerable",
+   "category": "join",
+   "question": "Which company is the Query Engine team part of?",
+   "gold": "SELECT ?company WHERE { res:team_Query_Engine ex:partOf ?company }",
+   "complexity": 0
+  },
+  {
+   "id": "join-04",
+   "kind": "answerable",
+   "category": "join",
+   "question": "Who knows Ada Lovelace?",
+   "gold": "SELECT ?p WHERE { ?p foaf:knows res:Ada_Lovelace }",
+   "complexity": 0
+  },
+  {
+   "id": "join-05",
+   "kind": "answerable",
+   "category": "join",
+   "question": "Which people based in Lisbon have the Rust skill?",
+   "gold": "SELECT ?p WHERE { ?p ex:basedIn res:Lisbon ; ex:hasSkill res:skill_Rust }",
+   "complexity": 1
+  },
+  {
+   "id": "join-06",
+   "kind": "answerable",
+   "category": "join",
+   "question": "Who wrote publications about SPARQL?",
+   "gold": "SELECT DISTINCT ?author WHERE { ?pub ex:author ?author ; ex:about ?topic . ?topic skos:prefLabel \"SPARQL\"@en }",
+   "complexity": 2
+  },
+  {
+   "id": "join-07",
+   "kind": "answerable",
+   "category": "join",
+   "question": "Which researchers are alumni of the Open Semantics University?",
+   "gold": "SELECT ?p WHERE { ?p a ex:Researcher ; ex:alumnusOf res:Open_Semantics_University }",
+   "complexity": 1
+  },
+  {
+   "id": "join-08",
+   "kind": "answerable",
+   "category": "join",
+   "question": "List the engineers with their team and the company they work for.",
+   "gold": "SELECT ?p ?team ?company WHERE { ?p a ex:Engineer ; ex:memberOf ?team ; ex:worksFor ?company }",
+   "complexity": 2
+  },
+  {
+   "id": "join-09",
+   "kind": "answerable",
+   "category": "join",
+   "question": "Which teams belong to Tessellate?",
+   "gold": "SELECT ?team WHERE { ?team a ex:Team ; ex:partOf res:Tessellate }",
+   "complexity": 1
+  },
+  {
+   "id": "join-10",
+   "kind": "answerable",
+   "category": "join",
+   "question": "Who works on the Sparkles project?",
+   "gold": "SELECT ?p WHERE { ?p ex:contributesTo res:project_Sparkles }",
+   "complexity": 0
+  },
+  {
+   "id": "join-11",
+   "kind": "answerable",
+   "category": "join",
+   "question": "Which people are based in the same city as the company they work for?",
+   "gold": "SELECT ?p WHERE { ?p ex:worksFor ?company ; ex:basedIn ?city . ?company ex:basedIn ?city }",
+   "complexity": 2
+  },
+  {
+   "id": "join-12",
+   "kind": "answerable",
+   "category": "join",
+   "question": "List each publication with the names of its authors.",
+   "gold": "SELECT ?pub ?name WHERE { ?pub a ex:Publication ; ex:author ?a . ?a foaf:name ?name }",
+   "complexity": 2
+  },
+  {
+   "id": "agg-01",
+   "kind": "answerable",
+   "category": "aggregate",
+   "question": "How many people are in each team?",
+   "gold": "SELECT ?team (COUNT(?p) AS ?members) WHERE { ?p ex:memberOf ?team } GROUP BY ?team",
+   "complexity": 4
+  },
+  {
+   "id": "agg-02",
+   "kind": "answerable",
+   "category": "aggregate",
+   "question": "What is the average salary at each company?",
+   "gold": "SELECT ?company (AVG(?salary) AS ?average) WHERE { ?p ex:worksFor ?company ; ex:salary ?salary } GROUP BY ?company",
+   "complexity": 5
+  },
+  {
+   "id": "agg-03",
+   "kind": "answerable",
+   "category": "aggregate",
+   "question": "Which team has the most members?",
+   "gold": "SELECT ?team (COUNT(?p) AS ?members) WHERE { ?p ex:memberOf ?team } GROUP BY ?team ORDER BY DESC(?members) LIMIT 1",
+   "complexity": 4
+  },
+  {
+   "id": "agg-04",
+   "kind": "answerable",
+   "category": "aggregate",
+   "question": "How many publications were issued each year?",
+   "gold": "SELECT ?year (COUNT(?pub) AS ?n) WHERE { ?pub a ex:Publication ; dcterms:issued ?year } GROUP BY ?year",
+   "complexity": 5
+  },
+  {
+   "id": "agg-05",
+   "kind": "answerable",
+   "category": "aggregate",
+   "question": "What is the total number of citations of all publications?",
+   "gold": "SELECT (SUM(?c) AS ?total) WHERE { ?pub ex:citations ?c }",
+   "complexity": 2
+  },
+  {
+   "id": "agg-06",
+   "kind": "answerable",
+   "category": "aggregate",
+   "question": "Which skill do the most people have?",
+   "gold": "SELECT ?skill (COUNT(?p) AS ?n) WHERE { ?p ex:hasSkill ?skill } GROUP BY ?skill ORDER BY DESC(?n) LIMIT 1",
+   "complexity": 4
+  },
+  {
+   "id": "agg-07",
+   "kind": "answerable",
+   "category": "aggregate",
+   "question": "What is the highest salary?",
+   "gold": "SELECT (MAX(?s) AS ?max) WHERE { ?p ex:salary ?s }",
+   "complexity": 2
+  },
+  {
+   "id": "agg-08",
+   "kind": "answerable",
+   "category": "aggregate",
+   "question": "Which companies have more than 8 employees?",
+   "gold": "SELECT ?company (COUNT(?p) AS ?n) WHERE { ?p ex:worksFor ?company } GROUP BY ?company HAVING (COUNT(?p) > 8)",
+   "complexity": 7
+  },
+  {
+   "id": "agg-09",
+   "kind": "answerable",
+   "category": "aggregate",
+   "question": "How many people are based in each city?",
+   "gold": "SELECT ?city (COUNT(DISTINCT ?p) AS ?n) WHERE { ?p a ?cls . ?cls rdfs:subClassOf* ex:Person . ?p ex:basedIn ?city } GROUP BY ?city",
+   "complexity": 6
+  },
+  {
+   "id": "agg-10",
+   "kind": "answerable",
+   "category": "aggregate",
+   "question": "Who is the oldest person?",
+   "gold": "SELECT ?p ?age WHERE { ?p foaf:age ?age } ORDER BY DESC(?age) LIMIT 1",
+   "complexity": 0
+  },
+  {
+   "id": "agg-11",
+   "kind": "answerable",
+   "category": "aggregate",
+   "question": "Which publication has the most citations?",
+   "gold": "SELECT ?pub ?c WHERE { ?pub ex:citations ?c } ORDER BY DESC(?c) LIMIT 1",
+   "complexity": 0
+  },
+  {
+   "id": "agg-12",
+   "kind": "answerable",
+   "category": "aggregate",
+   "question": "Which teams have more members than the average team?",
+   "gold": "SELECT ?team ?n WHERE { { SELECT ?team (COUNT(?p) AS ?n) WHERE { ?p ex:memberOf ?team } GROUP BY ?team } { SELECT (AVG(?m) AS ?avg) WHERE { SELECT ?t (COUNT(?q) AS ?m) WHERE { ?q ex:memberOf ?t } GROUP BY ?t } } FILTER(?n > ?avg) }",
+   "complexity": 20
+  },
+  {
+   "id": "agg-13",
+   "kind": "answerable",
+   "category": "aggregate",
+   "question": "Which companies employ more engineers than the average company does?",
+   "gold": "SELECT ?company ?n WHERE { { SELECT ?company (COUNT(?p) AS ?n) WHERE { ?p a ex:Engineer ; ex:worksFor ?company } GROUP BY ?company } { SELECT (AVG(?m) AS ?avg) WHERE { SELECT ?c (COUNT(?q) AS ?m) WHERE { ?q a ex:Engineer ; ex:worksFor ?c } GROUP BY ?c } } FILTER(?n > ?avg) }",
+   "complexity": 22
+  },
+  {
+   "id": "neg-06",
+   "kind": "answerable",
+   "category": "negation",
+   "question": "Which managers manage a team that none of the people they know belongs to?",
+   "gold": "SELECT ?m ?team WHERE { ?m a ex:Manager ; ex:manages ?team FILTER NOT EXISTS { ?m foaf:knows ?k . ?k ex:memberOf ?team } }",
+   "complexity": 3
+  },
+  {
+   "id": "neg-01",
+   "kind": "answerable",
+   "category": "negation",
+   "question": "Which teams have no manager?",
+   "gold": "SELECT ?team WHERE { ?team a ex:Team FILTER NOT EXISTS { ?m ex:manages ?team } }",
+   "complexity": 2
+  },
+  {
+   "id": "neg-02",
+   "kind": "answerable",
+   "category": "negation",
+   "question": "Which people have not authored any publication?",
+   "gold": "SELECT DISTINCT ?p WHERE { ?p a ?cls . ?cls rdfs:subClassOf* ex:Person . FILTER NOT EXISTS { ?pub ex:author ?p } }",
+   "complexity": 3
+  },
+  {
+   "id": "neg-03",
+   "kind": "answerable",
+   "category": "negation",
+   "question": "Which employees of a company do not have the SPARQL skill?",
+   "gold": "SELECT ?p WHERE { ?p ex:worksFor ?company MINUS { ?p ex:hasSkill res:skill_SPARQL } }",
+   "complexity": 3
+  },
+  {
+   "id": "neg-04",
+   "kind": "answerable",
+   "category": "negation",
+   "question": "Which cities have no company based in them?",
+   "gold": "SELECT ?city WHERE { ?city a ex:City FILTER NOT EXISTS { ?company a ex:Company ; ex:basedIn ?city } }",
+   "complexity": 2
+  },
+  {
+   "id": "neg-05",
+   "kind": "answerable",
+   "category": "negation",
+   "question": "Which people have no French comment?",
+   "gold": "SELECT DISTINCT ?p WHERE { ?p a ?cls . ?cls rdfs:subClassOf* ex:Person . OPTIONAL { ?p rdfs:comment ?c FILTER(LANG(?c) = \"fr\") } FILTER(!BOUND(?c)) }",
+   "complexity": 4
+  },
+  {
+   "id": "path-01",
+   "kind": "answerable",
+   "category": "path",
+   "question": "Which organizations is the Storage team part of, directly or indirectly?",
+   "gold": "SELECT ?org WHERE { res:team_Storage ex:partOf+ ?org }",
+   "complexity": 0
+  },
+  {
+   "id": "path-02",
+   "kind": "answerable",
+   "category": "path",
+   "question": "Who are the people that Ada Lovelace's acquaintances know?",
+   "gold": "SELECT DISTINCT ?p WHERE { res:Ada_Lovelace foaf:knows/foaf:knows ?p FILTER(?p != res:Ada_Lovelace) }",
+   "complexity": 1
+  },
+  {
+   "id": "path-03",
+   "kind": "answerable",
+   "category": "path",
+   "question": "Which people are employees, counting managers and engineers?",
+   "gold": "SELECT ?p WHERE { ?p rdf:type/rdfs:subClassOf* ex:Employee }",
+   "complexity": 1
+  },
+  {
+   "id": "path-04",
+   "kind": "answerable",
+   "category": "path",
+   "question": "Which classes are kinds of Agent?",
+   "gold": "SELECT ?class WHERE { ?class rdfs:subClassOf+ ex:Agent }",
+   "complexity": 0
+  },
+  {
+   "id": "path-05",
+   "kind": "answerable",
+   "category": "path",
+   "question": "Who knows someone who works for Quadrant Labs?",
+   "gold": "SELECT DISTINCT ?p WHERE { ?p foaf:knows/ex:worksFor res:Quadrant_Labs }",
+   "complexity": 1
+  },
+  {
+   "id": "date-01",
+   "kind": "answerable",
+   "category": "date",
+   "question": "Who started after the start of 2020?",
+   "gold": "SELECT ?p ?d WHERE { ?p ex:startDate ?d FILTER(?d >= \"2020-01-01\"^^xsd:date) }",
+   "complexity": 0
+  },
+  {
+   "id": "date-02",
+   "kind": "answerable",
+   "category": "date",
+   "question": "Who started most recently?",
+   "gold": "SELECT ?p ?d WHERE { ?p ex:startDate ?d } ORDER BY DESC(?d) LIMIT 1",
+   "complexity": 0
+  },
+  {
+   "id": "date-03",
+   "kind": "answerable",
+   "category": "date",
+   "question": "Which companies were founded before 2010?",
+   "gold": "SELECT ?company WHERE { ?company a ex:Company ; ex:founded ?y FILTER(xsd:integer(STR(?y)) < 2010) }",
+   "complexity": 1
+  },
+  {
+   "id": "date-04",
+   "kind": "answerable",
+   "category": "date",
+   "question": "How many people started in each year?",
+   "gold": "SELECT ?year (COUNT(?p) AS ?n) WHERE { ?p ex:startDate ?d BIND(YEAR(?d) AS ?year) } GROUP BY ?year",
+   "complexity": 5
+  },
+  {
+   "id": "date-05",
+   "kind": "answerable",
+   "category": "date",
+   "question": "Which publications were issued in 2020 or later?",
+   "gold": "SELECT ?pub WHERE { ?pub dcterms:issued ?y FILTER(xsd:integer(STR(?y)) >= 2020) }",
+   "complexity": 0
+  },
+  {
+   "id": "lang-01",
+   "kind": "answerable",
+   "category": "language",
+   "question": "What is the French label of the Person class?",
+   "gold": "SELECT ?label WHERE { ex:Person rdfs:label ?label FILTER(LANG(?label) = \"fr\") }",
+   "complexity": 0
+  },
+  {
+   "id": "lang-02",
+   "kind": "answerable",
+   "category": "language",
+   "question": "Which people have a comment in French?",
+   "gold": "SELECT ?p WHERE { ?p foaf:name ?n ; rdfs:comment ?c FILTER(LANG(?c) = \"fr\") }",
+   "complexity": 1
+  },
+  {
+   "id": "lang-03",
+   "kind": "answerable",
+   "category": "language",
+   "question": "Which entity is labelled Berlin?",
+   "gold": "SELECT ?x WHERE { ?x rdfs:label \"Berlin\"@en }",
+   "complexity": 0
+  },
+  {
+   "id": "lang-04",
+   "kind": "answerable",
+   "category": "language",
+   "question": "Which team is called the Storage team?",
+   "gold": "SELECT ?team WHERE { ?team a ex:Team ; rdfs:label \"Storage team\"@en }",
+   "complexity": 1
+  },
+  {
+   "id": "clar-01",
+   "kind": "clarify",
+   "category": "clarification",
+   "question": "Which people are in Research?",
+   "note": "Research names a team (res:team_Research) and reads as the class ex:Researcher."
+  },
+  {
+   "id": "clar-02",
+   "kind": "clarify",
+   "category": "clarification",
+   "question": "Which companies are the biggest?",
+   "note": "Biggest by employees, by teams or by projects is not said."
+  },
+  {
+   "id": "clar-03",
+   "kind": "clarify",
+   "category": "clarification",
+   "question": "Who is connected to Tim Berners-Lee?",
+   "note": "Connected by foaf:knows, by team or by company is not said."
+  },
+  {
+   "id": "clar-04",
+   "kind": "clarify",
+   "category": "clarification",
+   "question": "Which people are senior?",
+   "note": "Seniority by age, by start date or by the Manager class is not said."
+  },
+  {
+   "id": "none-01",
+   "kind": "unanswerable",
+   "category": "unanswerable",
+   "question": "What is Ada Lovelace's phone number?",
+   "note": "The data holds no phone numbers."
+  },
+  {
+   "id": "none-02",
+   "kind": "unanswerable",
+   "category": "unanswerable",
+   "question": "What is the revenue of Tessellate?",
+   "note": "The data holds no revenue."
+  },
+  {
+   "id": "none-03",
+   "kind": "unanswerable",
+   "category": "unanswerable",
+   "question": "Which people are married?",
+   "note": "The data holds no marital status."
+  },
+  {
+   "id": "none-04",
+   "kind": "unanswerable",
+   "category": "unanswerable",
+   "question": "When was the Storage team created?",
+   "note": "Teams have no creation date."
+  },
+  {
+   "id": "none-05",
+   "kind": "unanswerable",
+   "category": "unanswerable",
+   "question": "Who is the CEO of Lattice & Co?",
+   "note": "The data names no CEO or role in a company."
+  }
+ ]
+}

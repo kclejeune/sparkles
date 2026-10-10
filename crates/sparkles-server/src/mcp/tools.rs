@@ -150,7 +150,7 @@ pub(super) fn remaining(deadline: Instant) -> Result<Duration, Error> {
 
 /// The prefixes of a dataset: the well-known ones (as `/$/prefixes/{ds}`) and those
 /// seen at load or set on the dataset, which win.
-pub(super) fn dataset_prefixes(ds: &Dataset) -> BTreeMap<String, String> {
+pub(crate) fn dataset_prefixes(ds: &Dataset) -> BTreeMap<String, String> {
     let mut p = sparkles::io::standard_prefixes();
     p.extend(ds.store.prefixes());
     p

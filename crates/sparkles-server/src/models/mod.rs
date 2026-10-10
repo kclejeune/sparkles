@@ -25,9 +25,11 @@ pub mod http;
 pub(crate) mod mock;
 mod structured;
 
-pub use client::{CallError, ChatRequest, ChatResponse, Message};
-pub use config::{Kind, Level, ModelsConfig, Pair, ProviderConfig, Role};
-pub use structured::{OutputSchema, fenced, validate};
+pub use client::{CallError, ChatRequest, Message};
+pub use config::{DEFAULT_CONTEXT_TOKENS, Kind, Level, ModelsConfig, Pair, ProviderConfig, Role};
+#[cfg(test)]
+pub use structured::validate;
+pub use structured::{OutputSchema, fenced};
 
 use anyhow::{Context, Result};
 use parking_lot::{Condvar, Mutex};
@@ -105,6 +107,8 @@ pub struct StepRecord {
     pub outcome: String,
     /// at the pair's `pricing`, when it has one
     pub estimated_cost: Option<f64>,
+    /// the provider's reason for stopping its last answer, as it gave it
+    pub stop: Option<String>,
 }
 
 impl StepRecord {
@@ -126,6 +130,9 @@ impl StepRecord {
         }
         if let Some(c) = self.estimated_cost {
             j["estimatedCost"] = number(c);
+        }
+        if let Some(s) = &self.stop {
+            j["stopReason"] = s.clone().into();
         }
         j
     }
@@ -403,6 +410,14 @@ impl Models {
         };
         let m = p.model(&pair.model);
         let pricing = m.pricing;
+        // the provider's own connect timeout
+        let outbound = sparkles::outbound::OutboundPolicy {
+            connect_timeout: Duration::from_secs_f64(
+                p.connect_timeout_secs
+                    .unwrap_or(config::DEFAULT_CONNECT_TIMEOUT_SECS),
+            ),
+            ..self.outbound.clone()
+        };
         let started = Instant::now();
         let (levels, detecting) = self.levels(p, pair);
         let mut last: Option<StepError> = None;
@@ -470,7 +485,7 @@ impl Models {
                 rec.requests += 1;
                 rec.level = Some(level);
                 let t = client::Transport {
-                    outbound: &self.outbound,
+                    outbound: &outbound,
                     key: key.clone(),
                 };
                 let resp = client::send(&t, &pair.provider, p, &req);
@@ -489,6 +504,7 @@ impl Models {
                     }
                 };
                 rec.input_tokens += resp.input_tokens;
+                rec.stop = resp.stop.clone();
                 rec.output_tokens += resp.output_tokens;
                 {
                     let mut t = rt.tokens.lock();
