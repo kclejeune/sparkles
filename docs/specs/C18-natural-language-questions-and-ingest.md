@@ -3489,7 +3489,7 @@ dataset `org` with a text index over `rdfs:label` and `foaf:name` and the shapes
   `https://example.org/hr` on `main` answers `forbidden`, and writing it on
   `proposals.agent-7.fix` succeeds.
 - **A31.** With `conversationFacts: "review"` for `agent-7`, `assert_facts` on `main`
-  commits on `proposals/agent-7/inbox`, the result names that branch, and `main` is
+  commits on `proposals.agent-7.inbox`, the result names that branch, and `main` is
   unchanged.
 - **A32.** In the inbox, **Accept all that pass** selects facts whose span, link and
   guard signals pass, and leaves out a fact with confidence 0.99 whose link check finds
