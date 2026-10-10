@@ -5,6 +5,10 @@ This audit covers these source snapshots: Apache Jena `6.3.0-SNAPSHOT` (b1dcba53
 Sparkles added beyond these three projects has a design spec in
 [`specs/`](specs/README.md), which also records how it was implemented (§2b).
 
+This is the historical source and design audit. [ARCHITECTURE.md](ARCHITECTURE.md)
+describes the current implementation, [FEATURES.md](FEATURES.md#known-gaps) owns the
+current limits, and [COMPARISON.md](COMPARISON.md) explains compatibility differences.
+
 ## 1. Apache Jena — functional inventory
 
 | Module | Java LOC (main/test) | Role | Sparkles status |
@@ -46,7 +50,7 @@ Sparkles preserves these Jena behaviours:
 * **Reasoning.** RDFS (full, default and simple), the OWL Micro, Mini and Full rule sets,
   and `GenericRuleReasoner` with Jena rule syntax `[name: (?a p ?b) builtin(?x) -> (?a q ?b)]`.
 
-The tests run these suites from the Jena checkout. The `sparkles` crate runs
+The tests run these suites from the Jena checkout. The `sparkles-core` crate runs
 `jena-arq/testing/rdf-tests-cg/sparql/{sparql10,sparql11,sparql12}` and ARQ's `LATERAL`
 tests in `jena-arq/testing/ARQ`. The formatter's tests read the Turtle and TriG suites of
 `jena-arq/testing/rdf-tests-cg/rdf/{rdf11,rdf12}`, `sparkles-shacl` runs
@@ -124,54 +128,20 @@ make up for re-creating the parser, algebra and datatype stack.
 
 ## 4. Sparkles architecture
 
-```
-ui/ (SvelteKit)  ──HTTP──▶  sparkles-server (axum; Fuseki protocol + /$/ admin; auth, rate
-                                   │         limits, observability; CLI; MCP over stdio and HTTP)
-                                   ├─ sparkles-graphql  (the read-only GraphQL adapter, compiled to SPARQL algebra)
-                                   ├─ sparkles-reasoner (RDFS / OWL-RL / Jena rules, semi-naive forward chaining)
-                                   ├─ sparkles-shacl    (SHACL Core + SHACL-SPARQL, write-time validation)
-                                   ├─ sparkles-shex     (ShEx 2.1, write-time validation)
-                                   ├─ sparkles-fmt      (formatter; also built for the browser as sparkles-fmt-wasm)
-                                   ├─ sparkles-backup   (repositories on a file system or S3, backups, restore, policies)
-                                   └─ sparkles-client   (the Rust client; the CLI shares its credentials file code)
-                                   │
-sparkles (library)
- ├─ id        64-bit tagged ids, inline literals
- ├─ vocab     sorted front-coded base vocab (mmap) + delta vocab + local vocab
- ├─ index     permutation files: 32k-row blocks, per-column compression, in-RAM block metadata
- ├─ builder   parallel bulk loader (partial vocabs → merge → remap → external sort)
- ├─ store     generations, WAL, MVCC snapshots (base ⊕ delta), commit catalog, history,
- │            compaction, backup capture
- ├─ sparql    spargebra → planner (DP + interesting orders) → columnar operators → results
- ├─ text      full-text index (Tantivy)
- ├─ geo       GeoSPARQL: literals, CRSs, units, the geof: functions, the spatial index (geo, geo-index)
- ├─ vector    vector similarity, exact or through HNSW indexes, and embeddings computed on write
- ├─ codec     gzip / zstd / brotli / LZ4
- └─ io        RDF & result-format parsing/serialization (Oxigraph crates)
-```
+[ARCHITECTURE.md](ARCHITECTURE.md) describes the current library boundaries, storage
+and query execution, optimization mechanisms, and decisions across the implemented
+specs, with Mermaid diagrams. This audit records the source projects and the rationale
+for adopting their mechanisms.
 
 ## 5. Explicit non-goals for v1
 
-Sparkles v1 leaves out JavaScript scripting functions, jena-ontapi's object mapping API,
+The original v1 scope left out JavaScript scripting functions, jena-ontapi's object mapping API,
 jena-text's Lucene index format and assembler configuration, backward-chaining (LP) rules
 and Shiro authentication. Sparkles implements `text:query` itself and has its own
-authentication ([C09](specs/C09-dataset-access-control.md)). These are documented
-extension points, not hidden gaps. RDF Thrift, RDF Protobuf, TriX, RDF/JSON and RDF Patch
-were on this list at first. The server, `sparkles load` and `sparkles convert` now read and
-write Jena's formats, and RDF Patch is written and applied
-([F10](specs/F10-replication.md)). The library's loader and the Python package still take
-only the W3C syntaxes.
+authentication ([C09](specs/C09-dataset-access-control.md)). RDF Thrift, RDF Protobuf,
+TriX, RDF/JSON, RDF Patch and GeoSPARQL were initially outside that scope and have since
+been implemented, with limits.
 
-GeoSPARQL is supported ([G01](specs/G01-geosparql.md)), except for these parts:
-
-* **Computed geometries are 2D.** Z and M values are read, and `is3D`, `isMeasured`,
-  `minZ` and `maxZ` report them, but they are not kept. Buffers, hulls, overlays and
-  conversions return 2D geometries.
-* **Unions of curves are not noded.** Two lines that cross stay two lines. JTS would split
-  them at the crossing point. The result covers the same points either way.
-* **CRSs.** Sparkles ships no EPSG database. The server resolves projected EPSG codes
-  through the EPSG-derived proj4 table of `crs-definitions` (the `geo-epsg` feature, off
-  in the library), and other CRSs need a proj4 definition from the operator
-  (`--geo-crs`). Geographic CRSs on other datums and grid-based datum shifts are not
-  supported, and definitions that need grids are refused.
-* **GML.** Curved segments (arcs, circles, splines) and solids are not read.
+The current [format and feature limits](FEATURES.md#known-gaps) and
+[GeoSPARQL divergences](COMPARISON.md#geosparql) are maintained in the product guides.
+The original choices and later outcomes remain in the corresponding design specs.

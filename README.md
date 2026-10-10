@@ -5,6 +5,8 @@ Sparkles is a fast RDF, SPARQL and OWL database written in Rust. It reimplements
 operational model, on the index and execution architecture of
 [QLever](https://github.com/ad-freiburg/qlever). It ships as an embeddable library with
 Rust, Python, JVM and JavaScript APIs, a Fuseki-compatible server and CLI, and a web UI.
+The JVM binding implements Jena's `DatasetGraph`, letting Java and Kotlin applications
+use Sparkles through Jena's existing query, model and transaction APIs.
 
 > [!WARNING]
 > Sparkles is experimental. There are no releases, and the on-disk format, HTTP API, CLI
@@ -26,7 +28,9 @@ on top of the second:
 1. **Jena-compatible where users can see it.** Anything that talks to Fuseki keeps
    working. Sparkles implements the SPARQL 1.1 Query, Update and Graph Store protocols,
    Fuseki's endpoints and `/$/` admin API, Jena's formats and dataset semantics, and
-   TDB2's model of bulk loads, transactions, compaction and backups.
+   TDB2's model of bulk loads, transactions, compaction and backups. The JVM binding
+   brings that compatibility into the application: open a Sparkles dataset and keep
+   using Jena's `Model`, RIOT, `Txn` and `QueryExecution` APIs.
 2. **QLever-style internals where performance matters.** Terms are 64-bit ids with
    numbers and dates stored inline, indexes are sorted and compressed permutations, and
    a cost-based planner drives column-at-a-time execution. Sparkles adds MVCC
@@ -36,33 +40,6 @@ on top of the second:
    and the Python, JVM and Node.js bindings are built on its public API, so an embedded
    program gets the same features as the server. The term model, parsers and SPARQL
    algebra come from the Oxigraph project's crates.
-
-## Features
-
-* **Storage and history.** MVCC snapshots, a crash-safe write-ahead log, parallel bulk
-  loads and background compaction. Every commit can be read again by number, time or
-  name, diffed as JSON or RDF Patch, and followed as a change feed. Branches share their
-  upstream's index, merge with previews and conflict resolution, and back up on their own.
-* **Query.** SPARQL 1.1 and SPARQL 1.2 pass the W3C suites, together with Jena ARQ's
-  extensions and function libraries, federated `SERVICE` and query plans. Every query
-  runs within memory, row and work budgets.
-* **Search.** Full-text search through Jena's `text:query` with BM25 ranking, vector
-  similarity with HNSW and embeddings computed on write, path search, and GeoSPARQL 1.1
-  with a spatial index.
-* **Reasoning and validation.** RDFS, OWL 2 RL and Jena rules kept current as data
-  changes, SHACL and ShEx validation on request or on every write, and a schema report
-  with exact counts.
-* **Server.** Fuseki's endpoints and admin API with authentication, access control by
-  dataset, graph and triple, stored queries, GraphQL, Prometheus metrics, an OpenAPI
-  description, a Docker image, a NixOS module and a Home Manager module.
-* **Agents.** An MCP server whose tools run with the caller's grants, an Ask bar that
-  drafts, checks and runs a query from a question in plain language, ingestion that
-  turns Markdown, HTML and PDF documents into cited facts on a review branch, and agent
-  memory stored as reviewable graphs.
-* **Tooling.** A `sparkles` CLI with equivalents of Jena's `tdb2.*`, `arq` and file
-  tools, a formatter and linter for SPARQL and RDF, and a language server for editors.
-
-[docs/FEATURES.md](docs/FEATURES.md) lists every feature and the known gaps.
 
 ## Getting started
 
@@ -98,6 +75,44 @@ sparkles query --data books.ttl --query q.rq   # files in memory, no database
 The web UI is at <http://localhost:3030/ui/>. [docs/USAGE.md](docs/USAGE.md) covers
 running and operating the server, and `sparkles help COMMAND` describes each command.
 
+### Libraries and bindings
+
+**Use Sparkles through Apache Jena.** The JVM library provides Jena's `DatasetGraph`:
+change the line that opens a TDB2 dataset and keep using Jena's query, model, RDF I/O
+and transaction APIs.
+
+```java
+try (DatasetGraphSparkles dsg = SparklesDatasets.open(Path.of("mydb"))) {
+    Dataset ds = DatasetFactory.wrap(dsg);
+    Txn.executeRead(ds, () -> { /* QueryExecution, Model and RIOT as usual */ });
+}
+```
+
+[The JVM/Jena guide](docs/USAGE.md#jvm-apache-jena) covers building the binding,
+queries, updates, transactions, importing TDB2 data and compatibility differences.
+
+The `sparkles` Rust crate embeds the engine with no HTTP server or async runtime by
+default:
+
+```rust
+use sparkles::Dataset;
+
+let ds = Dataset::open("mydb")?;                 // or Dataset::memory()
+ds.load_file("data.ttl.gz")?;
+for row in &ds.select("SELECT ?s ?name { ?s <http://xmlns.com/foaf/0.1/name> ?name }")? {
+    println!("{} {}", row.get("s").unwrap(), row.get("name").unwrap());
+}
+```
+
+| API | Integration and examples |
+|---|---|
+| [Rust](docs/USAGE.md#embedding-the-library) | `Dataset`, query builders, extension functions and administration handles. |
+| [Python](docs/USAGE.md#python) | A pyoxigraph-style API and an rdflib store plugin. |
+| [Node.js / TypeScript](docs/USAGE.md#javascript-and-typescript) | RDF/JS terms and asynchronous results from the embedded engine. |
+
+The binding packages are not published to a registry. Build them with
+`mise run jvm:build`, `mise run py:build` or `mise run node:build`.
+
 ### Agents
 
 `sparkles mcp` serves a database to an MCP host such as Claude Code or Claude Desktop.
@@ -112,55 +127,45 @@ and hand a query to the web UI for a person to review
 ([usage](docs/USAGE.md#mcp-server-llm-agents)). With a model configured, the server's
 Ask bar answers questions in plain language ([usage](docs/USAGE.md#asking-questions-with-a-model)).
 
-### Libraries and bindings
+## Architecture
 
-The `sparkles` crate is the embeddable library, with no HTTP server or async runtime by
-default.
-
-```rust
-use sparkles::Dataset;
-
-let ds = Dataset::open("mydb")?;                 // or Dataset::memory()
-ds.load_file("data.ttl.gz")?;
-for row in &ds.select("SELECT ?s ?name { ?s <http://xmlns.com/foaf/0.1/name> ?name }")? {
-    println!("{} {}", row.get("s").unwrap(), row.get("name").unwrap());
-}
+```mermaid
+flowchart TB
+    embedded["Rust applications / Python, JVM and Node.js bindings"] --> library
+    clients["Web UI / remote clients"] --> server
+    agents["Agents via MCP"] --> server
+    server["sparkles-server · HTTP, CLI and MCP"] --> library
+    library["sparkles · Dataset, Catalog and administration"] --> core
+    library --> optional["Optional features · reasoning, validation, search and backups"]
+    core["sparkles-core · storage, snapshots, planner and executor"] --> parsers
+    parsers["Oxigraph crates · RDF terms, parsers and SPARQL algebra"]
 ```
 
-The Python package has a pyoxigraph-style API and an rdflib store plugin:
+Embedded programs and the server share the same library and engine. Jena and Fuseki
+guide compatibility. QLever inspires the sorted indexes and columnar execution.
+Sparkles adds durable transactions, online compaction, history and branches in the
+shared Rust engine. [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) explains the boundaries,
+optimization mechanisms and implemented decisions across the design specs.
 
-```python
-from sparkles import Dataset
+## Features
 
-with Dataset("mydb") as ds:
-    ds.load(path="data.ttl.gz")
-    for row in ds.query("SELECT ?s ?name WHERE { ?s <http://xmlns.com/foaf/0.1/name> ?name }"):
-        print(row["s"], row["name"].value)
-```
+* **Storage and history.** MVCC snapshots, durable commits, parallel bulk loads,
+  online compaction, historical reads, diffs, branches and merges.
+* **Query.** Passes the SPARQL 1.1 and 1.2 W3C suites, with Jena ARQ extensions,
+  federated `SERVICE`, query plans and execution budgets.
+* **Search.** Jena-compatible full-text search, HNSW vector similarity, embeddings
+  computed on write, path search and indexed GeoSPARQL 1.1.
+* **Reasoning and validation.** Incremental RDFS, OWL 2 RL and Jena rules, SHACL and
+  ShEx validation, and schema reports.
+* **Server.** Fuseki endpoints and administration, authentication and access control,
+  stored queries, GraphQL, metrics, Docker and NixOS deployment, and a Home Manager
+  module for the client.
+* **Agents.** MCP tools, questions answered with checked queries, document ingestion
+  and agent memory with sources and branch review.
+* **Tooling.** Jena-style CLI commands, SPARQL and RDF formatting and linting, and an
+  editor language server.
 
-The JVM library gives Jena programs a `DatasetGraph`, so TDB2 code runs on Sparkles after
-a change to the line that opens the dataset:
-
-```java
-try (DatasetGraphSparkles dsg = SparklesDatasets.open(Path.of("mydb"))) {
-    Dataset ds = DatasetFactory.wrap(dsg);
-    Txn.executeRead(ds, () -> { /* QueryExecution, Model and RIOT as usual */ });
-}
-```
-
-The Node.js package embeds the engine with RDF/JS terms and asynchronous results:
-
-```ts
-import { Dataset } from '@sparkles-rdf/engine';
-
-await using ds = await Dataset.open('mydb');
-for await (const row of await ds.select('SELECT ?s ?name { ?s <urn:name> ?name }'))
-  console.log(row.get('name')?.value);
-```
-
-The packages are not published to a registry. `mise run py:build`, `mise run jvm:build`
-and `mise run node:build` build them, and [docs/USAGE.md](docs/USAGE.md#python) describes
-each API.
+[docs/FEATURES.md](docs/FEATURES.md) lists every feature and the known gaps.
 
 ## Performance
 
@@ -214,14 +219,6 @@ merges, the Ask bar, and agent memory.
     <td>A query an agent handed over for review</td>
   </tr>
   <tr>
-    <td><img src="docs/images/ask-steps.png" alt="The Ask bar while it works, with the step indicator showing the summary step in progress"></td>
-    <td><img src="docs/images/memory.png" alt="The Memory page listing facts an agent recorded, each with its source and review status"></td>
-  </tr>
-  <tr>
-    <td>The steps of an answer as they run</td>
-    <td>What agent memory holds, with sources</td>
-  </tr>
-  <tr>
     <td><img src="docs/images/branches.png" alt="A dataset page listing its branches beside a commit graph of their history and a merge"></td>
     <td><img src="docs/images/merge.png" alt="The merge page previewing a branch merge into main, with a conflict and the choice of which side to take"></td>
   </tr>
@@ -245,52 +242,48 @@ merges, the Ask bar, and agent memory.
     <td>The schema browser</td>
     <td>GeoSPARQL results on a map</td>
   </tr>
+  <tr>
+    <td colspan="2" align="center"><img src="docs/images/memory.png" width="50%" alt="The Memory page listing facts an agent recorded, each with its source and review status"></td>
+  </tr>
+  <tr>
+    <td colspan="2" align="center">What agent memory holds, with sources</td>
+  </tr>
 </table>
+
+<details>
+<summary>More screenshots: Ask progress</summary>
+
+![The Ask bar while it works, with the step indicator showing the summary step in progress](docs/images/ask-steps.png)
+
+</details>
 
 ## Documentation
 
+[The documentation index](docs/README.md) groups all guides and references by task,
+including benchmarks, editor setup, design specs and UI development.
+
 | Document | Contents |
 |---|---|
-| [docs/FEATURES.md](docs/FEATURES.md) | Every feature by area, and the known gaps. |
-| [docs/USAGE.md](docs/USAGE.md) | The server and CLI, backups, MCP, the libraries and bindings, Docker and NixOS. |
-| [docs/API.md](docs/API.md) | The HTTP API: Fuseki's endpoints and the `/$/` extensions. |
-| [docs/openapi.json](docs/openapi.json) | The OpenAPI 3.1 description the server serves at `/$/openapi.json`. |
-| [docs/COMPARISON.md](docs/COMPARISON.md) | Feature gaps against Jena/Fuseki, QLever, Fluree and Oxigraph, and departures from Jena and QLever. |
-| [docs/BENCHMARKS.md](docs/BENCHMARKS.md) | Query, load, write, bindings and memory measurements against other engines, and how to reproduce them. |
-| [docs/editors.md](docs/editors.md) | Formatter and language-server setups for editors. |
-| [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | Building, mise tasks, tests, Nix and third-party licenses. |
-| [Design specs](docs/specs/README.md) | Why each feature is built the way it is. |
-| [docs/AUDIT.md](docs/AUDIT.md) | The Jena and QLever audits, and what Sparkles reuses from Oxigraph. |
-| [ui/README.md](ui/README.md) | Developing the web UI. |
+| [Usage](docs/USAGE.md) | Server and CLI workflows, libraries and bindings, MCP, backups and deployment. |
+| [Architecture](docs/ARCHITECTURE.md) | Library boundaries, storage, execution, optimizations and implemented design decisions. |
+| [Features](docs/FEATURES.md) | The capability inventory and known gaps. |
+| [HTTP API](docs/API.md) | Fuseki endpoints and Sparkles administration extensions. |
+| [Development](docs/DEVELOPMENT.md) | Project layout, builds, tests, mise tasks, Nix and third-party licenses. |
 
 ## Project layout
 
-| Path | Role | Jena analogue |
-|---|---|---|
-| `crates/sparkles-core` | The engine: ids, vocabulary, indexes, bulk builder, MVCC store and WAL, SPARQL and RDF I/O | jena-core, jena-arq, jena-tdb2 |
-| `crates/sparkles` | The library: the engine's modules, the `Dataset` API, its handles and the query builder | jena-querybuilder, in-process RDFConnection |
-| `crates/sparkles-server` | The HTTP server and the `sparkles` CLI | jena-fuseki2, jena-cmds |
-| `crates/sparkles-reasoner` | RDFS, OWL 2 RL and Jena rules by semi-naive forward chaining | jena-core `reasoner` |
-| `crates/sparkles-shacl`, `crates/sparkles-shex` | SHACL and ShEx validation over store snapshots | jena-shacl, jena-shex |
-| `crates/sparkles-backup` | Backup repositories on a file system or S3 | Fuseki `/$/backup` |
-| `crates/sparkles-graphql` | The read-only GraphQL adapter | — |
-| `crates/sparkles-fmt`, `crates/sparkles-fmt-wasm` | The formatter and linter, and their WebAssembly build | — |
-| `crates/sparkles-client` | The Rust client of remote SPARQL endpoints | jena-rdfconnection (remote) |
-| `crates/sparkles-py` | The Python package (PyO3, its own cargo workspace) | — |
-| `crates/sparkles-ffi`, `jvm/` | The JVM bindings: the UniFFI native library and the Kotlin `sparkles-jena` library | jena-tdb2's `DatasetGraphTDB` |
-| `crates/sparkles-node`, `js/` | The Node-API addon, RDF/JS contracts and TypeScript engine and remote client packages | — |
-| `vendor/spargebra` | Oxigraph's SPARQL parser, vendored with fixes ([PATCHED.md](vendor/spargebra/PATCHED.md)) | ARQ's grammar |
-| `ui/` | The SvelteKit web UI | jena-fuseki-ui |
+* `crates/sparkles-core` — storage, snapshots, query planning and execution.
+* `crates/sparkles` — the public library API and optional feature integrations.
+* `crates/sparkles-server` — the HTTP server, CLI and MCP endpoints.
+
+[The development guide](docs/DEVELOPMENT.md#project-layout) maps the remaining crates,
+bindings and UI to their roles and Jena counterparts.
 
 ## Development
 
-`mise run ci` runs the formatting checks, the check of the source paths the docs cite,
-Clippy over the workspace and over feature combinations, the WebAssembly build of the
-formatter, every workspace test, the UI's type check and tests, the Python, JVM and
-Node bindings' lints and tests, and the third-party license check. `mise run ci:fast`
-runs only the formatting, doc path, Clippy and workspace test steps. `mise run
-test:w3c`, `test:shacl` and `test:shex` run the conformance suites from an Apache Jena
-checkout. [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) covers the rest.
+`mise run ci` runs the full checks. `mise run ci:fast` runs the smaller set for
+iteration. [The development guide](docs/DEVELOPMENT.md) covers setup, individual tasks
+and the W3C and Jena compatibility suites.
 
 ## License
 

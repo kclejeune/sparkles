@@ -1,8 +1,11 @@
 # Sparkles HTTP API
 
 The server speaks the Fuseki protocol, so existing Jena tooling (`rdfconnection`,
-`s-query`, YASGUI and others) works unchanged. A small set of `/$/…` extensions serves the
-web UI.
+`s-query`, YASGUI and others) works unchanged. The `/$/…` extensions provide dataset
+administration, history, search configuration, validation and agent services.
+
+[USAGE.md](USAGE.md) provides workflows and CLI and binding examples. This document owns
+the HTTP contracts. [openapi.json](openapi.json) is their machine-readable description.
 
 All admin endpoints live under `/$/`. Dataset names match `[A-Za-z0-9_.-]+` and are
 addressed as `/{ds}`. JSON responses use `application/json`.
@@ -13,6 +16,36 @@ every route needs credentials or a grant to `anonymous`. See
 
 A machine-readable description of this API is served at `/$/openapi.json`. See
 [OpenAPI description](#openapi-description).
+
+* [OpenAPI description](#openapi-description)
+* [Server](#server)
+* [Datasets (admin)](#datasets-admin)
+* [Schema discovery](#schema-discovery)
+* [Per-dataset SPARQL protocol (Fuseki compatible)](#per-dataset-sparql-protocol-fuseki-compatible)
+* [Stored queries](#stored-queries)
+* [GraphQL](#graphql)
+* [Commits](#commits)
+* [Branches and merges](#branches-and-merges)
+* [Point-in-time reads and snapshots](#point-in-time-reads-and-snapshots)
+* [Backup repositories](#backup-repositories)
+* [Full-text search](#full-text-search)
+* [Vector similarity](#vector-similarity)
+* [Path search](#path-search)
+* [GeoSPARQL](#geosparql)
+* [Reasoning status and diagnostics](#reasoning-status-and-diagnostics)
+* [RDFS on read](#rdfs-on-read)
+* [Write-time validation](#write-time-validation)
+* [SHACL validation](#shacl-validation)
+* [ShEx validation](#shex-validation)
+* [Formatting](#formatting)
+* [Linting](#linting)
+* [`application/x-sparkles+json` (UI result format)](#applicationx-sparklesjson-ui-result-format)
+* [Explain](#explain)
+* [Compression](#compression)
+* [Errors](#errors)
+* [Authentication and access control](#authentication-and-access-control)
+* [MCP server](#mcp-server)
+* [Natural-language questions](#natural-language-questions)
 
 ## OpenAPI description
 

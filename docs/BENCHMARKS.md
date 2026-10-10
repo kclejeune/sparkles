@@ -1341,6 +1341,10 @@ so only its row count is checked.
 
 ### Reproducing
 
+[BENCHMARKING.md](BENCHMARKING.md) documents the harnesses, modes and outputs, including
+local and cloud regression comparisons. The commands below reproduce the published
+comparisons.
+
 * `mise run bench [people] [workdir]` or `scripts/bench.sh` runs the synthetic suite.
   `--engines NAME` re-measures one engine and merges it into an existing run, and
   `--answers-only` checks every engine's answers without timing. `scripts/bench.sh` takes
