@@ -27,6 +27,8 @@ sparkles = { path = "../sparkles", features = ["zstd", "brotli"] }
 sparkles-reasoner = { path = "../sparkles-reasoner", optional = true }
 sparkles-shacl = { path = "../sparkles-shacl", optional = true }
 sparkles-shex = { path = "../sparkles-shex", optional = true }
+mimalloc = { version = "0.1.52", optional = true }
+rustc-hash = "2"
 oxrdf = { version = "0.3", features = ["rdfc-10", "rdf-12"] }
 oxrdfio = { version = "0.2", features = ["rdf-12"] }
 anyhow = "1"
@@ -43,6 +45,8 @@ text = ["sparkles/text"]
 geo = ["sparkles/geo"]
 backup = ["sparkles/backup", "sparkles/backup-s3"]
 graphql = ["sparkles/graphql"]
+# mimalloc as the global allocator of the library's own allocations, as in the server
+mimalloc = ["dep:mimalloc"]
 
 [workspace]
 

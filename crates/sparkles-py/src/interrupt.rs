@@ -8,13 +8,21 @@
 use crate::errors::EngineResult;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
+use sparkles::embed::{WORKER_SPIN, recv_spin};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// How often a waiting thread lets Python check for signals.
 const POLL: Duration = Duration::from_millis(20);
+
+/// How long the main thread waits for an answer by spinning, without the GIL, before it
+/// sleeps. A small query answers within this, and the main thread then takes the answer
+/// without being woken, which takes far longer than the spin on a busy machine. The
+/// helper thread spins for its next request in the same way (`WORKER_SPIN`). The cost is
+/// up to this much CPU time on the main thread per request.
+const CALLER_SPIN: Duration = Duration::from_micros(200);
 
 /// A flag that cancels the queries and updates it is passed to. `cancel()` may be
 /// called from any thread, and a cancelled request raises `CancelledError`.
@@ -70,11 +78,13 @@ pub fn wait<T: Send>(
     rx: Receiver<T>,
 ) -> (Receiver<T>, PyResult<Option<T>>) {
     let mut rx = rx;
+    let mut spin = CALLER_SPIN;
     loop {
         let (back, r) = py.detach(move || {
-            let r = rx.recv_timeout(POLL);
+            let r = recv_spin_timeout(&rx, spin, POLL);
             (rx, r)
         });
+        spin = Duration::ZERO;
         rx = back;
         match r {
             Ok(v) => return (rx, Ok(Some(v))),
@@ -91,6 +101,29 @@ pub fn wait<T: Send>(
             }
         }
     }
+}
+
+/// Receive from `rx`, spinning for up to `spin` before sleeping for up to `timeout`.
+fn recv_spin_timeout<T>(
+    rx: &Receiver<T>,
+    spin: Duration,
+    timeout: Duration,
+) -> Result<T, RecvTimeoutError> {
+    let start = std::time::Instant::now();
+    let mut round = 0u32;
+    while !spin.is_zero() {
+        match rx.try_recv() {
+            Ok(v) => return Ok(v),
+            Err(TryRecvError::Disconnected) => return Err(RecvTimeoutError::Disconnected),
+            Err(TryRecvError::Empty) => {}
+        }
+        round = round.wrapping_add(1);
+        if round.is_multiple_of(64) && start.elapsed() >= spin {
+            break;
+        }
+        std::hint::spin_loop();
+    }
+    rx.recv_timeout(timeout)
 }
 
 type Job = Box<dyn FnOnce() + Send>;
@@ -112,7 +145,7 @@ fn submit(job: Job) -> std::io::Result<()> {
     std::thread::Builder::new()
         .name("sparkles-request".into())
         .spawn(move || {
-            while let Ok(job) = rx.recv() {
+            while let Ok(job) = recv_spin(&rx, WORKER_SPIN) {
                 job();
             }
         })?;
