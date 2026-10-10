@@ -4484,6 +4484,14 @@ a model. Every test runs against mock providers.
 7. `explain_query` already showed a hidden estimate as `est=?` and `null`. Its node facts
    now report `estimatedRows: null`, and a `hidden-estimates` note says why. `PlanView`
    no longer counts a hidden `-1` as a misestimate and reads `CursorPlan` trees.
+8. The new facts cost the operators nothing measurable. They live in a boxed
+   `PlanFidelity` that most nodes leave empty, so `PlanInfo` grows by one pointer, and
+   the failure hook is a drop guard that only acts when an operator returns an error.
+   A first version that kept them inline and wrapped every operator's result ran about
+   2,500 more instructions per execution of the smallest benchmark queries, which was
+   34% more in `exec::execute` for `distinct-obj` and 15 to 20% of its time. In callgrind counts against the main branch, the final
+   version runs 2.2% more instructions in `exec::execute` for `distinct-obj`, 1.8% for
+   `predicate-counts` and the same count for `path-plus`.
 
 - **Notes and the description.** The server's `explain` module reads a `PlanNode` or
   `CursorPlan` tree as node facts and computes the notes of §6.6.2 with a severity, the
