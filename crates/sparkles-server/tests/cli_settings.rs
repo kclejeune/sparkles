@@ -723,3 +723,101 @@ fn memory_init_and_maintenance() {
     let j = mem("plain", &["maintenance", "--json"]).ok().json();
     assert_eq!(j["consolidation"]["nextRun"], "due", "{j:#}");
 }
+
+/// Declared prefixes (spec C20) with a server process: `settings set`, `reset` and
+/// `diff` on the `prefixes` kind, a removal of a declared prefix that outlives a
+/// restart, a locked prefix, and `settings check` with its warning and errors.
+#[test]
+fn declared_prefixes() {
+    const NOTES: &str = "https://kclj.io/sparkles/memory/notes/";
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let f = dir.path().join("settings.json");
+    std::fs::write(
+        &f,
+        json!({
+            "defaults": {
+                "prefixes": {"kclj": "https://kclj.io/sparkles/", "mem": "https://example.org/mem#"},
+                "locked": ["prefixes.kclj"]
+            },
+            "datasets": {"slurp": {"prefixes": {"notes": NOTES}}}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let f_arg = f.to_str().unwrap().to_string();
+    let check = |args: &[&str]| {
+        Command::new(BIN)
+            .args(["settings", "check"])
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    // valid, with a warning for the shadowed mem:
+    let o = check(&[&f_arg]);
+    let err = String::from_utf8_lossy(&o.stderr).into_owned();
+    assert!(o.status.success(), "{err}");
+    assert!(
+        err.contains("warning") && err.contains("well-known mem:"),
+        "{err}"
+    );
+    // a bad name, and more declared prefixes than --max-prefixes, fail it
+    let bad = dir.path().join("bad.json");
+    std::fs::write(
+        &bad,
+        json!({"defaults": {"prefixes": {"bad name": "https://x/"}}}).to_string(),
+    )
+    .unwrap();
+    assert!(!check(&[bad.to_str().unwrap()]).status.success());
+    let o = check(&[&f_arg, "--max-prefixes", "2"]);
+    assert!(
+        !o.status.success(),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    let data = dir.path().join("data");
+    let loc_arg = format!("slurp={}", dir.path().join("slurp").display());
+    let args = ["--settings", f_arg.as_str(), "--loc", loc_arg.as_str()];
+    let run = |s: &Server, a: &[&str]| cli(s, &home, a, "", &[]);
+    {
+        let s = Server::start_in(&data, &args, 47740..47760);
+        let (st, v) = s.call("GET", "/$/prefixes/slurp", None);
+        assert_eq!(st, 200, "{v}");
+        assert_eq!(v["prefixes"]["notes"], NOTES);
+        let o = run(
+            &s,
+            &[
+                "settings",
+                "set",
+                "slurp",
+                "prefixes.ex=http://ex.org/",
+                "prefixes.notes=null",
+            ],
+        )
+        .ok();
+        assert!(o.stdout.contains("prefixes.ex"), "{}", o.stdout);
+        let o = run(
+            &s,
+            &["settings", "set", "slurp", "prefixes.kclj=https://other/"],
+        );
+        assert_ne!(o.code, Some(0));
+        assert!(o.stderr.contains("lock"), "{}", o.stderr);
+        let o = run(&s, &["settings", "diff", "slurp"]).ok();
+        assert!(o.stdout.contains("prefixes.notes"), "{}", o.stdout);
+    }
+    // the removal outlives a restart, and a reset brings the declared value back
+    let s = Server::start_in(&data, &args, 47740..47760);
+    let (_, v) = s.call("GET", "/$/prefixes/slurp", None);
+    assert!(v["prefixes"].get("notes").is_none(), "{v}");
+    assert_eq!(v["prefixes"]["ex"], "http://ex.org/");
+    run(&s, &["settings", "reset", "slurp", "prefixes.notes"]).ok();
+    let (_, v) = s.call("GET", "/$/prefixes/slurp", None);
+    assert_eq!(v["prefixes"]["notes"], NOTES);
+    let j = run(&s, &["settings", "get", "slurp", "prefixes", "--json"])
+        .ok()
+        .json();
+    assert_eq!(j["sources"]["kclj"], "locked");
+    assert_eq!(j["warnings"][0]["prefix"], "mem");
+}
