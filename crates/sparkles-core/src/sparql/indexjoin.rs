@@ -1063,14 +1063,33 @@ fn read_ranges_gallop(
             ctx.check_output(total(out), width)?;
         }
         let (lo, hi) = ranges.get(r);
+        b = gallop_to(b, metas.len(), |x| metas[x].last < lo);
         if delta && {
             let rng = (Bound::Included(lo), Bound::Included(hi));
             ins.intersects(rng) || del.intersects(rng)
         } {
-            read_ranges(ctx, perm, ranges, &[(r, r + 1)], cols, rule, out, stats)?;
+            if b == metas.len() || metas[b].first > hi {
+                // no base block reaches the range, so no deletion is in it either: its
+                // rows are the delta's inserted keys, read straight from the delta
+                stats.seeks += 1;
+                let mut last: Option<(usize, Key)> = None;
+                let mut it = ins.range(lo..=hi);
+                loop {
+                    let run = it.next_run();
+                    if run.is_empty() {
+                        break;
+                    }
+                    stats.rows += run.len();
+                    seen += run.len();
+                    for k in run {
+                        push_row(rule, ranges, cols, k, r, &mut last, out);
+                    }
+                }
+            } else {
+                read_ranges(ctx, perm, ranges, &[(r, r + 1)], cols, rule, out, stats)?;
+            }
             continue;
         }
-        b = gallop_to(b, metas.len(), |x| metas[x].last < lo);
         let d = ranges.depth(r);
         let t = ranges.part(r);
         let mut last: Option<(usize, Key)> = None;
