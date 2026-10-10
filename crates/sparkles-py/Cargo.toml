@@ -36,7 +36,7 @@ serde = "1"
 serde_json = "1"
 
 [features]
-default = ["reasoning", "shacl", "shex", "text", "geo", "backup", "graphql"]
+default = ["reasoning", "shacl", "shex", "text", "geo", "backup", "graphql", "mimalloc"]
 # the same names as the server's features
 reasoning = ["dep:sparkles-reasoner", "sparkles/reasoning"]
 shacl = ["dep:sparkles-shacl", "sparkles/shacl"]
