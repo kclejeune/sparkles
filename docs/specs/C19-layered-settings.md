@@ -1,6 +1,6 @@
 # C19: Layered dataset settings
 
-> **Status:** implemented in part (Phase 1)
+> **Status:** implemented in part (Phase 1 and the server side of Phase 4)
 >
 > **Phases:** Phase 1 is the server: settings kinds, the declared layer, layered
 > resolution, locks, the `/$/settings` routes and reloading on SIGHUP. Phase 2 is the
@@ -9,6 +9,9 @@
 > layered settings kind that server administrators can change, with write-only API keys.
 >
 > **User docs:** [API: Settings](../API.md#settings) ·
+> [API: Server settings](../API.md#server-settings) ·
+> [API: Model secrets](../API.md#model-secrets) ·
+> [Usage: Changing models and keys at runtime](../USAGE.md#changing-models-and-keys-at-runtime) ·
 > [Usage: Turning on the assistant in the server](../USAGE.md#turning-on-the-assistant-in-the-server) ·
 > [Features](../FEATURES.md)
 >
@@ -450,9 +453,10 @@ to replace or remove a runtime value.
 
 ## Outcome
 
-Phase 1 landed on 2026-10-10. Phases 2, 3 and 4 are not built. The `sparkles settings`
-command has only `check`, the UI has no settings tab, and `sparkles memory init` is
-unchanged.
+Phase 1 landed on 2026-10-10, and the server side of Phase 4 followed on the same day,
+as [Phase 4, the server](#phase-4-the-server) records. Phases 2 and 3 are not built. The
+`sparkles settings` command has only `check`, the UI has no settings tab, and
+`sparkles memory init` is unchanged.
 
 The server has a registry of three dataset-scoped kinds, `assistant`, `memory` and
 `ingest`. The `ingest` kind holds the settings members of `ingest.json`, and the
@@ -471,12 +475,13 @@ The registry was written so that Phase 4 can add server-scoped kinds. A kind has
 scope, the write locks are keyed by an optional dataset and the kind, and the layer
 resolution does not depend on where the declared layers come from. The parser accepts a
 top-level `server` member with a `locked` list whose fields start with `models` or
-`secrets`, checks it and stores it, and nothing applies it yet. The model configuration
+`secrets`, checks it and stores it, and Phase 4 applies it. The model configuration
 is read from one handle that a reload swaps, so a request in flight keeps the
 configuration it started with.
 
 The tests cover A1 to A7 and A9 in the process, and A2, A4 and A9 again with a server
-process, a restart and SIGHUP. A8 and A10 to A15 belong to later phases.
+process, a restart and SIGHUP. A8 and A10 belong to later phases, and A11 to A15 to
+Phase 4 below.
 
 These points differ from the design or settle what it left open.
 
@@ -503,5 +508,94 @@ These points differ from the design or settle what it left open.
   only the fields that differ from the declared values and the defaults.
 - The runtime layer of an in-memory dataset moves with a rename and is dropped when the
   dataset is deleted.
-- The new settings routes do not check the dataset's read-only flag. The legacy
-  `PUT /$/ingest/{ds}/settings` keeps its check.
+- Every settings write is refused on a read-only server (`serve --read-only`) with
+  `403`, as other admin writes are. This covers the routes of §6, the legacy
+  `PUT /$/assistant/{ds}`, `PUT /$/memory/{ds}` and `PUT /$/ingest/{ds}/settings`, and
+  the server-wide routes of §11. Phase 1 had left the new routes without the check.
+- A `PATCH` that restates the value of a locked field stores nothing for it, also when
+  the runtime layer already holds other members of the same object. Phase 1 kept the
+  restated value in that case.
+
+### Phase 4, the server
+
+The server side of Phase 4 landed on 2026-10-10. The `sparkles settings --server` and
+`sparkles secrets` commands, the UI's Models section and the NixOS module's
+`settings.server.locked` are not built.
+
+The registry has a server-wide kind, `models`, whose declared layer is the file of
+`--model-config` and whose runtime layer is `<dataDir>/models.json`. It resolves
+through the same code as the dataset kinds, with the locks of `server.locked`. The
+effective object is checked as `--model-config` is, and the configuration built from it
+replaces the one that `GET /$/models` and every model call read. Requests in flight keep
+the configuration they started with. The routes of §11.3 serve the kind, and
+`GET /$/settings` lists it under `serverKinds`. The secrets of §11.2 are stored in
+`<dataDir>/secrets` and listed, stored and removed through `/$/server/secrets`. All of
+these routes need `server-admin`, and `GET /$/models` keeps its shape with a `source` in
+each provider's `apiKey`.
+
+The routes never return a key, and the server takes these steps so that no log line
+carries one. A `PUT` body is read into a type whose `Debug` prints nothing of the value
+and which has no `Display` or `Serialize`. The errors about a body, an `apiKey` that
+holds a value instead of `{"secret": NAME}`, and a header that carries credentials
+never quote the value. The server never logs request bodies, and the access log names
+only the route and the principal. A runtime value is read only as a `file:` source at
+each request, as declared files are, and `GET /$/server/secrets` reads only the names
+and times of the files. The process test runs the server at TRACE and checks that its
+log holds neither the runtime nor the declared key.
+
+Each change to `models` is logged at INFO under the `sparkles::audit` target as the
+event `server_settings_changed`, with the kind, the operation, the changed fields as
+dotted paths and the principal. Each change to a secret is logged as `secret_set` or
+`secret_removed` with the secret's name and the principal. This is the target that the
+server's other admin actions, such as logins and backup repositories, already use.
+
+The tests cover A11 and A12 with access control in
+`http/router_tests/auth/server_settings.rs`, and A13 to A15 with the layering, the
+locks, the refusals, a restart and a reload in `settings/server_tests.rs`.
+`tests/cli_server_settings.rs` runs a server process through a restart, a SIGHUP that
+reads a changed `--model-config`, `sparkles settings check` with `server.locked`, and
+the log check of A12.
+
+These points differ from the design or settle what it left open.
+
+- A `PATCH` with `null` for a provider that `--model-config` defines stores `null` and
+  removes it, as §11.1 says, while `null` elsewhere still removes only a runtime value.
+  `DELETE ?field=providers.NAME` brings the declared provider back. The registry marks
+  `providers` as the one map whose members a `null` removes.
+- A lock on a provider that the declared configuration does not define keeps it from
+  being added at runtime. The settings file fails on a lock that names an unknown member
+  of `models`, of a provider or of `routing`, or an unknown role, and
+  `sparkles settings check --model-config` warns about a lock on a provider the
+  configuration lacks or on a secret that no provider uses. A role list is one field,
+  so a lock cannot name an entry of it.
+- Without `--model-config`, a runtime layer alone configures the models. With neither,
+  the server has no models, as before.
+- When a change of `--model-config` or of the locks makes the effective configuration
+  invalid, the server keeps the configuration in force on a reload, or uses the
+  declared configuration alone at a start, and reports the error under `models` in
+  `GET /$/settings` and in the kind's `status`. The start does not fail, so a server
+  administrator can repair the runtime layer through the API.
+- The tokens a provider has counted today carry over to the new configuration, and so
+  do the detected structured-output levels and the last outcome of a provider whose
+  kind and endpoint did not change. Concurrency slots start empty in the new
+  configuration.
+- Secret names follow one rule everywhere: 1 to 128 letters, digits, `_`, `-` and `.`,
+  not starting with `.` or `-`. `--model-secret` and `apiKey.secret` now refuse other
+  names, which earlier were only required to be non-empty.
+- `DELETE /$/server/secrets/{name}` answers `204` whether or not a runtime value
+  existed, so that it can be repeated. A locked secret's stored value can still be
+  removed, and while the lock holds it is listed as `overridden` and ignored.
+- `GET /$/server/secrets` also reports whether a declared source exists, and
+  `overridden`, and it lists the secrets that a provider or a lock names without any
+  source as `missing`.
+- A server without a data directory, as in embedded use, keeps the runtime layer of
+  `models` in the process and refuses to store a secret with `409` and
+  `no-data-directory`.
+- The runtime layer drops empty objects, as for the dataset kinds, so a model entry
+  without options, such as `"models": {"m": {}}`, cannot be added at runtime. An entry
+  with at least one option can.
+- The SIGHUP listeners of the settings and models, the auth configuration, the rate
+  limits and the TLS certificate now register with no await between them, the settings
+  first, and the auth and TLS listeners register before their tasks start. A reload
+  sent as soon as the process catches SIGHUP therefore reaches each of them. The
+  backup configuration registers its listener earlier in the start and is unchanged.

@@ -3850,6 +3850,13 @@ for her principal. The memory directory belongs to a project whose remote is
 
 ## Outcome
 
+**Amendment.** [C19 §11](C19-layered-settings.md#11-server-wide-model-settings)
+reverses the decision of §3.4 that no HTTP route creates or changes a provider. Server
+administrators can now change the model configuration, endpoints included, and store
+write-only keys through `/$/server/settings/models` and `/$/server/secrets/{name}`,
+unless the operator's settings file locks the fields. Users with `admin` on a dataset
+still only choose among the providers by name.
+
 **Phase 1 delivered on 2026-10-09.** The matrix has not been run with real models, and
 the public sets of §11.1 are not converted, so the targets of §11.3 and the measured role
 lists of §11.4 are still open. Phase 2 followed on the same day, and Phases 3m-a, 3,
