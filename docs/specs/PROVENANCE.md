@@ -608,6 +608,23 @@ implementation landed.
     checked by estimate alone;
   - the server's providers behind MCP's `explain_query` and `optimize_query`.
 
+## Layered dataset settings
+
+- **Spec:** [`C19-layered-settings.md`](C19-layered-settings.md), written on 2026-10-10
+  from:
+  - RFC 7396 (JSON Merge Patch) and RFC 9110 on `ETag` and `If-Match`;
+  - the public documentation of Grafana's provisioning, PostgreSQL's `ALTER SYSTEM`,
+    systemd's drop-in directories and Firefox's enterprise policies;
+  - the NixOS manual's guidance on settings options and secrets;
+  - the Sparkles code and specs C09, C17 and C18.
+- **Implementation:** not started.
+- **Rejected** (spec §11):
+  - writing declared settings into the dataset files before each start;
+  - declared values that always win, and runtime values that always win;
+  - locks per settings kind;
+  - creating datasets from the settings file;
+  - recreating a deleted declared dataset at the next start.
+
 ## Compression codecs
 
 - **Spec:** [`X01-compression-codecs.md`](X01-compression-codecs.md), written on
