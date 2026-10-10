@@ -2,18 +2,67 @@
 # UI at http://localhost:3030/ui/, keeping the data in the named volume `sparkles-data`.
 # docs/USAGE.md#docker covers configuration, authentication, upgrades and backups.
 #
+# Two opt-in profiles add services:
+#   ocr          `sparkles-ocr`, the same server from the image's OCR variant, reading the
+#                PP-OCR models in ./ocr-models. It uses the same data volume, so stop
+#                `sparkles` first and start it alone:
+#                  docker compose stop sparkles
+#                  docker compose --profile ocr up --build -d sparkles-ocr
+#   models-pull  `models-pull`, a one-shot run of `sparkles models pull` that fetches the
+#                pinned snapshots of ./models-manifest.json into the volume
+#                `sparkles-models`, which the servers mount read-only at /models:
+#                  docker compose --profile models-pull run --rm models-pull
+#
 # Variables, from the environment or an .env file next to this file:
 #   SPARKLES_PORT        host port, on 127.0.0.1 only (default 3030)
 #   RUST_LOG             log filter (default: the server's own, as below)
 #   SPARKLES_LOG_FORMAT  text or json (default text)
 #   SPARKLES_BUILD_JOBS  parallel compile jobs of the image build (default: all cores)
+#   SPARKLES_FEATURES    extra cargo features of the image build (default: none)
+
+x-build-args: &build-args
+  BUILD_JOBS: ${SPARKLES_BUILD_JOBS:-}
+  FEATURES: ${SPARKLES_FEATURES:-}
+
+x-server: &server
+  environment:
+    RUST_LOG: ${RUST_LOG:-sparkles=info,sparkles_server=info,tower_http=warn}
+    # Without --auth-config, every client that reaches the port may read, write and
+    # administer every dataset. The server therefore refuses to listen on 0.0.0.0
+    # unless this says that the port stays private. It does here: `ports` publishes it
+    # on the host's 127.0.0.1 only. Remove this line once you use --auth-config, and
+    # never publish the port more widely without it.
+    SPARKLES_ALLOW_OPEN_NETWORK: "1"
+    # SPARKLES_BACKUP_CONFIG: /etc/sparkles/backup.toml
+  ports:
+    - "127.0.0.1:${SPARKLES_PORT:-3030}:3030"
+  restart: unless-stopped
+  # more than the server's --shutdown-grace (20 s), so requests in flight can finish
+  stop_grace_period: 30s
+  # the image's health check, spelled out: GET /$/ready inside the container
+  healthcheck:
+    test: ["CMD", "sparkles-healthcheck"]
+    interval: 30s
+    timeout: 5s
+    start_period: 5m
+    start_interval: 2s
+    retries: 3
+  # deploy:
+  #   resources:
+  #     limits:
+  #       cpus: "4"
+  #       memory: 8g
+  # Keep --query-memory-mb, --max-mem-dataset-mb and --vector-memory-mb below the
+  # memory limit, or the kernel ends the container before a budget refuses a request.
+  # Local embedding models take memory too while loaded, about 1.2 GB for
+  # Qwen3-Embedding-0.6B in bf16.
 
 services:
   sparkles:
+    <<: *server
     build:
       context: .
-      args:
-        BUILD_JOBS: ${SPARKLES_BUILD_JOBS:-}
+      args: *build-args
     command:
       - serve
       - --data
@@ -31,17 +80,11 @@ services:
       # (without --auth-config, other names than IP addresses and localhost get 421):
       # - --public-host
       # - sparql.example.org
-    environment:
-      RUST_LOG: ${RUST_LOG:-sparkles=info,sparkles_server=info,tower_http=warn}
-      # Without --auth-config, every client that reaches the port may read, write and
-      # administer every dataset. The server therefore refuses to listen on 0.0.0.0
-      # unless this says that the port stays private. It does here: `ports` publishes it
-      # on the host's 127.0.0.1 only. Remove this line once you use --auth-config, and
-      # never publish the port more widely without it.
-      SPARKLES_ALLOW_OPEN_NETWORK: "1"
-      # SPARKLES_BACKUP_CONFIG: /etc/sparkles/backup.toml
-    ports:
-      - "127.0.0.1:${SPARKLES_PORT:-3030}:3030"
+      # The models that the models-pull profile fetched, on a build with `sparkles models`:
+      # - --models-dir
+      # - /models
+      # Reload the files above when they change, as on SIGHUP:
+      # - --watch-config
     volumes:
       - sparkles-data:/data
       # Authentication and per-dataset authorization (docs/API.md#configuration):
@@ -50,24 +93,60 @@ services:
       # (docs/USAGE.md#backup-repositories):
       # - ./backups:/backups
       # - ./backup.toml:/etc/sparkles/backup.toml:ro
-    restart: unless-stopped
-    # more than the server's --shutdown-grace (20 s), so requests in flight can finish
-    stop_grace_period: 30s
-    # the image's health check, spelled out: GET /$/ready inside the container
-    healthcheck:
-      test: ["CMD", "sparkles-healthcheck"]
-      interval: 30s
-      timeout: 5s
-      start_period: 5m
-      start_interval: 2s
-      retries: 3
-    # deploy:
-    #   resources:
-    #     limits:
-    #       cpus: "4"
-    #       memory: 8g
-    # Keep --query-memory-mb, --max-mem-dataset-mb and --vector-memory-mb below the
-    # memory limit, or the kernel ends the container before a budget refuses a request.
+      # The model store that the models-pull profile fills (with --models-dir above):
+      # - sparkles-models:/models:ro
+
+  # The OCR variant (`--target ocr`): PDFium and ONNX Runtime in the image, the PP-OCR
+  # models from ./ocr-models. Run it instead of `sparkles`, never beside it, since both
+  # use the data volume.
+  sparkles-ocr:
+    <<: *server
+    profiles: [ocr]
+    image: sparkles:ocr
+    build:
+      context: .
+      target: ocr
+      args: *build-args
+    command:
+      - serve
+      - --data
+      - /data
+      - --host
+      - 0.0.0.0
+      - --port
+      - "3030"
+      - --log-format
+      - ${SPARKLES_LOG_FORMAT:-text}
+      - --pdf-ocr-models
+      - /ocr-models
+    volumes:
+      - sparkles-data:/data
+      - ./ocr-models:/ocr-models:ro
+
+  # A one-shot fetch of the pinned model snapshots of ./models-manifest.json into the
+  # `sparkles-models` volume. Snapshots already present and verified need no network.
+  # Needs a build with the `sparkles models` subcommand.
+  models-pull:
+    profiles: [models-pull]
+    build:
+      context: .
+      args: *build-args
+    command:
+      - models
+      - pull
+      - --manifest
+      - /config/models-manifest.json
+      - --dir
+      - /models
+    environment:
+      RUST_LOG: ${RUST_LOG:-sparkles=info}
+      # a Hugging Face token, for gated repositories
+      # HF_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      - ./models-manifest.json:/config/models-manifest.json:ro
+      - sparkles-models:/models
+    restart: "no"
 
 volumes:
   sparkles-data:
+  sparkles-models:
