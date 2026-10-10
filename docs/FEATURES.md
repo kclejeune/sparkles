@@ -21,6 +21,7 @@ Legend: ✅ done and tested · 🚧 in progress · ⏳ planned · ❌ out of sco
 | 64-bit tagged ids. `xsd:integer`, `xsd:decimal`, `xsd:double`, `xsd:boolean`, `xsd:dateTime` and `xsd:date` values are stored inline when their lexical form is canonical. | ✅ |
 | A bulk write path. Large update and inference batches are merged into a rebuilt generation, published by an atomic `CURRENT` switch. | ✅ |
 | A sorted, front-coded, memory-mapped base vocabulary, and an append-only delta vocabulary. | ✅ |
+| A numeric column next to the base vocabulary (`vocab.num`). It holds the exact value of every numeric literal whose lexical form is not canonical, so range filters, sorts and aggregates over such literals (DBpedia's `geo:lat` floats, any `xsd:int`) read the value instead of decoding the key. Loads and compactions write it, and `sparkles vocab-index` adds it to an older database ([USAGE.md](USAGE.md#command-line-tools)). | ✅ |
 | 7 permutations (SPO, SOP, PSO, POS, OSP, OPS, GSPO) in compressed blocks of 32k rows. | ✅ |
 | A parallel bulk loader for Turtle, N-Triples, N-Quads, TriG, RDF/XML and JSON-LD. Reader-based loading is available for every supported format, with automatic selection and explicit streaming or buffered modes. Input can be compressed with gzip, xz, bzip2, zstd, brotli or LZ4. `sparkles load` and the library's `Dataset::load_file` also take Jena's TriX, RDF Thrift, RDF Protobuf and RDF/JSON, which they read into N-Quads first. | ✅ |
 | External sort for inputs larger than the memory budget. | ✅ |

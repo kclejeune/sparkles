@@ -739,7 +739,13 @@ The other commands are:
 * `vocab-index`, which adds the sparse vocabulary index (`vocab.idx`) to a database
   whose index was built before it existed. Loads and compactions write it. With it, a
   server that starts with a cold page cache looks up a term with one read instead of one
-  per step of a binary search over the vocabulary.
+  per step of a binary search over the vocabulary. It also adds the numeric column
+  (`vocab.num`), which holds the values of the numeric literals that the vocabulary
+  stores because their lexical form is not canonical, such as `"48.85"^^xsd:float` or
+  any `xsd:int`. Range filters, sorts and aggregates over those literals read 8 bytes
+  per value from the column instead of decoding each key. A database without the file
+  answers the same queries by decoding the keys, and `SPARKLES_NUMERIC_COLUMN=off`
+  turns the column off.
 
 `sparkles help COMMAND` describes each one.
 

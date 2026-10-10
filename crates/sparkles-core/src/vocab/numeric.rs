@@ -69,13 +69,14 @@ pub const GAP: u64 = 8192;
 /// Positions per rank entry: eight words of kinds, one cache line.
 const RANK_IDS: u64 = 128;
 const VALUED_BITS: u64 = 0x8888_8888_8888_8888;
-/// Read-ahead hints are given once per chunk of this many bytes.
-const HINT_CHUNK: usize = 16 << 10;
-/// Chunks this close are asked for in one request.
-const HINT_GAP: usize = 4;
-/// Chunks touching at least one in this many chunks of their span are asked for as the
-/// whole span.
-const DENSE: usize = 4;
+/// Read-ahead hints are given once per page.
+const HINT_CHUNK: usize = 4 << 10;
+/// Pages this close are asked for in one request.
+const HINT_GAP: usize = 1;
+/// Pages touching at least one in this many pages of their span are asked for as the
+/// whole span. Sparser pages are asked for one by one, so that a sort of a few hundred
+/// numbers reads a few hundred pages and not the whole value array.
+const DENSE: usize = 2;
 
 pub const NOT_NUMERIC: u8 = 0;
 pub const UNKNOWN: u8 = 1;
