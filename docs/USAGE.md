@@ -727,6 +727,8 @@ The other commands are:
   write-time validation ([below](#validating-with-shacl-and-shex));
 * `queries`, for stored queries ([below](#stored-queries));
 * `describe-settings`, for a dataset's DESCRIBE mode ([below](#describe-modes));
+* `settings`, for a dataset's assistant, memory and ingest settings on a server and for
+  checking a settings file ([below](#changing-dataset-settings-from-the-command-line));
 * `graphql`, for a dataset's GraphQL schema and queries ([below](#graphql));
 * `csv`, for CSV and TSV tables ([below](#loading-csv-and-tsv));
 * `config import` and `config check`, for Fuseki configurations
@@ -2359,7 +2361,9 @@ sparkles memory init --server https://sparql.example.org --dataset org \
 
 `init` writes the vocabulary graph `urn:x-sparkles:vocab:mem`, sets `imports.base` and
 the matching `agentGraphs` entry in the memory settings, and adds the memory shapes to
-the write-time guard in `warn` mode. Each person then grants themselves, or is granted,
+the write-time guard in `warn` mode. It also turns on server-side ingestion, as
+[Ingesting documents in the server](#ingesting-documents-in-the-server) describes, unless
+`--no-ingest` is given. Each person then grants themselves, or is granted,
 the template of [Agent memory grants](#agent-memory-grants) with `--import`, and keeps
 the server and dataset in `~/.config/sparkles/memory.toml`:
 
@@ -2563,17 +2567,23 @@ datasets by name:
 }
 ```
 
-**Configuration gap.** The current UI has no editor for the dataset's assistant
-settings, and the CLI has no assistant-settings command. On NixOS,
-[`services.sparkles.datasetSettings`](#declarative-dataset-settings) provisions them.
-The UI's **Ingest** section uploads documents and configures source
-retention and ingest profiles; it does not enable the assistant or permit sending
-documents to a model. `sparkles memory init` prepares the memory vocabulary, import
-settings and validation shapes, but does not enable assistant ingestion either.
+Without a settings file, `sparkles settings set` turns these fields on for one dataset,
+and `sparkles memory init` turns them on for the dataset it prepares. `memory init`
+changes only the fields that still have their built-in default, so a value from the
+settings file, a value set earlier and a locked field stay as they are. Its output lists
+the fields it changed, the fields it left alone with their source, and the providers of
+the `extract` role that will receive document text. `send: "documents"` also lets result
+rows go to the `summarize` providers for summaries, and the output says so. An operator
+who wants no document text to leave the server locks `assistant.send` in the settings
+file, and `memory init` then reports the lock.
 
-Without a settings file, configure the dataset through
-`PATCH /$/settings/{dataset}/assistant` as below. The server keeps the fields changed
-this way in `assistant.json` in a persistent dataset's database directory. With the
+**Configuration gap.** The UI has no editor for the dataset's assistant settings.
+Its **Ingest** section uploads documents and configures source retention and ingest
+profiles, but it does not turn on the assistant or allow documents to be sent to a
+model. The CLI, the settings file and the routes below do.
+
+The server keeps the fields changed at runtime in `assistant.json` in a persistent
+dataset's database directory. With the
 default server data directory, a dataset created through the UI or API keeps it at
 `/var/lib/sparkles/databases/{dataset}/assistant.json`, and a Nix-declared dataset
 with no explicit `path` at `/var/lib/sparkles/declarative/{dataset}/assistant.json`.
@@ -2584,18 +2594,16 @@ from the provider file of `--model-config` and the client's
 runtime settings changes, which the settings file of `--settings` avoids.
 
 The localhost example below assumes a server without authentication. On an
-authenticated server, the `PATCH` needs a bearer token with dataset `admin` permission;
-an existing browser session additionally needs its CSRF token. See
-[Settings](API.md#settings) for the routes and access requirements. A `PATCH` changes
-only the fields of its body, while `PUT /$/assistant/{dataset}` makes the settings
-equal to its body.
+authenticated server, changing settings needs `admin` on the dataset, and the CLI uses
+the token of `sparkles auth login` or `SPARKLES_TOKEN`. The command sends
+`PATCH /$/settings/{dataset}/assistant`, which changes only the fields of its body. See
+[Settings](API.md#settings) for the routes and access requirements.
 
 ```bash
 sparkles serve --loc org=/data/org --model-config models.json \
   --model-secret anthropic=env:ANTHROPIC_API_KEY
-curl -X PATCH -H 'Content-Type: application/json' \
-  -d '{"enabled": true, "ingest": true, "send": "documents"}' \
-  http://localhost:3030/$/settings/org/assistant
+sparkles settings set org assistant.enabled=true assistant.ingest=true \
+  assistant.send=documents
 curl -F file=@standup.md http://localhost:3030/$/ingest/org
 ```
 
@@ -2669,23 +2677,33 @@ default), its newest recorded time is older than `after`, and, with
 graph with no recorded time or more than 5,000 facts is kept. Deleting a graph removes
 it from the current state only. History and backups still hold it.
 
+The schedules are memory settings, which `sparkles settings set` changes like any other
+field:
+
 ```bash
-curl -X PUT -H 'Content-Type: application/json' -d '{
-  "agentGraphs": ["https://example.org/agents/*"],
-  "consolidatedGraph": "https://example.org/memory/consolidated",
-  "consolidation": {"every": "1d", "mode": "branch", "minSources": 2},
-  "retention": {"after": "365d"}
-}' http://localhost:3030/$/memory/org
-curl -X POST -H 'Content-Type: application/json' -d '{"dryRun": true}' \
-  http://localhost:3030/$/memory/org/consolidate
-curl http://localhost:3030/$/memory/org/maintenance
+sparkles settings set org \
+  memory.consolidatedGraph=https://example.org/memory/consolidated \
+  memory.consolidation.every=1d memory.consolidation.minSources=2 \
+  memory.retention.after=365d
+sparkles memory consolidate --dataset org --dry-run
+sparkles memory retention --dataset org --dry-run
+sparkles memory maintenance --dataset org
 ```
 
 The server checks every minute and starts each task whose `every` has passed, as itself.
 A scheduled consolidation writes nothing while the last one's branch waits for review.
-`POST /$/memory/{ds}/consolidate` and `POST /$/memory/{ds}/retention` run a pass now and
-answer with a task under `/$/ingest/{ds}`. `dryRun` reports what a pass would do.
-`GET /$/memory/{ds}/maintenance` shows the settings, the last task and the next run.
+`sparkles memory consolidate` and `sparkles memory retention` run a pass now, wait for
+its task and print the result. `--dry-run` reports what the pass would do without
+writing, and `--no-wait` prints the task as soon as it starts. `consolidate` takes
+`--mode`, `--min-sources` and `--message`, and `retention` takes `--after`, `--graph`
+patterns and `--require-consolidated` or `--no-require-consolidated`, each in place of
+the memory settings for that pass. `sparkles memory maintenance` shows the settings,
+the last scheduled run of each task with its outcome, and the next run. With `--json`
+the commands print the task or the server's answer.
+
+The commands call `POST /$/memory/{ds}/consolidate`, `POST /$/memory/{ds}/retention`
+and `GET /$/memory/{ds}/maintenance`, which answer with a task under `/$/ingest/{ds}`
+for the two passes. [Memory maintenance](API.md#memory-maintenance) describes them.
 
 `recall` takes `recency`, a half-life such as `"90d"`, that ranks recent facts and facts
 that several graphs assert first. Old facts are never deleted for their age alone.
@@ -2797,24 +2815,66 @@ settings that [API.md](API.md#settings) describes. It must not contain `endpoint
 `apiKey` members, since only the model configuration names providers and keys.
 
 A declared value is a default. A dataset admin can change any field that is not
-locked, through `PATCH /$/settings/{dataset}/{kind}`, and the change is kept in the
-dataset's directory across restarts and reloads:
-
-```sh
-curl -X PATCH http://localhost:3030/$/settings/org/assistant \
-  -H 'Content-Type: application/json' -d '{"historyDays": 7}'
-curl -X DELETE 'http://localhost:3030/$/settings/org/assistant?field=historyDays'
-```
-
-The `DELETE` brings back the declared value. `GET /$/settings/{dataset}/{kind}` answers
-the effective settings with the source of each field, which is `default`, `declared`,
-`runtime` or `locked`. A change to a locked field is refused with `409` and the code
-`locked-by-config`.
+locked, and the change is kept in the dataset's directory across restarts and reloads.
+A change to a locked field is refused with `409` and the code `locked-by-config`.
 
 SIGHUP, or `systemctl reload sparkles`, reads the settings file and the model
 configuration again. A file that does not validate is logged and the server keeps the
 previous one, while at start it fails the start. `GET /$/settings` reports when each
 file was read and the last reload error.
+
+### Changing dataset settings from the command line
+
+`sparkles settings` reads and changes a dataset's settings on a running server. It
+finds the server and the token as the other remote commands do, from `--server`,
+`SPARKLES_SERVER` or the saved login of `sparkles auth login`, and from `SPARKLES_TOKEN`
+or the credentials file. Reading needs `read` on the dataset, and changing needs `admin`.
+Each command takes `--json` to print the server's answers.
+
+```sh
+sparkles settings get org                    # every kind, each field with its source
+sparkles settings get org assistant --layer runtime
+sparkles settings set org assistant.historyDays=7 assistant.send=documents
+sparkles settings edit org memory
+sparkles settings reset org assistant.historyDays
+sparkles settings reset org memory
+sparkles settings diff
+sparkles settings apply settings.json
+```
+
+`get` prints each field of the effective settings with its source, which is `default`,
+`declared`, `runtime` or `locked`, and marks a runtime value that a lock overrides.
+`--layer declared` and `--layer runtime` print one layer instead, and with `--json` only
+that layer's object.
+
+`set` takes `KIND.FIELD=VALUE` pairs and sends one `PATCH` per kind. A value is read as
+JSON when it parses, else as a string, so `assistant.send=documents` and
+`assistant.budget.perRequest=80000` both work, and `null` removes the runtime value. A
+field path uses dots between members, and a member name that holds a dot writes it as
+`\.`. A locked field is refused, and the error names the field and says that only the
+server's settings file can change it.
+
+`edit` opens the runtime layer of one kind in `$VISUAL` or `$EDITOR` as JSON, and sends
+the difference as a `PATCH` with `If-Match`. When someone else changed the settings in
+the meantime, the server answers `412`. The command then keeps your version in a file,
+says where, and offers to open the editor again on the current settings. It offers the
+same when the server refuses the edit as invalid or locked.
+
+`reset` removes the runtime value of one field, or the whole runtime layer of a kind,
+so that the declared value or the default applies again.
+
+`diff` lists the runtime values that differ from the declared value or, where the
+settings file declares nothing, from the built-in default. Without a dataset it covers
+every dataset the caller can see.
+
+`apply` reads a file in the format of `--settings`, for a server that is started
+without one. It patches every dataset on the server with `defaults`, and each dataset
+named under `datasets` with its entry as well. A named dataset that does not exist is
+skipped. Locks in the file are listed and not applied, since only the server's own
+settings file can lock a field. A patch that the server refuses, for example because the
+server's settings file locks the field, is reported, the other datasets are still
+patched, and the exit status is 1. Datasets created later do not get the values, which
+is what the settings file of `--settings` is for.
 
 ### Escalation
 
