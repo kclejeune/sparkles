@@ -2637,7 +2637,12 @@
   .page {
     flex: 1;
     display: grid;
-    grid-template-rows: auto auto auto auto var(--editor-h) 7px minmax(0, 1fr);
+    /* the Ask bar, the tabs, the question and the toolbar, then the editor, the splitter
+       and the results; a phone changes only the two variables, so the tracks stay in step
+       when a row is added */
+    --editor-row: var(--editor-h);
+    --results-row: minmax(0, 1fr);
+    grid-template-rows: auto auto auto auto var(--editor-row) 7px var(--results-row);
     /* without an explicit column, wide content (long editor lines, the plan table)
        stretches the grid past the viewport and the toolbar's Run button is clipped */
     grid-template-columns: minmax(0, 1fr);
@@ -3233,7 +3238,8 @@
        screen: they get a fixed share of it, and the page scrolls down to them */
     .page {
       height: auto;
-      grid-template-rows: auto auto auto min(var(--editor-h), 40vh) 7px max(320px, 70vh);
+      --editor-row: min(var(--editor-h), 40vh);
+      --results-row: max(320px, 70vh);
     }
     .toolbar {
       position: relative;
