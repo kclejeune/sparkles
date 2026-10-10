@@ -2254,6 +2254,46 @@ fn assist(p: &mut Paths) {
     );
     p.add(
         op(
+            POST,
+            "/$/memory/{ds}/consolidate",
+            "startConsolidation",
+            "Datasets",
+            "Consolidate agent memory",
+        )
+        .doc("Starts a consolidation task: the facts that several sources of agent memory assert, and no reviewed graph yet, are asserted once in the consolidated graph on a review branch with reifiers derived from the session reifiers. The result lists duplicate entities and conflicts for a person. Needs `read` on the dataset; the writes run as the caller, and `auto` mode needs `admin`. The task routes of `/$/ingest/{ds}/{task}` read and cancel it.")
+        .see("memory-maintenance")
+        .json_body(false, "ConsolidateRequest")
+        .json("202", "The task.", "IngestTask")
+        .errors(&[400, 403, 404, 429]),
+    );
+    p.add(
+        op(
+            POST,
+            "/$/memory/{ds}/retention",
+            "startRetention",
+            "Datasets",
+            "Delete old session graphs",
+        )
+        .doc("Starts a retention task: each session graph whose newest fact is older than `after`, and whose facts a reviewed graph asserts too unless `requireConsolidated` is false, is deleted with its own Graph Store `DELETE`. Needs `admin` on the dataset.")
+        .see("memory-maintenance")
+        .json_body(false, "RetentionRequest")
+        .json("202", "The task.", "IngestTask")
+        .errors(&[400, 403, 404, 429]),
+    );
+    p.add(
+        op(
+            GET,
+            "/$/memory/{ds}/maintenance",
+            "getMaintenance",
+            "Datasets",
+            "Read the maintenance schedules",
+        )
+        .see("memory-maintenance")
+        .json("200", "The schedules.", "MaintenanceStatus")
+        .errors(&[404]),
+    );
+    p.add(
+        op(
             GET,
             "/$/ingest/{ds}/profiles",
             "listIngestProfiles",
