@@ -1,35 +1,38 @@
 //! Operators that map each input row to any number of output rows on their own: index
-//! joins, LET, UNFOLD and triple-term decomposition in input order, and transitive
-//! paths from the start nodes of their input. Each input
-//! batch runs through the eager kernel. Its output is charged state that later pulls
+//! joins, LET, UNFOLD and triple-term decomposition in input order, transitive paths
+//! from the start nodes of their input, local LATERAL and ARQ property functions over
+//! an input. Each input
+//! batch runs through the eager kernel. A path over a sequence or alternative first
+//! reads its edge plan into a charged edge relation, which every batch then walks. Its output is charged state that later pulls
 //! resume, so one batch that expands into many solutions leaves the following batches
 //! bounded by the caller's cap. The input demand follows the expansion seen so far.
 use super::{Buffer, CursorOptions, Operator, copy_rows, exec};
 use crate::error::Result;
 use crate::sparql::ctx::{Ctx, OwnedCharge};
-use crate::sparql::expr::Expr;
 use crate::sparql::plan::{Kind, Node};
 use crate::sparql::table::VarId;
 use std::sync::Arc;
 
 /// Whether a plan node runs as an expanding operator over its input's batches.
 pub(super) fn eligible(node: &Node) -> bool {
-    node.children.len() == 1
-        && match &node.kind {
-            Kind::IndexJoin(spec) => spec
-                .probes
-                .iter()
-                .all(|probe| !probe.filter.iter().any(Expr::has_exists)),
-            Kind::Assign(_, expr) => !expr.has_exists(),
-            Kind::Unfold { expr, .. } => !expr.has_exists(),
-            Kind::Unpack { .. } => true,
-            // A path from the start nodes of its input, without an edge input.
-            Kind::Path {
-                bound_from_left: true,
-                ..
-            } => true,
-            _ => false,
+    match &node.kind {
+        Kind::IndexJoin(_) | Kind::Assign(..) | Kind::Unfold { .. } | Kind::Unpack { .. } => {
+            node.children.len() == 1
         }
+        // LATERAL evaluates its right side for each left row, and an ARQ property
+        // function solves each input row, so the output of an input batch is the
+        // output of those rows, and a prefix of the input gives a subset of the
+        // output. A remote LATERAL sends several groups per request and stays eager.
+        Kind::Lateral(spec) => spec.service.is_none() && node.children.len() == 1,
+        Kind::PropertyFn(_) => node.children.len() == 1,
+        // A path from the start nodes of its input (the last child), after the edge
+        // plan when it has one.
+        Kind::Path {
+            bound_from_left: true,
+            spec,
+        } => node.children.len() == 1 + usize::from(spec.edge_vars.is_some()),
+        _ => false,
+    }
 }
 
 /// The variables an expanding operator may bind in a row whose input leaves them
@@ -60,6 +63,8 @@ pub(super) struct Expand {
     at: usize,
     /// Output rows per input row in the batches so far, at least one.
     ratio: f64,
+    /// A path's edge relation and its charge, once its edge plan has been read.
+    edges: Option<(crate::sparql::exec::PathEdges, OwnedCharge)>,
 }
 
 impl Expand {
@@ -69,6 +74,7 @@ impl Expand {
             pending: None,
             at: 0,
             ratio: 1.0,
+            edges: None,
         }
     }
 
@@ -79,11 +85,21 @@ impl Expand {
     pub(super) fn next(
         &mut self,
         ctx: &Arc<Ctx>,
-        child: &mut Operator,
+        children: &mut [Operator],
         options: &CursorOptions,
         vars: &[VarId],
         cap: usize,
     ) -> Result<Option<Buffer>> {
+        let (child, edge_plan) = match children {
+            [edges, input] => (input, Some(edges)),
+            [input] => (input, None),
+            _ => unreachable!("an expanding operator has one input"),
+        };
+        if let (Some(edge_plan), Kind::Path { spec, .. }) = (edge_plan, &self.node.kind)
+            && self.edges.is_none()
+        {
+            self.edges = Some(super::walk::read_edges(ctx, spec, edge_plan, options)?);
+        }
         loop {
             ctx.check()?;
             if let Some(buffer) = &self.pending {
@@ -112,13 +128,24 @@ impl Expand {
             let mut input = Some(table);
             // The kernel holds its input under its own charge while it runs.
             drop(charge);
-            let info = child.info.clone();
-            let (table, _) = exec::execute_with_inputs(ctx, &self.node, &mut |_| {
-                Ok((
-                    input.take().expect("one input table per batch"),
-                    info.clone(),
-                ))
-            })?;
+            let table = match (&self.edges, &self.node.kind) {
+                (Some((edges, _)), Kind::Path { spec, .. }) => {
+                    let input = input.take().expect("one input table per batch");
+                    // The kernel holds its input while it runs, as eager execution does.
+                    let _held = OwnedCharge::new(ctx, super::capacity_bytes(&input))?;
+                    exec::path_batch(ctx, spec, edges, &input, &self.node.vars)?
+                }
+                _ => {
+                    let info = child.info.clone();
+                    exec::execute_with_inputs(ctx, &self.node, &mut |_| {
+                        Ok((
+                            input.take().expect("one input table per batch"),
+                            info.clone(),
+                        ))
+                    })?
+                    .0
+                }
+            };
             let mut output = Buffer {
                 charge: OwnedCharge::new(ctx, super::capacity_bytes(&table))?,
                 table,

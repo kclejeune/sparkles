@@ -34,6 +34,8 @@
 #   --client-cpu N      the client's CPU (default 4, on another core than CPU 2's sibling)
 #   --no-spin           no idle-priority busy loops on the server and client CPUs
 #   --serve-args "..."  extra `sparkles serve` flags for both servers
+#   --execution MODE    send execution=MODE (eager, streaming or auto) with every query, or
+#                       A_MODE,B_MODE for a different mode per variant
 #   --cargo-args "..."  extra `cargo build` flags, e.g. "--features text"
 #   --machine-type T    Namespace machine type (default linux/amd64:8x16)
 #   --duration D        instance lifetime cap, as nsc takes it (default 2h)
@@ -53,6 +55,7 @@ RAYON_THREADS=1
 SERVER_CPU=2
 CLIENT_CPU=4
 SERVE_ARGS=
+EXECUTION=
 CARGO_ARGS=
 MACHINE=linux/amd64:8x16
 DURATION=2h
@@ -86,6 +89,7 @@ while [ $# -gt 0 ]; do
       continue
       ;;
     --serve-args) SERVE_ARGS=$2 ;;
+    --execution) EXECUTION=$2 ;;
     --cargo-args) CARGO_ARGS=$2 ;;
     --machine-type) MACHINE=$2 ;;
     --duration) DURATION=$2 ;;
@@ -192,8 +196,9 @@ SERVER_CPU=$SERVER_CPU
 CLIENT_CPU=$CLIENT_CPU
 SPIN=$SPIN
 SERVE_ARGS="$SERVE_ARGS"
+EXECUTION=$EXECUTION
 EOF
-note "settings: $NQ queries, $ROUNDS rounds of A,B,B,A, $WARMUP warm-up and $REPS timed requests per query and server, RAYON_NUM_THREADS=$RAYON_THREADS, server CPU $SERVER_CPU, client CPU $CLIENT_CPU, spinners $([ "$SPIN" = 1 ] && echo on || echo off)${SERVE_ARGS:+, serve $SERVE_ARGS}"
+note "settings: $NQ queries, $ROUNDS rounds of A,B,B,A, $WARMUP warm-up and $REPS timed requests per query and server, RAYON_NUM_THREADS=$RAYON_THREADS, server CPU $SERVER_CPU, client CPU $CLIENT_CPU, spinners $([ "$SPIN" = 1 ] && echo on || echo off)${SERVE_ARGS:+, serve $SERVE_ARGS}${EXECUTION:+, execution $EXECUTION}"
 
 # ---------------------------------------------------------------------------- instance
 ID=

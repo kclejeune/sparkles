@@ -23,6 +23,9 @@ use tokio::sync::{mpsc, oneshot};
 pub const STREAM_AFTER: usize = 1 << 20;
 /// Size of the chunks of a streamed body.
 pub const CHUNK: usize = 64 << 10;
+/// A controlled writer checks its deadline whenever its buffer crosses a multiple of
+/// 2^CONTROL_SHIFT bytes.
+const CONTROL_SHIFT: u32 = 14;
 
 type Chunk = io::Result<Bytes>;
 
@@ -74,13 +77,17 @@ impl StreamControl {
             wait_ns: Default::default(),
         }
     }
-    fn check(&self) -> io::Result<()> {
+    fn check_cancel(&self) -> io::Result<()> {
         if self.cancel.load(Ordering::Relaxed) {
             return Err(io::Error::new(
                 io::ErrorKind::ConnectionAborted,
                 "query cancelled",
             ));
         }
+        Ok(())
+    }
+    fn check(&self) -> io::Result<()> {
+        self.check_cancel()?;
         if self.deadline.is_some_and(|d| Instant::now() >= d) {
             return Err(io::Error::new(io::ErrorKind::TimedOut, "query timed out"));
         }
@@ -173,7 +180,16 @@ impl SwitchWriter {
 impl Write for SwitchWriter {
     fn write(&mut self, b: &[u8]) -> io::Result<usize> {
         if let Some(control) = &self.control {
-            control.check()?;
+            // Serializers write a few bytes at a time, and reading the clock on each
+            // write took a third of a streamed response's time. The deadline is
+            // checked when the buffer crosses a 16 KiB mark and before each chunk is
+            // sent. The cancellation flag is checked on every write.
+            let end = self.buf.len().saturating_add(b.len());
+            if end >> CONTROL_SHIFT != self.buf.len() >> CONTROL_SHIFT {
+                control.check()?;
+            } else {
+                control.check_cancel()?;
+            }
         }
         if self.signal.is_none() && self.tx.is_none() {
             // A quick result is tried synchronously, but its row count says nothing

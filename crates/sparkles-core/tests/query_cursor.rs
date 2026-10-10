@@ -857,7 +857,17 @@ fn charged_exists_state_matches_eager_with_budget_decline_and_partial_keys() {
 #[test]
 fn eager_fallback_is_visible_lazy_and_budgeted() {
     let s = store(100);
-    let q = "SELECT ?s ?o WHERE { ?s <urn:p> ?o FILTER NOT EXISTS { ?s <urn:q> ?o } }";
+    let data = (0..100)
+        .map(|i| format!("<urn:s:{i}> <urn:q> <urn:s:{}> .\n", (i * 7) % 100))
+        .collect::<String>();
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    let q =
+        "SELECT (COUNT(*) AS ?n) WHERE { { ?s <urn:p> ?o } UNION { ?s <urn:q> ?o } ?s <urn:q> ?t }";
     assert!(matches!(
         select_cursor(s.snapshot(), q, &Default::default(), &options(2)),
         Err(Error::Unsupported(_))
@@ -2039,7 +2049,7 @@ fn strict_automatic_execution_never_hides_materialization_in_eager_mode() {
     assert!(matches!(
         query_execution(
             s.snapshot(),
-            "SELECT * {?s ?p ?o FILTER NOT EXISTS {?o ?p ?s}}",
+            "SELECT (COUNT(*) AS ?n) {{?s ?p ?o} UNION {?o ?p ?s} ?s ?q ?t}",
             &Default::default(),
             &strict,
             ExecutionMode::Auto,
@@ -2069,17 +2079,15 @@ fn strict_policy_admits_a_budgeted_sort_and_reports_it_as_blocking() {
             "{q}"
         );
     }
-    // An ORDER key that evaluates EXISTS runs subqueries outside the cursor, so the
-    // strict policy still refuses it.
-    assert!(matches!(
-        select_cursor(
-            s.snapshot(),
-            "SELECT ?s WHERE { ?s <urn:p> ?o } ORDER BY (EXISTS { ?s <urn:q> ?x })",
-            &Default::default(),
-            &options(2),
-        ),
-        Err(Error::Unsupported(_))
-    ));
+    // An ORDER key that evaluates EXISTS runs its pattern under the cursor's charges,
+    // so the strict policy admits it.
+    let q = "SELECT ?s WHERE { ?s <urn:p> ?o } ORDER BY (EXISTS { ?s <urn:q> ?x }) ?s";
+    let c = open(&s, q, 2);
+    assert!(!c.plan().has_materialization(), "{q}");
+    assert_eq!(
+        all(c),
+        query(s.snapshot(), q, &Default::default()).unwrap().rows()
+    );
 }
 
 #[test]
@@ -2473,16 +2481,29 @@ impl Gen {
         }
     }
 
+    /// An EXISTS or NOT EXISTS. Single triples and joins are answered from a key
+    /// set on one or more variables, a FILTER inside can make an outer variable risky,
+    /// and OPTIONAL and nested EXISTS patterns are evaluated per row.
     fn exists(&mut self) -> String {
-        let (x, y) = (self.var(), self.var());
+        let (x, y, z) = (self.var(), self.var(), self.var());
         let p = self.pick(&["<urn:p>", "<urn:q>"]);
+        let r = self.pick(&["<urn:p>", "<urn:q>"]);
         let not = ["", "NOT "][self.rng.below(2) as usize];
-        format!("{not}EXISTS {{ {x} {p} {y} }}")
+        let body = match self.rng.below(7) {
+            0 | 1 => format!("{x} {p} {y}"),
+            2 => format!("{x} {p} {y} . {y} {r} {z}"),
+            3 => format!("{x} {p} {y} FILTER({z} != {y})"),
+            4 => format!("{x} {p} {y} OPTIONAL {{ {y} {r} {z} }}"),
+            5 => format!("{x} {p}+ {y} FILTER NOT EXISTS {{ {y} {r} {z} }}"),
+            _ => format!("<urn:s:1> {p} {y} . {y} {r} {x}"),
+        };
+        format!("{not}EXISTS {{ {body} }}")
     }
 
     fn value(&mut self) -> String {
         let (x, y) = (self.var(), self.var());
-        match self.rng.below(8) {
+        match self.rng.below(9) {
+            7 => self.exists(),
             0 => x.to_string(),
             1 => format!("({x} + 1)"),
             2 => format!("COALESCE({x}, {y})"),
@@ -2496,7 +2517,7 @@ impl Gen {
 
     fn aggregate(&mut self) -> String {
         let x = self.var();
-        match self.rng.below(12) {
+        match self.rng.below(14) {
             0 => "COUNT(*)".into(),
             1 => format!("COUNT({x})"),
             2 => format!("COUNT(DISTINCT {x})"),
@@ -2508,7 +2529,9 @@ impl Gen {
             8 => format!("SUM(DISTINCT {x})"),
             9 => format!("AVG({x} * 2)"),
             10 => format!("MAX(STR({x}))"),
-            _ => format!("COUNT(DISTINCT COALESCE({x}, 0))"),
+            11 => format!("COUNT(DISTINCT COALESCE({x}, 0))"),
+            12 => "COUNT(DISTINCT *)".into(),
+            _ => format!("SUM(IF({}, 1, 0))", self.exists()),
         }
     }
 
@@ -2524,6 +2547,9 @@ impl Gen {
                 "<urn:q>/(<urn:q>|<urn:p>)",
                 "<urn:q>+",
                 "^<urn:q>*",
+                "(<urn:q>|<urn:p>)+",
+                "(<urn:q>/<urn:q>)*",
+                "^(<urn:p>|<urn:q>/<urn:q>)+",
             ]);
             let scope = [s, o].into_iter().filter(|v| v.starts_with('?')).collect();
             return (format!("{s} {p} {o} ."), scope);
@@ -2546,12 +2572,33 @@ impl Gen {
         if depth == 0 || self.rng.below(3) == 0 {
             return self.leaf();
         }
-        match self.rng.below(9) {
+        match self.rng.below(10) {
+            9 => {
+                // A LATERAL that is not a join: the right side keeps one ordered
+                // solution per left row, or keeps the left row without one.
+                let (left, mut scope) = self.pattern(depth - 1);
+                let x = self.var();
+                let others: Vec<&'static str> = VARS.iter().copied().filter(|v| *v != x).collect();
+                let y = self.pick(&others);
+                let p = self.pick(&["<urn:p>", "<urn:q>"]);
+                let right = if self.rng.below(2) == 0 {
+                    scope.insert(x);
+                    format!("SELECT {x} {y} WHERE {{ {x} {p} {y} }} ORDER BY {y} LIMIT 1")
+                } else {
+                    format!("SELECT {y} WHERE {{ {x} {p} {y} }} ORDER BY DESC({y}) LIMIT 2")
+                };
+                scope.insert(y);
+                (format!("{{ {left} }} LATERAL {{ {right} }}"), scope)
+            }
             0..=4 => {
                 let (left, mut ls) = self.pattern(depth - 1);
                 let (right, rs) = self.pattern(depth - 1);
                 let text = match self.rng.below(4) {
                     0 => format!("{{ {left} }} {{ {right} }}"),
+                    1 if self.rng.below(3) == 0 => {
+                        let condition = self.exists();
+                        format!("{{ {left} }} OPTIONAL {{ {right} FILTER({condition}) }}")
+                    }
                     1 => format!("{{ {left} }} OPTIONAL {{ {right} }}"),
                     2 => {
                         return (format!("{{ {left} }} MINUS {{ {right} }}"), ls);
@@ -2668,6 +2715,10 @@ impl Gen {
         };
         let (order_text, order) = match self.rng.below(6) {
             0 | 1 => (String::new(), Order::None),
+            2 if self.rng.below(3) == 0 => {
+                let condition = self.exists();
+                (format!(" ORDER BY ({condition})"), Order::Expr)
+            }
             2 => {
                 let v = self.var();
                 (format!(" ORDER BY DESC(STR({v})) {v}"), Order::Expr)
@@ -3028,10 +3079,8 @@ fn a_fallback_materializes_only_its_operator_and_streams_its_inputs() {
         }
     }
     for q in [
-        "SELECT ?t (COUNT(*) AS ?n) WHERE { ?s <urn:p> ?o . ?s <urn:q> ?t } GROUP BY ?t HAVING (NOT EXISTS { ?t <urn:p> 3 })",
-        "SELECT ?s ?t WHERE { ?s <urn:p> ?o . ?s <urn:q> ?t FILTER NOT EXISTS { ?t <urn:p> 3 } }",
-        "SELECT ?s ?x WHERE { ?s <urn:p> ?o FILTER(?o < 20) ?s (<urn:q>/<urn:q>)+ ?x }",
-        "SELECT ?s ?x WHERE { { ?s <urn:q> ?t } UNION { ?t <urn:q> ?s } ?s (<urn:q>|^<urn:q>)* ?x }",
+        "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p> ?o FILTER(?o < 20) ?s <urn:q> ?t }",
+        "SELECT (COUNT(*) AS ?n) WHERE { { ?s <urn:p> ?o } UNION { ?s <urn:q> ?o } ?s <urn:q> ?t }",
     ] {
         let expected = bag(query(s.snapshot(), q, &Default::default()).unwrap().rows());
         for rows in [1, 2, 3, 4096] {
@@ -3065,6 +3114,9 @@ fn widened_incremental_groups_match_eager() {
         format!("SELECT ?j (COUNT(?x / 0) AS ?e) (SUM(?x / 0) AS ?f) WHERE {{ {rows} }} GROUP BY ?j"),
         "SELECT ?k ?j (COUNT(*) AS ?n) (GROUP_CONCAT(?x) AS ?g) WHERE { VALUES (?k ?j ?x) {} } GROUP BY ?k ?j".into(),
         "SELECT (COUNT(DISTINCT ?x) AS ?n) (GROUP_CONCAT(?x) AS ?g) (AVG(?x * 2) AS ?a) WHERE { VALUES ?x {} }".into(),
+        format!("SELECT ?k (COUNT(DISTINCT *) AS ?d) (COUNT(*) AS ?n) WHERE {{ {rows} {rows} }} GROUP BY ?k"),
+        format!("SELECT (COUNT(DISTINCT *) AS ?d) WHERE {{ {{ {rows} }} UNION {{ {rows} }} }}"),
+        "SELECT (COUNT(DISTINCT *) AS ?d) WHERE { VALUES ?x {} }".into(),
         "SELECT ?s ?o (COUNT(*) AS ?n) WHERE { ?s <urn:p> ?o } GROUP BY ?s ?o HAVING (?o > 30)".into(),
         "SELECT ?m (COUNT(?s) AS ?n) (SUM(?o) AS ?t) WHERE { ?s <urn:p> ?o BIND(?o - (?o / 5 - FLOOR(?o / 5)) * 5 AS ?r) } GROUP BY (FLOOR(?o / 10) AS ?m)".into(),
     ] {

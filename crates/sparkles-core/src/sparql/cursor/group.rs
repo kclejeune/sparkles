@@ -8,33 +8,33 @@ use crate::sparql::exec::{AggState, compute_column, stat_aggregate};
 use crate::sparql::expr::Expr;
 use crate::sparql::exprcache::Report;
 use crate::sparql::plan::{Agg, Kind, Node};
-use crate::sparql::table::VarId;
+use crate::sparql::table::{Table, VarId};
 use crate::sparql::value::Value;
 use rustc_hash::{FxHashMap, FxHashSet};
 use spargebra::algebra::AggregateFunction;
 use std::sync::Arc;
 
-/// Whether an aggregate keeps running state: COUNT(*), or COUNT, SUM, AVG, MIN, MAX,
-/// SAMPLE, GROUP_CONCAT or an ARQ statistics aggregate of an expression without
-/// EXISTS, with or without DISTINCT. FOLD and registered aggregates need their group's
-/// rows, and so do the other custom aggregates.
+/// Whether an aggregate keeps running state: COUNT(*), COUNT(DISTINCT *), or COUNT,
+/// SUM, AVG, MIN, MAX, SAMPLE, GROUP_CONCAT or an ARQ statistics aggregate of an
+/// expression, with or without DISTINCT. FOLD orders its group's rows and registered
+/// aggregates run one group's accumulator at a time, so both need their group's rows,
+/// and so do the other custom aggregates.
 fn admitted(agg: &Agg) -> bool {
     agg.registered.is_none()
         && agg.fold.is_none()
         && match &agg.expr {
-            None => matches!(agg.func, AggregateFunction::Count) && !agg.distinct,
-            Some(expr) => {
-                !expr.has_exists()
-                    && (matches!(
-                        agg.func,
-                        AggregateFunction::Count
-                            | AggregateFunction::Sum
-                            | AggregateFunction::Avg
-                            | AggregateFunction::Min
-                            | AggregateFunction::Max
-                            | AggregateFunction::Sample
-                            | AggregateFunction::GroupConcat { .. }
-                    ) || stat_aggregate(&agg.func).is_some())
+            None => matches!(agg.func, AggregateFunction::Count),
+            Some(_) => {
+                matches!(
+                    agg.func,
+                    AggregateFunction::Count
+                        | AggregateFunction::Sum
+                        | AggregateFunction::Avg
+                        | AggregateFunction::Min
+                        | AggregateFunction::Max
+                        | AggregateFunction::Sample
+                        | AggregateFunction::GroupConcat { .. }
+                ) || stat_aggregate(&agg.func).is_some()
             }
         }
 }
@@ -77,6 +77,10 @@ impl State {
     }
 }
 
+/// An input row that a COUNT(DISTINCT *) has counted: its group, its aggregate and
+/// every value of the row.
+type SeenRow = (u32, u32, Box<[Id]>);
+
 /// Groups found by their keys, in order of first appearance.
 enum Index {
     One(FxHashMap<Id, usize>),
@@ -95,6 +99,8 @@ pub(super) struct Group {
     payload: Vec<u64>,
     /// The values each DISTINCT aggregate has seen, by group and aggregate.
     seen: Option<FxHashSet<(u32, u32, Id)>>,
+    /// The input rows each COUNT(DISTINCT *) has seen, by group and aggregate.
+    rows_seen: Option<FxHashSet<SeenRow>>,
     loaded: bool,
     at: usize,
     charge: Option<RetainedCharge>,
@@ -136,7 +142,11 @@ impl Group {
             payload: Vec::new(),
             seen: aggs
                 .iter()
-                .any(|(_, agg)| agg.distinct)
+                .any(|(_, agg)| agg.distinct && agg.expr.is_some())
+                .then(Default::default),
+            rows_seen: aggs
+                .iter()
+                .any(|(_, agg)| agg.distinct && agg.expr.is_none())
                 .then(Default::default),
             loaded: false,
             at: 0,
@@ -193,7 +203,25 @@ impl Group {
     }
 
     fn only_counts_rows(&self) -> bool {
-        self.keys.is_empty() && self.args.iter().all(|arg| matches!(arg, Arg::Star))
+        self.keys.is_empty()
+            && self.args.iter().all(|arg| matches!(arg, Arg::Star))
+            && self.rows_seen.is_none()
+    }
+
+    /// Whether `row` of `table` is new to COUNT(DISTINCT *) aggregate `a` of `group`,
+    /// remembering it under a charge when it is. A row is all of its input's values.
+    fn new_row(&mut self, group: usize, a: usize, table: &Table, row: usize) -> Result<bool> {
+        let key: Box<[Id]> = table.cols.iter().map(|c| c[row]).collect();
+        let entry = (group as u32, a as u32, key);
+        let seen = self.rows_seen.as_ref().expect("a DISTINCT row set");
+        if seen.contains(&entry) {
+            return Ok(false);
+        }
+        // The boxed row, the set's entry and room for its table to grow.
+        self.retain(table.cols.len() as u64 * 8 + 96)?;
+        let seen = self.rows_seen.as_mut().expect("a DISTINCT row set");
+        seen.insert(entry);
+        Ok(true)
     }
 
     fn load(
@@ -259,6 +287,12 @@ impl Group {
                     self.find(ctx, &key)?
                 };
                 for (a, values) in computed.iter().enumerate() {
+                    if matches!(self.args[a], Arg::Star)
+                        && self.aggs[a].distinct
+                        && !self.new_row(group, a, table, row)?
+                    {
+                        continue;
+                    }
                     let id = match (&self.args[a], values) {
                         (_, Some(values)) => Some(values[row]),
                         (Arg::Column(column), _) => {
@@ -362,6 +396,7 @@ impl Group {
             self.load(ctx, child, options)?;
             // The value sets are not needed for output.
             self.seen = None;
+            self.rows_seen = None;
         }
         let n = cap.min(self.groups - self.at);
         if n == 0 {

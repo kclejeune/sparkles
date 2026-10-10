@@ -155,6 +155,18 @@ pub struct Decor {
     per_row: AtomicU64,
     /// why the EXISTS was last left to per-row evaluation (EXPLAIN)
     reason: Mutex<Option<String>>,
+    /// distinct outer keys of the batches a cursor filtered before the key set was built
+    seen: Mutex<Seen>,
+}
+
+/// The distinct outer keys of a cursor's earlier batches. A cursor filters one batch at
+/// a time, so the choice between the key set and per-row evaluation counts the keys of
+/// every batch so far rather than those of one batch. Otherwise small batches would
+/// never reach the number of keys that pays for the key set.
+#[derive(Default)]
+struct Seen {
+    keys: FxHashSet<Vec<Id>>,
+    charge: Option<RetainedCharge>,
 }
 
 #[derive(Default)]
@@ -511,16 +523,28 @@ fn prepare(ctx: &Ctx, spec: &ExistsSpec, t: &Table) -> Result<Option<Arc<Build>>
     } else {
         ((cost / ROW_EVAL_COST).ceil() as usize).max(1)
     };
-    let _scratch = if ctx.is_cursor() {
-        match ctx.charge(need.min(t.len()) as u64 * (plan.keys.len() as u64 * 8 + 128) + 1024) {
-            Ok(charge) => Some(charge),
+    // A cursor keeps the keys of its earlier batches, charged as retained state.
+    let mut local: FxHashSet<Vec<Id>> = FxHashSet::default();
+    let mut cumulative = ctx.is_cursor().then(|| decor.seen.lock());
+    let entry = plan.keys.len() as u64 * 8 + 128;
+    if let Some(seen) = cumulative.as_deref_mut() {
+        let room = need.saturating_sub(seen.keys.len()).min(t.len()) as u64;
+        let bytes = (seen.keys.len() as u64 + room) * entry + 1024;
+        let reserved = match seen.charge.as_mut() {
+            Some(charge) => charge.resize(bytes).map(|()| None),
+            None => ctx.retained_charge(bytes),
+        };
+        match reserved {
+            Ok(Some(charge)) => seen.charge = Some(charge),
+            Ok(None) => {}
             Err(Error::BudgetExceeded(_)) => return Ok(None),
             Err(error) => return Err(error),
         }
-    } else {
-        None
+    }
+    let seen = match cumulative.as_deref_mut() {
+        Some(seen) => &mut seen.keys,
+        None => &mut local,
     };
-    let mut seen: FxHashSet<Vec<Id>> = FxHashSet::default();
     for i in 0..t.len() {
         if i % 1024 == 0 {
             ctx.check()?;
@@ -532,16 +556,25 @@ fn prepare(ctx: &Ctx, spec: &ExistsSpec, t: &Table) -> Result<Option<Arc<Build>>
             seen.insert(keys.iter().map(|s| s.get(t, i)).collect());
         }
     }
-    if seen.is_empty() {
+    let distinct = seen.len();
+    if let Some(seen) = cumulative.as_deref_mut()
+        && let Some(charge) = seen.charge.as_mut()
+    {
+        charge.resize(distinct as u64 * entry + 1024)?;
+    }
+    if distinct == 0 {
         decor.note(RISKY_BOUND);
         return Ok(None);
     }
-    if seen.len() < need {
+    if distinct < need {
         decor.note(&format!(
-            "evaluating it for the {} distinct outer keys costs less than the whole pattern (estimated cost {cost:.0})",
-            seen.len()
+            "evaluating it for the {distinct} distinct outer keys costs less than the whole pattern (estimated cost {cost:.0})"
         ));
         return Ok(None);
+    }
+    // The key set answers every later batch, so the keys seen so far are not needed.
+    if let Some(mut seen) = cumulative.take() {
+        *seen = Seen::default();
     }
     if (ctx.rows_within_budget(plan.keys.len()) as f64) < plan.node.est {
         decor.note("its estimated solutions exceed the memory budget");
@@ -559,7 +592,11 @@ fn prepare(ctx: &Ctx, spec: &ExistsSpec, t: &Table) -> Result<Option<Arc<Build>>
             keyed.push(v);
         }
     }
-    match build(ctx, &plan.node, keyed, risky) {
+    let built = match ctx.cursor_owner() {
+        Some(owner) => build_streaming(&owner, &plan.node, keyed, risky),
+        None => build(ctx, &plan.node, keyed, risky),
+    };
+    match built {
         Ok(b) => {
             let b = Arc::new(b);
             *st = State::Built(b.clone());
@@ -619,6 +656,90 @@ fn build(ctx: &Ctx, node: &Node, keys: Vec<VarId>, risky: Vec<VarId>) -> Result<
         keys,
         risky,
         solutions: t.len(),
+        full,
+        partial: Mutex::new(FxHashMap::default()),
+        _charge: charge,
+    })
+}
+
+/// Collect the distinct keys of the pattern from a cursor over its plan. Only the key
+/// set is kept, never the pattern's solutions, and it is charged before every batch
+/// grows it.
+fn build_streaming(
+    ctx: &Arc<Ctx>,
+    node: &Node,
+    keys: Vec<VarId>,
+    risky: Vec<VarId>,
+) -> Result<Build> {
+    let width = keys.len();
+    // A key's slot, control byte and the old table while the set doubles, plus the
+    // boxed ids of a key over several variables.
+    let entry = if width == 1 {
+        32
+    } else {
+        width as u64 * 8 + 80
+    };
+    let mut charge = ctx.retained_charge(1024)?;
+    let mut one: FxHashSet<Id> = FxHashSet::default();
+    let mut many: FxHashSet<Box<[Id]>> = FxHashSet::default();
+    // Size the set for the pattern's estimated solutions when a quarter of the
+    // remaining budget covers them, so that it does not rehash as it fills. Growing
+    // from empty spent a fifth of a NOT EXISTS query in rehashing.
+    let expected = node.est.clamp(0.0, u32::MAX as f64) as usize;
+    let mut floor = 1024;
+    let presized = expected as u64 * entry + 1024;
+    if let Some(retained) = charge.as_mut()
+        && expected > 0
+        && presized < ctx.memory_remaining() / 4
+    {
+        retained.resize(presized)?;
+        floor = presized;
+        if width == 1 {
+            one.reserve(expected);
+        } else {
+            many.reserve(expected);
+        }
+    }
+    let mut solutions = 0usize;
+    super::cursor::drain(ctx, node.clone(), &mut |t: &Table| {
+        let cols: Vec<&[Id]> = keys
+            .iter()
+            .map(|&v| {
+                t.col_of(v)
+                    .map(|c| t.cols[c].as_slice())
+                    .ok_or_else(|| Error::invalid("a key variable is not bound by the pattern"))
+            })
+            .collect::<Result<_>>()?;
+        if cols.iter().any(|c| c.iter().any(|id| id.is_undef())) {
+            return Err(Error::invalid("a key variable is unbound in a solution"));
+        }
+        let held = one.len() + many.len();
+        // Reserve for every row of the batch being new before the set grows.
+        if let Some(charge) = charge.as_mut() {
+            charge.resize(((held + t.len()) as u64 * entry + 1024).max(floor))?;
+        }
+        if width == 1 {
+            one.extend(cols[0].iter().copied());
+        } else {
+            for i in 0..t.len() {
+                many.insert(cols.iter().map(|c| c[i]).collect());
+            }
+        }
+        solutions += t.len();
+        if let Some(charge) = charge.as_mut() {
+            charge.resize(((one.len() + many.len()) as u64 * entry + 1024).max(floor))?;
+        }
+        Ok(())
+    })?;
+    let full = if width == 1 {
+        KeySet::One(one)
+    } else {
+        KeySet::Many(many)
+    };
+    Ok(Build {
+        keys,
+        risky,
+        solutions,
         full,
         partial: Mutex::new(FxHashMap::default()),
         _charge: charge,

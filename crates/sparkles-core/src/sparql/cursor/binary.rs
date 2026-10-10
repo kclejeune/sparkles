@@ -12,11 +12,10 @@ use std::sync::Arc;
 
 pub(super) fn eligible(node: &Node) -> bool {
     node.children.len() == 2
-        && match &node.kind {
-            Kind::Join { .. } | Kind::HalfJoin { .. } | Kind::Minus => true,
-            Kind::LeftJoin { expr } => expr.as_ref().is_none_or(|e| !e.has_exists()),
-            _ => false,
-        }
+        && matches!(
+            node.kind,
+            Kind::Join { .. } | Kind::HalfJoin { .. } | Kind::Minus | Kind::LeftJoin { .. }
+        )
 }
 
 /// The input that is streamed. It matches the planner's hash probe order: the larger
@@ -285,6 +284,72 @@ impl Binary {
         Ok(())
     }
 
+    /// Join whole probe rows of an inner or OPTIONAL join without a predicate, when
+    /// every build row binds the hash key. A row goes through only when its whole
+    /// chain fits the output, so no candidate state is left between pulls. Rows with
+    /// an unbound key or a longer chain stay for the general loop.
+    fn whole_rows(&mut self, ctx: &Ctx, output: &mut Buffer, cap: usize) -> Result<()> {
+        let (Some(index), Some(probe), Some(build)) = (&self.index, &self.probe, &self.build)
+        else {
+            return Ok(());
+        };
+        let (probe, build) = (&probe.table, &build.table);
+        let optional = matches!(self.mode, Mode::Optional);
+        let mut row = self.row;
+        while row < probe.len && output.table.len < cap {
+            if row.is_multiple_of(1024) {
+                ctx.check()?;
+            }
+            let key = probe.cols[index.probe][row];
+            if key.is_undef() {
+                break;
+            }
+            let head = index.heads.get(&key).copied().unwrap_or(NONE);
+            let room = cap - output.table.len;
+            let (mut chain, mut at) = (0, head);
+            while at != NONE && chain <= room {
+                chain += 1;
+                at = index.next[at as usize];
+            }
+            if chain > room {
+                break;
+            }
+            let mut matched = false;
+            let mut at = head;
+            while at != NONE {
+                let other = at as usize;
+                at = index.next[other];
+                if self.shared.len() > 1
+                    && !self.shared.iter().all(|&(p, b)| {
+                        let (p, b) = (probe.cols[p][row], build.cols[b][other]);
+                        p == b || p.is_undef() || b.is_undef()
+                    })
+                {
+                    continue;
+                }
+                matched = true;
+                for (column, &(p, b)) in output.table.cols.iter_mut().zip(&self.columns) {
+                    let p = p.map_or(Id::UNDEF, |c| probe.cols[c][row]);
+                    column.push(if p.is_undef() {
+                        b.map_or(p, |c| build.cols[c][other])
+                    } else {
+                        p
+                    });
+                }
+                output.table.len += 1;
+            }
+            if optional && !matched {
+                for (column, &(p, _)) in output.table.cols.iter_mut().zip(&self.columns) {
+                    column.push(p.map_or(Id::UNDEF, |c| probe.cols[c][row]));
+                }
+                output.table.len += 1;
+            }
+            row += 1;
+        }
+        self.row = row;
+        Ok(())
+    }
+
     fn advance(&mut self) {
         self.row += 1;
         self.candidates = Candidates::Start;
@@ -314,6 +379,9 @@ impl Binary {
         }
         predicate.len = 1;
         let map = predicate.var_map(ctx.nvars());
+        let whole_rows = self.expression.is_none()
+            && matches!(self.mode, Mode::Inner | Mode::Optional)
+            && self.index.as_ref().is_some_and(|i| i.unbound.is_empty());
         let mut steps = 0usize;
         while output.table.len < cap {
             if steps.is_multiple_of(1024) {
@@ -322,6 +390,13 @@ impl Binary {
             steps += 1;
             if !self.ensure_probe(ctx, children, options, cap)? {
                 break;
+            }
+            if whole_rows && matches!(self.candidates, Candidates::Start) {
+                let row = self.row;
+                self.whole_rows(ctx, &mut output, cap)?;
+                if self.row != row {
+                    continue;
+                }
             }
             let probe = &self.probe.as_ref().expect("available probe").table;
             let build = &self.build.as_ref().expect("captured build").table;
@@ -357,6 +432,32 @@ impl Binary {
             {
                 continue;
             }
+            let Some(expression) = &self.expression else {
+                // Without a predicate the merged row goes straight to the output.
+                self.matched = true;
+                match self.mode {
+                    Mode::Anti | Mode::Minus => self.advance(),
+                    Mode::Semi => {
+                        for (column, &(p, _)) in output.table.cols.iter_mut().zip(&self.columns) {
+                            column.push(p.map_or(Id::UNDEF, |c| probe.cols[c][self.row]));
+                        }
+                        output.table.len += 1;
+                        self.advance();
+                    }
+                    Mode::Inner | Mode::Optional => {
+                        for (column, &(p, b)) in output.table.cols.iter_mut().zip(&self.columns) {
+                            let p = p.map_or(Id::UNDEF, |c| probe.cols[c][self.row]);
+                            column.push(if p.is_undef() {
+                                b.map_or(p, |c| build.cols[c][other])
+                            } else {
+                                p
+                            });
+                        }
+                        output.table.len += 1;
+                    }
+                }
+                continue;
+            };
             for (column, &(p, b)) in predicate.cols.iter_mut().zip(&self.columns) {
                 let p = p.map_or(Id::UNDEF, |c| probe.cols[c][self.row]);
                 column[0] = if p.is_undef() {
@@ -365,19 +466,13 @@ impl Binary {
                     p
                 };
             }
-            if self.expression.as_ref().is_some_and(|e| {
-                !ebv(
-                    e,
-                    &Row {
-                        table: &predicate,
-                        i: 0,
-                        map: &map,
-                        dec: None,
-                    },
-                    ctx,
-                )
-                .unwrap_or(false)
-            }) {
+            let row = Row {
+                table: &predicate,
+                i: 0,
+                map: &map,
+                dec: None,
+            };
+            if !ebv(expression, &row, ctx).unwrap_or(false) {
                 ctx.check()?;
                 continue;
             }

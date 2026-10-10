@@ -591,8 +591,12 @@ fn cursor_answer(
         ..Default::default()
     };
     let execution = match query_cursor(store.snapshot(), qtext, opts, &strict) {
-        Err(sparkles_core::Error::Unsupported(_)) => {
+        Err(sparkles_core::Error::Unsupported(reason)) => {
             FALLBACKS.with(|n| n.set(n.get() + 1));
+            // SPARKLES_W3C_FALLBACKS=1 lists the operator each fallback stops at.
+            if std::env::var_os("SPARKLES_W3C_FALLBACKS").is_some() {
+                eprintln!("fallback ({batch_rows} rows): {reason}");
+            }
             let allowed = CursorOptions {
                 fallback: FallbackPolicy::AllowMaterialization,
                 ..strict

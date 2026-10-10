@@ -2,6 +2,7 @@
 //! explicit, lazy materialization barriers; the eager query API is unchanged.
 
 use super::ctx::OwnedCharge;
+use super::expr::Expr;
 use super::exprcache::Report as ExprReport;
 use super::plan::{Kind, Node, RangeSpec, ScanSpec};
 use super::table::VarId;
@@ -1152,24 +1153,91 @@ struct Operator {
 }
 
 fn supported(kind: &Kind) -> bool {
-    match kind {
+    matches!(
+        kind,
         Kind::Scan(_)
-        | Kind::Values(_)
-        | Kind::Empty
-        | Kind::Project(_)
-        | Kind::Distinct
-        | Kind::CountScan { .. }
-        | Kind::CountDistinctScan { .. }
-        | Kind::GroupCountScan { .. }
-        | Kind::CountJoinRuns { .. }
-        | Kind::Slice { .. }
-        | Kind::Union => true,
-        Kind::RangeScan(_, r) => !r.filter.iter().any(super::expr::Expr::has_exists),
-        Kind::Filter(e) => !e.iter().any(super::expr::Expr::has_exists),
-        Kind::Extend(_, e) => !e.has_exists(),
-        Kind::CountFilterScan { filter, .. } => !filter.iter().any(super::expr::Expr::has_exists),
-        _ => false,
+            | Kind::Values(_)
+            | Kind::Empty
+            | Kind::Project(_)
+            | Kind::Distinct
+            | Kind::CountScan { .. }
+            | Kind::CountDistinctScan { .. }
+            | Kind::GroupCountScan { .. }
+            | Kind::CountJoinRuns { .. }
+            | Kind::Slice { .. }
+            | Kind::Union
+            | Kind::RangeScan(..)
+            | Kind::Filter(_)
+            | Kind::Extend(..)
+            | Kind::CountFilterScan { .. }
+    )
+}
+
+/// The expressions an operator evaluates itself, not those of its inputs.
+fn own_exprs(kind: &Kind) -> Vec<&Expr> {
+    match kind {
+        Kind::Filter(exprs)
+        | Kind::RangeScan(_, RangeSpec { filter: exprs, .. })
+        | Kind::CountFilterScan { filter: exprs, .. } => exprs.iter().collect(),
+        Kind::Extend(_, expr) | Kind::Assign(_, expr) | Kind::Unfold { expr, .. } => vec![expr],
+        Kind::LeftJoin { expr } => expr.iter().collect(),
+        Kind::OrderBy { keys, .. } => keys.iter().map(|(key, _)| key).collect(),
+        Kind::Group { aggs, .. } => aggs
+            .iter()
+            .flat_map(|(_, agg)| {
+                agg.expr.iter().chain(agg.fold.iter().flat_map(|fold| {
+                    fold.value
+                        .iter()
+                        .chain(fold.order.iter().map(|(key, _)| key))
+                }))
+            })
+            .collect(),
+        Kind::IndexJoin(spec) => spec
+            .probes
+            .iter()
+            .flat_map(|probe| probe.filter.iter())
+            .collect(),
+        _ => Vec::new(),
     }
+}
+
+/// Whether every EXISTS that an operator evaluates itself runs without an eager
+/// fallback. Each pattern is planned as the key set plans it, and that plan is built as
+/// cursor operators under the strict policy. A row evaluated on its own runs the same
+/// pattern with its values substituted and a limit of one solution.
+fn exists_streams(ctx: &Arc<Ctx>, kind: &Kind) -> Result<bool> {
+    let mut specs = Vec::new();
+    for expr in own_exprs(kind) {
+        expr.exists_specs(&mut specs);
+    }
+    for spec in specs {
+        let planned = super::plan::Planner::new(ctx).plan(&spec.pattern, &spec.graph, Vec::new());
+        let built = planned
+            .and_then(|node| Operator::build(ctx, node, FallbackPolicy::RejectMaterialization));
+        match built {
+            Ok(_) => {}
+            Err(error @ (Error::Cancelled | Error::Timeout | Error::BudgetExceeded(_))) => {
+                return Err(error);
+            }
+            Err(_) => return Ok(false),
+        }
+    }
+    Ok(true)
+}
+
+/// Run `node` as a cursor and hand each of its batches to `each`. EXISTS key sets use
+/// it to read their pattern without materializing its solutions.
+pub(super) fn drain(
+    ctx: &Arc<Ctx>,
+    node: Node,
+    each: &mut dyn FnMut(&Table) -> Result<()>,
+) -> Result<()> {
+    let options = CursorOptions::default();
+    let mut root = Operator::build(ctx, node, FallbackPolicy::AllowMaterialization)?;
+    while let Some(batch) = root.next(ctx, &options, options.batch_rows)? {
+        each(&batch.table)?;
+    }
+    Ok(())
 }
 
 /// What runs an operator, which decides the order its output keeps.
@@ -1240,7 +1308,10 @@ fn output_order(node: &Node, children: &[Operator], role: Role) -> Vec<VarId> {
                 spec.cols.iter().map(|&(_, v)| v).collect()
             }
             Kind::Values(table) => table.sorted.clone(),
-            Kind::Path { .. } if node.children.is_empty() => walk::order(node),
+            Kind::Path {
+                bound_from_left: false,
+                ..
+            } => walk::order(node),
             // A path over its input joins each batch with the paths of its start nodes.
             Kind::Path { .. } => Vec::new(),
             // Keys come in index order, one row each.
@@ -1276,23 +1347,23 @@ impl Operator {
         ctx.check()?;
         // Every merge-eligible join is also binary-eligible, so whether the node
         // materializes does not depend on the order its children turn out to have.
-        let joins = binary::eligible(&node);
-        let incremental_group = group::eligible(&node);
-        let expanding = expand::eligible(&node);
+        // An operator that evaluates EXISTS streams when every EXISTS pattern does.
+        let exists = own_exprs(&node.kind).iter().any(|e| e.has_exists());
+        let exists_streams = !exists || exists_streams(ctx, &node.kind)?;
+        let joins = exists_streams && binary::eligible(&node);
+        let incremental_group = exists_streams && group::eligible(&node);
+        let expanding = exists_streams && expand::eligible(&node);
         let walking = walk::eligible(&node);
         let native_blocking =
             matches!(node.kind, Kind::Sort(_) | Kind::OrderBy { .. }) && node.children.len() == 1;
         // A native sort consumes cursor batches into charged state. It blocks before
-        // its first output but is not an eager fallback, so strict policy admits it
-        // unless an ORDER key evaluates EXISTS, which runs whole subqueries.
-        let exists_keys = matches!(&node.kind, Kind::OrderBy { keys, .. }
-            if keys.iter().any(|(key, _)| key.has_exists()));
-        let materializes = !supported(&node.kind)
+        // its first output but is not an eager fallback, so strict policy admits it.
+        let materializes = !(exists_streams && supported(&node.kind))
             && !joins
             && !incremental_group
             && !expanding
             && !walking
-            && (!native_blocking || exists_keys);
+            && (!native_blocking || !exists_streams);
         if materializes && fallback == FallbackPolicy::RejectMaterialization {
             return Err(Error::Unsupported(format!(
                 "cursor requires materialization at {}; use AllowMaterialization or eager execution",
@@ -1373,7 +1444,8 @@ impl Operator {
             || incremental_binary
             || incremental_group
             || expanding
-            || walking;
+            || walking
+            || exists;
         let order = output_order(
             &node,
             &children,
@@ -1401,7 +1473,7 @@ impl Operator {
             .then(|| binary::Binary::new(ctx, &node))
             .transpose()?;
         let heap = native_blocking && !materializes && topk::eligible(ctx, &node);
-        let reason = (materializes || native_blocking).then(|| {
+        let reason = (materializes || native_blocking || exists).then(|| {
             if let (true, Kind::OrderBy { limit: Some(k), .. }) = (heap, &node.kind) {
                 format!(
                     "{} reads all input but keeps only its best {k} rows under the memory budget before output",
@@ -1410,6 +1482,11 @@ impl Operator {
             } else if native_blocking {
                 format!(
                     "{} consumes all input under the memory budget before output",
+                    node.operator()
+                )
+            } else if !materializes {
+                format!(
+                    "{} answers EXISTS from a key set of its pattern, built under the memory budget on first demand, or evaluates it once per distinct outer key",
                     node.operator()
                 )
             } else {
@@ -1811,14 +1888,14 @@ impl Operator {
                     batch
                 }
                 State::Walk(walk) => {
-                    let batch = walk.next(ctx, &self.vars, cap)?;
+                    let batch = walk.next(ctx, &mut self.children, options, &self.vars, cap)?;
                     self.done = walk.done();
                     batch
                 }
                 State::Expand(expand) => {
-                    let batch =
-                        expand.next(ctx, &mut self.children[0], options, &self.vars, cap)?;
-                    self.done = expand.done(self.children[0].done);
+                    let batch = expand.next(ctx, &mut self.children, options, &self.vars, cap)?;
+                    let input = self.children.last().is_none_or(|c| c.done);
+                    self.done = expand.done(input);
                     batch
                 }
                 State::Distinct(distinct) => {

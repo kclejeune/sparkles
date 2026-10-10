@@ -28,6 +28,9 @@ pub struct ExistsSpec {
     /// table no longer holds them as columns, but they are part of the outer solution
     pub bound: Vec<(VarId, Id)>,
     pub memo: Mutex<FxHashMap<Vec<Id>, bool>>,
+    /// The memory of `memo` in a cursor, which charges every entry to the query budget
+    /// and stops memoizing when the budget has no room for another one.
+    memo_charge: Mutex<Option<super::ctx::RetainedCharge>>,
     /// the key set answering the EXISTS for every outer row (see [`super::exists`])
     pub decor: super::exists::Decor,
 }
@@ -45,7 +48,37 @@ impl ExistsSpec {
             vars,
             bound,
             memo: Mutex::new(FxHashMap::default()),
+            memo_charge: Mutex::new(None),
             decor: Default::default(),
+        }
+    }
+
+    /// Memoize the answer for `key` in a cursor, charging the entry first. The memo
+    /// takes at most an eighth of the query's memory budget and leaves the evaluation of
+    /// later rows room to run. An entry that does not fit is not kept, and that key is
+    /// evaluated again when it recurs.
+    fn remember(&self, ctx: &super::ctx::Ctx, key: Vec<Id>, found: bool) {
+        // The key's heap allocation plus the map's slot, control byte and growth.
+        let bytes = key.len() as u64 * 8 + 64;
+        let mut charge = self.memo_charge.lock();
+        let held = charge.as_ref().map_or(0, |c| c.bytes());
+        if held.saturating_add(bytes) > ctx.mem_limit / 8
+            || ctx.memory_remaining() < ctx.mem_limit / 4
+        {
+            return;
+        }
+        let charged = match charge.as_mut() {
+            Some(charge) => charge.resize(charge.bytes().saturating_add(bytes)).is_ok(),
+            None => match ctx.retained_charge(bytes) {
+                Ok(retained) => {
+                    *charge = retained;
+                    charge.is_some()
+                }
+                Err(_) => false,
+            },
+        };
+        if charged {
+            self.memo.lock().insert(key, found);
         }
     }
 
@@ -198,6 +231,35 @@ impl Expr {
             Expr::In(a, l) => a.has_exists() || l.iter().any(|e| e.has_exists()),
             Expr::If(a, b, c) => a.has_exists() || b.has_exists() || c.has_exists(),
             Expr::Coalesce(l) | Expr::Call(_, l) => l.iter().any(|e| e.has_exists()),
+        }
+    }
+
+    /// The EXISTS patterns this expression evaluates, outermost first. Patterns nested
+    /// inside an EXISTS pattern belong to that pattern's plan and are not listed.
+    pub fn exists_specs<'a>(&'a self, out: &mut Vec<&'a Arc<ExistsSpec>>) {
+        match self {
+            Expr::Exists(spec) => out.push(spec),
+            Expr::Const(_) | Expr::Lit(..) | Expr::Var(_) | Expr::Bound(_) => {}
+            Expr::Or(a, b)
+            | Expr::And(a, b)
+            | Expr::Eq(a, b)
+            | Expr::SameTerm(a, b)
+            | Expr::Cmp(a, b, _)
+            | Expr::Arith(a, b, _) => {
+                a.exists_specs(out);
+                b.exists_specs(out);
+            }
+            Expr::Not(a) | Expr::Neg(a) | Expr::Pos(a) => a.exists_specs(out),
+            Expr::In(a, l) => {
+                a.exists_specs(out);
+                l.iter().for_each(|e| e.exists_specs(out));
+            }
+            Expr::If(a, b, c) => {
+                a.exists_specs(out);
+                b.exists_specs(out);
+                c.exists_specs(out);
+            }
+            Expr::Coalesce(l) | Expr::Call(_, l) => l.iter().for_each(|e| e.exists_specs(out)),
         }
     }
 
@@ -610,7 +672,6 @@ pub fn eval(e: &Expr, row: &Row<'_>, ctx: &Ctx) -> EvalResult<Val> {
         Expr::Exists(spec) => {
             let key: Vec<Id> = spec.vars.iter().map(|&v| spec.value(row, v)).collect();
             if !ctx.calls_extensions
-                && !ctx.is_cursor()
                 && let Some(&r) = spec.memo.lock().get(&key)
             {
                 return Ok(b(r));
@@ -625,9 +686,15 @@ pub fn eval(e: &Expr, row: &Row<'_>, ctx: &Ctx) -> EvalResult<Val> {
                 }
                 TypeError
             })?;
-            let mut m = spec.memo.lock();
-            if !ctx.calls_extensions && !ctx.is_cursor() && m.len() < 100_000 {
-                m.insert(key, r);
+            if !ctx.calls_extensions {
+                if ctx.is_cursor() {
+                    spec.remember(ctx, key, r);
+                } else {
+                    let mut m = spec.memo.lock();
+                    if m.len() < 100_000 {
+                        m.insert(key, r);
+                    }
+                }
             }
             Ok(b(r))
         }

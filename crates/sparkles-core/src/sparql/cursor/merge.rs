@@ -6,6 +6,7 @@ use crate::id::Id;
 use crate::sparql::ctx::{Ctx, RetainedCharge};
 use crate::sparql::plan::{JoinAlgo, Kind, Node};
 use crate::sparql::table::{Table, VarId};
+use crate::sparql::zipper;
 use std::cmp::Ordering;
 use std::ops::Range;
 use std::sync::Arc;
@@ -17,6 +18,17 @@ fn key(node: &Node) -> Option<VarId> {
             keys,
         } => keys.first().copied(),
         Kind::LeftJoin { expr: None } => node.children.first()?.sorted.first().copied(),
+        // MINUS and semi and anti joins compare the left row with the right input on
+        // their shared variables. With one shared variable that both inputs bind on
+        // every row, that comparison is equality of the key.
+        Kind::Minus | Kind::HalfJoin { .. } => {
+            let [left, right] = &node.children[..] else {
+                return None;
+            };
+            let mut shared = left.vars.iter().filter(|v| right.vars.contains(v));
+            let key = shared.next().copied();
+            if shared.next().is_some() { None } else { key }
+        }
         _ => None,
     }
 }
@@ -52,6 +64,11 @@ pub(super) struct Merge {
     columns: Vec<(Option<usize>, Option<usize>)>,
     pair: Option<Pair>,
     optional: bool,
+    /// For MINUS and semi and anti joins, whether a left row passes when the right
+    /// input has its key (a semi join) or when it lacks it.
+    filter: Option<bool>,
+    /// Whether the right input of a filtering join reads only the key yet.
+    narrowed: bool,
     _charge: Option<RetainedCharge>,
 }
 
@@ -237,6 +254,12 @@ impl Merge {
             columns,
             pair: None,
             optional: matches!(node.kind, Kind::LeftJoin { .. }),
+            filter: match node.kind {
+                Kind::Minus => Some(false),
+                Kind::HalfJoin { anti } => Some(!anti),
+                _ => None,
+            },
+            narrowed: false,
             _charge: charge,
         })
     }
@@ -255,6 +278,94 @@ impl Merge {
         Ok(())
     }
 
+    /// Pass up to `cap` left rows of a MINUS, semi or anti join into `out`, or count
+    /// them when `out` is None. A left row passes when the right input has its key
+    /// and `keep_matched`, or lacks it and not `keep_matched`. Both inputs are ordered
+    /// on the key, so the right input only moves forward and no run is held.
+    #[allow(clippy::too_many_arguments)]
+    fn filter(
+        &mut self,
+        ctx: &Arc<Ctx>,
+        children: &mut [Operator],
+        options: &CursorOptions,
+        cap: usize,
+        pull: usize,
+        keep_matched: bool,
+        mut out: Option<&mut Buffer>,
+    ) -> Result<usize> {
+        let mut passed = 0usize;
+        while passed < cap {
+            ctx.check()?;
+            if !self.inputs[0].ensure(ctx, &mut children[0], options, pull)? {
+                break;
+            }
+            let more = self.inputs[1].ensure(ctx, &mut children[1], options, pull)?;
+            if !more && keep_matched {
+                break;
+            }
+            let [left, right] = &self.inputs;
+            let table = left.table();
+            let lk = &table.cols[self.keys[0][0]];
+            let rk: &[Id] = if more {
+                &right.table().cols[self.keys[1][0]]
+            } else {
+                &[]
+            };
+            let (mut li, mut ri) = (left.at, right.at);
+            let mut emit = |rows: Range<usize>| {
+                if let Some(out) = out.as_deref_mut() {
+                    for (column, &(l, _)) in out.table.cols.iter_mut().zip(&self.columns) {
+                        let l = l.expect("filtering joins output left columns");
+                        column.extend_from_slice(&table.cols[l][rows.clone()]);
+                    }
+                    out.table.len += rows.len();
+                }
+            };
+            if !more {
+                // The right input is exhausted, so the rest of the left rows pass.
+                let end = lk.len().min(li.saturating_add(cap - passed));
+                emit(li..end);
+                passed += end - li;
+                li = end;
+            } else if ri < rk.len() {
+                // The loaded right batch decides every left row up to its last key.
+                // Their lower bounds in it come from the branch-free zipper of eager
+                // MINUS, because a compare per row mispredicts on interleaved keys.
+                let last = rk[rk.len() - 1];
+                let covered = li + lk[li..].partition_point(|k| *k <= last);
+                let end = covered.min(li.saturating_add(cap - passed));
+                if end > li {
+                    let _scratch = ctx.charge((end - li) as u64 * 4 + 64)?;
+                    let first = zipper::lower_bounds(ctx, &lk[li..end], &rk[ri..])?;
+                    let mut run = li;
+                    for (j, &at) in first.iter().enumerate() {
+                        let row = li + j;
+                        let hit = rk.get(ri + at as usize) == Some(&lk[row]);
+                        if hit != keep_matched {
+                            emit(run..row);
+                            passed += row - run;
+                            run = row + 1;
+                        }
+                    }
+                    emit(run..end);
+                    passed += end - run;
+                    // Later left keys are not less than the last one decided here.
+                    ri += first[first.len() - 1] as usize;
+                    li = end;
+                }
+                if li == covered && covered < lk.len() {
+                    // Every remaining left key follows this right batch.
+                    ri = rk.len();
+                }
+            }
+            self.inputs[0].at = li;
+            if more {
+                self.inputs[1].at = ri;
+            }
+        }
+        Ok(passed)
+    }
+
     pub(super) fn supports_count(&self) -> bool {
         self.columns
             .iter()
@@ -264,8 +375,9 @@ impl Merge {
     }
 
     /// Stay inside already loaded batches when the certainly-bound merge key
-    /// is the only shared variable. Lookahead proves singleton runs; duplicate
-    /// and boundary runs return to the resumable general path.
+    /// is the only shared variable. Lookahead proves that a run ends inside its
+    /// batch, and such runs join directly. Runs that touch a batch boundary, or
+    /// whose product does not fit the output, return to the resumable general path.
     fn interior(
         &mut self,
         ctx: &Ctx,
@@ -297,18 +409,33 @@ impl Merge {
                     li += 1;
                 }
                 Ordering::Equal => {
-                    if lk[li + 1] == lk[li] || rk[ri + 1] == rk[ri] {
+                    // Both runs must end inside their batches, which the next
+                    // different key proves, and their product must fit the output.
+                    let key = lk[li];
+                    let le = li + 1 + lk[li + 1..].iter().take_while(|&&k| k == key).count();
+                    let re = ri + 1 + rk[ri + 1..].iter().take_while(|&&k| k == key).count();
+                    if le == lk.len()
+                        || re == rk.len()
+                        || (le - li).saturating_mul(re - ri) > cap - out.table.len
+                    {
                         break;
                     }
-                    for (column, &(l, r)) in out.table.cols.iter_mut().zip(&self.columns) {
-                        column.push(match l {
-                            Some(c) => left.cols[c][li],
-                            None => r.map_or(Id::UNDEF, |c| right.cols[c][ri]),
-                        });
+                    for row in li..le {
+                        for (column, &(l, r)) in out.table.cols.iter_mut().zip(&self.columns) {
+                            match (l, r) {
+                                (Some(c), _) => {
+                                    column.extend(std::iter::repeat_n(left.cols[c][row], re - ri));
+                                }
+                                (None, Some(c)) => column.extend_from_slice(&right.cols[c][ri..re]),
+                                (None, None) => {
+                                    column.extend(std::iter::repeat_n(Id::UNDEF, re - ri));
+                                }
+                            }
+                        }
                     }
-                    out.table.len += 1;
-                    li += 1;
-                    ri += 1;
+                    out.table.len += (le - li) * (re - ri);
+                    li = le;
+                    ri = re;
                 }
             }
         }
@@ -330,6 +457,21 @@ impl Merge {
             let key = child.vars[self.keys[side][0]];
             child.restrict_count_scan(ctx, key);
             self.keys[side][0] = child.vars.iter().position(|v| *v == key).unwrap();
+        }
+        if let Some(keep_matched) = self.filter {
+            self.narrowed = true;
+            let count = self.filter(
+                ctx,
+                children,
+                options,
+                usize::MAX,
+                options.batch_rows,
+                keep_matched,
+                None,
+            )?;
+            ctx.check_rows(count)?;
+            ctx.check()?;
+            return Ok(count as u64);
         }
         let mut count = 0u64;
         let mut steps = 0usize;
@@ -487,6 +629,27 @@ impl Merge {
         cap: usize,
     ) -> Result<Option<Buffer>> {
         let mut out = Buffer::new(ctx, vars, cap)?;
+        if let Some(keep_matched) = self.filter {
+            if !self.narrowed {
+                // The output takes only left columns, so the right input needs its key alone.
+                let child = &mut children[1];
+                let key = child.vars[self.keys[1][0]];
+                child.restrict_count_scan(ctx, key);
+                self.keys[1][0] = child.vars.iter().position(|v| *v == key).unwrap();
+                self.narrowed = true;
+            }
+            self.filter(
+                ctx,
+                children,
+                options,
+                cap,
+                cap,
+                keep_matched,
+                Some(&mut out),
+            )?;
+            out.reconcile()?;
+            return Ok((!out.table.is_empty()).then_some(out));
+        }
         let mut steps = 0usize;
         while out.table.len < cap {
             if steps.is_multiple_of(1024) {
@@ -583,6 +746,9 @@ impl Merge {
                     matched: false,
                 });
             }
+            // With the certainly bound key as the only shared variable, every pair of
+            // the two runs is compatible, so a left row joins a slice of right rows.
+            let key_only = self.supports_count();
             let pair = self.pair.as_mut().expect("matched runs");
             let left = pair.left.table(&self.inputs[0]);
             let right = pair.right.table(&self.inputs[1]);
@@ -601,6 +767,23 @@ impl Merge {
                     pair.ri = pair.right.rows.start;
                     pair.li += 1;
                     pair.matched = false;
+                    continue;
+                }
+                if key_only {
+                    let n = (pair.right.rows.end - pair.ri).min(cap - out.table.len);
+                    let rows = pair.ri..pair.ri + n;
+                    for (col, &(l, r)) in out.table.cols.iter_mut().zip(&self.columns) {
+                        match (l, r) {
+                            (Some(l), _) => {
+                                col.extend(std::iter::repeat_n(left.cols[l][pair.li], n));
+                            }
+                            (None, Some(r)) => col.extend_from_slice(&right.cols[r][rows.clone()]),
+                            (None, None) => col.extend(std::iter::repeat_n(Id::UNDEF, n)),
+                        }
+                    }
+                    out.table.len += n;
+                    pair.matched = true;
+                    pair.ri += n;
                     continue;
                 }
                 let compatible = self.columns.iter().all(|&(l, r)| match (l, r) {
@@ -748,6 +931,120 @@ mod tests {
                 }
                 result.sort();
                 assert_eq!(result, expected, "batch cap {cap}");
+            }
+        }
+    }
+
+    /// With the key as the only shared variable, runs of duplicates on both sides join
+    /// inside a batch or across its boundary, for inner and OPTIONAL merges alike.
+    #[test]
+    fn key_only_merges_join_duplicate_runs_at_every_batch_size() {
+        let l = [
+            vec![0, 10],
+            vec![0, 11],
+            vec![1, 12],
+            vec![2, 13],
+            vec![2, 14],
+            vec![2, 15],
+            vec![4, 16],
+            vec![5, 17],
+            vec![5, 18],
+        ];
+        let r = [
+            vec![0, 20],
+            vec![0, 21],
+            vec![0, 22],
+            vec![2, 23],
+            vec![3, 24],
+            vec![5, 25],
+            vec![5, 26],
+            vec![6, 27],
+        ];
+        for optional in [false, true] {
+            for cap in [1, 2, 3, 4, 5, 4096] {
+                let ctx = context(1 << 20);
+                let mut node = join(values(vec![0, 2], &l), values(vec![0, 3], &r));
+                if optional {
+                    node.kind = Kind::LeftJoin { expr: None };
+                }
+                assert!(eligible(&node));
+                let expected = rows(&exec::execute(&ctx, &node).unwrap().0);
+                let mut op =
+                    Operator::build(&ctx, node, FallbackPolicy::RejectMaterialization).unwrap();
+                assert!(matches!(op.state, super::super::State::Merge(_)));
+                let options = CursorOptions {
+                    batch_rows: cap,
+                    ..Default::default()
+                };
+                let mut result = Vec::new();
+                while let Some(batch) = op.next(&ctx, &options, cap).unwrap() {
+                    assert!(batch.table.len <= cap);
+                    result.extend(rows(&batch.table));
+                }
+                result.sort();
+                assert_eq!(result, expected, "optional {optional}, batch cap {cap}");
+            }
+        }
+    }
+
+    /// MINUS and semi and anti joins on one ordered, certainly bound key pass left rows
+    /// by the presence of their key on the right, across duplicates on both sides,
+    /// batch boundaries and empty inputs, and count without building rows.
+    #[test]
+    fn filtering_merges_match_eager_at_every_batch_size() {
+        let l = [
+            vec![0, 10],
+            vec![0, 11],
+            vec![1, 12],
+            vec![2, 13],
+            vec![2, 14],
+            vec![4, 15],
+            vec![5, 16],
+            vec![9, 17],
+        ];
+        let r = [
+            vec![0, 20],
+            vec![0, 21],
+            vec![2, 22],
+            vec![3, 23],
+            vec![3, 24],
+            vec![5, 25],
+        ];
+        let kinds = [
+            Kind::Minus,
+            Kind::HalfJoin { anti: false },
+            Kind::HalfJoin { anti: true },
+        ];
+        for (k, kind) in kinds.into_iter().enumerate() {
+            for (left, right) in [(&l[..], &r[..]), (&l[..], &[][..]), (&[][..], &r[..])] {
+                for cap in [1, 2, 3, 4096] {
+                    let ctx = context(1 << 20);
+                    let left = values(vec![0, 1], left);
+                    let mut node = Node::leaf(kind.clone(), left.vars.clone(), 8.0, String::new());
+                    node.sorted = vec![0];
+                    node.children = vec![left, values(vec![0, 2], right)];
+                    assert!(eligible(&node));
+                    let expected = rows(&exec::execute(&ctx, &node).unwrap().0);
+                    let mut op =
+                        Operator::build(&ctx, node.clone(), FallbackPolicy::RejectMaterialization)
+                            .unwrap();
+                    assert!(matches!(op.state, super::super::State::Merge(_)));
+                    let options = CursorOptions {
+                        batch_rows: cap,
+                        ..Default::default()
+                    };
+                    let mut result = Vec::new();
+                    while let Some(batch) = op.next(&ctx, &options, cap).unwrap() {
+                        assert!(batch.table.len <= cap);
+                        result.extend(rows(&batch.table));
+                    }
+                    result.sort();
+                    assert_eq!(result, expected, "kind {k}, batch cap {cap}");
+                    let mut op =
+                        Operator::build(&ctx, node, FallbackPolicy::RejectMaterialization).unwrap();
+                    let counted = op.count_input(&ctx, &options).unwrap();
+                    assert_eq!(counted, Some(expected.len() as u64), "kind {k} count");
+                }
             }
         }
     }
