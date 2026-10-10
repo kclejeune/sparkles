@@ -137,6 +137,50 @@ implementation landed.
   - a model runtime in the binary;
   - always one vector per subject.
 
+## Local embedding models
+
+- **Spec:** [`F12-local-embeddings.md`](F12-local-embeddings.md), written on
+  2026-10-10 independently from:
+  - the Sparkles code and the [F08](F08-embeddings-on-write.md),
+    [C18](C18-natural-language-questions-and-ingest.md) and
+    [C19](C19-layered-settings.md) specs;
+  - Candle's documentation and source (MIT OR Apache-2.0), read for its tensor API, its
+    safetensors loading and its BERT, XLM-RoBERTa, NomicBERT and Qwen3 models;
+  - the sentence-transformers documentation of a saved model (`modules.json`, the
+    `Pooling` and `Normalize` modules, `sentence_bert_config.json` and prompts);
+  - the Hugging Face Hub documentation of the model revision API and `resolve`
+    downloads, the tokenizers crate's documentation and features, and the safetensors
+    format;
+  - the model cards of all-MiniLM-L6-v2, BGE-small-en-v1.5, multilingual-e5,
+    nomic-embed-text-v1.5 and Qwen3-Embedding-0.6B;
+  - the documentation of Git's object hashing and the Linux `setpriority(2)` man page.
+
+  The maintainer's decision of 2026-10-10 to run local models in the server reversed
+  the rejection in F08 §8.
+- **Implementation** (2026-10-10): from the spec, the Sparkles code and the public
+  sources above. The store, the Hub client, the dispatcher, the pooling and the Qwen3
+  and NomicBERT encoders are our own code. The NomicBERT encoder was written from the
+  model's `config.json` and checked against the output of candle-transformers 0.11's
+  `nomic_bert` (MIT OR Apache-2.0), whose structure it follows. The Qwen3 encoder
+  follows the layer structure of the Qwen3 configuration and was checked against the
+  similarity matrix of the model card.
+- **Dependencies:** `sparkles-modelstore` is always built and adds no crate the server
+  did not already have. The opt-in feature `embed-local` adds `sparkles-embed` with
+  `candle-core`, `candle-nn` and `candle-transformers` 0.9.2 (MIT OR Apache-2.0),
+  `tokenizers` 0.23 without default features (Apache-2.0), `safetensors` (Apache-2.0)
+  and `gemm` and `pulp` (MIT), 49 crates in all under MIT, Apache-2.0, Zlib or
+  BSD-2-Clause terms. Candle 0.10 and 0.11 were not used, because they depend on
+  tokenizers 0.22 with Oniguruma, a C library. THIRD_PARTY_LICENSES.md lists the crates
+  of the feature as well, so a build with it ships complete notices.
+- **Rejected** (spec §10):
+  - ONNX Runtime through `ort` or fastembed;
+  - the `hf-hub` crate for downloads;
+  - loading models at startup;
+  - rayon's global pool;
+  - Candle's Qwen3 model;
+  - a process per model;
+  - the runtime in cargo's default features (the flake's packages include it).
+
 ## Path search
 
 - **Spec:** [`F07-path-search.md`](F07-path-search.md), written on 2026-10-02

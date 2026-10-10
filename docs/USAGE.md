@@ -1990,8 +1990,9 @@ runs from both ends at once ([BENCHMARKS.md](BENCHMARKS.md#path-search)).
 A vector index can compute its vectors from the dataset's text through an embeddings
 endpoint that speaks OpenAI's `POST /v1/embeddings` protocol. That covers OpenAI and most
 hosted providers, and also local models served by Ollama, vLLM, LM Studio, llama.cpp's
-server or Text Embeddings Inference. Sparkles has no model runtime of its own, so a local
-model runs behind one of those servers. The design is in
+server or Text Embeddings Inference. A build with the `embed-local` feature can also run
+a model in the server process, as [Local embedding models](#local-embedding-models)
+describes. The design is in
 [F08](specs/F08-embeddings-on-write.md), and the fields and endpoints are in
 [API.md](API.md#embeddings-on-write).
 
@@ -2050,6 +2051,72 @@ sends nothing for text that was already embedded. The local commands use the loc
 outbound policy, which allows private addresses, and take `--embedding-secret` for keys
 named by a secret. The Python package does the same with
 `Dataset.indexes.vector.embed_until_idle()`.
+
+## Local embedding models
+
+A server built with the `embed-local` cargo feature runs sentence-embedding models
+itself, with no Ollama or other service next to it. The flake's packages have the
+feature. A plain `cargo build` leaves it out, so build with it:
+
+```sh
+cargo build --release -p sparkles-server --features embed-local
+```
+
+Without the feature, the server still reads the configuration below and reports each
+local model with `runtime: false`.
+
+The models come from a model store, a directory of pinned snapshots that
+`sparkles models` fills from the Hugging Face Hub. Each snapshot is named by its
+repository and a full commit id, and every file is checked against its hash:
+
+```sh
+sparkles models pull sentence-transformers/all-MiniLM-L6-v2@1110a243fdf4706b3f48f1d95db1a4f5529b4d41 --data ./data
+sparkles models list --data ./data
+sparkles models verify --data ./data
+```
+
+`--data DIR` uses `DIR/models`, the server's default store. `--dir` names any other
+directory, and so does `$SPARKLES_MODELS_DIR`. A branch or tag such as `main` is refused
+unless `--allow-unpinned` is given, and then the commit it points to is recorded. A
+snapshot already in the store is not downloaded again. `--manifest FILE` pulls a list
+of `{"repo", "revision", "files"}` entries, and `files` limits a snapshot to the files
+named. `sparkles models rm REPO@REVISION` deletes a snapshot.
+
+The model configuration then names the model under a provider of the `local` kind, and a
+vector index names that provider instead of a URL:
+
+```sh
+cat > models.json <<'EOF'
+{ "providers": { "embed": { "kind": "local", "models": {
+    "minilm": { "repo": "sentence-transformers/all-MiniLM-L6-v2",
+                "revision": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41" } } } } }
+EOF
+sparkles serve --data ./data --model-config models.json
+curl -X PUT http://localhost:3030/$/vector/ds/docs -H 'Content-Type: application/json' -d '{
+  "predicate": "http://example.org/embedding", "dimension": 384,
+  "embedding": { "provider": "embed", "model": "minilm",
+                 "predicates": ["http://www.w3.org/2000/01/rdf-schema#label"] }
+}'
+```
+
+The server reads the store at `<data>/models` unless `--models-dir` names another one,
+which may be read-only. It makes no download of its own unless it runs with
+`--models-download on`, which fetches a missing pinned snapshot in the background
+through the outbound policy. Both `sparkles models pull` and the server read a Hub
+mirror's address from `$SPARKLES_HUB_ENDPOINT` and a token for gated repositories
+from `$HF_TOKEN`, and `pull` also takes `--hub-token-file`. The weights load at the first text and are dropped after
+ten idle minutes (`idleUnloadSecs`). Each model runs on its own pool of two threads by
+default (`threads`), at a lower priority than queries, so embedding a large backlog
+slows searches little. `GET /$/models` and the index's card show whether a model is
+absent, present, loaded or unloaded, and how much memory its weights take.
+
+The architectures are BERT (all-MiniLM, BGE), XLM-RoBERTa (multilingual-e5), NomicBERT
+(nomic-embed-text) and Qwen3 (Qwen3-Embedding), with safetensors weights.
+`"dtype": "bf16"` halves the memory of NomicBERT and Qwen3 models. A provider of the
+`openai` or `ollama` kind works the same way in an index's `embedding`, with the
+provider's endpoint and key, so an index need not repeat them. The fields are in
+[API.md](API.md#model-providers) and the design is in
+[F12](specs/F12-local-embeddings.md).
 
 ## Checking a database
 
@@ -4891,6 +4958,52 @@ reload that does not validate is logged while the server keeps the previous
 configuration. Remove corresponding
 `--model-config` and `--model-secret` arguments from `extraArgs` when migrating to
 these options.
+
+### Local embedding models on NixOS
+
+The flake builds a model store in the Nix store from snapshot manifests, the
+`sparkles-manifest.json` files that `sparkles models pull` writes. Each file of each
+snapshot is a fixed-output download of the Hub's URL, checked against the SHA-256 in
+the manifest, so the build needs no other hash and the store is read-only.
+`services.sparkles.models.dir` passes it to the server as `--models-dir`:
+
+```nix
+{ inputs, pkgs, ... }:
+let
+  models = inputs.sparkles.legacyPackages.${pkgs.stdenv.hostPlatform.system}.modelSnapshots {
+    # pulled once with `sparkles models pull … --dir ./models` and copied into the
+    # configuration's repository
+    manifests = [ ./models/minilm.sparkles-manifest.json ];
+  };
+in
+{
+  services.sparkles = {
+    models.dir = models;
+    models.settings.providers.embed = {
+      kind = "local";
+      models.minilm = {
+        repo = "sentence-transformers/all-MiniLM-L6-v2";
+        revision = "1110a243fdf4706b3f48f1d95db1a4f5529b4d41";
+      };
+    };
+  };
+}
+```
+
+A manifest may also be written in Nix as an attribute set with `repo`, `revision` and
+`files`, each file with `path`, `size` and `sha256`. The helper takes `endpoint` for a
+Hub mirror. It cannot fetch gated or private repositories, which need a mirror or a
+store filled with `sparkles models pull` and a token.
+
+`services.sparkles.models.download = "on"` lets the server download missing snapshots
+itself. A `models.dir` outside the Nix store and the data directory is then added to
+the service's writable paths, and with downloads off to its read-only paths. With
+`models.dir` unset, the store is `models/` in the data directory.
+
+The flake's `sparkles` package has the `embed-local` feature. Its `features` argument
+lists the cargo features on top of the defaults, and
+`sparkles.override { features = [ ]; }` builds the package without the runtime, about
+5 MB smaller. A local provider of such a build reports `runtime: false`.
 
 ### Declarative dataset settings
 

@@ -4799,8 +4799,9 @@ PUT /$/vector/ds/docs
 
 | Field | Default | Meaning |
 |---|---|---|
-| `url` | required | The endpoint, an `http` or `https` URL without credentials. |
-| `model` | required | The `model` of each request. |
+| `url` | required without `provider` | The endpoint, an `http` or `https` URL without credentials. |
+| `provider` | none | A provider of the [model configuration](#model-providers) instead of `url` and `apiKey`. See below. |
+| `model` | required | The `model` of each request, or the model of the provider. |
 | `apiKey` | none | `{"secret": NAME}`, a secret the server defines with `--embedding-secret`. The local CLI and the libraries also accept `{"env": VAR}` and `{"file": PATH}`. Without it, requests carry no `Authorization` header. |
 | `sendDimensions` | `false` | Sends the index's dimension as `dimensions`, for models that shorten their output on request. |
 | `predicates` | — | The predicates whose `xsd:string` and language-tagged literals are embedded. One of `predicates` and `query` is required. |
@@ -4820,6 +4821,27 @@ PUT /$/vector/ds/docs
 
 The index's predicate cannot also be a source predicate. Changing the `embedding` object
 keeps the index's build.
+
+**Providers and local models.** With `provider`, the index uses a provider of the
+server's model configuration, and `url` and `apiKey` are absent. A provider of the
+`local` kind computes the vectors in the server process (see
+[Model providers](#model-providers)). Stored texts are embedded as documents and
+search texts as queries, each with the model's prompt. An `openai` provider is called at
+`{endpoint}/embeddings` and an `ollama` provider at `{endpoint}/v1/embeddings`, with the
+provider's key. The `anthropic` kind has no embeddings and is refused when the worker
+resolves it. The provider is looked up at each batch, so a change of the model
+configuration applies without editing the index. A new provider or model name embeds
+everything again, and a change behind the same names does not, so run `reembed` after
+pointing a local model at another snapshot. The design is in
+[F12 Local embedding models](specs/F12-local-embeddings.md).
+
+```json
+"embedding": { "provider": "embed", "model": "minilm",
+               "predicates": ["http://www.w3.org/2000/01/rdf-schema#label"] }
+```
+
+For an index with a local provider, `GET /$/vector/{ds}/{name}` adds the model's entry
+of `GET /$/models` as `embedding.local`, with its `state`.
 
 **Chunking.** Without `chunking`, a text longer than `maxInputChars` is cut, and the rest
 is not embedded. With it, a text longer than `size` is split into chunks of at most
@@ -9132,6 +9154,41 @@ defaults of its models. The `models` member sets `contextTokens`, `maxOutputToke
 with credentials, a query or a fragment. Requests go through the server's outbound
 policy, so a provider on a private address needs `--outbound-allow-private`.
 
+**Local embedding models.** A provider of the `local` kind runs embedding models in the
+server process, in builds with the `embed-local` cargo feature. It has no endpoint or
+key, no role may name it, and vector indexes use it through their `embedding.provider`
+([Embeddings on write](#embeddings-on-write)). Each model names a snapshot of the
+model store by `repo` and a 40-character commit `revision`, or a directory by an
+absolute `path`. The store is `serve --models-dir` (`<data>/models` by default), filled
+by `sparkles models pull` or a Nix build. With `--models-download on` the server
+downloads a missing pinned snapshot itself.
+
+```json
+"embed": {
+  "kind": "local",
+  "threads": 2,
+  "models": {
+    "minilm": { "repo": "sentence-transformers/all-MiniLM-L6-v2",
+                "revision": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41" }
+  }
+}
+```
+
+| Member | Default | Meaning |
+|---|---|---|
+| `repo`, `revision` | — | A snapshot of the model store. |
+| `path` | — | A directory with the model's files, instead of `repo` and `revision`. |
+| `dtype` | `f32` | `f32`, or `bf16` for NomicBERT and Qwen3 models, which halves their memory. |
+| `threads` | 2 | Threads of the model's own pool, which runs at a lower priority than queries. |
+| `idleUnloadSecs` | 600 | The weights are dropped after this long without work and loaded again at the next text. 0 keeps them. |
+| `dimensions` | the model's | Truncate the vectors, for Matryoshka models. |
+| `maxTokens` | the model's | The token limit per text. |
+| `queryPrefix`, `documentPrefix` | the snapshot's prompts | Text put before search texts and before stored texts. |
+
+The provider's members are the defaults of its models. The supported architectures are
+BERT, XLM-RoBERTa, NomicBERT and Qwen3, from safetensors weights in the layout of
+sentence-transformers.
+
 **Structured output.** Every model step asks for JSON that matches a schema. With
 `structuredOutput` set to `auto`, the server detects what each pair supports the first
 time it is called. It tries the provider's JSON Schema mode first (`format` for Ollama,
@@ -9146,7 +9203,11 @@ is `secret-missing` when its secret cannot be read, and its `apiKey` names the s
 with its `source`, which is `declared`, `runtime` or `missing`. Each model shows its configured and detected
 structured-output level and the outcome of its last call. When neither `--model-config`
 nor the runtime layer configures models, the answer is
-`{"configured": false, "providers": [], "roles": {}}`.
+`{"configured": false, "providers": [], "roles": {}}`. `modelsDir` names the model
+store, and `local` lists the models of local providers with their `provider`, `model`,
+source, `dtype`, `threads`, `runtime` (whether the build has the feature) and `state`:
+`absent`, `downloading`, `present`, `loading`, `loaded` (with `weightBytes`) or
+`unloaded`. A failed download adds `downloadError` and a failed load `lastError`.
 
 **`POST /$/models/{name}/test`** (server admin) sends a short prompt to one model of
 the provider. The optional body is `{"model": ..., "timeoutSeconds": ...}`, and the
