@@ -541,6 +541,7 @@ pub(crate) fn err_code(status: StatusCode, code: &str, msg: impl Into<String>) -
 }
 
 /// An error with a JSON body of the caller's making (it must hold `error`).
+#[cfg(feature = "mcp")]
 pub(crate) fn err_body(status: StatusCode, body: J) -> ApiError {
     ApiError(status, body)
 }

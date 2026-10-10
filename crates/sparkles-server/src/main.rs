@@ -36,6 +36,8 @@ mod http;
 mod lsp;
 #[cfg(feature = "mcp")]
 mod mcp;
+// the pipeline that uses most of the model clients (`ask`) needs the `mcp` feature
+#[cfg_attr(not(feature = "mcp"), allow(dead_code, unused_imports))]
 mod models;
 mod obs;
 mod openapi;
