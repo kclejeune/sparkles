@@ -950,3 +950,88 @@ commits with and without direct writes, including an 80 KiB commit that takes th
 buffered path. It restores a crash image of the log with its zero tail and checks that
 the head, the counts and the data survive a reopen. Another test checks that the handle
 follows compaction to the new log.
+
+**Framed update vocabulary.** The update vocabulary `delta.vocab` holds the terms that
+SPARQL Update adds after a load. Before this change a commit that added terms appended
+them to the file and called `fdatasync`. The append changed the file's size, so the sync
+waited for an ext4 journal commit, and that wait was most of the cost of a literal
+insert. The file now has a format that lets those writes overwrite preallocated space,
+as the WAL's direct writes do.
+
+A framed file starts with a 16-byte header. Its first 8 bytes are the magic
+`89 53 44 56 0d 0a 1a 0a`, followed by the format version 2 as a little-endian `u32` and
+four zero bytes. Chunks follow. Each commit that adds terms writes them as one chunk,
+which is a 24-byte header and a payload:
+
+| bytes | field |
+|---|---|
+| 0..4 | CRC-32 (IEEE, `flate2::Crc`) of header bytes 4..24 followed by the payload |
+| 4..8 | number of entries, at least 1 |
+| 8..12 | payload length in bytes |
+| 12..16 | zero |
+| 16..24 | the number of entries in the file before this chunk |
+
+The payload is the entries, each a little-endian `u32` key length of at least 1 followed
+by the key. The keys are the same encoded terms as before. An entry's id within the file
+is its position, so the ids of a chunk continue those of the chunk before it. A branch
+generation's own file counts from zero, and its link still names the dataset's prefix as
+a number of entries, so links did not change. A reader takes chunks from the start and
+stops at the first one whose header is zero, whose payload runs past the file, whose
+first id does not continue the entries before it, or whose checksum fails. A chunk that
+passes the checksum but whose entries do not fill its payload exactly is corruption, and
+a header with a later version is refused as unsupported. `sparkles_core::vocab::parse_delta`
+implements this reader, and other code that reads the file, such as a side column built
+from update terms, should use it rather than parse entries itself.
+
+The writer grows the file by zero bytes, in steps that start at 64 KiB and double up to
+1 MiB, and never by more than the WAL preallocation setting allows. The sync that grows
+the file makes the zeros durable together with the chunk that triggered it. A chunk that
+then fits inside the zeros, while every byte before it is durable, is written through a
+second handle opened with `O_DIRECT` and `O_DSYNC`. The write covers whole 4 KiB blocks,
+with the last partial block kept in memory, and changes no file metadata. The commit
+path runs it on the vocabulary worker at the same time as the direct write of the WAL
+records, and acknowledges the commit only when both have returned. A chunk that does
+not fit, a chunk written while earlier bytes are still only in the page cache, and every
+chunk when direct writes are off or the file system rejects them, take a buffered write
+and `fdatasync`. Readers, backups, branch links and the quota see the file's logical
+end, which is the end of its last chunk. Backups capture that length under the writer
+lock, and the quota does not count the preallocated zeros. A clean close, a compaction
+and a rebuild trim the zeros from the generation they leave.
+
+The durability argument has three parts.
+
+* A direct chunk is written only when every chunk before it is durable, and a buffered
+  chunk becomes durable together with everything before it. A durable chunk therefore
+  never follows one that did not reach the disk, and the reader's stop at the first bad
+  chunk loses only chunks whose commits were never acknowledged.
+* A crash can leave a commit's WAL records without its chunk, or the chunk without the
+  records. Replay already treated a last commit that names ids beyond the file as a torn
+  tail, and that rule now covers a chunk that is missing, cut short or torn. Terms
+  without a commit are unused entries, as for aborted transactions.
+* A rollback past a chunk that was already written zeroes it and syncs the zeros before
+  the position is used again, so a later crash cannot leave the old chunk where a new one
+  belongs. Opening a store for writing changes nothing until the WAL has replayed. It
+  then cuts the file at its logical end and syncs it, and it syncs the WAL too, because a
+  process that died may have left bytes in the page cache that a later direct write must
+  not overtake.
+
+A database written by an earlier release has a legacy file, the entries alone with no
+header. It opens unchanged and is read as before. The first commit that adds a term
+first sets `minimumReader` in `dataset.json` to 4, and in the dataset's root as well for
+a branch, and then rewrites the file framed through a temporary file, a rename and a
+directory sync. A release that reads only up to reader 3 then refuses the database with
+"requires reader 4" instead of misreading it. The way back to such a release is
+`sparkles dump` and a load. `sparkles check` names the format, the chunk count and the
+preallocated bytes in the `delta-vocabulary` summary.
+
+**Tests.** Unit tests in `vocab/delta.rs` cover syncs only when terms were added, chunks
+after the header with a zero tail, a legacy file read and rewritten at the first write,
+a rollback past a written chunk, and a branch's own file after its linked prefix.
+`tests/commits.rs` damages the last commit's chunk by losing it, cutting it at several
+points, zeroing its last bytes and removing the file header, and checks that each opens
+to the previous commit. It also covers a vocabulary ahead of the WAL, corruption before
+the last commit, which refuses to open and leaves both files as they were, and a crash
+image of both files with their zero tails after a commit of 3,000 new terms written
+through the direct path. Another test opens a legacy file with a torn entry and reader 1,
+checks that reads leave the reader at 1, that the first new term raises it to 4 and
+rewrites the file framed, and that a dataset asking for reader 5 is refused.
