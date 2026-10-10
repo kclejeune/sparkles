@@ -23,7 +23,30 @@ const MEM: &str = r#"@prefix ex:     <http://example.org/> .
   <urn:uuid:r1> rdf:reifies <<( ex:ana org:memberOf ex:platform )>> ;
       prov:wasGeneratedBy <urn:uuid:a0> ;
       prov:generatedAtTime "2026-10-01T10:02:11Z"^^xsd:dateTime .
+  <urn:uuid:a0> a prov:Activity .
 }
+"#;
+
+/// The memory shapes of C17 §3.5 and the unit shape of §14.
+#[cfg(feature = "shacl")]
+const GUARD_SHAPES: &str = r#"@prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix sh:   <http://www.w3.org/ns/shacl#> .
+@prefix prov: <http://www.w3.org/ns/prov#> .
+@prefix spk:  <urn:x-sparkles:> .
+@prefix xsd:  <http://www.w3.org/2001/XMLSchema#> .
+@prefix org:  <http://www.w3.org/ns/org#> .
+@prefix ex:   <http://example.org/> .
+spk:MemoryReifierShape a sh:NodeShape ;
+  sh:targetSubjectsOf prov:wasGeneratedBy ;
+  sh:property [ sh:path rdf:reifies ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path prov:wasGeneratedBy ; sh:minCount 1 ; sh:maxCount 1 ;
+                sh:class prov:Activity ] ;
+  sh:property [ sh:path spk:confidence ; sh:maxCount 1 ; sh:datatype xsd:decimal ;
+                sh:minInclusive 0 ; sh:maxInclusive 1 ] ;
+  sh:property [ sh:path prov:invalidatedAtTime ; sh:maxCount 1 ;
+                sh:datatype xsd:dateTime ] .
+ex:Unit a sh:NodeShape ; sh:targetClass org:OrganizationalUnit ;
+  sh:property [ sh:path org:unitOf ; sh:minCount 1 ; sh:maxCount 1 ] .
 "#;
 
 const NOTES_1008: &str = "https://example.org/notes/2026-10-08";
@@ -450,14 +473,20 @@ async fn retractions_keep_the_record() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a10_the_guard_validates_the_write() {
     let s = mem_server(&["--mcp-allow-update"]);
-    let shapes = "@prefix sh: <http://www.w3.org/ns/shacl#> .\n@prefix org: <http://www.w3.org/ns/org#> .\n@prefix ex: <http://example.org/> .\nex:Unit a sh:NodeShape ; sh:targetClass org:OrganizationalUnit ; sh:property [ sh:path org:unitOf ; sh:minCount 1 ; sh:maxCount 1 ] .\n";
-    let cfg = json!({"mode": "reject", "dataGraph": "union", "shapes": {"inline": shapes}});
+    let cfg = json!({"mode": "reject", "dataGraph": "union", "shapes": {"inline": GUARD_SHAPES}});
     let put = Request::put("/$/validation/mem")
         .header("content-type", "application/json")
         .body(Body::from(cfg.to_string()))
         .unwrap();
     let r = send(&s.app, put).await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    // what assert_facts writes, with a supersession, conforms to the memory shapes
+    let r = tool(&s.app, "assert_facts", standup(false), &[]).await;
+    assert_eq!(r["isError"], false, "{r}");
+    assert_eq!(
+        r["structuredContent"]["validation"]["status"], "passed",
+        "{r}"
+    );
     let before = head(&s);
     let args = |dry: bool| {
         json!({"graph": NOTES_1008,

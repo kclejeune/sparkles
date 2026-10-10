@@ -2149,6 +2149,18 @@ The tools are read-only unless the operator turns on the write tool:
   conditional. It happens only while that commit is still the head, so an agent that
   read commit 42 does not overwrite a change it has not seen. Hosts that confirm
   destructive tools ask before each call.
+* `assert_facts` is how an agent remembers. It writes facts into one named graph per
+  source or session, each with a reifier that records the source, the time, the caller
+  and, when given, a confidence and a supporting quote. New entities get minted IRIs.
+  The call refuses unknown predicates and classes, IRIs that occur nowhere and likely
+  duplicates of existing entities, and reports every problem at once. `mode: "replace"`
+  supersedes an old value and keeps the record of it, and `retract` removes a fact the
+  same way. An `idempotencyKey` makes a retried call write nothing. It is offered with
+  `sparql_update`.
+* `list_branches`, `create_branch`, `merge_branch` and `delete_branch` let an agent try
+  writes on a scratch branch and keep `main` unchanged. Every tool that reads or writes
+  a dataset takes `branch`. `merge_branch` previews by default and refuses merges with
+  conflicts. The write tools among them are offered with `sparql_update`.
 
 Hosts can also attach resources as context: the schema summary
 (`sparkles://{ds}/schema`) and the prefixes (`sparkles://{ds}/prefixes`) of each
@@ -2157,7 +2169,9 @@ The prompts `explore_dataset` and `answer_question` start a session with the too
 workflow and the dataset's prefixes. `answer_question` points the agent to `recall`,
 `similar_queries` and `check_query` before it writes a query of its own.
 `run_stored_query` runs a stored query with its parameters explained, and
-`explain_term` explains a class, predicate or resource. Hosts
+`explain_term` explains a class, predicate or resource. `agent_memory` sets out the
+loop of an agent that answers from the dataset and remembers what it learns with
+`link_entities` and `assert_facts`. Hosts
 that offer completion suggest dataset names, stored queries and their parameters, named
 graphs and prefixes for these arguments, from what the caller may see.
 
@@ -2196,12 +2210,12 @@ transport, next to the SPARQL endpoints:
 
 ```sh
 sparkles serve --data ./data --mcp                       # read-only tools
-sparkles serve --data ./data --mcp --mcp-allow-update    # plus sparql_update
+sparkles serve --data ./data --mcp --mcp-allow-update    # plus the write tools
 sparkles serve --data ./data --mcp --mcp-dataset 'wiki*' # only these datasets
 ```
 
 Each call runs as the HTTP request's caller. With `--auth-config`, an agent sees only
-the datasets its credentials may read, and `sparql_update` appears only when they may
+the datasets its credentials may read, and the write tools appear only when they may
 write to one of them. Give the agent its own API token, scoped to what it needs:
 
 ```sh
@@ -2240,6 +2254,25 @@ claude mcp add sparkles -- sparkles mcp --url https://sparql.example.org
 
 This is also the way to give a stdio host a database that a running server holds, since
 `sparkles mcp --loc` cannot open it while the server has its lock.
+
+An agent that keeps memory in a dataset needs `write` only on its own graphs. A grant
+limited to graphs such as `https://example.org/memory/*` lets it write facts there with
+`assert_facts`, while everything else stays read-only to it. Such an agent may still
+create scratch branches with `create_branch`, write its graphs on them, and merge or
+delete the scratch branches it created, but never a change to a graph it may not write.
+Leave the `merge` endpoint out of its grant to keep it from merging at all.
+`--mcp-scratch-branch-ttl 24h` deletes scratch branches that have been idle for a day:
+
+```toml
+[[tokens]]
+name = "agent-7"
+hash = "sha256:…"                 # sparkles auth gen-token --name agent-7
+datasets = { org = "read" }
+[[tokens.grants]]
+dataset = "org"
+level = "write"
+graphs = ["https://example.org/memory/agents/agent-7/*"]
+```
 
 MCP calls follow the server's rules. The rate limits of the `query` and `update` classes
 apply per dataset, as for `/{ds}/sparql` and `/{ds}/update`, and the memory budget is the

@@ -1,15 +1,18 @@
 # C17: Agent memory over MCP
 
-> **Status:** implemented in part (Phase 1a)
+> **Status:** implemented in part (Phases 1a, 1b and 1c)
 >
 > **Phases:** Phase 1a shipped on 2026-10-09. It adds four read tools to the MCP server,
 > `check_query`, `similar_queries`, `link_entities` and `recall`, and the `questions`
-> field of stored queries. Phase 1b adds the `assert_facts` write tool with its data
-> model of graphs, reifiers and supersession. Phase 1c adds a `branch` argument to the
-> MCP tools and tools that create, merge and delete branches. Phase 2, model calls
-> inside the server, is described in §10 and deferred.
+> field of stored queries. Phases 1b and 1c shipped on 2026-10-09 as well. Phase 1b adds
+> the `assert_facts` write tool with its data model of graphs, reifiers and supersession,
+> and the `agent_memory` prompt. Phase 1c adds a `branch` argument to the MCP tools,
+> tools that list, create, merge and delete branches, scratch branches for graph-limited
+> grants and their optional expiry. Phase 2, model calls inside the server, is described
+> in §10 and deferred.
 >
 > **User docs:** [API: MCP tools](../API.md#tools) ·
+> [API: Memory writes](../API.md#memory-writes) ·
 > [API: Stored queries](../API.md#stored-queries) ·
 > [Usage: MCP server](../USAGE.md#mcp-server-llm-agents) ·
 > [Features](../FEATURES.md)
@@ -1095,7 +1098,8 @@ commit 41.
 
 ## Outcome
 
-**Phase 1a delivered on 2026-10-09.** Phases 1b, 1c and 2 are not built.
+**Phase 1a delivered on 2026-10-09.** Phases 1b and 1c followed the same day, and are
+recorded after Phase 1a below. Phase 2 is not built.
 
 - The server's `mcp::memory` module holds the four tools, one file each, and a small
   text module with word splitting, a light plural stemmer, an in-memory BM25 index and
@@ -1192,3 +1196,110 @@ the MCP request, which keeps one code path as §6 requires.
 - The `mcp::memory::text` unit tests cover words, stems, the BM25 ranking, plain and
   phrase queries and the edit distance. `a03_tool_list` checks the four input schemas.
 - The server's tests, the OpenAPI check and Clippy over all targets pass.
+
+**Phases 1b and 1c delivered on 2026-10-09.**
+
+- `assert_facts` lives in `mcp::memory::assert`. It parses and checks the call, plans
+  the supersessions and retractions, and builds one SPARQL Update of `DELETE DATA` and
+  `INSERT DATA` with full IRIs. The update runs through `sparql::update::update_as`
+  with the write options that `sparql_update` uses, the caller's graph view of the
+  `update` endpoint, a deadline and cancellation, the commit message and the caller as
+  author. The engine therefore refuses a change to a graph the caller may not write,
+  the guard validates the state after the write, the quota applies and the change feed
+  records the commit. The idempotency check and `ifHead` run together in one
+  `Precondition` under the writer lock. The checks read the head through a `Reader`
+  built from the same view, without the union default graph and without inferences.
+  Every internal query has a `LIMIT` or a `VALUES` block of known size. Nothing is read
+  in full, and the update text is bounded by the caps of §7.
+- The branch tools live in `mcp::branches`, with the `branch` argument. A call with
+  `branch` runs as the caller on that branch, which is the principal's `on_branch`, so
+  every grant check and view of the other tools applies unchanged. Pinned snapshots are
+  keyed by dataset and branch. `merge_branch` reuses the merge API and the merge
+  metrics of the HTTP routes.
+- The store's branch table records `scratch: {creator}` on a branch, and
+  `Store::set_branch_scratch` sets it. The field is optional in the table's JSON, so
+  older tables read unchanged. `BranchInfo` carries it, and `GET /$/branches/{ds}`
+  lists it as `scratch`. The store's write path is unchanged.
+- `--mcp-scratch-branch-ttl` starts a background task in `serve` that deletes idle
+  scratch branches and counts them in `sparkles_mcp_scratch_branches_expired_total`.
+- The `agent_memory` prompt sets out the loop of §2, and the server's instructions
+  gain the writing sentence of §5.8 when `assert_facts` is offered.
+- The write tools are listed and rate-limited like `sparql_update`. `list_branches` is
+  a read tool and is always listed.
+
+**Deviations and additions in Phases 1b and 1c.**
+
+- A guard that rejects the write fails with `validation-failed`, the code that
+  `sparql_update` uses, instead of `validation`. As for `sparql_update`, a caller whose
+  grants are limited to some graphs or triples gets the guard's outcome without its
+  results.
+- A failed check is a tool error with status 422. Its code is the failures' common code,
+  or `invalid-facts` when they differ. Each entry of `errors` and `warnings` also has
+  `at`, the argument it concerns, such as `facts[1].p`. The checks add `invalid-term`,
+  `invalid-key`, `undeclared-entity`, `unused-entity`, `unknown-reifier`, `not-asserted`
+  and the warning `similar-entities`.
+- A new entity is a `possible-duplicate` when `link_entities` answers `exact` or
+  `ambiguous` for one of its labels and a candidate of a matching type matches the label
+  exactly, after case folding, or by all its words under `ambiguous`. The case-folded
+  match needs the full-text index, as in Phase 1a, so A8 runs with the `text` feature.
+- A new entity's types, label and alternative labels are written with reifiers like the
+  facts, and a source's `title` becomes its `rdfs:label` in the graph. The reifiers and
+  the software agent also have deterministic IRIs when the call has an idempotency key.
+  Version 5 UUIDs use `main`'s dataset id, so a call on a branch mints the IRIs the same
+  call would mint on `main`.
+- The principal of the activity is `urn:x-sparkles:principal:<author>`, where the author
+  is the name the commit log records, such as `user:bob` or `token:agent-7`. Over stdio
+  it is the operating-system user.
+- An object is read as a literal when it starts with a quote, a digit, a sign or a dot,
+  or is `true` or `false`, and as an IRI otherwise.
+- Old values with a blank node cannot be named in an update, so `replace` leaves them
+  and lists them in `conflicts` with `reason: "blank-node"`, and retracting one is
+  refused. `replace` also ignores the materialized inferences.
+- The checks look up at most 2000 terms with `ASK` beyond what the schema report
+  settles, and give suggestions for the first 20 unknown IRIs.
+- `delete_branch` takes `force`, because a branch with commits its upstream lacks needs
+  it, as over HTTP. A graph-limited caller's merge preview leaves out the merge's
+  per-graph counts and the conflict report.
+- A stored query's tool takes `branch` too, unless the query has a parameter of that
+  name.
+- The TTL is a `serve` flag. The matching dataset setting is not built, and `sparkles
+  mcp` over stdio has no expiry.
+- `create_branch` creates the branch and then marks it. When the mark fails, the branch
+  is deleted. A crash between the two leaves an ordinary branch, which the F09 rules
+  govern and the expiry never deletes.
+- A10 says a dry run leaves the guard's counters unchanged. The dry run of C15 does not
+  record a validation, but no test reads the counters.
+
+**What C18 can build on.** `assert_facts` takes its arguments as one JSON object
+(`AssertArgs`) and returns JSON, so `span` is one more optional field of a fact, and
+`POST /{ds}/facts` can call the same method once the argument parsing moves out of the
+MCP request, as the Phase 1a note says for the read tools. Re-ingestion can supersede a
+source's facts with `mode: "replace"` and `replaceScope: "graph"`, or retract them by
+reifier. The review status of C18 §8.8 and `conversationFacts` are not built, so session
+facts are written as plain facts. Proposals on branches can use `create_branch` and the
+scratch rules, and a grant without the `merge` endpoint keeps an agent from merging, as
+`router_tests::mcp::memory_writes::auth::c18_agent_grants` shows. Branch names allow
+only letters, digits, `.`, `_` and `-`, so the `proposals/agent-7/*` pattern of C18
+§8.6 cannot match a branch, and a name such as `proposals-agent-7-1` with the pattern
+`proposals-agent-7-*` works instead. The template's endpoint name `gsp` is not an
+endpoint, and the Graph Store endpoints are `gsp-r` and `gsp-rw`.
+
+**Tests at landing for Phases 1b and 1c.**
+
+- `router_tests::mcp::memory_writes` runs A6 to A8 (A8 with the `text` feature), A9,
+  A10 (with the `shacl` feature, where the memory shapes of §3.5 and the unit shape form
+  the guard and a write with a supersession passes it), A16 and A19 through `/$/mcp`.
+  It covers the checks and argument limits, retractions by reifier and by fact, a fact
+  asserted twice, a stale `ifHead`, the `branch` argument on reads and writes, merges
+  with and without the previewed heads, the instructions and the `agent_memory` prompt.
+- `router_tests::mcp::memory_writes::auth` runs A14 and the access rules of §6 as an
+  unrestricted principal, `agent-7` with write on the notes graphs, a reader, and a
+  principal with the grants of C18 §8.6. A write to a graph the caller may only read,
+  a retraction there, and merging, deleting or writing another's scratch branch are
+  `forbidden`. A replace whose old value is in such a graph reports a conflict and
+  leaves the value. The HTTP branch routes still refuse a graph-limited principal.
+- `store::branch_tests::scratch_marks_persist` checks the scratch mark across a reopen.
+  `a03_tool_list` checks the `branch` property of every dataset tool and the schema of
+  `list_branches`.
+- The server's tests, the OpenAPI check, the feature lint and Clippy over all targets
+  pass.
