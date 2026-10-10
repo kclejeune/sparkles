@@ -32,7 +32,7 @@ use crate::index::{
     BLOCK_ROWS, BlockMeta, Key, META_BYTES, Perm, decode_column, read_varint_checked,
 };
 use crate::store::{WAL_COMMIT, WAL_DELETE, WAL_INSERT, WAL_REC};
-use crate::vocab::{FC_BLOCK, delta_entries};
+use crate::vocab::{FC_BLOCK, parse_delta};
 use rayon::prelude::*;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -1026,11 +1026,21 @@ impl Checker<'_> {
                 return;
             }
         };
-        let (keys, pos) = delta_entries(&buf);
-        if pos != buf.len() {
+        let parsed = match parse_delta(&buf) {
+            Ok(p) => p,
+            Err(e) => {
+                run.add(Issue::error(e.to_string()).file(&file));
+                self.checks.push(run.done("unreadable"));
+                return;
+            }
+        };
+        let (keys, pos) = (parsed.keys, parsed.end);
+        // zero bytes after the last chunk are space preallocated for the next ones
+        let preallocated = buf[pos..].iter().all(|&b| b == 0);
+        if pos != buf.len() && !preallocated {
             run.add(
                 Issue::warning(format!(
-                    "{} bytes of a torn entry at the end: truncated on open",
+                    "{} bytes of a torn entry at the end: dropped on open",
                     buf.len() - pos
                 ))
                 .file(&file)
@@ -1052,8 +1062,18 @@ impl Checker<'_> {
             }
         }
         self.dvocab_len = Some(keys.len() as u64);
-        self.checks
-            .push(run.done(format!("{} terms added by updates", keys.len())));
+        let mut summary = format!(
+            "{} terms added by updates; {} format",
+            keys.len(),
+            parsed.format.as_str()
+        );
+        if parsed.chunks > 0 {
+            summary.push_str(&format!(", {} chunks", parsed.chunks));
+        }
+        if pos != buf.len() && preallocated {
+            summary.push_str(&format!("; {} bytes preallocated", buf.len() - pos));
+        }
+        self.checks.push(run.done(summary));
     }
 
     // ------------------------------------------------------------ permutations ------
@@ -1171,7 +1191,7 @@ impl Checker<'_> {
         // delta.vocab lacks (a torn tail). Counted again now, it covers every commit
         // before them.
         let dvocab_len = match std::fs::read(dir.join("delta.vocab")) {
-            Ok(b) => Some(delta_entries(&b).0.len() as u64),
+            Ok(b) => parse_delta(&b).ok().map(|p| p.keys.len() as u64),
             Err(_) => self.dvocab_len,
         };
         // the commit the base holds; a generation without commit.json starts a baseline
@@ -1888,7 +1908,8 @@ impl Checker<'_> {
                         )).file(file));
                     }
                     let terms = std::fs::read(sdir.join("delta.vocab"))
-                        .map(|b| crate::vocab::delta_entries(&b).0.len() as u64)
+                        .ok()
+                        .and_then(|b| Some(parse_delta(&b).ok()?.keys.len() as u64))
                         .unwrap_or(0);
                     if !seg.0.contains("branches/") && terms < seg.2 {
                         run.add(Issue::error(format!(

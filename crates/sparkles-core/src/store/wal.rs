@@ -103,7 +103,7 @@ const DIRECT_MAX: usize = 64 << 10;
 
 /// The write-through path of a log (Linux only): a second handle on the same file, opened
 /// with `O_DIRECT | O_DSYNC`, that writes a small commit into space the log has already
-/// allocated.
+/// allocated. The delta vocabulary writes its chunks through one too.
 ///
 /// A write with `O_DSYNC` returns once its data, and any metadata needed to read it back,
 /// are durable, the same promise as a write followed by `fdatasync`. On ext4 and XFS a
@@ -131,10 +131,10 @@ pub(crate) struct DirectLog {
 }
 
 impl DirectLog {
-    /// Open the write-through handle of `dir/wal.log`, which `log` has open: `None` where
-    /// direct I/O is not available (another OS, a file system without `O_DIRECT`) or the
-    /// path is not the same file.
-    pub fn open(dir: &Path, log: &File) -> Option<DirectLog> {
+    /// Open the write-through handle of the file at `path`, which `log` has open: `None`
+    /// where direct I/O is not available (another OS, a file system without `O_DIRECT`) or
+    /// the path is not the same file.
+    pub fn open(path: &Path, log: &File) -> Option<DirectLog> {
         #[cfg(target_os = "linux")]
         {
             use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -142,7 +142,7 @@ impl DirectLog {
                 .read(true)
                 .write(true)
                 .custom_flags(libc::O_DIRECT | libc::O_DSYNC)
-                .open(dir.join("wal.log"))
+                .open(path)
                 .ok()?;
             let (a, b) = (file.metadata().ok()?, log.metadata().ok()?);
             if (a.dev(), a.ino()) != (b.dev(), b.ino()) {
@@ -160,7 +160,7 @@ impl DirectLog {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = (dir, log);
+            let _ = (path, log);
             None
         }
     }
@@ -172,6 +172,13 @@ impl DirectLog {
         let start = at - at % BLOCK;
         let end = (at + len as u64).next_multiple_of(BLOCK);
         end <= alloc && end - start <= DIRECT_MAX as u64
+    }
+
+    /// Forget the copy of the last block: the file was written another way, and its
+    /// bytes may differ even where a later write starts at the same offset (a delta
+    /// vocabulary cut back by a rollback).
+    pub fn invalidate(&mut self) {
+        self.end = u64::MAX;
     }
 
     /// Write `data` at the log's logical end `at`, durably, through the direct handle.
@@ -234,11 +241,11 @@ pub(crate) enum Direct {
 }
 
 impl Direct {
-    /// The handle for a commit to the log `log` in the generation directory `dir`,
+    /// The handle for a write to `log`, the file at `path` (`None`: no direct writes),
     /// opening it if this is the first try.
-    pub fn handle(&mut self, dir: Option<&Path>, log: &File) -> Option<&mut DirectLog> {
+    pub fn handle(&mut self, path: Option<&Path>, log: &File) -> Option<&mut DirectLog> {
         if matches!(self, Direct::Untried) {
-            *self = match dir.and_then(|d| DirectLog::open(d, log)) {
+            *self = match path.and_then(|p| DirectLog::open(p, log)) {
                 Some(d) => Direct::Open(Box::new(d)),
                 None => Direct::Off,
             };
@@ -706,7 +713,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wal.log");
         let log = open_for_append(&path).unwrap();
-        let Some(mut direct) = DirectLog::open(dir.path(), &log) else {
+        let Some(mut direct) = DirectLog::open(&path, &log) else {
             // no direct I/O on this file system (or OS): commits take the buffered path
             return;
         };

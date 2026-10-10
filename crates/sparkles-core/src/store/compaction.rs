@@ -1354,6 +1354,10 @@ impl Store {
             }
             let wal = cu.wal.take().expect("a persistent store has a log");
             w.trim_wal();
+            // the old generation's vocabulary takes no more writes either
+            self.snapshot().generation.dvocab.trim();
+            self.quota
+                .set_vocab_preallocated(cu.gen_.dvocab.preallocated());
             w.wal = Some(wal);
             w.wal_direct = Default::default();
             w.wal_len = cu.wal_len;

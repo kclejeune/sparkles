@@ -424,8 +424,9 @@ pub(crate) fn parse_rfc3339_offset(s: &str) -> Option<i64> {
 // ------------------------------------------------------------- dataset.json ------
 
 /// Dataset capabilities supported by this reader (1: legacy, 2: branches,
-/// 3: relinked generations with an immutable base overlay).
-pub const DATASET_READER: u32 = 3;
+/// 3: relinked generations with an immutable base overlay, 4: framed delta
+/// vocabularies, see [`crate::vocab::delta`]).
+pub const DATASET_READER: u32 = 4;
 fn legacy_reader() -> u32 {
     1
 }
