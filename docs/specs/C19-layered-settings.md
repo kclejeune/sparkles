@@ -1,6 +1,6 @@
 # C19: Layered dataset settings
 
-> **Status:** specified
+> **Status:** implemented in part (Phase 1)
 >
 > **Phases:** Phase 1 is the server: settings kinds, the declared layer, layered
 > resolution, locks, the `/$/settings` routes and reloading on SIGHUP. Phase 2 is the
@@ -8,7 +8,9 @@
 > Phase 3 is the UI's settings tab. Phase 4 makes the server's model configuration a
 > layered settings kind that server administrators can change, with write-only API keys.
 >
-> **User docs:** none yet.
+> **User docs:** [API: Settings](../API.md#settings) ·
+> [Usage: Turning on the assistant in the server](../USAGE.md#turning-on-the-assistant-in-the-server) ·
+> [Features](../FEATURES.md)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
 > the end records how it landed.
@@ -448,4 +450,58 @@ to replace or remove a runtime value.
 
 ## Outcome
 
-Not implemented yet.
+Phase 1 landed on 2026-10-10. Phases 2, 3 and 4 are not built. The `sparkles settings`
+command has only `check`, the UI has no settings tab, and `sparkles memory init` is
+unchanged.
+
+The server has a registry of three dataset-scoped kinds, `assistant`, `memory` and
+`ingest`. The `ingest` kind holds the settings members of `ingest.json`, and the
+extraction profiles in the same file stay outside the layers. Each kind resolves its
+four layers as §4 describes, and every feature reads its settings through the registry.
+The answer of `GET /$/settings/{ds}/{kind}` carries `effective`, `declared`, `runtime`,
+`sources`, `locked`, `overridden`, `status` and `etag`. The routes of §6, the settings
+file of §5 with `serve --settings`, the reload on SIGHUP of the settings file and the
+model configuration, and `sparkles settings check` work as written. The legacy routes
+`/$/assistant/{ds}`, `/$/memory/{ds}` and `/$/ingest/{ds}/settings` write through the
+same code and keep their answers. Datasets of `--loc` and `--mem` answer `DELETE` with
+`409` and the code `declared-dataset`, and `DatasetInfo` marks them with `declared:
+true`.
+
+The registry was written so that Phase 4 can add server-scoped kinds. A kind has a
+scope, the write locks are keyed by an optional dataset and the kind, and the layer
+resolution does not depend on where the declared layers come from. The parser accepts a
+top-level `server` member with a `locked` list whose fields start with `models` or
+`secrets`, checks it and stores it, and nothing applies it yet. The model configuration
+is read from one handle that a reload swaps, so a request in flight keeps the
+configuration it started with.
+
+The tests cover A1 to A7 and A9 in the process, and A2, A4 and A9 again with a server
+process, a restart and SIGHUP. A8 and A10 to A15 belong to later phases.
+
+These points differ from the design or settle what it left open.
+
+- The refusal to delete a declared dataset is in the server's HTTP handler and not in
+  the catalog of the library. The Python and Node bindings attach and delete datasets
+  through the catalog, and the refusal would have changed their behaviour. A dataset of
+  `--mem` is attached the same way as one of `--loc`, so it counts as declared too.
+- A `PATCH` with `null` removes a runtime value and so cannot remove a member of a map
+  that the declared layer sets. A `PUT` without that member stores `null` for it, and
+  that does remove it.
+- A `PUT` body that leaves out a member gets the built-in default of the member, and a
+  locked field that the body leaves out keeps its value.
+- `status` is `{valid, error}`, where `error` is present only when `valid` is false.
+- `GET /$/settings` also reports when the model configuration was read and the last
+  error of reading it, under `models`.
+- A member name that holds a dot is written with a backslash before the dot in a field
+  path, such as `agents.claude\.ai`.
+- The ETag is computed per kind from its runtime layer, and the answer repeats it in an
+  `etag` member.
+- The settings of a dataset are read from the files of its main branch, never from a
+  branch.
+- A runtime file written before the layers existed holds every field, so its values
+  override the declared values that are not locked. A `PUT` rewrites the file with
+  only the fields that differ from the declared values and the defaults.
+- The runtime layer of an in-memory dataset moves with a rename and is dropped when the
+  dataset is deleted.
+- The new settings routes do not check the dataset's read-only flag. The legacy
+  `PUT /$/ingest/{ds}/settings` keeps its check.

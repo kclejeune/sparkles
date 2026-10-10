@@ -565,7 +565,7 @@ per-dataset form and no concurrency caps. `preauth=off` turns it off.
 | GET    | `/$/datasets/{ds}`           | `DatasetInfo` |
 | POST   | `/$/datasets/{ds}?state=offline\|active` | Fuseki's dataset state. An offline dataset answers `503 {code: "dataset-offline"}` on its own endpoints (`/{ds}/…`) and keeps its admin routes. The state is not persisted, so a restart brings every dataset back. `400` without `state` or for another value. Needs `admin` on the dataset. |
 | POST   | `/$/datasets/{ds}/rename`    | Renames the dataset with the JSON body `{ "name": "new-name" }`, keeping its identity and data. Returns `200` with `{ "name", "renamedFrom" }` and `Location`. Requires server administration. `400` for invalid names, `404` for a missing source. `409` for an existing target, live requests or views, reservations, a running compaction or reasoning task, a backup policy of the config file that names the dataset, or a grant, protection or active minted token scope that covers one of the two names and not the other. A pattern that covers both names, such as `*`, does not block a rename. The conflict lists the blockers. The rename carries the dataset's request metrics, compaction scheduler state and pending automatic reasoning run over to the new name, and rewrites the backup policies made through the API that name the dataset exactly. A policy that selects it with a glob is left as written, so it selects the dataset afterwards only if the glob matches the new name. |
-| DELETE | `/$/datasets/{ds}`           | Removes the dataset and its files. Requests to the dataset that arrive meanwhile answer `404`. A persistent dataset that a running request or task still holds answers `409`, so that no old handle can write into a dataset later created under the same name. |
+| DELETE | `/$/datasets/{ds}`           | Removes the dataset and its files. Requests to the dataset that arrive meanwhile answer `404`. A persistent dataset that a running request or task still holds answers `409`, so that no old handle can write into a dataset later created under the same name. A dataset of the server's command line (`--loc` or `--mem`) answers `409` with the code `declared-dataset` and stays as it is, since the next start would attach it again. Its `DatasetInfo` has `declared: true`. SPARQL Update and the Graph Store Protocol still clear its data. |
 | POST   | `/$/datasets/{ds}/clone`     | Copies the dataset, or some of its graphs, into a new persistent or in-memory dataset. Returns `202` with a `Task`. See [Clone](#clone). |
 | GET/POST | `/$/stats/{ds}`            | `DatasetStats`, which includes Fuseki's request counters in `datasets`. |
 | GET/POST | `/$/stats`                 | Fuseki's statistics: `{ "datasets": { "/ds": FusekiCounters } }` for every dataset the caller may read. |
@@ -8697,9 +8697,10 @@ A dataset's memory settings name the graphs that hold agent memory. They are kep
 }
 ```
 
-`GET /$/memory/{ds}` needs `read` and answers the settings, or
-`{"agentGraphs": [], "agents": {}}` without any. `PUT /$/memory/{ds}` needs `admin` and
-replaces them. `agentGraphs` holds at most 50 graph IRIs or patterns with `*`. The
+`GET /$/memory/{ds}` needs `read` and answers the effective settings of
+[Settings](#settings), which are `{"agentGraphs": [], "agents": {}}` when nothing sets
+them. `PUT /$/memory/{ds}` needs `admin` and makes the effective settings equal to its
+body, as `PUT /$/settings/{ds}/memory` does. `agentGraphs` holds at most 50 graph IRIs or patterns with `*`. The
 consolidated graph must not match `agentGraphs`, and `conversationFacts` is `immediate`
 or `review`. Anything else is a `400`.
 
@@ -8835,7 +8836,9 @@ source and that the call does not assert again. Their reifiers keep the record w
 
 The ingest settings live in `<db>/ingest.json`. `GET /$/ingest/{ds}/profiles` needs
 `read` and answers `keepText` and the stored profiles. `PUT /$/ingest/{ds}/settings`
-with `{"keepText": false}` needs `admin`, and then sources keep only their digest and
+changes the settings members of the `ingest` kind of [Settings](#settings) as
+`PATCH /$/settings/{ds}/ingest` does. With `{"keepText": false}` it needs `admin`, and
+then sources keep only their digest and
 length, `read_chunks` answers `no-text`, and a fact with a span must carry its quote
 (`quote-required`). `GET`, `PUT` and `DELETE /$/ingest/{ds}/profiles/{name}` read, store
 and remove one profile, and `PUT` and `DELETE` need `admin`:
@@ -8856,7 +8859,7 @@ IRIs, the language tag and the Turtle of `shapes` must parse.
 `PUT /$/ingest/{ds}/settings` also takes `confirmTokens`, the estimate above which an
 ingestion waits for a confirmation (200,000 tokens by default), and `autoConfidence`, the
 confidence that `auto` mode needs of every fact (0.8 by default). Members left out keep
-their value, and `null` restores the default.
+their value, and `null` falls back to the value of the settings file or the default.
 
 ### Ingestion
 
@@ -9289,9 +9292,12 @@ an ask, and the calls appear in `GET /$/models/usage` under the role `explain`.
 
 ### Assistant settings
 
-A dataset's assistant settings are kept in `<db>/assistant.json` of a persistent
-dataset and in the process for an in-memory one. `GET /$/assistant/{ds}` needs `read`
-and `PUT /$/assistant/{ds}` needs `admin`.
+A dataset's assistant settings are the `assistant` kind of [Settings](#settings). The
+fields changed at runtime are kept in `<db>/assistant.json` of a persistent dataset and
+in the process for an in-memory one. `GET /$/assistant/{ds}` needs `read` and answers
+the effective settings. `PUT /$/assistant/{ds}` needs `admin` and makes the effective
+settings equal to its body, as `PUT /$/settings/{ds}/assistant` does, and it answers
+in the shape of `GET`.
 
 ```json
 {
@@ -9323,6 +9329,98 @@ A `PUT` with an `endpoint` or an `apiKey` anywhere is a `400`, because only the 
 configuration names endpoints and keys. The `GET` answer adds `status`, which says
 whether asking works (`ask`), why not (`reason`), the draft pairs, whether a summary is
 possible, and the history days in force. A `status` member in a `PUT` is ignored.
+
+### Settings
+
+A dataset's `assistant`, `memory` and `ingest` settings are settings kinds. The
+effective value of a kind is computed from four layers, and a later layer overrides an
+earlier one.
+
+1. The built-in defaults of the kind.
+2. The `defaults` of the settings file of `serve --settings`.
+3. The settings file's entry for the dataset, by name.
+4. The runtime layer, which holds the fields changed through the API. It is kept in the
+   dataset's file (`assistant.json`, `memory.json`, or the settings members of
+   `ingest.json`), or in the process for an in-memory dataset.
+
+Layers merge as in RFC 7396. Objects merge member by member, and arrays and scalars
+replace the earlier value. A field is a path of members written with dots, such as
+`send` or `budget.perRequest`, and a member name that holds a dot escapes it with a
+backslash. A file written before the layers existed holds a complete object, and it
+reads as a runtime layer that sets every field.
+
+The settings file is JSON:
+
+```json
+{
+  "defaults": {
+    "assistant": { "enabled": true, "send": "schema" },
+    "locked": ["assistant.send"]
+  },
+  "datasets": {
+    "org": {
+      "assistant": { "ingest": true, "send": "documents" },
+      "memory": { "agentGraphs": ["urn:x-sparkles:import/*"] },
+      "locked": ["assistant.send"]
+    }
+  }
+}
+```
+
+A dataset's `locked` list adds to the list of `defaults`. A locked field takes its
+value from the declared layers, and the API cannot change it. A dataset entry that sets
+a field locked in `defaults` keeps it locked at its own value. An entry whose name
+matches no dataset applies as soon as a dataset with that name is created, and a
+renamed dataset takes the entry of its new name. The file must not contain `endpoint`
+or `apiKey` members anywhere. A top-level `server` member may hold `locked` fields of
+server-wide settings that start with `models` or `secrets`, which no kind uses so far.
+
+The server reads the file at start, where a file that does not validate fails the
+start, and again on SIGHUP, where such a file is logged and the previous one kept. The
+model configuration of `--model-config` is read again on the same signal, and requests
+in flight keep the configuration they started with. `sparkles settings check FILE
+[--model-config FILE]` validates a file without a server.
+
+| Method | Path | Needs | Effect |
+|---|---|---|---|
+| GET | `/$/settings` | `server-admin` | The settings file's `path`, `readAt`, the last reload `error` and `errorAt`, the `declared` dataset names, the `unmatched` names that match no dataset, the `kinds`, and the same report for the model configuration under `models`. |
+| GET | `/$/settings/{ds}` | `read` | `{dataset, kinds}`, with each kind as below. |
+| GET | `/$/settings/{ds}/{kind}` | `read` | The kind, with an `ETag` of its runtime layer. |
+| PATCH | `/$/settings/{ds}/{kind}` | `admin` | Merges the body into the runtime layer as RFC 7396 says. `null` removes a runtime value, so the field falls back to the declared value or the default. |
+| PUT | `/$/settings/{ds}/{kind}` | `admin` | Makes the effective object equal to the body. A member the body leaves out takes its built-in default, and a locked field it leaves out keeps its value. The runtime layer keeps the fields where the body differs from the declared values and the defaults, with `null` for a declared member the body removes. |
+| DELETE | `/$/settings/{ds}/{kind}[?field=PATH]` | `admin` | Clears the runtime layer, or one field of it. |
+
+A kind answers like this:
+
+```json
+{
+  "dataset": "org",
+  "kind": "assistant",
+  "effective": { "enabled": true, "send": "schema", "historyDays": 7, "ask": true },
+  "declared": { "enabled": true, "send": "schema" },
+  "runtime": { "historyDays": 7, "send": "rows" },
+  "sources": { "enabled": "declared", "send": "locked", "historyDays": "runtime", "ask": "default" },
+  "locked": ["send"],
+  "overridden": ["send"],
+  "status": { "valid": true },
+  "etag": "\"4f1c2a9e0b7d3c5a8e21\""
+}
+```
+
+The example leaves out most members of `effective` and `sources`. Each field of
+`effective` has a source: `default`, `declared`, `runtime`, or `locked` for a field the
+settings file locks. `overridden` lists the locked fields whose runtime value stays in
+the file but is ignored, such as a value stored before the lock was added. `status`
+says whether the effective object is valid and why not. It becomes invalid when a
+reload removes a provider that a role list names, and the feature then treats the
+provider as missing.
+
+Writes take `If-Match` with the `etag`, and a mismatch is `412` with the code
+`precondition-failed`. Writes to one kind of one dataset are serialized. A write that
+would change a locked field is `409` with the code `locked-by-config` and the locked
+`fields`, and one that restates the locked value stores nothing for it. A write whose
+effective object is not valid, or a body with an `endpoint` or `apiKey` member anywhere,
+is `400` with the code `bad-settings`. An unknown kind is `404` with `unknown-kind`.
 
 ### Ask history
 

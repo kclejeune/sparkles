@@ -2550,7 +2550,18 @@ The server can ingest a document without an agent when it has a model for the
 `extract` role. Start it with a model configuration whose `roles` list `extract`, and
 enable ingestion in the dataset's assistant settings with `"ingest": true` and
 `"send": "documents"`, so that the document's text may go to the provider. The section
-[Asking questions with a model](#asking-questions-with-a-model) describes both files.
+[Asking questions with a model](#asking-questions-with-a-model) describes the model
+configuration, and
+[Turning on the assistant in the server](#turning-on-the-assistant-in-the-server)
+describes the settings file that turns these settings on for every dataset or for
+datasets by name:
+
+```json
+{
+  "defaults": { "assistant": { "enabled": true } },
+  "datasets": { "org": { "assistant": { "ingest": true, "send": "documents" } } }
+}
+```
 
 **Configuration gap.** The current UI has no editor for the dataset's assistant
 settings, and the CLI has no assistant-settings command. On NixOS,
@@ -2560,36 +2571,31 @@ retention and ingest profiles; it does not enable the assistant or permit sendin
 documents to a model. `sparkles memory init` prepares the memory vocabulary, import
 settings and validation shapes, but does not enable assistant ingestion either.
 
-Configure the dataset through `PUT /$/assistant/{dataset}` as below, or provision
-`assistant.json` in a persistent dataset's database directory with:
-
-```json
-{ "enabled": true, "ingest": true, "send": "documents" }
-```
-
-With the default server data directory, a persistent dataset created through the UI
-or API stores this file at `/var/lib/sparkles/databases/{dataset}/assistant.json`.
-A Nix-declared dataset with no explicit `path` uses
-`/var/lib/sparkles/declarative/{dataset}/assistant.json`. The server reads these
-settings for each operation. They are separate from the provider file of
-`--model-config` and the client's `~/.config/sparkles/memory.toml`.
-The NixOS module can generate and install the file through `datasetSettings`, but
-no additional Nix file is required when configuring the dataset through the API.
-A deployment that reinstalls the file replaces later runtime settings changes.
+Without a settings file, configure the dataset through
+`PATCH /$/settings/{dataset}/assistant` as below. The server keeps the fields changed
+this way in `assistant.json` in a persistent dataset's database directory. With the
+default server data directory, a dataset created through the UI or API keeps it at
+`/var/lib/sparkles/databases/{dataset}/assistant.json`, and a Nix-declared dataset
+with no explicit `path` at `/var/lib/sparkles/declarative/{dataset}/assistant.json`.
+A complete `assistant.json` written by hand or by an earlier version still works and
+sets every field. The server reads the settings for each operation. They are separate
+from the provider file of `--model-config` and the client's
+`~/.config/sparkles/memory.toml`. A deployment that reinstalls the file replaces later
+runtime settings changes, which the settings file of `--settings` avoids.
 
 The localhost example below assumes a server without authentication. On an
-authenticated server, the `PUT` needs a bearer token with dataset `admin` permission;
+authenticated server, the `PATCH` needs a bearer token with dataset `admin` permission;
 an existing browser session additionally needs its CSRF token. See
-[Assistant settings](API.md#assistant-settings) for the complete settings and access
-requirements. A `PUT` replaces the settings, so read and merge existing settings
-first when changing a configured dataset.
+[Settings](API.md#settings) for the routes and access requirements. A `PATCH` changes
+only the fields of its body, while `PUT /$/assistant/{dataset}` makes the settings
+equal to its body.
 
 ```bash
 sparkles serve --loc org=/data/org --model-config models.json \
   --model-secret anthropic=env:ANTHROPIC_API_KEY
-curl -X PUT -H 'Content-Type: application/json' \
+curl -X PATCH -H 'Content-Type: application/json' \
   -d '{"enabled": true, "ingest": true, "send": "documents"}' \
-  http://localhost:3030/$/assistant/org
+  http://localhost:3030/$/settings/org/assistant
 curl -F file=@standup.md http://localhost:3030/$/ingest/org
 ```
 
@@ -2741,6 +2747,75 @@ tokens gets the 30 classes and 60 predicates that match the question best and tw
 stored examples, and under 8,192 the rows are shown without a summary. A model that
 cannot return JSON answers in plain text with a fenced query, and the output says so.
 
+### Turning on the assistant in the server
+
+A server started with `--model-config` has model providers, but each dataset's
+assistant stays off until its settings turn it on. The standard way to turn it on for
+every dataset, including datasets created later, is a settings file that the server
+reads with `--settings`:
+
+```json
+{
+  "defaults": {
+    "assistant": { "enabled": true, "send": "schema" },
+    "locked": ["assistant.send"]
+  }
+}
+```
+
+```sh
+sparkles settings check settings.json --model-config models.json
+sparkles serve --data ./data --model-config models.json --settings settings.json \
+  --model-secret anthropic=env:ANTHROPIC_API_KEY
+```
+
+`defaults` applies to every dataset. A dataset admin can still turn the assistant off
+for one dataset, unless the file also lists `assistant.enabled` under `locked`. The
+lock in the example keeps every dataset at `send: "schema"`, so no dataset admin can
+let result rows or document text leave the server. `sparkles settings check` validates
+the file without a server, and with `--model-config` it also checks that role lists
+name configured providers and models they allow.
+
+The file can also declare values for one dataset by name, under `datasets`:
+
+```json
+{
+  "defaults": { "assistant": { "enabled": true } },
+  "datasets": {
+    "org": {
+      "assistant": { "ingest": true, "send": "documents" },
+      "memory": { "agentGraphs": ["urn:x-sparkles:import/*"] },
+      "locked": ["assistant.send"]
+    }
+  }
+}
+```
+
+An entry for a name that matches no dataset waits, and applies as soon as a dataset
+with that name is created. The file holds the `assistant`, `memory` and `ingest`
+settings that [API.md](API.md#settings) describes. It must not contain `endpoint` or
+`apiKey` members, since only the model configuration names providers and keys.
+
+A declared value is a default. A dataset admin can change any field that is not
+locked, through `PATCH /$/settings/{dataset}/{kind}`, and the change is kept in the
+dataset's directory across restarts and reloads:
+
+```sh
+curl -X PATCH http://localhost:3030/$/settings/org/assistant \
+  -H 'Content-Type: application/json' -d '{"historyDays": 7}'
+curl -X DELETE 'http://localhost:3030/$/settings/org/assistant?field=historyDays'
+```
+
+The `DELETE` brings back the declared value. `GET /$/settings/{dataset}/{kind}` answers
+the effective settings with the source of each field, which is `default`, `declared`,
+`runtime` or `locked`. A change to a locked field is refused with `409` and the code
+`locked-by-config`.
+
+SIGHUP, or `systemctl reload sparkles`, reads the settings file and the model
+configuration again. A file that does not validate is logged and the server keeps the
+previous one, while at start it fails the start. `GET /$/settings` reports when each
+file was read and the last reload error.
+
 ### Escalation
 
 A role's list goes from the cheapest pair to the strongest. A step moves to the next
@@ -2763,12 +2838,15 @@ query.
 
 ### The Ask bar
 
-When a dataset has an assistant, the query page shows an **Ask** bar above the tabs. A
-dataset admin turns the assistant on with its settings, which name what may leave the
-server and may override the server's role lists:
+When a dataset has an assistant, the query page shows an **Ask** bar above the tabs.
+The settings file of the [previous section](#turning-on-the-assistant-in-the-server)
+turns the assistant on for every dataset. A dataset admin can also turn it on for one
+dataset with its settings, which name what may leave the server and may override the
+server's role lists:
 
 ```sh
-curl -X PUT http://localhost:3030/$/assistant/org -H 'Content-Type: application/json' \
+curl -X PATCH http://localhost:3030/$/settings/org/assistant \
+  -H 'Content-Type: application/json' \
   -d '{"enabled": true, "send": "rows", "sendByProvider": {"claude": "schema"}}'
 ```
 
