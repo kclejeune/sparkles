@@ -112,7 +112,9 @@ enum SettingsCmd {
     /// Validate a settings file offline: its form, the kinds and fields it names, and
     /// every effective object it declares (exit status 1 when it is not valid). With
     /// --model-config, roles and sendByProvider must name configured providers and
-    /// models they allow, and the locks of server.locked are checked against it
+    /// models they allow, and the locks of server.locked are checked against it. The
+    /// prefixes it declares for one dataset count against --max-prefixes, and a prefix
+    /// that shadows a well-known one is a warning
     Check {
         /// The settings file
         #[arg(value_name = "FILE")]
