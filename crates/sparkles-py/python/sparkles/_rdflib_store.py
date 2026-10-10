@@ -473,14 +473,33 @@ class SparklesStore(Store):
     def triples(  # type: ignore[override]
         self, triple_pattern: tuple[Any, Any, Any], context: Any = None
     ) -> Iterator[tuple[tuple[Node, Node, Node], Iterator[Graph]]]:
-        if context is not None and _is_union(context):
-            context = None
-        try:
-            s, p, o = self._spo(triple_pattern)
-            g = self._graph_pattern(context) if context is not None else None
-        except _NoMatch:
-            return
-        reader = self._reader()
+        s, p, o = triple_pattern
+        # The common call, a pattern on IRIs in a plain Graph read before, as `contains`
+        # and `Graph.value` make it, takes the kept nodes without the general helpers.
+        # Their calls took more time than the lookup itself.
+        g = None
+        if type(context) is Graph and type(s) is URIRef and type(p) is URIRef:
+            g = self._graph_names.get(context.identifier)
+        if g is not None:
+            iris = self._iris
+            sn = iris.get(s)
+            pn = iris.get(p)
+            on = iris.get(o) if type(o) is URIRef else None
+            try:
+                s = sn if sn is not None else self._pattern(s)
+                p = pn if pn is not None else self._pattern(p)
+                o = on if on is not None else self._pattern(o)
+            except _NoMatch:
+                return
+        else:
+            if context is not None and _is_union(context):
+                context = None
+            try:
+                s, p, o = self._spo(triple_pattern)
+                g = self._graph_pattern(context) if context is not None else None
+            except _NoMatch:
+                return
+        reader = self._reader() if self._pending else self._tx if self._tx is not None else self.dataset
         convert = self._conv.triples
         if g is not None:
             ctx = context if isinstance(context, Graph) else self._context_for(g)
