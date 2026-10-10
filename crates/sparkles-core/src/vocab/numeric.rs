@@ -59,6 +59,8 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 pub const FILE: &str = "vocab.num";
 const MAGIC: &[u8; 8] = b"SPKVNUM2";
 const HEADER: usize = 48;
+/// The kinds and the rank are kept in memory up to this size. DBpedia's take 4.3 MB.
+const RESIDENT: usize = 64 << 20;
 /// (first id, end, first position) of a segment
 type Segment = (u64, u64, u64);
 /// A run of more literals than this without a number ends a segment. It is the ids of
@@ -184,6 +186,9 @@ pub fn classify(key: &[u8]) -> (u8, u64) {
 /// A memory-mapped `vocab.num`.
 pub struct NumColumn {
     bytes: Bytes,
+    /// the header, the kinds and the rank, read into memory when they are at most
+    /// [`RESIDENT`] bytes: a lookup then reads only its value
+    head: Option<Box<[u8]>>,
     /// one bit per [`HINT_CHUNK`]: read ahead was asked for
     hinted: Box<[AtomicU64]>,
     covered: u64,
@@ -260,8 +265,16 @@ impl NumColumn {
             );
             return None;
         };
+        let head = (values <= RESIDENT)
+            .then(|| {
+                // one read, where the mapping would fault page after page
+                let mut h = vec![0u8; values];
+                (&f).read_exact(&mut h).ok().map(|()| h.into_boxed_slice())
+            })
+            .flatten();
         let chunks = b.len().div_ceil(HINT_CHUNK);
         Some(NumColumn {
+            head,
             hinted: (0..chunks.div_ceil(64))
                 .map(|_| AtomicU64::new(0))
                 .collect(),
@@ -310,13 +323,18 @@ impl NumColumn {
     }
 
     #[inline]
+    fn head(&self) -> &[u8] {
+        self.head.as_deref().unwrap_or(self.bytes.as_slice())
+    }
+
+    #[inline]
     fn kind_word(&self, w: usize) -> u64 {
-        word(self.bytes.as_slice(), HEADER + w * 8)
+        word(self.head(), HEADER + w * 8)
     }
 
     #[inline]
     fn rank_at(&self, g: usize) -> u64 {
-        let b = self.bytes.as_slice();
+        let b = self.head();
         let at = self.rank + g * 4;
         u32::from_le_bytes(b[at..at + 4].try_into().unwrap()) as u64
     }
@@ -398,11 +416,11 @@ impl NumColumn {
     }
 
     /// What the column says about each of `ids` (best sorted ascending), reading a cold
-    /// column in two rounds of large requests: first the kinds and rank entries of the
-    /// ids, then the values they point to.
+    /// column in large requests: first the kinds and rank entries of the ids, unless
+    /// they are in memory, then the values they point to.
     pub fn get_many(&self, ids: &[u64]) -> Vec<Numeric> {
         let hints = crate::index::io_hints() && ids.len() > 1;
-        if hints {
+        if hints && self.head.is_none() {
             let inside = || ids.iter().filter_map(|&id| self.position(id));
             self.advise(inside().map(|id| {
                 let first = (id / RANK_IDS) * RANK_IDS / 16;
@@ -860,6 +878,12 @@ pub(crate) mod tests {
             show(&num.get_many(&all)),
             show(&all.iter().map(|&i| num.get(i)).collect::<Vec<_>>())
         );
+        // the kinds and the rank read through the mapping, as in a column too large to
+        // keep them in memory
+        let mut mapped = NumColumn::open(dir.path(), v.len(), v.first_triple).unwrap();
+        assert!(mapped.head.is_some());
+        mapped.head = None;
+        assert_eq!(show(&mapped.get_many(&all)), show(&num.get_many(&all)));
     }
 
     #[test]
