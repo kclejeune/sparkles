@@ -22,6 +22,7 @@ server=(
   otel
   auth
   mcp
+  memory
   backup
   fmt
   tls

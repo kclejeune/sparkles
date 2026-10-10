@@ -173,6 +173,9 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/{ds}/sparql/diagnose", &["POST"]),
     // the asking pipeline (feature `mcp`, spec C18 §5)
     ("/{ds}/ask", &["POST"]),
+    // `assert_facts` and the memory brief over HTTP (C18 Phase 3m-a)
+    ("/{ds}/facts", &["POST"]),
+    ("/{ds}/memory/brief", &["POST"]),
     ("/{ds}/text", &["GET", "POST"]),
     ("/{ds}/diff", &["GET"]),
     ("/{ds}/changes", &["GET"]),
@@ -387,7 +390,8 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/backups/{ds}/{repo}/{backup}"
         | "/$/backups/{ds}/{repo}/{backup}/restore"
         | "/$/backups/{ds}/{repo}/{backup}/verify" => Dataset(Admin),
-        "/{ds}/update" | "/{ds}/upload" => Dataset(Write),
+        "/{ds}/update" | "/{ds}/upload" | "/{ds}/facts" => Dataset(Write),
+        "/{ds}/memory/brief" => Dataset(Read),
         // a method that is refused anyway needs only read, so a reader learns the 405
         "/{ds}/patch" if safe(method) => Dataset(Read),
         "/{ds}/patch" => Dataset(Write),
@@ -425,11 +429,12 @@ pub fn endpoint(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) ->
         | "/{ds}/recall"
         | "/{ds}/sparql/diagnose"
         | "/{ds}/ask"
+        | "/{ds}/memory/brief"
         | "/{ds}/text"
         | "/{ds}/geo"
         | "/{ds}/queries/{name}" => Endpoint::Query,
         "/{ds}/graphql" | "/{ds}/graphql/schema" => Endpoint::Graphql,
-        "/{ds}/update" => Endpoint::Update,
+        "/{ds}/update" | "/{ds}/facts" => Endpoint::Update,
         "/{ds}/get" => Endpoint::GspR,
         "/{ds}/data" | "/{ds}/{*graph}" if get => Endpoint::GspR,
         "/{ds}/data" | "/{ds}/{*graph}" => Endpoint::GspRw,

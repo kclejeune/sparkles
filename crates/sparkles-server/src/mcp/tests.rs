@@ -177,6 +177,9 @@ mod memory_tools;
 #[path = "c18_tests.rs"]
 mod c18;
 
+#[path = "import_tests.rs"]
+mod import;
+
 fn head(s: &McpServer, ds: &str) -> u64 {
     s.state.get(ds).unwrap().store.head_commit().seq
 }

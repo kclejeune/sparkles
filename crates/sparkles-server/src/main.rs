@@ -37,6 +37,8 @@ mod http;
 mod lsp;
 #[cfg(feature = "mcp")]
 mod mcp;
+#[cfg(feature = "memory")]
+mod memory_cmd;
 // the pipeline that uses most of the model clients (`ask`) needs the `mcp` feature
 #[cfg_attr(not(feature = "mcp"), allow(dead_code, unused_imports))]
 mod models;
@@ -1174,6 +1176,10 @@ enum Cmd {
     /// the tokens used
     #[cfg(feature = "mcp")]
     Ask(ask::AskArgs),
+    /// Agent memory (C18 §10.1): import the memory and instruction files of coding agents,
+    /// keep them in sync, and print the brief, recall, queries and facts
+    #[cfg(feature = "memory")]
+    Memory(memory_cmd::MemoryArgs),
     /// Format SPARQL, Turtle, TriG, N-Triples, N-Quads and JSON-LD: print, check (--check,
     /// -l) or rewrite (--write)
     #[cfg(feature = "fmt")]
@@ -2790,6 +2796,8 @@ fn run() -> Result<()> {
         Cmd::Mcp(args) => mcp::run(args, opts),
         #[cfg(feature = "mcp")]
         Cmd::Ask(args) => ask::run_cli(args, opts),
+        #[cfg(feature = "memory")]
+        Cmd::Memory(args) => memory_cmd::run(args, opts),
         #[cfg(feature = "fmt")]
         Cmd::Fmt(args) => fmt::run(args),
         #[cfg(feature = "fmt")]

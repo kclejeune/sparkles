@@ -49,6 +49,13 @@ pub enum AuthCmd {
         /// change only on its proposal branches (repeatable)
         #[arg(long = "curated", value_name = "IRI")]
         curated: Vec<String>,
+        /// Also let the agent import harness memory (C18 §8.10.2): write on
+        /// `<import base><agent>/*` on main, where `sparkles memory import` writes
+        #[arg(long, requires = "import_base")]
+        import: bool,
+        /// The `imports.base` of the dataset's memory settings, with --import
+        #[arg(long, value_name = "IRI", requires = "import")]
+        import_base: Option<String>,
     },
     /// Validate an auth configuration and print a summary; exits with 1 on errors
     Check {
@@ -165,6 +172,7 @@ pub fn agent_template(
     dataset: &str,
     session_graphs: &str,
     curated: &[String],
+    import_base: Option<&str>,
 ) -> Result<String> {
     if !super::config::valid_principal_name(agent) {
         bail!("invalid agent name '{agent}': use [A-Za-z0-9_.@-], at most 64 characters");
@@ -232,6 +240,23 @@ pub fn agent_template(
             list(&graphs)
         ));
     }
+    if let Some(base) = import_base {
+        iri("--import-base", base)?;
+        if base.contains('*') || !(base.ends_with('/') || base.ends_with('#')) {
+            bail!("--import-base {base:?} must be an IRI that ends in / or #");
+        }
+        // the graphs `sparkles memory import` writes for this principal (C18 §8.10.2)
+        let own = format!("{base}{agent}/*");
+        out.push_str(&format!(
+            "\n# Harness memory that {agent} imports with `sparkles memory import`.\n\
+             [[roles.{agent:?}.grants]]\n\
+             dataset = {dataset:?}\n\
+             level = \"write\"\n\
+             graphs = [{own:?}]\n\
+             branches = [\"main\"]\n\
+             endpoints = [{endpoints}]\n"
+        ));
+    }
     Ok(out)
 }
 
@@ -243,10 +268,18 @@ pub fn run(cmd: AuthCmd) -> Result<()> {
             dataset,
             session_graphs,
             curated,
+            import: _,
+            import_base,
         } => {
             print!(
                 "{}",
-                agent_template(&agent, &dataset, &session_graphs, &curated)?
+                agent_template(
+                    &agent,
+                    &dataset,
+                    &session_graphs,
+                    &curated,
+                    import_base.as_deref()
+                )?
             );
             Ok(())
         }

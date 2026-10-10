@@ -205,7 +205,7 @@ async fn ask_route(
         .branch
         .clone()
         .or_else(|| crate::http::branches::current().filter(|b| b != sparkles::branch::MAIN));
-    let cfg = crate::mcp::rest::config(&st);
+    let cfg = crate::mcp::rest::config(&st, crate::mcp::rest::Mode::Read);
     let max_rows = b.max_rows.unwrap_or(1000).clamp(1, cfg.max_rows.max(1));
     let rows_allowed = settings.send >= Send::Rows;
     let id = uuid::Uuid::new_v4().simple().to_string()[..16].to_string();
