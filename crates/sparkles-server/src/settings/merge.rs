@@ -36,6 +36,7 @@ pub fn merged(base: &Value, patch: &Value) -> Value {
 
 /// Two merge patches combined into one that applies both, `top` after `under`. Unlike
 /// [`merged`] it keeps a `null` of `top`, which still removes that member.
+#[cfg_attr(not(feature = "auth"), allow(dead_code))]
 pub fn overlaid(under: &Value, top: &Value) -> Value {
     match (under, top) {
         (Value::Object(u), Value::Object(t)) => {

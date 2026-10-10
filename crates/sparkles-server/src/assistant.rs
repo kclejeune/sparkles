@@ -15,7 +15,9 @@
 use crate::assist::{read_file, write_file};
 use crate::auth::Principal;
 use crate::http::{AdminBody, ApiResult, blocking, dataset, err, err_code};
-use crate::models::{Models, Pair, Role};
+#[cfg(feature = "mcp")]
+use crate::models::Models;
+use crate::models::{Pair, Role};
 use crate::settings::{Providers, Typed};
 use crate::state::{AppState, Dataset};
 use axum::extract::{Path, Query, State};

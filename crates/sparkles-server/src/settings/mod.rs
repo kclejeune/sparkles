@@ -172,6 +172,7 @@ pub fn server_kind(name: &str) -> Option<&'static Kind> {
 
 impl Kind {
     /// The built-in defaults, the first layer.
+    #[cfg_attr(not(feature = "auth"), allow(dead_code))]
     pub fn default_value(&self) -> Value {
         (self.defaults)()
     }
@@ -888,6 +889,7 @@ pub fn effective<T: Typed>(st: &AppState, ds: &Dataset, kind: &'static Kind) -> 
 
 /// The settings of a database directory without a server (`sparkles ask --loc`): the
 /// built-in defaults and the runtime layer.
+#[cfg(feature = "mcp")]
 pub fn effective_at<T: Typed>(dir: &Path, kind: &'static Kind) -> anyhow::Result<Option<T>> {
     let rt = match std::fs::read(dir.join(kind.file)) {
         Ok(b) => serde_json::from_slice::<Value>(&b)
