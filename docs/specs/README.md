@@ -15,6 +15,9 @@ design as it was written. Where the design and the code disagree, the code,
 [the API reference](../API.md) and [the feature list](../FEATURES.md) describe the current
 behaviour, and the Outcome explains the difference.
 
+[ARCHITECTURE.md](../ARCHITECTURE.md) connects the implemented decisions across these
+specs with an overview of the library, storage, execution and server boundaries.
+
 ## How to use them
 
 * **As the design rationale.** A spec explains why a feature works the way it does. It

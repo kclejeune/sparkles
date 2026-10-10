@@ -242,7 +242,9 @@ other RDF stores have and Sparkles does not.
 * **GeoSPARQL.** EPSG codes come from a table of proj4 definitions rather than the EPSG
   database, and the library includes the table only with its `geo-epsg` feature.
   Geographic CRSs on datums other than WGS 84, grid-based datum shifts and curved GML
-  segments are not supported, and Helmert datum shifts are approximate.
+  segments or solids are not supported, and Helmert datum shifts are approximate.
+  Geometry constructions return 2D results. Unions of crossing lines preserve the
+  covered points but do not split the lines at each crossing, unlike Jena's JTS engine.
 * **Shapes.** There is no ShEx 2.2, and SHACL 1.2 node expressions are not supported.
   `sparkles fmt` and the UI's Format button do not format SHACLC.
   Drafted shapes have no `sh:or` of datatypes, no inverse or sequence paths, no

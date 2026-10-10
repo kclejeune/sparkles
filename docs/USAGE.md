@@ -31,6 +31,7 @@ without a migration path, so keep backups of anything you cannot regenerate.
   * [DESCRIBE modes](#describe-modes)
   * [GraphQL](#graphql)
   * [Loading CSV and TSV](#loading-csv-and-tsv)
+* [Branches and merges](#branches-and-merges)
 * [Automatic compaction](#automatic-compaction)
 * [Formatting](#formatting)
 * [Linting](#linting)

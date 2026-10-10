@@ -100,7 +100,7 @@ jvm = [
   "jvm/*/testing/**",
 ]
 # The documents that tests and the doc-path check read. docs/plans is left out.
-docs = ["README.md", "docs/*.md", "docs/*.json", "docs/specs/**"]
+docs = ["README.md", "docs/*.md", "docs/*.json", "docs/specs/**", "docs/internals/**"]
 
 # ------------------------------------------------------------------------------ UI ----
 
@@ -292,7 +292,7 @@ run = "scripts/lint-features.sh"
 [tasks."lint:doc-paths"]
 sources = ["@group:rust", "@group:docs", "scripts/check-doc-paths.py"]
 outputs = []
-description = "Check that every crates/sparkles… path cited in the README, docs/*.md, docs/specs and the Rust comments exists"
+description = "Check that every crates/sparkles… path cited in the README, public docs and the Rust comments exists"
 run = "python3 scripts/check-doc-paths.py --code"
 
 [tasks.check]

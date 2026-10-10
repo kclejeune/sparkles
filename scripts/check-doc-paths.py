@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check that every `crates/sparkles…` path cited in the documentation exists.
 
-Scans README.md, docs/*.md and docs/specs/*.md (docs/plans is private and skipped), the
+Scans README.md and docs/**/*.md (docs/plans is private and skipped), the
 crates' README files, and with --code also the comments of the Rust sources. A path ends
 at the first character that cannot be part of one. A trailing `:123` line number and
 trailing punctuation are dropped, `…` and globs (`*`) are matched with glob, and
@@ -63,7 +63,12 @@ def clean(path):
 def doc_files(with_code):
     files = ["README.md"]
     files += sorted(glob.glob("docs/*.md", root_dir=ROOT))
-    files += sorted(glob.glob("docs/specs/*.md", root_dir=ROOT))
+    # Prune private scratch work before traversal; it can contain complete checkouts.
+    for entry in sorted(os.scandir(os.path.join(ROOT, "docs")), key=lambda e: e.name):
+        if entry.is_dir() and entry.name != "plans":
+            files += sorted(
+                glob.glob(f"docs/{entry.name}/**/*.md", root_dir=ROOT, recursive=True)
+            )
     files += sorted(glob.glob("crates/*/README.md", root_dir=ROOT))
     files += sorted(glob.glob("crates/*/*/README.md", root_dir=ROOT))
     for name in ("CLAUDE.md", "AGENTS.md"):
