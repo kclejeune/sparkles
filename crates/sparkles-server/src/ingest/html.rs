@@ -512,8 +512,6 @@ pub fn to_markdown(html: &str) -> Page {
                     "br" => {
                         if let Some(c) = &mut w.cell {
                             c.push(' ');
-                        } else if w.pre > 0 {
-                            w.line.push('\n');
                         } else {
                             w.line.push('\n');
                         }

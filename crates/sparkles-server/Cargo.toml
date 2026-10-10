@@ -161,8 +161,10 @@ memory = ["mcp", "auth", "dep:sparkles-memory-import", "dep:tower"]
 pdf = ["mcp", "dep:pdf-inspector"]
 # OCR of scanned PDF pages: PDFium and ONNX Runtime loaded at run time from paths the
 # operator gives, with the PP-OCR models from a directory (`serve --pdf-ocr-models`); never
-# downloads a model. Off by default and not part of release builds
-pdf-ocr = ["pdf", "pdf-inspector/render-pdfium", "pdf-inspector/ocr-oar"]
+# downloads a model. Off by default and not part of release builds. pdf-inspector's OCR
+# fusion compiles only under its `ocr` feature, which also builds its model downloader;
+# conversion sets the offline policy, so the downloader is never used
+pdf-ocr = ["pdf", "pdf-inspector/ocr"]
 # backup repositories on a filesystem or S3: `/$/repositories`, `/$/backups/{ds}`,
 # `/$/backup-policies`, `sparkles repo …`, `sparkles backup create|list|restore|…`
 backup = ["dep:sparkles-backup", "dep:toml", "sparkles/backup"]

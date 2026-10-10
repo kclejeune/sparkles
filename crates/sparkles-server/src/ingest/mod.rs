@@ -27,6 +27,7 @@ mod pdf;
 pub mod pipeline;
 
 #[cfg(test)]
+#[cfg_attr(not(feature = "pdf"), allow(dead_code))]
 mod fixtures;
 #[cfg(test)]
 mod tests;
@@ -124,6 +125,8 @@ impl OcrArgs {
 
 /// The PDF workers and the OCR configuration.
 #[derive(Debug)]
+// the workers and OCR serve PDF conversion only
+#[cfg_attr(not(feature = "pdf"), allow(dead_code))]
 pub struct PdfRuntime {
     max: usize,
     used: Mutex<usize>,
@@ -132,8 +135,10 @@ pub struct PdfRuntime {
 }
 
 /// One running PDF conversion's worker slot.
+#[cfg(feature = "pdf")]
 pub struct PdfSlot(Arc<PdfRuntime>);
 
+#[cfg(feature = "pdf")]
 impl Drop for PdfSlot {
     fn drop(&mut self) {
         *self.0.used.lock() -= 1;
@@ -152,6 +157,7 @@ impl PdfRuntime {
     }
 
     /// A worker slot, waiting until `deadline` for one.
+    #[cfg(feature = "pdf")]
     pub fn acquire(this: &Arc<PdfRuntime>, deadline: Instant) -> Option<PdfSlot> {
         let mut used = this.used.lock();
         while *used >= this.max {
@@ -163,6 +169,7 @@ impl PdfRuntime {
         Some(PdfSlot(this.clone()))
     }
 
+    #[cfg(feature = "pdf")]
     pub fn ocr(&self) -> Option<&OcrConfig> {
         self.ocr.as_ref()
     }

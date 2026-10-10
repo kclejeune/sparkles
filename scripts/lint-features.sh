@@ -27,6 +27,8 @@ server=(
   fmt
   tls
   graphql
+  pdf
+  pdf-ocr
   "mcp,shacl"
   "mcp,shex"
   "mcp,fmt"

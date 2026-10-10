@@ -1110,7 +1110,7 @@ impl Tools<'_> {
                     "SELECT ?title ?fmt WHERE {{ {} }} LIMIT 1",
                     br.quads(
                         &format!(
-                            "OPTIONAL {{ ?s <{}> ?title }} OPTIONAL {{ ?s <{}> ?fmt }}",
+                            "?s <{SPK}rendition> ?rend OPTIONAL {{ ?s <{}> ?title }} OPTIONAL {{ ?s <{}> ?fmt }}",
                             super::ingest::DCT_TITLE,
                             super::ingest::DCT_FORMAT
                         ),

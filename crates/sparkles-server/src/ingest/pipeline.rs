@@ -108,9 +108,10 @@ impl Progress for Task {
     }
 
     fn confirm(&self) -> bool {
+        let progress = self.state.lock().progress;
         self.set(
             Status::AwaitingConfirmation,
-            self.state.lock().progress,
+            progress,
             Some("the estimate is above the dataset's threshold: confirm to go on".into()),
         );
         self.wait_confirmation(super::CONFIRM_WAIT)
@@ -554,21 +555,39 @@ fn run_inner(r: &mut Run, req: &Request) -> Result<Value, Failed> {
         }
         Mode::Auto => {
             let b = branch.as_deref().expect("auto has a branch");
-            let why = auto_blocker(&proposals, &limits);
-            match why {
-                None => {
+            let message = format!("Ingest {}", title.as_deref().unwrap_or("a document"));
+            let mut why = auto_blocker(&proposals, &limits);
+            // the merge preview: the guard of main and conflicts keep the branch
+            let preview = if why.is_none() {
+                let p = r.tool(
+                    "merge_branch",
+                    json!({ "source": b, "message": message }),
+                    None,
+                )?;
+                if p["mergeable"] != true {
+                    why = Some("the merge preview found conflicts or guard findings".into());
+                }
+                Some(p)
+            } else {
+                None
+            };
+            match (why, preview) {
+                (None, Some(p)) => {
                     let m = r.tool(
                         "merge_branch",
-                        json!({ "source": b, "message": format!("Ingest {}", title.as_deref().unwrap_or("a document")) }),
+                        json!({ "source": b, "message": message, "dryRun": false,
+                                "expect": p["expect"] }),
                         None,
                     )?;
                     let _ = r.tool("delete_branch", json!({ "name": b, "force": true }), None);
                     out["outcome"] = "merged".into();
                     out["merge"] = m;
-                    out.as_object_mut().map(|o| o.remove("review"));
+                    if let Some(o) = out.as_object_mut() {
+                        o.remove("review");
+                    }
                 }
-                Some(w) => {
-                    out["autoFallback"] = w.into();
+                (w, _) => {
+                    out["autoFallback"] = w.unwrap_or_default().into();
                 }
             }
         }

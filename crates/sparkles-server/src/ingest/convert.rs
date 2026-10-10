@@ -235,6 +235,8 @@ pub fn page_starts(text: &str) -> Vec<usize> {
 
 /// How to convert.
 #[derive(Clone)]
+// all but the limits serve PDF conversion only
+#[cfg_attr(not(feature = "pdf"), allow(dead_code))]
 pub struct Options {
     /// convert what can be read of a PDF that needs OCR, and record the rest
     pub allow_partial: bool,

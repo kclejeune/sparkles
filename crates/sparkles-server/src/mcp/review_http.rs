@@ -225,7 +225,19 @@ async fn list_profiles(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct SettingsBody {
-    keep_text: bool,
+    keep_text: Option<bool>,
+    /// `null` restores the default
+    #[serde(default, deserialize_with = "some")]
+    confirm_tokens: Option<Option<u64>>,
+    #[serde(default, deserialize_with = "some")]
+    auto_confidence: Option<Option<f64>>,
+}
+
+/// A member that is present, `null` included.
+fn some<'de, T: Deserialize<'de>, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<Option<T>>, D::Error> {
+    Option::<T>::deserialize(d).map(Some)
 }
 
 async fn put_settings(
@@ -242,9 +254,25 @@ async fn put_settings(
     blocking(move || {
         let _g = INGEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut s = ingest_settings(&st, &ds);
-        s.keep_text = b.keep_text;
+        if let Some(k) = b.keep_text {
+            s.keep_text = k;
+        }
+        if let Some(c) = b.confirm_tokens {
+            s.confirm_tokens = c;
+        }
+        if let Some(c) = b.auto_confidence {
+            s.auto_confidence = c;
+        }
+        s.validate().map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
         store(&st, &ds, &s)?;
-        Ok(Json(json!({"dataset": ds.name, "keepText": s.keep_text})))
+        let mut out = json!({"dataset": ds.name, "keepText": s.keep_text});
+        if let Some(c) = s.confirm_tokens {
+            out["confirmTokens"] = c.into();
+        }
+        if let Some(c) = s.auto_confidence {
+            out["autoConfidence"] = c.into();
+        }
+        Ok(Json(out))
     })
     .await
 }
