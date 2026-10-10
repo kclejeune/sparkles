@@ -1037,6 +1037,27 @@ Single-triple updates that add no term did not change, at a mean of 0.615 ms aga
 0.618 ms. The instance's virtual disk is write through and reports no FUA, so the
 direct write saves the journal commit there but not a cache flush.
 
+The published comparison ran on forge, an i5-13500 with NVMe under dm-crypt and ext4,
+against `9d402e76` and Oxigraph 0.5.11. Each of 6 interleaved rounds used a fresh store
+copy and server. In serial churn on the 1.05M-triple store, literal inserts took a median
+of 1.126 ms against 1.633 ms and a 90th percentile of 1.345 ms against 1.975 ms. On the
+10.5M-triple store they took 1.284 ms against 1.905 ms, with a 90th percentile of
+2.781 ms against 4.657 ms. Inserts of known IRIs and deletes were 0.92 to 0.94 times as
+long at the median. A run of 5,000 commits on the smaller store issued 14 device cache
+flushes instead of 898, and about 6,000 device writes instead of about 11,000. Under 16 concurrent readers
+on the 10.5M-triple store, a writer of new literals completed 299 commits per second
+against 160, with a median of 3.2 ms against 5.9 ms, while read throughput stayed within
+2 percent. On the 1.05M-triple store, whose reads keep the CPU busier, the writer's
+throughput did not change and its 99th percentile fell to 0.78 times the old value.
+Single-triple updates that add no term did not change beyond the variation between
+server processes.
+
+Oxigraph remained faster per commit, at a median of 0.613 ms for literal inserts at
+1.05M and 0.926 ms at 10.5M, so Sparkles took 1.84 and 1.39 times as long, down from
+2.66 and 2.06 times. Oxigraph's server has no option to make each commit durable, and
+it issued no device writes during the churn runs, so the comparison is between a
+durable commit and one that is not.
+
 **Tests.** Unit tests in `vocab/delta.rs` cover syncs only when terms were added, chunks
 after the header with a zero tail, a legacy file read and rewritten at the first write,
 a rollback past a written chunk, and a branch's own file after its linked prefix.
