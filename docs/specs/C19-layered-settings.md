@@ -574,6 +574,8 @@ These points differ from the design or settle what it left open.
   The command resolves its target through one type with a dataset variant, so Phase 4
   can add a server-wide target, but it has to pick another spelling for it, such as a
   `--server-wide` flag or a reserved name in place of the dataset.
+  The maintainer chose `--global`, as in `git config --global`, so the Phase 4 command
+  is `sparkles settings set --global models.roles.draft=...`.
 - `get --layer declared` or `--layer runtime` prints that layer, and with `--json` only
   the layer's object, so that `get DS KIND --layer runtime --json` gives what `edit`
   edits. Without `--layer`, `--json` prints the server's answer.
