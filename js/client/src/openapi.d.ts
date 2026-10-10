@@ -2316,6 +2316,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/{ds}/facts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Write facts with provenance
+         * @description The MCP tool `assert_facts` as the caller, with its checks. Needs `write` on the graphs written and counts as an update. `sparkles memory import` and `assert` call it.
+         */
+        post: operations["assertFacts"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/{ds}/geo": {
         parameters: {
             query?: never;
@@ -2418,6 +2438,26 @@ export interface paths {
         get: operations["historyChanges"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/{ds}/memory/brief": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Brief what the graph knows
+         * @description The brief of C18 §8.10.9 for a project's import graphs, an entity or a recall query: reviewed facts by default, ranked by age and corroboration, bounded in facts and characters, with a citation per source.
+         */
+        post: operations["memoryBrief"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2718,6 +2758,104 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** @description The arguments of `assert_facts` without `dataset`. */
+        AssertFactsRequest: {
+            agent?: {
+                model?: string;
+                name: string;
+            };
+            allowUnknownIris?: boolean;
+            /** @description Write on this branch instead of main. */
+            branch?: string;
+            changes?: number;
+            dryRun?: boolean;
+            entities?: {
+                altLabels?: string[];
+                distinctFrom?: string[];
+                key: string;
+                label: string;
+                types: string[];
+            }[];
+            facts?: {
+                confidence?: number;
+                /** @enum {string} */
+                mode?: "add" | "replace";
+                /** @description An IRI, a key of `entities`, or a literal in SPARQL syntax. */
+                o: string;
+                p: string;
+                /** @description At most 1000 characters. */
+                quote?: string;
+                s: string;
+            }[];
+            /** @description The named graph to write (default: `source.iri`). */
+            graph?: string;
+            /** @description At most 128 characters. A retry with the same key writes nothing and answers `alreadyApplied`. */
+            idempotencyKey?: string;
+            ifHead?: number;
+            iriBase?: string;
+            message?: string;
+            /** @enum {string} */
+            replaceScope?: "graph" | "writable";
+            retract?: (string | {
+                graph: string;
+                o: string;
+                p: string;
+                s: string;
+            })[];
+            source?: {
+                iri: string;
+                title?: string;
+            };
+            timeoutSeconds?: number;
+        };
+        /** @description What `assert_facts` wrote, or would write in a dry run. */
+        AssertFactsResult: {
+            activity?: string;
+            alreadyApplied?: boolean;
+            branch?: string;
+            commit?: number;
+            committed: boolean;
+            conflicts?: {
+                graph: string;
+                reason?: string;
+                triple: string;
+            }[];
+            dataset: string;
+            deleted?: number;
+            /** @description A dry run's preview. */
+            dryRun?: {
+                [key: string]: unknown;
+            };
+            elapsedMs?: number;
+            graph: string;
+            head: number;
+            inserted?: number;
+            minted?: {
+                [key: string]: string;
+            };
+            /** @description The prefixes the compact terms use. */
+            prefixes?: {
+                [key: string]: unknown;
+            };
+            retracted?: {
+                graph: string;
+                reason?: string;
+                triple: string;
+            }[];
+            superseded?: {
+                graph: string;
+                reason?: string;
+                triple: string;
+            }[];
+            /** @description The guard's report. */
+            validation?: {
+                [key: string]: unknown;
+            };
+            warnings?: {
+                [key: string]: unknown;
+            }[];
+            wouldCommit?: boolean;
+        };
         AuthConfig: {
             cli?: {
                 authorizeUrl?: string;
@@ -2938,6 +3076,50 @@ export interface components {
             dataset?: string;
             /** @description Predicate IRIs whose cells never conflict in the dataset's merges. */
             exemptPredicates?: string[];
+        };
+        /** @description What to brief. */
+        BriefRequest: {
+            /** @description An IRI, or a label that must link exactly, with scope entity. */
+            entity?: string;
+            /** @description The age at which a fact's weight halves, 90 by default. */
+            halfLifeDays?: number;
+            includeUnreviewed?: boolean;
+            /** @description 500 to 100,000, 8000 by default. */
+            maxChars?: number;
+            /** @description 1 to 500, 60 by default. */
+            maxFacts?: number;
+            /** @description The project's key, such as `github.com/acme/shop`, with scope project. */
+            projectKey?: string;
+            /** @description The words to recall, with scope session. */
+            query?: string;
+            /** @enum {string} */
+            scope?: "project" | "entity" | "session";
+            timeoutSeconds?: number;
+            /** @description 0 to 1, 0.7 by default. */
+            unreviewedWeight?: number;
+        };
+        /** @description The brief of a project, an entity or a session. */
+        BriefResult: {
+            citations?: {
+                [key: string]: unknown;
+            }[];
+            commit: number;
+            dataset: string;
+            facts?: {
+                [key: string]: unknown;
+            }[];
+            /** @description Whether the dataset has an import base. */
+            imports?: boolean;
+            matched: number;
+            /** @description The prefixes the compact terms use. */
+            prefixes?: {
+                [key: string]: unknown;
+            };
+            reviewedOnly: boolean;
+            scope: string;
+            shown: number;
+            /** @description The brief as plain text. Its first line says that the lines are recalled data. */
+            text: string;
         };
         /** @description A `507` for a request over one of its budgets. */
         BudgetError: components["schemas"]["Error"] & {
@@ -4083,6 +4265,22 @@ export interface components {
             };
             /** @description The graph that promoted facts are written to. */
             consolidatedGraph?: string;
+            /** @description The imports of coding agents' memory files. */
+            imports?: {
+                /** @description The prefix of every import graph, an IRI that ends in `/` or `#`. `agentGraphs` must cover it. */
+                base: string;
+                /**
+                 * @description Who extracts facts from imported prose.
+                 * @enum {string}
+                 */
+                extract?: "agent" | "server" | "none";
+                secretPatterns?: {
+                    name: string;
+                    regex: string;
+                }[];
+                /** @description Whether transcripts may be imported (Phase 3m-b). */
+                transcripts?: boolean;
+            };
         };
         MergeRequest: {
             /** @description The merge base to use among several. */
@@ -12482,6 +12680,41 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    assertFacts: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AssertFactsRequest"];
+            };
+        };
+        responses: {
+            /** @description The result. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AssertFactsResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            409: components["responses"]["Conflict"];
+            422: components["responses"]["Unprocessable"];
+            default: components["responses"]["Error"];
+        };
+    };
     geoFeatures: {
         parameters: {
             query: {
@@ -12931,6 +13164,40 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             501: components["responses"]["NotImplemented"];
+            default: components["responses"]["Error"];
+        };
+    };
+    memoryBrief: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BriefRequest"];
+            };
+        };
+        responses: {
+            /** @description The brief. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BriefResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            422: components["responses"]["Unprocessable"];
             default: components["responses"]["Error"];
         };
     };

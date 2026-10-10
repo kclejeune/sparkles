@@ -237,6 +237,12 @@ fn memory(put: &mut dyn FnMut(&str, J)) {
                     "agents": { "type": "object", "description": "Per-agent policies by agent name.", "additionalProperties": closed(&[], json!({
                         "conversationFacts": string_enum(&["immediate", "review"]),
                     })) },
+                    "imports": with_desc(closed(&["base"], json!({
+                        "base": with_desc(string(), "The prefix of every import graph, an IRI that ends in `/` or `#`. `agentGraphs` must cover it."),
+                        "secretPatterns": array(closed(&["name", "regex"], json!({ "name": string(), "regex": string() }))),
+                        "transcripts": with_desc(boolean(), "Whether transcripts may be imported (Phase 3m-b)."),
+                        "extract": with_desc(string_enum(&["agent", "server", "none"]), "Who extracts facts from imported prose."),
+                    })), "The imports of coding agents' memory files."),
                 }),
             ),
             "The memory settings of a dataset.",
@@ -286,6 +292,135 @@ fn memory(put: &mut dyn FnMut(&str, J)) {
             ),
             "A question and the query that answers it.",
             "suggested-examples",
+        ),
+    );
+    imports(put);
+}
+
+/// `POST /{ds}/facts` and `POST /{ds}/memory/brief` (C18 Phase 3m-a).
+fn imports(put: &mut dyn FnMut(&str, J)) {
+    let fact = closed(
+        &["s", "p", "o"],
+        json!({
+            "s": string(), "p": string(),
+            "o": with_desc(string(), "An IRI, a key of `entities`, or a literal in SPARQL syntax."),
+            "mode": string_enum(&["add", "replace"]),
+            "confidence": num(),
+            "quote": with_desc(string(), "At most 1000 characters."),
+        }),
+    );
+    let retract = json!({ "oneOf": [
+        with_desc(string(), "A reifier IRI."),
+        closed(&["s", "p", "o", "graph"], json!({ "s": string(), "p": string(), "o": string(), "graph": string() })),
+    ]});
+    put(
+        "AssertFactsRequest",
+        doc(
+            closed(
+                &[],
+                json!({
+                    "graph": with_desc(string(), "The named graph to write (default: `source.iri`)."),
+                    "source": closed(&["iri"], json!({ "iri": string(), "title": string() })),
+                    "entities": array(closed(&["key", "label", "types"], json!({
+                        "key": string(), "label": string(), "types": strings(),
+                        "altLabels": strings(), "distinctFrom": strings(),
+                    }))),
+                    "facts": array(fact),
+                    "retract": array(retract),
+                    "replaceScope": string_enum(&["graph", "writable"]),
+                    "message": string(),
+                    "idempotencyKey": with_desc(string(), "At most 128 characters. A retry with the same key writes nothing and answers `alreadyApplied`."),
+                    "agent": closed(&["name"], json!({ "name": string(), "model": string() })),
+                    "iriBase": string(),
+                    "allowUnknownIris": boolean(),
+                    "dryRun": boolean(),
+                    "changes": int(),
+                    "ifHead": int(),
+                    "timeoutSeconds": num(),
+                    "branch": with_desc(string(), "Write on this branch instead of main."),
+                }),
+            ),
+            "The arguments of `assert_facts` without `dataset`.",
+            "importing-agent-memory",
+        ),
+    );
+    let change = obj(
+        &["triple", "graph"],
+        json!({ "triple": string(), "graph": string(), "reason": string() }),
+    );
+    put(
+        "AssertFactsResult",
+        doc(
+            obj(
+                &["dataset", "graph", "committed", "head"],
+                json!({
+                    "dataset": string(), "branch": string(), "graph": string(),
+                    "committed": boolean(), "wouldCommit": boolean(),
+                    "commit": int(), "head": int(), "alreadyApplied": boolean(),
+                    "activity": string(),
+                    "minted": { "type": "object", "additionalProperties": string() },
+                    "inserted": int(), "deleted": int(),
+                    "superseded": array(change.clone()), "retracted": array(change.clone()),
+                    "conflicts": array(change),
+                    "warnings": array(any_object("A problem the write did not refuse.")),
+                    "validation": any_object("The guard's report."),
+                    "dryRun": any_object("A dry run's preview."),
+                    "elapsedMs": num(),
+                    "prefixes": any_object("The prefixes the compact terms use."),
+                }),
+            ),
+            "What `assert_facts` wrote, or would write in a dry run.",
+            "importing-agent-memory",
+        ),
+    );
+    put(
+        "BriefRequest",
+        doc(
+            closed(
+                &[],
+                json!({
+                    "scope": string_enum(&["project", "entity", "session"]),
+                    "projectKey": with_desc(string(), "The project's key, such as `github.com/acme/shop`, with scope project."),
+                    "entity": with_desc(string(), "An IRI, or a label that must link exactly, with scope entity."),
+                    "query": with_desc(string(), "The words to recall, with scope session."),
+                    "includeUnreviewed": boolean(),
+                    "maxChars": with_desc(int(), "500 to 100,000, 8000 by default."),
+                    "maxFacts": with_desc(int(), "1 to 500, 60 by default."),
+                    "halfLifeDays": with_desc(num(), "The age at which a fact's weight halves, 90 by default."),
+                    "unreviewedWeight": with_desc(num(), "0 to 1, 0.7 by default."),
+                    "timeoutSeconds": num(),
+                }),
+            ),
+            "What to brief.",
+            "importing-agent-memory",
+        ),
+    );
+    put(
+        "BriefResult",
+        doc(
+            obj(
+                &[
+                    "dataset",
+                    "commit",
+                    "scope",
+                    "reviewedOnly",
+                    "matched",
+                    "shown",
+                    "text",
+                ],
+                json!({
+                    "dataset": string(), "commit": int(), "scope": string(),
+                    "reviewedOnly": boolean(),
+                    "imports": with_desc(boolean(), "Whether the dataset has an import base."),
+                    "matched": int(), "shown": int(),
+                    "text": with_desc(string(), "The brief as plain text. Its first line says that the lines are recalled data."),
+                    "facts": array(any_object("One fact with its citations.")),
+                    "citations": array(any_object("One source of the facts.")),
+                    "prefixes": any_object("The prefixes the compact terms use."),
+                }),
+            ),
+            "The brief of a project, an entity or a session.",
+            "importing-agent-memory",
         ),
     );
 }

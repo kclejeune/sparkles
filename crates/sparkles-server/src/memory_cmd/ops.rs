@@ -1538,8 +1538,8 @@ fn assert_cmd(
         format!(
             "{}: {} inserted, {} deleted{}",
             j["graph"].as_str().unwrap_or(""),
-            j["inserted"].as_array().map_or(0, |v| v.len()),
-            j["deleted"].as_array().map_or(0, |v| v.len()),
+            j["inserted"].as_u64().unwrap_or(0),
+            j["deleted"].as_u64().unwrap_or(0),
             if j["committed"] == true {
                 format!(", commit {}", j["commit"])
             } else if j["alreadyApplied"] == true {
