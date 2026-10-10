@@ -48,7 +48,76 @@ pub enum Cell {
 #[napi(object)]
 pub struct WireBatch {
     pub text: Text,
-    pub data: Uint32Array,
+    #[napi(ts_type = "Uint32Array")]
+    pub data: Words,
+}
+
+/// The words of a batch. A small batch, such as a lookup's, is copied into a new
+/// `ArrayBuffer`, which V8 frees with less work than an external buffer that calls back
+/// into Rust. A larger one is handed over without a copy.
+pub struct Words(Vec<u32>);
+
+/// The largest batch, in words, that is copied rather than handed over.
+const COPY_WORDS: usize = 4096;
+
+impl TypeName for Words {
+    fn type_name() -> &'static str {
+        "Uint32Array"
+    }
+    fn value_type() -> napi::ValueType {
+        napi::ValueType::Object
+    }
+}
+
+impl ValidateNapiValue for Words {}
+
+impl ToNapiValue for Words {
+    unsafe fn to_napi_value(
+        env: napi::sys::napi_env,
+        val: Self,
+    ) -> napi::Result<napi::sys::napi_value> {
+        let len = val.0.len();
+        if len == 0 || len > COPY_WORDS {
+            // SAFETY: as napi-rs's own conversion of a `Uint32Array`
+            return unsafe { Uint32Array::to_napi_value(env, Uint32Array::new(val.0)) };
+        }
+        let bytes = len * size_of::<u32>();
+        let mut buffer = std::ptr::null_mut();
+        let mut data = std::ptr::null_mut();
+        // SAFETY: V8 allocates `bytes` bytes at `data`, which the copy fills
+        let status =
+            unsafe { napi::sys::napi_create_arraybuffer(env, bytes, &mut data, &mut buffer) };
+        napi::check_status!(status, "failed to create a result buffer")?;
+        // SAFETY: `data` holds `bytes` bytes, and the vector as many
+        unsafe {
+            std::ptr::copy_nonoverlapping(val.0.as_ptr().cast::<u8>(), data.cast::<u8>(), bytes)
+        };
+        let mut out = std::ptr::null_mut();
+        // SAFETY: the array views the whole buffer just made
+        let status = unsafe {
+            napi::sys::napi_create_typedarray(
+                env,
+                napi::sys::TypedarrayType::uint32_array,
+                len,
+                buffer,
+                0,
+                &mut out,
+            )
+        };
+        napi::check_status!(status, "failed to create a result array")?;
+        Ok(out)
+    }
+}
+
+impl napi::bindgen_prelude::FromNapiValue for Words {
+    unsafe fn from_napi_value(
+        env: napi::sys::napi_env,
+        value: napi::sys::napi_value,
+    ) -> napi::Result<Self> {
+        // SAFETY: as napi-rs's own conversion of a `Uint32Array`
+        let array = unsafe { Uint32Array::from_napi_value(env, value)? };
+        Ok(Words(array.to_vec()))
+    }
 }
 
 /// The text of a batch. Text that is all ASCII, as IRIs nearly always are, becomes a
@@ -268,7 +337,7 @@ impl TermTable {
                 text: self.text,
                 ascii: self.ascii,
             },
-            data: Uint32Array::new(data),
+            data: Words(data),
         }
     }
 }
