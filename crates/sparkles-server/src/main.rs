@@ -43,9 +43,9 @@ mod lsp;
 mod mcp;
 #[cfg(feature = "memory")]
 mod memory_cmd;
+mod model_store;
 // the pipeline that uses most of the model clients (`ask`) needs the `mcp` feature
 #[cfg_attr(not(feature = "mcp"), allow(dead_code, unused_imports))]
-mod model_store;
 mod models;
 mod models_cmd;
 mod obs;
