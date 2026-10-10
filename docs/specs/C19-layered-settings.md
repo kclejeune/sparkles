@@ -5,7 +5,8 @@
 > **Phases:** Phase 1 is the server: settings kinds, the declared layer, layered
 > resolution, locks, the `/$/settings` routes and reloading on SIGHUP. Phase 2 is the
 > `sparkles settings` command, the NixOS module and the change to `sparkles memory init`.
-> Phase 3 is the UI's settings tab.
+> Phase 3 is the UI's settings tab. Phase 4 makes the server's model configuration a
+> layered settings kind that server administrators can change, with write-only API keys.
 >
 > **User docs:** none yet.
 >
@@ -56,13 +57,13 @@ Goals:
 - Every answer says where each value comes from.
 - The NixOS module validates declared settings at build time.
 - Model provider configuration reloads on SIGHUP instead of needing a restart.
+- Server administrators can change the model configuration at runtime, including
+  providers, endpoints and API keys, unless the operator locks it (Phase 4).
 
 Non-goals:
 
 - Creating datasets from the settings file. The module's `services.sparkles.datasets`
   and the catalog API already create datasets.
-- Editing model providers, endpoints or credentials at runtime. They stay with the
-  operator, as C18 requires.
 - Ingest profiles, stored queries, backup repositories and other collections. The
   registry of §3 is built so that more kinds can be added later.
 
@@ -264,7 +265,101 @@ read-only with a lock icon, and a runtime value has a button that resets it. A u
 without `admin` sees the tab read-only. Writes send `If-Match`, and a `412` reloads the
 section and tells the user that someone else changed it.
 
-## 11. Rejected alternatives
+## 11. Server-wide model settings
+
+Phase 4 adds the first server-wide settings kind, `models`. It holds the whole model
+configuration of C18: providers with their kind, endpoint, headers, limits, budgets and
+allowed models, the per-model options, the server's role lists and the routing
+settings. This changes a decision of C18, which allowed no route to create a provider or
+change its endpoint. Server administrators are trusted with the server's outbound
+connections, so they may now change providers through the API. Users with `admin` on a
+dataset still change only that dataset's `assistant` settings, as before.
+
+### 11.1 Layers
+
+The `models` kind uses the layers of §4 at server scope.
+
+1. The built-in defaults of C18.
+2. The declared model configuration of `--model-config`.
+3. The runtime layer in `<dataDir>/models.json`.
+
+Locks for server-wide kinds are declared in the settings file under `server`:
+
+```json
+{
+  "server": { "locked": ["models.providers.claude.endpoint", "models.routing"] }
+}
+```
+
+A lock may name a whole provider, such as `models.providers.claude`, which fixes every
+field of it and prevents its removal at runtime. Providers are objects keyed by name, so
+the merge of §4 adds and changes providers member by member. Removing a declared
+provider at runtime stores `null` for it in the runtime layer. Role lists are arrays, so
+each list is one field.
+
+Requests to providers still go through the server's outbound policy, so an endpoint on
+a private address still needs `--outbound-allow-private`. Headers that carry
+credentials and endpoints with credentials, a query or a fragment are refused as
+before. A change takes effect for requests that start after it, and requests in flight
+keep the configuration they started with, as in §7. A dataset's role list that names a
+provider removed at runtime is reported in that dataset's status, as in §4.3.
+
+### 11.2 API keys
+
+A provider names its key with `apiKey.secret`, as before. A secret has two possible
+sources. The declared source is `--model-secret NAME=file:PATH` or `NAME=env:VARIABLE`.
+The runtime source is a value that a server administrator stores through the API. A
+runtime value overrides the declared source unless the settings file locks the secret
+with `secrets.NAME` in `server.locked`.
+
+The server stores a runtime value in `<dataDir>/secrets/NAME` with mode 0600, in a
+directory with mode 0700. The files are not encrypted until the database-directory
+encryption of [F11](F11-encryption-at-rest.md) is built, and they are then wrapped by
+its master key like the rest of the data directory. An operator who does not want keys
+on disk locks the secrets in the settings file. No route and no command ever returns a
+key's value.
+
+| Method and path | Needs | Effect |
+|---|---|---|
+| `GET /$/server/secrets` | server `admin` | Each secret's name, source (`declared`, `runtime` or `missing`), whether it is locked, when a runtime value was last set, and the providers that use it. |
+| `PUT /$/server/secrets/{name}` | server `admin` | Stores a runtime value from `{"value": "..."}`, `204`. |
+| `DELETE /$/server/secrets/{name}` | server `admin` | Removes the runtime value, so the declared source applies again, `204`. |
+
+### 11.3 HTTP
+
+| Method and path | Needs | Effect |
+|---|---|---|
+| `GET /$/server/settings/{kind}` | server `admin` | The kind's effective object, declared and runtime layers, sources and locks, and an `ETag`, as in §6. |
+| `PATCH`, `PUT`, `DELETE /$/server/settings/{kind}` | server `admin` | As in §6, on the server's runtime layer. |
+
+`GET /$/models` keeps its current shape and access. It reports the effective
+configuration and each provider's status, and a provider's status now says whether its
+key is `missing`.
+
+Every change to `models` and to a secret is logged with the principal, the fields
+changed and, for a secret, its name only.
+
+### 11.4 CLI, NixOS module and UI
+
+`sparkles settings` takes `--server` in place of a dataset for server-wide kinds, as in
+`sparkles settings set --server models.roles.draft='[{"provider":"claude","model":"claude-haiku-5-5"}]'`.
+`sparkles secrets list`, `sparkles secrets set NAME` and `sparkles secrets unset NAME`
+manage runtime keys. `set` reads the value from standard input or a prompt with echo
+off, never from an argument, so the key does not end up in shell history or the
+process list.
+
+The NixOS module keeps `services.sparkles.models.settings` and
+`services.sparkles.models.secrets` as the declared layer. It adds
+`services.sparkles.settings.server.locked`, and `sparkles settings check` validates the
+generated model configuration together with the settings file.
+
+The UI's server page gets a Models section for server administrators. It lists the
+providers with their status and edits providers, per-model options, role lists and
+routing with the same source labels, locks and resets as §10. A key field is
+write-only. It shows whether a key is set, its source and when it was set, and offers
+to replace or remove a runtime value.
+
+## 12. Rejected alternatives
 
 - **Writing declared settings into the dataset files before each start.** This is the
   first NixOS integration. It loses runtime edits and delays settings for datasets
@@ -275,13 +370,20 @@ section and tells the user that someone else changed it.
   enforce a policy such as what may be sent to a model.
 - **Locks per kind instead of per field.** These force the operator to lock all of
   `assistant` in order to lock `send`.
+- **Model configuration only in the operator's file.** C18 chose this. It keeps
+  outbound connections with the operator, but it forces a restart or a redeploy for
+  every change of a role list or a budget. Server administrators are trusted with the
+  server, and the operator can still lock what must not change.
+- **Returning stored keys to administrators.** A key that can be read back can leak
+  through the UI, logs and backups of API answers. Keys are write-only, as in most
+  services that hold credentials.
 - **Creating datasets from the settings file.** The module and the catalog already
   create datasets, and two ways of declaring a dataset would have to agree on paths,
   types and deletion.
 - **Recreating a deleted declared dataset at the next start.** This is today's
   behavior, and it makes a deletion look successful until the restart undoes it.
 
-## 12. Acceptance examples
+## 13. Acceptance examples
 
 - **A1.** The settings file declares `slurp.assistant.enabled = true` and the dataset
   does not exist. After `POST /$/datasets` creates `slurp`, `GET /$/settings/slurp/assistant`
@@ -305,8 +407,22 @@ section and tells the user that someone else changed it.
   `declared-dataset`, and the dataset and its files are unchanged.
 - **A10.** A change to `services.sparkles.models.settings` reloads the server without a
   restart, and `GET /$/models` shows the new roles.
+- **A11.** A server administrator adds a provider and a role list with `PATCH
+  /$/server/settings/models` and stores its key with `PUT /$/server/secrets/{name}`. The
+  next ask uses the provider without a restart. A user with only dataset `admin` gets
+  `403` on both routes.
+- **A12.** `GET /$/server/secrets` and `GET /$/server/settings/models` never contain a
+  key's value, and neither does the server's log.
+- **A13.** With `models.providers.claude.endpoint` locked, a `PATCH` that changes the
+  endpoint is a `409` with `locked-by-config`, and a `PATCH` that changes the provider's
+  budget succeeds.
+- **A14.** A runtime key overrides a declared `file:` source. `DELETE` of the runtime
+  value brings back the declared file. With `secrets.anthropic` locked, the `PUT` is a
+  `409`.
+- **A15.** A runtime provider on a private address is refused at request time unless
+  `--outbound-allow-private` is set.
 
-## 13. Sources
+## 14. Sources
 
 - RFC 7396, JSON Merge Patch, for the merge rule and `null` as removal.
 - RFC 9110, sections 8.8.3 and 13.1.1, for `ETag` and `If-Match`.
@@ -317,7 +433,7 @@ section and tells the user that someone else changed it.
 - systemd's documentation of drop-in directories, for layered configuration.
 - Firefox's enterprise policy documentation, for locked preferences.
 - The NixOS manual's guidance on settings options and secrets.
-- The Sparkles code and specs C09, C17 and C18.
+- The Sparkles code and specs C09, C17, C18 and F11.
 
 ## Outcome
 

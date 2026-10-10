@@ -616,9 +616,11 @@ implementation landed.
   - the public documentation of Grafana's provisioning, PostgreSQL's `ALTER SYSTEM`,
     systemd's drop-in directories and Firefox's enterprise policies;
   - the NixOS manual's guidance on settings options and secrets;
-  - the Sparkles code and specs C09, C17 and C18.
+  - the Sparkles code and specs C09, C17, C18 and F11.
 - **Implementation:** not started.
-- **Rejected** (spec §11):
+- **Rejected** (spec §12):
+  - model configuration only in the operator's file;
+  - returning stored keys to administrators;
   - writing declared settings into the dataset files before each start;
   - declared values that always win, and runtime values that always win;
   - locks per settings kind;
