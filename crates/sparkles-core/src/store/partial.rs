@@ -373,7 +373,12 @@ pub(crate) fn write(
             .ok_or_else(|| Error::invalid("the generation has no index files"))?,
     };
     std::fs::create_dir_all(dir)?;
-    for f in ["vocab.dat", "vocab.off", "vocab.idx"] {
+    for f in [
+        "vocab.dat",
+        "vocab.off",
+        "vocab.idx",
+        crate::vocab::numeric::FILE,
+    ] {
         match std::fs::copy(from.join(f), dir.join(f)) {
             Ok(_) => File::open(dir.join(f))?.sync_all()?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}

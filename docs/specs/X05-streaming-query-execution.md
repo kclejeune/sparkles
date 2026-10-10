@@ -880,3 +880,15 @@ full DBpedia attributed the slower cold reads and loads of 2026-10-08 to the sta
 the benchmark machine's SSD rather than to query execution. After a trim, the current
 and 2026-10-03 binaries loaded equally fast, and the current binary's cold reads were
 within 10% or faster on every query.
+
+Range filters over numeric literals stored in the vocabulary read their values from the
+numeric column (`vocab.num`) in both execution modes. A scan with an inexact range, such
+as `FILTER(?lat > 48 && ?lat < 49)` over `xsd:float` literals in non-canonical form,
+tests each batch's distinct ids against the column and decodes only ids that the column
+does not hold, such as strings, dates and decimals with too many digits. The cursor
+scan does this per batch with no extra state, and the eager scan per parallel chunk.
+Sorts, top-k and the cursor's decoded value columns read numbers from the column too.
+On full DBpedia the cold `geo-box` query fell from 255 to 108 ms, and the answers are
+identical with the column switched off (`SPARKLES_NUMERIC_COLUMN=off`).
+[BENCHMARKS.md](../BENCHMARKS.md#numeric-literals-in-the-vocabulary) has the
+measurements.

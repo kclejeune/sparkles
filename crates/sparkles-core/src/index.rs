@@ -52,6 +52,19 @@ pub fn set_sparse_vocab(on: bool) {
     SPARSE_VOCAB.set(on);
 }
 
+/// Whether vocabularies opened from now on read the values of numeric literals from
+/// their numeric column (`vocab.num`, see [`crate::vocab::numeric`]) when they have one.
+/// On by default, `off` in `SPARKLES_NUMERIC_COLUMN` turns it off for a process.
+pub fn numeric_column() -> bool {
+    NUMERIC_COLUMN.get()
+}
+
+/// Turn the use of [`numeric_column`] on or off for vocabularies opened from now on.
+pub fn set_numeric_column(on: bool) {
+    NUMERIC_COLUMN.set(on);
+}
+
+static NUMERIC_COLUMN: EnvSwitch = EnvSwitch::new("SPARKLES_NUMERIC_COLUMN");
 static IO_HINTS: EnvSwitch = EnvSwitch::new("SPARKLES_IO_HINTS");
 static SPARSE_VOCAB: EnvSwitch = EnvSwitch::new("SPARKLES_SPARSE_VOCAB");
 

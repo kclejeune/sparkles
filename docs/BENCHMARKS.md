@@ -11,7 +11,7 @@ check every engine's answers before timing them, and list every case where Spark
 | OS and kernel | NixOS, Linux 6.18 |
 | Sparkles | 0.1.0, release builds with default features, rustc 1.98 and 1.99 |
 | Other engines | QLever 0.5.48, Oxigraph 0.5.11 (server, pyoxigraph and the JavaScript package), Apache Jena TDB2 6.2.0 with Fuseki 5.1.0, Jena 5.6.0 (TDB2 and TIM in the JVM comparison), rdflib 7.6.0, N3.js 2.13.11 with Comunica 5.4.1 |
-| Measured | 2026-10-03 to 2026-10-09 |
+| Measured | 2026-10-03 to 2026-10-09. The QLever figures for the DBpedia `geo-box` and `country-population` queries come from an earlier run on the same host. |
 
 * [Summary](#summary)
 * [Query performance](#query-performance)
@@ -256,7 +256,7 @@ and evict its files from the page cache before each query, then measure it once.
 | entity-summary-2 | **6.4 ± 1.5** | 12.1 ± 3.1 |
 | export-1m | **241.7 ± 13.2** | 1440.1 ± 3.3 |
 | film-director-optional | **21.2 ± 1.2** | 33.3 ± 8.1 ‡ |
-| geo-box | **27–31** | 143.8 ± 1.4 ‡ |
+| geo-box | **27.1** | 143.8 ± 1.4 ‡ |
 | inlinks-count-1 | **10.4 ± 1.0** | 14.7 ± 1.4 ‡ |
 | inlinks-count-2 | **11.5 ± 0.6** | 16.5 ± 1.1 ‡ |
 | label-regex | **13.6 ± 3.1** | 19.0 ± 0.0 |
@@ -278,8 +278,8 @@ and evict its files from the page cache before each query, then measure it once.
 ‡ Same values as different RDF terms, because QLever returns counts as `xsd:int`.
 † The two engines disagree for the reason given [below](#why-count-all-and-predicate-counts-differ).
 QLever's `count-all` is one triple short of the distinct input, and `predicate-counts` is
-not ranked. The `geo-box` row gives the range of the medians of 11 warm requests across
-the runs with the [numeric column](#numeric-literals-in-the-vocabulary).
+not ranked. The `geo-box` row is the median of 11 warm requests with the
+[numeric column](#numeric-literals-in-the-vocabulary).
 
 Sparkles is faster than QLever on all 29 queries that both rank. `place-union-1` is within
 10%. Under 16 clients it serves 1,517 `entity-facts-1` requests per second against
@@ -302,7 +302,7 @@ QLever's 1,064, and 830 `place-births-1` requests per second against 231.
 | entity-summary-2 | **9.3** | 29.5 |
 | export-1m | **1000.4** | 4261.4 |
 | film-director-optional | **35.3** | 68.6 |
-| geo-box | **105.6** | 157.9 |
+| geo-box | **108** | 157.9 |
 | inlinks-count-1 | **13.1** | 30.2 |
 | inlinks-count-2 | **10.4** | 27.3 |
 | label-regex | **40.1** | 71.3 |
@@ -341,19 +341,25 @@ DBpedia writes coordinates as `"48.8566"^^xsd:float` and many counts as `xsd:int
 numeric column, `vocab.num`, holds their exact values next to the vocabulary, so a range
 filter, sort or aggregate over them reads 8 bytes per value instead of decoding each key.
 It costs 20.7 MB on disk beside an 8.0 GB `vocab.dat`, and 4.3 MB of it stays in memory
-while the database is open. The extra queries below read `geo:lat`, `geo:long`,
-`dbo:populationTotal` and `dbo:elevation` and are not part of the suite. The cold times
-compare the same binary with the column and with `SPARKLES_NUMERIC_COLUMN=off`, as medians
-of alternating rounds with a restart and file-cache eviction before each query. The
-answers are identical in both modes.
+while the database is open. The `geo-box` and `country-population` queries of the suite and five extra queries over
+`geo:lat`, `geo:long`, `dbo:populationTotal` and `dbo:elevation` compare the same binary
+with the column and with `SPARKLES_NUMERIC_COLUMN=off`. Cold times are medians of 10
+alternating rounds with a restart and file-cache eviction before each query, and warm
+times are medians of 11 requests. The answers are identical in both modes.
 
-| 1.01B, cold | with the column (ms) | without (ms) |
-|---|---:|---:|
-| `geo-avg` | **553** | 3,005 |
-| `lat-order` | **72** | 137 |
-| `pop-topk` | **41** | 90 |
-| `pop-range` | **43** | 65 |
-| `elev` | **41** | 55 |
+| 1.01B | cold, with (ms) | cold, without (ms) | warm, with (ms) | warm, without (ms) |
+|---|---:|---:|---:|---:|
+| `geo-box` | **108** | 255 | **27.1** | 139.5 |
+| `country-population` | 29.0 | 28.2 | **2.8** | 3.2 |
+| `geo-avg` | **553** | 3,001 | **191** | 580 |
+| `lat-order` | **72** | 137 | **21.8** | 50.2 |
+| `pop-topk` | **41** | 90 | **9.3** | 20.7 |
+| `pop-range` | **43** | 65 | **7.8** | 17.2 |
+| `elev` | **41** | 54 | **6.7** | 14.0 |
+
+Cold, the column's values are read ahead page by page, so a filter over a few thousand
+values reads only the pages that hold them. `country-population` reads few such literals
+and is within 10% either way.
 
 #### Prefix filtering and large results
 
@@ -392,6 +398,9 @@ cold lookup reads:
   8.4 MB of memory at 1.01B quads. `SPARKLES_SPARSE_VOCAB=off` disables its use.
 * An index join with up to 16,384 keys requests its blocks before it decodes the first, so
   their reads overlap.
+* A filter, sort or aggregate over non-canonical numeric literals reads 8-byte values from
+  the [numeric column](#numeric-literals-in-the-vocabulary) instead of decoding each key
+  from the vocabulary.
 
 The tradeoff is faster sparse lookups against less automatic read-ahead for dense scans.
 These cold medians switch the first two features together.

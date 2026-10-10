@@ -1452,9 +1452,12 @@ enum Cmd {
         #[arg(long, value_name = "MODE")]
         partial: Option<String>,
     },
-    /// Add the sparse vocabulary index (vocab.idx) to a database whose current index was
-    /// built before it existed, so that a cold server looks up a term with one read
-    /// instead of one per step of a binary search. A load or compaction writes it too.
+    /// Add the sparse vocabulary index (vocab.idx) and the numeric column (vocab.num) to
+    /// a database whose current index was built before they existed. With the index, a
+    /// cold server looks up a term with one read instead of one per step of a binary
+    /// search. With the column, a FILTER or ORDER BY on numeric literals that are not in
+    /// canonical form reads their values without decoding their keys. A load or
+    /// compaction writes both.
     VocabIndex {
         #[arg(long)]
         loc: PathBuf,
@@ -3353,6 +3356,11 @@ fn run() -> Result<()> {
             match store.add_vocab_index()? {
                 Some(n) => println!("wrote vocab.idx ({n} entries)"),
                 None => println!("the current index already has vocab.idx"),
+            }
+            match store.add_numeric_column()? {
+                Some(0) => println!("the vocabulary holds no numeric literals, no vocab.num"),
+                Some(n) => println!("wrote vocab.num ({n} values)"),
+                None => println!("the current index already has vocab.num"),
             }
             Ok(())
         }
