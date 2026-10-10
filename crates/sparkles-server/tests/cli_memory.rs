@@ -1139,6 +1139,11 @@ fn memory_transcripts_review_and_export() {
     settings["consolidatedGraph"] = "https://example.org/memory/consolidated".into();
     let (st, _) = s.json("admin", "PUT", &format!("/$/memory/{DS}"), Some(&settings));
     assert_eq!(st, 200);
+    std::fs::write(
+        f.project().join(".claude/rules/python.md"),
+        "---\npaths:\n  - \"**/*.py\"\n---\nFormat with black.\n",
+    )
+    .unwrap();
     let imp = mem_json(&f, &s, "ana", &["import", "claude-code", "--project", p]);
     assert_eq!(imp["failed"], 0, "{imp:#}");
 
@@ -1410,7 +1415,7 @@ fn memory_transcripts_review_and_export() {
     let out3 = f.dir.path().join("other");
     std::fs::create_dir_all(&out3).unwrap();
     let o3 = out3.to_str().unwrap();
-    mem_json(
+    let ex = mem_json(
         &f,
         &s,
         "ana",
@@ -1427,6 +1432,10 @@ fn memory_transcripts_review_and_export() {
             "claude-code",
         ],
     );
+    // Codex does not read a rule's paths, so the rule loses them with a warning
+    let rule = std::fs::read_to_string(out3.join(".claude/rules/python.md")).unwrap();
+    assert!(rule.ends_with("-->\nFormat with black.\n"), "{rule}");
+    assert!(ex["warnings"].to_string().contains("python.md"), "{ex:#}");
     let agents = std::fs::read_to_string(out3.join("AGENTS.md")).unwrap();
     assert!(agents.starts_with("<!-- sparkles:copy-of <"), "{agents}");
     assert!(agents.contains("\n## staging-db\n"), "{agents}");

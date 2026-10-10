@@ -2706,6 +2706,7 @@ fn export(env: &Env, a: ExportArgs) -> Result<i32, CmdError> {
     let mut files: Vec<(String, Vec<u8>, Vec<String>, &'static str, bool)> = Vec::new();
     let mut fragment: Vec<&Stored> = Vec::new();
     let mut agents: Vec<&Stored> = Vec::new();
+    let mut warnings: Vec<Value> = Vec::new();
     for s in &sources {
         if s.harness == a.to {
             files.push((
@@ -2748,8 +2749,20 @@ fn export(env: &Env, a: ExportArgs) -> Result<i32, CmdError> {
                     agents.push(s);
                     continue;
                 }
+                let text = String::from_utf8_lossy(&s.bytes).into_owned();
+                let doc = sparkles_memory_import::frontmatter::parse(&text);
                 let mut t = copy_comment(&s.graph, &date);
-                t.push_str(&String::from_utf8_lossy(&s.bytes));
+                if to != "claude-code" && doc.has_frontmatter && doc.get("paths").is_some() {
+                    // only Claude Code reads a rule's `paths`
+                    warnings.push(json!({
+                        "source": s.graph,
+                        "path": name,
+                        "warning": format!("{to} does not read a rule's paths; the frontmatter is left out"),
+                    }));
+                    t.push_str(doc.body);
+                } else {
+                    t.push_str(&text);
+                }
                 files.push((
                     name,
                     t.into_bytes(),
@@ -2868,6 +2881,7 @@ fn export(env: &Env, a: ExportArgs) -> Result<i32, CmdError> {
         "out": a.out.display().to_string(),
         "files": written,
         "skipped": skipped,
+        "warnings": warnings,
     });
     env.out(&out, || {
         let mut t: Vec<String> = written
@@ -2890,6 +2904,13 @@ fn export(env: &Env, a: ExportArgs) -> Result<i32, CmdError> {
                 "{}: skipped ({})",
                 s["path"].as_str().unwrap_or(""),
                 s["reason"].as_str().unwrap_or("")
+            ));
+        }
+        for w in &warnings {
+            t.push(format!(
+                "{}: {}",
+                w["path"].as_str().unwrap_or(""),
+                w["warning"].as_str().unwrap_or("")
             ));
         }
         if t.is_empty() {
