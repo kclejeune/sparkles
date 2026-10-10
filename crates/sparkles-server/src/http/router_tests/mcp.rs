@@ -10,6 +10,8 @@ use axum::http::HeaderMap;
 use clap::Parser;
 use serde_json::json;
 
+mod memory_writes;
+
 const FIXTURE: &str = r#"@prefix ex:   <http://ex.org/> .
 @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
 ex:Person rdfs:label "Person"@en .

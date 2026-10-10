@@ -2754,6 +2754,10 @@ export interface components {
             note?: string | null;
             ordinal?: number;
             protected: boolean;
+            /** @description Set on a scratch branch that the MCP tool create_branch made (C17 §5.7): the principal that created it. */
+            scratch?: {
+                creator?: string;
+            } | null;
             storage: {
                 generation?: string;
                 heldBytes?: number;

@@ -590,6 +590,11 @@ pub(super) fn schemas() -> Map<String, J> {
                 "protected": { "type": "boolean" },
                 "note": { "type": ["string", "null"] },
                 "created": { "type": "string" },
+                "scratch": {
+                    "type": ["object", "null"],
+                    "description": "Set on a scratch branch that the MCP tool create_branch made (C17 §5.7): the principal that created it.",
+                    "properties": { "creator": { "type": "string" } },
+                },
                 "storage": {
                     "type": "object",
                     "properties": {

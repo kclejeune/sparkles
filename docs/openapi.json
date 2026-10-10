@@ -1629,6 +1629,18 @@
           "protected": {
             "type": "boolean"
           },
+          "scratch": {
+            "description": "Set on a scratch branch that the MCP tool create_branch made (C17 §5.7): the principal that created it.",
+            "properties": {
+              "creator": {
+                "type": "string"
+              }
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "storage": {
             "properties": {
               "generation": {
