@@ -1,16 +1,18 @@
-//! `sparkles memory` (spec C18 §10.1, Phase 3m-a): the commands a person, a hook or a
-//! skill uses for agent memory.
+//! `sparkles memory` (spec C18 §10.1): the commands a person, a hook or a skill uses for
+//! agent memory.
 //!
 //! Every subcommand calls an operation the server already has over HTTP, with the same
-//! access control (§10.3): Graph Store `PUT` and `DELETE`, `/$/memory/{ds}`,
-//! `/$/validation/{ds}`, `/{ds}/sparql`, `POST /{ds}/facts`, `POST /{ds}/recall` and
-//! `POST /{ds}/memory/brief`. The commands talk to a server by default and take `--loc`
+//! access control (§10.3): Graph Store `PUT` and `DELETE`, `/$/memory/{ds}` with its
+//! inbox, promotion and rejection, `/$/validation/{ds}`, `/$/merge/{ds}`,
+//! `/{ds}/sparql`, `POST` and `GET /{ds}/sources`, `POST /{ds}/facts`,
+//! `POST /{ds}/recall` and `POST /{ds}/memory/brief`. The commands talk to a server by default and take `--loc`
 //! for a database no server holds, which they serve in the process through the same
 //! router (§10.2).
 
 mod conn;
 mod ops;
 mod sync;
+mod transcripts;
 
 use anyhow::Result;
 use clap::{Args, Subcommand};
@@ -75,11 +77,28 @@ pub struct ImportFlags {
     /// Codex's memories, ~/.gemini/GEMINI.md and the managed CLAUDE.md
     #[arg(long)]
     pub user_scope: bool,
-    /// Import transcripts (needs Phase 3m-b; refused here with the reason)
+    /// Import session transcripts of the projects opted in, when the dataset allows them
+    /// (imports.transcripts)
     #[arg(long)]
     pub transcripts: bool,
-    /// Who extracts facts from prose: agent, server or none (Phase 3m-a writes structure
-    /// only and records the choice)
+    /// What a transcript keeps: the text of the messages, or also tool calls and the
+    /// first 2,000 characters of each tool result
+    #[arg(long, value_parser = ["text", "tools"], default_value = "text")]
+    pub transcript_content: String,
+    /// Import subagent transcripts as sources of their own
+    #[arg(long)]
+    pub subagents: bool,
+    /// Skip sessions older than this, such as 30d, 12h or 90m
+    #[arg(long, value_name = "DURATION", default_value = "30d")]
+    pub since: String,
+    /// The most transcript text one sync imports; the rest waits for the next sync
+    #[arg(long, value_name = "N", default_value_t = 32 << 20)]
+    pub max_transcript_bytes: u64,
+    /// The transcript a session end hook named, imported even when it is recent
+    #[arg(long, hide = true, value_name = "FILE")]
+    pub transcript: Option<PathBuf>,
+    /// Who extracts facts from prose: agent (the skill, default), server or none. The
+    /// choice is recorded; extraction runs through the skill or the server's role.
     #[arg(long, value_parser = ["agent", "server", "none"])]
     pub extract: Option<String>,
     /// Extra redaction patterns: one `name regex` per line
@@ -255,6 +274,94 @@ pub enum MemoryCmd {
         #[arg(long)]
         yes: bool,
     },
+    /// List the review inbox: unreviewed facts with an id each, and review branches
+    Inbox {
+        /// Only facts of this agent or person
+        #[arg(long)]
+        agent: Option<String>,
+        /// session or import for facts; ingest, proposal, consolidation or inbox for
+        /// branches
+        #[arg(long)]
+        kind: Option<String>,
+        /// Only import facts of this harness
+        #[arg(long)]
+        harness: Option<String>,
+        /// Only facts of this project (a directory or key)
+        #[arg(long)]
+        project: Option<String>,
+        /// The most facts read from the inbox
+        #[arg(long, default_value_t = 200)]
+        limit: u64,
+    },
+    /// Walk the inbox: promote, reject or skip each fact, one choice per line of input
+    Review {
+        /// Only facts of this agent or person
+        #[arg(long)]
+        agent: Option<String>,
+        /// session or import for facts; ingest, proposal, consolidation or inbox for
+        /// branches
+        #[arg(long)]
+        kind: Option<String>,
+        /// Only import facts of this harness
+        #[arg(long)]
+        harness: Option<String>,
+        /// Only facts of this project (a directory or key)
+        #[arg(long)]
+        project: Option<String>,
+        /// The most facts read from the inbox
+        #[arg(long, default_value_t = 200)]
+        limit: u64,
+        /// The graph promoted facts go to (default: consolidatedGraph)
+        #[arg(long, value_name = "GRAPH")]
+        into: Option<String>,
+    },
+    /// Promote inbox facts onto a review branch and print the merge preview
+    Promote {
+        /// Inbox ids, or unique prefixes of them
+        ids: Vec<String>,
+        /// The graph the facts go to (default: consolidatedGraph)
+        #[arg(long, value_name = "GRAPH")]
+        into: Option<String>,
+        /// Also every inbox fact whose signals all pass
+        #[arg(long)]
+        all_that_pass: bool,
+        /// Only facts that another source corroborates
+        #[arg(long)]
+        require_corroboration: bool,
+        /// Merge the branch after the preview, with the preview's heads as expect
+        #[arg(long)]
+        merge: bool,
+    },
+    /// Retract unreviewed facts in one commit whose message names you
+    Reject {
+        ids: Vec<String>,
+        #[arg(long)]
+        message: Option<String>,
+    },
+    /// Write the stored sources as a copy: byte-identical for the same harness, converted
+    /// with a copy comment for another
+    Export {
+        /// Export the stored source files (the only kind of export)
+        #[arg(long, required = true)]
+        sources: bool,
+        /// The harness the files are written for: claude-code, codex or generic
+        #[arg(long, value_name = "HARNESS")]
+        to: String,
+        #[arg(long, value_name = "DIR")]
+        out: PathBuf,
+        /// A project directory or key (default: the current directory's project)
+        #[arg(long)]
+        project: Option<String>,
+        /// Only sources of this harness
+        #[arg(long)]
+        harness: Option<String>,
+        /// Also the user-scope files
+        #[arg(long)]
+        user_scope: bool,
+        /// Overwrite existing files
+        #[arg(long)]
+        force: bool,
+    },
     /// Print, or merge with --write, the hooks, the skill and the MCP configuration of a
     /// harness
     Setup {
@@ -267,7 +374,8 @@ pub enum MemoryCmd {
         /// Only the session start hook that prints the brief
         #[arg(long)]
         brief: bool,
-        /// Import transcripts at the session's end (needs Phase 3m-b)
+        /// Import the session's transcript at its end (the dataset and the project must
+        /// allow transcripts too)
         #[arg(long)]
         transcripts: bool,
     },

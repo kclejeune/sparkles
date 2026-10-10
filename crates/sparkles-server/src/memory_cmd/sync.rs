@@ -214,7 +214,10 @@ pub fn list_sources(
 
 /// The structural facts a graph holds now: no reifier, activity, agent, rendition or
 /// chunk, and not the source description that `register_source` owns.
-fn current_facts(conn: &Conn, graph: &str) -> Result<BTreeSet<(String, String, Obj)>, CmdError> {
+pub(super) fn current_facts(
+    conn: &Conn,
+    graph: &str,
+) -> Result<BTreeSet<(String, String, Obj)>, CmdError> {
     let q = format!(
         "SELECT ?s ?p ?o WHERE {{ GRAPH <{graph}> {{ ?s ?p ?o }} \
          FILTER NOT EXISTS {{ GRAPH <{graph}> {{ ?s <{RDF_REIFIES}> ?x }} }} \
@@ -321,10 +324,10 @@ pub struct SyncOpts {
     pub prefix: String,
 }
 
-struct Change {
-    adds: Vec<Value>,
-    replaced: usize,
-    retracts: Vec<Value>,
+pub(super) struct Change {
+    pub adds: Vec<Value>,
+    pub replaced: usize,
+    pub retracts: Vec<Value>,
 }
 
 fn fact_json(f: &Fact, mode: Option<&str>, spans: Option<&Spans>) -> Value {
@@ -356,7 +359,7 @@ fn retract_json(s: &str, p: &str, o: &Obj, graph: &str) -> Value {
 /// The changes that turn `current` into the file's facts. With `all`, facts the graph
 /// already holds are sent again, so that a source registered for the first time gains
 /// their spans.
-fn diff(
+pub(super) fn diff(
     file: &FileImport,
     current: &BTreeSet<(String, String, Obj)>,
     all: bool,
@@ -434,7 +437,7 @@ fn idem_key(graph: &str, old: &str, new: &str, head: Option<u64>, part: usize) -
 /// Send the changes of one graph in calls of at most [`MAX_PER_CALL`] items. Returns the
 /// last commit.
 #[allow(clippy::too_many_arguments)]
-fn write(
+pub(super) fn write(
     conn: &Conn,
     graph: &str,
     adds: Vec<Value>,
@@ -498,18 +501,55 @@ fn register(
     message: &str,
     opts: &SyncOpts,
 ) -> Result<Value, CmdError> {
+    let original = (f.redactions.is_empty() && f.text != text).then_some(f.text.as_str());
+    register_text(
+        conn,
+        RegisterText {
+            graph: &f.graph,
+            iri: &f.graph,
+            title: &f.title,
+            format: "text/markdown",
+            text,
+            original,
+        },
+        reanchor,
+        from,
+        message,
+        opts,
+    )
+}
+
+/// One text for `POST /{ds}/sources`.
+pub(super) struct RegisterText<'a> {
+    pub graph: &'a str,
+    pub iri: &'a str,
+    pub title: &'a str,
+    pub format: &'a str,
+    pub text: &'a str,
+    /// the file's bytes, when they differ from the text
+    pub original: Option<&'a str>,
+}
+
+pub(super) fn register_text(
+    conn: &Conn,
+    t: RegisterText,
+    reanchor: bool,
+    from: Option<&str>,
+    message: &str,
+    opts: &SyncOpts,
+) -> Result<Value, CmdError> {
     let mut args = json!({
-        "graph": f.graph,
-        "iri": f.graph,
-        "title": f.title,
-        "format": "text/markdown",
-        "text": text,
+        "graph": t.graph,
+        "iri": t.iri,
+        "title": t.title,
+        "format": t.format,
+        "text": t.text,
         "message": message,
     });
-    if f.redactions.is_empty() && f.text != text {
+    if let Some(o) = t.original {
         use base64::Engine;
         args["original"] = base64::engine::general_purpose::STANDARD
-            .encode(f.text.as_bytes())
+            .encode(o.as_bytes())
             .into();
     }
     if reanchor {
@@ -534,7 +574,7 @@ fn rendition_of(out: &Value) -> Option<String> {
         .map(|r| r.trim_start_matches('<').trim_end_matches('>').to_string())
 }
 
-fn count(out: &Value, k: &str) -> usize {
+pub(super) fn count(out: &Value, k: &str) -> usize {
     out[k].as_u64().unwrap_or(0) as usize
 }
 
@@ -559,7 +599,7 @@ fn live_facts(conn: &Conn, graph: &str) -> Result<BTreeSet<(String, String, Obj)
     Ok(out)
 }
 
-fn now_rfc3339() -> String {
+pub(super) fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
@@ -582,7 +622,8 @@ pub fn sync(
     let mut gone: BTreeSet<String> = BTreeSet::new();
     if only.is_none() {
         for (g, l) in &listed {
-            if l.deleted || scanned.contains_key(g.as_str()) {
+            // a transcript stays when the harness deletes its file
+            if l.deleted || scanned.contains_key(g.as_str()) || g.contains("/sessions/") {
                 continue;
             }
             let in_area = scan.areas.iter().any(|a| g.starts_with(a.as_str()));

@@ -2,6 +2,7 @@
 
 use super::conn::{CmdError, Conn, enc, val};
 use super::sync::{self, Cache, Lock, SyncOpts};
+use super::transcripts;
 use super::{
     Common, EXIT_PARTIAL, EXIT_UNREACHABLE, ImportFlags, MemoryArgs, MemoryCmd, print_json,
 };
@@ -47,6 +48,8 @@ struct Config {
     dataset: Option<String>,
     /// project keys never imported
     skip_projects: Vec<String>,
+    /// project keys whose transcripts are imported (the person's opt-in of §8.10.7)
+    transcripts: Vec<String>,
     /// extra redaction patterns
     redact: Vec<ConfigPattern>,
     /// harness roots
@@ -302,6 +305,67 @@ pub fn dispatch(args: MemoryArgs, opts: StoreOptions) -> Result<i32, CmdError> {
             brief,
             transcripts,
         } => setup(&env, &harness, write, &scope, brief, transcripts),
+        MemoryCmd::Inbox {
+            agent,
+            kind,
+            harness,
+            project,
+            limit,
+        } => inbox(
+            &env,
+            InboxFilter {
+                agent,
+                kind,
+                harness,
+                project,
+                limit,
+            },
+        ),
+        MemoryCmd::Review {
+            agent,
+            kind,
+            harness,
+            project,
+            limit,
+            into,
+        } => review(
+            &env,
+            InboxFilter {
+                agent,
+                kind,
+                harness,
+                project,
+                limit,
+            },
+            into,
+        ),
+        MemoryCmd::Promote {
+            ids,
+            into,
+            all_that_pass,
+            require_corroboration,
+            merge,
+        } => promote(&env, ids, into, all_that_pass, require_corroboration, merge),
+        MemoryCmd::Reject { ids, message } => reject(&env, ids, message),
+        MemoryCmd::Export {
+            sources: _,
+            to,
+            out,
+            project,
+            harness,
+            user_scope,
+            force,
+        } => export(
+            &env,
+            ExportArgs {
+                to,
+                out,
+                project,
+                harness,
+                user_scope,
+                force,
+            },
+        ),
     }
 }
 
@@ -541,15 +605,21 @@ fn import(
     let ps = patterns(env, &settings, &flags)?;
     let roots = env.roots();
     let mut notes: Vec<String> = Vec::new();
-    if flags.transcripts {
+    // §8.10.7: the dataset allows transcripts, and the person opts the project in
+    let allowed = settings["imports"]["transcripts"].as_bool() == Some(true);
+    let opted = flags.transcripts || env.cfg.transcripts.contains(&project.key);
+    let with_transcripts = allowed && opted && flags.only.is_none() && !flags.instructions_only;
+    if flags.transcripts && !allowed {
         notes.push(
-            if settings["imports"]["transcripts"].as_bool() == Some(true) {
-                "transcripts are not imported: the transcript adapter arrives in Phase 3m-b".into()
-            } else {
-                "transcripts are not imported: imports.transcripts is off for this dataset".into()
-            },
+            "transcripts are not imported: imports.transcripts is off for this dataset".into(),
         );
     }
+    let since = transcripts::parse_duration(&flags.since).ok_or_else(|| {
+        CmdError::usage(format!(
+            "--since {}: use a number and d, h, m or s",
+            flags.since
+        ))
+    })?;
     if env.cfg.skip_projects.contains(&project.key) {
         let out = json!({ "dataset": conn.dataset, "project": project.key, "skipped": "skip-projects", "files": [] });
         env.out(&out, || {
@@ -601,9 +671,15 @@ fn import(
     };
     let mut reports;
     let mut runs = 0;
+    let mut file_graphs: std::collections::HashMap<PathBuf, String>;
     loop {
         runs += 1;
         let scan = sparkles_memory_import::scan(&req);
+        file_graphs = scan
+            .files
+            .iter()
+            .map(|f| (f.path.clone(), f.graph.clone()))
+            .collect();
         let skip = incremental && opts.only.is_none() && sync::unchanged_by_cache(&scan, &cache);
         if !skip || runs > 1 {
             reports = sync::sync(&conn, &scan, &mut cache, &opts)?;
@@ -632,6 +708,38 @@ fn import(
             _ => break,
         }
     }
+    if with_transcripts {
+        let harnesses: Vec<Harness> = req
+            .adapters
+            .iter()
+            .filter_map(|a| match a {
+                Adapter::ClaudeCode => Some(Harness::ClaudeCode),
+                Adapter::Codex => Some(Harness::Codex),
+                Adapter::Generic => None,
+            })
+            .collect();
+        let run = transcripts::Run {
+            conn: &conn,
+            ctx: &ctx,
+            roots: &roots,
+            project: &project,
+            harnesses,
+            patterns: &ps,
+            file_graphs,
+            opts: transcripts::Opts {
+                tools: flags.transcript_content == "tools",
+                subagents: flags.subagents,
+                since,
+                max_bytes: flags.max_transcript_bytes,
+                named: flags.transcript.clone(),
+            },
+            sync: &opts,
+        };
+        reports.extend(transcripts::sync(&run, &mut cache)?);
+        if !flags.dry_run {
+            let _ = cache.save(&cache_path);
+        }
+    }
     drop(lock);
     let failed = reports.iter().filter(|r| r.status == "failed").count();
     let changed = reports
@@ -648,6 +756,7 @@ fn import(
         "files": reports,
         "changed": changed,
         "failed": failed,
+        "transcripts": with_transcripts,
         "notes": notes,
     });
     if quiet != Some(true) || failed > 0 {
@@ -700,6 +809,16 @@ fn hook_target(env: &Env, harness: &str, flags: &mut ImportFlags) -> Result<Opti
             flags.harnesses.push("generic".into());
         }
     }
+    // a session's end names its transcript, which is imported even though it is recent
+    if j["tool_input"].is_null() {
+        if let Some(t) = j["transcript_path"].as_str().filter(|t| !t.is_empty()) {
+            flags.transcript = Some(PathBuf::from(t));
+        } else if harness == "codex"
+            && let Some(id) = j["session_id"].as_str().filter(|i| !i.is_empty())
+        {
+            flags.transcript = transcripts::codex_by_id(&env.roots(), id);
+        }
+    }
     if let Some(fp) = j["tool_input"]["file_path"].as_str() {
         let p = PathBuf::from(fp);
         let p = if p.is_absolute() {
@@ -742,6 +861,19 @@ fn child_args(env: &Env, flags: &ImportFlags) -> Vec<String> {
         flags.only.as_ref().map(|p| p.display().to_string()),
     );
     opt(
+        "--transcript",
+        flags.transcript.as_ref().map(|p| p.display().to_string()),
+    );
+    opt(
+        "--transcript-content",
+        Some(flags.transcript_content.clone()),
+    );
+    opt("--since", Some(flags.since.clone()));
+    opt(
+        "--max-transcript-bytes",
+        Some(flags.max_transcript_bytes.to_string()),
+    );
+    opt(
         "--redact-patterns",
         flags
             .redact_patterns
@@ -756,6 +888,8 @@ fn child_args(env: &Env, flags: &ImportFlags) -> Vec<String> {
         (c.insecure_http, "--insecure-http"),
         (flags.user_scope, "--user-scope"),
         (flags.instructions_only, "--instructions-only"),
+        (flags.transcripts, "--transcripts"),
+        (flags.subagents, "--subagents"),
     ] {
         if on {
             a.push(k.into());
@@ -1196,7 +1330,7 @@ fn status(env: &Env, project: Option<PathBuf>, harness: Option<String>) -> Resul
         "needsExtraction": needs,
         "unreviewedFacts": unreviewed,
         "lastSync": cache.last_sync,
-        "transcripts": "not imported in Phase 3m-a",
+        "transcripts": transcript_status(env, &conn, &settings, &project, &roots, &prefix)?,
     });
     env.out(&out, || {
         let mut t = format!("project {} ({})\n", project.key, ctx.principal);
@@ -1236,6 +1370,59 @@ fn status(env: &Env, project: Option<PathBuf>, harness: Option<String>) -> Resul
         t
     });
     Ok(0)
+}
+
+/// What `status` says about transcripts: whether they are imported, and the sessions on
+/// disk that are not imported yet, with those close to Claude Code's deletion (its
+/// `cleanupPeriodDays`, 30 by default).
+fn transcript_status(
+    env: &Env,
+    conn: &Conn,
+    settings: &Value,
+    project: &Project,
+    roots: &Roots,
+    prefix: &str,
+) -> Result<Value, CmdError> {
+    let allowed = settings["imports"]["transcripts"].as_bool() == Some(true);
+    let opted = env.cfg.transcripts.contains(&project.key);
+    let found = transcripts::find(
+        roots,
+        project,
+        &[Harness::ClaudeCode, Harness::Codex],
+        false,
+    );
+    let q = format!(
+        "SELECT DISTINCT ?g WHERE {{ GRAPH ?g {{ ?g <{}> ?d }} FILTER(STRSTARTS(STR(?g), {}) && CONTAINS(STR(?g), \"/sessions/\")) }}",
+        vocab::SPK_CONTENT_DIGEST,
+        sparkles_memory_import::quoted(prefix)
+    );
+    let imported = conn.select(&q)?.rows.len();
+    let cleanup_days = std::fs::read(roots.claude.join("settings.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .and_then(|j| j["cleanupPeriodDays"].as_u64())
+        .unwrap_or(30);
+    let mut expiring = Vec::new();
+    for f in &found {
+        if f.harness != Harness::ClaudeCode {
+            continue;
+        }
+        let age_days = std::fs::metadata(&f.path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.elapsed().ok())
+            .map_or(0, |d| d.as_secs() / 86_400);
+        if age_days + 5 >= cleanup_days {
+            expiring.push(json!({ "path": f.path.display().to_string(), "daysLeft": cleanup_days.saturating_sub(age_days) }));
+        }
+    }
+    Ok(json!({
+        "allowed": allowed,
+        "optedIn": opted,
+        "onDisk": found.len(),
+        "imported": imported,
+        "expiring": expiring,
+    }))
 }
 
 // ------------------------------------------------------------------ brief ------
@@ -1667,7 +1854,12 @@ fn forget(
 
 // ------------------------------------------------------------------ setup ------
 
-fn claude_hooks(brief_only: bool) -> Value {
+fn claude_hooks(brief_only: bool, transcripts: bool) -> Value {
+    let mut end =
+        "sparkles memory sync --from-hook claude-code --if-reachable --quiet --detach".to_string();
+    if transcripts {
+        end.push_str(" --transcripts");
+    }
     let start = json!([{ "matcher": "startup|resume|clear|compact",
         "hooks": [{ "type": "command", "timeout": 10,
                     "command": "sparkles memory brief --hook claude-code --if-reachable" }] }]);
@@ -1678,13 +1870,17 @@ fn claude_hooks(brief_only: bool) -> Value {
         "PostToolUse": [{ "matcher": "Write|Edit|MultiEdit",
             "hooks": [{ "type": "command", "async": true,
                         "command": "sparkles memory sync --from-hook claude-code --if-reachable --quiet" }] }],
-        "SessionEnd": [{ "hooks": [{ "type": "command", "timeout": 10,
-                        "command": "sparkles memory sync --from-hook claude-code --if-reachable --quiet --detach" }] }],
+        "SessionEnd": [{ "hooks": [{ "type": "command", "timeout": 10, "command": end }] }],
         "SessionStart": start,
     }})
 }
 
-fn codex_hooks(brief_only: bool) -> Value {
+fn codex_hooks(brief_only: bool, transcripts: bool) -> Value {
+    let mut end =
+        "sparkles memory sync --from-hook codex --if-reachable --quiet --detach".to_string();
+    if transcripts {
+        end.push_str(" --transcripts");
+    }
     let start = json!([{ "matcher": "startup|resume|clear|compact",
         "hooks": [{ "type": "command", "timeout": 10,
                     "command": "sparkles memory brief --hook codex --if-reachable" }] }]);
@@ -1694,8 +1890,7 @@ fn codex_hooks(brief_only: bool) -> Value {
     json!({ "hooks": {
         "Stop": [{ "hooks": [{ "type": "command", "timeout": 10,
                     "command": "sparkles memory sync --from-hook codex --instructions-only --if-reachable --quiet --detach" }] }],
-        "SessionEnd": [{ "hooks": [{ "type": "command", "timeout": 10,
-                    "command": "sparkles memory sync --from-hook codex --if-reachable --quiet --detach" }] }],
+        "SessionEnd": [{ "hooks": [{ "type": "command", "timeout": 10, "command": end }] }],
         "SessionStart": start,
     }})
 }
@@ -1759,12 +1954,6 @@ fn setup(
     brief_only: bool,
     transcripts: bool,
 ) -> Result<i32, CmdError> {
-    if transcripts {
-        return Err(CmdError::error(
-            "unavailable",
-            "transcript import arrives with C18 Phase 3m-b",
-        ));
-    }
     let roots = env.roots();
     let cwd = std::env::current_dir()?;
     let server = env.common.server.clone().or_else(|| env.cfg.server.clone());
@@ -1773,7 +1962,7 @@ fn setup(
         .unwrap_or_else(|| "https://sparkles.example.org".into());
     let (hooks, settings_path, skill_path) = match harness {
         "claude-code" => (
-            claude_hooks(brief_only),
+            claude_hooks(brief_only, transcripts),
             if scope == "project" {
                 cwd.join(".claude").join("settings.json")
             } else {
@@ -1786,7 +1975,7 @@ fn setup(
                 .join("SKILL.md"),
         ),
         _ => (
-            codex_hooks(brief_only),
+            codex_hooks(brief_only, transcripts),
             if scope == "project" {
                 cwd.join(".codex").join("hooks.json")
             } else {
@@ -1884,6 +2073,819 @@ fn setup(
     Ok(0)
 }
 
+// ------------------------------------------------- inbox, review, promote & reject ------
+
+/// The filters of `inbox` and `review`.
+#[derive(Clone, Default)]
+pub(super) struct InboxFilter {
+    pub agent: Option<String>,
+    pub kind: Option<String>,
+    pub harness: Option<String>,
+    pub project: Option<String>,
+    pub limit: u64,
+}
+
+/// One unreviewed fact of the inbox, with a short id for the command line.
+#[derive(Clone)]
+struct Item {
+    id: String,
+    /// `import` (a graph under the import base) or `session`
+    kind: &'static str,
+    graph: String,
+    fact: Value,
+}
+
+fn strip_iri(s: &str) -> String {
+    s.trim()
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .to_string()
+}
+
+/// The id of a fact: the first 10 hex digits of the SHA-256 of its graph and terms.
+fn item_id(graph: &str, f: &Value) -> String {
+    use sha2::Digest;
+    let h = sha2::Sha256::digest(
+        format!(
+            "{graph}\0{}\0{}\0{}",
+            f["s"].as_str().unwrap_or(""),
+            f["p"].as_str().unwrap_or(""),
+            f["o"].as_str().unwrap_or("")
+        )
+        .as_bytes(),
+    );
+    h.iter().take(5).map(|b| format!("{b:02x}")).collect()
+}
+
+/// `GET /$/memory/{ds}/inbox`: the facts as items and the review branches, filtered.
+fn inbox_items(conn: &Conn, flt: &InboxFilter) -> Result<(Vec<Item>, Vec<Value>, Value), CmdError> {
+    let j = conn.get_json(&format!(
+        "/$/memory/{}/inbox?limit={}",
+        enc(&conn.dataset),
+        flt.limit.clamp(1, 2000)
+    ))?;
+    let base = conn.memory_settings()?["imports"]["base"]
+        .as_str()
+        .map(str::to_string);
+    let seg = |s: &str| format!("/{}/", sparkles_memory_import::ids::segment(s));
+    let project = flt.project.as_deref().map(|p| {
+        seg(&sparkles_memory_import::project::segment_of(
+            &project_key_of(p),
+        ))
+    });
+    let mut items = Vec::new();
+    for s in j["sessions"].as_array().into_iter().flatten() {
+        let graph = strip_iri(s["graph"].as_str().unwrap_or(""));
+        let kind = if base.as_deref().is_some_and(|b| graph.starts_with(b)) {
+            "import"
+        } else {
+            "session"
+        };
+        if flt.kind.as_deref().is_some_and(|k| k != kind)
+            || flt
+                .harness
+                .as_deref()
+                .is_some_and(|h| kind != "import" || !graph.contains(&seg(h)))
+            || project.as_deref().is_some_and(|p| !graph.contains(p))
+        {
+            continue;
+        }
+        for f in s["facts"].as_array().into_iter().flatten() {
+            if let Some(a) = &flt.agent
+                && f["agent"].as_str() != Some(a.as_str())
+                && f["by"].as_str() != Some(a.as_str())
+            {
+                continue;
+            }
+            items.push(Item {
+                id: item_id(&graph, f),
+                kind,
+                graph: graph.clone(),
+                fact: f.clone(),
+            });
+        }
+    }
+    let branches: Vec<Value> = j["branches"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|b| flt.kind.as_deref().is_none_or(|k| b["kind"] == k))
+        .filter(|_| flt.harness.is_none() && flt.project.is_none())
+        .cloned()
+        .collect();
+    Ok((items, branches, j))
+}
+
+fn item_json(it: &Item) -> Value {
+    let mut j = json!({
+        "id": it.id,
+        "kind": it.kind,
+        "graph": it.graph,
+        "s": it.fact["s"],
+        "p": it.fact["p"],
+        "o": it.fact["o"],
+    });
+    for k in [
+        "quote", "by", "agent", "time", "signals", "passes", "sLabel", "oLabel",
+    ] {
+        if !it.fact[k].is_null() {
+            j[k] = it.fact[k].clone();
+        }
+    }
+    j
+}
+
+/// One line: id, kind, the fact as the server shows it, its signals and its quote.
+fn item_line(it: &Item) -> String {
+    let shown = &it.fact["shown"];
+    let t = |k: &str| {
+        shown[k]
+            .as_str()
+            .or(it.fact[k].as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let mut l = format!("{}  {:<7} {} {} {}", it.id, it.kind, t("s"), t("p"), t("o"));
+    if let Some(sig) = it.fact["signals"].as_object() {
+        let s: Vec<String> = sig
+            .iter()
+            .filter_map(|(k, v)| v.as_str().map(|v| format!("{k}={v}")))
+            .collect();
+        l.push_str(&format!("  [{}]", s.join(" ")));
+    }
+    if let Some(q) = it.fact["quote"].as_str() {
+        l.push_str(&format!("  {}", sparkles_memory_import::quoted(q)));
+    }
+    l
+}
+
+/// The facts named by ids or unique id prefixes.
+fn resolve_items(items: &[Item], ids: &[String]) -> Result<Vec<Item>, CmdError> {
+    let mut out: Vec<Item> = Vec::new();
+    for id in ids {
+        let m: Vec<&Item> = items
+            .iter()
+            .filter(|i| i.id.starts_with(id.as_str()))
+            .collect();
+        match m.as_slice() {
+            [one] => {
+                if !out.iter().any(|o| o.id == one.id) {
+                    out.push((*one).clone());
+                }
+            }
+            [] => {
+                return Err(CmdError::error(
+                    "not-found",
+                    format!("no inbox fact has the id {id}"),
+                ));
+            }
+            _ => {
+                return Err(CmdError::usage(format!(
+                    "the id {id} matches {} facts; give more of it",
+                    m.len()
+                )));
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn fact_refs(items: &[Item]) -> Value {
+    items
+        .iter()
+        .map(|i| json!({ "s": i.fact["s"], "p": i.fact["p"], "o": i.fact["o"], "graph": i.graph }))
+        .collect::<Vec<_>>()
+        .into()
+}
+
+fn inbox(env: &Env, flt: InboxFilter) -> Result<i32, CmdError> {
+    let conn = env.connect()?;
+    let (items, branches, j) = inbox_items(&conn, &flt)?;
+    let out = json!({
+        "dataset": conn.dataset,
+        "facts": items.iter().map(item_json).collect::<Vec<_>>(),
+        "branches": branches,
+        "truncated": j["truncated"],
+    });
+    env.out(&out, || {
+        let mut t: Vec<String> = items.iter().map(item_line).collect();
+        for b in &branches {
+            t.push(format!(
+                "branch  {} ({}, {} facts)",
+                b["name"].as_str().unwrap_or(""),
+                b["kind"].as_str().unwrap_or(""),
+                b["facts"].as_u64().unwrap_or(0)
+            ));
+        }
+        if t.is_empty() {
+            "the inbox is empty".into()
+        } else {
+            t.join("\n")
+        }
+    });
+    Ok(0)
+}
+
+/// Promote facts, read the merge preview, and with `merge` merge the branch with the
+/// preview's heads as `expect`.
+fn promote_items(
+    conn: &Conn,
+    chosen: &[Item],
+    into: Option<&str>,
+    merge: bool,
+) -> Result<Value, CmdError> {
+    let mut a = json!({ "facts": fact_refs(chosen) });
+    if let Some(t) = into {
+        a["target"] = t.into();
+    }
+    let p = conn
+        .post_json(&format!("/$/memory/{}/promote", enc(&conn.dataset)), &a)?
+        .check()?
+        .json()?;
+    let branch = p["branch"].as_str().unwrap_or("").to_string();
+    let q = format!("source={}&target=main", enc(&branch));
+    let preview = conn
+        .get_json(&format!("/$/merge/{}?{q}", enc(&conn.dataset)))
+        .unwrap_or(Value::Null);
+    let mut out = json!({ "promote": p, "branch": branch, "preview": preview });
+    if merge {
+        let mut body = json!({ "source": branch, "target": "main" });
+        if let (Some(s), Some(t)) = (
+            preview["source"]["seq"].as_u64(),
+            preview["target"]["seq"].as_u64(),
+        ) {
+            body["expect"] = json!({ "source": s, "target": t });
+        }
+        let r = conn
+            .post_json(&format!("/$/merge/{}", enc(&conn.dataset)), &body)?
+            .check()
+            .map_err(|mut e| {
+                e.message = format!(
+                    "the facts are on branch {branch}, and the merge failed: {}",
+                    e.message
+                );
+                e.with_detail(json!({ "branch": branch }))
+            })?
+            .json()?;
+        out["merge"] = r;
+    }
+    Ok(out)
+}
+
+fn promote_text(n: usize, out: &Value) -> String {
+    let mut t = format!(
+        "{n} facts promoted onto branch {}",
+        out["branch"].as_str().unwrap_or("")
+    );
+    let pv = &out["preview"];
+    if pv.is_object() {
+        t.push_str(&format!(
+            "\nmerge preview: {} inserted, {} deleted, {} conflicts",
+            pv["changes"]["inserted"].as_u64().unwrap_or(0),
+            pv["changes"]["deleted"].as_u64().unwrap_or(0),
+            pv["conflictCount"].as_u64().unwrap_or(0)
+        ));
+    }
+    if out["merge"].is_object() {
+        t.push_str("\nmerged into main");
+    }
+    t
+}
+
+#[allow(clippy::too_many_arguments)]
+fn promote(
+    env: &Env,
+    ids: Vec<String>,
+    into: Option<String>,
+    all_that_pass: bool,
+    require_corroboration: bool,
+    merge: bool,
+) -> Result<i32, CmdError> {
+    if ids.is_empty() && !all_that_pass {
+        return Err(CmdError::usage(
+            "name the facts by the ids that inbox prints, or pass --all-that-pass",
+        ));
+    }
+    let conn = env.connect()?;
+    let flt = InboxFilter {
+        limit: 2000,
+        ..Default::default()
+    };
+    let (items, _, _) = inbox_items(&conn, &flt)?;
+    let mut chosen = resolve_items(&items, &ids)?;
+    if all_that_pass {
+        for it in &items {
+            if it.fact["passes"] == true && !chosen.iter().any(|c| c.id == it.id) {
+                chosen.push(it.clone());
+            }
+        }
+    }
+    if require_corroboration {
+        chosen.retain(|it| it.fact["signals"]["corroboration"] == "pass");
+    }
+    if chosen.is_empty() {
+        env.out(&json!({ "dataset": conn.dataset, "promoted": 0 }), || {
+            "no fact to promote".into()
+        });
+        return Ok(0);
+    }
+    let out = promote_items(&conn, &chosen, into.as_deref(), merge)?;
+    env.out(&out, || promote_text(chosen.len(), &out));
+    Ok(0)
+}
+
+fn reject_items(conn: &Conn, chosen: &[Item], message: Option<&str>) -> Result<Value, CmdError> {
+    let mut a = json!({ "facts": fact_refs(chosen) });
+    if let Some(m) = message {
+        a["reason"] = m.into();
+    }
+    conn.post_json(&format!("/$/memory/{}/reject", enc(&conn.dataset)), &a)?
+        .check()?
+        .json()
+}
+
+fn reject(env: &Env, ids: Vec<String>, message: Option<String>) -> Result<i32, CmdError> {
+    if ids.is_empty() {
+        return Err(CmdError::usage(
+            "name the facts by the ids that inbox prints",
+        ));
+    }
+    let conn = env.connect()?;
+    let flt = InboxFilter {
+        limit: 2000,
+        ..Default::default()
+    };
+    let (items, _, _) = inbox_items(&conn, &flt)?;
+    let chosen = resolve_items(&items, &ids)?;
+    let out = reject_items(&conn, &chosen, message.as_deref())?;
+    env.out(&out, || format!("{} facts rejected", chosen.len()));
+    Ok(0)
+}
+
+/// `review`: each inbox fact in turn, with one choice per line of standard input:
+/// `p` promote, `r` reject, `s` skip, `o` print the link that opens it in the UI, `q`
+/// stop. The choices run as one `promote` and one `reject` at the end.
+fn review(env: &Env, flt: InboxFilter, into: Option<String>) -> Result<i32, CmdError> {
+    use std::io::BufRead;
+    let conn = env.connect()?;
+    let (items, _, _) = inbox_items(&conn, &flt)?;
+    let mut promote: Vec<Item> = Vec::new();
+    let mut reject: Vec<Item> = Vec::new();
+    let stdin = std::io::stdin();
+    let mut lines = stdin.lock().lines();
+    'items: for it in &items {
+        eprintln!("{}", item_line(it));
+        loop {
+            eprint!("[p]romote, [r]eject, [s]kip, [o]pen, [q]uit? ");
+            let _ = std::io::stderr().flush();
+            let Some(Ok(l)) = lines.next() else {
+                break 'items;
+            };
+            match l.trim() {
+                "p" | "promote" => promote.push(it.clone()),
+                "r" | "reject" => reject.push(it.clone()),
+                "o" | "open" => {
+                    eprintln!(
+                        "{}/ui/memory?ds={}&tab=inbox",
+                        conn.label(),
+                        enc(&conn.dataset)
+                    );
+                    continue;
+                }
+                "q" | "quit" => break 'items,
+                _ => {}
+            }
+            break;
+        }
+    }
+    let mut out = json!({
+        "dataset": conn.dataset,
+        "promoted": promote.len(),
+        "rejected": reject.len(),
+    });
+    if !promote.is_empty() {
+        out["promote"] = promote_items(&conn, &promote, into.as_deref(), false)?;
+    }
+    if !reject.is_empty() {
+        out["reject"] = reject_items(&conn, &reject, None)?;
+    }
+    env.out(&out, || {
+        let mut t = format!("{} promoted, {} rejected", promote.len(), reject.len());
+        if let Some(b) = out["promote"]["branch"].as_str() {
+            t.push_str(&format!("; the promoted facts are on branch {b}"));
+        }
+        t
+    });
+    Ok(0)
+}
+
+// ----------------------------------------------------------------- export ------
+
+/// The options of `export --sources`.
+pub(super) struct ExportArgs {
+    pub to: String,
+    pub out: PathBuf,
+    pub project: Option<String>,
+    pub harness: Option<String>,
+    pub user_scope: bool,
+    pub force: bool,
+}
+
+/// One stored source to export.
+struct Stored {
+    graph: String,
+    path: String,
+    harness: String,
+    /// `memory`, `index` or `instructions`
+    kind: &'static str,
+    redacted: bool,
+    bytes: Vec<u8>,
+    /// the memory's position in the index
+    position: Option<u64>,
+}
+
+fn harness_segment(iri: Option<&str>) -> String {
+    iri.and_then(|h| h.strip_prefix(MEM))
+        .map(|l| match l {
+            "ClaudeCode" => "claude-code",
+            "Codex" => "codex",
+            "GeminiCli" => "gemini-cli",
+            "Cursor" => "cursor",
+            _ => "generic",
+        })
+        .unwrap_or("generic")
+        .to_string()
+}
+
+/// The text of a source's current rendition, from its chunks in order.
+fn stored_text(conn: &Conn, graph: &str) -> Result<Option<String>, CmdError> {
+    let q = format!(
+        "SELECT ?t ?start WHERE {{ GRAPH <{graph}> {{ <{graph}> <urn:x-sparkles:rendition> ?r . \
+         ?c <urn:x-sparkles:chunkOf> ?r ; <urn:x-sparkles:start> ?start ; <urn:x-sparkles:text> ?t }} }} \
+         ORDER BY ?start"
+    );
+    let rows = conn.select(&q)?.rows;
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(rows.iter().filter_map(|r| val(r, "t")).collect()))
+}
+
+/// The instruction file's name under another harness.
+fn instruction_name(path: &str, to: &str) -> String {
+    let (dir, name) = match path.rsplit_once('/') {
+        Some((d, n)) => (format!("{d}/"), n),
+        None => (String::new(), path),
+    };
+    let mapped = match (to, name) {
+        ("claude-code", "AGENTS.md" | "GEMINI.md") => "CLAUDE.md",
+        ("claude-code", "AGENTS.override.md") => "CLAUDE.local.md",
+        ("codex", "CLAUDE.md" | "GEMINI.md") => "AGENTS.md",
+        ("codex", "CLAUDE.local.md") => "AGENTS.override.md",
+        _ => name,
+    };
+    format!("{dir}{mapped}")
+}
+
+fn copy_comment(graph: &str, date: &str) -> String {
+    format!(
+        "{}<{graph}> exported {date} -->\n",
+        sparkles_memory_import::COPY_OF
+    )
+}
+
+/// A memory's name, description, kind and body from its text.
+fn memory_parts(s: &Stored) -> (String, Option<String>, Option<String>, String) {
+    let text = String::from_utf8_lossy(&s.bytes).into_owned();
+    let doc = sparkles_memory_import::frontmatter::parse(&text);
+    let name = doc
+        .scalar("name")
+        .or_else(|| doc.scalar("title"))
+        .map(|(v, _)| v.to_string())
+        .unwrap_or_else(|| {
+            s.path
+                .rsplit('/')
+                .next()
+                .unwrap_or(&s.path)
+                .trim_end_matches(".md")
+                .to_string()
+        });
+    let description = doc.scalar("description").map(|(v, _)| v.to_string());
+    let kind = doc
+        .get_nested("metadata", "type")
+        .or_else(|| doc.get("type"))
+        .and_then(|e| match &e.value {
+            sparkles_memory_import::frontmatter::Value::Scalar(v) if !v.is_empty() => {
+                Some(v.clone())
+            }
+            _ => None,
+        });
+    (name, description, kind, doc.body.to_string())
+}
+
+/// YAML for one frontmatter value: plain when safe, else double-quoted.
+fn yaml_value(v: &str) -> String {
+    let plain = !v.is_empty()
+        && !v.starts_with([
+            ' ', '-', '?', ':', '#', '&', '*', '!', '|', '>', '\'', '"', '%', '@', '`', '[', '{',
+        ])
+        && !v.contains(": ")
+        && !v.contains(" #")
+        && !v.ends_with(' ')
+        && !v.contains('\n');
+    if plain {
+        v.to_string()
+    } else {
+        serde_json::to_string(v).unwrap_or_default()
+    }
+}
+
+fn export(env: &Env, a: ExportArgs) -> Result<i32, CmdError> {
+    if !matches!(a.to.as_str(), "claude-code" | "codex" | "generic") {
+        return Err(CmdError::usage(format!(
+            "--to {}: claude-code, codex or generic",
+            a.to
+        )));
+    }
+    let h = harness_filter(a.harness.as_deref())?;
+    let conn = env.connect()?;
+    let (ctx, _) = context(&conn)?;
+    let prefix = format!(
+        "{}{}/",
+        ctx.base,
+        sparkles_memory_import::ids::segment(&ctx.principal)
+    );
+    let key = match &a.project {
+        Some(p) => project_key_of(p),
+        None => project_of(None)?.key,
+    };
+    let lit = sparkles_memory_import::quoted;
+    let q = format!(
+        "SELECT ?g ?fp ?h ?red ?pk ?orig WHERE {{ GRAPH ?g {{ ?g <{}> ?d ; <{MEM}filePath> ?fp \
+         OPTIONAL {{ ?g <{MEM}harness> ?h }} OPTIONAL {{ ?g <{MEM}redactions> ?red }} \
+         OPTIONAL {{ ?g <{MEM}project> ?p . ?p <{}> ?pk }} \
+         OPTIONAL {{ ?g <urn:x-sparkles:originalContent> ?orig }} \
+         FILTER NOT EXISTS {{ ?g <{PROV}invalidatedAtTime> ?inv }} }} \
+         FILTER(STRSTARTS(STR(?g), {})) }} ORDER BY ?g",
+        vocab::SPK_CONTENT_DIGEST,
+        vocab::RDFS_LABEL,
+        lit(&prefix)
+    );
+    let rows = conn.select(&q)?.rows;
+    // the index positions of the memories
+    let pq = format!(
+        "SELECT ?g ?pos WHERE {{ GRAPH ?g {{ ?m <{MEM}file> ?g }} GRAPH ?i {{ ?m <{MEM}indexPosition> ?pos }} \
+         FILTER(STRSTARTS(STR(?g), {})) }}",
+        lit(&prefix)
+    );
+    let mut positions: std::collections::HashMap<String, u64> = Default::default();
+    for r in conn.select(&pq)?.rows {
+        if let (Some(g), Some(p)) = (val(&r, "g"), val(&r, "pos").and_then(|p| p.parse().ok())) {
+            positions.insert(g, p);
+        }
+    }
+    let mut sources: Vec<Stored> = Vec::new();
+    let mut skipped: Vec<Value> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for r in &rows {
+        let Some(g) = val(r, "g") else { continue };
+        if !seen.insert(g.clone()) {
+            continue;
+        }
+        let kind = if g.contains("/sessions/") {
+            // transcripts are never exported
+            continue;
+        } else if g.ends_with("/index") {
+            "index"
+        } else if g.contains("/instructions/") {
+            "instructions"
+        } else {
+            "memory"
+        };
+        let harness = harness_segment(val(r, "h").as_deref());
+        if h.is_some_and(|h| h.segment() != harness) {
+            continue;
+        }
+        match val(r, "pk") {
+            Some(pk) if pk == key => {}
+            None if a.user_scope => {}
+            _ => continue,
+        }
+        let path = val(r, "fp").unwrap_or_default();
+        let bytes = match val(r, "orig") {
+            Some(b64) => {
+                use base64::Engine;
+                base64::engine::general_purpose::STANDARD
+                    .decode(b64.trim())
+                    .map_err(|e| CmdError::error("bad-response", format!("{g}: {e}")))?
+            }
+            None => match stored_text(&conn, &g)? {
+                Some(t) => t.into_bytes(),
+                None => {
+                    skipped.push(json!({ "source": g, "path": path, "reason": "no-text" }));
+                    continue;
+                }
+            },
+        };
+        sources.push(Stored {
+            position: positions.get(&g).copied(),
+            graph: g,
+            path,
+            harness,
+            kind,
+            redacted: val(r, "red")
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0)
+                > 0,
+            bytes,
+        });
+    }
+    let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    // what to write: path under --out, bytes, the sources it holds, and how
+    let mut files: Vec<(String, Vec<u8>, Vec<String>, &'static str, bool)> = Vec::new();
+    let mut fragment: Vec<&Stored> = Vec::new();
+    for s in &sources {
+        if s.harness == a.to {
+            files.push((
+                s.path.clone(),
+                s.bytes.clone(),
+                vec![s.graph.clone()],
+                "copy",
+                s.redacted,
+            ));
+            continue;
+        }
+        match (s.kind, a.to.as_str()) {
+            ("index", _) => {}
+            ("memory", "codex") => fragment.push(s),
+            ("memory", _) => {
+                let (name, description, kind, body) = memory_parts(s);
+                let mut t = format!("---\nname: {}\n", yaml_value(&name));
+                if let Some(d) = &description {
+                    t.push_str(&format!("description: {}\n", yaml_value(d)));
+                }
+                if let Some(k) = &kind {
+                    t.push_str(&format!("type: {}\n", yaml_value(k)));
+                }
+                t.push_str("---\n");
+                t.push_str(&copy_comment(&s.graph, &date));
+                t.push_str(&body);
+                let file = format!("{}.md", sparkles_memory_import::norm_name(&name));
+                files.push((
+                    file,
+                    t.into_bytes(),
+                    vec![s.graph.clone()],
+                    "converted",
+                    s.redacted,
+                ));
+            }
+            (_, to) => {
+                let mut t = copy_comment(&s.graph, &date);
+                t.push_str(&String::from_utf8_lossy(&s.bytes));
+                files.push((
+                    instruction_name(&s.path, to),
+                    t.into_bytes(),
+                    vec![s.graph.clone()],
+                    "converted",
+                    s.redacted,
+                ));
+            }
+        }
+    }
+    if !fragment.is_empty() {
+        // §8.10.10: one AGENTS.md fragment with a section per memory in index order
+        fragment.sort_by(|x, y| {
+            (x.position.is_none(), x.position, &x.path).cmp(&(
+                y.position.is_none(),
+                y.position,
+                &y.path,
+            ))
+        });
+        let mut t = String::new();
+        for s in &fragment {
+            t.push_str(&copy_comment(&s.graph, &date));
+        }
+        for s in &fragment {
+            let (name, description, kind, body) = memory_parts(s);
+            t.push_str(&format!("\n## {name}\n\n"));
+            let first = match (description, kind) {
+                (Some(d), Some(k)) => format!("{d} ({k})"),
+                (Some(d), None) => d,
+                (None, Some(k)) => format!("({k})"),
+                (None, None) => String::new(),
+            };
+            if !first.is_empty() {
+                t.push_str(&first);
+                t.push_str("\n\n");
+            }
+            t.push_str(body.trim_start_matches('\n'));
+            if !t.ends_with('\n') {
+                t.push('\n');
+            }
+        }
+        let name = if files.iter().any(|f| f.0 == "AGENTS.md") {
+            "AGENTS.memory.md"
+        } else {
+            "AGENTS.md"
+        };
+        let redacted = fragment.iter().any(|s| s.redacted);
+        files.push((
+            name.into(),
+            t.into_bytes(),
+            fragment.iter().map(|s| s.graph.clone()).collect(),
+            "converted",
+            redacted,
+        ));
+    }
+    // refuse collisions and, without --force, existing files, before writing anything
+    let mut taken = std::collections::HashSet::new();
+    for f in &files {
+        if f.0.is_empty() || f.0.starts_with('/') || f.0.split('/').any(|c| c == "..") {
+            return Err(CmdError::error(
+                "bad-path",
+                format!("{}: a stored path that does not stay under --out", f.0),
+            ));
+        }
+        if !taken.insert(f.0.clone()) {
+            return Err(CmdError::error(
+                "conflict",
+                format!(
+                    "two sources export to {}; narrow with --harness or --project",
+                    f.0
+                ),
+            ));
+        }
+    }
+    if !a.force {
+        let exists: Vec<String> = files
+            .iter()
+            .filter(|f| a.out.join(&f.0).exists())
+            .map(|f| a.out.join(&f.0).display().to_string())
+            .collect();
+        if !exists.is_empty() {
+            return Err(CmdError::error(
+                "exists",
+                format!(
+                    "{} files exist; pass --force to overwrite them",
+                    exists.len()
+                ),
+            )
+            .with_detail(json!({ "files": exists })));
+        }
+    }
+    let mut written = Vec::new();
+    for (path, bytes, graphs, how, redacted) in &files {
+        let p = a.out.join(path);
+        if let Some(d) = p.parent() {
+            std::fs::create_dir_all(d)?;
+        }
+        std::fs::write(&p, bytes)?;
+        let mut j = json!({ "path": p.display().to_string(), "sources": graphs, "how": how });
+        if *redacted {
+            j["redacted"] = true.into();
+        }
+        written.push(j);
+    }
+    let out = json!({
+        "dataset": conn.dataset,
+        "project": key,
+        "to": a.to,
+        "out": a.out.display().to_string(),
+        "files": written,
+        "skipped": skipped,
+    });
+    env.out(&out, || {
+        let mut t: Vec<String> = written
+            .iter()
+            .map(|w| {
+                format!(
+                    "{}: {}{}",
+                    w["path"].as_str().unwrap_or(""),
+                    w["how"].as_str().unwrap_or(""),
+                    if w["redacted"] == true {
+                        ", redacted"
+                    } else {
+                        ""
+                    }
+                )
+            })
+            .collect();
+        for s in &skipped {
+            t.push(format!(
+                "{}: skipped ({})",
+                s["path"].as_str().unwrap_or(""),
+                s["reason"].as_str().unwrap_or("")
+            ));
+        }
+        if t.is_empty() {
+            "no sources to export".into()
+        } else {
+            t.join("\n")
+        }
+    });
+    Ok(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1891,8 +2893,15 @@ mod tests {
     #[test]
     fn hooks_merge_once() {
         let mut doc = json!({ "hooks": { "SessionStart": [ { "hooks": [ { "type": "command", "command": "other" } ] } ] }, "model": "x" });
-        assert_eq!(merge_hooks(&mut doc, &claude_hooks(false)), 3);
-        assert_eq!(merge_hooks(&mut doc, &claude_hooks(false)), 0);
+        assert_eq!(merge_hooks(&mut doc, &claude_hooks(false, false)), 3);
+        assert_eq!(merge_hooks(&mut doc, &claude_hooks(false, false)), 0);
+        let h = claude_hooks(false, true);
+        assert!(
+            h["hooks"]["SessionEnd"][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .ends_with("--transcripts")
+        );
         assert_eq!(doc["hooks"]["SessionStart"].as_array().unwrap().len(), 2);
         assert_eq!(doc["model"], "x");
     }

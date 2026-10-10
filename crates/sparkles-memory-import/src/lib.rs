@@ -21,7 +21,7 @@ pub mod vocab;
 
 mod adapters;
 
-pub use adapters::{Request, Roots, Scan, Skipped, scan};
+pub use adapters::{Request, Roots, Scan, Skipped, norm_name, scan};
 pub use ids::Ctx;
 pub use project::Project;
 
@@ -116,6 +116,8 @@ pub enum FileKind {
     Memory,
     Index,
     Instructions,
+    /// a session transcript, which the command line reads (§8.10.7)
+    Transcript,
 }
 
 impl FileKind {
@@ -124,6 +126,7 @@ impl FileKind {
             FileKind::Memory => "memory",
             FileKind::Index => "index",
             FileKind::Instructions => "instructions",
+            FileKind::Transcript => "transcript",
         }
     }
 }
