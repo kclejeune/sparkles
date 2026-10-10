@@ -503,8 +503,8 @@ pub(super) fn check(
     Ok(())
 }
 
-/// Branch creation and merges act on whole datasets: grants limited to some graphs do
-/// not allow them.
+/// Branch creation, merges and deletes act on whole datasets: grants limited to some
+/// graphs do not allow them.
 fn whole(p: &Principal, ds: &str, name: &str) -> ApiResult<()> {
     if p.restricted(&on_branch(ds, name)) {
         return Err(forbidden(format!(
@@ -839,13 +839,17 @@ pub(crate) async fn delete_branch(
     };
     check(&p, &name, &branch, Level::Write, Some(Endpoint::Branches))?;
     if branch != MAIN {
-        let protected = ds
-            .store
-            .branch_info(&branch)
-            .map(|i| i.protected)
-            .unwrap_or(false);
-        if protected {
+        let info = ds.store.branch_info(&branch).ok();
+        if info.as_ref().is_some_and(|i| i.protected) {
             check(&p, &name, &branch, Level::Admin, None)?;
+        }
+        // the rule of creation and merges, relaxed as in C17 §5.7: grants limited to
+        // some graphs delete only the scratch branches their holder created
+        let own = info
+            .and_then(|i| i.scratch)
+            .is_some_and(|s| s.creator == p.id());
+        if !own {
+            whole(&p, &name, &branch)?;
         }
     }
     let d = ds.clone();

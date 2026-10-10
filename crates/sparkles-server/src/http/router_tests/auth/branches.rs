@@ -1,6 +1,7 @@
 //! Grants limited to branches (F09 §6.1, A16): a grant with `branches` covers only those
 //! branches, a branch it does not cover answers like one that does not exist, and a
-//! grant limited to some graphs can neither create branches nor merge.
+//! grant limited to some graphs can neither create branches nor merge, and deletes only
+//! the scratch branches it created.
 
 use super::*;
 
@@ -323,6 +324,63 @@ async fn a16_grants_limited_to_branches() {
         matches!(r.status, StatusCode::FORBIDDEN | StatusCode::NOT_FOUND),
         "{}",
         r.status
+    );
+
+    // nor delete a branch, except a scratch branch it created (C17 §5.7)
+    let graphy = b("graphy");
+    let r = call(
+        app,
+        "DELETE",
+        "/$/branches/br/other",
+        &[("authorization", &graphy)],
+        "",
+    )
+    .await;
+    assert_eq!(
+        r.status,
+        StatusCode::FORBIDDEN,
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+    let ds = s.state.datasets().get("br").cloned().unwrap();
+    ds.store
+        .set_branch_scratch(
+            "other",
+            Some(sparkles::branch::Scratch {
+                creator: "user:devs".into(),
+            }),
+        )
+        .unwrap();
+    let r = call(
+        app,
+        "DELETE",
+        "/$/branches/br/other",
+        &[("authorization", &graphy)],
+        "",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "another's scratch branch");
+    ds.store
+        .set_branch_scratch(
+            "other",
+            Some(sparkles::branch::Scratch {
+                creator: "user:graphy".into(),
+            }),
+        )
+        .unwrap();
+    let r = call(
+        app,
+        "DELETE",
+        "/$/branches/br/other",
+        &[("authorization", &graphy)],
+        "",
+    )
+    .await;
+    assert_eq!(
+        r.status,
+        StatusCode::NO_CONTENT,
+        "{}",
+        String::from_utf8_lossy(&r.body)
     );
 }
 

@@ -2828,7 +2828,7 @@ including `main`.
 | POST | `/$/branches/{ds}` | Creates a branch from JSON `{name, from?, at?, protected?, note?}`. `from` defaults to `main` and `at` to its head. Answers `201` with `Location` and the `Branch`. |
 | GET | `/$/branches/{ds}/{name}` | The `Branch`, or `404 no-such-branch`. |
 | PATCH | `/$/branches/{ds}/{name}` | Changes `name`, `protected` or `note` (`null` removes the note). |
-| DELETE | `/$/branches/{ds}/{name}` | Deletes the branch, its commits, snapshots and storage. `?force=true` deletes one with unmerged commits, and `?reparent=true` one that other branches start from. Answers `204`. |
+| DELETE | `/$/branches/{ds}/{name}` | Deletes the branch, its commits, snapshots and storage. `?force=true` deletes one with unmerged commits, and `?reparent=true` one that other branches start from. Answers `204`. A caller whose grants are limited to some graphs may delete only the scratch branches it created. |
 | POST | `/$/branches/{ds}/{name}/relink` | Moves a linked branch onto `main`'s current index and answers the `RelinkResult`. See [Relinking](#relinking). |
 
 A read-only server (`serve --read-only`) refuses every route that changes branches with
