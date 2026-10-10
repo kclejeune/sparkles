@@ -85,11 +85,14 @@ fn mem(text: bool) -> McpServer {
     sparkles::sparql::update::update(&ds.store, A7, &sparkles::sparql::QueryOptions::default())
         .unwrap();
     assert_eq!(head(&server, "mem"), 2);
+    #[cfg(feature = "text")]
     if text {
         ds.store
             .enable_text(sparkles::text::TextConfig::default())
             .unwrap();
     }
+    #[cfg(not(feature = "text"))]
+    let _ = text;
     server
 }
 

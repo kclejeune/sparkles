@@ -4810,6 +4810,8 @@ export interface components {
                 [key: string]: unknown;
             };
             query: string;
+            /** @description Example questions the query answers, at most 500 characters each. The MCP tool similar_queries ranks queries by them. */
+            questions?: string[];
             results?: {
                 [key: string]: unknown;
             };
@@ -4839,6 +4841,8 @@ export interface components {
                 parameters?: {
                     [key: string]: unknown;
                 };
+                /** @description Example questions the query answers, at most 500 characters each. The MCP tool similar_queries ranks queries by them. */
+                questions?: string[];
                 results?: {
                     [key: string]: unknown;
                 };
