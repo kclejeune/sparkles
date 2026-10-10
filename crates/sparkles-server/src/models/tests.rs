@@ -270,7 +270,10 @@ fn keys_stay_in_headers() {
     let v = m.describe();
     assert_eq!(v["providers"][0]["status"], "ok");
     assert_eq!(v["providers"][1]["status"], "secret-missing");
-    assert_eq!(v["providers"][1]["apiKey"], json!({"secret": "missing"}));
+    assert_eq!(
+        v["providers"][1]["apiKey"],
+        json!({"secret": "missing", "source": "missing"})
+    );
     assert_eq!(v["providers"][0]["models"][0]["status"]["state"], "failing");
 }
 

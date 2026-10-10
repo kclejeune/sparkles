@@ -2486,7 +2486,7 @@ fn assist(p: &mut Paths) {
     let tag = "Models";
     p.add(
         op(GET, "/$/models", "listModelProviders", tag, "List model providers")
-            .doc("The providers of `serve --model-config`, their models with the detected structured-output level and last status, and the role lists. Keys are never returned, only the names of their secrets. `configured` is `false` without a configuration.")
+            .doc("The providers of the effective model configuration, their models with the detected structured-output level and last status, and the role lists. Keys are never returned, only the names of their secrets and where each comes from. `configured` is `false` when neither `serve --model-config` nor the runtime layer configures models.")
             .see("model-providers")
             .json("200", "The providers and role lists.", "ModelProviders"),
     );
@@ -2608,6 +2608,67 @@ fn assist(p: &mut Paths) {
             .header("If-Match", json!({ "type": "string" }), "The `etag` of the runtime layer the change is based on.")
             .json("200", "The kind after the change.", "SettingsKind")
             .errors(&[400, 409, 412]),
+    );
+    let server_body = |o: super::Op| {
+        o.body(
+            true,
+            "Fields of the model configuration: `providers`, `roles` and `routing`.",
+            json!({ "application/json": { "schema": { "type": "object" } } }),
+        )
+        .header(
+            "If-Match",
+            json!({ "type": "string" }),
+            "The `etag` of the runtime layer the change is based on.",
+        )
+        .json("200", "The kind after the change.", "ServerSettingsKind")
+        .errors(&[400, 404, 409, 412])
+    };
+    p.add(
+        op(GET, "/$/server/settings/{kind}", "getServerSettings", "Server", "Get a server settings kind")
+            .doc("The model configuration (`models`): the effective object, the declared configuration of `--model-config`, the runtime layer, the source of each field, the fields `server.locked` locks and whether the effective object is valid. The `ETag` names the runtime layer. Needs server `admin`.")
+            .see("server-settings")
+            .json("200", "The kind.", "ServerSettingsKind")
+            .errors(&[404]),
+    );
+    p.add(server_body(
+        op(PATCH, "/$/server/settings/{kind}", "patchServerSettings", "Server", "Change server settings fields")
+            .doc("Merges the body into the runtime layer as RFC 7396 says. Providers merge member by member, and `null` for a declared provider removes it. A role list is one field. Headers that carry credentials and endpoints with credentials, a query or a fragment are refused. A change to a locked field is a `409` with `locked-by-config`. Requests that start after the change use it. Needs server `admin`.")
+            .see("server-settings"),
+    ));
+    p.add(server_body(
+        op(PUT, "/$/server/settings/{kind}", "putServerSettings", "Server", "Set a server settings kind")
+            .doc("Makes the effective model configuration equal to the body. The runtime layer keeps the fields where the body differs from the declared configuration, with `null` for a declared provider the body leaves out. Needs server `admin`.")
+            .see("server-settings"),
+    ));
+    p.add(
+        op(DELETE, "/$/server/settings/{kind}", "resetServerSettings", "Server", "Reset server settings")
+            .doc("Clears the runtime layer, or with `field` one field of it, so the declared configuration applies. Needs server `admin`.")
+            .see("server-settings")
+            .query("field", json!({ "type": "string" }), "A dotted field such as `providers.claude` or `roles.draft`.")
+            .header("If-Match", json!({ "type": "string" }), "The `etag` of the runtime layer the change is based on.")
+            .json("200", "The kind after the change.", "ServerSettingsKind")
+            .errors(&[400, 404, 409, 412]),
+    );
+    p.add(
+        op(GET, "/$/server/secrets", "listSecrets", "Server", "List model secrets")
+            .doc("Each secret that `--model-secret`, a stored value, a provider or a lock names, with its source, whether it is locked, when a runtime value was stored and the providers that use it. Values are never returned. Needs server `admin`.")
+            .see("model-secrets")
+            .json("200", "The secrets.", "SecretList"),
+    );
+    p.add(
+        op(PUT, "/$/server/secrets/{name}", "putSecret", "Server", "Store a model secret")
+            .doc("Stores a runtime value for the secret in the data directory with mode 0600. It overrides the `--model-secret` source, and requests that start after it use it. A secret that `server.locked` locks is a `409` with `locked-by-config`. Needs server `admin`.")
+            .see("model-secrets")
+            .json_body(true, "SecretValue")
+            .no_content("Stored.")
+            .errors(&[400, 409]),
+    );
+    p.add(
+        op(DELETE, "/$/server/secrets/{name}", "deleteSecret", "Server", "Remove a model secret's runtime value")
+            .doc("Removes the runtime value, so the `--model-secret` source applies again. Needs server `admin`.")
+            .see("model-secrets")
+            .no_content("Removed, or there was no runtime value.")
+            .errors(&[400]),
     );
     p.add(
         op(GET, "/$/asks/{ds}", "listAsks", tag, "List your asked questions")

@@ -19,6 +19,7 @@ mod limits;
 mod oidc;
 mod proxy;
 mod rename;
+mod server_settings;
 mod sessions;
 mod tasks;
 mod tokens;

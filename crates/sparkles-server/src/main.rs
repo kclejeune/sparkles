@@ -889,7 +889,8 @@ enum Cmd {
         models: models::ModelArgs,
         /// Declared dataset settings, as JSON (spec C19 §5): defaults and per-dataset
         /// values of the assistant, memory and ingest settings, and the fields that cannot
-        /// be changed at runtime. Read again on SIGHUP, together with --model-config
+        /// be changed at runtime, including server.locked for the model configuration and
+        /// its secrets. Read again on SIGHUP, together with --model-config
         #[arg(long, value_name = "FILE")]
         settings: Option<PathBuf>,
         #[cfg(feature = "mcp")]
@@ -2474,11 +2475,10 @@ fn run() -> Result<()> {
                 secrets: vector_cmd::parse_secrets(&embedding_secret)?,
             });
             st.file_loads = outbound::file_loads(load_dir.as_deref(), &data)?;
-            st.set_models(models.load(st.outbound.clone())?);
-            if let Some(path) = &settings {
-                st.settings = settings::Settings::load(path, st.models().as_deref())?;
-            }
-            st.settings.set_models_file(models.model_config.clone());
+            // the model configuration is the `models` settings kind (spec C19 §11): the
+            // declared --model-config, the runtime layer of the data directory and the
+            // locks of the settings file
+            settings::server::start(&mut st, settings.as_deref(), &models)?;
             #[cfg(feature = "mcp")]
             {
                 st.ingest = ingest::Runtime::new(&ingest);
@@ -2736,6 +2736,12 @@ fn run() -> Result<()> {
                 {
                     mcp::branches::spawn_expiry(st.clone(), ttl);
                 }
+                // the SIGHUP listeners register one after another without an await
+                // between them, the settings and models first, so that a reload sent
+                // once the process catches the signal reaches all of them
+                #[cfg(unix)]
+                settings::spawn_reload_on_sighup(st.clone(), models);
+                auth::spawn_reload_on_sighup(&st);
                 if let Some(rl) = &st.rate_limit {
                     ratelimit::spawn_sweeper(rl.clone(), Duration::from_secs(60));
                     #[cfg(unix)]
@@ -2745,9 +2751,6 @@ fn run() -> Result<()> {
                 }
                 // every dataset was opened before the listener was bound
                 st.set_phase(obs::Phase::Ready);
-                auth::spawn_reload_on_sighup(&st);
-                #[cfg(unix)]
-                settings::spawn_reload_on_sighup(st.clone(), models);
                 let st2 = st.clone();
                 let app = http::router(st.clone());
                 let (draining_tx, draining) = tokio::sync::oneshot::channel();

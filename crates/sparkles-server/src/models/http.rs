@@ -1,6 +1,7 @@
 //! `GET /$/models` and `POST /$/models/{name}/test` (spec C18 §3.4), for server admins
-//! (the route table in `auth/routes.rs`). Neither returns a key, and no route creates a
-//! provider or changes its endpoint: providers come from `--model-config` only.
+//! (the route table in `auth/routes.rs`). Neither returns a key. The providers are those
+//! of the effective model configuration, which `/$/server/settings/models` changes
+//! (spec C19 §11, `crate::settings::server`).
 
 use crate::http::{AdminBody, ApiResult, blocking, err, err_code};
 use crate::state::AppState;

@@ -1505,7 +1505,7 @@ export interface paths {
         };
         /**
          * List model providers
-         * @description The providers of `serve --model-config`, their models with the detected structured-output level and last status, and the role lists. Keys are never returned, only the names of their secrets. `configured` is `false` without a configuration.
+         * @description The providers of the effective model configuration, their models with the detected structured-output level and last status, and the role lists. Keys are never returned, only the names of their secrets and where each comes from. `configured` is `false` when neither `serve --model-config` nor the runtime layer configures models.
          */
         get: operations["listModelProviders"];
         put?: never;
@@ -2178,6 +2178,82 @@ export interface paths {
         options?: never;
         head?: never;
         patch?: never;
+        trace?: never;
+    };
+    "/$/server/secrets": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List model secrets
+         * @description Each secret that `--model-secret`, a stored value, a provider or a lock names, with its source, whether it is locked, when a runtime value was stored and the providers that use it. Values are never returned. Needs server `admin`.
+         */
+        get: operations["listSecrets"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/server/secrets/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Store a model secret
+         * @description Stores a runtime value for the secret in the data directory with mode 0600. It overrides the `--model-secret` source, and requests that start after it use it. A secret that `server.locked` locks is a `409` with `locked-by-config`. Needs server `admin`.
+         */
+        put: operations["putSecret"];
+        post?: never;
+        /**
+         * Remove a model secret's runtime value
+         * @description Removes the runtime value, so the `--model-secret` source applies again. Needs server `admin`.
+         */
+        delete: operations["deleteSecret"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/server/settings/{kind}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get a server settings kind
+         * @description The model configuration (`models`): the effective object, the declared configuration of `--model-config`, the runtime layer, the source of each field, the fields `server.locked` locks and whether the effective object is valid. The `ETag` names the runtime layer. Needs server `admin`.
+         */
+        get: operations["getServerSettings"];
+        /**
+         * Set a server settings kind
+         * @description Makes the effective model configuration equal to the body. The runtime layer keeps the fields where the body differs from the declared configuration, with `null` for a declared provider the body leaves out. Needs server `admin`.
+         */
+        put: operations["putServerSettings"];
+        post?: never;
+        /**
+         * Reset server settings
+         * @description Clears the runtime layer, or with `field` one field of it, so the declared configuration applies. Needs server `admin`.
+         */
+        delete: operations["resetServerSettings"];
+        options?: never;
+        head?: never;
+        /**
+         * Change server settings fields
+         * @description Merges the body into the runtime layer as RFC 7396 says. Providers merge member by member, and `null` for a declared provider removes it. A role list is one field. Headers that carry credentials and endpoints with credentials, a query or a fragment are refused. A change to a locked field is a `409` with `locked-by-config`. Requests that start after the change use it. Needs server `admin`.
+         */
+        patch: operations["patchServerSettings"];
         trace?: never;
     };
     "/$/settings": {
@@ -5754,9 +5830,14 @@ export interface components {
             configured: boolean;
             providers: {
                 allowedModels?: string[];
-                /** @description The name of the secret that holds the key. The key itself is never returned. */
+                /** @description The name of the secret that holds the key and its source. The key itself is never returned. */
                 apiKey?: {
                     secret: string;
+                    /**
+                     * @description Where the key comes from: `--model-secret`, a value stored through `PUT /$/server/secrets/{name}`, or nowhere.
+                     * @enum {string}
+                     */
+                    source: "declared" | "runtime" | "missing";
                 };
                 budget?: {
                     tokensPerDay: number;
@@ -6756,6 +6837,32 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        /** @description The model secrets. A value is never returned. */
+        SecretList: {
+            secrets: {
+                /** @description Whether `--model-secret` names the secret. */
+                declared: boolean;
+                /** @description Whether `server.locked` names `secrets.NAME`, so that only the declared source applies. */
+                locked: boolean;
+                name: string;
+                /** @description A runtime value is stored but the lock ignores it. */
+                overridden: boolean;
+                /** @description The providers whose `apiKey` names the secret. */
+                providers: string[];
+                /** @description When the runtime value was stored. */
+                setAt: string | null;
+                /**
+                 * @description The source in force: a stored value, `--model-secret`, or none.
+                 * @enum {string}
+                 */
+                source: "declared" | "runtime" | "missing";
+            }[];
+        };
+        /** @description The value of a model secret. */
+        SecretValue: {
+            /** @description The key. It is stored and never returned. */
+            value: string;
+        };
         ServerInfo: {
             auth: {
                 enabled: boolean;
@@ -6772,6 +6879,39 @@ export interface components {
             uptimeSeconds: number;
             /** @description Left out for anonymous callers when auth is on. */
             version?: string;
+        };
+        /** @description A server-wide settings kind with its layers and sources. */
+        ServerSettingsKind: {
+            /** @description The model configuration of `--model-config`. */
+            declared: {
+                [key: string]: unknown;
+            };
+            /** @description The effective model configuration: `providers`, `roles` and `routing`, from the built-in defaults, `--model-config` and the runtime layer, with the locked fields from the declared configuration. */
+            effective: {
+                [key: string]: unknown;
+            };
+            /** @description The entity tag of the runtime layer, as in the `ETag` header. */
+            etag: string;
+            /** @enum {string} */
+            kind: "models";
+            /** @description The fields that `server.locked` of the settings file locks, without the `models.` prefix. */
+            locked: string[];
+            /** @description Locked fields whose runtime value is kept but ignored. */
+            overridden: string[];
+            /** @description The runtime layer kept in `<dataDir>/models.json`. `null` for a provider removes a declared provider. */
+            runtime: {
+                [key: string]: unknown;
+            };
+            /** @enum {string} */
+            scope: "server";
+            /** @description The source of each field of `effective`, by dotted path such as `providers.claude.endpoint`. */
+            sources: {
+                [key: string]: "default" | "declared" | "runtime" | "locked";
+            };
+            status: {
+                error?: string;
+                valid: boolean;
+            };
         };
         /** @description One settings kind of a dataset with its layers and sources. */
         SettingsKind: {
@@ -6823,6 +6963,8 @@ export interface components {
             };
             path: string | null;
             readAt: string | null;
+            /** @description The server-wide kinds of `/$/server/settings/{kind}`. */
+            serverKinds: string[];
             /** @description Declared names that match no dataset. Their entries apply when such a dataset is created. */
             unmatched: string[];
         };
@@ -7987,8 +8129,8 @@ export interface components {
         ifMatch: string;
         /** @description Entity tags, or `*`. */
         ifNoneMatch: string;
-        /** @description The settings kind: `assistant`, `memory` or `ingest`. */
-        kind: "assistant" | "memory" | "ingest";
+        /** @description The settings kind: `assistant`, `memory` or `ingest` of a dataset, or `models` of the server. */
+        kind: "assistant" | "memory" | "ingest" | "models";
         /** @description The page size. */
         limit: number;
         /** @description A lower budget of the serialized result, in MiB. */
@@ -7999,7 +8141,7 @@ export interface components {
         maxRowsProduced: number;
         /** @description A lower memory budget, in MiB. */
         memoryMb: number;
-        /** @description The name of the stored query, snapshot, vector index, branch or ingest profile. */
+        /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
         name: string;
         /** @description The named graphs (SPARQL Protocol). */
         namedGraphUri: string[];
@@ -9262,7 +9404,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The name of the stored query, snapshot, vector index, branch or ingest profile. */
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
                 name: components["parameters"]["name"];
             };
             cookie?: never;
@@ -9296,7 +9438,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The name of the stored query, snapshot, vector index, branch or ingest profile. */
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
                 name: components["parameters"]["name"];
             };
             cookie?: never;
@@ -9325,7 +9467,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The name of the stored query, snapshot, vector index, branch or ingest profile. */
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
                 name: components["parameters"]["name"];
             };
             cookie?: never;
@@ -9362,7 +9504,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The name of the stored query, snapshot, vector index, branch or ingest profile. */
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
                 name: components["parameters"]["name"];
             };
             cookie?: never;
@@ -10606,7 +10748,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The name of the stored query, snapshot, vector index, branch or ingest profile. */
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
                 name: components["parameters"]["name"];
             };
             cookie?: never;
@@ -10636,7 +10778,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The name of the stored query, snapshot, vector index, branch or ingest profile. */
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
                 name: components["parameters"]["name"];
             };
             cookie?: never;
@@ -10670,7 +10812,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The name of the stored query, snapshot, vector index, branch or ingest profile. */
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
                 name: components["parameters"]["name"];
             };
             cookie?: never;
@@ -11322,7 +11464,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The name of the stored query, snapshot, vector index, branch or ingest profile. */
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
                 name: components["parameters"]["name"];
             };
             cookie?: never;
@@ -11530,7 +11672,7 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description The name of the stored query, snapshot, vector index, branch or ingest profile. */
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
                 name: components["parameters"]["name"];
             };
             cookie?: never;
@@ -11814,7 +11956,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The name of the stored query, snapshot, vector index, branch or ingest profile. */
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
                 name: components["parameters"]["name"];
             };
             cookie?: never;
@@ -11852,7 +11994,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The name of the stored query, snapshot, vector index, branch or ingest profile. */
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
                 name: components["parameters"]["name"];
             };
             cookie?: never;
@@ -11900,7 +12042,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The name of the stored query, snapshot, vector index, branch or ingest profile. */
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
                 name: components["parameters"]["name"];
             };
             cookie?: never;
@@ -11928,7 +12070,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The name of the stored query, snapshot, vector index, branch or ingest profile. */
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
                 name: components["parameters"]["name"];
             };
             cookie?: never;
@@ -13124,6 +13266,223 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    listSecrets: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The secrets. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SecretList"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    putSecret: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
+                name: components["parameters"]["name"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SecretValue"];
+            };
+        };
+        responses: {
+            /** @description Stored. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    deleteSecret: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
+                name: components["parameters"]["name"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Removed, or there was no runtime value. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getServerSettings: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The settings kind: `assistant`, `memory` or `ingest` of a dataset, or `models` of the server. */
+                kind: components["parameters"]["kind"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The kind. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ServerSettingsKind"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    putServerSettings: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description The `etag` of the runtime layer the change is based on. */
+                "If-Match"?: string;
+            };
+            path: {
+                /** @description The settings kind: `assistant`, `memory` or `ingest` of a dataset, or `models` of the server. */
+                kind: components["parameters"]["kind"];
+            };
+            cookie?: never;
+        };
+        /** @description Fields of the model configuration: `providers`, `roles` and `routing`. */
+        requestBody: {
+            content: {
+                "application/json": Record<string, never>;
+            };
+        };
+        responses: {
+            /** @description The kind after the change. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ServerSettingsKind"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            412: components["responses"]["PreconditionFailed"];
+            default: components["responses"]["Error"];
+        };
+    };
+    resetServerSettings: {
+        parameters: {
+            query?: {
+                /** @description A dotted field such as `providers.claude` or `roles.draft`. */
+                field?: string;
+            };
+            header?: {
+                /** @description The `etag` of the runtime layer the change is based on. */
+                "If-Match"?: string;
+            };
+            path: {
+                /** @description The settings kind: `assistant`, `memory` or `ingest` of a dataset, or `models` of the server. */
+                kind: components["parameters"]["kind"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The kind after the change. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ServerSettingsKind"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            412: components["responses"]["PreconditionFailed"];
+            default: components["responses"]["Error"];
+        };
+    };
+    patchServerSettings: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description The `etag` of the runtime layer the change is based on. */
+                "If-Match"?: string;
+            };
+            path: {
+                /** @description The settings kind: `assistant`, `memory` or `ingest` of a dataset, or `models` of the server. */
+                kind: components["parameters"]["kind"];
+            };
+            cookie?: never;
+        };
+        /** @description Fields of the model configuration: `providers`, `roles` and `routing`. */
+        requestBody: {
+            content: {
+                "application/json": Record<string, never>;
+            };
+        };
+        responses: {
+            /** @description The kind after the change. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ServerSettingsKind"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            412: components["responses"]["PreconditionFailed"];
+            default: components["responses"]["Error"];
+        };
+    };
     getSettingsStatus: {
         parameters: {
             query?: never;
@@ -13181,7 +13540,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The settings kind: `assistant`, `memory` or `ingest`. */
+                /** @description The settings kind: `assistant`, `memory` or `ingest` of a dataset, or `models` of the server. */
                 kind: components["parameters"]["kind"];
             };
             cookie?: never;
@@ -13213,7 +13572,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The settings kind: `assistant`, `memory` or `ingest`. */
+                /** @description The settings kind: `assistant`, `memory` or `ingest` of a dataset, or `models` of the server. */
                 kind: components["parameters"]["kind"];
             };
             cookie?: never;
@@ -13256,7 +13615,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The settings kind: `assistant`, `memory` or `ingest`. */
+                /** @description The settings kind: `assistant`, `memory` or `ingest` of a dataset, or `models` of the server. */
                 kind: components["parameters"]["kind"];
             };
             cookie?: never;
@@ -13291,7 +13650,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The settings kind: `assistant`, `memory` or `ingest`. */
+                /** @description The settings kind: `assistant`, `memory` or `ingest` of a dataset, or `models` of the server. */
                 kind: components["parameters"]["kind"];
             };
             cookie?: never;
@@ -13400,7 +13759,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The name of the stored query, snapshot, vector index, branch or ingest profile. */
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
                 name: components["parameters"]["name"];
             };
             cookie?: never;
@@ -13429,7 +13788,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The name of the stored query, snapshot, vector index, branch or ingest profile. */
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
                 name: components["parameters"]["name"];
             };
             cookie?: never;
@@ -14165,7 +14524,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The name of the stored query, snapshot, vector index, branch or ingest profile. */
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
                 name: components["parameters"]["name"];
             };
             cookie?: never;
@@ -14194,7 +14553,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The name of the stored query, snapshot, vector index, branch or ingest profile. */
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
                 name: components["parameters"]["name"];
             };
             cookie?: never;
@@ -14238,7 +14597,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The name of the stored query, snapshot, vector index, branch or ingest profile. */
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
                 name: components["parameters"]["name"];
             };
             cookie?: never;
@@ -14265,7 +14624,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The name of the stored query, snapshot, vector index, branch or ingest profile. */
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
                 name: components["parameters"]["name"];
             };
             cookie?: never;
@@ -14293,7 +14652,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The name of the stored query, snapshot, vector index, branch or ingest profile. */
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
                 name: components["parameters"]["name"];
             };
             cookie?: never;
@@ -14322,7 +14681,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The name of the stored query, snapshot, vector index, branch or ingest profile. */
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
                 name: components["parameters"]["name"];
             };
             cookie?: never;
@@ -16126,7 +16485,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The name of the stored query, snapshot, vector index, branch or ingest profile. */
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
                 name: components["parameters"]["name"];
             };
             cookie?: never;
@@ -16191,7 +16550,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The name of the stored query, snapshot, vector index, branch or ingest profile. */
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
                 name: components["parameters"]["name"];
             };
             cookie?: never;

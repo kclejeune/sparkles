@@ -2910,6 +2910,66 @@ highlighted. Users without `admin` on the dataset see the tab read-only.
 The memory section also shows memory maintenance, which
 [Maintaining agent memory](#maintaining-agent-memory) describes.
 
+### Changing models and keys at runtime
+
+The file of `--model-config` is the operator's declared model configuration. A server
+administrator can change it at runtime without a restart, by adding a provider,
+changing a budget or replacing a role list, and can store a provider's key through the
+API. The changes are kept in the data directory, in `models.json` and the `secrets`
+directory, and they survive restarts and reloads. A server started without
+`--model-config` can get all of its providers this way.
+
+```sh
+curl -X PATCH http://localhost:3030/$/server/settings/models \
+  -H 'Content-Type: application/json' -d '{
+    "providers": {
+      "gateway": {
+        "kind": "openai",
+        "endpoint": "https://llm.internal.example/v1",
+        "apiKey": { "secret": "gateway" }
+      }
+    },
+    "roles": { "draft": [{ "provider": "gateway", "model": "qwen3-32b" }] }
+  }'
+printf '{"value": "%s"}' "$GATEWAY_KEY" | curl -X PUT \
+  http://localhost:3030/$/server/secrets/gateway \
+  -H 'Content-Type: application/json' --data-binary @-
+```
+
+The next question uses the new provider. Questions already running finish with the
+configuration they started with. The key is written to `<dataDir>/secrets/gateway`
+with mode 0600, and no route ever returns it. `GET /$/server/secrets` lists each
+secret with its source and the providers that use it, and `DELETE
+/$/server/secrets/gateway` removes the stored value so that the `--model-secret`
+source applies again. Reading the key from standard input, as above, keeps it out of
+the shell history and the process list.
+
+`GET /$/server/settings/models` answers the effective configuration with the source of
+each field, as for a dataset's settings. A `PATCH` with `null` for a provider removes
+it, and `DELETE /$/server/settings/models?field=providers.NAME` brings a declared
+provider back. Only users with `server-admin` can use these routes. Requests to a
+provider still pass through the outbound policy, so a provider on a private address,
+such as Ollama on the same host, needs `--outbound-allow-private`.
+
+The operator keeps control through `server.locked` in the settings file. A locked field
+cannot be changed at runtime, a locked provider can be neither changed nor removed, and
+a locked secret always uses its `--model-secret` source, so no key is stored on disk
+for it:
+
+```json
+{
+  "server": {
+    "locked": ["models.providers.claude", "models.roles.draft", "secrets.anthropic"]
+  }
+}
+```
+
+`sparkles settings check settings.json --model-config models.json` checks these locks
+too, and warns about a lock that names a provider the configuration does not define or
+a secret that no provider uses. Every change is logged under the `sparkles::audit`
+target with the person who made it and the fields it changed, and a secret's change
+names only the secret.
+
 ### Escalation
 
 A role's list goes from the cheapest pair to the strongest. A step moves to the next
@@ -4720,6 +4780,11 @@ readable by the service user within its sandbox; home and temporary directories
 are hidden. For an environment source, provide the variable at runtime through
 `systemd.services.sparkles.serviceConfig.EnvironmentFile`, and restart after
 updating that file.
+
+The generated configuration is the declared layer. Server administrators can still
+change providers and store keys at runtime, as
+[Changing models and keys at runtime](#changing-models-and-keys-at-runtime) describes,
+unless `server.locked` in the settings file locks them.
 
 Only credential references belong in Nix: generated settings are in the Nix store.
 The module does not copy key files into the store or read their contents during

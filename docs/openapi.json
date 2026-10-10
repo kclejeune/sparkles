@@ -225,7 +225,7 @@
         }
       },
       "kind": {
-        "description": "The settings kind: `assistant`, `memory` or `ingest`.",
+        "description": "The settings kind: `assistant`, `memory` or `ingest` of a dataset, or `models` of the server.",
         "in": "path",
         "name": "kind",
         "required": true,
@@ -233,7 +233,8 @@
           "enum": [
             "assistant",
             "memory",
-            "ingest"
+            "ingest",
+            "models"
           ],
           "type": "string"
         }
@@ -284,7 +285,7 @@
         }
       },
       "name": {
-        "description": "The name of the stored query, snapshot, vector index, branch or ingest profile.",
+        "description": "The name of the stored query, snapshot, vector index, branch, ingest profile or model secret.",
         "in": "path",
         "name": "name",
         "required": true,
@@ -9313,14 +9314,24 @@
                   "type": "array"
                 },
                 "apiKey": {
-                  "description": "The name of the secret that holds the key. The key itself is never returned.",
+                  "description": "The name of the secret that holds the key and its source. The key itself is never returned.",
                   "properties": {
                     "secret": {
+                      "type": "string"
+                    },
+                    "source": {
+                      "description": "Where the key comes from: `--model-secret`, a value stored through `PUT /$/server/secrets/{name}`, or nowhere.",
+                      "enum": [
+                        "declared",
+                        "runtime",
+                        "missing"
+                      ],
                       "type": "string"
                     }
                   },
                   "required": [
-                    "secret"
+                    "secret",
+                    "source"
                   ],
                   "type": "object"
                 },
@@ -12603,6 +12614,93 @@
         ],
         "type": "object"
       },
+      "SecretList": {
+        "description": "The model secrets. A value is never returned.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#model-secrets"
+        },
+        "properties": {
+          "secrets": {
+            "items": {
+              "properties": {
+                "declared": {
+                  "description": "Whether `--model-secret` names the secret.",
+                  "type": "boolean"
+                },
+                "locked": {
+                  "description": "Whether `server.locked` names `secrets.NAME`, so that only the declared source applies.",
+                  "type": "boolean"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "overridden": {
+                  "description": "A runtime value is stored but the lock ignores it.",
+                  "type": "boolean"
+                },
+                "providers": {
+                  "description": "The providers whose `apiKey` names the secret.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "setAt": {
+                  "description": "When the runtime value was stored.",
+                  "oneOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "source": {
+                  "description": "The source in force: a stored value, `--model-secret`, or none.",
+                  "enum": [
+                    "declared",
+                    "runtime",
+                    "missing"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "name",
+                "source",
+                "declared",
+                "locked",
+                "setAt",
+                "overridden",
+                "providers"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "secrets"
+        ],
+        "type": "object"
+      },
+      "SecretValue": {
+        "description": "The value of a model secret.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#model-secrets"
+        },
+        "properties": {
+          "value": {
+            "description": "The key. It is stored and never returned.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "value"
+        ],
+        "type": "object"
+      },
       "ServerInfo": {
         "properties": {
           "auth": {
@@ -12654,6 +12752,100 @@
           "readOnly",
           "datasets",
           "auth"
+        ],
+        "type": "object"
+      },
+      "ServerSettingsKind": {
+        "description": "A server-wide settings kind with its layers and sources.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#server-settings"
+        },
+        "properties": {
+          "declared": {
+            "additionalProperties": true,
+            "description": "The model configuration of `--model-config`.",
+            "type": "object"
+          },
+          "effective": {
+            "additionalProperties": true,
+            "description": "The effective model configuration: `providers`, `roles` and `routing`, from the built-in defaults, `--model-config` and the runtime layer, with the locked fields from the declared configuration.",
+            "type": "object"
+          },
+          "etag": {
+            "description": "The entity tag of the runtime layer, as in the `ETag` header.",
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "models"
+            ],
+            "type": "string"
+          },
+          "locked": {
+            "description": "The fields that `server.locked` of the settings file locks, without the `models.` prefix.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "overridden": {
+            "description": "Locked fields whose runtime value is kept but ignored.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "runtime": {
+            "additionalProperties": true,
+            "description": "The runtime layer kept in `<dataDir>/models.json`. `null` for a provider removes a declared provider.",
+            "type": "object"
+          },
+          "scope": {
+            "enum": [
+              "server"
+            ],
+            "type": "string"
+          },
+          "sources": {
+            "additionalProperties": {
+              "enum": [
+                "default",
+                "declared",
+                "runtime",
+                "locked"
+              ],
+              "type": "string"
+            },
+            "description": "The source of each field of `effective`, by dotted path such as `providers.claude.endpoint`.",
+            "type": "object"
+          },
+          "status": {
+            "additionalProperties": false,
+            "properties": {
+              "error": {
+                "type": "string"
+              },
+              "valid": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "valid"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "scope",
+          "kind",
+          "effective",
+          "declared",
+          "runtime",
+          "sources",
+          "locked",
+          "overridden",
+          "status",
+          "etag"
         ],
         "type": "object"
       },
@@ -12863,6 +13055,13 @@
               }
             ]
           },
+          "serverKinds": {
+            "description": "The server-wide kinds of `/$/server/settings/{kind}`.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "unmatched": {
             "description": "Declared names that match no dataset. Their entries apply when such a dataset is created.",
             "items": {
@@ -12879,6 +13078,7 @@
           "declared",
           "unmatched",
           "kinds",
+          "serverKinds",
           "models"
         ],
         "type": "object"
@@ -23484,7 +23684,7 @@
     },
     "/$/models": {
       "get": {
-        "description": "The providers of `serve --model-config`, their models with the detected structured-output level and last status, and the role lists. Keys are never returned, only the names of their secrets. `configured` is `false` without a configuration.",
+        "description": "The providers of the effective model configuration, their models with the detected structured-output level and last status, and the role lists. Keys are never returned, only the names of their secrets and where each comes from. `configured` is `false` when neither `serve --model-config` nor the runtime layer configures models.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#model-providers"
         },
@@ -26852,6 +27052,462 @@
           "Server"
         ],
         "x-sparkles-permission": "any caller"
+      }
+    },
+    "/$/server/secrets": {
+      "get": {
+        "description": "Each secret that `--model-secret`, a stored value, a provider or a lock names, with its source, whether it is locked, when a runtime value was stored and the providers that use it. Values are never returned. Needs server `admin`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#model-secrets"
+        },
+        "operationId": "listSecrets",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecretList"
+                }
+              }
+            },
+            "description": "The secrets."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "List model secrets",
+        "tags": [
+          "Server"
+        ],
+        "x-sparkles-permission": "server-admin"
+      }
+    },
+    "/$/server/secrets/{name}": {
+      "delete": {
+        "description": "Removes the runtime value, so the `--model-secret` source applies again. Needs server `admin`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#model-secrets"
+        },
+        "operationId": "deleteSecret",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/name"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed, or there was no runtime value."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Remove a model secret's runtime value",
+        "tags": [
+          "Server"
+        ],
+        "x-sparkles-permission": "server-admin"
+      },
+      "put": {
+        "description": "Stores a runtime value for the secret in the data directory with mode 0600. It overrides the `--model-secret` source, and requests that start after it use it. A secret that `server.locked` locks is a `409` with `locked-by-config`. Needs server `admin`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#model-secrets"
+        },
+        "operationId": "putSecret",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/name"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SecretValue"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Stored."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Store a model secret",
+        "tags": [
+          "Server"
+        ],
+        "x-sparkles-permission": "server-admin"
+      }
+    },
+    "/$/server/settings/{kind}": {
+      "delete": {
+        "description": "Clears the runtime layer, or with `field` one field of it, so the declared configuration applies. Needs server `admin`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#server-settings"
+        },
+        "operationId": "resetServerSettings",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/kind"
+          },
+          {
+            "description": "A dotted field such as `providers.claude` or `roles.draft`.",
+            "in": "query",
+            "name": "field",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The `etag` of the runtime layer the change is based on.",
+            "in": "header",
+            "name": "If-Match",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServerSettingsKind"
+                }
+              }
+            },
+            "description": "The kind after the change."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Reset server settings",
+        "tags": [
+          "Server"
+        ],
+        "x-sparkles-permission": "server-admin"
+      },
+      "get": {
+        "description": "The model configuration (`models`): the effective object, the declared configuration of `--model-config`, the runtime layer, the source of each field, the fields `server.locked` locks and whether the effective object is valid. The `ETag` names the runtime layer. Needs server `admin`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#server-settings"
+        },
+        "operationId": "getServerSettings",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/kind"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServerSettingsKind"
+                }
+              }
+            },
+            "description": "The kind."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Get a server settings kind",
+        "tags": [
+          "Server"
+        ],
+        "x-sparkles-permission": "server-admin"
+      },
+      "patch": {
+        "description": "Merges the body into the runtime layer as RFC 7396 says. Providers merge member by member, and `null` for a declared provider removes it. A role list is one field. Headers that carry credentials and endpoints with credentials, a query or a fragment are refused. A change to a locked field is a `409` with `locked-by-config`. Requests that start after the change use it. Needs server `admin`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#server-settings"
+        },
+        "operationId": "patchServerSettings",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/kind"
+          },
+          {
+            "description": "The `etag` of the runtime layer the change is based on.",
+            "in": "header",
+            "name": "If-Match",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "description": "Fields of the model configuration: `providers`, `roles` and `routing`.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServerSettingsKind"
+                }
+              }
+            },
+            "description": "The kind after the change."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Change server settings fields",
+        "tags": [
+          "Server"
+        ],
+        "x-sparkles-permission": "server-admin"
+      },
+      "put": {
+        "description": "Makes the effective model configuration equal to the body. The runtime layer keeps the fields where the body differs from the declared configuration, with `null` for a declared provider the body leaves out. Needs server `admin`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#server-settings"
+        },
+        "operationId": "putServerSettings",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/kind"
+          },
+          {
+            "description": "The `etag` of the runtime layer the change is based on.",
+            "in": "header",
+            "name": "If-Match",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "description": "Fields of the model configuration: `providers`, `roles` and `routing`.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServerSettingsKind"
+                }
+              }
+            },
+            "description": "The kind after the change."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Set a server settings kind",
+        "tags": [
+          "Server"
+        ],
+        "x-sparkles-permission": "server-admin"
       }
     },
     "/$/settings": {

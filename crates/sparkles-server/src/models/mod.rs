@@ -15,8 +15,11 @@
 //! caller's (§5.5).
 //!
 //! Keys are read from their secrets for each request. They never appear in a response,
-//! a log line or an error message, and no HTTP route can create a provider or change
-//! its endpoint.
+//! a log line or an error message. The configuration is the `models` settings kind of
+//! spec C19 §11: the operator's `--model-config` with the changes that server
+//! administrators make through `/$/server/settings/models`, and a secret's runtime value
+//! stored through `/$/server/secrets/{name}` overrides its `--model-secret` source
+//! (`crate::settings::server`).
 
 mod client;
 mod config;
@@ -27,7 +30,8 @@ mod structured;
 
 pub use client::{CallError, ChatRequest, Message};
 pub use config::{
-    DEFAULT_CONTEXT_TOKENS, Kind, Level, ModelsConfig, Pair, ProviderConfig, Role, Routing,
+    DEFAULT_CONTEXT_TOKENS, Kind, Level, ModelsConfig, PROVIDER_MEMBERS, Pair, ProviderConfig,
+    Role, Routing, check_secret_name,
 };
 #[cfg(test)]
 pub use structured::validate;
@@ -45,7 +49,8 @@ use std::time::{Duration, Instant, SystemTime};
 #[derive(clap::Args, Clone, Debug, Default)]
 pub struct ModelArgs {
     /// The model providers and role lists, as JSON (spec C18 §3.4): `{"models":
-    /// {"providers": {...}, "roles": {...}}}`. Without it the server has no model
+    /// {"providers": {...}, "roles": {...}}}`. For serve, this is the declared layer,
+    /// which server administrators may change at runtime (spec C19 §11)
     #[arg(long, value_name = "FILE")]
     pub model_config: Option<std::path::PathBuf>,
     /// A secret a provider may name as its API key (`"apiKey": {"secret": NAME}`), read
@@ -84,6 +89,7 @@ pub fn parse_secrets(flags: &[String]) -> Result<BTreeMap<String, SecretSource>>
         if name.is_empty() {
             anyhow::bail!("--model-secret {f}: the name is empty");
         }
+        check_secret_name(name).map_err(|e| anyhow::anyhow!("--model-secret: {e}"))?;
         let src = src
             .parse()
             .map_err(|e: String| anyhow::anyhow!("--model-secret {e}"))?;
@@ -250,6 +256,8 @@ pub struct Models {
     /// the level detected for each (provider, model) pair under `auto`
     levels: Mutex<HashMap<(String, String), Level>>,
     status: Mutex<HashMap<(String, String), PairStatus>>,
+    /// the secrets whose source is a value stored through the API (spec C19 §11.2)
+    runtime_secrets: std::collections::BTreeSet<String>,
 }
 
 /// A JSON number without a trailing `.0` for whole values.
@@ -298,6 +306,51 @@ impl Models {
             runtime,
             levels: Mutex::new(HashMap::new()),
             status: Mutex::new(HashMap::new()),
+            runtime_secrets: Default::default(),
+        }
+    }
+
+    /// Note the secrets whose source is a runtime value, for `GET /$/models`.
+    pub fn set_runtime_secrets(&mut self, names: std::collections::BTreeSet<String>) {
+        self.runtime_secrets = names;
+    }
+
+    /// Where the key of secret `name` comes from: `runtime`, `declared` or `missing`.
+    pub fn secret_source(&self, name: &str) -> &'static str {
+        if self.runtime_secrets.contains(name) {
+            "runtime"
+        } else if self.secrets.contains_key(name) {
+            "declared"
+        } else {
+            "missing"
+        }
+    }
+
+    /// Take over the state of `old`, the configuration this one replaces: the tokens
+    /// counted today, and for a provider whose kind and endpoint did not change, the
+    /// detected levels and the last outcome of its pairs. Concurrency slots start
+    /// empty, so requests that run on `old` do not count against the new slots.
+    pub fn inherit(&self, old: &Models) {
+        for (name, rt) in &self.runtime {
+            if let Some(o) = old.runtime.get(name) {
+                *rt.tokens.lock() = *o.tokens.lock();
+            }
+        }
+        let same = |provider: &str| match (self.provider(provider), old.provider(provider)) {
+            (Some(a), Some(b)) => a.kind == b.kind && a.endpoint == b.endpoint,
+            _ => false,
+        };
+        let mut levels = self.levels.lock();
+        for (k, v) in old.levels.lock().iter() {
+            if same(&k.0) {
+                levels.insert(k.clone(), *v);
+            }
+        }
+        let mut status = self.status.lock();
+        for (k, v) in old.status.lock().iter() {
+            if same(&k.0) {
+                status.insert(k.clone(), v.clone());
+            }
         }
     }
 
@@ -720,7 +773,10 @@ impl Models {
                     "models": models,
                 });
                 if let Some(k) = &p.api_key {
-                    j["apiKey"] = json!({ "secret": k.secret });
+                    j["apiKey"] = json!({
+                        "secret": k.secret,
+                        "source": self.secret_source(&k.secret),
+                    });
                 }
                 if let Some(a) = &p.allowed_models {
                     j["allowedModels"] = json!(a);
