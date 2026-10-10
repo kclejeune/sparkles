@@ -4,7 +4,9 @@
 // nothing here ever holds one after it is sent.
 
 import { json } from './api';
+import presets from './provider-presets.json';
 import {
+  getAt,
   parsePath,
   pathString,
   type FieldDef,
@@ -25,6 +27,44 @@ export const ROLES = ['draft', 'repair', 'summarize', 'extract', 'explain', 'opt
 
 const LEVELS = ['auto', 'json-schema', 'json-object', 'tool', 'text'] as const;
 
+/**
+ * A template for a provider with a well-known endpoint. It fills the Add provider form,
+ * and every field it fills stays editable. The table is `provider-presets.json`, which
+ * the server's `sparkles settings set --global --preset` reads in Rust as well; a Rust
+ * test checks that the two agree.
+ */
+export type ProviderPreset = {
+  name: string;
+  label: string;
+  kind: (typeof PROVIDER_KINDS)[number];
+  endpoint: string;
+  /** The secret that holds the key, or null for a provider without one. */
+  secret: string | null;
+  /** A model to start with. */
+  model: string;
+};
+
+export const PROVIDER_PRESETS = presets as readonly ProviderPreset[];
+
+/** The Add form's fields for a preset, or empty ones for Custom (any other name). */
+export function presetForm(name: string): {
+  name: string;
+  kind: string;
+  endpoint: string;
+  secret: string;
+  model: string;
+} {
+  const p = PROVIDER_PRESETS.find((x) => x.name === name);
+  if (!p) return { name: '', kind: 'openai', endpoint: '', secret: '', model: '' };
+  return {
+    name: p.name,
+    kind: p.kind,
+    endpoint: p.endpoint,
+    secret: p.secret ?? '',
+    model: p.model,
+  };
+}
+
 /** One provider of `GET /$/models`. */
 export type ProviderStatus = {
   name: string;
@@ -35,6 +75,18 @@ export type ProviderStatus = {
   concurrency?: number;
   apiKey?: { secret: string; source: 'declared' | 'runtime' | 'missing' };
   models: { name: string; status?: { state: string; message?: string } }[];
+  /** Certificate checks are off (`tls.insecureSkipVerify`). */
+  unverified?: boolean;
+  tls?: {
+    verification: 'system' | 'custom-ca' | 'off';
+    caCert?: {
+      file?: string;
+      secret?: string;
+      source?: string;
+      status: 'ok' | 'unreadable';
+      message?: string;
+    };
+  };
 };
 
 /** `GET /$/models`. */
@@ -61,7 +113,10 @@ export type SecretInfo = {
 };
 
 export const listSecrets = (signal?: AbortSignal) =>
-  json<{ secrets: SecretInfo[] }>('/$/server/secrets', { signal, cache: 'no-store' });
+  json<{ secrets: SecretInfo[] }>('/$/server/secrets', {
+    signal,
+    cache: 'no-store',
+  });
 
 /** Store a runtime value for a secret. The value is sent once and kept nowhere. */
 export const putSecret = (name: string, value: string) =>
@@ -125,6 +180,37 @@ export function providerKinds(k: SettingsKind | null): Record<string, string> {
   return Object.fromEntries(Object.entries(ps).map(([n, p]) => [n, String(p?.kind ?? '')]));
 }
 
+/** Whether an endpoint is an https URL, the only kind that takes TLS options. */
+export const isHttps = (endpoint: unknown) =>
+  typeof endpoint === 'string' && /^https:\/\//i.test(endpoint.trim());
+
+/** The providers whose endpoints are https URLs, which the TLS fields are shown for. */
+export function httpsProviders(k: SettingsKind | null): string[] {
+  const ps = (k?.effective.providers as Record<string, JsonObject> | undefined) ?? {};
+  return Object.entries(ps)
+    .filter(([, p]) => isHttps(p?.endpoint))
+    .map(([n]) => n)
+    .sort();
+}
+
+/** The path of a provider's `tls.insecureSkipVerify`. */
+export const insecurePath = (name: string) =>
+  pathString(['providers', name, 'tls', 'insecureSkipVerify']);
+
+/**
+ * The providers that a merge patch of the `models` kind turns certificate checks off for:
+ * those whose `tls.insecureSkipVerify` it sets to true while the effective object does
+ * not already have it. Saving such a patch needs the acknowledgement of what that means.
+ */
+export function enablesInsecure(patch: unknown, effective: JsonObject | undefined): string[] {
+  const ps = getAt(patch, ['providers']);
+  if (!ps || typeof ps !== 'object' || Array.isArray(ps)) return [];
+  return Object.keys(ps)
+    .filter((name) => getAt(patch, ['providers', name, 'tls', 'insecureSkipVerify']) === true)
+    .filter((name) => getAt(effective, ['providers', name, 'tls', 'insecureSkipVerify']) !== true)
+    .sort();
+}
+
 /** Declared providers removed at runtime: overrides whose runtime value is `null`. */
 export function removedProviders(k: SettingsKind | null): { name: string; path: string }[] {
   return (k?.overrides ?? [])
@@ -149,12 +235,19 @@ export const groupProvider = (group: string) =>
 export function modelFields(k: SettingsKind | null): FieldDef[] {
   const out: FieldDef[] = [];
   const kinds = providerKinds(k);
+  const https = httpsProviders(k);
   for (const name of providerNames(k)) {
     const at = (m: string) => pathString(['providers', name, ...m.split('.')]);
     const group = providerGroup(name);
     const kind = kinds[name];
     out.push(
-      { path: at('kind'), group, label: 'Protocol', type: 'enum', options: PROVIDER_KINDS },
+      {
+        path: at('kind'),
+        group,
+        label: 'Protocol',
+        type: 'enum',
+        options: PROVIDER_KINDS,
+      },
       {
         path: at('endpoint'),
         group,
@@ -252,7 +345,13 @@ export function modelFields(k: SettingsKind | null): FieldDef[] {
           min: 1,
           optional: true,
         },
-        { path: at('keepAlive'), group, label: 'Keep alive', type: 'text', optional: true },
+        {
+          path: at('keepAlive'),
+          group,
+          label: 'Keep alive',
+          type: 'text',
+          optional: true,
+        },
       );
     if (kind === 'anthropic')
       out.push({
@@ -263,6 +362,35 @@ export function modelFields(k: SettingsKind | null): FieldDef[] {
         optional: true,
         placeholder: '2023-06-01',
       });
+    if (https.includes(name))
+      out.push(
+        {
+          path: at('tls.caCert.file'),
+          group,
+          label: 'CA certificate file',
+          type: 'text',
+          optional: true,
+          placeholder: 'system roots only',
+          help: 'An absolute path on the server to a PEM CA certificate or bundle, trusted for this provider in addition to the system roots. Use it for an internal CA or a self-signed certificate.',
+        },
+        {
+          path: at('tls.caCert.secret'),
+          group,
+          label: 'CA certificate (secret name)',
+          type: 'text',
+          optional: true,
+          placeholder: 'none',
+          help: 'A secret that holds the PEM CA certificate, in place of a file. Set only one of the two.',
+        },
+        {
+          path: at('tls.insecureSkipVerify'),
+          group,
+          label: 'Skip certificate verification',
+          type: 'bool',
+          fallback: false,
+          help: 'Unsafe. The API key and the prompts sent to this provider can be read and changed by anyone on the network path. Saving it on asks for an acknowledgement. Prefer a CA certificate.',
+        },
+      );
     out.push({
       path: at('models'),
       group,
@@ -310,7 +438,13 @@ export function modelFields(k: SettingsKind | null): FieldDef[] {
 /** The merge patch that adds a provider from the Add form, or why it cannot. */
 export function newProviderPatch(
   existing: readonly string[],
-  input: { name: string; kind: string; endpoint: string; secret: string },
+  input: {
+    name: string;
+    kind: string;
+    endpoint: string;
+    secret: string;
+    model?: string;
+  },
 ): { patch: JsonObject } | { error: string } {
   const name = input.name.trim();
   const endpoint = input.endpoint.trim();
@@ -334,7 +468,9 @@ export function newProviderPatch(
       error:
         'A secret name has 1 to 128 letters, digits, _, - and ., and does not start with . or -.',
     };
+  const model = (input.model ?? '').trim();
   const provider: JsonObject = { kind: input.kind, endpoint };
   if (secret) provider.apiKey = { secret };
+  if (model) provider.models = { [model]: {} };
   return { patch: { providers: { [name]: provider } } };
 }

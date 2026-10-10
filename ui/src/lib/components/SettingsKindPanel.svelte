@@ -25,6 +25,7 @@
     writeFailure,
     type FieldDef,
     type FormValues,
+    type JsonObject,
     type SettingsKind,
   } from '$lib/settings';
   import Icon from './Icon.svelte';
@@ -40,6 +41,7 @@
     forbiddenText = 'Changing these settings needs admin on the dataset.',
     declaredName = "the server's settings file",
     groupExtra,
+    confirmWrite,
     onchange,
   }: {
     /** Where the declared layer comes from, in words. */
@@ -58,6 +60,11 @@
     groupExtra?: Snippet<[string]>;
     /** The kind after a load or a write. */
     onchange?: (k: SettingsKind) => void;
+    /**
+     * Asked before the form or the runtime JSON sends a patch: false keeps the patch
+     * unsent, as for a change that needs an acknowledgement first.
+     */
+    confirmWrite?: (patch: JsonObject, effective: JsonObject) => Promise<boolean>;
   } = $props();
 
   const slug = $derived(title.toLowerCase().replace(/[^a-z0-9]+/g, '-'));
@@ -186,6 +193,7 @@
       form = { ...initial };
       return;
     }
+    if (confirmWrite && !(await confirmWrite(r.patch, effective))) return;
     await write(`Saved the ${lower} settings`, (etag) => patchKind(url, r.patch, etag));
   }
 
@@ -222,6 +230,7 @@
     jsonError = null;
     if (!r.patch) return;
     const patch = r.patch;
+    if (confirmWrite && !(await confirmWrite(patch, k.effective))) return;
     await write(`Saved the ${lower} settings`, (etag) => patchKind(url, patch, etag));
   }
 
