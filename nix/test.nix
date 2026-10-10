@@ -29,7 +29,15 @@
         settings = {
           defaults = {
             assistant.enabled = true;
-            locked = [ "assistant.send" ];
+            # declared prefixes (spec C20), one of them locked
+            prefixes = {
+              kclj = "https://kclj.io/sparkles/";
+              memory = "https://kclj.io/sparkles/memory/";
+            };
+            locked = [
+              "assistant.send"
+              "prefixes.kclj"
+            ];
           };
           datasets = {
             demo = {
@@ -267,6 +275,17 @@
     assert code == 200, (code, body)
     a = kind("demo")
     assert a["effective"]["historyDays"] == 7 and a["sources"]["historyDays"] == "runtime", a
+    # declared prefixes apply to every dataset, and a locked one refuses runtime writes
+    # (spec C20 A1, A3, A10)
+    code, body = request("GET", f"{base}/$/prefixes/demo")
+    assert code == 200 and body["prefixes"]["kclj"] == "https://kclj.io/sparkles/", (code, body)
+    assert body["prefixes"]["memory"] == "https://kclj.io/sparkles/memory/", body
+    code, body = request("POST", f"{base}/demo/prefixes?prefix=kclj&uri=http://other/")
+    assert code == 409 and body["code"] == "locked-by-config", (code, body)
+    code, body = request("PATCH", f"{base}/$/settings/later/prefixes", {"kclj": None})
+    assert code == 409 and body["code"] == "locked-by-config", (code, body)
+    code, body = request("PATCH", f"{base}/$/settings/demo/prefixes", {"memory": None})
+    assert code == 200 and "memory" not in body["effective"], (code, body)
     # the operator's datasets cannot be deleted through the API (A9)
     code, body = request("DELETE", f"{base}/$/datasets/demo")
     assert code == 409 and body["code"] == "declared-dataset", (code, body)

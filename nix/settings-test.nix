@@ -45,7 +45,15 @@ let
         enabled = true;
         send = "schema";
       };
-      locked = [ "assistant.send" ];
+      prefixes = {
+        kclj = "https://kclj.io/sparkles/";
+        memory = "https://kclj.io/sparkles/memory/";
+        notes = "https://kclj.io/sparkles/memory/notes/";
+      };
+      locked = [
+        "assistant.send"
+        "prefixes.kclj"
+      ];
     };
     datasets = {
       slurp = {
@@ -112,6 +120,13 @@ let
       services.sparkles.settings.datasets.demo.assistant.endpoint = "https://example.org";
     };
     lock = refused "lock" { services.sparkles.settings.defaults.locked = [ "" ]; };
+    # a prefix name that is not a PN_PREFIX, and a relative prefix IRI (spec C20)
+    prefixName = refused "prefix-name" {
+      services.sparkles.settings.defaults.prefixes."bad name" = "https://kclj.io/";
+    };
+    prefixIri = refused "prefix-iri" {
+      services.sparkles.settings.defaults.prefixes.kclj = "kclj.io/sparkles/";
+    };
     # with model settings, a provider the model configuration lacks is refused too
     provider = refused "provider" {
       services.sparkles = {
