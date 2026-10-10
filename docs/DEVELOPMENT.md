@@ -584,25 +584,27 @@ flake runs the same tests as its `ui-e2e` check (see [Nix](#nix)).
 
 ## Continuous integration
 
-The workflows in `.github/workflows` run on [Namespace](https://namespace.so) runners,
-which bill per second. The repository needs Namespace's GitHub app, and each job names
-its machine and cache volume in `runs-on`. `.github/actionlint.yaml` lists the labels
-for `actionlint`. Every job on a Namespace runner checks out the repository through
-Namespace's git mirror and keeps Cargo's registry and target directory, and pnpm's or
-Gradle's caches where it uses them, on a cache volume. There is one volume per
-platform, `sparkles-linux-amd64`, `sparkles-linux-arm64`, `sparkles-linux-amd64-musl`,
-`sparkles-linux-arm64-musl` and `sparkles-macos-arm64`, shared by the workflows. Every
-run reads the volumes, and only runs on `main` write them back, so pull requests cannot
-fill them with their own builds. Watch their size in the Namespace dashboard. When a
-volume reaches its 50 GB limit, raise the `nscloud-cache-size` label or split the
-release and test builds onto separate tags.
+The workflows in `.github/workflows` run on standard GitHub-hosted runners:
+`ubuntu-24.04` for Linux x86_64, `ubuntu-24.04-arm` for Linux arm64 and `macos-15` for
+macOS arm64. These runners are free for public repositories. Jobs check out the
+repository with `actions/checkout` and use the GitHub Actions cache. `Swatinem/rust-cache`
+caches Cargo's registry and dependency build artifacts for host builds, `actions/setup-node`
+caches pnpm's store, and `gradle/actions/setup-gradle` caches Gradle's dependencies.
+Container builds use `actions/cache`: Python caches its target directory separately
+for manylinux and musllinux, and Node's Alpine builds cache the target directory,
+Rust toolchain, Cargo registry and pnpm store. Cache keys distinguish architectures,
+build profiles and toolchains. GitHub scopes caches to a branch or pull request, with
+the default branch's caches available to other branches. Successful runs can save
+caches, including binding jobs that run only for pull requests, tags or manual dispatch.
+`actionlint` checks the workflows without custom runner labels. Namespace remains
+available for development benchmarks through `bench:nsc` and `bench:jena-nsc`.
 
-Several choices keep the billed time down. The Rust workflow runs for pushes to `main`
+Several choices keep CI time down. The Rust workflow runs for pushes to `main`
 and for pull requests, but not for the pushes to a pull request's branch. Changes to the
 UI, the bindings' JavaScript and Kotlin sources, the README, the specs or the benchmark
 and image directories do not start it, while other edits under `docs/` do. A newer push
 cancels a running check of the same branch. Each platform runs Clippy and the tests in
-one job, so its cache volume has a single writer, and the Linux x86_64 job also checks
+one job, and the Linux x86_64 job also checks
 formatting. A formatting or Clippy failure still lets the tests report. The W3C, SHACL
 and ShEx suites skip themselves in CI, because the runners have no Jena or shexTest
 checkout. The binding workflows

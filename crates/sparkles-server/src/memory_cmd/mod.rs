@@ -10,6 +10,7 @@
 //! router (§10.2).
 
 mod conn;
+mod maintain;
 mod ops;
 mod sync;
 mod transcripts;
@@ -118,8 +119,10 @@ pub struct ImportFlags {
 
 #[derive(Subcommand, Debug)]
 pub enum MemoryCmd {
-    /// Write the memory vocabulary, install its shapes in the guard (as an admin), and
-    /// set the import base in the dataset's memory settings
+    /// Write the memory vocabulary, install its shapes in the guard (as an admin), set
+    /// the import base in the dataset's memory settings, and turn on server-side
+    /// ingestion (assistant enabled, ingest and send: documents) for the fields that
+    /// still have their built-in default
     Init {
         /// The prefix of every import graph (default: the current one, else
         /// urn:x-sparkles:import/)
@@ -128,7 +131,54 @@ pub enum MemoryCmd {
         /// Leave the guard alone
         #[arg(long)]
         no_shapes: bool,
+        /// Leave the assistant settings alone
+        #[arg(long)]
+        no_ingest: bool,
     },
+    /// Start a consolidation pass, which proposes the facts that several agent graphs
+    /// repeat for the consolidated graph, and wait for its result
+    Consolidate {
+        /// branch proposes on a review branch, auto also merges it when every fact
+        /// passes (default: the memory settings)
+        #[arg(long, value_parser = ["branch", "auto"])]
+        mode: Option<String>,
+        /// How many graphs must assert a fact, from 2 to 100 (default: the memory
+        /// settings)
+        #[arg(long, value_name = "N")]
+        min_sources: Option<u32>,
+        /// Report what the pass would propose without writing
+        #[arg(long)]
+        dry_run: bool,
+        /// The commit message
+        #[arg(long)]
+        message: Option<String>,
+        #[command(flatten)]
+        task: TaskFlags,
+    },
+    /// Start a retention pass, which deletes old session graphs, and wait for its result
+    Retention {
+        /// Delete graphs older than this, such as 365d (default: the memory settings)
+        #[arg(long, value_name = "DURATION")]
+        after: Option<String>,
+        /// An IRI pattern with * of the graphs to look at (repeatable; default: the
+        /// memory settings, else graphs whose IRI contains /sessions/)
+        #[arg(long = "graph", value_name = "PATTERN")]
+        graphs: Vec<String>,
+        /// Keep a graph unless a reviewed graph asserts each of its facts
+        #[arg(long, conflicts_with = "no_require_consolidated")]
+        require_consolidated: bool,
+        /// Delete old graphs whether or not their facts were reviewed
+        #[arg(long)]
+        no_require_consolidated: bool,
+        /// List what the pass would delete without deleting
+        #[arg(long)]
+        dry_run: bool,
+        #[command(flatten)]
+        task: TaskFlags,
+    },
+    /// Show the consolidation and retention settings, the last scheduled runs and the
+    /// next
+    Maintenance,
     /// Import every file the adapters find, once
     Import {
         #[command(flatten)]
@@ -380,6 +430,17 @@ pub enum MemoryCmd {
         #[arg(long)]
         transcripts: bool,
     },
+}
+
+/// How a command that starts a server task waits for it.
+#[derive(Args, Debug, Clone)]
+pub struct TaskFlags {
+    /// Print the task once it starts instead of waiting for its result
+    #[arg(long)]
+    pub no_wait: bool,
+    /// The most seconds the task may run on the server
+    #[arg(long, value_name = "SECONDS")]
+    pub deadline: Option<f64>,
 }
 
 /// Print one JSON document.

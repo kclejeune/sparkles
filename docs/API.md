@@ -8960,6 +8960,8 @@ session graphs. Both run in the ingestion task registry, so `GET /$/ingest/{ds}/
 reports them, with `input.kind` set to `consolidation` or `retention`. They work on the
 dataset's `main` branch only. The design is in
 [C18 §8.3 and §8.4](specs/C18-natural-language-questions-and-ingest.md#83-consolidation).
+`sparkles memory consolidate`, `retention` and `maintenance` call these routes
+([USAGE.md](USAGE.md#maintaining-agent-memory)).
 
 | Method | Path | Access | Meaning |
 |---|---|---|---|
@@ -9379,7 +9381,9 @@ The server reads the file at start, where a file that does not validate fails th
 start, and again on SIGHUP, where such a file is logged and the previous one kept. The
 model configuration of `--model-config` is read again on the same signal, and requests
 in flight keep the configuration they started with. `sparkles settings check FILE
-[--model-config FILE]` validates a file without a server.
+[--model-config FILE]` validates a file without a server, and the other subcommands of
+`sparkles settings` use the routes below
+([USAGE.md](USAGE.md#changing-dataset-settings-from-the-command-line)).
 
 | Method | Path | Needs | Effect |
 |---|---|---|---|

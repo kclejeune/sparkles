@@ -617,10 +617,9 @@ implementation landed.
     systemd's drop-in directories and Firefox's enterprise policies;
   - the NixOS manual's guidance on settings options and secrets;
   - the Sparkles code and specs C09, C17, C18 and F11.
-- **Implementation:** Phase 1 and the NixOS module of Phase 2 from the spec plus
-  Sparkles code and the NixOS manual's documentation of `specialisation` and
-  `reloadTriggers` only (2026-10-10). It adds no runtime dependency. The rest of Phase 2
-  and Phases 3 and 4 are not built.
+- **Implementation:** Phase 1 and Phase 2 from the spec plus Sparkles code and the
+  NixOS manual's documentation of `specialisation` and `reloadTriggers` only
+  (2026-10-10). They add no runtime dependency. Phases 3 and 4 are not built.
 - **Rejected** (spec §12):
   - model configuration only in the operator's file;
   - returning stored keys to administrators;

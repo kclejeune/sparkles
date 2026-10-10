@@ -1,6 +1,6 @@
 # C19: Layered dataset settings
 
-> **Status:** implemented in part (Phase 1 and the NixOS module of Phase 2)
+> **Status:** implemented in part (Phases 1 and 2)
 >
 > **Phases:** Phase 1 is the server: settings kinds, the declared layer, layered
 > resolution, locks, the `/$/settings` routes and reloading on SIGHUP. Phase 2 is the
@@ -10,6 +10,7 @@
 >
 > **User docs:** [API: Settings](../API.md#settings) ·
 > [Usage: Turning on the assistant in the server](../USAGE.md#turning-on-the-assistant-in-the-server) ·
+> [Usage: Changing dataset settings from the command line](../USAGE.md#changing-dataset-settings-from-the-command-line) ·
 > [Features](../FEATURES.md)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
@@ -450,9 +451,9 @@ to replace or remove a runtime value.
 
 ## Outcome
 
-Phase 1 and the NixOS module of Phase 2 landed on 2026-10-10. The rest of Phase 2 and
-Phases 3 and 4 are not built. The `sparkles settings` command has only `check`, the UI
-has no settings tab, and `sparkles memory init` is unchanged.
+Phase 1 landed on 2026-10-10, and both parts of Phase 2, the NixOS module and the
+command line, later the same day. Phases 3 and 4 are not built, so the UI has no
+settings tab.
 
 The server has a registry of three dataset-scoped kinds, `assistant`, `memory` and
 `ingest`. The `ingest` kind holds the settings members of `ingest.json`, and the
@@ -548,3 +549,60 @@ These points differ from the design or settle what it left open.
   its datasets, and SIGHUP before that would stop it. The reload command therefore
   waits until the main process's `SigCgt` mask in `/proc` shows SIGHUP as caught, for
   up to 80 seconds, before it sends the signal.
+
+### Phase 2: the command line
+
+`sparkles settings` has the subcommands of §8. `get`, `set`, `edit`, `reset`, `diff`
+and `apply` talk to a server through the routes of §6. They find the server and the
+token as the other remote commands do, from `--server`, `SPARKLES_SERVER` or the saved
+login, and from `SPARKLES_TOKEN` or the credentials file, and each takes `--json`.
+`check` works offline as before. `sparkles memory init` turns on server-side ingestion
+as §8.1 describes and takes `--no-ingest`. The tests in
+`crates/sparkles-server/tests/cli_settings.rs` cover every subcommand against a server
+process, a locked field, an `If-Match` conflict in `edit` with a scripted editor, and
+A8.
+
+These points differ from the design or settle what it left open.
+
+- The target options are `--server`, `--insecure-http` and `--json`, as in
+  `sparkles memory`. `sparkles dataset` also takes `--data-dir` for a stopped server's
+  catalog, but the settings commands need a running server, since the declared layers
+  live in the server's settings file. `--branch` is refused, because settings belong to
+  a dataset's main branch.
+- `--server` names the server's URL here, as in every other remote command. §11.4 uses
+  `--server` in place of a dataset for server-wide kinds, which would clash with it.
+  The command resolves its target through one type with a dataset variant, so Phase 4
+  can add a server-wide target, but it has to pick another spelling for it, such as a
+  `--server-wide` flag or a reserved name in place of the dataset.
+- `get --layer declared` or `--layer runtime` prints that layer, and with `--json` only
+  the layer's object, so that `get DS KIND --layer runtime --json` gives what `edit`
+  edits. Without `--layer`, `--json` prints the server's answer.
+- `set` with `null` as the value removes the runtime value, as a merge patch does.
+- `edit` opens `$VISUAL`, else `$EDITOR`, else `vi`, and sends the difference between
+  the runtime layer it read and the edited object as a merge patch with `If-Match`. A
+  member removed in the editor becomes `null` in the patch, which removes its runtime
+  value. On a `412` the command keeps the edited text in a file, says where, and offers
+  to open the editor again on the current runtime layer. On a `400` or a `409` it offers
+  to edit the same text again.
+- `diff` compares each runtime value with the declared value and, where the settings
+  file declares nothing, with the built-in default, so a runtime file written before the
+  layers existed lists only the fields that differ from the defaults. The built-in
+  defaults are those of the CLI's own build. A runtime value that a lock overrides is
+  marked as ignored.
+- `apply` patches every dataset on the server with `defaults`, merged with the
+  dataset's own entry, and skips names that match no dataset. It validates the file
+  offline first, reports the locks of `defaults`, the dataset entries and `server`
+  without applying them, and goes on after a refused patch, ending with exit status 1.
+- `memory init` reads `GET /$/settings/{ds}/assistant`, patches the fields whose source
+  is `default` with `If-Match`, and reads again on a `412`, up to three times. The
+  providers of the `extract` role come from the dataset's `roles.extract` when it is
+  set and from `GET /$/models` otherwise. That route needs server `admin`, so for a
+  caller with only dataset `admin` the output says the providers are unknown. Each
+  provider is listed with the `send` level that applies to it after `sendByProvider`,
+  and the text marks a provider that receives no document text. A failure of this step
+  is reported in the output and does not fail `init`.
+- The settings module gained `Kind::default_value`, which `diff` uses. Nothing else in
+  the server changed.
+- The same work added `sparkles memory consolidate`, `sparkles memory retention` and
+  `sparkles memory maintenance` for the maintenance routes of C18 Phase 5, which had no
+  command.

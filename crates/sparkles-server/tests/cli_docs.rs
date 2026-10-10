@@ -20,6 +20,8 @@ fn completions_for_each_shell() {
     assert!(out(&zsh).starts_with("#compdef sparkles"));
     // subcommands and their flags are completed
     assert!(out(&zsh).contains("--auth-config"));
+    assert!(out(&zsh).contains("--no-ingest"));
+    assert!(out(&zsh).contains("--layer"));
     for (shell, marker) in [
         ("bash", "complete -F _sparkles"),
         ("fish", "complete -c sparkles"),
@@ -45,6 +47,10 @@ fn man_pages() {
         "sparkles-serve.1",
         "sparkles-auth-login.1",
         "sparkles-completions.1",
+        "sparkles-settings-edit.1",
+        "sparkles-settings-apply.1",
+        "sparkles-memory-consolidate.1",
+        "sparkles-memory-maintenance.1",
     ] {
         let text = std::fs::read_to_string(man.join(page)).unwrap_or_else(|_| panic!("{page}"));
         assert!(text.contains(".TH"), "{page}");
