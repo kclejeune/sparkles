@@ -15,6 +15,7 @@
   import { DATASET_FIELDS, KIND_TITLES } from '$lib/settings-fields';
   import Icon from './Icon.svelte';
   import MaintenanceJob from './MaintenanceJob.svelte';
+  import PrefixesSettings from './PrefixesSettings.svelte';
   import SettingsKindPanel from './SettingsKindPanel.svelte';
 
   let {
@@ -109,6 +110,7 @@
       {/snippet}
     </SettingsKindPanel>
   {/each}
+  <PrefixesSettings {name} canEdit={canAdmin} />
 </div>
 
 <style>
