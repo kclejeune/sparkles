@@ -54,7 +54,7 @@ on top of the second:
   with exact counts.
 * **Server.** Fuseki's endpoints and admin API with authentication, access control by
   dataset, graph and triple, stored queries, GraphQL, Prometheus metrics, an OpenAPI
-  description, a Docker image and a NixOS module.
+  description, a Docker image, a Helm chart and a NixOS module.
 * **Agents.** An MCP server whose tools run with the caller's grants, an Ask bar that
   drafts, checks and runs a query from a question in plain language, ingestion that
   turns Markdown, HTML and PDF documents into cited facts on a review branch, and agent
@@ -252,7 +252,7 @@ merges, the Ask bar, and agent memory.
 | Document | Contents |
 |---|---|
 | [docs/FEATURES.md](docs/FEATURES.md) | Every feature by area, and the known gaps. |
-| [docs/USAGE.md](docs/USAGE.md) | The server and CLI, backups, MCP, the libraries and bindings, Docker and NixOS. |
+| [docs/USAGE.md](docs/USAGE.md) | The server and CLI, backups, MCP, the libraries and bindings, Docker, Kubernetes and NixOS. |
 | [docs/API.md](docs/API.md) | The HTTP API: Fuseki's endpoints and the `/$/` extensions. |
 | [docs/openapi.json](docs/openapi.json) | The OpenAPI 3.1 description the server serves at `/$/openapi.json`. |
 | [docs/COMPARISON.md](docs/COMPARISON.md) | Feature gaps against Jena/Fuseki, QLever, Fluree and Oxigraph, and departures from Jena and QLever. |
