@@ -74,6 +74,71 @@ fn locks_fix_fields_and_mark_runtime_values() {
     assert!(r.overridden.is_empty());
 }
 
+/// `overrides` names each runtime value that is used in place of a different declared
+/// value, and leaves out values equal to the declared one, values with no declared
+/// value beneath them and locked fields.
+#[test]
+fn overrides_name_the_declared_values_a_runtime_value_replaces() {
+    let d = declared(json!({
+        "defaults": {
+            "assistant": {"send": "schema", "budget": {"perRequest": 1000}, "historyDays": 30},
+            "locked": ["assistant.send"]
+        },
+        "datasets": {"slurp": {"assistant": {"sendByProvider": {"claude": "schema"}}}}
+    }));
+    let rt = json!({
+        "historyDays": 7,
+        "send": "rows",
+        "explain": true,
+        "budget": {"perRequest": 1000, "perPrincipalPerDay": 5},
+        "sendByProvider": {"claude": "rows", "local": "rows"}
+    });
+    let r = resolve(&ASSISTANT, &d, "slurp", rt, Providers::Unchecked);
+    let got: Vec<(String, Value, Value)> = r
+        .overrides
+        .iter()
+        .map(|o| {
+            (
+                merge::path_string(&o.path),
+                o.declared.clone(),
+                o.runtime.clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            ("historyDays".into(), json!(30), json!(7)),
+            (
+                "sendByProvider.claude".into(),
+                json!("schema"),
+                json!("rows")
+            ),
+        ]
+    );
+    let j = r.json("slurp");
+    assert_eq!(
+        j["overrides"][0],
+        json!({"path": "historyDays", "declared": 30, "runtime": 7})
+    );
+    // the sources are unchanged
+    assert_eq!(j["sources"]["historyDays"], "runtime");
+    // nothing at runtime, nothing overridden
+    let r = resolve(&ASSISTANT, &d, "slurp", json!({}), Providers::Unchecked);
+    assert!(r.overrides.is_empty());
+    assert_eq!(r.json("slurp")["overrides"], json!([]));
+    // a runtime object in place of a declared scalar is reported at the scalar
+    let o = overrides_of(&json!({"a": 5}), &json!({"a": {"x": 1}}), &[]);
+    assert_eq!(
+        o,
+        vec![Override {
+            path: p("a"),
+            declared: json!(5),
+            runtime: json!({"x": 1})
+        }]
+    );
+}
+
 /// A6: a file written before layering is a complete runtime layer and gives the same
 /// effective object as before.
 #[test]

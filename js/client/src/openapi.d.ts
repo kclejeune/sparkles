@@ -6898,6 +6898,8 @@ export interface components {
             locked: string[];
             /** @description Locked fields whose runtime value is kept but ignored. */
             overridden: string[];
+            /** @description The runtime values used in place of a different value of `--model-config`, one entry per field, such as a changed budget or a removed provider. Locked fields are left out. */
+            overrides: components["schemas"]["SettingsOverride"][];
             /** @description The runtime layer kept in `<dataDir>/models.json`. `null` for a provider removes a declared provider. */
             runtime: {
                 [key: string]: unknown;
@@ -6932,6 +6934,8 @@ export interface components {
             locked: string[];
             /** @description Locked fields whose runtime value is kept in the file but ignored. */
             overridden: string[];
+            /** @description The runtime values used in place of a different value of the settings file, one entry per field. Locked fields are left out, since their runtime value is ignored. */
+            overrides: components["schemas"]["SettingsOverride"][];
             /** @description The runtime layer: the fields changed through the API. `null` removes a declared member. */
             runtime: {
                 [key: string]: unknown;
@@ -6944,6 +6948,15 @@ export interface components {
                 error?: string;
                 valid: boolean;
             };
+        };
+        /** @description A runtime value that is used in place of a different declared value. A reset of `path` brings the declared value back. */
+        SettingsOverride: {
+            /** @description The value of the declared layers that the runtime value replaces. */
+            declared: unknown;
+            /** @description The field, as a dotted path. It is the runtime leaf, or the field above it that the declared layers set to something other than an object. */
+            path: string;
+            /** @description The runtime value in use, or `null` for a declared provider removed at runtime. */
+            runtime: unknown;
         };
         /** @description The settings file of `serve --settings` and its reads. */
         SettingsStatus: {

@@ -483,6 +483,8 @@ pub struct Resolved {
     pub overridden: Vec<Vec<String>>,
     /// the source of each field of `effective`
     pub sources: BTreeMap<Vec<String>, &'static str>,
+    /// the runtime values that take the place of a different declared value
+    pub overrides: Vec<Override>,
     /// whether the effective object is valid, and why not
     pub status: Result<(), String>,
     /// the tag of the runtime layer
@@ -563,6 +565,7 @@ pub fn resolve_layers(
         })
         .collect();
     let etag = etag_of(&runtime);
+    let overrides = overrides_of(&decl, &runtime, &locked);
     Resolved {
         kind,
         declared: decl,
@@ -572,9 +575,52 @@ pub fn resolve_layers(
         locked,
         overridden,
         sources,
+        overrides,
         status,
         etag,
     }
+}
+
+/// A runtime value that is used in place of a different declared value: the field, the
+/// value of the declared layers and the runtime value (`null` for a removed provider).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Override {
+    pub path: Vec<String>,
+    pub declared: Value,
+    pub runtime: Value,
+}
+
+/// The runtime values of `runtime` that override a different value of the declared
+/// layers `decl`. A field is reported where the declared layers set it: at the runtime
+/// leaf itself, or at a field above it that they set to something other than an object,
+/// which the runtime object replaces. A locked field is left out, since its runtime
+/// value is ignored (`overridden`).
+fn overrides_of(decl: &Value, runtime: &Value, locked: &[Vec<String>]) -> Vec<Override> {
+    let mut out: Vec<Override> = Vec::new();
+    for p in leaves(runtime) {
+        if locked.iter().any(|l| starts_with(&p, l)) {
+            continue;
+        }
+        let field = (1..=p.len()).map(|n| &p[..n]).find(|q| match at(decl, q) {
+            Some(Value::Object(_)) => q.len() == p.len(),
+            Some(_) => true,
+            None => false,
+        });
+        let Some(q) = field else {
+            continue;
+        };
+        let (Some(d), Some(r)) = (at(decl, q), at(runtime, q)) else {
+            continue;
+        };
+        if d != r && !out.iter().any(|o| o.path == q) {
+            out.push(Override {
+                path: q.to_vec(),
+                declared: d.clone(),
+                runtime: r.clone(),
+            });
+        }
+    }
+    out
 }
 
 /// Whether a layer sets the field at `path`, or a field above it to something other
@@ -620,6 +666,15 @@ impl Resolved {
             "sources": sources,
             "locked": paths(&self.locked),
             "overridden": paths(&self.overridden),
+            "overrides": self
+                .overrides
+                .iter()
+                .map(|o| json!({
+                    "path": path_string(&o.path),
+                    "declared": o.declared,
+                    "runtime": o.runtime,
+                }))
+                .collect::<Vec<_>>(),
             "status": match &self.status {
                 Ok(()) => json!({ "valid": true }),
                 Err(e) => json!({ "valid": false, "error": e }),

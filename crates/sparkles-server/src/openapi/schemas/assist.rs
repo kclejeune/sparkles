@@ -1355,6 +1355,7 @@ fn settings(put: &mut dyn FnMut(&str, J)) {
                     "sources",
                     "locked",
                     "overridden",
+                    "overrides",
                     "status",
                     "etag",
                 ],
@@ -1367,11 +1368,27 @@ fn settings(put: &mut dyn FnMut(&str, J)) {
                     "sources": { "type": "object", "description": "The source of each field of `effective`, by dotted path such as `budget.perRequest`.", "additionalProperties": source },
                     "locked": with_desc(strings(), "The fields the settings file locks."),
                     "overridden": with_desc(strings(), "Locked fields whose runtime value is kept in the file but ignored."),
+                    "overrides": with_desc(array(sref("SettingsOverride")), "The runtime values used in place of a different value of the settings file, one entry per field. Locked fields are left out, since their runtime value is ignored."),
                     "status": closed(&["valid"], json!({ "valid": boolean(), "error": string() })),
                     "etag": with_desc(string(), "The entity tag of the runtime layer, as in the `ETag` header."),
                 }),
             ),
             "One settings kind of a dataset with its layers and sources.",
+            "settings",
+        ),
+    );
+    put(
+        "SettingsOverride",
+        doc(
+            closed(
+                &["path", "declared", "runtime"],
+                json!({
+                    "path": with_desc(string(), "The field, as a dotted path. It is the runtime leaf, or the field above it that the declared layers set to something other than an object."),
+                    "declared": with_desc(json!({}), "The value of the declared layers that the runtime value replaces."),
+                    "runtime": with_desc(json!({}), "The runtime value in use, or `null` for a declared provider removed at runtime."),
+                }),
+            ),
+            "A runtime value that is used in place of a different declared value. A reset of `path` brings the declared value back.",
             "settings",
         ),
     );
@@ -1451,6 +1468,7 @@ fn server_settings(put: &mut dyn FnMut(&str, J)) {
                     "sources",
                     "locked",
                     "overridden",
+                    "overrides",
                     "status",
                     "etag",
                 ],
@@ -1463,6 +1481,7 @@ fn server_settings(put: &mut dyn FnMut(&str, J)) {
                     "sources": { "type": "object", "description": "The source of each field of `effective`, by dotted path such as `providers.claude.endpoint`.", "additionalProperties": source },
                     "locked": with_desc(strings(), "The fields that `server.locked` of the settings file locks, without the `models.` prefix."),
                     "overridden": with_desc(strings(), "Locked fields whose runtime value is kept but ignored."),
+                    "overrides": with_desc(array(sref("SettingsOverride")), "The runtime values used in place of a different value of `--model-config`, one entry per field, such as a changed budget or a removed provider. Locked fields are left out."),
                     "status": closed(&["valid"], json!({ "valid": boolean(), "error": string() })),
                     "etag": with_desc(string(), "The entity tag of the runtime layer, as in the `ETag` header."),
                 }),
