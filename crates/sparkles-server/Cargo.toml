@@ -75,6 +75,9 @@ toml = { version = "1", optional = true }
 zeroize = { version = "1", optional = true }
 jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs"], optional = true }
 reqwest = { workspace = true, optional = true }
+# `sparkles memory`: the harness adapters, and tower's `oneshot` for `--loc`
+sparkles-memory-import = { workspace = true, optional = true }
+tower = { version = "0.5", features = ["util"], optional = true }
 rpassword = { version = "7", optional = true }
 # the credentials file of `sparkles auth login`, shared with the Rust client
 sparkles-client = { workspace = true, optional = true }
@@ -115,7 +118,7 @@ sparkles-fmt = { workspace = true, features = ["fault-injection"] }
 sparkles-client = { workspace = true, features = ["blocking"] }
 
 [features]
-default = ["reasoning", "shacl", "shex", "mimalloc", "text", "geo", "geo-epsg", "otel", "auth", "mcp", "backup", "fmt", "tls", "graphql"]
+default = ["reasoning", "shacl", "shex", "mimalloc", "text", "geo", "geo-epsg", "otel", "auth", "mcp", "memory", "backup", "fmt", "tls", "graphql"]
 # RDFS / OWL RL / Jena-rules materialization (`/$/reason`, `sparkles infer`)
 reasoning = ["dep:sparkles-reasoner", "sparkles/reasoning"]
 # SHACL validation (`/{ds}/shacl`, `sparkles shacl`)
@@ -147,6 +150,9 @@ auth = [
 tls = ["dep:rustls", "dep:tokio-rustls"]
 # Model Context Protocol server for LLM agents (`sparkles mcp` on stdio, `serve --mcp`)
 mcp = ["dep:rmcp", "dep:tokio-util"]
+# `sparkles memory`: import coding agents' memory and instruction files, sync them, and
+# print the brief (C18 §10.1); `--loc` serves the database in the process
+memory = ["mcp", "auth", "dep:sparkles-memory-import", "dep:tower"]
 # backup repositories on a filesystem or S3: `/$/repositories`, `/$/backups/{ds}`,
 # `/$/backup-policies`, `sparkles repo …`, `sparkles backup create|list|restore|…`
 backup = ["dep:sparkles-backup", "dep:toml", "sparkles/backup"]

@@ -7,6 +7,10 @@
 //! one code path. The JSON body is the tool's arguments without `dataset`, which the
 //! path names. A tool error is answered with its HTTP status and `{error, code,
 //! hint?}`. The tools read `main` only, so another branch is refused.
+//!
+//! Phase 3m-a adds `POST /{ds}/facts` (`assert_facts`, which may name a `branch` in its
+//! body as the tool does) and `POST /{ds}/memory/brief` (the brief of §8.10.9, a
+//! `Tools` method that MCP does not offer as a tool).
 
 use super::{Call, McpConfig, McpServer, Outcome};
 use crate::auth::Principal;
@@ -27,11 +31,24 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/{ds}/check", post(check))
         .route("/{ds}/recall", post(recall))
         .route("/{ds}/sparql/diagnose", post(diagnose))
+        .route("/{ds}/facts", post(facts))
+        .route("/{ds}/memory/brief", post(brief))
+}
+
+/// How a route runs its tool.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Mode {
+    /// an offered read tool
+    Read,
+    /// `assert_facts`: the route's own grants decide, not `--mcp-allow-update`
+    Write,
+    /// a `Tools` method that MCP does not offer
+    Internal,
 }
 
 /// The tools' limits over HTTP: those of `/$/mcp` when the server runs it, else the
 /// server's own query limits.
-pub(crate) fn config(st: &AppState) -> McpConfig {
+pub(crate) fn config(st: &AppState, mode: Mode) -> McpConfig {
     let mut cfg = match &st.mcp {
         Some(conf) => conf.cfg.clone(),
         None => McpConfig {
@@ -44,7 +61,9 @@ pub(crate) fn config(st: &AppState) -> McpConfig {
     // switches do not apply to these routes
     cfg.datasets.clear();
     cfg.disabled.clear();
-    cfg.allow_update = false;
+    // `POST /{ds}/facts` needs `write` on the graphs it writes, which the tool checks,
+    // and a read-only server writes nothing
+    cfg.allow_update = mode == Mode::Write && !st.read_only;
     cfg.allow_service = false;
     cfg.stored_queries = false;
     cfg.http = true;
@@ -58,7 +77,37 @@ async fn check(
     headers: HeaderMap,
     body: AdminBody,
 ) -> ApiResult<Response> {
-    run("check_query", st, ds, p, headers, body, None).await
+    run("check_query", st, ds, p, headers, body, None, Mode::Read).await
+}
+
+async fn facts(
+    st: State<Arc<AppState>>,
+    ds: Path<String>,
+    p: Extension<Principal>,
+    headers: HeaderMap,
+    body: AdminBody,
+) -> ApiResult<Response> {
+    run("assert_facts", st, ds, p, headers, body, None, Mode::Write).await
+}
+
+async fn brief(
+    st: State<Arc<AppState>>,
+    ds: Path<String>,
+    p: Extension<Principal>,
+    headers: HeaderMap,
+    body: AdminBody,
+) -> ApiResult<Response> {
+    run(
+        "memory_brief",
+        st,
+        ds,
+        p,
+        headers,
+        body,
+        None,
+        Mode::Internal,
+    )
+    .await
 }
 
 async fn recall(
@@ -68,7 +117,17 @@ async fn recall(
     headers: HeaderMap,
     body: AdminBody,
 ) -> ApiResult<Response> {
-    run("recall", st, ds, p, headers, body, Some(("format", "json"))).await
+    run(
+        "recall",
+        st,
+        ds,
+        p,
+        headers,
+        body,
+        Some(("format", "json")),
+        Mode::Read,
+    )
+    .await
 }
 
 async fn diagnose(
@@ -78,7 +137,7 @@ async fn diagnose(
     headers: HeaderMap,
     body: AdminBody,
 ) -> ApiResult<Response> {
-    run("why_empty", st, ds, p, headers, body, None).await
+    run("why_empty", st, ds, p, headers, body, None, Mode::Read).await
 }
 
 /// The JSON body of a tool error.
@@ -97,6 +156,7 @@ pub(crate) fn tool_error(e: &super::errors::ToolError) -> crate::http::ApiError 
 }
 
 /// Run `tool` with the body's arguments and `{ds}`.
+#[allow(clippy::too_many_arguments)]
 async fn run(
     tool: &str,
     State(st): State<Arc<AppState>>,
@@ -105,6 +165,7 @@ async fn run(
     headers: HeaderMap,
     AdminBody(body): AdminBody,
     fixed: Option<(&str, &str)>,
+    mode: Mode,
 ) -> ApiResult<Response> {
     if let Some(b) = crate::http::branches::current()
         && b != sparkles::branch::MAIN
@@ -167,8 +228,25 @@ async fn run(
         headers: Some(headers),
         held: None,
     };
-    let server = McpServer::new(st.clone(), config(&st));
-    match server.call(tool, args, call).await {
+    let server = McpServer::new(st.clone(), config(&st, mode));
+    let out = if mode == Mode::Internal {
+        let name = tool.to_string();
+        let request_id = call.request_id.clone();
+        tokio::task::spawn_blocking(move || server.run_now(&name, args, &call))
+            .await
+            .map_err(|e| {
+                tracing::error!(request_id, "{tool} panicked: {e}");
+                err_code(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    "internal error",
+                )
+            })
+            .map(Ok)?
+    } else {
+        server.call(tool, args, call).await
+    };
+    match out {
         Err(_) => Err(err_code(
             StatusCode::NOT_FOUND,
             "unknown-tool",

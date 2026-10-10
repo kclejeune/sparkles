@@ -1,10 +1,11 @@
 # C18: Questions and ingestion in natural language
 
-> **Status:** implemented in part (Phases 1 and 2)
+> **Status:** implemented in part (Phases 1, 2 and 3m-a)
 >
 > **Phases:** Phases 1 and 2 shipped on 2026-10-09, without the measured runs of the
-> model matrix on the public sets. Phase 1 lets an agent connected over MCP hand the query it
-> wrote for a question to the web UI, where a person reads, edits and runs it, and adds
+> model matrix on the public sets. Phase 3m-a shipped on 2026-10-10. Phase 1 lets an
+> agent connected over MCP hand the query it wrote for a question to the web UI, where a
+> person reads, edits and runs it, and adds
 > a memory browser that shows each fact's source, passage and history. It also adds
 > model providers to the server, for Ollama and other local models, any
 > OpenAI-compatible endpoint and Anthropic's API, with an ordered list of provider and
@@ -25,6 +26,8 @@
 > [Usage: Asking questions with a model](../USAGE.md#asking-questions-with-a-model) ·
 > [Usage: Handing a query to the web UI](../USAGE.md#handing-a-query-to-the-web-ui) ·
 > [Usage: The Ask bar](../USAGE.md#the-ask-bar) ·
+> [Usage: Agent memory](../USAGE.md#agent-memory) ·
+> [API: Importing agent memory](../API.md#importing-agent-memory) ·
 > [Features](../FEATURES.md)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
@@ -3817,8 +3820,8 @@ for her principal. The memory directory belongs to a project whose remote is
 
 **Phase 1 delivered on 2026-10-09.** The matrix has not been run with real models, and
 the public sets of §11.1 are not converted, so the targets of §11.3 and the measured role
-lists of §11.4 are still open. Phase 2 followed on the same day, and Phases 2b to 6 are
-not built.
+lists of §11.4 are still open. Phase 2 followed on the same day and Phase 3m-a on
+2026-10-10. Both are recorded below, and Phases 2b, 3, 3m-b and 4 to 6 are not built.
 
 - **Model providers.** The server's `models` module holds the three kinds of §3.4 with
   their request and response formats, named secrets read at each request from
@@ -3972,3 +3975,114 @@ rather than measured ones.
   a query that reads the default graph and every named graph.
 - With history on, the UI keeps asked questions on the server only, and the Asked list
   shows the server's entries before the questions of handoff links kept in the browser.
+
+**Phase 3m-a delivered on 2026-10-10.** A person's Claude Code and Codex memory and
+instruction files become graphs of cited, unreviewed facts, a hook keeps them current,
+and a session start hook prints a brief of what the graph knows about the project.
+
+- **The adapters.** The `sparkles-memory-import` crate reads Claude Code's memory files,
+  its `MEMORY.md` index and its instruction files (`CLAUDE.md`, `CLAUDE.local.md`, rules
+  and the managed file), Codex's `AGENTS.md` and `AGENTS.override.md` files and its
+  generated memories, and the generic set of `GEMINI.md`, Cursor rules, GitHub Copilot's
+  instructions and any file given with `--path`. It parses the frontmatter itself,
+  follows `@path` imports only inside the project or `~/.claude` up to five levels,
+  redacts every text before it is parsed, skips files with the generated marker, and
+  turns each file into structural facts with the line each one came from. Project keys
+  come from the git remote, worktrees included, and entity IRIs are version 5 UUIDs of
+  the dataset's id, so a link to a memory that does not exist yet already names the IRI
+  that memory will get.
+- **The server.** `POST /{ds}/facts` runs `assert_facts` and `POST /{ds}/memory/brief`
+  runs the new `Tools::memory_brief`, both through the handler of the existing tool
+  routes. The facts route needs `write` on the graphs written and counts as an update,
+  and the brief needs `read`. `memory.json` gains `imports` with `base`,
+  `secretPatterns`, `transcripts` and `extract`, and a `PUT` checks that `agentGraphs`
+  covers the base. `sparkles auth grant --template agent --import --import-base IRI`
+  adds a write grant on `<base><agent>/*` on `main`.
+- **The commands.** `sparkles memory` has `init`, `import`, `sync`, `sources`,
+  `status`, `brief`, `recall`, `query`, `assert`, `forget` and `setup`, with `--server`,
+  `--dataset`, `--loc`, `--branch`, `--insecure-http`, `--if-reachable` and `--json` on
+  each and the exit statuses of §10.1. `--loc` serves the database in the process
+  through the same router and fails with the store's `locked` error when a server holds
+  it. The `memory` feature, on by default, gates the commands.
+- **Sync.** A sync lists the caller's import graphs with their digests in one query and
+  compares each scanned file with its source. A new file gets every fact, an edited one
+  is diffed against the structural facts its graph holds, a moved one changes only
+  `mem:filePath`, and a deleted one is retracted. The cache in
+  `$XDG_STATE_HOME/sparkles/memory/` is keyed by server, dataset and principal, and
+  lets a sync skip the server when no file changed. The lock queues a second sync, and
+  the holder runs once more.
+- **Hooks and setup.** `sync --from-hook claude-code|codex` reads the hook's JSON, exits
+  before any request for a file that is neither memory nor instructions, and syncs only
+  the named file otherwise. `--detach` starts the sync as a background process.
+  `brief --hook` prints the brief as plain text and nothing at all on any failure.
+  `brief --write FILE` writes the generated marker first and refuses to overwrite a file
+  without it. `setup claude-code|codex` prints the hooks, the skill and Codex's MCP
+  entry of §10.4, and `--write` merges them once.
+
+**Deviations and additions in Phase 3m-a.**
+
+- No source registration exists before Phase 3m-b, so the graph IRI is also the
+  source's IRI and the source is described in its graph by structural facts with
+  `spk:contentDigest`. No text, rendition or chunk is stored. A60 therefore makes no
+  call at all for an unchanged file, because the sync compares digests with the
+  server's listing. The prose facts and `reanchorFrom` of A62 and A64 wait for 3m-b.
+  A rename writes the new graph with `dcterms:replaces` the old one and treats the old
+  graph as deleted.
+- A deletion retracts every fact of the graph except the source's description, which
+  keeps `spk:contentDigest`, `mem:filePath` and the other source facts and gains
+  `prov:invalidatedAtTime`. The file's text appears in the memory browser once 3m-b
+  stores it.
+- The sync reads back only the predicates the import writes, so facts that an agent
+  extracts from the same file are never retracted by a sync.
+- An idempotency key is `import:` and 48 hex digits of the SHA-256 of the graph, the
+  old and new digests, the head and the part number. The form `import:<graph>:<digest>`
+  could exceed the 128 characters that `assert_facts` accepts.
+- The principal in graph IRIs is the name the caller acts as. A minted token acts as
+  its owner, a configured token as its name without `cfg-`, and a `--loc` run as the
+  operating-system user.
+- The session start hooks print the project scope of the hook's `cwd`, because a
+  session that starts has no query for the session scope.
+- `sync --watch` polls the harness directories once a second and syncs after 2 seconds
+  without a change, instead of using the operating system's notifications, which would
+  need a new dependency.
+- `sources --needs-extraction` lists a source that holds no fact with a predicate the
+  import does not write, which approximates the rendition check of 3m-b.
+- `query QUESTION` calls `POST /{ds}/ask` of Phase 2 and fails with `unavailable` when
+  the server does not have it. `query --sparql` works now.
+- `init` creates a guard in `warn` mode over the union graph with the shapes graph
+  `urn:x-sparkles:shapes:mem`, or adds that graph to an existing SHACL guard. A ShEx
+  guard, or a caller who is not an admin, leaves the guard alone and the output says
+  why. Without `--import-base` and without a current base, `init` uses
+  `urn:x-sparkles:import/`.
+- Redaction runs in the command line, with the built-in patterns, the dataset's
+  `secretPatterns`, the `redact` entries of `memory.toml` and `--redact-patterns`. The
+  server's `secret-detected` check of A66 comes with `POST /{ds}/sources` in 3m-b.
+- A file given with `--path` whose name is a known instruction file lands in the generic
+  harness's instruction area, so a later sync without that `--path` records it as
+  deleted. Other files given with `--path` are memory files and stay until `forget`.
+- The brief's base score for the entity and session scopes comes from recall's seed
+  rank and hop. `matched` counts the facts that pass the review filter.
+- `memory.toml` takes `server`, `dataset`, `skip-projects`, `redact`, `claude-dir` and
+  `codex-dir`. `SPARKLES_MEMORY_WATCH_EVENTS` stops `sync --watch` after that many
+  syncs, which the tests use.
+- `--transcripts` prints why no transcript was read, and `setup --transcripts`,
+  `export --sources`, `inbox`, `review`, `promote` and `reject` are left to 3m-b and
+  Phase 3.
+
+**Tests.** `crates/sparkles-server/tests/cli_memory.rs` runs the binary against a server
+with authentication on fixture directories. It covers A59 to A65, A68, A69, A72, A73,
+A74, the sync and assert parts of A76, and A77, and `memory_loc` covers `--loc` and the
+`locked` error. `mcp/import_tests.rs` covers the facts route, the import settings, A68,
+A70 and A71 at the route level. The adapters have unit tests and
+`crates/sparkles-memory-import/tests/adapters.rs`, and A30 with `--import` is in the
+router's auth tests. A66, A67, A75 and the promotion of A76 wait for 3m-b and Phase 3.
+
+**What 3m-b and Phase 3 build on.** `register_source` can adopt the graph IRIs as source
+IRIs, because every import graph already carries its digest, and the first 3m-b sync
+can register the text of each source whose digest matches. The adapters keep the line
+of every structural fact and a digest of the body after the frontmatter, which spans
+and re-anchoring need. `memory_brief` and the
+`Mode::Internal` route are the pattern for other `Tools` methods over HTTP, and the
+`sparkles memory` dispatcher has room for `inbox`, `review`, `promote`, `reject` and
+`export`. The import graphs match `agentGraphs`, so the review inbox of Phase 3 sees
+every imported fact as unreviewed.

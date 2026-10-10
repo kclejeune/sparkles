@@ -697,6 +697,8 @@ fn entries() -> Vec<(&'static str, Entry)> {
         server_only!("checkQuery", Mcp),
         server_only!("recallFacts", Mcp),
         server_only!("diagnoseQuery", Mcp),
+        server_only!("assertFacts", Mcp),
+        server_only!("memoryBrief", Mcp),
         server_only!("listModelProviders", Process),
         server_only!("testModelProvider", Process),
         server_only!("getMemorySettings", Process),

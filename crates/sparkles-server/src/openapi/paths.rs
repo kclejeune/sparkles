@@ -2107,6 +2107,22 @@ fn assist(p: &mut Paths) {
         "RecallResult",
     ));
     p.add(
+        op(POST, "/{ds}/facts", "assertFacts", "SPARQL", "Write facts with provenance")
+            .doc("The MCP tool `assert_facts` as the caller, with its checks. Needs `write` on the graphs written and counts as an update. `sparkles memory import` and `assert` call it.")
+            .see("importing-agent-memory")
+            .json_body(true, "AssertFactsRequest")
+            .json("200", "The result.", "AssertFactsResult")
+            .errors(&[400, 403, 404, 408, 409, 422]),
+    );
+    p.add(
+        op(POST, "/{ds}/memory/brief", "memoryBrief", "SPARQL", "Brief what the graph knows")
+            .doc("The brief of C18 §8.10.9 for a project's import graphs, an entity or a recall query: reviewed facts by default, ranked by age and corroboration, bounded in facts and characters, with a citation per source.")
+            .see("importing-agent-memory")
+            .json_body(true, "BriefRequest")
+            .json("200", "The brief.", "BriefResult")
+            .errors(&[400, 404, 408, 422]),
+    );
+    p.add(
         op(
             GET,
             "/$/memory/{ds}",

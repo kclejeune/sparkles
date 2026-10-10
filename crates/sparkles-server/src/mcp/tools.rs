@@ -99,6 +99,8 @@ fn dispatch(t: &Tools, name: &str, args: Map<String, Value>) -> Result<Outcome, 
         "create_branch" => t.create_branch(args),
         "merge_branch" => t.merge_branch(args),
         "delete_branch" => t.delete_branch(args),
+        // `POST /{ds}/memory/brief`, never offered as a tool
+        "memory_brief" => t.memory_brief(args),
         // a stored query of a dataset (`<dataset>__<query>`)
         name => t.stored_query(name, args),
     }

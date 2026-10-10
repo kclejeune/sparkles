@@ -143,13 +143,14 @@ pub fn classify(
         | "/{ds}/recall"
         | "/{ds}/sparql/diagnose"
         | "/{ds}/ask"
+        | "/{ds}/memory/brief"
         | "/{ds}/shacl"
         | "/{ds}/shex"
         | "/{ds}/diff"
         | "/{ds}/queries/{name}"
         | "/{ds}/graphql"
         | "/{ds}/graphql/schema" => Some(Class::Query),
-        "/{ds}/update" | "/{ds}/upload" => Some(Class::Update),
+        "/{ds}/update" | "/{ds}/upload" | "/{ds}/facts" => Some(Class::Update),
         "/{ds}/patch" => Some(if read { Class::Query } else { Class::Update }),
         "/{ds}/data" | "/{ds}/{*graph}" => Some(if read { Class::Query } else { Class::Update }),
         "/{ds}" => {

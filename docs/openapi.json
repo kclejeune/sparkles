@@ -1223,6 +1223,340 @@
         ],
         "type": "object"
       },
+      "AssertFactsRequest": {
+        "additionalProperties": false,
+        "description": "The arguments of `assert_facts` without `dataset`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#importing-agent-memory"
+        },
+        "properties": {
+          "agent": {
+            "additionalProperties": false,
+            "properties": {
+              "model": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "name"
+            ],
+            "type": "object"
+          },
+          "allowUnknownIris": {
+            "type": "boolean"
+          },
+          "branch": {
+            "description": "Write on this branch instead of main.",
+            "type": "string"
+          },
+          "changes": {
+            "type": "integer"
+          },
+          "dryRun": {
+            "type": "boolean"
+          },
+          "entities": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "altLabels": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "distinctFrom": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "key": {
+                  "type": "string"
+                },
+                "label": {
+                  "type": "string"
+                },
+                "types": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "key",
+                "label",
+                "types"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "facts": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "confidence": {
+                  "type": "number"
+                },
+                "mode": {
+                  "enum": [
+                    "add",
+                    "replace"
+                  ],
+                  "type": "string"
+                },
+                "o": {
+                  "description": "An IRI, a key of `entities`, or a literal in SPARQL syntax.",
+                  "type": "string"
+                },
+                "p": {
+                  "type": "string"
+                },
+                "quote": {
+                  "description": "At most 1000 characters.",
+                  "type": "string"
+                },
+                "s": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "s",
+                "p",
+                "o"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "graph": {
+            "description": "The named graph to write (default: `source.iri`).",
+            "type": "string"
+          },
+          "idempotencyKey": {
+            "description": "At most 128 characters. A retry with the same key writes nothing and answers `alreadyApplied`.",
+            "type": "string"
+          },
+          "ifHead": {
+            "type": "integer"
+          },
+          "iriBase": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "replaceScope": {
+            "enum": [
+              "graph",
+              "writable"
+            ],
+            "type": "string"
+          },
+          "retract": {
+            "items": {
+              "oneOf": [
+                {
+                  "description": "A reifier IRI.",
+                  "type": "string"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "graph": {
+                      "type": "string"
+                    },
+                    "o": {
+                      "type": "string"
+                    },
+                    "p": {
+                      "type": "string"
+                    },
+                    "s": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "s",
+                    "p",
+                    "o",
+                    "graph"
+                  ],
+                  "type": "object"
+                }
+              ]
+            },
+            "type": "array"
+          },
+          "source": {
+            "additionalProperties": false,
+            "properties": {
+              "iri": {
+                "type": "string"
+              },
+              "title": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "iri"
+            ],
+            "type": "object"
+          },
+          "timeoutSeconds": {
+            "type": "number"
+          }
+        },
+        "type": "object"
+      },
+      "AssertFactsResult": {
+        "description": "What `assert_facts` wrote, or would write in a dry run.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#importing-agent-memory"
+        },
+        "properties": {
+          "activity": {
+            "type": "string"
+          },
+          "alreadyApplied": {
+            "type": "boolean"
+          },
+          "branch": {
+            "type": "string"
+          },
+          "commit": {
+            "type": "integer"
+          },
+          "committed": {
+            "type": "boolean"
+          },
+          "conflicts": {
+            "items": {
+              "properties": {
+                "graph": {
+                  "type": "string"
+                },
+                "reason": {
+                  "type": "string"
+                },
+                "triple": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "triple",
+                "graph"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "dataset": {
+            "type": "string"
+          },
+          "deleted": {
+            "type": "integer"
+          },
+          "dryRun": {
+            "additionalProperties": true,
+            "description": "A dry run's preview.",
+            "type": "object"
+          },
+          "elapsedMs": {
+            "type": "number"
+          },
+          "graph": {
+            "type": "string"
+          },
+          "head": {
+            "type": "integer"
+          },
+          "inserted": {
+            "type": "integer"
+          },
+          "minted": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "prefixes": {
+            "additionalProperties": true,
+            "description": "The prefixes the compact terms use.",
+            "type": "object"
+          },
+          "retracted": {
+            "items": {
+              "properties": {
+                "graph": {
+                  "type": "string"
+                },
+                "reason": {
+                  "type": "string"
+                },
+                "triple": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "triple",
+                "graph"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "superseded": {
+            "items": {
+              "properties": {
+                "graph": {
+                  "type": "string"
+                },
+                "reason": {
+                  "type": "string"
+                },
+                "triple": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "triple",
+                "graph"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "validation": {
+            "additionalProperties": true,
+            "description": "The guard's report.",
+            "type": "object"
+          },
+          "warnings": {
+            "items": {
+              "additionalProperties": true,
+              "description": "A problem the write did not refuse.",
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "wouldCommit": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "dataset",
+          "graph",
+          "committed",
+          "head"
+        ],
+        "type": "object"
+      },
       "AssistantSettings": {
         "description": "The assistant settings of a dataset.",
         "externalDocs": {
@@ -2298,6 +2632,123 @@
             "type": "array"
           }
         },
+        "type": "object"
+      },
+      "BriefRequest": {
+        "additionalProperties": false,
+        "description": "What to brief.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#importing-agent-memory"
+        },
+        "properties": {
+          "entity": {
+            "description": "An IRI, or a label that must link exactly, with scope entity.",
+            "type": "string"
+          },
+          "halfLifeDays": {
+            "description": "The age at which a fact's weight halves, 90 by default.",
+            "type": "number"
+          },
+          "includeUnreviewed": {
+            "type": "boolean"
+          },
+          "maxChars": {
+            "description": "500 to 100,000, 8000 by default.",
+            "type": "integer"
+          },
+          "maxFacts": {
+            "description": "1 to 500, 60 by default.",
+            "type": "integer"
+          },
+          "projectKey": {
+            "description": "The project's key, such as `github.com/acme/shop`, with scope project.",
+            "type": "string"
+          },
+          "query": {
+            "description": "The words to recall, with scope session.",
+            "type": "string"
+          },
+          "scope": {
+            "enum": [
+              "project",
+              "entity",
+              "session"
+            ],
+            "type": "string"
+          },
+          "timeoutSeconds": {
+            "type": "number"
+          },
+          "unreviewedWeight": {
+            "description": "0 to 1, 0.7 by default.",
+            "type": "number"
+          }
+        },
+        "type": "object"
+      },
+      "BriefResult": {
+        "description": "The brief of a project, an entity or a session.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#importing-agent-memory"
+        },
+        "properties": {
+          "citations": {
+            "items": {
+              "additionalProperties": true,
+              "description": "One source of the facts.",
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "commit": {
+            "type": "integer"
+          },
+          "dataset": {
+            "type": "string"
+          },
+          "facts": {
+            "items": {
+              "additionalProperties": true,
+              "description": "One fact with its citations.",
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "imports": {
+            "description": "Whether the dataset has an import base.",
+            "type": "boolean"
+          },
+          "matched": {
+            "type": "integer"
+          },
+          "prefixes": {
+            "additionalProperties": true,
+            "description": "The prefixes the compact terms use.",
+            "type": "object"
+          },
+          "reviewedOnly": {
+            "type": "boolean"
+          },
+          "scope": {
+            "type": "string"
+          },
+          "shown": {
+            "type": "integer"
+          },
+          "text": {
+            "description": "The brief as plain text. Its first line says that the lines are recalled data.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "dataset",
+          "commit",
+          "scope",
+          "reviewedOnly",
+          "matched",
+          "shown",
+          "text"
+        ],
         "type": "object"
       },
       "BudgetError": {
@@ -6352,6 +6803,52 @@
           "consolidatedGraph": {
             "description": "The graph that promoted facts are written to.",
             "type": "string"
+          },
+          "imports": {
+            "additionalProperties": false,
+            "description": "The imports of coding agents' memory files.",
+            "properties": {
+              "base": {
+                "description": "The prefix of every import graph, an IRI that ends in `/` or `#`. `agentGraphs` must cover it.",
+                "type": "string"
+              },
+              "extract": {
+                "description": "Who extracts facts from imported prose.",
+                "enum": [
+                  "agent",
+                  "server",
+                  "none"
+                ],
+                "type": "string"
+              },
+              "secretPatterns": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "name": {
+                      "type": "string"
+                    },
+                    "regex": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "regex"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "transcripts": {
+                "description": "Whether transcripts may be imported (Phase 3m-b).",
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "base"
+            ],
+            "type": "object"
           }
         },
         "type": "object"
@@ -26582,6 +27079,90 @@
         "x-sparkles-permission": "read"
       }
     },
+    "/{ds}/facts": {
+      "post": {
+        "description": "The MCP tool `assert_facts` as the caller, with its checks. Needs `write` on the graphs written and counts as an update. `sparkles memory import` and `assert` call it.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#importing-agent-memory"
+        },
+        "operationId": "assertFacts",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AssertFactsRequest"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AssertFactsResult"
+                }
+              }
+            },
+            "description": "The result."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Write facts with provenance",
+        "tags": [
+          "SPARQL"
+        ],
+        "x-sparkles-permission": "write"
+      }
+    },
     "/{ds}/geo": {
       "get": {
         "description": "The indexed geometries that meet a CRS84 box, as GeoJSON.",
@@ -27659,6 +28240,87 @@
         "summary": "History query",
         "tags": [
           "History"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
+    "/{ds}/memory/brief": {
+      "post": {
+        "description": "The brief of C18 §8.10.9 for a project's import graphs, an entity or a recall query: reviewed facts by default, ranked by age and corroboration, bounded in facts and characters, with a citation per source.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#importing-agent-memory"
+        },
+        "operationId": "memoryBrief",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BriefRequest"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BriefResult"
+                }
+              }
+            },
+            "description": "The brief."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Brief what the graph knows",
+        "tags": [
+          "SPARQL"
         ],
         "x-sparkles-permission": "read"
       }
