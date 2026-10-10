@@ -8,8 +8,12 @@
 //!
 //! Literal keys sort before every other key, so the literals are the ids
 //! `0..covered`. The vocabulary sorts them by lexical form, which interleaves numbers
-//! with strings, dates and language-tagged text, so the column covers all of them with
-//! one 4-bit kind per id and stores values only for the numbers:
+//! with strings, dates and language-tagged text. Numbers still gather where lexical
+//! forms start with a digit, a sign or a point, and long runs of literals hold none
+//! (labels, abstracts). The column keeps a list of segments, ranges of ids that hold
+//! every number and no run of more than [`GAP`] literals without one. An id outside
+//! every segment is not a number, which costs no read. Each id inside a segment has a
+//! 4-bit kind, and the numbers have their values:
 //!
 //! * [`NOT_NUMERIC`]: the literal's value is not a number (a string, a date, an
 //!   ill-typed numeric literal…). Comparing it with a number is a type error.
@@ -31,11 +35,16 @@
 //! Layout, little-endian:
 //!
 //! ```text
-//! magic "SPKVNUM1" | vocabulary length u64 | covered u64 | values u64
-//! kinds: ceil(covered / 16) u64 words, id i in bits 4·(i % 16) of word i / 16
-//! rank: ceil(covered / 128) u32, the values before each group of 128 ids, padded to 8 bytes
-//! values: one u64 per id of a valued kind, in id order
+//! magic "SPKVNUM2" | vocabulary length u64 | covered u64 | values u64
+//!   | positions u64 | segments u64
+//! kinds: ceil(positions / 16) u64 words, position p in bits 4·(p % 16) of word p / 16
+//! rank: ceil(positions / 128) u32, the values before each group of 128 positions,
+//!   padded to 8 bytes
+//! values: one u64 per position of a valued kind, in id order
+//! segments: per segment its first id, its end and its first position, u64 each
 //! ```
+//!
+//! The ids of the segments, in order, are the positions `0..positions`.
 
 use super::Bytes;
 use crate::error::Result;
@@ -48,9 +57,12 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 /// The column's file name in a generation directory.
 pub const FILE: &str = "vocab.num";
-const MAGIC: &[u8; 8] = b"SPKVNUM1";
-const HEADER: usize = 32;
-/// Ids per rank entry: eight words of kinds, one cache line.
+const MAGIC: &[u8; 8] = b"SPKVNUM2";
+const HEADER: usize = 48;
+/// A run of more literals than this without a number ends a segment. It is the ids of
+/// one 4 KiB page of kinds.
+pub const GAP: u64 = 8192;
+/// Positions per rank entry: eight words of kinds, one cache line.
 const RANK_IDS: u64 = 128;
 const VALUED_BITS: u64 = 0x8888_8888_8888_8888;
 /// Read-ahead hints are given once per chunk of this many bytes.
@@ -176,18 +188,23 @@ pub struct NumColumn {
     count: u64,
     rank: usize,
     values: usize,
+    /// (first id, end, first position) of each segment
+    segments: Box<[(u64, u64, u64)]>,
 }
 
 fn word(b: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
 }
 
-fn layout(covered: u64, count: u64) -> (usize, usize, usize) {
-    let words = covered.div_ceil(16) as usize;
-    let rank = HEADER + words * 8;
-    let ranks = covered.div_ceil(RANK_IDS) as usize;
-    let values = rank + (ranks * 4).next_multiple_of(8);
-    (rank, values, values + count as usize * 8)
+/// The offsets of the rank, the values, the segments and the end of the file.
+fn layout(positions: u64, count: u64, segments: u64) -> Option<(usize, usize, usize, usize)> {
+    let words = usize::try_from(positions.div_ceil(16)).ok()?;
+    let rank = HEADER.checked_add(words.checked_mul(8)?)?;
+    let ranks = usize::try_from(positions.div_ceil(RANK_IDS)).ok()?;
+    let values = rank.checked_add(ranks.checked_mul(4)?.next_multiple_of(8))?;
+    let segs = values.checked_add(usize::try_from(count).ok()?.checked_mul(8)?)?;
+    let end = segs.checked_add(usize::try_from(segments).ok()?.checked_mul(24)?)?;
+    Some((rank, values, segs, end))
 }
 
 impl NumColumn {
@@ -202,23 +219,45 @@ impl NumColumn {
             _ => return None,
         };
         let b = bytes.as_slice();
-        let ok = |covered: u64, count: u64| {
-            b[..8] == *MAGIC
-                && word(b, 8) == len
-                && covered == literals
-                && count <= covered
-                && layout(covered, count).2 == b.len()
+        let (covered, count, positions, nsegs) =
+            (word(b, 16), word(b, 24), word(b, 32), word(b, 40));
+        let segments = || -> Option<(usize, usize, Box<[(u64, u64, u64)]>)> {
+            if b[..8] != *MAGIC
+                || word(b, 8) != len
+                || covered != literals
+                || count > positions
+                || positions > covered
+            {
+                return None;
+            }
+            let (rank, values, segs, end) = layout(positions, count, nsegs)?;
+            if end != b.len() {
+                return None;
+            }
+            let list: Box<[(u64, u64, u64)]> = (0..nsegs as usize)
+                .map(|i| {
+                    let at = segs + i * 24;
+                    (word(b, at), word(b, at + 8), word(b, at + 16))
+                })
+                .collect();
+            // ascending, apart, inside the literals, and their ids are the positions
+            let mut next = (0, 0);
+            for &(lo, hi, base) in &list {
+                if lo < next.0 || hi <= lo || hi > covered || base != next.1 {
+                    return None;
+                }
+                next = (hi, base + (hi - lo));
+            }
+            (next.1 == positions).then_some((rank, values, list))
         };
-        let (covered, count) = (word(b, 16), word(b, 24));
-        if !ok(covered, count) {
+        let Some((rank, values, segments)) = segments() else {
             tracing::warn!(
                 target: "sparkles::vocab",
                 "{} does not match its vocabulary; numbers are decoded from their keys",
                 path.display()
             );
             return None;
-        }
-        let (rank, values, _) = layout(covered, count);
+        };
         let chunks = b.len().div_ceil(HINT_CHUNK);
         Some(NumColumn {
             hinted: (0..chunks.div_ceil(64))
@@ -229,7 +268,22 @@ impl NumColumn {
             count,
             rank,
             values,
+            segments,
         })
+    }
+
+    /// Ranges of ids that hold every number.
+    pub fn segments(&self) -> usize {
+        self.segments.len()
+    }
+
+    /// The position of base id `id` in the kinds, if it is inside a segment.
+    #[inline]
+    fn position(&self, id: u64) -> Option<u64> {
+        let s = &self.segments;
+        let i = s.partition_point(|&(_, hi, _)| hi <= id);
+        let &(lo, _, base) = s.get(i)?;
+        (lo <= id).then(|| base + (id - lo))
     }
 
     /// Ids covered: the literals of the vocabulary.
@@ -261,9 +315,9 @@ impl NumColumn {
     /// The kind of base id `id` and, for a valued kind, the index of its value.
     #[inline]
     fn locate(&self, id: u64) -> (u8, u64) {
-        if id >= self.covered {
+        let Some(id) = self.position(id) else {
             return (NOT_NUMERIC, 0);
-        }
+        };
         let w = (id / 16) as usize;
         let shift = (id % 16) * 4;
         let kw = self.kind_word(w);
@@ -340,7 +394,7 @@ impl NumColumn {
     pub fn get_many(&self, ids: &[u64]) -> Vec<Numeric> {
         let hints = crate::index::io_hints() && ids.len() > 1;
         if hints {
-            let inside = || ids.iter().copied().filter(|&id| id < self.covered);
+            let inside = || ids.iter().filter_map(|&id| self.position(id));
             self.advise(inside().map(|id| {
                 let first = (id / RANK_IDS) * RANK_IDS / 16;
                 (
@@ -384,9 +438,17 @@ pub(super) struct NumWriter {
     kinds: BufWriter<crate::disk::WritebackFile>,
     values: BufWriter<File>,
     word: u64,
+    /// literal ids pushed
     covered: u64,
+    /// kinds written
+    pos: u64,
     count: u64,
     rank: Vec<u32>,
+    /// segments closed, and the open one's first id and position
+    segments: Vec<(u64, u64, u64)>,
+    open: Option<(u64, u64)>,
+    /// the last id of a number
+    last: u64,
     /// a non-literal key was pushed: every later key is one too
     done: bool,
     /// too many numbers for the rank's `u32`: no column is written
@@ -414,8 +476,12 @@ impl NumWriter {
             values,
             word: 0,
             covered: 0,
+            pos: 0,
             count: 0,
             rank: Vec::new(),
+            segments: Vec::new(),
+            open: None,
+            last: 0,
             done: false,
             failed: false,
         })
@@ -436,19 +502,43 @@ impl NumWriter {
     }
 
     fn push_kind(&mut self, kind: u8, bits: u64) -> Result<()> {
-        if self.covered.is_multiple_of(RANK_IDS) {
+        let id = self.covered;
+        self.covered += 1;
+        if kind == NOT_NUMERIC {
+            return Ok(());
+        }
+        match self.open {
+            Some(_) if id - self.last - 1 <= GAP => {
+                for _ in self.last + 1..id {
+                    self.put(NOT_NUMERIC, 0)?;
+                }
+            }
+            open => {
+                if let Some((lo, base)) = open {
+                    self.segments.push((lo, self.last + 1, base));
+                }
+                self.open = Some((id, self.pos));
+            }
+        }
+        self.last = id;
+        self.put(kind, bits)
+    }
+
+    /// The kind at the next position.
+    fn put(&mut self, kind: u8, bits: u64) -> Result<()> {
+        if self.pos.is_multiple_of(RANK_IDS) {
             match u32::try_from(self.count) {
                 Ok(r) => self.rank.push(r),
                 Err(_) => self.failed = true,
             }
         }
-        self.word |= (kind as u64) << ((self.covered % 16) * 4);
+        self.word |= (kind as u64) << ((self.pos % 16) * 4);
         if kind & 8 != 0 {
             self.values.write_all(&bits.to_le_bytes())?;
             self.count += 1;
         }
-        self.covered += 1;
-        if self.covered.is_multiple_of(16) {
+        self.pos += 1;
+        if self.pos.is_multiple_of(16) {
             self.kinds.write_all(&self.word.to_le_bytes())?;
             self.word = 0;
         }
@@ -464,7 +554,10 @@ impl NumWriter {
             if self.failed || self.count == 0 {
                 return Ok(false);
             }
-            if !self.covered.is_multiple_of(16) {
+            if let Some((lo, base)) = self.open {
+                self.segments.push((lo, self.last + 1, base));
+            }
+            if !self.pos.is_multiple_of(16) {
                 self.kinds.write_all(&self.word.to_le_bytes())?;
             }
             let mut rank = Vec::with_capacity((self.rank.len() * 4).next_multiple_of(8));
@@ -483,11 +576,18 @@ impl NumWriter {
                 }
                 self.kinds.write_all(&buf[..n])?;
             }
+            for &(lo, hi, base) in &self.segments {
+                for x in [lo, hi, base] {
+                    self.kinds.write_all(&x.to_le_bytes())?;
+                }
+            }
             let mut header = [0u8; HEADER];
             header[..8].copy_from_slice(MAGIC);
             header[8..16].copy_from_slice(&len.to_le_bytes());
             header[16..24].copy_from_slice(&self.covered.to_le_bytes());
             header[24..32].copy_from_slice(&self.count.to_le_bytes());
+            header[32..40].copy_from_slice(&self.pos.to_le_bytes());
+            header[40..48].copy_from_slice(&(self.segments.len() as u64).to_le_bytes());
             self.kinds.flush()?;
             let w = self.kinds.into_inner().map_err(|e| e.into_error())?;
             let mut f = w.get_ref();
@@ -702,6 +802,12 @@ pub(crate) mod tests {
                 &Literal::new_simple_literal(format!("{i}")).into(),
             ));
         }
+        // strings between the digits and "inf": two segments
+        for i in 0..GAP + 100 {
+            keys.push(term_key(
+                &Literal::new_simple_literal(format!("a{i:06}")).into(),
+            ));
+        }
         keys.sort();
         keys.dedup();
         let dir = tempfile::tempdir().unwrap();
@@ -714,6 +820,7 @@ pub(crate) mod tests {
         let v = Vocab::open(dir.path()).unwrap();
         let num = v.numeric().expect("numeric column");
         assert_eq!(num.covered(), v.first_triple);
+        assert!(num.segments() >= 2, "{}", num.segments());
         let (mut numbers, mut unknown) = (0, 0);
         for (id, k) in keys.iter().enumerate() {
             let decoded = Value::from_key(k);
