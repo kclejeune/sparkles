@@ -2583,11 +2583,6 @@ tab, which [The Settings tab](#the-settings-tab) describes. The UI's **Ingest** 
 uploads documents and configures source retention and ingest profiles, but it does not
 turn on the assistant.
 
-**Configuration gap.** The UI has no editor for the dataset's assistant settings.
-Its **Ingest** section uploads documents and configures source retention and ingest
-profiles, but it does not turn on the assistant or allow documents to be sent to a
-model. The CLI, the settings file and the routes below do.
-
 The server keeps the fields changed at runtime in `assistant.json` in a persistent
 dataset's database directory. With the
 default server data directory, a dataset created through the UI or API keeps it at
