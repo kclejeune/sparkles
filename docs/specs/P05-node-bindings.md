@@ -178,12 +178,12 @@ The crate has the features of the Python crate, with the same defaults: `reasoni
 is missing throws `UnsupportedError` that names the feature, and `FEATURES` lists the
 build's features.
 
-The addon uses the system allocator by default. The `mimalloc` feature makes mimalloc
-the global allocator of the addon's own allocations. Rust's global allocator in a
-`cdylib` covers only the addon, so the feature does not change how Node.js allocates.
-The binding benchmark found no speed difference on glibc and a peak RSS about 18% higher
-with it, so it stays off (see the Outcome). It could still pay off on musl, whose
-allocator is slow under threads.
+The `mimalloc` feature, which is on by default, makes mimalloc the global allocator of
+the addon's own allocations. Rust's global allocator in a `cdylib` covers only the addon,
+so the feature does not change how Node.js allocates. It trades memory for speed. Adds,
+bulk adds and `has()` take 15 to 25% less time with it, and the benchmark process's peak
+RSS is about 18% higher (see the Outcome). A build with `--no-default-features` and the
+features it needs keeps the system allocator.
 
 ## 3. The engine API
 
@@ -1186,7 +1186,8 @@ in-memory datasets use today.
    Default: not in Phase 1. Measure how long such reads block on a cold cache first.
 4. **The addon's allocator.** mimalloc as the addon's global allocator affects only the
    addon. Default: the system allocator, with mimalloc for the musl packages if the
-   Phase 2 benchmark on Alpine shows a clear gain.
+   Phase 2 benchmark on Alpine shows a clear gain. The Outcome's fourth round made
+   mimalloc the default on every platform.
 5. **A default transaction timeout.** A forgotten `await` can hold the writer for good.
    Default: no timeout, and a warning through `process.emitWarning` when a transaction
    holds the writer for more than 30 seconds.
@@ -1423,3 +1424,59 @@ times slower on this instance than in the previous round, so its figures are lef
 
 The `mimalloc` feature made no measurable difference to any case and raised the peak RSS
 of the benchmark process from 359 to 425 MiB, so the addon keeps the system allocator.
+
+**Settled answers and mimalloc (2026-10-10).** A fourth round compared every binding
+case with N3.js and with Oxigraph's JavaScript package again. `has()`, single adds and
+`addAll` were the cases still behind N3.js. Four changes followed.
+
+* `has()` on a dataset in memory returns a promise that is already settled, one of two
+  shared constants for `true` and `false`, instead of going through an `async`
+  function. A one-quad write in a transaction that the addon applied on the JavaScript
+  thread returns such a promise too.
+* The term table hands the addon its whole request buffer, which may be longer than
+  the request, together with the request's length. Before, it copied the request into
+  a new array of the exact size and made a view for each part.
+* The addon remembers, for each request handle, that a term was missing from the store,
+  together with the snapshot and vocabulary size it was missing from. A `has()` that
+  asks for it again answers `false` without a lookup, and any commit that adds a term
+  ends the memory. A repeated probe for a quad whose terms the store lacks is the common
+  case for such a miss.
+* The `mimalloc` feature is on by default (§2).
+
+The comparison ran A/B/B/A in fresh processes pinned to six cores of an 8-vCPU AMD EPYC
+instance on Namespace, at 105,000 triples, with four process medians per arm. Figures
+before and after the round are below, with N3.js's `Store` in brackets. `has()` went
+from 1.5 to 1.2 µs [0.9], the first object of `(s p ?)` from 5.9 to 5.4 µs [4.7], a
+single add in a transaction from 6.6 to 4.9 µs [3.5], and `addAll` from 6.4 to 5.2 µs
+per quad [3.8]. Iterating every quad took 47 and 42 ms [89], and `(s ? ?)` and
+`(? p o)` did not change [both ties]. The small queries took 360 to 650 µs, against 5
+to 36 ms for N3.js with Comunica. On a quiet laptop pinned to four performance cores,
+the code changes alone took `has()` from 0.88 to 0.76 µs and an add from 4.19 to
+3.97 µs. mimalloc then took the add to 3.23 µs and `addAll` from 3.37 to 2.78 µs per
+quad, and the remembered misses took `has()` to 0.63 µs.
+
+mimalloc is a trade of memory for speed. The peak RSS of the benchmark process rose
+from 366 to 432 MiB, about 18%, against the 15 to 25% less time on writes and `has()`
+above. The third round had found no difference. In this round both the laptop and the
+Namespace runs showed the gain on writes.
+
+Oxigraph's package was slower than Sparkles on every case. It took 304 µs per `has()`,
+214 µs per add and 3.7 s to iterate every quad, and 1.0 to 1.9 ms for the small
+queries against 0.45 to 1.2 ms for Sparkles. Its fine-grained figures are again far
+slower than in the second round, so they show only the direction. Its peak RSS was
+1,321 MiB against 346 MiB.
+
+What remains behind N3.js has these causes.
+
+* A `has()` in a hot loop takes 0.63 µs against N3.js's 0.10 µs on the laptop. The
+  rest is the N-API call, the encoding of the pattern and the engine's index probe. N3.js
+  answers from a JavaScript object without leaving the JavaScript heap.
+* A single add and `addAll` spend most of their time in the insert into the engine's
+  delta and its write log, which is the engine's write path and not the binding.
+* A small query that runs alone takes about 137 µs hot on the laptop, where the engine
+  in Rust takes about 62 µs. A profile puts 69% of the user-space cycles on the worker
+  thread, in parsing, planning and evaluation, with about 4% in encoding the result
+  batch. The JavaScript thread has 28%, in decoding the batch, parsing the result's
+  description and resolving promises. The rest of the wall time is the hop to a worker
+  and back, which a profile of cycles does not show. Queries are already far ahead of
+  both other engines, so the round left them alone.

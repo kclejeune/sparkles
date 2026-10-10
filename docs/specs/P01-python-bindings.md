@@ -736,7 +736,8 @@ The engine gained additive APIs for them: `Transaction::insert_linked`, `blank_n
   query then takes about 20 µs from the main thread and 14 µs from another thread, where
   the request runs in place because Python handles signals only on its main thread.
   Ctrl-C therefore works without an option. A query in a transaction is interrupted the
-  same way.
+  same way. The round of 2026-10-10 below runs `Dataset.query` in place on the main
+  thread instead, with a signal wakeup socket in place of the helper thread.
 * A blank node label that Sparkles hands out (`b…`) now names its stored node in writes
   too, through `Transaction::insert_linked`. Phase 1 made a new node for it on insert,
   which left no way to add a triple to an existing blank node from Python.
@@ -977,3 +978,65 @@ the larger fix, and the design below is for a later round in the engine.
 
 With planning and parsing skipped, the engine's part of the small `VALUES` query would
 drop from about 65 to about 15 µs.
+
+**Queries in place on the main thread and the plugin's lookups (2026-10-10).** A fourth
+round compared every binding case with pyoxigraph and the plugin with rdflib's Memory
+store again. The small `VALUES` query, the star lookup and the plugin's `contains` and
+`Graph.value` were behind. Three changes followed.
+
+* `Dataset.query` on Python's main thread runs the query in place. A profile showed that
+  the hop to the helper thread cost 50 to 80 µs whenever the helper had gone to sleep,
+  which is the usual case for a program that makes one query at a time. While the query
+  runs, the binding points `signal.set_wakeup_fd` at one end of a socket pair, and a
+  watcher thread that reads the other end sets the query's cancellation flag. After the
+  query the binding restores the wakeup descriptor and runs Python's signal handlers. A
+  handler that raises, such as the default handler of Ctrl-C, ends the call with its
+  exception. If no handler raised, a query that the signal cancelled runs again from the
+  start, so a signal whose handler returns costs the work done so far. A call with a
+  `CancelToken`, a call made while another wakeup descriptor is set, as asyncio does,
+  and a call on a platform without Unix sockets keep the helper thread. Updates, loads
+  and cursor batches also keep it.
+* A solution indexed by a variable name looks the name up first. Before, it tried to
+  read the key as an integer first and threw away the failed conversion, so a lookup by
+  name took 350 to 380 ns. It now takes about 120 ns.
+* The rdflib plugin answers a pattern in a plain `Graph` whose subject and predicate are
+  IRIs it has seen with the kept engine nodes directly, without building the pattern
+  through its general conversion. A profile of `contains` had put 55% of its time in the
+  plugin's own Python, 30% in rdflib's code and 15% in native calls. So the earlier
+  finding that rdflib's code was the cause was only partly right.
+
+The comparison ran A/B/B/A in fresh processes pinned to six cores of an 8-vCPU AMD EPYC
+instance on Namespace, at 105,000 triples, with four process medians per arm. Figures
+before and after the round are below, with pyoxigraph in brackets. The small `VALUES`
+query went from 150 to 133 µs [138], the star lookup from 345 to 257 µs [285], the
+employee lookup from 157 to 129 µs [136] and the two-hop `knows` query from 101 to
+63 µs [56]. `MINUS`, the subquery and the grouped count went from 160, 149 and 125 µs to
+110, 98 and 87 µs, against 2.2 to 5.0 ms for pyoxigraph. `in` took 1.1 µs in both [1.5],
+the first object of `(s p ?)` 2.0 and 1.8 µs [1.4], `tx.add` 4.8 and 5.6 µs [5.0] and
+`extend` 5.0 and 4.4 µs [5.3]. Iterating every quad took 115 and 124 ms [124]. That code
+did not change, and on a laptop the two arms took 65 ms each, so the difference is the
+instance's noise. On the laptop, quiet and pinned to four performance cores, with one
+query per sample after a collection, the small `VALUES` query went from 118 to 68 µs
+[83] and the star lookup from 265 to 126 µs [228]. The peak RSS stayed at 331 MiB
+against pyoxigraph's 149 MiB.
+
+Through the plugin, with the Memory store in brackets, `contains` went from 3.5 to
+2.7 µs [2.9] and `Graph.value` from 5.4 to 4.0 µs [4.7], so both are now faster than
+the Memory store. On the laptop they went from 1.68 to 1.42 µs [0.98] and from 2.58 to
+2.34 µs [2.01]. The other plugin cases moved within the noise. Iterating every triple
+took 110 ms [184], `(s ? ?)` 13 µs [15] and a small query about 2 ms [3.6 to 4.2].
+
+The remaining gaps have these causes.
+
+* The two-hop `knows` query and `Graph.value` on the native API are within 7 µs and
+  0.4 µs of pyoxigraph. The first object of `(s p ?)` tied pyoxigraph in the previous
+  run, so it sits at the edge of the noise.
+* Each small query spends about 45 µs of the engine's 62 µs in planning and about 10 µs
+  in parsing, measured in Rust on the laptop. The plan cache designed in the third round
+  would remove both from a repeated query shape. Every query and call through PyO3 also
+  pays about 6% for `ReferencePool::drop_deferred_references`, as pyoxigraph does.
+* A small query through the plugin takes about 2 ms, against 0.14 to 0.22 ms on the
+  native API, because the plugin fills the store through transactions and the data stays
+  in the store's delta. The same query on the same data loaded in bulk takes the native
+  API's time. Compacting 100,000 quads held in memory took 8.9 s on a busy laptop. Both
+  belong to the engine's delta and compaction, not to the binding.

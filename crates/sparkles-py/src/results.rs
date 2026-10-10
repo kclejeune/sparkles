@@ -375,6 +375,20 @@ impl PyQuerySolution {
         Self { vars, values }
     }
     fn index(&self, key: &Bound<'_, PyAny>) -> PyResult<usize> {
+        // A name is the common key. It is tried first, because a failed integer
+        // conversion makes and discards a Python exception.
+        let position = |name: &str| {
+            self.vars
+                .iter()
+                .position(|v| v == name)
+                .ok_or_else(|| PyKeyError::new_err(name.to_string()))
+        };
+        if let Ok(s) = key.cast::<PyString>() {
+            return position(s.to_str()?.trim_start_matches(['?', '$']));
+        }
+        if let Ok(v) = key.cast::<PyVariable>() {
+            return position(&v.get().name);
+        }
         if let Ok(i) = key.extract::<isize>() {
             let n = self.values.len() as isize;
             let j = if i < 0 { i + n } else { i };
@@ -383,19 +397,9 @@ impl PyQuerySolution {
             }
             return Ok(j as usize);
         }
-        let name = if let Ok(v) = key.cast::<PyVariable>() {
-            v.get().name.clone()
-        } else if let Ok(s) = key.cast::<PyString>() {
-            s.to_str()?.trim_start_matches(['?', '$']).to_string()
-        } else {
-            return Err(PyTypeError::new_err(
-                "a solution is indexed by int, str or Variable",
-            ));
-        };
-        self.vars
-            .iter()
-            .position(|v| *v == name)
-            .ok_or_else(|| PyKeyError::new_err(name))
+        Err(PyTypeError::new_err(
+            "a solution is indexed by int, str or Variable",
+        ))
     }
 
     fn value<'py>(&self, py: Python<'py>, i: usize) -> PyResult<Option<Bound<'py, PyAny>>> {

@@ -32,7 +32,7 @@ uuid = { version = "1", features = ["v4"] }
 napi-build = "2"
 
 [features]
-default = ["reasoning", "shacl", "shex", "text", "geo", "backup", "graphql"]
+default = ["reasoning", "shacl", "shex", "text", "geo", "backup", "graphql", "mimalloc"]
 reasoning = ["sparkles/reasoning", "dep:sparkles-reasoner"]
 shacl = ["sparkles/shacl", "dep:sparkles-shacl"]
 shex = ["sparkles/shex", "dep:sparkles-shex"]
@@ -40,7 +40,9 @@ text = ["sparkles/text"]
 geo = ["sparkles/geo"]
 backup = ["sparkles/backup", "sparkles/backup-s3"]
 graphql = ["sparkles/graphql"]
-# mimalloc as the global allocator of the library's own allocations, as in the server
+# mimalloc as the global allocator of the library's own allocations, as in the server. It is
+# on by default, because single adds, bulk adds and has() took 15 to 20% less time with it.
+# The process keeps more memory in exchange (P05 Outcome).
 mimalloc = ["dep:mimalloc"]
 
 [workspace]

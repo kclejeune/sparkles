@@ -286,9 +286,17 @@ impl PyDataset {
         let ds = self.ds(py)?;
         let (mut opts, at) = query_options(&args)?;
         apply_defaults(&mut opts, &ds.query_options(), &args)?;
-        let cancel = opts.cancel.clone().unwrap_or_default();
+        // a query may run again (interrupt::run_again), with the cancellation flag of
+        // each attempt unless the caller passed a token
+        let token = args
+            .cancel
+            .as_ref()
+            .is_some_and(|t| !t.is_none())
+            .then(|| opts.cancel.clone().unwrap_or_default());
         let query = query.to_string();
-        let r = interrupt::run(py, &cancel, move || {
+        let r = interrupt::run_again(py, token, move |flag| {
+            let mut opts = opts.clone();
+            opts.cancel = Some(flag);
             query_at(&ds, &query, &opts, at.as_ref())
         })?;
         result_to_py(py, r, want)

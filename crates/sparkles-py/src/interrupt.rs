@@ -196,6 +196,123 @@ pub fn run<T: Send + 'static>(
     }
 }
 
+/// Run a request that is safe to run again, such as a query, without the GIL. `f` gets
+/// the cancellation flag of each attempt. With a `token`, or where the signal wakeup
+/// descriptor is taken, this is [`run`] with the token's flag.
+///
+/// On Python's main thread the request runs in place, which saves the hand-off to the
+/// helper thread. That hand-off cost 50 to 80 µs when the helper had gone to sleep,
+/// which is the usual case for a request that follows other Python work. While the
+/// request runs, Python's signal wakeup descriptor points at a socket that a watcher
+/// thread reads. Python's C signal handler writes to it for every signal that has a
+/// Python handler, and the watcher then cancels the request. The main thread runs the
+/// handlers when the request returns. When a handler raises, such as
+/// `KeyboardInterrupt` on Ctrl-C, its exception propagates as with [`run`]. When none
+/// raises, the cancelled request runs again.
+pub fn run_again<T: Send + 'static>(
+    py: Python<'_>,
+    token: Option<Arc<AtomicBool>>,
+    f: impl Fn(Arc<AtomicBool>) -> sparkles::Result<T> + Send + Sync + 'static,
+) -> PyResult<T> {
+    if let Some(flag) = token {
+        let cancel = flag.clone();
+        return run(py, &cancel, move || f(flag));
+    }
+    if !on_main_thread(py)? {
+        return py.detach(|| f(Arc::new(AtomicBool::new(false)))).py(py);
+    }
+    #[cfg(unix)]
+    if let Some(r) = wakeup::run_in_place(py, &f) {
+        return r;
+    }
+    let flag = Arc::new(AtomicBool::new(false));
+    let cancel = flag.clone();
+    run(py, &cancel, move || f(flag))
+}
+
+#[cfg(unix)]
+mod wakeup {
+    use super::*;
+    use std::io::Read;
+    use std::os::fd::IntoRawFd;
+    use std::os::unix::net::UnixStream;
+    use std::sync::OnceLock;
+
+    /// The write end of the socket the watcher reads, once it runs.
+    static SOCKET: OnceLock<Option<i32>> = OnceLock::new();
+    /// The cancellation flag of the request running in place on the main thread.
+    static CURRENT: Mutex<Option<Arc<AtomicBool>>> = Mutex::new(None);
+    /// `signal.set_wakeup_fd`.
+    static SET_WAKEUP_FD: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+
+    /// The write end of the watcher's socket, starting the watcher on first use.
+    fn socket() -> Option<i32> {
+        *SOCKET.get_or_init(|| {
+            let (mut rx, tx) = UnixStream::pair().ok()?;
+            // Python requires a non-blocking descriptor, and a full socket drops bytes
+            tx.set_nonblocking(true).ok()?;
+            std::thread::Builder::new()
+                .name("sparkles-signals".into())
+                .spawn(move || {
+                    let mut buf = [0u8; 64];
+                    loop {
+                        match rx.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(_) => {
+                                let current = CURRENT.lock().unwrap_or_else(|e| e.into_inner());
+                                if let Some(flag) = current.as_ref() {
+                                    flag.store(true, Ordering::Relaxed);
+                                }
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                            Err(_) => break,
+                        }
+                    }
+                })
+                .ok()?;
+            Some(tx.into_raw_fd())
+        })
+    }
+
+    /// Point Python's wakeup descriptor at `fd`, returning the previous one.
+    fn set_wakeup_fd(py: Python<'_>, fd: i64) -> Option<i64> {
+        let set = SET_WAKEUP_FD
+            .get_or_try_init(py, || -> PyResult<_> {
+                Ok(py.import("signal")?.getattr("set_wakeup_fd")?.unbind())
+            })
+            .ok()?;
+        set.bind(py).call1((fd,)).ok()?.extract().ok()
+    }
+
+    /// Run `f` in place on the main thread, or `None` when the wakeup descriptor is
+    /// taken (asyncio sets one) or cannot be set.
+    pub(super) fn run_in_place<T: Send>(
+        py: Python<'_>,
+        f: &(impl Fn(Arc<AtomicBool>) -> sparkles::Result<T> + Sync),
+    ) -> Option<PyResult<T>> {
+        let fd = i64::from(socket()?);
+        loop {
+            let old = set_wakeup_fd(py, fd)?;
+            if old != -1 {
+                set_wakeup_fd(py, old);
+                return None;
+            }
+            let flag = Arc::new(AtomicBool::new(false));
+            *CURRENT.lock().unwrap_or_else(|e| e.into_inner()) = Some(flag.clone());
+            let r = py.detach(|| f(flag.clone()));
+            *CURRENT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            set_wakeup_fd(py, -1);
+            if let Err(e) = py.check_signals() {
+                return Some(Err(e));
+            }
+            // a signal whose handlers did not raise cancelled the request: run it again
+            if !(flag.load(Ordering::Relaxed) && matches!(r, Err(sparkles::Error::Cancelled))) {
+                return Some(r.py(py));
+            }
+        }
+    }
+}
+
 /// Run a controlled operation, retaining a callback exception until the worker has
 /// stopped. Progress may arrive from multiple engine threads; serialize reports and
 /// throttle them before acquiring the GIL.
