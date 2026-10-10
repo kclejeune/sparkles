@@ -16,7 +16,6 @@ import io.github.kclejeune.sparkles.jena.internal.ffi.QueryOpts
 import io.github.kclejeune.sparkles.jena.internal.ffi.SparklesJni
 import io.github.kclejeune.sparkles.jena.internal.mapError
 import io.github.kclejeune.sparkles.jena.SparklesInternalException
-import org.apache.jena.atlas.io.IndentedLineBuffer
 import org.apache.jena.atlas.io.IndentedWriter
 import org.apache.jena.graph.Node
 import org.apache.jena.query.Query
@@ -47,6 +46,7 @@ import org.apache.jena.sparql.serializer.SerializerRegistry
 import org.apache.jena.sparql.syntax.ElementGroup
 import org.apache.jena.sparql.util.Context
 import org.slf4j.LoggerFactory
+import java.io.Writer
 
 /**
  * The query engine (P04 §3.4): a whole query runs in Sparkles' planner and executor, and
@@ -169,11 +169,46 @@ public object QueryEngineSparkles {
      */
     private fun serialize(query: Query): String {
         if (query.explicitlySetBaseURI()) return query.serialize(Syntax.syntaxARQ)
-        val out = IndentedLineBuffer()
+        val out = TextBuffer()
         val factory = SerializerRegistry.get().getQuerySerializerFactory(Syntax.syntaxARQ)
         query.visit(factory.create(Syntax.syntaxARQ, Prologue(query.prefixMapping), out))
-        return out.toString()
+        return out.text()
     }
+}
+
+/**
+ * What Jena's `IndentedLineBuffer` does, over a `StringBuilder`. `IndentedLineBuffer` writes
+ * each character through a `StringWriter`, whose `StringBuffer` takes a lock for every
+ * character and grows from 16 characters, and that took about a third of the time of
+ * writing a small query.
+ */
+private class TextBuffer private constructor(private val sink: BuilderWriter) : IndentedWriter(sink, false) {
+    constructor() : this(BuilderWriter())
+
+    fun text(): String {
+        flush()
+        return sink.text.toString()
+    }
+}
+
+private class BuilderWriter : Writer() {
+    val text = StringBuilder(1024)
+
+    override fun write(c: Int) {
+        text.append(c.toChar())
+    }
+
+    override fun write(cbuf: CharArray, off: Int, len: Int) {
+        text.append(cbuf, off, len)
+    }
+
+    override fun write(str: String, off: Int, len: Int) {
+        text.append(str, off, off + len)
+    }
+
+    override fun flush() {}
+
+    override fun close() {}
 }
 
 /**
