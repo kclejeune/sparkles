@@ -449,6 +449,10 @@ pub struct Ctx {
     pub geo: crate::geo::memo::GeoMemo,
     /// notes for the plan's reader, without duplicates (see [`Ctx::warn`])
     warnings: parking_lot::Mutex<Vec<PlanWarning>>,
+    /// The plan of the operator that failed, as far as it ran, keyed by the address of
+    /// its node, until its parent takes it (see [`Ctx::take_failed`]). Execution state:
+    /// a plan shared between executions must not keep it.
+    failed: parking_lot::Mutex<Option<(usize, super::exec::PlanInfo)>>,
     /// FILTER selectivities measured on samples for this query, by conjunct text
     sampled: parking_lot::Mutex<FxHashMap<String, super::sample::Sampled>>,
     /// the star predicates registered per subject variable (see [`super::charsets`])
@@ -522,6 +526,7 @@ impl Ctx {
             opt: Optimizations::default(),
             geo: Default::default(),
             warnings: Default::default(),
+            failed: Default::default(),
             sampled: Default::default(),
             stars: Default::default(),
             probes: Default::default(),
@@ -686,6 +691,26 @@ impl Ctx {
         if !ws.contains(&w) && self.retain_cursor_bytes(w.message.len() as u64 + 128) {
             ws.push(w);
         }
+    }
+
+    /// Keep `info` as the plan of the failed node `node` (see [`Ctx::take_failed`]).
+    pub(super) fn set_failed(&self, node: &super::plan::Node, info: super::exec::PlanInfo) {
+        *self.failed.lock() = Some((node as *const _ as usize, info));
+    }
+
+    /// The plan of the failed node `node`, when the failure came from it.
+    pub(super) fn take_failed(&self, node: &super::plan::Node) -> Option<super::exec::PlanInfo> {
+        let mut f = self.failed.lock();
+        match &*f {
+            Some((at, _)) if *at == node as *const _ as usize => f.take().map(|(_, i)| i),
+            _ => None,
+        }
+    }
+
+    /// The plan of the operator tree that failed, as far as it ran, when a failure
+    /// recorded one.
+    pub fn failed_plan(&self) -> Option<super::exec::PlanInfo> {
+        self.failed.lock().take().map(|(_, i)| i)
     }
 
     /// The warnings recorded so far.

@@ -1234,6 +1234,8 @@ pub(crate) async fn run_query(
     };
     opts.initial_bindings = bindings;
     let in_place = at.is_none() && inline::available() && QUICK.is_quick(quick_key);
+    // the error body of the Sparkles format carries the plan as far as it ran
+    let failed_plan = sfmt == SolutionsFormat::Sparkles;
     let run = {
         let ds = ds.clone();
         move || {
@@ -1241,7 +1243,20 @@ pub(crate) async fn run_query(
             let t0 = crate::otel::start();
             let (snap, resolved) = history::snapshot_for(&ds, at.as_ref(), &opts)?;
             let seq = snap.commit;
-            let r = sparkles::sparql::query(snap, &query, &opts)?;
+            let r = match sparkles::sparql::query_with_plan(snap, &query, &opts) {
+                Ok(r) => r,
+                Err(f) => {
+                    let mut e: ApiError = f.error.into();
+                    if failed_plan && let (Some(plan), Some(body)) = (f.plan, e.1.as_object_mut()) {
+                        body.insert(
+                            "plan".into(),
+                            serde_json::to_value(&plan).unwrap_or_default(),
+                        );
+                        body.insert("commit".into(), seq.into());
+                    }
+                    return Err(e);
+                }
+            };
             tracing::debug!("query executed in {:?} ({} results)", t.elapsed(), r.len());
             Ok((r, seq, resolved, t0))
         }

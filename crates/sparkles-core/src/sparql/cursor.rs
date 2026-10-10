@@ -78,8 +78,10 @@ impl CursorStatus {
 
 /// Capability and partial runtime information. Incremental production can still
 /// retain growing state (for example query-created strings).
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
+///
+/// A written node and its operator carry the same `id`, the path of child indexes from
+/// the root, as the nodes of an eager plan do (see [`PlanInfo`]).
+#[derive(Clone, Debug)]
 pub struct CursorPlan {
     pub operator: PlanInfo,
     pub materializes: bool,
@@ -91,7 +93,54 @@ pub struct CursorPlan {
     pub children: Vec<CursorPlan>,
 }
 
+impl Serialize for CursorPlan {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        self.write("0", s)
+    }
+}
+
 impl CursorPlan {
+    fn write<S: serde::Serializer>(&self, id: &str, s: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        struct Operator<'a>(&'a PlanInfo, &'a str);
+        impl Serialize for Operator<'_> {
+            fn serialize<S: serde::Serializer>(
+                &self,
+                s: S,
+            ) -> std::result::Result<S::Ok, S::Error> {
+                let mut m = s.serialize_map(None)?;
+                self.0.serialize_members(self.1, &mut m)?;
+                m.serialize_entry("children", &[] as &[PlanInfo])?;
+                m.end()
+            }
+        }
+        struct Child<'a>(&'a CursorPlan, String);
+        impl Serialize for Child<'_> {
+            fn serialize<S: serde::Serializer>(
+                &self,
+                s: S,
+            ) -> std::result::Result<S::Ok, S::Error> {
+                self.0.write(&self.1, s)
+            }
+        }
+        let mut m = s.serialize_map(None)?;
+        m.serialize_entry("id", id)?;
+        m.serialize_entry("operator", &Operator(&self.operator, id))?;
+        m.serialize_entry("materializes", &self.materializes)?;
+        m.serialize_entry("fullInputBeforeOutput", &self.full_input_before_output)?;
+        m.serialize_entry("growingState", &self.growing_state)?;
+        m.serialize_entry("complete", &self.complete)?;
+        m.serialize_entry("reason", &self.reason)?;
+        let children: Vec<Child<'_>> = self
+            .children
+            .iter()
+            .enumerate()
+            .map(|(i, c)| Child(c, format!("{id}.{i}")))
+            .collect();
+        m.serialize_entry("children", &children)?;
+        m.end()
+    }
+
     pub fn has_materialization(&self) -> bool {
         self.materializes || self.children.iter().any(Self::has_materialization)
     }
@@ -730,7 +779,8 @@ pub fn query_execution(
                 Ok(QueryExecution::Select(Box::new(cursor)))
             } else {
                 let mut result =
-                    super::execute_prepared(&parsed, options, parse_ms, plan_ms, prepared)?;
+                    super::execute_prepared(&parsed, options, parse_ms, plan_ms, prepared)
+                        .map_err(|f| f.error)?;
                 if result.kind == QueryKind::Select {
                     super::select_star_order(query, &mut result);
                 }
@@ -932,6 +982,11 @@ impl QueryCursor {
                     }));
                 }
                 Err(error) => {
+                    // the counts so far, as the pull path keeps them
+                    if let Some(root) = &self.root {
+                        root.update_plan(&mut self.plan);
+                    }
+                    self.plan.operator.warnings = self.ctx.warnings();
                     self.failure = Some(error.to_string());
                     self.terminate(CursorStatus::Failed);
                     return Err(error);
@@ -991,6 +1046,16 @@ impl QueryCursor {
     }
 
     fn terminate(&mut self, status: CursorStatus) {
+        if status == CursorStatus::Complete {
+            // the query finished: an operator that did not finish had enough rows
+            fn stopped(p: &mut CursorPlan) {
+                if !p.complete && p.operator.actual_rows >= 0 && p.operator.skipped.is_none() {
+                    p.operator.stopped_early = true;
+                }
+                p.children.iter_mut().for_each(stopped);
+            }
+            stopped(&mut self.plan);
+        }
         self.status = status;
         self.ended = Some(Instant::now());
         // Destruction stays on the depth-protected calling thread.
@@ -1472,6 +1537,19 @@ impl Operator {
         let binary = incremental_binary
             .then(|| binary::Binary::new(ctx, &node))
             .transpose()?;
+        if binary.is_some()
+            && let Kind::Join {
+                algo: super::plan::JoinAlgo::Merge,
+                ..
+            } = node.kind
+        {
+            // the plan names what runs
+            info.operator = "HashJoin".into();
+            info.description = format!(
+                "{} [planned as a merge join: an input is not ordered on the key, so a hash join runs]",
+                info.description
+            );
+        }
         let heap = native_blocking && !materializes && topk::eligible(ctx, &node);
         let reason = (materializes || native_blocking || exists).then(|| {
             if let (true, Kind::OrderBy { limit: Some(k), .. }) = (heap, &node.kind) {
@@ -1616,33 +1694,38 @@ impl Operator {
     }
 
     fn describe(&self, ctx: &Ctx) -> CursorPlan {
+        // The subtree an eager kernel runs itself, in the shape of its eager plan.
+        fn eager(mut operator: PlanInfo, reason: &str) -> CursorPlan {
+            let children = std::mem::take(&mut operator.children);
+            CursorPlan {
+                operator,
+                materializes: true,
+                full_input_before_output: true,
+                growing_state: true,
+                complete: false,
+                reason: Some(reason.into()),
+                children: children.into_iter().map(|c| eager(c, reason)).collect(),
+            }
+        }
+        let described = |node: &Node| {
+            let mut d = exec::describe(ctx, node);
+            if ctx.graphs.is_some() {
+                d.redact();
+            }
+            d.children
+        };
         let children = match &self.state {
             State::Fallback {
                 node,
                 inputs: false,
                 ..
-            } => node
-                .children
-                .iter()
-                .map(|n| {
-                    fn fallback(ctx: &Ctx, node: &Node) -> CursorPlan {
-                        let mut operator = exec::describe(ctx, node);
-                        if ctx.graphs.is_some() {
-                            operator.redact();
-                        }
-                        operator.children.clear();
-                        CursorPlan {
-                            operator,
-                            materializes: true,
-                            full_input_before_output: true,
-                            growing_state: true,
-                            complete: false,
-                            reason: Some("inside an eager fallback subtree".into()),
-                            children: node.children.iter().map(|n| fallback(ctx, n)).collect(),
-                        }
-                    }
-                    fallback(ctx, n)
-                })
+            } => described(node)
+                .into_iter()
+                .map(|c| eager(c, "inside an eager fallback subtree"))
+                .collect(),
+            State::Scalar(node) if !node.children.is_empty() => described(node)
+                .into_iter()
+                .map(|c| eager(c, "read by its parent"))
                 .collect(),
             _ => self.children.iter().map(|c| c.describe(ctx)).collect(),
         };
@@ -1670,21 +1753,32 @@ impl Operator {
         plan.operator.actual_rows = self.info.actual_rows;
         plan.operator.time_ms = self.info.time_ms;
         plan.complete = self.done;
-        if self.materializes {
-            fn update(info: &PlanInfo, plan: &mut CursorPlan) {
-                plan.operator.actual_rows = info.actual_rows;
-                plan.operator.time_ms = info.time_ms;
-                plan.complete = info.actual_rows >= 0;
-                for (info, plan) in info.children.iter().zip(&mut plan.children) {
+        fn update(info: &PlanInfo, plan: &mut CursorPlan) {
+            plan.operator.actual_rows = info.actual_rows;
+            plan.operator.time_ms = info.time_ms;
+            plan.complete = info.actual_rows >= 0;
+            if plan.operator.description != info.description {
+                plan.operator.description.clone_from(&info.description);
+            }
+            plan.operator.counters.clone_from(&info.counters);
+            plan.operator.skipped.clone_from(&info.skipped);
+            plan.operator.stopped_early = info.stopped_early;
+            plan.operator.reruns = info.reruns;
+            plan.operator.cached = info.cached;
+            for (info, plan) in info.children.iter().zip(&mut plan.children) {
+                update(info, plan);
+            }
+        }
+        match &self.state {
+            State::Fallback {
+                loaded: Some(_), ..
+            } if self.materializes => update(&self.info, plan),
+            State::Scalar(_) if self.done => {
+                for (info, plan) in self.info.children.iter().zip(&mut plan.children) {
                     update(info, plan);
                 }
             }
-            if let State::Fallback {
-                loaded: Some(_), ..
-            } = &self.state
-            {
-                update(&self.info, plan);
-            }
+            _ => {}
         }
         for (child, plan) in self.children.iter().zip(&mut plan.children) {
             child.update_plan(plan);
@@ -1833,9 +1927,8 @@ impl Operator {
             ) {
                 ctx.produced(b.table.len)?;
             }
-            if !matches!(self.state, State::Fallback { .. }) {
-                self.info.actual_rows = self.rows.min(i64::MAX as usize) as i64;
-            }
+            // a fallback counts the rows it emitted; `materializedRows` holds its table
+            self.info.actual_rows = self.rows.min(i64::MAX as usize) as i64;
         } else {
             self.done = true;
         }
@@ -1853,7 +1946,12 @@ impl Operator {
             ctx.check()?;
             let batch = match &mut self.state {
                 State::Scalar(node) => {
-                    let (table, _) = exec::execute(ctx, node)?;
+                    let (table, mut info) = exec::execute(ctx, node)?;
+                    if ctx.graphs.is_some() {
+                        info.redact();
+                    }
+                    // the scans a count over key runs read itself
+                    self.info.children = info.children;
                     let charge = OwnedCharge::new(ctx, capacity_bytes(&table))?;
                     debug_assert!(table.len <= 1);
                     self.done = true;
@@ -1991,6 +2089,10 @@ impl Operator {
                             info.redact();
                         }
                         info.time_ms = self.info.time_ms;
+                        let mut counters = info.counters.take().unwrap_or_default();
+                        counters.insert("materializedRows".into(), table.len.into());
+                        info.counters = Some(counters);
+                        info.actual_rows = self.rows.min(i64::MAX as usize) as i64;
                         self.info = info;
                         let mut charge = OwnedCharge::new(ctx, capacity_bytes(&table))?;
                         // Parents rely on the planner's order, which the eager result
