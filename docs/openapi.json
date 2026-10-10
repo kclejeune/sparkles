@@ -3239,7 +3239,7 @@
         "type": "object"
       },
       "BriefResult": {
-        "description": "The brief of a project, an entity or a session.",
+        "description": "The brief of a project, an entity or a session. For a caller with `write` on the dataset, `review` and the `# review:` lines of `text` say what waits for review.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#importing-agent-memory"
         },
@@ -3277,6 +3277,9 @@
             "additionalProperties": true,
             "description": "The prefixes the compact terms use.",
             "type": "object"
+          },
+          "review": {
+            "$ref": "#/components/schemas/ReviewCounts"
           },
           "reviewedOnly": {
             "type": "boolean"
@@ -8233,7 +8236,7 @@
         "type": "object"
       },
       "MaintenanceStatus": {
-        "description": "The schedules of consolidation and retention.",
+        "description": "The schedules of consolidation and retention, and for a caller with `write` on a dataset with memory settings, the open items of its review inbox.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#memory-maintenance"
         },
@@ -8290,6 +8293,9 @@
               "settings"
             ],
             "type": "object"
+          },
+          "review": {
+            "$ref": "#/components/schemas/ReviewCounts"
           }
         },
         "required": [
@@ -12469,6 +12475,83 @@
           "dryRun",
           "delete",
           "keep"
+        ],
+        "type": "object"
+      },
+      "ReviewCounts": {
+        "description": "The open items of a dataset's memory review inbox, as the server last counted them.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#memory-maintenance"
+        },
+        "properties": {
+          "branches": {
+            "items": {
+              "properties": {
+                "created": {
+                  "type": "string"
+                },
+                "facts": {
+                  "description": "The facts the branch proposes, for the 10 newest branches.",
+                  "type": "integer"
+                },
+                "kind": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "name",
+                "kind",
+                "created"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "kinds": {
+            "additionalProperties": {
+              "properties": {
+                "oldest": {
+                  "description": "When the oldest open item of the kind arrived.",
+                  "type": "string"
+                },
+                "open": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "open"
+              ],
+              "type": "object"
+            },
+            "description": "The kinds with open items: `session`, `import`, `consolidation`, `ingest`, `review`, `inbox` or `proposal`.",
+            "type": "object"
+          },
+          "oldest": {
+            "description": "When the oldest open item arrived. Absent when nothing is open.",
+            "type": "string"
+          },
+          "open": {
+            "description": "Open items: unreviewed facts, and open review branches counted once each.",
+            "type": "integer"
+          },
+          "truncated": {
+            "description": "More than 5,000 unreviewed facts wait, and the count stopped there.",
+            "type": "boolean"
+          },
+          "updated": {
+            "description": "When the server last counted.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "open",
+          "kinds",
+          "branches",
+          "truncated",
+          "updated"
         ],
         "type": "object"
       },

@@ -4042,7 +4042,7 @@ export interface components {
             /** @description 0 to 1, 0.7 by default. */
             unreviewedWeight?: number;
         };
-        /** @description The brief of a project, an entity or a session. */
+        /** @description The brief of a project, an entity or a session. For a caller with `write` on the dataset, `review` and the `# review:` lines of `text` say what waits for review. */
         BriefResult: {
             citations?: {
                 [key: string]: unknown;
@@ -4059,6 +4059,7 @@ export interface components {
             prefixes?: {
                 [key: string]: unknown;
             };
+            review?: components["schemas"]["ReviewCounts"];
             reviewedOnly: boolean;
             scope: string;
             shown: number;
@@ -5513,7 +5514,7 @@ export interface components {
         Logout: {
             redirect: string | null;
         };
-        /** @description The schedules of consolidation and retention. */
+        /** @description The schedules of consolidation and retention, and for a caller with `write` on a dataset with memory settings, the open items of its review inbox. */
         MaintenanceStatus: {
             consolidation: {
                 /** @description When the last scheduled task started. */
@@ -5540,6 +5541,7 @@ export interface components {
                     [key: string]: unknown;
                 };
             };
+            review?: components["schemas"]["ReviewCounts"];
         };
         /** @description Everything that waits for a person: unreviewed session facts with their signals, by session, and the open review branches. */
         MemoryInbox: {
@@ -6789,6 +6791,32 @@ export interface components {
             dryRun: boolean;
             errors?: string[];
             keep: components["schemas"]["BackupSummary"][];
+        };
+        /** @description The open items of a dataset's memory review inbox, as the server last counted them. */
+        ReviewCounts: {
+            branches: {
+                created: string;
+                /** @description The facts the branch proposes, for the 10 newest branches. */
+                facts?: number;
+                kind: string;
+                name: string;
+            }[];
+            /** @description The kinds with open items: `session`, `import`, `consolidation`, `ingest`, `review`, `inbox` or `proposal`. */
+            kinds: {
+                [key: string]: {
+                    /** @description When the oldest open item of the kind arrived. */
+                    oldest?: string;
+                    open: number;
+                };
+            };
+            /** @description When the oldest open item arrived. Absent when nothing is open. */
+            oldest?: string;
+            /** @description Open items: unreviewed facts, and open review branches counted once each. */
+            open: number;
+            /** @description More than 5,000 unreviewed facts wait, and the count stopped there. */
+            truncated: boolean;
+            /** @description When the server last counted. */
+            updated: string;
         };
         Revoked: {
             revoked: number;
