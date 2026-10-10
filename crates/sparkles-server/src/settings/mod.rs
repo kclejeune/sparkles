@@ -146,6 +146,13 @@ pub fn kind(name: &str) -> Option<&'static Kind> {
     KINDS.iter().copied().find(|k| k.name == name)
 }
 
+impl Kind {
+    /// The built-in defaults, the first layer.
+    pub fn default_value(&self) -> Value {
+        (self.defaults)()
+    }
+}
+
 /// The file of ingest profiles and settings, of which the `ingest` kind holds the
 /// settings members.
 pub const INGEST_FILE: &str = "ingest.json";

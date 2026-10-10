@@ -1429,7 +1429,8 @@ enum Cmd {
     /// The storage quota of a persistent dataset: print it, set it (--max-mb), or go
     /// back to the default (--default)
     Quota(quota_cmd::QuotaArgs),
-    /// Layered dataset settings: check a settings file of serve --settings
+    /// Layered dataset settings: read and change them on a server, apply or check a
+    /// settings file of serve --settings
     Settings(settings_cmd::SettingsArgs),
     /// Manage datasets in a stopped server's catalog or on a running server
     Dataset {
