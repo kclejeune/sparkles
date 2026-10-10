@@ -426,6 +426,7 @@ pub(super) fn add_all(p: &mut Paths) {
     search(p);
     settings(p);
     format_and_mcp(p);
+    assist(p);
     backups(p);
     auth(p);
     protocol(p);
@@ -2065,6 +2066,24 @@ fn format_and_mcp(p: &mut Paths) {
             "Ends a legacy session.",
         )
         .resp("202", "Ended.", None),
+    );
+}
+
+fn assist(p: &mut Paths) {
+    let tag = "Models";
+    p.add(
+        op(GET, "/$/models", "listModelProviders", tag, "List model providers")
+            .doc("The providers of `serve --model-config`, their models with the detected structured-output level and last status, and the role lists. Keys are never returned, only the names of their secrets. `configured` is `false` without a configuration.")
+            .see("model-providers")
+            .json("200", "The providers and role lists.", "ModelProviders"),
+    );
+    p.add(
+        op(POST, "/$/models/{name}/test", "testModelProvider", tag, "Test a model provider")
+            .doc("Sends a short prompt to one model of the provider, detects its structured-output level again, and reports the latency, level and token counts. A failed call is a `200` with `ok` false and the error.")
+            .see("model-providers")
+            .body(false, "A `ModelTestRequest`.", json!({ "application/json": { "schema": sref("ModelTestRequest") } }))
+            .json("200", "The outcome.", "ModelTestResult")
+            .errors(&[400, 404]),
     );
 }
 

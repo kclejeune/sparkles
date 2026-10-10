@@ -8447,3 +8447,77 @@ is the equivalent HTTP status:
 | `internal` | 500 | Anything else. The message is "internal error (request id …)", and the error is logged at ERROR. |
 
 An unknown tool is a protocol error (`-32602`, "Unknown tool: NAME").
+
+## Natural-language questions
+
+These routes support asking a dataset questions in plain language (spec C18). The
+model pipeline itself runs in `sparkles ask` and in agents over MCP. The server routes
+here check and explain queries, run memory recalls, and describe the model providers.
+
+### Model providers
+
+The operator defines model providers in a JSON file passed to `serve --model-config`.
+Each provider has a name, a kind (`ollama`, `openai` for any endpoint that speaks the
+OpenAI chat protocol, or `anthropic`), an endpoint, and optionally the name of a secret
+that holds its API key. Keys are read from `--model-secret NAME=env:VARIABLE` or
+`--model-secret NAME=file:PATH` at each request. No route returns a key, and no route
+can create a provider or change its endpoint.
+
+```json
+{
+  "models": {
+    "providers": {
+      "local": { "kind": "ollama", "endpoint": "http://127.0.0.1:11434" },
+      "claude": {
+        "kind": "anthropic",
+        "endpoint": "https://api.anthropic.com",
+        "apiKey": { "secret": "anthropic" },
+        "budget": { "tokensPerDay": 2000000 }
+      }
+    },
+    "roles": {
+      "draft": [
+        { "provider": "local", "model": "qwen3:8b" },
+        { "provider": "claude", "model": "claude-sonnet-5" }
+      ],
+      "summarize": [{ "provider": "local", "model": "qwen3:8b" }]
+    }
+  }
+}
+```
+
+The roles are `draft`, `repair`, `summarize`, `extract`, `explain` and `optimize`. Each
+names an ordered list of provider and model pairs. A role without a list is turned off,
+except `repair`, which uses the `draft` list.
+
+A provider may also set `concurrency` (4 by default), `requestsPerMinute`,
+`allowedModels`, `connectTimeoutSecs`, extra `headers` for the `openai` kind, and the
+defaults of its models. The `models` member sets `contextTokens`, `maxOutputTokens`,
+`temperature`, `structuredOutput`, `pricing`, `requestTimeoutSecs` and, for Ollama,
+`numCtx` per model. Headers that carry credentials are refused, and so are endpoints
+with credentials, a query or a fragment. Requests go through the server's outbound
+policy, so a provider on a private address needs `--outbound-allow-private`.
+
+**Structured output.** Every model step asks for JSON that matches a schema. With
+`structuredOutput` set to `auto`, the server detects what each pair supports the first
+time it is called. It tries the provider's JSON Schema mode first (`format` for Ollama,
+`response_format` with `json_schema` for the OpenAI protocol, `output_config.format` for
+Anthropic), then a plain JSON mode, then plain text with the answer in a fenced block.
+The detected level is remembered until the server restarts or the pair is tested again.
+An answer that does not match the schema is retried once with the errors.
+
+**`GET /$/models`** (server admin) lists the providers with their kind, endpoint,
+status and models, and the role lists. A provider's `status` is `secret-missing` when
+its secret cannot be read. Each model shows its configured and detected
+structured-output level and the outcome of its last call. Without `--model-config`, the
+answer is `{"configured": false, "providers": [], "roles": {}}`.
+
+**`POST /$/models/{name}/test`** (server admin) sends a short prompt to one model of
+the provider. The optional body is `{"model": ..., "timeoutSeconds": ...}`, and the
+model defaults to the first one the role lists name for that provider. The answer
+reports `ok`, the structured-output `level`, the latency and the token counts. A failed
+call is still a `200`, with `ok` false and an `error` of `{code, message}`. The codes
+are `provider-unavailable`, `provider-auth`, `provider-rejected`, `refusal`,
+`invalid-output`, `secret-missing`, `budget-exceeded`, `outbound-refused`
+and `deadline`. An unknown provider is a `404` with code `unknown-provider`, and a
+server without providers answers `404` with code `no-models`.

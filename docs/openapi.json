@@ -5883,6 +5883,450 @@
         ],
         "type": "object"
       },
+      "ModelProviders": {
+        "description": "The model providers, their models and the role lists.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#model-providers"
+        },
+        "properties": {
+          "configured": {
+            "description": "Whether the server runs with `--model-config`.",
+            "type": "boolean"
+          },
+          "providers": {
+            "items": {
+              "properties": {
+                "allowedModels": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "apiKey": {
+                  "description": "The name of the secret that holds the key. The key itself is never returned.",
+                  "properties": {
+                    "secret": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "secret"
+                  ],
+                  "type": "object"
+                },
+                "budget": {
+                  "properties": {
+                    "tokensPerDay": {
+                      "type": "integer"
+                    },
+                    "usedToday": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "tokensPerDay",
+                    "usedToday"
+                  ],
+                  "type": "object"
+                },
+                "concurrency": {
+                  "type": "integer"
+                },
+                "endpoint": {
+                  "type": "string"
+                },
+                "kind": {
+                  "enum": [
+                    "ollama",
+                    "openai",
+                    "anthropic"
+                  ],
+                  "type": "string"
+                },
+                "models": {
+                  "items": {
+                    "properties": {
+                      "contextTokens": {
+                        "type": "integer"
+                      },
+                      "detected": {
+                        "oneOf": [
+                          {
+                            "description": "The level detected or configured for the pair, once known.",
+                            "enum": [
+                              "auto",
+                              "json-schema",
+                              "json-object",
+                              "tool",
+                              "text"
+                            ],
+                            "type": "string"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
+                      "maxOutputTokens": {
+                        "type": "integer"
+                      },
+                      "name": {
+                        "type": "string"
+                      },
+                      "pricing": {
+                        "properties": {
+                          "inputPerMTok": {
+                            "type": "number"
+                          },
+                          "outputPerMTok": {
+                            "type": "number"
+                          }
+                        },
+                        "required": [
+                          "inputPerMTok",
+                          "outputPerMTok"
+                        ],
+                        "type": "object"
+                      },
+                      "requestTimeoutSecs": {
+                        "type": "number"
+                      },
+                      "status": {
+                        "properties": {
+                          "at": {
+                            "format": "date-time",
+                            "type": "string"
+                          },
+                          "message": {
+                            "type": "string"
+                          },
+                          "state": {
+                            "enum": [
+                              "untested",
+                              "ok",
+                              "failing"
+                            ],
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "state"
+                        ],
+                        "type": "object"
+                      },
+                      "structuredOutput": {
+                        "description": "The configured level. `auto` detects it.",
+                        "enum": [
+                          "auto",
+                          "json-schema",
+                          "json-object",
+                          "tool",
+                          "text"
+                        ],
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "name",
+                      "contextTokens",
+                      "maxOutputTokens",
+                      "structuredOutput",
+                      "requestTimeoutSecs",
+                      "status"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "requestsPerMinute": {
+                  "type": "integer"
+                },
+                "status": {
+                  "description": "`secret-missing` when the named key cannot be read.",
+                  "enum": [
+                    "ok",
+                    "secret-missing"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "name",
+                "kind",
+                "endpoint",
+                "status",
+                "concurrency",
+                "models"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "roles": {
+            "properties": {
+              "draft": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "maxOutputTokens": {
+                      "type": "integer"
+                    },
+                    "model": {
+                      "type": "string"
+                    },
+                    "provider": {
+                      "type": "string"
+                    },
+                    "requestTimeoutSecs": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "provider",
+                    "model"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "explain": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "maxOutputTokens": {
+                      "type": "integer"
+                    },
+                    "model": {
+                      "type": "string"
+                    },
+                    "provider": {
+                      "type": "string"
+                    },
+                    "requestTimeoutSecs": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "provider",
+                    "model"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "extract": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "maxOutputTokens": {
+                      "type": "integer"
+                    },
+                    "model": {
+                      "type": "string"
+                    },
+                    "provider": {
+                      "type": "string"
+                    },
+                    "requestTimeoutSecs": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "provider",
+                    "model"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "optimize": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "maxOutputTokens": {
+                      "type": "integer"
+                    },
+                    "model": {
+                      "type": "string"
+                    },
+                    "provider": {
+                      "type": "string"
+                    },
+                    "requestTimeoutSecs": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "provider",
+                    "model"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "repair": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "maxOutputTokens": {
+                      "type": "integer"
+                    },
+                    "model": {
+                      "type": "string"
+                    },
+                    "provider": {
+                      "type": "string"
+                    },
+                    "requestTimeoutSecs": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "provider",
+                    "model"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "summarize": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "maxOutputTokens": {
+                      "type": "integer"
+                    },
+                    "model": {
+                      "type": "string"
+                    },
+                    "provider": {
+                      "type": "string"
+                    },
+                    "requestTimeoutSecs": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "provider",
+                    "model"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            },
+            "type": "object"
+          },
+          "routing": {
+            "additionalProperties": true,
+            "description": "The routing settings of the configuration.",
+            "type": "object"
+          }
+        },
+        "required": [
+          "configured",
+          "providers",
+          "roles"
+        ],
+        "type": "object"
+      },
+      "ModelTestRequest": {
+        "additionalProperties": false,
+        "description": "A test call to one provider and model.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#model-providers"
+        },
+        "properties": {
+          "model": {
+            "description": "The model to test. By default the first one the role lists name.",
+            "type": "string"
+          },
+          "timeoutSeconds": {
+            "description": "At most 600. 60 by default.",
+            "type": "number"
+          }
+        },
+        "type": "object"
+      },
+      "ModelTestResult": {
+        "description": "The outcome of a test call.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#model-providers"
+        },
+        "properties": {
+          "error": {
+            "properties": {
+              "code": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "code",
+              "message"
+            ],
+            "type": "object"
+          },
+          "inputTokens": {
+            "type": "integer"
+          },
+          "latencyMs": {
+            "type": "integer"
+          },
+          "level": {
+            "oneOf": [
+              {
+                "enum": [
+                  "auto",
+                  "json-schema",
+                  "json-object",
+                  "tool",
+                  "text"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "model": {
+            "type": "string"
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "outputTokens": {
+            "type": "integer"
+          },
+          "provider": {
+            "type": "string"
+          },
+          "requests": {
+            "type": "integer"
+          },
+          "structuredOutput": {
+            "description": "Whether the answer came at a structured level.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "provider",
+          "model",
+          "ok",
+          "structuredOutput",
+          "latencyMs",
+          "inputTokens",
+          "outputTokens",
+          "requests"
+        ],
+        "type": "object"
+      },
       "NamedSnapshot": {
         "description": "A named snapshot: the commit it pins and its expiry.",
         "externalDocs": {
@@ -16629,6 +17073,116 @@
           "Server"
         ],
         "x-sparkles-permission": "metrics"
+      }
+    },
+    "/$/models": {
+      "get": {
+        "description": "The providers of `serve --model-config`, their models with the detected structured-output level and last status, and the role lists. Keys are never returned, only the names of their secrets. `configured` is `false` without a configuration.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#model-providers"
+        },
+        "operationId": "listModelProviders",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelProviders"
+                }
+              }
+            },
+            "description": "The providers and role lists."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "List model providers",
+        "tags": [
+          "Models"
+        ],
+        "x-sparkles-permission": "server-admin"
+      }
+    },
+    "/$/models/{name}/test": {
+      "post": {
+        "description": "Sends a short prompt to one model of the provider, detects its structured-output level again, and reports the latency, level and token counts. A failed call is a `200` with `ok` false and the error.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#model-providers"
+        },
+        "operationId": "testModelProvider",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/name"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ModelTestRequest"
+              }
+            }
+          },
+          "description": "A `ModelTestRequest`.",
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelTestResult"
+                }
+              }
+            },
+            "description": "The outcome."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Test a model provider",
+        "tags": [
+          "Models"
+        ],
+        "x-sparkles-permission": "server-admin"
       }
     },
     "/$/openapi.json": {
@@ -28009,6 +28563,13 @@
         "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#http-endpoint-mcp"
       },
       "name": "MCP"
+    },
+    {
+      "description": "Model providers and the role lists of the question pipeline.",
+      "externalDocs": {
+        "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#model-providers"
+      },
+      "name": "Models"
     },
     {
       "description": "This description.",

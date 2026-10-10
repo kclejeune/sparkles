@@ -251,6 +251,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     let app = app.merge(crate::rdfs::routes());
     // DESCRIBE settings (`/$/describe`)
     let app = app.merge(describe::routes());
+    let app = app.merge(crate::models::http::routes());
     // backup repositories, per-dataset backups and backup policies
     #[cfg(feature = "backup")]
     let app = app.merge(crate::backup::http::routes());
@@ -527,6 +528,16 @@ pub(crate) fn add_request_id(resp: &mut Response, id: Option<String>) {
 
 pub(crate) fn err(status: StatusCode, msg: impl Into<String>) -> ApiError {
     ApiError(status, json!({ "error": msg.into() }))
+}
+
+/// An error with a machine-readable `code` next to its message.
+pub(crate) fn err_code(status: StatusCode, code: &str, msg: impl Into<String>) -> ApiError {
+    ApiError(status, json!({ "error": msg.into(), "code": code }))
+}
+
+/// An error with a JSON body of the caller's making (it must hold `error`).
+pub(crate) fn err_body(status: StatusCode, body: J) -> ApiError {
+    ApiError(status, body)
 }
 
 impl From<Error> for ApiError {

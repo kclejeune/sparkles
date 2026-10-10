@@ -112,6 +112,9 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/lint", &["POST"]),
     // MCP (`serve --mcp`): every message is checked against the caller's datasets
     ("/$/mcp", &["*"]),
+    // model providers (spec C18 §3.4): defined by `serve --model-config` only
+    ("/$/models", &["GET"]),
+    ("/$/models/{name}/test", &["POST"]),
     // backup repositories (feature `backup`)
     ("/$/repositories", &["GET", "POST"]),
     ("/$/repositories/{repo}", &["GET", "PUT", "DELETE"]),
@@ -239,6 +242,8 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         // a pure computation over the request's literals
         "/$/geo/convert" => Caller,
         "/$/metrics" => Server(ServerPerm::Metrics),
+        // endpoints, models, budgets and the secret names of the operator's providers
+        "/$/models" | "/$/models/{name}/test" => Server(ServerPerm::ServerAdmin),
         "/$/datasets" if get => Caller,
         "/$/datasets" => Server(ServerPerm::ServerAdmin),
         "/$/datasets/{ds}/rename" => Server(ServerPerm::ServerAdmin),

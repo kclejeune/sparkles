@@ -9,6 +9,7 @@ use super::{api_doc, sref};
 use serde_json::{Map, Value as J, json};
 
 mod admin;
+mod assist;
 mod changes;
 mod features;
 mod kit;
@@ -1237,5 +1238,6 @@ pub(super) fn schemas() -> Map<String, J> {
     changes::put_all(&mut put);
     features::put_all(&mut put);
     policies::put_all(&mut put);
+    assist::put_all(&mut put);
     s
 }
