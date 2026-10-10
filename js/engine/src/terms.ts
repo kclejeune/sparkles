@@ -7,7 +7,8 @@ import { InvalidInputError } from '@sparkles-rdf/common';
 // the unused entry 0, rows and cells per row), four words per term entry, then the cells.
 // An entry's first word is its kind plus a handle number shifted left by 8. A handle asks
 // the addon to keep the term under that number, and later requests send the number with
-// bit 31 set instead of the term. Offsets count UTF-16 units.
+// bit 31 set instead of the term. Offsets count UTF-16 units. The array may be longer
+// than the request, whose length the header gives.
 
 const NAMED = 1;
 const BLANK = 2;
@@ -35,18 +36,37 @@ export class TermCache {
   private defaultGraph = 0;
   private next = 1;
   private reset = false;
-  /** the header and the entries of the request being encoded */
+  /** the request handed to the addon: the header and the entries, then the cells */
   private head = new Uint32Array(256);
   private entries = 0;
-  /** its cells */
+  /** the cells of the request being encoded */
   private cells = new Uint32Array(64);
   private cellCount = 0;
   private text = '';
   private units = 0;
-  /** the request handed to the addon */
-  private out = new Uint32Array(256);
 
-  /** Encode quads. The request is valid until the next one is encoded. */
+  /** Encode one quad, as `encode([quad])` does. */
+  encodeQuad(q: RDF.Quad): { text: string; data: Uint32Array } {
+    try {
+      this.begin(1);
+      if (!q || q.termType !== 'Quad') throw new InvalidInputError('Expected an RDF quad');
+      this.row(
+        this.cell(q.subject),
+        this.cell(q.predicate),
+        this.cell(q.object),
+        this.cell(q.graph),
+      );
+      return this.end(1);
+    } catch (e) {
+      this.forget();
+      throw e;
+    }
+  }
+
+  /**
+   * Encode quads. The request is valid until the next one is encoded, and it is a prefix
+   * of `data`, whose header gives its length.
+   */
   encode(quads: readonly RDF.Quad[]): { text: string; data: Uint32Array } {
     try {
       this.begin(quads.length);
@@ -110,13 +130,20 @@ export class TermCache {
 
   private end(rows: number) {
     const at = 4 + 4 * this.entries;
+    const n = this.cellCount;
     // The addon reads a request before the call returns, so one buffer serves them all
-    // and no request allocates memory outside the JavaScript heap.
-    if (this.out.length < at + this.cellCount)
-      this.out = new Uint32Array(Math.max(2 * this.out.length, at + this.cellCount));
-    const data = this.out.subarray(0, at + this.cellCount);
-    data.set(this.head.subarray(0, at));
-    data.set(this.cells.subarray(0, this.cellCount), at);
+    // and no request allocates memory outside the JavaScript heap. The entries are
+    // already in it, and the addon reads the request from its start, so the buffer is
+    // handed over whole and no call makes a view of it.
+    if (this.head.length < at + n) {
+      const grown = new Uint32Array(Math.max(2 * this.head.length, at + n));
+      grown.set(this.head.subarray(0, at));
+      this.head = grown;
+    }
+    const data = this.head;
+    const c = this.cells;
+    if (n <= 64) for (let i = 0; i < n; i++) data[at + i] = c[i];
+    else data.set(c.subarray(0, n), at);
     data[0] = this.reset ? RESET : 0;
     data[1] = this.entries;
     data[2] = rows;

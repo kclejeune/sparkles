@@ -75,6 +75,21 @@ test('a rolled back term is not found, and adding it again works', async () => {
   assert.equal(await ds.has(quad), true);
 });
 
+test('a term found missing is found once a commit adds it', async () => {
+  const ds = Dataset.memory();
+  await ds.add(q(n('a'), n('p'), n('o')));
+  const absent = q(n('a'), n('p'), n('later'));
+  // the addon remembers that the term is missing, for as long as the vocabulary is unchanged
+  assert.equal(await ds.has(absent), false);
+  assert.equal(await ds.has(absent), false);
+  await ds.add(q(n('other'), n('p'), n('o')));
+  assert.equal(await ds.has(absent), false);
+  await ds.add(absent);
+  assert.equal(await ds.has(absent), true);
+  await ds.delete(absent);
+  assert.equal(await ds.has(absent), false);
+});
+
 test('a rejected request does not leave numbers the addon lacks', async () => {
   const ds = Dataset.memory();
   await ds.add(q(n('a'), n('p'), n('o')));

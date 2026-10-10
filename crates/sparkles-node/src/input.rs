@@ -57,7 +57,17 @@ pub struct Handle {
     pub cell: Cell,
     /// no blank nodes, whose labels a transaction scopes, so the id may be kept
     keep: bool,
-    id: Mutex<Option<(Stamp, Id)>>,
+    id: Mutex<Known>,
+}
+
+/// What a handle knows of its term in the store.
+#[derive(Clone, Copy)]
+enum Known {
+    Nothing,
+    Id(Stamp, Id),
+    /// Not in the vocabulary while the delta vocabulary had this many terms. The
+    /// vocabulary of a generation only grows until a rollback, which changes the epoch.
+    Absent(Stamp, u64),
 }
 
 impl Handle {
@@ -70,20 +80,33 @@ impl Handle {
         Handle {
             cell,
             keep,
-            id: Mutex::new(None),
+            id: Mutex::new(Known::Nothing),
         }
     }
 
     fn cached(&self, stamp: Stamp) -> Option<Id> {
         match *self.id.lock() {
-            Some((s, id)) if s == stamp => Some(id),
+            Known::Id(s, id) if s == stamp => Some(id),
             _ => None,
         }
     }
 
     fn remember(&self, stamp: Stamp, id: Id) {
         if self.keep {
-            *self.id.lock() = Some((stamp, id));
+            *self.id.lock() = Known::Id(stamp, id);
+        }
+    }
+
+    /// Whether the term was missing from a vocabulary of the same length, so that a probe
+    /// for an absent term, such as `has()` with a value that was never stored, skips the
+    /// lookup of its text.
+    fn known_absent(&self, stamp: Stamp, dvocab_len: u64) -> bool {
+        matches!(*self.id.lock(), Known::Absent(s, n) if s == stamp && n == dvocab_len)
+    }
+
+    fn remember_absent(&self, stamp: Stamp, dvocab_len: u64) {
+        if self.keep {
+            *self.id.lock() = Known::Absent(stamp, dvocab_len);
         }
     }
 
@@ -201,14 +224,15 @@ fn read_into(table: &mut Vec<Option<Arc<Handle>>>, text: &str, data: &[u32]) -> 
         .checked_mul(4)
         .and_then(|n| n.checked_add(4))
         .ok_or_else(bad)?;
-    if entries == 0
-        || rows
-            .checked_mul(width)
-            .and_then(|n| n.checked_add(cells_at))
-            != Some(data.len())
+    // The request is a prefix of `data`: JavaScript hands over its whole request buffer,
+    // which saves making a view of the exact length for every call.
+    let data = match rows
+        .checked_mul(width)
+        .and_then(|n| n.checked_add(cells_at))
     {
-        return Err(bad());
-    }
+        Some(len) if entries > 0 && len <= data.len() => &data[..len],
+        _ => return Err(bad()),
+    };
     if flags & RESET != 0 {
         table.clear();
     }
@@ -416,11 +440,15 @@ impl Request {
                 }
                 Some(id) => id,
                 None => {
+                    if h.known_absent(stamp, snap.dvocab_len) {
+                        return Ok(Some(false));
+                    }
                     let found = match &h.cell {
                         Cell::DefaultGraph => Some(Id::DEFAULT_GRAPH),
                         Cell::Term(t) => snap.lookup_term(t),
                     };
                     let Some(id) = found else {
+                        h.remember_absent(stamp, snap.dvocab_len);
                         return Ok(Some(false));
                     };
                     h.remember(stamp, id);

@@ -69,6 +69,12 @@ const INLINE_ROWS = 16;
 const ADD_BATCH = 4096;
 /** the information of a quad scan, which `info()` would only repeat */
 const scanInfo = { type: 'quads' };
+/**
+ * The settled answers of a call that finished on this thread, such as `has()` on a
+ * dataset in memory. Handing out one settled promise saves making one per call.
+ */
+const settledTrue = Promise.resolve(true);
+const settledFalse = Promise.resolve(false);
 export interface EngineConfiguration {
   /** rows per streaming batch (default 1024) */
   batchSize?: number;
@@ -947,20 +953,28 @@ export class Dataset extends Queryable {
       this.handle.matched(pattern(s, p, o, g), defaults.batchSize, defaults.batchBytes),
     ).then((handle) => this.result(handle, {}, scanInfo) as QuadsResult);
   }
-  async has(quad: RDF.Quad) {
+  has(quad: RDF.Quad): Promise<boolean> {
     if (this.path === null) {
-      // In memory, a lookup takes microseconds, so it runs on this thread.
-      this.check();
-      const { text, data } = this.terms.encode([quad]);
+      // In memory, a lookup takes microseconds, so it runs on this thread, and its
+      // answer is a promise that is already settled.
       let found: boolean | null;
       try {
-        found = this.handle.containsTerms(text, data);
+        this.check();
+        const { text, data } = this.terms.encodeQuad(quad);
+        try {
+          found = this.handle.containsTerms(text, data);
+        } catch (e) {
+          this.terms.forget();
+          throw nativeError(e);
+        }
       } catch (e) {
-        this.terms.forget();
-        throw nativeError(e);
+        return Promise.reject(e);
       }
-      if (found !== null) return found;
+      if (found !== null) return found ? settledTrue : settledFalse;
     }
+    return this.hasMatch(quad);
+  }
+  private async hasMatch(quad: RDF.Quad) {
     for await (const _ of this.match(quad.subject, quad.predicate, quad.object, quad.graph))
       return true;
     return false;
@@ -1456,9 +1470,26 @@ export class Transaction extends Queryable {
     // the transaction's thread answers later: later requests queue behind this one
     return this.call({}, () => r);
   }
-  private writeNow(insert: boolean, quads: readonly RDF.Quad[]) {
+  /**
+   * Insert or remove one quad, as `write` does. A write that the addon applies before it
+   * returns answers with a promise that is already settled.
+   */
+  private writeOne(insert: boolean, quad: RDF.Quad): Promise<boolean> {
+    if (this.inflight > 0 || this.ended) return this.write(insert, [quad]).then((n) => n > 0);
+    let r: number | Promise<number>;
+    try {
+      r = this.writeNow(insert, quad);
+    } catch (e) {
+      return Promise.reject(nativeError(e));
+    }
+    if (typeof r === 'number') return r > 0 ? settledTrue : settledFalse;
+    return this.call({}, () => r).then((n) => n > 0);
+  }
+  private writeNow(insert: boolean, quads: readonly RDF.Quad[] | RDF.Quad) {
     const terms = this.ds.terms;
-    const { text, data } = terms.encode(quads);
+    const { text, data } = Array.isArray(quads)
+      ? terms.encode(quads)
+      : terms.encodeQuad(quads as RDF.Quad);
     try {
       return this.handle.write(insert, text, data);
     } catch (e) {
@@ -1530,11 +1561,11 @@ export class Transaction extends Queryable {
     if (batch.length) inserted += await this.write(true, batch);
     return BigInt(inserted);
   }
-  async add(quad: RDF.Quad) {
-    return (await this.write(true, [quad])) > 0;
+  add(quad: RDF.Quad): Promise<boolean> {
+    return this.writeOne(true, quad);
   }
-  async delete(quad: RDF.Quad) {
-    return (await this.write(false, [quad])) > 0;
+  delete(quad: RDF.Quad): Promise<boolean> {
+    return this.writeOne(false, quad);
   }
   match(s?: RDF.Term | null, p?: RDF.Term | null, o?: RDF.Term | null, g?: RDF.Term | null) {
     return deferredQuads(
