@@ -92,6 +92,9 @@ pub(crate) struct Entry {
     /// the upstream commit kept readable for merges
     #[serde(default)]
     pub base_hold: Option<FromRef>,
+    /// set on a scratch branch (C17 §5.7)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scratch: Option<branch::Scratch>,
 }
 
 /// A deleted branch: kept so that the commits other branches merged from it still have
@@ -1405,6 +1408,7 @@ impl Store {
                     generation: self.snapshot().generation.name.clone(),
                 },
                 broken: false,
+                scratch: None,
             });
         }
         let e = set.entry(name)?;
@@ -1435,6 +1439,7 @@ impl Store {
                 generation: String::new(),
             },
             broken: set.broken.lock().contains(&e.id),
+            scratch: e.scratch.clone(),
         };
         if info.broken {
             return Ok(info);
@@ -1575,6 +1580,24 @@ impl Store {
         self.branch_info(name)
     }
 
+    /// Mark a branch as a scratch branch, or clear the mark (`None`). `main` is never
+    /// a scratch branch.
+    pub fn set_branch_scratch(
+        &self,
+        name: &str,
+        scratch: Option<branch::Scratch>,
+    ) -> Result<BranchInfo> {
+        if name == MAIN {
+            return Err(branch::invalid_branch("main cannot be a scratch branch"));
+        }
+        self.update_entry(name, |_, e| {
+            if let Some(e) = e {
+                e.scratch = scratch.clone();
+            }
+        })?;
+        self.branch_info(name)
+    }
+
     fn update_entry(
         &self,
         name: &str,
@@ -1707,6 +1730,7 @@ impl Store {
                     branch_id: up_store.dataset_id,
                     seq: start.commit.seq,
                 }),
+                scratch: None,
             };
             t.next_ordinal += 1;
             t.branches.push(e.clone());
@@ -1863,6 +1887,7 @@ impl Store {
             note: o.note.clone(),
             holds: Vec::new(),
             base_hold: Some(from),
+            scratch: None,
         });
         let store = Arc::new(store);
         let mut bases = set.memory_bases.lock();

@@ -166,6 +166,7 @@ export function buildDefinition(
   query: string,
   description: string,
   rows: ParamRow[],
+  questions: string[] = [],
 ): StoredDefinition {
   const parameters: Record<string, StoredParam> = {};
   for (const r of rows) {
@@ -179,6 +180,8 @@ export function buildDefinition(
   const def: StoredDefinition = { query };
   if (description.trim()) def.description = description.trim();
   if (Object.keys(parameters).length) def.parameters = parameters;
+  const qs = questions.map((q) => q.trim()).filter(Boolean);
+  if (qs.length) def.questions = qs.slice(0, 20);
   return def;
 }
 

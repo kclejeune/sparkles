@@ -41,6 +41,10 @@ without a migration path, so keep backups of anything you cannot regenerate.
 * [Embeddings computed on write](#embeddings-computed-on-write)
 * [Checking a database](#checking-a-database)
 * [MCP server (LLM agents)](#mcp-server-llm-agents)
+  * [Handing a query to the web UI](#handing-a-query-to-the-web-ui)
+  * [Agent memory grants](#agent-memory-grants)
+* [Asking questions with a model](#asking-questions-with-a-model)
+  * [Measuring models](#measuring-models)
 * [Embedding the library](#embedding-the-library)
 * [Python](#python)
 * [JVM (Apache Jena)](#jvm-apache-jena)
@@ -64,7 +68,9 @@ sparkles serve --data ./data --port 3030   # UI at http://localhost:3030/ui/
 
 The server and CLI use [mimalloc](https://github.com/microsoft/mimalloc) as their
 allocator. It comes from the `mimalloc` cargo feature of `sparkles-server`, which is on
-by default. The `sparkles` library leaves the choice of allocator to its embedder. Once
+by default. The `sparkles` library leaves the choice of allocator to its embedder. The
+Python extension and the JVM library use mimalloc for their own allocations by default,
+and the Node.js addon uses the system allocator. Once
 no request has been active for `--idle-release-ms` (default 1000 ms), `sparkles serve`
 hands free heap memory back to the OS. The interval counts from the end of the last
 request, so requests that keep arriving, even with short gaps, never meet a release. A build with
@@ -2155,6 +2161,18 @@ The tools are read-only unless the operator turns on the write tool:
   conditional. It happens only while that commit is still the head, so an agent that
   read commit 42 does not overwrite a change it has not seen. Hosts that confirm
   destructive tools ask before each call.
+* `assert_facts` is how an agent remembers. It writes facts into one named graph per
+  source or session, each with a reifier that records the source, the time, the caller
+  and, when given, a confidence and a supporting quote. New entities get minted IRIs.
+  The call refuses unknown predicates and classes, IRIs that occur nowhere and likely
+  duplicates of existing entities, and reports every problem at once. `mode: "replace"`
+  supersedes an old value and keeps the record of it, and `retract` removes a fact the
+  same way. An `idempotencyKey` makes a retried call write nothing. It is offered with
+  `sparql_update`.
+* `list_branches`, `create_branch`, `merge_branch` and `delete_branch` let an agent try
+  writes on a scratch branch and keep `main` unchanged. Every tool that reads or writes
+  a dataset takes `branch`. `merge_branch` previews by default and refuses merges with
+  conflicts. The write tools among them are offered with `sparql_update`.
 
 Hosts can also attach resources as context: the schema summary
 (`sparkles://{ds}/schema`) and the prefixes (`sparkles://{ds}/prefixes`) of each
@@ -2163,7 +2181,9 @@ The prompts `explore_dataset` and `answer_question` start a session with the too
 workflow and the dataset's prefixes. `answer_question` points the agent to `recall`,
 `similar_queries` and `check_query` before it writes a query of its own.
 `run_stored_query` runs a stored query with its parameters explained, and
-`explain_term` explains a class, predicate or resource. Hosts
+`explain_term` explains a class, predicate or resource. `agent_memory` sets out the
+loop of an agent that answers from the dataset and remembers what it learns with
+`link_entities` and `assert_facts`. Hosts
 that offer completion suggest dataset names, stored queries and their parameters, named
 graphs and prefixes for these arguments, from what the caller may see.
 
@@ -2202,12 +2222,12 @@ transport, next to the SPARQL endpoints:
 
 ```sh
 sparkles serve --data ./data --mcp                       # read-only tools
-sparkles serve --data ./data --mcp --mcp-allow-update    # plus sparql_update
+sparkles serve --data ./data --mcp --mcp-allow-update    # plus the write tools
 sparkles serve --data ./data --mcp --mcp-dataset 'wiki*' # only these datasets
 ```
 
 Each call runs as the HTTP request's caller. With `--auth-config`, an agent sees only
-the datasets its credentials may read, and `sparql_update` appears only when they may
+the datasets its credentials may read, and the write tools appear only when they may
 write to one of them. Give the agent its own API token, scoped to what it needs:
 
 ```sh
@@ -2247,6 +2267,25 @@ claude mcp add sparkles -- sparkles mcp --url https://sparql.example.org
 This is also the way to give a stdio host a database that a running server holds, since
 `sparkles mcp --loc` cannot open it while the server has its lock.
 
+An agent that keeps memory in a dataset needs `write` only on its own graphs. A grant
+limited to graphs such as `https://example.org/memory/*` lets it write facts there with
+`assert_facts`, while everything else stays read-only to it. Such an agent may still
+create scratch branches with `create_branch`, write its graphs on them, and merge or
+delete the scratch branches it created, but never a change to a graph it may not write.
+Leave the `merge` endpoint out of its grant to keep it from merging at all.
+`--mcp-scratch-branch-ttl 24h` deletes scratch branches that have been idle for a day:
+
+```toml
+[[tokens]]
+name = "agent-7"
+hash = "sha256:…"                 # sparkles auth gen-token --name agent-7
+datasets = { org = "read" }
+[[tokens.grants]]
+dataset = "org"
+level = "write"
+graphs = ["https://example.org/memory/agents/agent-7/*"]
+```
+
 MCP calls follow the server's rules. The rate limits of the `query` and `update` classes
 apply per dataset, as for `/{ds}/sparql` and `/{ds}/update`, and the memory budget is the
 smaller of `--mcp-query-memory-mb` and `--query-memory-mb`. A call may ask for up to the
@@ -2254,6 +2293,114 @@ server's `--timeout`. Requests from web pages pass the same Origin and Host chec
 rest of the API. Hosts that still use the older `initialize` handshake get a session,
 which belongs to the caller that opened it. [API.md](API.md#http-endpoint-mcp) lists the
 flags and the transport details.
+
+### Handing a query to the web UI
+
+An agent that wrote a query for a person's question can open it in the web UI, where
+the person reads the question, the agent's explanation and the terms the query uses
+before running it. The `share_query` tool checks the query and returns a link to a new
+tab of the query page. The query, the question and the explanation travel in the link's
+fragment, so they never reach a server log, and the page does not run the query until
+the person presses **Run**. Over `/$/mcp` the link points at the server itself. A stdio
+server needs the UI's address:
+
+```sh
+sparkles mcp --loc ./data/org --ui-url https://sparql.example.org
+```
+
+The `ask_graph` prompt gives a host the steps to follow for a question, from grounding
+through `check_query`, the run and `why_empty` to `share_query`. When a query returns
+nothing, `why_empty` names the first pattern, join or filter without solutions.
+
+### Agent memory grants
+
+`sparkles auth grant --template agent` prints the grants that let an agent keep its own
+memory without changing curated data on `main`. The agent reads the dataset, writes its
+own graphs on `main` and on its proposal branches, writes the curated graphs only on its
+proposal branches, and never merges:
+
+```sh
+sparkles auth grant --template agent --agent agent-7 --dataset org \
+  --session-graphs https://example.org/memory/agents/agent-7/ \
+  --curated https://example.org/hr --curated https://example.org/memory/consolidated
+```
+
+Paste the output into the auth configuration and give the agent's token or user
+`roles = ["agent-7"]`. The proposal branches are named `proposals.agent-7.*`, because
+branch names cannot hold a slash. `PUT /$/memory/{ds}` then names the agent graphs, so
+that `recall` marks the facts found only there as unreviewed
+([API.md](API.md#memory-settings)).
+
+## Asking questions with a model
+
+`sparkles ask` answers a question about a database with a language model. It grounds
+the question in the dataset's schema, its stored example queries and the entities the
+question names, asks the model for a query, checks it with `check_query`, runs it,
+repairs it at most twice from the check's issues or from `why_empty`, and asks the
+model to summarize the rows. The model has no tools, every query it writes is checked
+before it runs, and an update is refused. A `SELECT` without a limit gets `LIMIT 1000`.
+
+The providers and models come from a JSON file, the same one that `serve
+--model-config` reads ([API.md](API.md#model-providers)). Keys are named secrets that
+the command reads from the environment or a file:
+
+```json
+{
+  "models": {
+    "providers": {
+      "local": { "kind": "ollama", "endpoint": "http://127.0.0.1:11434",
+                 "models": { "qwen3:14b": { "contextTokens": 32768 } } },
+      "claude": { "kind": "anthropic", "endpoint": "https://api.anthropic.com",
+                  "apiKey": { "secret": "anthropic" } }
+    },
+    "roles": {
+      "draft": [{ "provider": "local", "model": "qwen3:14b" }],
+      "summarize": [{ "provider": "local", "model": "qwen3:14b" }]
+    }
+  }
+}
+```
+
+```sh
+sparkles ask --loc ./data/org org "Which team has the most members?" \
+  --model-config models.json --model-secret anthropic=env:ANTHROPIC_API_KEY
+```
+
+The first argument after the options is the dataset's name and the second the question.
+`--data FILE…` asks over files loaded into memory instead of a database, and `--text`
+indexes them for full-text search. Each role uses the first pair of its list, and
+`--pair ROLE=PROVIDER/MODEL` forces one, such as `--pair draft=claude/claude-sonnet-5`.
+A role without a list is off, except `repair`, which uses the draft's pair. The output
+gives the query, the explanation and assumptions, the first rows, the summary and the
+tokens used. `--json` prints one JSON object with every attempt, the result, the
+summary and the usage of each model call, and `--events` prints each step as a JSON line
+as it happens. `--no-run` stops after the check, and `--no-summary` leaves the summary
+out.
+
+When a name in the question matches several entities, or the model finds two readings
+of the question, the command prints the choices and stops. Ask again with
+`--clarification` and the chosen value. A model with a context window under 16,384
+tokens gets the 30 classes and 60 predicates that match the question best and two
+stored examples, and under 8,192 the rows are shown without a summary. A model that
+cannot return JSON answers in plain text with a fenced query, and the output says so.
+
+### Measuring models
+
+`scripts/eval-ask` runs `sparkles ask` for each pair on a question set and reports, for
+each pair and role, the accuracy overall and by complexity, the share of answers that
+matched the schema without a retry, the latency per call, and the tokens and estimated
+cost per question and per correct answer. It also reports a cascade of the pairs in the
+order given, with the share of questions each pair answered.
+
+```sh
+scripts/eval-ask --model-config models.json --model-secret anthropic=env:ANTHROPIC_API_KEY \
+  --pair local/qwen3:14b --pair claude/claude-sonnet-5
+```
+
+The default set is `testsuite/ask/demo.json`, 68 questions with gold queries over the
+organisation graph of the UI's mock server. The report goes to a new temporary
+directory, or to `--out` outside the repository. `scripts/eval-ask --self-test` runs the
+matrix against a local mock provider and needs no key.
 
 ## Embedding the library
 

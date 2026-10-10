@@ -9,6 +9,7 @@ use super::{api_doc, sref};
 use serde_json::{Map, Value as J, json};
 
 mod admin;
+mod assist;
 mod changes;
 mod features;
 mod kit;
@@ -590,6 +591,11 @@ pub(super) fn schemas() -> Map<String, J> {
                 "protected": { "type": "boolean" },
                 "note": { "type": ["string", "null"] },
                 "created": { "type": "string" },
+                "scratch": {
+                    "type": ["object", "null"],
+                    "description": "Set on a scratch branch that the MCP tool create_branch made (C17 §5.7): the principal that created it.",
+                    "properties": { "creator": { "type": "string" } },
+                },
                 "storage": {
                     "type": "object",
                     "properties": {
@@ -1237,5 +1243,6 @@ pub(super) fn schemas() -> Map<String, J> {
     changes::put_all(&mut put);
     features::put_all(&mut put);
     policies::put_all(&mut put);
+    assist::put_all(&mut put);
     s
 }

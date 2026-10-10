@@ -59,6 +59,7 @@ opentelemetry_sdk = { version = "0.33", default-features = false, features = ["t
 opentelemetry-otlp = { version = "0.33", default-features = false, features = ["trace", "metrics", "logs", "grpc-tonic", "http-proto", "reqwest-blocking-client"], optional = true }
 opentelemetry-appender-tracing = { version = "0.33", default-features = false, optional = true }
 tracing-opentelemetry = { version = "0.34", default-features = false, optional = true }
+sha1.workspace = true
 uuid.workspace = true
 # the UI's Content Security Policy (hashes of inline scripts); API token hashes
 sha2.workspace = true

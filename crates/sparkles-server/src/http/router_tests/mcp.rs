@@ -10,6 +10,8 @@ use axum::http::HeaderMap;
 use clap::Parser;
 use serde_json::json;
 
+mod memory_writes;
+
 const FIXTURE: &str = r#"@prefix ex:   <http://ex.org/> .
 @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
 ex:Person rdfs:label "Person"@en .
@@ -526,8 +528,7 @@ async fn a27_update_is_opt_in() {
     let s = open(&["--mcp-allow-update"], false);
     let r = modern(&s.app, "tools/list", json!({}), &[]).await;
     let tools = r.rpc()["result"]["tools"].as_array().unwrap().clone();
-    let last = tools.last().unwrap();
-    assert_eq!(last["name"], "sparql_update");
+    let last = tools.iter().find(|t| t["name"] == "sparql_update").unwrap();
     assert_eq!(last["annotations"]["destructiveHint"], true);
     assert_eq!(last["annotations"]["readOnlyHint"], false);
     let r = tool(
@@ -797,7 +798,9 @@ async fn a28_resources_and_prompts() {
             "explore_dataset",
             "answer_question",
             "run_stored_query",
-            "explain_term"
+            "ask_graph",
+            "explain_term",
+            "agent_memory"
         ]
     );
     let r = modern(

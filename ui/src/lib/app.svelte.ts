@@ -1,5 +1,6 @@
 // Global UI state (Svelte 5 runes in a module).
 import * as api from './api';
+import type { TabQuestion } from './ask';
 import { WELL_KNOWN, type PrefixMap } from './rdf';
 import { loadRaw, saveRaw } from './storage';
 
@@ -19,7 +20,7 @@ class AppState {
   vocab = $state<Record<string, string[]>>({});
 
   /** A query another page wants opened in a new Query tab. */
-  pendingQuery = $state<{ query: string; title?: string } | null>(null);
+  pendingQuery = $state<{ query: string; title?: string; question?: TabQuestion } | null>(null);
 
   /** The state the Query page reads (`at=`): empty for the head. */
   queryAt = $state('');

@@ -83,7 +83,7 @@ impl Pins {
                 touch(&mut inner, ds, head.clone(), now);
                 return Ok(head);
             };
-            if let Some(p) = inner.get_mut(&ds.name).and_then(|pins| {
+            if let Some(p) = inner.get_mut(&ds.key()).and_then(|pins| {
                 pins.iter_mut()
                     .find(|p| p.commit == c && p.owner.ptr_eq(&Arc::downgrade(ds)))
             }) {
@@ -118,7 +118,7 @@ impl Pins {
     /// Whether commit `c` of `ds` is held (for tests).
     #[cfg(test)]
     pub fn holds(&self, ds: &Arc<Dataset>, c: u64) -> bool {
-        self.inner.lock().get(&ds.name).is_some_and(|pins| {
+        self.inner.lock().get(&ds.key()).is_some_and(|pins| {
             pins.iter()
                 .any(|p| p.commit == c && p.owner.ptr_eq(&Arc::downgrade(ds)))
         })
@@ -141,7 +141,7 @@ fn touch(
     now: Instant,
 ) {
     let owner = Arc::downgrade(ds);
-    let pins = inner.entry(ds.name.clone()).or_default();
+    let pins = inner.entry(ds.key()).or_default();
     // pins of an older dataset instance under this name are dead
     pins.retain(|p| p.owner.ptr_eq(&owner));
     if let Some(p) = pins.iter_mut().find(|p| p.commit == snap.commit) {

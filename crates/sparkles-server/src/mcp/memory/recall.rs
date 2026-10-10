@@ -39,6 +39,30 @@ const CITED_LITERAL_BYTES: usize = 4096;
 /// Superseded reifiers read at most.
 const SUPERSEDED_ROWS: usize = 10_000;
 
+/// The review status of a fact (C18 §8.8).
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Status {
+    /// asserted in a graph that `agentGraphs` does not match
+    Reviewed,
+    /// asserted only in graphs that `agentGraphs` matches
+    Unreviewed,
+}
+
+impl Status {
+    fn as_str(self) -> &'static str {
+        match self {
+            Status::Reviewed => "reviewed",
+            Status::Unreviewed => "unreviewed",
+        }
+    }
+}
+
+/// The factor of seeds whose facts are all unreviewed.
+const UNREVIEWED_WEIGHT: f64 = 0.7;
+/// Triples whose other graphs one status query looks up.
+const STATUS_TRIPLES: usize = 500;
+
 #[derive(Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum Format {
@@ -64,6 +88,8 @@ struct RecallArgs {
     at_commit: Option<u64>,
     at: Option<Value>,
     timeout_seconds: Option<f64>,
+    statuses: Option<Vec<Status>>,
+    unreviewed_weight: Option<f64>,
 }
 
 /// One quad of the view.
@@ -121,6 +147,8 @@ struct Superseded {
     reifier: Term,
     at: Option<Term>,
     invalidated: Option<Term>,
+    /// the reifiers that name this one with `prov:wasRevisionOf`
+    replaced_by: Vec<Term>,
 }
 
 impl Tools<'_> {
@@ -154,8 +182,25 @@ impl Tools<'_> {
             self.cfg().max_bytes as u64,
         )? as usize;
         let format = a.format.unwrap_or(Format::Text);
+        let statuses = a
+            .statuses
+            .clone()
+            .unwrap_or_else(|| vec![Status::Reviewed, Status::Unreviewed]);
+        if statuses.is_empty() {
+            return Err(ToolError::bad_argument(
+                "statuses must name reviewed, unreviewed or both",
+            ));
+        }
+        let weight = a.unreviewed_weight.unwrap_or(UNREVIEWED_WEIGHT);
+        if !(0.0..=1.0).contains(&weight) {
+            return Err(ToolError::bad_argument(
+                "unreviewedWeight must be between 0 and 1",
+            ));
+        }
         let timeout = self.timeout(a.timeout_seconds)?;
         let ds = self.dataset(a.dataset.as_deref())?;
+        let memory = crate::assist::memory_settings(&self.server.state, &ds);
+        let agent = |g: &NamedNode| memory.is_agent_graph(g.as_str());
         let prefix_map = dataset_prefixes(&ds);
         let seeds_given: Vec<NamedNode> = seed_args
             .iter()
@@ -179,6 +224,8 @@ impl Tools<'_> {
             .map(|s| (Term::NamedNode(s.clone()), None))
             .collect();
         if let Some(q) = query {
+            let weigh =
+                (!memory.agent_graphs.is_empty() && weight < 1.0).then_some((&memory, weight));
             for found in self.search_seeds(
                 &ds,
                 &r,
@@ -187,6 +234,7 @@ impl Tools<'_> {
                 &graphs,
                 seed_limit,
                 !seeds_given.is_empty(),
+                weigh,
                 &ctx,
             )? {
                 if !seeds.iter().any(|(t, _)| *t == found.0) {
@@ -201,6 +249,7 @@ impl Tools<'_> {
         let mut entities: Vec<Entity> = Vec::new();
         let mut visited: HashMap<String, usize> = HashMap::new();
         let mut complete = true;
+        let status_kept: Option<Vec<Status>>;
         let budget = max_triples + 1;
         'seeds: for (rank, (seed, fact)) in seeds.iter().enumerate() {
             let mut queue: VecDeque<(Term, usize)> = VecDeque::from([(seed.clone(), 0)]);
@@ -260,6 +309,37 @@ impl Tools<'_> {
         if facts.len() > max_triples {
             complete = false;
         }
+        // the review status of each fact, and the statuses asked for
+        let status: Option<Vec<Status>> = if memory.agent_graphs.is_empty() {
+            None
+        } else {
+            Some(fact_statuses(&r, &facts, &agent).map_err(eng)?)
+        };
+        if let Some(st) = &status
+            && !(statuses.contains(&Status::Reviewed) && statuses.contains(&Status::Unreviewed))
+        {
+            let mut remap: Vec<Option<usize>> = Vec::with_capacity(facts.len());
+            let mut kept: Vec<Fact> = Vec::new();
+            let mut kept_status: Vec<Status> = Vec::new();
+            for (f, s) in facts.into_iter().zip(st) {
+                if statuses.contains(s) {
+                    remap.push(Some(kept.len()));
+                    kept.push(f);
+                    kept_status.push(*s);
+                } else {
+                    remap.push(None);
+                }
+            }
+            facts = kept;
+            for e in &mut entities {
+                e.facts = e.facts.iter().filter_map(|&i| remap[i]).collect();
+            }
+            // entities reached only through facts left out are dropped, seeds stay
+            entities.retain(|e| e.seed.is_some() || !e.facts.is_empty());
+            status_kept = Some(kept_status);
+        } else {
+            status_kept = status;
+        }
 
         // labels of the entities
         let iris: Vec<NamedNode> = entities
@@ -298,6 +378,8 @@ impl Tools<'_> {
             superseded: &superseded,
             conflicts: &conflicts,
             prefixes: &prefixes,
+            status: status_kept.as_deref(),
+            agent: &agent,
         };
         // the most facts that fit in maxTriples and maxBytes
         let total = facts.len().min(max_triples);
@@ -349,6 +431,7 @@ impl Tools<'_> {
         graphs: &[NamedNode],
         limit: usize,
         have_seeds: bool,
+        weigh: Option<(&crate::assist::MemorySettings, f64)>,
         ctx: &ErrorContext,
     ) -> Result<Vec<(Term, Option<Fact>)>, ToolError> {
         let eng = |e| ctx.engine(e);
@@ -416,6 +499,35 @@ impl Tools<'_> {
             }
         }
         let mut hits: Vec<(String, f64)> = fused.into_iter().collect();
+        // seeds whose facts are all unreviewed count for less (C18 §8.8)
+        if let Some((memory, w)) = weigh
+            && !hits.is_empty()
+        {
+            hits.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            hits.truncate((4 * limit).max(20));
+            let subjects: Vec<NamedNode> = hits.iter().map(|(s, _)| iri(s)).collect();
+            let q = format!(
+                "SELECT DISTINCT ?s ?g WHERE {{ {} {} }} LIMIT {}",
+                super::values_iris("s", &subjects),
+                r.quads("?s ?p ?o", graphs),
+                subjects.len() * 20
+            );
+            let mut reviewed: HashSet<String> = HashSet::new();
+            let mut seen: HashSet<String> = HashSet::new();
+            for row in r.rows(&q, Vec::new()).map_err(eng)? {
+                if let [Some(Term::NamedNode(s)), Some(Term::NamedNode(g))] = row.as_slice() {
+                    seen.insert(s.as_str().to_string());
+                    if !memory.is_agent_graph(g.as_str()) {
+                        reviewed.insert(s.as_str().to_string());
+                    }
+                }
+            }
+            for (s, score) in &mut hits {
+                if seen.contains(s.as_str()) && !reviewed.contains(s.as_str()) {
+                    *score *= w;
+                }
+            }
+        }
         hits.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         // reifiers stand for their triple's subject
         let hit_iris: Vec<NamedNode> = hits.iter().map(|(s, _)| iri(s)).collect();
@@ -668,9 +780,35 @@ impl Tools<'_> {
                 reifier: reifier.clone(),
                 at: at.clone(),
                 invalidated: inv.clone(),
+                replaced_by: Vec::new(),
             });
             if out.len() >= max {
                 break;
+            }
+        }
+        // the revisions that replace them, in any graph of the view
+        let named: Vec<NamedNode> = out
+            .iter()
+            .filter_map(|s| match &s.reifier {
+                Term::NamedNode(n) => Some(n.clone()),
+                _ => None,
+            })
+            .collect();
+        if !named.is_empty() {
+            let q = format!(
+                "SELECT DISTINCT ?r ?nr WHERE {{ {} {} }} LIMIT {}",
+                super::values_iris("r", &named),
+                r.quads(&format!("?nr <{PROV}wasRevisionOf> ?r"), &[]),
+                named.len() * 4
+            );
+            for row in r.rows(&q, Vec::new())? {
+                if let [Some(old), Some(new)] = row.as_slice() {
+                    for s in out.iter_mut().filter(|s| s.reifier == *old) {
+                        if !s.replaced_by.contains(new) {
+                            s.replaced_by.push(new.clone());
+                        }
+                    }
+                }
             }
         }
         Ok(out)
@@ -748,6 +886,60 @@ impl Tools<'_> {
 }
 
 /// One rank per subject term, best score first, ties sharing a rank.
+/// The status of each fact: `reviewed` when its triple is asserted in a graph of the
+/// view that is not agent memory, else `unreviewed`. A fact in an agent graph has its
+/// other graphs looked up, at most [`STATUS_TRIPLES`] triples in one query; a triple
+/// with a blank node keeps the status of the graphs it was read from.
+fn fact_statuses(
+    r: &Reader,
+    facts: &[Fact],
+    agent: &dyn Fn(&NamedNode) -> bool,
+) -> Result<Vec<Status>, Error> {
+    let triple = |f: &Fact| format!("{} {} {}", f.s, f.p, f.o);
+    let mut reviewed: HashSet<String> = facts.iter().filter(|f| !agent(&f.g)).map(triple).collect();
+    let mut rows: Vec<String> = Vec::new();
+    let mut asked: HashSet<String> = HashSet::new();
+    for f in facts {
+        let t = triple(f);
+        if reviewed.contains(&t) || rows.len() >= STATUS_TRIPLES || !asked.insert(t) {
+            continue;
+        }
+        if let (Some(s), Some(o)) = (values_term(&f.s), values_term(&f.o)) {
+            rows.push(format!("({s} {} {o})", f.p));
+        }
+    }
+    if !rows.is_empty() {
+        let q = format!(
+            "SELECT DISTINCT ?s ?p ?o ?g WHERE {{ VALUES (?s ?p ?o) {{ {} }} {} }} LIMIT {}",
+            rows.join(" "),
+            r.quads("?s ?p ?o", &[]),
+            rows.len() * 8
+        );
+        for row in r.rows(&q, Vec::new())? {
+            if let [
+                Some(s),
+                Some(Term::NamedNode(p)),
+                Some(o),
+                Some(Term::NamedNode(g)),
+            ] = row.as_slice()
+                && !agent(g)
+            {
+                reviewed.insert(format!("{s} {p} {o}"));
+            }
+        }
+    }
+    Ok(facts
+        .iter()
+        .map(|f| {
+            if reviewed.contains(&triple(f)) {
+                Status::Reviewed
+            } else {
+                Status::Unreviewed
+            }
+        })
+        .collect())
+}
+
 fn rank_terms(hits: impl Iterator<Item = (NamedNode, f64)>) -> HashMap<String, usize> {
     let mut best: HashMap<String, f64> = HashMap::new();
     for (s, score) in hits {
@@ -847,6 +1039,10 @@ struct Doc<'a> {
     superseded: &'a [Superseded],
     conflicts: &'a [Vec<usize>],
     prefixes: &'a Prefixes,
+    /// the review status of each fact, when the dataset names agent graphs
+    status: Option<&'a [Status]>,
+    /// whether a graph is agent memory
+    agent: &'a dyn Fn(&NamedNode) -> bool,
 }
 
 /// A time or number as it is when its lexical form is plain, else as a quoted term.
@@ -969,6 +1165,9 @@ impl Doc<'_> {
                 if conflicting.contains(&i) {
                     body.push_str(" conflict");
                 }
+                if self.status.is_some_and(|s| s[i] == Status::Unreviewed) {
+                    body.push_str(" unreviewed");
+                }
                 body.push('\n');
             }
         }
@@ -1000,6 +1199,13 @@ impl Doc<'_> {
             if let Some(q) = &c.quote {
                 body.push_str(&format!(" quote={}", terms.term(&quote_term(q))));
             }
+            if self.status.is_some() {
+                body.push_str(if (self.agent)(&c.graph) {
+                    " status=unreviewed"
+                } else {
+                    " status=reviewed"
+                });
+            }
             body.push('\n');
         }
         if !self.superseded.is_empty() {
@@ -1019,6 +1225,9 @@ impl Doc<'_> {
                 }
                 if let Some(i) = &s.invalidated {
                     body.push_str(&format!(" invalidated={}", plain(i, &mut terms, time_char)));
+                }
+                for n in &s.replaced_by {
+                    body.push_str(&format!(" replacedBy={}", terms.term(n)));
                 }
                 body.push('\n');
             }
@@ -1055,12 +1264,16 @@ impl Doc<'_> {
                     "hop": e.hop,
                     "facts": facts.iter().map(|&i| {
                         let f = &self.facts[i];
-                        json!({
+                        let mut j = json!({
                             "s": terms.term(&f.s),
                             "p": terms.iri(f.p.as_str()),
                             "o": terms.term(&f.o),
                             "citation": cite[i],
-                        })
+                        });
+                        if let Some(s) = self.status {
+                            j["status"] = s[i].as_str().into();
+                        }
+                        j
                     }).collect::<Vec<_>>(),
                 });
                 if let Some(l) = &e.label {
@@ -1094,6 +1307,14 @@ impl Doc<'_> {
                 }
                 if let Some(q) = &c.quote {
                     j["quote"] = terms.term(&quote_term(q)).into();
+                }
+                if self.status.is_some() {
+                    j["status"] = if (self.agent)(&c.graph) {
+                        "unreviewed"
+                    } else {
+                        "reviewed"
+                    }
+                    .into();
                 }
                 j
             })
@@ -1144,6 +1365,14 @@ impl Doc<'_> {
                     }
                     if let Some(i) = &s.invalidated {
                         j["invalidatedAt"] = plain(i, &mut terms, time_char).into();
+                    }
+                    if !s.replaced_by.is_empty() {
+                        j["replacedBy"] = s
+                            .replaced_by
+                            .iter()
+                            .map(|n| Value::from(terms.term(n)))
+                            .collect::<Vec<_>>()
+                            .into();
                     }
                     Some(j)
                 })

@@ -395,7 +395,7 @@ each request class per client:
 |-------|----------|
 | `auth` | Every path under `/$/auth/`, matched or not: login, token minting, device flow and the OIDC callback. |
 | `query` | `/{ds}/sparql`, `/{ds}/query`, `/{ds}/queries/{name}`, `/{ds}/explain`, `/{ds}/shacl`, `/{ds}/shex`, `/{ds}/diff`, `/{ds}/graphql` and `/{ds}/graphql/schema`, Graph Store `GET`/`HEAD` and reads of `/{ds}/patch`, `/{ds}` with `query=` or a GET, `/$/schema/*`, `/$/stats/*`, `/$/validate/*`, `/$/reason/{ds}/diagnostics`, `/$/graphql/{ds}/draft`, `/$/format`, `/$/lint`, and MCP tool calls and resource reads at `/$/mcp` |
-| `update` | `/{ds}/update`, `/{ds}/upload`, `POST` and `PATCH /{ds}/patch`, Graph Store `PUT`/`POST`/`DELETE`, `/{ds}` with `update=` or any other write, and the MCP `sparql_update` tool. A form POST to `/{ds}` counts as an update. |
+| `update` | `/{ds}/update`, `/{ds}/upload`, `POST` and `PATCH /{ds}/patch`, Graph Store `PUT`/`POST`/`DELETE`, `/{ds}` with `update=` or any other write, and the MCP tools that write (`sparql_update`, `assert_facts`, `create_branch`, `merge_branch` and `delete_branch`). A form POST to `/{ds}` counts as an update. |
 | `admin` | `/$/…` requests other than `GET`, `HEAD` and `OPTIONS` that are not in the `query` class. These cover dataset management, compaction, backups, reasoning, caches and full-text. |
 | `preauth` | Every request, before authentication. Counts failed credential checks per client address and per IPv6 /48. Has no per-dataset form. |
 
@@ -2828,7 +2828,7 @@ including `main`.
 | POST | `/$/branches/{ds}` | Creates a branch from JSON `{name, from?, at?, protected?, note?}`. `from` defaults to `main` and `at` to its head. Answers `201` with `Location` and the `Branch`. |
 | GET | `/$/branches/{ds}/{name}` | The `Branch`, or `404 no-such-branch`. |
 | PATCH | `/$/branches/{ds}/{name}` | Changes `name`, `protected` or `note` (`null` removes the note). |
-| DELETE | `/$/branches/{ds}/{name}` | Deletes the branch, its commits, snapshots and storage. `?force=true` deletes one with unmerged commits, and `?reparent=true` one that other branches start from. Answers `204`. |
+| DELETE | `/$/branches/{ds}/{name}` | Deletes the branch, its commits, snapshots and storage. `?force=true` deletes one with unmerged commits, and `?reparent=true` one that other branches start from. Answers `204`. A caller whose grants are limited to some graphs may delete only the scratch branches it created. |
 | POST | `/$/branches/{ds}/{name}/relink` | Moves a linked branch onto `main`'s current index and answers the `RelinkResult`. See [Relinking](#relinking). |
 
 A read-only server (`serve --read-only`) refuses every route that changes branches with
@@ -2845,9 +2845,14 @@ type Branch = {
   mergeBase: { branch: string; seq: number } | null;   // with its upstream
   ahead: number; behind: number;                 // commits relative to its upstream
   protected: boolean; note: string | null; created: string;
+  scratch: { creator: string } | null;           // made by the MCP tool create_branch
   storage: { linked: boolean; ownBytes: number; heldBytes: number; generation: string };
 };
 ```
+
+`scratch` marks a branch that the MCP tool `create_branch` made, with the principal that
+created it. Such a branch follows the routes' rules like any other, and the MCP tools
+give graph-limited callers more rights over it (see [Memory writes](#memory-writes)).
 
 `storage.linked` says the branch still reads its upstream's index files.
 `storage.heldBytes` counts the upstream generations that are no longer current there and
@@ -8004,11 +8009,14 @@ scope is `private`.
 `notifications/cancelled` stops the referenced call, and no response is sent for that
 call. The server's `instructions` describe the workflow
 (`list_datasets` → `describe_schema` → `sparql_query`), point to `recall`,
-`similar_queries` and `check_query`, and say that tool results are untrusted data.
+`similar_queries` and `check_query`, and say that tool results are untrusted data. When
+`assert_facts` is offered, they add "Before writing, call link_entities, then write with
+assert_facts and dryRun first."
 
 ### Tools
 
-Tools appear in this order. All but `sparql_update` are read-only
+Tools appear in this order. All but `sparql_update`, `assert_facts`, `create_branch`,
+`merge_branch` and `delete_branch` are read-only
 (`annotations: {"readOnlyHint": true, "openWorldHint": false}`). `sparql_query` is
 open-world when SERVICE is allowed. The common arguments are:
 
@@ -8020,6 +8028,12 @@ open-world when SERVICE is allowed. The common arguments are:
   both.
 * `reasoning` (boolean): include materialized inferences. By default they are included
   when the dataset has them.
+* `branch`: work on this [branch](#branches-and-merges) of the dataset instead of `main`,
+  as the HTTP `?branch=` parameter does. Every tool that takes `dataset` takes it, except
+  the branch tools, which name their branches themselves. The caller's grants apply on
+  the branch as they do on `main`, a branch the caller may not read answers as one that
+  does not exist (`no-such-branch`), and the result of a call on a branch other than
+  `main` names it in `branch`.
 * IRIs may be given as `<http://…>`, `http://…` or a prefixed name (`ex:alice`, with the
   dataset's prefixes). In `describe_resource` they may also be a blank node label
   `_:b…`.
@@ -8038,15 +8052,22 @@ open-world when SERVICE is allowed. The common arguments are:
 | `list_changes` | `subjects`, `predicates`, `objects` and `graphs` (each ≤ 20; objects may be literals in N-Triples syntax, graphs `default` or IRIs), `from` and `to` (a commit or a selector string), `op` (`add`\|`remove`), `order` (`asc`\|`desc`), `limit` (100, ≤ `--mcp-max-rows`), `timeoutSeconds` (30) | `{dataset, head, from, to, changes: [{commit, timestamp, kind, author?, message?, op, quad}], truncated, unrecorded: [{from, to, reason}], prefixes}`: the [history query](#history-queries) of `GET /{ds}/history`, with each quad as one line of terms. It needs the grant of the `diff` endpoint and leaves out the graphs and triples the caller may not read. |
 | `search_text` | `query` (required, ≤ 1000 characters: terms, `"phrases"`, AND/OR, `+required`, `-excluded`), `predicates` (≤ 20 IRIs), `lang`, `limit` (20, ≤ 200), `withTypes` (true) | `{dataset, commit, hits: [{s, score, text, p, label?, types?}], limited, prefixes}`: BM25-ranked matches of `text:query`. `text` is the matched literal, escaped and at most 300 characters long, and `types` has at most 3 entries. Only in builds with the `text` feature. A dataset without an index (`textSearch: false`) gives `text-disabled`. |
 | `similar_entities` | `predicate` (required), exactly one of `entity` (an IRI with one stored vector under `predicate`) and `vector` (1–16384 numbers), `k` (10, ≤ 100), `metric` (`cosine`\|`dot`\|`euclidean`), `excludeSelf` (true), `withLabels` (true) | `{dataset, commit, metric, higherIsBetter, hits: [{iri, score, label?}], prefixes}`: an exact `spk:vectorSearch` over the stored `spk:vector` literals. The tool never computes embeddings. `no-vectors` when the predicate has none, the dimensions differ, or the entity has no vector. |
-| `check_query` | `query` (required, ≤ 65536 characters), `explain` (false), `maxSuggestions` (3, ≤ 10), `timeoutSeconds` (30) | `{dataset, commit, ok, issues: [{code, severity, message, term?, line?, column?, suggestions?: [{term, label?, count, why}]}], estimatedRows?, prefixes}`. The query is parsed and compared with the caller's view without running it. The errors are `syntax` (with line and column), `not-a-query` (an update), `unknown-predicate` and `unknown-class`. The warnings are `unknown-term`, `class-mismatch`, `datatype-mismatch`, `language-tag` and `unbound-projection`, and with `explain` also `no-limit` and `large-estimate` and the plan's `estimatedRows`, which is left out when the caller's view hides the estimates. `ok` is false only when an issue is an error. A suggestion's `why` is `same-local-name`, `edit-distance` or `label` for an unknown term, `class-profile`, `datatype` or `language-tag` for a mismatch, and `same-name`, `namespace` or `edit-distance` for an undefined prefix. |
+| `check_query` | `query` (required, ≤ 65536 characters), `explain` (false), `maxSuggestions` (3, ≤ 10), `terms` (false), `timeoutSeconds` (30) | `{dataset, commit, ok, issues: [{code, severity, message, term?, line?, column?, suggestions?: [{term, label?, count, why}]}], estimatedRows?, terms?, prefixes}`. With `terms`, `terms` lists every constant IRI of the query as `{term, iri, kind, label?, count?, types?, occurs}`, where `kind` is `class`, `property` or `entity` and `occurs` is `null` when the check did not look the term up. The query is parsed and compared with the caller's view without running it. The errors are `syntax` (with line and column), `not-a-query` (an update), `unknown-predicate` and `unknown-class`. The warnings are `unknown-term`, `class-mismatch`, `datatype-mismatch`, `language-tag` and `unbound-projection`, and with `explain` also `no-limit` and `large-estimate` and the plan's `estimatedRows`, which is left out when the caller's view hides the estimates. `ok` is false only when an issue is an error. A suggestion's `why` is `same-local-name`, `edit-distance` or `label` for an unknown term, `class-profile`, `datatype` or `language-tag` for a mismatch, and `same-name`, `namespace` or `edit-distance` for an undefined prefix. |
 | `similar_queries` | `question` (required, ≤ 2000 characters), `k` (5, ≤ 20), `withText` (true), `embeddingIndex` (a vector index name), `timeoutSeconds` (30) | `{dataset, queries: [{name, tool?, description?, score, matchedBy, parameters: [{name, type, required, description?}], questions?, query?}], ranking, prefixes}`. The [stored queries](#stored-queries) the caller may run whose `mcp` is not `false`, ranked by BM25 over their description, parameters, the words of their IRIs and their `questions`. When the dataset has one vector index whose provider embeds query text, or `embeddingIndex` names one, the cosine similarity of embeddings is fused with BM25 by reciprocal rank (k = 60) and `ranking` is `hybrid`. If the provider fails, the ranking falls back to `text`. `tool` is the query's MCP tool name. |
 | `link_entities` | `mentions` (required, 1–20 of `{text (≤ 200 characters), types? (≤ 5 class IRIs), context? (≤ 500 characters)}`), `k` (5, ≤ 20), `labelPredicates` (≤ 20 IRIs, by default the label predicates of `describe_resource` and `skos:altLabel`), `graphs` (≤ 20 IRIs or `default`), `timeoutSeconds` (30) | `{dataset, commit, mentions: [{text, verdict, candidates: [{iri, label?, altLabels?, types, score, typeMatch, matchedBy, sameAs?, triples}]}], search: {text, vector}, prefixes}`. Candidates come from exact label matches, labels equal after case folding and collapsing white space, `text:query` over the label predicates the full-text index covers, and `spk:vectorSearch` with the mention and its context on a vector index that embeds labels. `verdict` is `exact`, `ambiguous`, `candidates` or `none`, and it is advice. Candidates of a type in `types`, or of a subclass, come first. `triples` holds up to 5 sampled outgoing triples, and `sameAs` the other candidates linked by `owl:sameAs` or `skos:exactMatch`. `search` says which indexes took part. |
-| `recall` | `query` (≤ 2000 characters) or `seeds` (≤ 20 IRIs) or both, `types` (≤ 5 class IRIs), `graphs` (≤ 20 IRIs or `default`), `hops` (1, ≤ 2), `seedLimit` (10, ≤ 50), `maxTriples` (150, ≤ 1000), `maxBytes` (32768, ≤ `--mcp-max-bytes`), `includeSuperseded` (false), `format` (`text`\|`json`), `timeoutSeconds` (30) | One text block: the facts around the seeds with their citations, described below. No `structuredContent`. |
+| `recall` | `query` (≤ 2000 characters) or `seeds` (≤ 20 IRIs) or both, `types` (≤ 5 class IRIs), `graphs` (≤ 20 IRIs or `default`), `hops` (1, ≤ 2), `seedLimit` (10, ≤ 50), `maxTriples` (150, ≤ 1000), `maxBytes` (32768, ≤ `--mcp-max-bytes`), `includeSuperseded` (false), `statuses` (both), `unreviewedWeight` (0.7), `format` (`text`\|`json`), `timeoutSeconds` (30) | One text block: the facts around the seeds with their citations, described below. No `structuredContent`. |
+| `why_empty` | `query` (required, ≤ 65536 characters), `timeoutSeconds` (30) | `{dataset, commit, empty, first?, steps, unchecked?, complete, message, prefixes}`, described in [Checking and explaining queries](#checking-and-explaining-queries). |
+| `share_query` | `query` (required, ≤ 65536 characters), `question` (≤ 2000 characters), `explanation` (≤ 400 characters), `assumptions` (≤ 5), `branch`, `atCommit` | `{url, dataset, commit, ok, issues, prefixes}`. The link opens the query in a new tab of the UI's query page with the question header. The query is checked and never run. Listed only when the server knows the UI's address, which is the request's own host over HTTP and `--ui-url` over stdio. A payload over 32 KiB is refused with `too-large`, and an update with `not-a-query`. |
 | `validate_shacl` | `shapes` (required: a shapes graph in Turtle, ≤ 1 MiB), `shapesFormat` (`turtle` or `shaclc`), `graph` (`default`\|`union`\|IRI), `maxResults` (20, ≤ `--mcp-max-rows`), `timeoutSeconds` (30) | `{dataset, commit, reasoning, conforms, total, bySeverity: {violation, warning, info}, results: [{focus, path?, value?, shape, constraint, severity, message?}], truncated, prefixes}`: the validation of [`/{ds}/shacl`](#shacl-validation). The most severe results come first, then results are ordered by shape and focus node. `severity` is `Violation`, `Warning` or `Info`. SHACL 1.2 `Debug` and `Trace` count as info. A complex `path` is a SPARQL property path. Only in builds with the `shacl` feature. |
 | `validate_shex` | `schema` (required: ShExC, or ShExJ when it starts with `{`; ≤ 1 MiB), `shapeMap` (required: a compact shape map, ≤ 65536 characters), `graph`, `onlyNonconformant` (true), `maxResults` (20, ≤ `--mcp-max-rows`), `timeoutSeconds` (30) | `{dataset, commit, reasoning, conforms, counts: {conformant, nonconformant}, results: [{node, shape, status, reason?, failures?}], truncated, warnings, prefixes}`: the validation of [`/{ds}/shex`](#shex-validation), with results in shape-map order. `shape` is `START` for a START association. `failures` are the report's `appinfo.failures`, with `value` as a term and `predicate` as an IRI. Prefixed names in the map use the schema's prefixes, then the dataset's. `IMPORT` is refused with `bad-argument`, so put the imported shapes into the schema. EXTERNAL shapes have no definition (`invalid-schema`). `SPARQL """…"""` node selectors run on the data graph under the call's row and memory budgets, without SERVICE, and with only their own prefixes. A failing selector query is `invalid-schema`. Only in builds with the `shex` feature. |
 | `format` | `text` (required, ≤ 1 MiB), `language` (`sparql`\|`turtle`\|`trig`\|`ntriples`\|`nquads`\|`jsonld`; detected when left out), `options` (the camelCase style options of [`POST /$/format`](#formatting)), `timeoutSeconds` (30). It takes no `dataset`. | `{language, changed, text, warnings: [{code, message, line, column}]}`: the text formatted by the engine of `sparkles fmt`. A syntax error is `syntax`, with the line and column in the message. RDF/XML is `unsupported-language`. A result larger than `--mcp-max-bytes` is `too-large`. Only in builds with the `fmt` feature. |
 | `graphql_query` | `query` (a GraphQL document, ≤ 65536 characters; leave it out for the API schema), `variables`, `operationName`, `maxBytes` (65536), `timeoutSeconds` (30) | One text block: the [GraphQL](#graphql) response as JSON with the dataset and commit added, `{dataset, commit, data?, errors?, extensions?}`, or the API schema (SDL) without `query`. Mutations are refused. Listed only while a dataset the caller may query through GraphQL has a schema installed. Only in builds with the `graphql` feature. |
 | `sparql_update` | `update` or `patch` (one of them, ≤ 1 Mi characters), `message` (the commit message), `ifHead` (a commit), `dryRun` (preview instead of committing), `changes` (0–100, with `dryRun`), `timeoutSeconds` (30) | `{dataset, committed, commit, inserted, deleted, patch?, message?, validation?, elapsedMs}`: the receipt of the write. A patch adds `patch: {rows, aborted, prevChecked, prefixesSet, prefixesRemoved}`. A dry run adds `dryRun`, `wouldCommit`, `outcome`, `head`, `graphs`, `changes?`, `storage` and `error?` (below). Listed only when the server allows updates and the caller may write to a dataset (below). |
+| `assert_facts` | `graph` or `source: {iri, title?}` (one is required), `entities` (≤ 200 of `{key, label, types, altLabels?, distinctFrom?}`), `facts` (≤ 500 of `{s, p, o, mode?, confidence?, quote?}`), `retract` (≤ 500 reifier IRIs or `{s, p, o, graph}`), `replaceScope` (`graph`\|`writable`), `message`, `idempotencyKey` (≤ 128 characters), `agent: {name, model?}`, `iriBase`, `allowUnknownIris` (false), `dryRun`, `changes` (0–100, with `dryRun`), `ifHead`, `timeoutSeconds` (30) | `{dataset, branch?, graph, committed, commit?, head, alreadyApplied?, activity, minted, inserted, deleted, superseded, retracted, conflicts, warnings, validation?, dryRun?, elapsedMs, prefixes}`: facts written with their provenance as one commit, described [below](#memory-writes). Listed like `sparql_update`. |
+| `list_branches` | none | `{dataset, branches: [{name, head, created, lastChange, upstream, from?, ahead, behind, protected, scratch, creator?, expires?, note?}]}`: the branches the caller may see, `main` first. `scratch` marks a branch made by `create_branch`, with its `creator` and, when the server expires idle scratch branches, the time it will expire. |
+| `create_branch` | `name` (required), `from` (`main`), `at` (a commit or selector of `from`), `note` | `{dataset, name, head, created, scratch: true, creator, from, expires?}`: a new [scratch branch](#memory-writes). |
+| `merge_branch` | `source` (required), `target` (`main`), `dryRun` (true), `expect: {source, target}` (required with `dryRun: false`), `message`, `squash`, `changes` (0–100, with `dryRun`), `timeoutSeconds` (30) | A preview as for `sparql_update` with `mergeable`, `conflicts?`, `expect` and `merge` (the fields of [`GET /$/merge/{ds}`](#merges)), or the merge's report with `committed`. |
+| `delete_branch` | `name` (required), `force` (false) | `{dataset, deleted}`. A branch with commits its upstream does not have needs `force`. |
 
 Every tool except `sparql_query`, `graphql_query` and `recall` declares an
 `outputSchema` and returns `structuredContent` plus the same object as one compact JSON
@@ -8230,6 +8251,97 @@ or the quota would refuse is not a tool error. Its result says so in `outcome` a
 `error`, with the validation summary, so an agent can read the findings and revise the
 update. A dry run needs the same permission as the write, and `--mcp-allow-update` too.
 
+### Memory writes
+
+`assert_facts`, `create_branch`, `merge_branch` and `delete_branch` are offered with
+`sparql_update`, under the same flags and to the same callers, and each can be turned
+off with `--disable-tool` or `--mcp-disable-tool`. Every write runs as the caller on the
+store's normal write path, with the caller's graph grants, the dataset's write-time
+validation, the storage quota and the change feed, exactly as `sparql_update` does. The
+design is [C17](specs/C17-agent-memory.md).
+
+**What `assert_facts` writes.** One call writes one commit into one named graph, which
+is `graph`, or `source.iri` when `graph` is left out. The default graph is refused. Each
+fact is asserted in the graph and reified there by a new `urn:uuid:` reifier that
+carries `rdf:reifies <<( s p o )>>`, `prov:wasGeneratedBy` the call's activity,
+`prov:generatedAtTime`, `prov:wasDerivedFrom` the source, and the fact's
+`spk:confidence` (an `xsd:decimal`) and `spk:quote` when given. The activity is a
+`prov:Activity` with `prov:wasAssociatedWith` the caller as
+`urn:x-sparkles:principal:<name>`, where the name is the commit author, such as
+`user:bob` or `token:agent-7`, and the operating-system user over stdio. It also has
+`prov:startedAtTime`, the message as `rdfs:label` and `spk:idempotencyKey`. With
+`agent`, a `prov:SoftwareAgent` with its name as `rdfs:label`, `spk:model` and
+`prov:actedOnBehalfOf` the principal is associated with the activity too. A source's
+`title` becomes its `rdfs:label` in the graph. A fact already asserted in the graph gets
+a second reifier and is not inserted again.
+
+A new entity is declared in `entities` with a key such as `_:pay`, a label (plain text,
+or a literal such as `"Payments team"@en`) and one to ten types. The server mints its
+IRI, writes its types, label and `skos:altLabel`s with reifiers like any fact, and maps
+the key to the IRI in `minted`. An IRI is `iriBase` (default `urn:uuid:`) followed by a
+UUID. With an `idempotencyKey` it is a version 5 UUID of the dataset's id, the key and
+the entity's key, so a dry run and the real call mint the same IRIs. Without one it is a
+version 7 UUID. The activity's IRI is derived the same way, and when the graph already
+holds that activity, the call writes nothing and answers `alreadyApplied: true`. The
+store checks this again with the writer lock held, so two retries cannot both write.
+
+**Checks.** Before writing, the call checks the facts against the caller's view and
+reports every failure in one error, whose `_meta` `data` holds `errors` and `warnings`,
+each `{code, message, at?, term?, candidates?, suggestions?}`. The error's code is the
+failures' common code, or `invalid-facts` when they differ, and its status is 422.
+
+| Code | Kind | When |
+|---|---|---|
+| `invalid-term`, `invalid-key` | error | A term that does not parse, a confidence outside 0 to 1, a quote over 1000 characters, or a key that is not `_:` and 1 to 64 letters, digits, `_` or `-`. |
+| `undeclared-entity`, `unused-entity` | error | A key used in a fact but not declared, or declared but not used. |
+| `unknown-predicate`, `unknown-class` | error | A predicate or type that the view neither uses nor declares, with the suggestions of `check_query`. A person adds new terms. |
+| `unknown-entity` | error | A subject or object IRI that occurs nowhere in the view, with the candidates of `link_entities` for its local name. `allowUnknownIris` accepts it. |
+| `possible-duplicate` | error | `link_entities` with a new entity's labels and types answers `exact` or `ambiguous` with a candidate of a matching type that is not in `distinctFrom`. Normalized label matches need the full-text index. |
+| `similar-entities` | warning | Weaker candidates for a new entity. |
+| `language-tag`, `datatype-mismatch` | warning | A literal object whose language tag or datatype the predicate's objects never have. |
+| `unknown-reifier`, `not-asserted` | error | A retraction whose reifier reifies nothing the caller can see, or whose fact is not asserted in its graph. |
+| `forbidden` | error | A retraction in a graph the caller may not write. |
+
+**Supersession and retraction.** A fact with `mode: "replace"` supersedes every other
+value of its subject and predicate in the target graph, or with `replaceScope:
+"writable"` in every graph of the view. A superseded triple is deleted, and each of its
+reifiers in its graph that has no `prov:wasInvalidatedBy` gets `prov:wasInvalidatedBy`
+the activity and `prov:invalidatedAtTime`. A triple without such a reifier gets one for
+the record. The new fact's reifier gets `prov:wasRevisionOf` each old reifier. An old
+value in a graph the caller may not write is left in place and listed in `conflicts`
+with `reason: "not-writable"`, and one with a blank node is listed with `reason:
+"blank-node"`. `retract` deletes facts the same way without a new value. `superseded`
+and `retracted` list `{reifier, triple, graph}`.
+
+The whole call is one SPARQL Update, so it commits completely or not at all. A guard
+that rejects it fails with `validation-failed` and nothing is written. `dryRun: true`
+runs the checks and previews the update as `sparql_update` does, with `wouldCommit`,
+`head`, the counts, the guard's summary in `validation` and the full preview in
+`dryRun`. `ifHead` works as for `sparql_update`. The annotations are `{"readOnlyHint":
+false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}`.
+
+**Branches.** `create_branch` makes a scratch branch, whose branch record names its
+creator. It needs `write` through the `branches` endpoint on the new name and `read` on
+`from`. A caller whose grants on the dataset are limited to some graphs may create one
+as long as it may write some graph on it through the `update` endpoint, which the HTTP
+branch routes do not allow. `merge_branch` and `delete_branch` need what
+`POST /$/merge/{ds}` and `DELETE /$/branches/{ds}/{name}` need. A graph-limited caller
+may merge and delete only the scratch branches it created, and its merge is refused with
+`forbidden` when the branch changes any graph it may not write on the target, whoever
+made that change. A grant that leaves out the `merge` endpoint allows no merge and no
+preview. A merge with conflicts fails with `merge-conflict` (409), because conflicts are
+resolved by a person on the merge page or with `sparkles merge`. A merge with `dryRun:
+false` needs the `expect` heads of a preview and fails with `head-moved` when either
+branch moved since. Deleting a protected branch needs `admin`. `merge_branch` and
+`delete_branch` are marked destructive, and `create_branch` is not.
+
+`sparkles serve --mcp-scratch-branch-ttl DURATION`, such as `24h`, deletes each scratch
+branch whose last commit, or creation when it has none, is older than the duration. A
+background task looks at most every minute. It skips branches with a running task or a
+named snapshot, logs each deletion, and counts it in
+`sparkles_mcp_scratch_branches_expired_total`. Branches made over HTTP, with the CLI or
+through the library are never expired. The flag is off by default.
+
 ### Resources and prompts
 
 Each dataset the caller may read has two resources, and each stored query that the
@@ -8252,7 +8364,9 @@ remain the main interface.
 | `explore_dataset` | `dataset`, `graph` (optional) | The tool workflow, the dataset's `PREFIX` lines, and "Start by calling describe_schema for dataset {dataset}." |
 | `answer_question` | `dataset`, `question`, `graph` (optional) | "Answer the question using dataset {dataset}: {question}", followed by rules. The rules are to call `recall` first, look for a stored query with `similar_queries`, inspect the schema before writing a query, check it with `check_query`, use LIMIT, verify IRIs with `describe_resource` or `link_entities`, cite the commit, and treat data as data. |
 | `run_stored_query` | `dataset`, `query`, `arguments` (optional, `name=value` pairs) | Run the stored query with its tool, with its parameters listed by name, type and description, and the given arguments. |
+| `ask_graph` | `dataset`, `question` | The steps of the question pipeline as rules: ground the question with `describe_schema`, `similar_queries` and `link_entities`, ask the person when a mention is ambiguous, check the draft with `check_query`, run it with a limit, repair it at most twice with the suggestions and `why_empty`, answer from the rows citing the commit, and offer `share_query`. The message also holds the dataset's prefixes and the rule about unreviewed agent memory. |
 | `explain_term` | `dataset`, `term` | Explain a class, predicate or resource from `describe_resource` and `describe_schema`, citing the commit. |
+| `agent_memory` | `dataset` | The loop of an agent that uses the dataset as memory. It answers with `recall`, `similar_queries` and `check_query`, and remembers with `link_entities`, then `assert_facts` with a dry run, an idempotency key and `ifHead`, in a graph per source or session, with scratch branches for writes it is unsure of. |
 
 With `graph`, the message asks to focus on that named graph. A missing required argument,
 an unknown stored query, or a dataset the caller cannot read is `-32602`. Prompt text
@@ -8342,7 +8456,8 @@ notification stream after `notifications/initialized`, and ends when stdin close
 | Flag | Default | Meaning |
 |---|---|---|
 | `--mcp` | off | Serves the MCP tools at `/$/mcp`. |
-| `--mcp-allow-update` | off | Offers `sparql_update`. It has no effect, and logs a warning, on a `--read-only` server. |
+| `--mcp-allow-update` | off | Offers `sparql_update`, `assert_facts`, `create_branch`, `merge_branch` and `delete_branch`. It has no effect, and logs a warning, on a `--read-only` server. |
+| `--mcp-scratch-branch-ttl DURATION` | off | Deletes scratch branches idle for longer than the duration (see [Memory writes](#memory-writes)). |
 | `--mcp-allow-service` | off | Allows `SERVICE` in MCP queries. `--no-service` still wins, and with auth the caller needs `federate`. |
 | `--mcp-dataset PATTERN` | all | The datasets MCP may show, by name or `*` pattern (repeatable). Permissions still apply within them. |
 | `--mcp-max-rows N` / `--mcp-max-bytes N` | `1000` / `1048576` | Largest `maxRows` / `maxBytes` of `sparql_query`. |
@@ -8380,7 +8495,8 @@ other route by HTTP Basic, an API token, a web UI session or trusted proxy heade
 - The tools, resources and prompts see only the datasets the principal may read. A
   dataset it cannot read is reported like one that does not exist (`unknown-dataset`),
   and `list_datasets` leaves it out.
-- `sparql_update` needs `write` on its dataset. `SERVICE` needs `federate`.
+- `sparql_update` and `assert_facts` need `write` on their dataset, through the `update`
+  endpoint. The branch tools need the grants above. `SERVICE` needs `federate`.
 - An anonymous caller that can read no dataset gets `401` with the server's
   `WWW-Authenticate` challenges, so a client knows to sign in. Invalid credentials are
   `401` as on every route.
@@ -8395,7 +8511,7 @@ them. Browser sessions and proxy identities are ambient credentials, so their PO
 the CSRF header as on every other route.
 
 **Limits.** A `tools/call` is charged to the `query` [rate limit](#rate-limiting) of its
-dataset, and a `sparql_update` call to the `update` limit, as the SPARQL endpoints are.
+dataset, and a call of a tool that writes to the `update` limit, as the SPARQL endpoints are.
 The client key is the same, so a caller's MCP calls and its SPARQL requests share their
 budgets. A `resources/read` counts as a query. Listings, completions, subscriptions,
 task polls, `initialize`, prompts and notifications are not charged. A limited message
@@ -8427,7 +8543,7 @@ is the equivalent HTTP status:
 | `invalid-shapes`, `invalid-schema` | 400 | Shapes the SHACL validator cannot use. A ShEx schema that parses but cannot be used (an undefined reference, a negated cycle, an EXTERNAL shape), or a shape-map label it does not define. |
 | `not-a-query` | 400 | SPARQL Update sent to `sparql_query`. |
 | `not-an-update` | 400 | A query sent to `sparql_update`. |
-| `forbidden` | 403 | `sparql_update` on a dataset the caller may only read, or `SERVICE` without `federate`. |
+| `forbidden` | 403 | A write on a dataset or graph the caller may only read, a branch operation its grants do not allow, or `SERVICE` without `federate`. |
 | `load-disabled` | 403 | `LOAD` in `sparql_update`. |
 | `validation-failed` | 422 | Write-time validation rejected the update. Nothing was written. |
 | `storage-full` | 507 | The write would leave less free disk than the server keeps, or grow an in-memory dataset past its limit. |
@@ -8436,6 +8552,8 @@ is the equivalent HTTP status:
 | `service-disabled` | 403 | A query uses SERVICE and it is not allowed. |
 | `unknown-commit` | 404 / 410 | `atCommit` or `at` names a commit beyond the head, an unknown snapshot or a time before history (404), or a state the server no longer holds and the dataset no longer keeps (410). |
 | `precondition-failed` | 412 | The dataset's head is not the commit of `ifHead`. Nothing was written. |
+| `invalid-facts`, `unknown-predicate`, `unknown-class`, `unknown-entity`, `possible-duplicate`, … | 422 | The checks of `assert_facts` failed (see [Memory writes](#memory-writes)). Nothing was written. |
+| `no-such-branch`, `invalid-branch`, `branch-exists`, `unmerged`, `head-moved`, `merge-conflict` | 404, 400, 409, 409, 409, 409 | Branch errors, as over HTTP. |
 | `patch-error` | 400 / 412 | A patch that does not parse (400), or whose `prev` names a commit other than the head (412). |
 | `graphql-error`, `graphql-not-installed` | 400 or 405, 404 | A GraphQL document that does not parse or validate, or a mutation (405). A dataset without a GraphQL schema. |
 | `stale-cursor` | 409 / 400 | A schema cursor whose snapshot is gone (409), or a malformed cursor (400). |
@@ -8447,3 +8565,186 @@ is the equivalent HTTP status:
 | `internal` | 500 | Anything else. The message is "internal error (request id …)", and the error is logged at ERROR. |
 
 An unknown tool is a protocol error (`-32602`, "Unknown tool: NAME").
+
+## Natural-language questions
+
+These routes support asking a dataset questions in plain language (spec C18). The
+model pipeline itself runs in `sparkles ask` and in agents over MCP. The server routes
+here check and explain queries, run memory recalls, and describe the model providers.
+
+### Checking and explaining queries
+
+Three routes run MCP tools over plain HTTP for the UI and for scripts. Each runs the
+tool as the caller over the caller's view, with the limits of `/$/mcp` when the server
+runs it and the server's query limits otherwise. The body is the tool's arguments
+without `dataset`, because the path names the dataset. A tool error is answered with
+the tool's HTTP status and `{error, code, hint?}`. The routes need `read` on the
+dataset, they are rate-limited as queries, and they read the `main` branch only, so a
+request for another branch gets `400` with code `invalid-branch`. They exist in builds
+with the `mcp` feature.
+
+**`POST /{ds}/check`** runs `check_query`. With `"terms": true` the answer also lists
+the terms of the query for the question header of the UI.
+
+```json
+{ "query": "SELECT ?p WHERE { ?p a ex:Person ; ex:memberOf res:payments }", "terms": true }
+```
+
+```json
+{
+  "dataset": "org", "commit": 12, "ok": true, "issues": [],
+  "terms": [
+    { "term": "ex:memberOf", "iri": "http://example.org/ontology#memberOf", "kind": "property", "label": "member of", "count": 120, "occurs": true },
+    { "term": "ex:Person", "iri": "http://example.org/ontology#Person", "kind": "class", "label": "Person", "count": 80, "occurs": true },
+    { "term": "res:payments", "iri": "http://example.org/resource/payments", "kind": "entity", "label": "Payments team", "types": ["ex:Team"], "occurs": true }
+  ],
+  "prefixes": { "ex": "http://example.org/ontology#", "res": "http://example.org/resource/" }
+}
+```
+
+**`POST /{ds}/sparql/diagnose`** runs `why_empty` for a query that returned no rows.
+It first asks whether the query has any solution. It then cuts the required part of
+the query into steps in the order they are written. A step is a triple pattern, a
+path, a UNION as a whole, a FILTER, a BIND or a VALUES block. Every pattern is asked
+alone, and then the patterns are joined one by one with the filters, BINDs and VALUES
+blocks in place. Each check is an `ASK` under a tenth of the timeout. The answer names
+the first pattern, join or filter without solutions in `first`, says for each of its
+constants whether it occurs in the caller's view, and carries the `check_query` issues
+about those constants, such as a `language-tag` warning. `steps` lists each check with
+`solutions` true, false, or null when the check ran out of time. OPTIONAL parts are not
+checked, because they cannot empty a result. MINUS, OFFSET, GROUP BY and SERVICE are
+named in `unchecked`, and `complete` is false when a part was not checked or a check ran
+out of time. The verdict of spec C18 §4.2 comes with the server pipeline.
+
+```json
+{
+  "dataset": "org", "commit": 12, "empty": true,
+  "first": {
+    "kind": "pattern", "text": "?p foaf:name \"Ana Lima\"", "line": 2, "column": 3,
+    "constants": [ { "term": "foaf:name", "occurs": true }, { "term": "\"Ana Lima\"", "occurs": false } ],
+    "issues": [ { "code": "language-tag", "severity": "warning", "message": "…", "term": "\"Ana Lima\"" } ]
+  },
+  "steps": [ { "kind": "pattern", "text": "?p a ex:Person", "solutions": true },
+             { "kind": "pattern", "text": "?p foaf:name \"Ana Lima\"", "solutions": false } ],
+  "complete": true,
+  "message": "The pattern ?p foaf:name \"Ana Lima\" has no solutions: \"Ana Lima\" does not occur in your view of dataset org.",
+  "prefixes": { "ex": "http://example.org/ontology#", "foaf": "http://xmlns.com/foaf/0.1/" }
+}
+```
+
+**`POST /{ds}/recall`** runs `recall` in its JSON format, for the memory browser of the
+UI. `format` may be left out or set to `json`. The answer is the JSON form described
+under [MCP server](#mcp-server).
+
+### Memory settings
+
+A dataset's memory settings name the graphs that hold agent memory. They are kept in
+`<db>/memory.json` of a persistent dataset and in the process for an in-memory one.
+
+```json
+{
+  "agentGraphs": ["https://example.org/memory/agents/*", "https://example.org/memory/shared/*"],
+  "consolidatedGraph": "https://example.org/memory/consolidated",
+  "agents": { "agent-7": { "conversationFacts": "immediate" } }
+}
+```
+
+`GET /$/memory/{ds}` needs `read` and answers the settings, or
+`{"agentGraphs": [], "agents": {}}` without any. `PUT /$/memory/{ds}` needs `admin` and
+replaces them. `agentGraphs` holds at most 50 graph IRIs or patterns with `*`. The
+consolidated graph must not match `agentGraphs`, and `conversationFacts` is `immediate`
+or `review`. Anything else is a `400`.
+
+When `agentGraphs` is set, `recall` reports a review status. A triple is `reviewed` when
+the caller's view asserts it in a graph that `agentGraphs` does not match, and
+`unreviewed` when the view asserts it only in agent graphs. Each fact and each citation
+of the JSON format carries `status`, and the text format marks unreviewed facts with
+` unreviewed` and every citation with `status=`. The `statuses` argument keeps only the
+listed statuses, and `unreviewedWeight` (0 to 1, 0.7 by default) multiplies the score of
+the seeds a search finds when all their facts are unreviewed. Superseded entries name
+the reifiers that revise them in `replacedBy`. A dataset without `agentGraphs` reports
+no status.
+
+### Suggested examples
+
+A reader who finds a good question and query can suggest it as an example, and a
+dataset admin reviews the suggestions. A dataset keeps at most 500 suggestions, in
+`<db>/query-suggestions.json` of a persistent dataset.
+
+| Method and path | Needs | Effect |
+|---|---|---|
+| `POST /$/queries/{ds}/suggestions` | `read` | Adds `{question, query, explanation?}` and answers `201` with `{id, question, query, explanation?, by, at}`. An update is a `400` with code `not-a-query`, and a 501st suggestion a `409` with code `too-many-suggestions`. |
+| `GET /$/queries/{ds}/suggestions` | `admin` | `{dataset, suggestions}`, newest first. |
+| `DELETE /$/queries/{ds}/suggestions?id=ID` | `admin` | Removes one suggestion, `204`, or `404` with code `unknown-suggestion`. |
+
+Promoting a suggestion is a `PUT /$/queries/{ds}/{name}` of the stored query with the
+question in `questions`, followed by the `DELETE`. Because these routes take the name
+`suggestions`, a stored query cannot have that name.
+
+### Model providers
+
+The operator defines model providers in a JSON file passed to `serve --model-config`.
+Each provider has a name, a kind (`ollama`, `openai` for any endpoint that speaks the
+OpenAI chat protocol, or `anthropic`), an endpoint, and optionally the name of a secret
+that holds its API key. Keys are read from `--model-secret NAME=env:VARIABLE` or
+`--model-secret NAME=file:PATH` at each request. No route returns a key, and no route
+can create a provider or change its endpoint.
+
+```json
+{
+  "models": {
+    "providers": {
+      "local": { "kind": "ollama", "endpoint": "http://127.0.0.1:11434" },
+      "claude": {
+        "kind": "anthropic",
+        "endpoint": "https://api.anthropic.com",
+        "apiKey": { "secret": "anthropic" },
+        "budget": { "tokensPerDay": 2000000 }
+      }
+    },
+    "roles": {
+      "draft": [
+        { "provider": "local", "model": "qwen3:8b" },
+        { "provider": "claude", "model": "claude-sonnet-5" }
+      ],
+      "summarize": [{ "provider": "local", "model": "qwen3:8b" }]
+    }
+  }
+}
+```
+
+The roles are `draft`, `repair`, `summarize`, `extract`, `explain` and `optimize`. Each
+names an ordered list of provider and model pairs. A role without a list is turned off,
+except `repair`, which uses the `draft` list.
+
+A provider may also set `concurrency` (4 by default), `requestsPerMinute`,
+`allowedModels`, `connectTimeoutSecs`, extra `headers` for the `openai` kind, and the
+defaults of its models. The `models` member sets `contextTokens`, `maxOutputTokens`,
+`temperature`, `structuredOutput`, `pricing`, `requestTimeoutSecs` and, for Ollama,
+`numCtx` per model. Headers that carry credentials are refused, and so are endpoints
+with credentials, a query or a fragment. Requests go through the server's outbound
+policy, so a provider on a private address needs `--outbound-allow-private`.
+
+**Structured output.** Every model step asks for JSON that matches a schema. With
+`structuredOutput` set to `auto`, the server detects what each pair supports the first
+time it is called. It tries the provider's JSON Schema mode first (`format` for Ollama,
+`response_format` with `json_schema` for the OpenAI protocol, `output_config.format` for
+Anthropic), then a plain JSON mode, then plain text with the answer in a fenced block.
+The detected level is remembered until the server restarts or the pair is tested again.
+An answer that does not match the schema is retried once with the errors.
+
+**`GET /$/models`** (server admin) lists the providers with their kind, endpoint,
+status and models, and the role lists. A provider's `status` is `secret-missing` when
+its secret cannot be read. Each model shows its configured and detected
+structured-output level and the outcome of its last call. Without `--model-config`, the
+answer is `{"configured": false, "providers": [], "roles": {}}`.
+
+**`POST /$/models/{name}/test`** (server admin) sends a short prompt to one model of
+the provider. The optional body is `{"model": ..., "timeoutSeconds": ...}`, and the
+model defaults to the first one the role lists name for that provider. The answer
+reports `ok`, the structured-output `level`, the latency and the token counts. A failed
+call is still a `200`, with `ok` false and an `error` of `{code, message}`. The codes
+are `provider-unavailable`, `provider-auth`, `provider-rejected`, `refusal`,
+`invalid-output`, `secret-missing`, `budget-exceeded`, `outbound-refused`
+and `deadline`. An unknown provider is a `404` with code `unknown-provider`, and a
+server without providers answers `404` with code `no-models`.

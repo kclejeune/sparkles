@@ -64,7 +64,7 @@ pub(super) fn requested(
 }
 
 /// The external base URL: `server.public_url`, or the request's scheme and `Host`.
-fn base_url(st: &AppState, h: &HeaderMap) -> String {
+pub(crate) fn base_url(st: &AppState, h: &HeaderMap) -> String {
     if let Some(u) = crate::auth::public_url(st) {
         return u.trim_end_matches('/').to_string();
     }

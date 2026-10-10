@@ -1,5 +1,6 @@
 import { parentPort, workerData } from 'node:worker_threads';
 import { native } from '../dist/native.js';
+import { TermCache } from '../dist/terms.js';
 const ds = await native.NativeDataset.open(workerData.path, '{}');
 const cancel = new native.Cancellation();
 if (workerData.mode === 'beginQueued' || workerData.mode === 'loadQueued') {
@@ -24,12 +25,15 @@ if (workerData.mode === 'beginQueued' || workerData.mode === 'loadQueued') {
     },
     graph: { termType: 'DefaultGraph', value: '' },
   });
+  const terms = new TermCache();
+  const write = (quads) => {
+    const { text, data } = terms.encode(quads);
+    return Promise.resolve(tx.write(true, text, data));
+  };
   if (workerData.mode === 'txApply')
-    void tx
-      .apply(JSON.stringify(Array.from({ length: 4096 }, (_, i) => [true, quad(i)])))
-      .catch(() => {});
+    void write(Array.from({ length: 4096 }, (_, i) => quad(i))).catch(() => {});
   else {
-    await tx.apply(JSON.stringify([[true, quad('commit')]]));
+    await write([quad('commit')]);
     void tx.end(true).catch(() => {});
   }
   parentPort.postMessage('ready');

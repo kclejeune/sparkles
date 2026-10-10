@@ -765,7 +765,7 @@ pub fn fetch_text(
 }
 
 /// The answer of [`post_json`]: the status, the `Retry-After` header and the body.
-pub(crate) struct Posted {
+pub struct Posted {
     pub status: reqwest::StatusCode,
     pub retry_after: Option<String>,
     pub body: Vec<u8>,
@@ -775,7 +775,7 @@ pub(crate) struct Posted {
 /// most the policy's), and read the whole response body under the policy's ceiling. Any
 /// status is an answer; only a refused destination, a network failure, a timeout or an
 /// oversized body is a [`Failure`].
-pub(crate) fn post_json(
+pub fn post_json(
     policy: &OutboundPolicy,
     url: &str,
     headers: &[(&str, &str)],

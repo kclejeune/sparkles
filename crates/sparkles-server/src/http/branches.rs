@@ -25,7 +25,13 @@ static MERGES: std::sync::LazyLock<
     parking_lot::Mutex<std::collections::BTreeMap<String, MergeCounts>>,
 > = std::sync::LazyLock::new(Default::default);
 
-fn count_merge(st: &AppState, ds: &str, result: &'static str, r: Option<&MergeReport>, secs: f64) {
+pub(crate) fn count_merge(
+    st: &AppState,
+    ds: &str,
+    result: &'static str,
+    r: Option<&MergeReport>,
+    secs: f64,
+) {
     let mut m = MERGES.lock();
     let c = m.entry(st.metrics.dataset_label(Some(ds))).or_default();
     *c.results.entry(result).or_default() += 1;
@@ -497,8 +503,8 @@ pub(super) fn check(
     Ok(())
 }
 
-/// Branch creation and merges act on whole datasets: grants limited to some graphs do
-/// not allow them.
+/// Branch creation, merges and deletes act on whole datasets: grants limited to some
+/// graphs do not allow them.
 fn whole(p: &Principal, ds: &str, name: &str) -> ApiResult<()> {
     if p.restricted(&on_branch(ds, name)) {
         return Err(forbidden(format!(
@@ -535,6 +541,7 @@ pub(crate) fn branch_json(b: &BranchInfo) -> J {
             "generation": b.storage.generation,
         },
         "broken": b.broken,
+        "scratch": b.scratch.as_ref().map(|s| json!({ "creator": s.creator })),
     })
 }
 
@@ -832,13 +839,17 @@ pub(crate) async fn delete_branch(
     };
     check(&p, &name, &branch, Level::Write, Some(Endpoint::Branches))?;
     if branch != MAIN {
-        let protected = ds
-            .store
-            .branch_info(&branch)
-            .map(|i| i.protected)
-            .unwrap_or(false);
-        if protected {
+        let info = ds.store.branch_info(&branch).ok();
+        if info.as_ref().is_some_and(|i| i.protected) {
             check(&p, &name, &branch, Level::Admin, None)?;
+        }
+        // the rule of creation and merges, relaxed as in C17 §5.7: grants limited to
+        // some graphs delete only the scratch branches their holder created
+        let own = info
+            .and_then(|i| i.scratch)
+            .is_some_and(|s| s.creator == p.id());
+        if !own {
+            whole(&p, &name, &branch)?;
         }
     }
     let d = ds.clone();
@@ -1007,7 +1018,7 @@ fn merge_options(st: &AppState, v: &J, preview: bool) -> ApiResult<MergeAsk> {
     })
 }
 
-fn merge_json(r: &MergeReport, stale: Option<bool>) -> J {
+pub(crate) fn merge_json(r: &MergeReport, stale: Option<bool>) -> J {
     let side = |c: &NamedCommitRef| json!({ "branch": c.branch, "seq": c.seq });
     let commit = r.commit.as_ref().filter(|rc| rc.committed).map(|rc| {
         let mut j = json!(sparkles::commit::AnnotatedCommit {
@@ -1489,7 +1500,7 @@ fn start_task(
 }
 
 /// Count a merge's outcome in the merge metrics.
-fn count_outcome(st: &AppState, name: &str, out: &MergeOutcome, secs: f64) {
+pub(crate) fn count_outcome(st: &AppState, name: &str, out: &MergeOutcome, secs: f64) {
     match out {
         MergeOutcome::Conflicts(c) => {
             let mut m = MERGES.lock();

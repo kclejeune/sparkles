@@ -18,10 +18,12 @@ sparkles-fmt = { path = "../sparkles-fmt" }
 oxrdf = { version = "0.3", features = ["rdfc-10", "rdf-12"] }
 oxrdfio = { version = "0.2", features = ["rdf-12"] }
 parking_lot = "0.12"
+rustc-hash = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sparkles-shacl = { path = "../sparkles-shacl", optional = true }
 sparkles-shex = { path = "../sparkles-shex", optional = true }
+mimalloc = { version = "0.1.52", optional = true }
 sparkles-reasoner = { path = "../sparkles-reasoner", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
 uuid = { version = "1", features = ["v4"] }
@@ -38,6 +40,8 @@ text = ["sparkles/text"]
 geo = ["sparkles/geo"]
 backup = ["sparkles/backup", "sparkles/backup-s3"]
 graphql = ["sparkles/graphql"]
+# mimalloc as the global allocator of the library's own allocations, as in the server
+mimalloc = ["dep:mimalloc"]
 
 [workspace]
 

@@ -15,6 +15,7 @@ use crate::index::{G, O, P, S};
 use crate::store::Snapshot;
 use oxrdf::{BlankNode, NamedNode, NamedOrBlankNode, Term};
 use std::sync::Arc;
+use std::sync::atomic::Ordering as AtomicOrdering;
 use std::sync::mpsc::{Receiver, RecvError, Sender, TryRecvError, channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -195,6 +196,35 @@ impl Transaction<'_> {
         self.txn.base().commit
     }
 
+    /// The id of a term, added to the vocabulary if the store does not have it, as
+    /// [`insert`](Self::insert) would give it. Blank node labels are scoped by this
+    /// transaction, as in `insert`. An id stays valid while the store keeps the same
+    /// vocabulary generation ([`vocab_uid`](Self::vocab_uid)), unless a failed commit
+    /// rolls back the terms this transaction added.
+    pub fn intern_term(&mut self, t: &Term) -> Result<Id> {
+        match t {
+            Term::BlankNode(_) | Term::Triple(_) => self.txn.intern_scoped(t, &mut self.labels),
+            Term::Literal(l) if crate::sparql::cdt::may_name_bnodes(l) => {
+                self.txn.intern_scoped(t, &mut self.labels)
+            }
+            Term::NamedNode(n) => self.txn.intern_key(&crate::id::iri_key(n.as_str())),
+            t => self.txn.intern(t),
+        }
+    }
+
+    /// Insert the quad of ids (subject, predicate, object, graph) that
+    /// [`intern_term`](Self::intern_term) gave, or [`Id::DEFAULT_GRAPH`]; true if it was
+    /// not present.
+    pub fn insert_ids(&mut self, q: [Id; 4]) -> Result<bool> {
+        self.txn.insert(q)
+    }
+
+    /// The identity of the vocabulary generation that this transaction's ids belong to.
+    /// It is unique within the process.
+    pub fn vocab_uid(&self) -> u64 {
+        self.txn.base().generation.uid
+    }
+
     /// Remove every quad that matches a pattern, without returning them; the number
     /// removed. Blank node labels that this transaction's inserts used name the nodes
     /// they made, as in [`Transaction::remove`]. A pattern on the union graph removes the
@@ -290,6 +320,45 @@ enum Msg {
     Commit(Sender<Result<Receipt>>),
 }
 
+/// The transaction, lent by the worker thread while it waits for its next request, so
+/// that [`TxnWorker::try_here`] can run a small write on the caller's thread.
+struct Lent {
+    /// Set only while the worker waits and does not touch the transaction. The worker
+    /// clears it under the lock before it uses the transaction again, so a caller that
+    /// holds the lock and finds it set has the transaction to itself.
+    tx: Option<std::ptr::NonNull<Transaction<'static>>>,
+    /// a call on another thread panicked, so the transaction must not commit
+    broken: bool,
+}
+
+// SAFETY: the pointer is dereferenced only under the lock, while the worker thread
+// waits, as `Lent::tx` describes. The transaction never moves to or drops on another
+// thread: the writer lock's guard and the writer registration stay on the worker, which
+// releases them. A lent call reaches only the vocabulary, the delta and the write
+// guard's counters, which hold no thread-bound state.
+unsafe impl Send for Lent {}
+
+struct Lending {
+    lent: std::sync::Mutex<Lent>,
+    /// requests sent to the worker and not finished, which a call on the caller's
+    /// thread must not overtake
+    pending: std::sync::atomic::AtomicUsize,
+}
+
+impl Lending {
+    fn lend(&self, tx: &mut Transaction<'_>) {
+        let ptr = std::ptr::NonNull::from(tx).cast::<Transaction<'static>>();
+        self.lent.lock().unwrap_or_else(|e| e.into_inner()).tx = Some(ptr);
+    }
+
+    /// Take the transaction back; true if a lent call broke it.
+    fn reclaim(&self) -> bool {
+        let mut lent = self.lent.lock().unwrap_or_else(|e| e.into_inner());
+        lent.tx = None;
+        lent.broken
+    }
+}
+
 /// A write transaction that runs on a thread of its own.
 ///
 /// The store's writer lock must be released by the thread that took it, and callers
@@ -301,6 +370,7 @@ pub struct TxnWorker {
     jobs: Option<Sender<Msg>>,
     base: u64,
     thread: Option<JoinHandle<()>>,
+    lending: Arc<Lending>,
 }
 
 fn ended() -> Error {
@@ -334,14 +404,23 @@ impl TxnWorker {
         let (jobs_tx, jobs_rx) = channel::<Msg>();
         let (started_tx, started_rx) = channel::<Result<Option<u64>>>();
         let ds = ds.clone();
+        let lending = Arc::new(Lending {
+            lent: std::sync::Mutex::new(Lent {
+                tx: None,
+                broken: false,
+            }),
+            pending: Default::default(),
+        });
+        let worker_lending = lending.clone();
         let thread = std::thread::Builder::new()
             .name("sparkles-txn".into())
-            .spawn(move || work(ds, expect_commit, opts, jobs_rx, started_tx))?;
+            .spawn(move || work(ds, expect_commit, opts, jobs_rx, started_tx, worker_lending))?;
         match started_rx.recv() {
             Ok(Ok(Some(base))) => Ok(Some(TxnWorker {
                 jobs: Some(jobs_tx),
                 base,
                 thread: Some(thread),
+                lending,
             })),
             Ok(Ok(None)) => {
                 let _ = thread.join();
@@ -370,12 +449,56 @@ impl TxnWorker {
         let job: Job = Box::new(move |t| {
             let _ = tx.send(f(t));
         });
-        self.jobs
-            .as_ref()
-            .ok_or_else(ended)?
-            .send(Msg::Job(job))
-            .map_err(|_| ended())?;
+        self.send(job)?;
         rx.recv().map_err(|_| ended())?
+    }
+
+    fn send(&self, job: Job) -> Result<()> {
+        let jobs = self.jobs.as_ref().ok_or_else(ended)?;
+        // counted before it is sent, so that `try_here` cannot overtake it
+        self.lending.pending.fetch_add(1, AtomicOrdering::SeqCst);
+        jobs.send(Msg::Job(job)).map_err(|_| {
+            self.lending.pending.fetch_sub(1, AtomicOrdering::SeqCst);
+            ended()
+        })
+    }
+
+    /// Run `f` in the transaction on the calling thread, if the worker is waiting for
+    /// its next request and none is queued, which keeps the order of requests. Gives
+    /// `f` back otherwise, and the caller then uses [`run`](Self::run) or
+    /// [`submit`](Self::submit). It saves the two thread hand-offs of a request, so it
+    /// suits a small write that takes microseconds and never waits for a device.
+    ///
+    /// A panic in `f` ends the transaction without committing it, as in `run`.
+    pub fn try_here<R, F>(&self, f: F) -> std::result::Result<Result<R>, F>
+    where
+        F: for<'a, 'b> FnOnce(&'a mut Transaction<'b>) -> Result<R>,
+    {
+        let mut lent = match self.lending.lent.try_lock() {
+            Ok(lent) => lent,
+            Err(std::sync::TryLockError::WouldBlock) => return Err(f),
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        };
+        if lent.broken {
+            return Ok(Err(Error::invalid("a request in the transaction panicked")));
+        }
+        let Some(ptr) = lent.tx else {
+            return Err(f);
+        };
+        if self.lending.pending.load(AtomicOrdering::SeqCst) != 0 {
+            return Err(f);
+        }
+        // SAFETY: see `Lent`. The worker waits and cannot take the transaction back
+        // while this thread holds the lock.
+        let tx = unsafe { &mut *ptr.as_ptr() };
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(tx))) {
+            Ok(r) => Ok(r),
+            Err(_) => {
+                lent.broken = true;
+                lent.tx = None;
+                Ok(Err(Error::invalid("a request in the transaction panicked")))
+            }
+        }
     }
 
     /// Run `f` in the transaction without waiting: the worker thread calls `reply` with
@@ -388,11 +511,7 @@ impl TxnWorker {
         reply: impl FnOnce(Result<R>) + Send + 'static,
     ) -> Result<()> {
         let job: Job = Box::new(move |t| reply(f(t)));
-        self.jobs
-            .as_ref()
-            .ok_or_else(ended)?
-            .send(Msg::Job(job))
-            .map_err(|_| ended())
+        self.send(job)
     }
 
     /// Whether the worker still runs a transaction.
@@ -441,6 +560,7 @@ fn work(
     opts: crate::guard::WriteOptions,
     jobs: Receiver<Msg>,
     started: Sender<Result<Option<u64>>>,
+    lending: Arc<Lending>,
 ) {
     let mut reply: Option<Sender<Result<Receipt>>> = None;
     let mut moved = false;
@@ -452,14 +572,28 @@ fn work(
             return Err(Error::Cancelled);
         }
         began = true;
+        lending.lend(tx);
         let _ = started.send(Ok(Some(base)));
         loop {
-            match recv_spin(&jobs, WORKER_SPIN) {
+            let msg = recv_spin(&jobs, WORKER_SPIN);
+            if lending.reclaim() {
+                match msg {
+                    Ok(Msg::Commit(r)) => reply = Some(r),
+                    Ok(Msg::Job(_)) => {
+                        lending.pending.fetch_sub(1, AtomicOrdering::SeqCst);
+                    }
+                    Err(_) => {}
+                }
+                return Err(Error::invalid("a request in the transaction panicked"));
+            }
+            match msg {
                 Ok(Msg::Job(f)) => {
                     let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(tx)));
+                    lending.pending.fetch_sub(1, AtomicOrdering::SeqCst);
                     if ok.is_err() {
                         return Err(Error::invalid("a request in the transaction panicked"));
                     }
+                    lending.lend(tx);
                 }
                 Ok(Msg::Commit(r)) => {
                     reply = Some(r);
@@ -677,6 +811,65 @@ mod tests {
         w.run(move |tx| tx.insert(q.as_ref())).unwrap();
         w.commit().unwrap();
         assert!(!waiter.join().unwrap().unwrap());
+    }
+
+    #[test]
+    fn worker_lends_its_transaction_between_requests() {
+        let ds = data();
+        let w = TxnWorker::begin(&ds, None).unwrap().unwrap();
+        let quad = |l: &str| Quad::new(n(l), n("p"), Literal::from(1), GraphName::DefaultGraph);
+        // the worker waits, so the write runs here
+        let q = quad("here");
+        let here = w.try_here(move |tx| tx.insert(q.as_ref()));
+        assert!(matches!(here, Ok(Ok(true))));
+        // ids from `intern_term` name the same quad as `insert`
+        let q = quad("here");
+        let again = w.try_here(move |tx| {
+            let ids = [
+                tx.intern_term(&q.subject.clone().into())?,
+                tx.intern_term(&q.predicate.clone().into())?,
+                tx.intern_term(&q.object)?,
+                Id::DEFAULT_GRAPH,
+            ];
+            tx.insert_ids(ids)
+        });
+        assert!(matches!(again, Ok(Ok(false))));
+        // a request that the worker has not finished is not overtaken
+        let (go, wait) = channel::<()>();
+        let (done, finished) = channel::<()>();
+        w.submit(
+            move |_| {
+                wait.recv().unwrap();
+                Ok(())
+            },
+            move |_: Result<()>| done.send(()).unwrap(),
+        )
+        .unwrap();
+        assert!(w.try_here(|_| Ok(())).is_err());
+        go.send(()).unwrap();
+        finished.recv().unwrap();
+        // the worker lends again once it waits; it may still be on its way there
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while w.try_here(|_| Ok(())).is_err() {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        let r = w.commit().unwrap();
+        assert_eq!(r.commit.inserted, 1);
+        assert!(ds.contains(quad("here").as_ref()).unwrap());
+
+        // a panic in a lent call ends the transaction without a commit
+        let w = TxnWorker::begin(&ds, None).unwrap().unwrap();
+        let q = quad("lost");
+        assert!(matches!(
+            w.try_here(move |tx| tx.insert(q.as_ref())),
+            Ok(Ok(true))
+        ));
+        let panicked = w.try_here(|_| -> Result<()> { panic!("lent call") });
+        assert!(matches!(panicked, Ok(Err(_))));
+        assert!(w.commit().is_err());
+        assert!(!ds.contains(quad("lost").as_ref()).unwrap());
+        TxnWorker::begin(&ds, None).unwrap().unwrap().abort();
     }
 
     #[test]

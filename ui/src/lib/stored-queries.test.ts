@@ -83,6 +83,10 @@ describe('saving', () => {
       },
     });
     expect(buildDefinition('ASK {}', '', [])).toEqual({ query: 'ASK {}' });
+    expect(buildDefinition('ASK {}', '', [], [' Is it? ', ''])).toEqual({
+      query: 'ASK {}',
+      questions: ['Is it?'],
+    });
   });
   it('checks the fields', () => {
     expect(saveProblems('ok', [])).toEqual([]);

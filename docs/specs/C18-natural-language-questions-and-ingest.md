@@ -1,8 +1,9 @@
 # C18: Questions and ingestion in natural language
 
-> **Status:** specified
+> **Status:** implemented in part (Phase 1)
 >
-> **Phases:** None shipped. Phase 1 lets an agent connected over MCP hand the query it
+> **Phases:** Phase 1 shipped on 2026-10-09, without the measured runs of the model
+> matrix on the public sets. Phase 1 lets an agent connected over MCP hand the query it
 > wrote for a question to the web UI, where a person reads, edits and runs it, and adds
 > a memory browser that shows each fact's source, passage and history. It also adds
 > model providers to the server, for Ollama and other local models, any
@@ -19,10 +20,14 @@
 > query and proves that they return the same results. Every phase builds on the tools
 > of [C17](C17-agent-memory.md).
 >
-> **User docs:** none, because nothing is built.
+> **User docs:** [API: Natural-language questions](../API.md#natural-language-questions) ·
+> [API: MCP tools](../API.md#tools) ·
+> [Usage: Asking questions with a model](../USAGE.md#asking-questions-with-a-model) ·
+> [Usage: Handing a query to the web UI](../USAGE.md#handing-a-query-to-the-web-ui) ·
+> [Features](../FEATURES.md)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
-> the end will record how it lands.
+> the end records how it lands.
 
 This design was written from the Model Context Protocol specification, the W3C SPARQL
 1.1 and 1.2 drafts, RDF 1.2, SHACL, PROV-O, RFC 5147, published work on translating
@@ -1674,7 +1679,7 @@ An ingestion runs in one of three modes.
 
 | Mode | What happens |
 |---|---|
-| `branch` | The default. The server creates a scratch branch `ingest/<source-slug>-<n>` and writes the proposals there with `assert_facts`. When an agent ingests, the branch is `proposals/{agent}/ingest-<source-slug>-<n>`, which the agent's grants cover (§8.6). A person reviews the proposals in the UI and merges through the merge preview of F09. |
+| `branch` | The default. The server creates a scratch branch `ingest.<source-slug>-<n>` and writes the proposals there with `assert_facts`. When an agent ingests, the branch is `proposals.{agent}.ingest-<source-slug>-<n>`, which the agent's grants cover (§8.6). A person reviews the proposals in the UI and merges through the merge preview of F09. |
 | `preview` | Nothing is written. The proposal is kept as a task result for 7 days, and a person approves it in the UI, which then writes it to `main` with `ifHead`. |
 | `auto` | The proposals are written to `main` when the guard passes, every span check passes, no entity is `ambiguous` and every fact's confidence is at least the threshold, 0.8 by default. Anything else falls back to `branch`. Only an admin of the dataset may enable `auto`. |
 
@@ -1718,7 +1723,7 @@ The dataset page gains an **Ingest** section next to Upload, and each review bra
 gets a review page at `/ui/datasets/{name}/review/{branch}`.
 
 ```
-┌─ org › Review ingest/standup-2026-10-08-1 ─────────────────────────────────────┐
+┌─ org › Review ingest.standup-2026-10-08-1 ─────────────────────────────────────┐
 │ Source  Stand-up notes of 2026-10-08 · markdown · 5,120 chars · 3 chunks       │
 │ 14 facts proposed · 9 accepted · 2 rejected · 3 open   guard ✓   [Merge ▸]     │
 ├──────────────────────────────────┬─────────────────────────────────────────────┤
@@ -1826,7 +1831,7 @@ retraction on a branch of its own, which a person merges.
 |---|---|
 | An agent's own memory | `read` and `write` on `…/agents/{agent}/*` for that agent only, on `main` and on its proposal branches. |
 | Shared team memory | `write` on `…/shared/*` for each agent of the team, under the same rules. |
-| Consolidated memory and curated data | `read` on `main`. `write` only on the agent's proposal branches `proposals/{agent}/*`. |
+| Consolidated memory and curated data | `read` on `main`. `write` only on the agent's proposal branches `proposals.{agent}.*`. |
 | Sensitive predicates | A C12b protection, such as hiding `schema:email` from agent tokens. |
 | Merging | Never. The `merge` endpoint of F09 §6.1 is left out of every agent grant. |
 
@@ -1837,12 +1842,12 @@ C12. For an agent `agent-7` on dataset `org`, an operator writes three grants.
 { "principal": "token:agent-7", "dataset": "org", "grants": [
   { "level": "read" },
   { "level": "write", "graphs": ["https://example.org/memory/agents/agent-7/*"],
-    "branches": ["main", "proposals/agent-7/*"],
-    "endpoints": ["query", "update", "gsp", "info", "branches"] },
+    "branches": ["main", "proposals.agent-7.*"],
+    "endpoints": ["query", "update", "gsp-r", "gsp-rw", "info", "branches"] },
   { "level": "write", "graphs": ["https://example.org/memory/consolidated",
                                  "https://example.org/hr", "https://example.org/projects/*"],
-    "branches": ["proposals/agent-7/*"],
-    "endpoints": ["query", "update", "gsp", "info", "branches"] } ] }
+    "branches": ["proposals.agent-7.*"],
+    "endpoints": ["query", "update", "gsp-r", "gsp-rw", "info", "branches"] } ] }
 ```
 
 The first grant lets the agent read everything it should see. The second lets it write
@@ -1850,7 +1855,7 @@ its own graphs on `main` and on its proposal branches. The third lets it write t
 consolidated and curated graphs only on its proposal branches. None of them lists
 `merge`, so a merge or merge preview by the agent is refused with `forbidden`, whatever
 C17 §5.7 would otherwise allow a graph-limited principal for its own scratch branches.
-C17's scratch-branch rule still lets the agent create `proposals/agent-7/…`, because
+C17's scratch-branch rule still lets the agent create `proposals.agent-7.…`, because
 its grants cover some graphs on that name. `sparkles auth grant --template agent` and
 the token form of the UI write this template from an agent name, a session graph prefix
 and the list of curated graphs, so operators do not write it by hand.
@@ -1919,7 +1924,7 @@ answer depends on them, and prefer a reviewed fact when the two disagree."
 **A stricter policy per agent.** For an agent that is trusted less, `conversationFacts:
 "review"` in the agent's entry of `memory.json` sends even its conversation facts to a
 branch first. `assert_facts` by that principal on `main` then writes to its branch
-`proposals/{agent}/inbox` instead, creating it when needed, and the result's `branch`
+`proposals.{agent}.inbox` instead, creating it when needed, and the result's `branch`
 member says so. The agent reads its own pending facts by passing that branch to
 `recall`, which the result's message tells it. The default stays `immediate`.
 
@@ -1938,11 +1943,11 @@ session facts, by source or by session.
 │   ☑ Ana Lima  member of → Payments      span ✓ link ✓ guard ✓ corroborated ✓  │
 │   ☑ Kai Ito   on leave until → 2026-10-10   span ✓ link ✓ guard ✓            │
 │   ☐ Payments  part of → Commerce        link ⚠ 2 candidates          [Fix ▸] │
-│ ▾ Ingest   ingest/standup-2026-10-08-1 · 14 facts · 3 open          [Open ▸] │
-│ ▾ Proposal proposals/agent-7/fix-due-date · retracts 1 curated fact [Open ▸] │
+│ ▾ Ingest   ingest.standup-2026-10-08-1 · 14 facts · 3 open          [Open ▸] │
+│ ▾ Proposal proposals.agent-7.fix-due-date · retracts 1 curated fact [Open ▸] │
 │      − Checkout redesign  due date 2026-10-14   (graph …/projects/checkout)   │
 │      + Checkout redesign  due date 2026-10-21   span ✓ guard ✓               │
-│ ▾ Consolidation proposals/agent-7/consolidate-2026-10-09 · 41 facts [Open ▸] │
+│ ▾ Consolidation proposals.agent-7.consolidate-2026-10-09 · 41 facts [Open ▸] │
 ├───────────────────────────────────────────────────────────────────────────────┤
 │ 2 selected   [Accept all that pass]  [Promote selected ▸]  [Reject selected]  │
 │ Promote into [https://example.org/memory/consolidated ▾]                      │
@@ -2024,7 +2029,7 @@ sources with their chunk and fact counts. It shows recent activity, which is the
 │  agent-7 (claude-code)  …/agents/agent-7/  1,204   38       today 09:14        │
 │  agent-9 (ingest)       …/shared/          5,311   112      yesterday          │
 │ Review queue                                                                  │
-│  ingest/standup-2026-10-08-1   14 facts · 3 open · guard ✓      [Review ▸]   │
+│  ingest.standup-2026-10-08-1   14 facts · 3 open · guard ✓      [Review ▸]   │
 │  scratch-s2 (agent-7)          2 facts · conflicts 0            [Review ▸]   │
 │ Recent activity                                                               │
 │  09:14  agent-7  "Stand-up notes of 2026-10-08"  +3 facts, 1 superseded       │
@@ -3411,7 +3416,7 @@ dataset `org` with a text index over `rdfs:label` and `foaf:name` and the shapes
   writes nothing.
 - **A8.** `assert_facts` with a fact whose `span` covers "Ana moved to the payments team"
   and whose quote is that text commits on the branch
-  `proposals/agent-7/ingest-standup-1`, and the reifier
+  `proposals.agent-7.ingest-standup-1`, and the reifier
   has `prov:wasDerivedFrom` of the span IRI. A fact whose quote is "Ana leads the
   payments team" at the same span fails with `span-mismatch`.
 - **A9.** A fact with the predicate `ex:leads`, which is not in the ingest profile,
@@ -3480,11 +3485,11 @@ dataset `org` with a text index over `rdfs:label` and `foaf:name` and the shapes
   reifier, and `recall` then reports it as `reviewed`. Rejecting another session fact
   retracts it, and its reifier has `prov:wasInvalidatedBy`.
 - **A30.** As `agent-7` with the template of §8.6, a merge preview or merge of
-  `proposals/agent-7/fix` into `main` answers `forbidden`. Writing
+  `proposals.agent-7.fix` into `main` answers `forbidden`. Writing
   `https://example.org/hr` on `main` answers `forbidden`, and writing it on
-  `proposals/agent-7/fix` succeeds.
+  `proposals.agent-7.fix` succeeds.
 - **A31.** With `conversationFacts: "review"` for `agent-7`, `assert_facts` on `main`
-  commits on `proposals/agent-7/inbox`, the result names that branch, and `main` is
+  commits on `proposals.agent-7.inbox`, the result names that branch, and `main` is
   unchanged.
 - **A32.** In the inbox, **Accept all that pass** selects facts whose span, link and
   guard signals pass, and leaves out a fact with confidence 0.99 whose link check finds
@@ -3809,4 +3814,81 @@ for her principal. The memory directory belongs to a project whose remote is
 
 ## Outcome
 
-Nothing is built.
+**Phase 1 delivered on 2026-10-09.** The matrix has not been run with real models, and
+the public sets of §11.1 are not converted, so the targets of §11.3 and the measured role
+lists of §11.4 are still open. Phases 2 to 6 are not built.
+
+- **Model providers.** The server's `models` module holds the three kinds of §3.4 with
+  their request and response formats, named secrets read at each request from
+  `--model-secret NAME=env:VAR|file:PATH`, concurrency slots, request spacing, a daily
+  token budget, estimated cost from `pricing`, and the role lists of §3.7.
+  `Models::call` asks one pair for an answer that matches a schema. Under `auto` it
+  tries the JSON Schema mode, then JSON mode, then plain text, remembers the first
+  level that works for each pair, validates every answer against the schema subset of
+  §3.6, and retries an invalid answer once with the errors. A key is scrubbed from every
+  error message, and no response carries it. `GET /$/models` and
+  `POST /$/models/{name}/test` describe and test the pairs. The provider clients are
+  tested against mock endpoints only (A19, A26).
+- **Tools and routes.** `share_query` and `why_empty` are MCP tools, and
+  `POST /{ds}/check`, `POST /{ds}/recall` and `POST /{ds}/sparql/diagnose` run
+  `check_query`, `recall` and `why_empty` over HTTP. Each request builds an MCP server
+  for the caller, so HTTP and MCP share one code path, one view and one set of budgets.
+  `check_query` gains `terms`, the list of §4.5. `recall` gains `statuses`,
+  `unreviewedWeight`, a `status` on each fact and citation and `replacedBy` on
+  superseded entries, read from `memory.json` (§8.8). `/$/memory/{ds}` and
+  `/$/queries/{ds}/suggestions` keep the memory settings and the suggested examples.
+  The `ask_graph` prompt holds the steps of §4.1 as rules (A1 to A4, A28).
+- **The pipeline.** The `ask` module runs §4.1 as a library function over the MCP tools,
+  as the caller, with the dataset's prefixes, and reports the events of §5.2. It
+  extracts the mentions of a question from quoted strings and runs of capitalized
+  words, asks about an `ambiguous` mention before drafting, checks every draft,
+  refuses updates through `check_query`, adds `LIMIT 1000`, repairs at most twice from
+  the check's issues, a failed run or `why_empty`, and summarizes up to 50 rows with
+  row markers that it checks against the rows sent. It trims the grounding for a small
+  context window and leaves out the summary below 8,192 tokens (A27). It also computes
+  the complexity score of §5.5, which Phase 2 routes on and the matrix buckets by.
+  `sparkles ask` runs it on a database or on files and prints text, one JSON object or
+  one JSON line per event.
+- **Evaluation.** `testsuite/ask/demo.json` holds 68 questions over the mock server's
+  organisation graph, which `testsuite/ask/org.ttl` keeps as Turtle. There are 59
+  answerable questions with gold queries in seven categories, four that need a
+  clarification and five that the data cannot answer. A test runs every gold query
+  and checks its stored complexity. `scripts/eval-ask` runs the matrix of §11.4 and
+  writes its report outside the repository, and `--self-test` runs it against a mock
+  provider (A43).
+- **Access.** `sparkles auth grant --template agent` prints the grants of §8.6 (A30).
+  The rule of §8.8 that the `agent_memory` prompt adds is the constant
+  `mcp::context::UNREVIEWED_RULE`, which `ask_graph` already includes.
+- **UI.** A handoff link opens a new query tab with the question header and the terms
+  list and does not run (A1, A2). The Saved menu lists the questions asked in the
+  browser, **Save as example** proposes parameters for the linked constants (A5),
+  **Suggest as example** posts a suggestion that an admin promotes or dismisses (A6), and
+  an empty result shows the diagnosis. The Explore page has a Memory tab and the UI a
+  Memory page (A20, A21).
+
+**Deviations and additions.**
+
+- Branch names cannot hold a slash, so the proposal branches of the agent template are
+  `proposals.NAME.*` instead of `proposals/NAME/*`. The UI treats both forms as review
+  branches. The template's write grants list the endpoints `query`, `update`, `gsp-r`,
+  `gsp-rw`, `info` and `branches`, which leaves out merges.
+- The model configuration lives only in the file of `--model-config`, which may wrap it
+  in `{"models": …}` as §3.4 writes it. The schemas of `Draft` and `Summary` mark every
+  member as required and use empty strings and lists for absent members, because the
+  strict mode of the `openai` kind accepts no optional member. Lengths are enforced
+  after validation rather than in the schema.
+- A draft whose `query` is empty is the model's way of saying that the data cannot
+  answer the question, and the ask ends with the outcome `unanswerable`.
+- In Phase 1 `sparkles ask` uses the first pair of each role and does not move to the
+  next pair on failure. `why_empty` has no `verdict` yet, so repair stops early only
+  when the first element without solutions is a join with no issues and every constant
+  occurs.
+- The matrix runs each pair in the draft, repair and summarize roles at once. The
+  cascade row is computed from those runs, moving a question on when the server sees a
+  failure, rather than from separate runs with escalation, which needs Phase 2.
+- QALD-9-plus and Text2SPARQL'25 are not converted. `scripts/eval-ask` takes any set in
+  the demo set's format with its own data file.
+- Promotion and rejection in the review inbox, and `actedOnBehalfOf` in citations, are
+  left to Phase 3.
+- A stored query named `suggestions` cannot be read at `/$/queries/{ds}/suggestions`,
+  which the suggestion list now answers.

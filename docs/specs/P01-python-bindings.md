@@ -145,6 +145,7 @@ The crate's features have the server's names, so a build can be configured the s
 | `shex` | on | `Dataset.validate_shex` (crate `sparkles-shex`) |
 | `text` | on | `sparkles/text`, so `text:query` works on datasets with a text index |
 | `geo` | on | `sparkles/geo`, the GeoSPARQL functions |
+| `mimalloc` | on | mimalloc as the allocator of the extension's own allocations |
 
 `sparkles/zstd` and `sparkles/brotli` are always on, as in the server, so compressed
 inputs and dumps work with every codec. In a build without a feature, its methods still
@@ -164,8 +165,10 @@ stay valid for every build, and `sparkles.FEATURES` lists what the build has.
 * **Licenses.** The wheel carries the Apache-2.0 license of Sparkles and a generated
   `THIRD_PARTY_LICENSES.md` for the crates it links, declared with `license-files`
   (PEP 639).
-* **Allocator.** The extension uses the system allocator. The server's mimalloc is a
-  process-wide choice that an extension module must not make for its host interpreter.
+* **Allocator.** The extension's own allocations go to mimalloc, through the default
+  `mimalloc` feature. Rust's global allocator in an extension module covers only that
+  module, so the interpreter and other extensions keep their allocator. The Outcome
+  records the measurement and its memory cost.
 
 ## 3. Python API
 
@@ -907,3 +910,70 @@ pyoxigraph's 126 µs, and that gap lies in query planning and evaluation, not in
 binding. Through the plugin, with the Memory store in brackets, 1,000 `contains` probes
 went from 4.6 to 3.3 µs each [2.6] and `Graph.value` from 6.2 to 5.7 µs [4.7], while
 `(? p o)` stayed at about 5.1 ms [3.5].
+
+**Queries from the main thread, rdflib scans and the allocator (2026-10-09).** A third
+round looked at the small `VALUES` query and the plugin's `(? p o)` pattern. Three changes
+followed.
+
+* A request made on Python's main thread runs on a helper thread so that Ctrl-C can
+  cancel it (§6). Waking the helper and then waking the main thread for the answer cost
+  more than the query itself on a busy machine. The helper thread now spins for up to
+  50 µs for its next request before it sleeps, and the main thread spins without the GIL
+  for up to 200 µs for the answer before it sleeps and polls for signals. The spins cost
+  up to 200 µs of the main thread's core per request that takes longer, and up to 50 µs
+  of one core after the last request of a burst.
+* The rdflib plugin reads a scan as engine ids and converts each distinct id of a batch
+  of 1,024 once, so the predicate and object that every row of a `(None, p, o)` pattern
+  repeats cost a lookup in a small map. Before, each row decoded all three terms and
+  looked each up by its text under a lock.
+* The `mimalloc` feature is on by default (§2.3 and §2.4).
+
+The comparison ran A/B/B/A in fresh processes pinned to six cores of an 8-vCPU AMD EPYC
+instance on Namespace, at 105,000 triples, with four process medians per arm. The arms
+are the code before the round, the round's code with the system allocator, and the
+round's code with mimalloc. The small `VALUES` query went from 420 to 295 to 246 µs
+[pyoxigraph 147], and the star lookup from 541 to 521 to 451 µs [288]. `addAll` went from
+6.3 to 6.5 to 5.2 µs per quad [7.7], and a single `tx.add` from 6.7 to 7.0 to 6.0 µs
+[6.8]. The other native cases did not change beyond the noise of the run. Through the
+plugin, with rdflib's Memory store in brackets, `(? p o)` went from 6.7 to 5.1 to 4.1 ms
+[4.1] and iterating every triple from 192 to 145 to 122 ms [155]. `contains` and
+`Graph.value` stayed at about 4.0 and 6.7 µs [3.1 and 5.1], because each makes one
+pattern call through rdflib's Python code, which the plugin does not control.
+
+mimalloc raised the peak RSS of the benchmark process from 238 to 288 MiB with the native
+API and from 207 to 240 MiB with the plugin, about 20%, against the speedups above. The
+process holds 105,000 triples, and most of the increase is memory that mimalloc keeps for
+reuse after the load.
+
+The query itself takes about 65 µs in Rust on the same laptop, and planning is about
+45 µs of it, while parsing takes 10 µs and evaluation 9 µs. The profile shows no single
+cheap fix. Join ordering is about half of planning, and it is mostly allocation of plan
+nodes and their clones. Building each scan's description text once per pattern instead
+of once per index order saved nothing measurable, and it was not kept. A plan cache is
+the larger fix, and the design below is for a later round in the engine.
+
+* **Key.** The parsed query with each constant IRI and literal replaced by a numbered
+  parameter, together with the options that change planning, such as the dataset clause,
+  inference, the union default graph and the names of initial bindings. The rows of a
+  `VALUES` block become parameters, while the number of rows stays in the key. A first
+  lookup by the exact query text skips parsing as well.
+* **Value.** The planned tree with parameters in place of constant ids, the table of
+  variable names, and for each scan with a bound constant the order of magnitude of the
+  estimate it was planned with.
+* **Reuse.** A hit interns the constants of the new query, which is a vocabulary lookup
+  each, and counts the prefix of each parameterized scan as the planner already does.
+  The cached plan is used when every count falls in the same power-of-two bucket as
+  before, and the query is planned again otherwise. A count of zero always replans,
+  because the planner turns such a scan into an empty node.
+* **Plan state and execution state.** Today the planner writes into the `Ctx` that
+  evaluation then uses, for variable ids, terms interned from outside the store,
+  registered characteristic sets, sampling and key probes. These move into an immutable
+  plan state behind an `Arc`, which a cached entry shares. Each execution makes a fresh
+  `Ctx` with the deadline, the budgets, the cursor owner, warnings, minted blank nodes,
+  expression caches and the bound parameter values, and refers to the plan state.
+* **Bounds and invalidation.** A small LRU per store, of about 256 plans of a few
+  kilobytes each. The bucket check makes a plan survive commits that do not change the
+  estimates much, and a compaction, which rebuilds the statistics, clears the cache.
+
+With planning and parsing skipped, the engine's part of the small `VALUES` query would
+drop from about 65 to about 15 µs.

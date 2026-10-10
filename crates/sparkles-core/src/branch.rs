@@ -110,6 +110,19 @@ pub struct BranchInfo {
     pub storage: BranchStorage,
     /// the branch's directory is listed but missing or unreadable
     pub broken: bool,
+    /// set on a scratch branch, which an MCP agent created for speculative writes
+    pub scratch: Option<Scratch>,
+}
+
+/// The mark of a scratch branch (spec C17 §5.7): a branch that an agent created through
+/// the MCP server's `create_branch` tool. Its creator may merge and delete it even with
+/// grants limited to some graphs, and the server may delete it once it has been idle
+/// for longer than the operator allows.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Scratch {
+    /// the principal that created the branch, as the server names it in its logs
+    pub creator: String,
 }
 
 /// Options of [`Store::create_branch`](crate::store::Store::create_branch).

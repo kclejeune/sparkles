@@ -53,10 +53,16 @@ pub struct ServeArgs {
     /// request's caller and sees only the datasets it may read
     #[arg(long)]
     pub mcp: bool,
-    /// Offer the sparql_update tool at /$/mcp to callers that may write to a dataset
-    /// (ignored, with a warning, on a --read-only server)
+    /// Offer the write tools at /$/mcp (sparql_update, assert_facts and the branch tools
+    /// that write) to callers that may write to a dataset (ignored, with a warning, on a
+    /// --read-only server)
     #[arg(long)]
     pub mcp_allow_update: bool,
+    /// Delete scratch branches that MCP's create_branch made once their last commit, or
+    /// their creation when they have none, is older than this duration (`90m`, `12h`,
+    /// `7d`; off by default)
+    #[arg(long, value_name = "DURATION")]
+    pub mcp_scratch_branch_ttl: Option<String>,
     /// Do not offer the datasets' stored queries as tools at /$/mcp
     #[arg(long)]
     pub mcp_no_stored_queries: bool,
@@ -142,6 +148,17 @@ impl ServeArgs {
         if self.mcp_allow_service && !st.allow_service {
             tracing::warn!("--mcp-allow-service has no effect with --no-service");
         }
+        let scratch_ttl = match &self.mcp_scratch_branch_ttl {
+            None => None,
+            Some(d) => {
+                let ms = crate::parse_duration_ms(d)
+                    .map_err(|e| anyhow::anyhow!("--mcp-scratch-branch-ttl: {e}"))?;
+                if ms == 0 {
+                    bail!("--mcp-scratch-branch-ttl must be longer than 0");
+                }
+                Some(std::time::Duration::from_millis(ms))
+            }
+        };
         let mcp_memory = (self.mcp_query_memory_mb > 0).then_some(self.mcp_query_memory_mb << 20);
         let query_memory_bytes = match (mcp_memory, st.limits.query_memory_bytes) {
             (Some(a), Some(b)) => Some(a.min(b)),
@@ -165,6 +182,8 @@ impl ServeArgs {
                 datasets: self.mcp_dataset.clone(),
                 stored_queries: !self.mcp_no_stored_queries,
                 task_after: std::time::Duration::from_millis(self.mcp_task_after_ms),
+                scratch_ttl,
+                http: true,
                 ..McpConfig::default()
             },
             max_sessions: self.mcp_max_sessions,
@@ -247,7 +266,10 @@ fn charge_of(message: &Value) -> Charge {
     match m.get("method").and_then(Value::as_str) {
         Some("tools/call") => {
             let name = str_at(params, "name");
-            let class = if name.as_deref() == Some("sparql_update") {
+            let class = if name
+                .as_deref()
+                .is_some_and(|n| super::branches::WRITE_TOOLS.contains(&n))
+            {
                 Class::Update
             } else {
                 Class::Query

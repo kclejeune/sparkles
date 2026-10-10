@@ -174,6 +174,9 @@ mod phase3;
 #[path = "memory_tests.rs"]
 mod memory_tools;
 
+#[path = "c18_tests.rs"]
+mod c18;
+
 fn head(s: &McpServer, ds: &str) -> u64 {
     s.state.get(ds).unwrap().store.head_commit().seq
 }
@@ -427,6 +430,7 @@ fn expected_input_schemas() -> Vec<(&'static str, Value)> {
                 "query": {"type":"string","minLength":1,"maxLength":65536,"description":"A SPARQL query; the dataset prefixes are predeclared"},
                 "explain": {"type":"boolean","default":false,"description":"Add the plan's estimated rows and the no-limit and large-estimate warnings of explain_query"},
                 "maxSuggestions": {"type":"integer","minimum":0,"maximum":10,"default":3,"description":"Suggestions per issue"},
+                "terms": {"type":"boolean","default":false,"description":"List every constant IRI of the query with its kind, label, count and whether it occurs"},
                 "reasoning": rs,
                 "timeoutSeconds": to,
                 "atCommit": at, "at": sel}}),
@@ -469,7 +473,18 @@ fn expected_input_schemas() -> Vec<(&'static str, Value)> {
                 "maxTriples": {"type":"integer","minimum":1,"maximum":1000,"default":150},
                 "maxBytes": {"type":"integer","minimum":1024,"maximum":1048576,"default":32768},
                 "includeSuperseded": {"type":"boolean","default":false,"description":"List the superseded and retracted facts of the entities returned"},
+                "statuses": {"type":"array","items":{"enum":["reviewed","unreviewed"]},"minItems":1,"maxItems":2,"description":"The review statuses to return when the dataset names agent memory graphs (default both). Unreviewed facts were written by an agent and not yet checked by a person"},
+                "unreviewedWeight": {"type":"number","minimum":0,"maximum":1,"default":0.7,"description":"Factor on the score of found seeds whose facts are all unreviewed"},
                 "format": {"enum":["text","json"],"default":"text"},
+                "reasoning": rs,
+                "timeoutSeconds": to,
+                "atCommit": at, "at": sel}}),
+        ),
+        (
+            "why_empty",
+            json!({"type":"object","additionalProperties":false,"required":["query"],"properties":{
+                "dataset": ds,
+                "query": {"type":"string","minLength":1,"maxLength":65536,"description":"The SPARQL query that returned no rows; the dataset prefixes are predeclared"},
                 "reasoning": rs,
                 "timeoutSeconds": to,
                 "atCommit": at, "at": sel}}),
@@ -543,15 +558,30 @@ async fn a03_tool_list() {
             "similar_queries",
             "link_entities",
             "recall",
+            "why_empty",
             #[cfg(feature = "shacl")]
             "validate_shacl",
             #[cfg(feature = "shex")]
             "validate_shex",
             #[cfg(feature = "fmt")]
             "format",
+            "list_branches",
         ]
     );
-    let expected = expected_input_schemas();
+    let mut expected = expected_input_schemas();
+    // every tool that reads a dataset also takes `branch` (C17 §5.7)
+    let br = json!({"type":"string","pattern":"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$","description":"Work on this branch of the dataset instead of main (see list_branches). Your grants apply on the branch as they do on main."});
+    for (_, schema) in &mut expected {
+        if let Some(props) = schema["properties"].as_object_mut()
+            && props.contains_key("dataset")
+        {
+            props.insert("branch".into(), br.clone());
+        }
+    }
+    expected.push((
+        "list_branches",
+        json!({"type":"object","additionalProperties":false,"properties":{"dataset": expected[1].1["properties"]["dataset"].clone()}}),
+    ));
     assert_eq!(expected.len(), tools.len());
     for ((name, schema), tool) in expected.into_iter().zip(tools) {
         assert_eq!(tool["name"], name);

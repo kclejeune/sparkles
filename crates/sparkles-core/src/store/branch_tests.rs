@@ -2005,3 +2005,29 @@ fn a18_the_first_rebuild_of_a_linked_branch_keeps_the_quota() {
     apply(&dev, "+<urn:new2> <urn:p> <urn:x> .");
     assert!(has(&dev, "urn:new2"));
 }
+
+/// The scratch mark of C17 §5.7: set on a branch, kept across a reopen, listed, and
+/// never on `main`.
+#[test]
+fn scratch_marks_persist() {
+    let (dir, s) = setup();
+    s.create_branch("try", &BranchOptions::default()).unwrap();
+    assert!(s.branch_info("try").unwrap().scratch.is_none());
+    let mark = crate::branch::Scratch {
+        creator: "user:agent-7".into(),
+    };
+    let info = s.set_branch_scratch("try", Some(mark.clone())).unwrap();
+    assert_eq!(info.scratch.as_ref().unwrap().creator, "user:agent-7");
+    assert_eq!(
+        code(&s.set_branch_scratch("main", Some(mark)).unwrap_err()),
+        "invalid-branch"
+    );
+    drop(s);
+    let s = Store::open(&dir.path().join("ds"), StoreOptions::default()).unwrap();
+    let list = s.branches().unwrap();
+    let b = |n: &str| list.iter().find(|b| b.name == n).unwrap().clone();
+    assert_eq!(b("try").scratch.unwrap().creator, "user:agent-7");
+    assert!(b("main").scratch.is_none());
+    s.set_branch_scratch("try", None).unwrap();
+    assert!(s.branch_info("try").unwrap().scratch.is_none());
+}

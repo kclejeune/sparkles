@@ -10,12 +10,13 @@
 //! off unless allowed, and the default tool set cannot write.
 
 mod adapter;
+pub(crate) mod branches;
 #[cfg(feature = "auth")]
 mod bridge;
 mod complete;
 mod context;
 mod draft;
-mod errors;
+pub(crate) mod errors;
 #[cfg(feature = "fmt")]
 mod format;
 #[cfg(feature = "graphql")]
@@ -35,12 +36,14 @@ mod notify;
 mod paths;
 mod pins;
 mod render;
+pub mod rest;
 mod schema_history;
 mod schemas;
 mod search;
+mod share;
 mod stored;
 mod tasks;
-mod tools;
+pub(crate) mod tools;
 mod update;
 #[cfg(any(feature = "shacl", feature = "shex"))]
 mod validate;
@@ -145,6 +148,10 @@ pub struct McpArgs {
     /// task that the client polls, in milliseconds
     #[arg(long, value_name = "MS", default_value_t = 2000)]
     pub task_after_ms: u64,
+    /// The base URL of a Sparkles server whose UI the share_query tool links to, such
+    /// as https://sparql.example.org (without it the tool is not offered)
+    #[arg(long, value_name = "URL")]
+    pub ui_url: Option<String>,
 }
 
 /// Limits and switches of the MCP tools.
@@ -173,6 +180,12 @@ pub struct McpConfig {
     /// how long a tool call of a client that supports tasks may run before it becomes a
     /// task that the client polls
     pub task_after: Duration,
+    /// delete scratch branches idle for longer than this (`None`: never)
+    pub scratch_ttl: Option<Duration>,
+    /// the base URL of the UI that `share_query` links to (`sparkles mcp --ui-url`)
+    pub ui_url: Option<String>,
+    /// tools served over HTTP, where `share_query` links to the request's own host
+    pub http: bool,
 }
 
 impl Default for McpConfig {
@@ -190,6 +203,9 @@ impl Default for McpConfig {
             stored_queries: true,
             watch_interval: Duration::from_secs(2),
             task_after: Duration::from_secs(2),
+            scratch_ttl: None,
+            ui_url: None,
+            http: false,
         }
     }
 }
@@ -274,8 +290,10 @@ impl McpServer {
         let tools = schemas::tools(&cfg)
             .into_iter()
             .filter(|t| !cfg.disabled.contains(t.name))
-            // a read-only server never offers the write tool
-            .filter(|t| !(read_only && t.name == "sparql_update"))
+            // a read-only server never offers the write tools
+            .filter(|t| !(read_only && branches::WRITE_TOOLS.contains(&t.name)))
+            // links need the address of the UI
+            .filter(|t| t.name != "share_query" || cfg.http || cfg.ui_url.is_some())
             .collect();
         McpServer {
             state,
@@ -313,12 +331,25 @@ impl McpServer {
                 .any(|ds| p.can(&ds.name, Level::Write))
     }
 
+    /// Whether `p` may write to some branch of a dataset it can see, which the other
+    /// write tools (`assert_facts` and the branch tools) need to be listed.
+    pub fn may_write_somewhere(&self, p: &Principal) -> bool {
+        self.state.datasets().values().any(|ds| {
+            self.exposed(&ds.name)
+                && p.level_any_branch(&ds.name)
+                    .is_some_and(|l| l >= Level::Write)
+        })
+    }
+
     /// Whether `p` may call the offered tool `name`: the write tool needs a dataset
     /// `p` may write to, and `graphql_query` one with a GraphQL schema that `p` may
     /// query. Tool listings leave out the others.
     pub fn allows(&self, p: &Principal, name: &str) -> bool {
         match name {
             "sparql_update" => self.may_update(p),
+            n if branches::WRITE_TOOLS.contains(&n) => {
+                self.offers(n) && self.may_write_somewhere(p)
+            }
             #[cfg(feature = "graphql")]
             "graphql_query" => self.graphql_available(p),
             _ => true,
@@ -363,10 +394,21 @@ impl McpServer {
         Ok(self.run(name, args, call).await)
     }
 
+    /// Run the tool `name` on this thread as `call.principal`, with no slot. The asking
+    /// pipeline (`crate::ask`) calls its tools this way from its own blocking thread.
+    pub(crate) fn run_now(
+        &self,
+        name: &str,
+        args: Map<String, Value>,
+        call: &Call,
+    ) -> Result<Outcome, ToolError> {
+        tools::run(self, name, args, call)
+    }
+
     /// Whether `p` may call the tool `name`: an offered tool (the write tool checks for
     /// itself which datasets `p` may write to) or one of its stored queries.
     pub fn known(&self, p: &Principal, name: &str) -> bool {
-        (self.offers(name) && (name == "sparql_update" || self.allows(p, name)))
+        (self.offers(name) && (branches::WRITE_TOOLS.contains(&name) || self.allows(p, name)))
             || self.stored_tool(p, name).is_some()
     }
 
@@ -529,6 +571,12 @@ pub fn run(args: McpArgs, store_opts: StoreOptions) -> Result<()> {
         datasets: Vec::new(),
         stored_queries: !args.no_stored_queries,
         task_after: Duration::from_millis(args.task_after_ms),
+        ui_url: match args.ui_url {
+            Some(u) if !(u.starts_with("http://") || u.starts_with("https://")) => {
+                bail!("--ui-url {u}: expected an http or https URL")
+            }
+            u => u,
+        },
         ..McpConfig::default()
     };
     let server = McpServer::new(st, cfg);

@@ -9,8 +9,10 @@ use pyo3::exceptions::{PyIndexError, PyKeyError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyString, PyTuple};
 use sparkles::QuadIter;
+use sparkles::id::Id;
 use sparkles::sparql::QueryResult;
 use sparkles::sparql::results::SolutionsFormat;
+use sparkles::store::Snapshot;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
@@ -145,6 +147,50 @@ impl PyQuadIterator {
         })
         .py(py)
     }
+}
+
+impl PyQuadIterator {
+    /// The next batch of a scan as engine ids, with the snapshot that decodes them, for
+    /// `sparkles.rdflib`, which converts each distinct id of a batch once. `None` when the
+    /// source is not a scan, when decoded quads are waiting, or once the scan is done, and
+    /// then `take_batch` serves the call, including any error the scan ended with.
+    pub(crate) fn take_ids(&self, py: Python<'_>) -> Option<(Arc<Snapshot>, Vec<[Id; 4]>)> {
+        let mut st = self.state.lock().unwrap();
+        if !matches!(st.source, QuadSource::Scan(_)) || !st.buf.is_empty() || st.done {
+            return None;
+        }
+        if st.inline {
+            // a scan of memory: its first few quads are read with the GIL held
+            st.inline = false;
+            return read_ids(&mut st, INLINE);
+        }
+        drop(st);
+        py.detach(|| read_ids(&mut self.state.lock().unwrap(), BATCH))
+    }
+}
+
+/// Read up to `limit` quads of a scan as ids. A short batch ends the scan, as in `refill`.
+fn read_ids(st: &mut QuadState, limit: usize) -> Option<(Arc<Snapshot>, Vec<[Id; 4]>)> {
+    let QuadSource::Scan(it) = &mut st.source else {
+        return None;
+    };
+    let snap = it.snapshot().clone();
+    let mut ids = Vec::with_capacity(limit);
+    while ids.len() < limit {
+        match it.next_ids() {
+            Some(Ok(q)) => ids.push(q),
+            Some(Err(e)) => {
+                st.done = true;
+                st.error = Some(e);
+                break;
+            }
+            None => {
+                st.done = true;
+                break;
+            }
+        }
+    }
+    Some((snap, ids))
 }
 
 /// Read the next batch of up to `limit` quads from the source into an empty buffer. A

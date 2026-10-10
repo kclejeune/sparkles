@@ -988,9 +988,23 @@ covers.
 | Protect, unprotect | `admin` on the branch |
 | Compact, snapshots and history settings of a branch | `admin` on the branch, as on a dataset |
 
-Merges and branch creation act on whole datasets, so they need grants without graph
-restrictions, in line with C12's rule for admin operations. A partial merge for a
+Merges, branch creation and branch deletion act on whole datasets, so they need grants
+without graph restrictions, in line with C12's rule for admin operations. A partial merge for a
 restricted principal would break the meaning of the merge base.
+
+Scratch branches are the exception, added by [C17 §5.7](C17-agent-memory.md#57-branches-as-scratchpads).
+A branch that the MCP tool `create_branch` makes is marked as a scratch branch in the
+branch table, with the principal that created it. Through the MCP tools, a principal
+whose grants cover only some graphs may create a scratch branch when it may write at
+least one graph of the dataset on the new name. It may merge or delete only the scratch
+branches it created, and its merge is refused with `forbidden` when the branch changes a
+graph that the principal may not write on the target, whoever made the change. The
+merge itself is not partial, so the merge base keeps its meaning. A grant without the
+`merge` endpoint still allows no merge. Over HTTP such a principal still cannot create
+or merge a branch, but `DELETE /$/branches/{ds}/{name}` lets it delete the scratch
+branches it created, as the MCP tool does. Principals with unrestricted grants keep
+their rights over every branch. `--mcp-scratch-branch-ttl` deletes idle scratch
+branches, and branches made any other way are never expired.
 
 A branch that a principal's grants do not cover answers as C09 answers for a dataset
 the principal cannot see, so a principal cannot learn whether such a branch exists.

@@ -10,14 +10,25 @@
 
 use crate::results::{PyQuadIterator, PyQuerySolutions};
 use crate::terms::{graph_to_py, term_to_py};
-use oxrdf::{Literal, NamedNode, NamedOrBlankNode, Term};
+use oxrdf::{GraphName, Literal, NamedNode, NamedOrBlankNode, Term};
 use pyo3::PyTraverseError;
 use pyo3::exceptions::PyValueError;
 use pyo3::gc::PyVisit;
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyTuple};
+use rustc_hash::FxHashMap;
+use sparkles::id::Id;
+use sparkles::store::Snapshot;
 use std::collections::HashMap;
 use std::sync::Mutex;
+
+/// What a converted id is, to check that it fits its place in a quad.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Iri,
+    Blank,
+    Other,
+}
 
 /// Nodes kept at most; the cache starts again when it is full, as the plugin's own does.
 const CACHE_LIMIT: usize = 100_000;
@@ -108,6 +119,82 @@ impl PyRdflibNodes {
         }
     }
 
+    /// A batch of a scan as rdflib tuples. Each distinct id of the batch is decoded and
+    /// converted once, so the predicate and object of a `(None, p, o)` pattern, which
+    /// every row repeats, cost a lookup in a small map rather than a decoded term, a
+    /// lock and a lookup by text. A quad whose terms do not decode is skipped, as the
+    /// decoding scan skips it.
+    fn triples_of_ids<'py>(
+        &self,
+        py: Python<'py>,
+        snap: &Snapshot,
+        ids: &[[Id; 4]],
+        graphs: bool,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let mut seen: FxHashMap<Id, (Py<PyAny>, Kind)> = FxHashMap::default();
+        let mut graph_nodes: FxHashMap<Id, Py<PyAny>> = FxHashMap::default();
+        let mut rows = Vec::with_capacity(ids.len());
+        'quads: for q in ids {
+            let mut nodes: [Option<Py<PyAny>>; 3] = [None, None, None];
+            for (pos, slot) in nodes.iter_mut().enumerate() {
+                let id = q[pos];
+                let (node, kind) = match seen.get(&id) {
+                    Some((node, kind)) => (node.clone_ref(py), *kind),
+                    None => {
+                        let Some(term) = snap.term(id) else {
+                            continue 'quads;
+                        };
+                        let kind = match term {
+                            Term::NamedNode(_) => Kind::Iri,
+                            Term::BlankNode(_) => Kind::Blank,
+                            _ => Kind::Other,
+                        };
+                        let node = self.node(py, &term)?;
+                        seen.insert(id, (node.clone_ref(py), kind));
+                        (node, kind)
+                    }
+                };
+                let fits = match pos {
+                    0 => kind != Kind::Other,
+                    1 => kind == Kind::Iri,
+                    _ => true,
+                };
+                if !fits {
+                    continue 'quads;
+                }
+                *slot = Some(node);
+            }
+            let [Some(s), Some(p), Some(o)] = nodes else {
+                continue;
+            };
+            let row = if graphs {
+                let g = q[3];
+                let graph = match graph_nodes.get(&g) {
+                    Some(node) => node.clone_ref(py),
+                    None => {
+                        let name = if g == Id::DEFAULT_GRAPH {
+                            GraphName::DefaultGraph
+                        } else {
+                            match snap.term(g) {
+                                Some(Term::NamedNode(n)) => GraphName::NamedNode(n),
+                                Some(Term::BlankNode(b)) => GraphName::BlankNode(b),
+                                _ => continue,
+                            }
+                        };
+                        let node = graph_to_py(py, &name)?.unbind();
+                        graph_nodes.insert(g, node.clone_ref(py));
+                        node
+                    }
+                };
+                PyTuple::new(py, [s, p, o, graph])?
+            } else {
+                PyTuple::new(py, [s, p, o])?
+            };
+            rows.push(row);
+        }
+        PyList::new(py, rows)
+    }
+
     fn subject(&self, py: Python<'_>, s: &NamedOrBlankNode) -> PyResult<Py<PyAny>> {
         match s {
             NamedOrBlankNode::NamedNode(n) => self.iri(py, n),
@@ -141,6 +228,11 @@ impl PyRdflibNodes {
         quads: &PyQuadIterator,
         graphs: bool,
     ) -> PyResult<Option<Bound<'py, PyList>>> {
+        if let Some((snap, ids)) = quads.take_ids(py)
+            && !ids.is_empty()
+        {
+            return self.triples_of_ids(py, &snap, &ids, graphs).map(Some);
+        }
         let batch = quads.take_batch(py)?;
         if batch.is_empty() {
             return Ok(None);

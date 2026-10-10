@@ -1,0 +1,503 @@
+#!/usr/bin/env python3
+"""The model matrix of C18 §11.4 on a question set: `sparkles ask` for every pair, then
+a cascade of the pairs in the order given.
+
+    scripts/eval-ask --model-config models.json [--model-secret NAME=env:VAR ...]
+                     --pair PROVIDER/MODEL [--pair ...] [--set testsuite/ask/demo.json]
+                     [--out DIR] [--sparkles BIN] [--jobs N] [--only ID,...]
+    scripts/eval-ask --self-test [--sparkles BIN]
+
+Each pair answers every question with `--pair draft=P --pair repair=P --pair
+summarize=P`, so one run measures the pair in the draft, repair and summarize roles. The
+final query of each answer runs again through `sparkles query`, and its answer set is
+compared with the gold query's. Answer sets compare as sets of rows, each row the set
+of its values, with literals by lexical value and numbers by value, so the order of
+the projected variables and their names do not matter.
+
+The report has a row per pair and role, with accuracy overall and by the complexity
+bucket of §5.5 (`simple` under 4, `medium` under 8, `complex` from 8), the share of
+answers that matched the schema without a retry, the median and 95th-percentile latency
+per call, tokens and estimated cost per question and per correct answer, and a cascade
+row. The cascade is simulated from the per-pair runs: a question goes to the next pair
+when the earlier one fails in a way the server observes (a provider error, a query that
+still fails its check, or no rows), as the escalation of §5.5 would move it, and the
+row gives the share answered by each pair.
+
+Reports are written outside the repository, to --out or a new directory under the
+system's temporary directory: `report.md`, `report.json` and the raw answers in
+`answers/`.
+
+`--self-test` starts a mock provider that speaks the OpenAI protocol with two models,
+`oracle`, which answers each question with its gold query, and `weak`, which answers
+every question with the same wrong query, runs the matrix on the demo set, and checks
+the report. It needs no key and makes no network call outside the loopback interface.
+
+The public sets of §11.1, QALD-9-plus and Text2SPARQL'25, need their own data loaded
+into a database and their questions converted into this set's format; this script runs
+any set in that format.
+"""
+
+import argparse
+import concurrent.futures
+import json
+import math
+import os
+import pathlib
+import statistics
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from decimal import Decimal, InvalidOperation
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+DEFAULT_SET = ROOT / "testsuite" / "ask" / "demo.json"
+NUMERIC = {
+    "http://www.w3.org/2001/XMLSchema#" + t
+    for t in (
+        "integer decimal double float long int short byte nonNegativeInteger "
+        "positiveInteger negativeInteger nonPositiveInteger unsignedLong unsignedInt "
+        "unsignedShort unsignedByte"
+    ).split()
+}
+
+
+def bucket(score):
+    if score is None:
+        return "unknown"
+    return "simple" if score < 4 else "medium" if score < 8 else "complex"
+
+
+def percentile(xs, p):
+    if not xs:
+        return None
+    xs = sorted(xs)
+    k = max(0, min(len(xs) - 1, math.ceil(p / 100 * len(xs)) - 1))
+    return xs[k]
+
+
+def norm_term(b):
+    if b is None or b.get("type") == "bnode":
+        return None
+    v = b.get("value", "")
+    if b.get("type") == "literal" and b.get("datatype") in NUMERIC:
+        try:
+            d = Decimal(v)
+            return "n:" + format(d.normalize() if d == d.to_integral() else round(d, 6).normalize(), "f")
+        except InvalidOperation:
+            return "l:" + v
+    return ("i:" if b.get("type") == "uri" else "l:") + v
+
+
+def answer_set(results):
+    """The answer of a SPARQL JSON result: a boolean, or a set of rows of value sets."""
+    if "boolean" in results:
+        return results["boolean"]
+    rows = set()
+    for b in results.get("results", {}).get("bindings", []):
+        vals = frozenset(x for x in (norm_term(t) for t in b.values()) if x is not None)
+        rows.add(vals)
+    return rows
+
+
+def prf(gold, got):
+    if isinstance(gold, bool) or isinstance(got, bool):
+        ok = gold == got
+        return (1.0 if ok else 0.0,) * 3
+    g = set().union(*gold) if gold else set()
+    a = set().union(*got) if got else set()
+    if not g and not a:
+        return 1.0, 1.0, 1.0
+    p = len(g & a) / len(a) if a else 0.0
+    r = len(g & a) / len(g) if g else 0.0
+    f = 2 * p * r / (p + r) if p + r else 0.0
+    return p, r, f
+
+
+class Runner:
+    def __init__(self, args, qset):
+        self.args = args
+        self.qset = qset
+        self.data = (pathlib.Path(args.set).parent / qset["data"]).resolve()
+        self.header = "".join(f"PREFIX {k}: <{v}>\n" for k, v in qset.get("prefixes", {}).items())
+        self.gold_cache = {}
+        self.lock = threading.Lock()
+
+    def query(self, text):
+        r = subprocess.run(
+            [self.args.sparkles, "query", "--data", str(self.data), "--results", "json", self.header + text],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if r.returncode:
+            return None
+        try:
+            return answer_set(json.loads(r.stdout))
+        except json.JSONDecodeError:
+            return None
+
+    def gold(self, q):
+        with self.lock:
+            if q["id"] in self.gold_cache:
+                return self.gold_cache[q["id"]]
+        g = self.query(q["gold"])
+        with self.lock:
+            self.gold_cache[q["id"]] = g
+        return g
+
+    def ask(self, pair, q):
+        cmd = [self.args.sparkles, "ask", "--data", str(self.data), "--text"]
+        cmd += [self.qset.get("dataset", "data"), q["question"], "--json"]
+        for role in ("draft", "repair", "summarize"):
+            cmd += ["--pair", f"{role}={pair}"]
+        cmd += ["--model-config", self.args.model_config]
+        for s in self.args.model_secret:
+            cmd += ["--model-secret", s]
+        started = time.monotonic()
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=self.args.deadline + 60)
+        wall = time.monotonic() - started
+        try:
+            out = json.loads(r.stdout.strip().splitlines()[-1])
+        except (json.JSONDecodeError, IndexError):
+            out = {"outcome": "error", "error": {"code": "cli", "message": r.stderr.strip()[-500:]}}
+        out["wallSeconds"] = wall
+        return out
+
+    def score(self, q, out):
+        """Whether the answer is correct, and its precision, recall and F1."""
+        kind = q["kind"]
+        outcome = out.get("outcome")
+        if kind == "clarify":
+            ok = outcome == "clarify"
+            return ok, (1.0 if ok else 0.0,) * 3
+        if kind == "unanswerable":
+            ok = outcome in ("unanswerable", "empty")
+            return ok, (1.0 if ok else 0.0,) * 3
+        query = (out.get("result") or {}).get("query")
+        if outcome not in ("answered", "empty") or not query:
+            return False, (0.0, 0.0, 0.0)
+        gold = self.gold(q)
+        got = self.query(query)
+        if gold is None or got is None:
+            return False, (0.0, 0.0, 0.0)
+        return gold == got, prf(gold, got)
+
+
+def observed_failure(out):
+    """What the server itself sees as a failure (the signals of §5.5)."""
+    return out.get("outcome") in ("error", "failed", "empty")
+
+
+def steps(out, role):
+    return [s for s in out.get("usage", {}).get("steps", []) if s.get("role") == role]
+
+
+def summarize_pair(pair, qs, answers, scores):
+    rows = []
+    n = len(qs)
+    cost = sum(a.get("usage", {}).get("estimatedCost", 0) or 0 for a in answers)
+    tin = sum(a.get("usage", {}).get("inputTokens", 0) for a in answers)
+    tout = sum(a.get("usage", {}).get("outputTokens", 0) for a in answers)
+    correct = sum(1 for s in scores if s[0])
+
+    def calls(role):
+        ss = [s for a in answers for s in steps(a, role)]
+        lat = [s["latencyMs"] for s in ss]
+        valid = [s for s in ss if s.get("outcome") == "ok" and s.get("requests") == 1]
+        return {
+            "calls": len(ss),
+            "validOutput": round(len(valid) / len(ss), 3) if ss else None,
+            "latencyP50Ms": statistics.median(lat) if lat else None,
+            "latencyP95Ms": percentile(lat, 95),
+        }
+
+    def by_bucket(pred):
+        out = {}
+        for b in ("simple", "medium", "complex"):
+            idx = [i for i, q in enumerate(qs) if q["kind"] == "answerable" and bucket(q.get("complexity")) == b]
+            if idx:
+                out[b] = round(sum(1 for i in idx if pred(i)) / len(idx), 3)
+        return out
+
+    answerable = [i for i, q in enumerate(qs) if q["kind"] == "answerable"]
+    first_ok = lambda i: scores[i][0] and answers[i].get("result", {}).get("attempt") == 1
+    final_ok = lambda i: scores[i][0]
+    clar = [i for i, a in enumerate(answers) if a.get("outcome") == "clarify"]
+    unans = [i for i, q in enumerate(qs) if q["kind"] == "unanswerable"]
+    finals = [a for a in answers if (a.get("result") or {}).get("query")]
+    valid_query = [a for a in finals if not any(i.get("severity") == "error" for i in (a["result"].get("issues") or []))]
+    common = {
+        "pair": pair,
+        "questions": n,
+        "inputTokensPerQuestion": round(tin / n, 1) if n else None,
+        "outputTokensPerQuestion": round(tout / n, 1) if n else None,
+        "costPerQuestion": round(cost / n, 6) if n else None,
+        "costPerCorrect": round(cost / correct, 6) if correct else None,
+    }
+    rows.append({
+        **common,
+        "role": "draft",
+        "accuracy": round(sum(1 for i in answerable if first_ok(i)) / len(answerable), 3) if answerable else None,
+        "byComplexity": by_bucket(first_ok),
+        "f1": round(statistics.mean(scores[i][1][2] for i in answerable), 3) if answerable else None,
+        "validQueryRate": round(len(valid_query) / len(finals), 3) if finals else None,
+        "clarificationPrecision": round(sum(1 for i in clar if qs[i]["kind"] == "clarify") / len(clar), 3) if clar else None,
+        "refusalAccuracy": round(sum(1 for i in unans if scores[i][0]) / len(unans), 3) if unans else None,
+        **calls("draft"),
+    })
+    failed_first = [i for i in answerable if answers[i].get("result", {}).get("attempt", 1) > 1 or not first_ok(i)]
+    rows.append({
+        **common,
+        "role": "repair",
+        "accuracy": round(sum(1 for i in failed_first if final_ok(i)) / len(failed_first), 3) if failed_first else None,
+        "byComplexity": by_bucket(final_ok),
+        "finalAccuracy": round(sum(1 for i in answerable if final_ok(i)) / len(answerable), 3) if answerable else None,
+        **calls("repair"),
+    })
+    sums = [a["summary"] for a in answers if a.get("summary")]
+    rows.append({
+        **common,
+        "role": "summarize",
+        "accuracy": round(sum(1 for s in sums if s.get("citations") and not s.get("uncited")) / len(sums), 3) if sums else None,
+        "byComplexity": {},
+        **calls("summarize"),
+    })
+    return rows
+
+
+def cascade(pairs, qs, runs):
+    answered_by = {p: 0 for p in pairs}
+    correct = 0
+    cost = 0.0
+    for i, q in enumerate(qs):
+        chosen = pairs[-1]
+        for p in pairs:
+            a = runs[p]["answers"][i]
+            cost += a.get("usage", {}).get("estimatedCost", 0) or 0
+            if not observed_failure(a):
+                chosen = p
+                break
+        answered_by[chosen] += 1
+        correct += runs[chosen]["scores"][i][0]
+    n = len(qs)
+    answerable = [i for i, q in enumerate(qs) if q["kind"] == "answerable"]
+    return {
+        "pair": " > ".join(pairs),
+        "role": "cascade",
+        "questions": n,
+        "accuracy": round(correct / n, 3) if n else None,
+        "answeredBy": {p: round(c / n, 3) for p, c in answered_by.items()},
+        "costPerQuestion": round(cost / n, 6) if n else None,
+        "costPerCorrect": round(cost / correct, 6) if correct else None,
+        "answerable": len(answerable),
+    }
+
+
+def fmt(v):
+    if v is None:
+        return "–"
+    if isinstance(v, float):
+        return f"{v:.4g}"
+    if isinstance(v, dict):
+        return ", ".join(f"{k} {fmt(x)}" for k, x in v.items()) or "–"
+    return str(v)
+
+
+def markdown(report):
+    lines = [
+        f"# eval-ask on {report['set']}",
+        "",
+        f"{report['questions']} questions, run on {report['started']}.",
+        "",
+        "| Pair | Role | Accuracy | By complexity | Valid output | p50 ms | p95 ms | Tokens in/out per question | Cost per question | Cost per correct |",
+        "|---|---|---|---|---|---|---|---|---|---|",
+    ]
+    for r in report["rows"]:
+        lines.append(
+            f"| {r['pair']} | {r['role']} | {fmt(r.get('accuracy'))} | {fmt(r.get('byComplexity'))} | "
+            f"{fmt(r.get('validOutput'))} | {fmt(r.get('latencyP50Ms'))} | {fmt(r.get('latencyP95Ms'))} | "
+            f"{fmt(r.get('inputTokensPerQuestion'))}/{fmt(r.get('outputTokensPerQuestion'))} | "
+            f"{fmt(r.get('costPerQuestion'))} | {fmt(r.get('costPerCorrect'))} |"
+        )
+    c = report.get("cascade")
+    if c:
+        lines.append(
+            f"| {c['pair']} | cascade | {fmt(c['accuracy'])} | answered by: {fmt(c['answeredBy'])} | – | – | – | – | "
+            f"{fmt(c['costPerQuestion'])} | {fmt(c['costPerCorrect'])} |"
+        )
+    lines += ["", "Draft rows also report:", ""]
+    for r in report["rows"]:
+        if r["role"] == "draft":
+            lines.append(
+                f"- {r['pair']}: F1 {fmt(r.get('f1'))}, valid-query rate {fmt(r.get('validQueryRate'))}, "
+                f"clarification precision {fmt(r.get('clarificationPrecision'))}, refusal accuracy {fmt(r.get('refusalAccuracy'))}."
+            )
+    return "\n".join(lines) + "\n"
+
+
+def run_matrix(args):
+    qset = json.loads(pathlib.Path(args.set).read_text())
+    qs = qset["questions"]
+    if args.only:
+        keep = set(args.only.split(","))
+        qs = [q for q in qs if q["id"] in keep]
+    out_dir = pathlib.Path(args.out or tempfile.mkdtemp(prefix="sparkles-eval-ask-")).resolve()
+    if out_dir == ROOT or ROOT in out_dir.parents:
+        sys.exit(f"eval-ask: --out {out_dir} is inside the repository; write reports elsewhere")
+    (out_dir / "answers").mkdir(parents=True, exist_ok=True)
+    runner = Runner(args, qset)
+    runs = {}
+    for pair in args.pair:
+        with concurrent.futures.ThreadPoolExecutor(args.jobs) as ex:
+            answers = list(ex.map(lambda q: runner.ask(pair, q), qs))
+        scores = [runner.score(q, a) for q, a in zip(qs, answers)]
+        runs[pair] = {"answers": answers, "scores": scores}
+        safe = pair.replace("/", "_").replace(":", "_")
+        (out_dir / "answers" / f"{safe}.json").write_text(
+            json.dumps([{"id": q["id"], "correct": s[0], "answer": a} for q, a, s in zip(qs, answers, scores)], indent=1)
+        )
+        print(f"eval-ask: {pair}: {sum(s[0] for s in scores)}/{len(qs)} correct", file=sys.stderr)
+    rows = [r for p in args.pair for r in summarize_pair(p, qs, runs[p]["answers"], runs[p]["scores"])]
+    report = {
+        "set": str(args.set),
+        "questions": len(qs),
+        "started": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "pairs": args.pair,
+        "rows": rows,
+        "cascade": cascade(args.pair, qs, runs) if len(args.pair) > 1 else None,
+    }
+    (out_dir / "report.json").write_text(json.dumps(report, indent=1))
+    (out_dir / "report.md").write_text(markdown(report))
+    print(f"eval-ask: report in {out_dir}", file=sys.stderr)
+    return out_dir, report
+
+
+class MockProvider(BaseHTTPRequestHandler):
+    """An OpenAI-protocol provider with the models `oracle` and `weak`."""
+
+    gold = {}
+    kinds = {}
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers.get("content-length", 0))) or b"{}")
+        msgs = body.get("messages", [])
+        system = msgs[0]["content"] if msgs else ""
+        user = msgs[-1]["content"] if msgs else ""
+        if "rows of a query result" in system:
+            content = {"text": "The result answers the question [1].", "citations": [1]}
+        else:
+            q = user.split("\n", 1)[0].removeprefix("Question: ").strip()
+            content = {
+                "query": "",
+                "explanation": "",
+                "assumptions": [],
+                "clarify": {"question": "", "choices": []},
+                "graph": {"subject": "", "predicate": "", "object": ""},
+            }
+            kind = self.kinds.get(q, "answerable")
+            if body.get("model") == "weak":
+                # every other question gets a class the data lacks, which fails the check
+                bad = sum(map(ord, q)) % 2 == 0
+                content["query"] = "SELECT ?s WHERE { ?s a ex:Teem }" if bad else "SELECT ?s WHERE { ?s a ex:Team } LIMIT 1"
+                content["explanation"] = "One team."
+            elif kind == "clarify":
+                content["query"] = "SELECT ?s WHERE { ?s a ex:Team }"
+                content["clarify"] = {"question": "Which reading?", "choices": ["the first", "the second"]}
+            elif kind == "unanswerable":
+                content["explanation"] = "The data cannot answer this."
+            else:
+                content["query"] = self.gold.get(q, "")
+                content["explanation"] = "The gold query."
+        out = json.dumps({
+            "choices": [{"message": {"role": "assistant", "content": json.dumps(content)}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": len(user) // 4, "completion_tokens": 40},
+        }).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(out)))
+        self.end_headers()
+        self.wfile.write(out)
+
+
+def self_test(args):
+    qset = json.loads(pathlib.Path(args.set).read_text())
+    MockProvider.gold = {q["question"]: q.get("gold", "") for q in qset["questions"]}
+    MockProvider.kinds = {q["question"]: q["kind"] for q in qset["questions"]}
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), MockProvider)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    tmp = pathlib.Path(tempfile.mkdtemp(prefix="sparkles-eval-ask-self-test-"))
+    cfg = {
+        "models": {
+            "providers": {
+                "mock": {
+                    "kind": "openai",
+                    "endpoint": f"http://127.0.0.1:{srv.server_address[1]}",
+                    "models": {
+                        "oracle": {"pricing": {"inputPerMTok": 1.0, "outputPerMTok": 5.0}},
+                        "weak": {"pricing": {"inputPerMTok": 0.1, "outputPerMTok": 0.5}},
+                    },
+                }
+            },
+            "roles": {"draft": [{"provider": "mock", "model": "weak"}]},
+        }
+    }
+    (tmp / "models.json").write_text(json.dumps(cfg))
+    args.model_config = str(tmp / "models.json")
+    args.pair = ["mock/weak", "mock/oracle"]
+    args.out = str(tmp / "report")
+    out_dir, report = run_matrix(args)
+    srv.shutdown()
+    rows = {(r["pair"], r["role"]): r for r in report["rows"]}
+    for p in args.pair:
+        for role in ("draft", "repair", "summarize"):
+            assert (p, role) in rows, (p, role)
+    oracle = rows[("mock/oracle", "draft")]
+    assert oracle["accuracy"] == 1.0, oracle
+    assert oracle["refusalAccuracy"] == 1.0 and oracle["clarificationPrecision"] == 1.0, oracle
+    assert set(oracle["byComplexity"]) >= {"simple", "medium", "complex"}, oracle
+    assert oracle["validOutput"] == 1.0 and oracle["latencyP95Ms"] is not None, oracle
+    assert oracle["costPerQuestion"] > 0 and oracle["costPerCorrect"] > 0, oracle
+    assert rows[("mock/weak", "draft")]["accuracy"] < 0.2, rows[("mock/weak", "draft")]
+    c = report["cascade"]
+    assert abs(sum(c["answeredBy"].values()) - 1) < 0.01 and min(c["answeredBy"].values()) > 0, c
+    assert c["accuracy"] > rows[("mock/weak", "draft")]["accuracy"], c
+    assert rows[("mock/weak", "repair")]["calls"] > 0, rows[("mock/weak", "repair")]
+    assert (out_dir / "report.md").read_text().count("| mock/") >= 6
+    print(f"eval-ask: self-test passed ({out_dir})", file=sys.stderr)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--model-config")
+    ap.add_argument("--model-secret", action="append", default=[])
+    ap.add_argument("--pair", action="append", default=[], help="PROVIDER/MODEL, in cascade order")
+    ap.add_argument("--set", default=str(DEFAULT_SET))
+    ap.add_argument("--out")
+    ap.add_argument("--sparkles", default=str(ROOT / "target" / "release" / "sparkles"))
+    ap.add_argument("--jobs", type=int, default=4)
+    ap.add_argument("--deadline", type=float, default=120)
+    ap.add_argument("--only", help="comma-separated question ids")
+    ap.add_argument("--self-test", action="store_true")
+    args = ap.parse_args()
+    if not os.path.exists(args.sparkles):
+        alt = ROOT / "target" / "debug" / "sparkles"
+        if alt.exists():
+            args.sparkles = str(alt)
+        else:
+            sys.exit(f"eval-ask: no sparkles binary at {args.sparkles}; build it or pass --sparkles")
+    if args.self_test:
+        self_test(args)
+        return
+    if not args.model_config or not args.pair:
+        sys.exit("eval-ask: --model-config and at least one --pair are required")
+    run_matrix(args)
+
+
+if __name__ == "__main__":
+    main()
