@@ -155,7 +155,11 @@ WHERE {
 ORDER BY DESC(?time)
 LIMIT 20`;
 
-/** Branch name prefixes of review work: proposals, ingestion, reviews and scratchpads. */
-export const REVIEW_BRANCH = /^(proposals\/|ingest\/|review\/|scratch)/;
+/**
+ * Branch name prefixes of review work: proposals, ingestion, reviews and scratchpads.
+ * Branch names hold no slash, so the server's agent template names proposal branches
+ * `proposals.NAME.*`; the slash form of the spec is accepted too.
+ */
+export const REVIEW_BRANCH = /^(proposals[./]|ingest[./]|review[./]|scratch)/;
 
 export const isReviewBranch = (name: string) => REVIEW_BRANCH.test(name);

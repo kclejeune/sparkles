@@ -145,6 +145,9 @@ describe('names', () => {
 
   it('knows review branches', () => {
     expect(isReviewBranch('proposals/agent-7/inbox')).toBe(true);
+    expect(isReviewBranch('proposals.agent-7.inbox')).toBe(true);
+    expect(isReviewBranch('ingest.standup-1')).toBe(true);
+    expect(isReviewBranch('proposalsx')).toBe(false);
     expect(isReviewBranch('ingest/standup-1')).toBe(true);
     expect(isReviewBranch('review/x')).toBe(true);
     expect(isReviewBranch('scratch-s2')).toBe(true);

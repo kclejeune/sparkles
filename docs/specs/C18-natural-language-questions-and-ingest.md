@@ -1,8 +1,9 @@
 # C18: Questions and ingestion in natural language
 
-> **Status:** specified
+> **Status:** implemented in part (Phase 1)
 >
-> **Phases:** None shipped. Phase 1 lets an agent connected over MCP hand the query it
+> **Phases:** Phase 1 shipped on 2026-10-09, without the measured runs of the model
+> matrix on the public sets. Phase 1 lets an agent connected over MCP hand the query it
 > wrote for a question to the web UI, where a person reads, edits and runs it, and adds
 > a memory browser that shows each fact's source, passage and history. It also adds
 > model providers to the server, for Ollama and other local models, any
@@ -19,10 +20,14 @@
 > query and proves that they return the same results. Every phase builds on the tools
 > of [C17](C17-agent-memory.md).
 >
-> **User docs:** none, because nothing is built.
+> **User docs:** [API: Natural-language questions](../API.md#natural-language-questions) ·
+> [API: MCP tools](../API.md#tools) ·
+> [Usage: Asking questions with a model](../USAGE.md#asking-questions-with-a-model) ·
+> [Usage: Handing a query to the web UI](../USAGE.md#handing-a-query-to-the-web-ui) ·
+> [Features](../FEATURES.md)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
-> the end will record how it lands.
+> the end records how it lands.
 
 This design was written from the Model Context Protocol specification, the W3C SPARQL
 1.1 and 1.2 drafts, RDF 1.2, SHACL, PROV-O, RFC 5147, published work on translating
@@ -3809,4 +3814,81 @@ for her principal. The memory directory belongs to a project whose remote is
 
 ## Outcome
 
-Nothing is built.
+**Phase 1 delivered on 2026-10-09.** The matrix has not been run with real models, and
+the public sets of §11.1 are not converted, so the targets of §11.3 and the measured role
+lists of §11.4 are still open. Phases 2 to 6 are not built.
+
+- **Model providers.** The server's `models` module holds the three kinds of §3.4 with
+  their request and response formats, named secrets read at each request from
+  `--model-secret NAME=env:VAR|file:PATH`, concurrency slots, request spacing, a daily
+  token budget, estimated cost from `pricing`, and the role lists of §3.7.
+  `Models::call` asks one pair for an answer that matches a schema. Under `auto` it
+  tries the JSON Schema mode, then JSON mode, then plain text, remembers the first
+  level that works for each pair, validates every answer against the schema subset of
+  §3.6, and retries an invalid answer once with the errors. A key is scrubbed from every
+  error message, and no response carries it. `GET /$/models` and
+  `POST /$/models/{name}/test` describe and test the pairs. The provider clients are
+  tested against mock endpoints only (A19, A26).
+- **Tools and routes.** `share_query` and `why_empty` are MCP tools, and
+  `POST /{ds}/check`, `POST /{ds}/recall` and `POST /{ds}/sparql/diagnose` run
+  `check_query`, `recall` and `why_empty` over HTTP. Each request builds an MCP server
+  for the caller, so HTTP and MCP share one code path, one view and one set of budgets.
+  `check_query` gains `terms`, the list of §4.5. `recall` gains `statuses`,
+  `unreviewedWeight`, a `status` on each fact and citation and `replacedBy` on
+  superseded entries, read from `memory.json` (§8.8). `/$/memory/{ds}` and
+  `/$/queries/{ds}/suggestions` keep the memory settings and the suggested examples.
+  The `ask_graph` prompt holds the steps of §4.1 as rules (A1 to A4, A28).
+- **The pipeline.** The `ask` module runs §4.1 as a library function over the MCP tools,
+  as the caller, with the dataset's prefixes, and reports the events of §5.2. It
+  extracts the mentions of a question from quoted strings and runs of capitalized
+  words, asks about an `ambiguous` mention before drafting, checks every draft,
+  refuses updates through `check_query`, adds `LIMIT 1000`, repairs at most twice from
+  the check's issues, a failed run or `why_empty`, and summarizes up to 50 rows with
+  row markers that it checks against the rows sent. It trims the grounding for a small
+  context window and leaves out the summary below 8,192 tokens (A27). It also computes
+  the complexity score of §5.5, which Phase 2 routes on and the matrix buckets by.
+  `sparkles ask` runs it on a database or on files and prints text, one JSON object or
+  one JSON line per event.
+- **Evaluation.** `testsuite/ask/demo.json` holds 68 questions over the mock server's
+  organisation graph, which `testsuite/ask/org.ttl` keeps as Turtle. There are 59
+  answerable questions with gold queries in seven categories, four that need a
+  clarification and five that the data cannot answer. A test runs every gold query
+  and checks its stored complexity. `scripts/eval-ask` runs the matrix of §11.4 and
+  writes its report outside the repository, and `--self-test` runs it against a mock
+  provider (A43).
+- **Access.** `sparkles auth grant --template agent` prints the grants of §8.6 (A30).
+  The rule of §8.8 that the `agent_memory` prompt adds is the constant
+  `mcp::context::UNREVIEWED_RULE`, which `ask_graph` already includes.
+- **UI.** A handoff link opens a new query tab with the question header and the terms
+  list and does not run (A1, A2). The Saved menu lists the questions asked in the
+  browser, **Save as example** proposes parameters for the linked constants (A5),
+  **Suggest as example** posts a suggestion that an admin promotes or dismisses (A6), and
+  an empty result shows the diagnosis. The Explore page has a Memory tab and the UI a
+  Memory page (A20, A21).
+
+**Deviations and additions.**
+
+- Branch names cannot hold a slash, so the proposal branches of the agent template are
+  `proposals.NAME.*` instead of `proposals/NAME/*`. The UI treats both forms as review
+  branches. The template's write grants list the endpoints `query`, `update`, `gsp-r`,
+  `gsp-rw`, `info` and `branches`, which leaves out merges.
+- The model configuration lives only in the file of `--model-config`, which may wrap it
+  in `{"models": …}` as §3.4 writes it. The schemas of `Draft` and `Summary` mark every
+  member as required and use empty strings and lists for absent members, because the
+  strict mode of the `openai` kind accepts no optional member. Lengths are enforced
+  after validation rather than in the schema.
+- A draft whose `query` is empty is the model's way of saying that the data cannot
+  answer the question, and the ask ends with the outcome `unanswerable`.
+- In Phase 1 `sparkles ask` uses the first pair of each role and does not move to the
+  next pair on failure. `why_empty` has no `verdict` yet, so repair stops early only
+  when the first element without solutions is a join with no issues and every constant
+  occurs.
+- The matrix runs each pair in the draft, repair and summarize roles at once. The
+  cascade row is computed from those runs, moving a question on when the server sees a
+  failure, rather than from separate runs with escalation, which needs Phase 2.
+- QALD-9-plus and Text2SPARQL'25 are not converted. `scripts/eval-ask` takes any set in
+  the demo set's format with its own data file.
+- Promotion and rejection in the review inbox, and `actedOnBehalfOf` in citations, are
+  left to Phase 3.
+- A stored query named `suggestions` cannot be read at `/$/queries/{ds}/suggestions`,
+  which the suggestion list now answers.
