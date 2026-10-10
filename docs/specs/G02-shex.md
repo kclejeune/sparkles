@@ -14,7 +14,7 @@
 >
 > **User docs:** [API: ShEx validation](../API.md#shex-validation) ·
 > [API: Write-time validation](../API.md#write-time-validation) ·
-> [API: MCP server](../API.md#mcp-server) · [Features](../FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui)
+> [API: MCP server](../API.md#mcp-server) · [Features](../FEATURES.md#reasoning-validation-and-schema)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
 > the end records how it landed.
@@ -1681,7 +1681,7 @@ third-party crates were added.
 negative-structure, representation and ShExR tests. It passes 99.9 % of the validation
 tests from ShExC, ShExJ and ShExR: 42 blank-node-label tests are skipped, and one more is
 listed in `known-failures.txt`.
-[FEATURES.md](../FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui) has the
+[FEATURES.md](../FEATURES.md#reasoning-validation-and-schema) has the
 current numbers. SHACL stayed at 98/98 + 20/20 through the shared-code moves.
 
 **Performance.** [BENCHMARKS.md](../BENCHMARKS.md) now publishes ShEx numbers from

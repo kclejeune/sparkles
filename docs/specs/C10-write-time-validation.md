@@ -14,7 +14,7 @@
 > are also implemented, for both SHACL and ShEx.
 >
 > **User docs:** [API: Write-time validation](../API.md#write-time-validation) ·
-> [API: Metrics](../API.md#metrics) · [Features](../FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui)
+> [API: Metrics](../API.md#metrics) · [Features](../FEATURES.md#reasoning-validation-and-schema)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
 > the end records how it landed.

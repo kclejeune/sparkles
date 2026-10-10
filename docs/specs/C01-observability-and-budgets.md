@@ -16,7 +16,7 @@
 > **User docs:** [API: Server](../API.md#server) ·
 > [API: Request ids and the access log](../API.md#request-ids-and-the-access-log) ·
 > [API: Metrics](../API.md#metrics) · [API: Budgets](../API.md#budgets) ·
-> [Features](../FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui) ·
+> [Features](../FEATURES.md#server-fuseki-equivalent) ·
 > [Benchmarks: Full-text index and observability](../BENCHMARKS.md#full-text-index-and-observability-105m-triples)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at

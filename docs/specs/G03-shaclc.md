@@ -10,7 +10,7 @@
 > **User docs:** [API: SHACL Compact Syntax](../API.md#shacl-compact-syntax-shaclc) ·
 > [API: SHACL validation](../API.md#shacl-validation) ·
 > [Usage: drafting shapes](../USAGE.md#drafting-shapes-from-the-data) ·
-> [Features](../FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui)
+> [Features](../FEATURES.md#reasoning-validation-and-schema)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
 > the end records how it landed.

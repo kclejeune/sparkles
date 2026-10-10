@@ -7,7 +7,7 @@
 > what was left out.
 >
 > **User docs:** [Usage: Rust client](../USAGE.md#rust-client) ·
-> [Features](../FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui) ·
+> [Features](../FEATURES.md#libraries-and-bindings) ·
 > [Comparison with Jena](../COMPARISON.md)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at

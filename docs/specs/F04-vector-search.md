@@ -12,7 +12,7 @@
 > with bound queries shipped. Background catch-up of the graph and keeping the graph
 > across compactions are not built.
 >
-> **User docs:** [API: Vector similarity](../API.md#vector-similarity) · [API: Vector indexes](../API.md#vector-indexes) · [Features](../FEATURES.md#sparql-arq-equivalent)
+> **User docs:** [API: Vector similarity](../API.md#vector-similarity) · [API: Vector indexes](../API.md#vector-indexes) · [Features](../FEATURES.md#search)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
 > the end records how it landed.

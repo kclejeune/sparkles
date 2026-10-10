@@ -10,7 +10,7 @@
 > [Outcome](#outcome) lists what it added.
 >
 > **User docs:** [Usage: Python](../USAGE.md#python) ·
-> [Features](../FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui) ·
+> [Features](../FEATURES.md#libraries-and-bindings) ·
 > [Known gaps](../FEATURES.md#known-gaps) · [Comparison](../COMPARISON.md#vs-oxigraph) ·
 > [Development](../DEVELOPMENT.md#python-bindings)
 >

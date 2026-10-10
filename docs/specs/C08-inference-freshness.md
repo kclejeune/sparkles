@@ -15,7 +15,7 @@
 > **User docs:** [API: Reasoning status and diagnostics](../API.md#reasoning-status-and-diagnostics) ·
 > [API: Input graphs and imports](../API.md#input-graphs-and-imports) ·
 > [API: RDFS on read](../API.md#rdfs-on-read) ·
-> [Features](../FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui)
+> [Features](../FEATURES.md#reasoning-validation-and-schema)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
 > the end records how it landed.

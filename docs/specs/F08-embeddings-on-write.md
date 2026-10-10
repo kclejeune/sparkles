@@ -9,7 +9,7 @@
 > search with text, chunk offsets are not stored, and the NixOS module has no embedding
 > options.
 >
-> **User docs:** [API: Embeddings on write](../API.md#embeddings-on-write) · [Usage: Embeddings](../USAGE.md#embeddings-computed-on-write) · [Features](../FEATURES.md#sparql-arq-equivalent)
+> **User docs:** [API: Embeddings on write](../API.md#embeddings-on-write) · [Usage: Embeddings](../USAGE.md#embeddings-computed-on-write) · [Features](../FEATURES.md#search)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
 > the end records how it landed.

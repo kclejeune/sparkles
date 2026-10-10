@@ -14,7 +14,7 @@
 >
 > **User docs:** [API: MCP server](../API.md#mcp-server) ·
 > [Usage: MCP server](../USAGE.md#mcp-server-llm-agents) ·
-> [Features](../FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui)
+> [Features](../FEATURES.md#agents-and-questions-in-plain-language)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
 > the end records how it landed.
