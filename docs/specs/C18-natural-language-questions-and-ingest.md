@@ -1,9 +1,9 @@
 # C18: Questions and ingestion in natural language
 
-> **Status:** implemented in part (Phase 1)
+> **Status:** implemented in part (Phases 1 and 2)
 >
-> **Phases:** Phase 1 shipped on 2026-10-09, without the measured runs of the model
-> matrix on the public sets. Phase 1 lets an agent connected over MCP hand the query it
+> **Phases:** Phases 1 and 2 shipped on 2026-10-09, without the measured runs of the
+> model matrix on the public sets. Phase 1 lets an agent connected over MCP hand the query it
 > wrote for a question to the web UI, where a person reads, edits and runs it, and adds
 > a memory browser that shows each fact's source, passage and history. It also adds
 > model providers to the server, for Ollama and other local models, any
@@ -24,6 +24,7 @@
 > [API: MCP tools](../API.md#tools) ·
 > [Usage: Asking questions with a model](../USAGE.md#asking-questions-with-a-model) ·
 > [Usage: Handing a query to the web UI](../USAGE.md#handing-a-query-to-the-web-ui) ·
+> [Usage: The Ask bar](../USAGE.md#the-ask-bar) ·
 > [Features](../FEATURES.md)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
@@ -3816,7 +3817,8 @@ for her principal. The memory directory belongs to a project whose remote is
 
 **Phase 1 delivered on 2026-10-09.** The matrix has not been run with real models, and
 the public sets of §11.1 are not converted, so the targets of §11.3 and the measured role
-lists of §11.4 are still open. Phases 2 to 6 are not built.
+lists of §11.4 are still open. Phase 2 followed on the same day, and Phases 2b to 6 are
+not built.
 
 - **Model providers.** The server's `models` module holds the three kinds of §3.4 with
   their request and response formats, named secrets read at each request from
@@ -3892,3 +3894,81 @@ lists of §11.4 are still open. Phases 2 to 6 are not built.
   left to Phase 3.
 - A stored query named `suggestions` cannot be read at `/$/queries/{ds}/suggestions`,
   which the suggestion list now answers.
+
+**Phase 2 delivered on 2026-10-09.** Every test runs against mock providers, so the
+role lists and thresholds that the server ships with are still the defaults of §5.5
+rather than measured ones.
+
+- **The endpoint.** `POST /{ds}/ask` runs the pipeline of §4.1 in a blocking task under
+  the query rate-limit class and streams the events of §5.2. A client that sends
+  `Accept: application/json` alone gets one object, with the status of its error code.
+  A client that goes away sets a cancel flag that the pipeline reads before each step.
+  The route reads `assistant.json` from the main dataset, answers `no-assistant`
+  without a usable draft list, refuses a request over a daily token cap with `429` and
+  `resetAt` before any model call (A15), and answers a clarification as `{id, value}`
+  (A14). Every tool runs as the caller over the caller's view, so a term of a hidden
+  graph never reaches a provider (A16), and the injection test of Phase 1 covers the
+  same code path (A17). With `send: "schema"` no step sends rows, and no summary is
+  made (A12).
+- **Settings.** `GET` and `PUT /$/assistant/{ds}` keep `assistant.json` with the members
+  of §3.5. A `PUT` refuses `endpoint` and `apiKey` anywhere, unknown roles, unknown
+  providers and models outside `allowedModels` (A19). `sendByProvider` filters the
+  summarize list to the providers that may receive rows (A42). The `GET` answer adds a
+  `status` that says whether asking works and why not, which the UI reads to show the
+  Ask bar.
+- **Escalation.** Each role keeps a pointer into its list. A step moves to the next pair
+  on `check-failed` when a repair still fails its check or run, on `empty-query` when a
+  repair is still empty and `why_empty` blames the query, on `provider-failure` for a
+  timeout, a refusal or invalid output after its retry, on `complexity` when a first
+  draft, the best example or the last earlier turn scores at least the threshold, and
+  on `try-harder`. A role moves at most twice and an ask has at most two failed calls.
+  Each move is an `escalate` event and a step of the routing record (A13, A35 to A40).
+- **The verdict.** `why_empty` answers `verdict`. It is `query` when a `check_query`
+  issue explains the empty element, `data` for a join or filter whose constants all
+  occur and for a pattern with an absent constant that has no suggestion, and `unknown`
+  otherwise. The pipeline stops on `data` without another model call (A37).
+- **History, feedback and usage.** The server keeps each principal's asks in
+  `<db>/asks.json` for `historyDays`, prunes them every hour, and never stores rows or
+  summaries. `GET` and `DELETE /$/asks/{ds}` show and remove only the caller's own
+  entries (A34). Feedback counts by role, pair and complexity bucket, and
+  `GET /$/models/usage` reports the counts with no question text (A41). `/$/metrics`
+  carries `sparkles_ask_total`, `sparkles_ask_answers`,
+  `sparkles_ask_escalations_total`, `sparkles_ask_tokens_total` and
+  `sparkles_ask_estimated_cost_total`.
+- **reviewedOnly.** `GraphRule` gains excluded patterns, and the principal of an ask
+  with `reviewedOnly` hides the dataset's `agentGraphs` from every step (A28).
+- **UI.** A dataset with an assistant gets the Ask bar above the query tabs with
+  **Preview first** and **Run, then show**, remembered per principal, a step indicator
+  and **Stop**. An answer opens in a new tab with the question header and the checked
+  query. Its rows use the table, graph, map and plan views of any query. The summary's
+  markers select the cited rows, a row under the pointer lights its markers, and the
+  summary collapses. An edit clears the summary, and **Summarize again** sends the
+  edited query. **Correct**, **Not correct** and **Try harder** send feedback, and the
+  model's name carries the routing record in its tooltip. Clarification choices, graph
+  variables, follow-up context, the failure states of §6.5, the server-side Asked list
+  and the Explore page's **Ask a question…** hint are in place (A22 to A25). The mock
+  server scripts the pipeline for the Playwright tests in `ui/tests/mock/ask.spec.ts`.
+- **CLI and matrix.** `sparkles ask` reads `assistant.json` of a database, walks the role
+  lists without `--pair`, and takes `--try-harder N`. The cascade row of
+  `scripts/eval-ask` comes from real runs with the pairs as the role lists of a copy of
+  the model configuration, and reports the escalations by signal (A43).
+
+**Deviations and additions of Phase 2.**
+
+- The `results` of a `result` event use the `application/x-sparkles+json` form of
+  `/{ds}/sparql`, with the plan and the timings, rather than the SPARQL 1.1 JSON
+  results format, so the UI's views and the Plan tab take it unchanged.
+- `send` defaults to `schema`, the most private level, because §3.5 names no default.
+- `POST /$/asks/{ds}/{id}/feedback` is an addition, because §5.5 records feedback but
+  names no route for it. The `query` member of an ask is an addition for **Summarize
+  again**. It checks, runs and summarizes a given query without a draft.
+- A clarification may be sent as `{id, value}` or as the value alone.
+- The usage counters of `GET /$/models/usage` and the daily token counts live in memory,
+  so a restart starts them again. The history file is the only stored record.
+- An unanswerable question and a draft that still fails after its repairs end the
+  stream with an `error` event that carries the last draft, and the `usage` event names
+  the outcome, so a stream client learns how the ask ended.
+- A16 is tested in the library with a C12 grant restricted to one graph, and A28 with
+  a query that reads the default graph and every named graph.
+- With history on, the UI keeps asked questions on the server only, and the Asked list
+  shows the server's entries before the questions of handoff links kept in the browser.
