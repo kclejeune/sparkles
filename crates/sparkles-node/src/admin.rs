@@ -341,6 +341,7 @@ impl NativeDataset {
                 options: opts,
             }))),
             read_only: false,
+            handles: Default::default(),
         })
     }
     #[napi]
@@ -367,6 +368,7 @@ impl NativeDataset {
         Ok(NativeDataset {
             shared: Mutex::new(Some(branch)),
             read_only,
+            handles: Default::default(),
         })
     }
     #[napi]

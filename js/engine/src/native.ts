@@ -28,8 +28,12 @@ export interface NativeResult {
   takeFirst(): NativeBatch | null;
 }
 export interface NativeTransaction {
-  /** the answer itself when the transaction answers within microseconds, else a promise */
-  apply(operations: string): string | Promise<string>;
+  /**
+   * Insert or remove the quads of a request that `TermCache` encoded, answering the number
+   * that changed: at once when the write runs on this thread or the transaction's thread
+   * answers within microseconds, else through a promise.
+   */
+  write(insert: boolean, text: string, data: Uint32Array): number | Promise<number>;
   query(text: string, options: string, cancel: NativeCancellation): Promise<NativeResult>;
   update(text: string, options: string, cancel: NativeCancellation): Promise<string>;
   matched(pattern: string, firstRows?: number, firstBytes?: number): Promise<NativeResult>;
@@ -51,9 +55,18 @@ export interface NativeDataset {
   path(): string | null;
   count(): Promise<string>;
   countPattern(pattern: string): Promise<string>;
-  matchedNow(pattern: string, firstRows: number, firstBytes: number): NativeResult | null;
-  /** whether a quad matches the pattern, for a dataset in memory; null for one on disk */
-  containsNow(pattern: string): boolean | null;
+  /**
+   * a match of a `TermCache` pattern with its first batch, computed on this thread for a
+   * dataset in memory: the batch alone when it holds every quad; null for a dataset on disk
+   */
+  matchedTerms(
+    text: string,
+    data: Uint32Array,
+    firstRows: number,
+    firstBytes: number,
+  ): NativeBatch | NativeResult | null;
+  /** whether the quad of a `TermCache` request is there, in memory; null for a dataset on disk */
+  containsTerms(text: string, data: Uint32Array): boolean | null;
   matched(pattern: string, firstRows?: number, firstBytes?: number): Promise<NativeResult>;
   query(text: string, options: string, cancel: NativeCancellation): Promise<NativeResult>;
   update(text: string, options: string, cancel: NativeCancellation): Promise<string>;

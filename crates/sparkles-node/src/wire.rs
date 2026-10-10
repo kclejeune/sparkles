@@ -20,10 +20,12 @@
 //! | 7 | the default graph | 0, 0 | 0 |
 //! | 8 | triple term | `a`, `b` and `c` are the entries of its subject, predicate and object | |
 
-use napi::bindgen_prelude::Uint32Array;
+use napi::bindgen_prelude::{ToNapiValue, TypeName, Uint32Array, ValidateNapiValue};
 use napi_derive::napi;
 use oxrdf::{BaseDirection, NamedOrBlankNode, Term};
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
+use sparkles::id::Id;
+use sparkles::store::Snapshot;
 
 pub const HEADER: usize = 4;
 const NAMED: u32 = 1;
@@ -45,8 +47,65 @@ pub enum Cell {
 /// One batch as JavaScript receives it.
 #[napi(object)]
 pub struct WireBatch {
-    pub text: String,
+    pub text: Text,
     pub data: Uint32Array,
+}
+
+/// The text of a batch. Text that is all ASCII, as IRIs nearly always are, becomes a
+/// JavaScript string through `napi_create_string_latin1`, which copies the bytes without
+/// decoding UTF-8.
+pub struct Text {
+    text: String,
+    ascii: bool,
+}
+
+impl TypeName for Text {
+    fn type_name() -> &'static str {
+        "String"
+    }
+    fn value_type() -> napi::ValueType {
+        napi::ValueType::String
+    }
+}
+
+impl ValidateNapiValue for Text {}
+
+impl ToNapiValue for Text {
+    unsafe fn to_napi_value(
+        env: napi::sys::napi_env,
+        val: Self,
+    ) -> napi::Result<napi::sys::napi_value> {
+        if !val.ascii {
+            // SAFETY: as napi-rs's own conversion of a `String`
+            return unsafe { String::to_napi_value(env, val.text) };
+        }
+        let mut out = std::ptr::null_mut();
+        // SAFETY: the bytes are valid for the call, and ASCII is valid Latin-1
+        let status = unsafe {
+            napi::sys::napi_create_string_latin1(
+                env,
+                val.text.as_ptr().cast(),
+                val.text.len() as isize,
+                &mut out,
+            )
+        };
+        napi::check_status!(status, "failed to create a result string")?;
+        Ok(out)
+    }
+}
+
+impl napi::bindgen_prelude::FromNapiValue for Text {
+    unsafe fn from_napi_value(
+        env: napi::sys::napi_env,
+        value: napi::sys::napi_value,
+    ) -> napi::Result<Self> {
+        // SAFETY: as napi-rs's own conversion of a `String`
+        let text = unsafe { String::from_napi_value(env, value)? };
+        Ok(Text {
+            ascii: text.is_ascii(),
+            text,
+        })
+    }
 }
 
 /// Builds the term entries of a batch, each distinct term once.
@@ -54,21 +113,30 @@ pub struct TermTable {
     text: String,
     /// the length of `text` in UTF-16 code units
     units: u32,
+    /// `text` is all ASCII
+    ascii: bool,
     entries: Vec<u32>,
-    index: HashMap<Cell, u32>,
+    index: FxHashMap<Cell, u32>,
+    /// the entries of the engine ids that `quad_ids` decoded
+    ids: FxHashMap<u64, u32>,
     /// the entries of the datatype IRIs, which few batches have more than a handful of
     datatypes: Vec<(String, u32)>,
 }
 
 impl TermTable {
-    pub fn new() -> Self {
-        let mut entries = Vec::with_capacity(4 * 256);
+    /// A table sized for a batch of about `rows` rows. It grows as needed, and a small
+    /// first batch, such as a lookup's, allocates little.
+    pub fn new(rows: usize) -> Self {
+        let terms = rows.clamp(4, 256) * 2;
+        let mut entries = Vec::with_capacity(4 * terms);
         entries.extend([0; 4]);
         TermTable {
-            text: String::with_capacity(16 << 10),
+            text: String::with_capacity(terms * 48),
             units: 0,
+            ascii: true,
             entries,
-            index: HashMap::with_capacity(256),
+            index: FxHashMap::default(),
+            ids: FxHashMap::default(),
             datatypes: Vec::new(),
         }
     }
@@ -88,6 +156,7 @@ impl TermTable {
         self.units += if s.is_ascii() {
             s.len() as u32
         } else {
+            self.ascii = false;
             s.encode_utf16().count() as u32
         };
         (start, self.units)
@@ -151,6 +220,28 @@ impl TermTable {
         }
     }
 
+    /// The entries of a quad of engine ids, each id decoded once per batch; `None` when
+    /// one of them has no term.
+    pub fn quad_ids(&mut self, snap: &Snapshot, q: [Id; 4]) -> Option<[u32; 4]> {
+        let mut out = [0; 4];
+        for (cell, id) in out.iter_mut().zip(q) {
+            *cell = match self.ids.get(&id.0) {
+                Some(e) => *e,
+                None => {
+                    let e = if id == Id::DEFAULT_GRAPH {
+                        self.cell(Cell::DefaultGraph)
+                    } else {
+                        // an id is one term, so the id map alone keeps it once
+                        self.term(&snap.term(id)?)
+                    };
+                    self.ids.insert(id.0, e);
+                    e
+                }
+            };
+        }
+        Some(out)
+    }
+
     fn datatype(&mut self, iri: &str) -> u32 {
         if let Some((_, id)) = self.datatypes.iter().find(|(d, _)| d == iri) {
             return *id;
@@ -173,7 +264,10 @@ impl TermTable {
         data.extend_from_slice(&self.entries);
         data.extend_from_slice(&cells);
         WireBatch {
-            text: self.text,
+            text: Text {
+                text: self.text,
+                ascii: self.ascii,
+            },
             data: Uint32Array::new(data),
         }
     }
