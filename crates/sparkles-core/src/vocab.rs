@@ -650,29 +650,20 @@ impl Vocab {
         );
     }
 
-    /// Read ahead what evaluating these ids' values reads (ids sorted ascending): with a
-    /// numeric column, the column's pages of the numbers, read now in two rounds of large
-    /// requests (see [`numeric::NumColumn::get_many`]), and the front-coded blocks of the
-    /// other terms, asked for as in [`Vocab::prefetch_sorted`].
+    /// Read ahead what evaluating these ids' values reads (ids sorted ascending), for a
+    /// sort of a few thousand rows: the front-coded blocks of every id, as
+    /// [`Vocab::prefetch_sorted`] does, and with a numeric column the column's pages of
+    /// the numbers, read now in two rounds (see [`numeric::NumColumn::get_many`]). The
+    /// sort compares the numbers from the column, and the keys arrive meanwhile for the
+    /// rows that the results print.
     pub fn prefetch_values(&self, ids: &[u64]) {
-        let Some(num) = &self.num else {
-            return self.prefetch_sorted(ids);
-        };
-        if !crate::index::io_hints() {
-            return;
+        self.prefetch_sorted(ids);
+        if let Some(num) = &self.num
+            && crate::index::io_hints()
+        {
+            let maybe: Vec<u64> = ids.iter().copied().filter(|&id| num.may_hold(id)).collect();
+            num.get_many(&maybe);
         }
-        // The keys of the ids outside the column's segments are read while the column
-        // answers for the others.
-        let (maybe, keys): (Vec<u64>, Vec<u64>) = ids.iter().partition(|&&id| num.may_hold(id));
-        self.prefetch_sorted(&keys);
-        let found = num.get_many(&maybe);
-        let rest: Vec<u64> = maybe
-            .iter()
-            .zip(found)
-            .filter(|(_, n)| n.value().is_none())
-            .map(|(&id, _)| id)
-            .collect();
-        self.prefetch_sorted(&rest);
     }
 
     /// Overlap the vocabulary reads of a medium-sized result decoded in row order.

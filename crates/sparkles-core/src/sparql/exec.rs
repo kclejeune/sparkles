@@ -1700,7 +1700,7 @@ impl NumAtom {
         if self.op == RangeOp::Eq && self.id == Some(x) {
             return true;
         }
-        let o = self.c.cmp(v);
+        let o = self.c.order(v);
         match self.op {
             RangeOp::Lt => o == Some(Less),
             RangeOp::Le => matches!(o, Some(Less | Equal)),

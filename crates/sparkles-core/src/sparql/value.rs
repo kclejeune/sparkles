@@ -405,7 +405,7 @@ impl NumConst {
 
     /// `num_cmp(x, c)`.
     #[inline]
-    pub fn cmp(&self, x: Num) -> Option<Ordering> {
+    pub fn order(&self, x: Num) -> Option<Ordering> {
         match x.rank().max(self.rank) {
             0 => match (x, self.c) {
                 (Num::Integer(x), Num::Integer(y)) => x.partial_cmp(&y),

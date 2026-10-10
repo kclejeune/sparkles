@@ -59,6 +59,8 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 pub const FILE: &str = "vocab.num";
 const MAGIC: &[u8; 8] = b"SPKVNUM2";
 const HEADER: usize = 48;
+/// (first id, end, first position) of a segment
+type Segment = (u64, u64, u64);
 /// A run of more literals than this without a number ends a segment. It is the ids of
 /// one 4 KiB page of kinds.
 pub const GAP: u64 = 8192;
@@ -189,7 +191,7 @@ pub struct NumColumn {
     rank: usize,
     values: usize,
     /// (first id, end, first position) of each segment
-    segments: Box<[(u64, u64, u64)]>,
+    segments: Box<[Segment]>,
 }
 
 fn word(b: &[u8], at: usize) -> u64 {
@@ -221,7 +223,7 @@ impl NumColumn {
         let b = bytes.as_slice();
         let (covered, count, positions, nsegs) =
             (word(b, 16), word(b, 24), word(b, 32), word(b, 40));
-        let segments = || -> Option<(usize, usize, Box<[(u64, u64, u64)]>)> {
+        let segments = || -> Option<(usize, usize, Box<[Segment]>)> {
             if b[..8] != *MAGIC
                 || word(b, 8) != len
                 || covered != literals
@@ -234,7 +236,7 @@ impl NumColumn {
             if end != b.len() {
                 return None;
             }
-            let list: Box<[(u64, u64, u64)]> = (0..nsegs as usize)
+            let list: Box<[Segment]> = (0..nsegs as usize)
                 .map(|i| {
                     let at = segs + i * 24;
                     (word(b, at), word(b, at + 8), word(b, at + 16))
