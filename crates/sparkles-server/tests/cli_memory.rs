@@ -486,7 +486,8 @@ fn memory_import_sync_and_brief() {
     let r = report(&sy, "staging-db.md");
     assert_eq!(r["status"], "edited", "{sy:#}");
     assert!(r["replaced"].as_u64().unwrap() >= 1);
-    assert_eq!(s.head(), head + 1, "one commit");
+    // the new rendition with its re-anchoring, then the structural diff
+    assert_eq!(s.head(), head + 2, "two commits");
     assert!(s.ask(&format!(
         "ASK {{ GRAPH <{g}> {{ <{m}> <http://schema.org/description> \"The staging database runs on port 5434\" . \
          ?r <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> <<( <{m}> <http://schema.org/description> \"The staging database runs on port 5433\" )>> ; \

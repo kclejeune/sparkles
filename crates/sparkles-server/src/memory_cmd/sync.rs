@@ -1,23 +1,32 @@
 //! `import` and `sync` (spec C18 §8.10.6 and §10.2): compare the scanned files with the
-//! sources on the server and write the difference with `POST /{ds}/facts`.
+//! sources on the server, register each changed file's text with `POST /{ds}/sources`,
+//! and write the difference with `POST /{ds}/facts`.
 //!
 //! The server holds the record. A file's graph is also its source's IRI, and the
-//! source's `spk:contentDigest` says what was imported. A sync lists the principal's
+//! source's `spk:contentDigest` says what was imported: the digest of the file's bytes,
+//! or of its redacted text when redaction changed it. A sync lists the principal's
 //! import graphs with their digests in one query, and then per file:
 //!
-//! - a graph that does not exist yet gets every structural fact, with its quote;
-//! - a graph with another digest is diffed against the structural facts it holds now:
-//!   single-valued predicates are replaced (the old value is superseded), new values of
-//!   other predicates are added, and values the file no longer gives are retracted;
+//! - a graph that does not exist yet gets the file's text as a rendition and every
+//!   structural fact, with its quote and the span of that quote;
+//! - a graph with another digest gets the new text with `reanchor`, which moves the
+//!   prose facts an agent extracted to the new text, and is then diffed against the
+//!   structural facts it holds now: single-valued predicates are replaced (the old value
+//!   is superseded), new values of other predicates are added, and values the file no
+//!   longer gives are retracted;
 //! - a file whose graph is gone but whose bytes match a source that lost its file is a
-//!   rename: the new graph is written with `dcterms:replaces` the old one, and the old
-//!   one is treated as deleted;
-//! - a source under a fully scanned area without a file is deleted: its facts are
-//!   retracted and the source description stays, with `prov:invalidatedAtTime`.
+//!   rename: the new source is registered with `reanchorFrom` the old one, which copies
+//!   the prose facts, the new graph is written with `dcterms:replaces` the old one, and
+//!   the old one is treated as deleted;
+//! - a source under a fully scanned area without a file is deleted: every live fact of
+//!   its graph is retracted and the source description stays, with
+//!   `prov:invalidatedAtTime`.
 //!
-//! Facts an agent extracted from a file are left alone, because the diff reads back only
-//! the import's structural predicates. The local cache only skips the facts query of a
-//! file whose digest and modification time are unchanged.
+//! The import's own facts name the agent `sparkles-import/<harness>`, which the server's
+//! `needsExtraction` rule leaves out. The diff reads back only the import's structural
+//! predicates, so facts an agent extracted are left to the re-anchoring. The local cache
+//! only skips the facts query of a file whose digest and modification time are
+//! unchanged.
 
 use super::conn::{CmdError, Conn, obj, val};
 use serde::{Deserialize, Serialize};
@@ -30,6 +39,62 @@ use std::path::{Path, PathBuf};
 
 const RDF_REIFIES: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies";
 const PROV: &str = "http://www.w3.org/ns/prov#";
+const SPK: &str = "urn:x-sparkles:";
+/// The agent of the import's own facts: `sparkles-import/<harness>`.
+pub const IMPORT_AGENT: &str = "sparkles-import/";
+
+/// The text as `register_source` stores it: line ends folded to `\n`, then NFC.
+pub fn normalize(text: &str) -> String {
+    sparkles::sparql::nfc(&text.replace("\r\n", "\n").replace('\r', "\n"))
+}
+
+/// The digest the server records for a file's source: of the bytes, unless redaction
+/// changed the text, then of the normalized text, since the bytes never leave the
+/// machine.
+pub fn source_digest(f: &FileImport) -> String {
+    if f.redactions.is_empty() {
+        f.digest.clone()
+    } else {
+        sparkles_memory_import::ids::digest(normalize(&f.text).as_bytes())
+    }
+}
+
+/// The source description that `register_source` writes: the import leaves it out of
+/// its facts and its diff.
+fn register_owned(graph: &str, s: &str, p: &str, o: &Obj) -> bool {
+    s == graph
+        && (p == vocab::DCT_TITLE
+            || p == vocab::DCT_FORMAT
+            || p == vocab::SPK_CONTENT_DIGEST
+            || (p == vocab::RDF_TYPE && *o == Obj::Iri(vocab::PROV_ENTITY.into())))
+}
+
+/// The code-point span of the first occurrence of `quote` in `text`.
+fn find_span(text: &str, quote: &str) -> Option<(usize, usize)> {
+    if quote.is_empty() {
+        return None;
+    }
+    let at = text.find(quote)?;
+    let start = text[..at].chars().count();
+    Some((start, start + quote.chars().count()))
+}
+
+/// The registered text of one file and its rendition, which the facts' spans cite.
+pub struct Spans {
+    text: String,
+    rendition: Option<String>,
+}
+
+impl Spans {
+    /// The fact's quote as the rendition holds it, and its span when found.
+    fn cite(&self, quote: &str) -> (String, Option<Value>) {
+        let q = normalize(quote);
+        let span = self.rendition.as_ref().and_then(|r| {
+            find_span(&self.text, &q).map(|(a, e)| json!({ "rendition": r, "start": a, "end": e }))
+        });
+        (q, span)
+    }
+}
 /// What `assert_facts` takes in one call.
 const MAX_PER_CALL: usize = 400;
 
@@ -111,6 +176,8 @@ pub struct Listed {
     pub digest: String,
     pub file_path: Option<String>,
     pub deleted: bool,
+    /// the current rendition; none for a source that an import before renditions wrote
+    pub rendition: Option<String>,
 }
 
 /// The import graphs under `prefix` with their digests, and the head they were read at.
@@ -119,8 +186,9 @@ pub fn list_sources(
     prefix: &str,
 ) -> Result<(BTreeMap<String, Listed>, Option<u64>), CmdError> {
     let q = format!(
-        "SELECT ?g ?d ?fp ?inv WHERE {{ GRAPH ?g {{ ?g <{}> ?d \
-         OPTIONAL {{ ?g <{MEM}filePath> ?fp }} OPTIONAL {{ ?g <{PROV}invalidatedAtTime> ?inv }} }} \
+        "SELECT ?g ?d ?fp ?inv ?rend WHERE {{ GRAPH ?g {{ ?g <{}> ?d \
+         OPTIONAL {{ ?g <{MEM}filePath> ?fp }} OPTIONAL {{ ?g <{PROV}invalidatedAtTime> ?inv }} \
+         OPTIONAL {{ ?g <{SPK}rendition> ?rend }} }} \
          FILTER(STRSTARTS(STR(?g), {})) }}",
         vocab::SPK_CONTENT_DIGEST,
         sparkles_memory_import::quoted(prefix)
@@ -137,18 +205,20 @@ pub fn list_sources(
                 digest: d,
                 file_path: val(row, "fp"),
                 deleted: val(row, "inv").is_some(),
+                rendition: val(row, "rend"),
             },
         );
     }
     Ok((out, sel.head))
 }
 
-/// The structural facts a graph holds now: no reifier, activity or agent.
+/// The structural facts a graph holds now: no reifier, activity, agent, rendition or
+/// chunk, and not the source description that `register_source` owns.
 fn current_facts(conn: &Conn, graph: &str) -> Result<BTreeSet<(String, String, Obj)>, CmdError> {
     let q = format!(
         "SELECT ?s ?p ?o WHERE {{ GRAPH <{graph}> {{ ?s ?p ?o }} \
          FILTER NOT EXISTS {{ GRAPH <{graph}> {{ ?s <{RDF_REIFIES}> ?x }} }} \
-         FILTER NOT EXISTS {{ GRAPH <{graph}> {{ ?s a ?k VALUES ?k {{ <{PROV}Activity> <{PROV}SoftwareAgent> }} }} }} }}"
+         FILTER NOT EXISTS {{ GRAPH <{graph}> {{ ?s a ?k VALUES ?k {{ <{PROV}Activity> <{PROV}SoftwareAgent> <{SPK}TextRendition> <{SPK}Chunk> }} }} }} }}"
     );
     let sel = conn.select(&q)?;
     let mut out = BTreeSet::new();
@@ -156,7 +226,8 @@ fn current_facts(conn: &Conn, graph: &str) -> Result<BTreeSet<(String, String, O
         let (Some(s), Some(p), Some(o)) = (val(row, "s"), val(row, "p"), obj(row, "o")) else {
             continue;
         };
-        if row["s"]["type"] != "uri" || !vocab::structural(&p) {
+        if row["s"]["type"] != "uri" || !vocab::structural(&p) || register_owned(graph, &s, &p, &o)
+        {
             continue;
         }
         out.insert((s, p, o));
@@ -180,6 +251,12 @@ pub struct FileReport {
     pub replaced: usize,
     #[serde(skip_serializing_if = "is_zero")]
     pub retracted: usize,
+    /// prose facts whose citations moved to the new text
+    #[serde(skip_serializing_if = "is_zero")]
+    pub reanchored: usize,
+    /// prose facts copied from the old graph of a rename
+    #[serde(skip_serializing_if = "is_zero")]
+    pub copied: usize,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub redactions: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -209,6 +286,12 @@ impl FileReport {
         }
         if self.retracted > 0 {
             parts.push(n(self.retracted, "retracted"));
+        }
+        if self.reanchored > 0 {
+            parts.push(n(self.reanchored, "re-anchored"));
+        }
+        if self.copied > 0 {
+            parts.push(n(self.copied, "copied"));
         }
         if !self.redactions.is_empty() {
             parts.push(format!("{} redacted", self.redactions.len()));
@@ -244,7 +327,7 @@ struct Change {
     retracts: Vec<Value>,
 }
 
-fn fact_json(f: &Fact, mode: Option<&str>) -> Value {
+fn fact_json(f: &Fact, mode: Option<&str>, spans: Option<&Spans>) -> Value {
     let mut j = json!({ "s": format!("<{}>", f.s), "p": format!("<{}>", f.p), "o": f.o.sparql() });
     if let Some(m) = mode {
         j["mode"] = m.into();
@@ -252,7 +335,16 @@ fn fact_json(f: &Fact, mode: Option<&str>) -> Value {
     if let Some(q) = &f.quote
         && !q.trim().is_empty()
     {
-        j["quote"] = q.clone().into();
+        match spans {
+            Some(sp) => {
+                let (q, span) = sp.cite(q);
+                j["quote"] = q.into();
+                if let Some(s) = span {
+                    j["span"] = s;
+                }
+            }
+            None => j["quote"] = q.clone().into(),
+        }
     }
     j
 }
@@ -261,10 +353,20 @@ fn retract_json(s: &str, p: &str, o: &Obj, graph: &str) -> Value {
     json!({ "s": format!("<{s}>"), "p": format!("<{p}>"), "o": o.sparql(), "graph": graph })
 }
 
-/// The changes that turn `current` into the file's facts.
-fn diff(file: &FileImport, current: &BTreeSet<(String, String, Obj)>) -> Change {
+/// The changes that turn `current` into the file's facts. With `all`, facts the graph
+/// already holds are sent again, so that a source registered for the first time gains
+/// their spans.
+fn diff(
+    file: &FileImport,
+    current: &BTreeSet<(String, String, Obj)>,
+    all: bool,
+    spans: Option<&Spans>,
+) -> Change {
     let mut wanted: BTreeMap<(String, String, Obj), &Fact> = BTreeMap::new();
     for f in &file.facts {
+        if register_owned(&file.graph, &f.s, &f.p, &f.o) {
+            continue;
+        }
         wanted
             .entry((f.s.clone(), f.p.clone(), f.o.clone()))
             .or_insert(f);
@@ -274,6 +376,9 @@ fn diff(file: &FileImport, current: &BTreeSet<(String, String, Obj)>) -> Change 
     let mut replaced_sp: BTreeSet<(String, String)> = BTreeSet::new();
     for (k, f) in &wanted {
         if current.contains(k) {
+            if all {
+                adds.push(fact_json(f, None, spans));
+            }
             continue;
         }
         let single =
@@ -281,17 +386,19 @@ fn diff(file: &FileImport, current: &BTreeSet<(String, String, Obj)>) -> Change 
         if single {
             replaced += 1;
             replaced_sp.insert((f.s.clone(), f.p.clone()));
-            adds.push(fact_json(f, Some("replace")));
+            adds.push(fact_json(f, Some("replace"), spans));
         } else {
-            adds.push(fact_json(f, None));
+            adds.push(fact_json(f, None, spans));
         }
     }
     let mut retracts = Vec::new();
     for k in current {
-        // a rename's link to the old source is the sync's own, not the file's
+        // a rename's link to the old source and a copy's link to its original are the
+        // sync's own, not the file's
         if wanted.contains_key(k)
             || replaced_sp.contains(&(k.0.clone(), k.1.clone()))
             || k.1 == vocab::DCT_REPLACES
+            || k.1 == vocab::mem("copyOf")
         {
             continue;
         }
@@ -334,6 +441,7 @@ fn write(
     retracts: Vec<Value>,
     message: &str,
     keys: (&str, &str, Option<u64>),
+    harness: &str,
     opts: &SyncOpts,
 ) -> Result<Option<u64>, CmdError> {
     let mut commit = None;
@@ -357,6 +465,7 @@ fn write(
             "message": message,
             "idempotencyKey": idem_key(graph, keys.0, keys.1, keys.2, part),
             "allowUnknownIris": true,
+            "agent": { "name": format!("{IMPORT_AGENT}{harness}") },
         });
         if !r.is_empty() {
             args["retract"] = r.into();
@@ -374,6 +483,80 @@ fn write(
         part += 1;
     }
     Ok(commit)
+}
+
+/// Register a file's text as its source's rendition with `POST /{ds}/sources`: with
+/// `reanchor` for an edit, with `from` for a rename. The bytes go along when they differ
+/// from the text and redaction left the file alone, so an export can write them back.
+#[allow(clippy::too_many_arguments)]
+fn register(
+    conn: &Conn,
+    f: &FileImport,
+    text: &str,
+    reanchor: bool,
+    from: Option<&str>,
+    message: &str,
+    opts: &SyncOpts,
+) -> Result<Value, CmdError> {
+    let mut args = json!({
+        "graph": f.graph,
+        "iri": f.graph,
+        "title": f.title,
+        "format": "text/markdown",
+        "text": text,
+        "message": message,
+    });
+    if f.redactions.is_empty() && f.text != text {
+        use base64::Engine;
+        args["original"] = base64::engine::general_purpose::STANDARD
+            .encode(f.text.as_bytes())
+            .into();
+    }
+    if reanchor {
+        args["reanchor"] = true.into();
+    }
+    if let Some(o) = from {
+        args["reanchorFrom"] = o.into();
+    }
+    if opts.dry_run {
+        args["dryRun"] = true.into();
+    }
+    if let Some(b) = &opts.branch {
+        args["branch"] = b.clone().into();
+    }
+    conn.tool("sources", &args)
+}
+
+/// The rendition IRI of `register_source`'s answer.
+fn rendition_of(out: &Value) -> Option<String> {
+    out["rendition"]
+        .as_str()
+        .map(|r| r.trim_start_matches('<').trim_end_matches('>').to_string())
+}
+
+fn count(out: &Value, k: &str) -> usize {
+    out[k].as_u64().unwrap_or(0) as usize
+}
+
+/// Every live fact of a graph, for a deletion: the asserted triples of its live reifiers
+/// and its structural facts.
+fn live_facts(conn: &Conn, graph: &str) -> Result<BTreeSet<(String, String, Obj)>, CmdError> {
+    let mut out = current_facts(conn, graph)?;
+    let q = format!(
+        "SELECT DISTINCT ?s ?p ?o WHERE {{ GRAPH <{graph}> {{ ?r <{RDF_REIFIES}> ?t \
+         FILTER NOT EXISTS {{ ?r <{PROV}wasInvalidatedBy> ?z }} \
+         BIND(SUBJECT(?t) AS ?s) BIND(PREDICATE(?t) AS ?p) BIND(OBJECT(?t) AS ?o) ?s ?p ?o }} }}"
+    );
+    for row in &conn.select(&q)?.rows {
+        let (Some(s), Some(p), Some(o)) = (val(row, "s"), val(row, "p"), obj(row, "o")) else {
+            continue;
+        };
+        if row["s"]["type"] != "uri" || register_owned(graph, &s, &p, &o) {
+            continue;
+        }
+        out.insert((s, p, o));
+    }
+    Ok(out)
 }
 
 fn now_rfc3339() -> String {
@@ -449,10 +632,13 @@ pub fn sync(
         let stamp = stamp(&f.path);
         let server = listed.get(&f.graph);
         let cached = cache.files.get(&path_key);
-        // unchanged: the server has this digest, and the source was not deleted
+        let expected = source_digest(f);
+        // unchanged: the server has this digest and a rendition, and the source was not
+        // deleted
         if let Some(l) = server
             && !l.deleted
-            && l.digest == f.digest
+            && l.rendition.is_some()
+            && l.digest == expected
             && l.file_path.as_deref() == Some(f.rel_path.as_str())
         {
             rep.status = "unchanged".into();
@@ -468,34 +654,88 @@ pub fn sync(
             f.rel_path,
             f.harness.segment()
         );
+        let harness = f.harness.segment();
         let result = (|| -> Result<(), CmdError> {
+            let mut spans = Spans {
+                text: normalize(&f.text),
+                rendition: None,
+            };
             match server {
                 Some(l) => {
-                    // edited, or recreated after a deletion
+                    // edited, recreated after a deletion, or written before renditions
+                    let fresh = l.rendition.is_none();
+                    spans.rendition = l.rendition.clone();
+                    if fresh || l.deleted || l.digest != expected {
+                        let out = register(
+                            conn,
+                            f,
+                            &spans.text,
+                            !fresh && !l.deleted,
+                            None,
+                            &message,
+                            opts,
+                        )?;
+                        rep.reanchored = count(&out, "reanchored");
+                        rep.retracted += count(&out, "retracted");
+                        spans.rendition = rendition_of(&out);
+                        if out["committed"] == true {
+                            rep.commit = out["head"].as_u64().or(out["commit"].as_u64());
+                        }
+                    }
+                    if opts.dry_run {
+                        spans.rendition = None;
+                    }
                     let current = current_facts(conn, &f.graph)?;
-                    let ch = diff(f, &current);
+                    let ch = diff(f, &current, fresh, Some(&spans));
                     rep.status = if l.deleted { "new" } else { "edited" }.into();
                     rep.added = ch.adds.len() - ch.replaced;
                     rep.replaced = ch.replaced;
-                    rep.retracted = ch.retracts.len();
+                    rep.retracted += ch.retracts.len();
                     rep.commit = write(
                         conn,
                         &f.graph,
                         ch.adds,
                         ch.retracts,
                         &message,
-                        (&l.digest, &f.digest, head),
+                        (&l.digest, &expected, head),
+                        harness,
                         opts,
-                    )?;
+                    )?
+                    .or(rep.commit);
                 }
                 None => {
                     let from = by_digest
-                        .get(f.digest.as_str())
+                        .get(expected.as_str())
+                        .or_else(|| by_digest.get(f.digest.as_str()))
                         .map(|g| g.to_string())
                         .or_else(|| by_body.get(&f.body_digest).cloned())
                         .filter(|g| !renamed_away.contains(g));
-                    let mut adds: Vec<Value> = f.facts.iter().map(|x| fact_json(x, None)).collect();
+                    let out =
+                        register(conn, f, &spans.text, false, from.as_deref(), &message, opts)?;
+                    rep.copied = count(&out, "copied");
+                    if !opts.dry_run {
+                        spans.rendition = rendition_of(&out);
+                    }
+                    let mut adds: Vec<Value> = f
+                        .facts
+                        .iter()
+                        .filter(|x| !register_owned(&f.graph, &x.s, &x.p, &x.o))
+                        .map(|x| fact_json(x, None, Some(&spans)))
+                        .collect();
                     rep.status = "new".into();
+                    // a byte copy of a live source elsewhere, such as an exported file
+                    let copy_of = f.facts.iter().any(|x| x.p == vocab::mem("copyOf"));
+                    if !copy_of && from.is_none() {
+                        for (g, l) in &listed {
+                            if g != &f.graph
+                                && !l.deleted
+                                && !gone.contains(g)
+                                && l.digest == expected
+                            {
+                                adds.push(json!({ "s": format!("<{}>", f.graph), "p": format!("<{}>", vocab::mem("copyOf")), "o": format!("<{g}>") }));
+                            }
+                        }
+                    }
                     if let Some(old) = &from {
                         adds.push(json!({ "s": format!("<{}>", f.graph), "p": format!("<{}>", vocab::DCT_REPLACES), "o": format!("<{old}>") }));
                         rep.status = "renamed".into();
@@ -512,7 +752,8 @@ pub fn sync(
                         adds,
                         Vec::new(),
                         &message,
-                        ("", &f.digest, head),
+                        ("", &expected, head),
+                        harness,
                         opts,
                     )?;
                 }
@@ -546,8 +787,13 @@ pub fn sync(
         if renamed_away.contains(g) {
             rep.reason = Some("renamed".into());
         }
+        let harness = g
+            .strip_prefix(opts.prefix.as_str())
+            .and_then(|r| r.split('/').next())
+            .unwrap_or("generic")
+            .to_string();
         let result = (|| -> Result<(), CmdError> {
-            let current = current_facts(conn, g)?;
+            let current = live_facts(conn, g)?;
             let retracts: Vec<Value> = current
                 .iter()
                 .filter(|(s, p, _)| !(s == g && kept_on_delete(p)))
@@ -567,6 +813,7 @@ pub fn sync(
                 Vec::new(),
                 &format!("sparkles memory sync: {} deleted", rep.path),
                 (&l.digest, "deleted", head),
+                &harness,
                 opts,
             )?;
             if !retracts.is_empty() {
@@ -577,6 +824,7 @@ pub fn sync(
                     retracts,
                     &format!("sparkles memory sync: {} deleted", rep.path),
                     (&l.digest, "deleted-facts", head),
+                    &harness,
                     opts,
                 )?
                 .or(rep.commit);
@@ -678,6 +926,7 @@ mod tests {
             title: "a.md".into(),
             redactions: vec![],
             facts,
+            text: String::new(),
         }
     }
 
@@ -714,7 +963,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let ch = diff(&file, &current);
+        let ch = diff(&file, &current, false, None);
         assert_eq!(ch.replaced, 1);
         assert_eq!(ch.adds.len(), 2);
         assert!(
@@ -730,7 +979,7 @@ mod tests {
             .iter()
             .map(|x| (x.s.clone(), x.p.clone(), x.o.clone()))
             .collect();
-        let ch = diff(&file, &same);
+        let ch = diff(&file, &same, false, None);
         assert!(ch.adds.is_empty() && ch.retracts.is_empty());
     }
 

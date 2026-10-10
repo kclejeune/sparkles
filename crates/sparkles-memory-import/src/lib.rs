@@ -245,4 +245,30 @@ pub struct FileImport {
     pub redactions: Vec<String>,
     /// the structural facts, the source's description included
     pub facts: Vec<Fact>,
+    /// the file's text after redaction: the text `register_source` receives
+    pub text: String,
+}
+
+/// The first line of a file that `sparkles memory export --sources` converted from
+/// another source: `<!-- sparkles:copy-of <IRI> exported DATE -->`. An import of the
+/// file records `mem:copyOf` that IRI, so the copy does not count as a second source.
+pub const COPY_OF: &str = "<!-- sparkles:copy-of ";
+
+/// The sources a converted file names in its leading copy comments, with each line.
+pub fn copies_of(text: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let t = line.trim();
+        let Some(rest) = t.strip_prefix(COPY_OF) else {
+            break;
+        };
+        if let Some(r) = rest.strip_prefix('<')
+            && let Some((iri, _)) = r.split_once('>')
+            && !iri.is_empty()
+            && !iri.contains(char::is_whitespace)
+        {
+            out.push((iri.to_string(), t.to_string()));
+        }
+    }
+    out
 }

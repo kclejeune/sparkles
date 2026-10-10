@@ -64,7 +64,7 @@ pub fn structural(p: &str) -> bool {
     single_valued(p)
         || [RDF_TYPE, DCT_REFERENCES, DCT_REPLACES, PROV_INVALIDATED_AT].contains(&p)
         || p.strip_prefix(MEM)
-            .is_some_and(|l| matches!(l, "appliesTo" | "imports"))
+            .is_some_and(|l| matches!(l, "appliesTo" | "imports" | "copyOf"))
 }
 
 /// The vocabulary graph in Turtle. Standard terms the import uses are declared too, so a
