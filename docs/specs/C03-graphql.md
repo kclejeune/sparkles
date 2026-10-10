@@ -9,7 +9,7 @@
 > for them.
 >
 > **User docs:** [API: GraphQL](../API.md#graphql) · [Usage: GraphQL](../USAGE.md#graphql) ·
-> [Features](../FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui)
+> [Features](../FEATURES.md#server-fuseki-equivalent)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
 > the end records how it landed.

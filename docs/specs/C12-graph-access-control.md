@@ -10,7 +10,7 @@
 >
 > **User docs:** [API: Graph-level access control](../API.md#graph-level-access-control) ·
 > [Usage: Restricting users to some graphs](../USAGE.md#restricting-users-to-some-graphs) ·
-> [Features](../FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui)
+> [Features](../FEATURES.md#server-fuseki-equivalent)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
 > the end records how it landed.

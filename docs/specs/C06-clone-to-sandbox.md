@@ -10,7 +10,7 @@
 > commit shipped with point-in-time reads, and branches and merges shipped as
 > [F09](F09-branches-and-merges.md). Cloning across servers is not built.
 >
-> **User docs:** [API: Clone](../API.md#clone) · [Features](../FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui)
+> **User docs:** [API: Clone](../API.md#clone) · [Features](../FEATURES.md#storage-tdb2-equivalent)
 >
 > This is the design as written before implementation; the [Outcome](#outcome) section at the end
 > records how it landed.

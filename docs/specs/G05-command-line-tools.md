@@ -6,7 +6,7 @@
 > `load` and `/$/validate/iri`.
 >
 > **User docs:** [Usage: File tools](../USAGE.md#file-tools) ·
-> [Features](../FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui) ·
+> [Features](../FEATURES.md#command-line) ·
 > [Comparison with Jena](../COMPARISON.md)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at

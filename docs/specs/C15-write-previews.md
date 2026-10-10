@@ -8,7 +8,7 @@
 >
 > **User docs:** [API: Write previews](../API.md#write-previews) ·
 > [Usage: Previewing a write](../USAGE.md#previewing-a-write) ·
-> [Features](../FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui)
+> [Features](../FEATURES.md#storage-tdb2-equivalent)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
 > the end records how it landed.

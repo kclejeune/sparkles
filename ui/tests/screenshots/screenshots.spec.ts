@@ -4,12 +4,10 @@
 // docs/images/<name>.png. Run with `mise run docs:screenshots`.
 
 import { test as base, expect, type Locator, type Page } from '@playwright/test';
-import { mkdirSync, readFileSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { settle, shoot } from '../shoot';
 import { DATASET, DEMO } from './global-setup';
-
-const OUT = resolve(import.meta.dirname, '../../../docs/images');
-mkdirSync(OUT, { recursive: true });
 
 const test = base.extend({
   baseURL: async ({}, use) => {
@@ -44,20 +42,6 @@ const PREFIX = {
   rdfs: 'PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>',
 };
 
-/** Waits for fonts, for spinners to go, and for `target` to look the same twice running. */
-async function settle(page: Page, target: Locator = page.locator('body')) {
-  await page.evaluate(() => document.fonts.ready.then(() => undefined));
-  await expect(page.locator('.spinner')).toHaveCount(0, { timeout: 15_000 });
-  let last: Buffer | null = null;
-  for (let i = 0; i < 60; i++) {
-    await page.waitForTimeout(250);
-    const now = await target.screenshot({ animations: 'disabled', scale: 'css' });
-    if (last && now.equals(last)) return;
-    last = now;
-  }
-  throw new Error('the page did not stop changing');
-}
-
 /**
  * Where the node labelled `label` of the graph drawn in `region` is on the page; with
  * `zoom`, first zooms the graph to that level around the node (a larger graph is laid out at
@@ -88,14 +72,6 @@ async function nodeAt(region: Locator, label: string, zoom?: number) {
       },
       [label, zoom] as const,
     );
-}
-
-async function shoot(page: Page, name: string, hover = false) {
-  // no hover state (unless it is the point) or focus ring in the picture
-  if (!hover) await page.mouse.move(0, 0);
-  await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
-  await settle(page);
-  await page.screenshot({ path: join(OUT, `${name}.png`), animations: 'disabled' });
 }
 
 /**
@@ -165,7 +141,7 @@ WHERE {
   // one person's neighbourhood highlighted
   const priya = await nodeAt(results, 'Priya Raman', 0.85);
   await page.mouse.move(priya.x, priya.y);
-  await shoot(page, 'graph', true);
+  await shoot(page, 'graph', { hover: true });
 });
 
 test('explore', async ({ page }) => {

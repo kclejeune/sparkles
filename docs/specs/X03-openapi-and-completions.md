@@ -12,7 +12,7 @@
 >
 > **User docs:** [API: OpenAPI description](../API.md#openapi-description) ·
 > [Usage: Shell completions and man pages](../USAGE.md#shell-completions-and-man-pages) ·
-> [Features](../FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui)
+> [Features](../FEATURES.md#server-fuseki-equivalent)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
 > the end records how it landed.

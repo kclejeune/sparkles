@@ -10,7 +10,7 @@
 > `path:edge` binding. Phase 3 waits for the Cypher frontend of [F01](F01-cypher.md),
 > which is not built.
 >
-> **User docs:** [API: Path search](../API.md#path-search) · [Usage: Finding paths](../USAGE.md#finding-paths) · [Features](../FEATURES.md#sparql-arq-equivalent)
+> **User docs:** [API: Path search](../API.md#path-search) · [Usage: Finding paths](../USAGE.md#finding-paths) · [Features](../FEATURES.md#search)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
 > the end records how it landed.

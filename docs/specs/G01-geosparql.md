@@ -18,7 +18,7 @@
 > [API: query rewrite and RDFS entailment](../API.md#query-rewrite-spatialequals-and-rdfs-entailment) ·
 > [API: maps in the web UI](../API.md#maps-in-the-web-ui) ·
 > [API: CRSs from proj4 definitions](../API.md#crss-from-proj4-definitions) ·
-> [Features](../FEATURES.md#sparql-arq-equivalent) ·
+> [Features](../FEATURES.md#geosparql) ·
 > [Benchmarks: spatial index commit cost](../BENCHMARKS.md#spatial-index-commit-cost) ·
 > [Benchmarks: GeoSPARQL Compliance Benchmark](../BENCHMARKS.md#geosparql-compliance-benchmark)
 >

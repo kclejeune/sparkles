@@ -22,7 +22,7 @@
 > [Usage: Constraints next to the counts](../USAGE.md#constraints-next-to-the-counts) ·
 > [Usage: Drafting shapes](../USAGE.md#drafting-shapes-from-the-data) ·
 > [Usage: What each class uses](../USAGE.md#what-each-class-uses-and-what-changed) ·
-> [Features](../FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui)
+> [Features](../FEATURES.md#reasoning-validation-and-schema)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
 > the end records how it landed.

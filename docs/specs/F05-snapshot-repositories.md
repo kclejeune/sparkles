@@ -14,7 +14,7 @@
 >
 > **User docs:** [API: Backup repositories](../API.md#backup-repositories) ·
 > [Usage: Backup repositories](../USAGE.md#backup-repositories) ·
-> [Features](../FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui) ·
+> [Features](../FEATURES.md#server-fuseki-equivalent) ·
 > [Benchmarks: Backup repositories](../BENCHMARKS.md#backup-repositories-105m-triples)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at

@@ -16,7 +16,8 @@
     "test:watch": "vitest",
     "e2e": "playwright test",
     "e2e:mock": "playwright test --config playwright.mock.config.ts",
-    "screenshots": "playwright test --config playwright.screenshots.config.ts"
+    "screenshots": "playwright test --config playwright.screenshots.config.ts",
+    "screenshots:mock": "playwright test --config playwright.screenshots-mock.config.ts"
   },
   "devDependencies": {
     "@playwright/test": "1.63.0",

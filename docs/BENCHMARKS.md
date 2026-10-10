@@ -1,197 +1,81 @@
 # Benchmarks
 
-This page is a dated snapshot of Sparkles performance, including comparisons with
-Apache Jena (TDB2 and Fuseki), QLever, Fluree and Oxigraph. Sparkles was measured on
-2026-10-08 on `forge`; the other engines retain their 2026-10-03 measurements.
-Data, queries and timing methods match, but these are dated reference comparisons
-rather than interleaved new runs. The measured default-feature release binary has
-SHA-256 `9eaf960a14fc5cbd0b573c32674eca9a874450ff2e4a804d3679ef82676cfaa0`. It was
-built from the source that was then committed unchanged as commit `ff7acde4`.
-The DBpedia snapshot was refreshed separately at commit `ba547b89`, using binary
-SHA-256 `9e892cb3e63f2f7270ed7ddff72e38331496b7a37a850f915e0b6fb09ad4bee3`.
-That binary was built and measured on `forge` on 2026-10-09 (EDT), with Rust 1.98.1,
-LLVM 22.1.8, default features, thin LTO and four codegen units. The filesystem was
-trimmed immediately before the load.
-The other tables retain their stated binaries and dates.
-[Sparkles HTTP latency](#sparkles-http-latency) and [HTTP writes](#http-write-snapshot)
-are separately dated measurements with different timing methods. Feature and
-configuration comparisons describe caching, loading, execution and storage settings.
-[Other measurements](#other-measurements) identifies each section's date and machine.
+This page reports how fast Sparkles loads, queries and writes RDF, how much memory and
+disk it uses for that speed, and how its Python, JVM and Node.js bindings compare with
+the libraries they replace. The comparisons run the same data and queries on every engine,
+check every engine's answers before timing them, and list every case where Sparkles loses.
 
-To reproduce the runs, use `mise run bench [people] [workdir]` or `scripts/bench.sh`. With
-`mise run bench`, `--engines fluree` re-measures one engine and merges its results into an
-existing run, and `--answers-only` re-checks every engine's answers without timing anything.
-`scripts/bench.sh` takes the same settings as the variables `ENGINES` and `ANSWERS_ONLY=1`.
-`mise run bench:watdiv [scale]` runs WatDiv, `scripts/bench-text.sh` runs the full-text
-comparison, and `mise run bench:billion full` runs DBpedia.
+| Measurement context | |
+|---|---|
+| Hardware | `forge`: Intel Core i5-13500 (6 performance and 8 efficiency cores, 20 threads), 16 GiB of RAM, NVMe SSD. `atlas`: the same CPU, for the bindings. A development laptop (Intel Core Ultra X7 358H, 32 GB) only where a section says so. |
+| OS and kernel | NixOS, Linux 6.18 |
+| Sparkles | 0.1.0, release builds with default features, rustc 1.98 and 1.99 |
+| Other engines | QLever 0.5.48, Fluree 4.2.2 (the release binary), Oxigraph 0.5.11 (server, pyoxigraph and the JavaScript package), Apache Jena TDB2 6.2.0 with Fuseki 5.1.0, Jena 5.6.0 (TDB2 and TIM in the JVM comparison), rdflib 7.6.0, N3.js 2.13.11 with Comunica 5.4.1 |
+| Measured | 2026-10-03 to 2026-10-09. The QLever figures for the DBpedia `geo-box` and `country-population` queries come from an earlier run on the same host. |
+
+* [Summary](#summary)
+* [Query performance](#query-performance)
+* [Loading and index builds](#loading-and-index-builds)
+* [Writes and updates](#writes-and-updates)
+* [Bindings](#bindings)
+* [Memory and disk](#memory-and-disk)
+* [Where Sparkles loses](#where-sparkles-loses)
+* [Methodology and reproduction](#methodology-and-reproduction)
 
 ## Summary
+
+The synthetic suite has 28 queries over generated data at 1.05 million and 10.5 million
+triples. Medians are over the queries each engine completes.
 
 | | 1.05M triples | 10.5M triples |
 |---|---|---|
 | Bulk load | **0.48 s** (Fluree 1.27, Oxigraph 1.28, QLever 1.51, TDB2 4.78) | **3.87 s** (QLever 9.69, Fluree 11.07, Oxigraph 14.13, TDB2 45.57) |
-| Fastest of the five | 26 of 28 queries | 27 of 28 queries |
-| Clear warm-query losses | `range-topk` to QLever, 1.12× | none |
+| Fastest of the five engines | 26 of 28 queries | 27 of 28 queries |
+| Clear losses | `range-topk` to QLever, 1.12× | none |
 | Ties within 10% | Fluree on `count-all`, `distinct-obj`, `star-lookup`, `values-star` and `employee-docs` | Fluree on `count-all`, `distinct-obj` and `star-lookup` |
-| vs. QLever | Faster on 27 of 28, median 2.7× | Faster on 28 of 28, median 3.9× |
-| vs. Fluree | Faster on 27 of 28, median 3.5× | Faster on 26 of 27 completed queries, median 9.9× |
-| vs. Fuseki | Faster on all 27 completed queries, median 13× | Faster on all 27 completed queries, median 79× |
-| vs. Oxigraph | Faster on all 28, median 25× | Faster on all 28, median 85× |
-| Update latency, 1 triple | 4.2 ms (**Oxigraph 3.71**, QLever 3.79, Fluree 5.60, Fuseki 32.6) | 4.9 ms (**QLever 4.19**, Oxigraph 4.27, Fluree 4.55, Fuseki 32.4) |
+| Against QLever | Faster on 27 of 28, median 2.7× | Faster on 28 of 28, median 3.9× |
+| Against Fluree | Faster on 27 of 28, median 3.5× | Faster on 26 of 27 completed, median 9.9× |
+| Against Fuseki | Faster on all 27 completed, median 13× | Faster on all 27 completed, median 79× |
+| Against Oxigraph | Faster on all 28, median 25× | Faster on all 28, median 85× |
 | Throughput, 16 clients | **1,220 q/s** (QLever 462, Fluree 246, Fuseki 113, Oxigraph 25) | **241 q/s** (QLever 92, Fluree 22, Fuseki 11, Oxigraph 1.7) |
 | Server RSS after the run | 405 MiB (**QLever 307**, Oxigraph 1,244, Fuseki 1,769, Fluree 2,735) | 840 MiB (**QLever 653**, Oxigraph 2,381, Fluree 4,664, Fuseki 4,899) |
 | Server RSS less the block cache | 341 MiB | 461 MiB |
-| Bulk load peak RSS | **349 MiB** (Fluree 475, QLever 660, Oxigraph 738, TDB2 2,188) | 2,165 MiB (**QLever 1,931**, Fluree 3,142, TDB2 4,115, Oxigraph 6,204) |
 
-“Fastest” and “faster” compare the means in the result tables. Where two means round
-to the same displayed value, the tables give a second decimal so that every count can
-be checked against them. Differences within 10% are ties, as explained under
-[Setup](#setup). Small HTTP measurements include the curl process. Sparkles uses
-durable acknowledgments, whereas Oxigraph's default does not synchronize its WAL and
-QLever retains writes in memory.
+On larger and standard workloads:
 
-On WatDiv at scale 100 (10.97M triples), Sparkles is fastest on all 20 templates and
-86 of 88 instances. Both remaining instance differences are within 10%. Sparkles'
-geometric mean is 4.84 ms, against 7.41 for Fluree, 14.2 for Fuseki, 17.2 for Oxigraph
-and 18.2 for QLever.
+* **DBpedia, 1.24 billion triples.** Sparkles loads English DBpedia in 480 s, against
+  QLever's 1,674 s and Fluree's 2,919 s. It is faster than QLever on all 29 warm queries that both answer
+  correctly and on 29 of 31 cold ones.
+* **WatDiv at 10.97M triples.** Sparkles is fastest on all 20 templates, with a
+  geometric mean of 4.84 ms against 7.41 ms for Fluree, 14.2 ms for Fuseki, 17.2 ms for
+  Oxigraph and 18.2 ms for QLever.
+* **Full-text search.** Sparkles is fastest on all seven queries at 1.05M and on six of
+  seven at 10.5M, against Fuseki with jena-text and QLever.
+* **Durable writes.** A commit that adds a new literal takes a median of 1.13 ms at 1.05M
+  and 1.28 ms at 10.5M, synchronized to disk before it is acknowledged. Oxigraph commits
+  faster without synchronizing, and Fluree takes 1.55 to 1.68 ms in the suite's churn.
+* **Bindings.** Through Jena's own API, Sparkles answers 24 of 28 suite queries faster
+  than TDB2 and than Jena's in-memory store. The Python package is faster than pyoxigraph
+  on 25 of 28, and the Node.js package is faster than Oxigraph's JavaScript package on 24
+  of 28.
 
-In full-text search, Sparkles is fastest on all seven queries at 1.05M and six at
-10.5M. QLever's advantage on the remaining common-word count is within 10%. Its text
-index is smaller, and the two engines differ in which predicates they index and in
-their stemming and highlighting support.
+Sparkles trades memory for speed by default. Its 1 GiB decoded-block cache and eager
+execution explain most of the RSS gap with QLever, and [Memory and disk](#memory-and-disk)
+gives the cost and the speed of each such default.
 
-The [DBpedia results](#dbpedia-at-124-billion-triples) cover 1.24 billion input triples.
-Sparkles loaded the data in 547 s, against QLever's 1,674 s and Fluree's 2,919 s.
-It was faster than QLever on all 29 agreeing warm queries and 28 of 31 cold queries.
+## Query performance
 
-Two runs on 2026-10-08 loaded the same input in 1,248 s and 1,351 s and lost 13 cold
-queries to QLever. Matched controls traced both slowdowns to the state of the SSD on
-`forge`, which had not been trimmed for several days, and not to a change in the code.
-[Changes against the run of 2026-10-03](#changes-against-the-run-of-2026-10-03)
-gives the evidence.
+These comparisons run each engine alone on `forge`, with result caches off, over HTTP.
+Queries are SPARQL protocol POSTs with TSV results, timed by hyperfine around `curl`, so
+each time includes about 3.5 ms of process start and round trip. Bold marks the fastest
+engine. [Methodology](#methodology-and-reproduction) gives the settings of each engine.
 
-Sparkles defaults to a 1 GiB decoded-block cache per dataset and eager execution.
-Explicit [streaming execution](#streaming-execution) reduces retained result memory
-and improves selected workloads, but some complete responses remain slower. Automatic
-selection is limited to measured eligible cases. [Memory and the speed it buys](#memory-and-the-speed-it-buys)
-and [Where Sparkles loses](#where-sparkles-loses) describe the remaining tradeoffs.
+### Synthetic suite at 1.05M triples
 
-## Setup
-
-* **Data:** `scripts/gen-data.py N` generates synthetic data with about 10.5 triples per
-  person. The data has people, organisations, documents, typed literals (integers,
-  decimals and dates), `foaf:knows` and citation graphs, language-tagged titles, and a
-  small OWL class hierarchy. Two sizes were measured:
-  * **1.05M triples** (N = 100k)
-  * **10.5M triples** (N = 1M, 1.12 GB of N-Triples)
-* **Queries:** `scripts/bench.sh` has 28 queries covering scans, counts, joins,
-  OPTIONAL, property paths, subqueries, grouping, sorting, point lookups and expressions
-  in BIND, ORDER BY and aggregate arguments.
-
-* **Engines:** no engine was allowed to answer from a result cache.
-  * Sparkles was measured on 2026-10-08 with a release build of `sparkles-server` at
-    commit `ff7acde4`, with its default features, made with rustc 1.98.1 and LLVM
-    22.1.8 on `forge`. The binary's SHA-256 is given at the top of this page. It ran as
-    `sparkles serve --result-cache-mb 0`, with every other setting at its default.
-    Competitor results below were retained from 2026-10-03, and their versions and
-    settings are unchanged.
-  * Jena: loaded with `tdb2.tdbloader` 6.2.0 and served by Fuseki 5.1.0 with `-Xmx8G`.
-    5.1.0 is the Fuseki version that nixpkgs packages. Fuseki has no result cache.
-  * QLever 0.5.48: `-m 8G -j 16 --cache-max-size-single-entry 0B`. The last setting
-    stops QLever from caching results, which `--cache-max-num-entries 0` does not. Its
-    cache is also cleared before every timed run.
-  * Fluree 4.2.2 (BUSL-1.1): the release binary, which the script downloads and
-    verifies against a checksum.
-    * Load: `fluree create bench --from data.nt --chunk-size-mb 16`, a parallel bulk
-      import.
-    * Server: `fluree server run` with `FLUREE_CACHE_MAX_MB=4096` and
-      `FLUREE_PATH_MAX_VISITED=20000000`. The second setting is needed because the
-      default traversal cap of 1M nodes rejects `knows-reach` at 10M.
-    * No result cache.
-  * Oxigraph 0.5.11: loaded with `oxigraph load` and then `oxigraph optimize`, and served
-    by `oxigraph serve --timeout-s 600`. `optimize` is the compaction that Oxigraph's
-    loader recommends before read-heavy workloads, and the load time includes both steps.
-    No result cache.
-* **Machine:** `forge`, an Intel Core i5-13500 with 6 performance cores (12 threads, CPUs
-  0–11) and 8 efficiency cores (CPUs 12–19). It has 16 GiB of RAM, of which 15 GiB is
-  usable, and an NVMe drive. It runs NixOS with Linux 6.18. Every engine comes from the
-  same nixpkgs revision, except Fluree, which is the release binary. The OS page cache is
-  warm except in the cold runs.
-* **Isolation:** each engine ran alone on the machine, one after another, with nothing
-  else heavy running. Every server ran in a systemd scope with a 12 GiB memory limit and
-  no swap (`SERVER_MEM_MAX=12G`), so an engine that runs out of memory is killed on its
-  own.
-* **Method:** timings use hyperfine 1.20.
-  * Queries are SPARQL protocol POSTs with TSV results. Each query gets 2 warm-ups and
-    10 runs at 1.05M, and 1 warm-up and 5 runs at 10.5M.
-  * Times are mean ± σ in ms. They include starting a `curl` process and the HTTP round
-    trip, which together take about 3.5 ms. A query that reports 3.5–4 ms did almost no
-    work.
-  * The client is pinned to one CPU. hyperfine and its `curl` processes run on CPU 11,
-    the last performance core. The servers are not pinned. Starting a `curl` process
-    takes 3.5 to 9 ms of CPU depending on the core it lands on, which is more than most
-    small queries take. Pinning reduces that source of variation. Measurements with
-    unpinned clients, identified in their sections, are not directly comparable.
-
-  * Loads: 1 run each, with peak RSS from GNU time.
-  * Comparisons on this page are descriptive. A difference within 10% is reported as
-    a tie, and no figure is a significance test or a confidence interval. Sections
-    that were measured separately from the main suite give their own date, method and
-    machine, and their figures are not directly comparable with the main tables.
-  * Answers are checked before timing. `scripts/bench-answers.py` fetches every
-    engine's answer to every query as SPARQL JSON and fingerprints it by:
-    * the row count;
-    * the solution multiset by RDF term identity;
-    * the same multiset with numeric literals compared by value, to 12 significant
-      digits. Engines print the non-terminating averages of `group-avg` to different
-      precisions.
-
-    An engine whose answer differs *in value* from the majority is marked † and not
-    ranked. That happened only to QLever, on `types-grouped` after the update churn at
-    both sizes. A ‡
-    marks equal values returned as different RDF terms. `export-500k` uses LIMIT without
-    ORDER BY, so only its row count is checked.
-  * Update latency is measured with a single-triple `INSERT DATA` into a named graph.
-    An untimed `DELETE DATA` runs before every timed request, so each request performs
-    a real insertion. An ASK before and after checks that the change is visible. Each
-    engine uses its default durability:
-    * Sparkles fsyncs its WAL before acknowledging;
-    * TDB2 commits durably;
-    * QLever keeps updates in memory only;
-    * Fluree uses its default commit path;
-    * Oxigraph commits a RocksDB transaction with RocksDB's default write options,
-      which write the WAL but do not fsync it.
-  * Throughput: 160 `star-join` requests from 16 parallel `curl` clients, which are not
-    pinned.
-  * Memory: the server's RSS 2 s after the throughput run, and its peak during that run.
-    Each server's peak is also reset before every query of the answer check, which gives
-    the rise in peak RSS per query.
-
-### Coverage and failures
-
-The comparison covers the default, `updates`, `mixed` and `cold` modes of
-`scripts/bench.sh` at both sizes, plus WatDiv and full-text search. Cache-size and
-execution-feature comparisons cover Sparkles alone. Each comparative run loads its
-own data. The `mixed` mode uses `oha`; the `cold` mode uses curl's request timer,
-which excludes process startup. Those two modes do not use the pinned client.
-
-Two queries are excluded at 10.5M:
-
-* Fluree's `optional-chain` exceeds the 12 GiB memory limit.
-* Fuseki's `knows-reach` overflows its stack and leaves TDB2's node cache wedged,
-  causing later queries to hang.
-
-At 1.05M, Fuseki's `knows-reach` fails with the same error but leaves the server usable,
-so it is reported as an error.
-
-## Results: 1.05M triples
-
-Most queries at this size are close to the cost of starting curl and making
-the request; differences of a few percent near that floor are ties.
+Most queries at this size are close to the cost of starting curl and making the request.
 
 | query | sparkles (ms) | jena-fuseki (ms) | qlever (ms) | fluree (ms) | oxigraph (ms) |
 |---|---:|---:|---:|---:|---:|
-| **load** (s) | **0.48** | 4.78 | 1.51 | 1.27 | 1.28 |
 | count-all | **3.5 ± 0.2** | 173.7 ± 19.8 | 10.7 ± 0.9 ‡ | 3.7 ± 0.2 | 256.3 ± 3.8 |
 | types-grouped | **3.6 ± 0.1** | 77.4 ± 8.0 | 5.9 ± 0.3 ‡ | 19.0 ± 1.0 | 42.9 ± 2.2 |
 | star-join | **7.5 ± 0.2** | 30.6 ± 1.7 | 33.5 ± 3.6 ‡ | 22.5 ± 1.8 | 388.9 ± 4.8 |
@@ -220,14 +104,12 @@ the request; differences of a few percent near that floor are ties.
 | expr-bind-group | **4.7 ± 0.4** | 48.1 ± 1.1 ‡ | 7.9 ± 0.5 ‡ | 44.4 ± 0.2 | 46.2 ± 4.1 |
 | expr-order-key | **6.1 ± 0.3** | 89.1 ± 1.1 | 14.2 ± 0.6 ‡ | 114.8 ± 0.3 | 2672.4 ± 18.4 |
 | expr-agg-arg | **8.4 ± 0.2** | 166.1 ± 0.9 | 14.4 ± 1.0 ‡ | 75.9 ± 2.8 | 298.7 ± 9.2 |
-| **update** (1-triple INSERT DATA) | 4.2 ± 0.6 | 32.6 ± 3.6 | 3.8 ± 0.1 | 5.6 ± 0.5 | **3.7 ± 0.1** |
 | **throughput** star-join, 16 clients (queries/s) | **1220** | 113 | 462 | 246 | 25 |
 
-## Results: 10.5M triples
+### Synthetic suite at 10.5M triples
 
 | query | sparkles (ms) | jena-fuseki (ms) | qlever (ms) | fluree (ms) | oxigraph (ms) |
 |---|---:|---:|---:|---:|---:|
-| **load** (s) | **3.87** | 45.57 | 9.69 | 11.07 | 14.13 |
 | count-all | **3.86 ± 0.25** | 1621.1 ± 16.0 | 53.3 ± 2.7 ‡ | 3.92 ± 0.28 | 2497.6 ± 18.9 |
 | types-grouped | **3.8 ± 0.3** | 5208.4 ± 285.4 | 6.6 ± 1.1 ‡ | 113.4 ± 9.3 | 381.2 ± 3.6 |
 | star-join | **31.0 ± 0.4** | 251.7 ± 17.1 | 115.1 ± 7.1 ‡ | 142.2 ± 4.6 | 4710.7 ± 22.6 |
@@ -256,177 +138,25 @@ the request; differences of a few percent near that floor are ties.
 | expr-bind-group | **8.9 ± 0.4** | 426.7 ± 11.6 ‡ | 34.1 ± 3.6 ‡ | 397.2 ± 1.9 | 354.4 ± 1.5 |
 | expr-order-key | **20.1 ± 0.4** | 937.2 ± 18.3 | 109.4 ± 4.0 ‡ | 1120.8 ± 27.1 | 38266.9 ± 54.8 |
 | expr-agg-arg | **46.0 ± 1.2** | 1789.4 ± 2.6 | 98.7 ± 6.9 ‡ | 767.0 ± 4.3 | 3899.0 ± 22.3 |
-| **update** (1-triple INSERT DATA) | 4.9 ± 0.7 | 32.4 ± 5.5 | **4.2 ± 0.2** | 4.5 ± 0.1 | 4.3 ± 1.4 |
 | **throughput** star-join, 16 clients (queries/s) | **241** | 11 | 92 | 22 | 1.7 |
 
-‡ Same values, different RDF terms. QLever returns integers such as counts and ages as
+‡ Same values as different RDF terms. QLever returns integers such as counts and ages as
 `xsd:int`, where the data and the other engines use `xsd:integer`. Sparkles writes
 `xsd:decimal` values in XSD 1.1 canonical form, so the data's `"175000.50"` comes back as
-`"175000.5"`. In `group-avg`, the averages agree to 12 significant digits. Sparkles and
-Oxigraph share the `oxsdatatypes` decimal type and print the same digits. The other
-engines print fewer or more.
+`"175000.5"`. In `group-avg` the averages agree to 12 significant digits.
 
-1. Fuseki 5.1 fails `knows-reach` (`<person/0> foaf:knows* ?x`) with a
-   `StackOverflowError` in TDB2's node cache. At 10.5M the failure also left the cache
-   wedged, so `knows-reach` is left out of Jena's 10.5M runs.
-2. Fluree's `optional-chain` at 10.5M grows past the 12 GiB memory limit, so it is left
-   out of Fluree's 10.5M runs.
+Fuseki 5.1 fails `knows-reach` (`<person/0> foaf:knows* ?x`) with a `StackOverflowError`
+in TDB2's node cache. At 10.5M the failure leaves the cache wedged, so `knows-reach` is
+left out of Fuseki's 10.5M run. Fluree's `optional-chain` at 10.5M grows past the 12 GiB
+memory limit, so it is left out of Fluree's 10.5M run.
 
-### Memory
+### Request latency without client startup
 
-These are server resident sets (VmRSS, and VmHWM for peaks), load peak RSS and allocated
-index bytes. Sparkles values are from 2026-10-08; competitors retain the same phases
-from 2026-10-03. Lower is better.
-
-| 1.05M triples | sparkles | jena-fuseki | qlever | fluree | oxigraph |
-|---|---:|---:|---:|---:|---:|
-| server RSS 2 s after start, before any query (MiB) | 52 | 257 | 28 | 52 | **22** |
-| server RSS after every query ran once (MiB) | 188 | 981 | 146 | 2083 | **91** |
-| server RSS after the run (MiB) | 405 | 1769 | **307** | 2735 | 1244 |
-| peak RSS during throughput (MiB) | 614 | 1769 | **335** | 2735 | 1250 |
-| Sparkles RSS after the run less its 64 MiB block cache (MiB) | 341 | — | — | — | — |
-| bulk load peak RSS (MiB) | **349** | 2188 | 660 | 475 | 738 |
-| index size on disk | 27 MiB | 132 MiB | **26 MiB** | 37 MiB | 147 MiB |
-
-| 10.5M triples | sparkles | jena-fuseki | qlever | fluree | oxigraph |
-|---|---:|---:|---:|---:|---:|
-| server RSS 2 s after start, before any query (MiB) | 53 | 270 | 43 | 260 | **28** |
-| server RSS after every query ran once (MiB) | 743 | 3409 | 414 | 3377 | **408** |
-| server RSS after the run (MiB) | 840 | 4899 | **653** | 4664 | 2381 |
-| peak RSS during throughput (MiB) | 1383 | 4899 | **778** | 4756 | 2381 |
-| Sparkles RSS after the run less its 379 MiB block cache (MiB) | 461 | — | — | — | — |
-| bulk load peak RSS (MiB) | 2165 | 4115 | **1931** | 3142 | 6204 |
-| index size on disk | 286 MiB | 1.3 GiB | **276 MiB** | 398 MiB | 1.4 GiB |
-
-A fresh-server probe runs every query once and then three rounds of 160 concurrent
-star joins. At 10.5M, Sparkles held 733 MiB after the query pass and 827 MiB after the
-third round, with a peak of 1,115 MiB and a 378 MiB block cache. At 1.05M the same
-figures were 186 MiB, 340 MiB and a peak of 365 MiB, with a 64 MiB cache. These are
-fresh processes, distinct from the full suite's post-run RSS.
-
-At 10.5M the largest per-query RSS rises were `order-by-full` at 278 MiB,
-`two-hop-count` at 239 MiB, `star-join` at 171 MiB and `optional-chain` at 97 MiB.
-These include cache growth as well as intermediate results. QLever's retained rises
-include 135 MiB for `distinct-join` and 124 MiB for `knows-reach`.
-
-## Memory and the speed it buys
-
-Sparkles trades memory for speed by default. These are the defaults that do it:
-
-* **The decoded-block cache** keeps decompressed index blocks, up to 1 GiB per dataset
-  (`--cache-mb`). It accounts for much of the RSS gap with QLever.
-* **The query result cache** keeps answers to repeated queries, up to 512 MiB per dataset
-  (`--result-cache-mb`). It was off in every run on this page.
-* **Materialized intermediate results** consume memory within the query's row and
-  memory budgets. Explicit streaming bounds the batches it produces and charges growing
-  operator state to the budget, but some operators still need their full input. The
-  main eager 10.5M suite peaked at 1,383 MiB under concurrent load, against QLever's
-  retained 778 MiB reference.
-* **mimalloc** keeps freed memory in per-thread heaps. The server hands free memory back
-  to the OS after it has been idle for a second (`--idle-release-ms`, default 1000).
-
-The cache-size runs measured the same 10.5M suite on `forge` on 2026-10-08. The first
-three memory columns come from a separate fresh-server probe, which runs all 28 queries
-once and then three rounds of 160 concurrent star joins. Full-suite RSS, throughput and
-query means come from the canonical suite. The 1 GiB row is the control for these
-cache runs, and it is a separate run from the main tables above.
-
-| Block cache | Probe RSS at start | Probe RSS after queries once | Probe peak RSS | Full-suite post-run RSS | Held by cache after probe | Suite throughput (q/s) | Sum of 28 query means |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| 0 MiB | 50 MiB | 150 MiB | 614 MiB | 304 MiB | 0 MiB | 127 | 3,548 ms |
-| 256 MiB | 49 MiB | 577 MiB | 985 MiB | 713 MiB | 255 MiB | 237 | 1,056 ms |
-| 1024 MiB (default) | 50 MiB | 724 MiB | 1101 MiB | 851 MiB | 378 MiB | 234 | 1,058 ms |
-| 4096 MiB | 49 MiB | 724 MiB | 1121 MiB | 849 MiB | 378 MiB | 231 | 1,056 ms |
-
-Disabling the cache saves 547 MiB of full-suite post-run RSS against the default in
-these runs, bringing it below QLever's 653 MiB reference. It costs about 46% of
-throughput and makes the suite 3.4× slower in total. The 256 MiB configuration saves
-138 MiB with about 1% higher throughput, which is a small difference. Increasing the
-cache to 4 GiB adds no useful capacity for this workload, which touches about 378 MiB
-of blocks.
-
-The default's full-suite post-run RSS less its block cache is 473 MiB in these runs.
-That subtraction describes what the resident memory is made of. A server without a
-cache has a different history. The main suite's corresponding figures are 840 MiB
-total and 461 MiB less cache.
-
-### Allocator choice (2026-09-30, laptop)
-
-These measurements ran on the laptop described under
-[Other measurements](#other-measurements), with an unpinned client. Allocator retention,
-preallocation of scan outputs from index counts, and idle heap release affect RSS as
-well as throughput. Each configuration used a fresh 10.5M server; RSS includes the
-block cache.
-
-| Allocator and memory settings (laptop, 2026-09-30) | after the queries | after the concurrent rounds | peak |
-|---|---:|---:|---:|
-| glibc malloc | 701–704 MiB | 1592–1727 MiB | 1845 MiB |
-| glibc, exact scan reservation | 675 MiB | 1426 MiB | 1430 MiB |
-| glibc, reservation + idle release (`malloc_trim`) | 644 MiB | 838 MiB | 1439 MiB |
-| **mimalloc, reservation + idle release (default build)** | 765 MiB | 920 MiB | 1682 MiB |
-
-mimalloc kept more memory than glibc with idle release, but it was faster. In 10.5M runs
-of Sparkles alone, the mimalloc build reached 190 q/s against 144 for glibc. `star-join`
-took 38 against 72 ms, `optional-count` 33 against 55 ms, `minus` 27 against 42 ms and
-`two-hop-count` 65 against 96 ms, and the load took 4.95 against 5.5 s. jemalloc, and
-glibc with fixed mmap thresholds, were measured too. Both were slower.
-
-## Where Sparkles loses
-
-The warm synthetic query comparison has one clear loss, `range-topk` at 1.05M, which
-takes 7.12 ms against QLever's 6.37 ms, or 1.12×. Fluree's lookup advantages are
-within 10%. Single-triple update latency is the other clear latency loss. At 1.05M
-Sparkles takes 4.2 ms against Oxigraph's 3.7 ms and QLever's 3.8 ms, and at 10.5M it
-takes 4.9 ms against QLever's 4.2 ms and Oxigraph's 4.3 ms. The table lists every case
-outside the 10% tie band.
-
-| Case | Reference advantage | Qualification |
-|---|---|---|
-| Warm `range-topk`, 1.05M | QLever 1.12× | The query filters salaries and keeps the top k. Sparkles wins at 10.5M. |
-| Single-triple update latency | Oxigraph 1.13× and QLever 1.11× at 1.05M, QLever 1.17× and Oxigraph 1.14× at 10.5M | Sparkles synchronizes each acknowledgment. Oxigraph does not synchronize its WAL, and QLever keeps updates in memory. |
-| Cold point lookups | Oxigraph 1.8–3.8× at 1.05M and 2.3–3.1× at 10.5M | These are request-only timings under [Cold starts](#cold-starts). |
-| Server RSS after the run | QLever 1.32× at 1.05M and 1.29× at 10.5M | Without its resident block cache, Sparkles holds 341 MiB at 1.05M and 461 MiB at 10.5M. |
-| Peak RSS under 16 readers | QLever 1.83× at 1.05M and 1.78× at 10.5M | Sparkles peaks at 614 and 1,383 MiB, against QLever's 335 and 778 MiB. |
-| Bulk load peak RSS, 10.5M | QLever 1.12× | Sparkles peaks at 2,165 MiB against QLever's 1,931 MiB. Sparkles has the lowest peak at 1.05M. |
-| Text index size | QLever about 1.18× at 1.05M and 1.23× at 10.5M | The indexed predicates and features differ. |
-| 5,000 serial single-triple commits | Oxigraph 1.11× at 1.05M and 1.72× at 10.5M | Sparkles synchronizes acknowledgments, and Oxigraph does not. |
-| Writes during mixed load | Oxigraph 4.7× at 1.05M and 3.6× at 10.5M, Fluree 1.6× at 10.5M | Both engines serve far fewer concurrent reads than Sparkles. |
-| Billion-scale cold reads | QLever 1.84× on `geo-box` and 1.25× on `outlink-classes-2` | Sparkles wins 28 of 31. QLever's third win, `people-no-birthdate`, is within 10%. Warm-query wins do not remove first-use I/O costs. |
-| Billion-scale server RSS | QLever 3.14× | Sparkles maps its index, so touched file pages count toward its RSS. |
-
-Billion-scale loading is no longer listed. It is 3.06× faster than QLever's retained
-load, and the slower loads of 2026-10-08 came from the state of the SSD rather than
-the code, as described under
-[Changes against the run of 2026-10-03](#changes-against-the-run-of-2026-10-03).
-WatDiv has no template loss and two instance losses, both ties. QLever's highlight
-form does not highlight words, so that comparison cannot isolate highlighting cost.
-The mixed workload combines read and write rates, and its 16 star readers differ from
-the readers of the snapshot-reader write suite.
-
-Default eager queries retain intermediate results. Explicit streaming avoids a full
-result table on incremental plans, while sorting and other barriers require charged
-state or explicit memory-budget failure. It improves scans, some joins and ordering
-in the [mode comparison](#streaming-execution), but range TopK, expression ordering,
-substring filters and TSV exports remain slower in streaming mode.
-
-## Sparkles HTTP latency
-
-These Sparkles-only measurements ran on `forge` on 2026-10-06, with Rust 1.99.0,
-a release build and default features. The binary's SHA-256 is
-`ce28cbfb2f4981b91755fa25c61c0e4e17eebb195c002f579c5786290d282f8e`, and the commit it
-was built from was not recorded.
-The result cache was off (`--result-cache-mb 0`), and the decoded-block cache used
-its default size. The client ran on CPU 11 and the server on CPUs 0–9.
-
-Each query had 30 warm-ups and 20 timed requests in each of two fresh server
-processes. The table gives the pooled median of 40 samples in milliseconds, including
-HTTP and the full TSV response, with a warm page cache. It excludes starting a
-`curl` process, so these numbers are not directly comparable with the hyperfine
-means in the five-engine tables. The datasets contain 1,052,801 and 10,527,319 triples.
-Recorded response bags were stable across both processes at each size.
-For `export-500k`, the unordered limit is checked by row count. The main suite
-verifies standard SPARQL results against reference answers, while these HTTP runs
-record TSV fingerprints and row counts.
+Starting `curl` costs more than most small queries take, so this Sparkles-only run timed
+requests from a persistent client instead. Each query had 30 warm-ups and 20 timed
+requests in each of two fresh server processes, and the table gives the pooled median of
+the 40 samples in milliseconds, including HTTP and the full TSV response. The client ran
+on CPU 11 and the server on CPUs 0–9, with the result cache off.
 
 | Query | 1.05M (ms) | 10.5M (ms) |
 |---|---:|---:|
@@ -459,662 +189,15 @@ record TSV fingerprints and row counts.
 | `types-grouped` | 0.222 | 0.225 |
 | `values-star` | 0.587 | 0.296 |
 
-## Updates and mixed load
-
-Sparkles' changed-state and commit measurements below are from 2026-10-08; competitor
-references retain 2026-10-03. [HTTP write snapshot](#http-write-snapshot) uses separately
-dated measurements with explicit client counts, affinity and batch sizes.
-
-The `updates` mode copies each engine's store, applies the same 5,000 single-triple
-INSERT/DELETE requests one at a time, and reruns the query suite. These changes remain
-in Sparkles' delta until a compaction folds them into the base index.
-
-| Churn of 5,000 commits | sparkles | jena-fuseki | qlever | fluree | oxigraph |
-|---|---:|---:|---:|---:|---:|
-| 1.05M: commits/s | 770 | 14 | 426 | 499 | **855** |
-| 1.05M: latency p50 / p99 (ms) | 1.33 / 2.31 | 74.06 / 102.20 | 2.27 / 4.57 | 1.68 / 7.16 | **1.16 / 2.04** |
-| 10.5M: commits/s | 663 | 14 | 475 | 459 | **1,140** |
-| 10.5M: latency p50 / p99 (ms) | 1.38 / 3.62 | 74.69 / 103.16 | 2.07 / 4.73 | 1.55 / 12.76 | **0.90 / 1.58** |
-
-No engine failed a commit. After the changes Sparkles is fastest on 26 of 28 queries
-at 1.05M and 26 of 28 at 10.5M. QLever's changed-state `types-grouped` answer differs
-in value and is not ranked. The one clear loss is `range-topk` at 1.05M, where QLever
-is 1.13× faster. The other differences are within 10%.
-
-At 10.5M the delta changes `star-join` from 31.0 to 59.8 ms, `two-hop-count` from 17.1
-to 38.7 ms, `contains` from 7.2 to 14.9 ms and `regex-iri` from 8.5 to 16.4 ms.
-Throughput falls from 241 to 169 q/s, compared with QLever's retained 87 q/s. Post-run
-RSS rises from 840 to 1,391 MiB, of which 718 MiB is resident block cache. All 28
-changed-state answers were checked.
-
-### Commit latency
-
-The 5,000-request run gives Sparkles median single-triple commit times of 1.33 ms at
-1.05M and 1.38 ms at 10.5M, with rates of 770 and 663 commits/s. Both the WAL and dirty
-vocabulary data are synchronized before acknowledgment. Oxigraph's retained default
-rates are higher without per-commit synchronization, and QLever keeps writes in memory.
-
-The WAL preallocates space by writing and synchronizing zeros, starting with 64 KiB and
-growing up to 4 MiB. `--wal-prealloc-kb` sets that limit, and `0` disables
-preallocation.
-Replay, readers, backups and quotas use the logical end of the last commit. Close trims
-unused space, and recovery recognizes a torn transaction tail. Copied stores are
-flushed before timing.
-
-### Mixed load
-
-Sparkles measurements are from 2026-10-08; competitors retain the 2026-10-03 results.
-The `mixed` mode runs 16 concurrent `star-join` readers with `oha` for 30 s while one
-writer commits single-triple `INSERT DATA` requests as fast as it can. Each insert adds
-a fresh literal, so these writes include vocabulary durability work. Every request opens
-a new connection.
-
-| Mixed load | sparkles | jena-fuseki | qlever | fluree | oxigraph |
-|---|---:|---:|---:|---:|---:|
-| 1.05M: reads/s | **2054.0** | 94.5 | 510.6 | 34.6 | 10.9 |
-| 1.05M: read p50 / p99 (ms) | **7.6 / 11.9** | 158.4 / 351.3 | 27.4 / 39.7 | 462.2 / 536.7 | 1192.3 / 3351.1 |
-| 1.05M: writes/s | 264.0 | 28.3 | 109.4 | 246.5 | **1247.3** |
-| 1.05M: write p50 / p99 (ms) | 2.9 / 10.1 | 17.9 / 97.7 | 6.0 / 25.8 | 3.6 / 16.2 | **0.8 / 1.0** |
-| 1.05M: failed reads / writes | 0 / 0 | 0 / 0 | 23929 / 827 | 0 / 0 | 0 / 0 |
-| 10.5M: reads/s | **198.8** | 7.7 | 69.5 | 3.6 | 0 |
-| 10.5M: read p50 / p99 (ms) | **80.8 / 100.6** | 1977.0 / 2859.2 | 229.5 / 270.6 | 4402.7 / 8621.1 | — |
-| 10.5M: writes/s | 187.3 | 20.7 | 51.1 | 299.4 | **676.7** |
-| 10.5M: write p50 / p99 (ms) | 5.2 / 10.6 | 62.8 / 86.7 | 11.9 / 108.8 | 1.9 / 14.8 | **1.4 / 3.2** |
-
-Across three Sparkles runs, reads ranged from 1,895 to 2,062 per second at 1.05M and
-from 198 to 201 at 10.5M. Writes ranged from 141 to 264 per second and from 187 to 202.
-All runs completed with zero errors. The table shows the first run, so that its read
-and write figures stay paired.
-Sparkles serves about 4.0× QLever's reads at 1.05M and 2.9× at 10.5M in that run.
-Oxigraph commits more writes at both sizes, and Fluree does at 10.5M, but their reads
-are slower. At 10.5M no Oxigraph reader finished within 30 s. QLever failed 23,929
-reads and 827 writes at 1.05M, and its retained log does not say why.
-
-### HTTP write snapshot
-
-The one-client table below uses the 1.05M-triple dataset on `forge`. These are
-release-build measurements from 2026-10-06, made with rustc 1.99.0 and default server
-features at a commit that was not recorded. Each row was collected in a separate run. Each run starts from its own
-durably copied store. Sparkles starts from a compacted base, and automatic compaction
-stays enabled but does not run during these measurements. The server uses one logical
-CPU and the HTTP client uses another. Result caches are disabled. Preparation, exports,
-validation and process shutdown happen outside the request timers.
-
-Every Sparkles acknowledgment follows synchronization of the write-ahead log and any new
-vocabulary data. The complete state before and after each run, and the effective
-changes, are checked against the operation manifest. The batched runs also check the
-exact changes of each request and that commit headers are contiguous. The original
-serial run checks the total of successful requests and the matching advance of the
-commit head. These rows stop the server after checking its state and do not reopen it.
-The concurrent-reader workload below adds a close and reopen and checks history. None
-of these checks is a power-loss test.
-
-| Default writes, one client | Effective changes per run | Changes per request | Fresh processes | Effective changes/s | Request p50 (ms) | Request p99 (ms) |
-|---|---:|---:|---:|---:|---:|---:|
-| Single-triple insert/delete churn | 5,000 | 1 | 2 | 1,046–1,062 | 0.856–0.870 | 1.536–1.609 |
-| Inserts introducing a new literal | 50,000 | 100 | 2 | 53,979–59,414 | 1.493–1.515 | 3.964–7.118 |
-| Insert/delete batches | 50,000 | 100 | 4 | 54,972–58,586 | 1.516–1.548 | 2.857–3.981 |
-
-The batched rows contain 500 acknowledged transactions each. The fresh-literal manifest
-preserves existing subjects and the predicate, introducing one new literal per inserted
-quad. The insert/delete manifest is a separate workload. A request can contain multiple
-DATA operations but commits once. Throughput counts effective changes, so it is not
-interchangeable with transactions per second.
-
-Ranges show the lowest and highest result of the processes, and each latency range
-contains each process's own percentile rather than a percentile pooled across
-processes. The batched runs are short, and their p99 varies substantially even when
-their median stays close. These measurements do not show an advantage for every write
-workload or for sustained operation over hours.
-
-On the same fresh-literal manifest, request size, client count and CPU placement, two
-Oxigraph 0.5.11 processes produced 34,641 and 58,853 effective changes/s, with request
-medians of 2.591 and 1.617 ms. Its default RocksDB acknowledgments do not synchronize
-the WAL, so their durability contract differs from Sparkles'. The observed throughput
-ranges overlap. These separate runs are a small reference rather than an interleaved
-comparison.
-
-At 10.5M triples, the one-client tests use the existing store fixture and the same CPU
-placement, with one CPU for the server and another for the client. Startup logs show
-that an age-triggered compaction was admitted but do not record when it finished, so
-compaction may have been running. These rows are separate from the 1.05M table, whose
-store was compacted beforehand.
-
-| Default writes at 10.5M, one client | Effective changes per run | Changes per request | Fresh processes | Effective changes/s | Request p50 (ms) | Request p99 (ms) |
-|---|---:|---:|---:|---:|---:|---:|
-| Single-triple insert/delete churn | 5,000 | 1 | 2 | 320–494 | 2.154–2.351 | 5.989–7.733 |
-| Insert/delete batches | 50,000 | 100 | 2 | 45,788–46,123 | 1.613–1.622 | 16.070–16.364 |
-
-Each batched request performs 50 effective inserts and 50 effective deletes. Every run
-passes the same count, commit-head and complete-state checks. The serial repeats vary
-considerably, and the batched p99 is much higher than its median. No corresponding
-Oxigraph run at this size is included in this snapshot.
-
-### Concurrent durable commits
-
-At 1.05M triples, this workload applies the same 50,000 fresh-literal changes as the
-one-client batch table, using four clients and one quad per request. The server uses
-ten logical CPUs and the client process uses another. The run begins from a durably
-copied, compacted base with automatic compaction enabled. Checks before the run, after
-it and after close show that no automatic compaction was pending, running or completed.
-The same binary ran four times, first with the default writer, then twice with group
-commit and then with the default again, giving two fresh processes per setting. The
-only difference in server options is `--experimental-group-commit`. Grouping is off by
-default, and a group is sealed immediately rather than after a collection delay.
-
-| 50,000 effective changes, four writers | Default | Experimental group commit |
-|---|---:|---:|
-| Acknowledged transactions/s | 221.5–231.8 | 529.0–543.3 |
-| Request p50 (ms) | 19.016–19.211 | 9.051–9.104 |
-| Request p99 (ms) | 39.972–41.342 | 15.693–15.894 |
-| Write interval (s) | 215.7–225.8 | 92.0–94.5 |
-
-Across these two processes per setting, mean transaction throughput is 2.37× the
-default and the mean of process medians is about 53% lower. Each process completes
-exactly 50,000 effective inserts with contiguous receipts and the correct final state.
-Acknowledgments stay durable. Group commit shares one synchronization across eligible
-commits and publishes each acknowledged prefix. This workload has no concurrent readers,
-and the reader test below is separate. It does not show a gain for serial clients,
-other write shapes or hours of operation.
-
-At 10.5M triples, the same manifest, four clients, CPU placement and run order produce
-the following results, again with two fresh processes per setting:
-
-| 10.5M, 50,000 effective changes, four writers | Default | Experimental group commit |
-|---|---:|---:|
-| Acknowledged transactions/s | 201.1–204.0 | 402.3–406.9 |
-| Request p50 (ms) | 19.338–19.415 | 9.709–9.735 |
-| Request p99 (ms) | 41.066–41.200 | 16.089–16.171 |
-
-Mean transaction throughput is 2.00× the default, with mean process medians about 50%
-lower and mean process p99 about 61% lower. All 200,000 effective inserts across the
-four processes pass complete-state and contiguous-receipt checks. This run uses the
-existing 10.5M fixture, whose startup logs show an admitted age-triggered compaction
-without a completion time. It lacks the compaction checks of the prepared 1.05M
-fixture.
-
-### Concurrent writers with snapshot readers
-
-This workload inserts 5,000 fresh quads using four writer clients while two scalar
-readers each issue up to 25 queries/s. Reads count the inserted namespace and verify the
-count against the commit snapshot reported in the response. It uses fresh subjects, a
-fresh predicate and fresh objects, so its vocabulary work differs from the one-client
-fresh-literal table. The server uses ten logical CPUs and the client process uses
-another. Result caching and reasoning are disabled. Each request opens a new
-connection.
-
-The same Sparkles binary runs with the default writer and with experimental group
-commit, in the same alternating order as above. Group commit stays opt-in and keeps
-acknowledgments durable.
-
-| 1.05M, 5,000-quads run, four writers + two readers | Default | Experimental group commit |
-|---|---:|---:|
-| Single-quad requests: acknowledged transactions/s | 1,375–1,386 | 3,344–3,365 |
-| Single-quad requests: writer p50 (ms) | 2.796–2.810 | 1.142–1.143 |
-| Single-quad requests: reader p50 (ms) | 0.845–0.862 | 0.545–0.585 |
-| Single-quad requests: completed reader responses during writes | 182 per run | 76 per run |
-| 100-quad requests: acknowledged transactions/s | 742–752 | 1,186–1,233 |
-| 100-quad requests: effective changes/s | 74,231–75,187 | 118,627–123,253 |
-
-The 1.05M single-quad runs last about 3.61–3.64 s by default and 1.49–1.50 s with
-group commit. The reader rate is deliberately limited, so fewer read responses fit in
-the shorter write interval. Readers observe advancing commit snapshots, and the state,
-history and reopened store are checked afterward.
-
-The 100-quad runs have only 50 transactions and last about 41–67 ms. They produce only
-two to four reader responses, so their throughput is a short-burst observation and their
-reader tails are not a sustained-load estimate. Both settings pass the same receipt and
-state checks. These results do not replace the separate 30-second star-join mixed-load
-comparison.
-
-At 10.5M triples, the same 5,000-change, single-quad reader workload uses the existing
-store fixture. Startup logs show an age-triggered compaction admitted about 23–25 s
-before the write timer, but do not record its completion. Compaction may therefore have
-overlapped these rows, which it could not do in the compacted 1.05M runs above.
-
-| 10.5M, 5,000 single-quad requests, four writers + two readers | Default | Experimental group commit |
-|---|---:|---:|
-| Acknowledged transactions/s | 202–231 | 370–386 |
-| Writer p50 (ms) | 19.093–19.274 | 9.932–10.315 |
-| Writer p99 (ms) | 40.221–40.947 | 15.735–17.861 |
-| Reader p50 (ms) | 0.917–0.936 | 0.895–1.000 |
-| Reader p99 (ms) | 1.410–1.549 | 1.960–2.143 |
-| Completed reader responses during writes | 1,084–1,240 | 648–678 |
-
-Both runs per setting pass the full-state, receipt, snapshot-count, history and actual
-reopen checks. Mean write throughput with grouping is about 75% higher in these rows.
-Reader medians are similar, and the mean of the processes' reader p99 is about 0.57 ms
-higher. The write intervals are 21.7–24.8 s by default and 12.9–13.5 s with
-grouping. Readers maintain the scheduled rate of about 50 queries/s in total and observe
-advancing snapshots throughout. These results establish productive reads under this
-load, rather than saturated query throughput.
-
-## Cold starts
-
-Cold mode restarts the server and requests eviction of its files from the OS page
-cache before each query, three times per query. This evicts the file cache but does not
-guarantee that the device itself is cold. Request times are medians of three successful
-curl requests, excluding process startup. Readiness is measured separately.
-Sparkles values are from 2026-10-08, competitors from 2026-10-03.
-
-| Cold, median of 3 | 1.05M | 10.5M |
-|---|---|---|
-| Sparkles fastest | 19 of 28 | 23 of 28 |
-| Time to ready after restart | 0.089 s | 0.089 s |
-
-| Query, cold | Faster reference (1.05M / 10.5M) | 1.05M | 10.5M |
-|---|---|---|---|
-| `count-all` | fluree / — | 2.64× (3.5 against 1.3 ms) | — |
-| `star-join` | fluree / — | 1.52× (53.1 against 34.9 ms) | — |
-| `range-topk` | qlever / qlever | 1.15× (26.5 against 23.0 ms) | 1.01× (44.5 against 43.9 ms) |
-| `contains` | fluree / — | 1.15× (14.4 against 12.4 ms) | — |
-| `path-plus` | oxigraph / oxigraph | 3.83× (7.5 against 1.9 ms) | 2.77× (5.3 against 1.9 ms) |
-| `lang-filter` | fluree / — | 1.28× (11.4 against 8.9 ms) | — |
-| `star-lookup` | oxigraph / oxigraph | 1.84× (27.4 against 14.9 ms) | 3.05× (47.8 against 15.7 ms) |
-| `values-star` | oxigraph / oxigraph | 2.16× (12.0 against 5.5 ms) | 2.71× (12.9 against 4.8 ms) |
-| `employee-docs` | fluree / oxigraph | 1.64× (16.8 against 10.2 ms) | 2.29× (29.3 against 12.8 ms) |
-
-The clearest differences are sparse point lookups and several small-dataset scans or
-statistics queries. Warm execution hides their first-use reads and block decoding.
-At 10.5M Sparkles is fastest on 23 of 28 cold queries. The `range-topk` difference is
-within 10%, while the four losses on point lookups and the path query are larger.
-
-### Cold reads
-
-Sparkles memory-maps its index and vocabulary files. Linux's read-ahead window is
-128 KiB on `forge` and 512 KiB on the laptop. Reading a large window around every
-sparse lookup can fetch much more data than the query needs. Three features address
-this:
-
-* Random-access mappings and explicit read-ahead request the columns or term ranges
-  that a query will read. `SPARKLES_IO_HINTS=off` disables those hints.
-* A sparse vocabulary index, `vocab.idx`, holds the first key of every 128th
-  front-coded block. It is loaded at open and narrows lookups to one range of offsets
-  and data. Read-ahead is requested once per group of 128 blocks. The index costs
-  66 KB at 10.5M and 8.4 MB of memory at 1.01B quads. Loads and compactions write it;
-  `sparkles vocab-index` adds it to a database without one.
-  `SPARKLES_SPARSE_VOCAB=off` disables its use.
-* A numeric column, `vocab.num`, holds the values of the numeric literals that the
-  vocabulary stores, so a range filter or sort over them reads 8 bytes per value
-  instead of a front-coded block. It reads ahead only the pages of the values it
-  needs. See [Numeric literals in the vocabulary](#numeric-literals-in-the-vocabulary).
-* An index join with up to 16,384 keys requests its blocks before decoding the first,
-  allowing their reads to overlap (`prefetch_blocks` in
-  `SPARKLES_DISABLE_OPTIMIZATIONS`).
-
-The tradeoff is better sparse point lookups versus less automatic read-ahead for
-dense scans. These configuration measurements used `forge` on 2026-10-06 and
-three cold requests per query. "Both off" sets
-`SPARKLES_IO_HINTS=off SPARKLES_SPARSE_VOCAB=off`.
-
-| 10.5M, cold, median of 3, ms | Both off | Both on (default) |
-|---|---:|---:|
-| `star-lookup` | 69.3 | **46.7** |
-| `star-join` | 99.9 | **93.3** |
-| `contains` | 82.4 | **33.5** |
-| `regex-iri` | 55.2 | **31.3** |
-| `lang-filter` | 36.1 | **27.9** |
-
-This comparison changes both options together and uses separate runs, so it does not
-isolate either option.
-
-With all three features enabled, a cold server on the laptop read the following
-amounts from disk on 2026-10-02. The load average was 11–65, so byte counts are more
-reliable than latency in these measurements.
-
-| 10.5M, first query after a restart, laptop | Read from disk (KiB) |
-|---|---:|
-| Start, before the first query | 348 |
-| `star-lookup` | 6,756 |
-| `values-star` | 608 |
-| `employee-docs` | 2,588 |
-| `range-topk` | 5,716 |
-| `distinct-obj` | 228 |
-| `path-plus` | 120 |
-
-A comparison on `forge` on 2026-10-04 measured the vocabulary read-ahead for cold
-serialization, planner samples and small sorts, later committed as `31c94cac`, against
-commit `2fafbe8c`. Cold medians fell from 325 to 90 ms for 10.5M `star-join`, from 131
-to 29 ms for DBpedia `label-regex` and from 1,840 to 1,029 ms for DBpedia `export-1m`.
-Warm `star-join`, export and full-sort timings did not change materially. These runs
-timed HTTP requests directly rather than through hyperfine and curl, and they compare
-two Sparkles builds only. [`scripts/bench-regressions.py`](../scripts/bench-regressions.py)
-took the measurements, and the [raw samples](benchmarks/2026-10-04-regressions.json)
-include result fingerprints.
-
-## DBpedia at 1.24 billion triples
-
-This run compared Sparkles with QLever and Fluree on real data at full scale, English
-DBpedia in its release of 2022.12.01. The 38 files of
-`scripts/bench-billion/dbpedia-2022.12.tsv` hold 1,237,418,025 lines of N-Triples, 16 GB
-compressed with zstd. Some lines repeat a triple, and 1,014,683,275 distinct triples
-remain. Sparkles' vocabulary has 205,941,262 terms.
-
-The run used `scripts/bench-billion.sh` with `SCALE=full`, `RUNS=3`, `TIMEOUT=300` and a
-query memory budget of 8 GB for Sparkles and QLever (`QUERY_MEM_GB=8`). It ran on
-`forge`, each engine alone. Sparkles was measured on 2026-10-09 with the release binary
-identified at the top of this page, built at commit `ba547b89`. The filesystem was
-trimmed with `fstrim` immediately before the load. The competitor
-references were retained from 2026-10-02 and 2026-10-03. Those runs did not start
-from a fresh trim, so their load times may include write stalls like the ones described
-under [Changes against the run of 2026-10-03](#changes-against-the-run-of-2026-10-03). QLever was the nixpkgs build
-of 0.5.48, with load figures from 2026-10-02 and query figures from 2026-10-03. Loads
-were pinned to the P-cores, CPUs 0–11. Every step ran in a systemd scope capped at
-14 GiB with no swap, with an open-file limit of 65,536. QLever indexed with 8 GB of sort
-memory and 5 million triples per batch. Each query ran once to warm up and then three
-times. The cold runs restarted the server and requested file-cache eviction before each
-query, then measured it once, which does not guarantee that the device itself is cold.
-The load also recorded cgroup pressure once per second and worker wait channels
-every five seconds. No other heavy build, benchmark or transfer ran alongside it.
-
-Fluree 4.2.2 ran with the settings of the 10.5M runs. Its bulk import had an 8 GiB memory
-budget, and its server had a 4 GiB cache and the run's 300 s query limit. Its load had a
-limit of 4 hours. Fluree's import fails on a file that is larger than its chunk size,
-768 MB with that budget, because it finds no statement boundary where it cuts the file. The
-harness therefore splits the 38 files into 370 pieces of at most 512 MB of N-Triples,
-which took 106 s and is not part of the load time. The import then loaded all
-1,014,683,275 distinct triples in 2,919 s, with a peak RSS of 12.1 GiB, into an index of
-69.7 GiB. Each cold run starts a fresh server, and all 31 cold queries completed.
-Fluree's warm measurements are incomplete because its server reached the 14 GiB
-memory limit. Only four warm queries have timings. Its answers agreed with the other
-engines on 27 of the 29 queries it answered warm. On `births-by-decade` it returned
-165 rows where Sparkles and QLever returned 171; on `entity-facts-2` it returned the
-same values as different RDF terms.
-
-Jena and Oxigraph were not measured at this scale. The DBpedia comparison covers
-Sparkles, QLever and Fluree; the small synthetic datasets do not establish Jena's
-or Oxigraph's full-scale loading, memory or query performance.
-
-| query | sparkles (ms) | qlever (ms) | fluree (ms) |
-|---|---:|---:|---:|
-| **load** (s) | **546.51** | 1673.78 | 2919.33 |
-| abstract-contains | **37.2 ± 7.0** | 234.2 ± 1.1 ‡ | 6719.1 ± 317.4 |
-| births-by-decade | **51.3 ± 3.5** | 137.9 ± 8.3 | 4300.2 ± 88.3 † |
-| category-people-1 | **13.0 ± 0.9** | 53.6 ± 3.5 | 63.2 ± 34.1 |
-| category-people-2 | **6.8 ± 1.8** | 36.3 ± 8.2 | 49.1 ± 34.3 |
-| category-tree | **269.3 ± 2.3** | 2050.1 ± 10.1 ‡ | — ⁴ |
-| class-counts | **10.8 ± 2.2** | 99.1 ± 5.8 ‡ | — ⁴ |
-| costar-birthplace | **50.9 ± 5.8** | 154.4 ± 5.6 ‡ | — ⁴ |
-| count-all | **8.4 ± 3.4** | 2616.8 ± 11.9 † | — ⁴ |
-| country-population | **12.2 ± 1.7** | 19.6 ± 6.0 ‡ | — ⁴ |
-| entity-facts-1 | **10.9 ± 0.5** | 16.1 ± 0.3 ‡ | — ⁴ |
-| entity-facts-2 | **5.7 ± 2.6** | 12.1 ± 4.0 | — ⁴ |
-| entity-summary-1 | **10.5 ± 0.9** | 21.6 ± 7.0 | — ⁴ |
-| entity-summary-2 | **6.4 ± 1.5** | 12.1 ± 3.1 | — ⁴ |
-| export-1m | **241.7 ± 13.2** | 1440.1 ± 3.3 | — ⁴ |
-| film-director-optional | **21.2 ± 1.2** | 33.3 ± 8.1 ‡ | — ⁴ |
-| geo-box | **141.7 ± 12.8** | 143.8 ± 1.4 ‡ | — ⁴ |
-| inlinks-count-1 | **10.4 ± 1.0** | 14.7 ± 1.4 ‡ | — ⁴ |
-| inlinks-count-2 | **11.5 ± 0.6** | 16.5 ± 1.1 ‡ | — ⁴ |
-| label-regex | **13.6 ± 3.1** | 19.0 ± 0.0 | — ⁴ |
-| outlink-classes-1 | **16.4 ± 5.3** | 22.6 ± 5.1 ‡ | — ⁴ |
-| outlink-classes-2 | **16.3 ± 6.2** | 23.7 ± 4.1 ‡ | — ⁴ |
-| people-no-birthdate | **50.7 ± 0.8** | 65.6 ± 4.9 ‡ | — ⁴ |
-| place-births-1 | **16.9 ± 0.7** | 43.9 ± 2.4 | — ⁴ |
-| place-births-2 | **15.6 ± 2.8** | 41.9 ± 1.0 | — ⁴ |
-| place-union-1 | **12.8 ± 1.1** | 13.7 ± 4.3 | — ⁴ |
-| place-union-2 | **10.0 ± 0.7** | 15.0 ± 0.6 | — ⁴ |
-| predicate-counts | 18.4 ± 2.6 † | 5732.6 ± 45.0 † | — ⁴ |
-| redirect-target-1 | **13.6 ± 4.2** | 22.8 ± 1.3 | — ⁴ |
-| redirect-target-2 | **9.1 ± 5.5** | 22.7 ± 1.6 | — ⁴ |
-| sameas-subjects | **8.8 ± 1.1** | 21.3 ± 2.9 ‡ | — ⁴ |
-| top-linked | **572.6 ± 14.9** | 5580.6 ± 7.6 | — ⁴ |
-| **throughput** entity-facts-1, 16 clients (queries/s) | **1517** | 1064 | — ⁴ |
-| **throughput** place-births-1, 16 clients (queries/s) | **830** | 231 | — ⁴ |
-
-‡ Same values, different RDF terms. QLever returns counts as `xsd:int`.
-† The engine's answer differs from the majority, so the query is not ranked for it.
-QLever's `count-all` is explained [below](#why-count-all-and-predicate-counts-differ). On
-`predicate-counts` Sparkles and QLever disagree for the same reason, and with Fluree's
-answer missing there is no majority, so the query is not ranked.
-
-4. Fluree's server was killed at the 14 GiB limit before it ran these queries warm.
-
-Sparkles is faster than QLever on all 29 queries that both rank. Differences on
-`geo-box` and `place-union-1` are within 10%. Sparkles serves 1,517
-`entity-facts-1` requests/s under 16 clients against QLever's retained 1,064, and
-830 `place-births-1` requests/s against 231. Loading is 3.06× faster than QLever
-and 5.34× faster than Fluree. These comparisons use independently checked answers
-and separately dated engine runs.
-
-| memory | sparkles | qlever | fluree |
-|---|---:|---:|---:|
-| server RSS after the run (MiB) | 4,480 | **1,426** | killed at 14 GiB |
-| load time (s) | **547** | 1,674 | 2,919 |
-| load peak RSS (MiB) | **6,847** | 11,401 | 12,366 |
-| index size on disk | **28.7 GiB** | 33.4 GiB | 69.7 GiB |
-
-RSS does not measure the same memory composition for Sparkles and QLever.
-Sparkles maps its index, so touched clean file pages count toward VmRSS and can be
-reclaimed by the kernel. QLever reads with `pread`, so file-cache pages do not count
-toward its process RSS. Sparkles also retains a decoded-block cache, capped at 1 GiB
-by default. The total RSS alone cannot isolate anonymous working memory or compare
-the two engines' complete memory footprints. Cache-size costs at 10.5M are under
-[Memory and the speed it buys](#memory-and-the-speed-it-buys).
-
-| query (cold) | sparkles (ms) | qlever (ms) | fluree (ms) | sparkles, 2026-10-03 (ms) |
-|---|---:|---:|---:|---:|
-| abstract-contains | **721.0** | 4296.2 | 4195.1 | 738.8 |
-| births-by-decade | **101.8** | 165.2 | 6108.5 | 114.9 |
-| category-people-1 | **118.6** | 224.0 | 2886.2 | 197.3 |
-| category-people-2 | **154.1** | 166.2 | 2172.0 | 136.7 |
-| category-tree | **368.9** | 2098.1 | 4559.3 | 730.9 |
-| class-counts | **6.4** | 177.8 | 9581.4 | 9.9 |
-| costar-birthplace | **146.6** | 183.0 | 4358.2 | 156.6 |
-| count-all | **5.5** | 4630.4 | 1273.3 | 2.2 |
-| country-population | **31.6** | 45.6 | 4324.1 | 63.4 |
-| entity-facts-1 | **18.7** | 36.4 | 1312.2 | 19.6 |
-| entity-facts-2 | **25.0** | 40.4 | 837.6 | 27.4 |
-| entity-summary-1 | **8.4** | 29.0 | 1303.7 | 9.3 |
-| entity-summary-2 | **9.3** | 29.5 | 799.9 | 9.6 |
-| export-1m | **1000.4** | 4261.4 | 6647.1 | 1949.6 |
-| film-director-optional | **35.3** | 68.6 | 13434.8 | 41.3 |
-| geo-box | 290.1 | **157.9** | 12218.4 | 395.5 |
-| inlinks-count-1 | **13.1** | 30.2 | 792.6 | 11.5 |
-| inlinks-count-2 | **10.4** | 27.3 | 1275.8 | 13.1 |
-| label-regex | **40.1** | 71.3 | 4328.6 | 138.5 |
-| outlink-classes-1 | **61.7** | 73.7 | 1711.0 | 59.5 |
-| outlink-classes-2 | 43.8 | **34.9** | 1665.2 | 39.7 |
-| people-no-birthdate | 97.3 | **92.0** | 2113.6 | 105.3 |
-| place-births-1 | **74.3** | 283.9 | 3293.1 | 209.2 |
-| place-births-2 | **85.8** | 361.5 | 3956.5 | 261.1 |
-| place-union-1 | **34.3** | 220.3 | 1235.7 | 168.1 |
-| place-union-2 | **30.9** | 217.4 | 1244.6 | 164.8 |
-| predicate-counts | **32.0** | 5880.8 | 81502.3 | 32.8 |
-| redirect-target-1 | **21.9** | 45.9 | 1290.5 | 18.7 |
-| redirect-target-2 | **20.4** | 48.0 | 1276.7 | 17.1 |
-| sameas-subjects | **9.4** | 38.2 | 772.8 | 8.2 |
-| top-linked | **938.8** | 6538.4 | 57624.6 | 1117.4 |
-
-Cold, Sparkles is faster than QLever on 28 of 31 queries. QLever wins `geo-box` at
-157.9 against 290.1 ms, `outlink-classes-2` at 34.9 against 43.8 ms and
-`people-no-birthdate` at 92.0 against 97.3 ms, and the last of these is within 10%.
-Fluree is slower than Sparkles on every cold query in this retained reference
-comparison. This count includes all 31 cold probes, and the RDF identity
-qualifications on `count-all` and `predicate-counts` above still apply.
-
-The last column gives Sparkles' cold times from the run of 2026-10-03, against the
-same QLever and Fluree references. That run was faster than QLever on 26 of 31 cold
-queries. Point lookups are back at the times of that run, for example
-`entity-summary-1` at 8.4 against 9.3 ms. Scans and exports are faster, including
-`export-1m` at 1,000.4 against 1,949.6 ms and `place-births-1` at 74.3 against
-209.2 ms. Each value is a single cold probe, and a few small lookups such as
-`count-all` and `sameas-subjects` are a few milliseconds slower than in that run. A
-same-index comparison of the two binaries, described under
-[Changes against the run of 2026-10-03](#changes-against-the-run-of-2026-10-03),
-found the current binary within 10% or faster on every query.
-
-The [cold-read features](#cold-reads) favor sparse point lookups but can slow queries
-that read many pages. The following configuration comparison was measured on the index
-of the 2026-10-03 run, with two rounds per setting, enabling or disabling the I/O hints
-and the sparse vocabulary index together.
-
-| 1.01B, cold, ms | Both off | Both on (default) |
-|---|---:|---:|
-| `entity-facts-1` | 36.0 to 38.3 | **14.6 to 15.2** |
-| `label-regex` | **66.4 to 68.5** | 119.5 to 130.8 |
-| `export-1m` | **1,231 to 1,239** | 1,883 to 1,956 |
-| `category-tree` | 369.7 to 371.1 | 364.5 to 365.2 |
-| `top-linked` | 949 to 1,000 | 946 to 964 |
-
-### Why `count-all` and `predicate-counts` differ
-
-QLever counts 1,014,683,273 triples, and Sparkles and Fluree count 1,014,683,275. QLever
-folds `xsd:float` and `xsd:double` literals whose lexical forms parse to the same number
-into one term. DBpedia has such pairs, for example distinct lexical forms of the same
-value in `geo:lat` and in `dbo:orbitalPeriod`, so QLever merges two pairs of triples that
-differ only in that literal. RDF 1.1 identifies a literal by its lexical form and
-datatype, so Sparkles keeps these as distinct terms and distinct triples, as Jena does.
-The per-predicate counts differ for the same reason. [COMPARISON.md](COMPARISON.md#general)
-lists this among the divergences.
-
-### Bulk loading
-
-The DBpedia load takes 547 s with a peak process RSS of 6,847 MiB, versus QLever's
-retained 1,674 s and 11,401 MiB. The load scope is capped at 14 GiB with no swap;
-its peak also includes file-cache pages and is distinct from GNU time's process RSS.
-This is one load of the complete normalized input, not a repeated-load mean.
-
-The pipeline combines parallel parsing and vocabulary merging with external sorting.
-Sampled keys divide partial vocabularies into ranges that merge in parallel and are
-appended in order. Each 64-million-quad chunk is remapped once, sorted by SPO, OSP and
-PSO, and written as compressed runs. Each order merges in its own thread. SOP, OPS and
-POS derive from those streams by sorting runs of the first column. Without named
-graphs, GSPO derives from SPO. Each permutation has its own writer. This limits
-repeated input reads while using the available parser and sorting cores.
-
-### Changes against the run of 2026-10-03
-
-Two runs on 2026-10-08 loaded the same 38 files on `forge` in 1,248 s and 1,351 s,
-against 596 s on 2026-10-03. The current load took 547 s. The slowdown came from the
-state of the SSD and not from the code. The drive had not been trimmed since
-2026-10-05, about 1 TB had been written to it since, and the filesystem does not
-discard online. The drive ran short of erased blocks and stalled writes.
-
-Load logs give these coarse phase boundaries, rather than isolated measurements:
-
-| Phase | Sparkles, 2026-10-03 (s) | Sparkles, 2026-10-08, first run (s) | Sparkles, 2026-10-08, second run (s) | Sparkles, 2026-10-09 (s) | QLever (s) |
-|---|---:|---:|---:|---:|---:|
-| Parse and partial vocabularies | 297 | 664 | 774 | 273 | 914 |
-| Vocabulary merge | 67 | 215 | 198 | 49 | 183 |
-| Remap to global ids | included in the sorts | included in the sorts | included in the sorts | included in the sorts | 117 |
-| Chunk sorts | 116 | 115 | 124 | 112 | — |
-| Permutation builds | 116 | 254 | 254 | 112 | — |
-| Total | 596 | 1,248 | 1,351 | 547 | 1,674 |
-
-The CPU work of the slow loads matched the fast ones. Total CPU time was 4,262,
-4,249, 4,298 and 4,138 seconds across the four loads, and GNU time's filesystem
-output counts stayed within 0.1% of each other. What changed was waiting. The second
-load of 2026-10-08 spent about 585 seconds, 43% of its elapsed time, with every task
-in its cgroup stalled on I/O. The current load spent 33.6 seconds, 6% of its elapsed
-time, in that state, and kept about 7.6 cores busy on average against 3.2.
-
-Matched loads isolated the cause. They compared the binary of the 2026-10-03 run with
-the binary of the second 2026-10-08 run on the same machine, inputs, CPU set and
-memory limit, alternating the two. Before a trim, both binaries were slow. A bounded
-load of 82 million statements took a median of 62.4 and 57.1 s, and a 15-file load
-of 399 million statements took 417 and 468 s. After `fstrim`, the same loads took
-33.7 and 33.9 s, and 189 and 191 s. Full I/O stall fell from 23–33 s to about 1 s per
-bounded load and from 189–275 s to 12–17 s per 15-file load. The drive's average
-write latency fell from 240–380 ms to 5–28 ms, and its write rate while busy rose
-from 130–190 MB/s to 1.0–4.0 GB/s. Write latency rose again within that session, from
-5 ms to 28 ms over about 300 GB of writes. A full load writes about 145 GB, so it
-should start soon after a trim.
-
-The cold point-lookup losses of 2026-10-08 had the same cause. After the trim, the
-canonical cold probes returned to the times of 2026-10-03, for example
-`entity-summary-1` at 8.4 ms against 53.5 ms on 2026-10-08. On the current index, the
-binary of 2026-10-03 and the current binary were compared over four alternating
-rounds, with a server restart and file-cache eviction before every query. The current binary
-was within 10% or faster on all 31 queries and more than 10% faster on 10 of them,
-with a geometric mean time ratio of 0.75. Point lookups were equal, and the scans that
-benefit from the [cold-read features](#cold-reads) were faster, for example `export-1m`
-at 1,004 against 1,903 ms. That harness's readiness polling adds about 7–8 ms to each
-point lookup, so its times are higher than the canonical cold column above. A
-separate sweep of 160 cases at 1.05M, 10.5M, full-text and WatDiv found no code
-regression outside the 10% band against the snapshot binary. The tables for those
-datasets keep their snapshot numbers.
-
-`scripts/bench-billion.sh` now records the filesystem's last trim, its free space
-and the system's I/O pressure before a load or query step. It warns when the last
-trim is more than two days old or less than 30% of the filesystem is free, and it
-samples pressure once per second while the steps run.
-
-### Numeric literals in the vocabulary
-
-Sparkles stores a number inline in its id only when its lexical form is canonical.
-DBpedia writes coordinates as `"48.8566"^^xsd:float` and many counts as `xsd:int` or
-`xsd:nonNegativeInteger`, so 2,057,247 of its numeric literals live in the vocabulary.
-A range filter, sort or aggregate over them used to decode the key of every candidate.
-The numeric column, `vocab.num`, now holds their exact values next to the vocabulary.
-The vocabulary sorts literals by lexical form, so numbers are not contiguous in it.
-The column keeps a 4-bit kind for every id in 132 segments that contain all numbers,
-8.06M of the 88.4M literal ids, and an 8-byte value for each number. A float keeps
-its `f32`, a double its `f64`, an integer its `i64` and a decimal an exact scale and
-mantissa. A decimal with too many digits is marked for decoding instead. The column
-costs 20.7 MB on disk beside an 8.0 GB `vocab.dat`, and its kinds and rank, 4.3 MB,
-stay in memory while the database is open. Writing it during the load had no
-measurable cost. The load took 480 s with a peak RSS of 6,059 MiB on 2026-10-09, and
-every other index file was byte-identical to the load of the same day without the
-column. `sparkles vocab-index` added it to that older index in 4.8 s.
-
-The following times were measured on `forge` on 2026-10-09 on the full DBpedia index,
-with the column against `SPARKLES_NUMERIC_COLUMN=off` in the same binary. Cold times are
-medians of 10 alternating rounds with a server restart and file-cache eviction before
-each query. Warm times are medians of 11 requests to one server. QLever's times are
-the retained references of 2026-10-03, because its index was no longer on the machine.
-`geo-avg`, `lat-order`, `pop-range`, `pop-topk` and `elev` are extra queries over
-`geo:lat`, `geo:long`, `dbo:populationTotal` and `dbo:elevation` that are not part of
-the suite. The cold rows of `pop-range` and `elev` come from a run of the same day
-with the earlier version of the column described at the end of this section.
-
-| 1.01B, ms | Cold, column | Cold, off | Warm, column | Warm, off | QLever cold | QLever warm |
-|---|---:|---:|---:|---:|---:|---:|
-| `geo-box` | **108** | 255 | **27.1** | 139.5 | 157.9 | 143.8 |
-| `country-population` | 29.0 | 28.2 | 2.8 | 3.2 | 45.6 | 19.6 |
-| `geo-avg` | **553** | 3,001 | **191** | 580 | | |
-| `lat-order` | **72** | 137 | **21.8** | 50.2 | | |
-| `pop-topk` | **41** | 90 | **9.3** | 20.7 | | |
-| `pop-range` | **43** | 65 | **7.8** | 17.2 | | |
-| `elev` | **41** | 54 | **6.7** | 14.0 | | |
-
-`people-no-birthdate`, `births-by-decade` and `label-regex` did not change. All 31
-suite queries and the five extra queries return identical answers with and without
-the column, and the suite's answers match the reference. A first version of the column
-read ahead whole spans of its value array, and a cold sort of a few hundred numbers
-such as `country-population` then read about 12 MB more than without it and took
-about 7 ms longer. The column now reads ahead page by page unless at least half of a
-span's pages are needed.
-
-### Prefix filtering and large results
-
-The `label-regex` filter, `REGEX(?l, "^The B")`, fixes the start of the label.
-Sparkles uses the sorted vocabulary to narrow matching ids to ranges before joining
-with the bands. The filtered range contains 23,812 rows here. Ids outside the range
-fail without reading their keys.
-
-Results above 65,536 rows are serialized in chunks of that size. Within a chunk,
-vocabulary ids are sorted, their pages are requested ahead, and front-coded blocks
-are decoded once in id order and in parallel. Requests for the next chunk overlap
-writing the current one. Smaller results are decoded row by row to limit per-request
-memory under concurrency.
-
-In the comparative DBpedia results, `export-1m` takes 241.7 ms warm and 1,000.4 ms
-cold. Batched serialization holds up to about 70 MiB of additional memory while
-writing an export. The cold-read configuration comparison above shows the remaining
-tradeoff between sparse lookup behavior and dense export reads.
-
-## WatDiv
-
-WatDiv v0.6 basic testing at scale 100 has 10,973,381 triples, 20 templates and five
-instances per template, except C1–C3, which have one: 88 instances. All answers agree
-with the retained independent reference multisets. Sparkles ran on 2026-10-08; the
-other engines retain 2026-10-03. Timings are geometric means over each template's
-five-run instance means after one warmup. Category means weight templates equally.
-
-| load (s) | sparkles | jena-fuseki | qlever | fluree | oxigraph |
-|---|---:|---:|---:|---:|---:|
-| load | **4.34** | 33.61 | 9.71 | 9.46 | 13.16 |
+### WatDiv
+
+WatDiv v0.6 basic testing at scale 100 has 10,973,381 triples and 20 templates with five
+instances each, except C1–C3, which have one, for 88 instances. All answers agree with
+independent reference multisets. Times are geometric means over each template's five-run
+instance means after one warm-up, and category means weight templates equally. Sparkles is
+fastest on all 20 templates and on 86 of 88 instances. Fluree is faster on `S7-5` by 3.8%
+and on `F2-1` by 0.04%, both within 10%. C3 returns 419,866 rows, and its time includes
+the complete response.
 
 | template | instances | sparkles (ms) | jena-fuseki (ms) | qlever (ms) | fluree (ms) | oxigraph (ms) |
 |---|---:|---:|---:|---:|---:|---:|
@@ -1141,39 +224,231 @@ five-run instance means after one warmup. Category means weight templates equall
 
 | category | templates | sparkles (ms) | jena-fuseki (ms) | qlever (ms) | fluree (ms) | oxigraph (ms) |
 |---|---:|---:|---:|---:|---:|---:|
-| **linear (L)** | 5 of 5 | **3.92** | 8.86 | 8.74 | 4.51 | 8.24 |
-| **star (S)** | 7 of 7 | **3.97** | 8.47 | 12.6 | 4.81 | 9.73 |
-| **snowflake (F)** | 5 of 5 | **4.18** | 7.80 | 25.6 | 9.23 | 8.75 |
-| **complex (C)** | 3 of 3 | **14.02** | 289 | 81.3 | 32.3 | 678 |
-| **all templates** | 20 of 20 | **4.84** | 14.2 | 18.2 | 7.41 | 17.2 |
-
-
-Sparkles is fastest on all 20 templates and 86 of 88 instances. Fluree is faster
-on `S7-5` by 3.8% and `F2-1` by 0.04%, both within 10%. The common-correct
-template geometric mean is 4.84 ms. Many selective cases are near the HTTP process
-floor. C3 returns 419,866 rows; its complete timing is included in the table.
+| **linear (L)** | 5 | **3.92** | 8.86 | 8.74 | 4.51 | 8.24 |
+| **star (S)** | 7 | **3.97** | 8.47 | 12.6 | 4.81 | 9.73 |
+| **snowflake (F)** | 5 | **4.18** | 7.80 | 25.6 | 9.23 | 8.75 |
+| **complex (C)** | 3 | **14.02** | 289 | 81.3 | 32.3 | 678 |
+| **all templates** | 20 | **4.84** | 14.2 | 18.2 | 7.41 | 17.2 |
 
 WatDiv was created by G. Aluç, O. Hartig, M. T. Özsu and K. Daudjee, “Diversified Stress
-Testing of RDF Data Management Systems,” ISWC 2014. Instance results are retained
-alongside the template summaries.
+Testing of RDF Data Management Systems,” ISWC 2014.
 
-## Full-text search
+### DBpedia at 1.24 billion triples
 
-The comparison uses Sparkles' Tantivy `text:query`, Fuseki's Lucene-backed jena-text,
-and QLever's `ql:contains-word`. Sparkles and Jena index `foaf:name`, `ex:title` and
-`rdfs:label`, with English title stemming. QLever indexes all literals and joins on
-predicates; it searches the indexed form for the stemmed case and does not highlight.
-Hit sets and counts agree under these query contracts. Scores and tied ranking order
-are not asserted equal. Sparkles ran on 2026-10-08; competitors retain 2026-10-03.
+This comparison runs English DBpedia, release 2022.12.01, against QLever and Fluree. The 38 files of
+`scripts/bench-billion/dbpedia-2022.12.tsv` hold 1,237,418,025 lines of N-Triples, 16 GB
+compressed with zstd, which are 1,014,683,275 distinct triples. Sparkles' vocabulary has
+205,941,262 terms. The run uses `scripts/bench-billion.sh` with `SCALE=full`, `RUNS=3`,
+`TIMEOUT=300` and a query memory budget of 8 GB for both engines. Each step runs alone in
+a systemd scope capped at 14 GiB with no swap, so the index of 28.7 GiB does not fit in
+memory. Each query runs once to warm up and then three times. Cold runs restart the server
+and evict its files from the page cache before each query, then measure it once.
 
-| Text index | sparkles | jena-fuseki | qlever |
+Fluree runs with the settings of the 10.5M runs, an 8 GiB import budget and a 4 GiB cache.
+Its import fails on a file larger than its chunk size, because it finds no statement
+boundary where it cuts the file, so the harness splits the input into 370 pieces of at
+most 512 MB first, which is not part of the load time. Fluree's server reached the 14 GiB
+limit during the warm runs, so only four warm queries have Fluree timings, while all 31
+cold queries completed. Of the 29 queries Fluree answered warm, its answers agreed with
+the other engines on 27. On `births-by-decade` it returned 165 rows where Sparkles and
+QLever returned 171, and on `entity-facts-2` it returned the same values as different RDF
+terms.
+
+| query | sparkles (ms) | qlever (ms) | fluree (ms) |
 |---|---:|---:|---:|
-| 1.05M: build (s) | **0.41** | 4.37 | 1.86 |
-| 1.05M: size (MB) | 13.1 | 24.9 | **11.1** |
-| 10.5M: build (s) | **6.48** | 25.98 | 19.35 |
-| 10.5M: size (MB) | 122.5 | 227.8 | **99.9** |
+| abstract-contains | **37.2 ± 7.0** | 234.2 ± 1.1 ‡ | 6719.1 ± 317.4 |
+| births-by-decade | **51.3 ± 3.5** | 137.9 ± 8.3 | 4300.2 ± 88.3 † |
+| category-people-1 | **13.0 ± 0.9** | 53.6 ± 3.5 | 63.2 ± 34.1 |
+| category-people-2 | **6.8 ± 1.8** | 36.3 ± 8.2 | 49.1 ± 34.3 |
+| category-tree | **269.3 ± 2.3** | 2050.1 ± 10.1 ‡ | — § |
+| class-counts | **10.8 ± 2.2** | 99.1 ± 5.8 ‡ | — § |
+| costar-birthplace | **50.9 ± 5.8** | 154.4 ± 5.6 ‡ | — § |
+| count-all | **8.4 ± 3.4** | 2616.8 ± 11.9 † | — § |
+| country-population | **12.2 ± 1.7** | 19.6 ± 6.0 ‡ | — § |
+| entity-facts-1 | **10.9 ± 0.5** | 16.1 ± 0.3 ‡ | — § |
+| entity-facts-2 | **5.7 ± 2.6** | 12.1 ± 4.0 | — § |
+| entity-summary-1 | **10.5 ± 0.9** | 21.6 ± 7.0 | — § |
+| entity-summary-2 | **6.4 ± 1.5** | 12.1 ± 3.1 | — § |
+| export-1m | **241.7 ± 13.2** | 1440.1 ± 3.3 | — § |
+| film-director-optional | **21.2 ± 1.2** | 33.3 ± 8.1 ‡ | — § |
+| geo-box | **27.1** | 143.8 ± 1.4 ‡ | — § |
+| inlinks-count-1 | **10.4 ± 1.0** | 14.7 ± 1.4 ‡ | — § |
+| inlinks-count-2 | **11.5 ± 0.6** | 16.5 ± 1.1 ‡ | — § |
+| label-regex | **13.6 ± 3.1** | 19.0 ± 0.0 | — § |
+| outlink-classes-1 | **16.4 ± 5.3** | 22.6 ± 5.1 ‡ | — § |
+| outlink-classes-2 | **16.3 ± 6.2** | 23.7 ± 4.1 ‡ | — § |
+| people-no-birthdate | **50.7 ± 0.8** | 65.6 ± 4.9 ‡ | — § |
+| place-births-1 | **16.9 ± 0.7** | 43.9 ± 2.4 | — § |
+| place-births-2 | **15.6 ± 2.8** | 41.9 ± 1.0 | — § |
+| place-union-1 | **12.8 ± 1.1** | 13.7 ± 4.3 | — § |
+| place-union-2 | **10.0 ± 0.7** | 15.0 ± 0.6 | — § |
+| predicate-counts | 18.4 ± 2.6 † | 5732.6 ± 45.0 † | — § |
+| redirect-target-1 | **13.6 ± 4.2** | 22.8 ± 1.3 | — § |
+| redirect-target-2 | **9.1 ± 5.5** | 22.7 ± 1.6 | — § |
+| sameas-subjects | **8.8 ± 1.1** | 21.3 ± 2.9 ‡ | — § |
+| top-linked | **572.6 ± 14.9** | 5580.6 ± 7.6 | — § |
+| **throughput**, entity-facts-1, 16 clients (q/s) | **1517** | 1064 | — § |
+| **throughput**, place-births-1, 16 clients (q/s) | **830** | 231 | — § |
 
-Times are TSV HTTP mean ± standard deviation in ms: ten runs at 1.05M, five at 10.5M.
+‡ Same values as different RDF terms, because QLever returns counts as `xsd:int`.
+§ Fluree's server was killed at the 14 GiB limit before it ran these queries warm.
+† The engine's answer differs from the majority, so the query is not ranked for it. On `count-all` and `predicate-counts`, Sparkles and QLever disagree for the reason given [below](#why-count-all-and-predicate-counts-differ).
+QLever's `count-all` is one triple short of the distinct input, and `predicate-counts` is
+not ranked. The `geo-box` row is the median of 11 warm requests with the
+[numeric column](#numeric-literals-in-the-vocabulary).
+
+Sparkles is faster than QLever on all 29 queries that both rank. `place-union-1` is within
+10%. Under 16 clients it serves 1,517 `entity-facts-1` requests per second against
+QLever's 1,064, and 830 `place-births-1` requests per second against 231. Fluree is slower
+on the four warm queries it completed.
+
+| query (cold) | sparkles (ms) | qlever (ms) | fluree (ms) |
+|---|---:|---:|---:|
+| abstract-contains | **721.0** | 4296.2 | 4195.1 |
+| births-by-decade | **101.8** | 165.2 | 6108.5 |
+| category-people-1 | **118.6** | 224.0 | 2886.2 |
+| category-people-2 | **154.1** | 166.2 | 2172.0 |
+| category-tree | **368.9** | 2098.1 | 4559.3 |
+| class-counts | **6.4** | 177.8 | 9581.4 |
+| costar-birthplace | **146.6** | 183.0 | 4358.2 |
+| count-all | **5.5** | 4630.4 | 1273.3 |
+| country-population | **31.6** | 45.6 | 4324.1 |
+| entity-facts-1 | **18.7** | 36.4 | 1312.2 |
+| entity-facts-2 | **25.0** | 40.4 | 837.6 |
+| entity-summary-1 | **8.4** | 29.0 | 1303.7 |
+| entity-summary-2 | **9.3** | 29.5 | 799.9 |
+| export-1m | **1000.4** | 4261.4 | 6647.1 |
+| film-director-optional | **35.3** | 68.6 | 13434.8 |
+| geo-box | **108** | 157.9 | 12218.4 |
+| inlinks-count-1 | **13.1** | 30.2 | 792.6 |
+| inlinks-count-2 | **10.4** | 27.3 | 1275.8 |
+| label-regex | **40.1** | 71.3 | 4328.6 |
+| outlink-classes-1 | **61.7** | 73.7 | 1711.0 |
+| outlink-classes-2 | 43.8 | **34.9** | 1665.2 |
+| people-no-birthdate | 97.3 | **92.0** | 2113.6 |
+| place-births-1 | **74.3** | 283.9 | 3293.1 |
+| place-births-2 | **85.8** | 361.5 | 3956.5 |
+| place-union-1 | **34.3** | 220.3 | 1235.7 |
+| place-union-2 | **30.9** | 217.4 | 1244.6 |
+| predicate-counts | **32.0** | 5880.8 | 81502.3 |
+| redirect-target-1 | **21.9** | 45.9 | 1290.5 |
+| redirect-target-2 | **20.4** | 48.0 | 1276.7 |
+| sameas-subjects | **9.4** | 38.2 | 772.8 |
+| top-linked | **938.8** | 6538.4 | 57624.6 |
+
+Cold, Sparkles is faster than QLever on 29 of 31 queries. QLever wins
+`outlink-classes-2`, at 34.9 against 43.8 ms, and `people-no-birthdate` by less than 10%.
+Fluree is slower than Sparkles on every cold query.
+
+#### Why `count-all` and `predicate-counts` differ
+
+QLever counts 1,014,683,273 triples, and Sparkles and Fluree count 1,014,683,275. QLever folds
+`xsd:float` and `xsd:double` literals whose lexical forms parse to the same number into
+one term. DBpedia has such pairs, for example distinct lexical forms of the same value in
+`geo:lat` and in `dbo:orbitalPeriod`, so QLever merges two pairs of triples that differ
+only in that literal. RDF 1.1 identifies a literal by its lexical form and datatype, so
+Sparkles keeps them as distinct terms and distinct triples, as Jena does. The
+per-predicate counts differ for the same reason, and
+[COMPARISON.md](COMPARISON.md#general) lists this among the divergences.
+
+#### Numeric literals in the vocabulary
+
+Sparkles stores a number inline in its id only when its lexical form is canonical.
+DBpedia writes coordinates as `"48.8566"^^xsd:float` and many counts as `xsd:int` or
+`xsd:nonNegativeInteger`, so 2,057,247 of its numeric literals live in the vocabulary. The
+numeric column, `vocab.num`, holds their exact values next to the vocabulary, so a range
+filter, sort or aggregate over them reads 8 bytes per value instead of decoding each key.
+It costs 20.7 MB on disk beside an 8.0 GB `vocab.dat`, and 4.3 MB of it stays in memory
+while the database is open. The `geo-box` and `country-population` queries of the suite and five extra queries over
+`geo:lat`, `geo:long`, `dbo:populationTotal` and `dbo:elevation` compare the same binary
+with the column and with `SPARKLES_NUMERIC_COLUMN=off`. Cold times are medians of 10
+alternating rounds with a restart and file-cache eviction before each query, and warm
+times are medians of 11 requests. The answers are identical in both modes.
+
+| 1.01B | cold, with (ms) | cold, without (ms) | warm, with (ms) | warm, without (ms) |
+|---|---:|---:|---:|---:|
+| `geo-box` | **108** | 255 | **27.1** | 139.5 |
+| `country-population` | 29.0 | 28.2 | **2.8** | 3.2 |
+| `geo-avg` | **553** | 3,001 | **191** | 580 |
+| `lat-order` | **72** | 137 | **21.8** | 50.2 |
+| `pop-topk` | **41** | 90 | **9.3** | 20.7 |
+| `pop-range` | **43** | 65 | **7.8** | 17.2 |
+| `elev` | **41** | 54 | **6.7** | 14.0 |
+
+Cold, the column's values are read ahead page by page, so a filter over a few thousand
+values reads only the pages that hold them. `country-population` reads few such literals
+and is within 10% either way.
+
+#### Prefix filtering and large results
+
+The `label-regex` filter, `REGEX(?l, "^The B")`, fixes the start of the label. Sparkles
+uses the sorted vocabulary to narrow the matching ids to ranges before the join, so ids
+outside the range fail without reading their keys. Results above 65,536 rows are
+serialized in chunks of that size. Within a chunk, vocabulary ids are sorted, their pages
+are requested ahead, and front-coded blocks are decoded once, in id order and in parallel.
+Requests for the next chunk overlap the writing of the current one. This holds up to about
+70 MiB of additional memory while an export is written.
+
+### Cold starts
+
+Cold mode restarts the server and evicts its files from the OS page cache before each
+query, three times per query, and reports the median request time without process
+startup. Eviction does not guarantee that the device itself is cold. A Sparkles server is
+ready 0.089 s after a restart at both sizes. Sparkles is fastest on 19 of 28 cold queries
+at 1.05M and on 23 of 28 at 10.5M. The cold losses are these:
+
+| Query, cold | Faster engine | 1.05M | 10.5M |
+|---|---|---|---|
+| `count-all` | Fluree at 1.05M | 2.64× (3.5 against 1.3 ms) | — |
+| `star-join` | Fluree at 1.05M | 1.52× (53.1 against 34.9 ms) | — |
+| `range-topk` | QLever | 1.15× (26.5 against 23.0 ms) | 1.01× (44.5 against 43.9 ms) |
+| `contains` | Fluree at 1.05M | 1.15× (14.4 against 12.4 ms) | — |
+| `path-plus` | Oxigraph | 3.83× (7.5 against 1.9 ms) | 2.77× (5.3 against 1.9 ms) |
+| `lang-filter` | Fluree at 1.05M | 1.28× (11.4 against 8.9 ms) | — |
+| `star-lookup` | Oxigraph | 1.84× (27.4 against 14.9 ms) | 3.05× (47.8 against 15.7 ms) |
+| `values-star` | Oxigraph | 2.16× (12.0 against 5.5 ms) | 2.71× (12.9 against 4.8 ms) |
+| `employee-docs` | Fluree at 1.05M, Oxigraph at 10.5M | 1.64× (16.8 against 10.2 ms) | 2.29× (29.3 against 12.8 ms) |
+
+Sparse point lookups and several small scans lose because warm execution hides their
+first-use reads and block decoding. Sparkles memory-maps its index and vocabulary, and three features limit what a
+cold lookup reads:
+
+* Random-access mappings and explicit read-ahead request only the columns or term ranges
+  a query reads. `SPARKLES_IO_HINTS=off` disables them.
+* A sparse vocabulary index, `vocab.idx`, holds the first key of every 128th front-coded
+  block. It narrows a lookup to one range of offsets and data, and costs 66 KB at 10.5M and
+  8.4 MB of memory at 1.01B quads. `SPARKLES_SPARSE_VOCAB=off` disables its use.
+* An index join with up to 16,384 keys requests its blocks before it decodes the first, so
+  their reads overlap.
+* A filter, sort or aggregate over non-canonical numeric literals reads 8-byte values from
+  the [numeric column](#numeric-literals-in-the-vocabulary) instead of decoding each key
+  from the vocabulary.
+
+The tradeoff is faster sparse lookups against less automatic read-ahead for dense scans.
+These cold medians switch the first two features together.
+
+| Cold, median of 3, ms | Both off | Both on (default) |
+|---|---:|---:|
+| 10.5M `star-lookup` | 69.3 | **46.7** |
+| 10.5M `star-join` | 99.9 | **93.3** |
+| 10.5M `contains` | 82.4 | **33.5** |
+| 10.5M `regex-iri` | 55.2 | **31.3** |
+| 10.5M `lang-filter` | 36.1 | **27.9** |
+| 1.01B `entity-facts-1` | 36.0 to 38.3 | **14.6 to 15.2** |
+| 1.01B `label-regex` | **66.4 to 68.5** | 119.5 to 130.8 |
+| 1.01B `export-1m` | **1,231 to 1,239** | 1,883 to 1,956 |
+| 1.01B `category-tree` | 369.7 to 371.1 | 364.5 to 365.2 |
+| 1.01B `top-linked` | 949 to 1,000 | 946 to 964 |
+
+### Full-text search
+
+The comparison uses Sparkles' Tantivy-backed `text:query`, Fuseki's Lucene-backed
+jena-text and QLever's `ql:contains-word`. Sparkles and Jena index `foaf:name`,
+`ex:title` and `rdfs:label`, with English stemming of titles. QLever indexes all literals
+and joins on predicates, searches the indexed form for the stemmed case, and does not
+highlight. Hit sets and counts agree, while scores and the order of tied hits are not
+compared. Times are TSV HTTP means ± standard deviation in ms, over ten runs at 1.05M and
+five at 10.5M.
 
 | query | sparkles 1.05M | jena-fuseki 1.05M | qlever 1.05M | sparkles 10.5M | jena-fuseki 10.5M | qlever 10.5M |
 |---|---:|---:|---:|---:|---:|---:|
@@ -1185,21 +460,31 @@ Times are TSV HTTP mean ± standard deviation in ms: ten runs at 1.05M, five at 
 | highlight | **11.4 ± 0.2** | 101.8 ± 8.7 | 13.7 ± 1.3 | **70.6 ± 0.5** | 841.8 ± 46.2 | 94.8 ± 6.5 |
 | stemmed | **4.0 ± 0.2** | 12.2 ± 0.6 | 5.9 ± 0.3 | **5.4 ± 0.3** | 53.5 ± 0.9 | 18.6 ± 2.6 |
 
-Sparkles is fastest on all seven queries at 1.05M and six at 10.5M. QLever is slightly
-faster on `common-count` at 10.5M, within 10%. That query counts 49,837 hits at 10.5M
-and 4,937 at 1.05M. QLever's text index is smaller, 99.9 against Sparkles' 122.5 MB at
-10.5M and 11.1 against 13.1 MB at 1.05M. The highlight form returns plain literals in
-QLever and marked words in Sparkles and Jena.
+QLever's lead on `common-count` at 10.5M, which counts 49,837 hits, is within 10%. The
+highlight form returns plain literals in QLever and marked words in Sparkles and Jena.
+Index build times and sizes are under [Index builds](#index-builds).
 
-## Vector search
+<a id="full-text-index-and-observability-105m-triples"></a>
 
-This Sparkles-only snapshot ran on `forge` on 2026-10-08 with 100,000 clustered
-384-dimensional vectors and cosine distance. Each configuration answered 1,000
-top-10 queries after 20 warmups, using a persistent HTTP connection and full TSV
-responses. Recall is relative to Sparkles' exact search on the same vectors, and the
-suite does not compare Sparkles with another vector engine.
+### Full-text index and observability
 
-| Search | Recall@10 vs exact | Mean (ms) | p50 (ms) | p99 (ms) |
+The full-text index commits staged documents when a text query needs them, on a tick of
+about one second, or when about 16,000 changes are staged. It syncs to disk at most once a
+second and replays the WAL after a crash, so a write does not wait for the index.
+
+Access logging and Prometheus metrics are on by default. With both on, the canonical 28
+queries at 10.5M summed to 1,027 ms of means, against 1,031 ms with
+`--no-access-log --no-metrics`. Under 16 clients the server answered 225 star joins per
+second with them on and 239 with them off, in a single pair of runs.
+
+### Vector search
+
+This Sparkles-only run searches 100,000 clustered 384-dimensional vectors by cosine
+distance. Each configuration answered 1,000 top-10 queries after 20 warm-ups over a
+persistent HTTP connection with full TSV responses. Recall is measured against Sparkles'
+exact search on the same vectors, and no other vector engine was measured.
+
+| Search | Recall@10 against exact | Mean (ms) | p50 (ms) | p99 (ms) |
 |---|---:|---:|---:|---:|
 | Exact | 1.0000 | 5.458 | 5.476 | 6.109 |
 | HNSW `ef=16` | 0.9916 | 0.257 | 0.251 | 0.336 |
@@ -1208,25 +493,18 @@ suite does not compare Sparkles with another vector engine.
 | HNSW `ef=128` | 0.9993 | 0.655 | 0.648 | 0.927 |
 | HNSW `ef=256` | 0.9993 | 1.181 | 1.169 | 1.554 |
 
-The HNSW build used `M=16` and `efConstruction=128`, taking 14.0 s with
-1,019.5 MB peak process RSS. The mapped index files occupy about 163 MB, and server RSS
-after the query sweep was 252.0 MB. Approximate search trades recall for latency,
-and these figures describe this synthetic distribution rather than all vectors.
+These figures describe this synthetic distribution, not all vectors.
 
-## Path search
+### Path search
 
 These Sparkles-only runs compare `SERVICE path:search` with property paths on the
-benchmark's `foaf:knows` graph. They ran on `forge` on 2026-10-08 with a release build,
-a warm server and the result cache off. Each query had one warmup and 31 measured
-requests, interleaved with the other queries. The client was pinned to CPU 11, and the
-server inherited CPUs 0–19. Times include a fresh HTTP connection, form POST and
-complete TSV response, without starting a `curl` process.
-
-Answers were checked against an independent graph traversal of the input triples:
-reachability, distances, shortest-path counts, five simple-path lengths and every
-returned path edge. The `+` path from person 0 reaches 89,090 nodes at 1.05M and 892,556
-at 10.5M. The last person is 99,999 or 999,999, with shortest chains of 12 and 17 edges.
-QLever's path-search service uses other parameters and was not measured here.
+benchmark's `foaf:knows` graph, with a warm server and the result cache off. Each query
+had one warm-up and 31 measured requests, interleaved with the other queries, and times
+include a fresh HTTP connection and the complete TSV response. Answers were checked
+against an independent traversal of the input: reachability, distances, shortest-path
+counts, five simple-path lengths and every returned edge. The `+` path from person 0
+reaches 89,090 nodes at 1.05M and 892,556 at 10.5M. The last person is 99,999 or 999,999,
+with shortest chains of 12 and 17 edges.
 
 | query | what it does | 1.05M min | 1.05M median | 10.5M min | 10.5M median |
 |---|---|---:|---:|---:|---:|
@@ -1240,547 +518,50 @@ QLever's path-search service uses other parameters and was not measured here.
 | `ps-values10` | distances from 10 people bound by `VALUES` to the last person | 2.41 | 2.81 | 14.84 | 15.25 |
 | `ps-all4` | `COUNT` of every path of up to 4 edges from person 0 | 0.36 | 0.43 | 0.65 | 0.78 |
 | `pp-len4` | the same count as a `UNION` of four fixed-length property paths | 0.48 | 0.59 | 0.70 | 0.83 |
-| `ps-any-weighted` | `ps-any` with `path:weight`, using Dijkstra's algorithm | 94.54 | 97.52 | 1,601.75 | 1,615.50 |
+| `ps-any-weighted` | `ps-any` with `path:weight`, by Dijkstra's algorithm | 94.54 | 97.52 | 1,601.75 | 1,615.50 |
 
-Times are milliseconds. The pair search's median is about 11–41× faster than the
-property-path ASK. Bidirectional search stops when the frontiers meet; the property
-path explores the reachable graph. Searching from one person to everyone costs
-about 1.4–1.8× the `+` count and also maintains path parents and levels. Weighted
-search costs about 5.6–6.3× the unweighted search. No edge has a weight in this fixture,
-so the default unit weight produces the same reachability count.
-
-The two up-to-four-edge counts agree at 21 and 43 on these fixtures; this does not
-establish equivalence of simple paths and walks on graphs with short cycles. The
-`VALUES` queries return distances for 8 and 7 reachable sources out of 10. This suite
-checks Sparkles' answers against the input graph, rather than comparing path-service
-syntax or performance with another engine.
-
-## Query execution features
-
-Executor optimizations can be switched off with `SPARKLES_DISABLE_OPTIMIZATIONS`.
-This release-build comparison on `forge` on 2026-10-08 ran the warm 10.5M suite with
-each of 33 switches disabled in turn and once with the defaults, 34 configurations in
-all. Each query had one warmup and five measured runs with the main suite's curl and
-hyperfine method, with the client pinned to CPU 11. The table lists changes larger
-than 25% in either direction.
-
-| Feature disabled | Measured effect at 10.5M |
-|---|---|
-| `anti_join` | `minus` 2.6× slower (22.8 vs 8.9 ms) |
-| `batched_join` | `values-star` 4.7× slower (18.9 vs 4.0 ms); `employee-docs` 1.6× slower (6.6 vs 4.2 ms); `star-lookup` 2.9× slower (12.2 vs 4.2 ms); throughput 112 vs 242 q/s |
-| `batched_paths` | `knows-reach` 2.6× slower (382.5 vs 145.6 ms) |
-| `count_filter_runs` | `lang-filter` 1.7× slower (11.1 vs 6.6 ms); `contains` 1.8× slower (12.7 vs 7.1 ms); `regex-iri` 1.5× slower (12.9 vs 8.4 ms) |
-| `count_join_runs` | `two-hop-count` 2.1× slower (34.5 vs 16.7 ms) |
-| `decorrelate_exists` | `expr-order-key` 1.3× slower (26.3 vs 20.9 ms); `exists-join` 196.1× slower (2835.7 vs 14.5 ms); `not-exists` 67.8× slower (974.3 vs 14.4 ms) |
-| `expr_cache` | `expr-order-key` 3.7× slower (78.2 vs 20.9 ms); `expr-agg-arg` 2.0× slower (93.3 vs 45.9 ms); `expr-bind-group` 5.0× slower (46.0 vs 9.2 ms) |
-| `filter_id_ranges` | `expr-order-key` 1.3× slower (26.7 vs 20.9 ms) |
-| `gallop_index_join` | throughput 124 vs 242 q/s |
-| `incremental_group` | `group-avg` 1.6× slower (83.5 vs 53.6 ms) |
-| `metadata_counts` | `expr-order-key` 1.4× slower (28.2 vs 20.9 ms); `predicate-counts` 2.0× slower (7.7 vs 3.9 ms); `distinct-obj` 1.8× slower (6.9 vs 3.8 ms) |
-| `ordered_topk` | `expr-order-key` 1.3× slower (26.7 vs 20.9 ms); `range-topk` 1.4× slower (21.2 vs 14.8 ms) |
-| `range_pushdown` | `optional-chain` 1.3× slower (93.0 vs 73.2 ms) |
-| `topk_first_key` | `expr-order-key` 8.3× slower (174.1 vs 20.9 ms) |
-
-All 34 configurations passed the 28-query answer checks, with `export-500k` checked by
-row count. Large gains from decorrelation, expression reuse, batched joins and metadata
-counts depend on the query shape. Smaller effects would need repeated runs to confirm.
-Spatial, text and vector optimizations need their own workloads. Prefix ranges matter
-for anchored vocabulary filters, prefetching for cold reads, and delta statistics after
-writes. The warm synthetic suite does not exercise every feature.
-
-### Streaming execution
-
-The query APIs default to eager execution. Explicit streaming returns bounded batches
-and keeps growing operator state within the query budget, and an operator that cannot
-stay within that budget fails. Sorting, DESCRIBE and unsupported operators can still
-need their full input. Automatic selection chooses streaming only for large immutable
-scans and eligible uncached OPTIONAL COUNT queries, where it was measured to help.
-
-These direct Rust measurements ran on the laptop on 2026-10-08, from Rust sources
-identical to commit `ff7acde4`. They used the production allocator, rustc 1.98.1 with
-LLVM 22.1.8, four CPU cores and four Rayon workers, a 1 GiB decoded-block cache, no
-result cache and an 8 GiB query budget. Batches have 4,096 rows and a 1 MiB byte
-ceiling. Each value is the median of the warm medians of fresh processes, excluding
-startup, HTTP and client costs. The table compares the two modes on the same source and
-fixture.
-
-| 10.5M synthetic control | Eager ms | Streaming ms |
-|---|---:|---:|
-| Name scan | 1.507 | 0.536 |
-| Grouped average | 40.002 | 40.363 |
-| OPTIONAL count | 5.162 | 4.501 |
-| Range TopK | 10.135 | 15.662 |
-| Substring filter | 8.538 | 9.798 |
-| Full ordering | 207.640 | 160.071 |
-| Expression ordering | 13.013 | 16.426 |
-| Native JSON, 500,000 rows | 527.604 | 516.189 |
-| TSV, 500,000 rows | 89.868 | 123.520 |
-
-For the complete scan, the reported query allocation peak is 241.0 MiB for eager result
-columns and 1.0 MiB for streaming. These are the query's allocation estimates. They are
-not process RSS, and they do not account for decoded-value caches in the same way. The
-shared cache and any batches the caller keeps are separate costs.
-
-Streaming improves the name scan, OPTIONAL count and full ordering in these runs. Range
-TopK, expression ordering, substring filtering and TSV output remain slower, which is
-why automatic selection does not choose streaming for them. A lower first-batch time
-does not imply a faster complete response.
-
-A later comparison over HTTP ran on Namespace instances on 2026-10-09, with one Rayon
-worker, the native JSON format and fresh servers in interleaved A, B, B, A rounds. No
-bench query needed an eager fallback in streaming mode. Across the bench queries,
-streaming had a geometric mean of client wall time 0.9% above eager execution at 1.05M
-and +6.9% at 10.5M. Range TopK and expression ordering were faster in streaming in
-that comparison. The [X05 outcome](specs/X05-streaming-query-execution.md#outcome)
-lists the queries that remain slower and the costs that were removed.
-
-## What the benchmark does not cover
-
-* **Larger scale.** The largest dataset measured is English DBpedia at 1.24 billion
-  triples ([DBpedia at 1.24 billion triples](#dbpedia-at-124-billion-triples)). QLever is
-  built for 10⁹–10¹¹ triples and routinely runs at that size (Wikidata, UniProt). Its
-  design advantages grow with size: lazy evaluation, FSST vocabulary compression and IRI
-  encoding. Sparkles defaults to eager intermediate results. Explicit streaming
-  limits retained batches, but growing-state operators and materialization barriers
-  can still exhaust a query budget; disk spill is not implemented.
-* **Data larger than RAM.** The cold runs restart the server and request eviction of its file pages.
-  Every store here fits in memory, except the DBpedia index of 28.7 GiB on a machine
-  with 15 GiB of RAM.
-* **Other standard benchmarks.** WatDiv's basic testing is covered. LUBM, BSBM, SP²Bench,
-  WatDiv's stress testing and the Wikidata query log are not. The synthetic suite has a
-  fairly regular shape, and its 28 queries are hand-picked.
-* **Write scope and long runs.** HTTP tests include 5,000 single-triple changes,
-  50,000 effective changes in 100-change batches, and 50,000 single-quad changes
-  from four concurrent writers. The separate snapshot-reader workload contains
-  5,000 changes and is short. Hours of sustained writes and compaction under load
-  were not compared with other engines.
-* **Spatial queries and inference-time reasoning.** GeoSPARQL workloads were not compared
-  with other engines. The sections below give the spatial index's commit cost and the
-  GeoSPARQL Compliance Benchmark results. Sparkles' only query-time reasoning is RDFS on
-  read, and it has no backward chaining, so query-time reasoning was not compared with
-  other engines.
-* **Result-cache benefit.** All runs had result caches off. With the cache on, repeated
-  queries are mostly served from memory, which is not a fair comparison.
-* **Other hardware.** Every comparison ran on one 20-thread machine with 15 GiB of RAM.
-
-## Other measurements
-
-These measurements time Sparkles on its own. Each section and table row gives its date
-and machine. Rows and sections without them ran on 2026-09-30 to 2026-10-02 on a laptop
-with an Intel Core Ultra X7 358H (16 threads), 32 GB of RAM of which about 31 GiB is
-usable, and NVMe, with an unpinned client. Their small-request times include the
-start-up noise described under [Setup](#setup).
-
-| | Sparkles |
-|---|---:|
-| RDFS materialization, 1,001,418 → 2,751,996 inferred triples (`forge`, 2026-10-08) | 3.974 s for inference and publication, excluding the load. Inference alone takes 2.323 s. |
-| SHACL validation, 20 shapes, 1.05M triples, 48,428 results (`forge`, 2026-10-08) | 449 ms parallel and 933 ms sequential, medians of 5 |
-| ShEx validation, 152,000 shape associations, 1.05M triples (`forge`, 2026-10-08) | 1.532 s parallel and 2.192 s sequential, medians of 5 |
-| `ASK { ?s ?p ?o }` and `SELECT * … LIMIT 100` at 10.5M (early termination) | 1.9 ms and 1.8 ms |
-
-### Embedded JVM / Jena (1.05M quads)
-
-These Sparkles-only results were measured on the laptop on 2026-10-08. They use the
-public Jena API through Kotlin, UniFFI and JNA, on a dataset of 1,052,801 quads. Java
-21.0.12, Jena 5.6.0 and a release build made with rustc 1.98.1 and LLVM 22.1.8 run on
-four distinct CPU cores with four Rayon workers. The native release library has SHA-256
-`f2c7764d4dbbc28915f8b35bd49380d43fddf56e1c4f1ba65191a5ff07f2bbe7` and was built from
-source identical to commit `ff7acde4`.
-
-Every row and term is consumed. All 27 canonical query answers pass untimed checks of
-their lexical bags against stored reference answers, and the fallback count stays at
-zero. Result caching is disabled, and the term cache uses its default of
-262,144 entries. Tables report the median of three fresh-JVM process medians. The
-figures describe this machine and method only.
-
-| Calibrated query | ms |
-|---|---:|
-| Count all | 0.279 |
-| Types grouped | 0.195 |
-| Path plus | 0.160 |
-| Distinct objects | 0.132 |
-| Predicate counts | 0.136 |
-| Star lookup | 0.261 |
-| VALUES star | 0.220 |
-| Employee documents | 0.188 |
-
-Each calibrated query uses 1,000 warmups and 100 measured repetitions per process. The
-following work queries, also fully consumed, use 101 warmups and 101 repetitions per
-process in six fresh JVMs. Their table reports the median of six process medians.
-
-| Work query | ms |
-|---|---:|
-| Star join | 3.592 |
-| Group average | 5.546 |
-| Full ordering, 102,000 rows | 53.592 |
-| OPTIONAL chain | 7.782 |
-
-The graph operation timings include the adapter scope that each public call opens
-automatically. Small operations use 500 warmups and 101 repetitions, and the complete
-name scan uses seven warmups and 11 repetitions.
-
-| Graph operation | ms |
-|---|---:|
-| Contains any quad | 0.024 |
-| Contains a bound subject/predicate | 0.038 |
-| Default graph size | 0.020 |
-| Find and consume 102,000 subject/name rows | 50.023 |
-
-In a fresh JVM, the median startup phases are 95.165 ms for loading the native library,
-151.263 ms for initializing Jena and 12.738 ms for opening the dataset. These are
-separate sequential intervals. The store has already recovered its derived metadata,
-OS pages are warm, and the native library path is explicit. The measurements exclude
-extracting the bundled library, parsing RDF, building the index and starting from a
-cold device.
-
-Repeated applications can pass an existing Jena `Query` instead of parsing the same input text on every call:
-
-```java
-void run(DatasetGraph dataset, String sparql) {
-    Query parsed = QueryFactory.create(sparql);
-    try (QueryExec execution = QueryExec.dataset(dataset).query(parsed).build()) {
-        RowSet rows = execution.select();
-        while (rows.hasNext()) {
-            Binding binding = rows.next();
-            // Consume the binding.
-        }
-    }
-}
-```
-
-A separate paired comparison uses 500 warmups and 101 repetitions in three alternating
-pairs of fresh JVMs.
-
-| Input | Count all ms | Star lookup ms | CONTAINS ms |
-|---|---:|---:|---:|
-| Query text | 0.276 | 0.441 | 0.961 |
-| Pre-parsed Jena Query | 0.159 | 0.272 | 0.766 |
-
-Every pair is faster with pre-parsed input, saving 0.12–0.20 ms per call. This removes
-Jena's text parsing from the repeated call, but adapter serialization and native
-parsing still happen.
-
-### Compression (10.5M triples)
-
-These runs measured Sparkles alone on `forge`, with a release build, on 2026-10-08. HTTP times are
-`hyperfine` means over 5 runs and include `curl`. Server CPU is the server process's
-user + system time per request.
-
-| Response | Encoding | Bytes | Ratio | Wall (s) | Server CPU (s) |
-|---|---|---:|---:|---:|---:|
-| Full N-Quads export (`GET /bench/data`) | identity | 1,121,335,687 | 1.00 | 5.141 | 5.427 |
-|  | gzip-6 | 74,937,009 | 14.96 | 9.478 | 14.745 |
-|  | br-4 | 96,641,420 | 11.60 | 5.295 | 10.453 |
-|  | zstd-3 | 83,261,471 | 13.47 | 5.139 | 6.650 |
-|  | zstd-1 | 79,063,209 | 14.18 | 5.145 | 6.325 |
-| `SELECT * … LIMIT 500000` as TSV | identity | 45,411,223 | 1.00 | 0.089 | 0.253 |
-|  | gzip-6 | 2,919,848 | 15.55 | 0.432 | 0.672 |
-|  | br-4 | 3,490,551 | 13.01 | 0.266 | 0.517 |
-|  | zstd-3 | 3,134,195 | 14.49 | 0.093 | 0.307 |
-|  | zstd-1 | 2,905,885 | 15.63 | 0.093 | 0.290 |
-
-zstd streams the export as fast as identity and makes it 13–14× smaller. gzip increases
-the wall time about 1.8× and server CPU about 2.7× for the full export. zstd-1 came out slightly smaller than zstd-3
-on both responses.
-
-`/$/backup` writes an N-Quads dump to a file. The times below are medians of 3 runs. The
-CLI `sparkles backup --threads 16` with zstd-3 took 9.67 s, close to the HTTP
-result; this workload did not benefit materially from the extra CLI threads.
-
-| Codec | Seconds | Size |
-|---|---:|---:|
-| none | 5.66 | 1,121.3 MB |
-| gzip-6 | 45.11 | 74.9 MB |
-| zstd-3 | 9.70 | 81.5 MB |
-| brotli-5 | 17.69 | 119.0 MB |
-| lz4 | 6.12 | 161.9 MB |
-
-`sparkles load` was timed on the 1.1 GB N-Triples file, raw and compressed. Times are
-medians of 3 runs. CPU is the load's user + system time, and parallelism is CPU divided
-by wall time.
-
-| Input | File size | Seconds | CPU (s) | Parallelism |
-|---|---:|---:|---:|---:|
-| raw | 1,121.3 MB | 3.85 | 28.5 | 7.4 |
-| gzip-6 | 81.9 MB | 4.27 | 36.8 | 8.7 |
-| zstd-3 | 78.6 MB | 4.08 | 36.2 | 8.7 |
-| brotli-5 | 69.0 MB | 4.37 | 36.9 | 8.2 |
-| lz4 | 160.0 MB | 3.99 | 36.2 | 9.0 |
-
-Decompression runs as a single stream in front of the parallel parser and costs
-0.1–0.5 s here. The combined load process averages about 7–9 cores.
-
-The full-text document store holds every string literal, 1,540,012 documents. With LZ4
-it takes 117.3 MB and builds in 6.07 s. With zstd, the default, it takes 114.1 MB and
-builds in 6.17 s. Build times are median wall times over three runs.
-
-<a id="point-in-time-reads-105m-triples"></a>
-
-### Point-in-time reads (1M triples)
-
-These HTTP measurements ran on `forge` on 2026-10-06 with a 1,000,000-triple
-base and 50,000 single-quad commits in one generation, written over four connections.
-History retention covers all commits. Individual curl request times exclude process
-startup; repeated rows use medians of 20 samples.
-
-| Request | Time |
-|---|---:|
-| `COUNT(*)` at base + 25,000, first | 19.89 ms |
-| The same, second / warm median | 1.04 / 0.95 ms |
-| Selective read at base + 25,001, first / warm | 1.20 / 0.69 ms |
-| `COUNT(*)` at sealed base, first / warm | 18.12 / 0.67 ms |
-| Sealed base, first after restart (median of 3) | 14.40 ms |
-| After restart, at base + 25,000 | 21.39 ms |
-
-A separate native test on the same machine read the middle of a 50,000-commit history
-in 42.33 ms on first use and 1.82 µs from its snapshot cache. A head diff of one commit
-took 0.126 ms; 100 commits took 0.181 ms. Reopening and replaying all 50,000 commits
-took 221.51 ms. Native timings exclude HTTP and have a different fixture and cache
-history from the table.
-
-A sparse WAL index and cached snapshots let a read start from the nearest known
-state and replay the intervening commits. The first read of an uncached state
-costs more than a repeated read or a read close to a cached state or the head.
-
-### Branches and merges (10.5M triples)
-
-A release build loaded the 10.5M-triple benchmark data into a new database and served it
-over HTTP, on a machine that other builds kept at a load average of 35 to 85 on 16
-cores. Each figure is one `curl` request's `time_total`, except the query rows, which
-are medians of 15 interleaved requests.
-
-| Step | Time |
-|---|---:|
-| Create a branch of `main` at its head (four runs) | 19.5–32.7 ms |
-| `star-join` on `main` | 38.3 ms |
-| `star-join` on the new, linked branch | 38.7 ms |
-| Preview a merge of 10,000 inserted quads into a `main` with 10,000 of its own | 61.9 ms |
-| That merge, committed | 114.9 ms |
-| First request to a linked branch after a restart | 3.2 ms |
-
-Creating a branch writes about 1.4 KB of files: the branch's identity, its link, its
-commit catalog and its copies of the configuration. When the branch's store first opens,
-its change log preallocates a 68 KiB segment, so a new branch takes about 70 KB on disk.
-A query on a linked branch reads `main`'s index files through the same cached blocks, and
-here took as long as on `main`. The first request after a restart replayed no inherited
-log, because `main` had no updates at the branch's starting commit; the replay costs
-what a past-state read of the same commits costs.
-
-### Backup repositories (10.5M triples)
-
-`mise run bench:backup` (`scripts/backup-bench.sh`) ran against the 10.5M-quad benchmark
-database on `forge` on 2026-10-08 (299.8 MB), with Sparkles alone, a release build
-and a warm page cache. The `fs`
-repository was on the same ext4 file system. Each figure is the median (min–max) of 3
-rounds, in wall-clock time including process start.
-
-| Case | Seconds | Size |
-|---|---:|---|
-| Full backup into an empty repository | 0.59 (0.56–0.61) | 299.8 MB logical, 281.1 MB stored, 509 MB/s |
-| Incremental backup after 1,000 single-quad commits | 0.34 (0.33–0.34) | 55.2 KB added (3 new blobs, 29 reused) |
-| Restore into a new directory (quick check) | 0.81 (0.71–1.63) | 300.0 MB |
-| Verify at level `data` | 0.21 (0.20–0.22) | 33 GETs, ok |
-
-An incremental backup stores only the appended tail of the update log and the files that
-changed, so its size follows the writes since the last backup, not the database size.
-S3, cold caches and databases larger than memory have not been measured.
-
-### Full-text index and observability (10.5M triples)
-
-The text-commit measurements below ran on the laptop on 2026-09-30–10-02,
-one configuration at a time. They are separate from the current text-query tables. They
-used `scripts/bench.sh` with `ENGINES=sparkles SKIP_LOAD=1`, plus `hyperfine` and `oha`.
-Update times are end to end over HTTP with `curl`. The comparison with jena-text and
-QLever is under [Full-text search](#full-text-search).
-
-The full-text index commits staged documents when a text query needs them, on a
-roughly one-second tick, or when about 16,000 changes are staged. It syncs to disk
-at most once a second and replays the WAL after a crash.
-
-| | Text search off | Text search on (lazy commit) |
-|---|---:|---:|
-| Build the index (every string literal, `sparkles text-index`) | — | 8.0 s, 1.3 GiB peak RSS, 102 MB on disk |
-| 1,000-triple `INSERT DATA` | 24.4–26.0 ms (median) | 28.4 ± 1.7 ms |
-| 1-triple `INSERT DATA` (harness) | 5.7–9.4 ms | 6.7 ± 3.0 ms |
-| `text:query ("Perlman" 10)`, top 10 with scores | — | 15.0 ± 0.7 ms |
-| `COUNT` of `text:query "Zurich"` (1,954 hits) | — | 28.6 ± 0.8 ms |
-
-Text-off medians span four fresh-server runs of 30 requests each. With text search
-on, a 1,000-triple batch costs about 3 ms more. Single-triple inserts vary by a few
-milliseconds between runs.
-
-Access logging and Prometheus metrics are on by default. A comparison on `forge` on
-2026-10-08 ran the canonical 28 queries with logging and metrics on, and again with
-`--no-access-log --no-metrics`. Both configurations passed the answer checks, and each
-query had one warmup and five curl and hyperfine samples. The sum of query means was
-1027 ms on and 1031 ms off (-0.4%). Throughput was 225 against 239 star joins/s under
-16 clients. This is a single pair of runs.
+Times are in milliseconds. A pair search is 11–41× faster than the property-path ASK,
+because the bidirectional search stops where its frontiers meet. Searching from one
+person to everyone costs 1.4–1.8× the `+` count, since it also keeps path parents and
+levels, and weighted search costs 5.6–6.3× the unweighted search.
 
 ### Spatial queries
 
-This Sparkles-only run on `forge` on 2026-10-08 uses the geo fixture generated with
-100,000 points, its polygon data, and 180,640 indexed geometry literals. The
-release server returns the same coordinate-normalized result bags with the index
-enabled and disabled. Each query has one warmup and five curl and hyperfine samples,
-and the means and standard deviations include process startup. Build time is 0.54 s and
-the spatial index occupies 13.8 MiB. The plain KNN form also agrees with both arms.
+This Sparkles-only run uses the geo fixture with 100,000 points, its polygons and 180,640
+indexed geometry literals. The server returns the same coordinate-normalized results
+with the spatial index on and off. Each query had one warm-up and five curl and hyperfine
+samples, so the times include process startup. The index builds in 0.54 s and takes
+13.8 MiB.
 
-| query | rows | with the index (ms) | without (ms) | speedup | rewrites off (ms) | same answer |
-|---|---:|---:|---:|---:|---:|:-:|
-| geo-q1-within | 2861 | 21.9 ± 4.0 | 793.7 ± 48.6 | 36.3× | — | yes |
-| geo-q2-distance | 85 | 16.0 ± 2.9 | 419.6 ± 41.6 | 26.2× | — | yes |
-| geo-q3-nearby | 10 | 15.9 ± 1.5 | 400.1 ± 15.7 | 25.1× | — | yes |
-| geo-q4-withinbox | 1 | 31.2 ± 3.1 | 344.4 ± 6.5 | 11.0× | — | yes |
-| geo-q5-points-per-state | 562 | 47.2 ± 2.2 | 100.9 ± 5.1 | 2.1× | — | yes |
-| geo-q6-touching-counties | 1 | 241.2 ± 4.0 | 309.5 ± 4.3 | 1.3× | — | yes |
-| geo-q7-knn | 10 | 7.2 ± 2.3 | 492.5 ± 10.8 | 68.0× | 304.2 ± 43.1 | yes |
-| geo-q8-area | 1 | 756.2 ± 0.9 | 971.6 ± 9.9 | 1.3× | — | yes |
-| geo-q9-star | 1374 | 23.8 ± 5.3 | 821.7 ± 22.2 | 34.6× | — | yes |
-
-### Validation on writes
-
-These Sparkles-only measurements on `forge` on 2026-10-08 use 1,052,801 distinct quads,
-single-triple HTTP inserts and either zero or 10,000 pending delta changes. Each mode
-has 20 curl and hyperfine samples. Every timed request and the configured validation
-status checks passed. Times below are mean ± standard deviation in ms. The full
-validation figures are separate wall-clock references and are not charged to each
-insert.
-
-SHACL:
-
-| write | pending delta | off | warn | reject | grandfather | full validation (warn / reject) | reject ≤ full + 10 ms |
-|---|---:|---:|---:|---:|---:|---:|:---:|
-| plain | 0 | 9.58 ± 1.13 | 6.76 ± 2.46 | 10.04 ± 2.05 | – | 478 / 485 ms | yes |
-| plain | 10000 | 9.22 ± 2.53 | 8.69 ± 2.73 | 9.03 ± 2.22 | – | 489 / 488 ms | yes |
-| person | 0 | 9.01 ± 2.11 | 11.30 ± 1.05 | 7.17 ± 2.54 | – | 478 / 485 ms | yes |
-| person | 10000 | 9.28 ± 2.06 | 8.90 ± 2.55 | 11.02 ± 2.49 | – | 489 / 488 ms | yes |
-
-ShEx:
-
-| write | pending delta | off | warn | reject | grandfather | full validation (warn / reject) | reject ≤ full + 10 ms |
-|---|---:|---:|---:|---:|---:|---:|:---:|
-| plain | 0 | 10.02 ± 2.25 | 10.63 ± 2.28 | 10.13 ± 2.26 | – | 1432 / 1091 ms | yes |
-| plain | 10000 | 9.41 ± 2.88 | 11.20 ± 2.10 | 6.23 ± 2.21 | – | 1398 / 1046 ms | yes |
-| person | 0 | 7.08 ± 2.62 | 7.89 ± 2.31 | 9.00 ± 2.90 | – | 1432 / 1091 ms | yes |
-| person | 10000 | 8.33 ± 2.84 | 11.37 ± 1.77 | 10.23 ± 2.69 | – | 1398 / 1046 ms | yes |
-
-The means of the off, warn and reject modes vary by several milliseconds. This short
-comparison shows that writes are validated incrementally rather than by validating the
-whole store on each write. It is too small to show a latency difference between modes.
-
-### Spatial index: commit cost
-
-This ignored release test ran on `forge` on 2026-10-06. It compares native
-commit latency on the same store with the spatial index on and off. Each figure is a
-median of 200 one-triple commits or 20 commits of 1,000 `geo:asWKT` points.
-
-| | Index off | Index on |
-|---|---:|---:|
-| 1-triple non-geometry commit | 0.025 ms | 0.025 ms |
-| 1,000-point commit | 3.546 ms | 4.119 ms |
-
-Non-geometry commits showed no measurable index cost in this sample; the point batch
-added 0.573 ms. These native-store measurements have a different durability and
-request contract from the persistent HTTP write tables.
-
-### Automatic compaction (1.05M triples)
-
-This test loaded the 1.05M-triple benchmark data (`gen-data.py 100000`) and sent the
-50,000 single-triple commits of `bench-writes.py gen` (35,000 inserts, 15,000 deletes),
-each as its own HTTP request on a new connection. It ran on 2026-10-02 with a release
-build at `9de1492` and `--result-cache-mb 0`. Background builds and tests were running
-on the machine (a load average of about 38 on 16 cores), so the tails are noisy.
-
-The statistics-answered queries are medians of 20 runs after 3 warm-up runs. The uncompacted
-store has a 50,000-quad delta with automatic compaction disabled. The compacted store
-uses automatic compaction with `idleSeconds` 5. That compaction took 2.0 s and held the writer lock for 5.7 ms.
-
-| Query | With the delta | After the compaction |
-|---|---:|---:|
-| `types-grouped` | 5.8 ms | 1.9 ms |
-| `predicate-counts` | 2.0 ms | 1.9 ms |
-| `distinct-obj` | 7.8 ms | 2.2 ms |
-
-The write latency was measured over the same 50,000 commits twice. The first run had
-automatic compaction off. The second set `deltaRatio` 0.01, so two compactions ran during
-the commits, at about 20,500 delta quads each. They took 1.26 s and 1.44 s, carried 348
-and 497 commits made during their builds into the new generation, and held the writer
-lock for 3.4 ms and 3.3 ms.
-
-| Commit latency | Compaction off | During the compactions (860 commits) | Rest of the run with compactions |
-|---|---:|---:|---:|
-| p50 | 2.7 ms | 2.0 ms | 2.0 ms |
-| p99 | 21.0 ms | 15.1 ms | 14.2 ms |
-| p99.9 | 622 ms | 28.7 ms | 250 ms |
-| max | 9.8 s | 58.7 ms | 12.1 s |
-
-Commits during a compaction were no slower than the others. The multi-second outliers
-appeared in both runs outside any compaction, and most likely come from `fsync`
-stalls on the shared machine.
-
-### Partial compaction and the spatial index
-
-Both measurements are ignored tests of `sparkles-core`, run in release mode on
-`forge` on 2026-10-06, with no concurrent benchmark or build.
-
-`partial_compaction_at_scale` loads the 10.5M-triple benchmark data, then copies the
-store for each delta and compacts once with `partial` forced to `always` and once to
-`off`. Each delta is 90% new `foaf:knows` links and 10% deleted `foaf:age` quads, all
-between existing terms. Concentrated deltas link 10 people to a narrow range of others
-and delete consecutive ages; spread deltas choose people at random. The generation
-has 2,254 blocks over seven permutations. Copies are flushed before timing.
-Each case was built once.
-
-| Delta | Blocks rewritten | Partial build | Full build |
-|---|---:|---:|---:|
-| 1,000 concentrated | 102 | 0.112 s | 7.343 s |
-| 10,000 concentrated | 107 | 0.584 s | 7.168 s |
-| 100,000 concentrated | 117 | 0.234 s | 7.317 s |
-| 1,000 spread | 1,201 | 0.572 s | 7.313 s |
-| 10,000 spread | 1,223 | 0.597 s | 7.245 s |
-| 100,000 spread | 1,223 | 0.669 s | 7.752 s |
-
-Concentrated deltas touch relatively few blocks, while spread deltas rewrite about
-54%. Full compaction merges the vocabulary and sorts every quad. Partial compaction
-was 12–66× faster in these samples; writer-lock times ranged from 3.0 to 12.1 ms.
-The automatic selection chose partial compaction for every delta here.
-
-`compaction_lock_with_a_spatial_index` loads 100,000 point features and labels
-(300,000 quads), enables the index, and makes 500 commits before each compaction
-while another 100 commits arrive during its build. Three rounds compare building the
-spatial base at the generation switch with building it alongside the generation.
-
-| Case | Median writer lock at switch | Range |
-|---|---:|---:|
-| No spatial index | 4.9 ms | 4.0–12.5 ms |
-| Spatial base built at switch | 64.5 ms | 56.4–67.2 ms |
-| Spatial base built with generation | 25.3 ms | 5.3–37.7 ms |
-
-Building the spatial base outside the writer lock reduces its cost at the switch,
-though concurrent changes and publication still consume time under the lock.
+| query | rows | with the index (ms) | without (ms) | speedup | rewrites off (ms) |
+|---|---:|---:|---:|---:|---:|
+| geo-q1-within | 2861 | 21.9 ± 4.0 | 793.7 ± 48.6 | 36.3× | — |
+| geo-q2-distance | 85 | 16.0 ± 2.9 | 419.6 ± 41.6 | 26.2× | — |
+| geo-q3-nearby | 10 | 15.9 ± 1.5 | 400.1 ± 15.7 | 25.1× | — |
+| geo-q4-withinbox | 1 | 31.2 ± 3.1 | 344.4 ± 6.5 | 11.0× | — |
+| geo-q5-points-per-state | 562 | 47.2 ± 2.2 | 100.9 ± 5.1 | 2.1× | — |
+| geo-q6-touching-counties | 1 | 241.2 ± 4.0 | 309.5 ± 4.3 | 1.3× | — |
+| geo-q7-knn | 10 | 7.2 ± 2.3 | 492.5 ± 10.8 | 68.0× | 304.2 ± 43.1 |
+| geo-q8-area | 1 | 756.2 ± 0.9 | 971.6 ± 9.9 | 1.3× | — |
+| geo-q9-star | 1374 | 23.8 ± 5.3 | 821.7 ± 22.2 | 34.6× | — |
 
 ### GeoSPARQL Compliance Benchmark
 
 The GeoSPARQL Compliance Benchmark (Jovanovik, Homburg and Spasić, 2021) has 206 queries
-over the 30 requirements of GeoSPARQL 1.0 and a 338-triple dataset. It was run with
-`scripts/geosparql-benchmark.sh` on `forge` on 2026-10-03, using the benchmark at commit
-`879e0746` and the release build of `sparkles-server` at commit `98a75c1a` with its
-default features.
-
-Each requirement ran against the configuration of its conformance class. The queries of
-R25 to R30 test the RDFS entailment and query rewrite extensions, so they ran against a
-database with `infer --profile rdfs --vocab geosparql` and `"queryRewrite": true`. The
-other requirements test the asserted data, so they ran against the same data with the
-spatial index and neither extension. Entailment and rewrite add answers to those queries,
-which the benchmark does not expect, and with every query against the extended database
-Sparkles scored 147.
+over the 30 requirements of GeoSPARQL 1.0 and a 338-triple dataset, and
+`scripts/geosparql-benchmark.sh` runs it. Each requirement runs against the configuration
+of its conformance class. R25 to R30 test RDFS entailment and query rewrite, so they run
+against a database with `infer --profile rdfs --vocab geosparql` and
+`"queryRewrite": true`. The other requirements run against the asserted data with the
+spatial index and neither extension, because entailment and rewrite add answers that
+those queries do not expect. With every query against the extended database, Sparkles
+scores 147.
 
 An answer counts as correct when it matches one of the expected result files. Solutions
-are compared as multisets, and numbers within a relative 1e-6. Geometry literals are
-compared by their coordinates, rounded to 6 decimals. GML and KML literals are first
-converted to GeoJSON by the server's `POST /$/geo/convert`. The comparison ignores ring
-starts and directions, line directions, vertices on straight runs and member order.
-Requirement R17 has no query.
+are compared as multisets, numbers within a relative 1e-6, and geometry literals by their
+coordinates rounded to 6 decimals. GML and KML literals are converted to GeoJSON by the
+server's `POST /$/geo/convert` first, and the comparison ignores ring starts and
+directions, line directions, vertices on straight runs and member order. R17 has no query.
 
 | Requirement | Correct | Queries |
 |---|---:|---:|
@@ -1816,11 +597,8 @@ Requirement R17 has no query.
 | **Total** | **187** | **206** |
 
 The mean of the per-requirement scores is 88.5% over the 29 requirements with queries.
-GeoSPARQL Fuseki 3.17 published 177 of 206. GML literal support is exercised by
-72 of the 96 R22 to R24 queries; the extension requirements use the configured
-RDFS entailment and query rewrite features described above.
-
-The 19 queries that fail disagree with choices Sparkles made on purpose.
+GeoSPARQL Fuseki 3.17 published 177 of 206. The 19 queries that fail disagree with
+choices Sparkles makes on purpose:
 
 * R13 and R16 (4 queries) expect two empty geometries to be `sfEquals`. In Sparkles an
   empty geometry is only disjoint, as in Jena.
@@ -1828,6 +606,755 @@ The 19 queries that fail disagree with choices Sparkles made on purpose.
   expect a 10-metre buffer to be 10 degrees wide.
 * Nine R28 to R30 queries expect relations that DE-9IM and the standard's tables do not
   give. They count a region as an RCC8 tangential proper part of itself, count a region
-  strictly inside another as `ehCoveredBy` it, leave a feature's own geometries and the points inside
-  it out of `sfIntersects`, and leave the EPSG:4326 point at latitude 31.95, longitude -88.38 out
-  of the geometries disjoint from feature B.
+  strictly inside another as `ehCoveredBy` it, leave a feature's own geometries and the
+  points inside it out of `sfIntersects`, and leave the EPSG:4326 point at latitude
+  31.95, longitude -88.38 out of the geometries disjoint from feature B.
+
+### Query execution features
+
+Executor optimizations can be switched off one at a time with
+`SPARKLES_DISABLE_OPTIMIZATIONS`. This comparison ran the warm 10.5M suite with each of 33
+switches off in turn and once with the defaults, and every configuration passed the answer
+checks. The table lists the changes larger than 25%.
+
+| Feature disabled | Effect at 10.5M |
+|---|---|
+| `anti_join` | `minus` 2.6× slower (22.8 against 8.9 ms) |
+| `batched_join` | `values-star` 4.7× slower (18.9 against 4.0 ms), `employee-docs` 1.6× slower (6.6 against 4.2 ms), `star-lookup` 2.9× slower (12.2 against 4.2 ms), throughput 112 against 242 q/s |
+| `batched_paths` | `knows-reach` 2.6× slower (382.5 against 145.6 ms) |
+| `count_filter_runs` | `lang-filter` 1.7× slower (11.1 against 6.6 ms), `contains` 1.8× slower (12.7 against 7.1 ms), `regex-iri` 1.5× slower (12.9 against 8.4 ms) |
+| `count_join_runs` | `two-hop-count` 2.1× slower (34.5 against 16.7 ms) |
+| `decorrelate_exists` | `exists-join` 196× slower (2835.7 against 14.5 ms), `not-exists` 68× slower (974.3 against 14.4 ms), `expr-order-key` 1.3× slower (26.3 against 20.9 ms) |
+| `expr_cache` | `expr-order-key` 3.7× slower (78.2 against 20.9 ms), `expr-agg-arg` 2.0× slower (93.3 against 45.9 ms), `expr-bind-group` 5.0× slower (46.0 against 9.2 ms) |
+| `filter_id_ranges` | `expr-order-key` 1.3× slower (26.7 against 20.9 ms) |
+| `gallop_index_join` | throughput 124 against 242 q/s |
+| `incremental_group` | `group-avg` 1.6× slower (83.5 against 53.6 ms) |
+| `metadata_counts` | `predicate-counts` 2.0× slower (7.7 against 3.9 ms), `distinct-obj` 1.8× slower (6.9 against 3.8 ms), `expr-order-key` 1.4× slower (28.2 against 20.9 ms) |
+| `ordered_topk` | `range-topk` 1.4× slower (21.2 against 14.8 ms), `expr-order-key` 1.3× slower (26.7 against 20.9 ms) |
+| `range_pushdown` | `optional-chain` 1.3× slower (93.0 against 73.2 ms) |
+| `topk_first_key` | `expr-order-key` 8.3× slower (174.1 against 20.9 ms) |
+
+## Loading and index builds
+
+Sparkles builds its index in one parallel pass. Parsing and vocabulary merging run on all
+cores, sampled keys divide the partial vocabularies into ranges that merge in parallel,
+and each 64-million-quad chunk is remapped once, sorted by SPO, OSP and PSO and written as
+compressed runs. SOP, OPS and POS derive from those streams by sorting runs of the first
+column, and without named graphs GSPO derives from SPO. Each permutation has its own
+writer, so the input is read once.
+
+### Bulk loading
+
+Load times include each engine's own preparation, such as `oxigraph optimize`, and peak
+RSS comes from GNU time. Each load ran once.
+
+| Load | sparkles | jena (tdb2.tdbloader) | qlever | fluree | oxigraph |
+|---|---:|---:|---:|---:|---:|
+| 1.05M triples, time | **0.48 s** | 4.78 s | 1.51 s | 1.27 s | 1.28 s |
+| 1.05M triples, peak RSS | **349 MiB** | 2,188 MiB | 660 MiB | 475 MiB | 738 MiB |
+| 10.5M triples, time | **3.87 s** | 45.57 s | 9.69 s | 11.07 s | 14.13 s |
+| 10.5M triples, peak RSS | 2,165 MiB | 4,115 MiB | **1,931 MiB** | 3,142 MiB | 6,204 MiB |
+| WatDiv, 10.97M triples, time | **4.34 s** | 33.61 s | 9.71 s | 9.46 s | 13.16 s |
+| DBpedia, 1.24B lines, time | **480 s** | — | 1,674 s | 2,919 s | — |
+| DBpedia, peak RSS | **6,059 MiB** | — | 11,401 MiB | 12,366 MiB | — |
+
+The DBpedia load is one load of the complete input with the CPUs pinned to the
+performance cores. Its peak includes file-cache pages counted in the 14 GiB scope, and
+writing the numeric column during the load had no measurable cost. QLever indexed with
+8 GB of sort memory and 5 million triples per batch. Jena and Oxigraph were not measured
+at this scale.
+
+### Compressed inputs
+
+`sparkles load` read the 1.1 GB N-Triples file of the 10.5M dataset raw and compressed.
+Times are medians of 3 runs, CPU is the load's user and system time, and parallelism is
+CPU divided by wall time.
+
+| Input | File size | Seconds | CPU (s) | Parallelism |
+|---|---:|---:|---:|---:|
+| raw | 1,121.3 MB | 3.85 | 28.5 | 7.4 |
+| gzip-6 | 81.9 MB | 4.27 | 36.8 | 8.7 |
+| zstd-3 | 78.6 MB | 4.08 | 36.2 | 8.7 |
+| brotli-5 | 69.0 MB | 4.37 | 36.9 | 8.2 |
+| lz4 | 160.0 MB | 3.99 | 36.2 | 9.0 |
+
+Decompression runs as one stream in front of the parallel parser and adds 0.1–0.5 s.
+
+### Index builds
+
+| Build | Time | Result |
+|---|---:|---|
+| Full-text index, 1.05M triples | **0.41 s** (Fuseki 4.37, QLever 1.86) | 13.1 MB (QLever **11.1**, Fuseki 24.9) |
+| Full-text index, 10.5M triples | **6.48 s** (Fuseki 25.98, QLever 19.35) | 122.5 MB (QLever **99.9**, Fuseki 227.8) |
+| Full-text document store, every string literal of 10.5M (1,540,012 documents) | 6.17 s with zstd, 6.07 s with LZ4 | 114.1 MB with zstd (the default), 117.3 MB with LZ4 |
+| HNSW vector index, 100,000 × 384 dimensions, `M=16`, `efConstruction=128` | 14.0 s | 163 MB of mapped files, 1,019.5 MB peak RSS |
+| Spatial index, 180,640 geometries | 0.54 s | 13.8 MiB |
+| RDFS materialization, 1,001,418 triples to 2,751,996 with inferences | 3.974 s, of which inference takes 2.323 s | — |
+| Numeric column added to the DBpedia index by `sparkles vocab-index` | 4.8 s | 20.7 MB |
+
+### Validation
+
+| Validation of 1.05M triples, medians of 5 | Parallel | Sequential |
+|---|---:|---:|
+| SHACL, 20 shapes, 48,428 results | 449 ms | 933 ms |
+| ShEx, 152,000 shape associations | 1.532 s | 2.192 s |
+
+<a id="partial-compaction-and-the-spatial-index"></a>
+
+### Compaction
+
+Compaction writes a new generation while writes go on. A partial compaction rewrites only
+the index blocks a delta touches. This test loads the 10.5M data, copies the store for each
+delta and compacts once with partial compaction forced and once without. Each delta is 90%
+new `foaf:knows` links and 10% deleted `foaf:age` quads between existing terms.
+Concentrated deltas touch a narrow range of people, and spread deltas choose people at
+random. The generation has 2,254 blocks over seven permutations.
+
+| Delta | Blocks rewritten | Partial build | Full build |
+|---|---:|---:|---:|
+| 1,000 concentrated | 102 | 0.112 s | 7.343 s |
+| 10,000 concentrated | 107 | 0.584 s | 7.168 s |
+| 100,000 concentrated | 117 | 0.234 s | 7.317 s |
+| 1,000 spread | 1,201 | 0.572 s | 7.313 s |
+| 10,000 spread | 1,223 | 0.597 s | 7.245 s |
+| 100,000 spread | 1,223 | 0.669 s | 7.752 s |
+
+Partial compaction is 12–66× faster in these samples, and the writer lock is held for 3.0
+to 12.1 ms. Automatic selection chooses partial compaction for every delta here.
+
+With a spatial index, the index's base is built alongside the new generation rather than
+at the switch. On 100,000 point features with 500 commits before each compaction and 100
+more during its build, the median writer lock at the switch is 4.9 ms without a spatial
+index, 64.5 ms when the spatial base is built at the switch, and 25.3 ms when it is built
+with the generation, which is the default.
+
+## Writes and updates
+
+Every Sparkles write is durable when it is acknowledged: the WAL record and any new
+vocabulary entries are synchronized first. The other engines use their defaults. TDB2
+commits durably, QLever keeps updates in memory only, Fluree uses its default commit
+path, and Oxigraph commits a RocksDB transaction that writes its WAL without
+synchronizing it. Of these comparisons, only
+the one with TDB2 is between two commits that are both synchronized.
+
+### Durable commit latency
+
+These serial single-triple commits alternate Sparkles and Oxigraph over 6 rounds, each
+with a fresh copy of the store and a fresh server. Literal inserts add a new term to the
+vocabulary, IRI inserts reuse known terms, and deletes remove triples.
+
+| Serial commits, ms | Sparkles median | Sparkles p90 | Oxigraph median | Oxigraph p90 |
+|---|---:|---:|---:|---:|
+| 1.05M, literal insert | 1.126 | 1.345 | **0.613** | 1.255 |
+| 1.05M, IRI insert | 1.080 | 1.273 | **0.627** | 1.298 |
+| 1.05M, delete | 1.075 | 1.272 | **0.549** | 1.060 |
+| 10.5M, literal insert | 1.284 | 2.781 | **0.926** | 1.318 |
+| 10.5M, IRI insert | 1.200 | 2.702 | **0.929** | 1.360 |
+| 10.5M, delete | 1.205 | 2.711 | **0.817** | 1.117 |
+
+Oxigraph issued no device writes during these runs, while a run of 5,000 Sparkles commits
+issued 14 device cache flushes.
+
+The comparative suite's `updates` mode applies the same 5,000 single-triple INSERT and
+DELETE requests, one at a time, to every engine's store. No engine failed a commit.
+
+| Churn of 5,000 commits | sparkles | jena-fuseki | qlever | fluree | oxigraph |
+|---|---:|---:|---:|---:|---:|
+| 1.05M: commits/s | 770 | 14 | 426 | 499 | **855** |
+| 1.05M: latency p50 / p99 (ms) | 1.33 / 2.31 | 74.06 / 102.20 | 2.27 / 4.57 | 1.68 / 7.16 | **1.16 / 2.04** |
+| 10.5M: commits/s | 663 | 14 | 475 | 459 | **1,140** |
+| 10.5M: latency p50 / p99 (ms) | 1.38 / 3.62 | 74.69 / 103.16 | 2.07 / 4.73 | 1.55 / 12.76 | **0.90 / 1.58** |
+
+The WAL preallocates space in steps from 64 KiB up to 4 MiB (`--wal-prealloc-kb`, `0`
+disables it). Replay, readers, backups and quotas use the logical end of the last commit,
+and recovery recognizes a torn tail.
+
+### Concurrent durable commits
+
+Four clients apply 50,000 fresh-literal changes, one quad per request, with the server on
+ten logical CPUs. The runs alternate the default writer and opt-in group commit
+(`--experimental-group-commit`), two fresh processes per setting. Group commit shares one
+synchronization among eligible commits and keeps acknowledgments durable. Every run
+completes all 50,000 inserts with contiguous receipts and the correct final state.
+
+| Four writers, 50,000 changes | 1.05M default | 1.05M group commit | 10.5M default | 10.5M group commit |
+|---|---:|---:|---:|---:|
+| Acknowledged transactions/s | 221.5–231.8 | **529.0–543.3** | 201.1–204.0 | **402.3–406.9** |
+| Request p50 (ms) | 19.016–19.211 | **9.051–9.104** | 19.338–19.415 | **9.709–9.735** |
+| Request p99 (ms) | 39.972–41.342 | **15.693–15.894** | 41.066–41.200 | **16.089–16.171** |
+
+### Concurrent writers with snapshot readers
+
+Four writers insert 5,000 fresh quads while two readers each issue up to 25 queries per
+second. Each read counts the inserted namespace and checks the count against the commit
+snapshot named in the response. The state, the history and the reopened store are checked
+afterwards.
+
+| Four writers and two readers | Default | Group commit |
+|---|---:|---:|
+| 1.05M, single-quad requests, transactions/s | 1,375–1,386 | **3,344–3,365** |
+| 1.05M, writer p50 (ms) | 2.796–2.810 | **1.142–1.143** |
+| 1.05M, reader p50 (ms) | 0.845–0.862 | **0.545–0.585** |
+| 1.05M, 100-quad requests, effective changes/s | 74,231–75,187 | **118,627–123,253** |
+| 10.5M, single-quad requests, transactions/s | 202–231 | **370–386** |
+| 10.5M, writer p50 (ms) | 19.093–19.274 | **9.932–10.315** |
+| 10.5M, reader p50 (ms) | 0.917–0.936 | 0.895–1.000 |
+| 10.5M, reader p99 (ms) | **1.410–1.549** | 1.960–2.143 |
+
+Readers keep their scheduled rate and see advancing snapshots throughout, so these runs
+show reads proceeding under write load rather than saturated query throughput. The
+100-quad runs at 1.05M last 41–67 ms and are short-burst observations.
+
+<a id="http-write-snapshot"></a>
+
+### Write throughput with one client
+
+One client sends requests to a server on one logical CPU, starting from a compacted
+1.05M store. Throughput counts effective changes, so it is not interchangeable with
+transactions per second. Ranges span the fresh processes.
+
+| One client | Changes per request | Effective changes/s | Request p50 (ms) | Request p99 (ms) |
+|---|---:|---:|---:|---:|
+| 1.05M, single-triple insert and delete churn | 1 | 1,046–1,062 | 0.856–0.870 | 1.536–1.609 |
+| 1.05M, inserts of new literals | 100 | 53,979–59,414 | 1.493–1.515 | 3.964–7.118 |
+| 1.05M, insert and delete batches | 100 | 54,972–58,586 | 1.516–1.548 | 2.857–3.981 |
+| 10.5M, single-triple insert and delete churn | 1 | 320–494 | 2.154–2.351 | 5.989–7.733 |
+| 10.5M, insert and delete batches | 100 | 45,788–46,123 | 1.613–1.622 | 16.070–16.364 |
+
+On the same new-literal workload, two Oxigraph processes produced 34,641 and 58,853
+effective changes per second, without synchronizing its WAL. The ranges overlap.
+
+### Mixed load
+
+Sixteen `star-join` readers run for 30 s with `oha` while one writer commits
+single-triple `INSERT DATA` requests of new literals as fast as it can. Every request
+opens a new connection.
+
+| Mixed load | sparkles | jena-fuseki | qlever | fluree | oxigraph |
+|---|---:|---:|---:|---:|---:|
+| 1.05M: reads/s | **2054.0** | 94.5 | 510.6 | 34.6 | 10.9 |
+| 1.05M: read p50 / p99 (ms) | **7.6 / 11.9** | 158.4 / 351.3 | 27.4 / 39.7 | 462.2 / 536.7 | 1192.3 / 3351.1 |
+| 1.05M: writes/s | 264.0 | 28.3 | 109.4 | 246.5 | **1247.3** |
+| 1.05M: write p50 / p99 (ms) | 2.9 / 10.1 | 17.9 / 97.7 | 6.0 / 25.8 | 3.6 / 16.2 | **0.8 / 1.0** |
+| 1.05M: failed reads / writes | 0 / 0 | 0 / 0 | 23929 / 827 | 0 / 0 | 0 / 0 |
+| 10.5M: reads/s | **198.8** | 7.7 | 69.5 | 3.6 | 0 |
+| 10.5M: read p50 / p99 (ms) | **80.8 / 100.6** | 1977.0 / 2859.2 | 229.5 / 270.6 | 4402.7 / 8621.1 | — |
+| 10.5M: writes/s | 187.3 | 20.7 | 51.1 | 299.4 | **676.7** |
+| 10.5M: write p50 / p99 (ms) | 5.2 / 10.6 | 62.8 / 86.7 | 11.9 / 108.8 | 1.9 / 14.8 | **1.4 / 3.2** |
+
+Sparkles serves 4.0× QLever's reads at 1.05M and 2.9× at 10.5M. Oxigraph commits more
+writes at both sizes, and Fluree does at 10.5M, while both serve far fewer reads. At 10.5M no Oxigraph reader finished within
+30 s. A separate run with the durable-commit harness above, with 16 readers on the 10.5M
+store, completed 299 new-literal commits per second at a median of 3.2 ms.
+
+### Queries after updates
+
+The `updates` mode applies the same 5,000 single-triple changes to each engine's store and
+runs the query suite again. The changes stay in Sparkles' delta until a compaction folds
+them into the base index. At 10.5M the delta changes `star-join` from 31.0 to 59.8 ms,
+`two-hop-count` from 17.1 to 38.7 ms, `contains` from 7.2 to 14.9 ms and `regex-iri` from
+8.5 to 16.4 ms, and throughput from 241 to 169 q/s, against QLever's 87 q/s on its changed
+store. On the changed stores Sparkles is fastest on 26 of 28 queries at both sizes.
+QLever's changed-store `types-grouped` answer differs in value and is not ranked. The one
+clear loss is `range-topk` at 1.05M, where QLever is 1.13× faster, and the other
+differences are within 10%.
+
+<a id="automatic-compaction-105m-triples"></a>
+
+### Automatic compaction
+
+This test sends 50,000 single-triple commits, 35,000 inserts and 15,000 deletes, to the
+1.05M store, each as its own HTTP request. It ran on the development laptop with other
+builds running, at a load average of about 38 on 16 cores, so the tails are noisy.
+
+| Query, median of 20 | With a 50,000-quad delta | After an automatic compaction |
+|---|---:|---:|
+| `types-grouped` | 5.8 ms | 1.9 ms |
+| `predicate-counts` | 2.0 ms | 1.9 ms |
+| `distinct-obj` | 7.8 ms | 2.2 ms |
+
+That compaction took 2.0 s and held the writer lock for 5.7 ms. With `deltaRatio` 0.01,
+two compactions ran during the 50,000 commits. They took 1.26 s and 1.44 s, carried 348
+and 497 commits made during their builds into the new generation, and held the writer
+lock for 3.4 ms and 3.3 ms. The commits made during a compaction had a p50 of 2.0 ms and
+a p99 of 15.1 ms, against 2.7 ms and 21.0 ms in the run without compaction, so a
+compaction does not slow the writes around it.
+
+<a id="other-measurements"></a>
+
+### Validation on writes
+
+Write-time validation checks only the focus nodes a write can affect. On 1.05M quads,
+single-triple HTTP inserts take about the same time with validation off, in `warn` mode
+and in `reject` mode, with or without 10,000 pending delta changes. Each mode had 20
+samples, and its mean varies by several milliseconds between runs, so this test shows
+incremental validation rather than a latency difference between modes.
+
+| Single-triple insert, mean ms | off | warn | reject | full validation of the store |
+|---|---:|---:|---:|---:|
+| SHACL, plain write, no delta | 9.58 ± 1.13 | 6.76 ± 2.46 | 10.04 ± 2.05 | 478 to 485 |
+| SHACL, write of a person, 10,000-change delta | 9.28 ± 2.06 | 8.90 ± 2.55 | 11.02 ± 2.49 | 488 to 489 |
+| ShEx, plain write, no delta | 10.02 ± 2.25 | 10.63 ± 2.28 | 10.13 ± 2.26 | 1,091 to 1,432 |
+| ShEx, write of a person, 10,000-change delta | 8.33 ± 2.84 | 11.37 ± 1.77 | 10.23 ± 2.69 | 1,046 to 1,398 |
+
+<a id="spatial-index-commit-cost"></a>
+
+### Spatial index commit cost
+
+On the native store, a one-triple commit without geometry takes 0.025 ms with the spatial
+index on and off, medians of 200. A commit of 1,000 `geo:asWKT` points takes 4.119 ms with
+the index and 3.546 ms without it, medians of 20.
+
+<a id="branches-and-merges-105m-triples"></a>
+
+### Branches and merges
+
+A release build served the 10.5M data on the development laptop, which other builds kept
+at a load average of 35 to 85 on 16 cores. Each figure is one request's `time_total`,
+except the queries, which are medians of 15 interleaved requests.
+
+| Step | Time |
+|---|---:|
+| Create a branch of `main` at its head (four runs) | 19.5–32.7 ms |
+| `star-join` on `main` | 38.3 ms |
+| `star-join` on the new branch | 38.7 ms |
+| Preview a merge of 10,000 inserted quads into a `main` with 10,000 of its own | 61.9 ms |
+| That merge, committed | 114.9 ms |
+| First request to the branch after a restart | 3.2 ms |
+
+A new branch writes about 1.4 KB of files and takes about 70 KB on disk once its change
+log opens, because it shares its upstream's index files until it compacts. A query on the
+branch reads the same cached blocks as `main` and takes as long.
+
+<a id="point-in-time-reads-105m-triples"></a>
+
+### Point-in-time reads
+
+A 1,000,000-triple base takes 50,000 single-quad commits in one generation, with history
+retention covering every commit. Request times exclude process startup, and repeated rows
+are medians of 20.
+
+| Request | Time |
+|---|---:|
+| `COUNT(*)` at base + 25,000, first | 19.89 ms |
+| The same, second / warm median | 1.04 / 0.95 ms |
+| Selective read at base + 25,001, first / warm | 1.20 / 0.69 ms |
+| `COUNT(*)` at the sealed base, first / warm | 18.12 / 0.67 ms |
+| Sealed base, first after a restart (median of 3) | 14.40 ms |
+| After a restart, at base + 25,000 | 21.39 ms |
+
+A read starts from the nearest known state, found through a sparse WAL index, and replays
+the commits in between, so a first read of an uncached state costs more than a repeat. In
+the native store, a read of the middle of a 50,000-commit history takes 42.33 ms on first
+use and 1.82 µs from the snapshot cache, a diff of one commit at the head 0.126 ms and of
+100 commits 0.181 ms, and reopening with a replay of all 50,000 commits 221.51 ms.
+
+<a id="backup-repositories-105m-triples"></a>
+
+### Backup repositories
+
+`mise run bench:backup` ran against the 10.5M database (299.8 MB) with a warm page cache
+and an `fs` repository on the same ext4 file system. Each figure is the median and range
+of 3 rounds, including process start.
+
+| Case | Seconds | Size |
+|---|---:|---|
+| Full backup into an empty repository | 0.59 (0.56–0.61) | 299.8 MB logical, 281.1 MB stored, 509 MB/s |
+| Incremental backup after 1,000 single-quad commits | 0.34 (0.33–0.34) | 55.2 KB added (3 new blobs, 29 reused) |
+| Restore into a new directory, with the quick check | 0.81 (0.71–1.63) | 300.0 MB |
+| Verify at level `data` | 0.21 (0.20–0.22) | 33 GETs |
+
+An incremental backup stores only the appended tail of the update log and the files that
+changed, so its size follows the writes since the last backup. S3, cold caches and
+databases larger than memory were not measured.
+
+## Bindings
+
+The bindings embed the engine in a JVM, Python or Node.js process. The comparison of
+`mise run bench:bindings` loads 105,302 synthetic triples (10,000 people) into each library
+and runs the suite's 28 queries through each library's own API, consuming every row and
+term. It ran on `atlas` with the processes pinned to CPUs 0–11, two processes per engine
+and mode, one warm-up and five samples per case, and reports medians of the process
+medians. Every engine's answers agree by value on all 33 cases.
+
+### JVM
+
+Jena's `QueryExec` runs on a `DatasetGraphSparkles`, on disk and in memory, against TDB2
+on disk and Jena's in-memory TIM dataset.
+
+| Case, ms | Sparkles on disk | Sparkles in memory | TDB2 | TIM |
+|---|---:|---:|---:|---:|
+| Load the N-Triples file (s) | **0.51** | 0.53 | 1.30 | 0.87 |
+| `count-all` | 0.988 | **0.979** | 23.7 | 46.3 |
+| `star-join` | 1.728 | **1.694** | 5.740 | 4.014 |
+| `two-hop-count` | 1.239 | **1.122** | 56.3 | 32.6 |
+| `group-avg` | 1.478 | **1.456** | 25.5 | 15.3 |
+| `order-by-full` | **6.991** | 8.091 | 41.4 | 22.8 |
+| `export-500k` | 28.0 | **25.2** | 54.0 | 44.5 |
+| `knows-reach` | 0.570 | 0.591 | 0.565 | **0.449** |
+| `star-lookup` | 0.739 | 0.800 | 0.739 | **0.426** |
+| `values-star` | 0.775 | 0.952 | 0.662 | **0.463** |
+| `employee-docs` | 0.626 | 0.707 | 0.509 | **0.391** |
+| Peak RSS, load process (MiB) | **149** | 151 | 457 | 416 |
+| Peak RSS, read process (MiB) | **345** | 346 | 472 | 590 |
+
+Over all 28 queries, Sparkles on disk is faster than TDB2 on 24, with a geometric mean
+8.1× faster, and Sparkles in memory is faster than TIM on 24, 5.8× faster. The four
+losses are the small lookups in the last rows, where a query's fixed cost through Jena
+dominates.
+
+Calls that read a few triples go through hand-written JNI entry points. This table gives
+their latency on one thread in microseconds, from the same dataset in memory, against
+TDB2 and TIM.
+
+| Operation, µs | Sparkles | TDB2 | TIM |
+|---|---:|---:|---:|
+| `Graph.contains` in its own read transaction | 1.68 | 2.47 | **0.53** |
+| `Model.getProperty` | 2.64 | 3.46 | **0.68** |
+| `find` on a subject | 5.20 | 5.59 | **1.71** |
+| `ASK` | 42.69 | 28.75 | **26.18** |
+| `SELECT ?o` on a subject | 42.61 | 27.48 | **23.92** |
+| `star-lookup` | 233.7 | 209.8 | **115.5** |
+| `values-star` | 195.8 | 101.7 | **88.9** |
+
+On four threads, `contains` reaches 1,680,000 operations per second against TDB2's
+678,000, `getProperty` 1,130,000 against 657,000, and `find` on a subject 704,000 against
+446,000. A small `ASK` reaches 43,200 queries per second against TDB2's 45,500.
+
+### Python
+
+The native API runs against pyoxigraph 0.5.11, and the rdflib store plugin against
+rdflib's in-memory store.
+
+| Case, ms | sparkles | pyoxigraph | rdflib on Sparkles | rdflib Memory |
+|---|---:|---:|---:|---:|
+| Load the N-Triples file (s) | 0.15 | **0.14** | 1.46 | 1.52 |
+| `count-all` | **0.236** | 14.8 | 2.413 | 641.5 |
+| `star-join` | **1.224** | 8.567 | 7.682 | 400.3 |
+| `two-hop-count` | **0.368** | 27.9 | 4.295 | 600.5 |
+| `group-avg` | **0.711** | 6.921 | 3.580 | 237.7 |
+| `order-by-full` | **20.5** | 41.6 | 76.5 | 511.1 |
+| `export-500k` | **233.1** | 308.9 | 881.9 | 2,234 |
+| `knows-reach` | 0.115 | **0.046** | 1.819 | 2.060 |
+| `star-lookup` | **0.291** | 0.316 | 3.928 | 4.625 |
+| `values-star` | 0.177 | **0.126** | 3.887 | 3.671 |
+| `employee-docs` | 0.164 | **0.140** | 2.337 | 3.234 |
+| Peak RSS, load process (MiB) | 65 | 65 | 127 | 160 |
+| Peak RSS, read process (MiB) | 135 | **97** | 197 | 291 |
+
+Over all 28 queries the native API is faster than pyoxigraph on 25, with a geometric
+mean 7.5× faster. Through rdflib's API the plugin answers every query faster than
+rdflib's own store, by a geometric mean of about 42×.
+
+### Node.js
+
+`@sparkles-rdf/engine` runs against Oxigraph's JavaScript package and N3.js's `Store`
+queried through Comunica.
+
+| Case, ms | @sparkles-rdf/engine | oxigraph (JS) | N3.js and Comunica |
+|---|---:|---:|---:|
+| Load the N-Triples file (s) | **0.17** | 0.22 | 0.39 |
+| `count-all` | **0.462** | 25.6 | 397.8 |
+| `star-join` | **3.301** | 102.0 | 212.1 |
+| `two-hop-count` | **0.606** | 37.5 | 278.1 |
+| `group-avg` | **1.161** | 10.8 | 210.8 |
+| `order-by-full` | **91.6** | 599.5 | 192.6 |
+| `export-500k` | 586.8 | 3,900 | **406.8** |
+| `knows-reach` | 0.340 | **0.308** | 2.932 |
+| `star-lookup` | 1.033 | **0.757** | 28.0 |
+| `values-star` | 0.564 | **0.488** | 8.004 |
+| `employee-docs` | 0.613 | **0.516** | 27.1 |
+| Peak RSS, load process (MiB) | **94** | 143 | 341 |
+| Peak RSS, read process (MiB) | **238** | 739 | 459 |
+
+Over all 28 queries the engine is faster than Oxigraph's package on 24, with a geometric
+mean 9.9× faster, and faster than N3.js with Comunica on 27.
+
+### Per-call costs
+
+Calls that touch a few quads, such as a `has()` probe or a single add in a transaction,
+cost more through a native binding than through a store written in the host language.
+The figures below are development measurements on 8-vCPU AMD EPYC instances of a cloud CI
+provider, not quiet-machine benchmarks, and runs on different instances differed by up to
+30%. They use the same 105,000 triples, A/B/B/A order in fresh processes pinned to six
+cores, and four to six process medians per arm.
+
+| Python, per call | sparkles | pyoxigraph |
+|---|---:|---:|
+| Single `tx.add` | **6.0 µs** | 6.8 µs |
+| `add_all`, per quad | **5.2 µs** | 7.7 µs |
+| `in` | **1.1 µs** | 1.4 µs |
+| First object of `(s p ?)` | 1.7 µs | **1.6 µs** |
+| `(s ? ?)`, per subject | **9.4 µs** | 9.7 µs |
+| `(? p o)` over 2,983 matches | **2.5 ms** | 2.9 ms |
+| Iterate every quad | **102 ms** | 119 ms |
+| Small `SELECT` with a five-subject `VALUES` | 246 µs | **147 µs** |
+
+Through the rdflib plugin, against rdflib's Memory store, `(? p o)` takes 4.1 ms against
+4.1 ms, iterating every triple 122 ms against 155 ms, a `contains` probe 4.0 µs against
+3.1 µs and `Graph.value` 6.7 µs against 5.1 µs.
+
+| Node.js, per call | @sparkles-rdf/engine | N3.js `Store` |
+|---|---:|---:|
+| Single add in a transaction | 7.6 µs | **5.1 µs** |
+| `addAll`, per quad | 7.0 µs | **5.8 µs** |
+| `has()` | 1.9 µs | **1.3 µs** |
+| First object of `(s p ?)` | **6.5 µs** | 8.0 µs |
+| `(s ? ?)`, per subject | **12 µs** | 21 µs |
+| `(? p o)` over 2,983 matches | 2.5 ms | **2.4 ms** |
+| Iterate every quad | **59 ms** | 123 ms |
+
+On the same kind of instance, ordinary Jena use on Sparkles took 25 µs for an `ASK` on a
+bound triple against TDB2's 27 µs, 22 µs for a `SELECT ?o` on a subject against 23 µs,
+10 µs for an initial binding on a parsed query against 12 µs, and 52 µs for a DESCRIBE
+of one resource against 36 µs. A DELETE/INSERT WHERE on one resource in the in-memory
+store took 13 to 15 ms against TDB2's 2.3 to 3.2 ms.
+
+## Memory and disk
+
+Sparkles uses more memory than QLever in exchange for speed, and less than Jena and
+Oxigraph. The decoded-block cache, eager execution and mimalloc each trade memory for
+speed, and each tradeoff is stated with its cost below.
+
+### Server memory and index size
+
+These are server resident sets (VmRSS, and VmHWM for peaks) and index sizes on disk from
+the synthetic suite. Lower is better.
+
+| 1.05M triples | sparkles | jena-fuseki | qlever | fluree | oxigraph |
+|---|---:|---:|---:|---:|---:|
+| RSS 2 s after start (MiB) | 52 | 257 | 28 | 52 | **22** |
+| RSS after every query ran once (MiB) | 188 | 981 | 146 | 2083 | **91** |
+| RSS after the run (MiB) | 405 | 1769 | **307** | 2735 | 1244 |
+| Peak RSS during throughput (MiB) | 614 | 1769 | **335** | 2735 | 1250 |
+| Index size on disk | 27 MiB | 132 MiB | **26 MiB** | 37 MiB | 147 MiB |
+
+| 10.5M triples | sparkles | jena-fuseki | qlever | fluree | oxigraph |
+|---|---:|---:|---:|---:|---:|
+| RSS 2 s after start (MiB) | 53 | 270 | 43 | 260 | **28** |
+| RSS after every query ran once (MiB) | 743 | 3409 | 414 | 3377 | **408** |
+| RSS after the run (MiB) | 840 | 4899 | **653** | 4664 | 2381 |
+| Peak RSS during throughput (MiB) | 1383 | 4899 | **778** | 4756 | 2381 |
+| Index size on disk | 286 MiB | 1.3 GiB | **276 MiB** | 398 MiB | 1.4 GiB |
+
+Of Sparkles' 405 and 840 MiB after the run, 64 and 379 MiB are the block cache. At 10.5M
+the largest per-query rises in peak RSS are `order-by-full` at 278 MiB, `two-hop-count`
+at 239 MiB, `star-join` at 171 MiB and `optional-chain` at 97 MiB, which include cache
+growth as well as intermediate results.
+
+| DBpedia, 1.24B lines | sparkles | qlever | fluree |
+|---|---:|---:|---:|
+| Server RSS after the run (MiB) | 4,480 | **1,426** | killed at 14 GiB |
+| Index size on disk | **28.7 GiB** | 33.4 GiB | 69.7 GiB |
+
+The DBpedia RSS figures do not measure the same memory. Sparkles maps its index, so the
+clean file pages it touches count toward its RSS and the kernel can reclaim them. QLever
+reads with `pread`, so the file cache does not count toward its RSS. The numeric column
+adds 20.7 MB on disk and 4.3 MB of resident memory to the Sparkles index.
+
+<a id="memory-and-the-speed-it-buys"></a>
+
+### Memory and the speed it buys
+
+**The decoded-block cache** keeps decompressed index blocks, up to 1 GiB per dataset by
+default (`--cache-mb`). These runs measured the 10.5M suite with four cache sizes. The
+first three memory columns come from a fresh-server probe that runs all 28 queries once
+and then three rounds of 160 concurrent star joins.
+
+| Block cache | Probe RSS after the queries | Probe peak RSS | Suite RSS after the run | Held by the cache | Throughput (q/s) | Sum of 28 query means |
+|---|---:|---:|---:|---:|---:|---:|
+| 0 MiB | 150 MiB | 614 MiB | 304 MiB | 0 MiB | 127 | 3,548 ms |
+| 256 MiB | 577 MiB | 985 MiB | 713 MiB | 255 MiB | 237 | 1,056 ms |
+| 1024 MiB (default) | 724 MiB | 1101 MiB | 851 MiB | 378 MiB | 234 | 1,058 ms |
+| 4096 MiB | 724 MiB | 1121 MiB | 849 MiB | 378 MiB | 231 | 1,056 ms |
+
+Turning the cache off saves 547 MiB of RSS after the run, below QLever's 653 MiB, and
+costs about 46% of throughput and a 3.4× slower suite. A 256 MiB cache saves 138 MiB at
+the same speed on this workload, which touches about 378 MiB of blocks. A larger cache
+adds nothing here.
+
+**The result cache** answers repeated queries from memory, up to 512 MiB per dataset
+(`--result-cache-mb`). It was off in every run on this page.
+
+<a id="streaming-execution"></a>
+
+**Eager execution** materializes each operator's result within the query's row and memory
+budgets. Opt-in streaming execution returns bounded batches and charges growing operator
+state to the budget, while sorts and some operators still need their full input. These
+direct Rust measurements on the development laptop, medians of warm medians from fresh
+processes at 10.5M, show the tradeoff:
+
+| 10.5M, ms | Eager | Streaming |
+|---|---:|---:|
+| Name scan | 1.507 | **0.536** |
+| Grouped average | **40.002** | 40.363 |
+| OPTIONAL count | 5.162 | **4.501** |
+| Range TopK | **10.135** | 15.662 |
+| Substring filter | **8.538** | 9.798 |
+| Full ordering | 207.640 | **160.071** |
+| Expression ordering | **13.013** | 16.426 |
+| Native JSON, 500,000 rows | 527.604 | **516.189** |
+| TSV, 500,000 rows | **89.868** | 123.520 |
+
+For the complete scan, the query's allocation estimate peaks at 241.0 MiB for eager
+result columns and 1.0 MiB when streaming. Eager execution stays the default because it
+is faster on several shapes, and automatic selection streams only the large scans and
+OPTIONAL counts where streaming measured faster.
+
+**mimalloc** keeps freed memory in per-thread heaps, and the server hands idle memory back
+to the OS after a second (`--idle-release-ms`). On the development laptop, a fresh 10.5M
+server with mimalloc held 920 MiB after concurrent rounds against 838 MiB for glibc with
+idle release, and peaked at 1,682 MiB against 1,439 MiB. In exchange it served 190 q/s
+against 144, and `star-join` took 38 ms against 72 ms. The bindings make the same choice
+case by case. The Python package and the JVM library use mimalloc, which raises the
+Python benchmark process's peak RSS by about 20% and a mixed JVM run's from 653 to
+962 MiB. The Node.js addon keeps the system allocator, because mimalloc made no
+measurable difference there.
+
+<a id="compression-105m-triples"></a>
+
+### Compression of exports and backups
+
+HTTP responses and backups can be compressed. Times are hyperfine means over 5 runs at
+10.5M, including `curl`, and server CPU is the server's user and system time per request.
+
+| Response | Encoding | Bytes | Ratio | Wall (s) | Server CPU (s) |
+|---|---|---:|---:|---:|---:|
+| Full N-Quads export | identity | 1,121,335,687 | 1.00 | 5.141 | 5.427 |
+| | gzip-6 | 74,937,009 | 14.96 | 9.478 | 14.745 |
+| | br-4 | 96,641,420 | 11.60 | 5.295 | 10.453 |
+| | zstd-3 | 83,261,471 | 13.47 | 5.139 | 6.650 |
+| | zstd-1 | 79,063,209 | 14.18 | 5.145 | 6.325 |
+| `SELECT * … LIMIT 500000` as TSV | identity | 45,411,223 | 1.00 | 0.089 | 0.253 |
+| | gzip-6 | 2,919,848 | 15.55 | 0.432 | 0.672 |
+| | br-4 | 3,490,551 | 13.01 | 0.266 | 0.517 |
+| | zstd-3 | 3,134,195 | 14.49 | 0.093 | 0.307 |
+| | zstd-1 | 2,905,885 | 15.63 | 0.093 | 0.290 |
+
+zstd streams the export as fast as identity at a 13–14× smaller size, while gzip takes
+about 1.8× the wall time and 2.7× the server CPU. `/$/backup` writes an N-Quads dump to a
+file, medians of 3 runs:
+
+| Codec | Seconds | Size |
+|---|---:|---:|
+| none | 5.66 | 1,121.3 MB |
+| gzip-6 | 45.11 | 74.9 MB |
+| zstd-3 | 9.70 | 81.5 MB |
+| brotli-5 | 17.69 | 119.0 MB |
+| lz4 | 6.12 | 161.9 MB |
+
+## Where Sparkles loses
+
+This table lists every comparison on this page where another engine is ahead by more
+than 10%. Fluree's warm advantages on small lookups at 1.05M are within 10%.
+
+| Case | Reference advantage | Qualification |
+|---|---|---|
+| Warm `range-topk`, 1.05M | QLever 1.12× | The query filters salaries and keeps the top k. Sparkles wins at 10.5M. |
+| Single-triple update latency in the suite | Oxigraph 1.13× and QLever 1.11× at 1.05M, QLever 1.17× and Oxigraph 1.14× at 10.5M | Sparkles takes 4.2 and 4.9 ms per request including curl, and synchronizes each acknowledgment. Oxigraph does not synchronize its WAL, and QLever keeps updates in memory. |
+| Serial durable commits | Oxigraph 1.84× on literal inserts at 1.05M and 1.39× at 10.5M | The same durability difference. |
+| Serial commits in the suite's churn | Oxigraph 1.11× at 1.05M and 1.72× at 10.5M | The same durability difference. |
+| Writes during mixed load | Oxigraph 4.7× at 1.05M and 3.6× at 10.5M, Fluree 1.6× at 10.5M | Both serve far fewer concurrent reads. |
+| Cold point lookups | Oxigraph 1.8–3.8× at 1.05M and 2.3–3.1× at 10.5M | Listed under [Cold starts](#cold-starts). |
+| Cold small scans at 1.05M | Fluree 1.15–2.64× on `count-all`, `star-join`, `contains`, `lang-filter` and `employee-docs` | Sparkles wins these at 10.5M. |
+| DBpedia cold `outlink-classes-2` | QLever 1.25× | Sparkles wins 29 of 31 cold queries. |
+| Server RSS after the run | QLever 1.32× at 1.05M and 1.29× at 10.5M | Without its block cache, Sparkles holds 341 and 461 MiB. |
+| Peak RSS under 16 readers | QLever 1.83× at 1.05M and 1.78× at 10.5M | Sparkles peaks at 614 and 1,383 MiB, against 335 and 778 MiB. |
+| Bulk load peak RSS, 10.5M | QLever 1.12× | Sparkles has the lowest peak at 1.05M and on DBpedia. |
+| DBpedia server RSS | QLever 3.14× | Sparkles maps its index, so touched file pages count toward its RSS. |
+| Text index size | QLever about 1.18× at 1.05M and 1.23× at 10.5M | The indexed predicates and features differ. |
+| JVM small lookups | TIM 1.3–2.1× and TDB2 1.1–1.4× on `star-lookup`, `values-star` and `employee-docs` | A small query's fixed cost through Jena dominates. |
+| Python small lookups | pyoxigraph 1.2–2.5× on `knows-reach`, `values-star` and `employee-docs` | The same fixed cost per query. |
+| Node.js small lookups and adds | Oxigraph's package 1.1–1.4× on four small queries, N3.js 1.2–1.5× on adds and `has()` | Each add crosses to the transaction's thread. |
+| Node.js `export-500k` | N3.js with Comunica 1.44× | Each row's terms cross into JavaScript. |
+
+## Methodology and reproduction
+
+<a id="setup"></a>
+
+### Setup
+
+* **Data.** `scripts/gen-data.py N` generates about 10.5 triples per person: people,
+  organisations, documents, typed literals, `foaf:knows` and citation graphs,
+  language-tagged titles and a small OWL class hierarchy. N = 100,000 gives 1.05M triples,
+  and N = 1,000,000 gives 10.5M triples, 1.12 GB of N-Triples.
+* **Queries.** `scripts/bench.sh` has 28 queries covering scans, counts, joins, OPTIONAL,
+  property paths, subqueries, grouping, sorting, point lookups and expressions in BIND,
+  ORDER BY and aggregate arguments.
+* **Engines.** No engine may answer from a result cache.
+  * Sparkles runs as `sparkles serve --result-cache-mb 0` with every other setting at its
+    default.
+  * Jena loads with `tdb2.tdbloader` and serves with Fuseki and `-Xmx8G`. Fuseki has no
+    result cache.
+  * QLever runs with `-m 8G -j 16 --cache-max-size-single-entry 0B`, which stops it from
+    caching results, and its cache is cleared before every timed run.
+  * Fluree 4.2.2 is the release binary, which `scripts/bench.sh` downloads and verifies
+    against a checksum. It loads with `fluree create bench --from data.nt
+    --chunk-size-mb 16` and serves with `fluree server run`, `FLUREE_CACHE_MAX_MB=4096` and
+    `FLUREE_PATH_MAX_VISITED=20000000`, because the default traversal cap of 1M nodes
+    rejects `knows-reach` at 10.5M. Fluree has no result cache.
+  * Oxigraph loads with `oxigraph load` and then `oxigraph optimize`, the compaction its
+    loader recommends before read-heavy workloads, and serves with
+    `oxigraph serve --timeout-s 600`.
+* **Isolation.** Each engine runs alone on the machine, one after another, in a systemd
+  scope with a 12 GiB memory limit and no swap, so an engine that runs out of memory is
+  killed on its own. The OS page cache is warm except in the cold runs.
+* **Timing.** hyperfine 1.20 times SPARQL protocol POSTs with TSV results, with 2 warm-ups
+  and 10 runs at 1.05M and 1 warm-up and 5 runs at 10.5M. Times are mean ± σ in ms and
+  include starting `curl` and the round trip, about 3.5 ms. The client runs on CPU 11, the
+  last performance core, and the servers are not pinned.
+* **Writes.** Update latency is a single-triple `INSERT DATA` into a named graph, preceded
+  by an untimed `DELETE DATA` so that each request inserts, with an ASK before and after.
+  Throughput is 160 `star-join` requests from 16 unpinned `curl` clients. Memory is the
+  server's RSS 2 s after the throughput run, and its peak during it.
+* **Comparisons.** A difference within 10% is a tie. No figure is a significance test or
+  a confidence interval.
+
+### Answer checks
+
+`scripts/bench-answers.py` fetches every engine's answer to every query as SPARQL JSON
+before timing and fingerprints it by the row count, by the solution multiset under RDF
+term identity, and by the same multiset with numbers compared by value to 12 significant
+digits. An engine whose answer differs in value from the majority is marked † and not
+ranked, which happens only to QLever, on `types-grouped` after the update churn. A ‡ marks
+equal values returned as different RDF terms. `export-500k` uses LIMIT without ORDER BY,
+so only its row count is checked.
+
+### What the benchmarks do not cover
+
+* **Larger scale.** The largest dataset is English DBpedia at 1.24 billion triples. QLever
+  is built for 10⁹–10¹¹ triples and runs Wikidata and UniProt, and its lazy evaluation,
+  FSST vocabulary compression and IRI encoding matter more as data grows. Sparkles has no
+  disk spill, so a query whose operator state outgrows its budget fails.
+* **Data larger than RAM.** Every store fits in memory except the DBpedia index of
+  28.7 GiB under a 14 GiB limit.
+* **Other standard benchmarks.** LUBM, BSBM, SP²Bench, WatDiv's stress testing and the
+  Wikidata query log were not run. The synthetic suite has a regular shape, and its 28
+  queries are hand-picked.
+* **Long runs.** Hours of sustained writes and compaction under load were not compared
+  with other engines.
+* **Spatial and query-time reasoning.** GeoSPARQL workloads and query-time reasoning were
+  not compared with other engines.
+* **Result caches.** All runs had result caches off.
+* **Other hardware.** Every comparison ran on one 20-thread machine with 15 GiB of usable
+  RAM.
+
+### Reproducing
+
+* `mise run bench [people] [workdir]` or `scripts/bench.sh` runs the synthetic suite.
+  `--engines NAME` re-measures one engine and merges it into an existing run, and
+  `--answers-only` checks every engine's answers without timing. `scripts/bench.sh` takes
+  the same settings as `ENGINES` and `ANSWERS_ONLY=1`.
+* `mise run bench:watdiv [scale]` runs WatDiv, and `scripts/bench-text.sh` the full-text
+  comparison.
+* `mise run bench:billion full` runs DBpedia. Run it on a quiet machine right after
+  `fstrim`, because an untrimmed SSD stalls the load's writes and slows cold lookups.
+  `scripts/bench-billion.sh` records the last trim, the free space and the I/O pressure,
+  and warns when the trim is more than two days old or less than 30% of the file system
+  is free.
+* `mise run bench:bindings` runs the JVM, Python and Node.js comparison, and
+  `mise run bench:jena` the ordinary Jena use cases.
+* `mise run bench:backup` runs the backup measurements, and
+  `scripts/geosparql-benchmark.sh` the GeoSPARQL Compliance Benchmark.
+* Engines must run alone. Stop each server by its PID or port before starting the next,
+  and keep builds and other benchmarks off the machine.

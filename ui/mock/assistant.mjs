@@ -10,6 +10,10 @@
 // - "connected" drafts a SELECT with graph variables.
 // - "provider" ends with `provider-unavailable`, and "budget" is refused with `429`.
 // - anything else drafts the members of the payments team.
+//
+// A request body with the mock-only field `hold: "summary"` stops before the summary
+// until the client goes away, so that the step indicator stays on Summarizing (the
+// screenshots of `mise run docs:screenshots` use it).
 
 import { randomUUID } from 'node:crypto';
 import { checkQuery, mockPrincipal, isAdmin } from './memory.mjs';
@@ -266,6 +270,7 @@ async function runAsk(req, res, ds, body, { sparklesResult }) {
     });
     await emit('result', { ...result, results: doc });
     if (rows && s.send !== 'schema' && body.summary !== false) {
+      if (body.hold === 'summary') while (!closed) await sleep(100);
       steps.push({
         role: 'summarize',
         ...SMALL,

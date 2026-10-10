@@ -16,7 +16,7 @@
 > now recover in the background at persistent open. Facets, search at historical
 > snapshots and an opt-in stale mode are not built.
 >
-> **User docs:** [API: Full-text search](../API.md#full-text-search) · [Features](../FEATURES.md#sparql-arq-equivalent) · [Benchmarks: Full-text index and observability](../BENCHMARKS.md#full-text-index-and-observability-105m-triples)
+> **User docs:** [API: Full-text search](../API.md#full-text-search) · [Features](../FEATURES.md#search) · [Benchmarks: Full-text index and observability](../BENCHMARKS.md#full-text-index-and-observability-105m-triples)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
 > the end records how it landed.

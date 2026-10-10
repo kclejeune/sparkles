@@ -8,7 +8,7 @@
 >
 > **User docs:** [API: Stored queries](../API.md#stored-queries) ·
 > [Usage: Stored queries](../USAGE.md#stored-queries) ·
-> [Features](../FEATURES.md#server-fuseki-equivalent-reasoning-validation-ui)
+> [Features](../FEATURES.md#server-fuseki-equivalent)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
 > the end records how it landed.
