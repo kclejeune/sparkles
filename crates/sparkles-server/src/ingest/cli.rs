@@ -150,6 +150,7 @@ pub fn run_cli(args: IngestArgs, store_opts: StoreOptions) -> Result<()> {
             base: args.base.clone(),
             message: None,
             pairs: pairs.clone(),
+            source: None,
         };
         let ctx = Ctx {
             server: &server,

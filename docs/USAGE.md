@@ -2412,6 +2412,15 @@ yet, and the extraction skill that `setup` installs works through that list with
 MCP tools. Facts an agent extracts are usable at once and unreviewed, like the import's
 own.
 
+The server can extract instead, when it has a model for the `extract` role (see
+[Ingesting documents in the server](#ingesting-documents-in-the-server)). With
+`imports.extract: "server"` in the memory settings, or `sync --extract server` for one
+run, each sync starts a server extraction for every new, edited or renamed memory file
+that needs one, and lists the tasks under `extractions` in its output. The facts land in
+the file's own graph on `main`, unreviewed. With `--loc` the sync waits for each
+extraction. Against a server it reports the task ids, which
+`GET /$/ingest/{ds}/{task}` follows.
+
 `sparkles memory setup claude-code` prints the hooks, the extraction skill and, for
 Codex, the MCP entry of [C18 §10.4](specs/C18-natural-language-questions-and-ingest.md#104-harness-integration),
 and `--write` merges them into `~/.claude/settings.json` (or `.claude/settings.json`
@@ -2595,6 +2604,53 @@ ontology with an ingest profile of its own, ingests every test sentence, and rep
 precision, recall, F1, ontology conformance, hallucination and cost per sentence.
 `scripts/eval-text2kg --self-test` runs it on a small benchmark of its own against a
 mock provider and needs no key.
+
+`POST /$/ingest/{ds}` with `{"source": IRI}` extracts from a source that is already
+registered, such as an imported memory file, instead of a new document. `mode: "memory"`
+writes the facts on `main` into the source's graph, which must be an agent graph, and
+the other modes work as for a document.
+
+### Maintaining agent memory
+
+Memory that many sessions write repeats itself and grows. The server has two
+maintenance tasks for it, both off until the memory settings name them.
+
+**Consolidation** asserts once, in the consolidated graph, each fact that at least
+`minSources` agent graphs repeat and no reviewed graph asserts yet. Each consolidated
+fact cites the session facts it summarizes with `prov:wasDerivedFrom`, and a copy made by
+`export` counts as the same source as its original. The task also lists possible
+duplicate entities and conflicting facts for a person, and never merges entities. It
+calls no model. In `branch` mode it proposes the facts on `consolidation.{date}-{n}`,
+which the inbox lists. In `auto` mode, which needs `admin`, it merges the branch when
+every fact passes its checks.
+
+**Retention** deletes old session graphs. A graph is deleted when its IRI matches the
+retention's `graphs` patterns (session graphs, whose IRI contains `/sessions/`, by
+default), its newest recorded time is older than `after`, and, with
+`requireConsolidated` (the default), every fact in it is also in a reviewed graph. A
+graph with no recorded time or more than 5,000 facts is kept. Deleting a graph removes
+it from the current state only. History and backups still hold it.
+
+```bash
+curl -X PUT -H 'Content-Type: application/json' -d '{
+  "agentGraphs": ["https://example.org/agents/*"],
+  "consolidatedGraph": "https://example.org/memory/consolidated",
+  "consolidation": {"every": "1d", "mode": "branch", "minSources": 2},
+  "retention": {"after": "365d"}
+}' http://localhost:3030/$/memory/org
+curl -X POST -H 'Content-Type: application/json' -d '{"dryRun": true}' \
+  http://localhost:3030/$/memory/org/consolidate
+curl http://localhost:3030/$/memory/org/maintenance
+```
+
+The server checks every minute and starts each task whose `every` has passed, as itself.
+A scheduled consolidation writes nothing while the last one's branch waits for review.
+`POST /$/memory/{ds}/consolidate` and `POST /$/memory/{ds}/retention` run a pass now and
+answer with a task under `/$/ingest/{ds}`. `dryRun` reports what a pass would do.
+`GET /$/memory/{ds}/maintenance` shows the settings, the last task and the next run.
+
+`recall` takes `recency`, a half-life such as `"90d"`, that ranks recent facts and facts
+that several graphs assert first. Old facts are never deleted for their age alone.
 
 ## Asking questions with a model
 

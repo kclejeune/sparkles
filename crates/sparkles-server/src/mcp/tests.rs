@@ -478,6 +478,7 @@ fn expected_input_schemas() -> Vec<(&'static str, Value)> {
                 "includeSuperseded": {"type":"boolean","default":false,"description":"List the superseded and retracted facts of the entities returned"},
                 "statuses": {"type":"array","items":{"enum":["reviewed","unreviewed","proposed"]},"minItems":1,"maxItems":3,"description":"The review statuses to return when the dataset names agent memory graphs (default all). Unreviewed facts were written by an agent and not yet checked by a person. Proposed facts are asserted only on the review branch you read, not on main"},
                 "unreviewedWeight": {"type":"number","minimum":0,"maximum":1,"default":0.7,"description":"Factor on the score of found seeds whose facts are all unreviewed"},
+                "recency": {"type":"string","pattern":"^[0-9]+(\\.[0-9]+)?[smhdwy]$","description":"A half-life such as 90d: found seeds whose facts are older weigh less, and seeds whose facts several graphs assert weigh more"},
                 "format": {"enum":["text","json"],"default":"text"},
                 "reasoning": rs,
                 "timeoutSeconds": to,

@@ -819,3 +819,401 @@ async fn a18_csv_mapping_draft() {
     assert_eq!(d["dryRun"], true, "{d}");
     assert_eq!(d["commit"]["inserted"], 20_000, "{d}");
 }
+
+/// The extraction of a registered source (`source`), which `sparkles memory sync` starts
+/// with `imports.extract: "server"`: memory mode writes on main into an agent graph, and
+/// the source no longer needs extraction. Branch mode works on any source, and memory
+/// mode is refused outside agent memory and without a source.
+#[tokio::test]
+async fn extraction_of_a_registered_source() {
+    let m = proposals_mock();
+    let (_st, app) = app(Some([&m.url(), &m.url()]));
+    enable(&app).await;
+    let (s, v) = send(
+        &app,
+        req(
+            "PUT",
+            "/$/memory/org",
+            json!({ "agentGraphs": ["https://example.org/memory/import/*"] }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let g = "https://example.org/memory/import/ana/claude-code/app/memory/team";
+    let other = "https://example.org/notes/stand-up";
+    for (graph, text) in [
+        (g, NOTES),
+        (other, "# Other\n\nKai Berg leads the platform team.\n"),
+    ] {
+        let (s, v) = send(
+            &app,
+            req(
+                "POST",
+                "/org/sources",
+                json!({ "graph": graph, "iri": graph, "format": "text/markdown", "text": text }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+    }
+    let needs = |v: &Value, g: &str| {
+        v["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["graph"].as_str().unwrap().contains(g))
+            .unwrap_or_else(|| panic!("{v}"))["needsExtraction"]
+            .clone()
+    };
+    let (_, l) = send(&app, req("GET", "/org/sources", Value::Null)).await;
+    assert_eq!(needs(&l, "memory/team"), true, "{l}");
+    // memory mode: on main, in the source's graph
+    let v = ingest(
+        &app,
+        req(
+            "POST",
+            "/$/ingest/org",
+            json!({ "source": g, "mode": "memory" }),
+        ),
+    )
+    .await;
+    assert_eq!(v["status"], "done", "{v}");
+    let r = &v["result"];
+    assert_eq!(r["outcome"], "proposed", "{v}");
+    assert_eq!(r["mode"], "memory");
+    assert_eq!(r["proposed"], 1, "{v}");
+    assert!(r["branch"].is_null(), "{v}");
+    assert_eq!(v["input"]["source"], g);
+    assert!(
+        ask(
+            &app,
+            &format!("ASK {{ GRAPH <{g}> {{ <http://example.org/ana> <{MEMBER_OF}> ?t }} }}")
+        )
+        .await
+    );
+    let (_, l) = send(&app, req("GET", "/org/sources", Value::Null)).await;
+    assert_eq!(needs(&l, "memory/team"), false, "{l}");
+    // the fact is unreviewed: the inbox lists it
+    let (_, inbox) = send(&app, req("GET", "/$/memory/org/inbox", Value::Null)).await;
+    assert!(
+        inbox["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["graph"] == g),
+        "{inbox}"
+    );
+    // memory mode outside agent memory is refused; branch mode proposes on a branch
+    let v = ingest(
+        &app,
+        req(
+            "POST",
+            "/$/ingest/org",
+            json!({ "source": other, "mode": "memory" }),
+        ),
+    )
+    .await;
+    assert_eq!(v["error"]["code"], "not-agent-memory", "{v}");
+    let v = ingest(
+        &app,
+        req("POST", "/$/ingest/org", json!({ "source": other })),
+    )
+    .await;
+    assert_eq!(v["status"], "done", "{v}");
+    assert_eq!(v["result"]["outcome"], "proposed", "{v}");
+    let b = v["result"]["branch"].as_str().unwrap().to_string();
+    let rv = review(&app, &b).await;
+    assert!(
+        rv["facts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["quote"] == "Kai Berg leads the platform team."),
+        "{rv}"
+    );
+    // refusals
+    let v = ingest(
+        &app,
+        req(
+            "POST",
+            "/$/ingest/org",
+            json!({ "source": "https://example.org/none", "mode": "memory" }),
+        ),
+    )
+    .await;
+    assert_eq!(v["error"]["code"], "unknown-source", "{v}");
+    let (s, e) = send(
+        &app,
+        req(
+            "POST",
+            "/$/ingest/org",
+            json!({ "text": NOTES, "mode": "memory" }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+    let (s, e) = send(
+        &app,
+        req(
+            "POST",
+            "/$/ingest/org",
+            json!({ "text": NOTES, "source": g }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+}
+
+const AGENTS: &str = "https://example.org/memory/agents/";
+const CONSOLIDATED: &str = "https://example.org/memory/consolidated";
+
+/// Agent memory settings with a consolidated graph, and `extra` members.
+async fn memory(app: &Router, extra: Value) {
+    let mut m = json!({
+        "agentGraphs": [format!("{AGENTS}*")],
+        "consolidatedGraph": CONSOLIDATED,
+    });
+    for (k, v) in extra.as_object().into_iter().flatten() {
+        m[k] = v.clone();
+    }
+    let (s, v) = send(app, req("PUT", "/$/memory/org", m)).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+}
+
+/// Assert facts in a session graph of agent-7.
+async fn session(app: &Router, name: &str, body: Value) {
+    let mut b = body;
+    b["graph"] = format!("<{AGENTS}agent-7/sessions/{name}>").into();
+    let (s, v) = send(app, req("POST", "/org/facts", b)).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+}
+
+/// Start a maintenance task and wait until it ends.
+async fn maintain(app: &Router, path: &str, body: Value) -> Value {
+    let (s, v) = send(app, req("POST", path, body)).await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{v}");
+    wait(app, v["id"].as_str().unwrap()).await
+}
+
+/// C18 §8.3 as a server task (Phase 5): a fact that two sessions assert is proposed once
+/// in the consolidated graph on a review branch, with reifiers derived from the
+/// session reifiers; a fact a reviewed graph asserts already and a fact one session
+/// asserts are left out; a duplicate entity is listed. A scheduled pass waits for the
+/// review, `auto` merges, and the next pass finds nothing.
+#[tokio::test]
+async fn consolidation_task() {
+    let (st, app) = app(None);
+    memory(&app, json!({})).await;
+    let ana_payments = json!({ "s": "<http://example.org/ana>", "p": format!("<{MEMBER_OF}>"),
+                               "o": "<http://example.org/payments>" });
+    session(
+        &app,
+        "s1",
+        json!({
+            "facts": [ana_payments,
+                // also asserted by the curated graph
+                { "s": "<http://example.org/kai>", "p": format!("<{MEMBER_OF}>"), "o": "<http://example.org/payments>" },
+                { "s": "_:t", "p": "<http://www.w3.org/ns/org#unitOf>", "o": "<http://example.org/acme>" }],
+            "entities": [{ "key": "_:t", "label": "Payments team",
+                           "types": ["http://www.w3.org/ns/org#OrganizationalUnit"],
+                           "distinctFrom": ["http://example.org/payments"] }],
+        }),
+    )
+    .await;
+    session(&app, "s2", json!({ "facts": [ana_payments] })).await;
+    session(
+        &app,
+        "s3",
+        json!({ "facts": [{ "s": "<http://example.org/ana>", "p": format!("<{MEMBER_OF}>"),
+                             "o": "<http://example.org/acme>" }] }),
+    )
+    .await;
+    // a dry run writes nothing
+    let v = maintain(&app, "/$/memory/org/consolidate", json!({ "dryRun": true })).await;
+    assert_eq!(v["status"], "done", "{v}");
+    assert_eq!(v["input"]["kind"], "consolidation");
+    let r = &v["result"];
+    assert_eq!(r["outcome"], "dry-run", "{v}");
+    assert_eq!(r["repeated"], 1, "{v}");
+    assert_eq!(r["facts"][0]["sources"], 2, "{v}");
+    assert_eq!(r["facts"][0]["derivedFrom"].as_array().unwrap().len(), 2);
+    let dup = &r["duplicates"][0];
+    assert_eq!(dup["label"], "Payments team", "{v}");
+    assert!(
+        dup["entities"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("http://example.org/payments")),
+        "{v}"
+    );
+    // a pass on a branch
+    let v = maintain(&app, "/$/memory/org/consolidate", json!({})).await;
+    let r = &v["result"];
+    assert_eq!(r["outcome"], "proposed", "{v}");
+    assert_eq!(r["proposed"], 1, "{v}");
+    let b = r["branch"].as_str().unwrap().to_string();
+    assert!(b.starts_with("consolidation."), "{b}");
+    let q = format!(
+        "ASK {{ GRAPH <{CONSOLIDATED}> {{ <http://example.org/ana> <{MEMBER_OF}> <http://example.org/payments> }} }}"
+    );
+    assert!(!ask(&app, &q).await);
+    let rv = review(&app, &b).await;
+    assert_eq!(rv["facts"].as_array().unwrap().len(), 1, "{rv}");
+    let (_, inbox) = send(&app, req("GET", "/$/memory/org/inbox", Value::Null)).await;
+    assert!(
+        inbox["branches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x["name"] == b.as_str() && x["kind"] == "consolidation"),
+        "{inbox}"
+    );
+    // a scheduled pass waits for that review
+    memory(&app, json!({ "consolidation": { "every": "1h" } })).await;
+    super::maintain::tick(&st);
+    let (_, l) = send(&app, req("GET", "/$/ingest/org", Value::Null)).await;
+    let id = l["tasks"][0]["id"].as_str().unwrap().to_string();
+    let v = wait(&app, &id).await;
+    assert_eq!(v["input"]["scheduled"], true, "{v}");
+    assert_eq!(v["result"]["outcome"], "pending-review", "{v}");
+    let (s, m) = send(&app, req("GET", "/$/memory/org/maintenance", Value::Null)).await;
+    assert_eq!(s, StatusCode::OK, "{m}");
+    assert_eq!(m["consolidation"]["lastTask"], id.as_str(), "{m}");
+    assert!(m["consolidation"]["nextRun"].is_string(), "{m}");
+    // not due again within the hour
+    super::maintain::tick(&st);
+    let (_, l2) = send(&app, req("GET", "/$/ingest/org", Value::Null)).await;
+    assert_eq!(
+        l2["tasks"].as_array().unwrap().len(),
+        l["tasks"].as_array().unwrap().len()
+    );
+    // auto merges, and the fact is then reviewed
+    let v = maintain(&app, "/$/memory/org/consolidate", json!({ "mode": "auto" })).await;
+    assert_eq!(v["result"]["outcome"], "merged", "{v}");
+    assert!(ask(&app, &q).await);
+    let v = maintain(&app, "/$/memory/org/consolidate", json!({})).await;
+    assert_eq!(v["result"]["outcome"], "nothing-to-consolidate", "{v}");
+    // refusals
+    let (s, e) = send(
+        &app,
+        req(
+            "POST",
+            "/$/memory/org/consolidate",
+            json!({ "minSources": 1 }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+    let (s, e) = send(
+        &app,
+        req("PUT", "/$/memory/org", json!({ "consolidation": {} })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+}
+
+/// C18 §8.4 (Phase 5): retention deletes session graphs whose newest fact is older than
+/// `after` and whose facts a reviewed graph asserts too; a graph with an unreviewed
+/// fact, a recent one and one outside the session pattern stay.
+#[tokio::test]
+async fn retention_task() {
+    let (st, app) = app(None);
+    memory(&app, json!({})).await;
+    let (s, e) = send(&app, req("POST", "/$/memory/org/retention", json!({}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+    assert_eq!(e["code"], "no-retention", "{e}");
+    let old = |g: &str, s: &str, o: &str| {
+        format!(
+            r#"<{AGENTS}agent-7/{g}> {{
+  <http://example.org/{s}> <{MEMBER_OF}> <http://example.org/{o}> .
+  <urn:r-{g}> <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> <<( <http://example.org/{s}> <{MEMBER_OF}> <http://example.org/{o}> )>> ;
+     <http://www.w3.org/ns/prov#generatedAtTime> "2020-01-01T00:00:00Z"^^<http://www.w3.org/2001/XMLSchema#dateTime> .
+}}
+"#
+        )
+    };
+    // kai's team is curated in the hr graph; ana's in s-open is not
+    let trig = [
+        old("sessions/s-done", "kai", "payments"),
+        old("sessions/s-open", "ana", "acme"),
+        old("notes", "kai", "payments"),
+    ]
+    .concat();
+    st.get("org")
+        .unwrap()
+        .store
+        .load(&[Source::from_bytes(trig.into_bytes(), RdfFormat::TriG, None)])
+        .unwrap();
+    session(
+        &app,
+        "s-new",
+        json!({ "facts": [{ "s": "<http://example.org/kai>", "p": format!("<{MEMBER_OF}>"),
+                             "o": "<http://example.org/payments>" }] }),
+    )
+    .await;
+    let v = maintain(
+        &app,
+        "/$/memory/org/retention",
+        json!({ "after": "365d", "dryRun": true }),
+    )
+    .await;
+    assert_eq!(v["status"], "done", "{v}");
+    let r = &v["result"];
+    assert_eq!(r["outcome"], "dry-run", "{v}");
+    assert_eq!(
+        r["delete"],
+        json!([format!("{AGENTS}agent-7/sessions/s-done")]),
+        "{v}"
+    );
+    let kept = |g: &str| {
+        r["graphs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["graph"].as_str().unwrap().ends_with(g))
+            .unwrap_or_else(|| panic!("{v}"))["kept"]
+            .clone()
+    };
+    assert_eq!(kept("s-open"), "unconsolidated");
+    assert_eq!(kept("s-new"), "recent");
+    assert!(
+        !r["graphs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x["graph"].as_str().unwrap().ends_with("/notes")),
+        "{v}"
+    );
+    let exists = |g: &str| format!("ASK {{ GRAPH <{AGENTS}agent-7/{g}> {{ ?s ?p ?o }} }}");
+    assert!(ask(&app, &exists("sessions/s-done")).await);
+    // the setting applies it on its schedule
+    memory(&app, json!({ "retention": { "after": "365d" } })).await;
+    super::maintain::tick(&st);
+    let (_, l) = send(&app, req("GET", "/$/ingest/org", Value::Null)).await;
+    let task = l["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["input"]["kind"] == "retention" && t["input"]["scheduled"] == true)
+        .unwrap_or_else(|| panic!("{l}"))["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let v = wait(&app, &task).await;
+    assert_eq!(v["result"]["outcome"], "deleted", "{v}");
+    assert_eq!(v["result"]["deleted"].as_array().unwrap().len(), 1, "{v}");
+    assert!(!ask(&app, &exists("sessions/s-done")).await);
+    assert!(ask(&app, &exists("sessions/s-open")).await);
+    assert!(ask(&app, &exists("notes")).await);
+    // bad settings
+    let (s, e) = send(
+        &app,
+        req(
+            "PUT",
+            "/$/memory/org",
+            json!({ "agentGraphs": [format!("{AGENTS}*")], "retention": { "after": "2h" } }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+}

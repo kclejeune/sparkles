@@ -709,6 +709,10 @@ fn entries() -> Vec<(&'static str, Entry)> {
         server_only!("rejectFacts", Mcp),
         server_only!("relinkEntity", Mcp),
         server_only!("editFact", Mcp),
+        // C18 Phase 5: consolidation and retention run as tasks of the server process
+        server_only!("startConsolidation", Process),
+        server_only!("startRetention", Process),
+        server_only!("getMaintenance", Process),
         server_only!("listIngestProfiles", Process),
         server_only!("putIngestSettings", Process),
         server_only!("getIngestProfile", Process),

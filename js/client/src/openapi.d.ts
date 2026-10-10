@@ -1272,6 +1272,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/$/memory/{ds}/consolidate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Consolidate agent memory
+         * @description Starts a consolidation task: the facts that several sources of agent memory assert, and no reviewed graph yet, are asserted once in the consolidated graph on a review branch with reifiers derived from the session reifiers. The result lists duplicate entities and conflicts for a person. Needs `read` on the dataset; the writes run as the caller, and `auto` mode needs `admin`. The task routes of `/$/ingest/{ds}/{task}` read and cancel it.
+         */
+        post: operations["startConsolidation"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/memory/{ds}/edit": {
         parameters: {
             query?: never;
@@ -1304,6 +1324,23 @@ export interface paths {
          * @description Needs `read` on the dataset and covers the caller's view. Unreviewed session facts come with their span, link, guard and corroboration signals.
          */
         get: operations["getMemoryInbox"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/memory/{ds}/maintenance": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read the maintenance schedules */
+        get: operations["getMaintenance"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1366,6 +1403,26 @@ export interface paths {
          * @description On a review branch, every triple and reifier that names `from` names `to` instead, and `from`'s own types and labels are removed, in one commit.
          */
         post: operations["relinkEntity"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/memory/{ds}/retention": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Delete old session graphs
+         * @description Starts a retention task: each session graph whose newest fact is older than `after`, and whose facts a reviewed graph asserts too unless `requireConsolidated` is false, is deleted with its own Graph Store `DELETE`. Needs `admin` on the dataset.
+         */
+        post: operations["startRetention"];
         delete?: never;
         options?: never;
         head?: never;
@@ -4212,6 +4269,22 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        /** @description A consolidation pass. An empty body uses the dataset's settings. */
+        ConsolidateRequest: {
+            /** @description The task's deadline, 1 to 86400 seconds (3600 by default). */
+            deadlineSeconds?: number;
+            /** @description Report the repeated facts, duplicates and conflicts, and write nothing. */
+            dryRun?: boolean;
+            /** @description The commit message of the proposals. */
+            message?: string;
+            /** @description The distinct sources that must assert a fact, 2 to 100 (default: the dataset's, else 2). */
+            minSources?: number;
+            /**
+             * @description `branch` (the default, or the dataset's `consolidation.mode`) leaves the proposals on a review branch. `auto` merges them when every fact passes and needs `admin`.
+             * @enum {string}
+             */
+            mode?: "branch" | "auto";
+        };
         /** @description The SHACL constraints layer of a schema report. */
         ConstraintsLayer: {
             sources: {
@@ -4956,8 +5029,11 @@ export interface components {
             iri?: string;
             /** @description The commit message of the registration. */
             message?: string;
-            /** @enum {string} */
-            mode?: "branch" | "preview" | "auto";
+            /**
+             * @description `memory` extracts a registered `source` of agent memory and writes its facts on main into the source's graph, which `agentGraphs` must match.
+             * @enum {string}
+             */
+            mode?: "branch" | "preview" | "auto" | "memory";
             /** @description The file name, which may say the format. */
             name?: string;
             /** @description The ingest profile (default `default`). */
@@ -5023,12 +5099,17 @@ export interface components {
             iri?: string;
             /** @description The commit message of the registration. */
             message?: string;
-            /** @enum {string} */
-            mode?: "branch" | "preview" | "auto";
+            /**
+             * @description `memory` extracts a registered `source` of agent memory and writes its facts on main into the source's graph, which `agentGraphs` must match.
+             * @enum {string}
+             */
+            mode?: "branch" | "preview" | "auto" | "memory";
             /** @description The file name, which may say the format. */
             name?: string;
             /** @description The ingest profile (default `default`). */
             profile?: string;
+            /** @description The graph IRI of a registered source to extract from instead of a document: its current rendition goes through the estimate, the `extract` role and linking. Leave out text, url and the file. */
+            source?: string;
             /** @description The document's text. */
             text?: string;
             title?: string;
@@ -5057,19 +5138,19 @@ export interface components {
             };
             finishedAt?: string;
             id: string;
-            /** @description What was ingested: its name, format, size, URL and mode. */
+            /** @description What was ingested: its name, format, size, URL or source and mode. A maintenance task has `kind` `consolidation` or `retention`, and `scheduled`. */
             input: {
                 [key: string]: unknown;
             };
             message?: string;
             /** @description From 0 to 1. */
             progress: number;
-            /** @description The outcome (`registered`, `proposed`, `no-facts`, `preview`, `merged`, `approved`, `already-registered` or `mapping-draft`), with the source, rendition, branch, pages, proposals, or a table's mapping draft and preview. */
+            /** @description The outcome (`registered`, `proposed`, `no-facts`, `preview`, `merged`, `approved`, `already-registered` or `mapping-draft`), with the source, rendition, branch, pages, proposals, or a table's mapping draft and preview. A consolidation's outcome is `proposed`, `merged`, `dry-run`, `nothing-to-consolidate`, `no-facts` or `pending-review`, with the branch, the repeated facts, the duplicates and the conflicts. A retention's is `deleted`, `dry-run` or `nothing-to-delete`, with each session graph and why it is kept or deleted. */
             result?: {
                 [key: string]: unknown;
             };
             /** @enum {string} */
-            status: "queued" | "converting" | "registering" | "awaiting-confirmation" | "extracting" | "linking" | "writing" | "awaiting-approval" | "done" | "failed" | "cancelled";
+            status: "queued" | "scanning" | "converting" | "registering" | "awaiting-confirmation" | "extracting" | "linking" | "writing" | "awaiting-approval" | "done" | "failed" | "cancelled";
             updatedAt: string;
             /** @description Model calls, tokens, estimated cost, escalations and the pair that answered each chunk. */
             usage: {
@@ -5139,6 +5220,34 @@ export interface components {
         };
         Logout: {
             redirect: string | null;
+        };
+        /** @description The schedules of consolidation and retention. */
+        MaintenanceStatus: {
+            consolidation: {
+                /** @description When the last scheduled task started. */
+                lastRun?: string;
+                /** @description Its id, readable at `/$/ingest/{ds}/{task}`. */
+                lastTask?: string;
+                /** @description When the next scheduled task starts, or `due`. Absent without a schedule. */
+                nextRun?: string;
+                /** @description The dataset's `consolidation` or `retention` member, or null. */
+                settings: {
+                    [key: string]: unknown;
+                };
+            };
+            dataset: string;
+            retention: {
+                /** @description When the last scheduled task started. */
+                lastRun?: string;
+                /** @description Its id, readable at `/$/ingest/{ds}/{task}`. */
+                lastTask?: string;
+                /** @description When the next scheduled task starts, or `due`. Absent without a schedule. */
+                nextRun?: string;
+                /** @description The dataset's `consolidation` or `retention` member, or null. */
+                settings: {
+                    [key: string]: unknown;
+                };
+            };
         };
         /** @description Everything that waits for a person: unreviewed session facts with their signals, by session, and the open review branches. */
         MemoryInbox: {
@@ -5233,6 +5342,15 @@ export interface components {
             };
             /** @description The graph that promoted facts are written to. */
             consolidatedGraph?: string;
+            /** @description The consolidation pass. Needs `agentGraphs` and `consolidatedGraph`. */
+            consolidation?: {
+                /** @description How often the server runs a pass, such as `1d` (at least `1h`). Without it a pass runs only on request. */
+                every?: string;
+                /** @description The distinct sources that must assert a fact, 2 to 100, 2 by default. */
+                minSources?: number;
+                /** @enum {string} */
+                mode?: "branch" | "auto";
+            };
             /** @description The imports of coding agents' memory files. */
             imports?: {
                 /** @description The prefix of every import graph, an IRI that ends in `/` or `#`. `agentGraphs` must cover it. */
@@ -5248,6 +5366,17 @@ export interface components {
                 }[];
                 /** @description Whether transcripts may be imported (Phase 3m-b). */
                 transcripts?: boolean;
+            };
+            /** @description The retention of session graphs, off without it. */
+            retention?: {
+                /** @description The age of a session graph's newest fact after which the graph is deleted, such as `365d` (at least `1d`). */
+                after: string;
+                /** @description How often the server applies it, `1d` by default. */
+                every?: string;
+                /** @description IRI patterns with `*` of the session graphs. By default, the agent graphs whose IRI holds `/sessions/`. */
+                graphs?: string[];
+                /** @description Delete only graphs whose facts a reviewed graph asserts too (true by default). */
+                requireConsolidated?: boolean;
             };
         };
         /** @description The commit of a reviewer's change. */
@@ -6018,6 +6147,8 @@ export interface components {
             query?: string;
             /** @description Include materialized inferences (default: true when the dataset has them). */
             reasoning?: boolean;
+            /** @description A half-life such as `90d` (units s, m, h, d, w, y). Found seeds rank by the age of their newest fact and by how many graphs assert their facts. */
+            recency?: string;
             seedLimit?: number;
             /** @description Entity IRIs to start from. */
             seeds?: string[];
@@ -6323,6 +6454,19 @@ export interface components {
             replace: boolean;
             /** @description The dataset to create, or to replace. `{ds}` by default. */
             target?: string;
+        };
+        /** @description A retention pass. An empty body applies the dataset's `retention`. */
+        RetentionRequest: {
+            /** @description The age after which a session graph is deleted, such as `365d` (default: the dataset's `retention.after`). */
+            after?: string;
+            /** @description The task's deadline, 1 to 86400 seconds (3600 by default). */
+            deadlineSeconds?: number;
+            /** @description List what would be deleted, and delete nothing. */
+            dryRun?: boolean;
+            /** @description IRI patterns of the session graphs (default: the dataset's). */
+            graphs?: string[];
+            /** @description Delete only graphs whose facts a reviewed graph asserts too (default: the dataset's, else true). */
+            requireConsolidated?: boolean;
         };
         /** @description What a policy's retention deleted and kept. */
         RetentionResult: {
@@ -10615,6 +10759,39 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    startConsolidation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["ConsolidateRequest"];
+            };
+        };
+        responses: {
+            /** @description The task. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IngestTask"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            429: components["responses"]["TooManyRequests"];
+            default: components["responses"]["Error"];
+        };
+    };
     editFact: {
         parameters: {
             query?: never;
@@ -10680,6 +10857,33 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             408: components["responses"]["Timeout"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getMaintenance: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The schedules. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MaintenanceStatus"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
             default: components["responses"]["Error"];
         };
     };
@@ -10782,6 +10986,39 @@ export interface operations {
             404: components["responses"]["NotFound"];
             408: components["responses"]["Timeout"];
             422: components["responses"]["Unprocessable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    startRetention: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["RetentionRequest"];
+            };
+        };
+        responses: {
+            /** @description The task. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IngestTask"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            429: components["responses"]["TooManyRequests"];
             default: components["responses"]["Error"];
         };
     };

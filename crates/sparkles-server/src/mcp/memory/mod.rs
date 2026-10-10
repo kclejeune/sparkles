@@ -20,6 +20,7 @@ mod diagnose;
 pub(crate) mod inbox;
 pub(crate) mod ingest;
 mod link;
+mod maintain;
 pub(crate) mod policy;
 mod recall;
 pub(crate) mod review;
@@ -192,6 +193,14 @@ pub(crate) fn graphs_arg(
             g => iri_arg(g, prefixes, "graphs"),
         })
         .collect()
+}
+
+pub(crate) use crate::assist::duration_days;
+
+/// Days since an `xsd:dateTime` lexical form, or `None` when it does not parse.
+pub(crate) fn age_days(t: &str, now: chrono::DateTime<chrono::Utc>) -> Option<f64> {
+    let at = chrono::DateTime::parse_from_rfc3339(t).ok()?;
+    Some(((now - at.with_timezone(&chrono::Utc)).num_seconds().max(0) as f64) / 86400.0)
 }
 
 /// Whether a term is a vector literal, which no tool shows.

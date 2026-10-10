@@ -9,6 +9,7 @@ pub(super) fn put_all(put: &mut dyn FnMut(&str, J)) {
     memory(put);
     asking(put);
     ingestion(put);
+    maintenance(put);
 }
 
 /// `POST /$/ingest/{ds}` and its tasks (C18 Phase 4).
@@ -21,7 +22,7 @@ fn ingestion(put: &mut dyn FnMut(&str, J)) {
         "iri": with_desc(string(), "The source's IRI."),
         "graph": with_desc(string(), "The named graph of the source and its facts."),
         "profile": with_desc(string(), "The ingest profile (default `default`)."),
-        "mode": string_enum(&["branch", "preview", "auto"]),
+        "mode": with_desc(string_enum(&["branch", "preview", "auto", "memory"]), "`memory` extracts a registered `source` of agent memory and writes its facts on main into the source's graph, which `agentGraphs` must match."),
         "branch": with_desc(string(), "The review branch (default `ingest.<slug>-<n>`)."),
         "allowPartial": with_desc(boolean(), "Register what can be read of a PDF that needs OCR, and record the other pages."),
         "extract": with_desc(boolean(), "Extract facts with the `extract` role (default: when the dataset lets ingestion use a provider)."),
@@ -32,6 +33,10 @@ fn ingestion(put: &mut dyn FnMut(&str, J)) {
     });
     let mut json_body = options.clone();
     json_body["text"] = with_desc(string(), "The document's text.");
+    json_body["source"] = with_desc(
+        string(),
+        "The graph IRI of a registered source to extract from instead of a document: its current rendition goes through the estimate, the `extract` role and linking. Leave out text, url and the file.",
+    );
     put(
         "IngestRequest",
         doc(
@@ -67,16 +72,16 @@ fn ingestion(put: &mut dyn FnMut(&str, J)) {
                 json!({
                     "id": string(),
                     "dataset": string(),
-                    "status": string_enum(&["queued", "converting", "registering", "awaiting-confirmation", "extracting", "linking", "writing", "awaiting-approval", "done", "failed", "cancelled"]),
+                    "status": string_enum(&["queued", "scanning", "converting", "registering", "awaiting-confirmation", "extracting", "linking", "writing", "awaiting-approval", "done", "failed", "cancelled"]),
                     "progress": with_desc(num(), "From 0 to 1."),
                     "message": string(),
                     "createdAt": string(),
                     "updatedAt": string(),
                     "finishedAt": string(),
-                    "input": any_object("What was ingested: its name, format, size, URL and mode."),
+                    "input": any_object("What was ingested: its name, format, size, URL or source and mode. A maintenance task has `kind` `consolidation` or `retention`, and `scheduled`."),
                     "estimate": any_object("The estimate of the extraction: chunks, tokens, the first pair, its estimated cost, the threshold and whether it needs a confirmation."),
                     "usage": any_object("Model calls, tokens, estimated cost, escalations and the pair that answered each chunk."),
-                    "result": any_object("The outcome (`registered`, `proposed`, `no-facts`, `preview`, `merged`, `approved`, `already-registered` or `mapping-draft`), with the source, rendition, branch, pages, proposals, or a table's mapping draft and preview."),
+                    "result": any_object("The outcome (`registered`, `proposed`, `no-facts`, `preview`, `merged`, `approved`, `already-registered` or `mapping-draft`), with the source, rendition, branch, pages, proposals, or a table's mapping draft and preview. A consolidation's outcome is `proposed`, `merged`, `dry-run`, `nothing-to-consolidate`, `no-facts` or `pending-review`, with the branch, the repeated facts, the duplicates and the conflicts. A retention's is `deleted`, `dry-run` or `nothing-to-delete`, with each session graph and why it is kept or deleted."),
                     "error": any_object("The code and message of a failed task, such as `needs-ocr` with the pages that need OCR and their reasons."),
                 }),
             ),
@@ -427,6 +432,7 @@ fn tools(put: &mut dyn FnMut(&str, J)) {
                     "includeSuperseded": boolean(),
                     "statuses": array(string_enum(&["reviewed", "unreviewed", "proposed"])),
                     "unreviewedWeight": num(),
+                    "recency": with_desc(string(), "A half-life such as `90d` (units s, m, h, d, w, y). Found seeds rank by the age of their newest fact and by how many graphs assert their facts."),
                     "format": with_desc(string_enum(&["json"]), "Always `json` here."),
                 })),
             ),
@@ -485,6 +491,64 @@ fn tools(put: &mut dyn FnMut(&str, J)) {
     );
 }
 
+/// The maintenance tasks of agent memory (C18 Phase 5).
+fn maintenance(put: &mut dyn FnMut(&str, J)) {
+    put(
+        "ConsolidateRequest",
+        doc(
+            closed(
+                &[],
+                json!({
+                    "mode": with_desc(string_enum(&["branch", "auto"]), "`branch` (the default, or the dataset's `consolidation.mode`) leaves the proposals on a review branch. `auto` merges them when every fact passes and needs `admin`."),
+                    "minSources": with_desc(int(), "The distinct sources that must assert a fact, 2 to 100 (default: the dataset's, else 2)."),
+                    "dryRun": with_desc(boolean(), "Report the repeated facts, duplicates and conflicts, and write nothing."),
+                    "message": with_desc(string(), "The commit message of the proposals."),
+                    "deadlineSeconds": with_desc(num(), "The task's deadline, 1 to 86400 seconds (3600 by default)."),
+                }),
+            ),
+            "A consolidation pass. An empty body uses the dataset's settings.",
+            "memory-maintenance",
+        ),
+    );
+    put(
+        "RetentionRequest",
+        doc(
+            closed(
+                &[],
+                json!({
+                    "after": with_desc(string(), "The age after which a session graph is deleted, such as `365d` (default: the dataset's `retention.after`)."),
+                    "graphs": with_desc(strings(), "IRI patterns of the session graphs (default: the dataset's)."),
+                    "requireConsolidated": with_desc(boolean(), "Delete only graphs whose facts a reviewed graph asserts too (default: the dataset's, else true)."),
+                    "dryRun": with_desc(boolean(), "List what would be deleted, and delete nothing."),
+                    "deadlineSeconds": with_desc(num(), "The task's deadline, 1 to 86400 seconds (3600 by default)."),
+                }),
+            ),
+            "A retention pass. An empty body applies the dataset's `retention`.",
+            "memory-maintenance",
+        ),
+    );
+    let entry = obj(
+        &["settings"],
+        json!({
+            "settings": any_object("The dataset's `consolidation` or `retention` member, or null."),
+            "lastRun": with_desc(string(), "When the last scheduled task started."),
+            "lastTask": with_desc(string(), "Its id, readable at `/$/ingest/{ds}/{task}`."),
+            "nextRun": with_desc(string(), "When the next scheduled task starts, or `due`. Absent without a schedule."),
+        }),
+    );
+    put(
+        "MaintenanceStatus",
+        doc(
+            obj(
+                &["dataset", "consolidation", "retention"],
+                json!({ "dataset": string(), "consolidation": entry.clone(), "retention": entry }),
+            ),
+            "The schedules of consolidation and retention.",
+            "memory-maintenance",
+        ),
+    );
+}
+
 fn memory(put: &mut dyn FnMut(&str, J)) {
     put(
         "MemorySettings",
@@ -503,6 +567,17 @@ fn memory(put: &mut dyn FnMut(&str, J)) {
                         "transcripts": with_desc(boolean(), "Whether transcripts may be imported (Phase 3m-b)."),
                         "extract": with_desc(string_enum(&["agent", "server", "none"]), "Who extracts facts from imported prose."),
                     })), "The imports of coding agents' memory files."),
+                    "consolidation": with_desc(closed(&[], json!({
+                        "every": with_desc(string(), "How often the server runs a pass, such as `1d` (at least `1h`). Without it a pass runs only on request."),
+                        "mode": string_enum(&["branch", "auto"]),
+                        "minSources": with_desc(int(), "The distinct sources that must assert a fact, 2 to 100, 2 by default."),
+                    })), "The consolidation pass. Needs `agentGraphs` and `consolidatedGraph`."),
+                    "retention": with_desc(closed(&["after"], json!({
+                        "after": with_desc(string(), "The age of a session graph's newest fact after which the graph is deleted, such as `365d` (at least `1d`)."),
+                        "graphs": with_desc(strings(), "IRI patterns with `*` of the session graphs. By default, the agent graphs whose IRI holds `/sessions/`."),
+                        "requireConsolidated": with_desc(boolean(), "Delete only graphs whose facts a reviewed graph asserts too (true by default)."),
+                        "every": with_desc(string(), "How often the server applies it, `1d` by default."),
+                    })), "The retention of session graphs, off without it."),
                 }),
             ),
             "The memory settings of a dataset.",

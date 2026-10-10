@@ -1593,6 +1593,24 @@ fn memory_loc() {
             .iter()
             .all(|r| r["status"] == "unchanged")
     );
+    // `--extract server` starts an extraction of each written source that needs one and,
+    // on a database directory, waits for it; without a provider it fails with no-model
+    f.write_mem(
+        "staging-db.md",
+        "---\nname: staging-db\ndescription: The staging database runs on port 5434\ntype: reference\n---\nThe staging DB is at db.staging:5434.\n",
+    );
+    let (code, j, e) = local(&["sync", "claude-code", "--project", p, "--extract", "server"]);
+    assert_eq!(code, Some(0), "{j:#} {e}");
+    assert_eq!(j["extract"], "server");
+    assert_eq!(report(&j, "staging-db.md")["status"], "edited", "{j:#}");
+    let ex = j["extractions"].as_array().unwrap();
+    assert_eq!(ex.len(), 1, "{j:#}");
+    assert_eq!(
+        ex[0]["graph"],
+        "urn:x-sparkles:import/kc/claude-code/github.com.acme.shop/memory/staging-db"
+    );
+    assert_eq!(ex[0]["status"], "failed", "{j:#}");
+    assert_eq!(ex[0]["error"], "no-model", "{j:#}");
     // a server holds it now
     let port = free_port();
     let mut child = Command::new(BIN)

@@ -4535,6 +4535,40 @@
         ],
         "type": "object"
       },
+      "ConsolidateRequest": {
+        "additionalProperties": false,
+        "description": "A consolidation pass. An empty body uses the dataset's settings.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#memory-maintenance"
+        },
+        "properties": {
+          "deadlineSeconds": {
+            "description": "The task's deadline, 1 to 86400 seconds (3600 by default).",
+            "type": "number"
+          },
+          "dryRun": {
+            "description": "Report the repeated facts, duplicates and conflicts, and write nothing.",
+            "type": "boolean"
+          },
+          "message": {
+            "description": "The commit message of the proposals.",
+            "type": "string"
+          },
+          "minSources": {
+            "description": "The distinct sources that must assert a fact, 2 to 100 (default: the dataset's, else 2).",
+            "type": "integer"
+          },
+          "mode": {
+            "description": "`branch` (the default, or the dataset's `consolidation.mode`) leaves the proposals on a review branch. `auto` merges them when every fact passes and needs `admin`.",
+            "enum": [
+              "branch",
+              "auto"
+            ],
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
       "ConstraintsLayer": {
         "description": "The SHACL constraints layer of a schema report.",
         "externalDocs": {
@@ -7226,10 +7260,12 @@
             "type": "string"
           },
           "mode": {
+            "description": "`memory` extracts a registered `source` of agent memory and writes its facts on main into the source's graph, which `agentGraphs` must match.",
             "enum": [
               "branch",
               "preview",
-              "auto"
+              "auto",
+              "memory"
             ],
             "type": "string"
           },
@@ -7400,10 +7436,12 @@
             "type": "string"
           },
           "mode": {
+            "description": "`memory` extracts a registered `source` of agent memory and writes its facts on main into the source's graph, which `agentGraphs` must match.",
             "enum": [
               "branch",
               "preview",
-              "auto"
+              "auto",
+              "memory"
             ],
             "type": "string"
           },
@@ -7413,6 +7451,10 @@
           },
           "profile": {
             "description": "The ingest profile (default `default`).",
+            "type": "string"
+          },
+          "source": {
+            "description": "The graph IRI of a registered source to extract from instead of a document: its current rendition goes through the estimate, the `extract` role and linking. Leave out text, url and the file.",
             "type": "string"
           },
           "text": {
@@ -7494,7 +7536,7 @@
           },
           "input": {
             "additionalProperties": true,
-            "description": "What was ingested: its name, format, size, URL and mode.",
+            "description": "What was ingested: its name, format, size, URL or source and mode. A maintenance task has `kind` `consolidation` or `retention`, and `scheduled`.",
             "type": "object"
           },
           "message": {
@@ -7506,12 +7548,13 @@
           },
           "result": {
             "additionalProperties": true,
-            "description": "The outcome (`registered`, `proposed`, `no-facts`, `preview`, `merged`, `approved`, `already-registered` or `mapping-draft`), with the source, rendition, branch, pages, proposals, or a table's mapping draft and preview.",
+            "description": "The outcome (`registered`, `proposed`, `no-facts`, `preview`, `merged`, `approved`, `already-registered` or `mapping-draft`), with the source, rendition, branch, pages, proposals, or a table's mapping draft and preview. A consolidation's outcome is `proposed`, `merged`, `dry-run`, `nothing-to-consolidate`, `no-facts` or `pending-review`, with the branch, the repeated facts, the duplicates and the conflicts. A retention's is `deleted`, `dry-run` or `nothing-to-delete`, with each session graph and why it is kept or deleted.",
             "type": "object"
           },
           "status": {
             "enum": [
               "queued",
+              "scanning",
               "converting",
               "registering",
               "awaiting-confirmation",
@@ -7763,6 +7806,73 @@
         },
         "required": [
           "redirect"
+        ],
+        "type": "object"
+      },
+      "MaintenanceStatus": {
+        "description": "The schedules of consolidation and retention.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#memory-maintenance"
+        },
+        "properties": {
+          "consolidation": {
+            "properties": {
+              "lastRun": {
+                "description": "When the last scheduled task started.",
+                "type": "string"
+              },
+              "lastTask": {
+                "description": "Its id, readable at `/$/ingest/{ds}/{task}`.",
+                "type": "string"
+              },
+              "nextRun": {
+                "description": "When the next scheduled task starts, or `due`. Absent without a schedule.",
+                "type": "string"
+              },
+              "settings": {
+                "additionalProperties": true,
+                "description": "The dataset's `consolidation` or `retention` member, or null.",
+                "type": "object"
+              }
+            },
+            "required": [
+              "settings"
+            ],
+            "type": "object"
+          },
+          "dataset": {
+            "type": "string"
+          },
+          "retention": {
+            "properties": {
+              "lastRun": {
+                "description": "When the last scheduled task started.",
+                "type": "string"
+              },
+              "lastTask": {
+                "description": "Its id, readable at `/$/ingest/{ds}/{task}`.",
+                "type": "string"
+              },
+              "nextRun": {
+                "description": "When the next scheduled task starts, or `due`. Absent without a schedule.",
+                "type": "string"
+              },
+              "settings": {
+                "additionalProperties": true,
+                "description": "The dataset's `consolidation` or `retention` member, or null.",
+                "type": "object"
+              }
+            },
+            "required": [
+              "settings"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "dataset",
+          "consolidation",
+          "retention"
         ],
         "type": "object"
       },
@@ -8093,6 +8203,28 @@
             "description": "The graph that promoted facts are written to.",
             "type": "string"
           },
+          "consolidation": {
+            "additionalProperties": false,
+            "description": "The consolidation pass. Needs `agentGraphs` and `consolidatedGraph`.",
+            "properties": {
+              "every": {
+                "description": "How often the server runs a pass, such as `1d` (at least `1h`). Without it a pass runs only on request.",
+                "type": "string"
+              },
+              "minSources": {
+                "description": "The distinct sources that must assert a fact, 2 to 100, 2 by default.",
+                "type": "integer"
+              },
+              "mode": {
+                "enum": [
+                  "branch",
+                  "auto"
+                ],
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
           "imports": {
             "additionalProperties": false,
             "description": "The imports of coding agents' memory files.",
@@ -8136,6 +8268,35 @@
             },
             "required": [
               "base"
+            ],
+            "type": "object"
+          },
+          "retention": {
+            "additionalProperties": false,
+            "description": "The retention of session graphs, off without it.",
+            "properties": {
+              "after": {
+                "description": "The age of a session graph's newest fact after which the graph is deleted, such as `365d` (at least `1d`).",
+                "type": "string"
+              },
+              "every": {
+                "description": "How often the server applies it, `1d` by default.",
+                "type": "string"
+              },
+              "graphs": {
+                "description": "IRI patterns with `*` of the session graphs. By default, the agent graphs whose IRI holds `/sessions/`.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "requireConsolidated": {
+                "description": "Delete only graphs whose facts a reviewed graph asserts too (true by default).",
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "after"
             ],
             "type": "object"
           }
@@ -10750,6 +10911,10 @@
             "description": "Include materialized inferences (default: true when the dataset has them).",
             "type": "boolean"
           },
+          "recency": {
+            "description": "A half-life such as `90d` (units s, m, h, d, w, y). Found seeds rank by the age of their newest fact and by how many graphs assert their facts.",
+            "type": "string"
+          },
           "seedLimit": {
             "type": "integer"
           },
@@ -11767,6 +11932,39 @@
           "target": {
             "description": "The dataset to create, or to replace. `{ds}` by default.",
             "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "RetentionRequest": {
+        "additionalProperties": false,
+        "description": "A retention pass. An empty body applies the dataset's `retention`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#memory-maintenance"
+        },
+        "properties": {
+          "after": {
+            "description": "The age after which a session graph is deleted, such as `365d` (default: the dataset's `retention.after`).",
+            "type": "string"
+          },
+          "deadlineSeconds": {
+            "description": "The task's deadline, 1 to 86400 seconds (3600 by default).",
+            "type": "number"
+          },
+          "dryRun": {
+            "description": "List what would be deleted, and delete nothing.",
+            "type": "boolean"
+          },
+          "graphs": {
+            "description": "IRI patterns of the session graphs (default: the dataset's).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "requireConsolidated": {
+            "description": "Delete only graphs whose facts a reviewed graph asserts too (default: the dataset's, else true).",
+            "type": "boolean"
           }
         },
         "type": "object"
@@ -21660,6 +21858,84 @@
         "x-sparkles-permission": "admin"
       }
     },
+    "/$/memory/{ds}/consolidate": {
+      "post": {
+        "description": "Starts a consolidation task: the facts that several sources of agent memory assert, and no reviewed graph yet, are asserted once in the consolidated graph on a review branch with reifiers derived from the session reifiers. The result lists duplicate entities and conflicts for a person. Needs `read` on the dataset; the writes run as the caller, and `auto` mode needs `admin`. The task routes of `/$/ingest/{ds}/{task}` read and cancel it.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#memory-maintenance"
+        },
+        "operationId": "startConsolidation",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConsolidateRequest"
+              }
+            }
+          },
+          "description": "",
+          "required": false
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IngestTask"
+                }
+              }
+            },
+            "description": "The task."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Consolidate agent memory",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
     "/$/memory/{ds}/edit": {
       "post": {
         "description": "Retracts the fact and asserts it with the new object, with the new reifier derived from the old one.",
@@ -21800,6 +22076,48 @@
           }
         },
         "summary": "List what waits for review",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
+    "/$/memory/{ds}/maintenance": {
+      "get": {
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#memory-maintenance"
+        },
+        "operationId": "getMaintenance",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MaintenanceStatus"
+                }
+              }
+            },
+            "description": "The schedules."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Read the maintenance schedules",
         "tags": [
           "Datasets"
         ],
@@ -22047,6 +22365,84 @@
           "Datasets"
         ],
         "x-sparkles-permission": "read"
+      }
+    },
+    "/$/memory/{ds}/retention": {
+      "post": {
+        "description": "Starts a retention task: each session graph whose newest fact is older than `after`, and whose facts a reviewed graph asserts too unless `requireConsolidated` is false, is deleted with its own Graph Store `DELETE`. Needs `admin` on the dataset.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#memory-maintenance"
+        },
+        "operationId": "startRetention",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RetentionRequest"
+              }
+            }
+          },
+          "description": "",
+          "required": false
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IngestTask"
+                }
+              }
+            },
+            "description": "The task."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Delete old session graphs",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "admin"
       }
     },
     "/$/memory/{ds}/review/{name}": {
