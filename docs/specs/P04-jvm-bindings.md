@@ -1792,3 +1792,48 @@ losses have these causes.
   Sparkles' longer `find` holds that lock longer and reaches 0.6 to 0.7 of TDB2.
 * Small queries at four threads vary by more than the gap between engines on these
   instances, so they are ties at best. NOW() is still computed eagerly for every query.
+
+**Small queries and the query text (2026-10-10).** A further round profiled the small
+queries that stay in Sparkles' engine, with Java Flight Recorder sampling every
+millisecond, on the in-memory store against TDB2 and TIM. One change followed.
+
+* `QueryEngineSparkles` wrote each query's text through Jena's `IndentedLineBuffer`,
+  which appends one character at a time to a synchronized `StringBuffer` that starts at
+  16 characters. That was 8.7% of the `VALUES` query over five subjects. The text now
+  goes through an `IndentedWriter` over a plain `StringBuilder` of 1,024 characters. On
+  a quiet laptop, in A/B/B/A runs of fresh JVMs, the `VALUES` query went from 133 to
+  125 µs and the star lookup from 188 to 181 µs.
+
+The profile of the `VALUES` query splits its time as follows. Jena's own parsing of the
+query text is 54%, or about 70 µs, and every engine pays it, because each operation
+builds a new query. The native call is about 31%, or 40 µs, which is Sparkles' parsing,
+planning and evaluation. The text serialization and the conversion of the solutions
+make up the rest. The query's estimate is 35 `find` calls, above the limit of 32 for
+`SmallQueries`, and the star lookup's estimate is above it too, so both stay in the
+engine.
+
+Two other changes were considered and not made. Handing Jena's algebra to the engine
+instead of the query text would save Sparkles' parsing, about 8 to 10 µs, and the
+serialization, but it needs a translation of the whole algebra into the engine's query
+form. A cache of parsed queries keyed by the text would not hit, because each operation's
+text names other resources. A plan cache that treats constants as parameters, as P01's
+Outcome designs, removes both the parsing and the planning, about 50 of the 62 µs that
+the engine spends on such a query.
+
+`mise run bench:jena` ran once more on an 8-vCPU AMD EPYC instance on Namespace with the
+change, at one thread, with two timing processes per arm. Against TDB2, Sparkles is
+faster on every Model and Graph call, on RDFS, on `ASK` and the small `SELECT`s, on the
+star lookup (231 against 258 µs), on substitution and initial bindings, on small writes
+and on the bulk load. It ties on the friends query, CONSTRUCT, the parameterized query
+and `update-modify`. It is behind on the `VALUES` query (185 against 119 µs), the
+filtered employees (243 against 139 µs), the COUNT (94 against 81 µs), DESCRIBE (59
+against 34 µs) and the two Fuseki cases (1.6 and 2.3 ms against 1.3 and 1.5 ms). TIM is
+faster than both on every case except iterating every triple and the repeated query,
+because it answers from Java maps without crossing JNI. On the laptop, quiet and in
+memory, Sparkles took 127 µs on the `VALUES` query against 111 µs for TDB2 and 83 µs
+for TIM, 185 µs on the star lookup against 341 and 126 µs, and 42 to 44 µs on `ASK` and
+`SELECT ?o` against 40 to 46 µs for the other two.
+
+`update-modify` was measured without changes. It took 4.2 ms on the in-memory store
+against 3.9 ms for TDB2 and 0.07 ms for TIM, down from the 13 to 15 ms of the previous
+round. The time is still in the engine's write path.
