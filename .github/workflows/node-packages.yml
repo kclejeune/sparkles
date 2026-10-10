@@ -1,8 +1,8 @@
 # Build/install checks; publishing additionally requires an explicitly enabled npm environment.
 #
 # Addons are built for Linux on x64 and arm64 (glibc and musl) and for macOS on Apple
-# silicon. The jobs run on Namespace runners with a cache volume per platform, shared with
-# the other workflows and written back only from main.
+# silicon. The jobs run on standard GitHub-hosted runners with Cargo and pnpm
+# dependencies cached in GitHub Actions.
 name: Node packages
 on:
   push:
@@ -31,25 +31,31 @@ jobs:
         exclude:
           - platform: ${{ github.event_name == 'pull_request' && 'linux-arm64' || 'none' }}
           - platform: ${{ github.event_name == 'pull_request' && 'darwin-arm64' || 'none' }}
-    runs-on: ${{ fromJSON(matrix.platform == 'darwin-arm64' && '["nscloud-macos-sequoia-arm64-6x14-with-cache", "nscloud-cache-tag-sparkles-macos-arm64", "nscloud-cache-size-50gb", "nscloud-cache-allow-commit-from-main", "nscloud-git-mirror-5gb"]' || format('["nscloud-ubuntu-24.04-{0}-8x16-with-cache", "nscloud-cache-tag-sparkles-linux-{0}", "nscloud-cache-size-50gb", "nscloud-cache-allow-commit-from-main", "nscloud-git-mirror-5gb"]', matrix.platform == 'linux-arm64' && 'arm64' || 'amd64')) }}
+    runs-on: ${{ matrix.platform == 'darwin-arm64' && 'macos-15' || matrix.platform == 'linux-arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
     steps:
-      - uses: namespacelabs/nscloud-checkout-action@v8
+      - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v4
+        with: {version: '10.34.5'}
       - uses: actions/setup-node@v5
-        with: {node-version: '24', package-manager-cache: false}
+        with:
+          node-version: '24'
+          cache: pnpm
+          cache-dependency-path: js/pnpm-lock.yaml
       - name: Check release tag matches package versions
         if: startsWith(github.ref, 'refs/tags/')
         run: node js/scripts/check-version.mjs "${{ github.ref_name }}"
-      - uses: pnpm/action-setup@v4
-        with: {version: '10.34.5'}
       # installs the toolchain, components and targets that rust-toolchain.toml pins; the
       # cache action below caches Cargo, and no RUSTFLAGS are added, as in local builds
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with: { cache: false, rustflags: "" }
-      - uses: namespacelabs/nscloud-cache-action@v1
+      - uses: Swatinem/rust-cache@v2
         with:
-          cache: |
-            pnpm
-            rust
+          key: ${{ matrix.platform }}-${{ env.NODE_PROFILE }}
+          workspaces: |
+            . -> target
+            crates/sparkles-node -> ../../target
       - run: pnpm --dir js install --frozen-lockfile
       - name: Build native Node-API module
         working-directory: js/engine
@@ -102,23 +108,21 @@ jobs:
       fail-fast: false
       matrix:
         arch: [amd64, arm64]
-    runs-on:
-      - nscloud-ubuntu-24.04-${{ matrix.arch }}-8x16-with-cache
-      - nscloud-cache-tag-sparkles-linux-${{ matrix.arch }}-musl
-      - nscloud-cache-size-50gb
-      - nscloud-cache-allow-commit-from-main
-      - nscloud-git-mirror-5gb
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     steps:
-      - uses: namespacelabs/nscloud-checkout-action@v8
+      - uses: actions/checkout@v5
       # The build runs in an Alpine container with the workspace mounted. Its Rust toolchain,
       # Cargo registry, pnpm store and target directory live in the workspace so that the
-      # cache volume keeps them between runs. The volume is separate from the glibc one
-      # because these artifacts are built for musl.
-      - uses: namespacelabs/nscloud-cache-action@v1
+      # GitHub Actions cache keeps them between runs. The cache is separate from the
+      # glibc one because these artifacts are built for musl.
+      - uses: actions/cache@v4
         with:
           path: |
             target
             .cache/musl
+          key: node-musl-${{ runner.os }}-${{ runner.arch }}-${{ env.NODE_PROFILE }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock', 'crates/sparkles-node/Cargo.lock', 'js/pnpm-lock.yaml', '.github/workflows/node-packages.yml') }}
+          restore-keys: |
+            node-musl-${{ runner.os }}-${{ runner.arch }}-${{ env.NODE_PROFILE }}-${{ hashFiles('rust-toolchain.toml') }}-
       - name: Build and test the addon on Alpine
         run: |
           docker run --rm -e NODE_PROFILE -v "$PWD:/work" -w /work node:24-alpine sh -ec '

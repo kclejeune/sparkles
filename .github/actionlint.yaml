@@ -1,4 +1,0 @@
-# Namespace runner labels (https://namespace.so), which actionlint does not know.
-self-hosted-runner:
-  labels:
-    - nscloud-*

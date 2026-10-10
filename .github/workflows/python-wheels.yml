@@ -7,8 +7,8 @@
 # and publishes nothing.
 #
 # Wheels are built for Linux on x86_64 and arm64 (manylinux and musllinux) and for macOS
-# on Apple silicon. The jobs run on Namespace runners with a cache volume per platform,
-# shared with the other workflows and written back only from main.
+# on Apple silicon. The jobs run on standard GitHub-hosted runners with build
+# dependencies cached in GitHub Actions.
 name: Python wheels
 
 on:
@@ -57,26 +57,24 @@ jobs:
           - libc: ${{ github.event_name == 'pull_request' && 'musllinux' || 'none' }}
     env:
       COMPAT: ${{ matrix.libc == 'manylinux' && '2_28' || 'musllinux_1_2' }}
-    runs-on:
-      - nscloud-ubuntu-24.04-${{ matrix.target == 'aarch64' && 'arm64' || 'amd64' }}-8x16-with-cache
-      - nscloud-cache-tag-sparkles-linux-${{ matrix.target == 'aarch64' && 'arm64' || 'amd64' }}
-      - nscloud-cache-size-50gb
-      - nscloud-cache-allow-commit-from-main
-      - nscloud-git-mirror-5gb
+    runs-on: ${{ matrix.target == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     steps:
-      - uses: namespacelabs/nscloud-checkout-action@v8
+      - uses: actions/checkout@v5
       # maturin builds in a manylinux or musllinux container with the workspace mounted,
       # so the cached target directory carries over between runs.
-      - uses: namespacelabs/nscloud-cache-action@v1
+      - uses: actions/cache@v4
         with:
           path: target
+          key: python-${{ runner.os }}-${{ runner.arch }}-${{ matrix.libc }}-${{ env.PROFILE_ARG }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock', 'crates/sparkles-py/Cargo.lock', '.github/workflows/python-wheels.yml') }}
+          restore-keys: |
+            python-${{ runner.os }}-${{ runner.arch }}-${{ matrix.libc }}-${{ env.PROFILE_ARG }}-${{ hashFiles('rust-toolchain.toml') }}-
       - name: Build the wheel
         uses: PyO3/maturin-action@v1
         with:
           maturin-version: ${{ env.MATURIN_VERSION }}
           target: ${{ matrix.target }}
           manylinux: ${{ env.COMPAT }}
-          args: ${{ env.PROFILE_ARG }} --locked --manifest-path ${{ env.MANIFEST }} --out dist
+          args: ${{ env.PROFILE_ARG }} --locked --manifest-path ${{ env.MANIFEST }} --target-dir target --out dist
       - name: Set up CPython 3.10 and 3.14
         if: matrix.libc == 'manylinux'
         uses: actions/setup-python@v6
@@ -103,24 +101,23 @@ jobs:
     name: macOS arm64
     # tags and manual runs only
     if: github.event_name != 'pull_request'
-    runs-on:
-      - nscloud-macos-sequoia-arm64-6x14-with-cache
-      - nscloud-cache-tag-sparkles-macos-arm64
-      - nscloud-cache-size-50gb
-      - nscloud-cache-allow-commit-from-main
-      - nscloud-git-mirror-5gb
+    runs-on: macos-15
     env:
       # the oldest macOS the wheels support (spec P01, §2.4)
       MACOSX_DEPLOYMENT_TARGET: "11.0"
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
     steps:
-      - uses: namespacelabs/nscloud-checkout-action@v8
+      - uses: actions/checkout@v5
       # installs the toolchain, components and targets that rust-toolchain.toml pins; the
       # cache action below caches Cargo, and no RUSTFLAGS are added, as in local builds
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with: { cache: false, rustflags: "" }
-      - uses: namespacelabs/nscloud-cache-action@v1
+      - uses: Swatinem/rust-cache@v2
         with:
-          cache: rust
+          key: ${{ env.PROFILE_ARG }}
+          workspaces: |
+            . -> target
+            crates/sparkles-py -> ../../target
       - name: Set up CPython 3.10 and 3.14
         uses: actions/setup-python@v6
         with:
@@ -144,21 +141,20 @@ jobs:
   sdist:
     timeout-minutes: 45
     name: Source distribution
-    runs-on:
-      - nscloud-ubuntu-24.04-amd64-8x16-with-cache
-      - nscloud-cache-tag-sparkles-linux-amd64
-      - nscloud-cache-size-50gb
-      - nscloud-cache-allow-commit-from-main
-      - nscloud-git-mirror-5gb
+    runs-on: ubuntu-24.04
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
     steps:
-      - uses: namespacelabs/nscloud-checkout-action@v8
+      - uses: actions/checkout@v5
       # installs the toolchain, components and targets that rust-toolchain.toml pins; the
       # cache action below caches Cargo, and no RUSTFLAGS are added, as in local builds
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with: { cache: false, rustflags: "" }
-      - uses: namespacelabs/nscloud-cache-action@v1
+      - uses: Swatinem/rust-cache@v2
         with:
-          cache: rust
+          workspaces: |
+            . -> target
+            crates/sparkles-py -> ../../target
       - name: Set up CPython 3.14
         uses: actions/setup-python@v6
         with:

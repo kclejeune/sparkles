@@ -1,8 +1,8 @@
 # The JVM bindings: native libraries for Linux on x86_64 and arm64 and for macOS on Apple
 # silicon, the jars with every native library inside, a compatibility matrix, and, for a
 # `jvm-v*` tag with publishing switched on, the release to Maven Central
-# (docs/DEVELOPMENT.md, "Releases"). The jobs run on Namespace runners with a cache volume
-# per platform, shared with the other workflows and written back only from main.
+# (docs/DEVELOPMENT.md, "Releases"). The jobs run on standard GitHub-hosted runners
+# with Cargo and Gradle dependencies cached in GitHub Actions.
 name: JVM bindings
 
 on:
@@ -36,11 +36,11 @@ jobs:
         exclude:
           - platform: ${{ github.event_name == 'pull_request' && 'linux-aarch64' || 'none' }}
           - platform: ${{ github.event_name == 'pull_request' && 'macos-aarch64' || 'none' }}
-    runs-on: ${{ fromJSON(matrix.platform == 'macos-aarch64' && '["nscloud-macos-sequoia-arm64-6x14-with-cache", "nscloud-cache-tag-sparkles-macos-arm64", "nscloud-cache-size-50gb", "nscloud-cache-allow-commit-from-main", "nscloud-git-mirror-5gb"]' || format('["nscloud-ubuntu-24.04-{0}-8x16-with-cache", "nscloud-cache-tag-sparkles-linux-{0}", "nscloud-cache-size-50gb", "nscloud-cache-allow-commit-from-main", "nscloud-git-mirror-5gb"]', matrix.platform == 'linux-aarch64' && 'arm64' || 'amd64')) }}
+    runs-on: ${{ matrix.platform == 'macos-aarch64' && 'macos-15' || matrix.platform == 'linux-aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     env:
       MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
-      - uses: namespacelabs/nscloud-checkout-action@v8
+      - uses: actions/checkout@v5
       # installs the toolchain, components and targets that rust-toolchain.toml pins; the
       # cache action below caches Cargo, and no RUSTFLAGS are added, as in local builds
       - uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -48,12 +48,13 @@ jobs:
       - uses: actions/setup-java@v5
         with: { distribution: temurin, java-version: "17" }
       - uses: gradle/actions/setup-gradle@v4
-        with: { cache-disabled: true }
-      - uses: namespacelabs/nscloud-cache-action@v1
+        with: { cache-read-only: false }
+      - uses: Swatinem/rust-cache@v2
         with:
-          cache: |
-            rust
-            gradle
+          key: ${{ env.JVM_PROFILE }}
+          workspaces: |
+            . -> target
+            crates/sparkles-ffi -> ../../target
       - name: Build native library and generate matching bindings
         shell: bash
         run: |
@@ -85,14 +86,9 @@ jobs:
   jars:
     timeout-minutes: 30
     needs: natives
-    runs-on:
-      - nscloud-ubuntu-24.04-amd64-8x16-with-cache
-      - nscloud-cache-tag-sparkles-linux-amd64
-      - nscloud-cache-size-50gb
-      - nscloud-cache-allow-commit-from-main
-      - nscloud-git-mirror-5gb
+    runs-on: ubuntu-24.04
     steps:
-      - uses: namespacelabs/nscloud-checkout-action@v8
+      - uses: actions/checkout@v5
       # installs the toolchain, components and targets that rust-toolchain.toml pins; the
       # cache action below caches Cargo, and no RUSTFLAGS are added, as in local builds
       - uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -100,12 +96,13 @@ jobs:
       - uses: actions/setup-java@v5
         with: { distribution: temurin, java-version: "17" }
       - uses: gradle/actions/setup-gradle@v4
-        with: { cache-disabled: true }
-      - uses: namespacelabs/nscloud-cache-action@v1
+        with: { cache-read-only: false }
+      - uses: Swatinem/rust-cache@v2
         with:
-          cache: |
-            rust
-            gradle
+          key: ${{ env.JVM_PROFILE }}
+          workspaces: |
+            . -> target
+            crates/sparkles-ffi -> ../../target
       - uses: actions/download-artifact@v4
         with: { pattern: "jvm-native-*", path: target/jvm/natives, merge-multiple: true }
       - name: Generate bindings and assemble all-platform artifacts
@@ -123,12 +120,7 @@ jobs:
   compatibility:
     timeout-minutes: 30
     needs: jars
-    runs-on:
-      - nscloud-ubuntu-24.04-amd64-8x16-with-cache
-      - nscloud-cache-tag-sparkles-linux-amd64
-      - nscloud-cache-size-50gb
-      - nscloud-cache-allow-commit-from-main
-      - nscloud-git-mirror-5gb
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -136,7 +128,7 @@ jobs:
           - { java: "17", jena: "5.6.0" }
           - { java: "21", jena: "6.2.0" }
     steps:
-      - uses: namespacelabs/nscloud-checkout-action@v8
+      - uses: actions/checkout@v5
       # installs the toolchain, components and targets that rust-toolchain.toml pins; the
       # cache action below caches Cargo, and no RUSTFLAGS are added, as in local builds
       - uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -144,12 +136,13 @@ jobs:
       - uses: actions/setup-java@v5
         with: { distribution: temurin, java-version: "${{ matrix.java }}" }
       - uses: gradle/actions/setup-gradle@v4
-        with: { cache-disabled: true }
-      - uses: namespacelabs/nscloud-cache-action@v1
+        with: { cache-read-only: false }
+      - uses: Swatinem/rust-cache@v2
         with:
-          cache: |
-            rust
-            gradle
+          key: ${{ env.JVM_PROFILE }}
+          workspaces: |
+            . -> target
+            crates/sparkles-ffi -> ../../target
       - uses: actions/download-artifact@v4
         with: { name: jvm-native-linux-x86_64, path: target/jvm/natives }
       - run: |
@@ -162,15 +155,10 @@ jobs:
     timeout-minutes: 30
     if: startsWith(github.ref, 'refs/tags/jvm-v') && vars.MAVEN_PUBLISH == 'true'
     needs: [jars, compatibility]
-    runs-on:
-      - nscloud-ubuntu-24.04-amd64-8x16-with-cache
-      - nscloud-cache-tag-sparkles-linux-amd64
-      - nscloud-cache-size-50gb
-      - nscloud-cache-allow-commit-from-main
-      - nscloud-git-mirror-5gb
+    runs-on: ubuntu-24.04
     environment: maven
     steps:
-      - uses: namespacelabs/nscloud-checkout-action@v8
+      - uses: actions/checkout@v5
       # installs the toolchain, components and targets that rust-toolchain.toml pins; the
       # cache action below caches Cargo, and no RUSTFLAGS are added, as in local builds
       - uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -178,12 +166,13 @@ jobs:
       - uses: actions/setup-java@v5
         with: { distribution: temurin, java-version: "17" }
       - uses: gradle/actions/setup-gradle@v4
-        with: { cache-disabled: true }
-      - uses: namespacelabs/nscloud-cache-action@v1
+        with: { cache-read-only: false }
+      - uses: Swatinem/rust-cache@v2
         with:
-          cache: |
-            rust
-            gradle
+          key: ${{ env.JVM_PROFILE }}
+          workspaces: |
+            . -> target
+            crates/sparkles-ffi -> ../../target
       - uses: actions/download-artifact@v4
         with: { pattern: "jvm-native-*", path: target/jvm/natives, merge-multiple: true }
       # Maven Central through the Central Portal's OSSRH Staging API: Gradle deploys the

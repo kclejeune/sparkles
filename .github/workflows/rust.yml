@@ -6,14 +6,12 @@
 # local checkouts of the test files and skip themselves here. `mise run ci` runs the
 # rest (the UI, the bindings, feature combinations and license notices).
 #
-# The jobs run on Namespace runners (docs/DEVELOPMENT.md, "Continuous integration"). The
-# cache volume tagged sparkles-linux-amd64 holds Cargo's registry and target directory
-# and is shared with the binding workflows; only runs on main write it back.
+# The jobs run on standard GitHub-hosted runners and cache Cargo dependencies in the
+# GitHub Actions cache (docs/DEVELOPMENT.md, "Continuous integration").
 name: Rust
 
-# Runners bill per second, so a branch with a pull request runs once (for the pull
-# request), not also for its pushes, and changes that cannot affect the Rust build do not
-# run it at all.
+# A branch with a pull request runs once (for the pull request), not also for its pushes,
+# and changes that cannot affect the Rust build do not run it at all.
 on:
   push:
     branches: [main]
@@ -63,8 +61,8 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
-  # One job per platform, so each platform's cache volume has a single writer. Formatting
-  # is platform independent and runs once; Clippy runs on every platform because cfg-gated
+  # One job per platform. Formatting is platform independent and runs once;
+  # Clippy runs on every platform because cfg-gated
   # code differs between them. After a formatting or Clippy failure the remaining steps
   # still run, so one push reports everything, and a cancelled run stops.
   check:
@@ -74,14 +72,14 @@ jobs:
       fail-fast: false
       matrix:
         platform: ${{ fromJSON(inputs.all-platforms && '["linux-amd64", "linux-arm64", "macos-arm64"]' || '["linux-amd64"]') }}
-    runs-on: ${{ fromJSON(matrix.platform == 'macos-arm64' && '["nscloud-macos-sequoia-arm64-12x28-with-cache", "nscloud-cache-tag-sparkles-macos-arm64", "nscloud-cache-size-50gb", "nscloud-cache-allow-commit-from-main", "nscloud-git-mirror-5gb"]' || format('["nscloud-ubuntu-24.04-{0}-16x32-with-cache", "nscloud-cache-tag-sparkles-{1}", "nscloud-cache-size-50gb", "nscloud-cache-allow-commit-from-main", "nscloud-git-mirror-5gb"]', matrix.platform == 'linux-arm64' && 'arm64' || 'amd64', matrix.platform)) }}
+    runs-on: ${{ matrix.platform == 'macos-arm64' && 'macos-15' || matrix.platform == 'linux-arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     steps:
-      - uses: namespacelabs/nscloud-checkout-action@v8
+      - uses: actions/checkout@v5
       # installs the toolchain, components and targets that rust-toolchain.toml pins; the
       # cache action below caches Cargo, and no RUSTFLAGS are added, as in local builds
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with: { cache: false, rustflags: "" }
-      # Formatting compiles nothing, so it runs before the cache volume is attached.
+      # Formatting compiles nothing, so it runs before the dependency cache is restored.
       - name: cargo fmt
         if: matrix.platform == 'linux-amd64'
         run: |
@@ -90,15 +88,9 @@ jobs:
           cargo fmt --manifest-path crates/sparkles-ffi/Cargo.toml --check
           cargo fmt --manifest-path crates/sparkles-node/Cargo.toml --check
       - if: ${{ !cancelled() }}
-        uses: namespacelabs/nscloud-cache-action@v1
+        uses: Swatinem/rust-cache@v2
         with:
-          cache: rust
-      # Which run saved the restored cache volume, so a log shows whether the cache was
-      # warm. The last step writes the stamp for the next run.
-      - name: Cache origin
-        if: ${{ !cancelled() }}
-        run: |
-          cat target/.ci-cache-stamp 2> /dev/null || echo "no stamp, so the cache is cold"
+          key: ${{ matrix.platform }}
       - name: cargo clippy
         if: ${{ !cancelled() }}
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
@@ -116,8 +108,3 @@ jobs:
       - name: Doctests
         if: ${{ !cancelled() }}
         run: cargo test --locked --workspace --doc
-      - name: Stamp the cache
-        if: always()
-        run: |
-          mkdir -p target
-          echo "run $GITHUB_RUN_ID ($GITHUB_EVENT_NAME on $GITHUB_REF_NAME at ${GITHUB_SHA::8}), saved $(date -u +%FT%TZ)" > target/.ci-cache-stamp
