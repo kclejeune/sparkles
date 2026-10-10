@@ -34,6 +34,7 @@
   import DescribePanel from '$components/DescribePanel.svelte';
   import FullTextPanel from '$components/FullTextPanel.svelte';
   import HistoryPanel from '$components/HistoryPanel.svelte';
+  import IngestPanel from '$components/IngestPanel.svelte';
   import SnapshotsPanel from '$components/SnapshotsPanel.svelte';
   import Icon from '$components/Icon.svelte';
   import ReasoningPanel from '$components/ReasoningPanel.svelte';
@@ -1343,6 +1344,15 @@ ex:PersonShape a sh:NodeShape ;
             </div>
           </div>
         </section>
+
+        <!-- ingest (C18 §7.10) -->
+        {#key name}
+          <IngestPanel
+            ds={name}
+            canWrite={auth.can(name, 'write') && !readOnly}
+            canAdmin={auth.can(name, 'admin')}
+          />
+        {/key}
 
         <!-- reasoning -->
         <ReasoningPanel

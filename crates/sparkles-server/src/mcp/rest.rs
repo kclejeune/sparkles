@@ -10,13 +10,15 @@
 //!
 //! Phase 3m-a adds `POST /{ds}/facts` (`assert_facts`, which may name a `branch` in its
 //! body as the tool does) and `POST /{ds}/memory/brief` (the brief of §8.10.9, a
-//! `Tools` method that MCP does not offer as a tool).
+//! `Tools` method that MCP does not offer as a tool). Phase 3m-b adds `POST /{ds}/sources`
+//! (`register_source`) and `GET /{ds}/sources` (`list_sources`, with its arguments in
+//! the query string).
 
 use super::{Call, McpConfig, McpServer, Outcome};
 use crate::auth::Principal;
 use crate::http::{AdminBody, ApiResult, err_body, err_code};
 use crate::state::AppState;
-use axum::extract::{Path, State};
+use axum::extract::{Path, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -33,6 +35,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/{ds}/sparql/diagnose", post(diagnose))
         .route("/{ds}/facts", post(facts))
         .route("/{ds}/memory/brief", post(brief))
+        .route("/{ds}/sources", post(register).get(sources))
 }
 
 /// How a route runs its tool.
@@ -90,6 +93,82 @@ async fn facts(
     run("assert_facts", st, ds, p, headers, body, None, Mode::Write).await
 }
 
+async fn register(
+    st: State<Arc<AppState>>,
+    ds: Path<String>,
+    p: Extension<Principal>,
+    headers: HeaderMap,
+    body: AdminBody,
+) -> ApiResult<Response> {
+    run(
+        "register_source",
+        st,
+        ds,
+        p,
+        headers,
+        body,
+        None,
+        Mode::Write,
+    )
+    .await
+}
+
+/// `GET /{ds}/sources?graph=…&graphPrefix=…&needsExtraction=true&limit=N`: the query
+/// string as `list_sources`' arguments.
+async fn sources(
+    st: State<Arc<AppState>>,
+    ds: Path<String>,
+    p: Extension<Principal>,
+    headers: HeaderMap,
+    RawQuery(q): RawQuery,
+) -> ApiResult<Response> {
+    let mut args = Map::new();
+    let mut graphs: Vec<Value> = Vec::new();
+    for (k, v) in form_urlencoded::parse(q.unwrap_or_default().as_bytes()) {
+        let bad = |what: &str| {
+            err_code(
+                StatusCode::BAD_REQUEST,
+                "bad-argument",
+                format!("{k}: {what}"),
+            )
+        };
+        match k.as_ref() {
+            "graph" => graphs.push(v.into_owned().into()),
+            "graphPrefix" => {
+                args.insert("graphPrefix".into(), v.into_owned().into());
+            }
+            "needsExtraction" => {
+                let b = match v.as_ref() {
+                    "true" | "1" => true,
+                    "false" | "0" => false,
+                    _ => return Err(bad("true or false")),
+                };
+                args.insert("needsExtraction".into(), b.into());
+            }
+            "limit" | "atCommit" => {
+                let n: u64 = v.parse().map_err(|_| bad("a whole number"))?;
+                args.insert(k.clone().into_owned(), n.into());
+            }
+            _ => return Err(bad("unknown parameter")),
+        }
+    }
+    if !graphs.is_empty() {
+        args.insert("graphs".into(), graphs.into());
+    }
+    let body = serde_json::to_vec(&Value::Object(args)).unwrap_or_default();
+    run(
+        "list_sources",
+        st,
+        ds,
+        p,
+        headers,
+        AdminBody(body.into()),
+        None,
+        Mode::Read,
+    )
+    .await
+}
+
 async fn brief(
     st: State<Arc<AppState>>,
     ds: Path<String>,
@@ -143,6 +222,15 @@ async fn diagnose(
 /// The JSON body of a tool error.
 pub(crate) fn tool_error(e: &super::errors::ToolError) -> crate::http::ApiError {
     let mut b = json!({ "error": e.message, "code": e.code });
+    // the details, such as the failed checks of `assert_facts` or the pattern and offset
+    // of `secret-detected`, beside the message
+    if let Some(Value::Object(d)) = &e.data {
+        for (k, v) in d {
+            if k != "error" && k != "code" {
+                b[k] = v.clone();
+            }
+        }
+    }
     if let Some(h) = &e.hint {
         b["hint"] = h.clone().into();
     }

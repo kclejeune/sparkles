@@ -104,6 +104,14 @@ impl Ctx {
     pub fn project_iri(&self, project_key: &str) -> String {
         self.mint(&format!("mem\0project\0{project_key}"))
     }
+
+    /// A session's IRI: from the principal, the harness and the session's id.
+    pub fn session_iri(&self, harness: &str, id: &str) -> String {
+        self.mint(&format!(
+            "mem\0session\0{}\0{harness}\0{id}",
+            self.principal
+        ))
+    }
 }
 
 #[cfg(test)]

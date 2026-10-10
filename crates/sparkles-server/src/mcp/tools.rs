@@ -109,6 +109,8 @@ fn dispatch(t: &Tools, name: &str, args: Map<String, Value>) -> Result<Outcome, 
         "sparql_update" => t.sparql_update(args),
         "assert_facts" => t.assert_facts(args),
         "register_source" => t.register_source(args),
+        // `POST /$/ingest/{ds}`, never offered as a tool
+        "register_converted" => t.register_converted(args),
         "read_chunks" => t.read_chunks(args),
         "list_sources" => t.list_sources(args),
         "ingest_profile" => t.ingest_profile(args),

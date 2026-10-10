@@ -117,6 +117,27 @@ pub fn redact(text: &str, patterns: &[Pattern]) -> Redacted {
     Redacted { text: out, names }
 }
 
+/// The first place where `patterns` match `text`, as the pattern's name and the byte
+/// offset of the match, with the rules of [`redact`]: the earliest match wins, and at
+/// one place the earlier pattern. A redaction marker never matches. The server runs this
+/// as its `secret-detected` check.
+pub fn first_match(text: &str, patterns: &[Pattern]) -> Option<(String, usize)> {
+    let mut best: Option<(usize, usize)> = None;
+    for (pi, p) in patterns.iter().enumerate() {
+        for c in p.regex.captures_iter(text) {
+            let m = c.name("v").or_else(|| c.get(0)).expect("group 0");
+            if m.start() == m.end() || text[m.start()..].starts_with("[redacted:") {
+                continue;
+            }
+            if best.is_none_or(|b| (m.start(), pi) < b) {
+                best = Some((m.start(), pi));
+            }
+            break;
+        }
+    }
+    best.map(|(at, pi)| (patterns[pi].name.clone(), at))
+}
+
 /// Patterns from a file: one `name<TAB or space>regex` per line; `#` starts a comment
 /// line.
 pub fn parse_pattern_file(text: &str) -> Result<Vec<Pattern>, String> {
@@ -183,6 +204,12 @@ mod tests {
         let r = redact("use acme_dk_ABCDEFGH now", &p);
         assert_eq!(r.text, "use [redacted:acme-deploy-key] now");
         assert!(parse_pattern_file("bad! x").is_err());
+        // the server's check finds the first match and never a marker
+        let gh = format!("ok\nuse ghp_{} now", "b".repeat(36));
+        assert_eq!(first_match(&gh, &p), Some(("github-token".into(), 7)));
+        let r = redact(&gh, &p);
+        assert_eq!(first_match(&r.text, &p), None);
+        assert_eq!(first_match("nothing here", &p), None);
         assert!(parse_pattern_file("x (").is_err());
     }
 }

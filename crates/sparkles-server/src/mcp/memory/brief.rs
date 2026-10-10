@@ -12,6 +12,10 @@
 //! score = base × 0.5 ^ (age / halfLife) × (1 + log2(sources)) × (unreviewed ? unreviewedWeight : 1)
 //! ```
 //!
+//! A graph whose source is `mem:copyOf` another graph that asserts the same fact, such
+//! as a file that `sparkles memory export --sources` converted, does not count as a
+//! second source.
+//!
 //! The text follows the format of `recall` (C11 §4.10): every term is one escaped line
 //! and structural lines begin with `#`, `##` or `[`, which no rendered term can, so a
 //! memory's text cannot forge a header, a citation or a status. The first line says the
@@ -285,6 +289,7 @@ impl Tools<'_> {
                 .collect()
         };
         let sources = self.graph_sources(&r, &graph_list).map_err(eng)?;
+        let copies = self.graph_copies(&r, &graph_list).map_err(eng)?;
         let reviewed = self.reviewed_triples(&r, &cands, &memory).map_err(eng)?;
         let agent = |g: &str| graph_iris.get(g).is_some_and(|i| memory.is_agent_graph(i));
         // merge the graphs of each fact
@@ -357,12 +362,27 @@ impl Tools<'_> {
         }
         // the statuses kept, and the score
         merged.retain(|m| m.reviewed || include_unreviewed);
+        let iri_of = |ci: usize| graph_iris.get(&cites[ci].graph).map(String::as_str);
         for m in &mut merged {
             let age =
                 m.at.as_deref()
                     .and_then(|t| age_days(t, now))
                     .unwrap_or(0.0);
-            m.score *= 0.5f64.powf(age / half_life) * (1.0 + (m.graphs.len() as f64).log2());
+            // a copy of another graph of the fact does not corroborate it
+            let n = m
+                .graphs
+                .iter()
+                .filter(|&&ci| {
+                    let origs = iri_of(ci).and_then(|g| copies.get(g));
+                    !origs.is_some_and(|o| {
+                        m.graphs
+                            .iter()
+                            .any(|&cj| cj != ci && iri_of(cj).is_some_and(|g| o.contains(g)))
+                    })
+                })
+                .count()
+                .max(1);
+            m.score *= 0.5f64.powf(age / half_life) * (1.0 + (n as f64).log2());
             if !m.reviewed {
                 m.score *= weight;
             }
@@ -759,6 +779,29 @@ impl Tools<'_> {
                         _ => None,
                     });
                     out.insert(g.as_str().to_string(), (lexical(path), h));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The graphs each graph's source is a copy of (`mem:copyOf`).
+    fn graph_copies(
+        &self,
+        r: &Reader,
+        graphs: &[NamedNode],
+    ) -> Result<HashMap<String, HashSet<String>>, Error> {
+        let mut out: HashMap<String, HashSet<String>> = HashMap::new();
+        for chunk in graphs.chunks(200) {
+            let q = format!(
+                "SELECT ?g ?o WHERE {{ {} GRAPH ?g {{ ?g <{MEM}copyOf> ?o }} }}",
+                values_iris("g", chunk)
+            );
+            for row in r.rows(&q, Vec::new())? {
+                if let [Some(Term::NamedNode(g)), Some(Term::NamedNode(o))] = row.as_slice() {
+                    out.entry(g.as_str().to_string())
+                        .or_default()
+                        .insert(o.as_str().to_string());
                 }
             }
         }

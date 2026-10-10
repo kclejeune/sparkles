@@ -441,6 +441,10 @@ impl Scanner<'_> {
             .file_name()
             .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
         let body = read.bytes.get(body_offset..).unwrap_or(&[]);
+        let mut facts = facts;
+        for (iri, line) in crate::copies_of(&read.text) {
+            facts.push(fact(&graph, &mem("copyOf"), Obj::Iri(iri), Some(&line)));
+        }
         self.out.files.push(FileImport {
             adapter,
             harness,
@@ -456,6 +460,7 @@ impl Scanner<'_> {
             title,
             redactions: read.redactions,
             facts,
+            text: read.text,
         });
     }
 

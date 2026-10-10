@@ -286,25 +286,39 @@ impl Tools<'_> {
                     .take(10)
                     .filter(char::is_ascii_digit)
                     .collect();
-                let base = format!("review.{}.{date}", slug(&who));
                 let taken: Vec<String> = ds
                     .store
                     .branches()
                     .map(|l| l.into_iter().map(|b| b.name).collect())
                     .unwrap_or_default();
-                let name = (1..)
-                    .map(|n| format!("{base}-{n}"))
-                    .find(|n| !taken.contains(n))
-                    .expect("a free name");
-                let mut c = Map::new();
-                c.insert("dataset".into(), ds.name.clone().into());
-                c.insert("name".into(), name.clone().into());
-                c.insert(
-                    "note".into(),
-                    format!("Facts promoted by {who} into {target}").into(),
-                );
-                self.create_branch(c)?;
-                name
+                let free = |base: String| {
+                    (1..)
+                        .map(|n| format!("{base}-{n}"))
+                        .find(|n| !taken.contains(n))
+                        .expect("a free name")
+                };
+                let create = |name: &str| {
+                    let mut c = Map::new();
+                    c.insert("dataset".into(), ds.name.clone().into());
+                    c.insert("name".into(), name.into());
+                    c.insert(
+                        "note".into(),
+                        format!("Facts promoted by {who} into {target}").into(),
+                    );
+                    self.create_branch(c)
+                };
+                let name = free(format!("review.{}.{date}", slug(&who)));
+                match create(&name) {
+                    Ok(_) => name,
+                    // an agent under the template of §8.6 creates only its proposal
+                    // branches, so its promotion goes to one of those
+                    Err(e) if e.code == "forbidden" => {
+                        let name = free(format!("proposals.{}.review-{date}", slug(&who)));
+                        create(&name)?;
+                        name
+                    }
+                    Err(e) => return Err(e),
+                }
             }
         };
         let message = a

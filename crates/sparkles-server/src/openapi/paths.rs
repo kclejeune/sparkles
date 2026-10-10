@@ -2115,6 +2115,26 @@ fn assist(p: &mut Paths) {
             .errors(&[400, 403, 404, 408, 409, 422]),
     );
     p.add(
+        op(POST, "/{ds}/sources", "registerSource", "SPARQL", "Register a source document")
+            .doc("The MCP tool `register_source` as the caller. Needs `write` on the graph and counts as an update. With `original` the file's bytes are kept beside the normalized text, `reanchor` moves the facts that cite the previous rendition to the new text, and `reanchorFrom` copies the facts of a renamed file's source. In a graph under the dataset's import base, a text that matches a secret pattern is refused with 422 `secret-detected`, the pattern's name and the offset. `sparkles memory import` calls it.")
+            .see("importing-agent-memory")
+            .json_body(true, "RegisterSourceRequest")
+            .json("200", "The source and its rendition.", "RegisterSourceResult")
+            .errors(&[400, 403, 404, 408, 409, 422]),
+    );
+    p.add(
+        op(GET, "/{ds}/sources", "listSources", "SPARQL", "List registered sources")
+            .doc("The MCP tool `list_sources` as the caller: the sources in the graphs the caller can read, with their current rendition, chunk and fact counts, and whether the rendition still needs extraction. Needs `read` and counts as a query.")
+            .see("importing-agent-memory")
+            .query("graph", s(), "Only sources in this graph; repeat for several, up to 20.")
+            .query("graphPrefix", s(), "Only sources in graphs whose IRI starts with this.")
+            .query("needsExtraction", boolean(), "Only sources whose current rendition no extraction has cited.")
+            .query("limit", json!({ "type": "integer", "minimum": 1, "maximum": 500, "default": 50 }), "The most sources listed.")
+            .query("atCommit", int(), "Read at this commit.")
+            .json("200", "The sources.", "SourceList")
+            .errors(&[400, 403, 404, 408]),
+    );
+    p.add(
         op(POST, "/{ds}/memory/brief", "memoryBrief", "SPARQL", "Brief what the graph knows")
             .doc("The brief of C18 §8.10.9 for a project's import graphs, an entity or a recall query: reviewed facts by default, ranked by age and corroboration, bounded in facts and characters, with a citation per source.")
             .see("importing-agent-memory")
@@ -2249,13 +2269,104 @@ fn assist(p: &mut Paths) {
             "/$/ingest/{ds}/settings",
             "putIngestSettings",
             "Datasets",
-            "Set whether sources keep their text",
+            "Set the ingest settings",
         )
         .doc("Needs `admin` on the dataset.")
         .see("ingest-profiles")
         .json_body(true, "IngestSettingsRequest")
         .json("200", "The stored setting.", "IngestSettingsRequest")
         .errors(&[400]),
+    );
+    p.add(
+        op(
+            POST,
+            "/$/ingest/{ds}",
+            "startIngest",
+            "Datasets",
+            "Ingest a document",
+        )
+        .doc("Starts an ingestion task: converts the document, registers it as a source on a review branch, and extracts its facts with the `extract` role into proposals there. A CSV or TSV file gets a C05 mapping draft instead, and nothing is written. Needs `read` on the dataset; every write runs as the caller, so it needs what `register_source` and `assert_facts` need. A PDF that needs OCR on a server without it fails with `needs-ocr` and its pages.")
+        .see("ingestion")
+        .body(
+            true,
+            "The document: a multipart upload, or JSON with text or a URL.",
+            json!({
+                "multipart/form-data": { "schema": sref("IngestForm") },
+                "application/json": { "schema": sref("IngestRequest") },
+            }),
+        )
+        .json("202", "The task.", "IngestTask")
+        .errors(&[400, 403, 404, 413, 415, 429]),
+    );
+    p.add(
+        op(
+            GET,
+            "/$/ingest/{ds}",
+            "listIngestTasks",
+            "Datasets",
+            "List ingestion tasks",
+        )
+        .doc("The caller's tasks, or every task for an admin of the dataset, without their usage. Finished tasks are kept for 7 days.")
+        .see("ingestion")
+        .json("200", "The tasks.", "IngestTaskList"),
+    );
+    p.add(
+        op(
+            GET,
+            "/$/ingest/{ds}/{task}",
+            "getIngestTask",
+            "Datasets",
+            "Read an ingestion task",
+        )
+        .doc("Visible to the principal that started it and to admins of the dataset.")
+        .see("ingestion")
+        .query(
+            "wait",
+            json!({"type": "number"}),
+            "Hold the answer until the task ends or waits for the caller, at most 60 seconds.",
+        )
+        .json("200", "The task.", "IngestTask")
+        .errors(&[404]),
+    );
+    p.add(
+        op(
+            DELETE,
+            "/$/ingest/{ds}/{task}",
+            "cancelIngestTask",
+            "Datasets",
+            "Cancel or forget an ingestion task",
+        )
+        .doc("Cancels a running task (`202`), or forgets one that has ended (`204`). A cancelled task removes nothing it already wrote on its review branch.")
+        .see("ingestion")
+        .json("202", "The task, cancelling.", "IngestTask")
+        .no_content("Forgotten.")
+        .errors(&[404]),
+    );
+    p.add(
+        op(
+            POST,
+            "/$/ingest/{ds}/{task}/confirm",
+            "confirmIngestTask",
+            "Datasets",
+            "Confirm an ingestion's estimate",
+        )
+        .doc("A task whose estimate is above the dataset's `confirmTokens` waits in `awaiting-confirmation` for this call.")
+        .see("ingestion")
+        .json("200", "The task.", "IngestTask")
+        .errors(&[404, 409]),
+    );
+    p.add(
+        op(
+            POST,
+            "/$/ingest/{ds}/{task}/approve",
+            "approveIngestTask",
+            "Datasets",
+            "Approve a preview",
+        )
+        .doc("Writes a preview's source and facts to `main` as the caller. Fails with `409` when `main` changed since the preview.")
+        .see("ingestion")
+        .json("200", "The task.", "IngestTask")
+        .errors(&[403, 404, 409, 422]),
     );
     p.add(
         op(

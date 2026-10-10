@@ -452,7 +452,7 @@ pub(crate) fn overlay_counts(snap: &Snapshot, p: Option<u64>) -> (u64, u64) {
     let lo = [p, 0, 0, 0];
     let hi = [p, u64::MAX, u64::MAX, u64::MAX];
     (
-        snap.delta.ins[pi].range(lo..=hi).count() as u64,
-        snap.delta.del[pi].range(lo..=hi).count() as u64,
+        snap.delta.ins[pi].count_between(&lo, &hi) as u64,
+        snap.delta.del[pi].count_between(&lo, &hi) as u64,
     )
 }

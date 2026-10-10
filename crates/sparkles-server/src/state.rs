@@ -309,6 +309,9 @@ pub struct AppState {
     pub models: Option<Arc<crate::models::Models>>,
     /// recent asks, usage counts and daily token counts (spec C18 §5.5)
     pub asks: crate::assistant::Runtime,
+    /// ingestion tasks and the PDF workers (spec C18 Phase 4)
+    #[cfg(feature = "mcp")]
+    pub ingest: crate::ingest::Runtime,
 }
 
 /// Who may use `POST /$/format` (`serve --format-endpoint`).
@@ -528,6 +531,8 @@ impl AppState {
             volatile: Default::default(),
             models: None,
             asks: Default::default(),
+            #[cfg(feature = "mcp")]
+            ingest: Default::default(),
         };
         Ok(state)
     }
@@ -574,6 +579,8 @@ impl AppState {
             volatile: Default::default(),
             models: None,
             asks: Default::default(),
+            #[cfg(feature = "mcp")]
+            ingest: Default::default(),
             rate_limit: None,
             auth: None,
             cors_origins: Vec::new(),

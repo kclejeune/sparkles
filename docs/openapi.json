@@ -348,6 +348,15 @@
           "type": "integer"
         }
       },
+      "task": {
+        "description": "The id of the ingestion task.",
+        "in": "path",
+        "name": "task",
+        "required": true,
+        "schema": {
+          "type": "string"
+        }
+      },
       "timeout": {
         "description": "Seconds. Capped at the server's `--max-timeout`.",
         "in": "query",
@@ -3081,6 +3090,36 @@
                 },
                 "length": {
                   "type": "integer"
+                },
+                "ocrPages": {
+                  "items": {
+                    "type": "integer"
+                  },
+                  "type": "array"
+                },
+                "omittedPages": {
+                  "items": {
+                    "type": "integer"
+                  },
+                  "type": "array"
+                },
+                "pages": {
+                  "items": {
+                    "properties": {
+                      "page": {
+                        "type": "integer"
+                      },
+                      "start": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "page",
+                      "start"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
                 },
                 "rendition": {
                   "type": "string"
@@ -7517,6 +7556,86 @@
         ],
         "type": "object"
       },
+      "IngestForm": {
+        "additionalProperties": false,
+        "description": "An ingestion of an uploaded file, with the options of `IngestRequest` as fields.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ingestion"
+        },
+        "properties": {
+          "allowPartial": {
+            "description": "Register what can be read of a PDF that needs OCR, and record the other pages.",
+            "type": "boolean"
+          },
+          "base": {
+            "description": "The namespace of a table's rows in its mapping draft.",
+            "type": "string"
+          },
+          "branch": {
+            "description": "The review branch (default `ingest.<slug>-<n>`).",
+            "type": "string"
+          },
+          "confirm": {
+            "description": "Confirm the estimate in advance.",
+            "type": "boolean"
+          },
+          "deadlineSeconds": {
+            "description": "The task's deadline, 1 to 86400 seconds (3600 by default).",
+            "type": "number"
+          },
+          "extract": {
+            "description": "Extract facts with the `extract` role (default: when the dataset lets ingestion use a provider).",
+            "type": "boolean"
+          },
+          "file": {
+            "contentMediaType": "application/octet-stream",
+            "type": "string"
+          },
+          "format": {
+            "description": "The media type of `text` or of the file, such as `text/html` or `application/pdf`.",
+            "type": "string"
+          },
+          "graph": {
+            "description": "The named graph of the source and its facts.",
+            "type": "string"
+          },
+          "iri": {
+            "description": "The source's IRI.",
+            "type": "string"
+          },
+          "message": {
+            "description": "The commit message of the registration.",
+            "type": "string"
+          },
+          "mode": {
+            "enum": [
+              "branch",
+              "preview",
+              "auto"
+            ],
+            "type": "string"
+          },
+          "name": {
+            "description": "The file name, which may say the format.",
+            "type": "string"
+          },
+          "profile": {
+            "description": "The ingest profile (default `default`).",
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "url": {
+            "description": "Where the document comes from; fetched through the outbound policy when there is no text or file, and the source's IRI by default.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "file"
+        ],
+        "type": "object"
+      },
       "IngestProfile": {
         "additionalProperties": false,
         "description": "An ingest profile.",
@@ -7615,19 +7734,235 @@
         ],
         "type": "object"
       },
+      "IngestRequest": {
+        "additionalProperties": false,
+        "description": "An ingestion from text or a URL. A multipart request sends the document as its `file` part and these options as fields.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ingestion"
+        },
+        "properties": {
+          "allowPartial": {
+            "description": "Register what can be read of a PDF that needs OCR, and record the other pages.",
+            "type": "boolean"
+          },
+          "base": {
+            "description": "The namespace of a table's rows in its mapping draft.",
+            "type": "string"
+          },
+          "branch": {
+            "description": "The review branch (default `ingest.<slug>-<n>`).",
+            "type": "string"
+          },
+          "confirm": {
+            "description": "Confirm the estimate in advance.",
+            "type": "boolean"
+          },
+          "deadlineSeconds": {
+            "description": "The task's deadline, 1 to 86400 seconds (3600 by default).",
+            "type": "number"
+          },
+          "extract": {
+            "description": "Extract facts with the `extract` role (default: when the dataset lets ingestion use a provider).",
+            "type": "boolean"
+          },
+          "format": {
+            "description": "The media type of `text` or of the file, such as `text/html` or `application/pdf`.",
+            "type": "string"
+          },
+          "graph": {
+            "description": "The named graph of the source and its facts.",
+            "type": "string"
+          },
+          "iri": {
+            "description": "The source's IRI.",
+            "type": "string"
+          },
+          "message": {
+            "description": "The commit message of the registration.",
+            "type": "string"
+          },
+          "mode": {
+            "enum": [
+              "branch",
+              "preview",
+              "auto"
+            ],
+            "type": "string"
+          },
+          "name": {
+            "description": "The file name, which may say the format.",
+            "type": "string"
+          },
+          "profile": {
+            "description": "The ingest profile (default `default`).",
+            "type": "string"
+          },
+          "text": {
+            "description": "The document's text.",
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "url": {
+            "description": "Where the document comes from; fetched through the outbound policy when there is no text or file, and the source's IRI by default.",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
       "IngestSettingsRequest": {
         "additionalProperties": false,
-        "description": "Whether sources keep their text.",
+        "description": "Whether sources keep their text, and the thresholds of ingestion. Members left out keep their value, and `null` restores a default.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ingest-profiles"
         },
         "properties": {
+          "autoConfidence": {
+            "description": "The confidence that `auto` mode needs of every fact (0.8 by default).",
+            "oneOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "confirmTokens": {
+            "description": "The estimate in tokens above which an ingestion waits for a confirmation (200000 by default).",
+            "oneOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "keepText": {
             "type": "boolean"
           }
         },
+        "type": "object"
+      },
+      "IngestTask": {
+        "description": "An ingestion task with its progress, estimate, usage and result.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ingestion"
+        },
+        "properties": {
+          "createdAt": {
+            "type": "string"
+          },
+          "dataset": {
+            "type": "string"
+          },
+          "error": {
+            "additionalProperties": true,
+            "description": "The code and message of a failed task, such as `needs-ocr` with the pages that need OCR and their reasons.",
+            "type": "object"
+          },
+          "estimate": {
+            "additionalProperties": true,
+            "description": "The estimate of the extraction: chunks, tokens, the first pair, its estimated cost, the threshold and whether it needs a confirmation.",
+            "type": "object"
+          },
+          "finishedAt": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "input": {
+            "additionalProperties": true,
+            "description": "What was ingested: its name, format, size, URL and mode.",
+            "type": "object"
+          },
+          "message": {
+            "type": "string"
+          },
+          "progress": {
+            "description": "From 0 to 1.",
+            "type": "number"
+          },
+          "result": {
+            "additionalProperties": true,
+            "description": "The outcome (`registered`, `proposed`, `no-facts`, `preview`, `merged`, `approved`, `already-registered` or `mapping-draft`), with the source, rendition, branch, pages, proposals, or a table's mapping draft and preview.",
+            "type": "object"
+          },
+          "status": {
+            "enum": [
+              "queued",
+              "converting",
+              "registering",
+              "awaiting-confirmation",
+              "extracting",
+              "linking",
+              "writing",
+              "awaiting-approval",
+              "done",
+              "failed",
+              "cancelled"
+            ],
+            "type": "string"
+          },
+          "updatedAt": {
+            "type": "string"
+          },
+          "usage": {
+            "additionalProperties": true,
+            "description": "Model calls, tokens, estimated cost, escalations and the pair that answered each chunk.",
+            "type": "object"
+          }
+        },
         "required": [
-          "keepText"
+          "id",
+          "dataset",
+          "status",
+          "progress",
+          "createdAt",
+          "updatedAt",
+          "input",
+          "usage"
+        ],
+        "type": "object"
+      },
+      "IngestTaskList": {
+        "description": "The caller's ingestion tasks, newest first, and whether this server converts PDFs and reads scanned pages.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ingestion"
+        },
+        "properties": {
+          "capabilities": {
+            "properties": {
+              "ocr": {
+                "type": "boolean"
+              },
+              "pdf": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "pdf",
+              "ocr"
+            ],
+            "type": "object"
+          },
+          "dataset": {
+            "type": "string"
+          },
+          "tasks": {
+            "items": {
+              "$ref": "#/components/schemas/IngestTask"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "dataset",
+          "tasks",
+          "capabilities"
         ],
         "type": "object"
       },
@@ -11111,6 +11446,176 @@
         ],
         "type": "object"
       },
+      "RegisterSourceRequest": {
+        "additionalProperties": false,
+        "description": "The arguments of `register_source` without `dataset`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#importing-agent-memory"
+        },
+        "properties": {
+          "dryRun": {
+            "type": "boolean"
+          },
+          "format": {
+            "description": "The media type of the original document (default `text/plain`).",
+            "type": "string"
+          },
+          "graph": {
+            "description": "The named graph of the source and its facts (default: the source's IRI).",
+            "type": "string"
+          },
+          "iri": {
+            "description": "The source's IRI (default: a `urn:uuid` minted from the text).",
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "original": {
+            "description": "The file's bytes in base64 when the text is their normalized form. They are kept so an export can write the file back unchanged, and their SHA-256 becomes the digest.",
+            "type": "string"
+          },
+          "profile": {
+            "type": "string"
+          },
+          "reanchor": {
+            "description": "Give each fact that cites the previous rendition a span in the new text where its quote occurs once, and retract the others.",
+            "type": "boolean"
+          },
+          "reanchorFrom": {
+            "description": "An earlier source whose facts are copied into this source's graph where their quotes occur in this text.",
+            "type": "string"
+          },
+          "text": {
+            "description": "The document as text or Markdown, at most 2 MiB.",
+            "type": "string"
+          },
+          "timeoutSeconds": {
+            "type": "number"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "type": "object"
+      },
+      "RegisterSourceResult": {
+        "description": "What `register_source` stored.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#importing-agent-memory"
+        },
+        "properties": {
+          "alreadyRegistered": {
+            "type": "boolean"
+          },
+          "branch": {
+            "type": "string"
+          },
+          "chunks": {
+            "items": {
+              "properties": {
+                "end": {
+                  "type": "integer"
+                },
+                "index": {
+                  "type": "integer"
+                },
+                "iri": {
+                  "type": "string"
+                },
+                "start": {
+                  "type": "integer"
+                },
+                "text": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "iri",
+                "index",
+                "start",
+                "end"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "commit": {
+            "type": "integer"
+          },
+          "committed": {
+            "type": "boolean"
+          },
+          "copied": {
+            "type": "integer"
+          },
+          "dataset": {
+            "type": "string"
+          },
+          "digest": {
+            "type": "string"
+          },
+          "elapsedMs": {
+            "type": "number"
+          },
+          "graph": {
+            "type": "string"
+          },
+          "head": {
+            "type": "integer"
+          },
+          "length": {
+            "type": "integer"
+          },
+          "originalKept": {
+            "type": "boolean"
+          },
+          "prefixes": {
+            "additionalProperties": true,
+            "description": "The prefixes the compact terms use.",
+            "type": "object"
+          },
+          "previousRendition": {
+            "type": "string"
+          },
+          "profile": {
+            "type": "string"
+          },
+          "reanchored": {
+            "type": "integer"
+          },
+          "rendition": {
+            "type": "string"
+          },
+          "retracted": {
+            "type": "integer"
+          },
+          "source": {
+            "type": "string"
+          },
+          "staleFacts": {
+            "type": "integer"
+          },
+          "textKept": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "dataset",
+          "graph",
+          "source",
+          "rendition",
+          "digest",
+          "length",
+          "alreadyRegistered",
+          "committed",
+          "chunks"
+        ],
+        "type": "object"
+      },
       "RejectRequest": {
         "additionalProperties": false,
         "description": "The facts to retract, at most 500.",
@@ -12525,6 +13030,89 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "SourceList": {
+        "description": "The sources `list_sources` found.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#importing-agent-memory"
+        },
+        "properties": {
+          "branch": {
+            "type": "string"
+          },
+          "commit": {
+            "type": "integer"
+          },
+          "dataset": {
+            "type": "string"
+          },
+          "prefixes": {
+            "additionalProperties": true,
+            "description": "The prefixes the compact terms use.",
+            "type": "object"
+          },
+          "sources": {
+            "items": {
+              "properties": {
+                "chunks": {
+                  "type": "integer"
+                },
+                "digest": {
+                  "type": "string"
+                },
+                "facts": {
+                  "type": "integer"
+                },
+                "format": {
+                  "type": "string"
+                },
+                "graph": {
+                  "type": "string"
+                },
+                "invalidatedAt": {
+                  "type": "string"
+                },
+                "lastIngestion": {
+                  "type": "string"
+                },
+                "length": {
+                  "type": "integer"
+                },
+                "needsExtraction": {
+                  "type": "boolean"
+                },
+                "rendition": {
+                  "type": "string"
+                },
+                "source": {
+                  "type": "string"
+                },
+                "title": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "source",
+                "graph",
+                "rendition",
+                "chunks",
+                "facts"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "dataset",
+          "commit",
+          "sources",
+          "truncated"
+        ],
         "type": "object"
       },
       "SparklesResult": {
@@ -20354,6 +20942,136 @@
         "x-sparkles-permission": "admin"
       }
     },
+    "/$/ingest/{ds}": {
+      "get": {
+        "description": "The caller's tasks, or every task for an admin of the dataset, without their usage. Finished tasks are kept for 7 days.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ingestion"
+        },
+        "operationId": "listIngestTasks",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IngestTaskList"
+                }
+              }
+            },
+            "description": "The tasks."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "List ingestion tasks",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "read"
+      },
+      "post": {
+        "description": "Starts an ingestion task: converts the document, registers it as a source on a review branch, and extracts its facts with the `extract` role into proposals there. A CSV or TSV file gets a C05 mapping draft instead, and nothing is written. Needs `read` on the dataset; every write runs as the caller, so it needs what `register_source` and `assert_facts` need. A PDF that needs OCR on a server without it fails with `needs-ocr` and its pages.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ingestion"
+        },
+        "operationId": "startIngest",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/IngestRequest"
+              }
+            },
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/IngestForm"
+              }
+            }
+          },
+          "description": "The document: a multipart upload, or JSON with text or a URL.",
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IngestTask"
+                }
+              }
+            },
+            "description": "The task."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Ingest a document",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
     "/$/ingest/{ds}/profiles": {
       "get": {
         "externalDocs": {
@@ -20647,11 +21365,267 @@
             "cloudflareAccess": []
           }
         ],
-        "summary": "Set whether sources keep their text",
+        "summary": "Set the ingest settings",
         "tags": [
           "Datasets"
         ],
         "x-sparkles-permission": "admin"
+      }
+    },
+    "/$/ingest/{ds}/{task}": {
+      "delete": {
+        "description": "Cancels a running task (`202`), or forgets one that has ended (`204`). A cancelled task removes nothing it already wrote on its review branch.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ingestion"
+        },
+        "operationId": "cancelIngestTask",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/task"
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IngestTask"
+                }
+              }
+            },
+            "description": "The task, cancelling."
+          },
+          "204": {
+            "description": "Forgotten."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Cancel or forget an ingestion task",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "read"
+      },
+      "get": {
+        "description": "Visible to the principal that started it and to admins of the dataset.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ingestion"
+        },
+        "operationId": "getIngestTask",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/task"
+          },
+          {
+            "description": "Hold the answer until the task ends or waits for the caller, at most 60 seconds.",
+            "in": "query",
+            "name": "wait",
+            "schema": {
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IngestTask"
+                }
+              }
+            },
+            "description": "The task."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Read an ingestion task",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
+    "/$/ingest/{ds}/{task}/approve": {
+      "post": {
+        "description": "Writes a preview's source and facts to `main` as the caller. Fails with `409` when `main` changed since the preview.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ingestion"
+        },
+        "operationId": "approveIngestTask",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/task"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IngestTask"
+                }
+              }
+            },
+            "description": "The task."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Approve a preview",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
+    "/$/ingest/{ds}/{task}/confirm": {
+      "post": {
+        "description": "A task whose estimate is above the dataset's `confirmTokens` waits in `awaiting-confirmation` for this call.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ingestion"
+        },
+        "operationId": "confirmIngestTask",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/task"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IngestTask"
+                }
+              }
+            },
+            "description": "The task."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Confirm an ingestion's estimate",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "read"
       }
     },
     "/$/lint": {
@@ -32401,6 +33375,180 @@
           "Validation"
         ],
         "x-sparkles-permission": "read"
+      }
+    },
+    "/{ds}/sources": {
+      "get": {
+        "description": "The MCP tool `list_sources` as the caller: the sources in the graphs the caller can read, with their current rendition, chunk and fact counts, and whether the rendition still needs extraction. Needs `read` and counts as a query.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#importing-agent-memory"
+        },
+        "operationId": "listSources",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "description": "Only sources in this graph; repeat for several, up to 20.",
+            "in": "query",
+            "name": "graph",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only sources in graphs whose IRI starts with this.",
+            "in": "query",
+            "name": "graphPrefix",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only sources whose current rendition no extraction has cited.",
+            "in": "query",
+            "name": "needsExtraction",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "The most sources listed.",
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "default": 50,
+              "maximum": 500,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Read at this commit.",
+            "in": "query",
+            "name": "atCommit",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SourceList"
+                }
+              }
+            },
+            "description": "The sources."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "List registered sources",
+        "tags": [
+          "SPARQL"
+        ],
+        "x-sparkles-permission": "read"
+      },
+      "post": {
+        "description": "The MCP tool `register_source` as the caller. Needs `write` on the graph and counts as an update. With `original` the file's bytes are kept beside the normalized text, `reanchor` moves the facts that cite the previous rendition to the new text, and `reanchorFrom` copies the facts of a renamed file's source. In a graph under the dataset's import base, a text that matches a secret pattern is refused with 422 `secret-detected`, the pattern's name and the offset. `sparkles memory import` calls it.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#importing-agent-memory"
+        },
+        "operationId": "registerSource",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RegisterSourceRequest"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RegisterSourceResult"
+                }
+              }
+            },
+            "description": "The source and its rendition."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Register a source document",
+        "tags": [
+          "SPARQL"
+        ],
+        "x-sparkles-permission": "write"
       }
     },
     "/{ds}/sparql": {

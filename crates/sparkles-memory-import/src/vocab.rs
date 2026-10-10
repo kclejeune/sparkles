@@ -19,6 +19,9 @@ pub const DCT_TITLE: &str = "http://purl.org/dc/terms/title";
 pub const DCT_FORMAT: &str = "http://purl.org/dc/terms/format";
 pub const PROV_ENTITY: &str = "http://www.w3.org/ns/prov#Entity";
 pub const PROV_INVALIDATED_AT: &str = "http://www.w3.org/ns/prov#invalidatedAtTime";
+pub const PROV_STARTED_AT: &str = "http://www.w3.org/ns/prov#startedAtTime";
+pub const PROV_ENDED_AT: &str = "http://www.w3.org/ns/prov#endedAtTime";
+pub const PROV_GENERATED_BY: &str = "http://www.w3.org/ns/prov#wasGeneratedBy";
 pub const SPK_CONTENT_DIGEST: &str = "urn:x-sparkles:contentDigest";
 pub const XSD_DATETIME: &str = "http://www.w3.org/2001/XMLSchema#dateTime";
 pub const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
@@ -39,12 +42,18 @@ pub fn single_valued(p: &str) -> bool {
         DCT_TITLE,
         DCT_FORMAT,
         SPK_CONTENT_DIGEST,
+        PROV_STARTED_AT,
+        PROV_ENDED_AT,
     ]
     .contains(&p)
         || p.strip_prefix(MEM).is_some_and(|l| {
             matches!(
                 l,
-                "kind"
+                "sessionId"
+                    | "gitBranch"
+                    | "model"
+                    | "harnessVersion"
+                    | "kind"
                     | "harness"
                     | "project"
                     | "scope"
@@ -62,9 +71,16 @@ pub fn single_valued(p: &str) -> bool {
 /// predicates, so the facts an agent extracts from the same file are left alone.
 pub fn structural(p: &str) -> bool {
     single_valued(p)
-        || [RDF_TYPE, DCT_REFERENCES, DCT_REPLACES, PROV_INVALIDATED_AT].contains(&p)
+        || [
+            RDF_TYPE,
+            DCT_REFERENCES,
+            DCT_REPLACES,
+            PROV_INVALIDATED_AT,
+            PROV_GENERATED_BY,
+        ]
+        .contains(&p)
         || p.strip_prefix(MEM)
-            .is_some_and(|l| matches!(l, "appliesTo" | "imports"))
+            .is_some_and(|l| matches!(l, "appliesTo" | "imports" | "copyOf"))
 }
 
 /// The vocabulary graph in Turtle. Standard terms the import uses are declared too, so a

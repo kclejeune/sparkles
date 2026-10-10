@@ -360,7 +360,6 @@ impl WriteTxn<'_> {
             geo: None,
             union_default_graph: self.base.union_default_graph,
             geo_op_vertices: self.base.geo_op_vertices,
-            delta_stats: Default::default(),
             counts: Default::default(),
             mask: None,
             historical: false,

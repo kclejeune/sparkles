@@ -214,37 +214,32 @@ pub(super) fn masked(
 }
 
 /// `snap` with the quads `hidden` (SPO keys, sorted, all present in `snap`) taken out:
-/// those of the base become deletions, those the delta inserted leave it. The counts,
-/// the delta's statistics and the caches keyed by the snapshot start empty.
+/// those of the base become deletions, those the delta inserted leave it, and the delta's
+/// predicate statistics follow. The counts and the caches keyed by the snapshot start
+/// empty.
 pub fn apply(snap: &Snapshot, hidden: Vec<Key>, key: String) -> Snapshot {
     use rayon::prelude::*;
     let spo = Perm::Spo.index();
-    let (from_ins, from_base): (Vec<Key>, Vec<Key>) = hidden
-        .iter()
-        .partition(|k| snap.delta.ins[spo].contains(*k));
-    let sets: Vec<_> = Perm::ALL
+    let (from_ins, from_base): (Vec<Key>, Vec<Key>) =
+        hidden.iter().partition(|k| snap.delta.ins[spo].contains(k));
+    let dels: Vec<_> = Perm::ALL
         .par_iter()
         .map(|&p| {
-            let i = p.index();
-            let mut ins = snap.delta.ins[i].clone();
-            let mut del = snap.delta.del[i].clone();
-            for k in &from_ins {
-                ins.remove(&p.to_key(&Perm::Spo.to_quad(k)));
-            }
+            let mut del = snap.delta.del[p.index()].clone();
             for k in &from_base {
                 del.insert(p.to_key(&Perm::Spo.to_quad(k)));
             }
-            (ins, del)
+            del
         })
         .collect();
     let mut delta = snap.delta.clone();
-    for (i, (ins, del)) in sets.into_iter().enumerate() {
-        delta.ins[i] = ins;
+    for (i, del) in dels.into_iter().enumerate() {
         delta.del[i] = del;
     }
+    let from_ins: Vec<[Id; 4]> = from_ins.iter().map(|k| Perm::Spo.to_quad(k)).collect();
+    delta.remove_inserted_all(&from_ins);
     Snapshot {
         delta,
-        delta_stats: Default::default(),
         counts: Default::default(),
         mask: Some(Arc::new(Mask {
             id: MASK_IDS.fetch_add(1, Ordering::Relaxed),

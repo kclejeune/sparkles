@@ -743,14 +743,22 @@ impl Tools<'_> {
                 gs.contains(f.g.as_str()) && gs.iter().all(|g| memory.is_agent_graph(g))
             })
         });
+        // §8.10.10: a copy and its original count as one source
+        let copies = copy_links(&r, &agent_graphs).map_err(eng)?;
+        let linked = |a: &str, b: &str| {
+            copies.get(a).is_some_and(|o| o.contains(b))
+                || copies.get(b).is_some_and(|o| o.contains(a))
+        };
         // the signals
         let mut ck = Checker::new(self, ds, &r, &ctx);
         let mut sigs: Vec<Signals> = Vec::with_capacity(facts.len());
         for f in &facts {
             let mut s = ck.signals(f)?;
-            let others = graphs_of
-                .get(&f.triple_key())
-                .map_or(0, |gs| gs.iter().filter(|g| *g != f.g.as_str()).count());
+            let others = graphs_of.get(&f.triple_key()).map_or(0, |gs| {
+                gs.iter()
+                    .filter(|g| *g != f.g.as_str() && !linked(g, f.g.as_str()))
+                    .count()
+            });
             s.corroboration = if others > 0 { "pass" } else { "none" };
             sigs.push(s);
         }
@@ -1076,7 +1084,7 @@ impl Tools<'_> {
                 rend_iris.insert(r.to_string());
             }
         }
-        for s in super::ingest::list_sources(&br, &[], 50).map_err(eng)? {
+        for s in super::ingest::list_sources(&br, &[], 50, None).map_err(eng)? {
             let fresh = !main
                 .ask(
                     &format!(
@@ -1110,7 +1118,7 @@ impl Tools<'_> {
                     "SELECT ?title ?fmt WHERE {{ {} }} LIMIT 1",
                     br.quads(
                         &format!(
-                            "OPTIONAL {{ ?s <{}> ?title }} OPTIONAL {{ ?s <{}> ?fmt }}",
+                            "?s <{SPK}rendition> ?rend OPTIONAL {{ ?s <{}> ?title }} OPTIONAL {{ ?s <{}> ?fmt }}",
                             super::ingest::DCT_TITLE,
                             super::ingest::DCT_FORMAT
                         ),
@@ -1139,6 +1147,11 @@ impl Tools<'_> {
                 } else {
                     j["textOmitted"] = true.into();
                 }
+            }
+            // the pages of a converted PDF (C18 §7.1.1)
+            let pages = super::ingest::RenditionExtras::read(&br, &iri(ri), &rd).map_err(eng)?;
+            for (k, v) in pages.as_object().into_iter().flatten() {
+                j[k] = v.clone();
             }
             sources.push(j);
         }
@@ -1400,6 +1413,26 @@ impl FactRef {
     pub fn retraction(&self) -> Value {
         json!({"s": self.s, "p": self.p, "o": self.o, "graph": self.graph})
     }
+}
+
+/// The graphs each of `graphs` names with `mem:copyOf`: an exported copy and its
+/// original.
+fn copy_links(r: &Reader, graphs: &[NamedNode]) -> Result<HashMap<String, HashSet<String>>, Error> {
+    let mut out: HashMap<String, HashSet<String>> = HashMap::new();
+    for chunk in graphs.chunks(200) {
+        let q = format!(
+            "SELECT ?g ?o WHERE {{ {} GRAPH ?g {{ ?g <urn:x-sparkles:mem:copyOf> ?o }} }}",
+            super::values_iris("g", chunk)
+        );
+        for row in r.rows(&q, Vec::new())? {
+            if let [Some(Term::NamedNode(g)), Some(Term::NamedNode(o))] = row.as_slice() {
+                out.entry(g.as_str().to_string())
+                    .or_default()
+                    .insert(o.as_str().to_string());
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// The live reifiers of facts on the reader's dataset, by fact.

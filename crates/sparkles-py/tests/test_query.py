@@ -134,10 +134,11 @@ def test_timeout_and_budget_classes() -> None:
     assert issubclass(sparkles.QueryTimeoutError, TimeoutError)
     ds = Dataset()
     ds.extend(Triple(ex(f"s{i}"), ex("p"), Literal(i)) for i in range(2000))
+    # a cross product of 8 billion rows: the default row budget (200 million) refuses it
+    # once the join's size is known, which can come before or after a short timeout, so
+    # each case sets only the limit it checks
+    query = "SELECT (COUNT(*) AS ?n) WHERE { ?a ?p ?x . ?b ?p ?y . ?c ?p ?z FILTER(?x + ?y + ?z < 0) }"
     with pytest.raises(sparkles.QueryTimeoutError):
-        list(
-            ds.query(
-                "SELECT (COUNT(*) AS ?n) WHERE { ?a ?p ?x . ?b ?p ?y . ?c ?p ?z FILTER(?x + ?y + ?z < 0) }",
-                timeout=0.05,
-            )
-        )
+        list(ds.query(query, timeout=0.05, max_rows=10**15))
+    with pytest.raises(BudgetExceededError, match="exceeds the limit of 200000000"):
+        list(ds.query(query))

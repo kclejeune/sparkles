@@ -1488,6 +1488,8 @@ export async function upload(
     tables?: { base?: string; key?: string; mapping?: File | null };
     onProgress?: (p: UploadProgress) => void;
     signal?: AbortSignal;
+    /** check and count without writing (`?dryRun=true`) */
+    dryRun?: boolean;
   } = {},
 ): Promise<UploadResult | string> {
   const csrf = await csrfFor('POST');
@@ -1497,7 +1499,8 @@ export async function upload(
     const mapping = opts.tables?.mapping;
     if (mapping) form.append(mappingPart(mapping.name), mapping, mapping.name);
     for (const f of files) form.append('file', f, f.name);
-    const params = opts.tables ? tableParams(opts.tables) : '';
+    let params = opts.tables ? tableParams(opts.tables) : '';
+    if (opts.dryRun) params = params ? `${params}&dryRun=true` : 'dryRun=true';
     const xhr = new XMLHttpRequest();
     xhr.open('POST', branchPath(`/${enc(ds)}/upload?receipt=true${params ? `&${params}` : ''}`));
     xhr.setRequestHeader('Accept', 'application/json');

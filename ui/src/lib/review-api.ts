@@ -103,6 +103,10 @@ export type ReviewSource = {
   length: number;
   text?: string;
   textOmitted?: boolean;
+  /** each page's number and start offset, for a converted PDF */
+  pages?: { page: number; start: number }[];
+  ocrPages?: number[];
+  omittedPages?: number[];
 };
 
 /** `GET /$/memory/{ds}/review/{branch}`. */
@@ -215,4 +219,162 @@ export const putProfile = (ds: string, name: string, p: IngestProfile) =>
 
 export async function deleteProfile(ds: string, name: string): Promise<void> {
   await request(`/$/ingest/${enc(ds)}/profiles/${enc(name)}`, { method: 'DELETE' });
+}
+
+export type IngestSettings = {
+  keepText?: boolean;
+  /** `null` restores the default */
+  confirmTokens?: number | null;
+  autoConfidence?: number | null;
+};
+
+export const putIngestSettings = (ds: string, s: IngestSettings) =>
+  json<IngestSettings & { dataset: string }>(`/$/ingest/${enc(ds)}/settings`, send('PUT', s));
+
+// --- ingestion tasks (C18 Phase 4) ------------------------------------------------------
+
+export type IngestMode = 'branch' | 'preview' | 'auto';
+
+export type IngestStatus =
+  | 'queued'
+  | 'converting'
+  | 'registering'
+  | 'awaiting-confirmation'
+  | 'extracting'
+  | 'linking'
+  | 'writing'
+  | 'awaiting-approval'
+  | 'done'
+  | 'failed'
+  | 'cancelled';
+
+/** A page that needs OCR, with pdf-inspector's reasons. */
+export type PageReason = { page: number; reasons: string[] };
+
+export type IngestEstimate = {
+  chunks: number;
+  inputTokens: number;
+  outputTokens: number;
+  tokens: number;
+  pair?: { provider: string; model: string };
+  estimatedCost?: number;
+  threshold?: number;
+  needsConfirmation?: boolean;
+};
+
+export type IngestError = {
+  code: string;
+  message: string;
+  status?: number;
+  pages?: PageReason[];
+  fonts?: string[];
+  estimate?: IngestEstimate;
+};
+
+export type IngestResult = {
+  outcome: string;
+  mode?: IngestMode;
+  format?: string;
+  source?: string;
+  graph?: string;
+  rendition?: string;
+  branch?: string;
+  review?: string;
+  length?: number;
+  chunks?: number;
+  proposed?: number;
+  extracted?: number;
+  failed?: { code: string; message?: string; quote?: string }[];
+  entities?: { linked: number; new: number; ambiguous: number };
+  pages?: { page: number; start: number }[];
+  ocrPages?: number[];
+  omittedPages?: number[];
+  notes?: string[];
+  autoFallback?: string;
+  // a table's mapping draft (§7.8)
+  file?: string;
+  base?: string;
+  rows?: number;
+  triples?: number;
+  mapping?: Record<string, unknown>;
+  preview?: { rows: number; triples: string[] };
+  drafted?: 'model' | 'default';
+  warnings?: string[];
+};
+
+export type IngestTask = {
+  id: string;
+  dataset: string;
+  status: IngestStatus;
+  progress: number;
+  message?: string;
+  createdAt: string;
+  updatedAt: string;
+  finishedAt?: string;
+  input: { name?: string; url?: string; format?: string; bytes?: number; mode?: IngestMode };
+  estimate?: IngestEstimate;
+  usage?: {
+    modelCalls?: number;
+    inputTokens?: number;
+    outputTokens?: number;
+    estimatedCost?: number;
+  };
+  result?: IngestResult;
+  error?: IngestError;
+};
+
+export type IngestTaskList = {
+  dataset: string;
+  tasks: IngestTask[];
+  capabilities: { pdf: boolean; ocr: boolean };
+};
+
+const WAITING: IngestStatus[] = [
+  'awaiting-confirmation',
+  'awaiting-approval',
+  'done',
+  'failed',
+  'cancelled',
+];
+
+/** Whether a task still runs on the server, and is worth polling. */
+export const running = (t: IngestTask) => !WAITING.includes(t.status);
+
+export type IngestOptions = {
+  mode?: IngestMode;
+  profile?: string;
+  title?: string;
+  allowPartial?: boolean;
+  confirm?: boolean;
+  base?: string;
+};
+
+/** `POST /$/ingest/{ds}` with a file and the options as fields. */
+export function startIngest(ds: string, file: File, opts: IngestOptions = {}) {
+  const form = new FormData();
+  for (const [k, v] of Object.entries(opts)) {
+    if (v !== undefined && v !== '') form.append(k, String(v));
+  }
+  form.append('file', file, file.name);
+  return json<IngestTask>(`/$/ingest/${enc(ds)}`, { method: 'POST', body: form });
+}
+
+export const ingestTasks = (ds: string, signal?: AbortSignal) =>
+  json<IngestTaskList>(`/$/ingest/${enc(ds)}`, { signal, cache: 'no-store' });
+
+/** `GET /$/ingest/{ds}/{task}`, held up to `wait` seconds while the task runs. */
+export const ingestTask = (ds: string, id: string, wait = 0, signal?: AbortSignal) =>
+  json<IngestTask>(`/$/ingest/${enc(ds)}/${enc(id)}${wait ? `?wait=${wait}` : ''}`, {
+    signal,
+    cache: 'no-store',
+  });
+
+export const confirmIngest = (ds: string, id: string) =>
+  json<IngestTask>(`/$/ingest/${enc(ds)}/${enc(id)}/confirm`, { method: 'POST' });
+
+export const approveIngest = (ds: string, id: string) =>
+  json<IngestTask>(`/$/ingest/${enc(ds)}/${enc(id)}/approve`, { method: 'POST' });
+
+export async function cancelIngest(ds: string, id: string): Promise<void> {
+  await request(`/$/ingest/${enc(ds)}/${enc(id)}`, { method: 'DELETE' });
 }

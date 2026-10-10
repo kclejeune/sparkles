@@ -96,6 +96,11 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/ingest/{ds}/profiles", &["GET"]),
     ("/$/ingest/{ds}/settings", &["PUT"]),
     ("/$/ingest/{ds}/profiles/{name}", &["GET", "PUT", "DELETE"]),
+    // ingestion tasks (C18 §10)
+    ("/$/ingest/{ds}", &["GET", "POST"]),
+    ("/$/ingest/{ds}/{task}", &["GET", "DELETE"]),
+    ("/$/ingest/{ds}/{task}/confirm", &["POST"]),
+    ("/$/ingest/{ds}/{task}/approve", &["POST"]),
     // assistant settings and the caller's own ask history (C18 §3.5, §6.4)
     ("/$/assistant/{ds}", &["GET", "PUT"]),
     ("/$/asks/{ds}", &["GET", "DELETE"]),
@@ -190,6 +195,8 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     // `assert_facts` and the memory brief over HTTP (C18 Phase 3m-a)
     ("/{ds}/facts", &["POST"]),
     ("/{ds}/memory/brief", &["POST"]),
+    // `register_source` and `list_sources` over HTTP (C18 Phase 3m-b)
+    ("/{ds}/sources", &["GET", "POST"]),
     ("/{ds}/text", &["GET", "POST"]),
     ("/{ds}/diff", &["GET"]),
     ("/{ds}/changes", &["GET"]),
@@ -286,6 +293,12 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/memory/{ds}/edit" => Dataset(Read),
         "/$/ingest/{ds}/profiles" | "/$/ingest/{ds}/profiles/{name}" if get => Dataset(Read),
         "/$/ingest/{ds}/settings" | "/$/ingest/{ds}/profiles/{name}" => Dataset(Admin),
+        // a task writes through the tools as its caller, which check the grants on the
+        // graphs and branches; a task is visible to its owner and the dataset's admins
+        "/$/ingest/{ds}"
+        | "/$/ingest/{ds}/{task}"
+        | "/$/ingest/{ds}/{task}/confirm"
+        | "/$/ingest/{ds}/{task}/approve" => Dataset(Read),
         "/$/assistant/{ds}" if get => Dataset(Read),
         "/$/assistant/{ds}" => Dataset(Admin),
         // only the caller's own entries, whatever its role (C18 §6.4)
@@ -415,6 +428,8 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/backups/{ds}/{repo}/{backup}/verify" => Dataset(Admin),
         "/{ds}/update" | "/{ds}/upload" | "/{ds}/facts" => Dataset(Write),
         "/{ds}/memory/brief" => Dataset(Read),
+        "/{ds}/sources" if get => Dataset(Read),
+        "/{ds}/sources" => Dataset(Write),
         // a method that is refused anyway needs only read, so a reader learns the 405
         "/{ds}/patch" if safe(method) => Dataset(Read),
         "/{ds}/patch" => Dataset(Write),
@@ -459,6 +474,8 @@ pub fn endpoint(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) ->
         | "/{ds}/queries/{name}" => Endpoint::Query,
         "/{ds}/graphql" | "/{ds}/graphql/schema" => Endpoint::Graphql,
         "/{ds}/update" | "/{ds}/facts" => Endpoint::Update,
+        "/{ds}/sources" if get => Endpoint::Query,
+        "/{ds}/sources" => Endpoint::Update,
         "/{ds}/get" => Endpoint::GspR,
         "/{ds}/data" | "/{ds}/{*graph}" if get => Endpoint::GspR,
         "/{ds}/data" | "/{ds}/{*graph}" => Endpoint::GspRw,

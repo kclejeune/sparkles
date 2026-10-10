@@ -29,6 +29,7 @@ mod embed;
 mod geo;
 mod group;
 mod history_query;
+pub mod keyset;
 mod link;
 mod mem_history;
 #[cfg(test)]
@@ -90,7 +91,7 @@ use crate::index::{Block, BlockCache, Key, Perm, PermIndex, pad};
 use crate::io::Source;
 use crate::vocab::{DeltaVocab, Vocab};
 use arc_swap::ArcSwap;
-use imbl::OrdSet;
+pub use keyset::KeySet;
 use oxrdf::{BlankNode, GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use parking_lot::{Mutex, MutexGuard};
 use std::borrow::Cow;
@@ -242,11 +243,163 @@ impl Generation {
 /// Inserted / deleted quads per permutation (keys in permutation order).
 #[derive(Clone, Default)]
 pub struct Delta {
-    pub ins: [OrdSet<Key>; 7],
-    pub del: [OrdSet<Key>; 7],
+    pub ins: [KeySet; 7],
+    pub del: [KeySet; 7],
+    /// the planner's statistics of the inserted quads, by predicate, kept up to date by
+    /// each write ([`Delta::insert_quad`], [`Delta::remove_inserted`])
+    predicates: imbl::OrdMap<u64, DeltaPredicate>,
+}
+
+/// Statistics of the quads a delta inserted with one predicate: their number and the
+/// numbers of distinct (predicate, subject) and (predicate, object) pairs among them.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct DeltaPredicate {
+    pub count: u64,
+    pub distinct_subjects: u64,
+    pub distinct_objects: u64,
 }
 
 impl Delta {
+    /// Whether the inserted keys of `perm` (PSO or POS) hold one starting with `a, b`.
+    fn ins_pair(&self, perm: Perm, a: u64, b: u64) -> bool {
+        self.ins[perm.index()].intersects([a, b, 0, 0]..=[a, b, u64::MAX, u64::MAX])
+    }
+
+    /// Add `q`, which is not in the base, to the inserted quads.
+    fn insert_quad(&mut self, q: &[Id; 4]) {
+        // whether the (predicate, subject) and (predicate, object) pairs are new, read
+        // off the keys next to the quad's in PSO and POS
+        let (mut new_s, mut new_o, mut added) = (false, false, false);
+        for perm in Perm::ALL {
+            let k = perm.to_key(q);
+            let set = &mut self.ins[perm.index()];
+            match perm {
+                Perm::Pso | Perm::Pos => {
+                    let shares = set.insert_sharing(k, 2);
+                    added |= shares.is_some();
+                    let new = shares == Some(false);
+                    if perm == Perm::Pso {
+                        new_s = new;
+                    } else {
+                        new_o = new;
+                    }
+                }
+                _ => added |= set.insert(k),
+            }
+        }
+        if added {
+            let e = self.predicates.entry(q[1].0).or_default();
+            e.count += 1;
+            e.distinct_subjects += new_s as u64;
+            e.distinct_objects += new_o as u64;
+        }
+    }
+
+    /// Take `q`, which is not in the base, out of the inserted quads.
+    fn remove_inserted(&mut self, q: &[Id; 4]) {
+        let mut removed = false;
+        for perm in Perm::ALL {
+            removed |= self.ins[perm.index()].remove(&perm.to_key(q));
+        }
+        if removed {
+            let (s, p, o) = (q[0].0, q[1].0, q[2].0);
+            self.forget(p, 1, &[s], &[o]);
+        }
+    }
+
+    /// Lower the statistics of predicate `p` by `n` removed quads, and by those of the
+    /// `subjects` and `objects` of the removed quads that no inserted quad with `p` holds
+    /// any longer.
+    fn forget(&mut self, p: u64, n: u64, subjects: &[u64], objects: &[u64]) {
+        let gone_s = subjects
+            .iter()
+            .filter(|&&s| !self.ins_pair(Perm::Pso, p, s))
+            .count() as u64;
+        let gone_o = objects
+            .iter()
+            .filter(|&&o| !self.ins_pair(Perm::Pos, p, o))
+            .count() as u64;
+        if let Some(e) = self.predicates.get_mut(&p) {
+            e.count = e.count.saturating_sub(n);
+            e.distinct_subjects = e.distinct_subjects.saturating_sub(gone_s);
+            e.distinct_objects = e.distinct_objects.saturating_sub(gone_o);
+            if e.count == 0 {
+                self.predicates.remove(&p);
+            }
+        }
+    }
+
+    /// Take the inserted quads `qs` out of the delta at once (a triple-level access
+    /// view's hidden quads). Every one of them is an inserted quad.
+    pub(crate) fn remove_inserted_all(&mut self, qs: &[[Id; 4]]) {
+        use rayon::prelude::*;
+        let sets: Vec<KeySet> = Perm::ALL
+            .par_iter()
+            .map(|&perm| {
+                let mut set = self.ins[perm.index()].clone();
+                for q in qs {
+                    set.remove(&perm.to_key(q));
+                }
+                set
+            })
+            .collect();
+        for (i, set) in sets.into_iter().enumerate() {
+            self.ins[i] = set;
+        }
+        // by predicate: the quads removed, and the distinct subjects and objects
+        let mut by_p: BTreeMap<u64, (u64, Vec<u64>, Vec<u64>)> = BTreeMap::new();
+        for q in qs {
+            let e = by_p.entry(q[1].0).or_default();
+            e.0 += 1;
+            e.1.push(q[0].0);
+            e.2.push(q[2].0);
+        }
+        for (p, (n, mut ss, mut os)) in by_p {
+            ss.sort_unstable();
+            ss.dedup();
+            os.sort_unstable();
+            os.dedup();
+            self.forget(p, n, &ss, &os);
+        }
+    }
+
+    /// The statistics of the inserted quads with predicate `p`.
+    pub fn predicate(&self, p: u64) -> Option<&DeltaPredicate> {
+        self.predicates.get(&p)
+    }
+
+    /// The statistics by predicate worked out from the inserted keys (what
+    /// [`predicate`](Self::predicate) keeps up to date), for checks.
+    pub fn predicates_from_keys(&self) -> BTreeMap<u64, DeltaPredicate> {
+        let mut m: BTreeMap<u64, DeltaPredicate> = BTreeMap::new();
+        let mut prev: Option<Key> = None;
+        for k in self.ins[Perm::Pso.index()].iter() {
+            let e = m.entry(k[0]).or_default();
+            e.count += 1;
+            if prev.is_none_or(|q| q[0] != k[0] || q[1] != k[1]) {
+                e.distinct_subjects += 1;
+            }
+            prev = Some(*k);
+        }
+        prev = None;
+        for k in self.ins[Perm::Pos.index()].iter() {
+            if prev.is_none_or(|q| q[0] != k[0] || q[1] != k[1])
+                && let Some(e) = m.get_mut(&k[0])
+            {
+                e.distinct_objects += 1;
+            }
+            prev = Some(*k);
+        }
+        m
+    }
+
+    /// Whether the kept statistics agree with the inserted keys.
+    pub fn predicates_consistent(&self) -> bool {
+        let kept: BTreeMap<u64, DeltaPredicate> =
+            self.predicates.iter().map(|(p, s)| (*p, *s)).collect();
+        kept == self.predicates_from_keys()
+    }
+
     pub fn inserts(&self) -> usize {
         self.ins[0].len()
     }
@@ -257,14 +410,15 @@ impl Delta {
         self.ins[0].is_empty() && self.del[0].is_empty()
     }
     /// The keys of `set` that start with `prefix`, in order.
-    pub(crate) fn range<'a>(
-        set: &'a OrdSet<Key>,
-        prefix: &[u64],
-    ) -> impl Iterator<Item = &'a Key> + 'a {
+    pub(crate) fn range<'a>(set: &'a KeySet, prefix: &[u64]) -> impl Iterator<Item = &'a Key> + 'a {
         Self::key_range(set, pad(prefix, 0), pad(prefix, u64::MAX))
     }
-    fn key_range(set: &OrdSet<Key>, lo: Key, hi: Key) -> impl Iterator<Item = &Key> + '_ {
-        set.range((Bound::Included(lo), Bound::Included(hi)))
+    pub(crate) fn key_range(set: &KeySet, lo: Key, hi: Key) -> crate::store::keyset::Iter<'_> {
+        set.range(lo..=hi)
+    }
+    /// The number of keys of `set` that start with `prefix` (two tree descents).
+    pub(crate) fn count_prefix(set: &KeySet, prefix: &[u64]) -> u64 {
+        set.count_between(&pad(prefix, 0), &pad(prefix, u64::MAX)) as u64
     }
 }
 
@@ -291,9 +445,6 @@ pub struct Snapshot {
     /// largest sum of input vertices of one geometry operation in queries on this
     /// snapshot ([`StoreOptions::geo_op_vertices`])
     pub geo_op_vertices: u64,
-    /// per-predicate statistics of the delta (computed lazily, once per snapshot)
-    pub delta_stats:
-        Arc<std::sync::OnceLock<rustc_hash::FxHashMap<u64, crate::builder::PredicateStat>>>,
     /// a past state (see [`Store::snapshot_at`]), not the live one
     pub historical: bool,
     /// exact counts from the statistics corrected for this snapshot's delta, worked out
@@ -373,41 +524,14 @@ impl Snapshot {
     /// inserted quads of the delta (deleted quads are ignored — estimates only).
     pub fn predicate_stat(&self, p: u64) -> Option<crate::builder::PredicateStat> {
         let base = self.generation.stats.predicate(p).cloned();
-        if self.delta.ins[0].is_empty() {
-            return base;
-        }
-        let delta = self.delta_stats.get_or_init(|| {
-            let mut m: rustc_hash::FxHashMap<u64, crate::builder::PredicateStat> =
-                Default::default();
-            // PSO: count and distinct subjects; POS: distinct objects
-            let mut prev: Option<Key> = None;
-            for k in self.delta.ins[Perm::Pso.index()].iter() {
-                let e = m
-                    .entry(k[0])
-                    .or_insert_with(|| crate::builder::PredicateStat {
-                        p: k[0],
-                        ..Default::default()
-                    });
-                e.count += 1;
-                if prev.is_none_or(|q| q[0] != k[0] || q[1] != k[1]) {
-                    e.distinct_subjects += 1;
-                }
-                prev = Some(*k);
-            }
-            prev = None;
-            for k in self.delta.ins[Perm::Pos.index()].iter() {
-                if prev.is_none_or(|q| q[0] != k[0] || q[1] != k[1])
-                    && let Some(e) = m.get_mut(&k[0])
-                {
-                    e.distinct_objects += 1;
-                }
-                prev = Some(*k);
-            }
-            m
-        });
-        match (base, delta.get(&p)) {
+        match (base, self.delta.predicate(p)) {
             (b, None) => b,
-            (None, Some(d)) => Some(d.clone()),
+            (None, Some(d)) => Some(crate::builder::PredicateStat {
+                p,
+                count: d.count,
+                distinct_subjects: d.distinct_subjects,
+                distinct_objects: d.distinct_objects,
+            }),
             (Some(mut b), Some(d)) => {
                 b.count += d.count;
                 b.distinct_subjects += d.distinct_subjects;
@@ -568,9 +692,7 @@ impl Snapshot {
                 None => Bound::Unbounded,
             };
             let to = Bound::Included(base.blocks[b].last);
-            if ins_set.range((from, to)).next().is_some()
-                || del_set.range((from, to)).next().is_some()
-            {
+            if ins_set.intersects((from, to)) || del_set.intersects((from, to)) {
                 crate::index::ALL_COLS
             } else {
                 mask
@@ -660,12 +782,7 @@ impl Snapshot {
         use rayon::prelude::*;
         let pi = perm.index();
         let touched = |&(lo, hi): &(Key, Key)| {
-            Delta::key_range(&self.delta.ins[pi], lo, hi)
-                .next()
-                .is_some()
-                || Delta::key_range(&self.delta.del[pi], lo, hi)
-                    .next()
-                    .is_some()
+            self.delta.ins[pi].intersects(lo..=hi) || self.delta.del[pi].intersects(lo..=hi)
         };
         if ranges.iter().any(touched) {
             return Ok(None);
@@ -722,8 +839,8 @@ impl Snapshot {
     pub fn count(&self, perm: Perm, prefix: &[u64]) -> Result<u64> {
         let base = self.perm(perm).count(&self.cache, prefix)?;
         let pi = perm.index();
-        let ins = Delta::range(&self.delta.ins[pi], prefix).count() as u64;
-        let del = Delta::range(&self.delta.del[pi], prefix).count() as u64;
+        let ins = Delta::count_prefix(&self.delta.ins[pi], prefix);
+        let del = Delta::count_prefix(&self.delta.del[pi], prefix);
         Ok((base + ins).saturating_sub(del))
     }
 
@@ -734,18 +851,15 @@ impl Snapshot {
         if self.delta.is_empty() {
             return base;
         }
-        let ins = Delta::range(&self.delta.ins[pi], prefix)
-            .take(10_000)
-            .count() as u64;
-        base + ins
+        base + Delta::count_prefix(&self.delta.ins[pi], prefix)
     }
 
     /// Exact number of quads with keys in `[lo, hi]` (at most two block decodes).
     pub fn count_between(&self, perm: Perm, lo: Key, hi: Key) -> Result<u64> {
         let base = self.perm(perm).count_between(&self.cache, &lo, &hi)?;
         let pi = perm.index();
-        let ins = Delta::key_range(&self.delta.ins[pi], lo, hi).count() as u64;
-        let del = Delta::key_range(&self.delta.del[pi], lo, hi).count() as u64;
+        let ins = self.delta.ins[pi].count_between(&lo, &hi) as u64;
+        let del = self.delta.del[pi].count_between(&lo, &hi) as u64;
         Ok((base + ins).saturating_sub(del))
     }
 
@@ -1286,7 +1400,6 @@ impl Store {
                 geo: None,
                 union_default_graph: opts.union_default_graph,
                 geo_op_vertices: opts.geo_op_vertices,
-                delta_stats: Default::default(),
                 counts: Default::default(),
                 mask: None,
                 historical: false,
@@ -1645,7 +1758,6 @@ impl Store {
                 geo: None,
                 union_default_graph: opts.union_default_graph,
                 geo_op_vertices: opts.geo_op_vertices,
-                delta_stats: Default::default(),
                 counts: Default::default(),
                 mask: None,
                 historical: false,
@@ -2066,7 +2178,6 @@ impl Store {
             geo: self.historical_geo(),
             union_default_graph: self.opts.union_default_graph,
             geo_op_vertices: self.opts.geo_op_vertices,
-            delta_stats: Default::default(),
             counts: Default::default(),
             mask: None,
             historical: true,
@@ -3986,7 +4097,6 @@ impl Store {
                 geo: None,
                 union_default_graph: self.opts.union_default_graph,
                 geo_op_vertices: self.opts.geo_op_vertices,
-                delta_stats: Default::default(),
                 counts: Default::default(),
                 mask: None,
                 historical: false,
@@ -4122,7 +4232,6 @@ impl Store {
             geo: None,
             union_default_graph: self.opts.union_default_graph,
             geo_op_vertices: self.opts.geo_op_vertices,
-            delta_stats: Default::default(),
             counts: Default::default(),
             mask: None,
             historical: false,
@@ -4502,24 +4611,19 @@ pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
 /// Apply an insert/delete to a delta, preserving the invariants
 /// `ins ∩ base = ∅` and `del ⊆ base`.
 fn apply(delta: &mut Delta, q: &[Id; 4], insert: bool, in_base: bool) {
-    for p in Perm::ALL {
-        let k = p.to_key(q);
-        let i = p.index();
-        // The invariants above determine the only set this operation can change.
-        // Even an absent removal can copy shared persistent-tree nodes, so avoid
-        // touching the opposite set when the immutable base proves absence.
-        match (insert, in_base) {
-            (true, false) => {
-                delta.ins[i].insert(k);
+    // The invariants above determine the only set this operation can change, so the
+    // opposite set is left alone. The inserted quads' writes keep their statistics.
+    match (insert, in_base) {
+        (true, false) => delta.insert_quad(q),
+        (false, false) => delta.remove_inserted(q),
+        (true, true) => {
+            for p in Perm::ALL {
+                delta.del[p.index()].remove(&p.to_key(q));
             }
-            (true, true) => {
-                delta.del[i].remove(&k);
-            }
-            (false, false) => {
-                delta.ins[i].remove(&k);
-            }
-            (false, true) => {
-                delta.del[i].insert(k);
+        }
+        (false, true) => {
+            for p in Perm::ALL {
+                delta.del[p.index()].insert(p.to_key(q));
             }
         }
     }
@@ -4710,7 +4814,6 @@ impl WriteTxn<'_> {
             geo: self.base.geo.as_ref().map(|v| Arc::new(v.for_txn())),
             union_default_graph: self.base.union_default_graph,
             geo_op_vertices: self.base.geo_op_vertices,
-            delta_stats: Default::default(),
             counts: Default::default(),
             mask: None,
             historical: false,
@@ -5303,7 +5406,6 @@ impl WriteTxn<'_> {
             geo: self.base.geo.clone(),
             union_default_graph: self.base.union_default_graph,
             geo_op_vertices: self.base.geo_op_vertices,
-            delta_stats: Default::default(),
             counts: Default::default(),
             mask: None,
             historical: false,
@@ -5951,7 +6053,6 @@ pub(crate) fn replay_wal(
         geo: None,
         union_default_graph: false,
         geo_op_vertices: StoreOptions::default().geo_op_vertices,
-        delta_stats: Default::default(),
         counts: Default::default(),
         mask: None,
         historical: false,
@@ -6728,8 +6829,93 @@ ex:a ex:p 1, 2, 3 . ex:b ex:p 2 . ex:c ex:q "hello"@en .
                     .unwrap();
                     assert_eq!(got, want, "{perm:?} {lo:?}..={hi:?} mask {mask:b}");
                 }
+                let n = keys.iter().filter(|k| **k >= lo && **k <= hi).count() as u64;
+                assert_eq!(snap.count_between(perm, lo, hi).unwrap(), n);
             }
         }
+    }
+
+    /// The delta's per-predicate statistics, kept up by each write, against the same
+    /// worked out from its keys: after inserts, removals of inserted quads, deletions
+    /// of base quads and re-inserts, and in a triple-level access view.
+    #[test]
+    fn delta_statistics_follow_the_writes() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut nt = String::new();
+        for i in 0..3_000u64 {
+            nt.push_str(&format!(
+                "<http://ex.org/s{}> <http://ex.org/p{}> <http://ex.org/o{}> .\n",
+                i % 300,
+                i % 5,
+                i % 70
+            ));
+        }
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(nt.into_bytes(), RdfFormat::NQuads, None)])
+            .unwrap();
+        let mut base: Vec<[Id; 4]> = Vec::new();
+        store
+            .snapshot()
+            .for_each_quad(|q| {
+                base.push(*q);
+                Ok(())
+            })
+            .unwrap();
+        let pick = |r: u64| base[r as usize % base.len()];
+        let mut inserted: Vec<[Id; 4]> = Vec::new();
+        for _ in 0..6 {
+            let mut t = store.write();
+            for _ in 0..400 {
+                match next() % 5 {
+                    // new quads from few terms, so subjects and objects repeat
+                    0 | 1 => {
+                        let (a, b, c) = (pick(next()), pick(next()), pick(next()));
+                        let q = [a[0], b[1], c[2], a[3]];
+                        t.insert(q).unwrap();
+                        inserted.push(q);
+                    }
+                    2 if !inserted.is_empty() => {
+                        let q = inserted.swap_remove(next() as usize % inserted.len());
+                        t.delete(q).unwrap();
+                    }
+                    3 => {
+                        t.delete(pick(next())).unwrap();
+                    }
+                    _ => {
+                        t.insert(pick(next())).unwrap();
+                    }
+                }
+            }
+            t.commit().unwrap();
+            let snap = store.snapshot();
+            assert!(snap.delta.inserts() > 0);
+            assert!(snap.delta.predicates_consistent());
+            for (p, d) in snap.delta.predicates_from_keys() {
+                let base = snap.generation.stats.predicate(p).map_or(0, |b| b.count);
+                assert_eq!(snap.predicate_stat(p).unwrap().count, base + d.count);
+            }
+        }
+        // an access view hides some inserted quads and some base quads
+        let snap = store.snapshot();
+        let mut hidden: Vec<Key> = snap.delta.ins[Perm::Spo.index()]
+            .iter()
+            .step_by(3)
+            .copied()
+            .collect();
+        hidden.extend(base.iter().step_by(7).map(|q| Perm::Spo.to_key(q)));
+        hidden.sort_unstable();
+        hidden.dedup();
+        hidden.retain(|k| snap.contains(&Perm::Spo.to_quad(k)).unwrap());
+        let view = crate::access::triples::apply(&snap, hidden, "test".into());
+        assert!(view.delta.inserts() < snap.delta.inserts());
+        assert!(view.delta.predicates_consistent());
     }
 
     #[test]

@@ -8734,13 +8734,42 @@ prefix of every import graph in `imports`:
 `base` is an IRI that ends in `/` or `#`, and `agentGraphs` must cover it, so imported
 facts are unreviewed until a person promotes them. `secretPatterns` adds redaction
 patterns to the built-in ones, and each regex must compile. `transcripts` (off by
-default) and `extract` (`agent`, `server` or `none`) are kept for the transcript import
-and the prose extraction of Phase 3m-b. A file's graph is
+default) lets the people who opt in import their session transcripts. `extract` is
+`agent` (the default), `server` or `none`, and says who extracts facts from the prose
+of imported files. A file's graph is
 `<base><principal>/<harness>/<project>/memory/<name>`, `…/index` for Claude Code's
-`MEMORY.md`, or `…/instructions/<path>`. The project is the git remote as
-`github.com.acme.shop`, or `user` for user-scope files. The graph IRI is also the
-source's IRI, and the source is described in its graph with `spk:contentDigest`,
-`mem:filePath`, `mem:harness`, `dcterms:modified` and `mem:redactions`.
+`MEMORY.md`, `…/instructions/<path>`, or `…/sessions/<id>` for a transcript. The
+project is the git remote as `github.com.acme.shop`, or `user` for user-scope files.
+The graph IRI is also the source's IRI. The import registers each file's text with
+`register_source`, so the graph holds the source, its rendition and chunks, and the
+structural facts cite the span of the line they came from. The source also carries
+`mem:filePath`, `mem:harness`, `dcterms:modified`, `mem:redactions` and, for a file
+exported from another source, `mem:copyOf` that source.
+
+**`POST /{ds}/sources`** runs `register_source` as the caller and **`GET /{ds}/sources`**
+runs `list_sources`. The POST body is the tool's arguments without `dataset`. It needs
+`write` on the source's graph and counts as an update. The GET takes `graph` (repeat
+for several), `graphPrefix`, `needsExtraction`, `limit` (at most 500) and `atCommit` as
+query parameters, needs `read` and counts as a query. Three arguments of
+`register_source` serve the import.
+
+| Argument | Meaning |
+|---|---|
+| `original` | The file's bytes in base64 when the text is their normalized form, such as a file with `\r\n` line ends. They are kept as `spk:originalContent`, their SHA-256 becomes the digest, and the result says `originalKept`. Bytes whose normalized form is not the text are a `400`. |
+| `reanchor` | For a changed text, the same commit gives each fact that cites the previous rendition a second reifier at the one place its quote occurs in the new text, and retracts with supersession the facts whose quote no longer occurs exactly once. The result counts `reanchored` and `retracted`. |
+| `reanchorFrom` | An earlier source, such as a renamed file's. Each fact that cites it and whose quote occurs in the new text is copied into the new graph with a reifier derived from the old one, and the result counts `copied`. It needs `write` on both graphs. |
+
+In a graph under `imports.base`, a text that matches a built-in secret pattern or one of
+`secretPatterns` is refused with a `422` and code `secret-detected`. The error names the
+pattern and the offset of the match, never the matched text, so a client that skipped
+redaction cannot store a secret the server recognizes. Pattern matching cannot find
+every secret.
+
+`list_sources` reports `needsExtraction` for each source. A rendition needs extraction
+until a fact cites a span of it through an activity that is neither a re-anchoring nor
+the import's own, whose agent is named `sparkles-import/<harness>`. With
+`needsExtraction=true` only those sources are listed, which is how the extraction skill
+of `sparkles memory setup` finds its work.
 
 **`POST /{ds}/facts`** runs `assert_facts` as the caller, with the same checks and
 results as the MCP tool. The body is the tool's arguments without `dataset`, and may
@@ -8816,6 +8845,101 @@ and remove one profile, and `PUT` and `DELETE` need `admin`:
 A profile left out lists every class and predicate of the schema report. The profile
 `default` answers `{}` until one is stored. A dataset keeps at most 50 profiles, and the
 IRIs, the language tag and the Turtle of `shapes` must parse.
+
+`PUT /$/ingest/{ds}/settings` also takes `confirmTokens`, the estimate above which an
+ingestion waits for a confirmation (200,000 tokens by default), and `autoConfidence`, the
+confidence that `auto` mode needs of every fact (0.8 by default). Members left out keep
+their value, and `null` restores the default.
+
+### Ingestion
+
+The server can do the whole ingestion itself, with no agent in between. It converts the
+document, registers it with `register_source` on a review branch, asks the `extract`
+role for the facts, links their entities with `link_entities`, and writes them with
+`assert_facts`, each with the span of its quote. Every tool runs as the caller, so an
+ingestion writes nothing the caller could not write with those tools.
+
+**`POST /$/ingest/{ds}`** starts a task and answers `202` with it and a `Location`
+header. The document is the `file` part of a multipart upload, with the options as
+further fields, or JSON with `text` or a `url` that the server fetches through its
+outbound policy:
+
+```bash
+curl -F file=@report.pdf -F mode=branch http://localhost:3030/$/ingest/org
+curl -H 'Content-Type: application/json' \
+  -d '{"text": "# Stand-up\n\nAna Lima moved to the payments team.", "format": "text/markdown", "title": "Stand-up"}' \
+  http://localhost:3030/$/ingest/org
+```
+
+| Option | Meaning |
+|---|---|
+| `format` | The media type, when the file name or content does not say it. |
+| `title`, `iri`, `graph`, `profile`, `message` | As `register_source` takes them. A `url` is the source's IRI by default. |
+| `mode` | `branch` (the default) writes on `ingest.<slug>-<n>`, or `proposals.<agent>.ingest-<slug>-<n>` for an agent of the memory settings. `preview` writes nothing until an approval. `auto` merges into `main` when every check passes and needs `admin`. |
+| `branch` | The review branch to use instead. |
+| `allowPartial` | Register the readable pages of a PDF that needs OCR, and record the other pages. |
+| `extract` | Extract facts. By default the server extracts when the dataset's assistant settings enable `ingest` and some pair of the `extract` role may receive documents (`send: "documents"`). |
+| `confirm` | Confirm the estimate in advance. |
+| `base` | The namespace of a table's rows in its mapping draft. |
+| `deadlineSeconds` | The task's deadline, 3600 seconds by default. |
+
+The server converts these inputs. Input is limited to 10 MiB and a source's text to
+2 MiB.
+
+| Input | Conversion |
+|---|---|
+| Plain text and Markdown | Kept as they are, after NFC normalization. |
+| HTML | The first `<main>` or `<article>`, or the body, as Markdown. Scripts, styles, navigation, headers, footers, forms and hidden elements are left out. Headings, lists, tables, code, quotes and links are kept. |
+| PDF | Markdown from pdf-inspector with a `<!-- Page N -->` marker before each page, when the server is built with the `pdf` feature. The rendition records each page's start offset as `spk:pageStart`. |
+| CSV and TSV | Not converted. The model sees the header and 20 rows and drafts a CSVW mapping, and the result holds the mapping, the row and triple counts of the whole file and the triples of the first 100 rows. Nothing is written. The mapping goes to [`POST /{ds}/upload`](#csv-and-tsv-uploads) as its `mapping` part, with `?dryRun=true` first. |
+
+A PDF page without usable text needs OCR. Without OCR the task fails with `needs-ocr`
+and lists each page with pdf-inspector's reasons, such as `scanned`, and the fonts whose
+characters cannot be mapped. Nothing is registered. With `allowPartial` the other pages
+are registered and the rendition records the left-out pages as `spk:omittedPage`. A
+server built with `pdf-ocr` and started with `--pdf-ocr-models DIR` reads those pages by
+OCR instead and records them as `spk:ocrPage`. It loads PDFium from `--pdfium-lib` and
+ONNX Runtime from `--onnxruntime-lib` or their usual search paths, and never downloads a
+model. Conversions run at most `--pdf-workers` (2) at a time. A build without `pdf`
+refuses a PDF with `unsupported-format`.
+
+Before any model call the task estimates the extraction's tokens from the chunks, the
+profile and the answer, and its cost from the first pair's pricing. Above the dataset's
+`confirmTokens` the task waits in `awaiting-confirmation` for
+`POST /$/ingest/{ds}/{task}/confirm`, for up to a day. A spent daily budget of the
+assistant settings fails the task with `budget-exceeded` before any call.
+
+Each chunk is one call of the `extract` role with structured output whose classes and
+predicates are the enumerations of the ingest profile, so a predicate outside the
+profile cannot be proposed. The model gives each fact's quote, and the server finds the
+quote in the chunk to compute the span. A fact whose quote is not in the text fails with
+`span-mismatch`. A chunk whose answer fails validation after its retry, or whose provider
+fails, moves to the next pair of the role's list for the rest of the task, and `usage`
+records the escalation and the pair that answered each chunk. Mentions with the same
+name and class are one entity. An `exact` link uses the existing IRI, an `ambiguous` one
+uses the first candidate and is flagged in the result, and the other verdicts declare a
+new entity with the candidates as `distinctFrom`. A dry run of `assert_facts` drops the
+facts it rejects before the write, and the result lists them under `failed`.
+
+**`GET /$/ingest/{ds}/{task}`** answers the task's `status` (`queued`, `converting`,
+`registering`, `awaiting-confirmation`, `extracting`, `linking`, `writing`,
+`awaiting-approval`, `done`, `failed` or `cancelled`), `progress`, `estimate`, `usage`
+and `result` or `error`. `?wait=SECONDS` holds the answer until the task ends or waits
+for the caller, for at most 60 seconds. A task is visible to the principal that started
+it and to admins of the dataset, and finished tasks are kept for 7 days.
+**`GET /$/ingest/{ds}`** lists them with the server's `capabilities` (`pdf`, `ocr`).
+**`DELETE /$/ingest/{ds}/{task}`** cancels a running task, which keeps what it already
+wrote on its branch, or forgets one that has ended.
+
+A `preview` task ends in `awaiting-approval` with the proposals in its result.
+**`POST /$/ingest/{ds}/{task}/approve`** writes the source and the facts to `main` as the
+caller, and fails with `409` when `main` changed since the preview. An `auto` task
+merges its branch when no fact failed, no entity is ambiguous, the guard reported
+nothing, every fact's confidence is at least `autoConfidence` and the merge preview has
+no conflict. Otherwise it keeps the branch and gives the reason as `autoFallback`.
+
+The review page's sources carry `pages` with each page's number and start, and
+`ocrPages` and `omittedPages`, so the UI shows the page of each fact.
 
 ### Review inbox
 
