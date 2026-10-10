@@ -45,6 +45,25 @@ pub fn run(
     super::branches::name_branch(out, call)
 }
 
+/// `sparql_query` for the asking pipeline: its result, and the same result in the
+/// `application/x-sparkles+json` form of `/{ds}/sparql`.
+pub(crate) fn sparql_query_full(
+    server: &McpServer,
+    args: Map<String, Value>,
+    call: &Call,
+) -> Result<(Outcome, Value), ToolError> {
+    let mut args = args;
+    let on_branch = super::branches::branch_call(server, "sparql_query", &mut args, call)?;
+    let call = on_branch.as_ref().unwrap_or(call);
+    let t = Tools { server, call };
+    if call.cancel.load(Ordering::Relaxed) {
+        return Err(t.ctx(&[], 0.0).engine(Error::Cancelled));
+    }
+    let a: SparqlQueryArgs = parse(args)?;
+    let (out, whole) = t.run_sparql_with(a, Vec::new(), true)?;
+    Ok((out, whole.unwrap_or(Value::Null)))
+}
+
 fn dispatch(t: &Tools, name: &str, args: Map<String, Value>) -> Result<Outcome, ToolError> {
     match name {
         "list_datasets" => t.list_datasets(args),
@@ -963,6 +982,18 @@ impl Tools<'_> {
         a: SparqlQueryArgs,
         bindings: Vec<(String, Term)>,
     ) -> Result<Outcome, ToolError> {
+        self.run_sparql_with(a, bindings, false).map(|(o, _)| o)
+    }
+
+    /// [`Tools::run_sparql`], and with `full` the same result in the
+    /// `application/x-sparkles+json` form of `/{ds}/sparql`, with its plan and timing,
+    /// at most `maxRows` rows (the asking pipeline shows it in the UI).
+    fn run_sparql_with(
+        &self,
+        a: SparqlQueryArgs,
+        bindings: Vec<(String, Term)>,
+        full: bool,
+    ) -> Result<(Outcome, Option<Value>), ToolError> {
         let cfg = self.cfg();
         query_text(&a.query)?;
         let max_rows = bounded(
@@ -1027,6 +1058,11 @@ impl Tools<'_> {
             sparql::select_star_order(&a.query, &mut r);
         }
         let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
+        let whole = full.then(|| {
+            let mut j = sparql::results::sparkles_json(&r, Some(max_rows));
+            j["meta"]["commit"] = snap.commit.into();
+            j
+        });
         let text = match r.kind {
             QueryKind::Ask => match format {
                 Format::Table => render::ask_table(snap.commit, r.boolean),
@@ -1065,7 +1101,7 @@ impl Tools<'_> {
                 }
             }
         };
-        Ok(Outcome::Text(text))
+        Ok((Outcome::Text(text), whole))
     }
 
     // ------------------------------------------------------------- explain_query ------

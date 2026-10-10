@@ -923,6 +923,544 @@
       }
     },
     "schemas": {
+      "AskFeedback": {
+        "additionalProperties": false,
+        "description": "Feedback on an answer.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ask-history"
+        },
+        "properties": {
+          "note": {
+            "description": "At most 1000 characters.",
+            "type": "string"
+          },
+          "outcome": {
+            "enum": [
+              "accepted",
+              "edited",
+              "rejected"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "outcome"
+        ],
+        "type": "object"
+      },
+      "AskHistory": {
+        "description": "The caller's asked questions, newest first.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ask-history"
+        },
+        "properties": {
+          "asks": {
+            "items": {
+              "properties": {
+                "at": {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                "commit": {
+                  "type": "integer"
+                },
+                "id": {
+                  "type": "string"
+                },
+                "note": {
+                  "type": "string"
+                },
+                "outcome": {
+                  "enum": [
+                    "none",
+                    "accepted",
+                    "edited",
+                    "rejected"
+                  ],
+                  "type": "string"
+                },
+                "principal": {
+                  "type": "string"
+                },
+                "query": {
+                  "type": "string"
+                },
+                "question": {
+                  "type": "string"
+                },
+                "result": {
+                  "description": "The pipeline's outcome.",
+                  "type": "string"
+                },
+                "routing": {
+                  "additionalProperties": true,
+                  "description": "The complexity, steps, escalations, answering pair and tokens.",
+                  "type": "object"
+                }
+              },
+              "required": [
+                "id",
+                "principal",
+                "at",
+                "question",
+                "result",
+                "outcome",
+                "routing"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "dataset": {
+            "type": "string"
+          },
+          "historyDays": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "dataset",
+          "historyDays",
+          "asks"
+        ],
+        "type": "object"
+      },
+      "AskRequest": {
+        "additionalProperties": false,
+        "description": "A question for the dataset.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#asking-in-the-server"
+        },
+        "properties": {
+          "at": {
+            "description": "A commit or time to read, as for `/{ds}/sparql`."
+          },
+          "branch": {
+            "type": "string"
+          },
+          "clarification": {
+            "description": "The chosen value of a `clarify` event, as `{id, value}` or as the value alone.",
+            "oneOf": [
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "id": {
+                    "type": "string"
+                  },
+                  "value": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "value"
+                ],
+                "type": "object"
+              },
+              {
+                "type": "string"
+              }
+            ]
+          },
+          "context": {
+            "description": "Earlier turns of the conversation, at most 5.",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "query": {
+                  "type": "string"
+                },
+                "question": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "question",
+                "query"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "maxRows": {
+            "description": "The rows returned in `result`, 1000 by default.",
+            "type": "integer"
+          },
+          "query": {
+            "description": "A query to check, run and summarize without drafting, for **Summarize again** after an edit.",
+            "type": "string"
+          },
+          "question": {
+            "description": "At most 2000 characters.",
+            "type": "string"
+          },
+          "reasoning": {
+            "type": "boolean"
+          },
+          "reviewedOnly": {
+            "description": "Hide the agent memory graphs of the dataset from the query.",
+            "type": "boolean"
+          },
+          "run": {
+            "description": "Whether to run the checked query. `true` by default.",
+            "type": "boolean"
+          },
+          "summary": {
+            "description": "Whether to summarize the rows. `true` by default when the dataset sends rows.",
+            "type": "boolean"
+          },
+          "tryHarder": {
+            "description": "The id of an earlier ask of the caller. Drafting starts at the pair after the one that drafted it.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "question"
+        ],
+        "type": "object"
+      },
+      "AskResult": {
+        "description": "The whole answer of an ask in the JSON form.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#asking-in-the-server"
+        },
+        "properties": {
+          "attempts": {
+            "items": {
+              "additionalProperties": true,
+              "description": "One draft with its check and run.",
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "clarify": {
+            "additionalProperties": true,
+            "description": "`{id, question, choices: [{label, value}]}`.",
+            "type": "object"
+          },
+          "dataset": {
+            "type": "string"
+          },
+          "error": {
+            "properties": {
+              "code": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "code",
+              "message"
+            ],
+            "type": "object"
+          },
+          "notes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "outcome": {
+            "enum": [
+              "answered",
+              "empty",
+              "checked",
+              "not-run",
+              "clarify",
+              "unanswerable",
+              "failed",
+              "error"
+            ],
+            "type": "string"
+          },
+          "question": {
+            "type": "string"
+          },
+          "result": {
+            "additionalProperties": true,
+            "description": "The checked query with `explanation`, `assumptions`, `terms`, `graph`, `commit`, `attempt`, `verdict` and `results` in the `application/x-sparkles+json` form.",
+            "type": "object"
+          },
+          "summary": {
+            "properties": {
+              "citations": {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              "model": {
+                "type": "string"
+              },
+              "provider": {
+                "type": "string"
+              },
+              "rowsSent": {
+                "type": "integer"
+              },
+              "text": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "text",
+              "citations"
+            ],
+            "type": "object"
+          },
+          "usage": {
+            "additionalProperties": true,
+            "description": "`askId`, the tokens and estimated cost, `complexity`, the `steps` with their pairs and signals, `escalations`, `draftPair`, `answeredBy` and `tryHarder`.",
+            "type": "object"
+          }
+        },
+        "required": [
+          "dataset",
+          "question",
+          "outcome",
+          "usage"
+        ],
+        "type": "object"
+      },
+      "AssistantSettings": {
+        "description": "The assistant settings of a dataset.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#assistant-settings"
+        },
+        "properties": {
+          "ask": {
+            "description": "Whether `POST /{ds}/ask` is enabled. `true` by default.",
+            "type": "boolean"
+          },
+          "budget": {
+            "additionalProperties": false,
+            "properties": {
+              "perDatasetPerDay": {
+                "type": "integer"
+              },
+              "perPrincipalPerDay": {
+                "type": "integer"
+              },
+              "perRequest": {
+                "type": "integer"
+              }
+            },
+            "type": "object"
+          },
+          "deadlineSecs": {
+            "description": "The time an ask may take, 120 seconds by default.",
+            "type": "number"
+          },
+          "enabled": {
+            "description": "Whether the dataset has an assistant. `false` by default.",
+            "type": "boolean"
+          },
+          "explain": {
+            "type": "boolean"
+          },
+          "historyDays": {
+            "description": "The days an asked question is kept. 0 keeps nothing.",
+            "type": "integer"
+          },
+          "ingest": {
+            "type": "boolean"
+          },
+          "optimize": {
+            "type": "boolean"
+          },
+          "roles": {
+            "description": "Role lists that replace the server's for this dataset.",
+            "properties": {
+              "draft": {
+                "items": {
+                  "properties": {
+                    "model": {
+                      "type": "string"
+                    },
+                    "provider": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "provider",
+                    "model"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "explain": {
+                "items": {
+                  "properties": {
+                    "model": {
+                      "type": "string"
+                    },
+                    "provider": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "provider",
+                    "model"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "extract": {
+                "items": {
+                  "properties": {
+                    "model": {
+                      "type": "string"
+                    },
+                    "provider": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "provider",
+                    "model"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "optimize": {
+                "items": {
+                  "properties": {
+                    "model": {
+                      "type": "string"
+                    },
+                    "provider": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "provider",
+                    "model"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "repair": {
+                "items": {
+                  "properties": {
+                    "model": {
+                      "type": "string"
+                    },
+                    "provider": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "provider",
+                    "model"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "summarize": {
+                "items": {
+                  "properties": {
+                    "model": {
+                      "type": "string"
+                    },
+                    "provider": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "provider",
+                    "model"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            },
+            "type": "object"
+          },
+          "routing": {
+            "additionalProperties": true,
+            "description": "`complexityThreshold` and `exampleScore` of the escalation rules.",
+            "type": "object"
+          },
+          "rowsForSummary": {
+            "description": "The rows sent to the summary, 50 by default.",
+            "type": "integer"
+          },
+          "send": {
+            "description": "What may leave the server. `schema` by default.",
+            "enum": [
+              "schema",
+              "rows",
+              "documents"
+            ],
+            "type": "string"
+          },
+          "sendByProvider": {
+            "additionalProperties": {
+              "enum": [
+                "schema",
+                "rows",
+                "documents"
+              ],
+              "type": "string"
+            },
+            "description": "A lower `send` level for some providers.",
+            "type": "object"
+          },
+          "status": {
+            "description": "Answered by the server and ignored in a `PUT`.",
+            "properties": {
+              "ask": {
+                "type": "boolean"
+              },
+              "draft": {
+                "items": {
+                  "properties": {
+                    "model": {
+                      "type": "string"
+                    },
+                    "provider": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "provider",
+                    "model"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "historyDays": {
+                "type": "integer"
+              },
+              "models": {
+                "type": "boolean"
+              },
+              "reason": {
+                "type": "string"
+              },
+              "summary": {
+                "description": "Whether an answer can carry a summary.",
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "models",
+              "historyDays",
+              "ask"
+            ],
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
       "AuthConfig": {
         "additionalProperties": true,
         "properties": {
@@ -3953,6 +4491,15 @@
               "type": "string"
             },
             "type": "array"
+          },
+          "verdict": {
+            "description": "For an empty result: `query` when a check issue explains the first element without solutions, `data` when the query is well formed for the data and the data holds no match, `unknown` otherwise.",
+            "enum": [
+              "query",
+              "data",
+              "unknown"
+            ],
+            "type": "string"
           }
         },
         "required": [
@@ -6788,6 +7335,72 @@
           "inputTokens",
           "outputTokens",
           "requests"
+        ],
+        "type": "object"
+      },
+      "ModelUsage": {
+        "description": "The routing counters by dataset.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#asking-in-the-server"
+        },
+        "properties": {
+          "datasets": {
+            "items": {
+              "properties": {
+                "answers": {
+                  "items": {
+                    "additionalProperties": true,
+                    "description": "`{role, provider, model, outcome, count}`.",
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "asks": {
+                  "type": "integer"
+                },
+                "dataset": {
+                  "type": "string"
+                },
+                "escalations": {
+                  "items": {
+                    "additionalProperties": true,
+                    "description": "`{role, signal, count}`.",
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "outcomes": {
+                  "items": {
+                    "additionalProperties": true,
+                    "description": "`{bucket, outcome, count}`.",
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "tokens": {
+                  "items": {
+                    "additionalProperties": true,
+                    "description": "`{provider, model, inputTokens, outputTokens, estimatedCost}`.",
+                    "type": "object"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "dataset",
+                "asks"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "days": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "days",
+          "datasets"
         ],
         "type": "object"
       },
@@ -12259,6 +12872,307 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/$/asks/{ds}": {
+      "delete": {
+        "description": "Removes the caller's entries, or the one entry `id` names.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ask-history"
+        },
+        "operationId": "deleteAsks",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "description": "The entry to remove. All of the caller's entries without it.",
+            "in": "query",
+            "name": "id",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Forget your asked questions",
+        "tags": [
+          "Assistant"
+        ],
+        "x-sparkles-permission": "read"
+      },
+      "get": {
+        "description": "The caller's own asks on the dataset, newest first, kept for `historyDays`. An entry holds the question, the final query, the commit, the feedback and the routing record, never rows or summaries.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ask-history"
+        },
+        "operationId": "listAsks",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "description": "The most entries listed.",
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "default": 100,
+              "maximum": 1000,
+              "minimum": 1,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AskHistory"
+                }
+              }
+            },
+            "description": "The entries."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "List your asked questions",
+        "tags": [
+          "Assistant"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
+    "/$/asks/{ds}/{id}/feedback": {
+      "post": {
+        "description": "Records `accepted`, `edited` or `rejected` for one of the caller's asks, in the routing counters and, when history is kept, in its entry.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ask-history"
+        },
+        "operationId": "askFeedback",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/id"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AskFeedback"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Recorded."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Give feedback on an answer",
+        "tags": [
+          "Assistant"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
+    "/$/assistant/{ds}": {
+      "get": {
+        "description": "The dataset's `assistant.json` with a `status` that says whether asking works, and why not when it does not.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#assistant-settings"
+        },
+        "operationId": "getAssistantSettings",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AssistantSettings"
+                }
+              }
+            },
+            "description": "The settings and their status."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Get the assistant settings",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "read"
+      },
+      "put": {
+        "description": "Replaces the dataset's `assistant.json`. Providers and models must be ones the server configuration names, and an `endpoint` or `apiKey` anywhere is refused.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#assistant-settings"
+        },
+        "operationId": "putAssistantSettings",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AssistantSettings"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AssistantSettings"
+                }
+              }
+            },
+            "description": "The stored settings and their status."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Set the assistant settings",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "admin"
+      }
+    },
     "/$/auth/cli/authorize": {
       "post": {
         "description": "Mints the CLI's token and issues the one-time code the browser hands to the CLI's loopback listener. The body may narrow the token's scope, as for `POST /$/auth/tokens`.",
@@ -18103,6 +19017,57 @@
           }
         },
         "summary": "List model providers",
+        "tags": [
+          "Models"
+        ],
+        "x-sparkles-permission": "server-admin"
+      }
+    },
+    "/$/models/usage": {
+      "get": {
+        "description": "The routing counters of the last `days` days by dataset: asks, answers by role, pair and feedback, escalations by role and signal, feedback by complexity bucket, and tokens with the estimated cost by pair. The counters live in memory and start again when the server restarts.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#asking-in-the-server"
+        },
+        "operationId": "modelUsage",
+        "parameters": [
+          {
+            "description": "The days counted, today included.",
+            "in": "query",
+            "name": "days",
+            "schema": {
+              "default": 30,
+              "maximum": 400,
+              "minimum": 1,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelUsage"
+                }
+              }
+            },
+            "description": "The counters."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Model usage by dataset",
         "tags": [
           "Models"
         ],
@@ -24558,6 +25523,92 @@
         "x-sparkles-permission": "read or write, by operation"
       }
     },
+    "/{ds}/ask": {
+      "post": {
+        "description": "Runs the pipeline of spec C18 with the dataset's model pairs. It grounds the question, drafts a query, checks and runs it, repairs it after a failure, escalates to a later pair on a verified signal, and summarizes the rows when the dataset sends rows. The answer streams as server-sent events, one JSON object per event, unless `Accept` names `application/json` without `text/event-stream`. Needs `read` and counts as a query for rate limits.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#asking-in-the-server"
+        },
+        "operationId": "askQuestion",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AskRequest"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AskResult"
+                }
+              },
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "The events `ground`, `clarify`, `draft`, `escalate`, `check`, `run`, `diagnosis`, `result`, `summary`, `error` and finally `usage`, or the whole answer as one object."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Ask a question",
+        "tags": [
+          "Assistant"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
     "/{ds}/changes": {
       "get": {
         "description": "The commits after `after`, oldest first, with their changes. `wait` long-polls, and `Accept: text/event-stream` streams the commits as server-sent events.",
@@ -29983,6 +31034,13 @@
         "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#model-providers"
       },
       "name": "Models"
+    },
+    {
+      "description": "Asking a dataset questions in plain language, the history of asked questions and feedback.",
+      "externalDocs": {
+        "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#asking-in-the-server"
+      },
+      "name": "Assistant"
     },
     {
       "description": "This description.",

@@ -84,6 +84,10 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/queries/{ds}/suggestions", &["GET", "POST", "DELETE"]),
     // memory settings (C18 §8.8)
     ("/$/memory/{ds}", &["GET", "PUT"]),
+    // assistant settings and the caller's own ask history (C18 §3.5, §6.4)
+    ("/$/assistant/{ds}", &["GET", "PUT"]),
+    ("/$/asks/{ds}", &["GET", "DELETE"]),
+    ("/$/asks/{ds}/{id}/feedback", &["POST"]),
     ("/$/queries/{ds}/{name}", &["GET", "PUT", "DELETE"]),
     ("/$/queries/{ds}/{name}/versions", &["GET"]),
     ("/{ds}/queries/{name}", &["GET", "POST"]),
@@ -119,6 +123,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     // model providers (spec C18 §3.4): defined by `serve --model-config` only
     ("/$/models", &["GET"]),
     ("/$/models/{name}/test", &["POST"]),
+    ("/$/models/usage", &["GET"]),
     // backup repositories (feature `backup`)
     ("/$/repositories", &["GET", "POST"]),
     ("/$/repositories/{repo}", &["GET", "PUT", "DELETE"]),
@@ -166,6 +171,8 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/{ds}/check", &["POST"]),
     ("/{ds}/recall", &["POST"]),
     ("/{ds}/sparql/diagnose", &["POST"]),
+    // the asking pipeline (feature `mcp`, spec C18 §5)
+    ("/{ds}/ask", &["POST"]),
     ("/{ds}/text", &["GET", "POST"]),
     ("/{ds}/diff", &["GET"]),
     ("/{ds}/changes", &["GET"]),
@@ -254,8 +261,14 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         "/$/queries/{ds}/suggestions" => Dataset(Admin),
         "/$/memory/{ds}" if get => Dataset(Read),
         "/$/memory/{ds}" => Dataset(Admin),
+        "/$/assistant/{ds}" if get => Dataset(Read),
+        "/$/assistant/{ds}" => Dataset(Admin),
+        // only the caller's own entries, whatever its role (C18 §6.4)
+        "/$/asks/{ds}" | "/$/asks/{ds}/{id}/feedback" => Dataset(Read),
         // endpoints, models, budgets and the secret names of the operator's providers
-        "/$/models" | "/$/models/{name}/test" => Server(ServerPerm::ServerAdmin),
+        "/$/models" | "/$/models/{name}/test" | "/$/models/usage" => {
+            Server(ServerPerm::ServerAdmin)
+        }
         "/$/datasets" if get => Caller,
         "/$/datasets" => Server(ServerPerm::ServerAdmin),
         "/$/datasets/{ds}/rename" => Server(ServerPerm::ServerAdmin),
@@ -293,6 +306,7 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/{ds}/check"
         | "/{ds}/recall"
         | "/{ds}/sparql/diagnose"
+        | "/{ds}/ask"
         | "/{ds}/text"
         | "/{ds}/diff"
         | "/{ds}/changes"
@@ -410,6 +424,7 @@ pub fn endpoint(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) ->
         | "/{ds}/check"
         | "/{ds}/recall"
         | "/{ds}/sparql/diagnose"
+        | "/{ds}/ask"
         | "/{ds}/text"
         | "/{ds}/geo"
         | "/{ds}/queries/{name}" => Endpoint::Query,
