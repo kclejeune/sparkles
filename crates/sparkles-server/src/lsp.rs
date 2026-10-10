@@ -10,10 +10,17 @@
 //! finding with a safe fix offers it as a quick fix (`textDocument/codeAction`), and
 //! `source.fixAll.sparkles` applies them all.
 //!
+//! Completion offers prefixes (spec C20 §8): declarations after `PREFIX` or `@prefix`,
+//! and prefix names where a prefixed name starts, adding the declaration a completed
+//! name needs. The prefixes come from [`sources`]. The lint's `undefined-prefix` finding
+//! gets a quick fix that declares a known prefix.
+//!
 //! A document's language comes from its `languageId`, else its extension, else its
 //! content. Languages this build does not format yet are refused when asked to format
 //! and get no diagnostics.
 
+mod complete;
+mod sources;
 mod text;
 
 use crate::fmt::{config, report};
@@ -24,9 +31,12 @@ use lsp_types::notification::{
     DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, Exit, Notification as _,
     PublishDiagnostics,
 };
-use lsp_types::request::{CodeActionRequest, Formatting, RangeFormatting, Request as _};
+use lsp_types::request::{
+    CodeActionRequest, Completion, Formatting, RangeFormatting, Request as _,
+};
 use lsp_types::{
-    CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams, Diagnostic,
+    CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams, CompletionItem,
+    CompletionItemKind, CompletionParams, CompletionResponse, CompletionTextEdit, Diagnostic,
     DiagnosticSeverity, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
     DidOpenTextDocumentParams, DocumentFormattingParams, DocumentRangeFormattingParams,
     NumberOrString, Position, PublishDiagnosticsParams, Range, TextEdit, Uri, WorkspaceEdit,
@@ -88,6 +98,7 @@ fn serve(conn: &Connection) -> Result<()> {
                 "codeActionProvider": {
                     "codeActionKinds": ["quickfix", FIX_ALL],
                 },
+                "completionProvider": {},
             },
             "serverInfo": {"name": "sparkles", "version": env!("CARGO_PKG_VERSION")},
         }),
@@ -96,6 +107,7 @@ fn serve(conn: &Connection) -> Result<()> {
         encoding,
         docs: HashMap::new(),
         stale: BTreeSet::new(),
+        sources: sources::Sources::default(),
     };
     loop {
         // diagnostics wait until the client has nothing more queued, so a burst of
@@ -178,6 +190,8 @@ struct Server {
     docs: HashMap<Uri, Doc>,
     /// documents whose diagnostics are out of date
     stale: BTreeSet<Uri>,
+    /// the prefixes of servers that config files name
+    sources: sources::Sources,
 }
 
 impl Server {
@@ -199,6 +213,8 @@ impl Server {
                         linted: None,
                     },
                 );
+                // a server that the config file names is read now, in the background
+                self.sources.known(&editor(&d.uri));
                 self.stale.insert(d.uri);
             }
             DidChangeTextDocument::METHOD => {
@@ -252,6 +268,14 @@ impl Server {
             RangeFormatting::METHOD => req
                 .extract::<DocumentRangeFormattingParams>(RangeFormatting::METHOD)
                 .map(|(_, p)| p.text_document.uri),
+            Completion::METHOD => {
+                return match req.extract::<CompletionParams>(Completion::METHOD) {
+                    Ok((_, p)) => self.completion(id, &p),
+                    Err(_) => {
+                        Response::new_err(id, ErrorCode::InvalidParams as i32, "bad params".into())
+                    }
+                };
+            }
             CodeActionRequest::METHOD => {
                 return match req.extract::<CodeActionParams>(CodeActionRequest::METHOD) {
                     Ok((_, p)) => self.code_actions(id, &p),
@@ -305,6 +329,41 @@ impl Server {
         }
     }
 
+    /// The prefixes to complete at a position (C20 §8). A document in a language without
+    /// prefixes, or one that is not open, gets none.
+    fn completion(&mut self, id: RequestId, p: &CompletionParams) -> Response {
+        let encoding = self.encoding;
+        let pos = &p.text_document_position;
+        let uri = &pos.text_document.uri;
+        let Some(doc) = self.docs.get(uri) else {
+            return Response::new_ok(id, CompletionResponse::Array(Vec::new()));
+        };
+        let lang = match language(&doc.language_id, uri.as_str(), &doc.text) {
+            Ok(l) if complete::completes(l) => l,
+            _ => return Response::new_ok(id, CompletionResponse::Array(Vec::new())),
+        };
+        let text = &doc.text;
+        let at = text::offset(text, pos.position.line, pos.position.character, encoding);
+        let known = self.sources.known(&editor(uri));
+        let edit = |e: &complete::Edit| TextEdit {
+            range: range(text, e.start, e.end, encoding),
+            new_text: e.insert.clone(),
+        };
+        let items: Vec<CompletionItem> = complete::complete(text, at, lang, &known)
+            .into_iter()
+            .map(|i| CompletionItem {
+                label: i.label.clone(),
+                kind: Some(CompletionItemKind::MODULE),
+                detail: Some(i.iri.clone()),
+                filter_text: Some(i.label.clone()),
+                text_edit: Some(CompletionTextEdit::Edit(edit(&i.edit))),
+                additional_text_edits: i.declare.as_ref().map(|d| vec![edit(d)]),
+                ..CompletionItem::default()
+            })
+            .collect();
+        Response::new_ok(id, CompletionResponse::Array(items))
+    }
+
     /// The quick fixes of the lint findings in the requested range, and the action that
     /// applies every safe fix.
     fn code_actions(&mut self, id: RequestId, p: &CodeActionParams) -> Response {
@@ -351,6 +410,40 @@ impl Server {
                     kind: Some(CodeActionKind::QUICKFIX),
                     diagnostics: Some(vec![lint_diagnostic(&text, d, encoding)]),
                     edit: Some(edit(edits)),
+                    is_preferred: Some(true),
+                    ..CodeAction::default()
+                }));
+            }
+            // an undefined prefix that a source knows: declare it (C20 §8); the IRI comes
+            // from outside the document, so `source.fixAll` leaves it out
+            let mut known = None;
+            let mut offered = BTreeSet::new();
+            for d in linted
+                .diagnostics
+                .iter()
+                .filter(|d| d.rule == "undefined-prefix")
+            {
+                let r = range(&text, d.start, d.end, encoding);
+                if r.end < p.range.start || p.range.end < r.start {
+                    continue;
+                }
+                let span = &text[d.start..d.end];
+                let label = &span[..span.find(':').unwrap_or(span.len())];
+                if !offered.insert(label.to_string()) {
+                    continue;
+                }
+                let known = known.get_or_insert_with(|| self.sources.known(&editor(uri)));
+                let Some(e) = complete::declare(&text, linted.language, label, known) else {
+                    continue;
+                };
+                actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                    title: format!("Declare {label}: as <{}>", known[label]),
+                    kind: Some(CodeActionKind::QUICKFIX),
+                    diagnostics: Some(vec![lint_diagnostic(&text, d, encoding)]),
+                    edit: Some(edit(vec![TextEdit {
+                        range: range(&text, e.start, e.end, encoding),
+                        new_text: e.insert,
+                    }])),
                     is_preferred: Some(true),
                     ..CodeAction::default()
                 }));
@@ -585,6 +678,16 @@ fn options(uri: &Uri) -> Result<Options, String> {
         Some(dir) => config::options_for_dir(dir),
         None => Ok(Options::default()),
     }
+}
+
+/// The `[prefixes]` and `[lsp]` tables of a document's config file. A broken file gives
+/// none, and its error is published with the formatter's diagnostics.
+fn editor(uri: &Uri) -> config::Editor {
+    file_path(uri.as_str())
+        .as_deref()
+        .and_then(Path::parent)
+        .and_then(|dir| config::editor_for_dir(dir).ok())
+        .unwrap_or_default()
 }
 
 /// Format a document with its options.
