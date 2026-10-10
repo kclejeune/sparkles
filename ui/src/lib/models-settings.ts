@@ -471,6 +471,7 @@ export function newProviderPatch(
   const model = (input.model ?? '').trim();
   const provider: JsonObject = { kind: input.kind, endpoint };
   if (secret) provider.apiKey = { secret };
-  if (model) provider.models = { [model]: {} };
+  // an empty entry would vanish in the merge, so it states the default level
+  if (model) provider.models = { [model]: { structuredOutput: 'auto' } };
   return { patch: { providers: { [name]: provider } } };
 }

@@ -51,12 +51,14 @@ pub fn preset(name: &str) -> Option<&'static Preset> {
 }
 
 impl Preset {
-    /// The provider object the preset gives, in the form of the `models` kind.
+    /// The provider object the preset gives, in the form of the `models` kind. The
+    /// model's entry states the default `structuredOutput`, since the merge of the
+    /// settings layers drops an empty object.
     pub fn provider(&self) -> Value {
         let mut p = json!({
             "kind": self.kind,
             "endpoint": self.endpoint,
-            "models": { self.model: {} },
+            "models": { self.model: { "structuredOutput": "auto" } },
         });
         if let Some(s) = self.secret {
             p["apiKey"] = json!({ "secret": s });

@@ -604,7 +604,7 @@ fn provider_presets_and_insecure_warning() {
         provider("claude"),
         json!({
             "kind": "anthropic", "endpoint": "https://api.anthropic.com",
-            "apiKey": { "secret": "anthropic" }, "models": { "claude-sonnet-5-5": {} }
+            "apiKey": { "secret": "anthropic" }, "models": { "claude-sonnet-5-5": { "structuredOutput": "auto" } }
         })
     );
     // the assignments replace the preset's fields
@@ -617,14 +617,14 @@ fn provider_presets_and_insecure_warning() {
         "oai",
         "endpoint=https://proxy.example/v1",
         "apiKey.secret=team-key",
-        r#"models={"gpt-x":{}}"#,
+        r#"models={"gpt-x":{"contextTokens":32768}}"#,
     ])
     .ok();
     assert_eq!(
         provider("oai"),
         json!({
             "kind": "openai", "endpoint": "https://proxy.example/v1",
-            "apiKey": { "secret": "team-key" }, "models": { "gpt-x": {} }
+            "apiKey": { "secret": "team-key" }, "models": { "gpt-x": { "contextTokens": 32768 } }
         })
     );
     let j = run(&[

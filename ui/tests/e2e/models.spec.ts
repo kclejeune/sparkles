@@ -152,7 +152,7 @@ open('the Models section edits providers, roles and keys', async ({ page, reques
     kind: 'openai',
     endpoint: 'https://api.openai.com/v1',
     apiKey: { secret: 'oai-key' },
-    models: { 'gpt-5-mini': {} },
+    models: { 'gpt-5-mini': { structuredOutput: 'auto' } },
   });
 
   // turning certificate checks off needs the acknowledgement; Cancel sends nothing

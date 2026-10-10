@@ -212,7 +212,7 @@ describe('presets', () => {
             kind: 'openai',
             endpoint: 'https://api.openai.com/v1',
             apiKey: { secret: 'team-key' },
-            models: { 'gpt-5-mini': {} },
+            models: { 'gpt-5-mini': { structuredOutput: 'auto' } },
           },
         },
       },

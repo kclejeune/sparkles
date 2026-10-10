@@ -386,7 +386,7 @@ fills can be changed before or after the provider is added.
 | `openai` | `openai` | `https://api.openai.com/v1` | `openai` | `gpt-5-mini` |
 | `ollama` | `ollama` | `http://127.0.0.1:11434` | none | `qwen3:8b` |
 
-The starting model becomes an empty entry of the provider's `models`, so that
+The starting model becomes an entry of the provider's `models`, so that
 `GET /$/models` lists it and `POST /$/models/{name}/test` has a model to call. No preset
 sets pricing. Generic OpenAI-compatible gateways have no preset, because their endpoints
 differ for every deployment. They use the `openai` kind with their own endpoint.
@@ -956,6 +956,9 @@ These points settle what the addendum left open.
   with a `caCert` is accepted, and verification is off.
 - A lock can name `tls`, `tls.caCert` or `tls.insecureSkipVerify`, but not a member
   of `caCert`.
+- A preset's starting model is the entry `{"structuredOutput": "auto"}`, which states
+  the default. The merge of the settings layers drops an empty object, so an empty
+  entry would never reach the effective configuration.
 - The UI asks for the acknowledgement when Save or the runtime JSON would send a patch
   that turns verification on, not when the checkbox is ticked, so the dialog also
   covers the JSON editor. The TLS fields appear only for providers with an `https`
