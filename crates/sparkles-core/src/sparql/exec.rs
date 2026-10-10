@@ -1670,13 +1670,172 @@ fn range_scan(ctx: &Ctx, spec: &ScanSpec, range: &RangeSpec, vars: &[VarId]) -> 
             let mut part = Table::new(vars.to_vec());
             scan_into(ctx, spec, lo, hi, None, &mut part)?;
             if !part.is_empty() {
-                apply_filter(ctx, &mut part, &range.filter)?;
+                apply_range_filter(ctx, &mut part, range.var, &range.filter)?;
                 t.append(part);
             }
         }
         ctx.check_output(t.len(), t.width())?;
     }
     Ok(t)
+}
+
+/// A pushed range conjunct `?v op c` (see [`super::plan::RangeSpec`]) in the form the
+/// numeric test reads: the constant prepared for comparisons, and its term id when the
+/// expression evaluates to that term (then `=` holds on the identical term, as in
+/// `val_eq`).
+struct NumAtom {
+    op: super::plan::RangeOp,
+    c: super::value::NumConst,
+    id: Option<Id>,
+}
+
+impl NumAtom {
+    /// Whether the conjunct holds for the term `x` whose value is the number `v`, as the
+    /// generic evaluator answers it. For two numbers, `compare` and `equals` are
+    /// `num_cmp`, and an incomparable pair (NaN) is false.
+    #[inline]
+    fn holds(&self, x: Id, v: super::value::Num) -> bool {
+        use super::plan::RangeOp;
+        use Ordering::*;
+        if self.op == RangeOp::Eq && self.id == Some(x) {
+            return true;
+        }
+        let o = self.c.order(v);
+        match self.op {
+            RangeOp::Lt => o == Some(Less),
+            RangeOp::Le => matches!(o, Some(Less | Equal)),
+            RangeOp::Gt => o == Some(Greater),
+            RangeOp::Ge => matches!(o, Some(Greater | Equal)),
+            RangeOp::Eq => o == Some(Equal),
+        }
+    }
+}
+
+/// The conjuncts of a pushed range filter on `var` as [`NumAtom`]s, `None` when one is
+/// not a range conjunct.
+fn num_atoms(ctx: &Ctx, var: VarId, exprs: &[Expr]) -> Option<Vec<NumAtom>> {
+    exprs
+        .iter()
+        .map(|e| {
+            let (op, c) = super::plan::range_atom(e, var, ctx)?;
+            let c = super::value::NumConst::new(super::value::Num::of(&c).ok()?);
+            let id = match e {
+                Expr::Cmp(a, b, _) | Expr::Eq(a, b) => match (&**a, &**b) {
+                    (Expr::Var(_), k) | (k, Expr::Var(_)) => k.const_id(),
+                    _ => None,
+                },
+                _ => None,
+            };
+            Some(NumAtom { op, c, id })
+        })
+        .collect()
+}
+
+/// Apply the pushed range filter `exprs` on `var` (see [`super::plan::RangeSpec`]) to
+/// the rows of an inexact id range. Numbers of the base vocabulary are tested on their
+/// value from the numeric column, inline numbers on their id, and a term the column
+/// knows is no number fails every conjunct. That is the generic filter's answer for each
+/// of them without decoding a key. The other rows (the column's unknown numbers, delta
+/// terms) go through the generic filter.
+pub(super) fn apply_range_filter(
+    ctx: &Ctx,
+    t: &mut Table,
+    var: VarId,
+    exprs: &[Expr],
+) -> Result<()> {
+    use crate::id::Tag;
+    use crate::vocab::numeric::Numeric;
+    let (Some(num), Some(c), Some(atoms)) = (
+        ctx.snap.generation.vocab.numeric(),
+        t.col_of(var),
+        num_atoms(ctx, var, exprs),
+    ) else {
+        apply_filter(ctx, t, exprs)?;
+        return Ok(());
+    };
+    let col = &t.cols[c];
+    use super::value::Num;
+    let test = |x: Id, v: Num| atoms.iter().all(|a| a.holds(x, v));
+    // `Some(passes)`, or `None` for the generic filter
+    let decide = |x: Id, n: Option<Numeric>| -> Option<bool> {
+        match (x.tag(), n) {
+            (Tag::Vocab, Some(n)) => match n {
+                Numeric::NotNumeric => Some(false),
+                Numeric::Unknown => None,
+                Numeric::Integer(i) => Some(test(x, Num::Integer(i.into()))),
+                Numeric::Decimal(d) => Some(test(x, Num::Decimal(d))),
+                Numeric::Float(f) => Some(test(x, Num::Float(f.into()))),
+                Numeric::Double(d) => Some(test(x, Num::Double(d.into()))),
+            },
+            (Tag::Int | Tag::Double | Tag::Decimal, _) => ctx
+                .value(x)
+                .and_then(|v| Num::of(&v).ok())
+                .map(|v| test(x, v)),
+            _ => None,
+        }
+    };
+    // the distinct vocabulary ids of a run of rows read from the column at once, and
+    // runs of one id (the scan's sorted column) decided once
+    let chunk = |ids: &[Id]| -> Vec<Option<bool>> {
+        let mut vocab: Vec<u64> = ids
+            .iter()
+            .filter(|x| x.tag() == Tag::Vocab)
+            .map(|x| x.payload())
+            .collect();
+        // already sorted when the column is the scan's sorted column
+        if !vocab.is_sorted() {
+            vocab.sort_unstable();
+        }
+        vocab.dedup();
+        let found = num.get_many(&vocab);
+        let mut at = 0;
+        let mut last: Option<(Id, Option<bool>)> = None;
+        ids.iter()
+            .map(|&x| match last {
+                Some((l, d)) if l == x => d,
+                _ => {
+                    let n = if x.tag() == Tag::Vocab {
+                        let p = x.payload();
+                        if vocab.get(at) != Some(&p) {
+                            at = if vocab.get(at + 1) == Some(&p) {
+                                at + 1
+                            } else {
+                                vocab.binary_search(&p).unwrap_or(at)
+                            };
+                        }
+                        found.get(at).copied()
+                    } else {
+                        None
+                    };
+                    let d = decide(x, n);
+                    last = Some((x, d));
+                    d
+                }
+            })
+            .collect()
+    };
+    let decided: Vec<Option<bool>> = if col.len() > PAR_THRESHOLD {
+        col.par_chunks(PAR_MIN_LEN.max(4096))
+            .flat_map_iter(chunk)
+            .collect()
+    } else {
+        chunk(col)
+    };
+    let rest: Vec<usize> = (0..decided.len())
+        .filter(|&i| decided[i].is_none())
+        .collect();
+    let mut keep: Vec<bool> = decided.iter().map(|d| d.unwrap_or(false)).collect();
+    if !rest.is_empty() {
+        let sub = t.take_rows(&rest);
+        let mask = filter_mask(ctx, &sub, exprs)?;
+        for (&i, k) in rest.iter().zip(mask) {
+            keep[i] = k;
+        }
+    }
+    let sorted = t.sorted.clone();
+    t.filter_rows(&keep);
+    t.sorted = sorted;
+    Ok(())
 }
 
 // ---------------------------------------------------------- ordered top-k ------
@@ -1716,7 +1875,7 @@ fn topk_read(
     scan_into(ctx, scan, bound(lo, 0), bound(hi, u64::MAX), None, &mut t)?;
     let scanned = t.len();
     if !exact && !spec.range_filter.is_empty() && !t.is_empty() {
-        apply_filter(ctx, &mut t, &spec.range_filter)?;
+        apply_range_filter(ctx, &mut t, spec.var, &spec.range_filter)?;
     }
     if !spec.filter.is_empty() && !t.is_empty() {
         apply_filter(ctx, &mut t, &spec.filter)?;
@@ -3111,14 +3270,7 @@ fn decode_for(ctx: &Ctx, t: &Table, exprs: &[&Expr]) -> Option<super::expr::Deco
         idx.par_sort_unstable_by_key(|&i| col[i as usize]);
         let mut uniq: Vec<u64> = idx.iter().map(|&i| col[i as usize].payload()).collect();
         uniq.dedup();
-        let decoded: Vec<Value> = uniq
-            .par_chunks(4096)
-            .flat_map_iter(|chunk| {
-                let mut part = Vec::with_capacity(chunk.len());
-                vocab.get_sorted(chunk, |_, k| part.push(Value::from_key(k)));
-                part
-            })
-            .collect();
+        let decoded = decode_sorted(vocab, &uniq);
         if decoded.len() != uniq.len() {
             continue;
         }
@@ -3141,6 +3293,63 @@ fn decode_for(ctx: &Ctx, t: &Table, exprs: &[&Expr]) -> Option<super::expr::Deco
         out[c] = Some(vals);
     }
     Some(out)
+}
+
+/// The values of base vocabulary ids (sorted, distinct), in their order: numbers from
+/// the numeric column when the vocabulary has one, the others decoded from their keys,
+/// each front-coded block touched once (in parallel). Fewer values than ids when a key
+/// is missing.
+fn decode_sorted(vocab: &crate::vocab::Vocab, uniq: &[u64]) -> Vec<Value> {
+    let decode = |ids: &[u64]| -> Vec<Value> {
+        ids.par_chunks(4096)
+            .flat_map_iter(|chunk| {
+                let mut part = Vec::with_capacity(chunk.len());
+                vocab.get_sorted(chunk, |_, k| part.push(Value::from_key(k)));
+                part
+            })
+            .collect()
+    };
+    let Some(num) = vocab.numeric() else {
+        return decode(uniq);
+    };
+    if !uniq.iter().any(|&id| num.may_hold(id)) {
+        return decode(uniq);
+    }
+    if (2..=1 << 16).contains(&uniq.len()) {
+        // the keys of the ids outside the column's segments are read meanwhile
+        let keys: Vec<u64> = uniq
+            .iter()
+            .copied()
+            .filter(|&id| !num.may_hold(id))
+            .collect();
+        vocab.prefetch_sorted(&keys);
+    }
+    let from_column: Vec<Option<Value>> = uniq
+        .par_chunks(4096)
+        .flat_map_iter(|chunk| num.get_many(chunk).into_iter().map(|n| n.value()))
+        .collect();
+    let rest: Vec<u64> = uniq
+        .iter()
+        .zip(&from_column)
+        .filter(|(_, v)| v.is_none())
+        .map(|(&p, _)| p)
+        .collect();
+    if rest.len() == uniq.len() {
+        return decode(uniq);
+    }
+    let mut rest = decode(&rest).into_iter();
+    let mut out = Vec::with_capacity(uniq.len());
+    for v in from_column {
+        match v {
+            Some(v) => out.push(v),
+            None => match rest.next() {
+                Some(v) => out.push(v),
+                // a missing key: the caller sees fewer values than ids
+                None => break,
+            },
+        }
+    }
+    out
 }
 
 /// Keep the rows that pass every conjunct: EXISTS conjuncts answered from a key set
@@ -3382,7 +3591,7 @@ fn order_by(
             .collect();
         ids.sort_unstable();
         ids.dedup();
-        ctx.snap.generation.vocab.prefetch_sorted(&ids);
+        ctx.snap.generation.vocab.prefetch_values(&ids);
     }
     let mut notes = Vec::new();
     let mut cursor_candidate_charge = None;

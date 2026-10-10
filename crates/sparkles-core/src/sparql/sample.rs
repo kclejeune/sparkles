@@ -200,7 +200,7 @@ fn test(ctx: &Ctx, rows: &[(Key, f64)], cols: &[(usize, VarId)], f: &Expr) -> Re
             .filter(|id| id.tag() == Tag::Vocab)
             .map(|id| id.payload())
             .collect();
-        ctx.snap.generation.vocab.prefetch_sorted(&ids);
+        ctx.snap.generation.vocab.prefetch_values(&ids);
         let (hit, _) = super::exprcache::filter_values(ctx, &uniq, *v, exprs)?;
         return Ok(rows
             .iter()

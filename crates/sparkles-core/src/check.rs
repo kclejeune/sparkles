@@ -1007,6 +1007,18 @@ impl Checker<'_> {
                 .file(format!("{name}/vocab.idx")),
             ),
         }
+        match crate::vocab::verify_numeric_column(dir, self.full) {
+            None => {}
+            Some(Ok(n)) => summary.push_str(&format!(", numeric column of {n} values")),
+            Some(Err((error, m))) => run.add(
+                if error {
+                    Issue::error(m)
+                } else {
+                    Issue::warning(m)
+                }
+                .file(format!("{name}/{}", crate::vocab::numeric::FILE)),
+            ),
+        }
         VocabRun {
             millis: run.millis(),
             run,

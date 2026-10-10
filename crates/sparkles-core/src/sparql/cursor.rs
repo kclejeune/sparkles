@@ -2144,6 +2144,8 @@ struct Scan {
     position: Option<Key>,
     last: Option<Key>,
     filter: Vec<super::expr::Expr>,
+    /// the variable of the range filter
+    var: VarId,
     base_checked: bool,
     base: Option<BaseScan>,
 }
@@ -2181,6 +2183,7 @@ impl Scan {
             position: None,
             last: None,
             filter: range.map_or_else(Vec::new, |r| r.filter.clone()),
+            var: range.map_or(0, |r| r.var),
             base_checked: false,
             base: None,
         }
@@ -2423,7 +2426,7 @@ impl Scan {
         }
         if !exact && !out.table.is_empty() {
             let _scratch = ctx.charge(out.table.len as u64 * 16 + ctx.nvars() as u64 * 16)?;
-            exec::apply_filter(ctx, &mut out.table, &self.filter)?;
+            exec::apply_range_filter(ctx, &mut out.table, self.var, &self.filter)?;
         }
         out.reconcile()?;
         ctx.check()?;
@@ -2520,7 +2523,7 @@ impl Scan {
         }
         if !exact && !b.table.is_empty() {
             let scratch = ctx.charge(b.table.len as u64 * 16 + ctx.nvars() as u64 * 16)?;
-            exec::apply_filter(ctx, &mut b.table, &self.filter)?;
+            exec::apply_range_filter(ctx, &mut b.table, self.var, &self.filter)?;
             drop(scratch);
         }
         ctx.check()?;

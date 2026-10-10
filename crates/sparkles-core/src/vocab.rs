@@ -10,6 +10,7 @@
 //! * [`LocalVocab`] — per-query dictionary for computed terms.
 
 pub mod delta;
+pub mod numeric;
 mod sync;
 pub(crate) use delta::DeltaFile;
 pub use delta::parse_delta;
@@ -271,6 +272,8 @@ pub struct Vocab {
     /// Bulk decodes hint a block once per mapping, not on every warm export.
     /// Like sparse lookup hints, these are advisory. Evicted pages still fault in.
     prefetched: Box<[AtomicU64]>,
+    /// the values of the numeric literals (`vocab.num`), when the generation has them
+    num: Option<numeric::NumColumn>,
 }
 
 impl Vocab {
@@ -283,6 +286,7 @@ impl Vocab {
             first_triple: 0,
             sparse: None,
             prefetched: Box::new([]),
+            num: None,
         }
     }
 
@@ -317,6 +321,7 @@ impl Vocab {
             prefetched: (0..blocks.div_ceil(64))
                 .map(|_| AtomicU64::new(0))
                 .collect(),
+            num: None,
         };
         // a cheap test that the index belongs to these files: its first and last data
         // offsets (`sparkles check` compares every entry)
@@ -338,6 +343,9 @@ impl Vocab {
         v.first_triple = match v.find(b"(") {
             Ok(i) | Err(i) => i,
         };
+        if crate::index::numeric_column() {
+            v.num = numeric::NumColumn::open(dir, v.len, v.first_triple);
+        }
         Ok(v)
     }
 
@@ -360,6 +368,12 @@ impl Vocab {
     }
     pub fn disk_bytes(&self) -> u64 {
         (self.data.as_slice().len() + self.offsets.as_slice().len()) as u64
+    }
+
+    /// The numeric column (`vocab.num`), when the generation has one and it is in use.
+    #[inline]
+    pub fn numeric(&self) -> Option<&numeric::NumColumn> {
+        self.num.as_ref()
     }
 
     #[inline]
@@ -640,6 +654,22 @@ impl Vocab {
         );
     }
 
+    /// Read ahead what evaluating these ids' values reads (ids sorted ascending), for a
+    /// sort of a few thousand rows: the front-coded blocks of every id, as
+    /// [`Vocab::prefetch_sorted`] does, and with a numeric column the column's pages of
+    /// the numbers, read now in two rounds (see [`numeric::NumColumn::get_many`]). The
+    /// sort compares the numbers from the column, and the keys arrive meanwhile for the
+    /// rows that the results print.
+    pub fn prefetch_values(&self, ids: &[u64]) {
+        self.prefetch_sorted(ids);
+        if let Some(num) = &self.num
+            && crate::index::io_hints()
+        {
+            let maybe: Vec<u64> = ids.iter().copied().filter(|&id| num.may_hold(id)).collect();
+            num.get_many(&maybe);
+        }
+    }
+
     /// Overlap the vocabulary reads of a medium-sized result decoded in row order.
     /// With a sparse index, use its in-memory offsets and hint each group once, as
     /// `find` does. Warm requests then avoid sorting their cells or repeating hints.
@@ -814,6 +844,8 @@ pub struct VocabWriter {
     /// the entries of the sparse index: the data offset and first key of every
     /// [`IDX_BLOCKS`]-th block
     sparse: Vec<(u64, Vec<u8>)>,
+    /// the numeric column, built along
+    num: numeric::NumWriter,
     dir: std::path::PathBuf,
 }
 
@@ -830,6 +862,7 @@ impl VocabWriter {
             prev: Vec::new(),
             buf: Vec::with_capacity(256),
             sparse: Vec::new(),
+            num: numeric::NumWriter::create(dir)?,
             dir: dir.to_path_buf(),
         })
     }
@@ -859,6 +892,7 @@ impl VocabWriter {
         self.pos += self.buf.len() as u64;
         self.prev.clear();
         self.prev.extend_from_slice(key);
+        self.num.push(key)?;
         let id = self.count;
         self.count += 1;
         Ok(id)
@@ -880,6 +914,7 @@ impl VocabWriter {
         self.data.get_ref().get_ref().sync_all()?;
         self.offsets.get_ref().get_ref().sync_all()?;
         write_sparse_index(&self.dir, &self.sparse)?;
+        self.num.finish(&self.dir, self.count)?;
         Ok(self.count)
     }
 }
@@ -943,6 +978,83 @@ pub fn add_sparse_index(dir: &Path) -> Result<usize> {
     std::fs::rename(&tmp, dir.join("vocab.idx"))?;
     crate::store::sync_dir(dir)?;
     Ok(entries.len())
+}
+
+/// For `sparkles check`: compare the numeric column in `dir` with its vocabulary.
+/// `None` without a column, the number of values when it matches, and otherwise whether
+/// the mismatch is an error and what it is. A column that does not read as one for this
+/// vocabulary is ignored by the server (a warning). With `full`, the column is rebuilt
+/// from every key and compared byte for byte, since one that reads well but holds other
+/// values would be used (an error).
+pub(crate) fn verify_numeric_column(
+    dir: &Path,
+    full: bool,
+) -> Option<std::result::Result<u64, (bool, String)>> {
+    if !dir.join(numeric::FILE).exists() {
+        return None;
+    }
+    let v = match Vocab::open(dir) {
+        Ok(v) => v,
+        Err(e) => return Some(Err((true, e.to_string()))),
+    };
+    let Some(col) = numeric::NumColumn::open(dir, v.len, v.first_triple) else {
+        return Some(Err((
+            false,
+            "not a numeric column of this vocabulary; numbers are decoded from their keys".into(),
+        )));
+    };
+    if full {
+        let rebuilt = (|| -> Result<Vec<u8>> {
+            let tmp = tempfile::tempdir()?;
+            let mut w = numeric::NumWriter::create(tmp.path())?;
+            let mut failed = None;
+            v.for_each(|_, k| {
+                if failed.is_none()
+                    && let Err(e) = w.push(k)
+                {
+                    failed = Some(e);
+                }
+            });
+            if let Some(e) = failed {
+                return Err(e);
+            }
+            w.finish(tmp.path(), v.len)?;
+            Ok(std::fs::read(tmp.path().join(numeric::FILE)).unwrap_or_default())
+        })();
+        match rebuilt {
+            Ok(b) if std::fs::read(dir.join(numeric::FILE)).ok().as_ref() == Some(&b) => {}
+            Ok(_) => {
+                return Some(Err((
+                    true,
+                    "does not hold the values of the vocabulary's numeric literals".into(),
+                )));
+            }
+            Err(e) => return Some(Err((true, e.to_string()))),
+        }
+    }
+    Some(Ok(col.count()))
+}
+
+/// Write the numeric column (`vocab.num`) of the vocabulary in `dir` that lacks one,
+/// built by a version from before the column. It reads every literal key once. Returns
+/// the numbers in it; with none, no file is written.
+pub fn add_numeric_column(dir: &Path) -> Result<u64> {
+    let v = Vocab::open(dir)?;
+    let mut w = numeric::NumWriter::create(dir)?;
+    let mut failed = None;
+    v.for_each(|_, k| {
+        if failed.is_none()
+            && let Err(e) = w.push(k)
+        {
+            failed = Some(e);
+        }
+    });
+    if let Some(e) = failed {
+        return Err(e);
+    }
+    let n = w.finish(dir, v.len())?;
+    crate::store::sync_dir(dir)?;
+    Ok(n)
 }
 
 /// An append-only dictionary; used for the persisted delta vocabulary and for per-query
