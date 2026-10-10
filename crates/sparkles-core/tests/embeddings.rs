@@ -634,3 +634,126 @@ fn text_that_changes_while_its_request_is_out_is_embedded_again() {
         [expected("second")]
     );
 }
+
+/// Providers of a test: `remote` sends to the mock with a key, `local` answers in the
+/// process with the mock's vectors, reversed for queries (spec F12 §6).
+#[derive(Debug)]
+struct TestProviders {
+    url: String,
+}
+
+struct Local;
+
+impl sparkles_core::vector::embed::LocalModel for Local {
+    fn embed(
+        &self,
+        inputs: &[String],
+        query: bool,
+        dimension: Option<usize>,
+    ) -> Result<Vec<Vec<f32>>, sparkles_core::vector::embed::client::CallError> {
+        assert_eq!(dimension, None);
+        Ok(inputs
+            .iter()
+            .map(|t| {
+                let mut v = MockProvider::vector(DIM, t);
+                if query {
+                    v.reverse();
+                }
+                v
+            })
+            .collect())
+    }
+}
+
+impl sparkles_core::vector::embed::Providers for TestProviders {
+    fn resolve(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> Result<sparkles_core::vector::embed::Target, sparkles_core::vector::embed::client::CallError>
+    {
+        use sparkles_core::vector::embed::Target;
+        assert_eq!(model, "m");
+        match provider {
+            "remote" => Ok(Target::Remote {
+                url: self.url.clone(),
+                bearer: Some("k-1".into()),
+            }),
+            "local" => Ok(Target::Local(std::sync::Arc::new(Local))),
+            p => Err(sparkles_core::vector::embed::client::CallError::Fatal(
+                format!("no provider {p}"),
+            )),
+        }
+    }
+}
+
+fn provider_store(env: Environment, provider: &str) -> Store {
+    let s = Store::in_memory(StoreOptions::default());
+    s.set_embedding_environment(Some(env));
+    let mut c = VectorIndexConfig::new(EMB, DIM);
+    let mut e = EmbeddingConfig::new("", "m").from_predicates(&[LABEL]);
+    e.provider = Some(provider.into());
+    e.max_retries = 0;
+    c.embedding = Some(e);
+    s.create_vector_index("docs", c).unwrap();
+    s
+}
+
+#[test]
+fn providers_of_the_model_configuration() {
+    let mock = MockProvider::start(DIM);
+    let providers = std::sync::Arc::new(TestProviders { url: mock.url() });
+    for name in ["remote", "local"] {
+        let s = provider_store(
+            Environment {
+                providers: Some(providers.clone()),
+                ..env()
+            },
+            name,
+        );
+        let before = mock.state().requests;
+        run(&s, "INSERT DATA { ex:a rdfs:label \"alpha\" }");
+        embed(&s);
+        assert_eq!(
+            vectors(&s, "http://example.org/a", None),
+            [expected("alpha")]
+        );
+        let st = s.embedding_status("docs").unwrap();
+        assert_eq!(st.endpoint, format!("provider:{name}"));
+        if name == "remote" {
+            assert!(mock.state().requests > before);
+            assert_eq!(
+                mock.state().auth.last().unwrap().as_deref(),
+                Some("Bearer k-1")
+            );
+        } else {
+            assert_eq!(mock.state().requests, before);
+            // a query is embedded as a query: the local model reverses its vector, so
+            // the stored text's vector is not taken from the cache
+            let q = format!(
+                "{PREFIXES}SELECT ?s ?score WHERE {{ (?s ?score) spk:vectorSearch (ex:emb \"alpha\" 1) }}"
+            );
+            let r = query(s.snapshot(), &q, &QueryOptions::default()).unwrap();
+            let score: f64 = match &r.rows()[0][1] {
+                Some(oxrdf::Term::Literal(l)) => l.value().parse().unwrap(),
+                t => panic!("{t:?}"),
+            };
+            assert!(score < 0.9999, "{score}");
+        }
+    }
+    // a provider and a URL at once, or a key with a provider, are refused
+    let mut e = EmbeddingConfig::new("http://x/", "m").from_predicates(&[LABEL]);
+    e.provider = Some("remote".into());
+    assert!(e.validate(EMB).is_err());
+    e.url.clear();
+    e.validate(EMB).unwrap();
+    e.api_key = Some(ApiKey::Secret("k".into()));
+    assert!(e.validate(EMB).is_err());
+    // without providers in the environment the batch fails with the reason
+    let s = provider_store(env(), "remote");
+    run(&s, "INSERT DATA { ex:a rdfs:label \"alpha\" }");
+    let _ = s.embed_until_idle(Duration::from_secs(2));
+    let st = s.embedding_status("docs").unwrap();
+    let m = st.last_error.unwrap().message;
+    assert!(m.contains("no model configuration"), "{m}");
+}

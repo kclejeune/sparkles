@@ -58,22 +58,75 @@ pub(crate) fn resolve_key(env: &Environment, key: &ApiKey) -> Result<String, Str
     Ok(k.trim().to_string())
 }
 
-/// One request for the vectors of `inputs`, in order.
+/// The vectors of a model run in the process, checked like a provider's answer.
+fn local(
+    m: &dyn super::LocalModel,
+    cfg: &EmbeddingConfig,
+    dimension: usize,
+    inputs: &[String],
+    query: bool,
+) -> Result<Vec<Result<Vec<f32>, String>>, CallError> {
+    let vs = m.embed(inputs, query, cfg.send_dimensions.then_some(dimension))?;
+    if vs.len() != inputs.len() {
+        return Err(CallError::Fatal(format!(
+            "{}: {} vectors for {} inputs",
+            cfg.endpoint(),
+            vs.len(),
+            inputs.len()
+        )));
+    }
+    Ok(vs
+        .into_iter()
+        .map(|v| {
+            if v.len() != dimension {
+                Err(format!(
+                    "the model returned a vector of dimension {}; the index expects {dimension}",
+                    v.len()
+                ))
+            } else if v.iter().any(|x| !x.is_finite()) {
+                Err("the vector holds a value that is not a finite number".to_string())
+            } else {
+                Ok(v)
+            }
+        })
+        .collect())
+}
+
+/// One request for the vectors of `inputs`, in order. `query` tells a local model to
+/// use its query prompt.
 pub(crate) fn request(
     env: &Environment,
     cfg: &EmbeddingConfig,
     dimension: usize,
     inputs: &[String],
+    query: bool,
 ) -> Result<Vec<Result<Vec<f32>, String>>, CallError> {
     let mut body = serde_json::json!({ "model": cfg.model, "input": inputs });
     if cfg.send_dimensions {
         body["dimensions"] = dimension.into();
     }
-    let key = match &cfg.api_key {
-        Some(k) => Some(resolve_key(env, k).map_err(CallError::Fatal)?),
-        None => None,
+    let (url, auth) = match &cfg.provider {
+        Some(p) => {
+            let providers = env.providers.as_ref().ok_or_else(|| {
+                CallError::Fatal(format!(
+                    "no model configuration defines the provider {p:?} in this process"
+                ))
+            })?;
+            match providers.resolve(p, &cfg.model)? {
+                super::Target::Local(m) => return local(&*m, cfg, dimension, inputs, query),
+                super::Target::Remote { url, bearer } => {
+                    (url, bearer.map(|k| format!("Bearer {k}")))
+                }
+            }
+        }
+        None => {
+            let key = match &cfg.api_key {
+                Some(k) => Some(resolve_key(env, k).map_err(CallError::Fatal)?),
+                None => None,
+            };
+            (cfg.url.clone(), key.map(|k| format!("Bearer {k}")))
+        }
     };
-    let auth = key.map(|k| format!("Bearer {k}"));
     let mut headers: Vec<(&str, &str)> = Vec::new();
     if let Some(a) = &auth {
         headers.push(("Authorization", a.as_str()));
@@ -81,7 +134,7 @@ pub(crate) fn request(
     let timeout = Duration::from_secs_f64(cfg.timeout_secs);
     let posted = crate::outbound::post_json(
         &env.outbound,
-        &cfg.url,
+        &url,
         &headers,
         serde_json::to_vec(&body).expect("serializable"),
         timeout,
@@ -199,13 +252,14 @@ pub(crate) fn embed(
     cfg: &EmbeddingConfig,
     dimension: usize,
     inputs: &[String],
+    query: bool,
     waits: &Waits<'_>,
     requests: &mut u64,
 ) -> Result<Vec<Result<Vec<f32>, String>>, CallError> {
     let mut attempt = 0u32;
     loop {
         *requests += 1;
-        match request(env, cfg, dimension, inputs) {
+        match request(env, cfg, dimension, inputs, query) {
             Ok(v) => return Ok(v),
             Err(CallError::Transient(m, after)) => {
                 if attempt >= cfg.max_retries {
@@ -223,8 +277,8 @@ pub(crate) fn embed(
             Err(CallError::Rejected(m)) if inputs.len() > 1 => {
                 let (a, b) = inputs.split_at(inputs.len() / 2);
                 tracing::info!(target: "sparkles::embed", "splitting a batch of {}: {m}", inputs.len());
-                let mut out = embed(env, cfg, dimension, a, waits, requests)?;
-                out.extend(embed(env, cfg, dimension, b, waits, requests)?);
+                let mut out = embed(env, cfg, dimension, a, query, waits, requests)?;
+                out.extend(embed(env, cfg, dimension, b, query, waits, requests)?);
                 return Ok(out);
             }
             Err(CallError::Rejected(m)) => return Ok(vec![Err(m)]),

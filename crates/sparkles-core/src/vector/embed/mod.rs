@@ -56,6 +56,37 @@ pub struct Environment {
     pub outbound: OutboundPolicy,
     /// the secrets `apiKey: {"secret": NAME}` names
     pub secrets: BTreeMap<String, SecretSource>,
+    /// what an index's `provider` names (spec F12 §6); `None` refuses such indexes
+    pub providers: Option<Arc<dyn Providers>>,
+}
+
+/// The providers of the server's model configuration, for indexes that name one
+/// instead of a URL (spec F12 §6). The server implements it.
+pub trait Providers: Send + Sync + std::fmt::Debug {
+    /// Where the texts of `provider`'s `model` go, resolved for each request so that a
+    /// changed configuration or a rotated key takes effect at once.
+    fn resolve(&self, provider: &str, model: &str) -> Result<Target, client::CallError>;
+}
+
+/// A resolved provider.
+pub enum Target {
+    /// An endpoint of OpenAI's embeddings protocol and the bearer token to send.
+    Remote { url: String, bearer: Option<String> },
+    /// A model run in this process.
+    Local(Arc<dyn LocalModel>),
+}
+
+/// A model run in the process (spec F12, `sparkles-embed`).
+pub trait LocalModel: Send + Sync {
+    /// The vectors of `inputs` in order, as queries or as stored documents, cut to
+    /// `dimension` components when it is given (the index's `sendDimensions`) and the
+    /// model's vectors are longer (Matryoshka truncation).
+    fn embed(
+        &self,
+        inputs: &[String],
+        query: bool,
+        dimension: Option<usize>,
+    ) -> Result<Vec<Vec<f32>>, client::CallError>;
 }
 
 impl Default for Environment {
@@ -64,6 +95,7 @@ impl Default for Environment {
             enabled: true,
             outbound: OutboundPolicy::default(),
             secrets: BTreeMap::new(),
+            providers: None,
         }
     }
 }
