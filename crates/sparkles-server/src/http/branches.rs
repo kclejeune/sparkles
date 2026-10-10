@@ -856,6 +856,8 @@ pub(crate) async fn delete_branch(
     let b = branch.clone();
     blocking(move || Ok(d.dataset.delete_branch_with(&b, &o)?)).await?;
     ds.branches.lock().remove(&branch);
+    #[cfg(feature = "mcp")]
+    crate::mcp::memory::pending::touch(&st, &name);
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
@@ -1406,6 +1408,9 @@ async fn execute(
         )),
         Ok(MergeOutcome::UpToDate(r)) => Ok(Json(op.json(&r, None)).into_response()),
         Ok(MergeOutcome::Merged(r)) => {
+            // a merged review branch leaves the memory review inbox
+            #[cfg(feature = "mcp")]
+            crate::mcp::memory::pending::touch(st, name);
             let stale = reasoned && (r.inserted + r.deleted) > 0;
             let seq = r.commit.as_ref().map_or(r.target.seq, |c| c.commit.seq);
             let resp = Json(op.json(&r, Some(stale))).into_response();

@@ -50,7 +50,21 @@ pub fn run(
     if call.cancel.load(Ordering::Relaxed) {
         return Err(t.ctx(&[], 0.0).engine(Error::Cancelled));
     }
+    // the tools that change a review inbox count it again when they succeed
+    let inbox = INBOX_TOOLS.contains(&name).then(|| {
+        args.get("dataset")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    });
     let out = dispatch(&t, name, args);
+    if let Some(ds) = inbox
+        && out.is_ok()
+    {
+        let ds = ds.or_else(|| t.dataset(None).ok().map(|d| d.name.clone()));
+        if let Some(ds) = ds {
+            super::memory::pending::touch(&server.state, &ds);
+        }
+    }
     let out = match notice {
         Some(n) => super::memory::policy::with_notice(out, n),
         None => out,
@@ -76,6 +90,18 @@ pub(crate) fn sparql_query_full(
     let (out, whole) = t.run_sparql_with(a, Vec::new(), true)?;
     Ok((out, whole.unwrap_or(Value::Null)))
 }
+
+/// The tools whose success may change a dataset's review inbox (C18 §8.9).
+const INBOX_TOOLS: &[&str] = &[
+    "assert_facts",
+    "sparql_update",
+    "merge_branch",
+    "delete_branch",
+    "memory_promote",
+    "memory_reject",
+    "memory_relink",
+    "memory_edit",
+];
 
 fn dispatch(t: &Tools, name: &str, args: Map<String, Value>) -> Result<Outcome, ToolError> {
     match name {

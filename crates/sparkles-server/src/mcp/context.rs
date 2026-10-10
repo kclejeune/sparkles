@@ -1,6 +1,8 @@
 //! Resources and prompts: context that the host, not the model, picks. Two resources per
 //! dataset (`sparkles://{ds}/schema`, `sparkles://{ds}/prefixes`), one per stored query
-//! the caller may run as a tool (`sparkles://{ds}/queries/{name}`), and five prompts
+//! the caller may run as a tool (`sparkles://{ds}/queries/{name}`), the open items of
+//! the memory review inbox of each dataset with memory settings whose inbox the caller
+//! may review (`sparkles://{ds}/memory/review`), and five prompts
 //! (`explore_dataset`, `answer_question`, `run_stored_query`, `ask_graph`,
 //! `explain_term`). Each lists
 //! and reads only the datasets the caller may read. Prompt text is static apart from the
@@ -25,10 +27,12 @@ pub enum Kind {
     Prefixes,
     /// a stored query (`queries/{name}`)
     Query,
+    /// the open items of the memory review inbox (`memory/review`)
+    Review,
 }
 
 impl Kind {
-    const ALL: [Kind; 3] = [Kind::Schema, Kind::Prefixes, Kind::Query];
+    const ALL: [Kind; 4] = [Kind::Schema, Kind::Prefixes, Kind::Query, Kind::Review];
 
     /// The path after the dataset name (for a stored query, before its name).
     pub fn path(self) -> &'static str {
@@ -36,12 +40,13 @@ impl Kind {
             Kind::Schema => "schema",
             Kind::Prefixes => "prefixes",
             Kind::Query => "queries",
+            Kind::Review => "memory/review",
         }
     }
 
     pub fn mime_type(self) -> &'static str {
         match self {
-            Kind::Schema | Kind::Query => "application/json",
+            Kind::Schema | Kind::Query | Kind::Review => "application/json",
             Kind::Prefixes => "application/sparql-query",
         }
     }
@@ -51,6 +56,7 @@ impl Kind {
             Kind::Schema => "Schema summary",
             Kind::Prefixes => "Prefixes",
             Kind::Query => "Stored query",
+            Kind::Review => "Memory review",
         }
     }
 
@@ -64,6 +70,9 @@ impl Kind {
             }
             Kind::Query => {
                 "A stored query of the dataset: its text, parameters and version, and the tool that runs it."
+            }
+            Kind::Review => {
+                "What waits for a person's review in the dataset's agent memory: unreviewed facts and open review branches, with the oldest of each kind."
             }
         }
     }
@@ -115,7 +124,7 @@ pub fn parse_uri(uri: &str) -> Option<(&str, Kind, Option<&str>)> {
     if let Some(q) = path.strip_prefix("queries/") {
         return (!q.is_empty()).then_some((name, Kind::Query, Some(q)));
     }
-    let kind = [Kind::Schema, Kind::Prefixes]
+    let kind = [Kind::Schema, Kind::Prefixes, Kind::Review]
         .into_iter()
         .find(|k| k.path() == path)?;
     Some((name, kind, None))
@@ -137,6 +146,15 @@ impl McpServer {
                     })
             })
             .collect();
+        for ds in self.visible(&call.principal) {
+            if super::memory::pending::offered(&self.state, &ds, &call.principal) {
+                out.push(Resource {
+                    uri: format!("{SCHEME}{}/{}", ds.name, Kind::Review.path()),
+                    name: format!("{} memory review", ds.name),
+                    kind: Kind::Review,
+                });
+            }
+        }
         for t in self.stored_tools(&call.principal) {
             out.push(Resource {
                 uri: format!("{SCHEME}{}/queries/{}", t.dataset.name, t.query),
@@ -195,6 +213,19 @@ impl McpServer {
                     "parameters": def.parameters,
                 });
                 Ok((kind, text.to_string()))
+            }
+            Kind::Review => {
+                let (st, p) = (self.state.clone(), call.principal.clone());
+                let read = tokio::task::spawn_blocking(move || {
+                    super::memory::pending::review_json(&st, &ds, &p)
+                })
+                .await
+                .ok()
+                .flatten();
+                match read {
+                    Some(v) => Ok((kind, v.to_string())),
+                    None => Err(unknown()),
+                }
             }
             Kind::Schema => {
                 let mut args = Map::new();

@@ -402,6 +402,11 @@ impl Tools<'_> {
         } else {
             "reviewed-only"
         };
+        // what waits for review, for a caller who may review it
+        let review = super::pending::review_json(&self.server.state, &ds, &self.call.principal);
+        let review_lines = review
+            .as_ref()
+            .map_or(String::new(), super::pending::brief_lines);
         // as many facts as fit
         let header = |shown: usize| {
             let mut h = String::from(FIRST_LINE);
@@ -412,6 +417,7 @@ impl Tools<'_> {
                 "# dataset={} commit={commit} scope={sc} {status_word} facts={matched} shown={shown}\n",
                 ds.name
             ));
+            h.push_str(&review_lines);
             h
         };
         let mut n = 0;
@@ -482,7 +488,7 @@ impl Tools<'_> {
             }
             text.push('\n');
         }
-        Ok(Outcome::Structured(json!({
+        let mut out = json!({
             "dataset": ds.name,
             "commit": commit,
             "scope": label,
@@ -494,7 +500,11 @@ impl Tools<'_> {
             "facts": facts,
             "citations": citations,
             "prefixes": prefixes_used,
-        })))
+        });
+        if let Some(r) = review {
+            out["review"] = r;
+        }
+        Ok(Outcome::Structured(out))
     }
 
     /// The entity of `--entity`: an IRI, or a label that `link_entities` links `exact`.

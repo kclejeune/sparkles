@@ -75,12 +75,16 @@ impl McpServer {
         // a dataset deleted and created again under its name is another one
         let instance = Arc::as_ptr(&ds) as usize;
         match path {
-            p if p == Kind::Schema.path() => Some(hash(&(instance, ds.store.head_commit().seq))),
-            p if p == Kind::Prefixes.path() => {
+            x if x == Kind::Schema.path() => Some(hash(&(instance, ds.store.head_commit().seq))),
+            x if x == Kind::Review.path() => {
+                let state = super::memory::pending::state(&self.state, &ds, p)?;
+                Some(hash(&(instance, state)))
+            }
+            x if x == Kind::Prefixes.path() => {
                 Some(hash(&(instance, super::tools::dataset_prefixes(&ds))))
             }
-            p => {
-                let query = p.strip_prefix(Kind::Query.path())?.strip_prefix('/')?;
+            x => {
+                let query = x.strip_prefix(Kind::Query.path())?.strip_prefix('/')?;
                 let version = ds
                     .dataset
                     .queries()
