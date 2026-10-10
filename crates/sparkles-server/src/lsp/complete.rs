@@ -75,7 +75,7 @@ pub fn complete(
     }
     // a prefixed name starts with a letter, after something that is not part of a term
     if !word.starts_with(|c: char| c.is_ascii_alphabetic())
-        || head.ends_with(|c: char| matches!(c, '?' | '$' | ':' | '_' | '@' | '^'))
+        || head.ends_with(['?', '$', ':', '_', '@', '^'])
     {
         return Vec::new();
     }
