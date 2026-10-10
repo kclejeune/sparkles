@@ -647,6 +647,7 @@ fn maintenance(put: &mut dyn FnMut(&str, J)) {
 }
 
 fn memory(put: &mut dyn FnMut(&str, J)) {
+    settings(put);
     put(
         "MemorySettings",
         doc(
@@ -1333,6 +1334,97 @@ fn models(put: &mut dyn FnMut(&str, J)) {
             ),
             "The outcome of a test call.",
             "model-providers",
+        ),
+    );
+}
+
+/// The layered settings of spec C19.
+fn settings(put: &mut dyn FnMut(&str, J)) {
+    let source = string_enum(&["default", "declared", "runtime", "locked"]);
+    put(
+        "SettingsKind",
+        doc(
+            obj(
+                &[
+                    "dataset",
+                    "kind",
+                    "effective",
+                    "declared",
+                    "runtime",
+                    "sources",
+                    "locked",
+                    "overridden",
+                    "status",
+                    "etag",
+                ],
+                json!({
+                    "dataset": string(),
+                    "kind": string_enum(&["assistant", "memory", "ingest"]),
+                    "effective": any_object("The effective object: the built-in defaults, the declared values and the runtime layer merged, with the locked fields from the settings file."),
+                    "declared": any_object("The settings file's `defaults` and dataset entry for this kind, merged."),
+                    "runtime": any_object("The runtime layer: the fields changed through the API. `null` removes a declared member."),
+                    "sources": { "type": "object", "description": "The source of each field of `effective`, by dotted path such as `budget.perRequest`.", "additionalProperties": source },
+                    "locked": with_desc(strings(), "The fields the settings file locks."),
+                    "overridden": with_desc(strings(), "Locked fields whose runtime value is kept in the file but ignored."),
+                    "status": closed(&["valid"], json!({ "valid": boolean(), "error": string() })),
+                    "etag": with_desc(string(), "The entity tag of the runtime layer, as in the `ETag` header."),
+                }),
+            ),
+            "One settings kind of a dataset with its layers and sources.",
+            "settings",
+        ),
+    );
+    put(
+        "DatasetSettings",
+        doc(
+            obj(
+                &["dataset", "kinds"],
+                json!({
+                    "dataset": string(),
+                    "kinds": { "type": "object", "additionalProperties": sref("SettingsKind") },
+                }),
+            ),
+            "Every settings kind of a dataset.",
+            "settings",
+        ),
+    );
+    let file = obj(
+        &["path", "readAt", "error", "errorAt"],
+        json!({
+            "path": or_null(string()),
+            "readAt": or_null(string()),
+            "error": with_desc(or_null(string()), "Why the last reload failed, while the previous file stays in use."),
+            "errorAt": or_null(string()),
+        }),
+    );
+    let mut status = file.clone();
+    status["required"] = json!([
+        "path",
+        "readAt",
+        "error",
+        "errorAt",
+        "declared",
+        "unmatched",
+        "kinds",
+        "models"
+    ]);
+    status["properties"]["declared"] =
+        with_desc(strings(), "The dataset names of the settings file.");
+    status["properties"]["unmatched"] = with_desc(
+        strings(),
+        "Declared names that match no dataset. Their entries apply when such a dataset is created.",
+    );
+    status["properties"]["kinds"] = strings();
+    status["properties"]["models"] = with_desc(
+        file,
+        "The model configuration of `--model-config`, which SIGHUP reads again too.",
+    );
+    put(
+        "SettingsStatus",
+        doc(
+            status,
+            "The settings file of `serve --settings` and its reads.",
+            "settings",
         ),
     );
 }

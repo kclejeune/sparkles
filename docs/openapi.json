@@ -224,6 +224,20 @@
           "type": "string"
         }
       },
+      "kind": {
+        "description": "The settings kind: `assistant`, `memory` or `ingest`.",
+        "in": "path",
+        "name": "kind",
+        "required": true,
+        "schema": {
+          "enum": [
+            "assistant",
+            "memory",
+            "ingest"
+          ],
+          "type": "string"
+        }
+      },
       "limit": {
         "description": "The page size.",
         "in": "query",
@@ -4856,6 +4870,10 @@
           "access": {
             "$ref": "#/components/schemas/Level"
           },
+          "declared": {
+            "description": "Whether the server's command line declares the dataset (`--loc` or `--mem`). The API does not delete it.",
+            "type": "boolean"
+          },
           "ds.name": {
             "description": "Fuseki's dataset path, such as `/ds`.",
             "type": "string"
@@ -5096,6 +5114,28 @@
           "source",
           "defaultMaxBytes",
           "usedBytes"
+        ],
+        "type": "object"
+      },
+      "DatasetSettings": {
+        "description": "Every settings kind of a dataset.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#settings"
+        },
+        "properties": {
+          "dataset": {
+            "type": "string"
+          },
+          "kinds": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/SettingsKind"
+            },
+            "type": "object"
+          }
+        },
+        "required": [
+          "dataset",
+          "kinds"
         ],
         "type": "object"
       },
@@ -12617,6 +12657,232 @@
         ],
         "type": "object"
       },
+      "SettingsKind": {
+        "description": "One settings kind of a dataset with its layers and sources.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#settings"
+        },
+        "properties": {
+          "dataset": {
+            "type": "string"
+          },
+          "declared": {
+            "additionalProperties": true,
+            "description": "The settings file's `defaults` and dataset entry for this kind, merged.",
+            "type": "object"
+          },
+          "effective": {
+            "additionalProperties": true,
+            "description": "The effective object: the built-in defaults, the declared values and the runtime layer merged, with the locked fields from the settings file.",
+            "type": "object"
+          },
+          "etag": {
+            "description": "The entity tag of the runtime layer, as in the `ETag` header.",
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "assistant",
+              "memory",
+              "ingest"
+            ],
+            "type": "string"
+          },
+          "locked": {
+            "description": "The fields the settings file locks.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "overridden": {
+            "description": "Locked fields whose runtime value is kept in the file but ignored.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "runtime": {
+            "additionalProperties": true,
+            "description": "The runtime layer: the fields changed through the API. `null` removes a declared member.",
+            "type": "object"
+          },
+          "sources": {
+            "additionalProperties": {
+              "enum": [
+                "default",
+                "declared",
+                "runtime",
+                "locked"
+              ],
+              "type": "string"
+            },
+            "description": "The source of each field of `effective`, by dotted path such as `budget.perRequest`.",
+            "type": "object"
+          },
+          "status": {
+            "additionalProperties": false,
+            "properties": {
+              "error": {
+                "type": "string"
+              },
+              "valid": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "valid"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "dataset",
+          "kind",
+          "effective",
+          "declared",
+          "runtime",
+          "sources",
+          "locked",
+          "overridden",
+          "status",
+          "etag"
+        ],
+        "type": "object"
+      },
+      "SettingsStatus": {
+        "description": "The settings file of `serve --settings` and its reads.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#settings"
+        },
+        "properties": {
+          "declared": {
+            "description": "The dataset names of the settings file.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "error": {
+            "description": "Why the last reload failed, while the previous file stays in use.",
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "errorAt": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "kinds": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "models": {
+            "description": "The model configuration of `--model-config`, which SIGHUP reads again too.",
+            "properties": {
+              "error": {
+                "description": "Why the last reload failed, while the previous file stays in use.",
+                "oneOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "errorAt": {
+                "oneOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "path": {
+                "oneOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "readAt": {
+                "oneOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "path",
+              "readAt",
+              "error",
+              "errorAt"
+            ],
+            "type": "object"
+          },
+          "path": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "readAt": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "unmatched": {
+            "description": "Declared names that match no dataset. Their entries apply when such a dataset is created.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "path",
+          "readAt",
+          "error",
+          "errorAt",
+          "declared",
+          "unmatched",
+          "kinds",
+          "models"
+        ],
+        "type": "object"
+      },
       "ShexReport": {
         "description": "A ShEx validation result, in shape-map order.",
         "externalDocs": {
@@ -15945,7 +16211,7 @@
     },
     "/$/assistant/{ds}": {
       "get": {
-        "description": "The dataset's `assistant.json` with a `status` that says whether asking works, and why not when it does not.",
+        "description": "The dataset's effective assistant settings with a `status` that says whether asking works, and why not when it does not.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#assistant-settings"
         },
@@ -15986,7 +16252,7 @@
         "x-sparkles-permission": "read"
       },
       "put": {
-        "description": "Replaces the dataset's `assistant.json`. Providers and models must be ones the server configuration names, and an `endpoint` or `apiKey` anywhere is refused.",
+        "description": "Makes the effective assistant settings equal to the body, as `PUT /$/settings/{ds}/assistant` does, and answers in the shape of `GET`. Providers and models must be ones the server configuration names, and an `endpoint` or `apiKey` anywhere is refused.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#assistant-settings"
         },
@@ -21497,7 +21763,7 @@
     },
     "/$/ingest/{ds}/settings": {
       "put": {
-        "description": "Needs `admin` on the dataset.",
+        "description": "Changes the settings members of the `ingest` kind as `PATCH /$/settings/{ds}/ingest` does. Needs `admin` on the dataset.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ingest-profiles"
         },
@@ -22180,7 +22446,7 @@
                 }
               }
             },
-            "description": "The settings, or the defaults."
+            "description": "The effective settings."
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
@@ -22202,6 +22468,7 @@
         "x-sparkles-permission": "read"
       },
       "put": {
+        "description": "Makes the effective memory settings equal to the body, as `PUT /$/settings/{ds}/memory` does.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#memory-settings"
         },
@@ -22231,7 +22498,7 @@
                 }
               }
             },
-            "description": "The stored settings."
+            "description": "The effective settings."
           },
           "400": {
             "$ref": "#/components/responses/BadRequest"
@@ -26585,6 +26852,397 @@
           "Server"
         ],
         "x-sparkles-permission": "any caller"
+      }
+    },
+    "/$/settings": {
+      "get": {
+        "description": "The path of `serve --settings`, when it and the model configuration were last read, the last reload error, and the declared dataset names that match no dataset. Needs server `admin`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#settings"
+        },
+        "operationId": "getSettingsStatus",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SettingsStatus"
+                }
+              }
+            },
+            "description": "The status."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Read the settings file's status",
+        "tags": [
+          "Server"
+        ],
+        "x-sparkles-permission": "server-admin"
+      }
+    },
+    "/$/settings/{ds}": {
+      "get": {
+        "description": "Each kind's effective object with its layers, sources and locks.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#settings"
+        },
+        "operationId": "getDatasetSettings",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DatasetSettings"
+                }
+              }
+            },
+            "description": "The kinds."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Get every settings kind",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
+    "/$/settings/{ds}/{kind}": {
+      "delete": {
+        "description": "Clears the runtime layer, or with `field` one field of it, so the declared values and the defaults apply. Needs `admin`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#settings"
+        },
+        "operationId": "resetSettings",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/kind"
+          },
+          {
+            "description": "A dotted field such as `historyDays` or `budget.perRequest`.",
+            "in": "query",
+            "name": "field",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The `etag` of the runtime layer the change is based on.",
+            "in": "header",
+            "name": "If-Match",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SettingsKind"
+                }
+              }
+            },
+            "description": "The kind after the change."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Reset settings",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "admin"
+      },
+      "get": {
+        "description": "The kind's effective object, its declared and runtime layers, the source of each field, the locked fields and whether the effective object is valid. The `ETag` names the runtime layer.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#settings"
+        },
+        "operationId": "getSettings",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/kind"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SettingsKind"
+                }
+              }
+            },
+            "description": "The kind."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Get a settings kind",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "read"
+      },
+      "patch": {
+        "description": "Merges the body into the runtime layer as RFC 7396 says. `null` removes a runtime value, so the field falls back to the declared value or the default. A change to a locked field is a `409` with `locked-by-config` and `fields`, and an `endpoint` or `apiKey` anywhere is a `400`. Needs `admin`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#settings"
+        },
+        "operationId": "patchSettings",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/kind"
+          },
+          {
+            "description": "The `etag` of the runtime layer the change is based on.",
+            "in": "header",
+            "name": "If-Match",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "description": "Fields of the kind: `AssistantSettings`, `MemorySettings` or `IngestSettingsRequest`.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SettingsKind"
+                }
+              }
+            },
+            "description": "The kind after the change."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Change settings fields",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "admin"
+      },
+      "put": {
+        "description": "Makes the effective object equal to the body, with built-in defaults for the members it leaves out and the current value for locked fields it leaves out. The runtime layer keeps the fields where the body differs from the declared values and the defaults. Needs `admin`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#settings"
+        },
+        "operationId": "putSettings",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/kind"
+          },
+          {
+            "description": "The `etag` of the runtime layer the change is based on.",
+            "in": "header",
+            "name": "If-Match",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "description": "Fields of the kind: `AssistantSettings`, `MemorySettings` or `IngestSettingsRequest`.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SettingsKind"
+                }
+              }
+            },
+            "description": "The kind after the change."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Set a settings kind",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "admin"
       }
     },
     "/$/snapshots/{ds}": {

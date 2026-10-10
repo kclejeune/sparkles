@@ -57,12 +57,12 @@ export interface paths {
         };
         /**
          * Get the assistant settings
-         * @description The dataset's `assistant.json` with a `status` that says whether asking works, and why not when it does not.
+         * @description The dataset's effective assistant settings with a `status` that says whether asking works, and why not when it does not.
          */
         get: operations["getAssistantSettings"];
         /**
          * Set the assistant settings
-         * @description Replaces the dataset's `assistant.json`. Providers and models must be ones the server configuration names, and an `endpoint` or `apiKey` anywhere is refused.
+         * @description Makes the effective assistant settings equal to the body, as `PUT /$/settings/{ds}/assistant` does, and answers in the shape of `GET`. Providers and models must be ones the server configuration names, and an `endpoint` or `apiKey` anywhere is refused.
          */
         put: operations["putAssistantSettings"];
         post?: never;
@@ -1132,7 +1132,7 @@ export interface paths {
         get?: never;
         /**
          * Set the ingest settings
-         * @description Needs `admin` on the dataset.
+         * @description Changes the settings members of the `ingest` kind as `PATCH /$/settings/{ds}/ingest` does. Needs `admin` on the dataset.
          */
         put: operations["putIngestSettings"];
         post?: never;
@@ -1263,7 +1263,10 @@ export interface paths {
         };
         /** Get the memory settings */
         get: operations["getMemorySettings"];
-        /** Set the memory settings */
+        /**
+         * Set the memory settings
+         * @description Makes the effective memory settings equal to the body, as `PUT /$/settings/{ds}/memory` does.
+         */
         put: operations["putMemorySettings"];
         post?: never;
         delete?: never;
@@ -2175,6 +2178,78 @@ export interface paths {
         options?: never;
         head?: never;
         patch?: never;
+        trace?: never;
+    };
+    "/$/settings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read the settings file's status
+         * @description The path of `serve --settings`, when it and the model configuration were last read, the last reload error, and the declared dataset names that match no dataset. Needs server `admin`.
+         */
+        get: operations["getSettingsStatus"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/settings/{ds}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get every settings kind
+         * @description Each kind's effective object with its layers, sources and locks.
+         */
+        get: operations["getDatasetSettings"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/settings/{ds}/{kind}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get a settings kind
+         * @description The kind's effective object, its declared and runtime layers, the source of each field, the locked fields and whether the effective object is valid. The `ETag` names the runtime layer.
+         */
+        get: operations["getSettings"];
+        /**
+         * Set a settings kind
+         * @description Makes the effective object equal to the body, with built-in defaults for the members it leaves out and the current value for locked fields it leaves out. The runtime layer keeps the fields where the body differs from the declared values and the defaults. Needs `admin`.
+         */
+        put: operations["putSettings"];
+        post?: never;
+        /**
+         * Reset settings
+         * @description Clears the runtime layer, or with `field` one field of it, so the declared values and the defaults apply. Needs `admin`.
+         */
+        delete: operations["resetSettings"];
+        options?: never;
+        head?: never;
+        /**
+         * Change settings fields
+         * @description Merges the body into the runtime layer as RFC 7396 says. `null` removes a runtime value, so the field falls back to the declared value or the default. A change to a locked field is a `409` with `locked-by-config` and `fields`, and an `endpoint` or `apiKey` anywhere is a `400`. Needs `admin`.
+         */
+        patch: operations["patchSettings"];
         trace?: never;
     };
     "/$/snapshots/{ds}": {
@@ -4384,6 +4459,8 @@ export interface components {
         };
         DatasetInfo: {
             access?: components["schemas"]["Level"];
+            /** @description Whether the server's command line declares the dataset (`--loc` or `--mem`). The API does not delete it. */
+            declared?: boolean;
             /** @description Fuseki's dataset path, such as `/ds`. */
             "ds.name"?: string;
             "ds.services"?: Record<string, never>[];
@@ -4452,6 +4529,13 @@ export interface components {
             /** @enum {string} */
             source: "dataset" | "default";
             usedBytes: number;
+        };
+        /** @description Every settings kind of a dataset. */
+        DatasetSettings: {
+            dataset: string;
+            kinds: {
+                [key: string]: components["schemas"]["SettingsKind"];
+            };
         };
         DatasetStats: {
             baseQuads?: number;
@@ -6689,6 +6773,59 @@ export interface components {
             /** @description Left out for anonymous callers when auth is on. */
             version?: string;
         };
+        /** @description One settings kind of a dataset with its layers and sources. */
+        SettingsKind: {
+            dataset: string;
+            /** @description The settings file's `defaults` and dataset entry for this kind, merged. */
+            declared: {
+                [key: string]: unknown;
+            };
+            /** @description The effective object: the built-in defaults, the declared values and the runtime layer merged, with the locked fields from the settings file. */
+            effective: {
+                [key: string]: unknown;
+            };
+            /** @description The entity tag of the runtime layer, as in the `ETag` header. */
+            etag: string;
+            /** @enum {string} */
+            kind: "assistant" | "memory" | "ingest";
+            /** @description The fields the settings file locks. */
+            locked: string[];
+            /** @description Locked fields whose runtime value is kept in the file but ignored. */
+            overridden: string[];
+            /** @description The runtime layer: the fields changed through the API. `null` removes a declared member. */
+            runtime: {
+                [key: string]: unknown;
+            };
+            /** @description The source of each field of `effective`, by dotted path such as `budget.perRequest`. */
+            sources: {
+                [key: string]: "default" | "declared" | "runtime" | "locked";
+            };
+            status: {
+                error?: string;
+                valid: boolean;
+            };
+        };
+        /** @description The settings file of `serve --settings` and its reads. */
+        SettingsStatus: {
+            /** @description The dataset names of the settings file. */
+            declared: string[];
+            /** @description Why the last reload failed, while the previous file stays in use. */
+            error: string | null;
+            errorAt: string | null;
+            kinds: string[];
+            /** @description The model configuration of `--model-config`, which SIGHUP reads again too. */
+            models: {
+                /** @description Why the last reload failed, while the previous file stays in use. */
+                error: string | null;
+                errorAt: string | null;
+                path: string | null;
+                readAt: string | null;
+            };
+            path: string | null;
+            readAt: string | null;
+            /** @description Declared names that match no dataset. Their entries apply when such a dataset is created. */
+            unmatched: string[];
+        };
         /** @description A ShEx validation result, in shape-map order. */
         ShexReport: {
             /** @description Every association conforms. */
@@ -7850,6 +7987,8 @@ export interface components {
         ifMatch: string;
         /** @description Entity tags, or `*`. */
         ifNoneMatch: string;
+        /** @description The settings kind: `assistant`, `memory` or `ingest`. */
+        kind: "assistant" | "memory" | "ingest";
         /** @description The page size. */
         limit: number;
         /** @description A lower budget of the serialized result, in MiB. */
@@ -10861,7 +11000,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description The settings, or the defaults. */
+            /** @description The effective settings. */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -10892,7 +11031,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description The stored settings. */
+            /** @description The effective settings. */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -12982,6 +13121,203 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getSettingsStatus: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The status. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SettingsStatus"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getDatasetSettings: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The kinds. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DatasetSettings"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getSettings: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The settings kind: `assistant`, `memory` or `ingest`. */
+                kind: components["parameters"]["kind"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The kind. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SettingsKind"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    putSettings: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description The `etag` of the runtime layer the change is based on. */
+                "If-Match"?: string;
+            };
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The settings kind: `assistant`, `memory` or `ingest`. */
+                kind: components["parameters"]["kind"];
+            };
+            cookie?: never;
+        };
+        /** @description Fields of the kind: `AssistantSettings`, `MemorySettings` or `IngestSettingsRequest`. */
+        requestBody: {
+            content: {
+                "application/json": Record<string, never>;
+            };
+        };
+        responses: {
+            /** @description The kind after the change. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SettingsKind"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            412: components["responses"]["PreconditionFailed"];
+            default: components["responses"]["Error"];
+        };
+    };
+    resetSettings: {
+        parameters: {
+            query?: {
+                /** @description A dotted field such as `historyDays` or `budget.perRequest`. */
+                field?: string;
+            };
+            header?: {
+                /** @description The `etag` of the runtime layer the change is based on. */
+                "If-Match"?: string;
+            };
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The settings kind: `assistant`, `memory` or `ingest`. */
+                kind: components["parameters"]["kind"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The kind after the change. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SettingsKind"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            412: components["responses"]["PreconditionFailed"];
+            default: components["responses"]["Error"];
+        };
+    };
+    patchSettings: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description The `etag` of the runtime layer the change is based on. */
+                "If-Match"?: string;
+            };
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The settings kind: `assistant`, `memory` or `ingest`. */
+                kind: components["parameters"]["kind"];
+            };
+            cookie?: never;
+        };
+        /** @description Fields of the kind: `AssistantSettings`, `MemorySettings` or `IngestSettingsRequest`. */
+        requestBody: {
+            content: {
+                "application/json": Record<string, never>;
+            };
+        };
+        responses: {
+            /** @description The kind after the change. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SettingsKind"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            412: components["responses"]["PreconditionFailed"];
             default: components["responses"]["Error"];
         };
     };

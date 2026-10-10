@@ -489,6 +489,12 @@ fn parameters() -> Map<String, J> {
             "The name of the stored query, snapshot, vector index, branch or ingest profile.",
         ),
     );
+    let mut kind = path(
+        "kind",
+        "The settings kind: `assistant`, `memory` or `ingest`.",
+    );
+    kind["schema"]["enum"] = json!(["assistant", "memory", "ingest"]);
+    put("kind", kind);
     put("id", path("id", "The id of the task, token or lock."));
     put("task", path("task", "The id of the ingestion task."));
     put("repo", path("repo", "The backup repository."));

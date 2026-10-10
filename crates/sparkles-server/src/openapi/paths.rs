@@ -2151,7 +2151,7 @@ fn assist(p: &mut Paths) {
             "Get the memory settings",
         )
         .see("memory-settings")
-        .json("200", "The settings, or the defaults.", "MemorySettings"),
+        .json("200", "The effective settings.", "MemorySettings"),
     );
     p.add(
         op(
@@ -2161,9 +2161,10 @@ fn assist(p: &mut Paths) {
             "Datasets",
             "Set the memory settings",
         )
+        .doc("Makes the effective memory settings equal to the body, as `PUT /$/settings/{ds}/memory` does.")
         .see("memory-settings")
         .json_body(true, "MemorySettings")
-        .json("200", "The stored settings.", "MemorySettings")
+        .json("200", "The effective settings.", "MemorySettings")
         .errors(&[400]),
     );
     p.add(
@@ -2311,7 +2312,7 @@ fn assist(p: &mut Paths) {
             "Datasets",
             "Set the ingest settings",
         )
-        .doc("Needs `admin` on the dataset.")
+        .doc("Changes the settings members of the `ingest` kind as `PATCH /$/settings/{ds}/ingest` does. Needs `admin` on the dataset.")
         .see("ingest-profiles")
         .json_body(true, "IngestSettingsRequest")
         .json("200", "The stored setting.", "IngestSettingsRequest")
@@ -2538,17 +2539,75 @@ fn assist(p: &mut Paths) {
     );
     p.add(
         op(GET, "/$/assistant/{ds}", "getAssistantSettings", "Datasets", "Get the assistant settings")
-            .doc("The dataset's `assistant.json` with a `status` that says whether asking works, and why not when it does not.")
+            .doc("The dataset's effective assistant settings with a `status` that says whether asking works, and why not when it does not.")
             .see("assistant-settings")
             .json("200", "The settings and their status.", "AssistantSettings"),
     );
     p.add(
         op(PUT, "/$/assistant/{ds}", "putAssistantSettings", "Datasets", "Set the assistant settings")
-            .doc("Replaces the dataset's `assistant.json`. Providers and models must be ones the server configuration names, and an `endpoint` or `apiKey` anywhere is refused.")
+            .doc("Makes the effective assistant settings equal to the body, as `PUT /$/settings/{ds}/assistant` does, and answers in the shape of `GET`. Providers and models must be ones the server configuration names, and an `endpoint` or `apiKey` anywhere is refused.")
             .see("assistant-settings")
             .json_body(true, "AssistantSettings")
             .json("200", "The stored settings and their status.", "AssistantSettings")
             .errors(&[400]),
+    );
+    p.add(
+        op(GET, "/$/settings", "getSettingsStatus", "Server", "Read the settings file's status")
+            .doc("The path of `serve --settings`, when it and the model configuration were last read, the last reload error, and the declared dataset names that match no dataset. Needs server `admin`.")
+            .see("settings")
+            .json("200", "The status.", "SettingsStatus"),
+    );
+    p.add(
+        op(
+            GET,
+            "/$/settings/{ds}",
+            "getDatasetSettings",
+            "Datasets",
+            "Get every settings kind",
+        )
+        .doc("Each kind's effective object with its layers, sources and locks.")
+        .see("settings")
+        .json("200", "The kinds.", "DatasetSettings"),
+    );
+    let kind_body = |o: super::Op| {
+        o.body(
+            true,
+            "Fields of the kind: `AssistantSettings`, `MemorySettings` or `IngestSettingsRequest`.",
+            json!({ "application/json": { "schema": { "type": "object" } } }),
+        )
+        .header(
+            "If-Match",
+            json!({ "type": "string" }),
+            "The `etag` of the runtime layer the change is based on.",
+        )
+        .json("200", "The kind after the change.", "SettingsKind")
+        .errors(&[400, 409, 412])
+    };
+    p.add(
+        op(GET, "/$/settings/{ds}/{kind}", "getSettings", "Datasets", "Get a settings kind")
+            .doc("The kind's effective object, its declared and runtime layers, the source of each field, the locked fields and whether the effective object is valid. The `ETag` names the runtime layer.")
+            .see("settings")
+            .json("200", "The kind.", "SettingsKind")
+            .errors(&[404]),
+    );
+    p.add(kind_body(
+        op(PATCH, "/$/settings/{ds}/{kind}", "patchSettings", "Datasets", "Change settings fields")
+            .doc("Merges the body into the runtime layer as RFC 7396 says. `null` removes a runtime value, so the field falls back to the declared value or the default. A change to a locked field is a `409` with `locked-by-config` and `fields`, and an `endpoint` or `apiKey` anywhere is a `400`. Needs `admin`.")
+            .see("settings"),
+    ));
+    p.add(kind_body(
+        op(PUT, "/$/settings/{ds}/{kind}", "putSettings", "Datasets", "Set a settings kind")
+            .doc("Makes the effective object equal to the body, with built-in defaults for the members it leaves out and the current value for locked fields it leaves out. The runtime layer keeps the fields where the body differs from the declared values and the defaults. Needs `admin`.")
+            .see("settings"),
+    ));
+    p.add(
+        op(DELETE, "/$/settings/{ds}/{kind}", "resetSettings", "Datasets", "Reset settings")
+            .doc("Clears the runtime layer, or with `field` one field of it, so the declared values and the defaults apply. Needs `admin`.")
+            .see("settings")
+            .query("field", json!({ "type": "string" }), "A dotted field such as `historyDays` or `budget.perRequest`.")
+            .header("If-Match", json!({ "type": "string" }), "The `etag` of the runtime layer the change is based on.")
+            .json("200", "The kind after the change.", "SettingsKind")
+            .errors(&[400, 409, 412]),
     );
     p.add(
         op(GET, "/$/asks/{ds}", "listAsks", tag, "List your asked questions")

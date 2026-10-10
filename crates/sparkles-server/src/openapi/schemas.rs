@@ -237,6 +237,7 @@ pub(super) fn schemas() -> Map<String, J> {
                 "access": sref("Level"),
                 "text": { "oneOf": [{ "type": "null" }, obj(&["state", "docs"], json!({ "state": { "type": "string" }, "docs": { "type": "integer" } }))] },
                 "geo": { "oneOf": [{ "type": "null" }, obj(&["state", "rows"], json!({ "state": { "type": "string" }, "rows": { "type": "integer" } }))] },
+                "declared": { "type": "boolean", "description": "Whether the server's command line declares the dataset (`--loc` or `--mem`). The API does not delete it." },
                 "ds.name": { "type": "string", "description": "Fuseki's dataset path, such as `/ds`." },
                 "ds.state": { "type": "boolean", "description": "Fuseki's state; false while offline." },
                 "ds.services": array(json!({ "type": "object" })),
