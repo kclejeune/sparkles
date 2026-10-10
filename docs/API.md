@@ -9132,6 +9132,27 @@ defaults of its models. The `models` member sets `contextTokens`, `maxOutputToke
 with credentials, a query or a fragment. Requests go through the server's outbound
 policy, so a provider on a private address needs `--outbound-allow-private`.
 
+**TLS.** A provider with an `https` endpoint may set `tls`. `tls.caCert` names a PEM CA
+certificate or bundle that is trusted for that provider in addition to the system
+roots, as `{"file": PATH}` with an absolute path on the server or `{"secret": NAME}`
+with a secret of `--model-secret` or [Model secrets](#model-secrets). A certificate
+written into the configuration is refused. `tls.insecureSkipVerify: true` turns
+certificate verification off for that provider, so anyone on the network path can read
+its key and prompts. The server logs a warning each time it loads a configuration that
+sets it, and the settings file can lock it with
+`models.providers.NAME.tls.insecureSkipVerify` in `server.locked`. Both options are
+refused for an `http` endpoint, and neither changes the outbound policy. While either is
+set, a redirect to another origin is refused.
+
+```json
+{
+  "kind": "openai",
+  "endpoint": "https://llm.internal.example/v1",
+  "apiKey": { "secret": "internal" },
+  "tls": { "caCert": { "file": "/etc/ssl/internal-ca.pem" } }
+}
+```
+
 **Structured output.** Every model step asks for JSON that matches a schema. With
 `structuredOutput` set to `auto`, the server detects what each pair supports the first
 time it is called. It tries the provider's JSON Schema mode first (`format` for Ollama,
@@ -9143,7 +9164,11 @@ An answer that does not match the schema is retried once with the errors.
 **`GET /$/models`** (server admin) lists the providers of the effective configuration
 with their kind, endpoint, status and models, and the role lists. A provider's `status`
 is `secret-missing` when its secret cannot be read, and its `apiKey` names the secret
-with its `source`, which is `declared`, `runtime` or `missing`. Each model shows its configured and detected
+with its `source`, which is `declared`, `runtime` or `missing`. `unverified` is true
+when the provider's certificate checks are off. A provider with `tls` also has a `tls`
+object whose `verification` is `system`, `custom-ca` or `off`, and whose `caCert`
+repeats the reference with a `status` of `ok` or `unreadable`, a `message` when it is
+unreadable and, for a secret, its `source`. Each model shows its configured and detected
 structured-output level and the outcome of its last call. When neither `--model-config`
 nor the runtime layer configures models, the answer is
 `{"configured": false, "providers": [], "roles": {}}`.
@@ -9154,8 +9179,8 @@ model defaults to the first one the role lists name for that provider. The answe
 reports `ok`, the structured-output `level`, the latency and the token counts. A failed
 call is still a `200`, with `ok` false and an `error` of `{code, message}`. The codes
 are `provider-unavailable`, `provider-auth`, `provider-rejected`, `refusal`,
-`invalid-output`, `secret-missing`, `budget-exceeded`, `outbound-refused`
-and `deadline`. An unknown provider is a `404` with code `unknown-provider`, and a
+`invalid-output`, `secret-missing`, `tls-config` (the `caCert` cannot be read or holds
+no certificate), `budget-exceeded`, `outbound-refused` and `deadline`. An unknown provider is a `404` with code `unknown-provider`, and a
 server without providers answers `404` with code `no-models`.
 
 ### Asking in the server

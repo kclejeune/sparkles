@@ -7,6 +7,7 @@
 > `sparkles settings` command, the NixOS module and the change to `sparkles memory init`.
 > Phase 3 is the UI's settings tab. Phase 4 makes the server's model configuration a
 > layered settings kind that server administrators can change, with write-only API keys.
+> An addendum (§11.5, §11.6) adds provider presets and per-provider TLS options.
 >
 > **User docs:** [API: Settings](../API.md#settings) ·
 > [API: Server settings](../API.md#server-settings) ·
@@ -370,6 +371,89 @@ providers with their status and edits providers, per-model options, role lists a
 routing with the same source labels, locks and resets as §10. A key field is
 write-only. It shows whether a key is set, its source and when it was set, and offers
 to replace or remove a runtime value.
+
+### 11.5 Provider presets
+
+This section and §11.6 were added after Phase 4 landed.
+
+A preset is a template for a provider whose endpoint is well known. It is not a new
+kind. It fills the members of a new provider of an existing kind, and every member it
+fills can be changed before or after the provider is added.
+
+| Preset | `kind` | `endpoint` | `apiKey.secret` | Starting model |
+|---|---|---|---|---|
+| `anthropic` | `anthropic` | `https://api.anthropic.com` | `anthropic` | `claude-sonnet-5-5` |
+| `openai` | `openai` | `https://api.openai.com/v1` | `openai` | `gpt-5-mini` |
+| `ollama` | `ollama` | `http://127.0.0.1:11434` | none | `qwen3:8b` |
+
+The starting model becomes an empty entry of the provider's `models`, so that
+`GET /$/models` lists it and `POST /$/models/{name}/test` has a model to call. No preset
+sets pricing. Generic OpenAI-compatible gateways have no preset, because their endpoints
+differ for every deployment. They use the `openai` kind with their own endpoint.
+
+The UI's Add provider form has a preset picker whose Custom choice keeps the empty form.
+`sparkles settings set --global --preset NAME PROVIDER [FIELD=VALUE…]` adds a provider
+from a preset. Each assignment names a member of the provider, such as
+`endpoint=https://proxy.example/v1` or `apiKey.secret=team-key`, and replaces the
+preset's value. The command refuses a provider name that is already in use, so a preset
+never overwrites a configured provider.
+
+The table is kept twice, as a Rust constant in `models/presets.rs` for the CLI and as
+`ui/src/lib/provider-presets.json` for the UI, and a Rust test checks that the two
+agree. Serving the table from the server was the alternative. It would have needed a
+route, its OpenAPI description and a request before the form can open, for data that
+changes only with a release.
+
+### 11.6 TLS options per provider
+
+A provider with an `https` endpoint may have a `tls` member.
+
+```json
+{
+  "providers": {
+    "internal": {
+      "kind": "openai", "endpoint": "https://llm.internal.example/v1",
+      "apiKey": { "secret": "internal" },
+      "tls": { "caCert": { "file": "/etc/ssl/internal-ca.pem" } }
+    }
+  }
+}
+```
+
+`tls.caCert` names a PEM CA certificate or bundle that is trusted for that provider in
+addition to the system roots. It is a reference, either `{"file": PATH}` with an
+absolute path on the server or `{"secret": NAME}` naming a secret of §11.2, so a
+declared `--model-secret` source or a runtime value stored through the API. The
+certificate itself is never written into the configuration, and a PEM text where the
+reference belongs is refused with a message that says so. The certificate is read for
+each request, as keys are, so a renewed file needs no reload. This is the answer for an
+endpoint with a self-signed certificate or a certificate from an internal CA.
+
+`tls.insecureSkipVerify: true` turns certificate verification off for that provider.
+Anyone on the network path can then read the API key and the prompts sent to the
+provider, and change the answers. The option is built to be hard to turn on by accident.
+
+* It exists per provider only. No server-wide switch turns verification off.
+* It is part of the `models` kind, so only server administrators can change it.
+* The settings file can lock it, as in `models.providers.NAME.tls.insecureSkipVerify`
+  under `server.locked`, which pins the declared value. A NixOS deployment that
+  declares nothing pins verification on.
+* The server logs a warning naming the provider each time it loads a configuration
+  that turns verification off, at start, on SIGHUP and after each change through the
+  API.
+* `GET /$/models` reports `unverified: true` for the provider, and the UI marks it.
+* The UI shows the option as an unchecked checkbox, and a change that turns it on is
+  sent only after a dialog whose acknowledgement explains what can be read. The same
+  dialog guards the runtime layer's JSON editor.
+
+Both options are refused on an `http://` endpoint, where there is no certificate to
+check. `tls` has no other members.
+
+The options change only how the provider's certificate is checked. The request still
+goes through the outbound policy: the destination is checked before any connection, a
+private address still needs `--outbound-allow-private`, and the connection goes to the
+addresses that were checked. While either option is set, a redirect to another origin
+is refused, so the options never apply beyond the server they were given for.
 
 ## 12. Rejected alternatives
 
@@ -834,3 +918,45 @@ These points differ from the design or settle what it left open.
   do not wait for Save.
 - Runtime keys stay unencrypted in `<dataDir>/secrets` until F11 adds encryption at
   rest. The UI's API keys panel says so.
+
+### Provider presets and TLS options
+
+The presets of §11.5 and the TLS options of §11.6 landed on 2026-10-10 as written.
+
+The outbound policy of the engine gained a `tls` member with extra root certificates
+and a switch that accepts any certificate. The model client sets it for each request
+from the provider's `tls`, next to the provider's connect timeout, and every other
+member of the policy stays the server's. A certificate that the client does not trust
+fails with the message "the server's TLS certificate is not trusted". A `caCert` that
+cannot be read or holds no PEM certificate fails the call before any request, with the
+code `tls-config`. `GET /$/models` gives each provider `unverified` and, for a provider
+with `tls`, a `tls` object with `verification` (`system`, `custom-ca` or `off`) and the
+`caCert` reference with its `status` (`ok` or `unreadable`). A secret that a `caCert`
+names is listed by `GET /$/server/secrets` with the providers that use it, and the API
+keys panel can store its runtime value like a key's.
+
+`models/tests.rs` runs an HTTPS mock with a certificate from a test CA. The call fails
+with the system roots, succeeds with the CA from a file and from a secret, fails without
+a request when the CA cannot be read or is not PEM, and succeeds with
+`insecureSkipVerify`, which `GET /$/models` reports as unverified. With a policy that
+refuses loopback addresses the same provider is still refused. `server_tests.rs` locks
+`tls.insecureSkipVerify` and checks that a `PATCH` turning it on is a `409` while the
+CA certificate can still change. `tests/cli_server_settings.rs` adds providers from each
+preset, with and without assignments, checks the refusals, and checks the warning in
+the server's log. The UI's unit tests cover the presets, the TLS fields and which
+patches need the acknowledgement, and `ui/tests/e2e/models.spec.ts` adds a provider
+from a preset and turns verification off through the dialog.
+
+These points settle what the addendum left open.
+
+- An empty `tls`, or `insecureSkipVerify: false`, is accepted on an `http` endpoint,
+  since a reset of its members through a merge patch can leave one behind. Only a
+  `caCert` or `insecureSkipVerify: true` is refused there.
+- A `caCert` with both a file and a secret is refused. `insecureSkipVerify` together
+  with a `caCert` is accepted, and verification is off.
+- A lock can name `tls`, `tls.caCert` or `tls.insecureSkipVerify`, but not a member
+  of `caCert`.
+- The UI asks for the acknowledgement when Save or the runtime JSON would send a patch
+  that turns verification on, not when the checkbox is ticked, so the dialog also
+  covers the JSON editor. The TLS fields appear only for providers with an `https`
+  endpoint.

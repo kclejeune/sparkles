@@ -3031,6 +3031,67 @@ a secret that no provider uses. Every change is logged under the `sparkles::audi
 target with the person who made it and the fields it changed, and a secret's change
 names only the secret.
 
+### Provider presets
+
+Anthropic, OpenAI and a local Ollama have presets that fill in a new provider's kind,
+endpoint, key secret and a model to start with. A preset is a template and not a kind,
+so every field it fills can be changed. In the web UI, the **Add provider** form has a
+**Preset** picker, and **Custom** keeps the empty form. On the command line, `sparkles
+settings set --global --preset NAME PROVIDER` adds the provider, and each `FIELD=VALUE`
+after it replaces one of the preset's fields:
+
+```sh
+sparkles settings set --global --preset anthropic claude
+sparkles settings set --global --preset openai oai apiKey.secret=team-openai
+sparkles settings set --global --preset ollama local endpoint=http://10.0.0.5:11434
+sparkles secrets set anthropic < anthropic.key
+```
+
+| Preset | Kind | Endpoint | Key secret | Model |
+|---|---|---|---|---|
+| `anthropic` | `anthropic` | `https://api.anthropic.com` | `anthropic` | `claude-sonnet-5-5` |
+| `openai` | `openai` | `https://api.openai.com/v1` | `openai` | `gpt-5-mini` |
+| `ollama` | `ollama` | `http://127.0.0.1:11434` | none | `qwen3:8b` |
+
+The command refuses a provider name that is already in use. An OpenAI-compatible
+gateway, such as vLLM or LiteLLM, has no preset. Add it with the `openai` kind and its
+own endpoint, as in the examples above.
+
+### Internal certificates and TLS options
+
+A provider behind an internal CA or a self-signed certificate fails with "the server's
+TLS certificate is not trusted". Give the provider the CA certificate with
+`tls.caCert`, and the server trusts it for that provider in addition to the system
+roots. The certificate is named by an absolute path on the server or by a secret, and
+never written into the configuration:
+
+```json
+{
+  "providers": {
+    "internal": {
+      "kind": "openai", "endpoint": "https://llm.internal.example/v1",
+      "apiKey": { "secret": "internal" },
+      "tls": { "caCert": { "file": "/etc/ssl/internal-ca.pem" } }
+    }
+  }
+}
+```
+
+`{"secret": "internal-ca"}` in place of the file reads the PEM text from a
+`--model-secret` source or a value stored with `sparkles secrets set internal-ca`. The
+file or secret is read for each request, so a renewed certificate needs no reload.
+`GET /$/models` reports whether it can be read.
+
+`tls.insecureSkipVerify: true` turns certificate verification off for one provider.
+Anyone on the network path can then read the API key and every prompt sent to that
+provider, so use it only to diagnose a connection and prefer `caCert`. The server logs
+a warning each time it loads a configuration with it, `GET /$/models` marks the
+provider `unverified`, and the web UI marks it too and asks for an acknowledgement
+before saving it. An operator can pin verification on by locking the field, as in
+`models.providers.internal.tls.insecureSkipVerify` under `server.locked`. Neither
+option is accepted for an `http://` endpoint, and neither changes the outbound policy,
+so a private address still needs `--outbound-allow-private`.
+
 ### Escalation
 
 A role's list goes from the cheapest pair to the strongest. A step moves to the next
@@ -4841,6 +4902,24 @@ readable by the service user within its sandbox; home and temporary directories
 are hidden. For an environment source, provide the variable at runtime through
 `systemd.services.sparkles.serviceConfig.EnvironmentFile`, and restart after
 updating that file.
+
+A provider behind an internal CA names the CA certificate with `tls.caCert`, as
+[Internal certificates and TLS options](#internal-certificates-and-tls-options)
+describes. The path must be readable by the service user, and the file is read again
+for each request, so a renewed certificate needs no reload. Locking
+`tls.insecureSkipVerify` keeps administrators from turning verification off at runtime:
+
+```nix
+services.sparkles = {
+  models.settings.providers.internal = {
+    kind = "openai";
+    endpoint = "https://llm.internal.example/v1";
+    apiKey.secret = "internal";
+    tls.caCert.file = "/etc/ssl/certs/internal-ca.pem";
+  };
+  settings.server.locked = [ "models.providers.internal.tls.insecureSkipVerify" ];
+};
+```
 
 The generated configuration is the declared layer. Server administrators can still
 change providers and store keys at runtime, as
