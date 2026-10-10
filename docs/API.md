@@ -183,6 +183,8 @@ validators (`sparkles_shacl`, `sparkles_shex`).
 | `sparkles_embedding_backlog` | gauge. Subjects (per graph) waiting to be embedded, the status's `backlog`. | `dataset`, `index` |
 | `sparkles_embedding_lag_commits` | gauge. Commits since the newest one whose text is all embedded, which is `headSeq − appliedSeq` of the status. | `dataset`, `index` |
 | `sparkles_graphql_groups` | histogram (1 … 64). The fetch groups, which are SPARQL queries, that each GraphQL request ran. | `dataset` |
+| `sparkles_memory_review_pending` | gauge. The open items of a dataset's [memory review inbox](#open-review-items): unreviewed facts of kinds `session` and `import`, and open review branches of the other kinds, each branch counting once. Only datasets with memory settings report, with every kind. | `dataset`, `kind` = `session` \| `import` \| `consolidation` \| `ingest` \| `review` \| `inbox` \| `proposal` |
+| `sparkles_memory_review_oldest_seconds` | gauge. The age of the oldest open item of the kind, `0` when none is open. | `dataset`, `kind` |
 | `process_resident_memory_bytes` | gauge (Linux) | |
 
 Label values are bounded. `dataset` is an existing dataset name, or `$none` for requests
@@ -291,6 +293,8 @@ type MetricsSnapshot = {
       candidates: number; refined: number; matches: number; rechecked: number;
     };
   }[];
+  // the memory review series, every kind of each dataset with memory settings
+  memoryReview: { dataset: string; kind: string; pending: number; oldestSeconds: number }[];
 };
 ```
 
@@ -377,8 +381,9 @@ twice and `/$/metrics` does not change. These instruments are
 `sparkles.block_cache.{size,capacity,hits,misses}`,
 `sparkles.result_cache.{size,capacity,entries,hits,misses}`, `sparkles.geo.rows`
 (`dataset`, `part`), `sparkles.geo.build.duration`,
-`sparkles.geo.{candidates,refined,matches,rechecked}`, `sparkles.ready`,
-`process.uptime` and `process.memory.usage`.
+`sparkles.geo.{candidates,refined,matches,rechecked}`,
+`sparkles.memory.review.pending` and `sparkles.memory.review.oldest` (`dataset`, `kind`),
+`sparkles.ready`, `process.uptime` and `process.memory.usage`.
 
 **Logs.** With `--otel-logs` or `OTEL_LOGS_EXPORTER=otlp`, every log event that passes
 `RUST_LOG` is also exported as an OTLP log record, with the trace and span id of its
@@ -8384,13 +8389,15 @@ through the library are never expired. The flag is off by default.
 ### Resources and prompts
 
 Each dataset the caller may read has two resources, and each stored query that the
-caller may run as a tool has one:
+caller may run as a tool has one. A dataset with memory settings has a third for a
+caller with `write` on it:
 
 | URI | `mimeType` | Content |
 |---|---|---|
 | `sparkles://{ds}/schema` | `application/json` | The `describe_schema` summary at the head commit, for the default graph with default reasoning. |
 | `sparkles://{ds}/prefixes` | `application/sparql-query` | The dataset's prefixes as `PREFIX` lines. |
 | `sparkles://{ds}/queries/{name}` | `application/json` | The stored query: `{dataset, name, tool, version, description, query, parameters}`. |
+| `sparkles://{ds}/memory/review` | `application/json` | The [open review items](#open-review-items) of the dataset's memory inbox, the `review` member of the maintenance answer. Listed for a dataset with memory settings to a caller with `write` on it. |
 
 `resources/list` returns them sorted by URI, and `resources/templates/list` returns the
 three URI templates. A `resources/read` result may be cached for 30 seconds by the caller
@@ -8450,7 +8457,9 @@ The server acknowledges with `notifications/subscriptions/acknowledged`, then se
 Over HTTP the answer is an SSE stream. A subscription looks at what its caller sees every
 2 seconds. It compares the tools the caller may call, with the versions of the stored
 queries behind them, and the URIs of its resources. For a subscribed resource it compares
-the dataset's head commit, its prefixes, or the stored query's version. A resource the
+the dataset's head commit, its prefixes, or the stored query's version, and for
+`memory/review` the open items of each kind and the oldest, as the server last counted
+them. A resource the
 caller may not read reports nothing. A legacy session gets the two list notifications on
 its stream from `notifications/initialized` on, and has no resource subscriptions. At
 most 64 subscriptions and sessions watch at once.
@@ -8967,7 +8976,7 @@ dataset's `main` branch only. The design is in
 |---|---|---|---|
 | POST | `/$/memory/{ds}/consolidate` | `read`, and `admin` for `auto` | Starts a consolidation pass and answers `202` with the task and a `Location` header. The body is `{ mode?, minSources?, dryRun?, message?, deadlineSeconds? }`, and the mode and `minSources` default to the settings. |
 | POST | `/$/memory/{ds}/retention` | `admin` | Starts a retention pass and answers `202` with the task. The body is `{ after?, graphs?, requireConsolidated?, dryRun?, deadlineSeconds? }`, and each member defaults to the settings. Without a retention setting `after` is required, or the answer is `400` with `no-retention`. |
-| GET | `/$/memory/{ds}/maintenance` | `read` | `{ dataset, consolidation, retention }`, each with the `settings`, and `lastRun`, `lastTask` and `nextRun` (a time, or `due`) once a schedule applies. |
+| GET | `/$/memory/{ds}/maintenance` | `read` | `{ dataset, consolidation, retention, review? }`. The two jobs each have the `settings`, and `lastRun`, `lastTask` and `nextRun` (a time, or `due`) once a schedule applies. `review` is described below. |
 
 The settings live in the dataset's memory settings:
 
@@ -9012,6 +9021,46 @@ its facts appears in no reviewed graph. The result lists each graph with `delete
 or the reason it stays: `recent`, `no-time`, `unconsolidated` or `too-many-facts` (more
 than 5,000). The `outcome` is `deleted`, `dry-run` or `nothing-to-delete`. A deleted
 graph stays in history and backups.
+
+#### Open review items
+
+A scheduled consolidation does nothing while an earlier branch waits, and retention with
+`requireConsolidated` keeps unreviewed graphs, so the server reports what waits for
+review. The maintenance answer has a `review` member for a caller with `write` on a
+dataset whose memory settings name `agentGraphs` or a `consolidatedGraph`:
+
+```json
+"review": {
+  "open": 3,
+  "oldest": "2026-10-08T12:00:00.000Z",
+  "kinds": { "session": { "open": 2, "oldest": "2026-10-08T12:00:00.000Z" },
+             "consolidation": { "open": 1, "oldest": "2026-10-10T03:00:00.000Z" } },
+  "branches": [{ "name": "consolidation.2026-10-10-1", "kind": "consolidation",
+                 "created": "2026-10-10T03:00:00.000Z", "facts": 1 }],
+  "truncated": false,
+  "updated": "2026-10-10T12:00:00.000Z"
+}
+```
+
+`open` adds up the unreviewed facts and the open review branches, a branch counting
+once, as the inbox's `open` does. The kinds are `session` and `import` for unreviewed
+facts, by whether the graph is under `imports.base`, and `consolidation`, `ingest`,
+`review`, `inbox` and `proposal` for branches with commits of their own. `kinds` lists
+the kinds with open items. `oldest` is when the oldest item arrived: a fact's reifier
+time, a branch's creation, or for a fact without a time the moment the server first
+counted its graph, which it keeps in `<db>/review.json`. `branches` lists the open
+review branches the caller may read, newest first, with the facts each proposes for the
+10 newest. The server counts as itself, up to 5,000 unreviewed facts (`truncated` says
+when more wait), without the inbox's signals. It counts every minute with the
+maintenance schedule, also on a read-only server, and right after a successful
+`assert_facts`, `sparql_update`, `merge_branch`, `delete_branch`, inbox action, merge
+or branch deletion on the dataset. A count whose dataset head, branches and memory
+settings did not change since the last one reads nothing.
+
+The same counts appear as the metrics `sparkles_memory_review_pending` and
+`sparkles_memory_review_oldest_seconds` (see [Metrics](#metrics)), in the brief of
+`POST /{ds}/memory/brief` as a `review` member and `# review:` lines, and as the MCP
+resource `sparkles://{ds}/memory/review`.
 
 ### Review inbox
 

@@ -4689,3 +4689,48 @@ argument checks. `mcp/c18_tests.rs` covers A79 in `recall_recency`, and
 `crates/sparkles-server/tests/cli_memory.rs` covers the sync half of A81 in
 `memory_loc`, where an edited memory file starts one extraction that fails with
 `no-model` because the fixture has no provider.
+
+**Review signals, added on 2026-10-10.** A forgotten review stalled maintenance without
+a sign: a scheduled consolidation only reported `pending-review`, and retention with
+`requireConsolidated` kept every unreviewed session graph. The server now counts what
+waits in each inbox and reports it.
+
+- **Counts.** `mcp/memory/pending.rs` counts, as the server and without the inbox's
+  signals, the unreviewed facts of kinds `session` and `import` (up to 5,000 per
+  dataset) and the open review branches by their inbox kind, each with the time of its
+  oldest item. A fact's time is its reifier's, a branch's is its creation, and a fact
+  without a time dates from the first count of its graph, kept in `<db>/review.json`.
+  Each count is kept per dataset with a fingerprint of the head commit, the review
+  branches and the memory settings. The maintenance tick refreshes every dataset with
+  memory settings once a minute, on a read-only server too, and the tools and routes
+  that change an inbox refresh their dataset on a thread of their own. A refresh with
+  an unchanged fingerprint reads nothing.
+- **Metrics.** `sparkles_memory_review_pending{dataset,kind}` and
+  `sparkles_memory_review_oldest_seconds{dataset,kind}` report every kind of each
+  dataset with memory settings from the kept counts, with no query at scrape time. The
+  JSON snapshot carries them as `memoryReview`, and OTel exports them as
+  `sparkles.memory.review.pending` and `sparkles.memory.review.oldest`.
+- **The maintenance answer.** `GET /$/memory/{ds}/maintenance` has a `review` member
+  for a caller with `write` on the dataset, with the open items, the oldest, the kinds
+  and the open branches the caller may read. `sparkles memory maintenance` prints it.
+- **UI.** The sidebar's Memory entry and the dataset page show a count badge, read from
+  that member, whose accessible name gives the count and the age of the oldest item.
+  The dataset page's badge opens the Inbox tab.
+- **Agents.** The brief has a `review` member and a `# review:` line per open review
+  branch and per kind of unreviewed fact, such as `# review: 3 consolidated facts on
+  branch consolidation.2026-10-10-1 await review since …`, for a caller with `write`.
+  MCP lists the resource `sparkles://{ds}/memory/review` to such a caller, and a
+  subscription to it gets `notifications/resources/updated` when a count or an oldest
+  time changes.
+
+The counts are not the inbox. They skip its signals, and a branch counts once whatever
+it proposes, as in the inbox's `open`. The signals go to callers with `write` on the
+dataset, a coarser rule than the grants on graphs and branches that the inbox actions
+check.
+
+**Tests.** `ingest/tests.rs` covers the counts in `review_signals`: no series before
+memory settings, the session facts, the consolidation branch after a pass with its
+fact count in the maintenance answer and the brief, and an empty inbox after the merge,
+in the Prometheus text and the JSON snapshot. `ui/src/lib/review-count.test.ts` covers
+the badge's words and the shared count store, and `ui/tests/e2e/pages.spec.ts` the
+badges on the dataset page and the sidebar.
