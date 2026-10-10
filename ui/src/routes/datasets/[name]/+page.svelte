@@ -31,6 +31,7 @@
   import BranchesPanel from '$components/BranchesPanel.svelte';
   import CloneDialog from '$components/CloneDialog.svelte';
   import DatasetDialogs from '$components/DatasetDialogs.svelte';
+  import DatasetSettingsTab from '$components/DatasetSettingsTab.svelte';
   import DescribePanel from '$components/DescribePanel.svelte';
   import FullTextPanel from '$components/FullTextPanel.svelte';
   import HistoryPanel from '$components/HistoryPanel.svelte';
@@ -93,13 +94,49 @@
     });
   });
 
+  /** The page's URL with these query parameters changed (null removes one). */
+  function withParams(changes: Record<string, string | null>) {
+    const p = new URLSearchParams(page.url.searchParams);
+    for (const [k, v] of Object.entries(changes)) {
+      if (v == null) p.delete(k);
+      else p.set(k, v);
+    }
+    const qs = p.toString();
+    return `${resolve('/datasets/[name]', { name })}${qs ? `?${qs}` : ''}`;
+  }
+
   /** Show another branch. The choice lives in the URL, so a link opens the same branch. */
   function selectBranch(b: string) {
-    const path = resolve('/datasets/[name]', { name });
-    goto(b === MAIN ? path : `${path}?branch=${encodeURIComponent(b)}`, {
+    goto(withParams({ branch: b === MAIN ? null : b }), {
       keepFocus: true,
       noScroll: true,
     });
+  }
+
+  // the page's tabs: the overview of the data, and the dataset's settings (`?tab=settings`)
+  type Tab = 'overview' | 'settings';
+  const TABS: { id: Tab; label: string; icon: string }[] = [
+    { id: 'overview', label: 'Overview', icon: 'database' },
+    { id: 'settings', label: 'Settings', icon: 'filter' },
+  ];
+  const tab = $derived<Tab>(
+    page.url.searchParams.get('tab') === 'settings' ? 'settings' : 'overview',
+  );
+  function setTab(t: Tab) {
+    goto(withParams({ tab: t === 'overview' ? null : t }), {
+      replaceState: true,
+      keepFocus: true,
+      noScroll: true,
+    });
+  }
+  function onTabKey(e: KeyboardEvent, i: number) {
+    const n = TABS.length;
+    const to =
+      e.key === 'ArrowRight' ? (i + 1) % n : e.key === 'ArrowLeft' ? (i + n - 1) % n : null;
+    if (to == null) return;
+    e.preventDefault();
+    setTab(TABS[to].id);
+    document.getElementById(`ds-tab-${TABS[to].id}`)?.focus();
   }
 
   let stats = $state<api.DatasetStats | null>(null);
@@ -623,7 +660,11 @@ ex:PersonShape a sh:NodeShape ;
           : 'Copy this dataset into a new, independent dataset'}
         ><Icon name="copy" size={14} /> Clone</button
       >
-      <button class="btn danger" onclick={() => (deleteTarget = name)}
+      <button
+        class="btn danger"
+        onclick={() => (deleteTarget = name)}
+        disabled={info?.declared === true}
+        title={info?.declared ? api.DECLARED_TEXT : 'Delete this dataset and its files'}
         ><Icon name="trash" size={14} /> Delete</button
       >
     {/if}
@@ -660,7 +701,31 @@ ex:PersonShape a sh:NodeShape ;
     </div>
   {/if}
 
-  {#if stats}
+  <div class="tabs page-tabs" role="tablist" aria-label="Dataset">
+    {#each TABS as t, i (t.id)}
+      <button
+        class="tab"
+        role="tab"
+        id="ds-tab-{t.id}"
+        aria-selected={tab === t.id}
+        aria-controls="ds-panel-{t.id}"
+        tabindex={tab === t.id ? 0 : -1}
+        onclick={() => setTab(t.id)}
+        onkeydown={(e) => onTabKey(e, i)}
+      >
+        <Icon name={t.icon} size={14} />
+        {t.label}
+      </button>
+    {/each}
+  </div>
+
+  {#if tab === 'settings'}
+    <div class="tabpanel" role="tabpanel" id="ds-panel-settings" aria-labelledby="ds-tab-settings">
+      {#key name}
+        <DatasetSettingsTab {name} {branch} {readOnly} canAdmin={auth.can(name, 'admin')} />
+      {/key}
+    </div>
+  {:else if stats}
     <!-- the state the figures describe -->
     <form
       class="stats-at row"
@@ -1908,6 +1973,9 @@ ex:PersonShape a sh:NodeShape ;
     .figures > div:nth-last-child(-n + 2) {
       border-bottom: 0;
     }
+  }
+  .page-tabs {
+    border-bottom: 1px solid var(--border);
   }
   .stats-at {
     gap: 8px;
