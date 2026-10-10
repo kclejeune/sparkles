@@ -61,6 +61,7 @@ async fn c18_a30_agent_template() {
             "https://example.org/hr".into(),
             "https://example.org/memory/consolidated".into(),
         ],
+        Some("https://example.org/memory/import/"),
     )
     .unwrap();
     let s = build(Fixture {
@@ -102,6 +103,28 @@ async fn c18_a30_agent_template() {
         "{}",
         String::from_utf8_lossy(&r.body)
     );
+    // with --import, its import graphs on main (C18 §8.10.2), and no one else's
+    let r = update_as(
+        app,
+        "org",
+        &agent,
+        &write("https://example.org/memory/import/agent-7/claude-code/local.x.1/memory/m"),
+    )
+    .await;
+    assert_eq!(
+        r.status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+    let r = update_as(
+        app,
+        "org",
+        &agent,
+        &write("https://example.org/memory/import/ana/claude-code/local.x.1/memory/m"),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
     // a curated graph: not on main, but on its proposal branch
     let r = update_as(app, "org", &agent, &write("https://example.org/hr")).await;
     assert_eq!(
@@ -154,16 +177,22 @@ async fn c18_a30_agent_template() {
     assert_eq!(r.status, StatusCode::OK);
     // bad input
     assert!(
-        crate::auth::cli::agent_template("bad name", "org", "https://x.example/", &[]).is_err()
+        crate::auth::cli::agent_template("bad name", "org", "https://x.example/", &[], None)
+            .is_err()
     );
     assert!(
         crate::auth::cli::agent_template(
             "a",
             "org",
             "https://x.example/a/",
-            &["https://x.example/*".into()]
+            &["https://x.example/*".into()],
+            None
         )
         .is_err()
+    );
+    assert!(
+        crate::auth::cli::agent_template("a", "org", "https://x.example/a/", &[], Some("no iri"))
+            .is_err()
     );
 }
 

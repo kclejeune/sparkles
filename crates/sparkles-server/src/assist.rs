@@ -61,6 +61,41 @@ pub struct MemorySettings {
     pub consolidated_graph: Option<String>,
     #[serde(default)]
     pub agents: BTreeMap<String, AgentPolicy>,
+    /// the imports of harness memory (§8.10.2)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imports: Option<Imports>,
+}
+
+/// Who extracts facts from imported prose (§8.10.2).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Extract {
+    #[default]
+    Agent,
+    Server,
+    None,
+}
+
+/// A redaction pattern of the dataset.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecretPattern {
+    pub name: String,
+    pub regex: String,
+}
+
+/// `imports` of `memory.json` (§8.10.2).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct Imports {
+    /// the prefix of every import graph
+    pub base: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secret_patterns: Vec<SecretPattern>,
+    #[serde(default)]
+    pub transcripts: bool,
+    #[serde(default)]
+    pub extract: Extract,
 }
 
 impl MemorySettings {
@@ -94,9 +129,53 @@ impl MemorySettings {
                 return Err("consolidatedGraph must not match agentGraphs".into());
             }
         }
+        if let Some(im) = &self.imports {
+            im.validate(self)?;
+        }
         for name in self.agents.keys() {
             if name.is_empty() || name.len() > 200 {
                 return Err(format!("agents: invalid agent name {name:?}"));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Imports {
+    fn validate(&self, s: &MemorySettings) -> Result<(), String> {
+        if oxrdf::NamedNode::new(format!("{}x", self.base)).is_err()
+            || !(self.base.ends_with('/') || self.base.ends_with('#'))
+        {
+            return Err(format!(
+                "imports.base: {:?} is not an IRI that ends in / or #",
+                self.base
+            ));
+        }
+        // imported facts stay unreviewed until a person promotes them
+        if !s.is_agent_graph(&format!("{}x", self.base)) {
+            return Err(format!(
+                "imports.base: agentGraphs must match the import graphs; add {:?}",
+                format!("{}*", self.base)
+            ));
+        }
+        if self.secret_patterns.len() > 100 {
+            return Err("imports.secretPatterns: at most 100 patterns".into());
+        }
+        for p in &self.secret_patterns {
+            if p.name.is_empty()
+                || p.name.len() > 64
+                || !p
+                    .name
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+            {
+                return Err(format!(
+                    "imports.secretPatterns: invalid name {:?}: use 1 to 64 letters, digits, - or _",
+                    p.name
+                ));
+            }
+            if let Err(e) = regex::Regex::new(&p.regex) {
+                return Err(format!("imports.secretPatterns: {}: {e}", p.name));
             }
         }
         Ok(())
