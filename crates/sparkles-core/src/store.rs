@@ -5083,7 +5083,12 @@ impl WriteTxn<'_> {
         // transaction's small changes need no WAL records.
         let bulk = std::mem::take(&mut self.bulk);
         let view = self.view();
-        self.base.generation.dvocab.sync()?;
+        // A dry run builds from the terms in memory and rolls them back. Writing them
+        // would rewrite a legacy file framed and raise the dataset's reader for a write
+        // that never happens.
+        if self.opts.dry_run.is_none() {
+            self.base.generation.dvocab.sync()?;
+        }
         let commit = BulkCommit {
             kind: self.kind,
             net_del: self.net_del,
