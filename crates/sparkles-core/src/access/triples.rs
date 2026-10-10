@@ -214,8 +214,9 @@ pub(super) fn masked(
 }
 
 /// `snap` with the quads `hidden` (SPO keys, sorted, all present in `snap`) taken out:
-/// those of the base become deletions, those the delta inserted leave it. The counts,
-/// the delta's statistics and the caches keyed by the snapshot start empty.
+/// those of the base become deletions, those the delta inserted leave it, and the delta's
+/// predicate statistics follow. The counts and the caches keyed by the snapshot start
+/// empty.
 pub fn apply(snap: &Snapshot, hidden: Vec<Key>, key: String) -> Snapshot {
     use rayon::prelude::*;
     let spo = Perm::Spo.index();

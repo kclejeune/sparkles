@@ -821,6 +821,44 @@ are carried over, and the automatic choice and its reasons are covered. The test
 open, and a rebuild or disable during the build. Two ignored tests take the
 measurements: `compaction_lock_with_a_spatial_index` and `partial_compaction_at_scale`.
 
+**Small queries over the delta (2026-10-10).** A small query over data written by
+transactions took about 1 ms where the same data loaded in bulk took 0.06 ms. A profile
+of `values-star` over a 105,300-quad delta put 59% of the cycles in stepping through
+the delta's ordered sets and 16% in `Snapshot::estimate` and `Snapshot::count`. The
+planner counts the rows of every scan it considers, and the ordered sets could only
+count a range by walking it. When each query followed a commit, the statistics that a
+new snapshot computed from the whole delta took 77% of the time as well. Four changes
+removed both costs.
+
+* **Counted sets.** `store/keyset.rs` holds `KeySet`, a persistent B+ tree with 64 keys
+  to a leaf, 32 children to a branch and the number of keys under each child. A clone
+  shares every node and a write copies the nodes on its path, as before. It counts a
+  range with two descents, tests whether a range holds a key with one, and reads its
+  keys as slices of a leaf. The seven sets of the delta use it.
+* **Statistics kept on each write.** The delta keeps each predicate's count and its
+  numbers of distinct subjects and objects up to date as quads are inserted and removed,
+  so a snapshot no longer builds them from the delta. An insert learns whether its
+  subject or object is new to the predicate from the keys next to it in its leaf.
+* **Index joins read the delta directly.** A range of an index join that no base block
+  reaches can hold no deletion, so its rows are read straight from the delta's inserts
+  without first asking the delta whether the range is touched.
+* **Planner counts.** `count`, `estimate` and the counts of `keyprobe`, `stats` and
+  partial compaction use the logarithmic counts.
+
+On the quiet Intel host, in memory and with the median of 7 rounds, `values-star` over
+the delta went from 1,022 to 58.5 µs and `star-lookup` from 993 to 88.7 µs, against
+62.2 and 74.6 µs on the same data loaded in bulk. With 10% of the data in the delta they
+went from 172 to 66.8 µs and from 231 to 102 µs. With a commit of one quad before each
+query, the two took 3,244 and 3,281 µs per commit and query before and 78 and 155 µs
+after. A store on disk gave the same figures. Queries over bulk-loaded and compacted
+data did not change. The cost moved to the writer: 105,300 quads written in commits of
+10,000 took 234 ms instead of 224 ms, 4.5% longer, because each insert also updates the
+counts on its path and the predicate's statistics. Peak memory stayed the same, at
+137.4 against 137.8 MiB, because a node is allocated with room for exactly one more
+entry. Compacting the 105,300 quads in memory took 72 ms, against 84 ms before. The
+8.9 s reported for 100,000 quads through the Python plugin did not reproduce, and every
+binding compacts them in 0.07 to 0.14 s.
+
 **Not built.** Delta quads located per block, a vocabulary that takes new terms without a
 full build, adaptive thresholds and compaction in embedded use without a server remain
 later work. The vector indexes' graphs are still built after the switch, so their

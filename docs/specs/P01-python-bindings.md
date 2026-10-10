@@ -1040,3 +1040,21 @@ The remaining gaps have these causes.
   in the store's delta. The same query on the same data loaded in bulk takes the native
   API's time. Compacting 100,000 quads held in memory took 8.9 s on a busy laptop. Both
   belong to the engine's delta and compaction, not to the binding.
+
+**Small queries over the delta and the budget test (2026-10-10).** The engine now counts
+the delta's ranges in logarithmic time and keeps its predicate statistics up to date on
+each write, as [C13's Outcome](C13-automatic-compaction.md#outcome) describes. On the
+laptop, with 105,300 quads written through transactions, `values-star` on the native API
+went from 708 to 38 µs and `star-lookup` from 675 to 73 µs, against 38 and 60 µs on the
+same data loaded in bulk. Filling the store took 0.183 s against 0.187 s. The Node
+binding went from 1,067 to 148 µs and from 860 to 221 µs, and the JVM binding from 982
+to 177 µs and from 1,235 to 289 µs, each close to its own bulk-loaded figures. The 8.9 s
+compaction did not reproduce. The same 100,000 quads compact in 0.10 s through the
+native API before and after the change, and took 0.14 s through the plugin before it.
+
+`test_timeout_and_budget_classes` failed now and then because its one query could hit
+either limit first. With both a 50 ms timeout and the default row budget, the
+intermediate result of 8 billion rows exceeded the budget after about 22 ms in 19 of 20
+runs, before the timeout fired. The test now checks each limit on its own. The timeout
+check raises the budget out of reach with `max_rows`, and the budget check sets no
+timeout and expects the budget's message.
