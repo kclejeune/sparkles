@@ -1,0 +1,16 @@
+apiVersion: v2
+name: sparkles
+description: Sparkles, an RDF database with a Jena/Fuseki-compatible SPARQL server and web UI
+type: application
+version: 0.1.0
+# the workspace version in Cargo.toml; the image tag defaults to it
+appVersion: "0.1.0"
+kubeVersion: ">=1.29.0-0"
+home: https://github.com/kclejeune/sparkles
+sources:
+  - https://github.com/kclejeune/sparkles
+keywords:
+  - rdf
+  - sparql
+  - fuseki
+  - database

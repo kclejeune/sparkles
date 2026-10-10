@@ -1,0 +1,18 @@
+# models from an OCI image mounted as an image volume, OCR with models on a PVC, and
+# a Gateway API route
+server:
+  allowOpenNetwork: true
+models:
+  delivery: image
+  image:
+    reference: registry.example.org/sparkles-models:qwen3-embedding-0.6b
+ocr:
+  enabled: true
+  models:
+    existingClaim: pp-ocr-models
+httpRoute:
+  enabled: true
+  parentRefs:
+    - name: gateway
+      namespace: gateway-system
+  hostnames: [sparql.example.org]

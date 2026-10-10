@@ -1,0 +1,10 @@
+# models copied from an OCI image by an init container, where image volumes are off,
+# and data in an emptyDir
+server:
+  allowOpenNetwork: true
+persistence:
+  enabled: false
+models:
+  delivery: imageCopy
+  image:
+    reference: registry.example.org/sparkles-models:qwen3-embedding-0.6b

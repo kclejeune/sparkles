@@ -1,0 +1,394 @@
+{{- include "sparkles.validate" . }}
+{{- $fullname := include "sparkles.fullname" . }}
+{{- $hasConfigMap := include "sparkles.hasConfigMap" . }}
+{{- $delivery := .Values.models.delivery }}
+{{- $modelsVolume := include "sparkles.modelsVolume" . }}
+{{- $modelSecrets := list }}
+{{- range $name, $ref := .Values.models.secrets }}
+{{- $modelSecrets = append $modelSecrets $ref.secretName }}
+{{- end }}
+{{- $modelSecrets = uniq $modelSecrets }}
+{{- $watched := or .Values.settings .Values.models.config .Values.rateLimits .Values.auth.enabled .Values.backup.enabled }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "sparkles.labels" . | nindent 4 }}
+spec:
+  # one writer on local disk: never more than one pod (docs/USAGE.md#kubernetes-helm)
+  replicas: 1
+  serviceName: {{ $fullname }}-headless
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      {{- include "sparkles.selectorLabels" . | nindent 6 }}
+  {{- if and .Values.persistence.enabled (not .Values.persistence.existingClaim) }}
+  persistentVolumeClaimRetentionPolicy:
+    {{- toYaml .Values.persistence.retentionPolicy | nindent 4 }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        {{- with .Values.persistence.annotations }}
+        annotations:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+      spec:
+        accessModes:
+          {{- toYaml .Values.persistence.accessModes | nindent 10 }}
+        {{- with .Values.persistence.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size }}
+  {{- end }}
+  template:
+    metadata:
+      labels:
+        {{- include "sparkles.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- if or .Values.podAnnotations .Values.restartOnConfigChange }}
+      annotations:
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- if .Values.restartOnConfigChange }}
+        checksum/config: {{ printf "%s%s" (include (print $.Template.BasePath "/configmap.yaml") .) (include (print $.Template.BasePath "/secret.yaml") .) | sha256sum }}
+        {{- end }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "sparkles.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- if has $delivery (list "pull" "imageCopy") }}
+      initContainers:
+        {{- if eq $delivery "pull" }}
+        # fetch the manifest's pinned snapshots; snapshots already present and verified
+        # need no network
+        - name: models-pull
+          image: {{ include "sparkles.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - models
+            - pull
+            - --manifest
+            - /etc/sparkles/config/models-manifest.json
+            - --dir
+            - {{ .Values.models.mountPath }}
+          env:
+            # the root filesystem is read-only; any cache a download keeps goes to /tmp
+            - name: HOME
+              value: /tmp
+            {{- with .Values.server.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.server.extraEnvFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          {{- with .Values.models.initResources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/sparkles/config
+              readOnly: true
+            - name: models
+              mountPath: {{ .Values.models.mountPath }}
+            - name: tmp
+              mountPath: /tmp
+        {{- else }}
+        # the image needs `sh` and `cp`, such as an image built FROM busybox
+        - name: models-copy
+          image: {{ .Values.models.image.reference }}
+          imagePullPolicy: {{ .Values.models.image.pullPolicy }}
+          command:
+            - sh
+            - -c
+            - cp -a "$0"/. /sparkles-models/
+            - {{ .Values.models.image.path }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          {{- with .Values.models.initResources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: models
+              mountPath: /sparkles-models
+        {{- end }}
+      {{- end }}
+      containers:
+        - name: sparkles
+          image: {{ include "sparkles.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - serve
+            - --data
+            - /data
+            - --host
+            - 0.0.0.0
+            - --port
+            - {{ .Values.server.port | quote }}
+            - --log-format
+            - {{ .Values.server.logFormat }}
+            - --shutdown-grace
+            - {{ .Values.server.shutdownGrace | quote }}
+            {{- range (include "sparkles.publicHosts" . | fromJsonArray) }}
+            - --public-host
+            - {{ . | quote }}
+            {{- end }}
+            {{- if .Values.settings }}
+            - --settings
+            - /etc/sparkles/config/settings.json
+            {{- end }}
+            {{- if .Values.models.config }}
+            - --model-config
+            - /etc/sparkles/config/models.json
+            {{- end }}
+            {{- range $name, $ref := .Values.models.secrets }}
+            - --model-secret
+            - {{ printf "%s=file:/run/secrets/sparkles/models/%s/%s" $name $ref.secretName $ref.key | quote }}
+            {{- end }}
+            {{- if .Values.rateLimits }}
+            - --rate-limit-config
+            - /etc/sparkles/config/rate-limits.json
+            {{- end }}
+            {{- if .Values.auth.enabled }}
+            - --auth-config
+            - /etc/sparkles/auth/{{ .Values.auth.key }}
+            {{- end }}
+            {{- if .Values.backup.enabled }}
+            - --backup-config
+            - /etc/sparkles/backup/{{ .Values.backup.key }}
+            {{- end }}
+            {{- if and .Values.server.watchConfig $watched }}
+            - --watch-config
+            {{- end }}
+            {{- if eq $delivery "download" }}
+            {{- if $modelsVolume }}
+            - --models-dir
+            - {{ .Values.models.mountPath }}
+            {{- end }}
+            - --models-download
+            - "on"
+            {{- else if ne $delivery "none" }}
+            - --models-dir
+            - {{ .Values.models.mountPath }}
+            - --models-download
+            - "off"
+            {{- end }}
+            {{- if .Values.ocr.enabled }}
+            - --pdf-ocr-models
+            - {{ .Values.ocr.models.mountPath }}
+            {{- end }}
+            {{- with .Values.server.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          env:
+            {{- if .Values.server.allowOpenNetwork }}
+            - name: SPARKLES_ALLOW_OPEN_NETWORK
+              value: "1"
+            {{- end }}
+            {{- with .Values.server.logLevel }}
+            - name: RUST_LOG
+              value: {{ . | quote }}
+            {{- end }}
+            # the image's health check script, for `kubectl exec ... sparkles-healthcheck`
+            - name: SPARKLES_HEALTHCHECK_PORT
+              value: {{ .Values.server.port | quote }}
+            {{- with .Values.server.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.server.extraEnvFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.server.port }}
+              protocol: TCP
+          # /$/ready answers 503 while the server starts and once it drains; /$/ping only
+          # shows that the process answers. Both need no credentials with auth.
+          startupProbe:
+            httpGet:
+              path: /$/ready
+              port: http
+              scheme: {{ .Values.probes.scheme }}
+            periodSeconds: {{ .Values.probes.startup.periodSeconds }}
+            failureThreshold: {{ .Values.probes.startup.failureThreshold }}
+            timeoutSeconds: {{ .Values.probes.startup.timeoutSeconds }}
+          readinessProbe:
+            httpGet:
+              path: /$/ready
+              port: http
+              scheme: {{ .Values.probes.scheme }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+          livenessProbe:
+            httpGet:
+              path: /$/ping
+              port: http
+              scheme: {{ .Values.probes.scheme }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+            {{- if $hasConfigMap }}
+            - name: config
+              mountPath: /etc/sparkles/config
+              readOnly: true
+            {{- end }}
+            {{- if .Values.auth.enabled }}
+            - name: auth
+              mountPath: /etc/sparkles/auth
+              readOnly: true
+            {{- end }}
+            {{- if .Values.backup.enabled }}
+            - name: backup
+              mountPath: /etc/sparkles/backup
+              readOnly: true
+            {{- end }}
+            {{- range $i, $s := $modelSecrets }}
+            - name: model-secret-{{ $i }}
+              mountPath: /run/secrets/sparkles/models/{{ $s }}
+              readOnly: true
+            {{- end }}
+            {{- if $modelsVolume }}
+            - name: models
+              mountPath: {{ .Values.models.mountPath }}
+              {{- if eq $delivery "image" }}
+              {{- with trimPrefix "/" .Values.models.image.path }}
+              subPath: {{ . }}
+              {{- end }}
+              {{- end }}
+              readOnly: {{ ne $delivery "download" }}
+            {{- end }}
+            {{- if .Values.ocr.enabled }}
+            - name: ocr-models
+              mountPath: {{ .Values.ocr.models.mountPath }}
+              {{- with .Values.ocr.models.subPath }}
+              subPath: {{ . }}
+              {{- end }}
+              readOnly: true
+            {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        {{- if not .Values.persistence.enabled }}
+        - name: data
+          emptyDir: {}
+        {{- else if .Values.persistence.existingClaim }}
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ .Values.persistence.existingClaim }}
+        {{- end }}
+        - name: tmp
+          emptyDir:
+            {{- with .Values.tmp.medium }}
+            medium: {{ . }}
+            {{- end }}
+            {{- with .Values.tmp.sizeLimit }}
+            sizeLimit: {{ . }}
+            {{- end }}
+        {{- if $hasConfigMap }}
+        - name: config
+          configMap:
+            name: {{ $fullname }}
+        {{- end }}
+        {{- if .Values.auth.enabled }}
+        - name: auth
+          {{- $src := include "sparkles.authSource" . }}
+          {{- if eq $src "configMap" }}
+          configMap:
+            name: {{ .Values.auth.existingConfigMap }}
+          {{- else }}
+          secret:
+            secretName: {{ ternary .Values.auth.existingSecret (printf "%s-auth" $fullname) (eq $src "secret") }}
+            defaultMode: 0400
+          {{- end }}
+        {{- end }}
+        {{- if .Values.backup.enabled }}
+        - name: backup
+          {{- $src := include "sparkles.backupSource" . }}
+          {{- if eq $src "configMap" }}
+          configMap:
+            name: {{ .Values.backup.existingConfigMap }}
+          {{- else }}
+          secret:
+            secretName: {{ ternary .Values.backup.existingSecret (printf "%s-backup" $fullname) (eq $src "secret") }}
+            defaultMode: 0400
+          {{- end }}
+        {{- end }}
+        {{- range $i, $s := $modelSecrets }}
+        - name: model-secret-{{ $i }}
+          secret:
+            secretName: {{ $s }}
+            defaultMode: 0400
+        {{- end }}
+        {{- if $modelsVolume }}
+        - name: models
+          {{- if eq $delivery "image" }}
+          image:
+            reference: {{ .Values.models.image.reference }}
+            pullPolicy: {{ .Values.models.image.pullPolicy }}
+          {{- else if .Values.models.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ default (printf "%s-models" $fullname) .Values.models.persistence.existingClaim }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        {{- end }}
+        {{- if .Values.ocr.enabled }}
+        - name: ocr-models
+          {{- if .Values.ocr.models.existingClaim }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.ocr.models.existingClaim }}
+            readOnly: true
+          {{- else }}
+          image:
+            reference: {{ .Values.ocr.models.imageReference }}
+            pullPolicy: {{ .Values.ocr.models.imagePullPolicy }}
+          {{- end }}
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

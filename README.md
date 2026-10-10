@@ -158,8 +158,8 @@ optimization mechanisms and implemented decisions across the design specs.
 * **Reasoning and validation.** Incremental RDFS, OWL 2 RL and Jena rules, SHACL and
   ShEx validation, and schema reports.
 * **Server.** Fuseki endpoints and administration, authentication and access control,
-  stored queries, GraphQL, metrics, Docker and NixOS deployment, and a Home Manager
-  module for the client.
+  stored queries, GraphQL, metrics, deployment with Docker, Helm and NixOS, and a Home
+  Manager module for the client.
 * **Agents.** MCP tools, questions answered with checked queries, document ingestion
   and agent memory with sources and branch review.
 * **Tooling.** Jena-style CLI commands, SPARQL and RDF formatting and linting, and an
@@ -264,7 +264,7 @@ including benchmarks, editor setup, design specs and UI development.
 
 | Document | Contents |
 |---|---|
-| [Usage](docs/USAGE.md) | Server and CLI workflows, libraries and bindings, MCP, backups and deployment. |
+| [Usage](docs/USAGE.md) | Server and CLI workflows, libraries and bindings, MCP, backups, and deployment with Docker, Kubernetes and NixOS. |
 | [Architecture](docs/ARCHITECTURE.md) | Library boundaries, storage, execution, optimizations and implemented design decisions. |
 | [Features](docs/FEATURES.md) | The capability inventory and known gaps. |
 | [HTTP API](docs/API.md) | Fuseki endpoints and Sparkles administration extensions. |

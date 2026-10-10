@@ -1,0 +1,274 @@
+# Values of the Sparkles chart. README.md in this directory lists them with their
+# defaults, and docs/USAGE.md#kubernetes-helm explains how they fit together.
+
+# -- Overrides the chart name in resource names.
+nameOverride: ""
+# -- Overrides the full resource name.
+fullnameOverride: ""
+
+image:
+  # -- The server image. The project publishes none, so build and push your own
+  # (docs/USAGE.md#docker).
+  repository: sparkles
+  # -- The image tag. Defaults to the chart's appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# -- Pull secrets for private registries.
+imagePullSecrets: []
+
+serviceAccount:
+  # -- Create a ServiceAccount for the pod.
+  create: true
+  # -- The ServiceAccount's name. Defaults to the full name when created, otherwise "default".
+  name: ""
+  annotations: {}
+  # -- The server never calls the Kubernetes API, so it gets no token.
+  automountServiceAccountToken: false
+
+# -- Annotations on the pod.
+podAnnotations: {}
+# -- Labels on the pod.
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  fsGroupChangePolicy: OnRootMismatch
+  seccompProfile:
+    type: RuntimeDefault
+
+# -- The server container's security context. The server writes only to the data
+# directory and to the temporary directory, which the chart mounts, so the root
+# filesystem can be read-only.
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+
+server:
+  # -- The port the server listens on in the pod.
+  port: 3030
+  # -- `--log-format`: text or json.
+  logFormat: json
+  # -- RUST_LOG. Empty keeps the server's default filter.
+  logLevel: ""
+  # -- `--shutdown-grace` in seconds. terminationGracePeriodSeconds must be longer.
+  shutdownGrace: 20
+  # -- Serve without authentication on the pod's address (SPARKLES_ALLOW_OPEN_NETWORK=1).
+  # Every client that reaches the Service may then read, write and administer every
+  # dataset. Either this or `auth` must be set.
+  allowOpenNetwork: false
+  # -- Extra `--public-host` names. The Service's DNS names and the Ingress and
+  # HTTPRoute hosts are added on their own.
+  publicHosts: []
+  # -- The cluster's DNS domain, for the Service names passed as `--public-host`.
+  clusterDomain: cluster.local
+  # -- Reload the configuration files when Kubernetes updates their volumes
+  # (`--watch-config`). Kubernetes sends no SIGHUP when a ConfigMap or Secret changes.
+  watchConfig: true
+  # -- More `serve` arguments.
+  extraArgs: []
+  # -- More environment variables of the server container.
+  extraEnv: []
+  # -- envFrom sources of the server container.
+  extraEnvFrom: []
+
+# -- Seconds Kubernetes waits after SIGTERM before it kills the server. Keep it above
+# `server.shutdownGrace`, which the schema and the templates check.
+terminationGracePeriodSeconds: 40
+
+# -- Restart the pod when the rendered configuration changes, through a checksum
+# annotation, for those who prefer restarts to `server.watchConfig`. It covers the
+# ConfigMap and the inline auth and backup Secrets, not existing Secrets or ConfigMaps.
+restartOnConfigChange: false
+
+# -- Declared dataset settings (`--settings`), rendered as JSON into the ConfigMap
+# (spec C19). Empty passes no `--settings`.
+settings: {}
+
+# -- The rate-limit configuration (`--rate-limit-config`), rendered as JSON into the
+# ConfigMap. Empty passes none.
+rateLimits: {}
+
+models:
+  # -- The model configuration (`--model-config`): the object with `models.providers`
+  # and `models.roles`, rendered as JSON into the ConfigMap. Never put API keys here.
+  config: {}
+  # -- API keys by reference. Each entry NAME maps to a key of an existing Secret and
+  # becomes `--model-secret NAME=file:/run/secrets/sparkles/models/SECRET/KEY`; the
+  # server reads the file at each request, so a rotated Secret needs no reload.
+  # Example: `openai: {secretName: model-keys, key: openai}`.
+  secrets: {}
+  # -- How local models reach the server's model store (`--models-dir`). `none` passes
+  # no store flags. `download` lets the server fetch pinned snapshots itself
+  # (`--models-download on`). `pull` runs `sparkles models pull --manifest` in an init
+  # container, with the server's downloads off. `image` mounts an OCI image of models
+  # read-only as an image volume, and `imageCopy` copies one in an init container where
+  # image volumes are not available. All but `none` need a build with the `models`
+  # subcommand.
+  delivery: none
+  # -- Where the model store is mounted in the pod. With `download` and no
+  # `models.persistence`, the store is `<data>/models` on the data volume instead.
+  mountPath: /models
+  # -- The manifest of `pull`: `{models: [{repo, revision, files}]}`, with 40-hex
+  # revisions, rendered into the ConfigMap as models-manifest.json.
+  manifest:
+    models: []
+  # -- A volume of its own for the store, with `download`, `pull` or `imageCopy`.
+  # Without it, `pull` and `imageCopy` use an emptyDir that is filled again at each start.
+  persistence:
+    enabled: false
+    size: 10Gi
+    storageClass: ""
+    accessModes: [ReadWriteOnce]
+    existingClaim: ""
+  # -- The OCI image of `image` and `imageCopy`, holding the store's
+  # `<org>/<name>/<revision>/` directories under `path`.
+  image:
+    reference: ""
+    pullPolicy: IfNotPresent
+    # -- The directory of the store in the image.
+    path: /models
+  # -- The init container's resources with `pull` and `imageCopy`.
+  initResources: {}
+
+ocr:
+  # -- Run the OCR image variant and pass `--pdf-ocr-models`. Needs `ocr.models`.
+  enabled: false
+  image:
+    # -- The OCR image. Defaults to `image.repository`.
+    repository: ""
+    # -- The OCR image's tag. Defaults to the server tag with `-ocr` appended.
+    tag: ""
+  models:
+    # -- Where the PP-OCR models are mounted.
+    mountPath: /ocr-models
+    # -- An existing PVC holding the PP-OCR models.
+    existingClaim: ""
+    # -- The directory of the models in that PVC.
+    subPath: ""
+    # -- Or an OCI image of the models, mounted as an image volume.
+    imageReference: ""
+    imagePullPolicy: IfNotPresent
+
+auth:
+  # -- Turn on authentication (`--auth-config`).
+  enabled: false
+  # -- The auth configuration as TOML (docs/API.md#configuration), rendered into a Secret
+  # because it may hold password and token hashes. Ignored with an existing source.
+  config: ""
+  # -- An existing Secret with the auth configuration.
+  existingSecret: ""
+  # -- An existing ConfigMap with the auth configuration, for a file without hashes,
+  # such as one that uses OIDC with a public client only.
+  existingConfigMap: ""
+  # -- The key of the auth configuration in the Secret or ConfigMap.
+  key: auth.toml
+
+backup:
+  # -- Pass a backup configuration (`--backup-config`).
+  enabled: false
+  # -- The backup configuration as TOML (docs/USAGE.md#backup-repositories), rendered
+  # into a Secret. Ignored with an existing source.
+  config: ""
+  existingSecret: ""
+  existingConfigMap: ""
+  key: backup.toml
+
+persistence:
+  # -- Keep the data on a PersistentVolumeClaim. Without it the data is in an emptyDir
+  # and lost with the pod.
+  enabled: true
+  # -- Sparkles is a single writer on local disk: one pod, one ReadWriteOnce volume.
+  accessModes: [ReadWriteOnce]
+  size: 20Gi
+  storageClass: ""
+  # -- Use an existing claim instead of the StatefulSet's volume claim template.
+  existingClaim: ""
+  annotations: {}
+  # -- What happens to the claim when the StatefulSet is deleted or scaled down.
+  retentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
+
+# -- The temporary directory (/tmp) where large request bodies are spooled. An emptyDir;
+# set `sizeLimit` and `medium` as needed.
+tmp:
+  sizeLimit: ""
+  medium: ""
+
+service:
+  type: ClusterIP
+  port: 3030
+  annotations: {}
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  # -- Hosts and paths; each host is also passed as `--public-host`.
+  hosts:
+    - host: sparql.example.org
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+# -- A Gateway API HTTPRoute, as an alternative to the Ingress.
+httpRoute:
+  enabled: false
+  annotations: {}
+  parentRefs: []
+  # -- Each host name is also passed as `--public-host`.
+  hostnames: []
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+
+podDisruptionBudget:
+  # -- With one replica, a budget of `maxUnavailable: 0` blocks voluntary evictions such
+  # as node drains until someone deletes the pod by hand.
+  enabled: false
+  maxUnavailable: 0
+
+# -- Resources of the server container. Size the memory for the query budgets
+# (`--query-memory-mb`, `--max-mem-dataset-mb`, `--vector-memory-mb`) plus the local
+# models that are loaded, such as about 1.2 GB for Qwen3-Embedding-0.6B in bf16.
+resources:
+  requests:
+    cpu: 500m
+    memory: 1Gi
+  limits:
+    memory: 4Gi
+
+probes:
+  # -- HTTPS when `server.extraArgs` turns on `--tls-cert`.
+  scheme: HTTP
+  # -- Allows `failureThreshold × periodSeconds` for opening the datasets at start
+  # (30 minutes by default), during which the other probes wait.
+  startup:
+    periodSeconds: 5
+    failureThreshold: 360
+    timeoutSeconds: 4
+  readiness:
+    periodSeconds: 10
+    failureThreshold: 3
+    timeoutSeconds: 4
+  liveness:
+    periodSeconds: 30
+    failureThreshold: 4
+    timeoutSeconds: 5
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+# -- Extra volumes of the pod, such as a backup directory.
+extraVolumes: []
+# -- Extra mounts of the server container.
+extraVolumeMounts: []

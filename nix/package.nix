@@ -18,8 +18,13 @@
   installShellFiles,
   makeBinaryWrapper,
   ui ? null,
+  # extra cargo features of sparkles-server, such as [ "pdf-ocr" ]
+  features ? [ ],
 }:
 let
+  featureArgs = lib.optionalString (
+    features != [ ]
+  ) " --features ${lib.concatStringsSep "," features}";
   version = (lib.importTOML ../Cargo.toml).workspace.package.version;
 
   # what the dependency layer is computed from: the manifests, Cargo.lock and the Rust
@@ -63,7 +68,7 @@ let
     commonArgs
     // {
       src = depsSrc;
-      buildPhaseCargoCommand = "cargoWithProfile build --locked -p sparkles-server";
+      buildPhaseCargoCommand = "cargoWithProfile build --locked -p sparkles-server${featureArgs}";
       checkPhaseCargoCommand = "cargoWithProfile test --locked -p sparkles-core -p sparkles --lib --no-run";
     }
   );
@@ -95,7 +100,7 @@ let
       pname = "sparkles-cli";
       inherit src cargoArtifacts;
 
-      cargoExtraArgs = "--locked -p sparkles-server";
+      cargoExtraArgs = "--locked -p sparkles-server${featureArgs}";
       # the unit tests are their own derivation (`tests`)
       doCheck = false;
 

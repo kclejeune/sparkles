@@ -4,8 +4,8 @@ This guide covers operating the `sparkles` binary. It describes running the serv
 command-line tools, automatic compaction, the formatter and linter, backups, outbound
 requests, path search, integrity checks, the MCP server, embedding the library, the
 Python package, the JVM library for Apache Jena, the JavaScript packages, the Rust
-client, Docker, deploying on NixOS and the Home Manager module. [API.md](API.md)
-specifies the HTTP API. [DEVELOPMENT.md](DEVELOPMENT.md) covers building from source and testing.
+client, Docker, Kubernetes, deploying on NixOS and the Home Manager module.
+[API.md](API.md) specifies the HTTP API. [DEVELOPMENT.md](DEVELOPMENT.md) covers building from source and testing.
 
 Sparkles is experimental. The on-disk format, HTTP API and CLI may change between commits
 without a migration path, so keep backups of anything you cannot regenerate.
@@ -64,6 +64,7 @@ without a migration path, so keep backups of anything you cannot regenerate.
 * [JavaScript and TypeScript](#javascript-and-typescript)
 * [Rust client](#rust-client)
 * [Docker](#docker)
+* [Kubernetes (Helm)](#kubernetes-helm)
 * [Deploying on NixOS](#deploying-on-nixos)
 * [Home Manager](#home-manager)
 
@@ -418,6 +419,7 @@ happens to materialized inferences, and the limits.
 | `--max-mem-dataset-mb N` | `4096` | Largest in-memory dataset; `0` means unlimited. A commit that would grow one past it fails with `507`. |
 | `--max-dataset-mb N` | `0` | Default storage quota of a persistent dataset, in MiB of its directory on disk; `0` means unlimited. A write that would take a dataset past its quota fails with `507`. `sparkles quota` and `/$/quota/{ds}` set a quota per dataset ([API.md](API.md#storage-quotas)). |
 | `--shutdown-grace S` | `20` | Seconds that requests in flight get to finish after SIGTERM or SIGINT. The rest are then cancelled, and a cancelled write commits nothing. |
+| `--watch-config` | off | Reload when a file of `--settings`, `--model-config`, `--auth-config`, `--backup-config` or `--rate-limit-config` changes, as SIGHUP does. The files are read every 2 seconds through their symlinks, so an updated Kubernetes ConfigMap is seen. Also `SPARKLES_WATCH_CONFIG=1`. |
 | `--max-tasks N` | `4` | Background tasks that may run at once: compaction, clones, reasoning, full-text, spatial and vector index builds, and N-Quads backups. More tasks wait as `queued`. `0` means no limit. |
 | `--max-clones N` | `2` | Clones that may run at once, within `--max-tasks`. More clones wait as `queued`, and other tasks still start in free slots. `0` leaves only the limit of `--max-tasks`. |
 | `--no-auto-compact` | | Never compact automatically. `POST /$/compact/{ds}` and `sparkles compact` still work. See [Automatic compaction](#automatic-compaction) for the `--auto-compact-*` flags. |
@@ -4665,6 +4667,75 @@ machine, and `mise run docker:build` runs the same build. The cache mounts live 
 Docker's build cache, about 3.5 GB after a build, and `docker builder prune` removes
 them.
 
+### Images and variants
+
+The `Dockerfile` builds two images. The default target is the image described above. The
+`ocr` target builds the server with the `pdf-ocr` feature and adds PDFium and ONNX
+Runtime as shared libraries:
+
+```sh
+docker build -t registry.example.org/sparkles:0.1.0 .
+docker build --target ocr -t registry.example.org/sparkles:0.1.0-ocr .
+docker push registry.example.org/sparkles:0.1.0
+docker push registry.example.org/sparkles:0.1.0-ocr
+```
+
+The OCR image downloads PDFium from bblanchon/pdfium-binaries (release `chromium/7988`,
+the one pdf-inspector's PDFium binding is tested with) and ONNX Runtime 1.30.0 from
+Microsoft's releases. The build checks both archives against sha256 sums recorded in the
+`Dockerfile` and fails when they differ. The libraries are in `/usr/local/lib/sparkles`,
+their license notices in `/usr/share/doc/pdfium` and `/usr/share/doc/onnxruntime`.
+`PDFIUM_LIB_PATH` and `ORT_DYLIB_PATH` point the server at them, so `--pdfium-lib` and
+`--onnxruntime-lib` are not needed. OCR still needs the PP-OCR models, which the server
+never downloads. Mount their directory and pass `--pdf-ocr-models DIR`, as described in
+[Ingesting documents in the server](#ingesting-documents-in-the-server). The OCR image is
+about 55 MB larger than the default one.
+
+`--build-arg FEATURES="..."` adds cargo features of `sparkles-server` to both builds, and
+`--build-arg NO_DEFAULT_FEATURES=1` starts from none, as `cargo build` does. Compose
+passes `SPARKLES_FEATURES` as `FEATURES`. The two server builds keep separate cargo
+target directories in the build cache, so building both does not recompile either one
+from scratch.
+
+The Nix flake builds the same images without Docker on Linux. `nix build .#image` and
+`nix build .#image-ocr` write a script that streams the image, which `docker load` reads
+or `skopeo` pushes:
+
+```sh
+nix build .#image-ocr
+./result | docker load                                    # sparkles:0.1.0-ocr
+./result | skopeo copy docker-archive:/dev/stdin docker://registry.example.org/sparkles:0.1.0-ocr
+```
+
+The Nix OCR image takes PDFium and ONNX Runtime from nixpkgs (`pdfium` and
+`onnxruntime`). It is about 1 GB, against about 375 MB for the Nix default image, because
+nixpkgs builds ONNX Runtime with OpenVINO and its other dependencies. The Nix images have no shell, so they have no `sparkles-healthcheck`
+script. Their health check runs `sparkles ping` directly.
+
+### Compose profiles
+
+`compose.yaml` has two services that only run when their profile is named, so
+`docker compose up` is unchanged.
+
+The `ocr` profile adds `sparkles-ocr`, the same server from the `ocr` image, with the
+PP-OCR models of `./ocr-models` mounted at `/ocr-models`. It uses the same data volume
+as `sparkles`, and the two must never run together, so stop one before you start the
+other:
+
+```sh
+docker compose stop sparkles
+docker compose --profile ocr up --build -d sparkles-ocr
+```
+
+The `models-pull` profile adds a one-shot service that fetches the pinned snapshots of
+`./models-manifest.json` into the volume `sparkles-models`. It needs a build that has the
+`sparkles models` command. The commented lines of the `sparkles` service mount that
+volume read-only at `/models` and pass `--models-dir /models`:
+
+```sh
+docker compose --profile models-pull run --rm models-pull
+```
+
 ### Network exposure in a container
 
 A published port cannot reach a loopback listener inside a container, so the image runs
@@ -4820,6 +4891,214 @@ docker run --rm -v sparkles_sparkles-data:/data:ro -v "$PWD":/out debian:bookwor
   tar -C /data -czf /out/sparkles-data.tar.gz .
 docker compose start
 ```
+
+## Kubernetes (Helm)
+
+The Helm chart in `deploy/helm/sparkles` runs the server as a StatefulSet with one pod
+and a ReadWriteOnce data volume. Sparkles keeps each database on local disk with a single
+writer, so the chart never runs a second replica, and an upgrade stops the old pod before
+the new one starts. Read replicas ([F10](specs/F10-replication.md)) are not part of the
+chart. [The chart's README](../deploy/helm/sparkles/README.md) lists every value.
+
+### Installing the chart
+
+The project publishes no image, so build one and push it to a registry that the cluster
+can pull from. [Images and variants](#images-and-variants) shows the builds. Then write a
+values file and install:
+
+```yaml
+# values.yaml
+image:
+  repository: registry.example.org/sparkles
+  tag: "0.1.0"
+auth:
+  enabled: true
+  existingSecret: sparkles-auth      # key auth.toml
+ingress:
+  enabled: true
+  className: nginx
+  hosts:
+    - host: sparql.example.org
+      paths: [{path: /, pathType: Prefix}]
+  tls:
+    - hosts: [sparql.example.org]
+      secretName: sparql-tls
+```
+
+```sh
+kubectl create namespace sparkles
+kubectl -n sparkles create secret generic sparkles-auth --from-file=auth.toml
+helm install sparkles deploy/helm/sparkles -n sparkles -f values.yaml
+kubectl -n sparkles port-forward svc/sparkles 3030:3030   # UI at http://localhost:3030/ui/
+```
+
+The server listens on the pod's address, so the chart refuses to render until you choose
+between authentication and an open server. `auth.enabled` with an auth configuration is
+the first. `server.allowOpenNetwork=true` is the second, and it lets every client that
+reaches the Service read, write and administer every dataset, as described in
+[Network exposure](#network-exposure). The chart passes the Service's DNS names, the
+Ingress hosts and the HTTPRoute host names as `--public-host`, so the host checks of an
+open server accept them. `server.publicHosts` adds other names. Behind an Ingress
+controller with authentication on, add `--rate-limit-trusted-proxy` with the controller's
+pod network to `server.extraArgs`, so that rate limits count clients rather than the
+proxy.
+
+`ingress` and `httpRoute` are both off by default. `httpRoute` creates a Gateway API
+`HTTPRoute` for the `parentRefs` you give it, and its `hostnames` are passed as
+`--public-host` too.
+
+The pod runs as uid 10001 with a read-only root filesystem, no privilege escalation and
+every capability dropped. The server writes only to the data volume and to `/tmp`, which
+is an emptyDir where large request bodies are spooled. `tmp.sizeLimit` bounds it. The
+probes need no credentials. The startup probe asks for `GET /$/ready` every 5 seconds
+for up to 30 minutes, which is the time the server has to open large datasets before it
+listens. The readiness probe uses `/$/ready` as well, and the liveness probe uses
+`/$/ping`. `terminationGracePeriodSeconds` (40) must be longer than
+`server.shutdownGrace` (20), so that requests in flight can finish after SIGTERM, and the
+chart refuses values where it is not.
+
+### Settings, models and secrets
+
+The values `settings`, `models.config` and `rateLimits` are written as JSON into the
+chart's ConfigMap. The server reads them as `--settings`, `--model-config` and
+`--rate-limit-config`, and an empty value passes no flag. These files hold no secrets. A
+provider's API key is named in the model configuration (`"apiKey": {"secret": "openai"}`)
+and comes from an existing Secret through `models.secrets`:
+
+```yaml
+settings:
+  defaults:
+    assistant: {enabled: true}
+models:
+  config:
+    models:
+      providers:
+        openai:
+          kind: openai
+          endpoint: https://api.openai.com/v1
+          apiKey: {secret: openai}
+      roles:
+        draft: [{provider: openai, model: gpt-5-mini}]
+  secrets:
+    openai: {secretName: model-keys, key: openai}
+```
+
+Each entry becomes `--model-secret openai=file:/run/secrets/sparkles/models/model-keys/openai`
+with the Secret mounted read-only. The server reads the file at each request, so a
+rotated key takes effect without a reload.
+
+The auth and backup configurations come from `auth.existingSecret` or
+`backup.existingSecret`, from an existing ConfigMap, or from the inline TOML of
+`auth.config` or `backup.config`. The chart renders inline TOML into a Secret, never into
+the ConfigMap, because an auth configuration may hold password and token hashes. An
+existing ConfigMap suits an auth configuration without hashes, such as one whose users
+log in through an OIDC public client.
+
+### Configuration reload
+
+Kubernetes updates a mounted ConfigMap or Secret by swapping a symlink in the volume, and
+it sends the process no signal. The chart therefore passes `--watch-config`, which reads
+the files of `--settings`, `--model-config`, `--auth-config`, `--backup-config` and
+`--rate-limit-config` every 2 seconds through their symlinks. When their contents change
+and then stay the same for a second, the server runs the reload that SIGHUP runs and logs
+which files changed. A file that does not load is logged with its error and leaves the
+running configuration in place, as with `kill -HUP`. After `helm upgrade` changes a
+value, the kubelet updates the volume within its sync period, which is usually under two
+minutes. The chart mounts each ConfigMap and Secret as a directory, because Kubernetes
+never updates a file mounted with `subPath`.
+
+`--watch-config`, or `SPARKLES_WATCH_CONFIG=1`, works outside Kubernetes too. Set
+`server.watchConfig=false` to turn it off. `restartOnConfigChange=true` adds a checksum
+of the rendered ConfigMap and inline Secrets to the pod's annotations instead, so that a
+changed value restarts the pod. It does not cover existing Secrets and ConfigMaps.
+
+### Local models
+
+Local embedding models are data. The image never contains them, and the server reads
+them from its model store (`--models-dir`, `<data>/models` by default) as snapshots
+pinned to a revision. `models.delivery` chooses how the snapshots reach the store, and
+each choice other than `none` needs a build that has the `sparkles models` command.
+
+`download` passes `--models-download on`, and the server fetches the pinned snapshots
+that the model configuration names when it first needs them. The store is
+`<data>/models` on the data volume, or a PVC of its own with
+`models.persistence.enabled`. The pod then needs outbound access to Hugging Face.
+
+`pull` keeps the server offline. An init container runs
+`sparkles models pull --manifest` with the manifest from `models.manifest`, and the
+server mounts the store read-only with `--models-download off`. Snapshots that are
+already present and verified need no network, so with `models.persistence.enabled` only
+the first start downloads. Without it, the store is an emptyDir that each start fills
+again. `server.extraEnv` reaches the init container too, for `HF_TOKEN` or a proxy.
+
+```yaml
+models:
+  delivery: pull
+  manifest:
+    models:
+      - repo: Qwen/Qwen3-Embedding-0.6B
+        revision: <40-hex commit>
+  persistence: {enabled: true, size: 5Gi}
+```
+
+`image` mounts an OCI image of the store as a read-only image volume, so the cluster pulls
+models like any image and caches them on the node. Image volumes were added in
+Kubernetes 1.31 behind the `ImageVolume` feature gate. They are beta and on by default
+from 1.35, and stable from 1.36. They need containerd 2.1 or later, or CRI-O 1.31 or
+later. The chart mounts `models.image.path` of the image with `subPath`, which image
+volumes accept from Kubernetes 1.33. Where image volumes are not available, `imageCopy`
+copies the same image's store into an emptyDir, or into a PVC, in an init container
+before the server starts. The copy runs `sh` and `cp` from the model image. Build the
+image from a store that `sparkles models pull` filled:
+
+```sh
+sparkles models pull Qwen/Qwen3-Embedding-0.6B@<40-hex commit> --dir models
+cat > Containerfile <<'EOF'
+FROM busybox:1.37.0
+COPY models /models
+EOF
+docker build -f Containerfile -t registry.example.org/sparkles-models:qwen3-0.6b .
+docker push registry.example.org/sparkles-models:qwen3-0.6b
+```
+
+```yaml
+models:
+  delivery: image            # or imageCopy
+  image:
+    reference: registry.example.org/sparkles-models:qwen3-0.6b
+```
+
+### OCR in Kubernetes
+
+`ocr.enabled` runs the OCR image variant, whose tag defaults to the server's tag with
+`-ocr` appended, and passes `--pdf-ocr-models`. The PP-OCR models come from an existing
+PVC (`ocr.models.existingClaim`, with `ocr.models.subPath`) or from an OCI image mounted
+as an image volume (`ocr.models.imageReference`). The server never downloads them.
+
+### Upgrades and backups
+
+`helm upgrade` with a new `image.tag` replaces the pod. The StatefulSet stops the old pod
+before it starts the new one, so the service is down while the new server opens the
+datasets. Sparkles is experimental and its on-disk format may change without a migration
+path, so take a backup before you upgrade, as described in
+[Upgrading the container](#upgrading-the-container).
+
+The data PVC survives `helm uninstall` and a scale-down
+(`persistence.retentionPolicy`), and so does the models PVC. Take backups with backup
+repositories ([Backup repositories](#backup-repositories)). Give `backup.existingSecret`
+a backup configuration, and use an S3 repository, or mount a volume for an `fs`
+repository with `extraVolumes` and `extraVolumeMounts`. A snapshot of the data PVC is a
+consistent backup only while the pod is stopped
+(`kubectl scale statefulset sparkles --replicas 0`).
+
+### Resources
+
+The defaults request 500m CPU and 1 GiB and limit memory to 4 GiB. Size the memory limit
+above the query budgets (`--query-memory-mb`, `--max-mem-dataset-mb`,
+`--vector-memory-mb`), so that a budget refuses a large request before the kernel ends
+the container. Add the local models that the server loads. Qwen3-Embedding-0.6B takes
+about 1.2 GB in bf16 while it is loaded. With OCR, add the PP-OCR models and ONNX
+Runtime's working memory for each of the `--pdf-workers` conversions that run at once.
 
 ## Deploying on NixOS
 

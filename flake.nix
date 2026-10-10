@@ -111,6 +111,13 @@
               inherit craneLib;
               ui = null;
             };
+            # the server built with PDF OCR (`pdf-ocr`); PDFium and ONNX Runtime come from
+            # the image or the host at run time
+            sparkles-ocr = pkgs.callPackage ./nix/package.nix {
+              inherit craneLib;
+              ui = self'.packages.sparkles-ui;
+              features = [ "pdf-ocr" ];
+            };
             # the Python bindings (crates/sparkles-py) for nixpkgs' python3
             sparkles-py = pkgs.callPackage ./nix/python.nix { inherit rustPlatform; };
             # the JVM bindings' native library (lib/) with its generated Kotlin (share/uniffi)
@@ -121,6 +128,14 @@
             sparkles-node-native = node.native;
             sparkles-node = node.packages;
             default = self'.packages.sparkles;
+          }
+          // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+            # OCI images of the server (nix/image.nix): `nix build .#image && ./result | docker load`
+            image = pkgs.callPackage ./nix/image.nix { sparkles = self'.packages.sparkles; };
+            image-ocr = pkgs.callPackage ./nix/image.nix {
+              sparkles = self'.packages.sparkles-ocr;
+              ocr = true;
+            };
           };
 
           apps.default = {

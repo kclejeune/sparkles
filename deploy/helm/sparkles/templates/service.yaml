@@ -1,0 +1,37 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "sparkles.fullname" . }}
+  labels:
+    {{- include "sparkles.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "sparkles.selectorLabels" . | nindent 4 }}
+---
+# the StatefulSet's governing Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "sparkles.fullname" . }}-headless
+  labels:
+    {{- include "sparkles.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  ports:
+    - name: http
+      port: {{ .Values.server.port }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "sparkles.selectorLabels" . | nindent 4 }}

@@ -1,0 +1,17 @@
+Sparkles is starting as the StatefulSet {{ include "sparkles.fullname" . }} in {{ .Release.Namespace }}.
+
+Reach the UI from your machine:
+
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "sparkles.fullname" . }} 3030:{{ .Values.service.port }}
+  open http://localhost:3030/ui/
+
+{{- if not .Values.auth.enabled }}
+
+The server runs without authentication. Every client that reaches the Service may read,
+write and administer every dataset. Keep the Service private, or set auth.enabled.
+{{- end }}
+{{- if .Values.server.watchConfig }}
+
+Configuration files are reloaded when their ConfigMap or Secret changes, after the
+kubelet has updated the volume (usually within a minute or two).
+{{- end }}

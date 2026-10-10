@@ -20,6 +20,7 @@ mod compaction;
 mod compaction_cmd;
 mod compress;
 mod config_cmd;
+mod config_watch;
 mod csv_cmd;
 mod dataset_cmd;
 mod describe_cmd;
@@ -1139,6 +1140,16 @@ enum Cmd {
         /// proxy headers can then be limited to the socket (`proxy.trusted = ["unix"]`)
         #[arg(long, value_name = "PATH")]
         unix_socket: Option<PathBuf>,
+        /// Reload when a file of --settings, --model-config, --auth-config,
+        /// --backup-config or --rate-limit-config changes, as on SIGHUP. The files are
+        /// read every 2 s, through symlinks, so an updated Kubernetes ConfigMap or Secret
+        /// volume is seen too
+        #[arg(
+            long,
+            env = "SPARKLES_WATCH_CONFIG",
+            value_parser = clap::builder::BoolishValueParser::new()
+        )]
+        watch_config: bool,
         /// Serve without --auth-config on a non-loopback --host, which is refused
         /// otherwise: every client that can reach the port may then read, write and
         /// administer every dataset
@@ -2362,6 +2373,7 @@ fn run() -> Result<()> {
             #[cfg(feature = "backup")]
             backup_max_tasks,
             unix_socket,
+            watch_config,
             tls_cert,
             tls_key,
             allow_open_network,
@@ -2457,6 +2469,20 @@ fn run() -> Result<()> {
             if let Some(url) = &map_style_url {
                 ui::map_style_origin(url)?;
             }
+            // the files `--watch-config` reloads on change, taken before they move
+            let watched: Vec<PathBuf> = if watch_config {
+                let mut v: Vec<PathBuf> = [&settings, &models.model_config, &auth_config]
+                    .into_iter()
+                    .flatten()
+                    .cloned()
+                    .collect();
+                #[cfg(feature = "backup")]
+                v.extend(backup_config.clone());
+                v.extend(rate_limit_config.clone());
+                v
+            } else {
+                Vec::new()
+            };
             let mut st = state::AppState::new(&data, opts, Duration::from_secs_f64(timeout))?;
             st.auth = auth;
             st.cors_origins = cors_origin;
@@ -2759,6 +2785,11 @@ fn run() -> Result<()> {
                     if limit_sources.file.is_some() {
                         ratelimit::spawn_reload_on_sighup(rl.clone(), limit_sources);
                     }
+                }
+                // after every SIGHUP listener above, since a SIGHUP that nothing
+                // listens for would end the process
+                if watch_config {
+                    config_watch::start(watched)?;
                 }
                 // every dataset was opened before the listener was bound
                 st.set_phase(obs::Phase::Ready);

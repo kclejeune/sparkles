@@ -1,0 +1,27 @@
+{{- if include "sparkles.hasConfigMap" . }}
+# The configuration files without secrets. The pod mounts the whole ConfigMap, without
+# subPath, so that Kubernetes updates the files and --watch-config sees the change.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "sparkles.fullname" . }}
+  labels:
+    {{- include "sparkles.labels" . | nindent 4 }}
+data:
+  {{- with .Values.settings }}
+  settings.json: |
+    {{- toPrettyJson . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.models.config }}
+  models.json: |
+    {{- toPrettyJson . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.rateLimits }}
+  rate-limits.json: |
+    {{- toPrettyJson . | nindent 4 }}
+  {{- end }}
+  {{- if eq .Values.models.delivery "pull" }}
+  models-manifest.json: |
+    {{- toPrettyJson .Values.models.manifest | nindent 4 }}
+  {{- end }}
+{{- end }}
