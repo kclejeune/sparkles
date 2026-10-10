@@ -149,6 +149,7 @@ pub fn answer(kind: super::Kind, text: &str) -> Value {
         super::Kind::Ollama => ollama(text),
         super::Kind::Openai => openai(text),
         super::Kind::Anthropic => anthropic(text),
+        super::Kind::Local => Value::Null,
     }
 }
 

@@ -66,7 +66,14 @@ async fn status(State(st): St, Path(name): Path<String>) -> ApiResult<Json<J>> {
         "budgetBytes": sparkles::vector::budget(),
         "usedBytes": vectors.used_bytes(),
         "generation": snap.generation.name,
-        "indexes": ds.dataset.indexes().vector().list(),
+        "indexes": ds
+            .dataset
+            .indexes()
+            .vector()
+            .list()
+            .iter()
+            .map(|i| with_local(&st, i))
+            .collect::<Vec<_>>(),
         "predicates": predicates,
     })))
 }
@@ -75,17 +82,30 @@ fn unknown(name: &str) -> crate::http::ApiError {
     err(StatusCode::NOT_FOUND, format!("no vector index {name}"))
 }
 
+/// An index's status, with `embedding.local` when its embedding names a local provider
+/// of the model configuration: the model's state and memory (spec F12).
+fn with_local(st: &crate::state::AppState, s: &VectorIndexStatus) -> J {
+    let mut v = serde_json::to_value(s).unwrap_or_default();
+    if let (Some(e), Some(l), Some(m)) = (&s.embedding, &st.local_models, st.models())
+        && let Some(p) = &e.config.provider
+        && let Some(j) = l.describe_one(&m.config, p, &e.config.model)
+    {
+        v["embedding"]["local"] = j;
+    }
+    v
+}
+
 /// `GET /$/vector/{ds}/{name}`
 async fn index_status(
     State(st): St,
     Path((ds_name, name)): Path<(String, String)>,
-) -> ApiResult<Json<VectorIndexStatus>> {
+) -> ApiResult<Json<J>> {
     let ds = dataset(&st, &ds_name)?;
     ds.dataset
         .indexes()
         .vector()
         .get(&name)
-        .map(Json)
+        .map(|i| Json(with_local(&st, &i)))
         .ok_or_else(|| unknown(&name))
 }
 
@@ -237,6 +257,10 @@ pub fn check_embedding(
             ));
         }
         _ => {}
+    }
+    // a provider is resolved when a batch runs, from the model configuration then
+    if e.provider.is_some() {
+        return Ok(());
     }
     env.outbound
         .check_url(&e.url)

@@ -224,6 +224,8 @@ pub fn build(p: &ProviderConfig, req: &ChatRequest) -> (String, Value) {
             }
             (format!("{base}/v1/messages"), body)
         }
+        // `Models::call` refuses local providers before building a request
+        Kind::Local => (String::new(), Value::Null),
     }
 }
 
@@ -307,6 +309,9 @@ pub fn parse(kind: Kind, body: &[u8]) -> Result<ChatResponse, CallError> {
                 latency: Duration::ZERO,
             })
         }
+        Kind::Local => Err(CallError::Invalid(
+            "a local provider computes embeddings and does not chat".into(),
+        )),
     }
 }
 
@@ -338,6 +343,7 @@ fn headers(p: &ProviderConfig, key: Option<&str>) -> Vec<(String, String)> {
                     .unwrap_or_else(|| DEFAULT_ANTHROPIC_VERSION.into()),
             ));
         }
+        Kind::Local => {}
     }
     h
 }

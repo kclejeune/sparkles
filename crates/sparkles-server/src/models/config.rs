@@ -19,6 +19,8 @@ pub enum Kind {
     Openai,
     /// Anthropic's `POST {endpoint}/v1/messages`
     Anthropic,
+    /// embedding models run in the server process (spec F12); no endpoint, no chat
+    Local,
 }
 
 impl Kind {
@@ -27,6 +29,7 @@ impl Kind {
             Kind::Ollama => "ollama",
             Kind::Openai => "openai",
             Kind::Anthropic => "anthropic",
+            Kind::Local => "local",
         }
     }
 }
@@ -136,6 +139,26 @@ pub struct ModelOptions {
     pub request_timeout_secs: Option<f64>,
     /// Ollama: the context option (`num_ctx`)
     pub num_ctx: Option<u64>,
+    /// local (spec F12): the Hugging Face repository of the model's snapshot
+    pub repo: Option<String>,
+    /// local: the snapshot's full 40-character commit
+    pub revision: Option<String>,
+    /// local: a snapshot directory the operator provides, instead of repo and revision
+    pub path: Option<String>,
+    /// local: `f32` or `bf16`
+    pub dtype: Option<String>,
+    /// local: threads of the model's inference pool
+    pub threads: Option<usize>,
+    /// local: seconds without work before the weights are dropped (0 keeps them)
+    pub idle_unload_secs: Option<u64>,
+    /// local: Matryoshka truncation of the vectors to this many components
+    pub dimensions: Option<usize>,
+    /// local: tokens per text, at most the model's own limit
+    pub max_tokens: Option<usize>,
+    /// local: text put before queries, replacing the snapshot's query prompt
+    pub query_prefix: Option<String>,
+    /// local: text put before stored documents, replacing the snapshot's prompt
+    pub document_prefix: Option<String>,
 }
 
 impl ModelOptions {
@@ -149,6 +172,22 @@ impl ModelOptions {
             pricing: self.pricing.or(base.pricing),
             request_timeout_secs: self.request_timeout_secs.or(base.request_timeout_secs),
             num_ctx: self.num_ctx.or(base.num_ctx),
+            repo: self.repo.clone().or_else(|| base.repo.clone()),
+            revision: self.revision.clone().or_else(|| base.revision.clone()),
+            path: self.path.clone().or_else(|| base.path.clone()),
+            dtype: self.dtype.clone().or_else(|| base.dtype.clone()),
+            threads: self.threads.or(base.threads),
+            idle_unload_secs: self.idle_unload_secs.or(base.idle_unload_secs),
+            dimensions: self.dimensions.or(base.dimensions),
+            max_tokens: self.max_tokens.or(base.max_tokens),
+            query_prefix: self
+                .query_prefix
+                .clone()
+                .or_else(|| base.query_prefix.clone()),
+            document_prefix: self
+                .document_prefix
+                .clone()
+                .or_else(|| base.document_prefix.clone()),
         }
     }
 }
@@ -159,6 +198,8 @@ impl ModelOptions {
 #[serde(rename_all = "camelCase")]
 pub struct ProviderConfig {
     pub kind: Kind,
+    /// empty for the local kind
+    #[serde(default)]
     pub endpoint: String,
     pub api_key: Option<SecretRef>,
     pub connect_timeout_secs: Option<f64>,
@@ -338,6 +379,16 @@ pub const PROVIDER_MEMBERS: &[&str] = &[
     "pricing",
     "requestTimeoutSecs",
     "numCtx",
+    "repo",
+    "revision",
+    "path",
+    "dtype",
+    "threads",
+    "idleUnloadSecs",
+    "dimensions",
+    "maxTokens",
+    "queryPrefix",
+    "documentPrefix",
 ];
 
 /// Refuse unknown provider members, which serde's `flatten` would ignore.
@@ -479,7 +530,11 @@ impl ModelsConfig {
             {
                 bail!("provider name {name:?}: use letters, digits, '_', '-' and '.'");
             }
-            check_endpoint(&p.endpoint).with_context(|| format!("provider {name}"))?;
+            if p.kind == Kind::Local {
+                check_local(p).with_context(|| format!("provider {name}"))?;
+            } else {
+                check_endpoint(&p.endpoint).with_context(|| format!("provider {name}"))?;
+            }
             if let Some(k) = &p.api_key {
                 if k.secret.is_empty() {
                     bail!("provider {name}: apiKey names an empty secret");
@@ -519,6 +574,11 @@ impl ModelsConfig {
                 .chain(p.models.iter().map(|(m, o)| (m.as_str(), o)))
             {
                 check_options(o).with_context(|| format!("provider {name}, model {m}"))?;
+                if p.kind != Kind::Local && local_members_elsewhere(o) {
+                    bail!(
+                        "provider {name}, model {m}: repo, revision, path, dtype, threads, idleUnloadSecs, dimensions, maxTokens, queryPrefix and documentPrefix apply to the local kind only"
+                    );
+                }
                 if o.num_ctx.is_some() && p.kind != Kind::Ollama {
                     bail!("provider {name}, model {m}: numCtx applies to the ollama kind only");
                 }
@@ -550,6 +610,13 @@ impl ModelsConfig {
                 };
                 if pair.model.is_empty() {
                     bail!("role {}: an entry names no model", role.as_str());
+                }
+                if p.kind == Kind::Local {
+                    bail!(
+                        "role {}: provider {} is of the local kind, which computes embeddings and does not answer prompts",
+                        role.as_str(),
+                        pair.provider
+                    );
                 }
                 if !p.allows(&pair.model) {
                     bail!(
@@ -604,6 +671,67 @@ fn check_options(o: &ModelOptions) -> Result<()> {
         bail!("pricing must hold non-negative numbers");
     }
     Ok(())
+}
+
+/// The local kind (spec F12): no endpoint or key, and each model names a snapshot by
+/// `repo` and a pinned `revision`, or by `path`. The other kinds take none of the local
+/// members.
+fn check_local(p: &ProviderConfig) -> Result<()> {
+    if !p.endpoint.is_empty() {
+        bail!("the local kind takes no endpoint");
+    }
+    if p.api_key.is_some() {
+        bail!("the local kind takes no apiKey");
+    }
+    for (m, o) in &p.models {
+        let o = o.over(&p.defaults);
+        let what = format!("model {m}");
+        match (&o.repo, &o.revision, &o.path) {
+            (Some(r), Some(v), None) => {
+                sparkles_modelstore::check_repo(r).map_err(|e| anyhow::anyhow!("{what}: {e}"))?;
+                if !sparkles_modelstore::is_pinned(v) {
+                    bail!("{what}: revision must be a full 40-character commit id, not {v:?}");
+                }
+            }
+            (None, None, Some(path)) => {
+                if !std::path::Path::new(path).is_absolute() {
+                    bail!("{what}: path must be absolute");
+                }
+            }
+            _ => bail!("{what}: give repo and revision, or path"),
+        }
+        if let Some(d) = &o.dtype
+            && !matches!(d.as_str(), "f32" | "bf16")
+        {
+            bail!("{what}: dtype must be f32 or bf16");
+        }
+        if o.threads.is_some_and(|t| t == 0 || t > 256) {
+            bail!("{what}: threads must be 1 to 256");
+        }
+        if o.dimensions == Some(0) || o.max_tokens.is_some_and(|t| t < 2) {
+            bail!("{what}: dimensions must be at least 1 and maxTokens at least 2");
+        }
+        for t in [&o.query_prefix, &o.document_prefix].into_iter().flatten() {
+            if t.len() > 4096 {
+                bail!("{what}: queryPrefix and documentPrefix take at most 4096 bytes");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether a provider of another kind sets a member of the local kind.
+fn local_members_elsewhere(o: &ModelOptions) -> bool {
+    o.repo.is_some()
+        || o.revision.is_some()
+        || o.path.is_some()
+        || o.dtype.is_some()
+        || o.threads.is_some()
+        || o.idle_unload_secs.is_some()
+        || o.dimensions.is_some()
+        || o.max_tokens.is_some()
+        || o.query_prefix.is_some()
+        || o.document_prefix.is_some()
 }
 
 /// An endpoint is an absolute `http` or `https` URL without credentials, a query or a

@@ -79,6 +79,7 @@ fn each_kind_gets_the_schema_in_its_member() {
                 // current Claude models refuse temperature: it is never sent
                 assert!(r.body.get("temperature").is_none());
             }
+            Kind::Local => unreachable!("not in the list"),
         }
         // the detected level is remembered for the pair
         assert_eq!(m.level_of(&Pair::new("p", "m1")), Some(Level::JsonSchema));

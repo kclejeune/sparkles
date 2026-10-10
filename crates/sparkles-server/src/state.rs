@@ -308,6 +308,8 @@ pub struct AppState {
     /// the model providers and role lists (`serve --model-config`, spec C18 §3.4),
     /// replaced on SIGHUP (spec C19 §7); read them with [`models`](Self::models)
     pub models: arc_swap::ArcSwapOption<crate::models::Models>,
+    /// the model store and the local embedding models (`serve --models-dir`, spec F12)
+    pub local_models: Option<Arc<crate::model_store::LocalModels>>,
     /// the declared settings file (`serve --settings`, spec C19 §5)
     pub settings: crate::settings::Settings,
     /// recent asks, usage counts and daily token counts (spec C18 §5.5)
@@ -533,6 +535,7 @@ impl AppState {
             mcp: None,
             volatile: Default::default(),
             models: Default::default(),
+            local_models: None,
             settings: crate::settings::Settings::in_dir(data_dir),
             asks: Default::default(),
             #[cfg(feature = "mcp")]
@@ -582,6 +585,7 @@ impl AppState {
             mcp: None,
             volatile: Default::default(),
             models: Default::default(),
+            local_models: None,
             settings: Default::default(),
             asks: Default::default(),
             #[cfg(feature = "mcp")]

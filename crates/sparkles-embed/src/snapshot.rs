@@ -105,30 +105,10 @@ fn as_u32(v: Option<&Value>) -> Option<u32> {
     }
 }
 
-/// The files of a Hub repository an embedding model needs: the root JSON files, the
-/// tokenizer, the safetensors weights (one file or shards) and the configuration of each
-/// sentence-transformers module directory. ONNX, OpenVINO, PyTorch pickles and other
-/// formats are skipped.
+/// The files of a Hub repository an embedding model needs
+/// ([`sparkles_modelstore::sentence_transformers_files`]).
 pub fn hub_select(path: &str) -> bool {
-    let (dir, file) = match path.rsplit_once('/') {
-        Some((d, f)) => (Some(d), f),
-        None => (None, path),
-    };
-    match dir {
-        None => {
-            file.ends_with(".json") && !file.starts_with("onnx")
-                || file == "model.safetensors"
-                || (file.starts_with("model-") && file.ends_with(".safetensors"))
-                || file == "tokenizer.model"
-        }
-        // `1_Pooling/config.json`, `2_Normalize` holds no file
-        Some(d) => {
-            !d.contains('/')
-                && d.split_once('_')
-                    .is_some_and(|(n, _)| n.parse::<u32>().is_ok())
-                && file == "config.json"
-        }
-    }
+    sparkles_modelstore::sentence_transformers_files(path)
 }
 
 impl SnapshotConfig {

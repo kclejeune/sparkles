@@ -371,6 +371,41 @@ impl Models {
         self.provider(&pair.provider).map(|p| p.model(&pair.model))
     }
 
+    /// The embeddings endpoint and key of a remote provider for vector indexes that
+    /// name it (spec F12 §6): OpenAI's `{endpoint}/embeddings` for the openai kind and
+    /// Ollama's `{endpoint}/v1/embeddings` for the ollama kind. The key is read now.
+    pub fn embedding_endpoint(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> Result<(Kind, String, Option<String>), String> {
+        let p = self
+            .provider(provider)
+            .ok_or_else(|| format!("no provider named {provider:?} in the model configuration"))?;
+        if !p.allows(model) {
+            return Err(format!(
+                "provider {provider} does not allow the model {model:?}"
+            ));
+        }
+        let base = p.endpoint.trim_end_matches('/');
+        let url = match p.kind {
+            Kind::Openai => format!("{base}/embeddings"),
+            Kind::Ollama => format!("{base}/v1/embeddings"),
+            Kind::Local => String::new(),
+            Kind::Anthropic => {
+                return Err(format!(
+                    "provider {provider} is of the anthropic kind, which offers no embeddings"
+                ));
+            }
+        };
+        let key = if p.kind == Kind::Local {
+            None
+        } else {
+            self.key(p)?
+        };
+        Ok((p.kind, url, key))
+    }
+
     /// The key of provider `name`, read now: `Ok(None)` when it names none.
     fn key(&self, p: &ProviderConfig) -> Result<Option<String>, String> {
         let Some(r) = &p.api_key else {
@@ -462,6 +497,15 @@ impl Models {
                 rec,
             );
         };
+        if p.kind == Kind::Local {
+            return fail(
+                StepError::UnknownPair(format!(
+                    "provider {} is of the local kind, which computes embeddings and does not answer prompts",
+                    pair.provider
+                )),
+                rec,
+            );
+        }
         let key = match self.key(p) {
             Ok(k) => k,
             Err(m) => {

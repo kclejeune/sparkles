@@ -45,7 +45,9 @@ mod mcp;
 mod memory_cmd;
 // the pipeline that uses most of the model clients (`ask`) needs the `mcp` feature
 #[cfg_attr(not(feature = "mcp"), allow(dead_code, unused_imports))]
+mod model_store;
 mod models;
+mod models_cmd;
 mod obs;
 mod openapi;
 mod otel;
@@ -888,6 +890,8 @@ enum Cmd {
         outbound: outbound::OutboundArgs,
         #[command(flatten)]
         models: models::ModelArgs,
+        #[command(flatten)]
+        model_store: model_store::ModelStoreArgs,
         /// Declared dataset settings, as JSON (spec C19 §5): defaults and per-dataset
         /// values of the assistant, memory and ingest settings, and the fields that cannot
         /// be changed at runtime, including server.locked for the model configuration and
@@ -1437,6 +1441,9 @@ enum Cmd {
     /// Runtime values of model secrets on a running server: list them, store one from
     /// standard input or a prompt that does not echo, or remove one
     Secrets(secrets_cmd::SecretsArgs),
+    /// The model store of local models: pull pinned snapshots from the Hugging Face
+    /// Hub with verified hashes, list and verify them, or remove one
+    Models(models_cmd::ModelsArgs),
     /// Manage datasets in a stopped server's catalog or on a running server
     Dataset {
         #[command(subcommand)]
@@ -2302,6 +2309,7 @@ fn run() -> Result<()> {
             no_embedding,
             outbound,
             models,
+            model_store,
             settings,
             #[cfg(feature = "mcp")]
             ingest,
@@ -2473,10 +2481,23 @@ fn run() -> Result<()> {
             st.allow_service = !no_service;
             st.outbound = outbound.policy()?;
             // embedding requests go through the same outbound policy
+            // the model store and the providers of the model configuration, which a vector
+            // index may name instead of a URL (spec F12)
+            let local_models = Arc::new(model_store::LocalModels::new(
+                model_store
+                    .models_dir
+                    .clone()
+                    .unwrap_or_else(|| data.join("models")),
+                model_store.models_download,
+                st.outbound.clone(),
+            ));
+            let providers = Arc::new(model_store::ServerProviders::new(local_models.clone()));
+            st.local_models = Some(local_models);
             sparkles::vector::embed::set_environment(sparkles::vector::embed::Environment {
                 enabled: !no_embedding,
                 outbound: st.outbound.clone(),
                 secrets: vector_cmd::parse_secrets(&embedding_secret)?,
+                providers: Some(providers.clone()),
             });
             st.file_loads = outbound::file_loads(load_dir.as_deref(), &data)?;
             // the model configuration is the `models` settings kind (spec C19 §11): the
@@ -2609,6 +2630,7 @@ fn run() -> Result<()> {
                 tracing::warn!("{w}");
             }
             let st = Arc::new(st);
+            providers.attach(&st);
             otel::register_metrics(&st);
             #[cfg(feature = "reasoning")]
             if st.read_only {
@@ -3396,6 +3418,7 @@ fn run() -> Result<()> {
         Cmd::Quota(args) => quota_cmd::run(args, opts),
         Cmd::Settings(args) => settings_cmd::run(args),
         Cmd::Secrets(args) => secrets_cmd::run(args),
+        Cmd::Models(args) => models_cmd::run(args),
         Cmd::Dataset { cmd } => dataset_cmd::run(cmd, opts),
         Cmd::Compaction(args) => compaction_cmd::run(args, opts),
         #[cfg(feature = "auth")]

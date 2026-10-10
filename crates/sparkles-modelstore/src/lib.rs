@@ -92,7 +92,7 @@ pub trait HttpClient: Send + Sync {
 
 /// A snapshot's identity: a repository (`owner/name`) and a revision. For the Hub the
 /// revision is a full commit id; other sources may use any stable version string.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SnapshotId {
     pub repo: String,
     pub revision: String,
@@ -514,6 +514,33 @@ fn sha256_of(path: &Path, verified: &Digest) -> Result<[u8; 32]> {
 pub fn read_manifest(dir: &Path) -> Result<Manifest> {
     serde_json::from_slice(&fs::read(dir.join(MANIFEST))?)
         .map_err(|e| Error::Invalid(format!("{}: {e}", dir.join(MANIFEST).display())))
+}
+
+/// The default selection of a Hub repository's files: what a sentence-transformers or
+/// Transformers model needs to run from safetensors. That is the JSON files at the root
+/// (configuration, tokenizer, modules), the safetensors weights (one file or shards),
+/// a SentencePiece `tokenizer.model`, and the `config.json` of each numbered module
+/// directory such as `1_Pooling`. ONNX, OpenVINO, PyTorch pickles, READMEs and other
+/// formats are skipped. A caller that needs other files lists them explicitly.
+pub fn sentence_transformers_files(path: &str) -> bool {
+    let (dir, file) = match path.rsplit_once('/') {
+        Some((d, f)) => (Some(d), f),
+        None => (None, path),
+    };
+    match dir {
+        None => {
+            file.ends_with(".json") && !file.starts_with("onnx")
+                || file == "model.safetensors"
+                || (file.starts_with("model-") && file.ends_with(".safetensors"))
+                || file == "tokenizer.model"
+        }
+        Some(d) => {
+            !d.contains('/')
+                && d.split_once('_')
+                    .is_some_and(|(n, _)| n.parse::<u32>().is_ok())
+                && file == "config.json"
+        }
+    }
 }
 
 fn check_segment(s: &str) -> Result<()> {
