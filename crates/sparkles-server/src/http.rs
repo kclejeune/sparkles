@@ -46,7 +46,7 @@ mod patch;
 mod queries;
 pub(crate) mod schema;
 pub(crate) use schema::constraints::ShapesRequest;
-mod sd;
+pub(crate) mod sd;
 mod shex;
 mod stream;
 mod tabular;
@@ -251,12 +251,18 @@ pub fn router(state: Arc<AppState>) -> Router {
     let app = app.merge(crate::rdfs::routes());
     // DESCRIBE settings (`/$/describe`)
     let app = app.merge(describe::routes());
+    // model providers, memory settings and suggested examples (C18)
+    let app = app.merge(crate::models::http::routes());
+    let app = app.merge(crate::assist::routes());
     // backup repositories, per-dataset backups and backup policies
     #[cfg(feature = "backup")]
     let app = app.merge(crate::backup::http::routes());
     // the formatter, with its own body limit
     #[cfg(feature = "fmt")]
     let app = app.merge(format::routes(&state));
+    // the memory tools over HTTP: check, recall and the empty-result diagnosis
+    #[cfg(feature = "mcp")]
+    let app = app.merge(crate::mcp::rest::routes());
     // the MCP endpoint (`serve --mcp`)
     #[cfg(feature = "mcp")]
     let app = match crate::mcp::http::route(&state) {
@@ -527,6 +533,17 @@ pub(crate) fn add_request_id(resp: &mut Response, id: Option<String>) {
 
 pub(crate) fn err(status: StatusCode, msg: impl Into<String>) -> ApiError {
     ApiError(status, json!({ "error": msg.into() }))
+}
+
+/// An error with a machine-readable `code` next to its message.
+pub(crate) fn err_code(status: StatusCode, code: &str, msg: impl Into<String>) -> ApiError {
+    ApiError(status, json!({ "error": msg.into(), "code": code }))
+}
+
+/// An error with a JSON body of the caller's making (it must hold `error`).
+#[cfg(feature = "mcp")]
+pub(crate) fn err_body(status: StatusCode, body: J) -> ApiError {
+    ApiError(status, body)
 }
 
 impl From<Error> for ApiError {

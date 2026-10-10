@@ -5,6 +5,9 @@
 //! validate|parse`).
 
 mod alloc;
+#[cfg(feature = "mcp")]
+mod ask;
+mod assist;
 mod auth;
 #[cfg(feature = "backup")]
 mod backup;
@@ -33,6 +36,9 @@ mod http;
 mod lsp;
 #[cfg(feature = "mcp")]
 mod mcp;
+// the pipeline that uses most of the model clients (`ask`) needs the `mcp` feature
+#[cfg_attr(not(feature = "mcp"), allow(dead_code, unused_imports))]
+mod models;
 mod obs;
 mod openapi;
 mod otel;
@@ -870,6 +876,8 @@ enum Cmd {
         no_service: bool,
         #[command(flatten)]
         outbound: outbound::OutboundArgs,
+        #[command(flatten)]
+        models: models::ModelArgs,
         /// A secret vector indexes may name as their embedding API key, read from an
         /// environment variable or a file when a request is made: NAME=env:VARIABLE or
         /// NAME=file:PATH (repeatable)
@@ -1156,6 +1164,11 @@ enum Cmd {
     /// on stdin/stdout): read-only tools for schema discovery and bounded queries
     #[cfg(feature = "mcp")]
     Mcp(mcp::McpArgs),
+    /// Answer a question about a database with the configured models (C18 §4): ground,
+    /// draft, check, run, repair and summarize, printing the checked query, its rows and
+    /// the tokens used
+    #[cfg(feature = "mcp")]
+    Ask(ask::AskArgs),
     /// Format SPARQL, Turtle, TriG, N-Triples, N-Quads and JSON-LD: print, check (--check,
     /// -l) or rewrite (--write)
     #[cfg(feature = "fmt")]
@@ -2247,6 +2260,7 @@ fn run() -> Result<()> {
             embedding_secret,
             no_embedding,
             outbound,
+            models,
             load_dir,
             idle_release_ms,
             mut text,
@@ -2420,6 +2434,7 @@ fn run() -> Result<()> {
                 secrets: vector_cmd::parse_secrets(&embedding_secret)?,
             });
             st.file_loads = outbound::file_loads(load_dir.as_deref(), &data)?;
+            st.models = models.load(st.outbound.clone())?;
             st.schema_max_entries = schema_max_entries;
             #[cfg(feature = "shex")]
             {
@@ -2764,6 +2779,8 @@ fn run() -> Result<()> {
         }
         #[cfg(feature = "mcp")]
         Cmd::Mcp(args) => mcp::run(args, opts),
+        #[cfg(feature = "mcp")]
+        Cmd::Ask(args) => ask::run_cli(args, opts),
         #[cfg(feature = "fmt")]
         Cmd::Fmt(args) => fmt::run(args),
         #[cfg(feature = "fmt")]

@@ -23,7 +23,14 @@ pub fn all_tools() -> Vec<&'static str> {
         v.push("search_text");
     }
     v.push("similar_entities");
-    v.extend(["check_query", "similar_queries", "link_entities", "recall"]);
+    v.extend([
+        "check_query",
+        "similar_queries",
+        "link_entities",
+        "recall",
+        "why_empty",
+        "share_query",
+    ]);
     if cfg!(feature = "shacl") {
         v.push("validate_shacl");
     }
@@ -39,6 +46,24 @@ pub fn all_tools() -> Vec<&'static str> {
     v.push("sparql_update");
     v.extend(super::branches::TOOLS_AFTER_UPDATE);
     v
+}
+
+/// The output of `why_empty` and the body of `POST /{ds}/sparql/diagnose`.
+pub(crate) fn why_empty_output() -> Value {
+    let step = json!({"type":"object","required":["kind","text","solutions"],"properties":{
+        "kind":{"enum":["pattern","join","filter"]},"text":{"type":"string"},"solutions":{"type":["boolean","null"]}}});
+    json!({"type":"object","required":["dataset","commit","empty","steps","complete","message","prefixes"],"properties":{
+        "dataset":{"type":"string"},"commit":{"type":"integer"},
+        "empty":{"type":["boolean","null"],"description":"Whether the query has no solutions; null when the check ran out of time"},
+        "first":{"type":"object","required":["kind","text","constants","issues"],"properties":{
+            "kind":{"enum":["pattern","join","filter"]},"text":{"type":"string"},
+            "line":{"type":"integer"},"column":{"type":"integer"},
+            "constants":{"type":"array","items":{"type":"object","required":["term","occurs"],"properties":{"term":{"type":"string"},"occurs":{"type":"boolean"}}}},
+            "issues":{"type":"array","items":{"type":"object"}}}},
+        "steps":{"type":"array","items":step},
+        "unchecked":strings(),
+        "complete":{"type":"boolean"},"message":{"type":"string"},
+        "prefixes":prefixes()}})
 }
 
 pub struct ToolDef {
@@ -438,6 +463,7 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
                 "query": {"type":"string","minLength":1,"maxLength":65536,"description":"A SPARQL query; the dataset prefixes are predeclared"},
                 "explain": {"type":"boolean","default":false,"description":"Add the plan's estimated rows and the no-limit and large-estimate warnings of explain_query"},
                 "maxSuggestions": {"type":"integer","minimum":0,"maximum":10,"default":3,"description":"Suggestions per issue"},
+                "terms": {"type":"boolean","default":false,"description":"List every constant IRI of the query with its kind, label, count and whether it occurs"},
                 "reasoning": rs(),
                 "timeoutSeconds": to(cfg),
                 "atCommit": at(), "at": at_sel()}}),
@@ -449,6 +475,9 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
                     "suggestions":{"type":"array","items":{"type":"object","required":["term","count","why"],"properties":{
                         "term":{"type":"string"},"label":{"type":"string"},"count":{"type":"integer"},"why":{"type":"string"}}}}}}},
                 "estimatedRows":{"type":"number"},
+                "terms":{"type":"array","items":{"type":"object","required":["term","iri","kind","occurs"],"properties":{
+                    "term":{"type":"string"},"iri":{"type":"string"},"kind":{"enum":["class","property","entity"]},
+                    "label":{"type":"string"},"count":{"type":"integer"},"types":strings(),"occurs":{"type":["boolean","null"]}}}},
                 "prefixes":prefixes()}})),
         ),
         read(
@@ -518,11 +547,42 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
                 "maxTriples": {"type":"integer","minimum":1,"maximum":1000,"default":150},
                 "maxBytes": {"type":"integer","minimum":1024,"maximum":cfg.max_bytes,"default":32768.min(cfg.max_bytes)},
                 "includeSuperseded": {"type":"boolean","default":false,"description":"List the superseded and retracted facts of the entities returned"},
+                "statuses": {"type":"array","items":{"enum":["reviewed","unreviewed"]},"minItems":1,"maxItems":2,"description":"The review statuses to return when the dataset names agent memory graphs (default both). Unreviewed facts were written by an agent and not yet checked by a person"},
+                "unreviewedWeight": {"type":"number","minimum":0,"maximum":1,"default":0.7,"description":"Factor on the score of found seeds whose facts are all unreviewed"},
                 "format": {"enum":["text","json"],"default":"text"},
                 "reasoning": rs(),
                 "timeoutSeconds": to(cfg),
                 "atCommit": at(), "at": at_sel()}}),
             None,
+        ),
+        read(
+            "why_empty",
+            "Explain an empty result",
+            "For a query that returned no rows, check each triple pattern alone, then the patterns joined in order with the filters in place, and report the first pattern, join or filter without solutions: its text, whether its constants occur in your view at all, and the check_query issues about them. Each check is an ASK under a tenth of the timeout. Use it after sparql_query returns nothing, then fix the query.",
+            json!({"type":"object","additionalProperties":false,"required":["query"],"properties":{
+                "dataset": ds(),
+                "query": {"type":"string","minLength":1,"maxLength":65536,"description":"The SPARQL query that returned no rows; the dataset prefixes are predeclared"},
+                "reasoning": rs(),
+                "timeoutSeconds": to(cfg),
+                "atCommit": at(), "at": at_sel()}}),
+            Some(why_empty_output()),
+        ),
+        read(
+            "share_query",
+            "Open a query in the Sparkles UI",
+            "Check a query and return a link that opens it in a new tab of the Sparkles query page, with the person's question, your explanation and your assumptions above it. The query is not run; the person reviews and runs it. Offer the link after you answer from a query so the person can see and edit it.",
+            json!({"type":"object","additionalProperties":false,"required":["query"],"properties":{
+                "dataset": ds(),
+                "query": {"type":"string","minLength":1,"maxLength":65536,"description":"A SPARQL query; the dataset prefixes are predeclared"},
+                "question": {"type":"string","maxLength":2000,"description":"The person's question"},
+                "explanation": {"type":"string","maxLength":400,"description":"What the query does, in a sentence or two"},
+                "assumptions": {"type":"array","items":{"type":"string","maxLength":400},"maxItems":5,"description":"Choices you made that the person should know"},
+                "branch": {"type":"string","maxLength":200,"description":"The branch the query reads"},
+                "atCommit": at()}}),
+            Some(json!({"type":"object","required":["url","dataset","ok","issues"],"properties":{
+                "url":{"type":"string"},"dataset":{"type":"string"},"commit":{"type":"integer"},
+                "ok":{"type":"boolean"},"issues":{"type":"array","items":{"type":"object"}},
+                "prefixes":prefixes()}})),
         ),
         read(
             "validate_shacl",

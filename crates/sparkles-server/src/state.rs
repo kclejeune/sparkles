@@ -303,6 +303,10 @@ pub struct AppState {
     /// the MCP endpoint `/$/mcp` (`serve --mcp`); `None`: not mounted
     #[cfg(feature = "mcp")]
     pub mcp: Option<Arc<crate::mcp::http::HttpConf>>,
+    /// the C18 files of in-memory datasets (`assist`)
+    pub volatile: crate::assist::Volatile,
+    /// the model providers and role lists (`serve --model-config`, spec C18 §3.4)
+    pub models: Option<Arc<crate::models::Models>>,
 }
 
 /// Who may use `POST /$/format` (`serve --format-endpoint`).
@@ -519,6 +523,8 @@ impl AppState {
             format: FormatConf::default(),
             #[cfg(feature = "mcp")]
             mcp: None,
+            volatile: Default::default(),
+            models: None,
         };
         Ok(state)
     }
@@ -562,6 +568,8 @@ impl AppState {
             format: FormatConf::default(),
             #[cfg(feature = "mcp")]
             mcp: None,
+            volatile: Default::default(),
+            models: None,
             rate_limit: None,
             auth: None,
             cors_origins: Vec::new(),

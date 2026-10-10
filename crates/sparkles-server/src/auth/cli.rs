@@ -25,6 +25,31 @@ pub enum AuthCmd {
         #[arg(long, default_value = "token")]
         name: String,
     },
+    /// Print the grants of a template as `[[roles.NAME.grants]]` for the auth
+    /// configuration. `--template agent` writes an agent's memory grants (spec C18
+    /// §8.6): read on the dataset, write on its own graphs on `main` and on its proposal
+    /// branches, write on the curated graphs only on its proposal branches, and never
+    /// merge. Give the role to the agent's token or user with `roles = ["NAME"]`
+    Grant {
+        /// The template
+        #[arg(long, value_parser = ["agent"])]
+        template: String,
+        /// The agent's name, which names the role and its proposal branches
+        /// `proposals.NAME.*`
+        #[arg(long)]
+        agent: String,
+        /// The dataset
+        #[arg(long)]
+        dataset: String,
+        /// The IRI prefix of the agent's own graphs, such as
+        /// https://example.org/memory/agents/agent-7/
+        #[arg(long, value_name = "IRI")]
+        session_graphs: String,
+        /// A consolidated or curated graph, or a pattern with `*`, that the agent may
+        /// change only on its proposal branches (repeatable)
+        #[arg(long = "curated", value_name = "IRI")]
+        curated: Vec<String>,
+    },
     /// Validate an auth configuration and print a summary; exits with 1 on errors
     Check {
         #[arg(long)]
@@ -131,8 +156,100 @@ fn read_secret(what: &str) -> Result<zeroize::Zeroizing<String>> {
     Ok(zeroize::Zeroizing::new(s))
 }
 
+/// The endpoints an agent's write grants cover: everything but merges.
+const AGENT_ENDPOINTS: [&str; 6] = ["query", "update", "gsp-r", "gsp-rw", "info", "branches"];
+
+/// The `agent` template of C18 §8.6 as TOML grants of the role `agent`.
+pub fn agent_template(
+    agent: &str,
+    dataset: &str,
+    session_graphs: &str,
+    curated: &[String],
+) -> Result<String> {
+    if !super::config::valid_principal_name(agent) {
+        bail!("invalid agent name '{agent}': use [A-Za-z0-9_.@-], at most 64 characters");
+    }
+    if !sparkles::branch::valid_name(&format!("proposals.{agent}.x")) {
+        bail!("agent name '{agent}' cannot name branches: use [A-Za-z0-9_.-]");
+    }
+    if dataset.is_empty()
+        || !dataset
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'-' | b'*'))
+    {
+        bail!("invalid dataset name '{dataset}'");
+    }
+    let iri = |what: &str, s: &str| -> Result<()> {
+        if oxrdf::NamedNode::new(s.replace('*', "x")).is_err() {
+            bail!("{what} {s:?} is not an IRI or an IRI pattern with *");
+        }
+        Ok(())
+    };
+    iri("--session-graphs", session_graphs)?;
+    for c in curated {
+        iri("--curated", c)?;
+        if crate::auth::glob(c, &format!("{}x", session_graphs.trim_end_matches('*'))) {
+            bail!("--curated {c} covers the agent's own graphs");
+        }
+    }
+    let own = if session_graphs.ends_with('*') {
+        session_graphs.to_string()
+    } else {
+        format!("{session_graphs}*")
+    };
+    let list = |v: &[&str]| {
+        v.iter()
+            .map(|s| format!("{s:?}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let endpoints = list(&AGENT_ENDPOINTS);
+    // branch names hold no slash, so proposal branches are proposals.{agent}.*
+    let proposals = format!("proposals.{agent}.*");
+    let mut out = format!(
+        "# The memory grants of agent {agent} on dataset {dataset} (sparkles auth grant --template agent).\n\
+         # It reads the dataset, writes its own graphs on main and on {proposals}, and changes\n\
+         # curated graphs only on {proposals}. No grant covers merges.\n\
+         [[roles.{agent:?}.grants]]\n\
+         dataset = {dataset:?}\n\
+         level = \"read\"\n\n\
+         [[roles.{agent:?}.grants]]\n\
+         dataset = {dataset:?}\n\
+         level = \"write\"\n\
+         graphs = [{own:?}]\n\
+         branches = [\"main\", {proposals:?}]\n\
+         endpoints = [{endpoints}]\n"
+    );
+    if !curated.is_empty() {
+        let graphs: Vec<&str> = curated.iter().map(String::as_str).collect();
+        out.push_str(&format!(
+            "\n[[roles.{agent:?}.grants]]\n\
+             dataset = {dataset:?}\n\
+             level = \"write\"\n\
+             graphs = [{}]\n\
+             branches = [{proposals:?}]\n\
+             endpoints = [{endpoints}]\n",
+            list(&graphs)
+        ));
+    }
+    Ok(out)
+}
+
 pub fn run(cmd: AuthCmd) -> Result<()> {
     match cmd {
+        AuthCmd::Grant {
+            template: _,
+            agent,
+            dataset,
+            session_graphs,
+            curated,
+        } => {
+            print!(
+                "{}",
+                agent_template(&agent, &dataset, &session_graphs, &curated)?
+            );
+            Ok(())
+        }
         AuthCmd::Hash { token } => {
             if token {
                 let t = read_secret("Token")?;

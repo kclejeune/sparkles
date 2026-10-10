@@ -798,6 +798,7 @@ async fn a28_resources_and_prompts() {
             "explore_dataset",
             "answer_question",
             "run_stored_query",
+            "ask_graph",
             "explain_term",
             "agent_memory"
         ]

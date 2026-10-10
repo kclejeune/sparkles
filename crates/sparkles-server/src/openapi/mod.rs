@@ -933,6 +933,11 @@ fn tags() -> J {
             "The Model Context Protocol endpoint.",
             "http-endpoint-mcp"
         ),
+        t(
+            "Models",
+            "Model providers and the role lists of the question pipeline.",
+            "model-providers"
+        ),
         t("OpenAPI", "This description.", "openapi-description"),
     ])
 }

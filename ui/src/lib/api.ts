@@ -2959,6 +2959,8 @@ export type StoredDefinition = {
   parameters?: Record<string, StoredParam>;
   results?: string;
   mcp?: boolean;
+  /** Example questions the query answers (C17), at most 20. */
+  questions?: string[];
 };
 
 export type StoredVersion = {

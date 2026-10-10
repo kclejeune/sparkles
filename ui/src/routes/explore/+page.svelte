@@ -20,6 +20,7 @@
   import { coverage, objectKinds, shortenExpression, valuesRange } from '$lib/schema-history';
   import SimilarPanel from '$components/SimilarPanel.svelte';
   import TermView from '$components/TermView.svelte';
+  import MemoryTab from '$components/MemoryTab.svelte';
   import TextSearchView from '$components/TextSearchView.svelte';
 
   type ENode = {
@@ -42,6 +43,10 @@
   type Tab = 'graph' | 'schema' | 'search';
   const urlTab = page.url.searchParams.get('tab');
   let tab = $state<Tab>(urlTab === 'schema' || urlTab === 'search' ? urlTab : 'graph');
+  /** The view of the selected resource: its properties or its memory (`&view=memory`). */
+  let sideTab = $state<'props' | 'memory'>(
+    page.url.searchParams.get('view') === 'memory' ? 'memory' : 'props',
+  );
   /** Full-text query of the Search tab (`&q=`). */
   let textQuery = $state(page.url.searchParams.get('q') ?? '');
   let nodes = $state<Record<string, ENode>>({});
@@ -192,6 +197,7 @@
     if (iri) p.set('iri', iri);
     if (tab !== 'graph') p.set('tab', tab);
     if (tab === 'search' && textQuery.trim()) p.set('q', textQuery.trim());
+    if (iri && sideTab === 'memory') p.set('view', 'memory');
     goto(`${resolve('/explore')}?${p}`, { replaceState: true, keepFocus: true, noScroll: true });
   }
 
@@ -791,6 +797,22 @@
                   <Icon name="x" size={13} />
                 </button>
               </div>
+              <div class="tabs side-tabs" role="tablist" aria-label="Resource views">
+                <button
+                  class="tab"
+                  role="tab"
+                  aria-selected={sideTab === 'props'}
+                  onclick={() => (sideTab = 'props')}>Properties</button
+                >
+                <button
+                  class="tab"
+                  role="tab"
+                  aria-selected={sideTab === 'memory'}
+                  onclick={() => (sideTab = 'memory')}
+                  title="What the memory you can read holds about it, with citations"
+                  ><Icon name="brain" size={13} /> Memory</button
+                >
+              </div>
             {/if}
           </div>
 
@@ -804,6 +826,12 @@
           {:else if n.term.type !== 'uri'}
             <div class="side-body faint">
               Blank nodes can only be explored through their neighbours.
+            </div>
+          {:else if sideTab === 'memory' && ds}
+            <div class="side-body scroll">
+              {#key n.iri}
+                <MemoryTab {ds} iri={n.iri} {prefixes} onopen={(iri) => focusOn(iri)} />
+              {/key}
             </div>
           {:else if !detail}
             <div class="side-body row faint"><span class="spinner"></span> Loading properties…</div>
@@ -1524,6 +1552,9 @@
     display: flex;
     flex-wrap: wrap;
     gap: 4px;
+  }
+  .side-tabs {
+    margin-top: 8px;
   }
   .side-body {
     padding: 8px 16px 16px;

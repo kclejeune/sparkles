@@ -16,7 +16,7 @@ mod bridge;
 mod complete;
 mod context;
 mod draft;
-mod errors;
+pub(crate) mod errors;
 #[cfg(feature = "fmt")]
 mod format;
 #[cfg(feature = "graphql")]
@@ -36,12 +36,14 @@ mod notify;
 mod paths;
 mod pins;
 mod render;
+pub mod rest;
 mod schema_history;
 mod schemas;
 mod search;
+mod share;
 mod stored;
 mod tasks;
-mod tools;
+pub(crate) mod tools;
 mod update;
 #[cfg(any(feature = "shacl", feature = "shex"))]
 mod validate;
@@ -146,6 +148,10 @@ pub struct McpArgs {
     /// task that the client polls, in milliseconds
     #[arg(long, value_name = "MS", default_value_t = 2000)]
     pub task_after_ms: u64,
+    /// The base URL of a Sparkles server whose UI the share_query tool links to, such
+    /// as https://sparql.example.org (without it the tool is not offered)
+    #[arg(long, value_name = "URL")]
+    pub ui_url: Option<String>,
 }
 
 /// Limits and switches of the MCP tools.
@@ -176,6 +182,10 @@ pub struct McpConfig {
     pub task_after: Duration,
     /// delete scratch branches idle for longer than this (`None`: never)
     pub scratch_ttl: Option<Duration>,
+    /// the base URL of the UI that `share_query` links to (`sparkles mcp --ui-url`)
+    pub ui_url: Option<String>,
+    /// tools served over HTTP, where `share_query` links to the request's own host
+    pub http: bool,
 }
 
 impl Default for McpConfig {
@@ -194,6 +204,8 @@ impl Default for McpConfig {
             watch_interval: Duration::from_secs(2),
             task_after: Duration::from_secs(2),
             scratch_ttl: None,
+            ui_url: None,
+            http: false,
         }
     }
 }
@@ -280,6 +292,8 @@ impl McpServer {
             .filter(|t| !cfg.disabled.contains(t.name))
             // a read-only server never offers the write tools
             .filter(|t| !(read_only && branches::WRITE_TOOLS.contains(&t.name)))
+            // links need the address of the UI
+            .filter(|t| t.name != "share_query" || cfg.http || cfg.ui_url.is_some())
             .collect();
         McpServer {
             state,
@@ -378,6 +392,17 @@ impl McpServer {
             return Err(UnknownTool(name.to_string()));
         }
         Ok(self.run(name, args, call).await)
+    }
+
+    /// Run the tool `name` on this thread as `call.principal`, with no slot. The asking
+    /// pipeline (`crate::ask`) calls its tools this way from its own blocking thread.
+    pub(crate) fn run_now(
+        &self,
+        name: &str,
+        args: Map<String, Value>,
+        call: &Call,
+    ) -> Result<Outcome, ToolError> {
+        tools::run(self, name, args, call)
     }
 
     /// Whether `p` may call the tool `name`: an offered tool (the write tool checks for
@@ -546,6 +571,12 @@ pub fn run(args: McpArgs, store_opts: StoreOptions) -> Result<()> {
         datasets: Vec::new(),
         stored_queries: !args.no_stored_queries,
         task_after: Duration::from_millis(args.task_after_ms),
+        ui_url: match args.ui_url {
+            Some(u) if !(u.starts_with("http://") || u.starts_with("https://")) => {
+                bail!("--ui-url {u}: expected an http or https URL")
+            }
+            u => u,
+        },
         ..McpConfig::default()
     };
     let server = McpServer::new(st, cfg);

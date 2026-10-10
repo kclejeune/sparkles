@@ -48,6 +48,125 @@ async fn post_json(app: &Router, user: &str, uri: &str, body: &str) -> R {
     call(app, "POST", uri, &h, body).await
 }
 
+/// C18 A30: the agent template lets an agent write its own graphs on main, change a
+/// curated graph only on its proposal branches, and never merge.
+#[tokio::test]
+async fn c18_a30_agent_template() {
+    let h = |pw: &str| hash_password_with(pw, 8, 1, 1).unwrap();
+    let template = crate::auth::cli::agent_template(
+        "agent-7",
+        "org",
+        "https://example.org/memory/agents/agent-7/",
+        &[
+            "https://example.org/hr".into(),
+            "https://example.org/memory/consolidated".into(),
+        ],
+    )
+    .unwrap();
+    let s = build(Fixture {
+        extra: format!(
+            "{template}\n[[users]]\nname = \"agent-7\"\npassword = \"{a}\"\nroles = [\"agent-7\"]\n\n[[users]]\nname = \"owner\"\npassword = \"{o}\"\ndatasets = {{ org = \"admin\" }}\n",
+            a = h("agent-7-pw"),
+            o = h("owner-pw"),
+        ),
+        ..Default::default()
+    });
+    s.state.attach("org", DbType::Persistent, None).unwrap();
+    let app = &s.app;
+    let r = post_json(
+        app,
+        "owner",
+        "/$/branches/org",
+        r#"{"name":"proposals.agent-7.fix"}"#,
+    )
+    .await;
+    assert_eq!(
+        r.status,
+        StatusCode::CREATED,
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+    let agent = b("agent-7");
+    let write = |g: &str| format!("INSERT DATA {{ GRAPH <{g}> {{ <a:x> <a:y> <a:z> }} }}");
+    // its own graphs on main
+    let r = update_as(
+        app,
+        "org",
+        &agent,
+        &write("https://example.org/memory/agents/agent-7/sessions/s1"),
+    )
+    .await;
+    assert_eq!(
+        r.status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+    // a curated graph: not on main, but on its proposal branch
+    let r = update_as(app, "org", &agent, &write("https://example.org/hr")).await;
+    assert_eq!(
+        r.status,
+        StatusCode::FORBIDDEN,
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+    let r = update_as(
+        app,
+        "org@proposals.agent-7.fix",
+        &agent,
+        &write("https://example.org/hr"),
+    )
+    .await;
+    assert_eq!(
+        r.status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+    // never a merge or a merge preview
+    let r = post_json(
+        app,
+        "agent-7",
+        "/$/merge/org",
+        r#"{"source":"proposals.agent-7.fix"}"#,
+    )
+    .await;
+    assert_eq!(
+        r.status,
+        StatusCode::FORBIDDEN,
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+    let r = get_as(
+        app,
+        "/$/merge/org?source=proposals.agent-7.fix",
+        Some(&agent),
+    )
+    .await;
+    assert_eq!(
+        r.status,
+        StatusCode::FORBIDDEN,
+        "{}",
+        String::from_utf8_lossy(&r.body)
+    );
+    // it reads everything
+    let r = get_as(app, &format!("/org{ASK}"), Some(&agent)).await;
+    assert_eq!(r.status, StatusCode::OK);
+    // bad input
+    assert!(
+        crate::auth::cli::agent_template("bad name", "org", "https://x.example/", &[]).is_err()
+    );
+    assert!(
+        crate::auth::cli::agent_template(
+            "a",
+            "org",
+            "https://x.example/a/",
+            &["https://x.example/*".into()]
+        )
+        .is_err()
+    );
+}
+
 #[tokio::test]
 async fn a16_grants_limited_to_branches() {
     let s = build(Fixture {

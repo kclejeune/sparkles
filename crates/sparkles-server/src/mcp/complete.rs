@@ -108,6 +108,7 @@ impl Tools<'_> {
                 "run_stored_query" => (true, &["dataset", "query", "arguments"]),
                 "explain_term" => (false, &["dataset", "term"]),
                 "agent_memory" => (false, &["dataset"]),
+                "ask_graph" => (false, &["dataset", "question"]),
                 _ => return Err(unknown(&format!("prompt: {name}"))),
             },
             Target::Template(uri) => {

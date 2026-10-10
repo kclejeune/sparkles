@@ -1,0 +1,863 @@
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+@prefix foaf: <http://xmlns.com/foaf/0.1/> .
+@prefix dcterms: <http://purl.org/dc/terms/> .
+@prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+@prefix schema: <http://schema.org/> .
+@prefix ex: <http://example.org/ontology#> .
+@prefix res: <http://example.org/resource/> .
+
+
+ex: a owl:Ontology ; rdfs:label "Sparkles example organisation ontology"@en ;
+  dcterms:creator "Sparkles mock" ; owl:versionInfo "0.3" .
+
+ex:Agent a owl:Class ; rdfs:label "Agent"@en ; rdfs:comment "Something that can act."@en .
+ex:Person a owl:Class ; rdfs:subClassOf ex:Agent, foaf:Person ; rdfs:label "Person"@en, "Personne"@fr .
+ex:Employee a owl:Class ; rdfs:subClassOf ex:Person ; rdfs:label "Employee"@en .
+ex:Manager a owl:Class ; rdfs:subClassOf ex:Employee ; rdfs:label "Manager"@en .
+ex:Engineer a owl:Class ; rdfs:subClassOf ex:Employee ; rdfs:label "Engineer"@en .
+ex:Researcher a owl:Class ; rdfs:subClassOf ex:Person ; rdfs:label "Researcher"@en .
+ex:Organization a owl:Class ; rdfs:subClassOf ex:Agent, foaf:Organization ; rdfs:label "Organization"@en .
+ex:Company a owl:Class ; rdfs:subClassOf ex:Organization ; rdfs:label "Company"@en .
+ex:University a owl:Class ; rdfs:subClassOf ex:Organization ; rdfs:label "University"@en .
+ex:Team a owl:Class ; rdfs:subClassOf ex:Organization ; rdfs:label "Team"@en .
+ex:Project a owl:Class ; rdfs:label "Project"@en .
+ex:Publication a owl:Class ; rdfs:label "Publication"@en .
+ex:Place a owl:Class ; rdfs:label "Place"@en .
+ex:City a owl:Class ; rdfs:subClassOf ex:Place ; rdfs:label "City"@en .
+ex:Skill a owl:Class ; rdfs:subClassOf skos:Concept ; rdfs:label "Skill"@en .
+
+ex:worksFor a owl:ObjectProperty ; rdfs:label "works for"@en ; rdfs:domain ex:Employee ; rdfs:range ex:Company .
+ex:memberOf a owl:ObjectProperty ; rdfs:label "member of"@en ; rdfs:domain ex:Person ; rdfs:range ex:Team .
+ex:manages a owl:ObjectProperty ; rdfs:label "manages"@en ; rdfs:domain ex:Manager ; rdfs:range ex:Team .
+ex:partOf a owl:ObjectProperty, owl:TransitiveProperty ; rdfs:label "part of"@en ; rdfs:domain ex:Team ; rdfs:range ex:Organization .
+ex:contributesTo a owl:ObjectProperty ; rdfs:label "contributes to"@en ; rdfs:domain ex:Person ; rdfs:range ex:Project .
+ex:authored a owl:ObjectProperty ; rdfs:label "authored"@en ; rdfs:domain ex:Person ; rdfs:range ex:Publication ; owl:inverseOf ex:author .
+ex:author a owl:ObjectProperty ; rdfs:label "author"@en ; rdfs:domain ex:Publication ; rdfs:range ex:Person .
+ex:basedIn a owl:ObjectProperty ; rdfs:label "based in"@en ; rdfs:domain ex:Agent ; rdfs:range ex:City .
+ex:hasSkill a owl:ObjectProperty ; rdfs:label "has skill"@en ; rdfs:domain ex:Person ; rdfs:range ex:Skill .
+ex:alumnusOf a owl:ObjectProperty ; rdfs:label "alumnus of"@en ; rdfs:domain ex:Person ; rdfs:range ex:University .
+ex:salary a owl:DatatypeProperty ; rdfs:label "salary"@en ; rdfs:domain ex:Employee ; rdfs:range xsd:decimal .
+ex:startDate a owl:DatatypeProperty ; rdfs:label "start date"@en ; rdfs:domain ex:Employee ; rdfs:range xsd:date .
+ex:founded a owl:DatatypeProperty ; rdfs:label "founded"@en ; rdfs:domain ex:Organization ; rdfs:range xsd:gYear .
+ex:citations a owl:DatatypeProperty ; rdfs:label "citations"@en ; rdfs:domain ex:Publication ; rdfs:range xsd:integer .
+foaf:knows a owl:ObjectProperty, owl:SymmetricProperty ; rdfs:label "knows"@en ; rdfs:domain foaf:Person ; rdfs:range foaf:Person .
+foaf:name a owl:DatatypeProperty ; rdfs:label "name"@en ; rdfs:range xsd:string .
+foaf:age a owl:DatatypeProperty ; rdfs:label "age"@en ; rdfs:range xsd:integer .
+foaf:mbox a owl:ObjectProperty ; rdfs:label "mailbox"@en .
+
+
+res:Berlin a ex:City ; rdfs:label "Berlin"@en ; schema:addressCountry "DE" ;
+      schema:latitude "52.52"^^xsd:decimal ; schema:longitude "13.405"^^xsd:decimal .
+
+res:Lisbon a ex:City ; rdfs:label "Lisbon"@en ; schema:addressCountry "PT" ;
+      schema:latitude "38.72"^^xsd:decimal ; schema:longitude "-9.14"^^xsd:decimal .
+
+res:Montreal a ex:City ; rdfs:label "Montréal"@en ; schema:addressCountry "CA" ;
+      schema:latitude "45.5"^^xsd:decimal ; schema:longitude "-73.57"^^xsd:decimal .
+
+res:Kyoto a ex:City ; rdfs:label "Kyoto"@en ; schema:addressCountry "JP" ;
+      schema:latitude "35.01"^^xsd:decimal ; schema:longitude "135.77"^^xsd:decimal .
+
+res:Nairobi a ex:City ; rdfs:label "Nairobi"@en ; schema:addressCountry "KE" ;
+      schema:latitude "-1.29"^^xsd:decimal ; schema:longitude "36.82"^^xsd:decimal .
+
+res:Portland a ex:City ; rdfs:label "Portland"@en ; schema:addressCountry "US" ;
+      schema:latitude "45.52"^^xsd:decimal ; schema:longitude "-122.68"^^xsd:decimal .
+
+res:Tessellate a ex:Company ; rdfs:label "Tessellate" ; foaf:name "Tessellate" ;
+      ex:founded "1998"^^xsd:gYear ; ex:basedIn res:Berlin ;
+      foaf:homepage <https://tessellate.example> .
+
+res:Quadrant_Labs a ex:Company ; rdfs:label "Quadrant Labs" ; foaf:name "Quadrant Labs" ;
+      ex:founded "2011"^^xsd:gYear ; ex:basedIn res:Portland ;
+      foaf:homepage <https://quadrant_labs.example> .
+
+res:Northwind_Graph a ex:Company ; rdfs:label "Northwind Graph" ; foaf:name "Northwind Graph" ;
+      ex:founded "2004"^^xsd:gYear ; ex:basedIn res:Lisbon ;
+      foaf:homepage <https://northwind_graph.example> .
+
+res:Lattice_Co a ex:Company ; rdfs:label "Lattice & Co" ; foaf:name "Lattice & Co" ;
+      ex:founded "2016"^^xsd:gYear ; ex:basedIn res:Lisbon ;
+      foaf:homepage <https://lattice_co.example> .
+
+res:Institute_of_Formal_Methods a ex:University ; rdfs:label "Institute of Formal Methods"@en ; ex:basedIn res:Nairobi .
+
+res:Polytechnic_of_the_North a ex:University ; rdfs:label "Polytechnic of the North"@en ; ex:basedIn res:Kyoto .
+
+res:Open_Semantics_University a ex:University ; rdfs:label "Open Semantics University"@en ; ex:basedIn res:Lisbon .
+
+res:team_Storage a ex:Team ; rdfs:label "Storage team"@en ; ex:partOf res:Tessellate .
+
+res:team_Query_Engine a ex:Team ; rdfs:label "Query Engine team"@en ; ex:partOf res:Quadrant_Labs .
+
+res:team_Reasoner a ex:Team ; rdfs:label "Reasoner team"@en ; ex:partOf res:Northwind_Graph .
+
+res:team_Web_UI a ex:Team ; rdfs:label "Web UI team"@en ; ex:partOf res:Lattice_Co .
+
+res:team_Ingest a ex:Team ; rdfs:label "Ingest team"@en ; ex:partOf res:Tessellate .
+
+res:team_Research a ex:Team ; rdfs:label "Research team"@en ; ex:partOf res:Quadrant_Labs .
+
+res:project_Sparkles a ex:Project ; rdfs:label "Sparkles" ;
+      dcterms:description "Work on sparkles for the Sparkles engine."@en .
+
+res:project_Permutation_Index a ex:Project ; rdfs:label "Permutation Index" ;
+      dcterms:description "Work on permutation index for the Sparkles engine."@en .
+
+res:project_Delta_Merge a ex:Project ; rdfs:label "Delta Merge" ;
+      dcterms:description "Work on delta merge for the Sparkles engine."@en .
+
+res:project_OWL_RL_Rules a ex:Project ; rdfs:label "OWL-RL Rules" ;
+      dcterms:description "Work on owl-rl rules for the Sparkles engine."@en .
+
+res:project_Cardinality_Estimator a ex:Project ; rdfs:label "Cardinality Estimator" ;
+      dcterms:description "Work on cardinality estimator for the Sparkles engine."@en .
+
+res:project_Result_Cache a ex:Project ; rdfs:label "Result Cache" ;
+      dcterms:description "Work on result cache for the Sparkles engine."@en .
+
+res:skill_Rust a ex:Skill ; skos:prefLabel "Rust"@en .
+
+res:skill_SPARQL a ex:Skill ; skos:prefLabel "SPARQL"@en .
+
+res:skill_OWL a ex:Skill ; skos:prefLabel "OWL"@en .
+
+res:skill_Query_optimization a ex:Skill ; skos:prefLabel "Query optimization"@en .
+
+res:skill_Compression a ex:Skill ; skos:prefLabel "Compression"@en .
+
+res:skill_Svelte a ex:Skill ; skos:prefLabel "Svelte"@en .
+
+res:skill_Distributed_systems a ex:Skill ; skos:prefLabel "Distributed systems"@en .
+
+res:skill_Datalog a ex:Skill ; skos:prefLabel "Datalog"@en .
+
+res:Ada_Lovelace a ex:Manager ;
+  foaf:name "Ada Lovelace" ;
+  rdfs:label "Ada Lovelace" ;
+  foaf:givenName "Ada" ;
+  foaf:familyName "Lovelace" ;
+  foaf:age 53 ;
+  foaf:mbox <mailto:ada@lattice_co.example> ;
+  ex:basedIn res:Kyoto ;
+  ex:memberOf res:team_Ingest ;
+  ex:hasSkill res:skill_Distributed_systems, res:skill_SPARQL ;
+  ex:contributesTo res:project_Cardinality_Estimator ;
+  foaf:knows res:Barbara_Liskov, res:Mary_Shaw, res:Sophie_Wilson, res:Evelyn_Boyd ;
+  ex:worksFor res:Lattice_Co ;
+  ex:salary "132000.00"^^xsd:decimal ;
+  ex:startDate "2010-05-18"^^xsd:date ;
+  ex:manages res:team_Ingest ;
+  rdfs:comment "Ada likes sorted permutations."@en, "Ada aime les permutations triées."@fr .
+
+res:Grace_Hopper a ex:Engineer ;
+  foaf:name "Grace Hopper" ;
+  rdfs:label "Grace Hopper" ;
+  foaf:givenName "Grace" ;
+  foaf:familyName "Hopper" ;
+  foaf:age 45 ;
+  foaf:mbox <mailto:grace@northwind_graph.example> ;
+  ex:basedIn res:Portland ;
+  ex:memberOf res:team_Research ;
+  ex:hasSkill res:skill_OWL, res:skill_Distributed_systems ;
+  ex:contributesTo res:project_Sparkles ;
+  foaf:knows res:Hedy_Lamarr, res:Niklaus_Wirth, res:Evelyn_Boyd ;
+  ex:worksFor res:Northwind_Graph ;
+  ex:salary "110000.00"^^xsd:decimal ;
+  ex:startDate "2020-08-10"^^xsd:date .
+
+res:Alan_Turing a ex:Engineer ;
+  foaf:name "Alan Turing" ;
+  rdfs:label "Alan Turing" ;
+  foaf:givenName "Alan" ;
+  foaf:familyName "Turing" ;
+  foaf:age 45 ;
+  foaf:mbox <mailto:alan@quadrant_labs.example> ;
+  ex:basedIn res:Kyoto ;
+  ex:memberOf res:team_Reasoner ;
+  ex:hasSkill res:skill_Datalog ;
+  ex:contributesTo res:project_Delta_Merge ;
+  foaf:knows res:Robin_Milner, res:Evelyn_Boyd, res:Guido_van_Rossum ;
+  ex:worksFor res:Quadrant_Labs ;
+  ex:salary "74000.00"^^xsd:decimal ;
+  ex:startDate "2014-03-13"^^xsd:date .
+
+res:Barbara_Liskov a ex:Employee ;
+  foaf:name "Barbara Liskov" ;
+  rdfs:label "Barbara Liskov" ;
+  foaf:givenName "Barbara" ;
+  foaf:familyName "Liskov" ;
+  foaf:age 34 ;
+  foaf:mbox <mailto:barbara@quadrant_labs.example> ;
+  ex:basedIn res:Kyoto ;
+  ex:memberOf res:team_Web_UI ;
+  ex:hasSkill res:skill_Datalog ;
+  ex:contributesTo res:project_Result_Cache ;
+  foaf:knows res:Adele_Goldberg, res:Guido_van_Rossum, res:Sophie_Wilson, res:Jim_Gray ;
+  ex:worksFor res:Quadrant_Labs ;
+  ex:salary "144000.00"^^xsd:decimal ;
+  ex:startDate "2014-07-12"^^xsd:date .
+
+res:Edsger_Dijkstra a ex:Researcher ;
+  foaf:name "Edsger Dijkstra" ;
+  rdfs:label "Edsger Dijkstra" ;
+  foaf:givenName "Edsger" ;
+  foaf:familyName "Dijkstra" ;
+  foaf:age 35 ;
+  foaf:mbox <mailto:edsger@northwind_graph.example> ;
+  ex:basedIn res:Lisbon ;
+  ex:memberOf res:team_Reasoner ;
+  ex:hasSkill res:skill_Datalog, res:skill_Rust, res:skill_Svelte ;
+  ex:contributesTo res:project_Delta_Merge ;
+  foaf:knows res:Barbara_Liskov, res:Fran_Bilas ;
+  ex:alumnusOf res:Institute_of_Formal_Methods .
+
+res:Margaret_Hamilton a ex:Engineer ;
+  foaf:name "Margaret Hamilton" ;
+  rdfs:label "Margaret Hamilton" ;
+  foaf:givenName "Margaret" ;
+  foaf:familyName "Hamilton" ;
+  foaf:age 26 ;
+  foaf:mbox <mailto:margaret@northwind_graph.example> ;
+  ex:basedIn res:Montreal ;
+  ex:memberOf res:team_Web_UI ;
+  ex:hasSkill res:skill_Datalog ;
+  ex:contributesTo res:project_Result_Cache, res:project_Cardinality_Estimator ;
+  foaf:knows res:Ole_Dahl, res:Leslie_Lamport, res:Ada_Lovelace, res:Ken_Thompson, res:Barbara_Liskov ;
+  ex:worksFor res:Northwind_Graph ;
+  ex:salary "60000.00"^^xsd:decimal ;
+  ex:startDate "2018-03-16"^^xsd:date ;
+  rdfs:comment "Margaret likes sorted permutations."@en, "Margaret aime les permutations triées."@fr .
+
+res:Donald_Knuth a ex:Employee ;
+  foaf:name "Donald Knuth" ;
+  rdfs:label "Donald Knuth" ;
+  foaf:givenName "Donald" ;
+  foaf:familyName "Knuth" ;
+  foaf:age 50 ;
+  foaf:mbox <mailto:donald@quadrant_labs.example> ;
+  ex:basedIn res:Lisbon ;
+  ex:memberOf res:team_Research ;
+  ex:hasSkill res:skill_OWL ;
+  ex:contributesTo res:project_Sparkles, res:project_OWL_RL_Rules ;
+  foaf:knows res:Whitfield_Diffie, res:Adele_Goldberg ;
+  ex:worksFor res:Quadrant_Labs ;
+  ex:salary "142000.00"^^xsd:decimal ;
+  ex:startDate "2008-09-11"^^xsd:date .
+
+res:Frances_Allen a ex:Engineer ;
+  foaf:name "Frances Allen" ;
+  rdfs:label "Frances Allen" ;
+  foaf:givenName "Frances" ;
+  foaf:familyName "Allen" ;
+  foaf:age 45 ;
+  foaf:mbox <mailto:frances@lattice_co.example> ;
+  ex:basedIn res:Nairobi ;
+  ex:memberOf res:team_Query_Engine ;
+  ex:hasSkill res:skill_SPARQL ;
+  ex:contributesTo res:project_Sparkles, res:project_Cardinality_Estimator ;
+  foaf:knows res:Jim_Gray, res:Sophie_Wilson, res:Grace_Hopper, res:Edsger_Dijkstra ;
+  ex:worksFor res:Lattice_Co ;
+  ex:salary "142000.00"^^xsd:decimal ;
+  ex:startDate "2010-07-18"^^xsd:date .
+
+res:Tim_Berners_Lee a ex:Researcher ;
+  foaf:name "Tim Berners-Lee" ;
+  rdfs:label "Tim Berners-Lee" ;
+  foaf:givenName "Tim" ;
+  foaf:familyName "Berners-Lee" ;
+  foaf:age 59 ;
+  foaf:mbox <mailto:tim@tessellate.example> ;
+  ex:basedIn res:Portland ;
+  ex:memberOf res:team_Research ;
+  ex:hasSkill res:skill_Distributed_systems, res:skill_OWL, res:skill_SPARQL ;
+  ex:contributesTo res:project_Result_Cache, res:project_Permutation_Index ;
+  foaf:knows res:Dennis_Ritchie, res:Katherine_Johnson ;
+  ex:alumnusOf res:Polytechnic_of_the_North .
+
+res:Radia_Perlman a ex:Manager ;
+  foaf:name "Radia Perlman" ;
+  rdfs:label "Radia Perlman" ;
+  foaf:givenName "Radia" ;
+  foaf:familyName "Perlman" ;
+  foaf:age 47 ;
+  foaf:mbox <mailto:radia@quadrant_labs.example> ;
+  ex:basedIn res:Nairobi ;
+  ex:memberOf res:team_Reasoner ;
+  ex:hasSkill res:skill_Query_optimization, res:skill_SPARQL, res:skill_OWL ;
+  ex:contributesTo res:project_Result_Cache, res:project_OWL_RL_Rules ;
+  foaf:knows res:Whitfield_Diffie, res:Frances_Allen, res:Adele_Goldberg, res:Edsger_Dijkstra, res:Guido_van_Rossum ;
+  ex:worksFor res:Quadrant_Labs ;
+  ex:salary "110000.00"^^xsd:decimal ;
+  ex:startDate "2021-09-14"^^xsd:date ;
+  ex:manages res:team_Query_Engine .
+
+res:Ken_Thompson a ex:Engineer ;
+  foaf:name "Ken Thompson" ;
+  rdfs:label "Ken Thompson" ;
+  foaf:givenName "Ken" ;
+  foaf:familyName "Thompson" ;
+  foaf:age 27 ;
+  foaf:mbox <mailto:ken@quadrant_labs.example> ;
+  ex:basedIn res:Kyoto ;
+  ex:memberOf res:team_Web_UI ;
+  ex:hasSkill res:skill_Compression, res:skill_Distributed_systems ;
+  ex:contributesTo res:project_Cardinality_Estimator ;
+  foaf:knows res:Niklaus_Wirth, res:Bjarne_Stroustrup ;
+  ex:worksFor res:Quadrant_Labs ;
+  ex:salary "78000.00"^^xsd:decimal ;
+  ex:startDate "2020-03-12"^^xsd:date ;
+  rdfs:comment "Ken likes sorted permutations."@en, "Ken aime les permutations triées."@fr .
+
+res:Leslie_Lamport a ex:Engineer ;
+  foaf:name "Leslie Lamport" ;
+  rdfs:label "Leslie Lamport" ;
+  foaf:givenName "Leslie" ;
+  foaf:familyName "Lamport" ;
+  foaf:age 39 ;
+  foaf:mbox <mailto:leslie@northwind_graph.example> ;
+  ex:basedIn res:Berlin ;
+  ex:memberOf res:team_Ingest ;
+  ex:hasSkill res:skill_Datalog, res:skill_Distributed_systems, res:skill_Compression ;
+  ex:contributesTo res:project_Sparkles, res:project_Cardinality_Estimator ;
+  foaf:knows res:Carla_Ellis, res:Whitfield_Diffie, res:Grace_Hopper, res:Margaret_Hamilton ;
+  ex:worksFor res:Northwind_Graph ;
+  ex:salary "67000.00"^^xsd:decimal ;
+  ex:startDate "2009-01-10"^^xsd:date .
+
+res:Niklaus_Wirth a ex:Researcher ;
+  foaf:name "Niklaus Wirth" ;
+  rdfs:label "Niklaus Wirth" ;
+  foaf:givenName "Niklaus" ;
+  foaf:familyName "Wirth" ;
+  foaf:age 62 ;
+  foaf:mbox <mailto:niklaus@northwind_graph.example> ;
+  ex:basedIn res:Lisbon ;
+  ex:memberOf res:team_Storage ;
+  ex:hasSkill res:skill_Svelte ;
+  ex:contributesTo res:project_Delta_Merge ;
+  foaf:knows res:Hedy_Lamarr, res:Mary_Shaw, res:Joan_Clarke, res:Shafi_Goldwasser, res:Dennis_Ritchie ;
+  ex:alumnusOf res:Institute_of_Formal_Methods .
+
+res:Karen_Sparck_Jones a ex:Engineer ;
+  foaf:name "Karen Spärck Jones" ;
+  rdfs:label "Karen Spärck Jones" ;
+  foaf:givenName "Karen" ;
+  foaf:familyName "Spärck Jones" ;
+  foaf:age 56 ;
+  foaf:mbox <mailto:karen@tessellate.example> ;
+  ex:basedIn res:Portland ;
+  ex:memberOf res:team_Storage ;
+  ex:hasSkill res:skill_Compression, res:skill_Rust, res:skill_OWL ;
+  ex:contributesTo res:project_Permutation_Index, res:project_Sparkles ;
+  foaf:knows res:Robin_Milner, res:Bjarne_Stroustrup, res:Linus_Torvalds ;
+  ex:worksFor res:Tessellate ;
+  ex:salary "149000.00"^^xsd:decimal ;
+  ex:startDate "2009-04-12"^^xsd:date .
+
+res:John_McCarthy a ex:Engineer ;
+  foaf:name "John McCarthy" ;
+  rdfs:label "John McCarthy" ;
+  foaf:givenName "John" ;
+  foaf:familyName "McCarthy" ;
+  foaf:age 20 ;
+  foaf:mbox <mailto:john@tessellate.example> ;
+  ex:basedIn res:Montreal ;
+  ex:memberOf res:team_Storage ;
+  ex:hasSkill res:skill_Datalog ;
+  ex:contributesTo res:project_Cardinality_Estimator, res:project_Delta_Merge ;
+  foaf:knows res:Rasmus_Lerdorf, res:Joan_Clarke, res:Adele_Goldberg, res:Anita_Borg, res:Niklaus_Wirth ;
+  ex:worksFor res:Tessellate ;
+  ex:salary "96000.00"^^xsd:decimal ;
+  ex:startDate "2016-05-15"^^xsd:date .
+
+res:Shafi_Goldwasser a ex:Employee ;
+  foaf:name "Shafi Goldwasser" ;
+  rdfs:label "Shafi Goldwasser" ;
+  foaf:givenName "Shafi" ;
+  foaf:familyName "Goldwasser" ;
+  foaf:age 49 ;
+  foaf:mbox <mailto:shafi@northwind_graph.example> ;
+  ex:basedIn res:Kyoto ;
+  ex:memberOf res:team_Ingest ;
+  ex:hasSkill res:skill_Distributed_systems, res:skill_Datalog, res:skill_OWL ;
+  ex:contributesTo res:project_Result_Cache ;
+  foaf:knows res:Karen_Sparck_Jones, res:Barbara_Liskov, res:John_McCarthy, res:Katherine_Johnson, res:Jim_Gray ;
+  ex:worksFor res:Northwind_Graph ;
+  ex:salary "126000.00"^^xsd:decimal ;
+  ex:startDate "2024-08-11"^^xsd:date ;
+  rdfs:comment "Shafi likes sorted permutations."@en, "Shafi aime les permutations triées."@fr .
+
+res:Dennis_Ritchie a ex:Researcher ;
+  foaf:name "Dennis Ritchie" ;
+  rdfs:label "Dennis Ritchie" ;
+  foaf:givenName "Dennis" ;
+  foaf:familyName "Ritchie" ;
+  foaf:age 55 ;
+  foaf:mbox <mailto:dennis@tessellate.example> ;
+  ex:basedIn res:Berlin ;
+  ex:memberOf res:team_Research ;
+  ex:hasSkill res:skill_Svelte, res:skill_Compression, res:skill_Query_optimization ;
+  ex:contributesTo res:project_Result_Cache ;
+  foaf:knows res:Katherine_Johnson, res:Ken_Thompson, res:Mary_Shaw, res:Hedy_Lamarr ;
+  ex:alumnusOf res:Polytechnic_of_the_North .
+
+res:Hedy_Lamarr a ex:Engineer ;
+  foaf:name "Hedy Lamarr" ;
+  rdfs:label "Hedy Lamarr" ;
+  foaf:givenName "Hedy" ;
+  foaf:familyName "Lamarr" ;
+  foaf:age 46 ;
+  foaf:mbox <mailto:hedy@tessellate.example> ;
+  ex:basedIn res:Lisbon ;
+  ex:memberOf res:team_Research ;
+  ex:hasSkill res:skill_OWL, res:skill_Svelte, res:skill_Datalog ;
+  ex:contributesTo res:project_Permutation_Index ;
+  foaf:knows res:Ada_Lovelace, res:Donald_Knuth, res:Dennis_Ritchie, res:Grace_Hopper, res:Carla_Ellis ;
+  ex:worksFor res:Tessellate ;
+  ex:salary "140000.00"^^xsd:decimal ;
+  ex:startDate "2010-02-18"^^xsd:date .
+
+res:Linus_Torvalds a ex:Manager ;
+  foaf:name "Linus Torvalds" ;
+  rdfs:label "Linus Torvalds" ;
+  foaf:givenName "Linus" ;
+  foaf:familyName "Torvalds" ;
+  foaf:age 27 ;
+  foaf:mbox <mailto:linus@northwind_graph.example> ;
+  ex:basedIn res:Berlin ;
+  ex:memberOf res:team_Web_UI ;
+  ex:hasSkill res:skill_Distributed_systems ;
+  ex:contributesTo res:project_Cardinality_Estimator, res:project_Sparkles ;
+  foaf:knows res:Jim_Gray, res:Rasmus_Lerdorf, res:Anita_Borg ;
+  ex:worksFor res:Northwind_Graph ;
+  ex:salary "112000.00"^^xsd:decimal ;
+  ex:startDate "2021-07-16"^^xsd:date ;
+  ex:manages res:team_Web_UI .
+
+res:Sophie_Wilson a ex:Engineer ;
+  foaf:name "Sophie Wilson" ;
+  rdfs:label "Sophie Wilson" ;
+  foaf:givenName "Sophie" ;
+  foaf:familyName "Wilson" ;
+  foaf:age 22 ;
+  foaf:mbox <mailto:sophie@tessellate.example> ;
+  ex:basedIn res:Kyoto ;
+  ex:memberOf res:team_Query_Engine ;
+  ex:hasSkill res:skill_OWL, res:skill_SPARQL ;
+  ex:contributesTo res:project_OWL_RL_Rules, res:project_Result_Cache ;
+  foaf:knows res:Whitfield_Diffie, res:Alan_Turing ;
+  ex:worksFor res:Tessellate ;
+  ex:salary "122000.00"^^xsd:decimal ;
+  ex:startDate "2014-08-15"^^xsd:date .
+
+res:Guido_van_Rossum a ex:Researcher ;
+  foaf:name "Guido van Rossum" ;
+  rdfs:label "Guido van Rossum" ;
+  foaf:givenName "Guido" ;
+  foaf:familyName "van Rossum" ;
+  foaf:age 24 ;
+  foaf:mbox <mailto:guido@lattice_co.example> ;
+  ex:basedIn res:Portland ;
+  ex:memberOf res:team_Web_UI ;
+  ex:hasSkill res:skill_Query_optimization, res:skill_Datalog, res:skill_Svelte ;
+  ex:contributesTo res:project_Result_Cache, res:project_Cardinality_Estimator ;
+  foaf:knows res:Carla_Ellis, res:Margaret_Hamilton ;
+  ex:alumnusOf res:Institute_of_Formal_Methods ;
+  rdfs:comment "Guido likes sorted permutations."@en, "Guido aime les permutations triées."@fr .
+
+res:Anita_Borg a ex:Employee ;
+  foaf:name "Anita Borg" ;
+  rdfs:label "Anita Borg" ;
+  foaf:givenName "Anita" ;
+  foaf:familyName "Borg" ;
+  foaf:age 62 ;
+  foaf:mbox <mailto:anita@lattice_co.example> ;
+  ex:basedIn res:Berlin ;
+  ex:memberOf res:team_Storage ;
+  ex:hasSkill res:skill_Datalog ;
+  ex:contributesTo res:project_Result_Cache, res:project_Permutation_Index ;
+  foaf:knows res:Grace_Hopper, res:Linus_Torvalds ;
+  ex:worksFor res:Lattice_Co ;
+  ex:salary "110000.00"^^xsd:decimal ;
+  ex:startDate "2010-03-14"^^xsd:date .
+
+res:Bjarne_Stroustrup a ex:Engineer ;
+  foaf:name "Bjarne Stroustrup" ;
+  rdfs:label "Bjarne Stroustrup" ;
+  foaf:givenName "Bjarne" ;
+  foaf:familyName "Stroustrup" ;
+  foaf:age 22 ;
+  foaf:mbox <mailto:bjarne@tessellate.example> ;
+  ex:basedIn res:Berlin ;
+  ex:memberOf res:team_Storage ;
+  ex:hasSkill res:skill_Query_optimization, res:skill_Distributed_systems ;
+  ex:contributesTo res:project_OWL_RL_Rules, res:project_Cardinality_Estimator ;
+  foaf:knows res:Yukihiro_Matsumoto, res:Rasmus_Lerdorf, res:Ole_Dahl ;
+  ex:worksFor res:Tessellate ;
+  ex:salary "146000.00"^^xsd:decimal ;
+  ex:startDate "2020-06-17"^^xsd:date .
+
+res:Lynn_Conway a ex:Engineer ;
+  foaf:name "Lynn Conway" ;
+  rdfs:label "Lynn Conway" ;
+  foaf:givenName "Lynn" ;
+  foaf:familyName "Conway" ;
+  foaf:age 22 ;
+  foaf:mbox <mailto:lynn@tessellate.example> ;
+  ex:basedIn res:Nairobi ;
+  ex:memberOf res:team_Web_UI ;
+  ex:hasSkill res:skill_Compression, res:skill_OWL ;
+  ex:contributesTo res:project_Sparkles ;
+  foaf:knows res:Barbara_Liskov, res:John_McCarthy ;
+  ex:worksFor res:Tessellate ;
+  ex:salary "91000.00"^^xsd:decimal ;
+  ex:startDate "2011-06-11"^^xsd:date .
+
+res:Yukihiro_Matsumoto a ex:Researcher ;
+  foaf:name "Yukihiro Matsumoto" ;
+  rdfs:label "Yukihiro Matsumoto" ;
+  foaf:givenName "Yukihiro" ;
+  foaf:familyName "Matsumoto" ;
+  foaf:age 20 ;
+  foaf:mbox <mailto:yukihiro@tessellate.example> ;
+  ex:basedIn res:Portland ;
+  ex:memberOf res:team_Research ;
+  ex:hasSkill res:skill_Distributed_systems ;
+  ex:contributesTo res:project_Delta_Merge ;
+  foaf:knows res:Tony_Hoare, res:Ada_Lovelace, res:Fran_Bilas, res:Tim_Berners_Lee, res:Adele_Goldberg ;
+  ex:alumnusOf res:Polytechnic_of_the_North .
+
+res:Adele_Goldberg a ex:Engineer ;
+  foaf:name "Adele Goldberg" ;
+  rdfs:label "Adele Goldberg" ;
+  foaf:givenName "Adele" ;
+  foaf:familyName "Goldberg" ;
+  foaf:age 27 ;
+  foaf:mbox <mailto:adele@tessellate.example> ;
+  ex:basedIn res:Nairobi ;
+  ex:memberOf res:team_Ingest ;
+  ex:hasSkill res:skill_Distributed_systems ;
+  ex:contributesTo res:project_Permutation_Index, res:project_OWL_RL_Rules ;
+  foaf:knows res:Radia_Perlman, res:Katherine_Johnson, res:Jean_Sammet ;
+  ex:worksFor res:Tessellate ;
+  ex:salary "121000.00"^^xsd:decimal ;
+  ex:startDate "2016-08-17"^^xsd:date ;
+  rdfs:comment "Adele likes sorted permutations."@en, "Adele aime les permutations triées."@fr .
+
+res:Robin_Milner a ex:Engineer ;
+  foaf:name "Robin Milner" ;
+  rdfs:label "Robin Milner" ;
+  foaf:givenName "Robin" ;
+  foaf:familyName "Milner" ;
+  foaf:age 54 ;
+  foaf:mbox <mailto:robin@lattice_co.example> ;
+  ex:basedIn res:Portland ;
+  ex:memberOf res:team_Ingest ;
+  ex:hasSkill res:skill_Svelte ;
+  ex:contributesTo res:project_Result_Cache ;
+  foaf:knows res:Ivan_Sutherland, res:Adele_Goldberg ;
+  ex:worksFor res:Lattice_Co ;
+  ex:salary "133000.00"^^xsd:decimal ;
+  ex:startDate "2015-08-17"^^xsd:date .
+
+res:Mary_Shaw a ex:Manager ;
+  foaf:name "Mary Shaw" ;
+  rdfs:label "Mary Shaw" ;
+  foaf:givenName "Mary" ;
+  foaf:familyName "Shaw" ;
+  foaf:age 30 ;
+  foaf:mbox <mailto:mary@tessellate.example> ;
+  ex:basedIn res:Lisbon ;
+  ex:memberOf res:team_Storage ;
+  ex:hasSkill res:skill_Distributed_systems, res:skill_Compression ;
+  ex:contributesTo res:project_Result_Cache, res:project_Cardinality_Estimator ;
+  foaf:knows res:Anita_Borg, res:Hedy_Lamarr ;
+  ex:worksFor res:Tessellate ;
+  ex:salary "94000.00"^^xsd:decimal ;
+  ex:startDate "2017-07-14"^^xsd:date ;
+  ex:manages res:team_Reasoner .
+
+res:Jim_Gray a ex:Researcher ;
+  foaf:name "Jim Gray" ;
+  rdfs:label "Jim Gray" ;
+  foaf:givenName "Jim" ;
+  foaf:familyName "Gray" ;
+  foaf:age 31 ;
+  foaf:mbox <mailto:jim@quadrant_labs.example> ;
+  ex:basedIn res:Nairobi ;
+  ex:memberOf res:team_Ingest ;
+  ex:hasSkill res:skill_OWL ;
+  ex:contributesTo res:project_OWL_RL_Rules, res:project_Result_Cache ;
+  foaf:knows res:Niklaus_Wirth, res:Lynn_Conway, res:Bjarne_Stroustrup, res:Adele_Goldberg ;
+  ex:alumnusOf res:Polytechnic_of_the_North .
+
+res:Carla_Ellis a ex:Engineer ;
+  foaf:name "Carla Ellis" ;
+  rdfs:label "Carla Ellis" ;
+  foaf:givenName "Carla" ;
+  foaf:familyName "Ellis" ;
+  foaf:age 29 ;
+  foaf:mbox <mailto:carla@tessellate.example> ;
+  ex:basedIn res:Berlin ;
+  ex:memberOf res:team_Reasoner ;
+  ex:hasSkill res:skill_Distributed_systems, res:skill_Compression ;
+  ex:contributesTo res:project_Delta_Merge ;
+  foaf:knows res:Edsger_Dijkstra, res:Donald_Knuth, res:Grace_Hopper ;
+  ex:worksFor res:Tessellate ;
+  ex:salary "102000.00"^^xsd:decimal ;
+  ex:startDate "2014-01-15"^^xsd:date .
+
+res:Ole_Dahl a ex:Employee ;
+  foaf:name "Ole Dahl" ;
+  rdfs:label "Ole Dahl" ;
+  foaf:givenName "Ole" ;
+  foaf:familyName "Dahl" ;
+  foaf:age 40 ;
+  foaf:mbox <mailto:ole@quadrant_labs.example> ;
+  ex:basedIn res:Berlin ;
+  ex:memberOf res:team_Research ;
+  ex:hasSkill res:skill_OWL ;
+  ex:contributesTo res:project_Permutation_Index ;
+  foaf:knows res:Frances_Allen, res:Yukihiro_Matsumoto, res:Bjarne_Stroustrup ;
+  ex:worksFor res:Quadrant_Labs ;
+  ex:salary "127000.00"^^xsd:decimal ;
+  ex:startDate "2021-05-17"^^xsd:date ;
+  rdfs:comment "Ole likes sorted permutations."@en, "Ole aime les permutations triées."@fr .
+
+res:Joan_Clarke a ex:Engineer ;
+  foaf:name "Joan Clarke" ;
+  rdfs:label "Joan Clarke" ;
+  foaf:givenName "Joan" ;
+  foaf:familyName "Clarke" ;
+  foaf:age 25 ;
+  foaf:mbox <mailto:joan@northwind_graph.example> ;
+  ex:basedIn res:Kyoto ;
+  ex:memberOf res:team_Ingest ;
+  ex:hasSkill res:skill_Compression, res:skill_Datalog, res:skill_SPARQL ;
+  ex:contributesTo res:project_Sparkles, res:project_Permutation_Index ;
+  foaf:knows res:Jean_Sammet, res:Whitfield_Diffie, res:Robin_Milner ;
+  ex:worksFor res:Northwind_Graph ;
+  ex:salary "109000.00"^^xsd:decimal ;
+  ex:startDate "2012-05-16"^^xsd:date .
+
+res:Tony_Hoare a ex:Researcher ;
+  foaf:name "Tony Hoare" ;
+  rdfs:label "Tony Hoare" ;
+  foaf:givenName "Tony" ;
+  foaf:familyName "Hoare" ;
+  foaf:age 56 ;
+  foaf:mbox <mailto:tony@tessellate.example> ;
+  ex:basedIn res:Nairobi ;
+  ex:memberOf res:team_Web_UI ;
+  ex:hasSkill res:skill_OWL, res:skill_Rust, res:skill_Distributed_systems ;
+  ex:contributesTo res:project_OWL_RL_Rules, res:project_Cardinality_Estimator ;
+  foaf:knows res:Grace_Hopper, res:Mary_Shaw, res:Fran_Bilas, res:Ivan_Sutherland ;
+  ex:alumnusOf res:Open_Semantics_University .
+
+res:Ivan_Sutherland a ex:Employee ;
+  foaf:name "Ivan Sutherland" ;
+  rdfs:label "Ivan Sutherland" ;
+  foaf:givenName "Ivan" ;
+  foaf:familyName "Sutherland" ;
+  foaf:age 29 ;
+  foaf:mbox <mailto:ivan@northwind_graph.example> ;
+  ex:basedIn res:Kyoto ;
+  ex:memberOf res:team_Web_UI ;
+  ex:hasSkill res:skill_Rust, res:skill_Datalog ;
+  ex:contributesTo res:project_Result_Cache, res:project_Permutation_Index ;
+  foaf:knows res:Evelyn_Boyd, res:Anita_Borg, res:Yukihiro_Matsumoto, res:Frances_Allen ;
+  ex:worksFor res:Northwind_Graph ;
+  ex:salary "81000.00"^^xsd:decimal ;
+  ex:startDate "2015-04-10"^^xsd:date .
+
+res:Jean_Sammet a ex:Engineer ;
+  foaf:name "Jean Sammet" ;
+  rdfs:label "Jean Sammet" ;
+  foaf:givenName "Jean" ;
+  foaf:familyName "Sammet" ;
+  foaf:age 55 ;
+  foaf:mbox <mailto:jean@northwind_graph.example> ;
+  ex:basedIn res:Portland ;
+  ex:memberOf res:team_Storage ;
+  ex:hasSkill res:skill_Compression ;
+  ex:contributesTo res:project_Permutation_Index ;
+  foaf:knows res:Alan_Turing, res:Shafi_Goldwasser, res:Hedy_Lamarr ;
+  ex:worksFor res:Northwind_Graph ;
+  ex:salary "117000.00"^^xsd:decimal ;
+  ex:startDate "2016-05-13"^^xsd:date .
+
+res:Katherine_Johnson a ex:Engineer ;
+  foaf:name "Katherine Johnson" ;
+  rdfs:label "Katherine Johnson" ;
+  foaf:givenName "Katherine" ;
+  foaf:familyName "Johnson" ;
+  foaf:age 60 ;
+  foaf:mbox <mailto:katherine@northwind_graph.example> ;
+  ex:basedIn res:Portland ;
+  ex:memberOf res:team_Reasoner ;
+  ex:hasSkill res:skill_Datalog, res:skill_Compression, res:skill_OWL ;
+  ex:contributesTo res:project_Sparkles, res:project_Delta_Merge ;
+  foaf:knows res:Tony_Hoare, res:Edsger_Dijkstra ;
+  ex:worksFor res:Northwind_Graph ;
+  ex:salary "81000.00"^^xsd:decimal ;
+  ex:startDate "2019-02-12"^^xsd:date ;
+  rdfs:comment "Katherine likes sorted permutations."@en, "Katherine aime les permutations triées."@fr .
+
+res:Whitfield_Diffie a ex:Manager ;
+  foaf:name "Whitfield Diffie" ;
+  rdfs:label "Whitfield Diffie" ;
+  foaf:givenName "Whitfield" ;
+  foaf:familyName "Diffie" ;
+  foaf:age 54 ;
+  foaf:mbox <mailto:whitfield@tessellate.example> ;
+  ex:basedIn res:Lisbon ;
+  ex:memberOf res:team_Web_UI ;
+  ex:hasSkill res:skill_Rust, res:skill_Distributed_systems, res:skill_Datalog ;
+  ex:contributesTo res:project_Result_Cache, res:project_Sparkles ;
+  foaf:knows res:Grace_Hopper, res:Fran_Bilas ;
+  ex:worksFor res:Tessellate ;
+  ex:salary "102000.00"^^xsd:decimal ;
+  ex:startDate "2012-05-17"^^xsd:date ;
+  ex:manages res:team_Ingest .
+
+res:Evelyn_Boyd a ex:Engineer ;
+  foaf:name "Evelyn Boyd" ;
+  rdfs:label "Evelyn Boyd" ;
+  foaf:givenName "Evelyn" ;
+  foaf:familyName "Boyd" ;
+  foaf:age 20 ;
+  foaf:mbox <mailto:evelyn@lattice_co.example> ;
+  ex:basedIn res:Berlin ;
+  ex:memberOf res:team_Web_UI ;
+  ex:hasSkill res:skill_Rust, res:skill_Query_optimization, res:skill_Compression ;
+  ex:contributesTo res:project_Cardinality_Estimator, res:project_OWL_RL_Rules ;
+  foaf:knows res:Whitfield_Diffie, res:Fran_Bilas ;
+  ex:worksFor res:Lattice_Co ;
+  ex:salary "115000.00"^^xsd:decimal ;
+  ex:startDate "2020-02-18"^^xsd:date .
+
+res:Rasmus_Lerdorf a ex:Engineer ;
+  foaf:name "Rasmus Lerdorf" ;
+  rdfs:label "Rasmus Lerdorf" ;
+  foaf:givenName "Rasmus" ;
+  foaf:familyName "Lerdorf" ;
+  foaf:age 35 ;
+  foaf:mbox <mailto:rasmus@tessellate.example> ;
+  ex:basedIn res:Nairobi ;
+  ex:memberOf res:team_Reasoner ;
+  ex:hasSkill res:skill_Datalog, res:skill_Query_optimization ;
+  ex:contributesTo res:project_OWL_RL_Rules, res:project_Sparkles ;
+  foaf:knows res:Frances_Allen, res:Tony_Hoare ;
+  ex:worksFor res:Tessellate ;
+  ex:salary "90000.00"^^xsd:decimal ;
+  ex:startDate "2024-05-11"^^xsd:date .
+
+res:Fran_Bilas a ex:Employee ;
+  foaf:name "Fran Bilas" ;
+  rdfs:label "Fran Bilas" ;
+  foaf:givenName "Fran" ;
+  foaf:familyName "Bilas" ;
+  foaf:age 42 ;
+  foaf:mbox <mailto:fran@quadrant_labs.example> ;
+  ex:basedIn res:Berlin ;
+  ex:memberOf res:team_Web_UI ;
+  ex:hasSkill res:skill_Query_optimization, res:skill_SPARQL, res:skill_Rust ;
+  ex:contributesTo res:project_Delta_Merge, res:project_Sparkles ;
+  foaf:knows res:Ada_Lovelace, res:Katherine_Johnson, res:Mary_Shaw, res:Jean_Sammet, res:Yukihiro_Matsumoto ;
+  ex:worksFor res:Quadrant_Labs ;
+  ex:salary "121000.00"^^xsd:decimal ;
+  ex:startDate "2022-03-16"^^xsd:date .
+
+res:pub_0 a ex:Publication ; dcterms:title "Index Efficient Incremental Compressed"@en ;
+      dcterms:issued "2013"^^xsd:gYear ; ex:citations 88 ;
+      ex:author res:Guido_van_Rossum ;
+      ex:about [ a skos:Concept ; skos:prefLabel "OWL"@en ] .
+
+res:pub_1 a ex:Publication ; dcterms:title "for Compressed Adaptive Knowledge Graphs"@en ;
+      dcterms:issued "2015"^^xsd:gYear ; ex:citations 218 ;
+      ex:author res:Mary_Shaw, res:Jean_Sammet, res:Donald_Knuth ;
+      ex:about [ a skos:Concept ; skos:prefLabel "Query optimization"@en ] .
+
+res:pub_2 a ex:Publication ; dcterms:title "Reasoning Join Permutations Triple Stores"@en ;
+      dcterms:issued "2021"^^xsd:gYear ; ex:citations 374 ;
+      ex:author res:Dennis_Ritchie, res:Karen_Sparck_Jones, res:Rasmus_Lerdorf ;
+      ex:about [ a skos:Concept ; skos:prefLabel "SPARQL"@en ] .
+
+res:pub_3 a ex:Publication ; dcterms:title "Datalog RDF Reasoning Index"@en ;
+      dcterms:issued "2018"^^xsd:gYear ; ex:citations 176 ;
+      ex:author res:Katherine_Johnson, res:Frances_Allen ;
+      ex:about [ a skos:Concept ; skos:prefLabel "Distributed systems"@en ] .
+
+res:pub_4 a ex:Publication ; dcterms:title "over for Permutations Efficient"@en ;
+      dcterms:issued "2019"^^xsd:gYear ; ex:citations 13 ;
+      ex:author res:Ole_Dahl ;
+      ex:about [ a skos:Concept ; skos:prefLabel "Compression"@en ] .
+
+res:pub_5 a ex:Publication ; dcterms:title "Triple Stores Efficient Datalog Reasoning"@en ;
+      dcterms:issued "2023"^^xsd:gYear ; ex:citations 22 ;
+      ex:author res:Jean_Sammet, res:Whitfield_Diffie ;
+      ex:about [ a skos:Concept ; skos:prefLabel "Distributed systems"@en ] .
+
+res:pub_6 a ex:Publication ; dcterms:title "Sorted over Scalable Index"@en ;
+      dcterms:issued "2016"^^xsd:gYear ; ex:citations 126 ;
+      ex:author res:Niklaus_Wirth ;
+      ex:about [ a skos:Concept ; skos:prefLabel "Query optimization"@en ] .
+
+res:pub_7 a ex:Publication ; dcterms:title "Efficient Join Index RDF"@en ;
+      dcterms:issued "2020"^^xsd:gYear ; ex:citations 54 ;
+      ex:author res:Alan_Turing, res:Linus_Torvalds, res:Lynn_Conway ;
+      ex:about [ a skos:Concept ; skos:prefLabel "Rust"@en ] .
+
+res:pub_8 a ex:Publication ; dcterms:title "Join Efficient Adaptive over"@en ;
+      dcterms:issued "2023"^^xsd:gYear ; ex:citations 223 ;
+      ex:author res:Rasmus_Lerdorf ;
+      ex:about [ a skos:Concept ; skos:prefLabel "SPARQL"@en ] .
+
+res:pub_9 a ex:Publication ; dcterms:title "Join over Compressed Index"@en ;
+      dcterms:issued "2014"^^xsd:gYear ; ex:citations 2 ;
+      ex:author res:Shafi_Goldwasser ;
+      ex:about [ a skos:Concept ; skos:prefLabel "SPARQL"@en ] .
+
+res:pub_10 a ex:Publication ; dcterms:title "Reasoning for Efficient Datalog"@en ;
+      dcterms:issued "2021"^^xsd:gYear ; ex:citations 273 ;
+      ex:author res:Edsger_Dijkstra ;
+      ex:about [ a skos:Concept ; skos:prefLabel "Svelte"@en ] .
+
+res:pub_11 a ex:Publication ; dcterms:title "Reasoning Datalog Efficient Adaptive"@en ;
+      dcterms:issued "2016"^^xsd:gYear ; ex:citations 80 ;
+      ex:author res:John_McCarthy ;
+      ex:about [ a skos:Concept ; skos:prefLabel "Rust"@en ] .
+
+res:pub_12 a ex:Publication ; dcterms:title "Incremental Permutations Datalog Scalable"@en ;
+      dcterms:issued "2023"^^xsd:gYear ; ex:citations 269 ;
+      ex:author res:Adele_Goldberg, res:Edsger_Dijkstra ;
+      ex:about [ a skos:Concept ; skos:prefLabel "Svelte"@en ] .
+
+res:pub_13 a ex:Publication ; dcterms:title "Datalog for Incremental Join"@en ;
+      dcterms:issued "2017"^^xsd:gYear ; ex:citations 316 ;
+      ex:author res:Leslie_Lamport, res:Margaret_Hamilton ;
+      ex:about [ a skos:Concept ; skos:prefLabel "Svelte"@en ] .
+
+res:pub_14 a ex:Publication ; dcterms:title "for RDF Knowledge Graphs Join"@en ;
+      dcterms:issued "2024"^^xsd:gYear ; ex:citations 266 ;
+      ex:author res:Karen_Sparck_Jones ;
+      ex:about [ a skos:Concept ; skos:prefLabel "Svelte"@en ] .
+
+res:pub_15 a ex:Publication ; dcterms:title "RDF Join over Adaptive"@en ;
+      dcterms:issued "2012"^^xsd:gYear ; ex:citations 205 ;
+      ex:author res:Ada_Lovelace, res:Bjarne_Stroustrup ;
+      ex:about [ a skos:Concept ; skos:prefLabel "Query optimization"@en ] .
+
+res:pub_16 a ex:Publication ; dcterms:title "Join Incremental Permutations Compressed"@en ;
+      dcterms:issued "2022"^^xsd:gYear ; ex:citations 224 ;
+      ex:author res:Edsger_Dijkstra, res:Ada_Lovelace ;
+      ex:about [ a skos:Concept ; skos:prefLabel "Distributed systems"@en ] .
+
+res:pub_17 a ex:Publication ; dcterms:title "RDF for over Knowledge Graphs"@en ;
+      dcterms:issued "2016"^^xsd:gYear ; ex:citations 11 ;
+      ex:author res:Whitfield_Diffie, res:John_McCarthy ;
+      ex:about [ a skos:Concept ; skos:prefLabel "Rust"@en ] .

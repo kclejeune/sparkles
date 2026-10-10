@@ -15,6 +15,7 @@
 
 mod assert;
 mod check;
+mod diagnose;
 mod link;
 mod recall;
 mod similar;

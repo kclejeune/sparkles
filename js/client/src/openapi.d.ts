@@ -1033,6 +1033,24 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/$/memory/{ds}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get the memory settings */
+        get: operations["getMemorySettings"];
+        /** Set the memory settings */
+        put: operations["putMemorySettings"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/merge/{ds}": {
         parameters: {
             query?: never;
@@ -1071,6 +1089,46 @@ export interface paths {
         get: operations["metrics"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/models": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List model providers
+         * @description The providers of `serve --model-config`, their models with the detected structured-output level and last status, and the role lists. Keys are never returned, only the names of their secrets. `configured` is `false` without a configuration.
+         */
+        get: operations["listModelProviders"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/models/{name}/test": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Test a model provider
+         * @description Sends a short prompt to one model of the provider, detects its structured-output level again, and reports the latency, level and token counts. A failed call is a `200` with `ok` false and the error.
+         */
+        post: operations["testModelProvider"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1164,6 +1222,34 @@ export interface paths {
         put?: never;
         post?: never;
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/queries/{ds}/suggestions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List suggested examples
+         * @description Needs `admin` on the dataset.
+         */
+        get: operations["listSuggestions"];
+        put?: never;
+        /**
+         * Suggest an example
+         * @description Needs `read` on the dataset. A dataset keeps at most 500 suggestions.
+         */
+        post: operations["suggestExample"];
+        /**
+         * Remove a suggested example
+         * @description Needs `admin` on the dataset. Promoting a suggestion is a `PUT` of the stored query and then this call.
+         */
+        delete: operations["deleteSuggestion"];
         options?: never;
         head?: never;
         patch?: never;
@@ -2139,6 +2225,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/{ds}/check": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Check a query against the schema
+         * @description The MCP tool `check_query` as the caller, over the caller's view. With `terms`, every constant IRI of the query is listed with its kind, label, count and whether it occurs.
+         */
+        post: operations["checkQuery"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/{ds}/data": {
         parameters: {
             query?: never;
@@ -2419,6 +2525,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/{ds}/recall": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Recall facts
+         * @description The MCP tool `recall` in its JSON format: the facts around the seeds or the entities a search finds, with citations and, when the dataset names agent memory graphs, the review status of each fact.
+         */
+        post: operations["recallFacts"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/{ds}/shacl": {
         parameters: {
             query?: never;
@@ -2477,6 +2603,26 @@ export interface paths {
          * @description The SPARQL 1.1 Query protocol with an `application/sparql-query` body or a form.
          */
         post: operations["sparqlQueryPost"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/{ds}/sparql/diagnose": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Explain an empty result
+         * @description The MCP tool `why_empty`: each triple pattern alone, then the patterns joined in order with the filters, each an ASK under a tenth of the timeout. The answer names the first pattern, join or filter without solutions.
+         */
+        post: operations["diagnoseQuery"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2839,6 +2985,65 @@ export interface components {
             predicate: string;
             /** @description In N-Triples syntax, as are the other terms. */
             subject: string;
+        };
+        /** @description The arguments of `check_query` without `dataset`. */
+        CheckRequest: {
+            /** @description A commit number, `commit:N`, `time:<RFC 3339>`, `snapshot:<name>` or `head`. */
+            at?: number | string;
+            /** @description Read the snapshot of this commit. */
+            atCommit?: number;
+            /** @description Add the plan's estimated rows and its warnings. */
+            explain?: boolean;
+            /** @description Suggestions per issue, 0 to 10. 3 by default. */
+            maxSuggestions?: number;
+            /** @description A SPARQL query. The dataset's prefixes are predeclared. */
+            query: string;
+            /** @description Include materialized inferences (default: true when the dataset has them). */
+            reasoning?: boolean;
+            /** @description List every constant IRI of the query. */
+            terms?: boolean;
+            /** @description At most the server's query timeout. 30 by default. */
+            timeoutSeconds?: number;
+        };
+        /** @description The issues of a query, and with `terms` the terms it uses. */
+        CheckResult: {
+            commit: number;
+            dataset: string;
+            estimatedRows?: number;
+            issues: {
+                code: string;
+                column?: number;
+                line?: number;
+                message: string;
+                /** @enum {string} */
+                severity: "error" | "warning";
+                suggestions?: {
+                    count: number;
+                    label?: string;
+                    term: string;
+                    why: string;
+                }[];
+                term?: string;
+            }[];
+            /** @description False when an issue is an error. */
+            ok: boolean;
+            /** @description The prefixes the compact terms use. */
+            prefixes: {
+                [key: string]: unknown;
+            };
+            terms?: {
+                /** @description Instances of a class, or triples of a property, in the caller's view. */
+                count?: number;
+                iri: string;
+                /** @enum {string} */
+                kind: "class" | "property" | "entity";
+                label?: string;
+                /** @description Whether the term occurs in the caller's view. Null when the check did not look it up. */
+                occurs: boolean | null;
+                /** @description The IRI, compacted with `prefixes`. */
+                term: string;
+                types?: string[];
+            }[];
         };
         ClassEntry: {
             builtin: boolean;
@@ -3305,6 +3510,68 @@ export interface components {
             user_code: string;
             verification_uri: string;
             verification_uri_complete?: string;
+        };
+        /** @description The arguments of `why_empty` without `dataset`. */
+        DiagnoseRequest: {
+            /** @description A commit number, `commit:N`, `time:<RFC 3339>`, `snapshot:<name>` or `head`. */
+            at?: number | string;
+            /** @description Read the snapshot of this commit. */
+            atCommit?: number;
+            /** @description The query that returned no rows. */
+            query: string;
+            /** @description Include materialized inferences (default: true when the dataset has them). */
+            reasoning?: boolean;
+            /** @description At most the server's query timeout. 30 by default. */
+            timeoutSeconds?: number;
+        };
+        /** @description Why a query has no solutions: the first pattern, join or filter without any. */
+        Diagnosis: {
+            commit: number;
+            /** @description Whether every check finished and every part was checked. */
+            complete: boolean;
+            dataset: string;
+            /** @description Whether the query has no solutions. Null when the check ran out of time. */
+            empty: boolean | null;
+            first?: {
+                column?: number;
+                constants: {
+                    occurs: boolean;
+                    term: string;
+                }[];
+                issues: {
+                    code: string;
+                    column?: number;
+                    line?: number;
+                    message: string;
+                    /** @enum {string} */
+                    severity: "error" | "warning";
+                    suggestions?: {
+                        count: number;
+                        label?: string;
+                        term: string;
+                        why: string;
+                    }[];
+                    term?: string;
+                }[];
+                /** @enum {string} */
+                kind: "pattern" | "join" | "filter";
+                line?: number;
+                text: string;
+            };
+            message: string;
+            /** @description The prefixes the compact terms use. */
+            prefixes: {
+                [key: string]: unknown;
+            };
+            steps: {
+                /** @enum {string} */
+                kind: "pattern" | "join" | "filter";
+                /** @description Null when the check ran out of time. */
+                solutions: boolean | null;
+                text: string;
+            }[];
+            /** @description Parts of the query the diagnosis does not cut, such as MINUS. */
+            unchecked?: string[];
         };
         /** @description OWL 2 RL inconsistency checks and their findings. */
         DiagnosticsReport: {
@@ -3803,6 +4070,20 @@ export interface components {
         Logout: {
             redirect: string | null;
         };
+        /** @description The memory settings of a dataset. */
+        MemorySettings: {
+            /** @description Graph IRIs or `*` patterns of agent memory. Facts asserted only there are unreviewed. */
+            agentGraphs?: string[];
+            /** @description Per-agent policies by agent name. */
+            agents?: {
+                [key: string]: {
+                    /** @enum {string} */
+                    conversationFacts?: "immediate" | "review";
+                };
+            };
+            /** @description The graph that promoted facts are written to. */
+            consolidatedGraph?: string;
+        };
         MergeRequest: {
             /** @description The merge base to use among several. */
             base?: Record<string, never>;
@@ -3946,6 +4227,122 @@ export interface components {
             }[];
             uptimeSeconds: number;
             version: string;
+        };
+        /** @description The model providers, their models and the role lists. */
+        ModelProviders: {
+            /** @description Whether the server runs with `--model-config`. */
+            configured: boolean;
+            providers: {
+                allowedModels?: string[];
+                /** @description The name of the secret that holds the key. The key itself is never returned. */
+                apiKey?: {
+                    secret: string;
+                };
+                budget?: {
+                    tokensPerDay: number;
+                    usedToday: number;
+                };
+                concurrency: number;
+                endpoint: string;
+                /** @enum {string} */
+                kind: "ollama" | "openai" | "anthropic";
+                models: {
+                    contextTokens: number;
+                    detected?: ("auto" | "json-schema" | "json-object" | "tool" | "text") | null;
+                    maxOutputTokens: number;
+                    name: string;
+                    pricing?: {
+                        inputPerMTok: number;
+                        outputPerMTok: number;
+                    };
+                    requestTimeoutSecs: number;
+                    status: {
+                        /** Format: date-time */
+                        at?: string;
+                        message?: string;
+                        /** @enum {string} */
+                        state: "untested" | "ok" | "failing";
+                    };
+                    /**
+                     * @description The configured level. `auto` detects it.
+                     * @enum {string}
+                     */
+                    structuredOutput: "auto" | "json-schema" | "json-object" | "tool" | "text";
+                }[];
+                name: string;
+                requestsPerMinute?: number;
+                /**
+                 * @description `secret-missing` when the named key cannot be read.
+                 * @enum {string}
+                 */
+                status: "ok" | "secret-missing";
+            }[];
+            roles: {
+                draft?: {
+                    maxOutputTokens?: number;
+                    model: string;
+                    provider: string;
+                    requestTimeoutSecs?: number;
+                }[];
+                explain?: {
+                    maxOutputTokens?: number;
+                    model: string;
+                    provider: string;
+                    requestTimeoutSecs?: number;
+                }[];
+                extract?: {
+                    maxOutputTokens?: number;
+                    model: string;
+                    provider: string;
+                    requestTimeoutSecs?: number;
+                }[];
+                optimize?: {
+                    maxOutputTokens?: number;
+                    model: string;
+                    provider: string;
+                    requestTimeoutSecs?: number;
+                }[];
+                repair?: {
+                    maxOutputTokens?: number;
+                    model: string;
+                    provider: string;
+                    requestTimeoutSecs?: number;
+                }[];
+                summarize?: {
+                    maxOutputTokens?: number;
+                    model: string;
+                    provider: string;
+                    requestTimeoutSecs?: number;
+                }[];
+            };
+            /** @description The routing settings of the configuration. */
+            routing?: {
+                [key: string]: unknown;
+            };
+        };
+        /** @description A test call to one provider and model. */
+        ModelTestRequest: {
+            /** @description The model to test. By default the first one the role lists name. */
+            model?: string;
+            /** @description At most 600. 60 by default. */
+            timeoutSeconds?: number;
+        };
+        /** @description The outcome of a test call. */
+        ModelTestResult: {
+            error?: {
+                code: string;
+                message: string;
+            };
+            inputTokens: number;
+            latencyMs: number;
+            level?: ("auto" | "json-schema" | "json-object" | "tool" | "text") | null;
+            model: string;
+            ok: boolean;
+            outputTokens: number;
+            provider: string;
+            requests: number;
+            /** @description Whether the answer came at a structured level. */
+            structuredOutput: boolean;
         };
         /** @description A named snapshot: the commit it pins and its expiry. */
         NamedSnapshot: {
@@ -4379,6 +4776,92 @@ export interface components {
             /** @description Recall@k against the exact search, `null` when the index has no vector to sample. */
             recall: number | null;
             samples: number;
+        };
+        /** @description The arguments of `recall` without `dataset`. */
+        RecallRequest: {
+            /** @description A commit number, `commit:N`, `time:<RFC 3339>`, `snapshot:<name>` or `head`. */
+            at?: number | string;
+            /** @description Read the snapshot of this commit. */
+            atCommit?: number;
+            /**
+             * @description Always `json` here.
+             * @enum {string}
+             */
+            format?: "json";
+            /** @description Graph IRIs to read, or `default`. */
+            graphs?: string[];
+            hops?: number;
+            includeSuperseded?: boolean;
+            maxBytes?: number;
+            maxTriples?: number;
+            /** @description The question or the words to search for. Give query, seeds or both. */
+            query?: string;
+            /** @description Include materialized inferences (default: true when the dataset has them). */
+            reasoning?: boolean;
+            seedLimit?: number;
+            /** @description Entity IRIs to start from. */
+            seeds?: string[];
+            statuses?: ("reviewed" | "unreviewed")[];
+            /** @description At most the server's query timeout. 30 by default. */
+            timeoutSeconds?: number;
+            /** @description Class IRIs that seeds found by search must have. */
+            types?: string[];
+            unreviewedWeight?: number;
+        };
+        /** @description The facts around the seeds, with a citation for each. */
+        RecallResult: {
+            citations: {
+                at?: string;
+                by?: string;
+                confidence?: string;
+                graph: string;
+                id: number;
+                quote?: string;
+                reifier?: string;
+                source?: string;
+                /** @enum {string} */
+                status?: "reviewed" | "unreviewed";
+            }[];
+            commit: number;
+            conflicts: {
+                p: string;
+                s: string;
+                values: {
+                    citation: number;
+                    o: string;
+                }[];
+            }[];
+            dataset: string;
+            entities: {
+                facts: {
+                    citation: number;
+                    o: string;
+                    p: string;
+                    s: string;
+                    /** @enum {string} */
+                    status?: "reviewed" | "unreviewed";
+                }[];
+                hop: number;
+                iri: string;
+                label?: string;
+                seed?: number;
+                types: string[];
+            }[];
+            /** @description The prefixes the compact terms use. */
+            prefixes: {
+                [key: string]: unknown;
+            };
+            superseded?: {
+                at?: string;
+                graph: string;
+                invalidatedAt?: string;
+                o: string;
+                p: string;
+                reifier: string;
+                replacedBy?: string[];
+                s: string;
+            }[];
+            truncated: boolean;
         };
         Receipt: {
             commit: components["schemas"]["Commit"];
@@ -4874,6 +5357,40 @@ export interface components {
                 message?: string;
                 parent?: number;
                 version: number;
+            }[];
+        };
+        /** @description A question and the query that answers it. */
+        SuggestRequest: {
+            /** @description At most 400 characters. */
+            explanation?: string;
+            /** @description A SPARQL query of at most 65,536 characters. */
+            query: string;
+            /** @description At most 2000 characters. */
+            question: string;
+        };
+        /** @description A suggested example. */
+        Suggestion: {
+            /** Format: date-time */
+            at: string;
+            /** @description The principal who suggested it. */
+            by: string;
+            explanation?: string;
+            id: string;
+            query: string;
+            question: string;
+        };
+        /** @description The suggested examples, newest first. */
+        SuggestionList: {
+            dataset: string;
+            suggestions: {
+                /** Format: date-time */
+                at: string;
+                /** @description The principal who suggested it. */
+                by: string;
+                explanation?: string;
+                id: string;
+                query: string;
+                question: string;
             }[];
         };
         Task: {
@@ -8210,6 +8727,65 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    getMemorySettings: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The settings, or the defaults. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemorySettings"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    putMemorySettings: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MemorySettings"];
+            };
+        };
+        responses: {
+            /** @description The stored settings. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemorySettings"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
     previewMerge: {
         parameters: {
             query: {
@@ -8336,6 +8912,62 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listModelProviders: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The providers and role lists. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModelProviders"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    testModelProvider: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The name of the stored query, snapshot, vector index or branch. */
+                name: components["parameters"]["name"];
+            };
+            cookie?: never;
+        };
+        /** @description A `ModelTestRequest`. */
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["ModelTestRequest"];
+            };
+        };
+        responses: {
+            /** @description The outcome. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModelTestResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
             default: components["responses"]["Error"];
         };
     };
@@ -8490,6 +9122,94 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["StoredQueryList"];
                 };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listSuggestions: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The suggestions, newest first. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SuggestionList"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    suggestExample: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SuggestRequest"];
+            };
+        };
+        responses: {
+            /** @description The suggestion. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Suggestion"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    deleteSuggestion: {
+        parameters: {
+            query: {
+                /** @description The suggestion's id. */
+                id: string;
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Removed. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
@@ -11322,6 +12042,39 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    checkQuery: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CheckRequest"];
+            };
+        };
+        responses: {
+            /** @description The result. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CheckResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            default: components["responses"]["Error"];
+        };
+    };
     gspGet: {
         parameters: {
             query?: {
@@ -12737,6 +13490,39 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    recallFacts: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RecallRequest"];
+            };
+        };
+        responses: {
+            /** @description The result. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecallResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            default: components["responses"]["Error"];
+        };
+    };
     shacl: {
         parameters: {
             query?: {
@@ -12989,6 +13775,39 @@ export interface operations {
             501: components["responses"]["NotImplemented"];
             503: components["responses"]["Unavailable"];
             507: components["responses"]["InsufficientStorage"];
+            default: components["responses"]["Error"];
+        };
+    };
+    diagnoseQuery: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DiagnoseRequest"];
+            };
+        };
+        responses: {
+            /** @description The result. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Diagnosis"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
             default: components["responses"]["Error"];
         };
     };

@@ -72,6 +72,8 @@ fn dispatch(t: &Tools, name: &str, args: Map<String, Value>) -> Result<Outcome, 
         "similar_queries" => t.similar_queries(args),
         "link_entities" => t.link_entities(args),
         "recall" => t.recall(args),
+        "why_empty" => t.why_empty(args),
+        "share_query" => t.share_query(args),
         "sparql_update" => t.sparql_update(args),
         "assert_facts" => t.assert_facts(args),
         "list_branches" => t.list_branches(args),
@@ -163,7 +165,7 @@ pub(super) fn remaining(deadline: Instant) -> Result<Duration, Error> {
 
 /// The prefixes of a dataset: the well-known ones (as `/$/prefixes/{ds}`) and those
 /// seen at load or set on the dataset, which win.
-pub(super) fn dataset_prefixes(ds: &Dataset) -> BTreeMap<String, String> {
+pub(crate) fn dataset_prefixes(ds: &Dataset) -> BTreeMap<String, String> {
     let mut p = sparkles::io::standard_prefixes();
     p.extend(ds.store.prefixes());
     p
@@ -553,7 +555,7 @@ impl Tools<'_> {
     }
 
     /// Parse a query, telling SPARQL Update apart from a syntax error.
-    fn parse_query(
+    pub(crate) fn parse_query(
         &self,
         q: &str,
         prefixes: &BTreeMap<String, String>,

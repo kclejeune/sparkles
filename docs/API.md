@@ -8052,10 +8052,12 @@ open-world when SERVICE is allowed. The common arguments are:
 | `list_changes` | `subjects`, `predicates`, `objects` and `graphs` (each ≤ 20; objects may be literals in N-Triples syntax, graphs `default` or IRIs), `from` and `to` (a commit or a selector string), `op` (`add`\|`remove`), `order` (`asc`\|`desc`), `limit` (100, ≤ `--mcp-max-rows`), `timeoutSeconds` (30) | `{dataset, head, from, to, changes: [{commit, timestamp, kind, author?, message?, op, quad}], truncated, unrecorded: [{from, to, reason}], prefixes}`: the [history query](#history-queries) of `GET /{ds}/history`, with each quad as one line of terms. It needs the grant of the `diff` endpoint and leaves out the graphs and triples the caller may not read. |
 | `search_text` | `query` (required, ≤ 1000 characters: terms, `"phrases"`, AND/OR, `+required`, `-excluded`), `predicates` (≤ 20 IRIs), `lang`, `limit` (20, ≤ 200), `withTypes` (true) | `{dataset, commit, hits: [{s, score, text, p, label?, types?}], limited, prefixes}`: BM25-ranked matches of `text:query`. `text` is the matched literal, escaped and at most 300 characters long, and `types` has at most 3 entries. Only in builds with the `text` feature. A dataset without an index (`textSearch: false`) gives `text-disabled`. |
 | `similar_entities` | `predicate` (required), exactly one of `entity` (an IRI with one stored vector under `predicate`) and `vector` (1–16384 numbers), `k` (10, ≤ 100), `metric` (`cosine`\|`dot`\|`euclidean`), `excludeSelf` (true), `withLabels` (true) | `{dataset, commit, metric, higherIsBetter, hits: [{iri, score, label?}], prefixes}`: an exact `spk:vectorSearch` over the stored `spk:vector` literals. The tool never computes embeddings. `no-vectors` when the predicate has none, the dimensions differ, or the entity has no vector. |
-| `check_query` | `query` (required, ≤ 65536 characters), `explain` (false), `maxSuggestions` (3, ≤ 10), `timeoutSeconds` (30) | `{dataset, commit, ok, issues: [{code, severity, message, term?, line?, column?, suggestions?: [{term, label?, count, why}]}], estimatedRows?, prefixes}`. The query is parsed and compared with the caller's view without running it. The errors are `syntax` (with line and column), `not-a-query` (an update), `unknown-predicate` and `unknown-class`. The warnings are `unknown-term`, `class-mismatch`, `datatype-mismatch`, `language-tag` and `unbound-projection`, and with `explain` also `no-limit` and `large-estimate` and the plan's `estimatedRows`, which is left out when the caller's view hides the estimates. `ok` is false only when an issue is an error. A suggestion's `why` is `same-local-name`, `edit-distance` or `label` for an unknown term, `class-profile`, `datatype` or `language-tag` for a mismatch, and `same-name`, `namespace` or `edit-distance` for an undefined prefix. |
+| `check_query` | `query` (required, ≤ 65536 characters), `explain` (false), `maxSuggestions` (3, ≤ 10), `terms` (false), `timeoutSeconds` (30) | `{dataset, commit, ok, issues: [{code, severity, message, term?, line?, column?, suggestions?: [{term, label?, count, why}]}], estimatedRows?, terms?, prefixes}`. With `terms`, `terms` lists every constant IRI of the query as `{term, iri, kind, label?, count?, types?, occurs}`, where `kind` is `class`, `property` or `entity` and `occurs` is `null` when the check did not look the term up. The query is parsed and compared with the caller's view without running it. The errors are `syntax` (with line and column), `not-a-query` (an update), `unknown-predicate` and `unknown-class`. The warnings are `unknown-term`, `class-mismatch`, `datatype-mismatch`, `language-tag` and `unbound-projection`, and with `explain` also `no-limit` and `large-estimate` and the plan's `estimatedRows`, which is left out when the caller's view hides the estimates. `ok` is false only when an issue is an error. A suggestion's `why` is `same-local-name`, `edit-distance` or `label` for an unknown term, `class-profile`, `datatype` or `language-tag` for a mismatch, and `same-name`, `namespace` or `edit-distance` for an undefined prefix. |
 | `similar_queries` | `question` (required, ≤ 2000 characters), `k` (5, ≤ 20), `withText` (true), `embeddingIndex` (a vector index name), `timeoutSeconds` (30) | `{dataset, queries: [{name, tool?, description?, score, matchedBy, parameters: [{name, type, required, description?}], questions?, query?}], ranking, prefixes}`. The [stored queries](#stored-queries) the caller may run whose `mcp` is not `false`, ranked by BM25 over their description, parameters, the words of their IRIs and their `questions`. When the dataset has one vector index whose provider embeds query text, or `embeddingIndex` names one, the cosine similarity of embeddings is fused with BM25 by reciprocal rank (k = 60) and `ranking` is `hybrid`. If the provider fails, the ranking falls back to `text`. `tool` is the query's MCP tool name. |
 | `link_entities` | `mentions` (required, 1–20 of `{text (≤ 200 characters), types? (≤ 5 class IRIs), context? (≤ 500 characters)}`), `k` (5, ≤ 20), `labelPredicates` (≤ 20 IRIs, by default the label predicates of `describe_resource` and `skos:altLabel`), `graphs` (≤ 20 IRIs or `default`), `timeoutSeconds` (30) | `{dataset, commit, mentions: [{text, verdict, candidates: [{iri, label?, altLabels?, types, score, typeMatch, matchedBy, sameAs?, triples}]}], search: {text, vector}, prefixes}`. Candidates come from exact label matches, labels equal after case folding and collapsing white space, `text:query` over the label predicates the full-text index covers, and `spk:vectorSearch` with the mention and its context on a vector index that embeds labels. `verdict` is `exact`, `ambiguous`, `candidates` or `none`, and it is advice. Candidates of a type in `types`, or of a subclass, come first. `triples` holds up to 5 sampled outgoing triples, and `sameAs` the other candidates linked by `owl:sameAs` or `skos:exactMatch`. `search` says which indexes took part. |
-| `recall` | `query` (≤ 2000 characters) or `seeds` (≤ 20 IRIs) or both, `types` (≤ 5 class IRIs), `graphs` (≤ 20 IRIs or `default`), `hops` (1, ≤ 2), `seedLimit` (10, ≤ 50), `maxTriples` (150, ≤ 1000), `maxBytes` (32768, ≤ `--mcp-max-bytes`), `includeSuperseded` (false), `format` (`text`\|`json`), `timeoutSeconds` (30) | One text block: the facts around the seeds with their citations, described below. No `structuredContent`. |
+| `recall` | `query` (≤ 2000 characters) or `seeds` (≤ 20 IRIs) or both, `types` (≤ 5 class IRIs), `graphs` (≤ 20 IRIs or `default`), `hops` (1, ≤ 2), `seedLimit` (10, ≤ 50), `maxTriples` (150, ≤ 1000), `maxBytes` (32768, ≤ `--mcp-max-bytes`), `includeSuperseded` (false), `statuses` (both), `unreviewedWeight` (0.7), `format` (`text`\|`json`), `timeoutSeconds` (30) | One text block: the facts around the seeds with their citations, described below. No `structuredContent`. |
+| `why_empty` | `query` (required, ≤ 65536 characters), `timeoutSeconds` (30) | `{dataset, commit, empty, first?, steps, unchecked?, complete, message, prefixes}`, described in [Checking and explaining queries](#checking-and-explaining-queries). |
+| `share_query` | `query` (required, ≤ 65536 characters), `question` (≤ 2000 characters), `explanation` (≤ 400 characters), `assumptions` (≤ 5), `branch`, `atCommit` | `{url, dataset, commit, ok, issues, prefixes}`. The link opens the query in a new tab of the UI's query page with the question header. The query is checked and never run. Listed only when the server knows the UI's address, which is the request's own host over HTTP and `--ui-url` over stdio. A payload over 32 KiB is refused with `too-large`, and an update with `not-a-query`. |
 | `validate_shacl` | `shapes` (required: a shapes graph in Turtle, ≤ 1 MiB), `shapesFormat` (`turtle` or `shaclc`), `graph` (`default`\|`union`\|IRI), `maxResults` (20, ≤ `--mcp-max-rows`), `timeoutSeconds` (30) | `{dataset, commit, reasoning, conforms, total, bySeverity: {violation, warning, info}, results: [{focus, path?, value?, shape, constraint, severity, message?}], truncated, prefixes}`: the validation of [`/{ds}/shacl`](#shacl-validation). The most severe results come first, then results are ordered by shape and focus node. `severity` is `Violation`, `Warning` or `Info`. SHACL 1.2 `Debug` and `Trace` count as info. A complex `path` is a SPARQL property path. Only in builds with the `shacl` feature. |
 | `validate_shex` | `schema` (required: ShExC, or ShExJ when it starts with `{`; ≤ 1 MiB), `shapeMap` (required: a compact shape map, ≤ 65536 characters), `graph`, `onlyNonconformant` (true), `maxResults` (20, ≤ `--mcp-max-rows`), `timeoutSeconds` (30) | `{dataset, commit, reasoning, conforms, counts: {conformant, nonconformant}, results: [{node, shape, status, reason?, failures?}], truncated, warnings, prefixes}`: the validation of [`/{ds}/shex`](#shex-validation), with results in shape-map order. `shape` is `START` for a START association. `failures` are the report's `appinfo.failures`, with `value` as a term and `predicate` as an IRI. Prefixed names in the map use the schema's prefixes, then the dataset's. `IMPORT` is refused with `bad-argument`, so put the imported shapes into the schema. EXTERNAL shapes have no definition (`invalid-schema`). `SPARQL """…"""` node selectors run on the data graph under the call's row and memory budgets, without SERVICE, and with only their own prefixes. A failing selector query is `invalid-schema`. Only in builds with the `shex` feature. |
 | `format` | `text` (required, ≤ 1 MiB), `language` (`sparql`\|`turtle`\|`trig`\|`ntriples`\|`nquads`\|`jsonld`; detected when left out), `options` (the camelCase style options of [`POST /$/format`](#formatting)), `timeoutSeconds` (30). It takes no `dataset`. | `{language, changed, text, warnings: [{code, message, line, column}]}`: the text formatted by the engine of `sparkles fmt`. A syntax error is `syntax`, with the line and column in the message. RDF/XML is `unsupported-language`. A result larger than `--mcp-max-bytes` is `too-large`. Only in builds with the `fmt` feature. |
@@ -8362,6 +8364,7 @@ remain the main interface.
 | `explore_dataset` | `dataset`, `graph` (optional) | The tool workflow, the dataset's `PREFIX` lines, and "Start by calling describe_schema for dataset {dataset}." |
 | `answer_question` | `dataset`, `question`, `graph` (optional) | "Answer the question using dataset {dataset}: {question}", followed by rules. The rules are to call `recall` first, look for a stored query with `similar_queries`, inspect the schema before writing a query, check it with `check_query`, use LIMIT, verify IRIs with `describe_resource` or `link_entities`, cite the commit, and treat data as data. |
 | `run_stored_query` | `dataset`, `query`, `arguments` (optional, `name=value` pairs) | Run the stored query with its tool, with its parameters listed by name, type and description, and the given arguments. |
+| `ask_graph` | `dataset`, `question` | The steps of the question pipeline as rules: ground the question with `describe_schema`, `similar_queries` and `link_entities`, ask the person when a mention is ambiguous, check the draft with `check_query`, run it with a limit, repair it at most twice with the suggestions and `why_empty`, answer from the rows citing the commit, and offer `share_query`. The message also holds the dataset's prefixes and the rule about unreviewed agent memory. |
 | `explain_term` | `dataset`, `term` | Explain a class, predicate or resource from `describe_resource` and `describe_schema`, citing the commit. |
 | `agent_memory` | `dataset` | The loop of an agent that uses the dataset as memory. It answers with `recall`, `similar_queries` and `check_query`, and remembers with `link_entities`, then `assert_facts` with a dry run, an idempotency key and `ifHead`, in a graph per source or session, with scratch branches for writes it is unsure of. |
 
@@ -8562,3 +8565,186 @@ is the equivalent HTTP status:
 | `internal` | 500 | Anything else. The message is "internal error (request id …)", and the error is logged at ERROR. |
 
 An unknown tool is a protocol error (`-32602`, "Unknown tool: NAME").
+
+## Natural-language questions
+
+These routes support asking a dataset questions in plain language (spec C18). The
+model pipeline itself runs in `sparkles ask` and in agents over MCP. The server routes
+here check and explain queries, run memory recalls, and describe the model providers.
+
+### Checking and explaining queries
+
+Three routes run MCP tools over plain HTTP for the UI and for scripts. Each runs the
+tool as the caller over the caller's view, with the limits of `/$/mcp` when the server
+runs it and the server's query limits otherwise. The body is the tool's arguments
+without `dataset`, because the path names the dataset. A tool error is answered with
+the tool's HTTP status and `{error, code, hint?}`. The routes need `read` on the
+dataset, they are rate-limited as queries, and they read the `main` branch only, so a
+request for another branch gets `400` with code `invalid-branch`. They exist in builds
+with the `mcp` feature.
+
+**`POST /{ds}/check`** runs `check_query`. With `"terms": true` the answer also lists
+the terms of the query for the question header of the UI.
+
+```json
+{ "query": "SELECT ?p WHERE { ?p a ex:Person ; ex:memberOf res:payments }", "terms": true }
+```
+
+```json
+{
+  "dataset": "org", "commit": 12, "ok": true, "issues": [],
+  "terms": [
+    { "term": "ex:memberOf", "iri": "http://example.org/ontology#memberOf", "kind": "property", "label": "member of", "count": 120, "occurs": true },
+    { "term": "ex:Person", "iri": "http://example.org/ontology#Person", "kind": "class", "label": "Person", "count": 80, "occurs": true },
+    { "term": "res:payments", "iri": "http://example.org/resource/payments", "kind": "entity", "label": "Payments team", "types": ["ex:Team"], "occurs": true }
+  ],
+  "prefixes": { "ex": "http://example.org/ontology#", "res": "http://example.org/resource/" }
+}
+```
+
+**`POST /{ds}/sparql/diagnose`** runs `why_empty` for a query that returned no rows.
+It first asks whether the query has any solution. It then cuts the required part of
+the query into steps in the order they are written. A step is a triple pattern, a
+path, a UNION as a whole, a FILTER, a BIND or a VALUES block. Every pattern is asked
+alone, and then the patterns are joined one by one with the filters, BINDs and VALUES
+blocks in place. Each check is an `ASK` under a tenth of the timeout. The answer names
+the first pattern, join or filter without solutions in `first`, says for each of its
+constants whether it occurs in the caller's view, and carries the `check_query` issues
+about those constants, such as a `language-tag` warning. `steps` lists each check with
+`solutions` true, false, or null when the check ran out of time. OPTIONAL parts are not
+checked, because they cannot empty a result. MINUS, OFFSET, GROUP BY and SERVICE are
+named in `unchecked`, and `complete` is false when a part was not checked or a check ran
+out of time. The verdict of spec C18 §4.2 comes with the server pipeline.
+
+```json
+{
+  "dataset": "org", "commit": 12, "empty": true,
+  "first": {
+    "kind": "pattern", "text": "?p foaf:name \"Ana Lima\"", "line": 2, "column": 3,
+    "constants": [ { "term": "foaf:name", "occurs": true }, { "term": "\"Ana Lima\"", "occurs": false } ],
+    "issues": [ { "code": "language-tag", "severity": "warning", "message": "…", "term": "\"Ana Lima\"" } ]
+  },
+  "steps": [ { "kind": "pattern", "text": "?p a ex:Person", "solutions": true },
+             { "kind": "pattern", "text": "?p foaf:name \"Ana Lima\"", "solutions": false } ],
+  "complete": true,
+  "message": "The pattern ?p foaf:name \"Ana Lima\" has no solutions: \"Ana Lima\" does not occur in your view of dataset org.",
+  "prefixes": { "ex": "http://example.org/ontology#", "foaf": "http://xmlns.com/foaf/0.1/" }
+}
+```
+
+**`POST /{ds}/recall`** runs `recall` in its JSON format, for the memory browser of the
+UI. `format` may be left out or set to `json`. The answer is the JSON form described
+under [MCP server](#mcp-server).
+
+### Memory settings
+
+A dataset's memory settings name the graphs that hold agent memory. They are kept in
+`<db>/memory.json` of a persistent dataset and in the process for an in-memory one.
+
+```json
+{
+  "agentGraphs": ["https://example.org/memory/agents/*", "https://example.org/memory/shared/*"],
+  "consolidatedGraph": "https://example.org/memory/consolidated",
+  "agents": { "agent-7": { "conversationFacts": "immediate" } }
+}
+```
+
+`GET /$/memory/{ds}` needs `read` and answers the settings, or
+`{"agentGraphs": [], "agents": {}}` without any. `PUT /$/memory/{ds}` needs `admin` and
+replaces them. `agentGraphs` holds at most 50 graph IRIs or patterns with `*`. The
+consolidated graph must not match `agentGraphs`, and `conversationFacts` is `immediate`
+or `review`. Anything else is a `400`.
+
+When `agentGraphs` is set, `recall` reports a review status. A triple is `reviewed` when
+the caller's view asserts it in a graph that `agentGraphs` does not match, and
+`unreviewed` when the view asserts it only in agent graphs. Each fact and each citation
+of the JSON format carries `status`, and the text format marks unreviewed facts with
+` unreviewed` and every citation with `status=`. The `statuses` argument keeps only the
+listed statuses, and `unreviewedWeight` (0 to 1, 0.7 by default) multiplies the score of
+the seeds a search finds when all their facts are unreviewed. Superseded entries name
+the reifiers that revise them in `replacedBy`. A dataset without `agentGraphs` reports
+no status.
+
+### Suggested examples
+
+A reader who finds a good question and query can suggest it as an example, and a
+dataset admin reviews the suggestions. A dataset keeps at most 500 suggestions, in
+`<db>/query-suggestions.json` of a persistent dataset.
+
+| Method and path | Needs | Effect |
+|---|---|---|
+| `POST /$/queries/{ds}/suggestions` | `read` | Adds `{question, query, explanation?}` and answers `201` with `{id, question, query, explanation?, by, at}`. An update is a `400` with code `not-a-query`, and a 501st suggestion a `409` with code `too-many-suggestions`. |
+| `GET /$/queries/{ds}/suggestions` | `admin` | `{dataset, suggestions}`, newest first. |
+| `DELETE /$/queries/{ds}/suggestions?id=ID` | `admin` | Removes one suggestion, `204`, or `404` with code `unknown-suggestion`. |
+
+Promoting a suggestion is a `PUT /$/queries/{ds}/{name}` of the stored query with the
+question in `questions`, followed by the `DELETE`. Because these routes take the name
+`suggestions`, a stored query cannot have that name.
+
+### Model providers
+
+The operator defines model providers in a JSON file passed to `serve --model-config`.
+Each provider has a name, a kind (`ollama`, `openai` for any endpoint that speaks the
+OpenAI chat protocol, or `anthropic`), an endpoint, and optionally the name of a secret
+that holds its API key. Keys are read from `--model-secret NAME=env:VARIABLE` or
+`--model-secret NAME=file:PATH` at each request. No route returns a key, and no route
+can create a provider or change its endpoint.
+
+```json
+{
+  "models": {
+    "providers": {
+      "local": { "kind": "ollama", "endpoint": "http://127.0.0.1:11434" },
+      "claude": {
+        "kind": "anthropic",
+        "endpoint": "https://api.anthropic.com",
+        "apiKey": { "secret": "anthropic" },
+        "budget": { "tokensPerDay": 2000000 }
+      }
+    },
+    "roles": {
+      "draft": [
+        { "provider": "local", "model": "qwen3:8b" },
+        { "provider": "claude", "model": "claude-sonnet-5" }
+      ],
+      "summarize": [{ "provider": "local", "model": "qwen3:8b" }]
+    }
+  }
+}
+```
+
+The roles are `draft`, `repair`, `summarize`, `extract`, `explain` and `optimize`. Each
+names an ordered list of provider and model pairs. A role without a list is turned off,
+except `repair`, which uses the `draft` list.
+
+A provider may also set `concurrency` (4 by default), `requestsPerMinute`,
+`allowedModels`, `connectTimeoutSecs`, extra `headers` for the `openai` kind, and the
+defaults of its models. The `models` member sets `contextTokens`, `maxOutputTokens`,
+`temperature`, `structuredOutput`, `pricing`, `requestTimeoutSecs` and, for Ollama,
+`numCtx` per model. Headers that carry credentials are refused, and so are endpoints
+with credentials, a query or a fragment. Requests go through the server's outbound
+policy, so a provider on a private address needs `--outbound-allow-private`.
+
+**Structured output.** Every model step asks for JSON that matches a schema. With
+`structuredOutput` set to `auto`, the server detects what each pair supports the first
+time it is called. It tries the provider's JSON Schema mode first (`format` for Ollama,
+`response_format` with `json_schema` for the OpenAI protocol, `output_config.format` for
+Anthropic), then a plain JSON mode, then plain text with the answer in a fenced block.
+The detected level is remembered until the server restarts or the pair is tested again.
+An answer that does not match the schema is retried once with the errors.
+
+**`GET /$/models`** (server admin) lists the providers with their kind, endpoint,
+status and models, and the role lists. A provider's `status` is `secret-missing` when
+its secret cannot be read. Each model shows its configured and detected
+structured-output level and the outcome of its last call. Without `--model-config`, the
+answer is `{"configured": false, "providers": [], "roles": {}}`.
+
+**`POST /$/models/{name}/test`** (server admin) sends a short prompt to one model of
+the provider. The optional body is `{"model": ..., "timeoutSeconds": ...}`, and the
+model defaults to the first one the role lists name for that provider. The answer
+reports `ok`, the structured-output `level`, the latency and the token counts. A failed
+call is still a `200`, with `ok` false and an `error` of `{code, message}`. The codes
+are `provider-unavailable`, `provider-auth`, `provider-rejected`, `refusal`,
+`invalid-output`, `secret-missing`, `budget-exceeded`, `outbound-refused`
+and `deadline`. An unknown provider is a `404` with code `unknown-provider`, and a
+server without providers answers `404` with code `no-models`.
