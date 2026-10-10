@@ -1571,6 +1571,7 @@ mod auth {
     }
 
     /// A memory tool's result as text: the text block, or the structured content.
+    #[cfg(feature = "text")]
     fn result_text(r: &J) -> String {
         match r.get("structuredContent") {
             Some(s) => s.to_string(),
@@ -1645,6 +1646,7 @@ mod auth {
     /// The memory tools of C17 §6 through graph grants (C12): checks, candidates,
     /// facts and citations come from the caller's view only, and a term that exists
     /// only in a hidden graph is reported as an absent one is.
+    #[cfg(feature = "text")]
     #[tokio::test(flavor = "multi_thread")]
     async fn memory_tools_follow_graph_grants() {
         use crate::http::router_tests::auth::graphs::{DATA, users};
@@ -1778,6 +1780,7 @@ mod auth {
     /// The memory tools under protections of triples (C12b): a protected predicate is
     /// unknown to `check_query`, never suggested, and its facts never reach `recall`; a
     /// protected entity is never a candidate.
+    #[cfg(feature = "text")]
     #[tokio::test(flavor = "multi_thread")]
     async fn memory_tools_follow_triple_protections() {
         use crate::http::router_tests::auth::triples::{DATA, users};
