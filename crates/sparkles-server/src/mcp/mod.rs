@@ -16,6 +16,7 @@ mod bridge;
 mod complete;
 mod context;
 mod draft;
+mod elicit;
 pub(crate) mod errors;
 #[cfg(feature = "fmt")]
 mod format;

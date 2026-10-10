@@ -265,6 +265,91 @@ async fn ingest_settings_and_read_tools() {
     assert_eq!(r.status, StatusCode::NO_CONTENT);
 }
 
+/// A33: a client that declares elicitation chooses between the candidates; one
+/// without gets `possible-duplicate`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a33_elicitation_for_possible_duplicates() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut st =
+        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap();
+    st.mcp = Some(conf(&st, &["--mcp-allow-update"]));
+    let state = Arc::new(st);
+    attach_org(&state);
+    let s = Server {
+        _dir: dir,
+        state: state.clone(),
+        app: router(state),
+    };
+    let args = json!({"dataset": "mem", "graph": NOTES,
+        "entities": [{"key": "_:pay", "label": "Payments team", "types": ["org:OrganizationalUnit"]}],
+        "facts": [{"s": "ex:ana", "p": "org:memberOf", "o": "_:pay"}]});
+    // without elicitation
+    let r = tool(&s.app, "assert_facts", args.clone(), &[]).await;
+    assert_eq!(code(&r), "possible-duplicate", "{r}");
+    // with elicitation
+    let meta = json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {"elicitation": {}}
+    });
+    let r = modern(
+        &s.app,
+        "tools/call",
+        json!({"name": "assert_facts", "arguments": args, "_meta": meta}),
+        &[],
+    )
+    .await;
+    let res = r.rpc()["result"].clone();
+    assert_eq!(res["resultType"], "input_required", "{res}");
+    let state = res["requestState"].clone();
+    let field =
+        &res["inputRequests"]["entities"]["params"]["requestedSchema"]["properties"]["entity0"];
+    let options: Vec<&str> = field["oneOf"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["const"].as_str().unwrap())
+        .collect();
+    assert_eq!(options, ["ex:payments", "new"], "{res}");
+    assert_eq!(head(&s, None), 1);
+    // the retry with a candidate chosen writes the fact with that IRI
+    let r = modern(
+        &s.app,
+        "tools/call",
+        json!({"name": "assert_facts", "arguments": args, "_meta": meta,
+               "requestState": state,
+               "inputResponses": {"entities": {"action": "accept", "content": {"entity0": "ex:payments"}}}}),
+        &[],
+    )
+    .await;
+    let res = r.rpc()["result"].clone();
+    assert_eq!(res["isError"], false, "{res}");
+    let units = rows(
+        &s,
+        None,
+        &format!("SELECT ?u WHERE {{ GRAPH <{NOTES}> {{ ex:ana org:memberOf ?u }} }}"),
+    );
+    assert_eq!(units, [["<http://example.org/payments>".to_string()]]);
+    let units = rows(
+        &s,
+        None,
+        "SELECT ?u WHERE { GRAPH ?g { ?u a org:OrganizationalUnit } }",
+    );
+    assert_eq!(units.len(), 1, "{units:?}");
+    // an answer that names no candidate leaves the error
+    let r = modern(
+        &s.app,
+        "tools/call",
+        json!({"name": "assert_facts", "arguments": {"dataset": "mem", "graph": NOTES,
+                 "entities": [{"key": "_:p2", "label": "Payments team", "types": ["org:OrganizationalUnit"]}],
+                 "facts": [{"s": "ex:kai", "p": "org:memberOf", "o": "_:p2"}]},
+               "_meta": meta, "requestState": "forged",
+               "inputResponses": {"entities": {"action": "accept", "content": {"entity0": "ex:acme"}}}}),
+        &[],
+    )
+    .await;
+    assert_eq!(code(&r.rpc()["result"]), "possible-duplicate");
+}
+
 #[cfg(feature = "auth")]
 mod auth {
     use super::*;
