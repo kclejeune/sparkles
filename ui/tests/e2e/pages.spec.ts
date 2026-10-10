@@ -90,6 +90,12 @@ open('a badge counts what waits in the memory review inbox', async ({ page, requ
   const agents = 'https://example.org/e2e/memory/agents/';
   let r = await request.post('/$/datasets', { data: { dbName: ds, dbType: 'mem' } });
   expect(r.ok(), await r.text()).toBe(true);
+  // the facts below name known entities and a known predicate
+  r = await request.post(`/${ds}/update`, {
+    headers: { 'Content-Type': 'application/sparql-update' },
+    data: `INSERT DATA { GRAPH <${EX}people> { <${EX}ada> <${EX}knows> <${EX}charles> . <${EX}grace> a <${EX}Person> } }`,
+  });
+  expect(r.ok(), await r.text()).toBe(true);
   r = await request.put(`/$/memory/${ds}`, {
     data: { agentGraphs: [`${agents}*`], consolidatedGraph: 'https://example.org/e2e/memory/ok' },
   });
