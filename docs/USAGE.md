@@ -460,7 +460,7 @@ happens to materialized inferences, and the limits.
 | `--load-dir DIR` | | Let `LOAD <file:…>` read the regular files under `DIR`, with symbolic links resolved and nothing outside it. Without this flag, the server refuses file loads. |
 | `--embedding-secret NAME=SOURCE` | | A secret that vector indexes may name as their embedding API key: `NAME=env:VARIABLE` or `NAME=file:PATH`, read when a request is made. Repeatable. See [Embeddings computed on write](#embeddings-computed-on-write). |
 | `--no-embedding` | | Compute no embeddings. No worker sends text to a provider, and searches cannot pass text. The configurations are kept. |
-| `--wal-prealloc-kb N` | `4096` | The most a write-ahead log grows ahead of its commits at once, as zero bytes written and synced in advance; `0` means each commit appends to the file. A commit that overwrites preallocated bytes syncs them without a file-system journal commit, which on ext4 and XFS is faster and no longer waits behind other files' writeback. On Linux, a commit of up to 64 KiB that lands inside preallocated space is written with `O_DIRECT` and `O_DSYNC`, which the device can complete as a forced-unit-access write instead of a full cache flush. A file system that refuses direct I/O falls back to buffered writes and `fdatasync`, and the hidden `--no-wal-direct-writes` flag forces that path. The log ends at its last commit for readers, backups and the quota, and a close trims the zeros. A global flag. |
+| `--wal-prealloc-kb N` | `4096` | The most a write-ahead log grows ahead of its commits at once, as zero bytes written and synced in advance; `0` means each commit appends to the file. A commit that overwrites preallocated bytes syncs them without a file-system journal commit, which on ext4 and XFS is faster and no longer waits behind other files' writeback. On Linux, a commit of up to 64 KiB that lands inside preallocated space is written with `O_DIRECT` and `O_DSYNC`, which the device can complete as a forced-unit-access write instead of a full cache flush. The update vocabulary `delta.vocab` grows the same way, by up to 1 MiB at a time, and a commit that adds terms writes them as one checksummed chunk with `O_DIRECT` and `O_DSYNC` at the same time as its log records, so it no longer waits for a journal commit either. A file system that refuses direct I/O falls back to buffered writes and `fdatasync`, and the hidden `--no-wal-direct-writes` flag forces that path for both files. The log ends at its last commit and the vocabulary at its last chunk for readers, backups and the quota, and a close trims the zeros. A global flag. |
 | `--max-prefixes N` | `1000` | Prefixes per dataset; `0` means unlimited. A global flag. A new prefix past the limit is refused with `400`, and loaded data stops adding its prefixes. |
 | `--reason-cache-triples N` | `10000000` | The largest closure of a materialization that a dataset keeps in memory, so that the next re-run or automatic run updates it incrementally. A closure takes about 135 bytes per triple. With `0`, a run reads the closure back from a persistent dataset, and an in-memory dataset runs in full. |
 
@@ -2054,7 +2054,7 @@ clean, 1 when any check found an error, and 2 when there are warnings only.
 | `layout` | `CURRENT` names an existing generation. `dataset.json`, the generation's `commit.json` (with the same dataset id) and `prefixes.json` parse. Leftovers of interrupted work are warnings: `*.tmp`, `text.new`/`text.old`, an old or unfinished `gen-NNNN`, or a set-aside catalog. |
 | `generation` | `meta.json` (index format) and `stats.json` parse and agree on the quad count. |
 | `vocabulary` | The front-coded vocabulary decodes, its keys strictly increase, and its size matches `meta.json`. Every vocabulary id in the permutations is below that size. Every entry of the sparse index `vocab.idx` names the offset and first key of its block. An index that does not read as one for this vocabulary is a warning, because the server ignores it. |
-| `delta-vocabulary` | The update vocabulary is well formed and holds no duplicate. A torn tail is a warning. |
+| `delta-vocabulary` | The update vocabulary is well formed and holds no duplicate. The summary names its format, `framed` or `legacy`, and the zero bytes preallocated after its last chunk. A torn tail is a warning. |
 | `perm.spo` … `perm.gspo` | Block metadata is contiguous, sorted and fits the file, and the row count matches `meta.json`. Every block decodes to its row count, and its first and last keys match the metadata. Keys strictly increase within and across blocks, and every id is valid for its position. |
 | `permutations` | The 7 permutations hold the same number of rows and, compared by an order-independent hash, the same quads. |
 | `wal` | Records are well formed, and every commit record's checksum matches. A damaged final transaction is a warning, because open truncates it. So is a final transaction that names update-vocabulary terms the file lacks, which a crash during its commit can leave, and one with zero records before its commit record. Zero bytes after the last commit are preallocated space, reported in the summary. Commit numbers continue from the generation's base commit, and ids resolve. |
@@ -3868,6 +3868,15 @@ docker compose up --build -d
 Compose rebuilds the image and replaces the container, and the volume keeps the data.
 Sparkles is experimental, and its on-disk format may change between commits without a
 migration path, so take a backup before you upgrade.
+
+A release refuses a database whose `dataset.json` asks for a later reader
+(`minimumReader`), so an older release never misreads files it does not know. A
+database moves to a later reader only when it first uses the feature that needs it. The
+framed update vocabulary needs reader 4. A database that an earlier release wrote opens
+unchanged, and the first commit that adds a term to it raises `minimumReader` to 4 and
+rewrites its `delta.vocab` in the framed format. From then on, releases that read only
+up to reader 3 refuse it. To go back to such a release, dump the database with
+`sparkles dump` and load the dump with the older release.
 
 ### Backing up the container's data
 

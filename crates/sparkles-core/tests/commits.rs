@@ -462,16 +462,17 @@ fn ask(s: &Store, q: &str) -> bool {
         .boolean
 }
 
-/// The lengths of the complete entries of a delta vocabulary file, in order.
-fn delta_entry_ends(path: &Path) -> Vec<u64> {
-    let buf = std::fs::read(path).unwrap();
-    let (mut pos, mut ends) = (0usize, Vec::new());
-    while pos + 4 <= buf.len() {
-        let len = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
-        pos += 4 + len;
-        ends.push(pos as u64);
-    }
-    ends
+/// Where each chunk of a framed delta vocabulary file ends, in order.
+fn chunk_ends(path: &Path) -> Vec<u64> {
+    sparkles_core::vocab::delta::chunk_ends(&std::fs::read(path).unwrap())
+        .unwrap()
+        .into_iter()
+        .map(|e| e as u64)
+        .collect()
+}
+
+fn vocab_of(root: &Path) -> std::path::PathBuf {
+    wal(root).with_file_name("delta.vocab")
 }
 
 fn truncate(path: &Path, len: u64) {
@@ -483,9 +484,10 @@ fn truncate(path: &Path, len: u64) {
         .unwrap();
 }
 
-/// A commit's new terms and its WAL records are synced at the same time, so a crash can
-/// leave the commit record on disk without the terms it names. That commit was never
-/// acknowledged: open drops it like any torn tail.
+/// A commit's new terms and its WAL records are written at the same time, so a crash
+/// can leave the commit record on disk without the chunk of `delta.vocab` that holds
+/// the terms it names, or with that chunk torn. That commit was never acknowledged:
+/// open drops it like any torn tail.
 #[test]
 fn a_last_commit_whose_new_terms_were_lost_is_a_torn_tail() {
     let dir = tempfile::tempdir().unwrap();
@@ -496,12 +498,13 @@ fn a_last_commit_whose_new_terms_were_lost_is_a_torn_tail() {
         upd(&s, "INSERT DATA { <urn:b> <urn:p> \"two\" }");
     }
     let wal_path = wal(&root);
-    let vocab = wal_path.with_file_name("delta.vocab");
+    let vocab = vocab_of(&root);
     let wal_full = std::fs::read(&wal_path).unwrap();
     let vocab_full = std::fs::read(&vocab).unwrap();
-    // urn:a, urn:p, "one" for commit 1, then urn:b and "two" for commit 2
-    let ends = delta_entry_ends(&vocab);
-    assert_eq!(ends.len(), 5);
+    // urn:a, urn:p and "one" in commit 1's chunk, urn:b and "two" in commit 2's
+    let ends = chunk_ends(&vocab);
+    assert_eq!(ends.len(), 2);
+    assert_eq!(ends[1], vocab_full.len() as u64);
     let wal_one = {
         let s = Store::open(&root, StoreOptions::default()).unwrap();
         assert_eq!(s.head_commit().seq, 2);
@@ -511,36 +514,54 @@ fn a_last_commit_whose_new_terms_were_lost_is_a_torn_tail() {
         let first = (0..recs).find(|&i| wal_full[i * 33] == 3).unwrap();
         ((first + 1) * 33) as u64
     };
-    // commit 2's terms lost entirely, or the last one torn half-way, or zeros where
-    // they were (the file's length reached the disk, its data did not)
-    for (cut, zeros) in [
-        (ends[2], false),
-        (ends[3], false),
-        (ends[4] - 2, false),
-        (ends[2], true),
-    ] {
-        std::fs::write(&wal_path, &wal_full).unwrap();
-        if zeros {
+    let c2 = ends[0] as usize;
+    let damaged: Vec<(&str, Vec<u8>)> = vec![
+        // commit 2's chunk lost entirely
+        ("lost", vocab_full[..c2].to_vec()),
+        // cut short half-way, or by its last byte
+        ("cut", vocab_full[..c2 + 30].to_vec()),
+        ("cut by one", vocab_full[..vocab_full.len() - 1].to_vec()),
+        // the file's length reached the disk, its data did not (preallocated zeros)
+        ("zeros", {
             let mut v = vocab_full.clone();
-            v[cut as usize..].fill(0);
-            std::fs::write(&vocab, &v).unwrap();
-        } else {
-            std::fs::write(&vocab, &vocab_full).unwrap();
-            truncate(&vocab, cut);
-        }
+            v[c2..].fill(0);
+            v.resize(64 << 10, 0);
+            v
+        }),
+        // a sector of the chunk did not reach the disk: its checksum fails
+        ("torn", {
+            let mut v = vocab_full.clone();
+            v[vocab_full.len() - 3..].fill(0);
+            v.resize(8192, 0);
+            v
+        }),
+        // the chunk's header missing, its entries there
+        ("no header", {
+            let mut v = vocab_full.clone();
+            v[c2..c2 + 24].fill(0);
+            v
+        }),
+    ];
+    for (what, v) in &damaged {
+        std::fs::write(&wal_path, &wal_full).unwrap();
+        std::fs::write(&vocab, v).unwrap();
         {
             let s = Store::open(&root, StoreOptions::default()).unwrap();
-            assert_eq!(s.head_commit().seq, 1, "cut at {cut}");
+            assert_eq!(s.head_commit().seq, 1, "{what}");
             assert!(ask(&s, "ASK { <urn:a> <urn:p> \"one\" }"));
             assert!(!ask(&s, "ASK { <urn:b> ?p ?o }"));
             assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), wal_one);
+            // open cut the vocabulary back to commit 1's chunk
+            assert_eq!(std::fs::metadata(&vocab).unwrap().len(), ends[0], "{what}");
             // the next commit takes the number the lost one had
             let r = upd(&s, "INSERT DATA { <urn:b> <urn:p> \"two\" }");
             assert_eq!(r.commit.seq, 2);
         }
         let s = Store::open(&root, StoreOptions::default()).unwrap();
-        assert_eq!(s.head_commit().seq, 2);
+        assert_eq!(s.head_commit().seq, 2, "{what}");
         assert!(ask(&s, "ASK { <urn:b> <urn:p> \"two\" }"));
+        drop(s);
+        assert_eq!(std::fs::read(&vocab).unwrap(), vocab_full, "{what}");
     }
     // the terms on disk without the WAL records: the commit is simply not there, and
     // the terms are used again when the triple is inserted again
@@ -562,10 +583,175 @@ fn a_last_commit_whose_new_terms_were_lost_is_a_torn_tail() {
     // terms missing for a commit before the last one cannot come from a crash: open
     // refuses the database and leaves its files alone
     std::fs::write(&wal_path, &wal_full).unwrap();
-    truncate(&vocab, ends[1]);
+    let mut v = vocab_full.clone();
+    v[ends[0] as usize - 2] ^= 0xff;
+    std::fs::write(&vocab, &v).unwrap();
     let e = Store::open(&root, StoreOptions::default()).err().unwrap();
     assert!(e.to_string().contains("delta.vocab"), "{e}");
     assert_eq!(std::fs::read(&wal_path).unwrap(), wal_full);
+    assert_eq!(std::fs::read(&vocab).unwrap(), v);
+}
+
+/// Terms go to `delta.vocab` in one checksummed chunk per commit, written with
+/// `O_DIRECT | O_DSYNC` into zeros the file was grown by, at the same time as the
+/// commit's WAL records. A crash image of both files, preallocated zeros included,
+/// opens with every commit, and later commits continue both files.
+#[test]
+fn new_terms_take_direct_writes_and_survive_a_crash_image() {
+    let dir = tempfile::tempdir().unwrap();
+    let supported = direct_io(dir.path());
+    for direct in [true, false] {
+        let root = dir.path().join(format!("db-{direct}"));
+        let opts = || StoreOptions {
+            wal_direct_writes: direct,
+            ..Default::default()
+        };
+        let s = Store::open(&root, opts()).unwrap();
+        for i in 0..300 {
+            upd(
+                &s,
+                &format!("INSERT DATA {{ <urn:s> <urn:p> \"literal {i}\" }}"),
+            );
+        }
+        // a commit with more terms than one direct write takes
+        let big: String = (0..3000)
+            .map(|i| format!("<urn:s> <urn:q> \"a longer literal number {i}\" . "))
+            .collect();
+        upd(&s, &format!("INSERT DATA {{ {big} }}"));
+        for i in 300..400 {
+            upd(
+                &s,
+                &format!("INSERT DATA {{ <urn:s> <urn:p> \"literal {i}\" }}"),
+            );
+        }
+        assert_eq!(s.wal_direct_active(), direct && supported);
+        assert_eq!(s.vocab_direct_active(), direct && supported);
+        let head = s.head_commit().seq;
+        let len = s.snapshot().len();
+        let vocab = vocab_of(&root);
+        let (wal_crash, vocab_crash) = (
+            std::fs::read(wal(&root)).unwrap(),
+            std::fs::read(&vocab).unwrap(),
+        );
+        // one chunk for each commit, then the space preallocated for later ones
+        let ends = chunk_ends(&vocab);
+        assert_eq!(ends.len(), 401);
+        let last = *ends.last().unwrap();
+        assert!(vocab_crash.len() as u64 > last);
+        assert!(vocab_crash[last as usize..].iter().all(|&b| b == 0));
+        drop(s);
+        // a clean close cuts the zeros
+        assert_eq!(std::fs::metadata(&vocab).unwrap().len(), last);
+        std::fs::write(wal(&root), &wal_crash).unwrap();
+        std::fs::write(&vocab, &vocab_crash).unwrap();
+        let s = Store::open(&root, opts()).unwrap();
+        assert_eq!(s.head_commit().seq, head);
+        assert_eq!(s.snapshot().len(), len);
+        assert!(ask(&s, "ASK { <urn:s> <urn:p> \"literal 0\" }"));
+        assert!(ask(&s, "ASK { <urn:s> <urn:p> \"literal 399\" }"));
+        assert!(ask(
+            &s,
+            "ASK { <urn:s> <urn:q> \"a longer literal number 2999\" }"
+        ));
+        for i in 400..420 {
+            upd(
+                &s,
+                &format!("INSERT DATA {{ <urn:s> <urn:p> \"literal {i}\" }}"),
+            );
+        }
+        assert_eq!(s.wal_direct_active(), direct && supported);
+        assert_eq!(s.vocab_direct_active(), direct && supported);
+        drop(s);
+        let s = Store::open(&root, opts()).unwrap();
+        assert_eq!(s.head_commit().seq, head + 20);
+        assert!(ask(&s, "ASK { <urn:s> <urn:p> \"literal 419\" }"));
+        assert_eq!(chunk_ends(&vocab).len(), 421);
+    }
+}
+
+/// The `minimumReader` of a dataset's `dataset.json`.
+fn minimum_reader(root: &Path) -> u64 {
+    let ds: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("dataset.json")).unwrap()).unwrap();
+    ds["minimumReader"].as_u64().unwrap()
+}
+
+/// A dataset from an earlier release has a legacy `delta.vocab`, the entries alone. It
+/// opens and reads as before, and nothing in the file changes until a commit adds a
+/// term. That commit first requires reader 4 in `dataset.json`, which earlier releases
+/// refuse, and then rewrites the file framed. Commits that add no terms keep the
+/// dataset's reader.
+#[test]
+fn a_legacy_delta_vocabulary_is_rewritten_framed_by_the_first_new_term() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    {
+        let s = Store::open(&root, StoreOptions::default()).unwrap();
+        upd(&s, "INSERT DATA { <urn:a> <urn:p> \"one\" }");
+        upd(&s, "INSERT DATA { <urn:b> <urn:p> \"two\" }");
+    }
+    // the dataset as an earlier release left it, with a torn entry at the end
+    let vocab = vocab_of(&root);
+    let parsed = std::fs::read(&vocab).unwrap();
+    let keys = sparkles_core::vocab::parse_delta(&parsed).unwrap().keys;
+    assert_eq!(keys.len(), 5);
+    let mut legacy: Vec<u8> = keys
+        .iter()
+        .flat_map(|k| [&(k.len() as u32).to_le_bytes()[..], k].concat())
+        .collect();
+    let legacy_len = legacy.len();
+    legacy.extend_from_slice(&[9, 0, 0, 0, b'<']);
+    std::fs::write(&vocab, &legacy).unwrap();
+    let mut ds: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("dataset.json")).unwrap()).unwrap();
+    ds["minimumReader"] = serde_json::json!(1);
+    std::fs::write(root.join("dataset.json"), ds.to_string()).unwrap();
+    {
+        let s = Store::open(&root, StoreOptions::default()).unwrap();
+        assert_eq!(s.head_commit().seq, 2);
+        assert!(ask(&s, "ASK { <urn:b> <urn:p> \"two\" }"));
+        // a commit without new terms leaves the file as it is
+        upd(&s, "INSERT DATA { <urn:b> <urn:p> \"one\" }");
+        assert_eq!(minimum_reader(&root), 1);
+    }
+    // the open dropped the torn entry, and the legacy entries are as they were
+    assert_eq!(std::fs::read(&vocab).unwrap(), &legacy[..legacy_len]);
+    let check = |root: &Path| {
+        let r = sparkles_core::check::check(root, &Default::default()).unwrap();
+        r.get("delta-vocabulary").unwrap().summary.clone()
+    };
+    assert!(check(&root).contains("legacy format"), "{}", check(&root));
+    {
+        let s = Store::open(&root, StoreOptions::default()).unwrap();
+        upd(&s, "INSERT DATA { <urn:c> <urn:p> \"three\" }");
+        assert_eq!(minimum_reader(&root), 4);
+        assert_eq!(s.head_commit().seq, 4);
+    }
+    let framed = std::fs::read(&vocab).unwrap();
+    assert_eq!(&framed[..8], &sparkles_core::vocab::delta::MAGIC);
+    // the rewritten entries in one chunk, the new terms in the next
+    assert_eq!(chunk_ends(&vocab).len(), 2);
+    assert!(check(&root).contains("framed format"), "{}", check(&root));
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    assert_eq!(s.head_commit().seq, 4);
+    for q in [
+        "ASK { <urn:a> <urn:p> \"one\" }",
+        "ASK { <urn:b> <urn:p> \"two\" }",
+        "ASK { <urn:b> <urn:p> \"one\" }",
+        "ASK { <urn:c> <urn:p> \"three\" }",
+    ] {
+        assert!(ask(&s, q), "{q}");
+    }
+    drop(s);
+    // a release that reads up to reader 3 refuses the dataset now, as this one
+    // refuses a dataset that requires a later reader
+    assert_eq!(sparkles_core::commit::DATASET_READER, 4);
+    let mut ds: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("dataset.json")).unwrap()).unwrap();
+    ds["minimumReader"] = serde_json::json!(sparkles_core::commit::DATASET_READER + 1);
+    std::fs::write(root.join("dataset.json"), ds.to_string()).unwrap();
+    let e = Store::open(&root, StoreOptions::default()).err().unwrap();
+    assert!(e.to_string().contains("requires reader 5"), "{e}");
 }
 
 #[test]

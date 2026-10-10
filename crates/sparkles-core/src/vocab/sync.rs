@@ -7,6 +7,8 @@ use std::thread::JoinHandle;
 
 struct Job {
     file: Arc<Mutex<DeltaFile>>,
+    /// through the write-through handle when it can
+    direct: bool,
     done: mpsc::Sender<Result<()>>,
 }
 
@@ -43,7 +45,11 @@ impl PendingSync {
 }
 
 impl LazySync {
-    pub(super) fn start(&mut self, file: Arc<Mutex<DeltaFile>>) -> Option<PendingSync> {
+    pub(super) fn start(
+        &mut self,
+        file: Arc<Mutex<DeltaFile>>,
+        direct: bool,
+    ) -> Option<PendingSync> {
         if !self.attempted {
             self.attempted = true;
             let (send, receive) = mpsc::sync_channel::<Job>(1);
@@ -57,7 +63,11 @@ impl LazySync {
                         .name("vocab-sync".into())
                         .spawn(move || {
                             while let Ok(job) = receive.recv() {
-                                let result = DeltaFile::sync(&job.file);
+                                let result = if job.direct {
+                                    DeltaFile::sync_direct(&job.file)
+                                } else {
+                                    DeltaFile::sync(&job.file)
+                                };
                                 let _ = job.done.send(result);
                             }
                         })
@@ -77,7 +87,7 @@ impl LazySync {
             .send
             .as_ref()
             .expect("live worker sender")
-            .send(Job { file, done });
+            .send(Job { file, direct, done });
         Some(PendingSync(receive))
     }
 
@@ -112,19 +122,6 @@ mod tests {
     }
 
     #[test]
-    fn dirty_version_exhaustion_refuses_clean_state_and_fences() {
-        let root = tempfile::tempdir().unwrap();
-        let v = DeltaVocab::open(&root.path().join("vocab")).unwrap();
-        v.file.as_ref().unwrap().lock().dirty_version = u64::MAX;
-        assert!(v.insert(b"<urn:exhausted>").is_err());
-        assert!(v.needs_sync());
-        let mut worker = LazySync::default();
-        assert!(v.sync_on(&mut worker).unwrap().wait().is_err());
-        assert!(v.needs_sync());
-        assert!(v.sync().is_err());
-    }
-
-    #[test]
     fn captured_prefix_allows_mark_append_and_keeps_suffix_dirty() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("vocab");
@@ -132,7 +129,7 @@ mod tests {
         v.insert(b"<urn:first>").unwrap();
         let (observed, release) = pause(&v);
         let mut worker = LazySync::default();
-        let pending = v.sync_on(&mut worker).unwrap();
+        let pending = v.sync_on(&mut worker, false).unwrap();
         observed.recv_timeout(Duration::from_secs(2)).unwrap();
         let (done, arrived) = mpsc::channel();
         let writer = {
@@ -150,13 +147,13 @@ mod tests {
         writer.join().unwrap();
         assert!(progress.is_ok(), "mark/append blocked behind fdatasync");
         assert!(v.needs_sync(), "old prefix cannot clean a newer append");
-        v.sync_on(&mut worker).unwrap().wait().unwrap();
+        v.sync_on(&mut worker, false).unwrap().wait().unwrap();
         assert!(!v.needs_sync());
         assert_eq!(DeltaVocab::open(&path).unwrap().len(), 2);
     }
 
     #[test]
-    fn rollback_waits_for_captured_prefix_and_versions_never_rewind() {
+    fn rollback_waits_for_a_captured_prefix() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("vocab");
         let v = Arc::new(DeltaVocab::open(&path).unwrap());
@@ -164,10 +161,9 @@ mod tests {
         v.sync().unwrap();
         let mark = v.mark();
         v.insert(b"<urn:temporary>").unwrap();
-        let captured_version = v.file.as_ref().unwrap().lock().dirty_version;
         let (observed, release) = pause(&v);
         let mut worker = LazySync::default();
-        let pending = v.sync_on(&mut worker).unwrap();
+        let pending = v.sync_on(&mut worker, false).unwrap();
         observed.recv_timeout(Duration::from_secs(2)).unwrap();
         let (done, arrived) = mpsc::channel();
         let rollback = {
@@ -182,10 +178,9 @@ mod tests {
         pending.wait().unwrap();
         arrived.recv_timeout(Duration::from_secs(2)).unwrap();
         rollback.join().unwrap();
-        assert!(v.file.as_ref().unwrap().lock().dirty_version > captured_version);
-        assert!(v.needs_sync(), "truncate must be durably fenced");
+        assert!(!v.needs_sync(), "the rollback zeroed and synced the chunk");
         v.insert(b"<urn:replacement>").unwrap();
-        v.sync_on(&mut worker).unwrap().wait().unwrap();
+        v.sync_on(&mut worker, false).unwrap().wait().unwrap();
         let reopened = DeltaVocab::open(&path).unwrap();
         assert_eq!(reopened.len(), 2);
         assert_eq!(reopened.get(1).unwrap(), b"<urn:replacement>");
@@ -202,7 +197,7 @@ mod tests {
             let v = DeltaVocab::open(&path).unwrap();
             v.insert(format!("<urn:g{generation}>").as_bytes()).unwrap();
             v.flush().unwrap();
-            let pending = v.sync_on(&mut worker).unwrap();
+            let pending = v.sync_on(&mut worker, false).unwrap();
             let id = worker.thread_id().unwrap();
             assert_eq!(*first.get_or_insert(id), id);
             drop(v);
@@ -220,10 +215,10 @@ mod tests {
         v.insert(b"<urn:failed>").unwrap();
         v.flush().unwrap();
         v.fail_next_sync();
-        assert!(v.sync_on(&mut worker).unwrap().wait().is_err());
+        assert!(v.sync_on(&mut worker, false).unwrap().wait().is_err());
         assert!(v.needs_sync());
         let id = worker.thread_id();
-        v.sync_on(&mut worker).unwrap().wait().unwrap();
+        v.sync_on(&mut worker, false).unwrap().wait().unwrap();
         assert_eq!(worker.thread_id(), id);
         assert!(!v.needs_sync());
     }
@@ -234,10 +229,10 @@ mod tests {
         let v = DeltaVocab::open(&root.path().join("vocab")).unwrap();
         v.insert(b"<urn:pending>").unwrap();
         v.flush().unwrap();
-        let file = v.file.as_ref().unwrap().clone();
+        let file = v.file_handle();
         let held = file.lock();
         let mut worker = LazySync::default();
-        let pending = v.sync_on(&mut worker).unwrap();
+        let pending = v.sync_on(&mut worker, false).unwrap();
         let (done, finish) = mpsc::channel();
         let closer = std::thread::spawn(move || {
             drop(worker);
@@ -263,11 +258,11 @@ mod tests {
             ..Default::default()
         };
         v.insert(b"<urn:first>").unwrap();
-        assert!(v.sync_on(&mut worker).is_none());
+        assert!(v.sync_on(&mut worker, false).is_none());
         v.sync().unwrap();
         worker.fail_spawn = false;
         v.insert(b"<urn:second>").unwrap();
-        assert!(v.sync_on(&mut worker).is_none());
+        assert!(v.sync_on(&mut worker, false).is_none());
         v.sync().unwrap();
         assert!(worker.thread_id().is_none());
         assert!(!v.needs_sync());

@@ -296,12 +296,15 @@ impl WriteTxn<'_> {
         let unfenced = u8::try_from(self.unfenced(store)).expect("drained above");
         self.check_storage()?;
         let generation = self.base.generation.clone();
-        if generation.dvocab.needs_sync() {
-            generation.dvocab.flush()?;
-        }
         let c = self.next_commit(None);
         let bytes = self.wal_bytes();
         let prealloc = self.wal_prealloc();
+        // the terms are in the file before the records that name them
+        let vocab_before = generation.dvocab.allocated();
+        generation.dvocab.set_prealloc(prealloc);
+        if generation.dvocab.needs_sync() {
+            generation.dvocab.flush()?;
+        }
         let w = &mut **self.guard;
         let wal = w.wal.as_mut().expect("persistent grouped transaction");
         // The descriptor clone fails before any byte of this transaction is written.
@@ -336,8 +339,14 @@ impl WriteTxn<'_> {
             return Err(e.into());
         }
         store.quota.add(w.wal_alloc - before);
+        store
+            .quota
+            .add(generation.dvocab.allocated().saturating_sub(vocab_before));
         w.wal_len += bytes;
         store.quota.set_preallocated(w.wal_alloc - w.wal_len);
+        store
+            .quota
+            .set_vocab_preallocated(generation.dvocab.preallocated());
         let snapshot = Arc::new(Snapshot {
             dataset_id: self.base.dataset_id,
             generation: generation.clone(),
