@@ -2593,6 +2593,40 @@ organisation graph of the UI's mock server. The report goes to a new temporary
 directory, or to `--out` outside the repository. `scripts/eval-ask --self-test` runs the
 matrix against a local mock provider and needs no key.
 
+### Explaining a query
+
+The Plan tab of a result, and the plan that **Explain** shows, has an **Explanation**
+switch. It opens a panel beside the plan tree with what the query asks, in one to four
+sentences, and notes on the operators that matter, such as the slowest one, an estimate
+that was off ten times or more, a join that multiplied its rows, a filter that kept
+almost nothing, or a node that never ran and why. Each sentence and note ends with links
+such as ‹Filter›. A link selects its operator in the tree, expands the path to it and
+scrolls it into view, and hovering an operator in the tree highlights the sentences that
+mention it. The marks in the tree are the notes' severities.
+
+When a query stops at its timeout or a budget, the error offers **Explain why**. It
+opens the plan as it stood when the query stopped. The note on the budget comes first,
+then the operator that spent most of it, and counts that stopped early carry a small
+`p` for partial.
+
+The notes and the plain description need no model. When the dataset's assistant
+settings turn on `explain`, the `explain` role rewrites them as prose. The server checks
+that prose against the plan. A sentence that names an operator the plan lacks is dropped,
+and a note with a number the plan does not hold is replaced by the computed one. The
+panel marks the model's text as generated, and **Show template text** shows the
+computed description instead.
+
+```sh
+curl -X PUT http://localhost:3030/$/assistant/org -H 'Content-Type: application/json' \
+  -d '{"enabled": true, "explain": true}'
+```
+
+Scripts and agents get the same explanation from `POST /{ds}/sparql/explain`, described
+in [API.md](API.md#explaining-a-query), and from the MCP tool `explain_query` with
+`notes: true`. `profile: "run"` runs the query read-only and explains the executed plan.
+The MCP tool calls the server's models only with `useServerModel: true`, which needs a
+grant with `server_models = true`.
+
 ## Embedding the library
 
 `sparkles::Dataset` opens one database, and `sparkles::Catalog` manages named datasets
