@@ -647,7 +647,9 @@ impl Store {
             Some(_) => w.wal_len,
             None => 0,
         };
-        let dvocab_len = snap.generation.dvocab.flush()?;
+        // the vocabulary's own handle: a first write can rewrite a legacy file under a
+        // new inode after the lock, and the captured length is of this one
+        let mut dvocab = snap.generation.dvocab.capture()?;
         let catalog_len = self.catalog.lock().flushed_len()?;
         // opened under the lock: pruning replaces the file, and holds the lock to do it
         let catalog = File::open(root.join("commits.bin"))?;
@@ -675,10 +677,16 @@ impl Store {
             if !e.file_type()?.is_file() || name.ends_with(".tmp") {
                 continue;
             }
+            if name == "delta.vocab"
+                && let Some((f, len)) = dvocab.take()
+            {
+                gen_files.push((name, f, len));
+                continue;
+            }
             let f = File::open(e.path())?;
             let len = match name.as_str() {
                 "wal.log" => wal_len,
-                "delta.vocab" => dvocab_len,
+                "delta.vocab" => 0,
                 // immutable: its whole length
                 _ => f.metadata()?.len(),
             };

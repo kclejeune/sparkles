@@ -53,6 +53,7 @@ pub use backup::{
     BackupBranch, BackupCapture, CapturedFile, FileKind, FileSource, LeaseGuard,
     MEMORY_CAPTURE_PREFIX, MemoryCaptureOptions,
 };
+pub(crate) use branching::BRANCH_FILE as BRANCH_FILE_NAME;
 pub(crate) use branching::write_initial_table;
 pub use branching::{
     BRANCHES_DIR, BRANCHES_FILE, BranchCommit, BranchSet, BranchStore, read_branch_table,
@@ -1581,6 +1582,15 @@ impl Store {
             .map(|c| catalog.get(c.seq).filter(|r| r.seq == c.seq).unwrap_or(*c))
             .unwrap_or(base);
         let wal = wal::open_for_append(&wal_path)?;
+        // What this open read is where the writes to come start, so it must be durable
+        // first. A process that stopped without syncing can leave bytes that are only
+        // in the page cache, and a direct write after them would be durable while
+        // they are not. The delta vocabulary also drops anything past its complete
+        // entries here, after the replay has accepted them.
+        if wal_len > 0 {
+            wal.sync_data()?;
+        }
+        gen_.dvocab.settle()?;
         let dvocab_len = gen_.dvocab.len();
         *gen_.wal_index.lock() = Some(wal_index);
         let history = open_history(root, dataset_id, gen_no, head.seq, &catalog)?;
@@ -4066,6 +4076,9 @@ impl Store {
                 return Err(e);
             }
             w.trim_wal();
+            // the old generation's vocabulary takes no more writes either
+            self.snapshot().generation.dvocab.trim();
+            self.quota.set_vocab_preallocated(0);
             w.wal_alloc = wal.metadata()?.len();
             w.wal = Some(BufWriter::new(wal));
             w.wal_direct = Default::default();
@@ -4380,6 +4393,13 @@ impl Store {
     #[doc(hidden)]
     pub fn wal_direct_active(&self) -> bool {
         matches!(self.writer.lock().wal_direct, wal::Direct::Open(_))
+    }
+
+    /// Whether the current generation's delta vocabulary has its write-through handle
+    /// open, so that the terms of small commits use direct writes (for tests).
+    #[doc(hidden)]
+    pub fn vocab_direct_active(&self) -> bool {
+        self.snapshot().generation.dvocab.direct_active()
     }
 }
 
@@ -5079,7 +5099,12 @@ impl WriteTxn<'_> {
         // transaction's small changes need no WAL records.
         let bulk = std::mem::take(&mut self.bulk);
         let view = self.view();
-        self.base.generation.dvocab.sync()?;
+        // A dry run builds from the terms in memory and rolls them back. Writing them
+        // would rewrite a legacy file framed and raise the dataset's reader for a write
+        // that never happens.
+        if self.opts.dry_run.is_none() {
+            self.base.generation.dvocab.sync()?;
+        }
         let commit = BulkCommit {
             kind: self.kind,
             net_del: self.net_del,
@@ -5131,13 +5156,9 @@ impl WriteTxn<'_> {
         // persistent one's quota) has no room
         self.check_storage()?;
         // A commit that added terms syncs them together with its WAL records (see
-        // `sync_commit`); without a WAL they are synced here. They are written to the
-        // file first, so that a reader of the WAL (`sparkles check`, a backup) finds
-        // every term its commit records name.
+        // `commit_direct` and `sync_commit_reused`); without a WAL they are synced here.
         if self.guard.wal.is_none() {
             gen_.dvocab.sync()?;
-        } else if gen_.dvocab.needs_sync() {
-            gen_.dvocab.flush()?;
         }
         let c = self.next_commit(validation.as_deref());
         // the message and digest are durable before the commit is (see `annotations`)
@@ -5179,13 +5200,17 @@ impl WriteTxn<'_> {
             // once the first byte is written, a failure leaves the WAL in an unknown
             // state: refuse further writes, so a seq can never be written twice
             let alloc_before = w.wal_alloc;
-            let dir = gen_
+            let vocab_before = gen_.dvocab.allocated();
+            let direct_on = self.store.opts.wal_direct_writes;
+            let path = gen_
                 .dir
                 .as_deref()
-                .filter(|_| self.store.opts.wal_direct_writes);
+                .filter(|_| direct_on)
+                .map(|d| d.join("wal.log"));
+            gen_.dvocab.set_prealloc(prealloc);
             let written = wal.flush().map_err(Error::from).and_then(|_| {
                 if wal::DirectLog::fits(w.wal_len, data.len(), w.wal_alloc)
-                    && let Some(direct) = w.wal_direct.handle(dir, wal.get_ref())
+                    && let Some(direct) = w.wal_direct.handle(path.as_deref(), wal.get_ref())
                 {
                     if commit_direct(direct, w.wal_len, &data, &gen_.dvocab, &mut w.vocab_sync)? {
                         return Ok(());
@@ -5193,6 +5218,12 @@ impl WriteTxn<'_> {
                     // the file system refused direct I/O: write this commit and the
                     // later ones the buffered way
                     w.wal_direct = wal::Direct::Off;
+                }
+                // The terms are written before the records, so that a reader of the
+                // WAL (`sparkles check`, a linked branch opening) finds every term
+                // the records name. The sync covers both.
+                if gen_.dvocab.needs_sync() {
+                    gen_.dvocab.flush()?;
                 }
                 wal::write_commit(wal.get_ref(), w.wal_len, &mut w.wal_alloc, &data, prealloc)?;
                 sync_commit_reused(wal.get_ref(), &gen_.dvocab, &mut w.vocab_sync)
@@ -5205,9 +5236,16 @@ impl WriteTxn<'_> {
             }
             // the bytes the file grew by: the records past its end and any zeros after,
             // which the quota does not count
+            // and the bytes the vocabulary file grew by
             self.store.quota.add(w.wal_alloc - alloc_before);
+            self.store
+                .quota
+                .add(gen_.dvocab.allocated().saturating_sub(vocab_before));
             w.wal_len += data.len() as u64;
             self.store.quota.set_preallocated(w.wal_alloc - w.wal_len);
+            self.store
+                .quota
+                .set_vocab_preallocated(gen_.dvocab.preallocated());
             self.store.wal_end.store(w.wal_len, Ordering::Relaxed);
             if let Some(ix) = gen_.wal_index.lock().as_mut() {
                 ix.note(wal::WalPoint {
@@ -5583,6 +5621,9 @@ impl Drop for Store {
             // Shut down the owned worker now, rather than with that last lease.
             w.vocab_sync = Default::default();
             w.trim_wal();
+            if !w.poisoned {
+                self.snapshot().generation.dvocab.trim();
+            }
         }
         if let Some(log) = &self.changelog
             && let Err(e) = log.flush(true)
@@ -5683,7 +5724,7 @@ fn sync_commit_reused(
     if !dvocab.needs_sync() {
         return Ok(wal.sync_data()?);
     }
-    let pending = dvocab.sync_on(worker);
+    let pending = dvocab.sync_on(worker, false);
     let synced = wal.sync_data();
     let vocab = match pending {
         Some(pending) => pending.wait(),
@@ -5695,12 +5736,15 @@ fn sync_commit_reused(
 }
 
 /// Write a commit's WAL records `data` at the log's logical end `at` through the
-/// write-through handle (see [`wal::DirectLog`]), and sync the delta terms it added, if
-/// any, at the same time on the vocabulary worker. `Ok(true)` once both are durable;
-/// `Ok(false)` when the file system refused direct I/O, after which the caller writes
-/// and syncs the records the buffered way. The commit is acknowledged only after both
-/// succeed. A crash in between can leave either file ahead of the other, which replay
-/// handles as it does for [`sync_commit_reused`].
+/// write-through handle (see [`wal::DirectLog`]), and write the delta terms it added, if
+/// any, at the same time on the vocabulary worker, as one chunk through the vocabulary's
+/// own write-through handle when it fits (see [`crate::vocab::delta`]). Both are then
+/// `O_DSYNC` writes into allocated space, which a device with FUA persists without a
+/// cache flush. `Ok(true)` once both are durable; `Ok(false)` when the file system
+/// refused direct I/O for the log, after which the caller writes and syncs the records
+/// the buffered way. The commit is acknowledged only after both succeed. A crash in
+/// between can leave either file ahead of the other, which replay handles as it does
+/// for [`sync_commit_reused`].
 fn commit_direct(
     direct: &mut wal::DirectLog,
     at: u64,
@@ -5711,11 +5755,11 @@ fn commit_direct(
     if !dvocab.needs_sync() {
         return Ok(direct.write(at, data)?);
     }
-    let pending = dvocab.sync_on(worker);
+    let pending = dvocab.sync_on(worker, true);
     let written = direct.write(at, data);
     let vocab = match pending {
         Some(pending) => pending.wait(),
-        None => dvocab.sync(),
+        None => dvocab.sync_direct(),
     };
     // Always await both, including when the WAL write fails, before releasing ownership.
     let written = written?;

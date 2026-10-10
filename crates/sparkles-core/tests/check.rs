@@ -445,14 +445,8 @@ fn a_wal_checksum_mismatch_mid_log_is_an_error() {
 /// drops. The same for an earlier commit is damage, which open refuses.
 #[test]
 fn a_final_wal_transaction_whose_terms_were_lost_is_a_warning() {
-    let entry_ends = |path: &Path| {
-        let buf = std::fs::read(path).unwrap();
-        let (mut pos, mut ends) = (0usize, Vec::new());
-        while pos + 4 <= buf.len() {
-            pos += 4 + u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
-            ends.push(pos as u64);
-        }
-        ends
+    let chunk_ends = |path: &Path| {
+        sparkles_core::vocab::delta::chunk_ends(&std::fs::read(path).unwrap()).unwrap()
     };
     let cut = |path: &Path, len: u64| {
         std::fs::OpenOptions::new()
@@ -464,10 +458,11 @@ fn a_final_wal_transaction_whose_terms_were_lost_is_a_warning() {
     };
     let (_d, root) = fresh();
     let vocab = gen_dir(&root).join("delta.vocab");
-    // ex:later and its label (commit 5), then the two labels of commit 7
-    let ends = entry_ends(&vocab);
-    assert_eq!(ends.len(), 4);
-    cut(&vocab, ends[2]);
+    // a chunk with ex:later and its label (commit 5), then one with the two labels of
+    // commit 7, which loses its end
+    let ends = chunk_ends(&vocab);
+    assert_eq!(ends.len(), 2);
+    cut(&vocab, ends[1] as u64 - 5);
     let r = run(&root, false);
     assert_eq!(status(&r, "wal"), Status::Warning, "{}", r.to_text());
     assert!(
@@ -486,7 +481,7 @@ fn a_final_wal_transaction_whose_terms_were_lost_is_a_warning() {
     // commit 5's label lost as well: damage before the last commit
     let (_d, root) = fresh();
     let vocab = gen_dir(&root).join("delta.vocab");
-    cut(&vocab, ends[0]);
+    cut(&vocab, ends[0] as u64 - 5);
     let r = run(&root, false);
     assert_eq!(status(&r, "wal"), Status::Error, "{}", r.to_text());
     assert!(

@@ -72,6 +72,8 @@ pub(crate) struct Quota {
     /// bytes preallocated after the last commit of the write-ahead log: on disk, but
     /// not counted (see [`StoreOptions::wal_prealloc_bytes`](super::StoreOptions::wal_prealloc_bytes))
     preallocated: AtomicU64,
+    /// the same after the last chunk of the delta vocabulary
+    vocab_preallocated: AtomicU64,
 }
 
 impl Quota {
@@ -90,6 +92,7 @@ impl Quota {
             measured: Mutex::new(None),
             excluded: Mutex::new(None),
             preallocated: AtomicU64::new(0),
+            vocab_preallocated: AtomicU64::new(0),
         })
     }
 
@@ -113,10 +116,12 @@ impl Quota {
                 .store(dir_size(root).saturating_sub(building), Ordering::Relaxed);
             *m = Some(Instant::now());
         }
-        // the zero bytes preallocated after the last commit of the log are not data
-        self.used
-            .load(Ordering::Relaxed)
-            .saturating_sub(self.preallocated.load(Ordering::Relaxed))
+        // the zero bytes preallocated after the last commit of the log, and after the
+        // last chunk of the delta vocabulary, are not data
+        self.used.load(Ordering::Relaxed).saturating_sub(
+            self.preallocated.load(Ordering::Relaxed)
+                + self.vocab_preallocated.load(Ordering::Relaxed),
+        )
     }
 
     /// Leave `dir` (a generation being built in the background) out of the measured
@@ -134,6 +139,11 @@ impl Quota {
     /// The write-ahead log now holds `bytes` of preallocated zeros after its last commit.
     pub(crate) fn set_preallocated(&self, bytes: u64) {
         self.preallocated.store(bytes, Ordering::Relaxed);
+    }
+
+    /// The delta vocabulary now holds `bytes` of preallocated zeros after its last chunk.
+    pub(crate) fn set_vocab_preallocated(&self, bytes: u64) {
+        self.vocab_preallocated.store(bytes, Ordering::Relaxed);
     }
 
     /// A small commit grew the write-ahead log by `bytes`, its records and any zeros
