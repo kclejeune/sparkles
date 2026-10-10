@@ -1053,6 +1053,71 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/$/ingest/{ds}/profiles": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List the ingest profiles */
+        get: operations["listIngestProfiles"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/ingest/{ds}/profiles/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get an ingest profile
+         * @description The profile `default` answers `{}` when it is not stored, which means the whole schema.
+         */
+        get: operations["getIngestProfile"];
+        /**
+         * Set an ingest profile
+         * @description Needs `admin` on the dataset. A dataset keeps at most 50 profiles.
+         */
+        put: operations["putIngestProfile"];
+        post?: never;
+        /**
+         * Remove an ingest profile
+         * @description Needs `admin` on the dataset.
+         */
+        delete: operations["deleteIngestProfile"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/ingest/{ds}/settings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Set whether sources keep their text
+         * @description Needs `admin` on the dataset.
+         */
+        put: operations["putIngestSettings"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/lint": {
         parameters: {
             query?: never;
@@ -1112,6 +1177,126 @@ export interface paths {
         get: operations["getMemorySettings"];
         /** Set the memory settings */
         put: operations["putMemorySettings"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/memory/{ds}/edit": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Edit a fact's value
+         * @description Retracts the fact and asserts it with the new object, with the new reifier derived from the old one.
+         */
+        post: operations["editFact"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/memory/{ds}/inbox": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List what waits for review
+         * @description Needs `read` on the dataset and covers the caller's view. Unreviewed session facts come with their span, link, guard and corroboration signals.
+         */
+        get: operations["getMemoryInbox"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/memory/{ds}/promote": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Promote facts for review
+         * @description Writes the facts into the target graph on a review branch with reifiers derived from the facts' own, for a person to merge. Needs `write` on the target graph on that branch.
+         */
+        post: operations["promoteFacts"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/memory/{ds}/reject": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Reject facts
+         * @description Retracts the facts on main or on a review branch, keeping their reifiers with `prov:wasInvalidatedBy`, with a commit message that names the reviewer.
+         */
+        post: operations["rejectFacts"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/memory/{ds}/relink": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Use an existing entity
+         * @description On a review branch, every triple and reifier that names `from` names `to` instead, and `from`'s own types and labels are removed, in one commit.
+         */
+        post: operations["relinkEntity"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/memory/{ds}/review/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Review a branch
+         * @description What the branch proposes and retracts relative to main, with signals, new entities and their possible duplicates, and the text of the sources the facts cite.
+         */
+        get: operations["getBranchReview"];
+        put?: never;
         post?: never;
         delete?: never;
         options?: never;
@@ -2981,6 +3166,8 @@ export interface components {
             }[];
             facts?: {
                 confidence?: number;
+                /** @description Reifiers of existing facts this fact rests on, at most 20. */
+                derivedFrom?: string[];
                 /** @enum {string} */
                 mode?: "add" | "replace";
                 /** @description An IRI, a key of `entities`, or a literal in SPARQL syntax. */
@@ -2989,6 +3176,12 @@ export interface components {
                 /** @description At most 1000 characters. */
                 quote?: string;
                 s: string;
+                /** @description The passage of a registered source that supports the fact, in code points of its rendition. */
+                span?: {
+                    end: number;
+                    rendition: string;
+                    start: number;
+                };
             }[];
             /** @description The named graph to write (default: `source.iri`). */
             graph?: string;
@@ -3005,6 +3198,8 @@ export interface components {
                 p: string;
                 s: string;
             })[];
+            /** @description A rendition of `register_source`. The facts of the graph that cite only earlier renditions of its source, and that this call does not assert again, are retracted. */
+            retractStale?: string;
             source?: {
                 iri: string;
                 title?: string;
@@ -3036,6 +3231,8 @@ export interface components {
             minted?: {
                 [key: string]: string;
             };
+            /** @description Set when the review policy wrote the facts to the agent's inbox branch. */
+            notice?: string;
             /** @description The prefixes the compact terms use. */
             prefixes?: {
                 [key: string]: unknown;
@@ -3348,6 +3545,130 @@ export interface components {
             name?: string;
             note?: string | null;
             protected?: boolean;
+        };
+        /** @description What a review branch proposes and retracts, its new entities and the text of the sources it cites. */
+        BranchReview: {
+            ahead?: number;
+            base?: number;
+            behind?: number;
+            branch: string;
+            creator?: string;
+            dataset: string;
+            entities: {
+                candidates: {
+                    iri: string;
+                    label?: string;
+                    shown?: string;
+                }[];
+                iri: string;
+                label?: string;
+                shown?: string;
+                types: string[];
+            }[];
+            facts: {
+                agent?: string;
+                by?: string;
+                candidates?: {
+                    iri: string;
+                    label?: string;
+                    shown?: string;
+                }[];
+                confidence?: string;
+                graph: string;
+                notes?: string[];
+                o: string;
+                oLabel?: string;
+                p: string;
+                /** @description Whether the span, link and guard signals pass. */
+                passes?: boolean;
+                quote?: string;
+                reifiers: string[];
+                s: string;
+                sLabel?: string;
+                /** @description The terms in compact form. */
+                shown?: {
+                    [key: string]: unknown;
+                };
+                signals?: {
+                    /** @enum {string} */
+                    corroboration: "pass" | "fail" | "none" | "unchecked";
+                    /** @enum {string} */
+                    guard: "pass" | "fail" | "none" | "unchecked";
+                    /** @enum {string} */
+                    link: "pass" | "fail" | "none" | "unchecked";
+                    /** @enum {string} */
+                    span: "pass" | "fail" | "none" | "unchecked";
+                };
+                span?: {
+                    end: number;
+                    rendition: string;
+                    start: number;
+                };
+                /** @enum {string} */
+                status: "unreviewed" | "proposed" | "reviewed";
+                time?: string;
+            }[];
+            head?: number;
+            kind?: string;
+            note?: string;
+            /** @description The prefixes the compact terms use. */
+            prefixes?: {
+                [key: string]: unknown;
+            };
+            /** @description Facts made and retracted on the branch. */
+            rejected?: number;
+            retracts: {
+                agent?: string;
+                by?: string;
+                candidates?: {
+                    iri: string;
+                    label?: string;
+                    shown?: string;
+                }[];
+                confidence?: string;
+                graph: string;
+                notes?: string[];
+                o: string;
+                oLabel?: string;
+                p: string;
+                /** @description Whether the span, link and guard signals pass. */
+                passes?: boolean;
+                quote?: string;
+                reifiers: string[];
+                s: string;
+                sLabel?: string;
+                /** @description The terms in compact form. */
+                shown?: {
+                    [key: string]: unknown;
+                };
+                signals?: {
+                    /** @enum {string} */
+                    corroboration: "pass" | "fail" | "none" | "unchecked";
+                    /** @enum {string} */
+                    guard: "pass" | "fail" | "none" | "unchecked";
+                    /** @enum {string} */
+                    link: "pass" | "fail" | "none" | "unchecked";
+                    /** @enum {string} */
+                    span: "pass" | "fail" | "none" | "unchecked";
+                };
+                span?: {
+                    end: number;
+                    rendition: string;
+                    start: number;
+                };
+                /** @enum {string} */
+                status: "unreviewed" | "proposed" | "reviewed";
+                time?: string;
+            }[];
+            sources: {
+                format?: string;
+                length: number;
+                rendition: string;
+                source?: string;
+                text?: string;
+                textOmitted?: boolean;
+                title?: string;
+            }[];
         };
         BranchSettings: {
             dataset?: string;
@@ -4161,6 +4482,21 @@ export interface components {
             validation?: components["schemas"]["ValidationSummary"];
             wouldCommit: boolean;
         };
+        /** @description **Edit value**: replace a fact's object, with the new reifier derived from the old one. */
+        EditFactRequest: {
+            /** @description The review branch the fact is on (default: main). */
+            branch?: string;
+            fact: {
+                graph: string;
+                /** @description The object in N-Triples form, as the inbox lists it. */
+                o: string;
+                p: string;
+                s: string;
+            };
+            /** @description The new object, as `assert_facts` takes it. */
+            o: string;
+            timeoutSeconds?: number;
+        };
         /** @description The body of every non-2xx response. Some errors add members of their own. */
         Error: {
             /** @description A machine-readable reason, such as `precondition-failed`, `history-gone`, `dataset-restoring` or a backup error code. */
@@ -4479,6 +4815,45 @@ export interface components {
             }[];
             snapshots: number;
         };
+        /** @description An ingest profile. */
+        IngestProfile: {
+            /** @description The classes new entities may have (default: the classes with instances or a declaration). */
+            classes?: string[];
+            labelPredicate?: string;
+            /** @description A BCP 47 language tag for new labels. */
+            language?: string;
+            /** @description The predicates facts may use (default: those with triples or a declaration). */
+            predicates?: string[];
+            /** @description Extra SHACL shapes in Turtle. */
+            shapes?: string;
+            /** @description A graph whose classes and properties are offered. */
+            vocabulary?: string;
+        };
+        /** @description The ingest settings of a dataset. */
+        IngestProfiles: {
+            dataset: string;
+            /** @description Whether sources keep their text as chunks. */
+            keepText: boolean;
+            profiles: {
+                [key: string]: {
+                    /** @description The classes new entities may have (default: the classes with instances or a declaration). */
+                    classes?: string[];
+                    labelPredicate?: string;
+                    /** @description A BCP 47 language tag for new labels. */
+                    language?: string;
+                    /** @description The predicates facts may use (default: those with triples or a declaration). */
+                    predicates?: string[];
+                    /** @description Extra SHACL shapes in Turtle. */
+                    shapes?: string;
+                    /** @description A graph whose classes and properties are offered. */
+                    vocabulary?: string;
+                };
+            };
+        };
+        /** @description Whether sources keep their text. */
+        IngestSettingsRequest: {
+            keepText: boolean;
+        };
         /** @enum {string} */
         Level: "read" | "write" | "admin";
         /** @description The server's per-request budgets. 0 means unlimited. */
@@ -4534,6 +4909,86 @@ export interface components {
         Logout: {
             redirect: string | null;
         };
+        /** @description Everything that waits for a person: unreviewed session facts with their signals, by session, and the open review branches. */
+        MemoryInbox: {
+            agentGraphs?: string[];
+            branches: {
+                ahead: number;
+                behind: number;
+                created?: string;
+                creator?: string;
+                /** @description The facts the branch proposes. */
+                facts?: number;
+                /** @enum {string} */
+                kind: "ingest" | "review" | "inbox" | "consolidation" | "proposal";
+                modified?: string;
+                name: string;
+                note?: string;
+                /** @description The facts of main the branch retracts. */
+                retracts?: number;
+            }[];
+            commit: number;
+            dataset: string;
+            /** @description Unreviewed facts plus open review branches. */
+            open: number;
+            /** @description The prefixes the compact terms use. */
+            prefixes?: {
+                [key: string]: unknown;
+            };
+            sessions: {
+                by?: string[];
+                facts: {
+                    agent?: string;
+                    by?: string;
+                    candidates?: {
+                        iri: string;
+                        label?: string;
+                        shown?: string;
+                    }[];
+                    confidence?: string;
+                    graph: string;
+                    notes?: string[];
+                    o: string;
+                    oLabel?: string;
+                    p: string;
+                    /** @description Whether the span, link and guard signals pass. */
+                    passes?: boolean;
+                    quote?: string;
+                    reifiers: string[];
+                    s: string;
+                    sLabel?: string;
+                    /** @description The terms in compact form. */
+                    shown?: {
+                        [key: string]: unknown;
+                    };
+                    signals?: {
+                        /** @enum {string} */
+                        corroboration: "pass" | "fail" | "none" | "unchecked";
+                        /** @enum {string} */
+                        guard: "pass" | "fail" | "none" | "unchecked";
+                        /** @enum {string} */
+                        link: "pass" | "fail" | "none" | "unchecked";
+                        /** @enum {string} */
+                        span: "pass" | "fail" | "none" | "unchecked";
+                    };
+                    span?: {
+                        end: number;
+                        rendition: string;
+                        start: number;
+                    };
+                    /** @enum {string} */
+                    status: "unreviewed" | "proposed" | "reviewed";
+                    time?: string;
+                }[];
+                first?: string;
+                graph: string;
+                last?: string;
+                shown?: string;
+            }[];
+            /** @description The consolidated graph that promotions write to by default. */
+            target?: string;
+            truncated: boolean;
+        };
         /** @description The memory settings of a dataset. */
         MemorySettings: {
             /** @description Graph IRIs or `*` patterns of agent memory. Facts asserted only there are unreviewed. */
@@ -4563,6 +5018,15 @@ export interface components {
                 /** @description Whether transcripts may be imported (Phase 3m-b). */
                 transcripts?: boolean;
             };
+        };
+        /** @description The commit of a reviewer's change. */
+        MemoryWriteResult: {
+            branch?: string;
+            commit?: number;
+            committed?: boolean;
+            dataset: string;
+            deleted?: number;
+            inserted?: number;
         };
         MergeRequest: {
             /** @description The merge base to use among several. */
@@ -5104,6 +5568,31 @@ export interface components {
                 [key: string]: string;
             };
         };
+        /** @description The facts to promote, at most 500. */
+        PromoteRequest: {
+            /** @description An open review branch to add the facts to (default: a new `review.{person}.{date}-{n}`). */
+            branch?: string;
+            facts: {
+                graph: string;
+                /** @description The object in N-Triples form, as the inbox lists it. */
+                o: string;
+                p: string;
+                s: string;
+            }[];
+            message?: string;
+            /** @description The graph to promote into (default: `consolidatedGraph`). */
+            target?: string;
+            timeoutSeconds?: number;
+        };
+        /** @description The review branch that holds the promoted facts, for the merge page. */
+        PromoteResult: {
+            branch: string;
+            commit?: number;
+            committed: boolean;
+            dataset: string;
+            promoted: number;
+            target: string;
+        };
         /** @description One of the two members; 0 means unlimited. */
         QuotaRequest: {
             maxBytes?: number;
@@ -5301,7 +5790,7 @@ export interface components {
             seedLimit?: number;
             /** @description Entity IRIs to start from. */
             seeds?: string[];
-            statuses?: ("reviewed" | "unreviewed")[];
+            statuses?: ("reviewed" | "unreviewed" | "proposed")[];
             /** @description At most the server's query timeout. 30 by default. */
             timeoutSeconds?: number;
             /** @description Class IRIs that seeds found by search must have. */
@@ -5368,6 +5857,39 @@ export interface components {
             committed: boolean;
             dataset: string;
             datasetId: string;
+        };
+        /** @description The facts to retract, at most 500. */
+        RejectRequest: {
+            /** @description The review branch the facts are on (default: main). */
+            branch?: string;
+            facts: {
+                graph: string;
+                /** @description The object in N-Triples form, as the inbox lists it. */
+                o: string;
+                p: string;
+                s: string;
+            }[];
+            /** @description Added to the commit message, at most 500 characters. */
+            reason?: string;
+            timeoutSeconds?: number;
+        };
+        /** @description The retractions, one commit per graph. */
+        RejectResult: {
+            branch: string;
+            commits: {
+                [key: string]: unknown;
+            }[];
+            dataset: string;
+            rejected: number;
+        };
+        /** @description **Use existing**: name an existing entity instead of a new one on a review branch. */
+        RelinkRequest: {
+            branch: string;
+            /** @description The new entity's IRI. */
+            from: string;
+            timeoutSeconds?: number;
+            /** @description The existing entity's IRI. */
+            to: string;
         };
         RelinkResult: {
             /** @description Why the relink published nothing. */
@@ -6733,7 +7255,7 @@ export interface components {
         maxRowsProduced: number;
         /** @description A lower memory budget, in MiB. */
         memoryMb: number;
-        /** @description The name of the stored query, snapshot, vector index or branch. */
+        /** @description The name of the stored query, snapshot, vector index, branch or ingest profile. */
         name: string;
         /** @description The named graphs (SPARQL Protocol). */
         namedGraphUri: string[];
@@ -7994,7 +8516,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The name of the stored query, snapshot, vector index or branch. */
+                /** @description The name of the stored query, snapshot, vector index, branch or ingest profile. */
                 name: components["parameters"]["name"];
             };
             cookie?: never;
@@ -8028,7 +8550,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The name of the stored query, snapshot, vector index or branch. */
+                /** @description The name of the stored query, snapshot, vector index, branch or ingest profile. */
                 name: components["parameters"]["name"];
             };
             cookie?: never;
@@ -8057,7 +8579,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The name of the stored query, snapshot, vector index or branch. */
+                /** @description The name of the stored query, snapshot, vector index, branch or ingest profile. */
                 name: components["parameters"]["name"];
             };
             cookie?: never;
@@ -8094,7 +8616,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The name of the stored query, snapshot, vector index or branch. */
+                /** @description The name of the stored query, snapshot, vector index, branch or ingest profile. */
                 name: components["parameters"]["name"];
             };
             cookie?: never;
@@ -9240,6 +9762,157 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    listIngestProfiles: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The settings and profiles. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IngestProfiles"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getIngestProfile: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The name of the stored query, snapshot, vector index, branch or ingest profile. */
+                name: components["parameters"]["name"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The profile. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IngestProfile"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    putIngestProfile: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The name of the stored query, snapshot, vector index, branch or ingest profile. */
+                name: components["parameters"]["name"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["IngestProfile"];
+            };
+        };
+        responses: {
+            /** @description The stored profile. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IngestProfile"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    deleteIngestProfile: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The name of the stored query, snapshot, vector index, branch or ingest profile. */
+                name: components["parameters"]["name"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Removed. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    putIngestSettings: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["IngestSettingsRequest"];
+            };
+        };
+        responses: {
+            /** @description The stored setting. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IngestSettingsRequest"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
     lint: {
         parameters: {
             query?: never;
@@ -9435,6 +10108,212 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    editFact: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EditFactRequest"];
+            };
+        };
+        responses: {
+            /** @description The result of `assert_facts`. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AssertFactsResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            422: components["responses"]["Unprocessable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getMemoryInbox: {
+        parameters: {
+            query?: {
+                /** @description The most facts, 1 to 500, 200 by default. */
+                limit?: number;
+                /** @description The time limit. */
+                timeoutSeconds?: number;
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The inbox. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryInbox"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            default: components["responses"]["Error"];
+        };
+    };
+    promoteFacts: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PromoteRequest"];
+            };
+        };
+        responses: {
+            /** @description The review branch. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PromoteResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            422: components["responses"]["Unprocessable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    rejectFacts: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RejectRequest"];
+            };
+        };
+        responses: {
+            /** @description The retractions. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RejectResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            422: components["responses"]["Unprocessable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    relinkEntity: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RelinkRequest"];
+            };
+        };
+        responses: {
+            /** @description The commit. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryWriteResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            422: components["responses"]["Unprocessable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getBranchReview: {
+        parameters: {
+            query?: {
+                /** @description The most facts, 1 to 2000, 500 by default. */
+                limit?: number;
+                /** @description The time limit. */
+                timeoutSeconds?: number;
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The name of the stored query, snapshot, vector index, branch or ingest profile. */
+                name: components["parameters"]["name"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The review. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BranchReview"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            default: components["responses"]["Error"];
+        };
+    };
     previewMerge: {
         parameters: {
             query: {
@@ -9619,7 +10498,7 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description The name of the stored query, snapshot, vector index or branch. */
+                /** @description The name of the stored query, snapshot, vector index, branch or ingest profile. */
                 name: components["parameters"]["name"];
             };
             cookie?: never;
@@ -9903,7 +10782,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The name of the stored query, snapshot, vector index or branch. */
+                /** @description The name of the stored query, snapshot, vector index, branch or ingest profile. */
                 name: components["parameters"]["name"];
             };
             cookie?: never;
@@ -9941,7 +10820,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The name of the stored query, snapshot, vector index or branch. */
+                /** @description The name of the stored query, snapshot, vector index, branch or ingest profile. */
                 name: components["parameters"]["name"];
             };
             cookie?: never;
@@ -9989,7 +10868,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The name of the stored query, snapshot, vector index or branch. */
+                /** @description The name of the stored query, snapshot, vector index, branch or ingest profile. */
                 name: components["parameters"]["name"];
             };
             cookie?: never;
@@ -10017,7 +10896,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The name of the stored query, snapshot, vector index or branch. */
+                /** @description The name of the stored query, snapshot, vector index, branch or ingest profile. */
                 name: components["parameters"]["name"];
             };
             cookie?: never;
@@ -11292,7 +12171,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The name of the stored query, snapshot, vector index or branch. */
+                /** @description The name of the stored query, snapshot, vector index, branch or ingest profile. */
                 name: components["parameters"]["name"];
             };
             cookie?: never;
@@ -11321,7 +12200,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The name of the stored query, snapshot, vector index or branch. */
+                /** @description The name of the stored query, snapshot, vector index, branch or ingest profile. */
                 name: components["parameters"]["name"];
             };
             cookie?: never;
@@ -12057,7 +12936,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The name of the stored query, snapshot, vector index or branch. */
+                /** @description The name of the stored query, snapshot, vector index, branch or ingest profile. */
                 name: components["parameters"]["name"];
             };
             cookie?: never;
@@ -12086,7 +12965,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The name of the stored query, snapshot, vector index or branch. */
+                /** @description The name of the stored query, snapshot, vector index, branch or ingest profile. */
                 name: components["parameters"]["name"];
             };
             cookie?: never;
@@ -12130,7 +13009,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The name of the stored query, snapshot, vector index or branch. */
+                /** @description The name of the stored query, snapshot, vector index, branch or ingest profile. */
                 name: components["parameters"]["name"];
             };
             cookie?: never;
@@ -12157,7 +13036,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The name of the stored query, snapshot, vector index or branch. */
+                /** @description The name of the stored query, snapshot, vector index, branch or ingest profile. */
                 name: components["parameters"]["name"];
             };
             cookie?: never;
@@ -12185,7 +13064,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The name of the stored query, snapshot, vector index or branch. */
+                /** @description The name of the stored query, snapshot, vector index, branch or ingest profile. */
                 name: components["parameters"]["name"];
             };
             cookie?: never;
@@ -12214,7 +13093,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The name of the stored query, snapshot, vector index or branch. */
+                /** @description The name of the stored query, snapshot, vector index, branch or ingest profile. */
                 name: components["parameters"]["name"];
             };
             cookie?: never;
@@ -14018,7 +14897,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The name of the stored query, snapshot, vector index or branch. */
+                /** @description The name of the stored query, snapshot, vector index, branch or ingest profile. */
                 name: components["parameters"]["name"];
             };
             cookie?: never;
@@ -14083,7 +14962,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The name of the stored query, snapshot, vector index or branch. */
+                /** @description The name of the stored query, snapshot, vector index, branch or ingest profile. */
                 name: components["parameters"]["name"];
             };
             cookie?: never;

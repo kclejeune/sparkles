@@ -268,6 +268,9 @@ pub fn router(state: Arc<AppState>) -> Router {
     // the memory tools over HTTP: check, recall and the empty-result diagnosis
     #[cfg(feature = "mcp")]
     let app = app.merge(crate::mcp::rest::routes());
+    // the review inbox, branch review and ingest profiles (C18 §7.10, §8.9)
+    #[cfg(feature = "mcp")]
+    let app = app.merge(crate::mcp::review_http::routes());
     // the MCP endpoint (`serve --mcp`)
     #[cfg(feature = "mcp")]
     let app = match crate::mcp::http::route(&state) {

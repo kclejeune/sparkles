@@ -8063,7 +8063,11 @@ open-world when SERVICE is allowed. The common arguments are:
 | `format` | `text` (required, ≤ 1 MiB), `language` (`sparql`\|`turtle`\|`trig`\|`ntriples`\|`nquads`\|`jsonld`; detected when left out), `options` (the camelCase style options of [`POST /$/format`](#formatting)), `timeoutSeconds` (30). It takes no `dataset`. | `{language, changed, text, warnings: [{code, message, line, column}]}`: the text formatted by the engine of `sparkles fmt`. A syntax error is `syntax`, with the line and column in the message. RDF/XML is `unsupported-language`. A result larger than `--mcp-max-bytes` is `too-large`. Only in builds with the `fmt` feature. |
 | `graphql_query` | `query` (a GraphQL document, ≤ 65536 characters; leave it out for the API schema), `variables`, `operationName`, `maxBytes` (65536), `timeoutSeconds` (30) | One text block: the [GraphQL](#graphql) response as JSON with the dataset and commit added, `{dataset, commit, data?, errors?, extensions?}`, or the API schema (SDL) without `query`. Mutations are refused. Listed only while a dataset the caller may query through GraphQL has a schema installed. Only in builds with the `graphql` feature. |
 | `sparql_update` | `update` or `patch` (one of them, ≤ 1 Mi characters), `message` (the commit message), `ifHead` (a commit), `dryRun` (preview instead of committing), `changes` (0–100, with `dryRun`), `timeoutSeconds` (30) | `{dataset, committed, commit, inserted, deleted, patch?, message?, validation?, elapsedMs}`: the receipt of the write. A patch adds `patch: {rows, aborted, prevChecked, prefixesSet, prefixesRemoved}`. A dry run adds `dryRun`, `wouldCommit`, `outcome`, `head`, `graphs`, `changes?`, `storage` and `error?` (below). Listed only when the server allows updates and the caller may write to a dataset (below). |
-| `assert_facts` | `graph` or `source: {iri, title?}` (one is required), `entities` (≤ 200 of `{key, label, types, altLabels?, distinctFrom?}`), `facts` (≤ 500 of `{s, p, o, mode?, confidence?, quote?}`), `retract` (≤ 500 reifier IRIs or `{s, p, o, graph}`), `replaceScope` (`graph`\|`writable`), `message`, `idempotencyKey` (≤ 128 characters), `agent: {name, model?}`, `iriBase`, `allowUnknownIris` (false), `dryRun`, `changes` (0–100, with `dryRun`), `ifHead`, `timeoutSeconds` (30) | `{dataset, branch?, graph, committed, commit?, head, alreadyApplied?, activity, minted, inserted, deleted, superseded, retracted, conflicts, warnings, validation?, dryRun?, elapsedMs, prefixes}`: facts written with their provenance as one commit, described [below](#memory-writes). Listed like `sparql_update`. |
+| `assert_facts` | `graph` or `source: {iri, title?}` (one is required), `entities` (≤ 200 of `{key, label, types, altLabels?, distinctFrom?}`), `facts` (≤ 500 of `{s, p, o, mode?, confidence?, quote?, span?, derivedFrom?}`), `retract` (≤ 500 reifier IRIs or `{s, p, o, graph}`), `replaceScope` (`graph`\|`writable`), `message`, `idempotencyKey` (≤ 128 characters), `agent: {name, model?}`, `iriBase`, `allowUnknownIris` (false), `dryRun`, `changes` (0–100, with `dryRun`), `ifHead`, `retractStale` (a rendition IRI), `timeoutSeconds` (30) | `{dataset, branch?, graph, committed, commit?, head, alreadyApplied?, activity, minted, inserted, deleted, superseded, retracted, conflicts, warnings, validation?, dryRun?, notice?, elapsedMs, prefixes}`: facts written with their provenance as one commit, described [below](#memory-writes). `span`, `derivedFrom` and `retractStale` are described in [Ingest profiles](#ingest-profiles). Listed like `sparql_update`. |
+| `register_source` | `text` (required, ≤ 2 MiB), `iri`, `graph`, `title`, `format` (`text/plain`), `profile`, `message`, `dryRun`, `timeoutSeconds` (30) | `{dataset, branch?, graph, source, rendition, digest, length, alreadyRegistered, committed, commit?, head?, textKept?, profile?, previousRendition?, staleFacts?, chunks: [{iri, index, start, end, text?}], elapsedMs?, prefixes}`: the document's text as a source with chunks, described in [Ingest profiles](#ingest-profiles). Listed like `sparql_update`. |
+| `read_chunks` | `rendition` (required), `from` (0), `count` (5, ≤ 20), `atCommit`, `timeoutSeconds` (30) | `{dataset, branch?, commit, rendition, length, total, chunks, next?, prefixes}`: chunks of a rendition in order with their offsets. |
+| `list_sources` | `graphs` (≤ 20), `limit` (50), `atCommit`, `timeoutSeconds` (30) | `{dataset, branch?, commit, sources: [{source, graph, title?, format?, digest?, rendition, length?, chunks, facts, lastIngestion?}], truncated, prefixes}`. |
+| `ingest_profile` | `name` (`default`), `timeoutSeconds` (30) | `{dataset, name, stored?, classes, predicates: [{iri, label?, object, datatypes?, languages?, ranges?}], shapes?, labelPredicate, language?, vocabulary?, keepText?, schema, prefixes}`: the vocabulary to extract in, with a JSON Schema for an extraction whose class and predicate members are enumerations. |
 | `list_branches` | none | `{dataset, branches: [{name, head, created, lastChange, upstream, from?, ahead, behind, protected, scratch, creator?, expires?, note?}]}`: the branches the caller may see, `main` first. `scratch` marks a branch made by `create_branch`, with its `creator` and, when the server expires idle scratch branches, the time it will expire. |
 | `create_branch` | `name` (required), `from` (`main`), `at` (a commit or selector of `from`), `note` | `{dataset, name, head, created, scratch: true, creator, from, expires?}`: a new [scratch branch](#memory-writes). |
 | `merge_branch` | `source` (required), `target` (`main`), `dryRun` (true), `expect: {source, target}` (required with `dryRun: false`), `message`, `squash`, `changes` (0–100, with `dryRun`), `timeoutSeconds` (30) | A preview as for `sparql_update` with `mergeable`, `conflicts?`, `expect` and `merge` (the fields of [`GET /$/merge/{ds}`](#merges)), or the merge's report with `committed`. |
@@ -8367,6 +8371,8 @@ remain the main interface.
 | `ask_graph` | `dataset`, `question` | The steps of the question pipeline as rules: ground the question with `describe_schema`, `similar_queries` and `link_entities`, ask the person when a mention is ambiguous, check the draft with `check_query`, run it with a limit, repair it at most twice with the suggestions and `why_empty`, answer from the rows citing the commit, and offer `share_query`. The message also holds the dataset's prefixes and the rule about unreviewed agent memory. |
 | `explain_term` | `dataset`, `term` | Explain a class, predicate or resource from `describe_resource` and `describe_schema`, citing the commit. |
 | `agent_memory` | `dataset` | The loop of an agent that uses the dataset as memory. It answers with `recall`, `similar_queries` and `check_query`, and remembers with `link_entities`, then `assert_facts` with a dry run, an idempotency key and `ifHead`, in a graph per source or session, with scratch branches for writes it is unsure of. |
+| `ingest_document` | `dataset`, `profile` (optional) | The steps of an ingestion on a proposal branch: register the text with `register_source`, read the profile with `ingest_profile`, read the chunks in order, link the mentions, and write each fact with its span and quote with `assert_facts`, with `retractStale` on a re-ingestion. The agent stops before the merge, which a person makes. |
+| `consolidate_memory` | `dataset`, `graphs` (optional) | The steps of a consolidation pass on a proposal branch: assert facts that several session graphs repeat into the consolidated graph with `derivedFrom` the session reifiers, and list duplicate entities and conflicts for a person. It never asserts `owl:sameAs` and never merges. |
 
 With `graph`, the message asks to focus on that named graph. A missing required argument,
 an unknown stored query, or a dataset the caller cannot read is `-32602`. Prompt text
@@ -8666,7 +8672,9 @@ When `agentGraphs` is set, `recall` reports a review status. A triple is `review
 the caller's view asserts it in a graph that `agentGraphs` does not match, and
 `unreviewed` when the view asserts it only in agent graphs. Each fact and each citation
 of the JSON format carries `status`, and the text format marks unreviewed facts with
-` unreviewed` and every citation with `status=`. The `statuses` argument keeps only the
+` unreviewed` and every citation with `status=`. On a branch other than `main`, a fact
+that the branch asserts and `main` does not is `proposed`, and the text format marks it
+with ` proposed`. The `statuses` argument keeps only the
 listed statuses, and `unreviewedWeight` (0 to 1, 0.7 by default) multiplies the score of
 the seeds a search finds when all their facts are unreviewed. Superseded entries name
 the reifiers that revise them in `replacedBy`. A dataset without `agentGraphs` reports
@@ -8724,6 +8732,110 @@ instructions.`, then a header line with the dataset, commit, scope, `reviewed-on
 `with-unreviewed`, and the counts. Every literal is escaped as C11 §4.10 requires, so no
 text from a file can start a line of the brief. An entity label that links to more than
 one entity is a `422` with code `ambiguous-entity` and the candidates.
+
+### Ingest profiles
+
+An agent turns a document into facts in three steps. `register_source` stores the
+document's text as a source, `ingest_profile` gives the vocabulary to extract in, and
+`assert_facts` writes each fact with a `span` that points at the passage it rests on. The
+design is in
+[C18 §7](specs/C18-natural-language-questions-and-ingest.md#7-ingestion).
+
+`register_source` normalizes the text to NFC with `\n` line ends and splits it into
+chunks of about 1,000 tokens at headings, paragraphs and sentences. The source
+(`spk:rendition`, `spk:contentDigest`, `dcterms:title`, `dcterms:format`), its
+`spk:TextRendition` and the chunks are written to the source's graph in one commit.
+Offsets count Unicode code points of the normalized text. The rendition IRI is a
+version 5 UUID of the dataset and the digest, so registering the same text again writes
+nothing and answers `alreadyRegistered: true`. A changed text of the same source IRI
+makes a new rendition with `prov:wasRevisionOf` the old one, and the result names
+`previousRendition` and the number of `staleFacts` that cite it. `read_chunks` reads the
+text back, and `list_sources` lists the sources with their chunk and fact counts.
+
+A fact's `span` is `{rendition, start, end}`. `assert_facts` checks that the quote is the
+text at that span, after folding whitespace, and answers `span-mismatch` otherwise. With
+no quote, the passage becomes the quote. The reifier gets `prov:wasDerivedFrom` of the
+span IRI `<rendition#char=start,end>` and of the source. When the rendition's profile
+lists predicates, a fact with a span and another predicate is `unknown-predicate`.
+`derivedFrom` names reifiers a fact rests on, and `retractStale` on the last call of a
+re-extraction retracts the facts of the graph that cite only earlier renditions of the
+source and that the call does not assert again. Their reifiers keep the record with
+`prov:wasInvalidatedBy`.
+
+The ingest settings live in `<db>/ingest.json`. `GET /$/ingest/{ds}/profiles` needs
+`read` and answers `keepText` and the stored profiles. `PUT /$/ingest/{ds}/settings`
+with `{"keepText": false}` needs `admin`, and then sources keep only their digest and
+length, `read_chunks` answers `no-text`, and a fact with a span must carry its quote
+(`quote-required`). `GET`, `PUT` and `DELETE /$/ingest/{ds}/profiles/{name}` read, store
+and remove one profile, and `PUT` and `DELETE` need `admin`:
+
+```json
+{
+  "classes": ["http://www.w3.org/ns/org#OrganizationalUnit"],
+  "predicates": ["http://www.w3.org/ns/org#memberOf", "http://www.w3.org/ns/org#unitOf"],
+  "labelPredicate": "http://www.w3.org/2000/01/rdf-schema#label",
+  "language": "en"
+}
+```
+
+A profile left out lists every class and predicate of the schema report. The profile
+`default` answers `{}` until one is stored. A dataset keeps at most 50 profiles, and the
+IRIs, the language tag and the Turtle of `shapes` must parse.
+
+### Review inbox
+
+The review routes are how a person reviews what agents wrote. They need `read` on the
+dataset and cover the caller's view. Each action writes through `assert_facts` or the
+guard as the caller, so the grants on the graphs and branches it touches decide.
+
+**`GET /$/memory/{ds}/inbox`** lists the unreviewed facts of the agent graphs, grouped
+by session graph, and the open review branches (`proposals.*`, `ingest.*` and
+`review.*`) with the facts each proposes and retracts. A fact is unreviewed when it is
+asserted only in graphs that `agentGraphs` matches. Facts without a reifier, such as
+imported harness memory, are listed after the others. Each fact carries four signals,
+each `pass`, `fail`, `none` or `unchecked`:
+
+| Signal | Passes when |
+|---|---|
+| `span` | The fact cites a span and its quote is still the text there. A fact without a span shows `none`. |
+| `link` | No other entity of a matching type has the same label as an entity the fact names. The other entities are listed in `candidates`. |
+| `guard` | A dry run that writes the fact into the consolidated graph reports no violation for it. |
+| `corroboration` | Another graph asserts the same triple. |
+
+`passes` is true when the span, link and guard signals pass, which is what **Accept all
+that pass** selects. `limit` is 1 to 500, 200 by default.
+
+**`GET /$/memory/{ds}/review/{name}`** reviews one branch. It lists the facts the branch
+asserts with reifiers that `main` does not know, the facts of `main` it retracts, the
+entities it types that `main` does not know with their possible duplicates, and the
+text of the sources the facts cite or the branch registers, up to 2 MiB.
+
+**`POST /$/memory/{ds}/promote`** takes `facts` as the inbox lists them (`s`, `p`, `o`
+and `graph`), an optional `target` graph (the consolidated graph by default) and an
+optional `branch`. It creates `review.{person}.{date}-{n}` unless a branch is named,
+writes the facts into the target with reifiers derived from the facts' own, and answers
+the branch for the merge page. The merge is the acceptance, and after it `recall`
+reports the facts as `reviewed`. **`POST /$/memory/{ds}/reject`** retracts `facts` on
+`main` or on a named `branch` in one commit per graph, with the message
+`Rejected by {person}` and the optional `reason`. **`POST /$/memory/{ds}/relink`** with
+`branch`, `from` and `to` is **Use existing**: on the branch every triple and reifier
+that names `from` names `to` instead, and `from`'s own types and labels go, in one
+commit. **`POST /$/memory/{ds}/edit`** with a `fact` and a new object `o` retracts the
+fact and asserts the new one with its reifier derived from the old.
+
+With `conversationFacts: "review"` for an agent in the memory settings, an
+`assert_facts` call of that agent on `main` runs on its branch `proposals.{agent}.inbox`
+instead, which is created when needed. The result names the branch and carries a
+`notice`, and `main` is unchanged. The agent is matched by the caller's user name or
+one of its roles.
+
+When every error of an `assert_facts` call is `possible-duplicate` and the client uses
+the protocol revision `2026-07-28` and declares elicitation, the call answers
+`input_required` instead of the error. The request `entities` asks, for each new entity,
+whether it is one of the candidates or a new entity. The retried call with the answers
+writes the facts with the chosen IRIs, or with the candidates in `distinctFrom` for a
+new entity. A client without elicitation, or of an older revision, gets the
+`possible-duplicate` error.
 
 ### Suggested examples
 

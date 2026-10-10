@@ -1,0 +1,474 @@
+{
+ "description": "The labelled local sample of C18 §11.2: short documents about the organisation of testsuite/ask/org.ttl, each with gold facts in the demo vocabulary and the quote that supports each fact. A subject or object `_:key` is a new entity that the document introduces, listed with its label and types under `entities`. Every other IRI is a link to an existing entity. The documents are Markdown and plain text. HTML and PDF documents join the sample with the server-side conversion of Phase 4. scripts/eval-ingest scores an ingestion of the sample.",
+ "dataset": "org",
+ "data": "../ask/org.ttl",
+ "prefixes": {
+  "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+  "rdfs": "http://www.w3.org/2000/01/rdf-schema#",
+  "xsd": "http://www.w3.org/2001/XMLSchema#",
+  "foaf": "http://xmlns.com/foaf/0.1/",
+  "ex": "http://example.org/ontology#",
+  "res": "http://example.org/resource/"
+ },
+ "documents": [
+  {
+   "id": "standup-2026-09-01",
+   "title": "Stand-up 2026-09-01",
+   "format": "text/markdown",
+   "source": "https://example.org/sample/standup-2026-09-01",
+   "text": "# Stand-up 2026-09-01\n\nGrace Hopper moved to the Storage team this week. Alan Turing now contributes to the Result Cache project.\n\nNo blockers.\n",
+   "facts": [
+    {
+     "s": "res:Grace_Hopper",
+     "p": "ex:memberOf",
+     "o": "res:team_Storage",
+     "quote": "Grace Hopper moved to the Storage team this week."
+    },
+    {
+     "s": "res:Alan_Turing",
+     "p": "ex:contributesTo",
+     "o": "res:project_Result_Cache",
+     "quote": "Alan Turing now contributes to the Result Cache project."
+    }
+   ]
+  },
+  {
+   "id": "standup-2026-09-08",
+   "title": "Stand-up 2026-09-08",
+   "format": "text/markdown",
+   "source": "https://example.org/sample/standup-2026-09-08",
+   "text": "# Stand-up 2026-09-08\n\n- Barbara Liskov joined the Query Engine team.\n- Ken Thompson is now based in Berlin.\n- The demo moved to Thursday.\n",
+   "facts": [
+    {
+     "s": "res:Barbara_Liskov",
+     "p": "ex:memberOf",
+     "o": "res:team_Query_Engine",
+     "quote": "Barbara Liskov joined the Query Engine team."
+    },
+    {
+     "s": "res:Ken_Thompson",
+     "p": "ex:basedIn",
+     "o": "res:Berlin",
+     "quote": "Ken Thompson is now based in Berlin."
+    }
+   ]
+  },
+  {
+   "id": "hire-sophie-wilson",
+   "title": "New hire: Sophie Wilson",
+   "format": "text/plain",
+   "source": "https://example.org/sample/hire-sophie-wilson",
+   "text": "Sophie Wilson starts at Tessellate on 2026-11-02. She will work for Tessellate from the Berlin office and brings deep experience with Rust.\n",
+   "facts": [
+    {
+     "s": "res:Sophie_Wilson",
+     "p": "ex:worksFor",
+     "o": "res:Tessellate",
+     "quote": "She will work for Tessellate"
+    },
+    {
+     "s": "res:Sophie_Wilson",
+     "p": "ex:startDate",
+     "o": "\"2026-11-02\"^^xsd:date",
+     "quote": "Sophie Wilson starts at Tessellate on 2026-11-02."
+    },
+    {
+     "s": "res:Sophie_Wilson",
+     "p": "ex:basedIn",
+     "o": "res:Berlin",
+     "quote": "from the Berlin office"
+    },
+    {
+     "s": "res:Sophie_Wilson",
+     "p": "ex:hasSkill",
+     "o": "res:skill_Rust",
+     "quote": "brings deep experience with Rust"
+    }
+   ]
+  },
+  {
+   "id": "project-graph-diff",
+   "title": "Project charter: Graph Diff",
+   "format": "text/markdown",
+   "source": "https://example.org/sample/project-graph-diff",
+   "text": "# Graph Diff\n\nGraph Diff is a new project that compares two snapshots of a dataset. Leslie Lamport contributes to Graph Diff, and so does Lynn Conway.\n",
+   "entities": [
+    {
+     "key": "_:graph-diff",
+     "label": "Graph Diff",
+     "types": [
+      "ex:Project"
+     ]
+    }
+   ],
+   "facts": [
+    {
+     "s": "res:Leslie_Lamport",
+     "p": "ex:contributesTo",
+     "o": "_:graph-diff",
+     "quote": "Leslie Lamport contributes to Graph Diff"
+    },
+    {
+     "s": "res:Lynn_Conway",
+     "p": "ex:contributesTo",
+     "o": "_:graph-diff",
+     "quote": "and so does Lynn Conway."
+    }
+   ]
+  },
+  {
+   "id": "team-billing",
+   "title": "Team page: Billing",
+   "format": "text/markdown",
+   "source": "https://example.org/sample/team-billing",
+   "text": "# Billing team\n\nThe Billing team is part of Lattice & Co. Mary Shaw manages the Billing team. Rasmus Lerdorf is a member of the Billing team.\n",
+   "entities": [
+    {
+     "key": "_:billing",
+     "label": "Billing team",
+     "types": [
+      "ex:Team"
+     ]
+    }
+   ],
+   "facts": [
+    {
+     "s": "_:billing",
+     "p": "ex:partOf",
+     "o": "res:Lattice_Co",
+     "quote": "The Billing team is part of Lattice & Co."
+    },
+    {
+     "s": "res:Mary_Shaw",
+     "p": "ex:manages",
+     "o": "_:billing",
+     "quote": "Mary Shaw manages the Billing team."
+    },
+    {
+     "s": "res:Rasmus_Lerdorf",
+     "p": "ex:memberOf",
+     "o": "_:billing",
+     "quote": "Rasmus Lerdorf is a member of the Billing team."
+    }
+   ]
+  },
+  {
+   "id": "retro-q3",
+   "title": "Q3 retrospective",
+   "format": "text/markdown",
+   "source": "https://example.org/sample/retro-q3",
+   "text": "# Q3 retrospective\n\nThe Reasoner team shipped OWL-RL Rules. Robin Milner now contributes to OWL-RL Rules and learned Datalog along the way.\n",
+   "facts": [
+    {
+     "s": "res:Robin_Milner",
+     "p": "ex:contributesTo",
+     "o": "res:project_OWL_RL_Rules",
+     "quote": "Robin Milner now contributes to OWL-RL Rules"
+    },
+    {
+     "s": "res:Robin_Milner",
+     "p": "ex:hasSkill",
+     "o": "res:skill_Datalog",
+     "quote": "learned Datalog along the way"
+    }
+   ]
+  },
+  {
+   "id": "alumni-note",
+   "title": "Alumni newsletter",
+   "format": "text/plain",
+   "source": "https://example.org/sample/alumni-note",
+   "text": "Two of our engineers studied together: Hedy Lamarr and Joan Clarke are both alumni of the Polytechnic of the North.\n",
+   "facts": [
+    {
+     "s": "res:Hedy_Lamarr",
+     "p": "ex:alumnusOf",
+     "o": "res:Polytechnic_of_the_North",
+     "quote": "Hedy Lamarr and Joan Clarke are both alumni of the Polytechnic of the North."
+    },
+    {
+     "s": "res:Joan_Clarke",
+     "p": "ex:alumnusOf",
+     "o": "res:Polytechnic_of_the_North",
+     "quote": "Hedy Lamarr and Joan Clarke are both alumni of the Polytechnic of the North."
+    }
+   ]
+  },
+  {
+   "id": "company-profile-lattice",
+   "title": "Company profile: Lattice & Co",
+   "format": "text/markdown",
+   "source": "https://example.org/sample/company-profile-lattice",
+   "text": "# Lattice & Co\n\nLattice & Co was founded in 2016 and is based in Lisbon. Its newest unit is the Search team, which is part of Lattice & Co.\n",
+   "entities": [
+    {
+     "key": "_:search",
+     "label": "Search team",
+     "types": [
+      "ex:Team"
+     ]
+    }
+   ],
+   "facts": [
+    {
+     "s": "_:search",
+     "p": "ex:partOf",
+     "o": "res:Lattice_Co",
+     "quote": "Its newest unit is the Search team, which is part of Lattice & Co."
+    }
+   ]
+  },
+  {
+   "id": "onboarding-ari",
+   "title": "Onboarding: Ari Moreau",
+   "format": "text/markdown",
+   "source": "https://example.org/sample/onboarding-ari",
+   "text": "# Onboarding\n\nAri Moreau joins Quadrant Labs as an engineer. Ari Moreau is a member of the Research team and knows Grace Hopper from a previous job.\n",
+   "entities": [
+    {
+     "key": "_:ari",
+     "label": "Ari Moreau",
+     "types": [
+      "ex:Engineer"
+     ]
+    }
+   ],
+   "facts": [
+    {
+     "s": "_:ari",
+     "p": "ex:worksFor",
+     "o": "res:Quadrant_Labs",
+     "quote": "Ari Moreau joins Quadrant Labs as an engineer."
+    },
+    {
+     "s": "_:ari",
+     "p": "ex:memberOf",
+     "o": "res:team_Research",
+     "quote": "Ari Moreau is a member of the Research team"
+    },
+    {
+     "s": "_:ari",
+     "p": "foaf:knows",
+     "o": "res:Grace_Hopper",
+     "quote": "knows Grace Hopper from a previous job"
+    }
+   ]
+  },
+  {
+   "id": "standup-2026-09-15",
+   "title": "Stand-up 2026-09-15",
+   "format": "text/markdown",
+   "source": "https://example.org/sample/standup-2026-09-15",
+   "text": "# Stand-up 2026-09-15\n\nDonald Knuth is now a member of the Storage team. Frances Allen contributes to the Delta Merge project. Kai asked about the offsite.\n",
+   "facts": [
+    {
+     "s": "res:Donald_Knuth",
+     "p": "ex:memberOf",
+     "o": "res:team_Storage",
+     "quote": "Donald Knuth is now a member of the Storage team."
+    },
+    {
+     "s": "res:Frances_Allen",
+     "p": "ex:contributesTo",
+     "o": "res:project_Delta_Merge",
+     "quote": "Frances Allen contributes to the Delta Merge project."
+    }
+   ]
+  },
+  {
+   "id": "skills-matrix",
+   "title": "Skills matrix update",
+   "format": "text/plain",
+   "source": "https://example.org/sample/skills-matrix",
+   "text": "Skills update: Katherine Johnson has picked up SPARQL. Evelyn Boyd now lists Compression as a skill.\n",
+   "facts": [
+    {
+     "s": "res:Katherine_Johnson",
+     "p": "ex:hasSkill",
+     "o": "res:skill_SPARQL",
+     "quote": "Katherine Johnson has picked up SPARQL."
+    },
+    {
+     "s": "res:Evelyn_Boyd",
+     "p": "ex:hasSkill",
+     "o": "res:skill_Compression",
+     "quote": "Evelyn Boyd now lists Compression as a skill."
+    }
+   ]
+  },
+  {
+   "id": "relocation",
+   "title": "Relocation notice",
+   "format": "text/plain",
+   "source": "https://example.org/sample/relocation",
+   "text": "Relocation: Linus Torvalds moves to Portland in November, and Anita Borg moves to Nairobi.\n",
+   "facts": [
+    {
+     "s": "res:Linus_Torvalds",
+     "p": "ex:basedIn",
+     "o": "res:Portland",
+     "quote": "Linus Torvalds moves to Portland in November"
+    },
+    {
+     "s": "res:Anita_Borg",
+     "p": "ex:basedIn",
+     "o": "res:Nairobi",
+     "quote": "Anita Borg moves to Nairobi."
+    }
+   ]
+  },
+  {
+   "id": "reorg-storage",
+   "title": "Reorganisation memo",
+   "format": "text/markdown",
+   "source": "https://example.org/sample/reorg-storage",
+   "text": "# Reorganisation\n\nFrom October the Storage team is part of Quadrant Labs. Whitfield Diffie manages the Storage team.\n",
+   "facts": [
+    {
+     "s": "res:team_Storage",
+     "p": "ex:partOf",
+     "o": "res:Quadrant_Labs",
+     "quote": "From October the Storage team is part of Quadrant Labs."
+    },
+    {
+     "s": "res:Whitfield_Diffie",
+     "p": "ex:manages",
+     "o": "res:team_Storage",
+     "quote": "Whitfield Diffie manages the Storage team."
+    }
+   ]
+  },
+  {
+   "id": "project-vector-search",
+   "title": "Project charter: Vector Search",
+   "format": "text/markdown",
+   "source": "https://example.org/sample/project-vector-search",
+   "text": "# Vector Search\n\nVector Search adds nearest-neighbour queries. Carla Ellis contributes to Vector Search. Jim Gray reviews the design.\n",
+   "entities": [
+    {
+     "key": "_:vector-search",
+     "label": "Vector Search",
+     "types": [
+      "ex:Project"
+     ]
+    }
+   ],
+   "facts": [
+    {
+     "s": "res:Carla_Ellis",
+     "p": "ex:contributesTo",
+     "o": "_:vector-search",
+     "quote": "Carla Ellis contributes to Vector Search."
+    }
+   ]
+  },
+  {
+   "id": "standup-2026-09-22",
+   "title": "Stand-up 2026-09-22",
+   "format": "text/markdown",
+   "source": "https://example.org/sample/standup-2026-09-22",
+   "text": "# Stand-up 2026-09-22\n\nAdele Goldberg joined the Web UI team. Bjarne Stroustrup started on 2026-09-21.\n",
+   "facts": [
+    {
+     "s": "res:Adele_Goldberg",
+     "p": "ex:memberOf",
+     "o": "res:team_Web_UI",
+     "quote": "Adele Goldberg joined the Web UI team."
+    },
+    {
+     "s": "res:Bjarne_Stroustrup",
+     "p": "ex:startDate",
+     "o": "\"2026-09-21\"^^xsd:date",
+     "quote": "Bjarne Stroustrup started on 2026-09-21."
+    }
+   ]
+  },
+  {
+   "id": "contract-shafi",
+   "title": "Contract change: Shafi Goldwasser",
+   "format": "text/plain",
+   "source": "https://example.org/sample/contract-shafi",
+   "text": "Shafi Goldwasser now works for Northwind Graph and is based in Lisbon.\n",
+   "facts": [
+    {
+     "s": "res:Shafi_Goldwasser",
+     "p": "ex:worksFor",
+     "o": "res:Northwind_Graph",
+     "quote": "Shafi Goldwasser now works for Northwind Graph"
+    },
+    {
+     "s": "res:Shafi_Goldwasser",
+     "p": "ex:basedIn",
+     "o": "res:Lisbon",
+     "quote": "is based in Lisbon"
+    }
+   ]
+  },
+  {
+   "id": "intro-email",
+   "title": "Introduction",
+   "format": "text/plain",
+   "source": "https://example.org/sample/intro-email",
+   "text": "Hi all, Tony Hoare knows Edsger Dijkstra from the Formal Methods workshop, and he would like to introduce him to Niklaus Wirth.\n",
+   "facts": [
+    {
+     "s": "res:Tony_Hoare",
+     "p": "foaf:knows",
+     "o": "res:Edsger_Dijkstra",
+     "quote": "Tony Hoare knows Edsger Dijkstra"
+    }
+   ]
+  },
+  {
+   "id": "ingest-team-page",
+   "title": "Team page: Ingest",
+   "format": "text/markdown",
+   "source": "https://example.org/sample/ingest-team-page",
+   "text": "# Ingest team\n\nThe Ingest team is part of Tessellate. Ivan Sutherland is a member of the Ingest team. Ada Lovelace manages it.\n",
+   "facts": [
+    {
+     "s": "res:Ivan_Sutherland",
+     "p": "ex:memberOf",
+     "o": "res:team_Ingest",
+     "quote": "Ivan Sutherland is a member of the Ingest team."
+    }
+   ]
+  },
+  {
+   "id": "standup-2026-09-29",
+   "title": "Stand-up 2026-09-29",
+   "format": "text/markdown",
+   "source": "https://example.org/sample/standup-2026-09-29",
+   "text": "# Stand-up 2026-09-29\n\nFran Bilas contributes to the Permutation Index project. Ole Dahl has picked up Svelte for the new pages.\n",
+   "facts": [
+    {
+     "s": "res:Fran_Bilas",
+     "p": "ex:contributesTo",
+     "o": "res:project_Permutation_Index",
+     "quote": "Fran Bilas contributes to the Permutation Index project."
+    },
+    {
+     "s": "res:Ole_Dahl",
+     "p": "ex:hasSkill",
+     "o": "res:skill_Svelte",
+     "quote": "Ole Dahl has picked up Svelte for the new pages."
+    }
+   ]
+  },
+  {
+   "id": "company-profile-northwind",
+   "title": "Company profile: Northwind Graph",
+   "format": "text/markdown",
+   "source": "https://example.org/sample/company-profile-northwind",
+   "text": "# Northwind Graph\n\nNorthwind Graph was founded in 2004. The Reasoner team is part of Northwind Graph. Mary Shaw knows Radia Perlman.\n",
+   "facts": [
+    {
+     "s": "res:Mary_Shaw",
+     "p": "foaf:knows",
+     "o": "res:Radia_Perlman",
+     "quote": "Mary Shaw knows Radia Perlman."
+    }
+   ]
+  }
+ ]
+}

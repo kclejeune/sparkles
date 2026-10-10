@@ -476,7 +476,7 @@ fn expected_input_schemas() -> Vec<(&'static str, Value)> {
                 "maxTriples": {"type":"integer","minimum":1,"maximum":1000,"default":150},
                 "maxBytes": {"type":"integer","minimum":1024,"maximum":1048576,"default":32768},
                 "includeSuperseded": {"type":"boolean","default":false,"description":"List the superseded and retracted facts of the entities returned"},
-                "statuses": {"type":"array","items":{"enum":["reviewed","unreviewed"]},"minItems":1,"maxItems":2,"description":"The review statuses to return when the dataset names agent memory graphs (default both). Unreviewed facts were written by an agent and not yet checked by a person"},
+                "statuses": {"type":"array","items":{"enum":["reviewed","unreviewed","proposed"]},"minItems":1,"maxItems":3,"description":"The review statuses to return when the dataset names agent memory graphs (default all). Unreviewed facts were written by an agent and not yet checked by a person. Proposed facts are asserted only on the review branch you read, not on main"},
                 "unreviewedWeight": {"type":"number","minimum":0,"maximum":1,"default":0.7,"description":"Factor on the score of found seeds whose facts are all unreviewed"},
                 "format": {"enum":["text","json"],"default":"text"},
                 "reasoning": rs,
@@ -528,6 +528,32 @@ fn expected_input_schemas() -> Vec<(&'static str, Value)> {
                 "options": {"type":"object","description":"Style options, as in .sparklesfmt.toml but in camelCase: lineWidth, indentWidth, sort, prunePrefixes, directiveStyle, prefixGroups, typeShorthand, compactIris, quoteStyle, operatorPosition, turtleLayout, alignValues"},
                 "timeoutSeconds": to}}),
         ),
+        (
+            "read_chunks",
+            json!({"type":"object","additionalProperties":false,"required":["rendition"],"properties":{
+                "dataset": ds,
+                "rendition": {"type":"string","description":"The rendition IRI that register_source or list_sources returned"},
+                "from": {"type":"integer","minimum":0,"default":0},
+                "count": {"type":"integer","minimum":1,"maximum":20,"default":5},
+                "atCommit": {"type":"integer","minimum":0},
+                "timeoutSeconds": to}}),
+        ),
+        (
+            "list_sources",
+            json!({"type":"object","additionalProperties":false,"properties":{
+                "dataset": ds,
+                "graphs": {"type":"array","items":{"type":"string"},"maxItems":20,"description":"Only sources in these graphs"},
+                "limit": {"type":"integer","minimum":1,"maximum":200,"default":50},
+                "atCommit": {"type":"integer","minimum":0},
+                "timeoutSeconds": to}}),
+        ),
+        (
+            "ingest_profile",
+            json!({"type":"object","additionalProperties":false,"properties":{
+                "dataset": ds,
+                "name": {"type":"string","description":"The profile's name (default: default)"},
+                "timeoutSeconds": to}}),
+        ),
     ]
 }
 
@@ -568,6 +594,9 @@ async fn a03_tool_list() {
             "validate_shex",
             #[cfg(feature = "fmt")]
             "format",
+            "read_chunks",
+            "list_sources",
+            "ingest_profile",
             "list_branches",
         ]
     );

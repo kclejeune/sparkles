@@ -16,6 +16,7 @@ mod bridge;
 mod complete;
 mod context;
 mod draft;
+mod elicit;
 pub(crate) mod errors;
 #[cfg(feature = "fmt")]
 mod format;
@@ -37,6 +38,7 @@ mod paths;
 mod pins;
 mod render;
 pub mod rest;
+pub mod review_http;
 mod schema_history;
 mod schemas;
 mod search;

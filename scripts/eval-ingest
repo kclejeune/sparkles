@@ -1,0 +1,574 @@
+#!/usr/bin/env python3
+"""The ingestion evaluation of C18 §11.2 on the labelled local sample.
+
+    scripts/eval-ingest --server URL [--dataset org] [--token TOKEN] [--set FILE]
+                        [--branch NAME ...] [--log FILE] [--out DIR]
+    scripts/eval-ingest --self-test [--sparkles BIN] [--out DIR]
+
+An agent ingests the documents of the sample (testsuite/ingest/sample.json) into a
+server that holds testsuite/ask/org.ttl, each document on its own ingest or proposal
+branch, through `register_source` and `assert_facts` with spans. This script then reads
+every such branch through `GET /$/memory/{ds}/review/{branch}` and scores what the branch
+proposes against the gold facts of the sample. A branch belongs to the document whose
+source IRI its sources or its facts' graphs name. `--branch` limits the branches read.
+
+The metrics are those of §11.2.
+
+- Fact precision and recall. A proposed fact matches a gold fact when subject,
+  predicate and object match after linking. A new entity that the agent minted stands
+  for the gold entity of the same document with the same label, compared without case
+  and spacing. Literals match after datatype normalization: numbers by value, and a
+  plain string equal to an `xsd:string`.
+- Linking accuracy. Each existing entity that a document's gold facts name is a
+  mention. It counts as linked when the branch names its IRI, and as mislinked when
+  the branch instead mints a new entity whose duplicate candidates include it. The
+  type and label that declare a new entity are not scored as facts.
+- Duplicate rate. New entities that the gold set does not introduce and that the
+  server's duplicate check found candidates for, per 100 new entities.
+- Span check failures and guard rejections. These calls are refused, so nothing of
+  them reaches a branch. The agent's harness records them in `--log`, a JSON Lines file
+  with one object per `assert_facts` call: `{"doc": ID, "facts": N, "code": CODE}`, where
+  `code` is absent for a call that wrote. `span-mismatch` counts as a span failure and
+  `shape-violation` or `guard` as a guard rejection. An object `{"doc": ID, "tokens":
+  {"input": N, "output": N}}` adds the tokens the document cost.
+- Cost. Tokens per 1,000 characters of source, from the log.
+
+Review effort needs a person and is not measured here.
+
+Reports are written outside the repository, to --out or a new directory under the
+system's temporary directory: `report.md` and `report.json`.
+
+`--self-test` loads org.ttl into a temporary database, serves it with `sparkles serve`
+on a free loopback port, and ingests the sample twice through `/$/mcp`: once as an
+`oracle` agent that asserts the gold facts with their quotes and spans, and once as a
+`weak` agent that misquotes some facts, mints a duplicate of an existing team and gets
+some literals wrong. It checks that the oracle scores 1 on precision, recall and
+linking with no duplicates and no span failures, and that the weak agent scores below
+it on each. It needs no model and makes no network call outside the loopback interface.
+"""
+
+import argparse
+import json
+import os
+import pathlib
+import re
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+from decimal import Decimal, InvalidOperation
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+DEFAULT_SET = ROOT / "testsuite" / "ingest" / "sample.json"
+XSD = "http://www.w3.org/2001/XMLSchema#"
+NUMERIC = {
+    XSD + t
+    for t in (
+        "integer decimal double float long int short byte nonNegativeInteger "
+        "positiveInteger negativeInteger nonPositiveInteger unsignedLong unsignedInt "
+        "unsignedShort unsignedByte"
+    ).split()
+}
+SPAN_CODES = {"span-mismatch"}
+DECLARATION = {
+    "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>",
+    "<http://www.w3.org/2000/01/rdf-schema#label>",
+}
+GUARD_CODES = {"shape-violation", "guard", "write-guard"}
+
+
+# --- terms --------------------------------------------------------------------------
+
+
+def expand(term, prefixes):
+    """A gold term (`res:x`, `"v"^^xsd:date`, `_:key`) in N-Triples form."""
+    if term.startswith("_:") or term.startswith("<"):
+        return term
+    m = re.fullmatch(r'"(.*)"\^\^([A-Za-z][\w-]*):(\S+)', term)
+    if m:
+        return f'"{m.group(1)}"^^<{prefixes[m.group(2)]}{m.group(3)}>'
+    if term.startswith('"'):
+        return term
+    p, _, local = term.partition(":")
+    return f"<{prefixes[p]}{local}>"
+
+
+def norm_label(s):
+    s = unicodedata.normalize("NFKC", s or "").casefold()
+    return " ".join(re.sub(r"[^\w]+", " ", s).split())
+
+
+LIT = re.compile(r'^"(.*)"(?:@([A-Za-z0-9-]+)|\^\^<([^>]*)>)?$', re.S)
+
+
+def norm_term(t):
+    """A term compared after datatype normalization."""
+    m = LIT.match(t)
+    if not m:
+        return t
+    value, lang, dt = m.groups()
+    if lang:
+        return ("lit", value, "@" + lang.lower())
+    dt = dt or XSD + "string"
+    if dt in NUMERIC:
+        try:
+            return ("num", Decimal(value).normalize())
+        except InvalidOperation:
+            pass
+    return ("lit", value, dt)
+
+
+# --- reading a server ---------------------------------------------------------------
+
+
+class Client:
+    def __init__(self, base, token=None):
+        self.base = base.rstrip("/")
+        self.token = token
+
+    def request(self, method, path, body=None, headers=None):
+        h = {"Accept": "application/json"}
+        if self.token:
+            h["Authorization"] = f"Bearer {self.token}"
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode()
+            h["Content-Type"] = "application/json"
+        h.update(headers or {})
+        req = urllib.request.Request(self.base + path, data=data, method=method, headers=h)
+        try:
+            with urllib.request.urlopen(req, timeout=120) as r:
+                raw = r.read().decode()
+                ctype = r.headers.get("Content-Type", "")
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(f"{method} {path}: {e.code} {e.read().decode()[:500]}") from None
+        if "text/event-stream" in ctype:
+            datas = [line[5:].strip() for line in raw.splitlines() if line.startswith("data:")]
+            raw = datas[-1] if datas else "{}"
+        return json.loads(raw) if raw.strip() else None
+
+    def get(self, path):
+        return self.request("GET", path)
+
+    def tool(self, name, args):
+        """A modern `tools/call` through `/$/mcp`; returns the result object."""
+        body = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": name,
+                "arguments": args,
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+            },
+        }
+        rpc = self.request(
+            "POST",
+            "/$/mcp",
+            body,
+            {
+                "Accept": "application/json, text/event-stream",
+                "mcp-protocol-version": "2026-07-28",
+                "mcp-method": "tools/call",
+                "mcp-name": name,
+            },
+        )
+        if rpc.get("error"):
+            raise RuntimeError(f"{name}: {rpc['error']}")
+        return rpc["result"]
+
+
+def error_code(result):
+    if not result.get("isError"):
+        return None
+    meta = (result.get("_meta") or {}).get("io.github.kclejeune.sparkles/error") or {}
+    if meta.get("code"):
+        return meta["code"]
+    text = json.dumps(result)
+    for code in ("span-mismatch", "possible-duplicate", "unknown-predicate", "shape-violation"):
+        if code in text:
+            return code
+    return "error"
+
+
+def read_branches(client, ds, only):
+    inbox = client.get(f"/$/memory/{urllib.parse.quote(ds)}/inbox?limit=500")
+    names = [b["name"] for b in inbox.get("branches", []) if b.get("kind") in ("ingest", "proposal")]
+    if only:
+        names = [n for n in names if n in only] + [n for n in only if n not in names]
+    out = {}
+    for n in names:
+        out[n] = client.get(
+            f"/$/memory/{urllib.parse.quote(ds)}/review/{urllib.parse.quote(n, safe='')}?limit=500"
+        )
+    return out
+
+
+# --- scoring --------------------------------------------------------------------------
+
+
+def score(sample, reviews, log):
+    prefixes = sample["prefixes"]
+    docs = {d["source"]: d for d in sample["documents"]}
+    per_doc = {d["id"]: {"facts": [], "entities": []} for d in sample["documents"]}
+    unattributed = 0
+    for review in reviews.values():
+        sources = {s.get("rendition"): s.get("source") for s in review.get("sources", [])}
+        doc_of_branch = None
+        for s in review.get("sources", []):
+            if s.get("source") in docs:
+                doc_of_branch = docs[s["source"]]["id"]
+        for f in review.get("facts", []):
+            src = None
+            if f.get("span"):
+                src = sources.get(f["span"].get("rendition"))
+            g = f.get("graph", "").strip("<>")
+            doc = docs.get(src) or docs.get(g)
+            did = doc["id"] if doc else doc_of_branch
+            if did is None:
+                unattributed += 1
+                continue
+            per_doc[did]["facts"].append(f)
+        if doc_of_branch:
+            per_doc[doc_of_branch]["entities"].extend(review.get("entities", []))
+
+    tp = fp = fn = 0
+    linked = mislinked = mentions = 0
+    new_entities = duplicates = 0
+    rows = []
+    for d in sample["documents"]:
+        got = per_doc[d["id"]]
+        gold_new = {norm_label(e["label"]): e["key"] for e in d.get("entities", [])}
+        # the minted IRIs of the branch, by label
+        minted = {}
+        for e in got["entities"]:
+            iri = f"<{e['iri']}>" if not e["iri"].startswith("<") else e["iri"]
+            minted[iri] = e
+        to_gold = {}
+        for iri, e in minted.items():
+            key = gold_new.get(norm_label(e.get("label")))
+            to_gold[iri] = key or iri
+            new_entities += 1
+            if key is None and e.get("candidates"):
+                duplicates += 1
+        gold = {
+            (expand(f["s"], prefixes), expand(f["p"], prefixes), norm_term(expand(f["o"], prefixes)))
+            for f in d["facts"]
+        }
+        # the type and label of a new entity come with its declaration and are not facts
+        # that the sample scores
+        proposed = {
+            (to_gold.get(f["s"], f["s"]), f["p"], norm_term(to_gold.get(f["o"], f["o"])))
+            for f in got["facts"]
+            if not (f["s"] in minted and f["p"] in DECLARATION)
+        }
+        hit = gold & proposed
+        tp += len(hit)
+        fp += len(proposed - gold)
+        fn += len(gold - proposed)
+        # links: the existing entities the gold facts name
+        named = {t for f in got["facts"] for t in (f["s"], f["o"])}
+        candidates = {
+            c["iri"] if c["iri"].startswith("<") else f"<{c['iri']}>"
+            for e in minted.values()
+            for c in e.get("candidates", [])
+        }
+        for t in {expand(x, prefixes) for f in d["facts"] for x in (f["s"], f["o"])}:
+            if not t.startswith("<"):
+                continue
+            mentions += 1
+            if t in named:
+                linked += 1
+            elif t in candidates:
+                mislinked += 1
+        rows.append(
+            {"doc": d["id"], "gold": len(gold), "proposed": len(proposed), "matched": len(hit)}
+        )
+
+    calls = [x for x in log if "facts" in x]
+    asserted = sum(x.get("facts", 1) for x in calls)
+    span_fail = sum(x.get("facts", 1) for x in calls if x.get("code") in SPAN_CODES)
+    guard_fail = sum(x.get("facts", 1) for x in calls if x.get("code") in GUARD_CODES)
+    tokens = [x["tokens"] for x in log if "tokens" in x]
+    chars = sum(len(d["text"]) for d in sample["documents"])
+    p = tp / (tp + fp) if tp + fp else 0.0
+    r = tp / (tp + fn) if tp + fn else 0.0
+    return {
+        "documents": len(sample["documents"]),
+        "goldFacts": tp + fn,
+        "proposedFacts": tp + fp,
+        "precision": p,
+        "recall": r,
+        "f1": 2 * p * r / (p + r) if p + r else 0.0,
+        "mentions": mentions,
+        "linkingAccuracy": linked / mentions if mentions else None,
+        "mislinked": mislinked,
+        "newEntities": new_entities,
+        "duplicateRate": 100 * duplicates / new_entities if new_entities else 0.0,
+        "assertedFacts": asserted if log else None,
+        "spanFailureRate": span_fail / asserted if asserted else None,
+        "guardRejectionRate": guard_fail / asserted if asserted else None,
+        "tokensPer1000Chars": (
+            1000 * sum(t.get("input", 0) + t.get("output", 0) for t in tokens) / chars
+            if tokens
+            else None
+        ),
+        "unattributedFacts": unattributed,
+        "byDocument": rows,
+    }
+
+
+def fmt(v, pct=False):
+    if v is None:
+        return "not measured"
+    if isinstance(v, float):
+        return f"{100 * v:.1f}%" if pct else f"{v:.3f}"
+    return str(v)
+
+
+def write_report(out, runs):
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "report.json").write_text(json.dumps(runs, indent=1, default=str) + "\n")
+    lines = ["# Ingestion evaluation (C18 §11.2)", ""]
+    lines += [
+        "| Run | Facts | Precision | Recall | F1 | Linking | Mislinked | Duplicates per 100 | Span failures | Guard rejections | Tokens per 1,000 chars |",
+        "|---|---|---|---|---|---|---|---|---|---|---|",
+    ]
+    for name, s in runs.items():
+        lines.append(
+            f"| {name} | {s['proposedFacts']}/{s['goldFacts']} | {fmt(s['precision'])} | {fmt(s['recall'])} "
+            f"| {fmt(s['f1'])} | {fmt(s['linkingAccuracy'])} | {s['mislinked']} | {s['duplicateRate']:.1f} "
+            f"| {fmt(s['spanFailureRate'], True)} | {fmt(s['guardRejectionRate'], True)} "
+            f"| {fmt(s['tokensPer1000Chars'])} |"
+        )
+    lines += ["", "Review effort needs a person and is not measured by this script.", ""]
+    (out / "report.md").write_text("\n".join(lines))
+    return out / "report.md"
+
+
+# --- the self-test --------------------------------------------------------------------
+
+
+def free_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def code_points(text, needle):
+    b = text.index(needle)
+    a = len(text[:b])
+    return a, a + len(needle)
+
+
+def ingest(client, ds, sample, agent, log):
+    """Ingest every document as `agent` (`oracle` or `weak`)."""
+    prefixes = sample["prefixes"]
+    n = 0
+    for d in sample["documents"]:
+        branch = f"ingest.{agent}-{d['id']}"
+        r = client.tool("create_branch", {"dataset": ds, "name": branch})
+        if r.get("isError"):
+            raise RuntimeError(f"create_branch {branch}: {r}")
+        r = client.tool(
+            "register_source",
+            {
+                "dataset": ds,
+                "branch": branch,
+                "iri": d["source"],
+                "graph": d["source"],
+                "title": d["title"],
+                "format": d["format"],
+                "text": d["text"],
+            },
+        )
+        if r.get("isError"):
+            raise RuntimeError(f"register_source {d['id']}: {r}")
+        rendition = r["structuredContent"]["rendition"]
+        entities = [
+            {"key": e["key"], "label": e["label"], "types": [expand(t, prefixes) for t in e["types"]]}
+            for e in d.get("entities", [])
+        ]
+        swap = {}
+        if agent == "weak" and d["id"] == "reorg-storage":
+            # a duplicate of an existing team instead of the link
+            entities.append(
+                {
+                    "key": "_:storage",
+                    "label": "Storage team",
+                    "types": [expand("ex:Team", prefixes)],
+                    "distinctFrom": [expand("res:team_Storage", prefixes)],
+                }
+            )
+            swap[expand("res:team_Storage", prefixes)] = "_:storage"
+        for i, f in enumerate(d["facts"]):
+            n += 1
+            quote = f["quote"]
+            a, e = code_points(d["text"], quote)
+            o = expand(f["o"], prefixes)
+            if agent == "weak":
+                if n % 4 == 0:
+                    quote = quote + " (paraphrased)"
+                if n % 5 == 0 and o.startswith('"'):
+                    o = o.replace("-0", "-1", 1)
+            s = expand(f["s"], prefixes)
+            fact = {
+                "s": swap.get(s, s),
+                "p": expand(f["p"], prefixes),
+                "o": swap.get(o, o),
+                "quote": quote,
+                "span": {"rendition": rendition, "start": a, "end": e},
+            }
+            used = {fact["s"], fact["o"]}
+            args = {
+                "dataset": ds,
+                "branch": branch,
+                "graph": d["source"],
+                "facts": [fact],
+                "agent": {"name": agent},
+            }
+            ents = [x for x in entities if x["key"] in used]
+            if ents:
+                args["entities"] = ents
+            r = client.tool("assert_facts", args)
+            code = error_code(r)
+            entry = {"doc": d["id"], "facts": 1}
+            if code:
+                entry["code"] = code
+            log.append(entry)
+            if code is None:
+                minted = {
+                    k: v if v.startswith("<") else f"<{v}>"
+                    for k, v in (r["structuredContent"].get("minted") or {}).items()
+                }
+                # later facts of the document name the minted IRI
+                for k, iri in minted.items():
+                    for x in entities:
+                        if x["key"] == k:
+                            x["minted"] = iri
+                entities = [x for x in entities if "minted" not in x]
+                for k, iri in minted.items():
+                    swap_key(swap, d, k, iri)
+                    replace_key(d, k, iri)
+
+
+def swap_key(swap, d, key, iri):
+    for k, v in list(swap.items()):
+        if v == key:
+            swap[k] = iri
+
+
+def replace_key(d, key, iri):
+    """Later facts of the document use the minted IRI of `key`."""
+    for f in d["facts"]:
+        if f["s"] == key:
+            f["s"] = iri
+        if f["o"] == key:
+            f["o"] = iri
+
+
+def self_test(args):
+    sparkles = pathlib.Path(args.sparkles)
+    if not sparkles.exists():
+        sys.exit(f"no sparkles binary at {sparkles}; build it or pass --sparkles")
+    tmp = pathlib.Path(tempfile.mkdtemp(prefix="sparkles-eval-ingest-self-test-"))
+    sample_path = pathlib.Path(args.set)
+    data = (sample_path.parent / json.loads(sample_path.read_text())["data"]).resolve()
+    db = tmp / "org"
+    subprocess.run([str(sparkles), "load", "--loc", str(db), str(data)], check=True,
+                   stdout=subprocess.DEVNULL)
+    port = free_port()
+    server = subprocess.Popen(
+        [str(sparkles), "serve", "--port", str(port), "--data", str(tmp / "data"),
+         "--loc", f"org={db}", "--mcp", "--mcp-allow-update"],
+        stdout=open(tmp / "serve.log", "w"),
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        client = Client(f"http://127.0.0.1:{port}")
+        for _ in range(300):
+            try:
+                client.get("/$/ping")
+                break
+            except Exception:
+                if server.poll() is not None:
+                    sys.exit(f"sparkles serve exited; see {tmp / 'serve.log'}")
+                time.sleep(0.2)
+        runs = {}
+        for agent in ("oracle", "weak"):
+            sample = json.loads(sample_path.read_text())
+            log = []
+            ingest(client, "org", sample, agent, log)
+            reviews = {
+                k: v
+                for k, v in read_branches(client, "org", None).items()
+                if k.startswith(f"ingest.{agent}-")
+            }
+            runs[agent] = score(json.loads(sample_path.read_text()), reviews, log)
+        report = write_report(pathlib.Path(args.out) if args.out else tmp / "report", runs)
+        o, w = runs["oracle"], runs["weak"]
+        checks = [
+            ("oracle precision is 1", o["precision"] == 1.0),
+            ("oracle recall is 1", o["recall"] == 1.0),
+            ("oracle linking is 1", o["linkingAccuracy"] == 1.0),
+            ("oracle has no duplicates", o["duplicateRate"] == 0.0),
+            ("oracle has no span failures", o["spanFailureRate"] == 0.0),
+            ("weak recall is lower", w["recall"] < o["recall"]),
+            ("weak precision is lower", w["precision"] < o["precision"]),
+            ("weak has span failures", (w["spanFailureRate"] or 0) > 0),
+            ("weak has a duplicate", w["duplicateRate"] > 0),
+            ("weak mislinks", w["mislinked"] > 0),
+        ]
+        failed = [n for n, ok in checks if not ok]
+        print(report.read_text())
+        if failed:
+            print("self-test failed: " + ", ".join(failed), file=sys.stderr)
+            print(json.dumps(runs, indent=1, default=str), file=sys.stderr)
+            sys.exit(1)
+        print(f"self-test passed; report in {report.parent}")
+    finally:
+        server.terminate()
+        try:
+            server.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            server.kill()
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--server")
+    ap.add_argument("--dataset", default="org")
+    ap.add_argument("--token", default=os.environ.get("SPARKLES_TOKEN"))
+    ap.add_argument("--set", default=str(DEFAULT_SET))
+    ap.add_argument("--branch", action="append", default=[])
+    ap.add_argument("--log")
+    ap.add_argument("--out")
+    ap.add_argument("--self-test", action="store_true")
+    ap.add_argument("--sparkles", default=str(ROOT / "target" / "release" / "sparkles"))
+    args = ap.parse_args()
+    if args.self_test:
+        return self_test(args)
+    if not args.server:
+        ap.error("--server or --self-test is required")
+    sample = json.loads(pathlib.Path(args.set).read_text())
+    log = []
+    if args.log:
+        log = [json.loads(line) for line in pathlib.Path(args.log).read_text().splitlines() if line.strip()]
+    client = Client(args.server, args.token)
+    reviews = read_branches(client, args.dataset, args.branch)
+    result = score(sample, reviews, log)
+    out = pathlib.Path(args.out) if args.out else pathlib.Path(tempfile.mkdtemp(prefix="sparkles-eval-ingest-"))
+    print(write_report(out, {"run": result}).read_text())
+    print(f"report in {out}")
+
+
+if __name__ == "__main__":
+    main()

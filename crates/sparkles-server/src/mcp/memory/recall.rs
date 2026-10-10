@@ -47,6 +47,8 @@ pub(crate) enum Status {
     Reviewed,
     /// asserted only in graphs that `agentGraphs` matches
     Unreviewed,
+    /// asserted only on the review branch the call reads, not on `main`
+    Proposed,
 }
 
 impl Status {
@@ -54,6 +56,7 @@ impl Status {
         match self {
             Status::Reviewed => "reviewed",
             Status::Unreviewed => "unreviewed",
+            Status::Proposed => "proposed",
         }
     }
 }
@@ -185,10 +188,10 @@ impl Tools<'_> {
         let statuses = a
             .statuses
             .clone()
-            .unwrap_or_else(|| vec![Status::Reviewed, Status::Unreviewed]);
+            .unwrap_or_else(|| vec![Status::Reviewed, Status::Unreviewed, Status::Proposed]);
         if statuses.is_empty() {
             return Err(ToolError::bad_argument(
-                "statuses must name reviewed, unreviewed or both",
+                "statuses must name reviewed, unreviewed or proposed",
             ));
         }
         let weight = a.unreviewed_weight.unwrap_or(UNREVIEWED_WEIGHT);
@@ -313,10 +316,14 @@ impl Tools<'_> {
         let status: Option<Vec<Status>> = if memory.agent_graphs.is_empty() {
             None
         } else {
-            Some(fact_statuses(&r, &facts, &agent).map_err(eng)?)
+            let mut st = fact_statuses(&r, &facts, &agent).map_err(eng)?;
+            self.mark_proposed(&ds, &facts, &mut st, deadline, &ctx)?;
+            Some(st)
         };
         if let Some(st) = &status
-            && !(statuses.contains(&Status::Reviewed) && statuses.contains(&Status::Unreviewed))
+            && ![Status::Reviewed, Status::Unreviewed, Status::Proposed]
+                .iter()
+                .all(|s| statuses.contains(s))
         {
             let mut remap: Vec<Option<usize>> = Vec::with_capacity(facts.len());
             let mut kept: Vec<Fact> = Vec::new();
@@ -940,6 +947,74 @@ fn fact_statuses(
         .collect())
 }
 
+impl Tools<'_> {
+    /// On a branch other than `main`, the facts whose triple `main` does not assert in
+    /// any graph the caller reads there are `proposed` (C18 §8.8).
+    fn mark_proposed(
+        &self,
+        ds: &crate::state::Dataset,
+        facts: &[Fact],
+        status: &mut [Status],
+        deadline: std::time::Instant,
+        ctx: &crate::mcp::errors::ErrorContext,
+    ) -> Result<(), ToolError> {
+        let on_branch = self
+            .call
+            .principal
+            .branch
+            .as_deref()
+            .is_some_and(|b| b != sparkles::branch::MAIN);
+        let Some(main) = ds.main().filter(|_| on_branch) else {
+            return Ok(());
+        };
+        let call = crate::mcp::Call {
+            arrived: self.call.arrived,
+            cancel: self.call.cancel.clone(),
+            request_id: self.call.request_id.clone(),
+            principal: self.call.principal.clone().on_branch(None),
+            headers: None,
+            held: None,
+        };
+        let t = Tools {
+            server: self.server,
+            call: &call,
+        };
+        let r = t.reader(&main, None, None, Some(false), deadline, ctx)?;
+        let triple = |f: &Fact| format!("{} {} {}", f.s, f.p, f.o);
+        let mut rows: Vec<String> = Vec::new();
+        let mut asked: HashSet<String> = HashSet::new();
+        for f in facts {
+            if rows.len() < STATUS_TRIPLES
+                && asked.insert(triple(f))
+                && let (Some(s), Some(o)) = (values_term(&f.s), values_term(&f.o))
+            {
+                rows.push(format!("({s} {} {o})", f.p));
+            }
+        }
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let q = format!(
+            "SELECT DISTINCT ?s ?p ?o WHERE {{ VALUES (?s ?p ?o) {{ {} }} {} }}",
+            rows.join(" "),
+            r.quads("?s ?p ?o", &[]),
+        );
+        let mut on_main: HashSet<String> = HashSet::new();
+        for row in r.rows(&q, Vec::new()).map_err(|e| ctx.engine(e))? {
+            if let [Some(s), Some(p), Some(o)] = row.as_slice() {
+                on_main.insert(format!("{s} {p} {o}"));
+            }
+        }
+        for (f, s) in facts.iter().zip(status.iter_mut()) {
+            let t = triple(f);
+            if asked.contains(&t) && !on_main.contains(&t) {
+                *s = Status::Proposed;
+            }
+        }
+        Ok(())
+    }
+}
+
 fn rank_terms(hits: impl Iterator<Item = (NamedNode, f64)>) -> HashMap<String, usize> {
     let mut best: HashMap<String, f64> = HashMap::new();
     for (s, score) in hits {
@@ -1165,8 +1240,10 @@ impl Doc<'_> {
                 if conflicting.contains(&i) {
                     body.push_str(" conflict");
                 }
-                if self.status.is_some_and(|s| s[i] == Status::Unreviewed) {
-                    body.push_str(" unreviewed");
+                match self.status.map(|s| s[i]) {
+                    Some(Status::Unreviewed) => body.push_str(" unreviewed"),
+                    Some(Status::Proposed) => body.push_str(" proposed"),
+                    _ => {}
                 }
                 body.push('\n');
             }

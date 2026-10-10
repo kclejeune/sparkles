@@ -270,7 +270,7 @@
         }
       },
       "name": {
-        "description": "The name of the stored query, snapshot, vector index or branch.",
+        "description": "The name of the stored query, snapshot, vector index, branch or ingest profile.",
         "in": "path",
         "name": "name",
         "required": true,
@@ -1303,6 +1303,13 @@
                 "confidence": {
                   "type": "number"
                 },
+                "derivedFrom": {
+                  "description": "Reifiers of existing facts this fact rests on, at most 20.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
                 "mode": {
                   "enum": [
                     "add",
@@ -1323,6 +1330,27 @@
                 },
                 "s": {
                   "type": "string"
+                },
+                "span": {
+                  "additionalProperties": false,
+                  "description": "The passage of a registered source that supports the fact, in code points of its rendition.",
+                  "properties": {
+                    "end": {
+                      "type": "integer"
+                    },
+                    "rendition": {
+                      "type": "string"
+                    },
+                    "start": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "rendition",
+                    "start",
+                    "end"
+                  ],
+                  "type": "object"
                 }
               },
               "required": [
@@ -1392,6 +1420,10 @@
               ]
             },
             "type": "array"
+          },
+          "retractStale": {
+            "description": "A rendition of `register_source`. The facts of the graph that cite only earlier renditions of its source, and that this call does not assert again, are retracted.",
+            "type": "string"
           },
           "source": {
             "additionalProperties": false,
@@ -1484,6 +1516,10 @@
               "type": "string"
             },
             "type": "object"
+          },
+          "notice": {
+            "description": "Set when the review policy wrote the facts to the agent's inbox branch.",
+            "type": "string"
           },
           "prefixes": {
             "additionalProperties": true,
@@ -2617,6 +2653,468 @@
             "type": "boolean"
           }
         },
+        "type": "object"
+      },
+      "BranchReview": {
+        "description": "What a review branch proposes and retracts, its new entities and the text of the sources it cites.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#review-inbox"
+        },
+        "properties": {
+          "ahead": {
+            "type": "integer"
+          },
+          "base": {
+            "type": "integer"
+          },
+          "behind": {
+            "type": "integer"
+          },
+          "branch": {
+            "type": "string"
+          },
+          "creator": {
+            "type": "string"
+          },
+          "dataset": {
+            "type": "string"
+          },
+          "entities": {
+            "items": {
+              "properties": {
+                "candidates": {
+                  "items": {
+                    "properties": {
+                      "iri": {
+                        "type": "string"
+                      },
+                      "label": {
+                        "type": "string"
+                      },
+                      "shown": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "iri"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "iri": {
+                  "type": "string"
+                },
+                "label": {
+                  "type": "string"
+                },
+                "shown": {
+                  "type": "string"
+                },
+                "types": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "iri",
+                "types",
+                "candidates"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "facts": {
+            "items": {
+              "properties": {
+                "agent": {
+                  "type": "string"
+                },
+                "by": {
+                  "type": "string"
+                },
+                "candidates": {
+                  "items": {
+                    "properties": {
+                      "iri": {
+                        "type": "string"
+                      },
+                      "label": {
+                        "type": "string"
+                      },
+                      "shown": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "iri"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "confidence": {
+                  "type": "string"
+                },
+                "graph": {
+                  "type": "string"
+                },
+                "notes": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "o": {
+                  "type": "string"
+                },
+                "oLabel": {
+                  "type": "string"
+                },
+                "p": {
+                  "type": "string"
+                },
+                "passes": {
+                  "description": "Whether the span, link and guard signals pass.",
+                  "type": "boolean"
+                },
+                "quote": {
+                  "type": "string"
+                },
+                "reifiers": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "s": {
+                  "type": "string"
+                },
+                "sLabel": {
+                  "type": "string"
+                },
+                "shown": {
+                  "additionalProperties": true,
+                  "description": "The terms in compact form.",
+                  "type": "object"
+                },
+                "signals": {
+                  "properties": {
+                    "corroboration": {
+                      "enum": [
+                        "pass",
+                        "fail",
+                        "none",
+                        "unchecked"
+                      ],
+                      "type": "string"
+                    },
+                    "guard": {
+                      "enum": [
+                        "pass",
+                        "fail",
+                        "none",
+                        "unchecked"
+                      ],
+                      "type": "string"
+                    },
+                    "link": {
+                      "enum": [
+                        "pass",
+                        "fail",
+                        "none",
+                        "unchecked"
+                      ],
+                      "type": "string"
+                    },
+                    "span": {
+                      "enum": [
+                        "pass",
+                        "fail",
+                        "none",
+                        "unchecked"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "span",
+                    "link",
+                    "guard",
+                    "corroboration"
+                  ],
+                  "type": "object"
+                },
+                "span": {
+                  "properties": {
+                    "end": {
+                      "type": "integer"
+                    },
+                    "rendition": {
+                      "type": "string"
+                    },
+                    "start": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "rendition",
+                    "start",
+                    "end"
+                  ],
+                  "type": "object"
+                },
+                "status": {
+                  "enum": [
+                    "unreviewed",
+                    "proposed",
+                    "reviewed"
+                  ],
+                  "type": "string"
+                },
+                "time": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "s",
+                "p",
+                "o",
+                "graph",
+                "status",
+                "reifiers"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "head": {
+            "type": "integer"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "note": {
+            "type": "string"
+          },
+          "prefixes": {
+            "additionalProperties": true,
+            "description": "The prefixes the compact terms use.",
+            "type": "object"
+          },
+          "rejected": {
+            "description": "Facts made and retracted on the branch.",
+            "type": "integer"
+          },
+          "retracts": {
+            "items": {
+              "properties": {
+                "agent": {
+                  "type": "string"
+                },
+                "by": {
+                  "type": "string"
+                },
+                "candidates": {
+                  "items": {
+                    "properties": {
+                      "iri": {
+                        "type": "string"
+                      },
+                      "label": {
+                        "type": "string"
+                      },
+                      "shown": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "iri"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "confidence": {
+                  "type": "string"
+                },
+                "graph": {
+                  "type": "string"
+                },
+                "notes": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "o": {
+                  "type": "string"
+                },
+                "oLabel": {
+                  "type": "string"
+                },
+                "p": {
+                  "type": "string"
+                },
+                "passes": {
+                  "description": "Whether the span, link and guard signals pass.",
+                  "type": "boolean"
+                },
+                "quote": {
+                  "type": "string"
+                },
+                "reifiers": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "s": {
+                  "type": "string"
+                },
+                "sLabel": {
+                  "type": "string"
+                },
+                "shown": {
+                  "additionalProperties": true,
+                  "description": "The terms in compact form.",
+                  "type": "object"
+                },
+                "signals": {
+                  "properties": {
+                    "corroboration": {
+                      "enum": [
+                        "pass",
+                        "fail",
+                        "none",
+                        "unchecked"
+                      ],
+                      "type": "string"
+                    },
+                    "guard": {
+                      "enum": [
+                        "pass",
+                        "fail",
+                        "none",
+                        "unchecked"
+                      ],
+                      "type": "string"
+                    },
+                    "link": {
+                      "enum": [
+                        "pass",
+                        "fail",
+                        "none",
+                        "unchecked"
+                      ],
+                      "type": "string"
+                    },
+                    "span": {
+                      "enum": [
+                        "pass",
+                        "fail",
+                        "none",
+                        "unchecked"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "span",
+                    "link",
+                    "guard",
+                    "corroboration"
+                  ],
+                  "type": "object"
+                },
+                "span": {
+                  "properties": {
+                    "end": {
+                      "type": "integer"
+                    },
+                    "rendition": {
+                      "type": "string"
+                    },
+                    "start": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "rendition",
+                    "start",
+                    "end"
+                  ],
+                  "type": "object"
+                },
+                "status": {
+                  "enum": [
+                    "unreviewed",
+                    "proposed",
+                    "reviewed"
+                  ],
+                  "type": "string"
+                },
+                "time": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "s",
+                "p",
+                "o",
+                "graph",
+                "status",
+                "reifiers"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "sources": {
+            "items": {
+              "properties": {
+                "format": {
+                  "type": "string"
+                },
+                "length": {
+                  "type": "integer"
+                },
+                "rendition": {
+                  "type": "string"
+                },
+                "source": {
+                  "type": "string"
+                },
+                "text": {
+                  "type": "string"
+                },
+                "textOmitted": {
+                  "type": "boolean"
+                },
+                "title": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "rendition",
+                "length"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "dataset",
+          "branch",
+          "facts",
+          "retracts",
+          "entities",
+          "sources"
+        ],
         "type": "object"
       },
       "BranchSettings": {
@@ -5435,6 +5933,56 @@
         ],
         "type": "object"
       },
+      "EditFactRequest": {
+        "additionalProperties": false,
+        "description": "**Edit value**: replace a fact's object, with the new reifier derived from the old one.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#review-inbox"
+        },
+        "properties": {
+          "branch": {
+            "description": "The review branch the fact is on (default: main).",
+            "type": "string"
+          },
+          "fact": {
+            "additionalProperties": false,
+            "properties": {
+              "graph": {
+                "type": "string"
+              },
+              "o": {
+                "description": "The object in N-Triples form, as the inbox lists it.",
+                "type": "string"
+              },
+              "p": {
+                "type": "string"
+              },
+              "s": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "s",
+              "p",
+              "o",
+              "graph"
+            ],
+            "type": "object"
+          },
+          "o": {
+            "description": "The new object, as `assert_facts` takes it.",
+            "type": "string"
+          },
+          "timeoutSeconds": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "fact",
+          "o"
+        ],
+        "type": "object"
+      },
       "Error": {
         "additionalProperties": true,
         "description": "The body of every non-2xx response. Some errors add members of their own.",
@@ -6587,6 +7135,120 @@
         ],
         "type": "object"
       },
+      "IngestProfile": {
+        "additionalProperties": false,
+        "description": "An ingest profile.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ingest-profiles"
+        },
+        "properties": {
+          "classes": {
+            "description": "The classes new entities may have (default: the classes with instances or a declaration).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "labelPredicate": {
+            "type": "string"
+          },
+          "language": {
+            "description": "A BCP 47 language tag for new labels.",
+            "type": "string"
+          },
+          "predicates": {
+            "description": "The predicates facts may use (default: those with triples or a declaration).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "shapes": {
+            "description": "Extra SHACL shapes in Turtle.",
+            "type": "string"
+          },
+          "vocabulary": {
+            "description": "A graph whose classes and properties are offered.",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "IngestProfiles": {
+        "description": "The ingest settings of a dataset.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ingest-profiles"
+        },
+        "properties": {
+          "dataset": {
+            "type": "string"
+          },
+          "keepText": {
+            "description": "Whether sources keep their text as chunks.",
+            "type": "boolean"
+          },
+          "profiles": {
+            "additionalProperties": {
+              "additionalProperties": false,
+              "properties": {
+                "classes": {
+                  "description": "The classes new entities may have (default: the classes with instances or a declaration).",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "labelPredicate": {
+                  "type": "string"
+                },
+                "language": {
+                  "description": "A BCP 47 language tag for new labels.",
+                  "type": "string"
+                },
+                "predicates": {
+                  "description": "The predicates facts may use (default: those with triples or a declaration).",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "shapes": {
+                  "description": "Extra SHACL shapes in Turtle.",
+                  "type": "string"
+                },
+                "vocabulary": {
+                  "description": "A graph whose classes and properties are offered.",
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            },
+            "type": "object"
+          }
+        },
+        "required": [
+          "dataset",
+          "keepText",
+          "profiles"
+        ],
+        "type": "object"
+      },
+      "IngestSettingsRequest": {
+        "additionalProperties": false,
+        "description": "Whether sources keep their text.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ingest-profiles"
+        },
+        "properties": {
+          "keepText": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "keepText"
+        ],
+        "type": "object"
+      },
       "Level": {
         "enum": [
           "read",
@@ -6769,6 +7431,298 @@
         ],
         "type": "object"
       },
+      "MemoryInbox": {
+        "description": "Everything that waits for a person: unreviewed session facts with their signals, by session, and the open review branches.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#review-inbox"
+        },
+        "properties": {
+          "agentGraphs": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "branches": {
+            "items": {
+              "properties": {
+                "ahead": {
+                  "type": "integer"
+                },
+                "behind": {
+                  "type": "integer"
+                },
+                "created": {
+                  "type": "string"
+                },
+                "creator": {
+                  "type": "string"
+                },
+                "facts": {
+                  "description": "The facts the branch proposes.",
+                  "type": "integer"
+                },
+                "kind": {
+                  "enum": [
+                    "ingest",
+                    "review",
+                    "inbox",
+                    "consolidation",
+                    "proposal"
+                  ],
+                  "type": "string"
+                },
+                "modified": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "note": {
+                  "type": "string"
+                },
+                "retracts": {
+                  "description": "The facts of main the branch retracts.",
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "name",
+                "kind",
+                "ahead",
+                "behind"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "commit": {
+            "type": "integer"
+          },
+          "dataset": {
+            "type": "string"
+          },
+          "open": {
+            "description": "Unreviewed facts plus open review branches.",
+            "type": "integer"
+          },
+          "prefixes": {
+            "additionalProperties": true,
+            "description": "The prefixes the compact terms use.",
+            "type": "object"
+          },
+          "sessions": {
+            "items": {
+              "properties": {
+                "by": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "facts": {
+                  "items": {
+                    "properties": {
+                      "agent": {
+                        "type": "string"
+                      },
+                      "by": {
+                        "type": "string"
+                      },
+                      "candidates": {
+                        "items": {
+                          "properties": {
+                            "iri": {
+                              "type": "string"
+                            },
+                            "label": {
+                              "type": "string"
+                            },
+                            "shown": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "iri"
+                          ],
+                          "type": "object"
+                        },
+                        "type": "array"
+                      },
+                      "confidence": {
+                        "type": "string"
+                      },
+                      "graph": {
+                        "type": "string"
+                      },
+                      "notes": {
+                        "items": {
+                          "type": "string"
+                        },
+                        "type": "array"
+                      },
+                      "o": {
+                        "type": "string"
+                      },
+                      "oLabel": {
+                        "type": "string"
+                      },
+                      "p": {
+                        "type": "string"
+                      },
+                      "passes": {
+                        "description": "Whether the span, link and guard signals pass.",
+                        "type": "boolean"
+                      },
+                      "quote": {
+                        "type": "string"
+                      },
+                      "reifiers": {
+                        "items": {
+                          "type": "string"
+                        },
+                        "type": "array"
+                      },
+                      "s": {
+                        "type": "string"
+                      },
+                      "sLabel": {
+                        "type": "string"
+                      },
+                      "shown": {
+                        "additionalProperties": true,
+                        "description": "The terms in compact form.",
+                        "type": "object"
+                      },
+                      "signals": {
+                        "properties": {
+                          "corroboration": {
+                            "enum": [
+                              "pass",
+                              "fail",
+                              "none",
+                              "unchecked"
+                            ],
+                            "type": "string"
+                          },
+                          "guard": {
+                            "enum": [
+                              "pass",
+                              "fail",
+                              "none",
+                              "unchecked"
+                            ],
+                            "type": "string"
+                          },
+                          "link": {
+                            "enum": [
+                              "pass",
+                              "fail",
+                              "none",
+                              "unchecked"
+                            ],
+                            "type": "string"
+                          },
+                          "span": {
+                            "enum": [
+                              "pass",
+                              "fail",
+                              "none",
+                              "unchecked"
+                            ],
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "span",
+                          "link",
+                          "guard",
+                          "corroboration"
+                        ],
+                        "type": "object"
+                      },
+                      "span": {
+                        "properties": {
+                          "end": {
+                            "type": "integer"
+                          },
+                          "rendition": {
+                            "type": "string"
+                          },
+                          "start": {
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "rendition",
+                          "start",
+                          "end"
+                        ],
+                        "type": "object"
+                      },
+                      "status": {
+                        "enum": [
+                          "unreviewed",
+                          "proposed",
+                          "reviewed"
+                        ],
+                        "type": "string"
+                      },
+                      "time": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "s",
+                      "p",
+                      "o",
+                      "graph",
+                      "status",
+                      "reifiers"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "first": {
+                  "type": "string"
+                },
+                "graph": {
+                  "type": "string"
+                },
+                "last": {
+                  "type": "string"
+                },
+                "shown": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "graph",
+                "facts"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "target": {
+            "description": "The consolidated graph that promotions write to by default.",
+            "type": "string"
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "dataset",
+          "commit",
+          "sessions",
+          "branches",
+          "open",
+          "truncated"
+        ],
+        "type": "object"
+      },
       "MemorySettings": {
         "additionalProperties": false,
         "description": "The memory settings of a dataset.",
@@ -6851,6 +7805,36 @@
             "type": "object"
           }
         },
+        "type": "object"
+      },
+      "MemoryWriteResult": {
+        "description": "The commit of a reviewer's change.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#review-inbox"
+        },
+        "properties": {
+          "branch": {
+            "type": "string"
+          },
+          "commit": {
+            "type": "integer"
+          },
+          "committed": {
+            "type": "boolean"
+          },
+          "dataset": {
+            "type": "string"
+          },
+          "deleted": {
+            "type": "integer"
+          },
+          "inserted": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "dataset"
+        ],
         "type": "object"
       },
       "MergeRequest": {
@@ -8693,6 +9677,95 @@
         ],
         "type": "object"
       },
+      "PromoteRequest": {
+        "additionalProperties": false,
+        "description": "The facts to promote, at most 500.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#review-inbox"
+        },
+        "properties": {
+          "branch": {
+            "description": "An open review branch to add the facts to (default: a new `review.{person}.{date}-{n}`).",
+            "type": "string"
+          },
+          "facts": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "graph": {
+                  "type": "string"
+                },
+                "o": {
+                  "description": "The object in N-Triples form, as the inbox lists it.",
+                  "type": "string"
+                },
+                "p": {
+                  "type": "string"
+                },
+                "s": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "s",
+                "p",
+                "o",
+                "graph"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "message": {
+            "type": "string"
+          },
+          "target": {
+            "description": "The graph to promote into (default: `consolidatedGraph`).",
+            "type": "string"
+          },
+          "timeoutSeconds": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "facts"
+        ],
+        "type": "object"
+      },
+      "PromoteResult": {
+        "description": "The review branch that holds the promoted facts, for the merge page.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#review-inbox"
+        },
+        "properties": {
+          "branch": {
+            "type": "string"
+          },
+          "commit": {
+            "type": "integer"
+          },
+          "committed": {
+            "type": "boolean"
+          },
+          "dataset": {
+            "type": "string"
+          },
+          "promoted": {
+            "type": "integer"
+          },
+          "target": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "dataset",
+          "branch",
+          "target",
+          "promoted",
+          "committed"
+        ],
+        "type": "object"
+      },
       "QuotaRequest": {
         "description": "One of the two members; 0 means unlimited.",
         "properties": {
@@ -9356,7 +10429,8 @@
             "items": {
               "enum": [
                 "reviewed",
-                "unreviewed"
+                "unreviewed",
+                "proposed"
               ],
               "type": "string"
             },
@@ -9618,6 +10692,119 @@
           "datasetId",
           "committed",
           "commit"
+        ],
+        "type": "object"
+      },
+      "RejectRequest": {
+        "additionalProperties": false,
+        "description": "The facts to retract, at most 500.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#review-inbox"
+        },
+        "properties": {
+          "branch": {
+            "description": "The review branch the facts are on (default: main).",
+            "type": "string"
+          },
+          "facts": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "graph": {
+                  "type": "string"
+                },
+                "o": {
+                  "description": "The object in N-Triples form, as the inbox lists it.",
+                  "type": "string"
+                },
+                "p": {
+                  "type": "string"
+                },
+                "s": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "s",
+                "p",
+                "o",
+                "graph"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "reason": {
+            "description": "Added to the commit message, at most 500 characters.",
+            "type": "string"
+          },
+          "timeoutSeconds": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "facts"
+        ],
+        "type": "object"
+      },
+      "RejectResult": {
+        "description": "The retractions, one commit per graph.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#review-inbox"
+        },
+        "properties": {
+          "branch": {
+            "type": "string"
+          },
+          "commits": {
+            "items": {
+              "additionalProperties": true,
+              "description": "The result of `assert_facts` for one graph.",
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "dataset": {
+            "type": "string"
+          },
+          "rejected": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "dataset",
+          "branch",
+          "rejected",
+          "commits"
+        ],
+        "type": "object"
+      },
+      "RelinkRequest": {
+        "additionalProperties": false,
+        "description": "**Use existing**: name an existing entity instead of a new one on a review branch.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#review-inbox"
+        },
+        "properties": {
+          "branch": {
+            "type": "string"
+          },
+          "from": {
+            "description": "The new entity's IRI.",
+            "type": "string"
+          },
+          "timeoutSeconds": {
+            "type": "number"
+          },
+          "to": {
+            "description": "The existing entity's IRI.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "branch",
+          "from",
+          "to"
         ],
         "type": "object"
       },
@@ -18751,6 +19938,306 @@
         "x-sparkles-permission": "admin"
       }
     },
+    "/$/ingest/{ds}/profiles": {
+      "get": {
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ingest-profiles"
+        },
+        "operationId": "listIngestProfiles",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IngestProfiles"
+                }
+              }
+            },
+            "description": "The settings and profiles."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "List the ingest profiles",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
+    "/$/ingest/{ds}/profiles/{name}": {
+      "delete": {
+        "description": "Needs `admin` on the dataset.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ingest-profiles"
+        },
+        "operationId": "deleteIngestProfile",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/name"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Remove an ingest profile",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "admin"
+      },
+      "get": {
+        "description": "The profile `default` answers `{}` when it is not stored, which means the whole schema.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ingest-profiles"
+        },
+        "operationId": "getIngestProfile",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/name"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IngestProfile"
+                }
+              }
+            },
+            "description": "The profile."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Get an ingest profile",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "read"
+      },
+      "put": {
+        "description": "Needs `admin` on the dataset. A dataset keeps at most 50 profiles.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ingest-profiles"
+        },
+        "operationId": "putIngestProfile",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/name"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/IngestProfile"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IngestProfile"
+                }
+              }
+            },
+            "description": "The stored profile."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Set an ingest profile",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "admin"
+      }
+    },
+    "/$/ingest/{ds}/settings": {
+      "put": {
+        "description": "Needs `admin` on the dataset.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ingest-profiles"
+        },
+        "operationId": "putIngestSettings",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/IngestSettingsRequest"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IngestSettingsRequest"
+                }
+              }
+            },
+            "description": "The stored setting."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Set whether sources keep their text",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "admin"
+      }
+    },
     "/$/lint": {
       "post": {
         "description": "Lints a SPARQL query or update, or a Turtle or TriG document, with the rules of `sparkles lint`. A syntax error is one of the findings, so the answer is `200` either way. `--format-endpoint` may limit or turn off the route.",
@@ -19197,6 +20684,463 @@
           "Datasets"
         ],
         "x-sparkles-permission": "admin"
+      }
+    },
+    "/$/memory/{ds}/edit": {
+      "post": {
+        "description": "Retracts the fact and asserts it with the new object, with the new reifier derived from the old one.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#review-inbox"
+        },
+        "operationId": "editFact",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EditFactRequest"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AssertFactsResult"
+                }
+              }
+            },
+            "description": "The result of `assert_facts`."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Edit a fact's value",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
+    "/$/memory/{ds}/inbox": {
+      "get": {
+        "description": "Needs `read` on the dataset and covers the caller's view. Unreviewed session facts come with their span, link, guard and corroboration signals.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#review-inbox"
+        },
+        "operationId": "getMemoryInbox",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "description": "The most facts, 1 to 500, 200 by default.",
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The time limit.",
+            "in": "query",
+            "name": "timeoutSeconds",
+            "schema": {
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryInbox"
+                }
+              }
+            },
+            "description": "The inbox."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "List what waits for review",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
+    "/$/memory/{ds}/promote": {
+      "post": {
+        "description": "Writes the facts into the target graph on a review branch with reifiers derived from the facts' own, for a person to merge. Needs `write` on the target graph on that branch.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#review-inbox"
+        },
+        "operationId": "promoteFacts",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PromoteRequest"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PromoteResult"
+                }
+              }
+            },
+            "description": "The review branch."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Promote facts for review",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
+    "/$/memory/{ds}/reject": {
+      "post": {
+        "description": "Retracts the facts on main or on a review branch, keeping their reifiers with `prov:wasInvalidatedBy`, with a commit message that names the reviewer.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#review-inbox"
+        },
+        "operationId": "rejectFacts",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RejectRequest"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RejectResult"
+                }
+              }
+            },
+            "description": "The retractions."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Reject facts",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
+    "/$/memory/{ds}/relink": {
+      "post": {
+        "description": "On a review branch, every triple and reifier that names `from` names `to` instead, and `from`'s own types and labels are removed, in one commit.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#review-inbox"
+        },
+        "operationId": "relinkEntity",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RelinkRequest"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryWriteResult"
+                }
+              }
+            },
+            "description": "The commit."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Use an existing entity",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
+    "/$/memory/{ds}/review/{name}": {
+      "get": {
+        "description": "What the branch proposes and retracts relative to main, with signals, new entities and their possible duplicates, and the text of the sources the facts cite.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#review-inbox"
+        },
+        "operationId": "getBranchReview",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/name"
+          },
+          {
+            "description": "The most facts, 1 to 2000, 500 by default.",
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The time limit.",
+            "in": "query",
+            "name": "timeoutSeconds",
+            "schema": {
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BranchReview"
+                }
+              }
+            },
+            "description": "The review."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Review a branch",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "read"
       }
     },
     "/$/merge/{ds}": {

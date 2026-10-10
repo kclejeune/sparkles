@@ -30,6 +30,9 @@ pub fn all_tools() -> Vec<&'static str> {
         "recall",
         "why_empty",
         "share_query",
+        "read_chunks",
+        "list_sources",
+        "ingest_profile",
     ]);
     if cfg!(feature = "shacl") {
         v.push("validate_shacl");
@@ -547,7 +550,7 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
                 "maxTriples": {"type":"integer","minimum":1,"maximum":1000,"default":150},
                 "maxBytes": {"type":"integer","minimum":1024,"maximum":cfg.max_bytes,"default":32768.min(cfg.max_bytes)},
                 "includeSuperseded": {"type":"boolean","default":false,"description":"List the superseded and retracted facts of the entities returned"},
-                "statuses": {"type":"array","items":{"enum":["reviewed","unreviewed"]},"minItems":1,"maxItems":2,"description":"The review statuses to return when the dataset names agent memory graphs (default both). Unreviewed facts were written by an agent and not yet checked by a person"},
+                "statuses": {"type":"array","items":{"enum":["reviewed","unreviewed","proposed"]},"minItems":1,"maxItems":3,"description":"The review statuses to return when the dataset names agent memory graphs (default all). Unreviewed facts were written by an agent and not yet checked by a person. Proposed facts are asserted only on the review branch you read, not on main"},
                 "unreviewedWeight": {"type":"number","minimum":0,"maximum":1,"default":0.7,"description":"Factor on the score of found seeds whose facts are all unreviewed"},
                 "format": {"enum":["text","json"],"default":"text"},
                 "reasoning": rs(),
@@ -707,6 +710,7 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
     ]
     .into_iter()
     .chain(super::memory::assert_tool(cfg))
+    .chain(super::memory::ingest_tools(cfg))
     .chain(super::branches::tool_defs(cfg))
     .filter(|t| all_tools().contains(&t.name))
     .filter(|t| !super::branches::WRITE_TOOLS.contains(&t.name) || cfg.allow_update)

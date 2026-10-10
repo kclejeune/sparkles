@@ -90,6 +90,9 @@ struct AssertArgs {
     changes: Option<usize>,
     if_head: Option<u64>,
     timeout_seconds: Option<f64>,
+    /// C18 §7.9: retract the facts of the graph that cite only earlier renditions of
+    /// this rendition's source
+    retract_stale: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -110,7 +113,7 @@ struct EntityArg {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct FactArg {
     s: String,
     p: String,
@@ -118,6 +121,18 @@ struct FactArg {
     mode: Option<String>,
     confidence: Option<f64>,
     quote: Option<String>,
+    /// C18 §7.6: the passage of a registered source that supports the fact
+    span: Option<SpanArg>,
+    /// C18 §8.3, §8.8: reifiers this fact's reifier is derived from
+    derived_from: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SpanArg {
+    rendition: String,
+    start: usize,
+    end: usize,
 }
 
 #[derive(Deserialize)]
@@ -209,6 +224,9 @@ struct Fact {
     replace: bool,
     confidence: Option<String>,
     quote: Option<String>,
+    /// further `prov:wasDerivedFrom` values of its reifier: a span, its source, and
+    /// the reifiers it was derived from
+    derived: Vec<NamedNode>,
 }
 
 /// A triple asserted in a graph, by its terms.
@@ -222,7 +240,7 @@ struct Quad {
 
 /// The N-Triples form of a term for SPARQL Update text, with triple terms as
 /// `<<( s p o )>>`. The terms come from oxrdf, which validated and escapes them.
-fn nt(t: &Term) -> String {
+pub(super) fn nt(t: &Term) -> String {
     match t {
         Term::Triple(tr) => triple_term(tr),
         t => t.to_string(),
@@ -238,7 +256,7 @@ fn triple_term(t: &Triple) -> String {
 }
 
 /// The update text's form of a graph: empty for the default graph.
-fn graph_block(g: &NamedNode, body: &str) -> String {
+pub(super) fn graph_block(g: &NamedNode, body: &str) -> String {
     if g.as_str() == DEFAULT_GRAPH {
         format!("{body}\n")
     } else {
@@ -258,13 +276,13 @@ fn decimal(x: f64) -> String {
     }
 }
 
-fn literal(value: &str, datatype: &str) -> String {
+pub(super) fn literal(value: &str, datatype: &str) -> String {
     Literal::new_typed_literal(value, NamedNode::new_unchecked(datatype)).to_string()
 }
 
 /// The IRI of a principal as `urn:x-sparkles:principal:<name>`, percent-encoding what
 /// an IRI may not hold.
-fn principal_iri(name: &str) -> NamedNode {
+pub(super) fn principal_iri(name: &str) -> NamedNode {
     let mut out = String::from("urn:x-sparkles:principal:");
     for b in name.bytes() {
         if b.is_ascii_alphanumeric() || b"-._~:@!$&'()*+,;=".contains(&b) {
@@ -277,7 +295,7 @@ fn principal_iri(name: &str) -> NamedNode {
 }
 
 /// A version 5 UUID (RFC 9562 §5.5) in the namespace `ns`.
-fn uuid_v5(ns: &uuid::Uuid, name: &str) -> uuid::Uuid {
+pub(super) fn uuid_v5(ns: &uuid::Uuid, name: &str) -> uuid::Uuid {
     use sha1::{Digest, Sha1};
     let mut h = Sha1::new();
     h.update(ns.as_bytes());
@@ -367,11 +385,11 @@ fn label_literal(s: &str, prefixes: &[(String, String)]) -> Result<Literal, Stri
 }
 
 /// The time of the call as `xsd:dateTime`.
-fn date_time(ms: i64) -> String {
+pub(super) fn date_time(ms: i64) -> String {
     sparkles::commit::rfc3339_ms(ms)
 }
 
-fn now_ms() -> i64 {
+pub(super) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as i64)
@@ -406,7 +424,12 @@ pub(crate) fn tool_def(cfg: &McpConfig) -> [ToolDef; 1] {
                 "o":{"type":"string","description":"An IRI, a declared key, or a literal in SPARQL syntax (\"text\"@en, 42, \"2026-10-08\"^^xsd:date)"},
                 "mode":{"enum":["add","replace"],"default":"add"},
                 "confidence":{"type":"number","minimum":0,"maximum":1},
-                "quote":{"type":"string","maxLength":MAX_QUOTE_CHARS,"description":"The passage of the source that supports the fact"}}}},
+                "quote":{"type":"string","maxLength":MAX_QUOTE_CHARS,"description":"The passage of the source that supports the fact"},
+                "span":{"type":"object","additionalProperties":false,"required":["rendition","start","end"],"properties":{
+                    "rendition":{"type":"string","description":"The rendition IRI of register_source"},
+                    "start":{"type":"integer","minimum":0},"end":{"type":"integer","minimum":1}},
+                    "description":"Where the passage is in a registered source, in code points of its rendition: the server checks that quote is the text there (span-mismatch otherwise), stores the passage as the quote when you give none, and cites the span and the source"},
+                "derivedFrom":{"type":"array","items":{"type":"string"},"maxItems":20,"description":"Reifiers of existing facts this fact summarizes or copies, such as the session facts a consolidated fact rests on"}}}},
             "retract": {"type":"array","maxItems":MAX_RETRACT,"items":{"anyOf":[
                 {"type":"string","description":"A reifier IRI"},
                 {"type":"object","additionalProperties":false,"required":["s","p","o","graph"],"properties":{
@@ -422,6 +445,7 @@ pub(crate) fn tool_def(cfg: &McpConfig) -> [ToolDef; 1] {
             "dryRun": {"type":"boolean","default":false,"description":"Check and preview the write without committing it"},
             "changes": {"type":"integer","minimum":0,"maximum":MAX_CHANGES,"description":"With dryRun, list up to this many changed quads"},
             "ifHead": {"type":"integer","minimum":0,"description":"Write only if this commit is still the head (the preview's head)"},
+            "retractStale": {"type":"string","description":"A rendition of register_source: also retract the facts of the graph that cite only earlier renditions of its source and that this call does not assert again. Send it with the last call of a re-extraction"},
             "timeoutSeconds": to(cfg)}}),
         output: Some(
             json!({"type":"object","required":["dataset","graph","committed","head","activity","minted","inserted","deleted","superseded","retracted","conflicts","warnings","prefixes"],"properties":{
@@ -435,6 +459,7 @@ pub(crate) fn tool_def(cfg: &McpConfig) -> [ToolDef; 1] {
             "warnings":{"type":"array","items":problem},
             "validation":{"type":"object"},"dryRun":{"type":"object"},
             "elapsedMs":{"type":"number"},
+            "notice":{"type":"string"},
             "prefixes":prefixes()}}),
         ),
         read_only: false,
@@ -485,7 +510,7 @@ impl Tools<'_> {
                 "at most {MAX_RETRACT} retractions per call"
             )));
         }
-        if facts.is_empty() && retract.is_empty() {
+        if facts.is_empty() && retract.is_empty() && a.retract_stale.is_none() {
             return Err(ToolError::bad_argument(
                 "give facts to assert, retract, or both",
             ));
@@ -902,8 +927,20 @@ impl Tools<'_> {
                 replace: f.mode.as_deref() == Some("replace"),
                 confidence: f.confidence.map(decimal),
                 quote: f.quote.clone(),
+                derived: Vec::new(),
             });
         }
+        // C18 §7.6: the span of each fact, and the reifiers it derives from
+        self.check_derivations(
+            &ds,
+            &r,
+            &graph,
+            &resolved,
+            &mut plan_facts,
+            &prefix_map,
+            &ctx,
+            &mut errors,
+        )?;
         // the entities' own facts: their types, labels and alternative labels
         for (i, _) in entities.iter().enumerate() {
             let Some(e) = new_iri(i) else { continue };
@@ -916,6 +953,7 @@ impl Tools<'_> {
                     replace: false,
                     confidence: None,
                     quote: None,
+                    derived: Vec::new(),
                 });
             }
             if let Some((l, alts)) = labels.get(i) {
@@ -926,6 +964,7 @@ impl Tools<'_> {
                     replace: false,
                     confidence: None,
                     quote: None,
+                    derived: Vec::new(),
                 });
                 for al in alts {
                     plan_facts.push(Fact {
@@ -935,6 +974,7 @@ impl Tools<'_> {
                         replace: false,
                         confidence: None,
                         quote: None,
+                        derived: Vec::new(),
                     });
                 }
             }
@@ -972,6 +1012,19 @@ impl Tools<'_> {
                     &mut errors,
                 )
                 .map_err(eng)?;
+            // C18 §7.9: facts that only earlier renditions of the source support
+            if let Some(rs) = &a.retract_stale {
+                self.stale_retractions(
+                    &r,
+                    &graph,
+                    rs,
+                    &plan_facts,
+                    &prefix_map,
+                    &mut retracted,
+                    &mut errors,
+                )
+                .map_err(eng)?;
+            }
         }
         if !errors.is_empty() {
             let codes: BTreeSet<&str> = errors.iter().map(|e| e.code).collect();
@@ -1121,6 +1174,229 @@ impl Tools<'_> {
         out["elapsedMs"] = number(elapsed());
         out["prefixes"] = json!(terms.used());
         Ok(Outcome::Structured(out))
+    }
+
+    /// The span check of C18 §7.6 for each fact with a `span`, the ingest profile of its
+    /// source, and the reifiers named in `derivedFrom`, which must exist in the view.
+    #[allow(clippy::too_many_arguments)]
+    fn check_derivations(
+        &self,
+        ds: &crate::state::Dataset,
+        r: &Reader,
+        graph: &NamedNode,
+        resolved: &[(Node, NamedNode, Node, &FactArg)],
+        plan_facts: &mut [Fact],
+        prefix_map: &BTreeMap<String, String>,
+        ctx: &ErrorContext,
+        errors: &mut Vec<Problem>,
+    ) -> Result<(), ToolError> {
+        use super::ingest::{Renditions, SpanCheck, check_span, ingest_settings, outside_profile};
+        let mut rends = Renditions::default();
+        let settings = resolved
+            .iter()
+            .any(|(_, _, _, f)| f.span.is_some())
+            .then(|| ingest_settings(&self.server.state, ds));
+        let eng = |e: Error| ctx.engine(e);
+        for (i, (_, p, _, f)) in resolved.iter().enumerate() {
+            if let Some(sp) = &f.span {
+                let at = format!("facts[{i}].span");
+                match iri_arg(&sp.rendition, prefix_map, "span.rendition") {
+                    Err(e) => errors.push(Problem::new("invalid-term", e.message).at(&at)),
+                    Ok(rend) => match check_span(
+                        &mut rends,
+                        r,
+                        &rend,
+                        sp.start,
+                        sp.end,
+                        f.quote.as_deref(),
+                        graph,
+                        MAX_QUOTE_CHARS,
+                    )
+                    .map_err(eng)?
+                    {
+                        SpanCheck::Failed { code, message } => {
+                            errors.push(Problem::new(code, message).at(&at))
+                        }
+                        SpanCheck::Ok {
+                            span,
+                            source,
+                            quote,
+                            profile,
+                        } => {
+                            if let (Some(st), Some(name)) = (&settings, &profile)
+                                && outside_profile(st, name, p.as_str())
+                            {
+                                errors.push(
+                                    Problem::new(
+                                        "unknown-predicate",
+                                        format!(
+                                            "<{}> is not in the ingest profile {name} of this source; ingest_profile lists the predicates to extract",
+                                            p.as_str()
+                                        ),
+                                    )
+                                    .at(format!("facts[{i}].p"))
+                                    .term(p.as_str()),
+                                );
+                            }
+                            plan_facts[i].quote = Some(quote);
+                            plan_facts[i].derived.push(span);
+                            if let Some(s) = source {
+                                plan_facts[i].derived.push(s);
+                            }
+                        }
+                    },
+                }
+            }
+            let from = f.derived_from.as_deref().unwrap_or_default();
+            if from.len() > 20 {
+                errors.push(
+                    Problem::new("invalid-term", "at most 20 reifiers in derivedFrom")
+                        .at(format!("facts[{i}].derivedFrom")),
+                );
+                continue;
+            }
+            for (j, d) in from.iter().enumerate() {
+                let at = format!("facts[{i}].derivedFrom[{j}]");
+                match iri_arg(d, prefix_map, "derivedFrom") {
+                    Err(e) => errors.push(Problem::new("invalid-term", e.message).at(at)),
+                    Ok(n) => {
+                        let q = format!(
+                            "ASK {{ {} }}",
+                            r.quads(&format!("?d <{RDF_REIFIES}> ?t"), &[])
+                        );
+                        if r.ask(&q, vec![("d".into(), n.clone().into())])
+                            .map_err(eng)?
+                        {
+                            plan_facts[i].derived.push(n);
+                        } else {
+                            errors.push(
+                                Problem::new(
+                                    "unknown-reifier",
+                                    format!("<{}> reifies no fact you can see", n.as_str()),
+                                )
+                                .at(at)
+                                .term(n.as_str()),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The facts of `graph` whose live reifiers cite spans of earlier renditions of the
+    /// source of `rendition` and none of `rendition` itself, and that this call does
+    /// not assert again (C18 §7.9), added to the retractions.
+    #[allow(clippy::too_many_arguments)]
+    fn stale_retractions(
+        &self,
+        r: &Reader,
+        graph: &NamedNode,
+        rendition: &str,
+        facts: &[Fact],
+        prefix_map: &BTreeMap<String, String>,
+        retracted: &mut Vec<(Quad, Vec<NamedNode>)>,
+        errors: &mut Vec<Problem>,
+    ) -> Result<(), Error> {
+        let rend = match iri_arg(rendition, prefix_map, "retractStale") {
+            Ok(n) => n,
+            Err(e) => {
+                errors.push(Problem::new("invalid-term", e.message).at("retractStale"));
+                return Ok(());
+            }
+        };
+        let g1 = std::slice::from_ref(graph);
+        // the renditions of the same source in the graph
+        let q = format!(
+            "SELECT DISTINCT ?other WHERE {{ {} }} LIMIT 1000",
+            r.quads(
+                &format!(
+                    "?rend <{PROV}wasDerivedFrom> ?src . ?other <{PROV}wasDerivedFrom> ?src ; a <{SPK}TextRendition>"
+                ),
+                g1
+            )
+        );
+        let others: HashSet<String> = r
+            .rows(&q, vec![("rend".into(), rend.clone().into())])?
+            .into_iter()
+            .filter_map(|row| match row.into_iter().next() {
+                Some(Some(Term::NamedNode(n))) => Some(n.as_str().to_string()),
+                _ => None,
+            })
+            .collect();
+        if !others.contains(rend.as_str()) {
+            errors.push(
+                Problem::new(
+                    "unknown-rendition",
+                    format!(
+                        "<{}> is not a rendition registered in graph <{}>",
+                        rend.as_str(),
+                        graph.as_str()
+                    ),
+                )
+                .at("retractStale"),
+            );
+            return Ok(());
+        }
+        // the live reifiers that cite a span, by triple
+        let q = format!(
+            "SELECT ?t ?span WHERE {{ {} }} LIMIT {MAX_OLD_VALUES}",
+            r.quads(
+                &format!(
+                    "?r <{RDF_REIFIES}> ?t ; <{PROV}wasDerivedFrom> ?span FILTER(isIRI(?span) && CONTAINS(STR(?span), \"#char=\")) FILTER NOT EXISTS {{ ?r <{PROV}wasInvalidatedBy> ?x }}"
+                ),
+                g1
+            )
+        );
+        let mut cites: HashMap<String, (Triple, bool, bool)> = HashMap::new();
+        for row in r.rows(&q, Vec::new())? {
+            let [Some(Term::Triple(t)), Some(Term::NamedNode(span))] = row.as_slice() else {
+                continue;
+            };
+            let Some((of, _, _)) = super::ingest::parse_span(span.as_str()) else {
+                continue;
+            };
+            if !others.contains(of) {
+                continue;
+            }
+            let e = cites
+                .entry(t.to_string())
+                .or_insert_with(|| ((**t).clone(), false, false));
+            if of == rend.as_str() {
+                e.1 = true;
+            } else {
+                e.2 = true;
+            }
+        }
+        let again: HashSet<String> = facts
+            .iter()
+            .map(|f| format!("{} {} {}", f.s, f.p, f.o))
+            .collect();
+        let mut stale: Vec<(String, Triple)> = cites
+            .into_iter()
+            .filter(|(_, (_, new, old))| *old && !*new)
+            .map(|(k, (t, _, _))| (k, t))
+            .collect();
+        stale.sort_by(|a, b| a.0.cmp(&b.0));
+        for (_, t) in stale {
+            let s: Term = t.subject.clone().into();
+            let q = Quad {
+                s,
+                p: t.predicate.clone(),
+                o: t.object.clone(),
+                g: graph.clone(),
+            };
+            if again.contains(&format!("{} {} {}", q.s, q.p, q.o))
+                || retracted.iter().any(|(x, _)| *x == q)
+                || !self.is_asserted(r, &q)?
+            {
+                continue;
+            }
+            let rs = live_reifiers(r, &q)?;
+            retracted.push((q, rs));
+        }
+        Ok(())
     }
 
     /// Check 2 of §5.6: each predicate and each type is known to the view.
@@ -1837,6 +2113,11 @@ fn build_update(
         );
         if let Some(s) = source {
             let _ = write!(line, " ; <{PROV}wasDerivedFrom> {s}");
+        }
+        for d in &f.derived {
+            if source != Some(d) {
+                let _ = write!(line, " ; <{PROV}wasDerivedFrom> {d}");
+            }
         }
         if let Some(c) = &f.confidence {
             let _ = write!(line, " ; <{SPK}confidence> {}", literal(c, XSD_DECIMAL));

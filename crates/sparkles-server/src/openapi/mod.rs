@@ -486,7 +486,7 @@ fn parameters() -> Map<String, J> {
         "name",
         path(
             "name",
-            "The name of the stored query, snapshot, vector index or branch.",
+            "The name of the stored query, snapshot, vector index, branch or ingest profile.",
         ),
     );
     put("id", path("id", "The id of the task, token or lock."));

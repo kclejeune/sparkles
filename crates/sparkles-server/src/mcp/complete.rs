@@ -109,6 +109,8 @@ impl Tools<'_> {
                 "explain_term" => (false, &["dataset", "term"]),
                 "agent_memory" => (false, &["dataset"]),
                 "ask_graph" => (false, &["dataset", "question"]),
+                "ingest_document" => (false, &["dataset", "profile"]),
+                "consolidate_memory" => (false, &["dataset", "graphs"]),
                 _ => return Err(unknown(&format!("prompt: {name}"))),
             },
             Target::Template(uri) => {

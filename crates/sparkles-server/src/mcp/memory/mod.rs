@@ -17,8 +17,12 @@ mod assert;
 mod brief;
 mod check;
 mod diagnose;
+pub(crate) mod inbox;
+pub(crate) mod ingest;
 mod link;
+pub(crate) mod policy;
 mod recall;
+pub(crate) mod review;
 mod similar;
 pub(crate) mod text;
 
@@ -269,4 +273,9 @@ impl Tools<'_> {
 /// The definition of `assert_facts`.
 pub(crate) fn assert_tool(cfg: &super::McpConfig) -> [super::schemas::ToolDef; 1] {
     assert::tool_def(cfg)
+}
+
+/// The definitions of the ingestion tools.
+pub(crate) fn ingest_tools(cfg: &super::McpConfig) -> [super::schemas::ToolDef; 4] {
+    ingest::tool_defs(cfg)
 }

@@ -626,17 +626,38 @@ impl ServerHandler for Adapter {
         let args = request.arguments.unwrap_or_default();
         let modern = modern(&ctx);
         let server = self.server.clone();
+        // C18 §9.5: `assert_facts` asks a client that declared elicitation to choose
+        // between possible duplicates (an `input_required` result, which only a modern
+        // client may receive), and applies the answers of its retry
+        let responses = request.input_responses;
+        let can_elicit = modern
+            && ctx
+                .client_capabilities()
+                .is_some_and(|c| c.elicitation.is_some());
+        let asked: Arc<std::sync::Mutex<Option<rmcp::model::InputRequiredResult>>> = Arc::default();
+        let slot = asked.clone();
         // The call runs on its own task, so that it can outlive this request as a task
         // of the tasks extension. Until then, dropping this future stops it.
         let mut stop = StopOnDrop(Some(cancel.clone()));
         let mut work = tokio::spawn(async move {
-            let outcome = match server.call(&name, args, call).await {
-                Ok(o) => o,
-                Err(UnknownTool(name)) => Err(ToolError::new(
-                    "unknown-tool",
-                    404,
-                    format!("Unknown tool: {name}"),
-                )),
+            let outcome = if name == "assert_facts" {
+                let (o, ask) =
+                    super::elicit::assert_facts(&server, args, call, responses, can_elicit).await;
+                if let Some(a) = ask
+                    && let Ok(mut s) = slot.lock()
+                {
+                    *s = Some(a);
+                }
+                o
+            } else {
+                match server.call(&name, args, call).await {
+                    Ok(o) => o,
+                    Err(UnknownTool(name)) => Err(ToolError::new(
+                        "unknown-tool",
+                        404,
+                        format!("Unknown tool: {name}"),
+                    )),
+                }
             };
             let mut r = result(outcome);
             if modern {
@@ -644,11 +665,16 @@ impl ServerHandler for Adapter {
             }
             r
         });
-        let joined = |r: Result<CallToolResult, tokio::task::JoinError>| match r {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!("MCP tool call failed: {e}");
-                result(Err(ToolError::internal(&ctx.id.to_string())))
+        let joined = |r: Result<CallToolResult, tokio::task::JoinError>| -> CallToolResponse {
+            if let Some(a) = asked.lock().ok().and_then(|mut s| s.take()) {
+                return CallToolResponse::InputRequired(a);
+            }
+            match r {
+                Ok(r) => r.into(),
+                Err(e) => {
+                    tracing::error!("MCP tool call failed: {e}");
+                    result(Err(ToolError::internal(&ctx.id.to_string()))).into()
+                }
             }
         };
         // a client that declared the tasks extension gets a task for a call that runs
@@ -665,13 +691,13 @@ impl ServerHandler for Adapter {
         tokio::select! {
             r = &mut work => {
                 stop.0 = None;
-                return Ok(joined(r).into());
+                return Ok(joined(r));
             }
             () = ctx.ct.cancelled() => {
                 cancel.store(true, Ordering::Relaxed);
                 let r = work.await;
                 stop.0 = None;
-                return Ok(joined(r).into());
+                return Ok(joined(r));
             }
             () = after, if as_task => {}
         }
