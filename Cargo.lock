@@ -5661,6 +5661,8 @@ dependencies = [
  "candle-nn",
  "candle-transformers",
  "libc",
+ "libmimalloc-sys",
+ "mimalloc",
  "parking_lot",
  "rayon",
  "reqwest",

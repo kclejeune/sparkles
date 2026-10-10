@@ -29,6 +29,9 @@ libc = "0.2"
 tempfile.workspace = true
 # the HTTP client of the benchmark example's downloads
 reqwest.workspace = true
+# the server's allocator, so the benchmark's memory figures match a server's
+mimalloc = "0.1.52"
+libmimalloc-sys = { version = "0.1.49", features = ["extended"] }
 
 [[example]]
 name = "embed-bench"

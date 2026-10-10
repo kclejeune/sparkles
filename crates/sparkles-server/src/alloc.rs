@@ -88,6 +88,22 @@ pub fn start_idle_release(interval: Duration) {
         .expect("spawning the idle-release thread");
 }
 
+/// Return the calling thread's free heap memory to the system: what a local embedding
+/// model runs on each of its threads after it drops its weights (spec F12).
+#[cfg_attr(not(feature = "embed-local"), allow(dead_code))]
+pub fn release_current_thread() {
+    #[cfg(feature = "mimalloc")]
+    // SAFETY: mi_collect only returns free memory to the OS.
+    unsafe {
+        libmimalloc_sys::mi_collect(true)
+    };
+    #[cfg(all(target_os = "linux", target_env = "gnu", not(feature = "mimalloc")))]
+    // SAFETY: malloc_trim only returns free memory to the OS.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
 fn release() {
     #[cfg(feature = "mimalloc")]
     {

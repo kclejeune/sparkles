@@ -347,9 +347,10 @@ fn indexes(put: &mut dyn FnMut(&str, J)) {
         json!({ "m": int(), "efConstruction": int(), "efSearch": int(), "nodes": int(), "layers": int() }),
     );
     let embedding_config = obj(
-        &["url", "model"],
+        &["model"],
         json!({
-            "url": string(),
+            "url": with_desc(string(), "The endpoint. Required unless `provider` is set."),
+            "provider": with_desc(string(), "A provider of the model configuration, instead of `url` and `apiKey`."),
             "model": string(),
             "apiKey": { "type": "object", "description": "`{secret: NAME}`, or `{env}` and `{file}` locally.", "additionalProperties": string() },
             "sendDimensions": boolean(),
@@ -452,6 +453,7 @@ fn indexes(put: &mut dyn FnMut(&str, J)) {
                             "retryAt": string(),
                             "lastBatch": obj(&["at", "inputs", "ms"], json!({ "at": string(), "inputs": int(), "ms": num() })),
                             "config": embedding_config,
+                            "local": any_object("For a provider of the local kind, the model's entry of `local` in `GET /$/models`."),
                         }),
                     ),
                 }),

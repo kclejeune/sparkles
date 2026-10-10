@@ -238,7 +238,14 @@ impl LocalModels {
             "downloading the model {label} into {}",
             self.store.root().display()
         );
-        let r = sparkles_modelstore::HubSource::default()
+        // a mirror and a token for gated repositories, as `sparkles models pull` reads them
+        let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+        let hub = sparkles_modelstore::HubSource {
+            endpoint: env("SPARKLES_HUB_ENDPOINT")
+                .unwrap_or_else(|| sparkles_modelstore::DEFAULT_ENDPOINT.into()),
+            token: env("HF_TOKEN"),
+        };
+        let r = hub
             .plan(
                 &client,
                 &id.repo,
@@ -287,6 +294,11 @@ impl LocalModels {
             threads: spec.threads,
             idle_unload: (spec.idle_unload_secs > 0)
                 .then(|| Duration::from_secs(spec.idle_unload_secs)),
+            // the freed weights go back to the system at once, not at the next idle
+            // release of the request threads
+            release: Some(sparkles_embed::Release(Arc::new(
+                crate::alloc::release_current_thread,
+            ))),
             ..Default::default()
         };
         let e = Arc::new(
@@ -573,5 +585,74 @@ mod tests {
         .unwrap();
         let d = local.describe_one(&models.config, "emb", "minilm").unwrap();
         assert_eq!(d["state"], "present");
+    }
+
+    /// A local model from a directory: resolved, embedded in the process, its state
+    /// reported, and a change of its settings starts a new runtime.
+    #[cfg(feature = "embed-local")]
+    #[test]
+    fn a_local_model_embeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let model = tmp.path().join("tiny");
+        std::fs::create_dir_all(&model).unwrap();
+        sparkles_embed::testing::tiny_bert(&model);
+        let mut st =
+            AppState::new(tmp.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap();
+        let local = Arc::new(LocalModels::new(
+            tmp.path().join("models"),
+            Download::Off,
+            OutboundPolicy::default(),
+        ));
+        st.local_models = Some(local.clone());
+        let st = Arc::new(st);
+        let config = |dimensions: Option<usize>| {
+            let mut m = json!({ "path": model.display().to_string(), "threads": 1 });
+            if let Some(d) = dimensions {
+                m["dimensions"] = d.into();
+            }
+            let cfg = ModelsConfig::parse(
+                &json!({ "providers": { "emb": { "kind": "local", "models": { "tiny": m } } } })
+                    .to_string(),
+            )
+            .unwrap();
+            Arc::new(Models::new(
+                cfg,
+                Default::default(),
+                OutboundPolicy::default(),
+            ))
+        };
+        st.set_models(Some(config(None)));
+        let p = ServerProviders::new(local.clone());
+        p.attach(&st);
+        let Target::Local(m) = p.resolve("emb", "tiny").unwrap() else {
+            panic!("a local target");
+        };
+        let v = m
+            .embed(
+                &["hello world".into(), "rivers of france".into()],
+                false,
+                None,
+            )
+            .unwrap();
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].len(), 32);
+        let q = m.embed(&["hello world".into()], true, Some(8)).unwrap();
+        assert_eq!(q[0].len(), 8);
+        let d = local
+            .describe_one(&st.models().unwrap().config, "emb", "tiny")
+            .unwrap();
+        assert_eq!(d["state"], "loaded", "{d}");
+        assert_eq!(d["arch"], "bert");
+        assert!(d["weightBytes"].as_u64().unwrap() > 0);
+
+        // new settings, a new runtime with them
+        st.set_models(Some(config(Some(16))));
+        let Target::Local(m) = p.resolve("emb", "tiny").unwrap() else {
+            panic!("a local target");
+        };
+        assert_eq!(
+            m.embed(&["hello".into()], false, None).unwrap()[0].len(),
+            16
+        );
     }
 }

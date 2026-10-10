@@ -19,6 +19,8 @@ mod nomic;
 pub mod pooling;
 mod qwen3;
 pub mod snapshot;
+#[doc(hidden)]
+pub mod testing;
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -123,6 +125,20 @@ pub struct Options {
     pub micro_batch: usize,
     /// Added to the nice value of the inference threads (Linux); 0 leaves it.
     pub nice: i32,
+    /// Called after the weights are dropped, on the dispatcher thread and on each thread
+    /// of the pool, to hand the freed memory back to the system. An allocator with
+    /// per-thread heaps, such as mimalloc, keeps freed pages until it is asked.
+    pub release: Option<Release>,
+}
+
+/// A function that returns freed heap memory to the system ([`Options::release`]).
+#[derive(Clone)]
+pub struct Release(pub Arc<dyn Fn() + Send + Sync>);
+
+impl std::fmt::Debug for Release {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Release")
+    }
 }
 
 impl Default for Options {
@@ -133,6 +149,7 @@ impl Default for Options {
             max_queued: 4096,
             micro_batch: 16,
             nice: 10,
+            release: None,
         }
     }
 }
@@ -448,6 +465,10 @@ fn dispatch(
     let mut model: Option<Loaded> = None;
     let unload = |model: &mut Option<Loaded>| {
         if model.take().is_some() {
+            if let Some(Release(f)) = &opts.release {
+                f();
+                pool.broadcast(|_| f());
+            }
             let mut s = shared.status.lock();
             s.state = State::Unloaded;
             s.unloads += 1;
