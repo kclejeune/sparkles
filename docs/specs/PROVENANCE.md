@@ -648,6 +648,10 @@ implementation landed.
   - for the email channel of Phase 2, RFC 5321, RFC 5322, RFC 3207, RFC 4954, RFC 6409
     and RFC 8314;
   - the Sparkles code and specs C18, C19 and F05.
+- **Implementation:** Phase 1, from the spec, docs/API.md and the Sparkles code only
+  (2026-10-10). It adds no dependency. HMAC-SHA256 is written on the `sha2` crate the
+  server already uses, and checked against the vectors of RFC 4231 and the example of
+  the Standard Webhooks reference libraries.
 - **Rejected** (spec §13):
   - notifications through Alertmanager only;
   - a configuration file of its own;

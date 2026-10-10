@@ -49,6 +49,7 @@ without a migration path, so keep backups of anything you cannot regenerate.
   * [Escalation](#escalation)
   * [The Ask bar](#the-ask-bar)
   * [Measuring models](#measuring-models)
+* [Sending notifications](#sending-notifications)
 * [Embedding the library](#embedding-the-library)
 * [Python](#python)
 * [JVM (Apache Jena)](#jvm-apache-jena)
@@ -3145,6 +3146,98 @@ in [API.md](API.md#explaining-a-query), and from the MCP tool `explain_query` wi
 `notes: true`. `profile: "run"` runs the query read-only and explains the executed plan.
 The MCP tool calls the server's models only with `useServerModel: true`, which needs a
 grant with `server_models = true`.
+
+## Sending notifications
+
+The server can tell a person when something needs them. It sends a notification to a
+webhook or an ntfy topic when agent memory has waited for review too long, when a
+backup policy run fails, and when a model provider's daily token budget is used up.
+Notifications are off until the configuration turns them on.
+
+The configuration is the server-wide settings kind `notifications`. An operator declares
+it in the settings file under `server.notifications`, and a server administrator changes
+it at runtime unless the settings file locks a field, as for the model configuration.
+A channel never holds a credential. It names a secret, which comes from
+`--model-secret NAME=file:PATH` or from a value stored with `sparkles secrets set`.
+
+```json
+{
+  "server": {
+    "notifications": {
+      "enabled": true,
+      "baseUrl": "https://sparkles.example.org",
+      "channels": {
+        "phone": { "type": "ntfy", "topic": "sparkles-ops", "token": { "secret": "ntfy-token" } },
+        "ops": { "type": "webhook", "url": "https://hooks.example.org/sparkles", "signingSecret": { "secret": "hook-signing" } }
+      },
+      "routes": { "memory.review.pending": ["phone"], "backup.*": ["phone", "ops"], "*": ["ops"] }
+    },
+    "locked": ["notifications.channels.phone"]
+  }
+}
+```
+
+```sh
+sparkles serve --loc data/org --settings settings.json \
+  --model-secret ntfy-token=file:/run/secrets/ntfy-token \
+  --model-secret hook-signing=file:/run/secrets/hook-signing
+sparkles notify test phone
+sparkles notify status
+```
+
+`sparkles notify test CHANNEL` sends a test notification to one channel at once, even
+while notifications are off, and prints the HTTP status the channel answered or the
+error. `sparkles notify status` prints each channel with its last success and its last
+failure, the routes, and the conditions that were notified. The same configuration can
+be changed from the command line:
+
+```sh
+sparkles settings set --global notifications.enabled=true \
+  'notifications.routes.*=["ops"]'
+sparkles secrets set hook-signing < hook-signing.key
+```
+
+A webhook receives the notification as a JSON body. With `signingSecret`, the request
+carries the `webhook-id`, `webhook-timestamp` and `webhook-signature` headers of
+Standard Webhooks, and the libraries of that specification verify them. A webhook URL
+that holds a token, as many chat services' incoming webhooks do, goes into a secret
+with `"urlSecret": {"secret": NAME}` in place of `url`. An ntfy channel publishes to
+`https://ntfy.sh` unless `server` names another ntfy server. A topic on the public
+server can be read by anyone who guesses its name, so use an access token with a
+reserved topic, or a server of your own.
+
+Each dataset decides how long its memory review may wait. The event fires when the
+oldest open review branch, such as a scheduled consolidation's, is older than
+`notifyAfter`, and then at most once per `repeatEvery` until no review branch is open:
+
+```sh
+sparkles settings set org memory.review.notifyAfter=2d memory.review.repeatEvery=1d
+```
+
+A backup policy that fails notifies once, then at most once per the kind's
+`repeatEvery` (one day by default) until a run of the policy succeeds. A spent model
+budget notifies once per provider and day. Requests to the channels go through the
+outbound policy, so a channel on a private address needs `--outbound-allow-private`.
+A failed delivery is retried with backoff, five attempts by default.
+[API.md](API.md#notifications) lists every member, the events and their data, and the
+metrics.
+
+On NixOS the settings file comes from `services.sparkles.settings` and the secrets from
+`services.sparkles.models.secrets`, which also serves the model providers' keys:
+
+```nix
+services.sparkles = {
+  settings.server.notifications = {
+    enabled = true;
+    baseUrl = "https://sparkles.example.org";
+    channels.phone = { type = "ntfy"; topic = "sparkles-ops"; token.secret = "ntfy-token"; };
+    routes."*" = [ "phone" ];
+  };
+  settings.server.locked = [ "notifications.channels.phone" ];
+  settings.datasets.org.memory.review.notifyAfter = "2d";
+  models.secrets.ntfy-token.file = config.sops.secrets."ntfy-token".path;
+};
+```
 
 ## Embedding the library
 

@@ -427,6 +427,21 @@ in
         either fixes fields so that they cannot be changed at runtime. The top-level
         `server.locked` list is accepted for locks of server-wide settings.
 
+        `server.notifications` declares outbound notifications to webhooks and ntfy
+        topics (`docs/USAGE.md`, Sending notifications). Channels name their
+        credentials by secret, and {option}`models.secrets` declares the secrets'
+        files, for example:
+
+        ```nix
+        settings.server.notifications = {
+          enabled = true;
+          channels.phone = { type = "ntfy"; topic = "sparkles-ops"; token.secret = "ntfy-token"; };
+          routes."*" = [ "phone" ];
+        };
+        settings.datasets.org.memory.review.notifyAfter = "2d";
+        models.secrets.ntfy-token.file = config.sops.secrets."ntfy-token".path;
+        ```
+
         The assistant stays off until a setting turns it on, even with
         {option}`models` configured. `defaults.assistant.enabled = true` turns it on
         for every dataset, including datasets created later through the API or the
@@ -601,7 +616,8 @@ in
           }
         '';
         description = ''
-          Credential sources keyed by the names used in providers' `apiKey.secret`.
+          Credential sources keyed by the names used in providers' `apiKey.secret`
+          and in the secret references of notification channels.
           Each entry generates `--model-secret NAME=file:PATH` or
           `--model-secret NAME=env:VARIABLE`. Set exactly one source per entry.
           These options contain references only, never key values.

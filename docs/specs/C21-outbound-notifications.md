@@ -1,6 +1,6 @@
 # C21: Outbound notifications
 
-> **Status:** specified
+> **Status:** implemented in part (Phase 1)
 >
 > **Phases:** Phase 1 is the `notifications` settings kind, the webhook and ntfy
 > channels, delivery with retries, deduplication and repeats, a test send, delivery
@@ -462,3 +462,54 @@ section is changing in parallel work.
 - For Phase 2, RFC 5321 (SMTP), RFC 5322 (message format), RFC 3207 (STARTTLS), RFC
   4954 (SMTP AUTH), RFC 6409 (message submission) and RFC 8314 (implicit TLS).
 - The Sparkles code and specs C18, C19 and F05.
+
+## Outcome
+
+Phase 1 landed on 2026-10-10. Phases 2 and 3 are not built.
+
+The module `crates/sparkles-server/src/notify/` holds the settings type, the delivery
+queue and worker, the events, the routes and the HMAC signing. It is not behind a cargo
+feature, since the model configuration it sits next to is not either. The settings
+registry has a second server-wide kind, `notifications`, which resolves through the same
+code as `models`, with the settings file's `server.notifications` as its declared layer
+and `<dataDir>/notifications.json` as its runtime layer. The routes of C19 §11.3 serve
+it, `server.locked` accepts its fields, `GET /$/settings` lists it under `serverKinds`,
+and SIGHUP reads its runtime layer again. The memory kind has the `review` member of
+§5.4. `GET /$/notifications`, `POST /$/notifications/test/{channel}`,
+`sparkles notify status` and `sparkles notify test CHANNEL` work as written, and so do
+the metrics and the audit event of §7.
+
+The tests in `crates/sparkles-server/src/notify/tests.rs` run a local HTTP receiver and
+cover A1 to A10. They verify the Standard Webhooks signature of a test send, check an
+ntfy publish with its bearer token, retry two `503` answers with waits of 0.05 and 0.1
+seconds, try a `400` once, and refuse a loopback channel without contacting it. They
+age a consolidation branch by passing the evaluation time, see one notification, three
+held back within the day, a second one a day later, the condition cleared when the
+branch is gone, and a new notification for a new branch. They also cover a backup
+failure that repeats and clears, the locks of a declared channel, an inline token that
+is refused without being quoted, and the route and backoff rules. `sign.rs` checks the
+HMAC against RFC 4231 and the signature against the example of the Standard Webhooks
+reference libraries.
+
+These points differ from the design or settle what it left open.
+
+- `models.budget.exceeded` is part of Phase 1. The check reads the counts that
+  `GET /$/models` reports, so the model code did not change.
+- An open review branch is recognized by the prefixes the memory inbox uses. The
+  notifier keeps its own copy of that rule instead of calling into the MCP module,
+  which is behind the `mcp` feature. Its age is the time the branch was created.
+- The backup event covers the runs of backup policies. A backup started by hand and a
+  policy run that fails before it records a result send nothing.
+- `partial` is a `warning` and `failed` is `critical`.
+- Secrets have no new flag. The declared source of a notification secret is
+  `--model-secret`, and on NixOS `services.sparkles.models.secrets`. A dedicated
+  `--secret` flag would be clearer and is left for later.
+- One worker thread sends the deliveries in turn, so a channel that times out delays
+  the others by up to `timeoutSecs` per attempt.
+- A test send is counted in the metrics and the channel status with the event
+  `notification.test`.
+- The OpenAPI description gained a shared `502` response, `BadGateway`.
+- The Notifications section of the UI is Phase 3. The server page's Models section
+  was changing in parallel work, and the API and CLI cover the operations.
+- The NixOS module needed no new option. Its option descriptions and the user docs show
+  `settings.server.notifications` with a secret from sops-nix, and no VM test was added.

@@ -9531,7 +9531,7 @@ file.
 
 | Method | Path | Needs | Effect |
 |---|---|---|---|
-| GET | `/$/server/secrets` | `server-admin` | `{secrets}`, each with its `name`, `source` (`declared`, `runtime` or `missing`), whether a `declared` source exists, whether it is `locked`, `setAt` for a runtime value, `overridden` when a lock ignores a stored value, and the `providers` that use it. |
+| GET | `/$/server/secrets` | `server-admin` | `{secrets}`, each with its `name`, `source` (`declared`, `runtime` or `missing`), whether a `declared` source exists, whether it is `locked`, `setAt` for a runtime value, `overridden` when a lock ignores a stored value, and the `providers` and notification `channels` that use it. |
 | PUT | `/$/server/secrets/{name}` | `server-admin` | Stores a runtime value from `{"value": "..."}`, `204`. |
 | DELETE | `/$/server/secrets/{name}` | `server-admin` | Removes the runtime value, so the declared source applies again, `204` whether or not there was one. |
 
@@ -9544,6 +9544,130 @@ so the next request reads the new key. Each change is logged at INFO under
 `sparkles::audit` as `secret_set` or `secret_removed`, with the secret's name and the
 `principal`. `sparkles secrets list`, `set NAME` and `unset NAME` use these routes, and
 `set` reads the value from standard input or a prompt that does not echo it.
+
+Notification channels name their credentials with the same secrets, and the answer of
+`GET /$/server/secrets` lists them in `channels` next to `providers`, as
+[Notifications](#notifications) describes.
+
+### Notifications
+
+The server can push notifications to a webhook or an ntfy topic when something needs a
+person. The design is in [C21](specs/C21-outbound-notifications.md). The configuration
+is the server-wide settings kind `notifications`, at `/$/server/settings/notifications`
+with the routes of [Server settings](#server-settings). Its layers are the built-in
+defaults, the settings file's `server.notifications` object and the runtime layer in
+`<dataDir>/notifications.json`. Notifications are off until `enabled` is true.
+
+```json
+{
+  "server": {
+    "notifications": {
+      "enabled": true,
+      "server": "sparkles-prod",
+      "baseUrl": "https://sparkles.example.org",
+      "repeatEvery": "1d",
+      "channels": {
+        "phone": { "type": "ntfy", "topic": "sparkles-ops", "token": { "secret": "ntfy-token" } },
+        "ops": { "type": "webhook", "url": "https://hooks.example.org/sparkles", "signingSecret": { "secret": "hook-signing" } }
+      },
+      "routes": { "memory.review.pending": ["phone"], "backup.*": ["phone", "ops"], "*": ["ops"] },
+      "delivery": { "attempts": 5, "backoffSecs": 30, "maxBackoffSecs": 1800, "timeoutSecs": 10 }
+    },
+    "locked": ["notifications.channels.phone"]
+  }
+}
+```
+
+| Member | Meaning |
+|---|---|
+| `enabled` | Whether events are delivered. `false` by default. A test send works either way. |
+| `server` | The server's name in each notification. The host name by default. |
+| `baseUrl` | The URL of the server, which makes the links of notifications absolute. Without it a link is a path under `/ui`. |
+| `repeatEvery` | The shortest time between two notifications about one lasting condition, at least `1m`. `1d` by default. |
+| `channels` | Channels by name. A name has the form of a secret's name. |
+| `routes` | Event types to channel names. A key is an event type, a prefix such as `backup.*`, or `*`. An event goes to the union of the channels of every key that matches it. |
+| `delivery` | `attempts` from 1 to 10 with the first included, `backoffSecs` before the second attempt and doubled for each later one, `maxBackoffSecs`, and `timeoutSecs` per attempt, at most the outbound policy's timeout. |
+
+A `webhook` channel has `url`, or `urlSecret: {"secret": NAME}` for a URL that carries a
+credential, and an optional `signingSecret`. A `url` with a user name, a password, a
+query or a fragment is refused. With `signingSecret` each request carries the
+`webhook-id`, `webhook-timestamp` and `webhook-signature` headers of Standard Webhooks.
+The signature is `v1,` and the Base64 HMAC-SHA256 of `{id}.{timestamp}.{body}`, under
+the Base64-decoded key after `whsec_` or else the secret's bytes.
+
+An `ntfy` channel has `server` (`https://ntfy.sh` by default), `topic`, an optional
+`token` secret sent as a bearer token, `priority` from 1 to 5 and `tags`. The server
+publishes `{topic, title, message, priority, tags, click}` to the root of `server`.
+Without `priority`, the event's severity gives 3, 4 or 5.
+
+A credential is always a secret reference. A channel member such as `token` that holds a
+string is a `400`, and the error does not quote it. A route that names an unknown
+channel is a `400`. `server.locked` takes fields such as `notifications.enabled`,
+`notifications.routes` or `notifications.channels.phone`, and a lock on a channel
+fixes all of it and keeps it from being removed. A `PATCH` with `null` for a declared
+channel removes it.
+
+Each notification is a JSON envelope. The webhook sends it as the body.
+
+```json
+{
+  "version": 1,
+  "id": "0b4f8a7e-6f53-4a8e-9a43-1f1f5c1f2d7e",
+  "type": "memory.review.pending",
+  "time": "2026-10-10T09:00:00Z",
+  "server": "sparkles-prod",
+  "dataset": "org",
+  "severity": "warning",
+  "title": "Memory review waiting in org",
+  "summary": "2 review branches in org wait for review. The oldest, consolidation.20261007-1, was created 3 days ago.",
+  "link": "https://sparkles.example.org/ui/memory?ds=org&tab=inbox",
+  "data": { "open": 2, "oldest": { "branch": "consolidation.20261007-1", "kind": "consolidation", "created": "2026-10-07T02:00:00Z" } }
+}
+```
+
+The `id` stays the same across the retries of one delivery. `dataset` is absent for
+server-wide events, and new members may appear in later versions.
+
+| Event | Fires when | `data` |
+|---|---|---|
+| `memory.review.pending` | The oldest open review branch of a dataset is older than the dataset's `memory.review.notifyAfter`. Repeats at most every `memory.review.repeatEvery`, or the kind's `repeatEvery`, until no review branch is open. | `open`, `oldest` with `branch`, `kind` and `created`, `branches` (at most 10), `notifyAfter`, `repeatEvery` |
+| `backup.failed` | A backup policy run ends `failed` or `partial`. Repeats at most every `repeatEvery` per policy, until a run of the policy succeeds. | `policy`, `run`, `result`, `repository`, `failedDatasets` with `dataset` and `reason`, `consecutiveFailures` |
+| `models.budget.exceeded` | A provider's tokens counted today reach its `budget.tokensPerDay`. Once per provider and day. | `provider`, `tokensPerDay`, `usedToday` |
+| `notification.test` | A test send. | `channel` |
+
+An open review branch is an `ingest.`, `review.`, `consolidation.` or `proposals.` branch
+with commits that `main` does not have. A dataset sends no memory review event without
+`notifyAfter`, which it sets in its memory settings:
+
+```json
+{ "review": { "notifyAfter": "2d", "repeatEvery": "1d" } }
+```
+
+Both durations are at least `1h`. The server checks the memory review and budget
+conditions once a minute, and sends a backup event when the run ends. When a condition
+was notified less than its repeat interval ago, the event is held back and counted. The
+conditions that were notified are kept in `<dataDir>/notifications-state.json`, so a
+restart does not repeat them.
+
+Every request goes through the outbound policy. A channel on a loopback or private
+address needs `--outbound-allow-private`, and a refused delivery is not retried. A
+connection error, a timeout, `408`, `429` and `5xx` are retried with backoff, honoring
+`Retry-After` up to `maxBackoffSecs`. Other answers and a missing secret end the
+delivery. Deliveries wait in a queue in the process of at most 1,000 entries, which a
+restart loses.
+
+| Method | Path | Needs | Effect |
+|---|---|---|---|
+| GET | `/$/notifications` | `server-admin` | `{enabled, channels, routes, queued, active, recent}`. Each channel has its `name`, `type`, `target` without credentials, `secrets`, `lastSuccess`, `lastFailure`, `sent` and `failed`. `active` lists the conditions that were notified, and `recent` the last 50 deliveries with their `result` (`ok`, `failed`, `refused` or `dropped`) and `attempts`. |
+| POST | `/$/notifications/test/{channel}` | `server-admin` | Sends a `notification.test` now, in one attempt. `200` with `{channel, type, result, status, id, latencyMs}`, `404` with `unknown-channel`, or `502` with `delivery-failed` or `outbound-refused` and the error. |
+
+The metrics are `sparkles_notifications_sent_total{channel,event,result}`,
+`sparkles_notifications_retries_total{channel}`,
+`sparkles_notifications_suppressed_total{event}` and the gauge
+`sparkles_notifications_queued`. A test send is logged under `sparkles::audit` as
+`notification_test` with the channel, the result and the `principal`, and each failed
+delivery is logged under `sparkles::notify` with an error that never holds a secret.
+`sparkles notify status` and `sparkles notify test CHANNEL` use these routes.
 
 ### Ask history
 
