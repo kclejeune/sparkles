@@ -3166,7 +3166,16 @@ terminal, and otherwise asks for it without echoing it. It never takes the key f
 argument or an environment variable, and it never prints it. `sparkles secrets list`
 prints each secret with its source, whether it is locked, when its runtime value was
 set, the providers that use it, and whether a runtime value overrides the declared
-source. `--json` prints the server's answer.
+source. `--json` prints the server's answer. When the server keeps stored values
+without encryption, the list ends with a note that says so.
+
+`serve --secrets-key SOURCE` seals the stored values with a 32-byte key, which the
+server reads once at the start from `file:PATH`, `env:VARIABLE`, `credential:NAME` or
+`command:PROGRAM ARGS`. The option needs a build with `backup-encryption`. Create a key
+with `openssl rand -hex 32 > /etc/sparkles/secrets.key` and `chmod 600` it, outside the
+data directory. Values stored before are sealed at the next start, and a start with a
+key that does not open them fails with an error that names them, as
+[Model secrets](API.md#model-secrets) describes.
 
 The **Server** page of the web UI has a **Models** section for users with
 `server-admin`. It lists the providers with their protocol, endpoint and whether their
@@ -3180,7 +3189,8 @@ The **API keys** panel lists each secret and whether it is set. **Replace** open
 password field, and the key typed there is sent once and is not kept in the page. A
 runtime key over a declared one is marked "overrides server config" and has a **Use
 server config** button, and a key that only exists at runtime has **Remove runtime
-value**.
+value**. The panel notes whether stored keys are encrypted with the server's secrets key
+or kept unencrypted.
 
 `GET /$/server/settings/models` answers the effective configuration with the source of
 each field, as for a dataset's settings. A `PATCH` with `null` for a provider removes
@@ -5377,6 +5387,38 @@ services.sparkles.backup = {
   fsRoots = [ "/srv/backups/sparkles" ];             # also [api] fs_roots, for API registrations
   maxTasks = 1;
 };
+```
+
+On Linux the flake's packages are built with `backup-encryption`, so the service can
+open [encrypted repositories](#encrypted-repositories-in-the-server). Pass each key as a
+systemd credential with `LoadCredential`. systemd copies the file into the service's
+`$CREDENTIALS_DIRECTORY` at the start, so the file can stay readable by root alone, such
+as a sops-nix secret, and no key enters the Nix store. The backup config file then names
+the key with a `credential` source:
+
+```nix
+systemd.services.sparkles.serviceConfig.LoadCredential = [
+  "backup-online:/run/secrets/backup-online"
+  "backup-recovery:/run/secrets/backup-recovery"
+];
+```
+
+```toml
+[repositories.secure.encryption]
+keys = [
+  { label = "online", key = { source = "credential", name = "backup-online" } },
+  { label = "recovery", key = { source = "credential", name = "backup-recovery" } },
+]
+```
+
+`secretsKeyFile` seals the keys that administrators store at runtime through
+`sparkles secrets set` or the UI, as [Model secrets](API.md#model-secrets) describes.
+The module passes the file with `LoadCredential` and the server reads it with
+`--secrets-key credential:secrets-key`. Values stored before are sealed at the next
+start:
+
+```nix
+services.sparkles.secretsKeyFile = config.sops.secrets."sparkles-secrets-key".path;
 ```
 
 `maxTasks` and `maxClones` pass `--max-tasks` and `--max-clones`. The options under

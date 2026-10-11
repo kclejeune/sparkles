@@ -2229,7 +2229,7 @@ export interface paths {
         };
         /**
          * List model secrets
-         * @description Each secret that `--model-secret`, a stored value, a provider or a lock names, with its source, whether it is locked, when a runtime value was stored and the providers that use it. Values are never returned. Needs server `admin`.
+         * @description Each secret that `--model-secret`, a stored value, a provider or a lock names, with its source, whether it is locked, when a runtime value was stored and the providers that use it, and whether stored values are sealed. Values are never returned. Needs server `admin`.
          */
         get: operations["listSecrets"];
         put?: never;
@@ -2250,7 +2250,7 @@ export interface paths {
         get?: never;
         /**
          * Store a model secret
-         * @description Stores a runtime value for the secret in the data directory with mode 0600. It overrides the `--model-secret` source, and requests that start after it use it. A secret that `server.locked` locks is a `409` with `locked-by-config`. Needs server `admin`.
+         * @description Stores a runtime value for the secret in the data directory with mode 0600, sealed with the key of `serve --secrets-key` when the server has one. It overrides the `--model-secret` source, and requests that start after it use it. A secret that `server.locked` locks is a `409` with `locked-by-config`. Needs server `admin`.
          */
         put: operations["putSecret"];
         post?: never;
@@ -7059,6 +7059,11 @@ export interface components {
                  */
                 source: "declared" | "runtime" | "missing";
             }[];
+            /**
+             * @description How runtime values are kept in the data directory: `sealed` with the key of `serve --secrets-key`, or `plaintext` in files with mode 0600.
+             * @enum {string}
+             */
+            storage: "sealed" | "plaintext";
         };
         /** @description The value of a model secret. */
         SecretValue: {

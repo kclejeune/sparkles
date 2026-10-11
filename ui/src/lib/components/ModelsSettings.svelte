@@ -48,6 +48,8 @@
   let status = $state<ModelsStatus | null>(null);
   let statusError = $state<string | null>(null);
   let secrets = $state<SecretInfo[] | null>(null);
+  /** How the server keeps stored keys: `sealed` or `plaintext`. */
+  let storage = $state<string | null>(null);
   let secretsError = $state<string | null>(null);
   /** The `models` kind as the panel last showed it. */
   let kind = $state<SettingsKind | null>(null);
@@ -87,6 +89,7 @@
     } else statusError = api.errorMessage(m.reason);
     if (s.status === 'fulfilled') {
       secrets = s.value.secrets;
+      storage = s.value.storage ?? null;
       secretsError = null;
     } else secretsError = api.errorMessage(s.reason);
   }
@@ -475,8 +478,18 @@
     <div class="panel-body">
       <p class="faint intro">
         Keys are write-only: the server never sends one back. A key stored here is kept in the data
-        directory without encryption and overrides the server config's key until it is removed.
+        directory and overrides the server config's key until it is removed.
       </p>
+      {#if storage === 'sealed'}
+        <p class="faint" data-testid="secrets-storage">
+          Stored keys are encrypted with the server's secrets key.
+        </p>
+      {:else if storage === 'plaintext'}
+        <p class="faint" data-testid="secrets-storage">
+          Stored keys are kept unencrypted, readable by anyone who can read the data directory.
+          Start the server with <code>--secrets-key</code> to encrypt them.
+        </p>
+      {/if}
       {#if secretsError}
         <div class="error-box">
           <strong>The keys are not available.</strong>

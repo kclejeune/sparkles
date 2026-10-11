@@ -86,8 +86,11 @@ let
         settings = models;
         secrets.anthropic.file = "/run/secrets/anthropic";
       };
+      secretsKeyFile = "/run/secrets/sparkles-secrets-key";
     };
   };
+  # a secrets key in the Nix store is refused
+  storeKey = evaluate { services.sparkles.secretsKeyFile = "/nix/store/x-key"; };
   # a second module's lock adds to the first one's
   merged = evaluate {
     imports = [
@@ -157,6 +160,8 @@ let
       unchecked = settingsSource unchecked;
       command = (service configured).serviceConfig.ExecStart;
       plainCommand = (service plain).serviceConfig.ExecStart;
+      credentials = (service configured).serviceConfig.LoadCredential;
+      plainCredentials = (service plain).serviceConfig.LoadCredential;
       reload = (service configured).serviceConfig.ExecReload;
       plainReload = (service plain).serviceConfig.ExecReload;
       triggers = map toString (service configured).reloadTriggers;
@@ -170,6 +175,7 @@ assert failures configured == [ ];
 assert failures merged == [ ];
 assert failures plain == [ ];
 assert builtins.all (config: failures config != [ ]) invalidNames;
+assert failures storeKey != [ ];
 assert (service configured).restartTriggers == [ ];
 assert (service plain).restartTriggers == [ ];
 assert (service configured).preStart == "";
@@ -210,6 +216,11 @@ pkgs.runCommand "sparkles-settings-test"
     for command in (fixture["command"], fixture["plainCommand"]):
         assert values(command, "--settings") == ["/etc/sparkles/settings.json"], command
     assert values(fixture["command"], "--model-config") == ["/etc/sparkles/models.json"]
+    # the secrets key is a systemd credential, named by the flag
+    assert values(fixture["command"], "--secrets-key") == ["credential:secrets-key"]
+    assert fixture["credentials"] == ["secrets-key:/run/secrets/sparkles-secrets-key"]
+    assert values(fixture["plainCommand"], "--secrets-key") == []
+    assert fixture["plainCredentials"] == []
     assert fixture["triggers"] == [fixture["source"], fixture["models"]], fixture["triggers"]
     assert fixture["plainTriggers"] == [fixture["plain"]], fixture["plainTriggers"]
     # the module no longer writes into dataset directories

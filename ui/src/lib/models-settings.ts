@@ -112,8 +112,15 @@ export type SecretInfo = {
   providers: string[];
 };
 
+/** `GET /$/server/secrets`: how stored values are kept, and the secrets. */
+export type SecretList = {
+  /** `sealed` with the key of `serve --secrets-key`, else `plaintext` (mode 0600). */
+  storage?: 'sealed' | 'plaintext';
+  secrets: SecretInfo[];
+};
+
 export const listSecrets = (signal?: AbortSignal) =>
-  json<{ secrets: SecretInfo[] }>('/$/server/secrets', {
+  json<SecretList>('/$/server/secrets', {
     signal,
     cache: 'no-store',
   });

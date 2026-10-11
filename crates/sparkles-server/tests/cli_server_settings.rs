@@ -498,6 +498,8 @@ fn global_settings_and_secrets_commands() {
     let o = run(&["secrets", "list"], "").ok();
     let gw = line(&o.stdout, "gw");
     assert!(gw.contains("declared"), "{}", o.stdout);
+    // a server without --secrets-key keeps stored values unencrypted, and the list says so
+    assert!(o.stdout.contains("kept unencrypted"), "{}", o.stdout);
     let o = run(&["secrets", "set", "gw"], &format!("{CLI_KEY}\n")).ok();
     assert!(
         o.stdout.contains("stored a runtime value for secret gw"),
@@ -517,6 +519,7 @@ fn global_settings_and_secrets_commands() {
         format!("Bearer {CLI_KEY}")
     );
     let j = run(&["secrets", "list", "--json"], "").ok().json();
+    assert_eq!(j["storage"], "plaintext", "{j}");
     let gw = &j["secrets"][0];
     assert_eq!(gw["source"], "runtime", "{j}");
     assert!(gw["setAt"].is_string(), "{j}");

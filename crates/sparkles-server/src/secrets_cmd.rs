@@ -167,6 +167,9 @@ mod remote {
             .collect();
         if rows.is_empty() {
             println!("no secrets: no provider names a key and none is stored");
+            if let Some(note) = storage_note(&v) {
+                println!("{note}");
+            }
             return Ok(());
         }
         let head = ["NAME", "SOURCE", "LOCKED", "SET AT", "USED BY", ""];
@@ -188,7 +191,17 @@ mod remote {
         for row in &rows {
             line(&row.each_ref().map(String::as_str));
         }
+        if let Some(note) = storage_note(&v) {
+            println!("\n{note}");
+        }
         Ok(())
+    }
+
+    /// A line about how the server keeps stored values, when they are not sealed.
+    fn storage_note(v: &J) -> Option<&'static str> {
+        (v["storage"] == "plaintext").then_some(
+            "stored values are kept unencrypted in the data directory (files with mode 0600); start the server with --secrets-key to seal them",
+        )
     }
 
     /// The value from standard input, or from a prompt with echo off on a terminal.
