@@ -191,6 +191,11 @@ let
     modelConfigFile
   ]
   ++ modelSecretArgs
+  # the key reaches the server through systemd's credentials, never the Nix store
+  ++ lib.optionals (cfg.secretsKeyFile != null) [
+    "--secrets-key"
+    "credential:secrets-key"
+  ]
   ++ lib.optionals (cfg.models.dir != null) [
     "--models-dir"
     (toString cfg.models.dir)
@@ -892,6 +897,22 @@ in
       };
     };
 
+    secretsKeyFile = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      example = "/run/secrets/sparkles-secrets-key";
+      description = ''
+        A file holding the 32-byte key that seals the runtime values of
+        `/$/server/secrets` in the data directory, as 64 hexadecimal digits or base64,
+        such as a sops-nix or agenix secret. systemd passes it to the service with
+        `LoadCredential`, so it need not be readable by the service user, and the
+        module passes `--secrets-key credential:secrets-key`. Values stored without
+        encryption are sealed at the next start. Without a key the values are kept in
+        files with mode 0600. The package must be built with the `backup-encryption`
+        feature, as the flake's packages are on Linux.
+      '';
+    };
+
     logLevel = mkOption {
       type = types.str;
       default = "sparkles=info,sparkles_server=info,tower_http=warn";
@@ -1080,6 +1101,12 @@ in
         message = "services.sparkles.auth.configFile must be an absolute path outside the Nix store (it holds secrets).";
       }
       {
+        assertion =
+          cfg.secretsKeyFile == null
+          || (lib.hasPrefix "/" cfg.secretsKeyFile && !lib.hasPrefix "/nix/store" cfg.secretsKeyFile);
+        message = "services.sparkles.secretsKeyFile must be an absolute path outside the Nix store (it is a secret).";
+      }
+      {
         assertion = (cfg.tls.certFile == null) == (cfg.tls.keyFile == null);
         message = "services.sparkles: set both tls.certFile and tls.keyFile, or neither.";
       }
@@ -1206,6 +1233,7 @@ in
         # configurations and the TLS certificate
         ExecReload = "${reloadScript} $MAINPID";
         ExecStart = lib.escapeShellArgs ([ (lib.getExe cfg.package) ] ++ args);
+        LoadCredential = lib.optional (cfg.secretsKeyFile != null) "secrets-key:${cfg.secretsKeyFile}";
         RuntimeDirectory = mkIf (
           cfg.unixSocket != null && lib.hasPrefix "/run/sparkles/" cfg.unixSocket
         ) "sparkles";

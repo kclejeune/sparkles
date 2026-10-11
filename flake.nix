@@ -121,7 +121,8 @@
               features = [
                 "embed-local"
                 "pdf-ocr"
-              ];
+              ]
+              ++ lib.optional pkgs.stdenv.hostPlatform.isLinux "backup-encryption";
             };
             # the Python bindings (crates/sparkles-py) for nixpkgs' python3
             sparkles-py = pkgs.callPackage ./nix/python.nix { inherit rustPlatform; };

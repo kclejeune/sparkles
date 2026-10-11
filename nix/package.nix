@@ -20,8 +20,10 @@
   ui ? null,
   # cargo features of sparkles-server on top of its defaults: the local embedding
   # runtime of spec F12 by default, which adds about 5 MB to the binary and runs nothing
-  # until a local provider is configured; [ ] leaves it out
-  features ? [ "embed-local" ],
+  # until a local provider is configured, and on Linux encrypted backup repositories and
+  # sealed runtime secrets (`serve --secrets-key`), whose protected key memory needs
+  # Linux; [ ] leaves them out
+  features ? [ "embed-local" ] ++ lib.optional stdenv.hostPlatform.isLinux "backup-encryption",
 }:
 let
   featureArgs = lib.optionalString (
