@@ -954,3 +954,155 @@ async fn a_read_only_server_refuses_settings_writes() {
     }
     assert!(!dir.path().join("data/secrets").exists());
 }
+
+/// A server state over `dir/data` like [`open`], with the runtime secrets sealed by the
+/// key of `--secrets-key key` when there is one. The error is the one that stops the
+/// start.
+#[cfg(all(feature = "backup-encryption", target_os = "linux"))]
+fn open_sealed(
+    dir: &std::path::Path,
+    models: &Value,
+    key: Option<&str>,
+) -> anyhow::Result<(Arc<AppState>, axum::Router)> {
+    let mut st = AppState::new(
+        &dir.join("data"),
+        sparkles::store::StoreOptions::default(),
+        std::time::Duration::from_secs(30),
+    )
+    .unwrap();
+    st.outbound.allow_private = true;
+    if let Some(key) = key {
+        // the key is read on a runtime of its own, as `serve` does before its runtime
+        let (key, data) = (key.to_string(), dir.join("data"));
+        st.settings.server.sealing =
+            std::thread::spawn(move || super::secrets::Sealing::load(&key, &data))
+                .join()
+                .unwrap()?;
+    }
+    let f = dir.join("models.json");
+    std::fs::write(&f, models.to_string()).unwrap();
+    let args = crate::models::ModelArgs {
+        model_config: Some(f),
+        model_secret: Vec::new(),
+    };
+    server::start(&mut st, None, &args)?;
+    let st = Arc::new(st);
+    let app = crate::http::router(st.clone());
+    Ok((st, app))
+}
+
+/// `serve --secrets-key`: a plaintext value is sealed at the start and read back
+/// transparently, new values are stored sealed, and a wrong key, a missing key or a
+/// sealed file copied to another secret's name stop the start. `storage` tells which.
+#[cfg(all(feature = "backup-encryption", target_os = "linux"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn sealed_runtime_secrets() {
+    use std::os::unix::fs::PermissionsExt;
+    let m = key_mock();
+    let dir = tempfile::tempdir().unwrap();
+    let models = declared_models(&format!("{}/v1", m.url()));
+    let key_file = |name: &str, byte: u8| {
+        let p = dir.path().join(name);
+        std::fs::write(&p, format!("{}\n", format!("{byte:02x}").repeat(32))).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        format!("file:{}", p.display())
+    };
+    let (key_a, key_b) = (key_file("a.key", 7), key_file("b.key", 8));
+    let gw = dir.path().join("data/secrets/gw");
+    let test = |app: axum::Router| async move {
+        send(
+            &app,
+            "POST",
+            "/$/models/local/test",
+            Some(json!({"model": "m"})),
+        )
+        .await
+    };
+
+    // without a key: plaintext, and `storage` says so
+    let (st, app) = open_sealed(dir.path(), &models, None).unwrap();
+    let (s, _, _) = send(
+        &app,
+        "PUT",
+        "/$/server/secrets/gw",
+        Some(json!({"value": "runtime-key-456"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    assert_eq!(std::fs::read_to_string(&gw).unwrap(), "runtime-key-456");
+    let (_, v, _) = send(&app, "GET", "/$/server/secrets", None).await;
+    assert_eq!(v["storage"], "plaintext", "{v}");
+    drop((st, app));
+
+    // with a key: the plaintext value is sealed at the start and still used
+    let (st, app) = open_sealed(dir.path(), &models, Some(&key_a)).unwrap();
+    let sealed = std::fs::read_to_string(&gw).unwrap();
+    assert!(sealed.starts_with("sparkles-sealed-secret/1 "), "{sealed}");
+    assert!(!sealed.contains("runtime-key-456"));
+    assert_eq!(
+        std::fs::metadata(&gw).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let (_, v, _) = send(&app, "GET", "/$/server/secrets", None).await;
+    assert_eq!(v["storage"], "sealed", "{v}");
+    let (_, v, _) = test(app.clone()).await;
+    assert_eq!(v["ok"], true, "{v}");
+    assert_eq!(bearer(&m).as_deref(), Some("Bearer runtime-key-456"));
+    // a new value is stored sealed and read back
+    send(
+        &app,
+        "PUT",
+        "/$/server/secrets/gw",
+        Some(json!({"value": "runtime-key-789"})),
+    )
+    .await;
+    let sealed = std::fs::read_to_string(&gw).unwrap();
+    assert!(sealed.starts_with("sparkles-sealed-secret/1 ") && !sealed.contains("789"));
+    test(app.clone()).await;
+    assert_eq!(bearer(&m).as_deref(), Some("Bearer runtime-key-789"));
+    // a value that looks sealed is refused as a plaintext value
+    let (s, v, _) = send(
+        &app,
+        "PUT",
+        "/$/server/secrets/gw",
+        Some(json!({"value": sealed.trim()})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    drop((st, app));
+
+    // a wrong key stops the start and names the secret
+    let e = open_sealed(dir.path(), &models, Some(&key_b))
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(e.contains("does not open") && e.contains("gw"), "{e}");
+    // so does a start without a key
+    let e = open_sealed(dir.path(), &models, None)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(e.contains("--secrets-key") && e.contains("gw"), "{e}");
+    // a sealed file copied to another secret's name does not open
+    std::fs::copy(&gw, dir.path().join("data/secrets/anthropic")).unwrap();
+    let e = open_sealed(dir.path(), &models, Some(&key_a))
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(e.contains("anthropic") && !e.contains("gw,"), "{e}");
+    std::fs::remove_file(dir.path().join("data/secrets/anthropic")).unwrap();
+    // the right key opens it again
+    let (_st, app) = open_sealed(dir.path(), &models, Some(&key_a)).unwrap();
+    test(app).await;
+    assert_eq!(bearer(&m).as_deref(), Some("Bearer runtime-key-789"));
+
+    // a key source that is not one of the four forms
+    let e = std::thread::spawn(|| {
+        super::secrets::Sealing::load("vault:x", std::path::Path::new("/nonexistent"))
+    })
+    .join()
+    .unwrap()
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("file:PATH"), "{e}");
+}
