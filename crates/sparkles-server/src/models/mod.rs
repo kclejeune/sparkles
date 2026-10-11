@@ -261,6 +261,8 @@ pub struct Models {
     status: Mutex<HashMap<(String, String), PairStatus>>,
     /// the secrets whose source is a value stored through the API (spec C19 §11.2)
     runtime_secrets: std::collections::BTreeSet<String>,
+    /// how those runtime values are kept (`serve --secrets-key`)
+    sealing: crate::settings::secrets::Sealing,
 }
 
 /// A JSON number without a trailing `.0` for whole values.
@@ -319,12 +321,19 @@ impl Models {
             levels: Mutex::new(HashMap::new()),
             status: Mutex::new(HashMap::new()),
             runtime_secrets: Default::default(),
+            sealing: Default::default(),
         }
     }
 
-    /// Note the secrets whose source is a runtime value, for `GET /$/models`.
-    pub fn set_runtime_secrets(&mut self, names: std::collections::BTreeSet<String>) {
+    /// Note the secrets whose source is a runtime value, for `GET /$/models`, and how
+    /// their values are kept.
+    pub fn set_runtime_secrets(
+        &mut self,
+        names: std::collections::BTreeSet<String>,
+        sealing: crate::settings::secrets::Sealing,
+    ) {
         self.runtime_secrets = names;
+        self.sealing = sealing;
     }
 
     /// Where the key of secret `name` comes from: `runtime`, `declared` or `missing`.
@@ -423,6 +432,9 @@ impl Models {
             None => return Err(format!("no model secret named {name:?} is defined")),
             Some(SecretSource::Env(v)) => std::env::var(v)
                 .map_err(|_| format!("the environment variable of secret {name:?} is not set")),
+            Some(SecretSource::File(path)) if self.runtime_secrets.contains(name) => {
+                self.sealing.read(path, name)
+            }
             Some(SecretSource::File(path)) => std::fs::read_to_string(path)
                 .map_err(|_| format!("the file of secret {name:?} cannot be read")),
         }?;

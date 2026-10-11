@@ -1600,8 +1600,9 @@ fn server_settings(put: &mut dyn FnMut(&str, J)) {
         "SecretList",
         doc(
             obj(
-                &["secrets"],
+                &["storage", "secrets"],
                 json!({
+                    "storage": with_desc(string_enum(&["sealed", "plaintext"]), "How runtime values are kept in the data directory: `sealed` with the key of `serve --secrets-key`, or `plaintext` in files with mode 0600."),
                     "secrets": array(obj(
                         &["name", "source", "declared", "locked", "setAt", "overridden", "providers"],
                         json!({

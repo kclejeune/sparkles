@@ -177,6 +177,8 @@ pub struct ServerLayers {
     /// the data directory (`None`: the runtime layer lives in the process, and no
     /// secret can be stored)
     dir: Option<PathBuf>,
+    /// how runtime secret values are kept (`serve --secrets-key`)
+    pub sealing: super::secrets::Sealing,
 }
 
 impl ServerLayers {
@@ -408,7 +410,7 @@ fn build(st: &AppState, d: &Declared, runtime: Value) -> Result<(), String> {
     let cfg = ModelsConfig::from_value(&r.effective).map_err(|e| format!("{e:#}"))?;
     let (sources, runtime_secrets) = secret_sources(st, d);
     let mut m = Models::new(cfg, sources, st.outbound.clone());
-    m.set_runtime_secrets(runtime_secrets);
+    m.set_runtime_secrets(runtime_secrets, st.settings.server.sealing.clone());
     if let Some(old) = st.models() {
         m.inherit(&old);
     }
@@ -464,6 +466,11 @@ pub fn start(st: &mut AppState, settings: Option<&Path>, args: &ModelArgs) -> an
         s.status.lock().read_at = Some(super::now());
     }
     s.server.set_dir(&st.data_dir.clone());
+    // the key of --secrets-key, which `serve` read into the handle before
+    s.server.sealing = std::mem::take(&mut st.settings.server.sealing);
+    if let Some(dir) = s.server.secrets_dir() {
+        s.server.sealing.prepare(&dir)?;
+    }
     s.server.load_declared(args)?;
     s.server.load_runtime()?;
     s.server.load_others()?;

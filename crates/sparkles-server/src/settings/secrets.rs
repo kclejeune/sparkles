@@ -7,6 +7,9 @@
 //! `<dataDir>/secrets/NAME` with mode 0600, in a directory with mode 0700, and the model
 //! configuration reads it as a `file:` source at each request.
 //!
+//! With `serve --secrets-key SOURCE`, each runtime value is sealed with that key (see
+//! [`Sealing`]), and plaintext values found at the start are sealed in place.
+//!
 //! No route returns a value, and none is logged. The body of a `PUT` is read into a
 //! [`SecretValue`], whose `Debug` prints nothing of it, and errors about the body never
 //! quote it. `GET /$/server/secrets` reads only the names and times of the files.
@@ -76,11 +79,197 @@ impl SecretValue {
         if t.chars().any(char::is_control) {
             return Err("the value holds a control character, such as a line break".into());
         }
+        if t.starts_with(SEALED_MARK) {
+            return Err("the value looks like a sealed secret file".into());
+        }
         Ok(SecretValue(t.to_string()))
     }
 
     fn bytes(&self) -> &[u8] {
         self.0.as_bytes()
+    }
+}
+
+/// The start of a sealed value, as `sparkles_backup::crypto::SEALED_SECRET_PREFIX`
+/// writes it. A build without `backup-encryption` still recognizes sealed files.
+const SEALED_MARK: &str = "sparkles-sealed-secret/";
+
+fn is_sealed(bytes: &[u8]) -> bool {
+    bytes.starts_with(SEALED_MARK.as_bytes())
+}
+
+/// How runtime values are kept: sealed with the key of `serve --secrets-key`, or as
+/// plaintext files with mode 0600 without one.
+#[derive(Clone, Debug, Default)]
+pub struct Sealing {
+    #[cfg(feature = "backup-encryption")]
+    sealer: Option<sparkles_backup::crypto::SecretSealer>,
+}
+
+impl Sealing {
+    /// Read the key of `--secrets-key SOURCE` once. `SOURCE` is `file:PATH`,
+    /// `env:VAR`, `credential:NAME` (in `$CREDENTIALS_DIRECTORY`) or `command:CMD`,
+    /// where `CMD` is a JSON argv array or an absolute program and its arguments split
+    /// at spaces, run without a shell. The key is 32 bytes, as 64 hexadecimal digits,
+    /// base64 or raw bytes, like a backup repository key. A key file may not lie in
+    /// `data_dir`.
+    #[cfg(feature = "backup-encryption")]
+    pub fn load(source: &str, data_dir: &FsPath) -> anyhow::Result<Sealing> {
+        use sparkles::backup::config::{KeyInput, KeySource, RepositoryEncryption};
+        use sparkles::backup::keys::{KeyContext, resolve};
+        let bad = || {
+            anyhow::anyhow!(
+                "--secrets-key takes file:PATH, env:VAR, credential:NAME or command:CMD"
+            )
+        };
+        let (kind, rest) = source.split_once(':').ok_or_else(bad)?;
+        if rest.is_empty() {
+            return Err(bad());
+        }
+        let key = match kind {
+            "file" => KeySource::File {
+                path: std::path::absolute(rest)?.to_string_lossy().into_owned(),
+            },
+            "env" => KeySource::Env { var: rest.into() },
+            "credential" => KeySource::Credential { name: rest.into() },
+            "command" => KeySource::Command {
+                argv: if rest.trim_start().starts_with('[') {
+                    serde_json::from_str(rest).map_err(|_| {
+                        anyhow::anyhow!(
+                            "--secrets-key command:[...] must be a JSON array of strings"
+                        )
+                    })?
+                } else {
+                    rest.split_whitespace().map(str::to_string).collect()
+                },
+                timeout_secs: 10,
+            },
+            _ => return Err(bad()),
+        };
+        let settings = RepositoryEncryption {
+            keys: vec![KeyInput {
+                label: "secrets-key".into(),
+                key,
+            }],
+            single_key_ok: true,
+        };
+        settings
+            .validate()
+            .map_err(|e| anyhow::anyhow!("--secrets-key: {e}"))?;
+        let context = KeyContext::from_environment(vec![data_dir.to_path_buf()]);
+        let ctl = sparkles_backup::Ctl::with_cancel(Default::default());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let mut keys = rt
+            .block_on(resolve(&settings, &context, &ctl))
+            .map_err(|e| anyhow::anyhow!("--secrets-key: {e}"))?;
+        let key = keys
+            .keys
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("--secrets-key: no key was read"))?;
+        Ok(Sealing {
+            sealer: Some(sparkles_backup::crypto::SecretSealer::new(&key)),
+        })
+    }
+
+    /// `--secrets-key` in a build without `backup-encryption`.
+    #[cfg(not(feature = "backup-encryption"))]
+    pub fn load(_source: &str, _data_dir: &FsPath) -> anyhow::Result<Sealing> {
+        anyhow::bail!("--secrets-key needs a build with the backup-encryption feature")
+    }
+
+    /// `"sealed"` with a key, else `"plaintext"`.
+    pub fn storage(&self) -> &'static str {
+        if self.sealed() { "sealed" } else { "plaintext" }
+    }
+
+    pub fn sealed(&self) -> bool {
+        #[cfg(feature = "backup-encryption")]
+        {
+            self.sealer.is_some()
+        }
+        #[cfg(not(feature = "backup-encryption"))]
+        {
+            false
+        }
+    }
+
+    /// Store `value` as the runtime value of `name` in `dir`, sealed with a key.
+    pub(crate) fn write(&self, dir: &FsPath, name: &str, value: &[u8]) -> std::io::Result<()> {
+        #[cfg(feature = "backup-encryption")]
+        if let Some(s) = &self.sealer {
+            let sealed = s.seal(name, value).map_err(std::io::Error::other)?;
+            return write_atomic(&dir.join(name), &sealed, 0o600);
+        }
+        write_atomic(&dir.join(name), value, 0o600)
+    }
+
+    /// The value in `stored` of the secret `name`, opened when it is sealed. The error
+    /// never holds the value.
+    fn open(&self, name: &str, stored: Vec<u8>) -> Result<String, String> {
+        if !is_sealed(&stored) {
+            return String::from_utf8(stored)
+                .map_err(|_| format!("the stored value of secret {name:?} is not text"));
+        }
+        #[cfg(feature = "backup-encryption")]
+        if let Some(s) = &self.sealer {
+            let plain = s.open(name, &stored).map_err(|_| {
+                format!("the stored value of secret {name:?} does not open with the secrets key")
+            })?;
+            return String::from_utf8(plain.to_vec())
+                .map_err(|_| format!("the stored value of secret {name:?} is not text"));
+        }
+        Err(format!(
+            "the stored value of secret {name:?} is sealed, and the server has no --secrets-key"
+        ))
+    }
+
+    /// The runtime value of `name` in the file `path`, trimmed.
+    pub fn read(&self, path: &FsPath, name: &str) -> Result<String, String> {
+        let bytes = std::fs::read(path)
+            .map_err(|_| format!("the stored value of secret {name:?} cannot be read"))?;
+        self.open(name, bytes).map(|v| v.trim().to_string())
+    }
+
+    /// Check the runtime values in `dir` at the start. Every sealed value must open,
+    /// so a wrong key, a changed file or a file renamed to another secret stops the
+    /// start. With a key, each plaintext value is sealed in place. Without one, a sealed
+    /// value stops the start.
+    pub fn prepare(&self, dir: &FsPath) -> anyhow::Result<()> {
+        let mut failed = Vec::new();
+        let mut migrated = 0usize;
+        for name in stored(dir).into_keys() {
+            let bytes = std::fs::read(dir.join(&name))
+                .map_err(|e| anyhow::anyhow!("cannot read secret {name}: {e}"))?;
+            let was_sealed = is_sealed(&bytes);
+            match self.open(&name, bytes) {
+                Err(_) => failed.push(name),
+                Ok(v) if !was_sealed && self.sealed() => {
+                    self.write(dir, &name, v.trim().as_bytes())
+                        .map_err(|e| anyhow::anyhow!("cannot seal secret {name}: {e}"))?;
+                    migrated += 1;
+                }
+                Ok(_) => {}
+            }
+        }
+        if !failed.is_empty() {
+            let names = failed.join(", ");
+            if self.sealed() {
+                anyhow::bail!(
+                    "the secrets key does not open the stored secrets {names} in {}: it is not the key they were sealed with, or a file was changed or renamed",
+                    dir.display()
+                );
+            }
+            anyhow::bail!(
+                "the stored secrets {names} in {} are sealed: start the server with --secrets-key",
+                dir.display()
+            );
+        }
+        if migrated > 0 {
+            tracing::info!("sealed {migrated} plaintext runtime secret(s) with the secrets key");
+        }
+        Ok(())
     }
 }
 
@@ -231,7 +420,9 @@ async fn list(State(st): St) -> ApiResult<Json<Value>> {
                 })
             })
             .collect();
-        Ok(Json(json!({ "secrets": secrets })))
+        Ok(Json(
+            json!({ "storage": layers.sealing.storage(), "secrets": secrets }),
+        ))
     })
     .await
 }
@@ -266,7 +457,11 @@ async fn put_secret(
         }
         let dir = st.settings.server.secrets_dir().ok_or_else(no_dir)?;
         private_dir(&dir).map_err(|e| internal(&name, e))?;
-        write_atomic(&dir.join(&name), value.bytes(), 0o600).map_err(|e| internal(&name, e))?;
+        st.settings
+            .server
+            .sealing
+            .write(&dir, &name, value.bytes())
+            .map_err(|e| internal(&name, e))?;
         drop(value);
         if let Err(e) = super::server::apply_with(&st, &d) {
             tracing::error!("model configuration not rebuilt after storing secret {name}: {e}");

@@ -35,7 +35,7 @@ impl LocalKeySource {
 pub struct LocalKey {
     pub label: String,
     pub source: LocalKeySource,
-    secret: std::sync::Arc<super::memory::LockedKey>,
+    pub(super) secret: std::sync::Arc<super::memory::LockedKey>,
 }
 impl std::fmt::Debug for LocalKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

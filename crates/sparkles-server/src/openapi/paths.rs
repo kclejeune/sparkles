@@ -2651,13 +2651,13 @@ fn assist(p: &mut Paths) {
     );
     p.add(
         op(GET, "/$/server/secrets", "listSecrets", "Server", "List model secrets")
-            .doc("Each secret that `--model-secret`, a stored value, a provider or a lock names, with its source, whether it is locked, when a runtime value was stored and the providers that use it. Values are never returned. Needs server `admin`.")
+            .doc("Each secret that `--model-secret`, a stored value, a provider or a lock names, with its source, whether it is locked, when a runtime value was stored and the providers that use it, and whether stored values are sealed. Values are never returned. Needs server `admin`.")
             .see("model-secrets")
             .json("200", "The secrets.", "SecretList"),
     );
     p.add(
         op(PUT, "/$/server/secrets/{name}", "putSecret", "Server", "Store a model secret")
-            .doc("Stores a runtime value for the secret in the data directory with mode 0600. It overrides the `--model-secret` source, and requests that start after it use it. A secret that `server.locked` locks is a `409` with `locked-by-config`. Needs server `admin`.")
+            .doc("Stores a runtime value for the secret in the data directory with mode 0600, sealed with the key of `serve --secrets-key` when the server has one. It overrides the `--model-secret` source, and requests that start after it use it. A secret that `server.locked` locks is a `409` with `locked-by-config`. Needs server `admin`.")
             .see("model-secrets")
             .json_body(true, "SecretValue")
             .no_content("Stored.")

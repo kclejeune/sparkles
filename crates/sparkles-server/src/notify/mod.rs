@@ -494,8 +494,7 @@ pub fn read_secret(st: &AppState, name: &str) -> Result<String, String> {
         .map(|dir| dir.join(name))
         .filter(|p| p.is_file());
     let read = match runtime {
-        Some(p) => std::fs::read_to_string(p)
-            .map_err(|_| format!("the stored value of secret {name:?} cannot be read"))?,
+        Some(p) => layers.sealing.read(&p, name)?,
         None => match layers.secret_sources().get(name) {
             None => return Err(format!("no secret named {name:?} is defined")),
             Some(sparkles::vector::embed::SecretSource::Env(v)) => std::env::var(v)

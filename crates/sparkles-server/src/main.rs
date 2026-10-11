@@ -901,6 +901,13 @@ enum Cmd {
         /// its secrets. Read again on SIGHUP, together with --model-config
         #[arg(long, value_name = "FILE")]
         settings: Option<PathBuf>,
+        /// Seal the runtime secret values of `/$/server/secrets` in the data directory
+        /// with this key, read once at the start: file:PATH, env:VAR, credential:NAME
+        /// (in $CREDENTIALS_DIRECTORY) or command:CMD. The key is 32 bytes as 64
+        /// hexadecimal digits or base64. Plaintext values are sealed at the start
+        /// (needs the backup-encryption feature)
+        #[arg(long, value_name = "SOURCE", env = "SPARKLES_SECRETS_KEY")]
+        secrets_key: Option<String>,
         #[cfg(feature = "mcp")]
         #[command(flatten)]
         ingest: ingest::IngestServeArgs,
@@ -2329,6 +2336,7 @@ fn run() -> Result<()> {
             models,
             model_store,
             settings,
+            secrets_key,
             #[cfg(feature = "mcp")]
             ingest,
             ask_history_days,
@@ -2536,6 +2544,9 @@ fn run() -> Result<()> {
             // the model configuration is the `models` settings kind (spec C19 §11): the
             // declared --model-config, the runtime layer of the data directory and the
             // locks of the settings file
+            if let Some(source) = &secrets_key {
+                st.settings.server.sealing = settings::secrets::Sealing::load(source, &data)?;
+            }
             settings::server::start(&mut st, settings.as_deref(), &models)?;
             #[cfg(feature = "mcp")]
             {
