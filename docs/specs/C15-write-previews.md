@@ -726,8 +726,8 @@ vocabulary back at first. A failed load now removes its terms too. The local `up
 (item 49, Tier 5, [ROADMAP](../ROADMAP.md)).
 
 * **What is missing today.** `sparkles update`, `sparkles load` and `sparkles infer`
-  take no `--dry-run`, neither for `--loc` nor for `--server` (`main.rs` has no such
-  flag). The UI uses `dryRun` in two places only: the tabular import in
+  take no `--dry-run` (`main.rs` has no such flag), whether `update` and `load` work on
+  `--loc` or on `--server`; `infer` works on `--loc` only. The UI uses `dryRun` in two places only: the tabular import in
   `IngestPanel.svelte`, which shows the count of triples a CSV would add, and the merge
   page (`POST /$/merge/{ds}` with `dryRun: true`). The query editor's updates, Graph
   Store uploads and RDF Patch uploads have no preview. A read-only server refuses dry
@@ -735,7 +735,7 @@ vocabulary back at first. A failed load now removes its terms too. The local `up
   run builds a whole candidate generation before discarding it.
 * **CLI.** `--dry-run` on `update`, `load`, `patch` and `infer`, with `--changes N` to
   list up to N changes. With `--loc` it calls `WriteOptions::dry_run` and prints the
-  `Preview`; with `--server` it sends `dryRun=true` and `changes=N`. The output is the
+  `Preview`; with `--server` (not available for `infer`) it sends `dryRun=true` and `changes=N`. The output is the
   preview document with `--format json` and a summary otherwise: the commit that would
   be made, the counts per graph, the validation outcome, quota and precondition
   checks. The exit status is 0 for a write that would commit, 1 for one that would be
