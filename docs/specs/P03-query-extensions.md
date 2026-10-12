@@ -317,3 +317,63 @@ Dynamic registered dispatch, foreign-language callbacks, batching across rows,
 aggregates with other arities and the classification of aggregates called by direct
 IRI remain open. Quiet measurements of callback overhead also remain open. This
 implementation adds no dependency.
+
+### Roadmap follow-ups (2026-10-12)
+
+**Foreign callbacks, dynamic dispatch, batching, arities and measurements** (item 25,
+Tier 3, [ROADMAP](../ROADMAP.md)). The last paragraph of the Outcome lists these as
+open.
+
+* **What already works for Java.** A query that calls a function registered in Jena's
+  `FunctionRegistry`, a property function in its `PropertyFunctionRegistry` or a
+  custom aggregate runs today: the fallback detector of [P04](P04-jvm-bindings.md)
+  (§3.5, cases 1 to 3)
+  sends the whole query to ARQ over the Sparkles `DatasetGraph`. The new Java work is
+  native dispatch, so such a query stays in the Sparkles engine and only the function
+  calls cross to the JVM, through the UniFFI foreign interfaces §7 describes. A
+  function is dispatched natively when it is registered with Sparkles' registry from
+  Kotlin, or when the detector finds a Jena function whose class implements a small
+  marker interface declaring it pure and deterministic; any other Jena function keeps
+  the fallback, as §7 says.
+* **Python and Node callbacks first.** These bindings have no fallback engine, so a
+  query with an application function cannot run at all today. §9 orders JVM callbacks
+  first; since Java functions already run through ARQ, the Python adapter (§7's GIL
+  rules, through PyO3) and the synchronous Node adapter (§7's thread-safe dispatch
+  through napi-rs) come before native Java dispatch. Each exposes
+  `Registry.scalar(iri, fn, volatile=…)`, `aggregate(iri, factory)` and
+  `property(iri, fn)` with the Rust registry's checks, and passes RDF/JS terms in Node
+  and the package's term classes in Python. A8 runs against each adapter.
+* **Dynamic registered dispatch.** `fn:apply` and `afn:eval` resolve only the built-in
+  catalog (`dynamic_call` in `sparql/expr.rs`). With a registry attached, an IRI
+  unknown to the catalog is looked up in it at run time. The optimizer and cache rules
+  of §4 must then hold for a callback they could not see at planning: a query whose
+  plan contains `fn:apply` or `afn:eval` with a non-constant IRI is treated as
+  referencing every registered callback, so it bypasses the result cache and the
+  unsafe rewrites when the registry holds any volatile callback. A constant IRI is
+  resolved at planning like a direct call.
+* **Batching across rows.** `call_batch` and `add_batch` in `sparql/extensions.rs`
+  accept batches but receive one row per call. A projection or BIND whose expression
+  is a registered call (or contains one in a position evaluated for every row, not in
+  an `IF` or `COALESCE` arm) evaluates the call column-wise: it gathers the distinct
+  argument tuples of an input batch, calls once per chunk under the row and 1 MiB
+  byte ceilings, and scatters the results. Short-circuit positions keep single calls,
+  so A3 and A5 hold. Aggregates receive each group's rows of a batch in one
+  `add_batch`. The gain is largest for foreign callbacks, where one crossing per batch
+  replaces one per row.
+* **Aggregates with other arities.** `AGG <iri>(expr)` takes one argument. The syntax
+  gains `AGG <iri>(e1, e2, …)` and zero arguments, with the arity checked against the
+  descriptor at planning, and `SEPARATOR`-style named options stay out. The
+  classification of aggregates called by direct IRI (`<iri>(…)` without `AGG`) is
+  decided at planning from the attached registry, so a prepared query keeps its form
+  and a registry that later gains the IRI does not change an existing plan.
+* **Quiet measurements.** A10 asks for overhead numbers taken on a quiet machine: no
+  registry, an unused registry, a tiny scalar callback, a realistic one, and batched
+  against scalar foreign dispatch, per binding. They are taken with X06's benchmark
+  runs on the benchmark machine and published in BENCHMARKS.md before any binding
+  claims a cost.
+
+Acceptance: from Python, a registered `ex:double` used in `BIND(ex:double(?x) AS ?y)`
+over 100,000 rows returns the right values with at most 100 foreign calls; a Jena
+function marked pure runs natively with the same answer as its ARQ fallback; `fn:apply`
+with a variable IRI that names a registered function calls it and the query is not
+cached.

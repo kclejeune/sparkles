@@ -943,3 +943,98 @@ a container in the store.
 **Phase 3, not built.** JavaScript functions, `afn:context`, the Leviathan library,
 locale collation, the `JSON` query form, ARQ's `EXISTS { … }` element, and Phase 3
 methods in the query builder.
+
+### Roadmap follow-ups (2026-10-12)
+
+**Parallel LATERAL, user DESCRIBE handlers, client options, builder methods and
+`shortest(…)`** (item 51, Tier 5, [ROADMAP](../ROADMAP.md)).
+
+* **What is missing today.** `sparql/lateral.rs` runs a `LATERAL` group per left row,
+  one after another, with no parallelism. DESCRIBE has three built-in modes and no way
+  to register another. The Rust client sends only `default-graph-uri`,
+  `named-graph-uri`, `timeout`, `reasoning` and `at` with a query
+  (`crates/sparkles-client/src/routes.rs`, `QUERY_PARAMS`), so it cannot pass the
+  `describe` options, `maxRows` or `nocache`, which the JavaScript client sends
+  (`js/client/src/index.ts`). The query builder has `lateral` but no methods for `LET`,
+  `FOLD`, `UNFOLD`, `SEMIJOIN`, `ANTIJOIN` or the Phase 3 path forms. `shortest(…)`
+  parses and the planner refuses it (`sparql/plan.rs`), as ARQ throws "not
+  implemented".
+* **Parallel LATERAL.** When the right side does not read a SERVICE or a property
+  function with side effects, the operator takes the left rows in batches of 256 and
+  evaluates the groups on the rayon pool that parallel scans use, each group with its
+  own child context charged to the query's budgets. Results are emitted in the left
+  rows' order, so answers and their order equal the sequential run. Parallelism is
+  used only when the left side has at least 1,024 rows by estimate and the query's
+  `ORDER BY`/`LIMIT` does not let the sequential operator stop early. A cancellation or
+  budget error stops every worker.
+* **User DESCRIBE handlers.** A handler is a stored CONSTRUCT query
+  ([C16](C16-stored-queries.md)) with one parameter, `?resource`, registered as a mode:
+  `PUT /$/describe/{ds}` takes `{"mode": "query:NAME"}`. The engine runs the query once
+  per described resource with the resource bound as a term, merges the graphs, and
+  applies `maxTriples` across them. Libraries can also register a Rust closure
+  (`DescribeHandler` trait) or, through P03's callbacks, a Python, JVM or Node function.
+  A handler runs under the caller's view, so it cannot reveal hidden triples.
+* **Remaining client options.** `QueryOptions` in `sparkles-client` gains `describe`
+  (a mode or the options object), `max_rows`, `max_memory_bytes`, `max_rows_produced`
+  and `no_cache`, each added to `QUERY_PARAMS` so that the contract test checks them.
+  The Python and JVM remote paths get the same set.
+* **Builder methods.** `WhereBuilder::let_`, `unfold`, `semijoin` and `antijoin`,
+  `Expr::fold`, and path constructors `Path::distinct`, `multi`, `shortest` and
+  `inverse_seq` (`:p^:q`), rendered behind ARQ syntax. The renderer's round-trip test
+  (render, parse, compare algebra) covers each.
+* **`shortest(…)` evaluation.** The path form is evaluated by the shortest-path code of
+  [F07](F07-path-search.md): for each start node, a breadth-first search over the path
+  expression's automaton that returns, per end node, the length of the shortest walk.
+  `?s shortest(p) ?o` then binds the pairs connected by `p`, once each, like
+  `distinct(p)`, keeping for each pair only walks of the minimal length. Because ARQ
+  never evaluated the form, there is no answer to match, and the Outcome will record
+  the semantics chosen.
+
+**Compatibility leftovers** (item 69, Tier 7, [ROADMAP](../ROADMAP.md)). §12.1 and the
+Phase 3 Outcome excluded these. Each sketch says why it was excluded and what would
+change that.
+
+* **JavaScript functions (`js:`).** Excluded because they need a JavaScript engine in
+  the server, and running user code from a query is a sandboxing problem. Sketch: an
+  optional cargo feature `js-functions` with an embedded engine, `boa_engine` (pure
+  Rust) or QuickJS through `rquickjs`. ARQ reads the library from a file named in a context setting, so the
+  server takes
+  `--js-library FILE` and Python, JVM and Node pass a source string. Each query gets a
+  fresh context with no host bindings beyond the RDF term conversion (strings, numbers,
+  booleans, IRIs as strings, as ARQ converts them), a memory limit, and an instruction
+  or time budget checked by the engine's interrupt hook against the query's deadline.
+  No file, network or clock access. Calls are cached per argument tuple within a
+  query. What would change the exclusion: users porting Jena applications that rely on
+  `js:` functions, or P03's callbacks proving insufficient for them.
+* **`afn:context`.** Excluded because it reads ARQ's execution context, a Java map of
+  symbols with no counterpart in Sparkles. Sketch: map a fixed set of keys to the
+  query's own settings: the timeout, `describe` options, the dataset name, the
+  `reasoning` flag and the snapshot's commit, returned as strings, and an unknown key
+  is an unbound result, as ARQ returns for an unset symbol. What would change it: a
+  real query that uses it; none is known.
+* **Leviathan `lfn:`.** Excluded because it is not part of ARQ's `afn:` and `fn:`
+  libraries. It is a separate function library (dotNetRDF's Leviathan) that Jena also
+  registers, with numeric functions (squares, cubes, roots, powers, logarithms,
+  factorials, trigonometry) and hash functions. Sketch: implement those as aliases of `math:` and the SPARQL hash functions in
+  `fnlib.rs`, list them in the service description, and test against Jena 6.2.0's
+  answers. Most have a standard equivalent. What would change it: a request from a
+  user, since it is cheap.
+* **The `JSON` query form.** Excluded as rarely used. ARQ's `JSON { "key": ?var … }
+  WHERE { … }` returns a JSON array of objects. Sketch: a fifth query form in the
+  vendored spargebra behind `arq()`, `Query::Json { template, pattern }`, evaluated as a
+  SELECT over the template's variables, and serialized as `application/json` by a new
+  writer that streams the array. Literals become JSON numbers, booleans or strings as
+  ARQ does. Stored queries, the CLI and the formatter learn the form. What would change
+  it: client libraries that use it against Fuseki.
+* **Locale collation for `afn:collation`.** Excluded because ordering by a locale needs
+  a collation library and a value kind for sort keys; today `afn:collation` returns its
+  string and orders by code point (`expr.rs`). Sketch: ICU4X's `icu_collator` behind a
+  `collation` feature, with compiled data for the root locale and a configured list of
+  locales, since full data is several megabytes. `afn:collation(locale, str)` returns a
+  value of a new kind, a collation key holding the locale and the string; `ORDER BY`
+  compares two keys of the same locale with the collator and falls back to code point
+  order otherwise, so mixed keys still have a total order. `fn:collation-key` returns
+  the collator's sort key bytes as `xsd:base64Binary`. The crate family already appears
+  in `Cargo.lock` through `icu_normalizer` and `icu_properties`. What would change it:
+  users with non-English data who sort in queries, which the UI's tables would also
+  benefit from.

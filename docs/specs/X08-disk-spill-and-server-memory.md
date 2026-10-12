@@ -94,7 +94,6 @@ problem:
 | `--history-cache-mb` | 512 | Materialized past states for the whole server (was 1024 per dataset). |
 | `--memory-profile` | `default` | `small` or `default`. A profile sets the defaults of the flags in this table, and explicit flags override it (§3.3). |
 | `--total-query-memory-mb` | half the memory limit (§4.2) | The pool for the estimated memory of all queries and updates. 0 turns the pool off. |
-| `--max-concurrent-queries` | twice the CPUs | Queries and updates that execute at once. Others wait in the admission queue. 0 is unlimited. |
 | `--query-admission-wait` | 2 s | How long a request waits for admission before `503`. |
 | `--spill` | `on` | `on`, `off` or `encrypted` (§6.6). |
 | `--spill-dir` | `<data-dir>/.spill` | Directory of temporary files. Must be on a local file system. |
@@ -107,14 +106,17 @@ own budget and what the pool can grant it (§4).
 
 `sparkles serve --memory-profile small` sets `--cache-mb 256`, `--result-cache-mb 64`,
 `--service-cache-mb 16`, `--history-cache-mb 128`, `--query-memory-mb 1024`,
-`--total-query-memory-mb 2048` and `--max-concurrent-queries` to the number of CPUs. The
-values come from §3.3.
+`--total-query-memory-mb 2048`. The values come from §3.3.
+
+Concurrency is not a new flag. The rate limiter already caps concurrent requests per
+class (`--rate-limit query=…,concurrency=N` and `client-concurrency=N`, answering `503`
+with `Retry-After`; C01 Outcome). The pool adds what those caps cannot express: one byte
+budget shared by all queries, and admission on bytes.
 
 ### 2.2 HTTP
 
 * A request that cannot be admitted within `--query-admission-wait` answers `503` with
-  `Retry-After: 1` and the C01 error body, with budget kind `server-memory` or
-  `concurrency`.
+  `Retry-After: 1` and the C01 error body, with budget kind `server-memory`.
 * A query whose state grows past what the pool can grant, with spill unavailable for the
   operator, fails with budget kind `server-memory`. It answers `503` with `Retry-After`,
   since a retry can succeed when the server is less busy. A query that exceeds its own
@@ -136,7 +138,7 @@ New series, following C01 §4.5:
 | `sparkles_query_pool_capacity_bytes`, `…_granted_bytes` | gauge | – |
 | `sparkles_query_admission_waiting` | gauge | – |
 | `sparkles_query_admission_wait_seconds` | histogram | – |
-| `sparkles_query_admission_rejected_total` | counter | `reason=memory\|concurrency` |
+| `sparkles_query_admission_rejected_total` | counter | – |
 | `sparkles_spill_bytes_total` | counter | `dataset,operator` |
 | `sparkles_spill_reserved_bytes` | gauge | – |
 | `sparkles_spilled_queries_total` | counter | `dataset` |
@@ -250,24 +252,24 @@ the same pool.
 
 ### 4.2 Admission
 
-A request is admitted before it parses. Admission takes a concurrency slot (when
-`--max-concurrent-queries` is set) and an initial grant of 16 MiB. If either is
-unavailable, the request waits in the queue in arrival order, cancellable by disconnect,
+A request is admitted before it parses, after the rate limiter's per-class concurrency
+cap has let it through. Admission takes an initial grant of 16 MiB. If the pool cannot
+give it, the request waits in the queue in arrival order, cancellable by disconnect,
 until `--query-admission-wait` passes. Then it answers `503` with `Retry-After: 1`. A
 request whose own `memory-mb` is below the initial grant takes only that much.
 
 The queue is FIFO, so a large waiter blocks smaller ones behind it. This is deliberate:
 skipping it would starve queries that need more than the minimum. A waiter at the head
 that waits for memory lets a later request pass when the later request needs only the
-minimum and a slot is free, at most eight times in a row.
+minimum, at most eight times in a row.
 
 The default capacity is half of the memory available to the process: the cgroup v2
 `memory.max` of the server's cgroup when it is set, and physical memory otherwise, less
 the configured caches. A host where that is below 256 MiB gets 256 MiB and a warning.
 `--total-query-memory-mb 0` turns the pool off, which is today's behaviour.
 
-The rate limiter's per-class concurrency caps (`ratelimit.rs`) stay as they are. They
-limit clients. The pool limits the server.
+The rate limiter's per-class and per-client concurrency caps (`ratelimit.rs`) stay as
+they are and run first. They count requests. The pool counts estimated bytes.
 
 ### 4.3 Deadlock and fairness
 
@@ -517,7 +519,7 @@ The eager executor does not spill. Two paths bring eager queries to it:
 | Bindings | `sparkles-py`, `sparkles-ffi`, `sparkles-node` | Profile defaults, catalog options |
 
 `Error` gains `NeedsSpill` (internal, never returned to callers) and the budget kinds
-`server-memory`, `concurrency` and `spill`. The server maps them as in §2.2.
+`server-memory` and `spill`. The server maps them as in §2.2.
 
 ## 8. Footprint (Phase 3)
 
@@ -603,8 +605,9 @@ index.
   query that holds 60 MiB of state runs while a second request waits. With
   `--query-admission-wait 0.2`, the second answers `503` with `Retry-After: 1` and kind
   `server-memory`. After the first ends, the second succeeds.
-* **A5 — Concurrency.** With `--max-concurrent-queries 2`, three slow queries make the
-  third wait, and `sparkles_query_admission_waiting` reads 1 while it does.
+* **A5 — Queueing.** With a pool of 64 MiB and three queries that each hold 30 MiB, the
+  third waits, and `sparkles_query_admission_waiting` reads 1 while it does. A rate-limit
+  concurrency cap below the pool's capacity still answers `503` first, as today.
 * **A6 — No deadlock.** 64 clients run joins that each want 40% of the pool, for a
   minute. Every request ends with a result, `503` or a `server-memory` failure, and the
   granted total returns to zero.

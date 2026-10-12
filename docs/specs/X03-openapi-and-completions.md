@@ -488,3 +488,42 @@ limited caller is the only one that sees the difference.
 **Not built.** A "try it" page in the UI, and a bundled Swagger UI. Dynamic completion
 of dataset names, and Nushell completions. Named schemas for the inline answers listed
 above.
+
+### Roadmap follow-ups (2026-10-12)
+
+**Dynamic and Nushell completions, a "try it" page and the remaining named schemas**
+(item 55, Tier 5, [ROADMAP](../ROADMAP.md)).
+
+* **What is missing today.** `sparkles completions` takes bash, zsh, fish, elvish and
+  powershell and prints a static script with `clap_complete::generate`
+  (`crates/sparkles-server/src/cli_docs.rs`), so dataset, branch, stored query and
+  repository names are not completed. There is no Nushell script. The UI links the
+  description from the Server page but has no page to send requests from it. The
+  inline answers listed under Phase 2 (drafted shapes as JSON, class profiles, schema
+  diffs, the linter's result, MCP messages, the pending device login and `DELETE
+  /$/reason/{ds}`) are still not named schemas. The checked-in copy now has 264
+  operations on 165 paths and 191 schemas.
+* **Dynamic completions.** `clap_complete`'s dynamic mode, where the shell calls the
+  binary back (`COMPLETE=bash sparkles`), registered with `sparkles completions --dynamic
+  <shell>`. Values are completed from the target the command line names: with `--loc`
+  or `--data`, the catalog read without taking its lock; with `--server` or the saved
+  login's default server, `GET /$/datasets` and the listing routes with the saved
+  credentials, a 500 ms timeout and a five-second cache in the user's cache directory.
+  Completion never prompts and never writes. A failure completes nothing. The static
+  scripts stay the default, because they cost nothing at each keystroke.
+* **Nushell.** `clap_complete_nushell` generates an `extern` definition. `sparkles
+  completions nushell` prints it and the Nix package installs it under
+  `share/nushell/vendor/autoload` if nixpkgs adopts a standard place; otherwise
+  USAGE.md documents `source`.
+* **"Try it" page.** A UI page under the Server section that lists the operations from
+  `/$/openapi.json` by tag, renders the parameters and request body from the schema as
+  a form with a JSON editor for bodies, and sends the request from the browser with the
+  session cookie and the CSRF header, so it acts with the signed-in user's permissions.
+  Unsafe methods ask for confirmation and default to `dryRun=true` where the operation
+  takes it. It is written in the UI's own components rather than bundling Swagger UI,
+  which would add a large dependency and a second styling, and its Content Security
+  Policy would need relaxing.
+* **Named schemas.** `DraftedShapes`, `ClassProfile`, `SchemaDiff`, `LintResult`,
+  `DeviceLoginPending` and `ReasonDeleted`, each added to `openapi::contract_tests` with
+  a request that produces it. MCP's JSON-RPC messages stay an open object, since the MCP
+  specification defines them.

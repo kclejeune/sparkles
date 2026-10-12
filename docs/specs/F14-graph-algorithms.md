@@ -424,7 +424,7 @@ community and for modularity no lower than Louvain's on the same graph. Embeddin
 tests check dimensions, determinism with a seed, and that nodes of a planted
 two-community graph are closer to their own community's nodes.
 
-**LDBC Graphalytics.** X06 runs the Graphalytics workload: BFS, PageRank, WCC, CDLP,
+**LDBC Graphalytics.** [X06](X06-benchmark-coverage.md) runs the Graphalytics workload: BFS, PageRank, WCC, CDLP,
 LCC and SSSP, with `algo:graphalytics true`, on the benchmark's validation graphs and on
 its S and M class graphs, converted to RDF with one `ex:edge` predicate and weights on
 reifiers for SSSP. A run must pass the benchmark's output validation for every algorithm

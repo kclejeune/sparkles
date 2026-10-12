@@ -385,7 +385,8 @@ them.
 
 ## 9. A Datalog surface syntax
 
-The specs README lists a Datalog frontend as an unspecified roadmap item. This spec
+The specs README names a Datalog frontend among the numbering gaps that have no spec
+([README](README.md#ids), the paragraph after the table of prefixes). This spec
 decides the surface for rules over triples: **Jena's rule language is the Datalog syntax
 of Sparkles.** Forward rules are materialized, backward rules are evaluated on demand,
 and both are queried with SPARQL. The parser (`crates/sparkles-reasoner/src/parser.rs`)

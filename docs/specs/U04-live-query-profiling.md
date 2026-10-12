@@ -257,8 +257,8 @@ reveal the size of hidden data.
 ## 7. Acceptance examples
 
 The examples use a dataset `big` with 2 million `ex:memberOf` triples and a name per
-subject, and a test-only SPARQL function `spk:sleep` registered through P03's scalar
-registry to make operators slow and deterministic.
+subject. Operators are made slow and deterministic with `afn:wait(ms)`, which Sparkles
+already implements and which stops early when the query is cancelled.
 
 - **A1. Live counts.** Running a query whose filter calls the slow function shows the
   Plan tab after one second, with the scan `done`, the filter `running` and its row count
@@ -288,8 +288,8 @@ registry to make operators slow and deterministic.
   limited views. A stream subscriber that connects before the query registers.
 - **Vitest.** `lib/progress.ts` merging deltas into the tree state, the hot-spot rules,
   reconnection.
-- **Playwright.** A1–A4 and A7–A8 against a real server, with the slow function in the
-  test build. The mock server serves a scripted stream for layout tests.
+- **Playwright.** A1–A4 and A7–A8 against a real server, with `afn:wait` making the
+  queries slow. The mock server serves a scripted stream for layout tests.
 - **Benchmarks.** A6 and §4.2 in the benchmark harness, recorded in BENCHMARKS.md.
 
 ## 9. Rejected alternatives

@@ -28,12 +28,24 @@ graph drawing.
 ## 1. Summary, goals, non-goals
 
 Sparkles keeps every commit readable within its retention window and records the net
-changes of every commit in the change log (F06). The UI can already read a past state:
-the query page has an **at** field (`app.queryAt`) that sends `at=` with a query, the
-dataset page's History panel lists commits with their diffs and draws the commit graph,
-and the schema tab's **Compare** dialog shows a schema diff between two states. What is
-missing is a way to move through time continuously and see what changed in the view one
-is looking at, instead of reading commit lists and diff lines.
+changes of every commit in the change log (F06). The UI already reads past states in
+several places, and this spec builds on them rather than adding point-in-time viewing:
+
+- the query page's **at** field (`app.queryAt`), which sends `at=` with a query and
+  offers named snapshots, and shows the state a result read (`Sparkles-At`);
+- the dataset page's History panel (`HistoryPanel.svelte`), which lists commits with
+  their diffs from `/{ds}/diff`, runs history lookups, and draws every branch as a commit
+  graph (`CommitGraph.svelte`, `lib/commit-graph.ts`);
+- the Memory tab's **as of** selector (`MemoryTab.svelte`), which reads an entity's
+  memory facts at a chosen commit;
+- the schema tab's **Compare** dialog (`SchemaDiffDialog.svelte`), which shows a schema
+  diff between two states.
+
+Each of these picks one state from a field or a list. What is missing is a way to move
+through time continuously and see what changed in the view one is looking at, instead
+of reading commit lists and diff lines. The slider is a new control over the same
+selectors: it writes the existing `at` field, and it replaces the Memory tab's select
+with the same component, keeping its behaviour.
 
 This spec adds one slider component, `TimeSlider`, and puts it over four views: query
 results, the Explore graph, an entity's properties and the schema tab. Moving the handle
@@ -125,6 +137,10 @@ as bags of their terms, as in C18 §6.7.5. The graph view of a result marks adde
 edges with a solid outline and a `+` badge and removed ones with a dashed outline and a
 `−` badge. When either result has more than 10,000 rows, the client compares counts only
 and offers **Compare on the server** (Phase 3, §4.4).
+
+**Agent memory in Explore (Phase 1).** The Memory tab's **as of** select becomes a
+`TimeSlider` over the same commit list. Choosing a commit reads the same facts as the
+select does today, and compare mode marks facts added and superseded between two commits.
 
 **An entity in Explore (Phase 1).** The properties panel of a focused resource gets a
 **History** strip: a slider whose ticks are only the commits that changed the resource's
@@ -286,7 +302,8 @@ otherwise.
 | Slider | `ui/src/lib/components/TimeSlider.svelte` (new) |
 | Change marks in graphs | `GraphView.svelte`, `lib/graph.ts` (`changes` on `GNode` and `GEdge`) |
 | Change column and filter | `ResultTable.svelte` |
-| Query page wiring, URL | `routes/query/+page.svelte` (the existing `app.queryAt`) |
+| Query page wiring, URL | `routes/query/+page.svelte` (the existing `app.queryAt` field stays, and the slider writes it) |
+| Memory tab | `MemoryTab.svelte`, whose **as of** select the slider replaces |
 | Explore wiring | `routes/explore/+page.svelte`, `lib/explore.ts` (`at` on its reads) |
 | Schema tab | `routes/explore/+page.svelte`, `SchemaDiffDialog.svelte` |
 | Timeline route | `sparkles-server` `http` commits handlers, reading the commit catalog |
@@ -297,8 +314,8 @@ otherwise.
 ## 6. Phases
 
 1. **Phase 1.** `TimeSlider`, `lib/timeline.ts`, `lib/rowdiff.ts`, the query page's table
-   and graph views with compare mode, and an entity's History strip in Explore. No server
-   change.
+   and graph views with compare mode, the Memory tab's **as of** control, and an entity's
+   History strip in Explore. No server change.
 2. **Phase 2.** The Explore graph with animation, the schema tab, the timeline route and
    the term filter on diffs.
 3. **Phase 3.** Comparison across branches, `POST /{ds}/sparql/diff`, and the map view.

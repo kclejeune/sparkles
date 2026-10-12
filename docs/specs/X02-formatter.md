@@ -2243,3 +2243,32 @@ file.
 [X04](X04-linter.md), on the formatter's syntax tree. It adds a `[lint]` table to the
 config file, which the formatter ignores, lint diagnostics and quick fixes to
 `sparkles lsp`, and a `lint` function to the WebAssembly module.
+
+### Roadmap follow-ups (2026-10-12)
+
+**SHACLC formatting** (item 48, Tier 5, [ROADMAP](../ROADMAP.md)). The linter's half
+of item 48 is in [X04](X04-linter.md#roadmap-follow-ups-2026-10-12).
+
+* **What is missing today.** `sparkles_fmt::Language` has six languages: SPARQL,
+  Turtle, TriG, N-Triples, N-Quads and JSON-LD (`crates/sparkles-fmt/src/lib.rs`).
+  SHACLC has a reader and a writer in `sparkles-shacl/src/compact` ([G03](G03-shaclc.md)),
+  but the writer works from a shapes graph: it drops comments and the author's order,
+  so it is a conversion, not a formatter. The UI's shapes editor accepts SHACLC and its
+  Format button cannot format it.
+* **Design.** A seventh language, `Language::Shaclc`, with a lossless syntax tree in
+  `crates/sparkles-fmt/src/shaclc/` built like the Turtle one: the lexer of
+  `sparkles-shacl/src/compact/lex.rs` extended to keep trivia, a tree that holds every
+  token, and a printer over the shared document model of §4. Layout: directives first
+  as written, one blank line between shapes, a shape's header on one line, one property
+  per line indented by `indent`, and a property's constraints on its line until
+  `line-width`, then one per line. Node constraints, paths and arrays break by the same
+  rules as Turtle's lists. `prune-prefixes` and `align-values` apply; the sorting keys
+  do not.
+* **Checks.** The same as for the other languages: the output parses with
+  `sparkles_shacl::compact::parse`, produces an isomorphic shapes graph, keeps every
+  comment, and formats to itself. The corpus is G03's test files and the SHACLC
+  documents of the W3C draft's examples.
+* **Surfaces.** `sparkles fmt` by the `.shaclc` extension and `--language shaclc`,
+  `POST /$/format` with `language: "shaclc"`, the MCP `format` tool, `sparkles lsp`,
+  the WebAssembly module and the shapes editor, which picks the language from the
+  editor's syntax switch.

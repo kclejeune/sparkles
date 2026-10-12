@@ -138,7 +138,7 @@ builds result-cache keys, with these replacements:
 * A `VALUES` block keeps its variables and its row count, and each cell becomes a slot.
   An `UNDEF` cell stays `UNDEF` in the key, because it changes the block's shape.
 * Each initial binding becomes a slot named by its variable, `$?name`. This covers
-  `QueryOptions::initial_bindings`, C16 parameters (bound through `StoredQuery::bind`), the
+  `QueryOptions::initial_bindings`, C16 parameters (bound through `stored::Definition::bind`), the
   bindings of prepared queries, and Jena's substitution.
 * Generated variable names are replaced by positions, as `CacheKey` does.
 
@@ -276,9 +276,9 @@ The cache is a `quick_cache` weighted by the bytes of each entry: the key, the p
 query for text entries, and the plan tree with its patch sites and `PlanState` for shape
 entries. The P01 sketch estimated a few kilobytes per plan. The default of 16 MiB for the
 server holds a few thousand plans. With X08, the cache is part of `SharedCaches` with a
-namespace per dataset. Before X08, each store has its own cache of `--plan-cache-mb`
-divided by nothing, and the per-dataset multiplication that X08 removes applies to it as
-well.
+namespace per dataset. If this spec lands before X08, each store has its own cache of
+`--plan-cache-mb`, and the per-dataset multiplication that X08 removes applies to it
+until X08 lands.
 
 A plan's `PlanState` and nodes are behind `Arc`, so an entry evicted while an execution
 uses it lives until that execution ends. Its memory is not charged to a query budget,

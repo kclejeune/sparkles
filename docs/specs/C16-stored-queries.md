@@ -381,3 +381,50 @@ a `--server` mode for `sparkles queries` were not built.
 deleted through `notifications/tools/list_changed`, each stored query offered as a tool
 is also a resource with its definition, and the `run_stored_query` prompt explains its
 parameters ([C11](C11-mcp-server.md#outcome)).
+
+### Roadmap follow-ups (2026-10-12)
+
+**Stored updates, list parameters, private queries and a remote CLI** (item 39, Tier 4,
+[ROADMAP](../ROADMAP.md)). The four were non-goals of §1 and are listed under *Not
+built* above.
+
+* **Stored updates.** `Definition::check` in `crates/sparkles-core/src/stored.rs` refuses
+  updates. A definition gains `kind: "update"`, whose text is one SPARQL Update request.
+  Parameters bind as in queries, through `QueryOptions::initial_bindings`, which the
+  update's WHERE clauses and templates both read; a parameter in `INSERT DATA` or
+  `DELETE DATA` is refused, since data blocks take no variables. A run is a `POST` to
+  `/{ds}/queries/{name}` (a `GET` of an update answers `405`), charged to the `update`
+  endpoint of C12 and the `update` rate-limit class, and goes through the write path:
+  C10's guard, C15's `dryRun`, the commit message and author, and the receipt in the
+  response. Creating an update definition needs `admin`; running it needs the caller's
+  `update` grant. MCP offers stored updates as tools only when the server's update tool
+  is enabled ([C11](C11-mcp-server.md)), with the same preview-first flow as
+  `sparql_update`.
+* **Parameters that bind several values.** `Parameter` gains `list: true` with
+  `minItems` and `maxItems` (default at most 1,000). Each value is checked as a single
+  value is. `initial_bindings` holds one row (`Vec<(String, Term)>`), so a list
+  parameter is bound by rewriting the algebra instead: the parameter's variable is
+  joined with a `VALUES` block of the values at the top of the WHERE clause, which the
+  planner treats as any `VALUES` leaf. Two list parameters give two blocks, not their
+  product in one block. The HTTP form repeats the parameter (`?city=a&city=b`), JSON
+  takes an array, and the MCP tool's input schema declares an array.
+* **Private per-user queries.** A definition gains `owner` (the principal's log name)
+  and `visibility: "dataset" | "private"`. Private queries are stored in the same
+  `queries.json`, listed and run only for their owner and for `admin`, never offered
+  as MCP tools to anyone else, and created by any caller with `query` on the dataset.
+  A private query becomes a dataset query through a `PUT` by an admin that sets
+  `visibility: "dataset"`, which records a new version. The UI's Saved menu lists the
+  caller's private queries apart from the shared ones.
+* **A `--server` mode for `sparkles queries`.** The command works on a database
+  directory only and takes its lock (`queries_cmd.rs`). Each subcommand gains
+  `--server URL` with the CLI's usual login and token handling, mapped onto
+  `/$/queries/{ds}` and `/{ds}/queries/{name}`: `list`, `get`, `put` with
+  `If-Match`, `delete`, `versions` and `run`, whose output follows `sparkles query`'s
+  formats. The author of a remote version is the authenticated principal.
+
+Acceptance: a stored update `DELETE { ?s ex:status ?o } INSERT { ?s ex:status "done" }
+WHERE { ?s ex:status ?o FILTER(?s = ?item) }` with `item` of type `iri` marks one item
+and returns a receipt, and with `dryRun` changes nothing; a query with `city` as a list
+of three IRIs returns the rows of the three cities; a private query is invisible to
+another reader; `sparkles queries list --server` prints what `GET /$/queries/{ds}`
+returns.

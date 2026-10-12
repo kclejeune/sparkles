@@ -33,8 +33,8 @@ the filtered and masked views of [C12](C12-graph-access-control.md) and
 [C12b](C12b-triple-access-control.md), branches ([F09](F09-branches-and-merges.md)), the
 MCP server ([C11](C11-mcp-server.md)) and stored queries ([C16](C16-stored-queries.md)).
 It is the engine planned for GraphQL subscriptions ([C03 §13](C03-graphql.md#13-subscriptions)),
-for the derived-fact layer of F16, for the tabled caches of F17 and for the explanations
-of F18.
+for the derived-fact layer of [F16](F16-materialization-at-scale.md), for the tabled caches of [F17](F17-query-time-reasoning.md) and for the explanations
+of [F18](F18-explanations-and-entailment-diffs.md).
 
 ## 1. Summary, goals, non-goals
 
@@ -333,7 +333,7 @@ The indexed state of an operator is an arrangement: a hash map from the join key
 rows with their weights, keyed by `Id`s of the current generation. Rows are fixed-width
 id tuples, stored in columnar chunks of the kind `sparql::table::Table` already uses.
 The state of every view counts against its `memoryBytes` and against a server-wide pool
-of `--views-memory`, which X08's server-wide memory pool provides. A view whose state
+of `--views-memory`, which [X08](X08-disk-spill-and-server-memory.md)'s server-wide memory pool provides. A view whose state
 passes its budget is `suspended` with `over-budget`, and its reads fail with
 `503 view-suspended` until a rebuild with a larger budget. A live query whose state
 passes the per-query budget fails with an `error` event naming the budget.
@@ -502,6 +502,8 @@ any commit the change log holds.
 - `crates/sparkles-core/src/sparql/` gains `viewsvc.rs`, the `SERVICE view:read` and
   `view:why` leaves, recognized by the planner before remote SERVICE planning as
   `pathsearch.rs` and `history_svc.rs` are.
+- `crates/sparkles-core/src/commit.rs`: `CommitKind` gains `View` for the commits of
+  `graph` views.
 - `crates/sparkles/src/handles/views.rs` and `Dataset::live` in the embedding API.
 - `crates/sparkles-server/src/http/views.rs` for `/$/views/{ds}`, `http/live.rs` for
   `/{ds}/live` on the SSE code of `http/changes.rs`, and `mcp/live.rs` for `watch_query`,
@@ -626,7 +628,7 @@ The same tests run with masked snapshots for random protections.
 **Recovery tests.** Crashes injected between a commit and its pass, during a checkpoint
 and during a generation switch, followed by an open, must give the oracle's answer.
 
-**Benchmarks** (X06):
+**Benchmarks** ([X06](X06-benchmark-coverage.md)):
 
 - LDBC SNB Interactive's update streams applied to the SF1 and SF10 RDF conversions,
   with the short reads as live queries and the complex reads that fall in the fragment
@@ -638,7 +640,7 @@ and during a generation switch, followed by an open, must give the oracle's answ
 - A fan-out test of 1,000 subscribers to 10 distinct queries, for shared circuits and the
   SSE writer.
 - Write throughput with 0, 10 and 100 async views and with one view maintained at commit,
-  against X09's group commit, to show the cost on the writer.
+  against [X09](X09-group-commit-by-default.md)'s group commit, to show the cost on the writer.
 
 The target is a pass at least 100 times cheaper than re-evaluation for single-quad
 commits on the SNB SF10 views, and no change to write throughput with async views until

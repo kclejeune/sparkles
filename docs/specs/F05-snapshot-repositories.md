@@ -1891,3 +1891,48 @@ otherwise. Every repository backup names its `repository` in a JSON body, and th
 routes are unchanged. Moving the repository routes was rejected because the UI, the docs
 and running scripts already use them, and because Fuseki has no other route under
 `/$/backups/` that they would collide with.
+
+### Roadmap follow-ups (2026-10-12)
+
+**Whole-server backup and restore, every dataset in one request, a remote backup CLI,
+repository copy and content-defined chunking** (item 61, Tier 6,
+[ROADMAP](../ROADMAP.md)).
+
+* **What is missing today.** The status block's list still holds. The repository routes
+  are `GET /$/repositories/{repo}/backups` (a listing only), `gc`, `locks`, `test` and
+  `verify`; there is no `POST` that backs up several datasets
+  (`docs/openapi.json`). `sparkles repo` has `add`, `key`, `list`, `show`, `test`,
+  `verify`, `remove`, `gc` and `locks`, with no `copy`, and `sparkles backup` works on a
+  data directory or a stopped server only, with no `--server`
+  (`crates/sparkles-server/src/backup/cli.rs`). Pieces are fixed 32 MiB slices of each
+  file. Server state (the catalog's `config.json`, auth state, `models.json`, settings
+  and notification files, repository registrations) is not backed up.
+* **Every dataset in one request.** `POST /$/repositories/{repo}/backups` with
+  `{datasets: [...] | "*", message?}` starts one task that backs up each dataset in
+  turn, sharing a `run` id, as §7 Phase 2 designs; policies already do this.
+* **Server backups.** A backup kind `server` beside the dataset backups. Its manifest
+  lists the server's own files from the data directory: the catalog registry, the
+  dataset-independent settings, `models.json`, notification settings, backup
+  repositories and policies, and the auth store (users and token hashes, not session
+  secrets). Runtime model secrets are left out unless the server seals them
+  ([C19](C19-layered-settings.md#roadmap-follow-ups-2026-10-12)); sealed values are
+  included and restore only with the same key. `POST /$/server/backups {repository,
+  datasets?}` makes a server backup plus one backup per listed dataset under one run
+  id. `sparkles backup restore-server RUN --data DIR` restores into an empty data
+  directory, offline, and recreates every dataset of the run; it refuses a non-empty
+  directory.
+* **Remote backup CLI.** `--server URL` on `backup create`, `list`, `show`, `restore`,
+  `verify` and `delete`, sending the existing routes through the shared client with the
+  saved credentials of [C09 §7.4](C09-dataset-access-control.md), and waiting for the
+  task with progress unless `--no-wait`.
+* **Repository copy.** `sparkles repo copy SRC DST [--dataset D] [--backups NAME...]
+  [--since DATE]` copies manifests and the blobs they reference that `DST` lacks,
+  checked by id, then writes the manifests last so that a partial copy is invisible.
+  Between two encrypted repositories blob ids are keyed per repository ([F11
+  §5.2](F11-encryption-at-rest.md)), so the copy re-encrypts and re-keys each blob and
+  cannot deduplicate by id; it deduplicates by the plaintext id inside the run. The
+  server route is a task, `POST /$/repositories/{repo}/copy`.
+* **Content-defined chunking.** Designed in [F11 §6](F11-encryption-at-rest.md#6-content-defined-chunking-and-write-only-repositories-phase-2):
+  FastCDC for `vocab.dat` behind the 30% gate of §5.4. It applies to plaintext
+  repositories too, and the manifest records the chunker per file so old backups stay
+  readable.

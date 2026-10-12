@@ -2186,3 +2186,71 @@ admin operations were not built either. Sign-ins, tokens and backups emit audit 
 under `sparkles::audit`, but creating, deleting and cloning a dataset do not.
 Endpoint-level permissions and graph-level ACLs (Phase 3) were built later,
 as [C12](C12-graph-access-control.md) describes.
+
+### Roadmap follow-ups (2026-10-12)
+
+**Audit events for dataset administration** (item 62, Tier 6,
+[ROADMAP](../ROADMAP.md)).
+
+* **What is missing today.** The Outcome's last paragraph still holds. Events under the
+  `sparkles::audit` target come from `auth/handlers.rs`, `auth/policy.rs`, the backup
+  routes and policies, `notify/http.rs` and the settings routes
+  (`settings/secrets.rs`, `settings/server.rs`). `create_dataset`, the dataset
+  `DELETE` and `clone_dataset` in `crates/sparkles-server/src/http.rs` log nothing
+  under that target, and neither do branch creation and deletion
+  (`http/branches.rs`) or the offline `sparkles dataset` commands. Restores already log
+  `restore_started` and `restore_finished` (`backup/http.rs`, `backup/ops.rs`).
+* **Design.** One helper, `audit::dataset(event, name, id, principal, fields)`, called
+  after the operation succeeds, with the events `dataset_created` (type, declared or
+  runtime), `dataset_deleted` (id, quads at deletion), `dataset_cloned` (source, source
+  commit, target), `branch_created` and `branch_deleted`. Failures that reach the handler after authorization log
+  `dataset_admin_failed` with the error code, so an operator can see attempts by an
+  authorized principal. The offline commands log the same events with the principal
+  `local:<user>` from the process's user. Fields follow the existing events (`event`,
+  the object's name, `principal`), and the router test that runs every admin route
+  under auth gains a check that each state-changing dataset route emits exactly one
+  event.
+
+**Mutual TLS, OCSP, opaque-token introspection, front-channel logout and Cloudflare
+group lookup** (item 63, Tier 6, [ROADMAP](../ROADMAP.md)).
+
+* **What is missing today.** `tls.rs` builds its rustls configuration with
+  `with_no_client_auth()`, so no client certificate is requested. The server does not
+  staple OCSP responses. An access token on the API must be a JWT: the OIDC provider's
+  tokens are checked for signature, issuer, expiry and an audience in
+  `oidc.api_audience` (`auth/config.rs`; with an empty list no access token is
+  accepted), and opaque tokens cannot be checked. Only back-channel logout exists. A
+  Cloudflare Access principal gets the groups in the assertion only.
+* **Mutual TLS.** `--tls-client-ca FILE` and `tls.client_auth = "optional" |
+  "required"` in the auth config. rustls verifies the chain against that CA set (with
+  CRLs from `--tls-client-crl`); the handshake does no authorization. A verified
+  certificate becomes a principal `cert:<subject>` mapped to a user by a
+  `[[tls.client_users]]` table matching the subject DN or a SAN (DNS, email or URI), with
+  that user's grants. With `optional`, a request without a certificate falls through to
+  the other schemes. The certificate's identity is never combined with another scheme's
+  in one request. Reload on SIGHUP with the certificate pair, as today.
+* **OCSP stapling.** rustls serves a stapled response given to it, so the server fetches
+  one from the responder named in the certificate's AIA extension at start and before
+  half its validity has passed, through the outbound policy, and keeps the last good
+  response on disk in the data directory. A fetch failure keeps the last response until
+  it expires, then serves without stapling and logs a warning; it never stops the
+  server. `--tls-ocsp off` disables it.
+* **Opaque-token introspection (RFC 7662).** `oidc.introspection_endpoint` with client
+  credentials from a secret reference. A bearer token that does not parse as a JWT is
+  posted to the endpoint; an `active: true` answer is checked for `aud` against
+  `api_audience`, `exp`, `iss` and the configured scopes exactly as a JWT's claims are,
+  and mapped to a principal by the same claim settings. Answers are cached by the
+  token's SHA-256 until the earlier of `exp` and `introspection_cache_secs` (default
+  60), so a revoked token stops working within that time. Inactive answers are cached
+  for 10 seconds to bound the cost of a flood of bad tokens, which the existing failed
+  login rate limit also covers.
+* **Front-channel logout.** `GET /$/auth/oidc/frontchannel-logout?iss=…&sid=…`, per
+  OpenID Connect Front-Channel Logout 1.0, ends the sessions with that `sid` as
+  back-channel logout does, answers a page with no content that the provider embeds in
+  an iframe, and sets `Cache-Control: no-store`. The CSP's `frame-ancestors` allows the
+  provider's origin for this route only.
+* **Cloudflare group lookup.** With `cloudflare_access.identity_groups = true`, the
+  server fetches the user's identity from the team domain's `get-identity` endpoint
+  with the request's `CF_Authorization` cookie, caches it for the assertion's lifetime,
+  and takes the groups from it. The fetch goes through the outbound policy; on failure
+  the principal keeps the assertion's groups and the server logs a warning.

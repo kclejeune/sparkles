@@ -500,3 +500,41 @@ would have reflected that load rather than the client.
 - A typed `SchemaSummary`, statistics and backups, which stay `serde_json::Value`.
 - The change feed, diffs between commits, snapshots, clones, search, reasoning and
   validation calls, which are reachable through `call_json` only.
+
+### Roadmap follow-ups (2026-10-12)
+
+**Typed admin calls, rate-limit pacing and credential tests** (item 47, Tier 5,
+[ROADMAP](../ROADMAP.md)).
+
+* **What is missing today.** `routes.rs` still holds 31 operations, against 264
+  operations on 165 paths in `docs/openapi.json`. `Client::stats` and `backup_files`
+  (`admin.rs`) and `Dataset::stats`, `schema`, `backups`, `stored_queries`,
+  `stored_query` and `put_stored_query` (`dataset.rs`) return `serde_json::Value`. The
+  change feed, diffs, snapshots, clones, search, reasoning, validation, branches and
+  settings are reachable through `call_json` only. `RateLimit` is parsed
+  (`retry.rs`) and used to wait after a `429`, but never before one. `from_env` and
+  `saved_credentials` have no integration test.
+* **Typed bodies.** The OpenAPI description now names every admin body (X03's Phase 2
+  left no open object), so the types can be generated from it rather than written by
+  hand. A build-time step is rejected because it would make `docs/openapi.json` a build
+  input of the crate. Instead `mise run client:types` writes `src/types/generated.rs`
+  from the schemas the client uses, and the existing contract test fails when the
+  checked-in file differs. Each new method gets an entry in `routes.rs`, so the first
+  contract test covers it. The order follows use: `SchemaSummary`, statistics, stored
+  queries and backups first, then the change feed (`ChangeFeed`, streamed as the result
+  stream is), diffs, snapshots, clones, branches and merges, `TextHits`, reasoning and
+  validation status, then settings. `call_json` stays for routes without a method.
+* **Proactive pacing.** An opt-in `ClientBuilder::pace(true)`. After each response with
+  a `RateLimit` field, the client records the remaining quota and the reset time per
+  policy. When the remaining quota is below the number of requests in flight, a new
+  request waits until the reset, bounded by the request's deadline; a wait that would
+  pass the deadline fails at once with `Error::RateLimited` carrying the reset. The
+  state is per `Client` and shared by clones, under a mutex held only to read and
+  update it. Off by default, because a single client rarely shares a quota with nobody
+  and the server's `429` with `Retry-After` already works.
+* **Credential tests.** `from_env` reads `SPARKLES_URL`, `SPARKLES_TOKEN` and the
+  credentials file. The test runs as its own process (`tests/env_credentials.rs` with
+  `harness = false`, one process per case), so setting environment variables cannot
+  race other tests. Cases: a token from the environment, a saved login for the URL, the
+  environment taking precedence, a missing file, and a file with the wrong permissions,
+  each against a `sparkles serve` with an auth configuration.

@@ -26,7 +26,7 @@ and `docs/benchmarks/2026-10-04-regressions.json`. It builds on full-text search
 search ([F07](F07-path-search.md)), GeoSPARQL ([G01](G01-geosparql.md)), automatic
 compaction ([C13](C13-automatic-compaction.md)), inference ([C08](C08-inference-freshness.md))
 and the streaming executor ([X05](X05-streaming-query-execution.md)). The sources are
-listed in §15.
+listed in §17.
 
 ## 1. Summary, goals, non-goals
 
@@ -81,7 +81,7 @@ the refresh protocol and the regression tracking.
 |---|---|---|---|
 | `scripts/bench.sh` (modes default, `updates`, `mixed`, `cold`) | `scripts/gen-data.py`, 1.05M and 10.5M triples | Sparkles, Fuseki/TDB2, QLever, Fluree, Oxigraph | Published |
 | `scripts/bench-watdiv.sh` | WatDiv v0.6, pinned by `watdiv.nix`, scale 100 | The same five | Published; basic testing only |
-| `scripts/bench-billion.sh` | English DBpedia 2022.12, checksums in `scripts/bench-billion/dbpedia-2022.12.tsv` | Sparkles, QLever, Fluree (Jena and Oxigraph optional) | Published |
+| `scripts/bench-billion.sh` | English DBpedia 2022.12, checksums in `scripts/bench-billion/dbpedia-2022.12.tsv` | Sparkles and QLever by default; Fluree, Jena and Oxigraph with `--engines` | Published |
 | `scripts/bench-text.sh` | The synthetic data | Sparkles, Fuseki with jena-text, QLever | Published |
 | `scripts/bench-vector.sh` | Generated clustered vectors | Sparkles only | Published |
 | `scripts/bench-geo.sh`, `scripts/gen-geo.py` | Generated geometries | Sparkles only, index on and off | Published |
