@@ -40,7 +40,7 @@ Three tracks run through the tiers:
 |---|---|---|
 | **Performance** | 1 → 2 → 3 → 4 → 7 → 16 | X06 → X08 → X09 → X07 → X08 Phase 2 → X11 |
 | **Graph features** | 8 → 12 → 20 | F14 → C22 → F01 |
-| **Reasoning** | 9 → 17 → 18 → 19 | F16 → F13 → F18 → F17 |
+| **Reasoning** | 9 → 19 → 18, with 17 before F18 Phase 3 | F16 → F17 → F18 Phases 1–2 → F13 → F18 Phase 3 |
 
 The UI items (11, 21, 27–31) fill time when a track is waiting on benchmark results.
 
@@ -69,7 +69,7 @@ These items are cheap or foundational.
 |---|---|---|---|---|
 | 7 | **Batch-oriented joins and grouping, then disk spill.** Also covers LIMIT propagation, running state for FOLD aggregates, parallel decoding and earlier first bytes. | [X08]({X08}) Phase 2, [X05](specs/X05-streaming-query-execution.md#roadmap-follow-ups-2026-10-12) | L | Very high |
 | 8 | **Graph-algorithm library.** PageRank, centrality, components, Louvain and Leiden, similarity, and FastRP and node2vec embeddings | [F14](specs/F14-graph-algorithms.md) | M–L | Very high |
-| 9 | **Materialization at scale.** `owl:sameAs` by representatives, rules over the compressed indexes instead of an in-memory copy, and a separate layer for derived facts. Semi-naive evaluation is already parallel. | [F16]({F16}), [C08](specs/C08-inference-freshness.md#roadmap-follow-ups-2026-10-12) | L | High |
+| 9 | **Materialization at scale.** `owl:sameAs` by representatives, rules over the compressed indexes instead of an in-memory copy, and a separate layer for derived facts. Semi-naive evaluation is already parallel; the single-threaded merge in `add_batch` and the barrier after each iteration are not. | [F16]({F16}), [C08](specs/C08-inference-freshness.md#roadmap-follow-ups-2026-10-12) | L | High |
 | 10 | **Vector index maintenance.** Incremental HNSW inserts, graphs kept across compactions, background catch-up and build speed | [F04](specs/F04-vector-search.md#roadmap-follow-ups-2026-10-12) | M | Medium–high |
 | 11 | **Time slider** over graphs, results, entities and the schema. It builds on the existing `at=` field, history diffs and Memory's "As of" selector. | [U01](specs/U01-time-slider.md) | M | High |
 | 12 | **GraphRAG community summaries** for Ask and agent memory | [C22](specs/C22-graph-rag-community-summaries.md) | M | High |
@@ -83,8 +83,8 @@ These items are cheap or foundational.
 | # | Item | Spec | Size | Impact |
 |---|---|---|---|---|
 | 17 | **Incremental computation core.** Materialized SPARQL views, live queries that push result changes, and provenance per fact | [F13](specs/F13-incremental-views-and-provenance.md) | XL | Very high |
-| 18 | **Explanations.** Derivation trees, "why not?" answers, entailment diffs on branches, and minimal justifications; protections that track provenance, and `reviewedOnly` (which Ask already has) extended to derived facts | [F18]({F18}) | M–L | High |
-| 19 | **Query-time reasoning.** A cost-based choice between materialized and on-demand derivation (magic sets), Jena backward rules, OWL 2 QL rewriting, and part of the Datalog frontend that [specs/README.md](specs/README.md) lists as unspecified | [F17]({F17}) | L | High |
+| 18 | **Explanations.** Derivation trees, "why not?" answers, entailment diffs on branches, and minimal justifications; protections that track provenance, and `reviewedOnly` (which Ask already has, but which doesn't cover the inferred graph) extended to derived facts. Phases 1–2 need only F17 Phase 1; Phase 3 needs F13. | [F18]({F18}) | M–L | High |
+| 19 | **Query-time reasoning.** A cost-based choice between materialized and on-demand derivation (magic sets), Jena backward rules (today `<-` rules parse but are skipped with a warning), OWL 2 QL rewriting, and part of the Datalog frontend that [specs/README.md](specs/README.md) lists as unspecified | [F17]({F17}) | L | High |
 | 20 | **openCypher,** with graph algorithms as procedures and LDBC SNB as acceptance | [F01](specs/F01-cypher.md#roadmap-follow-ups-2026-10-12) | L–XL | High |
 | 21 | **Editing forms generated from SHACL shapes,** writing to branches | [U02](specs/U02-shape-driven-forms.md) | M–L | Medium–high |
 | 22 | **RML, R2RML and YARRRML loading,** CSVW standard mode and key checks, and tests that Tarql's functions work in templates (`apf:strSplit` already exists in the engine) | [F19](specs/F19-mappings-and-virtual-graphs.md) Phase 1, [C05](specs/C05-tabular-imports.md#roadmap-follow-ups-2026-10-12) | M–L | Medium–high |

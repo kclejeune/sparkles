@@ -4734,3 +4734,88 @@ fact count in the maintenance answer and the brief, and an empty inbox after the
 in the Prometheus text and the JSON snapshot. `ui/src/lib/review-count.test.ts` covers
 the badge's words and the shared count store, and `ui/tests/e2e/pages.spec.ts` the
 badges on the dataset page and the sidebar.
+
+### Roadmap follow-ups (2026-10-12)
+
+These items come from the [roadmap](../ROADMAP.md). They extend the design above and do
+not change it.
+
+**Item 6: Ask measured on QALD and LC-QuAD, with numbers per model.** §11.1 already
+plans QALD-9-plus over DBpedia and Text2SPARQL'25, and `scripts/eval-ask` already runs
+the matrix of §11.4 on the demo set of `testsuite/ask/demo.json`, with `--self-test`
+against a mock provider. What is missing is a run with real models and the published
+numbers. The follow-up:
+
+- Run the matrix of §11.4 with real providers on the demo set, QALD-9-plus (DBpedia
+  questions, gold answers recomputed on the loaded release as §11.1 says) and the
+  Text2SPARQL'25 sets, for at least one model per provider kind and size class: a small
+  and a large local model through Ollama, an OpenAI-compatible model, and Haiku-, Sonnet-
+  and Opus-class Anthropic models. Each run fixes the prompts, the dataset's commit and
+  the provider's model version, and the report records them.
+- Publish per model and role the metrics of §11.1 and §11.4 (execution accuracy with
+  QALD's precision, recall and F1, valid-query rate, repair rate, latency and cost per
+  correct answer) in a section of [BENCHMARKS](../BENCHMARKS.md), and replace §3.7's
+  example role lists in the documentation with the measured ones, as §11.4 intends.
+- Add LC-QuAD 2.0 and QALD-10, which §11.1 deferred until a Wikidata subset can be
+  loaded. X06's Wikidata work ([X06](X06-benchmark-coverage.md)) provides the load. The
+  subset is the closure of the gold queries' answers and the entities the questions
+  mention, to two hops, plus the properties' labels, so the schema grounding sees a
+  realistic vocabulary. Questions whose gold query returns nothing on the subset are
+  dropped and counted, as for QALD-9-plus.
+- Report the memorization risk: for each public set, the accuracy on questions whose
+  gold query appears verbatim in public repositories against the rest, and the
+  corporate Text2SPARQL'25 set as the uncontaminated reference.
+- Run the subset on the demo set in CI on every change to the prompts, as §11.4 says,
+  with the mock provider when no key is configured.
+
+**Item 15: multimodal ingestion, more transcript adapters and CSV entity linking.**
+§7.1 converts text, Markdown, HTML and PDF (`ingest/convert.rs`, `Format`), the
+transcript adapters of `sparkles-memory-import` read Claude Code and Codex, and a CSV
+draft mints IRIs for its IRI columns without linking them (Phase 4 deviations).
+
+- **Office documents.** DOCX, PPTX, XLSX and ODF text and presentations, converted to
+  Markdown in the server by reading their XML parts: headings, lists, tables, speaker
+  notes and slide titles, with a marker per slide or sheet that serves as the page
+  marker of §7.1.1 for citations. Spreadsheets go through §7.8's tabular path one sheet
+  at a time. Embedded images follow the image path below. The converter is a Rust
+  crate under a permissive license or written in the server, behind an `office`
+  feature, and is fuzzed like the PDF path.
+- **Images.** PNG, JPEG and WebP, through a provider whose model accepts images, under
+  a new role `describe` with the providers' capability detection of §3.6. The model
+  returns a description and the text it reads, both stored as the rendition with a
+  region per passage, so a span cites the image and a bounding box. OCR behind
+  `pdf-ocr` serves images with text when no such model is configured. Images never go
+  to a provider that `sendByProvider` limits.
+- **Audio and video.** Speech to text through a local Whisper-class model behind a
+  feature, or an OpenAI-compatible transcription endpoint, with timestamps per segment.
+  The rendition is the transcript with a time marker per segment, and a span cites a
+  time range. Speaker labels, when the model gives them, become mentions for linking.
+- **Transcript adapters.** Adapters for Gemini CLI, Cursor, GitHub Copilot's and
+  Aider's session logs, with their file locations and formats documented as §8.10.1
+  documents Claude Code's and Codex's, the same redaction, and the generic adapter as
+  the fallback. Each adapter is a module of `sparkles-memory-import` with fixtures taken
+  from the harness's documented format.
+- **CSV entity linking.** After the mapping draft, the values of each column that the
+  mapping maps to IRIs of an existing class are linked with `link_entities` in batches.
+  Exact links replace the minted IRIs, ambiguous ones are listed in the preview for a
+  person to choose, and the choices are kept as a lookup table in the CSVW metadata
+  (a `valueUrl` template over a lookup), so a second upload of the same file links the
+  same way.
+
+**Item 27: rewrite suggestions moved to U04.** Phase 6 (§6.7) was not built. The `optimize`
+role exists in `models/config.rs`, but there is no `POST /{ds}/sparql/optimize`. Live
+query profiling with per-operator row counts and the verified rewrites of §6.7 are
+designed together in [U04](U04-live-query-profiling.md), which takes over §6.7's gate,
+result comparison and profile comparison. Phase 6 here is replaced by U04.
+
+**Community summaries for global questions.** [C22](C22-graph-rag-community-summaries.md)
+adds communities from [F14](F14-graph-algorithms.md)'s Leiden with reports written by a
+new `community` role, global questions in Ask (`mode: "global"`), and community context
+in `recall` and the brief.
+
+**Item 77: ingestion controls in the UI and redaction.** The UI's Ingest card shows the
+ingestion settings but a dataset admin cannot enable server ingestion or set its
+provider policy there. The follow-up adds those controls to the dataset's settings tab
+through the C19 routes, and extends redaction beyond the fixed patterns of
+`sparkles-memory-import/src/redact.rs` with patterns that an administrator adds per
+dataset, applied in the server's `secret-detected` check as well.

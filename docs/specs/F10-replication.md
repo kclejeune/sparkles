@@ -1466,3 +1466,51 @@ replication and failover.
 Open questions 3 (a commit per transaction), 4 (idempotent patches by `H id`), 13 (a
 parameter for the blank-node rule) and 14 (refusing graph terms on prefix rows) keep the
 designed defaults.
+
+### Roadmap follow-ups (2026-10-12)
+
+**Read replicas, preserved primary commit ids, bootstrap and promotion, failover,
+synchronous replication, and rotation of a patch log or continuous archive** (item 66,
+Tier 6, [ROADMAP](../ROADMAP.md)). §2.3 to §4.8 and §8 hold the design.
+
+* **What is missing today.** Only Phase 1 exists. No `/$/replication` route is in
+  `docs/openapi.json`, and the engine has no role, no `apply_replicated` and no lineage.
+  `Store::apply_patch` (`store/patch_apply.rs`) commits a patch as a new local commit of
+  kind `Patch`, with the local sequence number, so a commit applied from another server
+  does not keep that server's commit id; the Outcome records that the apply path was not
+  shaped for replicas. There is no patch log to rotate: each generation's `wal.log`
+  records the commits since the last compaction, and the change log
+  ([F06](F06-snapshots-and-point-in-time.md)) keeps per-commit changes for the
+  retention window. Neither is shipped anywhere between backups.
+* **Preserved commit ids.** `apply_replicated` is a separate engine entry point from
+  `apply_patch`: it takes the commit's `H id`, `H prev`, timestamp, kind, counts and
+  `nextBnode` from the stream (§2.3.1), checks that `prev` is the local head, and writes
+  the WAL commit record with the primary's sequence number instead of allocating one.
+  It never runs write-time validation, quotas or protections, which the primary
+  already applied. The local `apply_patch` stays as it is for clients.
+* **Order.**
+  1. Phase 2 as §8 lists it: the commit stream, captures, bootstrap from a capture or
+     a backup, `minCommit`, status and readiness, manual promotion. Promotion writes a
+     new lineage (§4.7) so a demoted primary that comes back cannot be followed by
+     mistake.
+  2. **A patch log or continuous archive** (§8 Phase 3's continuous archiving). The
+     primary appends each commit's patch, as the stream renders it, to segment files in
+     an F05 repository: `archive/<dataset id>/<lineage>/<first>-<last>.rdfp`, sealed as
+     blobs are when the repository is encrypted. A segment is closed and uploaded at
+     64 MiB or 60 seconds, whichever comes first, which bounds the loss window of an
+     archive-only setup. **Rotation:** a segment is deleted when every backup it would
+     replay onto is older than the archive's retention (default: the oldest backup a
+     policy keeps), so the archive plus the backups always reach any commit in the
+     window; GC treats segments like blobs with the same grace period. A replica can
+     bootstrap from the newest backup and catch up from the segments without the
+     primary, and `backup restore --at COMMIT` restores any archived commit.
+  3. **Synchronous replication.** `--sync-replicas N` and named replicas: a commit is
+     acknowledged after N replicas report it applied through the `applied` parameter of
+     their stream requests, with a timeout after which the commit is acknowledged
+     with `Sparkles-Replication: degraded`. PostgreSQL instead waits indefinitely, which
+     `--sync-replicas-strict` reproduces by failing the write at the timeout.
+  4. **Failover** through an external lease (§8 Phase 3): a `--lease k8s:NAME` or
+     `consul:KEY` holder is the primary; a replica that acquires the lease promotes
+     itself after it has applied everything the stream sent, and the old primary
+     demotes itself when it loses the lease, refusing writes before the lease
+     expires.

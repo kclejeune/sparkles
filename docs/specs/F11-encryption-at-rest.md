@@ -1647,3 +1647,51 @@ protected-memory backends, FIPS operational-mode evidence and representative per
 measurements.
 Cloud KMS providers and all later phases remain unimplemented. No complete Phase 1
 claim is made.
+
+### Roadmap follow-ups (2026-10-12)
+
+**Key workflows in the API, UI and NixOS module, Vault and cloud KMS, recovery export,
+encrypted live datasets and derived indexes** (item 65, Tier 6,
+[ROADMAP](../ROADMAP.md)). §8, §11 and §7 hold the design; this section records what
+is missing at `537e048` and the order of the remaining work.
+
+* **What is missing today.**
+  * Key sources are `file`, `env`, `credential`, `passphrase-file` and `command`, as the
+    Outcome says. `vault-transit`, `aws-kms` and `gcp-kms` (§8.1) have no code; the
+    only KMS reference in `sparkles-backup` is S3's server-side `aws:kms` option
+    (`repo.rs`), which is not a key source.
+  * The API refuses encryption metadata on `POST` and `PUT /$/repositories`, and there
+    are no `/$/repositories/{repo}/keys` or `/$/encryption` routes in
+    `docs/openapi.json`. The UI has no lock badge or key slot panel. The NixOS module
+    has no `services.sparkles.encryption` or `backup.repositoryKeys`; its only key
+    option is `secretsKeyFile` for C19's sealed secrets.
+  * `sparkles repo key` has `list`, `add`, `remove`, `rotate-master` and `retire`, and
+    no `export --paper` (§5.7).
+  * Phases 2 to 4 have no code: no FastCDC, no write-only repositories, no keyring in
+    dataset directories, and no encrypting Tantivy directory.
+  * Both cargo features (`sparkles-backup/encryption`, `backup-encryption`) are off by
+    default. The Nix package turns `backup-encryption` on for Linux; the `Dockerfile`
+    and a plain `cargo build` do not ([X12 §3.1](X12-release-engineering.md)).
+* **Order.**
+  1. **API and NixOS key workflows** (§8.3, §8.4) for repositories: `encryption` in
+     `RepositoryConfig` limited to key sources the config file allows, the key slot
+     routes, `repositoryKeys` passed with `LoadCredential=`, and the audit events
+     `repository_key_added`, `_removed` and `_rotated` beside the existing
+     `repository_*` events. The UI's lock badge and key slot panel follow (§8.5).
+  2. **Recovery export.** `sparkles repo key export --paper --repo R` prints the current
+     epoch's master key as an armored block with a checksum, the repository UUID and
+     the epoch, refuses to write to a terminal-less stdout unless `--force`, and logs
+     `repository_key_exported`. `repo key import --paper` adds a slot from it. The
+     key-loss test restores from a repository whose every other slot was removed.
+  3. **Vault Transit and cloud KMS** as wrapping key sources (§8.1): Vault through its
+     HTTP API with the token file, AWS and GCP behind cargo features with their SDKs'
+     default credential chains, all through the outbound policy. A provider outage is
+     `502 key-provider-unavailable` and keeps open handles working, as the
+     generation-guarded cache already does for local providers.
+  4. **Encrypted live datasets** (Phase 3, §7) and then **derived indexes** (Phase 4),
+     as designed. Phase 3 depends on [X12](X12-release-engineering.md)'s format window,
+     because sealed generations are a new index format that a release must read beside
+     the plaintext one; enabling encryption is a compaction into the sealed format, the
+     third kind of format change of X12 §4.3.
+* **Builds.** Encryption is useful only if the published binaries have it, so X12 puts
+  `backup-encryption` in every release build and image.
