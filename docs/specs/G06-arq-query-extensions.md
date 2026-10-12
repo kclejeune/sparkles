@@ -954,7 +954,8 @@ methods in the query builder.
   to register another. The Rust client sends only `default-graph-uri`,
   `named-graph-uri`, `timeout`, `reasoning` and `at` with a query
   (`crates/sparkles-client/src/routes.rs`, `QUERY_PARAMS`), so it cannot pass the
-  `describe` options, `maxRows` or `nocache`, which the JavaScript client sends
+  `describe` options, `max-rows`, `max-rows-produced`, `memory-mb` or `nocache`, which
+  the server's query routes take and the JavaScript client sends
   (`js/client/src/index.ts`). The query builder has `lateral` but no methods for `LET`,
   `FOLD`, `UNFOLD`, `SEMIJOIN`, `ANTIJOIN` or the Phase 3 path forms. `shortest(…)`
   parses and the planner refuses it (`sparql/plan.rs`), as ARQ throws "not
@@ -975,8 +976,9 @@ methods in the query builder.
   (`DescribeHandler` trait) or, through P03's callbacks, a Python, JVM or Node function.
   A handler runs under the caller's view, so it cannot reveal hidden triples.
 * **Remaining client options.** `QueryOptions` in `sparkles-client` gains `describe`
-  (a mode or the options object), `max_rows`, `max_memory_bytes`, `max_rows_produced`
-  and `no_cache`, each added to `QUERY_PARAMS` so that the contract test checks them.
+  (a mode or the options object, sent as `describe`, `describe-labels`,
+  `describe-reifiers`, `describe-max-triples` and `describe-max-depth`), `max_rows`,
+  `max_rows_produced`, `memory_mb`, `max_result_mb` and `no_cache`, each added to `QUERY_PARAMS` so that the contract test checks them.
   The Python and JVM remote paths get the same set.
 * **Builder methods.** `WhereBuilder::let_`, `unfold`, `semijoin` and `antijoin`,
   `Expr::fold`, and path constructors `Path::distinct`, `multi`, `shortest` and

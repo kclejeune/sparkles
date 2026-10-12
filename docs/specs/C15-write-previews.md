@@ -747,7 +747,8 @@ vocabulary back at first. A failed load now removes its terms too. The local `up
   the first changes as a diff table, the validation summary with a link to the rejected
   write report, and Commit and Cancel. Commit sends the same update with `If-Match` set
   to the preview's commit, so a write that landed in between turns the commit into a
-  `412` and asks for a new preview. The Graph Store upload dialog and the patch upload
+  `412` and asks for a new preview. Graph Store writes already take `If-Match`;
+  `POST /{ds}/update` does not, and gains it here with the same meaning. The Graph Store upload dialog and the patch upload
   get the same panel.
 * **Read-only servers.** A dry run on a `--read-only` server stays refused by default,
   since the guard and quota checks read state that a read-only server may not keep

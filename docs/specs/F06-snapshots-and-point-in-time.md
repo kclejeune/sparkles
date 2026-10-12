@@ -1809,8 +1809,8 @@ lists pin rebasing, periods per quad and point-in-time reads rebuilt from the ch
 *Still not built* in Phase 2 records that the feed is per dataset. Full-text search at
 pins (§11.6) is listed with F03's follow-ups.
 
-* **Pin rebasing.** A pin holds its whole generation and the write-ahead log up to its
-  commit (§4). `POST /$/snapshots/{ds}/{name}/rebase` builds the pinned state into a
+* **Pin rebasing.** A pin keeps the whole generation, and its write-ahead log, that its
+  commit is read from. `POST /$/snapshots/{ds}/{name}/rebase` builds the pinned state into a
   generation of its own with the bulk builder, from a snapshot of the pin, without the
   writer lock, then points the pin at it and releases the old generation's hold. The
   rebased generation has no write-ahead log, so it answers only the pinned commit.
