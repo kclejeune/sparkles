@@ -513,7 +513,10 @@ one ranking.
 
 - The harness scripts are checked by `shellcheck` and run in CI in an `ANSWERS_ONLY`
   smoke mode at the smallest scale for Sparkles alone, so a broken script is found before
-  a refresh. The smoke mode times nothing.
+  a refresh. The smoke mode times nothing. It leaves out every suite whose benchmark or
+  engine is GPL-licensed: `scripts/geosparql-benchmark.sh` refuses to fetch the
+  GeoSPARQL Compliance Benchmark without `SPARKLES_ALLOW_GPL_BENCHMARK=1`, and CI never
+  sets it.
 - `bench-record.py` and `compare` have unit tests on fixture result directories.
 - Each suite's first published run includes a control: two runs of the same Sparkles
   binary, compared with `compare`, to measure the noise floor on that host. The noise
