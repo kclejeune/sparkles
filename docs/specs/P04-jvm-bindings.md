@@ -1861,6 +1861,29 @@ round. The time is still in the engine's write path.
   * *Batched calls.* `containsAll` and a `find` over several subjects in one call, used
     by `SmallQueries` when ARQ asks for a run of patterns, return their answers in one
     buffer.
+* **JVM metrics** ([ROADMAP](../ROADMAP.md) item 76). [FEATURES](../FEATURES.md) lists no
+  JVM metrics. The server's metrics are counted in `crates/sparkles-server/src/obs.rs` and
+  are not reachable from the library, and the FFI exposes no dataset statistics. The
+  library already has the counters: `Dataset::stats` (`crates/sparkles/src/stats.rs`)
+  returns quads, delta inserts and deletes, disk bytes and the block, result and SERVICE
+  cache counts, and the store has `wal_bytes`, `disk_bytes`, `Store::rebuilds(reason)` and
+  the compaction status. Sketch:
+  * *FFI.* `FfiDataset::metrics()` returns a record of these counters only, without the
+    lists of graphs, predicates and classes that `DatasetStats` also computes, so a scrape
+    is a few atomic loads and stays cheap enough to call every few seconds.
+  * *Kotlin counters.* The library counts what only the JVM side sees: queries and updates
+    by outcome, their durations, budget failures by kind, queries routed to ARQ by
+    `SmallQueries` and fallbacks to ARQ, and calls by bridge (JNI or UniFFI).
+  * *Micrometer.* An optional `SparklesMetrics : MeterBinder`, with Micrometer as a
+    `compileOnly` dependency, registers gauges and function counters tagged with the
+    dataset's name. Their names follow the server's (`sparkles.block.cache.bytes` for
+    `sparkles_block_cache_bytes`), so the same dashboards work. The Fuseki assembler binds
+    it to Fuseki's Micrometer registry when one is present.
+  * *JMX.* `SparklesJmx.register(dataset)` registers a `SparklesDatasetMXBean` with the
+    same values under `io.github.kclejeune.sparkles:type=Dataset,name=<name>`, for
+    programs without Micrometer.
+  With [X08](X08-disk-spill-and-server-memory.md), the cache gauges become catalog-wide,
+  as on the server.
 * **Release work** (item 58), designed in [X12](X12-release-engineering.md):
   * *Maven Central.* `jvm-bindings.yml` has a publish job for `jvm-v*` tags behind the
     repository variable `MAVEN_PUBLISH`, which uploads through the Central Portal's staging
