@@ -969,3 +969,84 @@ hybrid retrieval.
   organization's employees for `ada`, with 2 hits, took a median of 3.9 ms against
   6.1 ms over 30 runs, and the titles of one organization's authors for `theory` 5.6 ms
   and 2.0 ms of CPU against 20.6 ms and 9.7 ms.
+
+### Roadmap follow-ups (2026-10-12)
+
+**Full-text parity** (item 23, Tier 3, [ROADMAP](../ROADMAP.md)). Each part below is
+sized at about one to two weeks.
+
+* **Lucene analyzer parity.** The comparison with Jena above found 1,235 of 1,590
+  stemmed queries in agreement. The remaining differences have known causes: Lucene's
+  light stemmers for French, Spanish, Italian and Portuguese (401 of 728 agreed), which
+  *Porter's stemmer* above records as not built; Lucene's Dutch stem dictionary; `ё`
+  in Russian stems; the possessive `'s`, which the standard tokenizer splits off where
+  Lucene's `EnglishPossessiveFilter` removes it; and stop words in the `cjk` analyzer,
+  which Lucene removes and Sparkles does not. Each becomes an analyzer named after its
+  Lucene counterpart (`french-light`, `spanish-light`, `italian-light`,
+  `portuguese-light`, `dutch-lucene`), written from the published algorithms (Savoy's
+  light stemmers) in `text/` as `porter.rs` was, with no new crate, and selected per
+  tag in `languages` as `porter` is. The defaults stay Snowball, so existing indexes
+  keep their configuration hash. Acceptance: the nine-language corpus rerun against
+  Fuseki with the Lucene analyzers selected agrees on at least 1,550 of the 1,590
+  queries, and each remaining difference is listed.
+* **CJK dictionary segmentation.** The `cjk` analyzer makes overlapping bigrams, which
+  index more terms and match across word boundaries. A dictionary analyzer per language
+  (`ja-dict` after Lucene's Kuromoji, `zh-dict` after SmartChineseAnalyzer, `ko-dict`
+  after Nori) segments by a lattice over a dictionary with costs. The dictionaries are
+  large (tens of MB) and carry their own licenses, so they are a cargo feature
+  (`text-cjk-dict`) and the analyzer reads a dictionary file that the operator
+  provides or that `sparkles models`-style verified downloads fetch; the bigram
+  analyzer stays the default. The provenance and license of each dictionary go into
+  PROVENANCE before adoption.
+* **Online enable and reconfigure.** `Store::enable_text` in
+  `crates/sparkles-core/src/store.rs` takes the writer lock (`guarded_writer`) for the
+  whole build, and *Online rebuilds* above records that reconfiguring still builds
+  with writes waiting. Enabling and reconfiguring reuse the online rebuild: write
+  `text.json` as pending, start the journal under the lock, build into `text.new`
+  from a snapshot with writes going on, apply the journal under the lock and swap.
+  Until the swap, a reconfigured index keeps serving searches with its old
+  configuration, and a newly enabled one answers `503` with `text-unavailable`, the
+  error a search gets today while startup recovery rebuilds the index. `GET /$/text/{ds}` shows the pending
+  configuration beside the active one. Acceptance: enabling the index on 10.5M triples
+  while single-triple writes run keeps their median latency within twice the latency
+  without the build, as the rebuild measurement above does.
+* **Search after uncommitted writes.** A `text:query` in a write transaction after the
+  transaction changed data fails with `uncommitted_changes()` (`text.rs`, checked in
+  `text/search.rs` through `view.uncommitted`). The transaction's own inserts and
+  deletes are in its delta. A search in that state runs against the committed index,
+  drops hits whose quads the transaction deleted, and adds hits from an in-memory
+  Tantivy index (`RamDirectory`) of the transaction's inserted literals, built on the
+  first search and extended on later ones. Scores of the two indexes are not
+  comparable as BM25 statistics differ, so the merged hits are re-scored with the
+  committed index's document frequencies, which the searcher exposes. A transaction
+  whose inserted text passes a budget (by default 10,000 literals) keeps the current
+  error. Acceptance: in one transaction, insert `ex:a rdfs:label "quokka"`, then
+  `text:query "quokka"` returns `ex:a`; delete an existing indexed literal, and it
+  is no longer returned.
+* **Historical full-text.** A `text:query` at `?at=` answers `501`
+  ([F06 §11.6](F06-snapshots-and-point-in-time.md)). Two steps: first, a search at a
+  past commit in the current generation runs against the head index and corrects it by
+  the commits between, as the transaction case above does with the reversed changes
+  from the change log (bounded by the same budget). Second, a pin can be created with
+  `text: true`, which builds and keeps a Tantivy index for the pinned state in the
+  pin's directory, charged to the pin's bytes in retention. Other past states keep
+  answering `501`.
+
+**Multi-field entity documents** (item 35, Tier 4, [ROADMAP](../ROADMAP.md)). Documents
+are per quad (`text.rs`: the key is a hash of the s, p, o and g keys), so a query cannot
+require words from two properties of one entity, and BM25 scores one literal at a time.
+jena-text's entity map and QLever's text records both group text by entity. An index
+configuration gains `entities`: a list of fields, each a name, its predicates and a
+boost, as in `{"fields": [{"name": "name", "predicates": ["rdfs:label"], "boost": 2},
+{"name": "body", "predicates": ["schema:description"]}]}`. Each (subject, graph) with a
+literal under a field's predicates gets one entity document with a field per name,
+next to the per-quad documents, so existing queries are unchanged. A new property
+function, `text:entity`, takes Lucene syntax with field names (`name:quokka AND
+body:marsupial`) and binds the subject, the score and the rank. Maintenance re-indexes
+an entity document when any of its quads changes: the commit path collects the touched
+subjects of configured predicates and rebuilds their documents from the snapshot, which
+costs a lookup per touched subject and field. Bulk maintenance and rebuilds read the
+fields' predicates in PSO order, so an entity's literals come together. Acceptance: with
+fields `name` and `body`, an entity whose label has `quokka` and description
+`marsupial` is found by `name:quokka AND body:marsupial`; an entity with both words in
+its label only is not.

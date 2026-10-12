@@ -1746,3 +1746,96 @@ point-in-time reads rebuilt from the change log.
 **Later additions (2026-10-03).** The MCP read tools take `at` and read past states as
 `?at=` does, and the MCP tool `list_changes` runs the history query of
 `GET /{ds}/history` ([C11](C11-mcp-server.md#outcome)).
+
+### Roadmap follow-ups (2026-10-12)
+
+**Small bulk commits into large datasets lose their quads** (item 5, Tier 1,
+[ROADMAP](../ROADMAP.md)). §11.3 limits the recorded changes of a bulk commit by the
+size of the states, not of the change. `state_change_keys` in
+`crates/sparkles-core/src/store/changelog.rs` returns `None`, and the commit becomes a
+counts-only summary, when the dataset was not empty and `a.len() + b.len()` exceeds
+`StoreOptions::change_log_bulk_max_quads` (1,000,000 by default,
+`crates/sparkles-core/src/store.rs`). A load of 10 quads through the bulk path into a
+dataset of 600,000 quads is therefore recorded with its counts only: history queries
+skip it, and once its generation is collected the change feed lists it without changes.
+The comparison itself, `diff::compare_changes`, reads both states in full while the
+writer lock is held (`rebuild_locked` calls `log_bulk_commit` before it publishes the
+new snapshot), which is why the limit exists.
+
+The fix bounds the work by the change and takes the change from the build:
+
+* **The limit applies to the delta.** A bulk commit's change is recorded when its
+  inserted plus deleted quads are at most `change_log_bulk_max_quads`. The build knows
+  an upper bound before it starts (the new quads, `BulkCommit::net_del` and the
+  dropped graphs' sizes) and the exact counts when it ends. The option keeps its name and default; its meaning changes from "quads of
+  both states" to "quads changed", which the API docs say.
+* **The delta comes from the build.** `rebuild_locked` writes the transaction's
+  snapshot into a `Builder` through `write_snapshot`, whose filter drops the quads of
+  deleted graphs, then adds the new quads (`extra_quads` and the `extra` sources). The
+  builder sorts and deduplicates them all. Three sources give the change without a
+  second read of either state: the quads the filter drops are deletions; the
+  transaction's own net deletions and insertions before its bulk batch are in the
+  snapshot's delta against the head; and a key is an addition when, in the builder's
+  `GSPO` merge of its sorted runs, every copy of it comes from the new quads. The runs
+  carry one bit for their origin to make the last test. The keys go into a buffer
+  charged to the build's memory budget, which stops collecting, and the commit falls
+  back to a summary, when it passes the limit. Nothing is compared while the writer
+  lock waits. `state_change_keys` stays for recovery when no file of the change exists
+  (below).
+* **Crash before recording.** Today the record is queued after `CURRENT` switches and
+  written by the background writer, and the old generation is removed after the
+  switch, so a crash in between leaves the commit unrecorded (as §11.3 says). The build
+  writes the collected keys to `changes.bin` in the new generation's directory and
+  syncs it before `CURRENT` switches. Recovery's `Step::Compare` reads that file when
+  it is present, before it tries to compare states. The file is removed when the
+  change log has synced past the commit, or with its generation.
+
+Acceptance examples:
+
+* **A-B1.** With the default limit, a dataset of 2,000,000 quads, and a bulk load of 10
+  new quads: `GET /{ds}/history?subject=` one of the new subjects returns its
+  additions, and `/{ds}/changes` after a compaction lists the 10 quads.
+* **A-B2.** A bulk load of 1,500,000 quads into the same dataset is recorded as a
+  summary with its counts, as now.
+* **A-B3.** A replace of a named graph of 5 quads through the bulk path records 5
+  deletions and the new quads.
+* **A-B4.** A failpoint between the `CURRENT` switch and the change log's flush, then a
+  reopen: the bulk commit of A-B1 is recorded with its 10 quads, not as a gap.
+* **A-B5.** The commit latency of a 10-quad bulk load into 10.5M triples does not grow
+  against the build before the change.
+
+**History extensions** (item 52, Tier 5, [ROADMAP](../ROADMAP.md)). *Not built* above
+lists pin rebasing, periods per quad and point-in-time reads rebuilt from the change log;
+*Still not built* in Phase 2 records that the feed is per dataset. Full-text search at
+pins (§11.6) is listed with F03's follow-ups.
+
+* **Pin rebasing.** A pin holds its whole generation and the write-ahead log up to its
+  commit (§4). `POST /$/snapshots/{ds}/{name}/rebase` builds the pinned state into a
+  generation of its own with the bulk builder, from a snapshot of the pin, without the
+  writer lock, then points the pin at it and releases the old generation's hold. The
+  rebased generation has no write-ahead log, so it answers only the pinned commit.
+  Retention counts the new generation's bytes instead of the old one's. A rebase is a
+  task with progress, and `sparkles snapshot rebase` runs it.
+* **Periods per quad.** A history query gains `hist:periods`: for each matching quad,
+  the ranges of commits during which it held, folded from the change log's additions
+  and deletions in commit order. A quad present before the log's first record starts
+  at an open bound, and an unrecorded commit (a summary or a gap) inside a period ends
+  it with an unknown bound rather than a guess. Output per row: the quad, `hist:from`,
+  `hist:to` (unbound while it still holds) and whether either bound is unknown.
+* **Reconstructing expired states.** When no retained generation holds commit N but
+  the change log records every commit from N + 1 to a retained state in full, a read
+  at N starts from that later state and applies the recorded changes backwards as a
+  delta overlay, under the history cache's budget. A summary or gap on the way makes
+  the commit unreadable as now, with the error naming the unrecorded commit.
+  `/$/history/{ds}` reports these ranges as `reconstructableFromLog`.
+* **A change feed per graph.** `/{ds}/changes?graph=` filters every page by graph after
+  reading each commit. The change log's index gains, per sealed segment, the set of
+  graph keys its records touch, so a feed of one graph skips segments that do not
+  touch it, and the page's cursor still counts in dataset commits.
+* **Settings history.** Settings changes ([C19](C19-layered-settings.md)) are not
+  commits. Server-wide changes are logged under the `sparkles::audit` target
+  (`settings/server.rs`); nothing keeps a readable history of a dataset's runtime
+  layer. Each change is appended to a `settings-log.jsonl` per
+  dataset with its time, author, layer, the changed keys and their old and new values
+  (secrets redacted), retained by count or age, and `GET /$/settings/{ds}/history`
+  lists it.
