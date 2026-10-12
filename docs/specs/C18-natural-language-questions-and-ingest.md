@@ -4812,10 +4812,3 @@ result comparison and profile comparison. Phase 6 here is replaced by U04.
 adds communities from [F14](F14-graph-algorithms.md)'s Leiden with reports written by a
 new `community` role, global questions in Ask (`mode: "global"`), and community context
 in `recall` and the brief.
-
-**Item 77: ingestion controls in the UI and redaction.** The UI's Ingest card shows the
-ingestion settings but a dataset admin cannot enable server ingestion or set its
-provider policy there. The follow-up adds those controls to the dataset's settings tab
-through the C19 routes, and extends redaction beyond the fixed patterns of
-`sparkles-memory-import/src/redact.rs` with patterns that an administrator adds per
-dataset, applied in the server's `secret-detected` check as well.

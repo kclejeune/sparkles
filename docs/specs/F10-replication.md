@@ -1507,8 +1507,9 @@ Tier 6, [ROADMAP](../ROADMAP.md)). §2.3 to §4.8 and §8 hold the design.
   3. **Synchronous replication.** `--sync-replicas N` and named replicas: a commit is
      acknowledged after N replicas report it applied through the `applied` parameter of
      their stream requests, with a timeout after which the commit is acknowledged
-     with `Sparkles-Replication: degraded`. PostgreSQL instead waits indefinitely, which
-     `--sync-replicas-strict` reproduces by failing the write at the timeout.
+     with `Sparkles-Replication: degraded`. PostgreSQL instead keeps the commit
+     waiting until a standby confirms; `--sync-replicas-strict` never acknowledges an
+     unconfirmed commit and fails the write at the timeout.
   4. **Failover** through an external lease (§8 Phase 3): a `--lease k8s:NAME` or
      `consul:KEY` holder is the primary; a replica that acquires the lease promotes
      itself after it has applied everything the stream sent, and the old primary

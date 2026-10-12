@@ -56,7 +56,9 @@ zooming into a group fetches its members. The existing view stays for small grap
   better at Explore's sizes.
 - Edge bundling, 3D views and animation of layouts over time. U01's slider works on the
   small view.
-- Computing communities. F14 computes them, and this spec reads its output.
+- Computing communities. F14 computes them, and this spec reads its written-back output.
+  F14 also lets the small view colour nodes by community, which this spec does not
+  change.
 - Graph editing.
 
 ## 2. User-visible behaviour
@@ -161,10 +163,14 @@ type GroupsAnswer = {
 };
 ```
 
-- **By community.** F14 writes a community id per node to a predicate the caller names,
-  through its `SERVICE` procedures or as a materialized result. The route groups the
-  `within` set by that predicate's values and counts the edges between groups, for all
-  predicates or the one the request names.
+- **By community.** F14's write-back ([F14 §2.5](F14-graph-algorithms.md)) writes, for
+  each node, a predicate the caller names (such as `ex:community`) to a community
+  resource per level, with `skos:broader` between levels. The route groups the `within`
+  set by that predicate's values at the coarsest level, and opening a community group
+  groups its members by the next finer level, following `skos:broader` down. It counts
+  the edges between groups, for all predicates or the one the request names. Community
+  ids that exist only as `SERVICE` output are not read; the person writes them back
+  first.
 - **By property.** Values of a literal property are bucketed into at most `buckets`
   ranges (numbers and dates) or most frequent values (strings and IRIs, the rest in one
   group).
@@ -300,8 +306,8 @@ opens, so the size of the query page's first load does not change.
 
 1. Whether group answers should be cached on the server per commit, or recomputed, given
    that the schema reports' incremental updates (C02) do not cover them.
-2. How F14 exposes community ids: as a materialized predicate, which this spec assumes,
-   or only as `SERVICE` output, which would need the groups route to call F14 itself.
+2. Whether the groups route should run an F14 community detection itself when no
+   written-back result exists, as a task, instead of asking the person to write one back.
 3. Whether the overview should also offer grouping by named graph for datasets that keep
    one graph per source.
 

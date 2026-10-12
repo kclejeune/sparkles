@@ -963,3 +963,61 @@ These points settle what the addendum left open.
   that turns verification on, not when the checkbox is ticked, so the dialog also
   covers the JSON editor. The TLS fields appear only for providers with an `https`
   endpoint.
+
+### Roadmap follow-ups (2026-10-12)
+
+**Assistant secrets sealed by default** (item 68, Tier 6, [ROADMAP](../ROADMAP.md)).
+
+* **What exists today.** The Phase 4 note above that runtime keys "stay unencrypted in
+  `<dataDir>/secrets` until F11" is out of date. `serve --secrets-key SOURCE` (with
+  `file:`, `env:`, `credential:` or `command:` sources) seals each runtime value
+  (`crates/sparkles-server/src/settings/secrets.rs`, `Sealing`), using
+  `sparkles_backup::crypto::SecretSealer`, which binds the secret's name to its
+  ciphertext. At start, `Sealing::prepare` opens every stored value, seals plaintext
+  values in place when a key is given, and stops the start when a sealed value does not
+  open or when sealed values exist and no key is given. `GET /$/server/secrets` reports
+  `storage: "sealed" | "plaintext"`, and the NixOS module's `secretsKeyFile` passes
+  `--secrets-key credential:secrets-key`.
+* **What is missing.** Sealing is opt-in: without `--secrets-key`, values are
+  plaintext files with mode 0600. It also needs the `backup-encryption` cargo feature,
+  which is not a default feature of `sparkles-server` and is not in the `Dockerfile`'s
+  build; `--secrets-key` in such a build fails at start with "needs a build with the
+  backup-encryption feature". Only the Nix package turns that feature on, and only on
+  Linux.
+* **Seal in every build.** The secret sealer (AES-256-GCM, HKDF) moves out of the
+  `encryption` feature into a small always-built module of `sparkles-backup`, with
+  `aws-lc-rs`, which the default `tls` feature already brings in through rustls. The
+  repository engine stays behind the feature. The sealer keeps its key in
+  `LockedKey` (`crypto/memory.rs`), whose locked page exists on Linux and Android only,
+  and F11's Outcome records that other platforms fail explicitly. For secrets the
+  sealer falls back to a zeroizing heap buffer on other platforms and reports
+  `keyMemory: "locked" | "heap"` in `GET /$/server/secrets`, since the plaintext values
+  it protects are read into ordinary memory at each request anyway.
+* **A key at first start.** When `--secrets-key` is absent, the server looks for a key
+  in this order: `$CREDENTIALS_DIRECTORY/sparkles-secrets-key` (systemd), then
+  `<dataDir>/secrets.key`. If neither exists and the first runtime secret is being
+  stored, it generates 32 random bytes and writes `<dataDir>/secrets.key` with mode
+  0400 in a directory it owns, then seals with it. `--secrets-key none` keeps the
+  plaintext behaviour for operators who want it.
+* **What the generated key protects.** A key in the data directory does not protect
+  against someone who can read the whole directory. It does protect the values when
+  `secrets/` is copied without the key: in a server backup (the F05 follow-up excludes
+  `secrets.key` from server backups and restores sealed values only with the same key),
+  in a support archive, or in a clone of the directory that leaves out `secrets.key`.
+  `GET /$/server/secrets` reports `keySource: "generated" | "configured"`, the UI's
+  API keys panel says that a generated key lives beside the data, and the docs
+  recommend a credential or command source outside the data directory.
+* **Migration.** Existing plaintext values are sealed at the first start of the
+  release that makes sealing the default, through the existing `prepare` path, which
+  already writes each value atomically. The release notes ([X12 §5.5](X12-release-engineering.md))
+  list it under **Format**, since an older release then refuses to start
+  ("the stored secrets … are sealed"). For a downgrade, `sparkles secrets unseal --data
+  DIR` (offline, holding the catalog lock) writes the values back as plaintext, and
+  `sparkles secrets rekey --data DIR --new-key SOURCE` reseals them under another key.
+  A start whose key does not open the stored values still stops, with the names, as it
+  does today.
+* **Tests.** A first start with no key generates one and seals a stored value; a
+  restart opens it; a data directory with plaintext values from the previous release is
+  sealed on start; `unseal` then the previous release's binary reads them; a wrong
+  configured key stops the start; `--secrets-key none` stores plaintext; the TRACE log
+  check of A12 still finds no value.

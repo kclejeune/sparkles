@@ -229,7 +229,7 @@ instead of failing. Each new platform gets a classifier jar.
 
 The engine has five platform packages: `linux-x64-gnu`, `linux-arm64-gnu`,
 `linux-x64-musl`, `linux-arm64-musl` and `darwin-arm64` (`js/scripts/platforms.mjs`).
-Phase 2 adds `darwin-x64` and `win32-x64-msvc`, which P05 §6 already names.
+Phase 2 adds `darwin-x64` and `win32-x64-msvc`, which [P05 §7.1](P05-node-bindings.md) already names.
 
 ### 3.5 Windows
 
@@ -256,7 +256,7 @@ locking whose semantics differ from `flock`.
 | Write-ahead log | `wal.log` | none: 33-byte records | primary |
 | Commit catalog | `commits.bin` | magic `SPKCMTS\0`, 64-byte records, flag bits added compatibly | primary |
 | Change log | segments and index | magics `SPKCHGL\0`, `SPKCHGI\0`, `FORMAT` 1 | primary |
-| Annotations | annotation file | magic `SPKANNO\0`, `FORMAT` 1 | primary |
+| Annotations | `annotations.bin` | magic `SPKANNO\0`, `FORMAT` 1 | primary |
 | Catalog | `config.json`, `catalog.lock` | none | primary |
 | Full-text index | Tantivy directory and `text.json` | `FORMAT` 2 (`text.rs`); another format is rebuilt on open | derived |
 | Vector index | `vector.json`, index files | config `FORMAT_VERSION` 1, file `SPKVEC` `FILE_VERSION` 1 | derived |
