@@ -232,6 +232,8 @@ orders every item by difficulty and impact and links each to its design spec.
   * Editing forms generated from shapes.
   * RML mappings and virtual graphs.
   * A local-first WebAssembly engine.
+* **Lower tiers.** Smaller backlog items, the release work (packages, server binaries,
+  images, format stability, replication) and leftover Jena compatibility features.
 
 ## Web UI
 

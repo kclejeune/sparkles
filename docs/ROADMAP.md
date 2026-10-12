@@ -22,7 +22,8 @@ Sizes are estimates:
 | L | Several weeks |
 | XL | A quarter or more |
 
-Impact is judged against the goal above.
+Impact is judged against the goal above. Tiers 1–4 are the main plan. Tiers 5–7 are
+work that is wanted at a lower priority, and items move between tiers as results come in.
 
 ## How the work is organized
 
@@ -109,49 +110,53 @@ These items are cheap or foundational.
 | 43 | Virtual graphs over SQL, Parquet and Iceberg | [F19](specs/F19-mappings-and-virtual-graphs.md) Phase 2 | XL |
 | 44 | A local-first engine in WebAssembly that syncs through RDF Patch and branches | [F20](specs/F20-local-first-engine.md) | XL |
 
-## Backlog
+## Tier 5: backlog
 
-These are small or narrow items. They stay listed so they aren't lost, and their specs
-already describe them.
+These items are smaller or narrower. Each has a design sketch in the linked spec.
 
-* **Branches** ([F09](specs/F09-branches-and-merges.md#roadmap-follow-ups-2026-10-12)): a remote branch-relink CLI, and clones and archive transfer between servers.
-* **Notifications** ([C21](specs/C21-outbound-notifications.md#roadmap-follow-ups-2026-10-12)): an email channel, an administration UI, broader coverage of backup failures, and delivery that doesn't let a slow channel delay the others.
-* **Rust client** ([P02](specs/P02-rust-client.md#outcome)): typed bodies for the remaining administration calls, proactive rate-limit pacing, and integration tests with environment and saved credentials.
-* **Formatter and linter** ([X02](specs/X02-formatter.md#outcome), [X04](specs/X04-linter.md#outcome)): SHACLC formatting, and linting of N-Triples, N-Quads, JSON-LD and embedded SHACL queries.
-* **Write previews** ([C15](specs/C15-write-previews.md#outcome)): local dry-run flags and UI previews.
-* **Restricted views** ([C12](specs/C12-graph-access-control.md#roadmap-follow-ups-2026-10-12)): token scopes limited to graphs, validation and statistics for restricted views, and text scoring local to what a caller can see.
-* **ARQ extensions** ([G06](specs/G06-arq-query-extensions.md#outcome)): parallel LATERAL and user DESCRIBE handlers.
-* **History** ([F06](specs/F06-snapshots-and-point-in-time.md#roadmap-follow-ups-2026-10-12)): pin rebasing, periods per quad, change feeds per graph, and reconstructing expired states from the change log.
-* **Inference** ([C08](specs/C08-inference-freshness.md#roadmap-follow-ups-2026-10-12)): input-graph and RDFS settings in the UI, the remaining RDFS-on-read surfaces, and controls for the import policy.
-* **ShEx** ([G02](specs/G02-shex.md#roadmap-follow-ups-2026-10-12)): combined SHACL and ShEx guards, schemas from a graph plus a file, and CLI outbound controls.
-* **CLI and OpenAPI** ([X03](specs/X03-openapi-and-completions.md#outcome)): dynamic and Nushell completions, and an OpenAPI "try it" page.
-* **MCP** ([C11](specs/C11-mcp-server.md#roadmap-follow-ups-2026-10-12)): legacy resource subscriptions.
-* **Agent memory** ([C18](specs/C18-natural-language-questions-and-ingest.md#roadmap-follow-ups-2026-10-12)): scratch-branch expiry settings and stdio expiry.
+| # | Item | Spec | Size |
+|---|---|---|---|
+| 45 | Branches: a remote branch-relink CLI, and clones and archive transfer between servers | [F09](specs/F09-branches-and-merges.md#roadmap-follow-ups-2026-10-12) | M |
+| 46 | Notifications: an email channel, an administration UI, broader backup-failure coverage, and delivery that doesn't let a slow channel delay the others | [C21](specs/C21-outbound-notifications.md#roadmap-follow-ups-2026-10-12) | M |
+| 47 | Rust client: typed bodies for the remaining administration calls, proactive rate-limit pacing, and credential integration tests | [P02](specs/P02-rust-client.md#roadmap-follow-ups-2026-10-12) | S–M |
+| 48 | SHACLC formatting; linting of N-Triples, N-Quads, JSON-LD and embedded SHACL queries; linting in the shapes editor; an MCP lint tool | [X02](specs/X02-formatter.md#roadmap-follow-ups-2026-10-12), [X04](specs/X04-linter.md#roadmap-follow-ups-2026-10-12) | M |
+| 49 | Write previews: local dry-run flags, UI previews, and the handling of read-only servers and costly bulk previews | [C15](specs/C15-write-previews.md#roadmap-follow-ups-2026-10-12) | S–M |
+| 50 | Restricted views: token scopes limited to graphs, validation and statistics for restricted views, and text scoring local to what a caller can see | [C12](specs/C12-graph-access-control.md#roadmap-follow-ups-2026-10-12) | M |
+| 51 | ARQ: parallel LATERAL, user DESCRIBE handlers, the remaining client options and builder methods, and `shortest(…)` evaluation | [G06](specs/G06-arq-query-extensions.md#roadmap-follow-ups-2026-10-12) | M |
+| 52 | History: pin rebasing, periods per quad, change feeds per graph, reconstructing expired states, and history of settings | [F06](specs/F06-snapshots-and-point-in-time.md#roadmap-follow-ups-2026-10-12) | M |
+| 53 | Inference: input-graph and RDFS settings in the UI, the remaining RDFS-on-read surfaces, and controls for the import policy | [C08](specs/C08-inference-freshness.md#roadmap-follow-ups-2026-10-12) | S–M |
+| 54 | ShEx: combined SHACL and ShEx guards, schemas from a graph plus a file, and CLI outbound controls | [G02](specs/G02-shex.md#roadmap-follow-ups-2026-10-12) | M |
+| 55 | Dynamic and Nushell completions, and an OpenAPI "try it" page with named schemas | [X03](specs/X03-openapi-and-completions.md#roadmap-follow-ups-2026-10-12) | S–M |
+| 56 | Legacy MCP resource subscriptions | [C11](specs/C11-mcp-server.md#roadmap-follow-ups-2026-10-12) | S |
+| 57 | Scratch-branch expiry settings and stdio expiry | [C18](specs/C18-natural-language-questions-and-ingest.md#roadmap-follow-ups-2026-10-12) | S |
 
-## Deferred until the first release
+## Tier 6: release work
 
-These matter for a release but not for the goal above.
+This work is done when the first release is cut.
 
-* **Packages and binaries** ([P01](specs/P01-python-bindings.md), [P04](specs/P04-jvm-bindings.md), [P05](specs/P05-node-bindings.md)):
-  * Publishing to PyPI, Maven Central and npm. The workflows exist, with their publish jobs switched off.
-  * Windows and Intel macOS builds.
-  * Server binaries and published container images.
-* **Release contract:** a stability and migration policy for the on-disk format. Today a format mismatch is refused with "dump and reload".
-* **Backups** ([F05](specs/F05-snapshot-repositories.md#outcome)): whole-server backup and restore, a backup of every dataset in one request, and a remote backup CLI.
-* **Access control** ([C09](specs/C09-dataset-access-control.md#outcome)):
-  * Audit events for creating, deleting and cloning datasets.
-  * Mutual TLS, OCSP, opaque-token introspection, front-channel logout and Cloudflare group lookup.
-* **Operations** ([C01](specs/C01-observability-and-budgets.md#roadmap-follow-ups-2026-10-12)): binding the listener before datasets open, degraded startup, and OTLP metric export.
-* **Encryption** ([F11](specs/F11-encryption-at-rest.md#outcome)): key management workflows, Vault and cloud KMS, and encryption of live datasets and derived indexes.
-* **Replication** ([F10](specs/F10-replication.md#outcome)): read replicas, failover and synchronous replication.
-* **MCP** ([C11](specs/C11-mcp-server.md#roadmap-follow-ups-2026-10-12)): OAuth protected-resource metadata, audience validation and scope challenges.
-* **Secrets** ([C19](specs/C19-layered-settings.md#outcome)): assistant secrets are stored in plaintext unless the server runs with `--secrets-key`.
-* **Bindings** ([P01](specs/P01-python-bindings.md), [P04](specs/P04-jvm-bindings.md)): Python async wrappers, PyPy and free-threaded wheels, and a musl JVM build.
+| # | Item | Spec | Size |
+|---|---|---|---|
+| 58 | Packages: publishing to PyPI, Maven Central and npm, Windows and Intel macOS builds, a musl JVM build, PyPy and free-threaded wheels, and Python async wrappers. The workflows exist, with their publish jobs switched off. | [X12]({X12}), [P01](specs/P01-python-bindings.md#roadmap-follow-ups-2026-10-12), [P04](specs/P04-jvm-bindings.md#roadmap-follow-ups-2026-10-12), [P05](specs/P05-node-bindings.md#roadmap-follow-ups-2026-10-12) | M–L |
+| 59 | Server binaries and published container images | [X12]({X12}) | M |
+| 60 | A stability and migration policy for the on-disk format and the APIs. Today a format mismatch is refused with "dump and reload". | [X12]({X12}) | M–L |
+| 61 | Whole-server backup and restore, all datasets in one request, a remote backup CLI, and repository copy | [F05](specs/F05-snapshot-repositories.md#roadmap-follow-ups-2026-10-12) | M |
+| 62 | Audit events for creating, deleting and cloning datasets | [C09](specs/C09-dataset-access-control.md#roadmap-follow-ups-2026-10-12) | S |
+| 63 | Mutual TLS, OCSP, opaque-token introspection, front-channel logout and Cloudflare group lookup | [C09](specs/C09-dataset-access-control.md#roadmap-follow-ups-2026-10-12) | M |
+| 64 | Binding the listener before datasets open, degraded startup, OTLP metric export, and a separate metrics listener | [C01](specs/C01-observability-and-budgets.md#roadmap-follow-ups-2026-10-12) | M |
+| 65 | Encryption: key management workflows, Vault and cloud KMS, recovery export, and encryption of live datasets and derived indexes | [F11](specs/F11-encryption-at-rest.md#roadmap-follow-ups-2026-10-12) | L–XL |
+| 66 | Replication: read replicas, preserved primary IDs, promotion, failover and synchronous replication | [F10](specs/F10-replication.md#roadmap-follow-ups-2026-10-12) | XL |
+| 67 | MCP OAuth: protected-resource metadata, audience validation and scope challenges | [C11](specs/C11-mcp-server.md#roadmap-follow-ups-2026-10-12) | S–M |
+| 68 | Assistant secrets sealed by default (today they are plaintext unless `--secrets-key` is set) | [C19](specs/C19-layered-settings.md#roadmap-follow-ups-2026-10-12) | S–M |
 
-## Not planned
+## Tier 7: compatibility leftovers
 
-* **ARQ features** ([G06](specs/G06-arq-query-extensions.md#outcome)): JavaScript functions, `afn:context`, the Leviathan library, the `JSON` query form and locale collation. These are deliberate exclusions.
-* **GeoSPARQL expected answers** ([COMPARISON.md](COMPARISON.md#geosparql)): Sparkles won't change to match every expected answer of the GeoSPARQL benchmarks where it made a deliberate semantic choice.
+These were excluded earlier on purpose. They stay on the list and are reconsidered when
+users ask for them.
+
+| # | Item | Spec | Size |
+|---|---|---|---|
+| 69 | ARQ: JavaScript functions, `afn:context`, the Leviathan library, the `JSON` query form and locale collation | [G06](specs/G06-arq-query-extensions.md#roadmap-follow-ups-2026-10-12) | M each |
+| 70 | GeoSPARQL: an optional mode that reproduces Jena's answers where Sparkles diverges on purpose ([COMPARISON.md](COMPARISON.md#geosparql)) | [G01](specs/G01-geosparql.md#roadmap-follow-ups-2026-10-12) | M |
 
 ## Keeping this current
 
