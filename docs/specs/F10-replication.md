@@ -1515,3 +1515,76 @@ Tier 6, [ROADMAP](../ROADMAP.md)). §2.3 to §4.8 and §8 hold the design.
      itself after it has applied everything the stream sent, and the old primary
      demotes itself when it loses the lease, refusing writes before the lease
      expires.
+
+**RDF Patch: several transactions as several commits, blank-node identity across
+datasets, and patch logs** (item 74, Tier 5, [ROADMAP](../ROADMAP.md)). These are open
+questions 3, 13 and 4, which the Outcome above left at their designed defaults.
+
+* **What is missing today.** `Store::apply_patch` (`store/patch_apply.rs`) runs the
+  whole patch in one `WriteTxn` and one commit of kind `Patch`; its module comment says
+  `TX`, `TC` and `Z` are markers and a `TA` anywhere aborts the whole patch. A blank node
+  label names a stored node only when the leading headers' `prev` names a commit of this
+  dataset and the label has the stored form `b<hex>` (`Labels::get`); every other label
+  is local to the request, so a second patch from another dataset or from Jena cannot
+  delete or extend a blank node that its first patch created.
+  [FEATURES](../FEATURES.md#known-gaps) lists both, and "no patch logs". The `id`
+  header is read and ignored, so no record ties a commit to the patch that made it.
+* **One commit per transaction.** `POST /{ds}/patch?transactions=each` (and
+  `sparkles patch --each`, `Dataset::apply_patch_with` with
+  `PatchOptions::transactions`) applies each `TX … TC` block as its own `WriteTxn` and
+  commit. Rows before the first `TX` and between a `TC` and the next `TX` form a block
+  of their own. The default stays `one`, Fuseki's behaviour. In `each` mode:
+  * `H prev` is the precondition of the first block, and each later block's
+    precondition is the commit the previous block made, so no other writer's commit can
+    land between two blocks unnoticed: a block that finds another head fails with
+    `prev-mismatch`.
+  * `TA` aborts only its block, as RDF Patch defines it for a transaction.
+  * A block that fails (validation, quota, protections, a syntax error in its rows)
+    stops the patch. The answer is `409` or the error of that block, with `committed`,
+    the receipts of the blocks before it, and `failedBlock`, its index and row. The
+    patch can be resent from that block with `prev` set to the last committed commit.
+  * The commit message from the `message` header goes on every commit, with
+    `(n/m)` appended.
+  * A dry run evaluates the blocks in order inside one transaction that is rolled back,
+    and reports per-block counts and the validation of the final state; it says that
+    blocks would be validated one by one when applied.
+* **Blank-node identity across datasets.** `bnodes=stored|local|mapped|skolem`, which
+  open question 13 asked for:
+  * `stored` and `local` are the two halves of today's rule, chosen explicitly.
+  * `mapped` keeps a persistent map from the sender's labels to local nodes, per
+    sender. The sender is the dataset id in the patch's `prev` or `id` header, or the
+    `source` parameter for patches that carry neither. The first use of a label makes a
+    node and records it; later patches from the same sender that use the label name
+    that node, so a Jena producer's `_:label` or `<_:label>` keeps its identity across
+    patches. The map lives in `patch-bnodes/<sender>.map` in the dataset directory,
+    written in the commit's WAL record so that it is as durable as the data, and
+    compaction drops entries whose node no longer occurs in any quad. Clones copy it;
+    backups include it.
+  * `skolem` replaces each label with an IRI under
+    `<base>/.well-known/genid/<sender>/<label>`, as RDF 1.1 Concepts §3.5 describes for
+    Skolem IRIs, for users who prefer IRIs that any system can name.
+  The default stays today's rule, so no existing client changes behaviour.
+* **Patch logs.** A patch log, in RDF Delta's sense, is the ordered sequence of patches
+  with `id` and `prev` headers that chain them. Sparkles already serves each commit as a
+  patch with `H id` and `H prev` through the change feed
+  ([F06](F06-snapshots-and-point-in-time.md)), so the log needs no second copy of the
+  data:
+  * `apply_patch` records the patch's `id` header, when it has one, in the commit's
+    annotations, with an index from patch id to commit in the change log. A patch whose
+    `id` is already recorded answers `200` with the earlier commit and
+    `"duplicate": true` instead of applying again (open question 4).
+  * `GET /{ds}/patch/log?after=ID|commit:N&limit=` lists the commits made by patches,
+    each with its patch id, `prev`, commit and counts, and `GET /{ds}/patch/log/{id}`
+    returns that commit's changes as an RDF Patch whose `H id` is the original patch id
+    and whose `H prev` is the previous logged patch's id, so a Delta-style follower can
+    replay the log in order. Commits not made by patches appear in the change feed and
+    not in the log.
+  * The log reaches back as far as the change log's retention. Keeping it longer,
+    shipping it elsewhere and rotating it is the archive of item 66 above.
+* **Tests.** A patch of three `TX … TC` blocks with `each` makes three commits; with a
+  validation failure in the second, one commit and a `409` naming block 2; with `TA` in
+  the second, two commits. Two patches from a Jena `RDFChangesCollector` that create
+  then delete a blank node with `bnodes=mapped` leave no node behind, and with `local`
+  leave one, as today. `mise run test:jena-clients` gains these cases. Resending a patch
+  with a recorded `id` makes no commit. Replaying `/{ds}/patch/log` from the start into
+  an empty dataset with `bnodes=mapped` gives an isomorphic dataset.

@@ -775,3 +775,44 @@ Acceptance: a token scoped to `urn:tenant:a` reads only that graph although its 
 reads all; `/{ds}/shacl` for a reader of one graph reports only that graph's results;
 `/$/stats` for the same reader lists one graph; and two datasets that differ only in a
 hidden graph give a restricted reader the same `text:query` scores.
+
+**Validation for callers whose grants cover part of a dataset** (item 75, Tier 5,
+[ROADMAP](../ROADMAP.md)). Item 75 also covers two parts of
+[C12b](C12b-triple-access-control.md#roadmap-follow-ups-2026-10-12). Its validation part
+shares the design of "Validating a view" above (item 50); this entry records the
+evidence and the parts that entry leaves out.
+
+* **What is missing today.** `whole_dataset` in `crates/sparkles-server/src/auth/routes.rs`
+  lists `/{ds}/shacl` and `/{ds}/shex`, so the middleware refuses them with "covers every
+  graph of /{ds}, and your access is limited to some graphs or triples" whenever
+  `Principal::view` is not `None`, which includes callers limited only by C12b
+  protections. The MCP validation tools refuse the same callers in
+  `crates/sparkles-server/src/mcp/validate.rs` ("validation covers every graph"). A
+  restricted writer also loses the guard's summary: `write_response` in
+  `crates/sparkles-server/src/http.rs` and the dry-run answer in `http/dry_run.rs` drop
+  `receipt.validation` when the caller is restricted, so such a writer learns that a
+  write was accepted or rejected but not which of its own focus nodes failed.
+* **Validation on the view.** As item 50's entry says, both validators read through a
+  snapshot, so `/{ds}/shacl`, `/{ds}/shex` and the MCP tools take the caller's masked
+  snapshot (C12's filtered view and C12b's mask together). The answer gains
+  `"scope": "view"` and the reasons the result can differ from a full validation: a
+  `sh:minCount` or a ShEx cardinality may fail because the values that would satisfy it
+  are hidden. That is the intended meaning: the caller validates what it can see. The
+  shapes graph or ShEx schema graph is read with the same view, and one the caller
+  cannot read is `403`. The routes leave `whole_dataset`; `/$/validation/{ds}` (the guard
+  configuration and its counts) stays admin-only.
+* **The guard's summary for restricted writers.** The write-time guard keeps validating
+  the whole dataset, so a restricted writer cannot change what it checks. Its summary is
+  filtered instead of dropped: results whose focus node, value and the triples on the
+  result's path are all visible to the caller are kept, and the rest are counted as
+  `hidden` without detail. `blocking` and the decision stay those of the whole dataset,
+  so a write can be rejected for a result the caller cannot see; the answer then says
+  `"rejectedBy": "hidden"`, which reveals only that something the caller cannot see
+  blocks the write, as the `422` does today. Filtering needs the view's mask at the
+  write's end state, which the write already computes for protections that limit
+  writes (C12b's `WriteCheck`).
+* **Tests.** A reader of one graph validates that graph and gets its results only; a
+  reader under a C12b protection that hides `ex:email` gets a `sh:minCount 1` failure
+  for `ex:email` on every person, and the answer says `scope: "view"`; a restricted
+  writer's rejected write lists its own failing focus node and counts the others as
+  hidden.

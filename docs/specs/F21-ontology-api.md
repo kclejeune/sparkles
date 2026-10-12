@@ -271,9 +271,9 @@ and `rdf:type` triples whose object is an OWL built-in class. Assertions are not
 eagerly: `class_assertions(c)`, `instances(c)`, `property_assertions(i)` and the
 listing of all assertions are iterators over the store, so an ontology with a billion
 assertions opens in the time its terminology takes. A parsed ontology is cached per
-(snapshot, graphs, mode, view), with the same bounded cache the reasoner keeps for its
-inputs (`sparkles_reasoner::Cache`), and is dropped at the next commit that touches one
-of its graphs.
+(snapshot, graphs, mode, view) in a cache bounded by axiom count, as the reasoner bounds
+the closure it keeps between runs (`sparkles_reasoner::Cache`), and is dropped at the
+next commit that touches one of its graphs.
 
 ## 5. Writing to RDF
 

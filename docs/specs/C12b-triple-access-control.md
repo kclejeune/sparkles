@@ -575,3 +575,70 @@ over hidden predicates get faster, since there is less to read.
 
 The GraphQL endpoint of [C03](C03-graphql.md), which came later, runs its queries with
 the caller's view, so protections hide triples from it as they do from SPARQL.
+
+### Roadmap follow-ups (2026-10-12)
+
+**Item 75 (Tier 5, [ROADMAP](../ROADMAP.md)): the change feed for protections that depend
+on the data, and hiding the IRIs that visible triples mention.** The item's third part,
+validation for callers whose grants cover part of a dataset, is in
+[C12's follow-ups](C12-graph-access-control.md#roadmap-follow-ups-2026-10-12).
+
+* **What is missing today: the change feed.** The Outcome lists the change feed among
+  the surfaces that apply the view, and it does for protections by predicate and graph.
+  For protections by class or pattern, `Store::changes` in
+  `crates/sparkles-core/src/store/changes.rs` returns `NotPermitted` ("the change feed is
+  not available to a caller whose protections depend on the data (classes or patterns);
+  the diff between two commits is") when `TripleRules::state_independent` is false, and
+  `check_history_access` in `store/history_query.rs` refuses history queries for the same
+  callers. The diff between two commits works for them, because
+  `crates/sparkles-core/src/store/diff.rs` compares the two masked states
+  (`DiffMethod::Compare`). The reason for the refusal is real: under such a protection,
+  a commit can change what the caller sees without touching the quads it sees. Adding
+  `ex:bob a ex:Manager` hides every triple of `ex:bob` from a caller whose protection
+  hides managers, and the commit's own changes list only the type triple.
+* **Design: visible changes per commit.** For a commit `c`, the caller's change is the
+  difference between `Q(c−1) \ H(c−1)` and `Q(c) \ H(c)`, where `Q` is the state and `H`
+  the view's mask (`Mask::hidden`, the sorted hidden quads). It splits into two parts
+  that are cheap to compute:
+  1. the commit's own changes, each kept when the quad is visible in the state where it
+     exists (added quads in `c`, removed quads in `c−1`);
+  2. the quads whose visibility flipped: `H(c−1) Δ H(c)`, restricted to quads present in
+     both states, emitted as an addition when the quad became visible and as a removal
+     when it became hidden.
+  Part 2 needs the masks of consecutive commits. A mask is built from a snapshot, so the
+  feed builds `H(c)` for each listed commit from `snapshot_at(commit:c)` under F06's
+  retention, and keeps the last mask per view key to start the next page. Commits the
+  generations no longer hold but the change log does cannot be masked, so a page that
+  reaches one ends there with `history-gone` for this caller only, naming the first
+  commit it can serve; callers without such protections keep reading the change log as
+  today. The per-commit cost is one mask build, bounded by `max_hidden_quads`; a commit
+  whose rule inputs did not change (no `rdf:type`, `rdfs:subClassOf` or pattern
+  predicate among its changes) reuses the previous mask unchanged, which is the common
+  case. The event stream does the same for each new commit. History queries follow with
+  the same method once the feed works.
+* **What is missing today: mentioned IRIs.** §1.2 makes hiding the existence of IRIs a
+  non-goal, and §9 lists the leak: with a protection that hides `ex:bob`'s triples by
+  class, `ex:alice ex:knows ex:bob` stays visible, and so does the IRI `ex:bob` in it, in
+  triple terms that quote it, in full-text and path results that reach it, and in
+  `DESCRIBE ex:alice`.
+* **Design: `hide_mentions`.** A protection by class or pattern may set
+  `hide_mentions = true`. Its protected resources are the subjects whose triples it
+  hides: the instances of its classes, or the `?this` bindings of its pattern. With the
+  option, the mask also hides every quad whose object is a protected resource and every
+  quad with a triple term that mentions one. The quads are found through the object
+  permutation for each protected resource, so the cost is the resources' in-degree, and
+  they count against `max_hidden_quads`. Protections by predicate have no protected
+  resources and refuse the option. Writes follow the existing rule that refuses by the
+  triples asked for: inserting `ex:alice ex:knows ex:bob` is a write of a protected triple
+  for a caller the protection is not lifted for. The option does not hide an IRI that
+  appears as a literal's lexical form, a class or predicate name in schema listings, or
+  the commit sequence; the documentation lists those. The accepted leak of §9 narrows to
+  a caller that already knows the IRI and probes for it.
+* **Tests.** The random-view test of `crates/sparkles-core/tests/triple_access.rs` gains
+  the change feed: for random histories, the concatenated visible changes of commits 1 to
+  n under a class or pattern protection equal the diff of the masked states at 0 and n,
+  and replaying them onto an empty store gives the masked state at n. It also gains
+  `hide_mentions`, comparing each query with a store that holds the visible triples
+  after removing every triple that mentions a protected resource.
+  `router_tests::auth::triples` checks that the feed answers instead of refusing, and
+  that `ex:bob` appears in no answer to the managers-hidden caller with the option on.

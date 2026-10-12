@@ -4812,3 +4812,64 @@ result comparison and profile comparison. Phase 6 here is replaced by U04.
 adds communities from [F14](F14-graph-algorithms.md)'s Leiden with reports written by a
 new `community` role, global questions in Ask (`mode: "global"`), and community context
 in `recall` and the brief.
+
+**Item 77 (Tier 5): redaction beyond the fixed secret patterns.** The other half of item
+77, ingestion controls in the UI, is in
+[C19's follow-ups](C19-layered-settings.md#roadmap-follow-ups-2026-10-12).
+
+- **What exists and what is missing.** Redaction (§8.10.7) is regular expressions only:
+  the built-in list of `builtin()` in `crates/sparkles-memory-import/src/redact.rs`
+  (private keys, AWS, GitHub, Slack, Anthropic, OpenAI and Google keys, JWTs,
+  authorization headers, passwords in URLs, and `key`/`secret`/`token`/`password`
+  assignments), the dataset's `imports.secretPatterns` (at most 100, checked in
+  `crates/sparkles-server/src/assist.rs`), and the person's `--redact-patterns` file or
+  `memory.toml` entries. A secret in any other format, such as a database password in
+  prose, a token of a service the list does not know, or personal data, passes. The
+  server's own check, `secret_check` in `crates/sparkles-server/src/mcp/memory/ingest.rs`,
+  runs only in `register_source` and only for graphs under `imports.base`. Server-side
+  document ingestion (`crates/sparkles-server/src/ingest/`) converts an uploaded document
+  and sends its text to the `extract` role's providers with no redaction and no check at
+  all; `send: "documents"` is the only control.
+- **One redaction policy.** `imports.secretPatterns` generalizes to a `redaction` object
+  in the memory settings, which the CLI already reads from `GET /$/memory/{ds}`:
+  `{ patterns, entropy, personal, allow, knownValues }`. `secretPatterns` stays accepted
+  as `redaction.patterns`. The same policy runs in the CLI before upload, in
+  `register_source` for every graph (not only under `imports.base`) when the dataset
+  sets `redaction.everywhere`, and in server ingestion before any text reaches a
+  provider.
+- **High-entropy tokens.** `entropy: { minLength: 20, minBitsPerChar: 4.0 }` marks
+  strings of base64, base64url or hexadecimal characters whose Shannon entropy per
+  character passes the threshold, when they stand as a value in an assignment, a
+  header, a URL query parameter or a quoted string. Hexadecimal strings of exactly 40 or
+  64 characters (commit and content hashes) and canonical UUIDs are not marked, since
+  sessions and notes are full of them. The replacement is `[redacted:high-entropy]`.
+  Off by default, because it has false positives that patterns do not.
+- **Personal data.** `personal: ["email", "phone", "payment-card", "iban", "ip"]` adds
+  detectors for those categories. Payment cards must pass the Luhn check and IBANs the
+  ISO 13616 check digits, which removes most false positives; phone numbers need a `+`
+  and a country code. Each category is opt-in and its matches are counted per category
+  in `mem:redactions`.
+- **Known values.** The strongest detector needs no pattern: the exact values that must
+  never leave. The server knows its runtime secrets and provider keys (C19 §11.2), and
+  ingestion on the server replaces any occurrence of one of those values, matched with
+  Aho-Corasick over the text, with `[redacted:server-secret]`. The CLI does the same for
+  the values of its own environment variables whose names contain `KEY`, `SECRET`,
+  `TOKEN` or `PASSWORD`, and for the values of a `knownValues` file the person names.
+  Values shorter than 8 characters are skipped. Values are compared, never logged or
+  stored.
+- **Allow list.** `allow` holds patterns whose matches are never redacted, such as a
+  project's public test keys, so that a false positive can be silenced without turning
+  a detector off.
+- **Server ingestion.** The pipeline redacts the converted text after conversion and
+  before chunking, so the rendition the facts cite is the redacted text, as it is for
+  imports, and the task reports `redactions` by detector. `redaction.serverIngest:
+  "redact" | "refuse" | "off"` chooses whether a match is replaced, fails the task with
+  `secret-detected` and the detector's name and offset, or is ignored; the default is
+  `redact`. In `register_source`, a match in a source sent with `original` is refused
+  rather than redacted, as today, because the kept bytes would still hold the value.
+- **Tests.** Detector unit tests with positive and negative examples per category,
+  including hashes and UUIDs that the entropy detector must leave alone; a server
+  ingestion of a Markdown file holding a provider key from the server's own secrets,
+  checked against a mock provider that records what it received; an import with an
+  allow-listed test key left in place; `secretPatterns` from an existing `memory.json`
+  read as `redaction.patterns`.

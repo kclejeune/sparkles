@@ -2268,6 +2268,55 @@ implementation landed.
   - a separate diagram library with a layered layout;
   - one figure mixing observed and declared multiplicities.
 
+## OWL 2 ontology API
+
+- **Spec:** [`F21-ontology-api.md`](F21-ontology-api.md), written on 2026-10-12 independently from:
+  - the W3C OWL 2 Structural Specification and Functional-Style Syntax, OWL 2 Mapping to
+    RDF Graphs and OWL 2 Profiles recommendations (second edition, 2012), and RDF 1.1
+    Concepts, cited from working knowledge and not re-fetched;
+  - the public documentation and Javadoc of Apache Jena's `jena-ontapi` module
+    (`OntModel`, `OntModelFactory`, `OntSpecification`, the `Ont*` interfaces) and of the
+    legacy `org.apache.jena.ontology` API, cited from working knowledge; no Jena code was
+    read for this spec;
+  - the Sparkles code (`crates/sparkles-reasoner/src/{lib.rs,diagnostics.rs,inputs.rs}`,
+    `crates/sparkles/src/handles/`, `crates/sparkles/src/dataset.rs`,
+    `jvm/gradle/libs.versions.toml`) and specs C02, C08, C12, C12b, C17, F16, F17, F18, P01,
+    P04, P05, P06 and AUDIT §5.
+- **Implementation:** not built. `jena-ontapi` (Apache-2.0) is planned as an optional
+  dependency of `sparkles-jena`. No new Rust dependency is planned; `horned-owl`
+  (LGPL-3.0) is named only as a rejected alternative and was not read.
+- **Rejected** (spec §13):
+  - a native implementation of `jena-ontapi`'s interfaces in the JVM binding;
+  - an ontology store separate from the triples;
+  - using an existing Rust OWL library;
+  - profile checks as SPARQL queries.
+
+## JSON queries, JSON-LD frames and Datalog queries
+
+- **Spec:** [`C24-json-query-languages.md`](C24-json-query-languages.md), written on 2026-10-12 independently from:
+  - the W3C JSON-LD 1.1, JSON-LD 1.1 Processing Algorithms and API, JSON-LD 1.1 Framing,
+    SPARQL 1.1 Query Language and SPARQL 1.1 Query Results JSON Format recommendations,
+    and RFC 6901 (JSON Pointer), cited from working knowledge and not re-fetched;
+  - the public documentation of Fluree's JSON-LD query language (Fluree is BUSL-1.1; no
+    code was read), of TerminusDB's WOQL, of Apache Jena ARQ's `JSON` query form and rule
+    syntax, and of Soufflé, cited from working knowledge;
+  - Abiteboul, Hull and Vianu, *Foundations of Databases* (1995); Calì, Gottlob and
+    Lukasiewicz, "A general Datalog-based framework for tractable query answering over
+    ontologies" (Journal of Web Semantics, 2012); Fagin, Kolaitis, Miller and Popa,
+    "Data exchange: semantics and query answering" (Theoretical Computer Science, 2005);
+  - the Sparkles code (`crates/sparkles-graphql/src/{algebra.rs,exec.rs}`,
+    `crates/sparkles-core/src/sparql/mod.rs`, `crates/sparkles-reasoner/src/{parser.rs,builtins.rs}`,
+    `crates/sparkles-server/src/http.rs`, `crates/sparkles-server/src/main.rs`) and specs
+    C01, C03, C11, C12, C12b, C16, C20, F01 and F17, FEATURES and COMPARISON.
+- **Implementation:** not built. No new dependency is planned; JSON-LD context processing,
+  pattern expansion and framing are to be written in `sparkles-core`.
+- **Rejected** (spec §12):
+  - adopting Fluree's query syntax as is;
+  - a JSON serialization of the SPARQL algebra;
+  - framing only, without a query language;
+  - a new Datalog syntax with typed columns and `.input`/`.output`;
+  - writing derived relations to a graph.
+
 ## Development tools (not linked into Sparkles)
 
 - **Adopted** (2026-09-30, with the pre-commit hooks in `.pre-commit-config.yaml`):

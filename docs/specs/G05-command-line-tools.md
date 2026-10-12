@@ -412,3 +412,77 @@ measured.
 non-goal, came later with the patch reader of [F10](F10-replication.md#outcome), and it
 prints the rows of RDF Patch files and counts them. Jena's `--rdfs` and `--formatted`
 flags of `riot` and a configurable severity per rule were not built.
+
+### Roadmap follow-ups (2026-10-12)
+
+**Item 73 (Tier 5, [ROADMAP](../ROADMAP.md)): every syntax in `load_str`, `dump_graph` and
+SPARQL `LOAD`, and Jena's syntaxes loaded without a temporary N-Quads copy.**
+
+* **Where each syntax is handled today.** Jena's TriX, RDF Thrift, RDF Protobuf and
+  RDF/JSON have a streaming reader each in `crates/sparkles-core/src/jena_formats.rs`
+  (`ThriftReader::read_stream`, `ProtoReader::read_stream`, `read_rdf_json`, and
+  `crate::trix::parse`), which call a quad sink. The only public entry point is
+  `transcode_with_base`, which feeds that sink into an N-Quads or N-Triples serializer.
+  Every loading path goes through it:
+  * `Dataset::load_file`, `load_file_into` and `load_files` call
+    `syntax::file_sources` (`crates/sparkles/src/syntax.rs`), which transcodes each such
+    file into a `tempfile::NamedTempFile` and loads that as `RdfFormat::NQuads`.
+  * `sparkles load` does the same in `jena_to_nquads` (`crates/sparkles-server/src/
+    csv_cmd.rs`), with temporary files named `sparkles-load-*.nq`.
+  * The server's uploads and Graph Store bodies go through `transcode_body`
+    (`crates/sparkles-server/src/http.rs`), which writes the N-Quads in memory and spills
+    to a `sparkles-transcode-` or `sparkles-body-` temporary file past `SPOOL_AFTER`.
+  * The Python bindings transcode on a thread through a pipe for `parse`, and spool to a
+    temporary file for `Dataset.load` (`crates/sparkles-py/src/io.rs`).
+  * `sparkles convert` transcodes to N-Quads on a second thread as it streams, which is
+    not a temporary file.
+  The paths that take only the W3C syntaxes: `Dataset::load_str` and `load_str_into` take
+  an `RdfFormat` and a `&str`, so a binary syntax cannot even be passed;
+  `Dataset::dump_graph` takes an `RdfFormat`, while `Dataset::dump` takes
+  `impl Into<RdfSyntax>` and writes Jena's syntaxes through `dump_jena`. SPARQL `LOAD`
+  (`load` and `insert_parsed` in `crates/sparkles-core/src/sparql/update.rs`) has
+  `LoadSyntax::Rdf` and `LoadSyntax::TriX` and nothing for the other three, and its
+  `Accept` header names TriX but not them. The JVM binding's `load_files` and
+  `load_bytes` (`crates/sparkles-ffi/src/lib.rs`) build sources with `Source::from_path`
+  and `RdfFormat::from_media_type`, and the Node.js binding's `format`
+  (`crates/sparkles-node/src/streams.rs`) returns an `RdfFormat`, so neither reads
+  Jena's syntaxes.
+* **A quad source for Jena's syntaxes.** `jena_formats` gains
+  `pub fn read(fmt, input, base, sink: &mut dyn FnMut(Quad) -> Result<()>)`, the dispatch
+  that `transcode_with_base` has inside it, and `transcode_with_base` becomes a caller of
+  it. `Source::format` (`crates/sparkles-core/src/io.rs`) becomes an `RdfSyntax`, which
+  moves from `crates/sparkles/src/syntax.rs` into the core crate beside `Source`, with
+  `From<RdfFormat>` so existing callers compile unchanged. `parse_source` sends a Jena
+  syntax to the streaming path it already has for non-splittable inputs: decompression by
+  `source_reader`, then `read` into the sink that `make_sink` gives. Blank node labels are
+  scoped to the source as they are for N-Quads, through the same label map.
+* **Callers drop the temporary files.** `syntax::file_sources` returns plain sources and
+  no `TempPath`s, `jena_to_nquads` is removed, `transcode_body` is replaced by a body
+  source of the Jena syntax, and the Python `Dataset.load` passes the stream through.
+  Parallel parsing of the N-Quads copy is the one thing the copy gave: the bulk loader
+  splits N-Quads into chunks, while a Thrift or Protobuf stream has no record boundaries
+  to split at. The decoders are cheap next to the loader's encoding and sorting, which
+  stay parallel, so the direct path is expected to be faster; the change lands only if
+  the measurement below shows it is not slower, and otherwise keeps the copy for files
+  over a size threshold that the measurement sets.
+* **The remaining APIs.** `Dataset::load_str` and `load_str_into` take
+  `impl Into<RdfSyntax>`, and a new `load_bytes(data: &[u8], format, base, graph)` takes
+  the binary syntaxes. `dump_graph` takes `impl Into<RdfSyntax>`; a quad syntax writes the
+  graph's triples in the default graph, as `RdfWriter::triple` already does for
+  Graph Store `GET`. SPARQL `LOAD` gains `LoadSyntax::Jena(JenaFormat)`, chosen by
+  `JenaFormat::from_media_type` or the file extension as TriX is now, read through
+  `jena_formats::read` into `insert`, with the decompressed-size accounting it already
+  applies; its `Accept` header adds `application/rdf+thrift`, `application/rdf+protobuf`
+  and `application/rdf+json` at `q=0.8`. The JVM and Node.js bindings parse format names
+  into `RdfSyntax` and use `file_sources`, and P06's mapping test covers the new
+  signatures.
+* **Tests and measurement.** Round trips through `load_str`/`load_bytes` and
+  `dump_graph` for each Jena syntax, over the TriX files of `testsuite/trix` and files
+  of the other syntaxes written by `dump`; `LOAD <file:…>`
+  and `LOAD <http…>` of each syntax with and without compression, and `LOAD SILENT` of a
+  broken Thrift body leaving nothing behind; a check that no `sparkles-load-`,
+  `sparkles-transcode-` or `sparkles-body-` file is created during `sparkles load`, an
+  upload or a Graph Store `PUT` of each syntax. A load measurement of RDF Thrift and RDF
+  Protobuf copies of the 10.5M-quad benchmark data (`scripts/gen-data.py`) compares the
+  direct path with the copy for time and peak disk use, and its numbers go in the
+  Outcome.

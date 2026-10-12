@@ -1021,3 +1021,53 @@ These points settle what the addendum left open.
   sealed on start; `unseal` then the previous release's binary reads them; a wrong
   configured key stops the start; `--secrets-key none` stores plaintext; the TRACE log
   check of A12 still finds no value.
+
+**UI controls that turn on assistant ingestion** (item 77, Tier 5,
+[ROADMAP](../ROADMAP.md)). The other half of item 77, redaction beyond the fixed
+patterns, is in
+[C18's follow-ups](C18-natural-language-questions-and-ingest.md#roadmap-follow-ups-2026-10-12).
+
+* **What exists today.** §8.1's rule lives in the CLI only: `enable_ingest` in
+  `crates/sparkles-server/src/memory_cmd/ops.rs` reads `/$/settings/{ds}/assistant`,
+  patches `enabled`, `ingest` and `send = "documents"` (`ingest_fields`) where their
+  source is `default`, and retries on a `412`. The Settings tab of Phase 4 shows the same
+  three fields separately (`ASSISTANT_FIELDS` in `ui/src/lib/settings-fields.ts`, with
+  `ingest` labelled "Server ingestion"), so an administrator who knows which three to
+  change can change them there.
+* **What is missing.** The UI's ingestion controls do not do it.
+  `ui/src/lib/components/IngestPanel.svelte`, the dataset page's "Ingest a document"
+  section, is shown whenever the ingest routes answer, whether or not ingestion is on.
+  When it is off, `extract_pairs` in `crates/sparkles-server/src/ingest/pipeline.rs`
+  returns no provider and the pipeline sets `extract` to false, so the upload registers
+  the document as a source and extracts no facts, and the panel does not say why.
+  `IngestSettings.svelte` on the memory page edits `keepText` and the profiles and
+  nothing that turns ingestion on.
+* **Design: the state where the controls are.** Both components read
+  `GET /$/settings/{ds}/assistant` with its sources and locks, and the providers of the
+  `extract` role that may receive documents (the role list filtered by `send` and
+  `sendByProvider`, as `extract_pairs` filters it). They show one line of state:
+  "Server ingestion is on: documents go to `claude`", or "Server ingestion is off:
+  uploaded documents are stored as sources without facts", with the field and source
+  that keep it off (for example "`send` is `rows`, declared in the settings file").
+* **Design: turning it on.** An administrator of the dataset gets "Turn on server
+  ingestion", which applies §8.1's rule from the browser: a `PATCH` with `If-Match` of
+  only the three fields whose source is `default`, read again and retried on `412`, and
+  never a declared or locked field. Before it writes, a dialog lists what will change,
+  what will stay and why, the providers that will receive document text, and that
+  `send: "documents"` also allows rows for summaries, which is what `memory init`
+  prints. When a declared or locked value keeps ingestion off, the button is replaced by
+  that explanation and a link to the field in the Settings tab, where Use server config
+  and the lock already explain themselves. "Turn off server ingestion" patches `ingest`
+  to false, the one field that stops document text from leaving. The rule lives in
+  `ui/src/lib/settings.ts` as `enableIngest(ds)` beside the CLI's, and a JSON fixture of
+  cases (each field's source, effective value and lock, and the expected patch) is
+  checked by a unit test of `ingest_fields` in Rust and by a Vitest test of
+  `enableIngest`, so the two cannot drift.
+* **Design: uploads while it is off.** The panel's Ingest button asks first, "Store this
+  document as a source without facts?", and sends the request with `extract: false`
+  explicitly, so the outcome is the one the person chose.
+* **Tests.** `ui/tests/e2e/settings.spec.ts` gains: turning ingestion on from the panel
+  on a dataset with default settings patches three fields and the next upload extracts
+  facts with the mock provider; with `assistant.send` locked to `rows` in the settings
+  file, the panel shows the lock and no button; with `ingest` declared `false`, the
+  button is replaced by a link to the field; turning it off patches `ingest` only.

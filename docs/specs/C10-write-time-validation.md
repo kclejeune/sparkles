@@ -1293,3 +1293,66 @@ and branch that produced the report. The original error stays visible. Unit, moc
 browser and real-server browser tests cover source retention, configuration conflicts,
 memory datasets and rejected writes that leave the data unchanged. Rust regressions
 cover editable memory sources, ShExJ prefix preservation and SHACLC backup conversion.
+
+### Roadmap follow-ups (2026-10-12)
+
+**Item 78 (Tier 4, [ROADMAP](../ROADMAP.md)): incremental validation of recursive shapes
+and of SHACL-SPARQL constraints whose queries are not anchored at the focus node.**
+
+* **What is missing today.** Phase 2 and Phase 3 above keep two fallbacks that validate a
+  shape in full on every write that its relevance filter lets through. F5: a shape that
+  reaches a reference cycle is planned as `Plan::Global(Fallback::Recursive)`, because
+  `Analyzer::deps` in `crates/sparkles-shacl/src/incremental.rs` returns
+  `Err(Fallback::Recursive)` when it meets a shape already on its stack. F4: a
+  SHACL-SPARQL constraint or component whose query `crate::localize::reads` cannot
+  anchor is planned as `Plan::Global(Fallback::Sparql)`; `localize.rs` refuses patterns
+  not connected to `$this`, subqueries, `GRAPH`, `SERVICE`, `VALUES` and `MINUS`.
+  [FEATURES](../FEATURES.md#known-gaps) lists both under shapes. The Phase 3 Outcome
+  shows the cost of a full fallback: validating the benchmark's SHACL-SPARQL shape alone
+  in full took about 0.8 s at 1.05M triples, which every write paid while that shape fell
+  under F4, against 16 to 19 ms once it was localized.
+* **Recursive shapes as path closures.** The validator decides a reference cycle by
+  assuming that a (shape, node) pair already on the evaluation stack conforms
+  (`Engine::conforms` in `validate.rs`), so the result at a focus node is still a
+  function of the edges that the shapes' paths reach from it, through the cycle. Those
+  reads can be written as dependencies with closures. For each strongly connected
+  component of the shape reference graph, the analyzer sets up one equation per shape,
+  `deps(S) = local(S) ∪ π₁·deps(T₁) ∪ …`, where `πᵢ` is the path along which `S` refers
+  to `Tᵢ` (the property's path for `sh:node` inside `sh:property`, the empty path for a
+  node-level `sh:node`, `sh:and`, `sh:or`, `sh:not` or `sh:xone`), and solves it by
+  Arden's rule into prefixes of the form `(π₁/σ₁ | …)*/ρ`. The reverse evaluation already
+  takes closures in prefixes, and F7's visit budget (100,000 nodes) bounds it, so a write
+  that touches a node deep in a long recursive chain still falls back, now with reason
+  `budget` instead of `recursive`. Soundness follows as in §6.2.2: the first changed edge
+  on any read path from the focus node is reached over unchanged edges, in both states.
+  `sh:not` and `sh:xone` inside a cycle are included, because the reads do not depend on
+  polarity; only the results do, and those are computed by validating the affected nodes.
+* **Unanchored SHACL-SPARQL in two parts.** The localizer splits a query's patterns into
+  the component connected to `$this` (or `$value`) and the rest. The rest does not
+  depend on the focus node, so its solutions are one relation per shape and state. The
+  guard keeps, per such constraint, the relation's digest and size for the head, computed
+  by running the unanchored part alone as a SELECT of the variables it shares with the
+  anchored part. On a write:
+  1. if the write changes no predicate the unanchored part reads (the relevance test of
+     §6.2.1 applied to that part), the relation is unchanged, and the anchored part is
+     validated incrementally as Phase 3 does;
+  2. otherwise the unanchored part is evaluated in the state after the write; if its
+     digest is unchanged, the same holds;
+  3. if it changed, the shape is validated in full, as today, with reason `sparql`.
+  Constants count as anchors of their own: a pattern `ex:config ex:limit ?n` reads the
+  `ex:limit` edges of `ex:config`, and a write that changes one of them falls under
+  step 3, while other writes stay incremental. `VALUES` with constants only is treated
+  as such constants. Subqueries are split the same way when their projection connects
+  to the anchored part, and `GRAPH` with a constant graph reads that graph's edges.
+  `SERVICE` keeps F4.
+* **Interaction with F13.** When the incremental views of
+  [F13](F13-incremental-views-and-provenance.md) exist, the unanchored part can be kept
+  as a maintained view instead of being evaluated again in step 2, which removes the
+  cost of step 2 for large relations.
+* **Tests.** A15's generator gains recursive shapes through `sh:node`, `sh:and`, `sh:or`
+  and `sh:not`, and SHACL-SPARQL constraints with a global part (for example a uniqueness
+  check against a configured list, or a comparison with a dataset-wide maximum). Each
+  write's decision and counts are compared with full validations as before, and the
+  fallback counters must show `recursive` and `sparql` only for the cases the design
+  still refuses. `bench:shacl-write` gains a recursive shape and a constraint with a
+  constant anchor, at 1.05M and 10.5M triples.
