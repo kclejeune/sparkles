@@ -210,6 +210,8 @@ These are implementation limits, missing configuration controls, and features th
 other RDF stores have and Sparkles does not.
 [COMPARISON.md](COMPARISON.md) covers each engine, and
 [BENCHMARKS.md](BENCHMARKS.md#where-sparkles-loses) covers performance.
+Each gap ends with the [roadmap](ROADMAP.md) items that address it. The roadmap orders
+that work by priority and links each item to its design spec.
 
 * **Scale and execution.** The largest measured dataset is English DBpedia, 1.24 billion
   triples on one machine. Nothing larger, such as Wikidata, has been tried. Queries run
@@ -221,17 +223,17 @@ other RDF stores have and Sparkles does not.
   DESCRIBE still collect their whole input, and EXISTS and the operators it does not support run
   eagerly. Operator state is never spilled to disk, so a query whose state outgrows its
   budget fails. There is no FSST vocabulary compression, IRI encoding, pattern trick,
-  pinned results, materialized views or live query monitoring.
+  pinned results, materialized views or live query monitoring. [Roadmap](ROADMAP.md) items 1, 7, 16, 17, 27, 40.
 * **Inference.** Inference is forward materialization, plus Jena's RDFS on read. There
   are no other on-the-fly rules and no backward (LP) rules. Incremental maintenance does not cover rules with `noValue`,
   `now` or new blank nodes, or RDF lists that change under OWL 2 RL. Those runs, and the
   first run after a compaction without retained history, compute everything again.
-  Inconsistency checks cover a fixed subset of OWL 2 RL.
+  Inconsistency checks cover a fixed subset of OWL 2 RL. [Roadmap](ROADMAP.md) items 9, 17, 19, 53.
 * **SPARQL extensions.** Sparkles has ARQ's query language and function library apart
   from JavaScript functions, `afn:context`, the Leviathan `lfn:` library, the `JSON`
   query form and evaluation of `shortest(…)` paths, which ARQ does not evaluate either.
   `afn:collation` orders by code point instead of by locale. Jena's service enhancer has no slice-aware cache and no
-  `se:cacheRm` or `se:cacheLs` functions.
+  `se:cacheRm` or `se:cacheLs` functions. [Roadmap](ROADMAP.md) items 38, 51, 69.
 * **Search.** Full-text search has no multi-field documents, and its stemmers are
   Tantivy's Snowball stemmers rather than Lucene's analyzers, apart from Porter's
   stemmer for English. CJK text is cut into
@@ -240,14 +242,14 @@ other RDF stores have and Sparkles does not.
   transaction cannot search the full-text index after it has changed data, because the
   index covers committed data only ([API.md](API.md#full-text-search)). A vector index has no quantization,
   so its packed vectors take 4 bytes per dimension. Its graph is not carried across
-  compactions and is built again for each new generation.
-* **Query languages.** There is no openCypher frontend and no JSON query language.
+  compactions and is built again for each new generation. [Roadmap](ROADMAP.md) items 10, 23, 34, 35.
+* **Query languages.** There is no openCypher frontend and no JSON query language. [Roadmap](ROADMAP.md) items 20, 72.
 * **GeoSPARQL.** EPSG codes come from a table of proj4 definitions rather than the EPSG
   database, and the library includes the table only with its `geo-epsg` feature.
   Geographic CRSs on datums other than WGS 84, grid-based datum shifts and curved GML
   segments or solids are not supported, and Helmert datum shifts are approximate.
   Geometry constructions return 2D results. Unions of crossing lines preserve the
-  covered points but do not split the lines at each crossing, unlike Jena's JTS engine.
+  covered points but do not split the lines at each crossing, unlike Jena's JTS engine. [Roadmap](ROADMAP.md) items 24, 70.
 * **Shapes.** There is no ShEx 2.2, and SHACL 1.2 node expressions are not supported.
   `sparkles fmt` and the UI's Format button do not format SHACLC.
   Drafted shapes have no `sh:or` of datatypes, no inverse or sequence paths, no
@@ -255,7 +257,7 @@ other RDF stores have and Sparkles does not.
   Write-time validation validates recursive SHACL shapes, and SHACL-SPARQL constraints
   whose queries are not anchored at the focus node, in full on every write. ShEx keeps no
   typing across a restart, so after one the first writes to a recursive schema over a
-  large connected graph may be validated in full.
+  large connected graph may be validated in full. [Roadmap](ROADMAP.md) items 13, 48, 54, 78.
 * **Formats and change logs.** TriX, RDF Thrift, RDF Protobuf and RDF/JSON are read and
   written by the server, `sparkles load`, `sparkles convert`, the Python bindings and the
   library's `Dataset::load_file` and `dump`. The loader reads them by rewriting each file
@@ -263,25 +265,25 @@ other RDF stores have and Sparkles does not.
   only the W3C syntaxes, and SPARQL `LOAD` reads TriX but not the other three. A patch
   is applied as one commit, even when it holds several `TX … TC` transactions, and a
   patch from another dataset cannot name its existing blank nodes. There are no patch
-  logs and no replicas that follow a server.
+  logs and no replicas that follow a server. [Roadmap](ROADMAP.md) items 66, 73, 74.
 * **Tabular imports.** CSV and TSV tables are mapped by CSVW metadata in its minimal
   mode or by CONSTRUCT templates. There are no RML or R2RML mappings, no CSVW standard
   mode, and no primary-key or foreign-key checks, and a template cannot read the target
-  dataset. Tables are imported, not queried in place. The Graph Store endpoint does not read CSV.
+  dataset. Tables are imported, not queried in place. The Graph Store endpoint does not read CSV. [Roadmap](ROADMAP.md) items 22, 43.
 * **GraphQL.** There are no mutations or subscriptions, and no stored GraphQL queries,
   `persistedOnly` or UI page for it. Nested lists are not connections. A
   nested `first` limits the response, while the engine still produces every value of
   the field. Parent ids reach a child query as terms rather than engine ids, and blank
-  node parents each take a `UNION` branch.
+  node parents each take a `UNION` branch. [Roadmap](ROADMAP.md) item 37.
 * **Stored queries.** There are no stored updates, no parameters bound to several values
-  at once, and no private queries per user.
+  at once, and no private queries per user. [Roadmap](ROADMAP.md) item 39.
 * **Operations.** There are no JVM metrics and no ontology object API. Assembler bodies
   are read only for the part that maps to a dataset, and direct Graph Store naming is on
   for every dataset or none. Validation endpoints refuse callers whose grants cover only
   some graphs or triples. The change feed refuses callers whose protections depend on the
   data, and protections hide triples, not the IRIs that visible triples mention. Backups
   cover individual datasets. There is no whole-server backup, and encryption keys for
-  backup repositories cannot be managed through the API, Vault or a cloud KMS.
+  backup repositories cannot be managed through the API, Vault or a cloud KMS. [Roadmap](ROADMAP.md) items 61, 65, 71, 75, 76.
 * **Assistant configuration.** Dataset assistant settings, including `enabled`,
   `ingest` and `send: "documents"`, can be declared for every dataset or by name in the
   settings file of `serve --settings`, which can also lock them, and changed through
@@ -295,23 +297,24 @@ other RDF stores have and Sparkles does not.
   unencrypted in the data directory unless the server runs with `--secrets-key`, which
   needs the `backup-encryption` feature. An operator who does not want keys on disk
   either way locks the secrets in the settings file. See
-  [USAGE.md](USAGE.md#ingesting-documents-in-the-server) for the setup routes.
+  [USAGE.md](USAGE.md#ingesting-documents-in-the-server) for the setup routes. [Roadmap](ROADMAP.md) items 68, 77.
 * **Agents.** Agent memory imports transcripts only from Claude Code and Codex, and
   redaction finds only the secrets its patterns describe. The server converts Markdown, HTML and PDF documents, but not
   office formats, images or audio. Scanned PDF pages need a build with `pdf-ocr` and
   OCR models from the operator. A CSV mapping draft names its own IRIs for the values
-  of IRI columns and does not link them to existing entities.
+  of IRI columns and does not link them to existing entities. [Roadmap](ROADMAP.md) items 15, 77.
 * **History.** A past state can be read only while a
-  retained generation holds it, even when the change log has its changes. A bulk commit
-  of more than 1,000,000 quads into a non-empty dataset is recorded in the change log
-  with its counts only. Full-text search works at the head only.
+  retained generation holds it, even when the change log has its changes. A bulk commit is
+  recorded in the change log with its counts only when the states before and after it
+  hold more than 1,000,000 quads together, so even a small bulk commit into a large
+  dataset keeps no quads. Full-text search works at the head only. [Roadmap](ROADMAP.md) items 5, 23, 52.
 * **Deployment.** Sparkles runs as a single node on local disk. There is no clustering,
   no replicas, and live RDF data stays on local disk without encryption at rest.
-  Backup repositories can use object storage and optional encryption.
+  Backup repositories can use object storage and optional encryption. [Roadmap](ROADMAP.md) items 65, 66.
 * **Embedding.** The database has Rust, Python, JVM and Node.js APIs and no WebAssembly build of the engine. The
   Python package is not on PyPI and has no PyPy or free-threaded wheels. The release
   workflows build for Linux on x86_64 and arm64 and for macOS on Apple silicon only, with
   no Windows or Intel macOS packages. The JVM library is not on Maven Central, and the JavaScript packages are not on npm.
   Their gated release workflows build native platform artifacts, and Linux is the platform
   tested locally. JVM functions registered in Java still run through ARQ, and the
-  JVM library has no musl build.
+  JVM library has no musl build. [Roadmap](ROADMAP.md) items 25, 44, 58.

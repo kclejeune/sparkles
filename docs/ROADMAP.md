@@ -9,9 +9,14 @@ are listed at the end and wait until a release is cut.
 The order weighs implementation difficulty against impact. Each item links to the spec
 that holds its design. New items have their own spec. Items that extend an existing spec
 are designed in a **Roadmap follow-ups (2026-10-12)** section at the end of that spec's
-Outcome. [FEATURES.md](FEATURES.md#known-gaps) remains the record of current limits,
-and [BENCHMARKS.md](BENCHMARKS.md#where-sparkles-loses) remains the record of measured
-losses.
+Outcome.
+
+This document and [FEATURES.md](FEATURES.md#known-gaps) are kept separate on purpose.
+FEATURES describes what Sparkles does and does not do at the current commit. This
+document describes what will be done and in what order. Every known gap in FEATURES
+names the roadmap items that address it, and every gap is on this roadmap, in Tier 7 if
+nothing else. [BENCHMARKS.md](BENCHMARKS.md#where-sparkles-loses) remains the record of
+measured losses.
 
 Sizes are estimates:
 
@@ -22,7 +27,8 @@ Sizes are estimates:
 | L | Several weeks |
 | XL | A quarter or more |
 
-Impact is judged against the goal above. Tiers 1–4 are the main plan. Tiers 5–7 are
+Item numbers are stable identifiers, not a ranking: a new item takes the next free
+number in whatever tier it belongs to. Impact is judged against the goal above. Tiers 1–4 are the main plan. Tiers 5–7 are
 work that is wanted at a lower priority, and items move between tiers as results come in.
 
 ## How the work is organized
@@ -83,8 +89,8 @@ These items are cheap or foundational.
 | 21 | **Editing forms generated from SHACL shapes,** writing to branches | [U02](specs/U02-shape-driven-forms.md) | M–L | Medium–high |
 | 22 | **RML, R2RML and YARRRML loading,** CSVW standard mode and key checks, and Tarql functions | [F19](specs/F19-mappings-and-virtual-graphs.md) Phase 1, [C05](specs/C05-tabular-imports.md#roadmap-follow-ups-2026-10-12) | M–L | Medium–high |
 | 23 | **Full-text parity.** Lucene analyzers, CJK segmentation, online reindexing, search after uncommitted writes, and historical search | [F03](specs/F03-full-text-search.md#roadmap-follow-ups-2026-10-12) | M each | Medium |
-| 24 | **GeoSPARQL.** k-NN with arbitrary joins, polygon approximations, datum shifts and QLever's spatial syntax | [G01](specs/G01-geosparql.md#roadmap-follow-ups-2026-10-12) | M | Medium |
-| 25 | **Callbacks in other languages** (Python, JavaScript and Java functions inside queries) | [P03](specs/P03-query-extensions.md#roadmap-follow-ups-2026-10-12) | M | Medium |
+| 24 | **GeoSPARQL.** k-NN with arbitrary joins, polygon approximations, QLever's spatial syntax, and geometry limits: geographic CRSs on datums other than WGS 84, grid-based datum shifts, exact Helmert shifts, curved GML segments and solids, 3D constructions, and lines split at crossings | [G01](specs/G01-geosparql.md#roadmap-follow-ups-2026-10-12) | M | Medium |
+| 25 | **Callbacks in other languages** (Python, JavaScript and Java functions inside queries). Functions registered in Java then run in the engine instead of through ARQ. | [P03](specs/P03-query-extensions.md#roadmap-follow-ups-2026-10-12) | M | Medium |
 | 26 | **Local models.** GPU, ONNX and GGUF, rerankers, and models shared between processes | [F12](specs/F12-local-embeddings.md#roadmap-follow-ups-2026-10-12) | M–L | Medium |
 
 ## Tier 4: worth doing, not urgent
@@ -109,6 +115,8 @@ These items are cheap or foundational.
 | 42 | MCP progress notifications, per-tool metrics and performance measurements | [C11](specs/C11-mcp-server.md#roadmap-follow-ups-2026-10-12) | S–M |
 | 43 | Virtual graphs over SQL, Parquet and Iceberg | [F19](specs/F19-mappings-and-virtual-graphs.md) Phase 2 | XL |
 | 44 | A local-first engine in WebAssembly that syncs through RDF Patch and branches | [F20](specs/F20-local-first-engine.md) | XL |
+| 72 | JSON query languages, and a Datalog surface syntax for rules and queries | [F17]({F17}), [FEATURES](FEATURES.md#known-gaps) | M–L |
+| 78 | Incremental write-time validation of recursive SHACL shapes and SHACL-SPARQL constraints not anchored at the focus node | [C10](specs/C10-write-time-validation.md#roadmap-follow-ups-2026-10-12) | M–L |
 
 ## Tier 5: backlog
 
@@ -129,6 +137,12 @@ These items are smaller or narrower. Each has a design sketch in the linked spec
 | 55 | Dynamic and Nushell completions, and an OpenAPI "try it" page with named schemas | [X03](specs/X03-openapi-and-completions.md#roadmap-follow-ups-2026-10-12) | S–M |
 | 56 | Legacy MCP resource subscriptions | [C11](specs/C11-mcp-server.md#roadmap-follow-ups-2026-10-12) | S |
 | 57 | Scratch-branch expiry settings and stdio expiry | [C18](specs/C18-natural-language-questions-and-ingest.md#roadmap-follow-ups-2026-10-12) | S |
+| 71 | An OWL 2 ontology object API, as Jena's `jena-ontapi` provides | [FEATURES](FEATURES.md#known-gaps), [AUDIT §5](AUDIT.md) | L |
+| 73 | Format coverage: all formats in `load_str`, `dump_graph` and SPARQL `LOAD`, and loading Thrift, Protobuf, RDF/JSON and TriX without a temporary N-Quads copy | [FEATURES](FEATURES.md#known-gaps) | S–M |
+| 74 | RDF Patch: patches with several transactions applied as several commits, blank-node identity across datasets, and patch logs | [F10](specs/F10-replication.md#roadmap-follow-ups-2026-10-12) | M |
+| 75 | Access control: validation endpoints for callers whose grants cover part of a dataset, the change feed for data-dependent protections, and hiding IRIs that visible triples mention | [C12](specs/C12-graph-access-control.md#roadmap-follow-ups-2026-10-12), [C12b](specs/C12b-triple-access-control.md#roadmap-follow-ups-2026-10-12) | M–L |
+| 76 | Jena compatibility: complete assembler bodies, direct Graph Store naming per dataset, and JVM metrics | [G08](specs/G08-fuseki-configuration.md#roadmap-follow-ups-2026-10-12), [P04](specs/P04-jvm-bindings.md#roadmap-follow-ups-2026-10-12) | S–M |
+| 77 | Assistant ingestion: UI controls that turn on assistant ingestion, and redaction beyond the fixed secret patterns | [C18](specs/C18-natural-language-questions-and-ingest.md#roadmap-follow-ups-2026-10-12), [C19](specs/C19-layered-settings.md#roadmap-follow-ups-2026-10-12) | S–M |
 
 ## Tier 6: release work
 
@@ -160,9 +174,9 @@ users ask for them.
 
 ## Keeping this current
 
-Update this document when an item ships, changes tier or gets a new spec. When an item
-ships:
+Update this document when an item ships, changes tier or gets a new spec. A new known gap in
+FEATURES gets a roadmap item in the same commit. When an item ships:
 
 * Its spec's Outcome records what landed.
-* [FEATURES.md](FEATURES.md) and [BENCHMARKS.md](BENCHMARKS.md) change in the same commit.
+* [FEATURES.md](FEATURES.md) and [BENCHMARKS.md](BENCHMARKS.md) change in the same commit, and the Known gaps bullet drops the item's number.
 * The row here is removed or marked done.
