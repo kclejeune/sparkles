@@ -207,13 +207,13 @@ departs from Jena and QLever on purpose.
 ## Roadmap
 
 The goal of the current work is the best graph database on the published benchmarks
-and in practical use, with no remaining feature gaps. The first release, its packages
+and in practical use, with the real feature gaps filled. The first release, its packages
 and its stability contract come after that work. [docs/ROADMAP.md](docs/ROADMAP.md)
 orders every item by difficulty and impact and links each to its design spec.
 
 * **Now.**
-  * Benchmarks: BSBM, SP²Bench, LUBM, LDBC and Wikidata query logs, refreshed at the
-    current head.
+  * Benchmarks: BSBM, SP²Bench, LUBM, LDBC and Wikidata query logs, with every
+    comparison refreshed at the current head.
   * Memory: caches sized across the whole server and a shared query memory pool.
   * Writes: group commit as the default.
   * Reads: faster cold sparse lookups.
@@ -222,7 +222,8 @@ orders every item by difficulty and impact and links each to its design spec.
     and FSST vocabulary compression.
   * Graph algorithms: a library with node embeddings, and GraphRAG summaries built on
     it.
-  * Reasoning: materialization fast enough to leave on.
+  * Reasoning: materialization fast enough to leave on, with `owl:sameAs` handled by
+    representatives and rules evaluated over the compressed indexes.
   * Data model: SHACL 1.2 and ShEx 2.2.
   * UI: a time slider over history.
 * **Later.**

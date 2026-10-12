@@ -1842,3 +1842,88 @@ from `forge` on 2026-10-08, with the index 1.3 to 68 times faster than without i
 the same answers both ways. The cell grid made 200,000 `sfContains` tests against a 1,024-vertex polygon
 4.3 times faster (60 ms instead of 256 ms) and 5.4 times faster against a 16,384-vertex
 one, for about 16 bytes per region vertex, up to 64 KiB per region.
+
+### Roadmap follow-ups (2026-10-12)
+
+**The rest of Phase 3** (item 24, Tier 3, [ROADMAP](../ROADMAP.md)). The Outcome lists
+these as not built. The deliberate divergences in
+[COMPARISON.md](../COMPARISON.md#geosparql) stay the default; item 70 below adds an
+opt-in mode for Jena's answers.
+
+* **k-NN with arbitrary joins.** `geojoin.rs` turns `ORDER BY ASC(geof:distance(?w, C,
+  u)) LIMIT k` into a `SpatialKnnSpec` only when `C` is a constant in longitude and
+  latitude and the group's other patterns connect to one indexed scan (a star on its
+  subject or a path from it); every other shape keeps the generic plan with a
+  `geo-not-knn` warning. Two shapes are added. First, a group with patterns that do
+  not connect to the scan: the scan's side runs in increasing distance as now, and the
+  rest of the group is planned on its own and joined with each batch, so a batch can
+  yield no rows and the search goes on until `k` rows are proven, bounded by the
+  query's budget. Second, a k-NN join, where the query geometry is bound per row:
+  `?a` from one pattern and the `k` nearest `?b` per `?a`, written as a `LATERAL`
+  subquery with `ORDER BY … LIMIT k` (the [G06](G06-arq-query-extensions.md)
+  operator) or with QLever's syntax below. The planner runs one k-NN search per
+  distinct left geometry over the right side's tree. Acceptance: the five nearest
+  restaurants of every station in a dataset of 10,000 stations and 100,000 restaurants
+  equal the generic plan's answer and run at least 50 times faster.
+* **Polygon approximations.** The cell grid decides points and small regions against a
+  prepared region of 32 or more vertices. Polygon-against-polygon joins over two large
+  sides still run the exact test for each pair the trees propose. The index keeps, per
+  indexed region, an inner and an outer approximation: a simplified outer ring
+  (Douglas-Peucker on a buffer, at most 64 vertices) and the largest axis-aligned box
+  inside it. A pair whose outers do not meet is disjoint, a pair whose inner boxes meet
+  intersects, and only the rest run the exact test. The approximations count toward the
+  index's bytes and its identity hash.
+* **Datum shift grids.** `geo/crs.rs` refuses a definition whose shift needs grids
+  (`+nadgrids`, or `+datum=NAD27`), 239 of the EPSG table's definitions. The server
+  gains `--geo-grids DIR`, a directory of NTv2 (`.gsb`) and NADCON grid files that the
+  operator provides; Sparkles ships none, since the national grids carry their own
+  licenses. A definition whose grids are all present is accepted and transformed with
+  the grid's bilinear interpolation, as PROJ does; one whose grids are missing is
+  refused as now, with the missing file named. The grid files join the index files'
+  identity. Acceptance: EPSG:27700 with OSTN15's NTv2 file is within 0.1 m of PROJ 9.9
+  at the three points the Outcome measured.
+* **QLever's spatial SERVICE syntax.** §11 q14 left a shim open. `SERVICE
+  spatialSearch: { … }` with QLever's configuration (`spatialSearch:left`,
+  `spatialSearch:right`, `spatialSearch:numNearestNeighbors`,
+  `spatialSearch:maxDistance`, `spatialSearch:bindDistance`, and the right side as a
+  nested group) is translated at planning time into the FILTER or k-NN forms above,
+  the way `SERVICE path:search` became a leaf in [F07](F07-path-search.md). It is
+  recognized before remote SERVICE planning, so the outbound policy does not apply,
+  and an option without a translation is a `400` naming it. The test runs QLever's
+  documented examples and compares them with the FILTER form.
+* **Metric-property rewrites.** GeoSPARQL 1.1 defines `geo:hasMetricArea`,
+  `geo:hasMetricLength`, `geo:hasMetricPerimeterLength`, `geo:hasMetricSize` and
+  related properties, which data seldom asserts. With query rewrite on, a triple
+  pattern `?g geo:hasMetricArea ?a` over a geometry with no asserted value binds
+  `?a` to `geof:metricArea` of its serialization, as the topological rewrite does for
+  the relations; an asserted value wins. The rewrite is in `georewrite.rs` and shares
+  its switch.
+* **The Compliance Benchmark in CI.** `scripts/geosparql-benchmark.sh` fetches the
+  GPL-2.0 benchmark only with `SPARKLES_ALLOW_GPL_BENCHMARK=1` (q12). A scheduled CI job
+  sets the variable, runs the script against the current head, and fails when the score
+  falls below the recorded 187 of 206 or when a query that passed now fails. The
+  benchmark is fetched into the runner and never committed. The score joins X06's
+  benchmark tables.
+
+**A Jena compatibility mode** (item 70, Tier 7, [ROADMAP](../ROADMAP.md)). The decisions in
+[COMPARISON.md](../COMPARISON.md#geosparql) give different answers from Jena on purpose,
+and the Compliance Benchmark's misses trace to some of them (the Conformance paragraph
+above: empty-geometry equality, distances, a metre buffer and rewrite answers). Two are
+already switches: `geo.json` `"distance": "haversine"` gives Jena's sphere and
+`"queryRewrite": true` gives its rewrite. A per-dataset `"compat": "jena"` in `geo.json`
+sets both and adds the rest:
+
+* every relation is false when either side is empty, and `sfEquals` compares with the
+  `TFFFTFFFT` pattern, so two equal points are not equal, as in Jena;
+* a literal in an unknown CRS is read as CRS84 degrees with a warning in the plan,
+  instead of being left out of metric functions and the index;
+* `geof:getSRID` returns `xsd:string`;
+* `spatialF:angle` returns Jena's value in every quadrant, including the quarter turn
+  off south-east and north-west of the first point;
+* `spatial:withinBox` and `spatial:intersectBox` with an unbound subject return the
+  index's envelope hits without the exact refinement.
+
+The mode is part of the index files' identity where it changes what is indexed (unknown
+CRSs). It never changes a dataset without the setting. Acceptance: with the mode on,
+each of the benchmark's misses that the Conformance paragraph attributes to these
+choices passes, and the score with the mode is reported beside the default's.

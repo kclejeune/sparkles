@@ -56,12 +56,12 @@ These items are cheap or foundational.
 
 | # | Item | Spec | Size | Impact |
 |---|---|---|---|---|
-| 1 | **Benchmark coverage and refresh.** Adds BSBM, SP²Bench, LUBM, OWL2Bench, LDBC SNB and Graphalytics, Wikidata query logs, the GeoSPARQL compliance benchmark, vector recall and latency, sustained writes with compaction, and data above 1.24B triples. All comparisons are refreshed at the current head. | [X06]({X06}) | M | Very high |
-| 2 | **Server-wide cache sizing and query memory pool.** Today each dataset's block and result caches are sized to the global limit, so memory grows with the number of datasets. | [X08]({X08}) Phase 1, [C01](specs/C01-observability-and-budgets.md#roadmap-follow-ups-2026-10-12) | S, then M | High |
+| 1 | **Benchmark coverage and refresh.** Adds BSBM, SP²Bench, LUBM, OWL2Bench, LDBC SNB and Graphalytics, Wikidata query logs, sustained writes with compaction, and data above 1.24B triples. Reruns the GeoSPARQL compliance benchmark, and compares vector recall and latency with other engines (today only Sparkles is measured). All comparisons are refreshed at the current head. | [X06]({X06}) | M | Very high |
+| 2 | **Server-wide cache sizing and query memory pool.** Today each dataset's block and result caches are sized to the global limit, so memory grows with the number of datasets. Per-class concurrency caps already exist. The pool adds a shared byte budget with admission control. | [X08]({X08}) Phase 1, [C01](specs/C01-observability-and-budgets.md#roadmap-follow-ups-2026-10-12) | S, then M | High |
 | 3 | **Group commit, hardened and made the default.** Commits stay synchronized before acknowledgement. | [X09]({X09}) | S–M | High |
-| 4 | **Cold sparse lookups.** These are 2.3–3× slower than Oxigraph at 10.5M triples. | [X07]({X07}) | M | High |
+| 4 | **Cold sparse lookups.** These are 2.3–3.1× slower than Oxigraph at 10.5M triples and 1.8–3.8× at 1.05M. | [X07]({X07}) | M | High |
 | 5 | **Correctness fixes.** `allShortest` misses equal-cost paths over zero-weight edges. Small bulk commits into large datasets keep only counts in the change log. | [F07](specs/F07-path-search.md#roadmap-follow-ups-2026-10-12), [F06](specs/F06-snapshots-and-point-in-time.md#roadmap-follow-ups-2026-10-12) | S | Medium |
-| 6 | **Ask evaluation on QALD and LC-QuAD,** with published per-model results | [C18](specs/C18-natural-language-questions-and-ingest.md#roadmap-follow-ups-2026-10-12) | S–M | Medium |
+| 6 | **Ask evaluation on public benchmarks.** QALD-9-plus first; LC-QuAD 2.0 once Wikidata can be loaded. `scripts/eval-ask` already runs the model matrix on the demo questions. | [C18](specs/C18-natural-language-questions-and-ingest.md#roadmap-follow-ups-2026-10-12) | S–M | Medium |
 
 ## Tier 2: high-impact features and the scale foundation
 
@@ -69,9 +69,9 @@ These items are cheap or foundational.
 |---|---|---|---|---|
 | 7 | **Batch-oriented joins and grouping, then disk spill.** Also covers LIMIT propagation, running state for FOLD aggregates, parallel decoding and earlier first bytes. | [X08]({X08}) Phase 2, [X05](specs/X05-streaming-query-execution.md#roadmap-follow-ups-2026-10-12) | L | Very high |
 | 8 | **Graph-algorithm library.** PageRank, centrality, components, Louvain and Leiden, similarity, and FastRP and node2vec embeddings | [F14](specs/F14-graph-algorithms.md) | M–L | Very high |
-| 9 | **Materialization at scale.** `owl:sameAs` by representatives, parallel semi-naive evaluation, rules over the compressed indexes, and a separate layer for derived facts | [F16]({F16}), [C08](specs/C08-inference-freshness.md#roadmap-follow-ups-2026-10-12) | L | High |
+| 9 | **Materialization at scale.** `owl:sameAs` by representatives, rules over the compressed indexes instead of an in-memory copy, and a separate layer for derived facts. Semi-naive evaluation is already parallel. | [F16]({F16}), [C08](specs/C08-inference-freshness.md#roadmap-follow-ups-2026-10-12) | L | High |
 | 10 | **Vector index maintenance.** Incremental HNSW inserts, graphs kept across compactions, background catch-up and build speed | [F04](specs/F04-vector-search.md#roadmap-follow-ups-2026-10-12) | M | Medium–high |
-| 11 | **Time slider** over graphs, results, entities and the schema | [U01](specs/U01-time-slider.md) | M | High |
+| 11 | **Time slider** over graphs, results, entities and the schema. It builds on the existing `at=` field, history diffs and Memory's "As of" selector. | [U01](specs/U01-time-slider.md) | M | High |
 | 12 | **GraphRAG community summaries** for Ask and agent memory | [C22](specs/C22-graph-rag-community-summaries.md) | M | High |
 | 13 | **Current shape standards.** SHACL 1.2 node expressions, ShEx 2.2, recursive ShEx typing that survives restarts, and richer drafted shapes | [G03](specs/G03-shaclc.md#roadmap-follow-ups-2026-10-12), [G02](specs/G02-shex.md#roadmap-follow-ups-2026-10-12), [C02](specs/C02-schema-discovery.md#roadmap-follow-ups-2026-10-12) | M | Medium–high |
 | 14 | **Compaction.** Delta changes located per block, new vocabulary without a full rebuild, adaptive thresholds, and automatic compaction in embedded use | [C13](specs/C13-automatic-compaction.md#roadmap-follow-ups-2026-10-12) | M | Medium–high |
@@ -83,14 +83,14 @@ These items are cheap or foundational.
 | # | Item | Spec | Size | Impact |
 |---|---|---|---|---|
 | 17 | **Incremental computation core.** Materialized SPARQL views, live queries that push result changes, and provenance per fact | [F13](specs/F13-incremental-views-and-provenance.md) | XL | Very high |
-| 18 | **Explanations.** Derivation trees, "why not?" answers, entailment diffs on branches, and minimal justifications; protections and `reviewedOnly` that track provenance | [F18]({F18}) | M–L | High |
-| 19 | **Query-time reasoning.** A cost-based choice between materialized and on-demand derivation (magic sets), Jena backward rules, and OWL 2 QL rewriting | [F17]({F17}) | L | High |
+| 18 | **Explanations.** Derivation trees, "why not?" answers, entailment diffs on branches, and minimal justifications; protections that track provenance, and `reviewedOnly` (which Ask already has) extended to derived facts | [F18]({F18}) | M–L | High |
+| 19 | **Query-time reasoning.** A cost-based choice between materialized and on-demand derivation (magic sets), Jena backward rules, OWL 2 QL rewriting, and part of the Datalog frontend that [specs/README.md](specs/README.md) lists as unspecified | [F17]({F17}) | L | High |
 | 20 | **openCypher,** with graph algorithms as procedures and LDBC SNB as acceptance | [F01](specs/F01-cypher.md#roadmap-follow-ups-2026-10-12) | L–XL | High |
 | 21 | **Editing forms generated from SHACL shapes,** writing to branches | [U02](specs/U02-shape-driven-forms.md) | M–L | Medium–high |
 | 22 | **RML, R2RML and YARRRML loading,** CSVW standard mode and key checks, and Tarql functions | [F19](specs/F19-mappings-and-virtual-graphs.md) Phase 1, [C05](specs/C05-tabular-imports.md#roadmap-follow-ups-2026-10-12) | M–L | Medium–high |
 | 23 | **Full-text parity.** Lucene analyzers, CJK segmentation, online reindexing, search after uncommitted writes, and historical search | [F03](specs/F03-full-text-search.md#roadmap-follow-ups-2026-10-12) | M each | Medium |
-| 24 | **GeoSPARQL.** k-NN with arbitrary joins, polygon approximations, QLever's spatial syntax, and geometry limits: geographic CRSs on datums other than WGS 84, grid-based datum shifts, exact Helmert shifts, curved GML segments and solids, 3D constructions, and lines split at crossings | [G01](specs/G01-geosparql.md#roadmap-follow-ups-2026-10-12) | M | Medium |
-| 25 | **Callbacks in other languages** (Python, JavaScript and Java functions inside queries). Functions registered in Java then run in the engine instead of through ARQ. | [P03](specs/P03-query-extensions.md#roadmap-follow-ups-2026-10-12) | M | Medium |
+| 24 | **GeoSPARQL.** k-NN with arbitrary joins, better polygon approximations than the existing cell grid, QLever's spatial syntax, and geometry limits: geographic CRSs on datums other than WGS 84, grid-based datum shifts, exact Helmert shifts, curved GML segments and solids, 3D constructions, and lines split at crossings | [G01](specs/G01-geosparql.md#roadmap-follow-ups-2026-10-12) | M | Medium |
+| 25 | **Callbacks in other languages** (Python and JavaScript functions inside queries, and native dispatch of Java functions, which today run through ARQ) | [P03](specs/P03-query-extensions.md#roadmap-follow-ups-2026-10-12) | M | Medium |
 | 26 | **Local models.** GPU, ONNX and GGUF, rerankers, and models shared between processes | [F12](specs/F12-local-embeddings.md#roadmap-follow-ups-2026-10-12) | M–L | Medium |
 
 ## Tier 4: worth doing, not urgent
@@ -103,7 +103,7 @@ These items are cheap or foundational.
 | 30 | Notebooks stored in the dataset | [U05](specs/U05-notebooks.md) | M |
 | 31 | Data-quality timeline and schema diagram | [U07](specs/U07-data-quality-and-schema-diagram.md) | M |
 | 32 | Parameterized reusable plans | [X10]({X10}), [P01](specs/P01-python-bindings.md#roadmap-follow-ups-2026-10-12) | L |
-| 33 | Per-call overhead in the bindings: JNI, Node `has()` and export conversion | [P04](specs/P04-jvm-bindings.md#roadmap-follow-ups-2026-10-12), [P05](specs/P05-node-bindings.md#roadmap-follow-ups-2026-10-12) | M |
+| 33 | Per-call overhead in the bindings: JNI calls (3–4× Jena's in-memory store), Node `has()` (1.9 vs 1.3 µs published) and Node export conversion (1.44×) | [P04](specs/P04-jvm-bindings.md#roadmap-follow-ups-2026-10-12), [P05](specs/P05-node-bindings.md#roadmap-follow-ups-2026-10-12) | M |
 | 34 | Vector quantization and vector-result caching | [F04](specs/F04-vector-search.md#roadmap-follow-ups-2026-10-12) | M |
 | 35 | Multi-field full-text entity documents | [F03](specs/F03-full-text-search.md#roadmap-follow-ups-2026-10-12) | M |
 | 36 | Batched (chunked) updates and commit triggers | [C23](specs/C23-batched-updates-and-triggers.md) | M |
@@ -136,7 +136,7 @@ These items are smaller or narrower. Each has a design sketch in the linked spec
 | 54 | ShEx: combined SHACL and ShEx guards, schemas from a graph plus a file, and CLI outbound controls | [G02](specs/G02-shex.md#roadmap-follow-ups-2026-10-12) | M |
 | 55 | Dynamic and Nushell completions, and an OpenAPI "try it" page with named schemas | [X03](specs/X03-openapi-and-completions.md#roadmap-follow-ups-2026-10-12) | S–M |
 | 56 | Legacy MCP resource subscriptions | [C11](specs/C11-mcp-server.md#roadmap-follow-ups-2026-10-12) | S |
-| 57 | Scratch-branch expiry settings and stdio expiry | [C18](specs/C18-natural-language-questions-and-ingest.md#roadmap-follow-ups-2026-10-12) | S |
+| 57 | Scratch-branch expiry as a dataset setting, and expiry under stdio (today only `--mcp-scratch-branch-ttl` on the server) | [C17](specs/C17-agent-memory.md#roadmap-follow-ups-2026-10-12) | S |
 | 71 | An OWL 2 ontology object API, as Jena's `jena-ontapi` provides | [FEATURES](FEATURES.md#known-gaps), [AUDIT §5](AUDIT.md) | L |
 | 73 | Format coverage: all formats in `load_str`, `dump_graph` and SPARQL `LOAD`, and loading Thrift, Protobuf, RDF/JSON and TriX without a temporary N-Quads copy | [FEATURES](FEATURES.md#known-gaps) | S–M |
 | 74 | RDF Patch: patches with several transactions applied as several commits, blank-node identity across datasets, and patch logs | [F10](specs/F10-replication.md#roadmap-follow-ups-2026-10-12) | M |
@@ -156,10 +156,10 @@ This work is done when the first release is cut.
 | 61 | Whole-server backup and restore, all datasets in one request, a remote backup CLI, and repository copy | [F05](specs/F05-snapshot-repositories.md#roadmap-follow-ups-2026-10-12) | M |
 | 62 | Audit events for creating, deleting and cloning datasets | [C09](specs/C09-dataset-access-control.md#roadmap-follow-ups-2026-10-12) | S |
 | 63 | Mutual TLS, OCSP, opaque-token introspection, front-channel logout and Cloudflare group lookup | [C09](specs/C09-dataset-access-control.md#roadmap-follow-ups-2026-10-12) | M |
-| 64 | Binding the listener before datasets open, degraded startup, OTLP metric export, and a separate metrics listener | [C01](specs/C01-observability-and-budgets.md#roadmap-follow-ups-2026-10-12) | M |
+| 64 | Binding the listener before datasets open, and degraded startup when a dataset fails to open | [C01](specs/C01-observability-and-budgets.md#roadmap-follow-ups-2026-10-12) | M |
 | 65 | Encryption: key management workflows, Vault and cloud KMS, recovery export, and encryption of live datasets and derived indexes | [F11](specs/F11-encryption-at-rest.md#roadmap-follow-ups-2026-10-12) | L–XL |
-| 66 | Replication: read replicas, preserved primary IDs, promotion, failover and synchronous replication | [F10](specs/F10-replication.md#roadmap-follow-ups-2026-10-12) | XL |
-| 67 | MCP OAuth: protected-resource metadata, audience validation and scope challenges | [C11](specs/C11-mcp-server.md#roadmap-follow-ups-2026-10-12) | S–M |
+| 66 | Replication: read replicas, preserved primary IDs, promotion, failover, synchronous replication, and a patch log or continuous archive | [F10](specs/F10-replication.md#roadmap-follow-ups-2026-10-12) | XL |
+| 67 | MCP OAuth: RFC 9728 protected-resource metadata, audiences bound to the resource, and scope challenges. OIDC tokens are already audience-checked on every route. | [C11](specs/C11-mcp-server.md#roadmap-follow-ups-2026-10-12) | S–M |
 | 68 | Assistant secrets sealed by default (today they are plaintext unless `--secrets-key` is set) | [C19](specs/C19-layered-settings.md#roadmap-follow-ups-2026-10-12) | S–M |
 
 ## Tier 7: compatibility leftovers

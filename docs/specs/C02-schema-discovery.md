@@ -1118,3 +1118,63 @@ full reports after the same kind of write. After larger writes the update took 4
 100 changes, 9 ms for 300, 25 ms for 600, 91 to 119 ms for 1,000 to 2,000 and 363 ms for
 10,000, while full reports took 45 to 700 ms, which set the limit of one change per 500
 triples.
+
+### Roadmap follow-ups (2026-10-12)
+
+**Richer drafted shapes, ShEx summaries and stable cursors** (item 13, Tier 2,
+[ROADMAP](../ROADMAP.md)). The schema diagram with observed cardinalities and the
+data-quality timeline built on these reports are U07.
+
+* **What the draft covers today.** `crates/sparkles-core/src/schema/draft.rs` drafts
+  `sh:minCount`, `sh:maxCount`, `sh:nodeKind`, `sh:datatype`, `sh:class`, `sh:in`,
+  `sh:languageIn`, `sh:uniqueLang` and `sh:closed`, for direct predicates only. A
+  datatype is drafted when one datatype reaches the support; otherwise the constraint
+  is listed as not drafted. `sh:class` names a class of the values, never a drafted
+  shape.
+* **Datatype alternatives.** When no single datatype reaches the support but two or
+  three together do (for example `xsd:integer` and `xsd:decimal`, or `xsd:date` and
+  `xsd:dateTime`), the draft writes `sh:or ( [ sh:datatype A ] [ sh:datatype B ] )`, and
+  in ShEx `A OR B`. The profile already counts instances per datatype; the alternative
+  is the smallest set, at most three, whose union reaches the support.
+* **Inverse paths.** Per class, the predicates whose objects are instances get an
+  inverse property shape (`sh:path [ sh:inversePath p ]`, ShEx `^p`) with counts and
+  the class of the subjects, counted in the `POS[p]` pass the draft already makes. Only inverse predicates with at least one instance in support are
+  drafted, so a class pointed at by thousands of predicates does not list them all; a
+  `maxInverse` option (default 10) caps the list by instance count.
+* **Sequence paths.** A sequence `p/q` is drafted when `p`'s values have no drafted
+  class of their own (typically blank nodes, such as an address node), so that the
+  draft can describe `ex:address/ex:city` without a shape for the blank nodes. This
+  stays one level deep.
+* **Patterns and ranges.** For string values, a pattern is drafted when all values in
+  support share one of a fixed set of shapes: a fixed prefix (an IRI namespace, `ISBN-`),
+  digits only with a fixed length, or a common character-class skeleton
+  (`^[A-Z]{2}[0-9]{4}$`) learned from at most 64 distinct skeletons. For numbers and
+  dates, `sh:minInclusive` and `sh:maxInclusive` are drafted from the observed minimum
+  and maximum, with a support below 1 trimming the extremes. Both are commented as
+  observed, not intended, in the Turtle.
+* **Class references.** When the values of a predicate are instances of a class that
+  the draft also shapes, the property shape gains `sh:node <ClassShape>` beside
+  `sh:class`, and the ShEx draft writes `@<ClassShape>` instead of a class constraint,
+  so the schema validates the values' own shapes. A cycle of references is allowed,
+  since both validators handle recursion; the draft's comment says so.
+* **ShEx schema summaries.** The constraints layer summarizes SHACL guards only (*A
+  ShEx guard is not summarized* above). For a ShEx guard, each triple constraint of a
+  shape that a shape map selects by class (`{FOCUS rdf:type C}`) maps to the layer's
+  entries: the predicate (or its inverse), the cardinality as min and max, a node
+  constraint's datatype, node kind or value set, and a reference to another shape as
+  its class when that shape is selected by one class. Constraints outside that mapping
+  are listed under `other`, as SHACL components are.
+* **Restart-stable cursors.** Cursors bind to `snapshot_identity`, which is
+  `snapshot.version` (`crates/sparkles-core/src/schema.rs`): it changes on every commit
+  and compaction and restarts at 0 on reopen. Since reports carry `snapshot.commit`,
+  the identity becomes the dataset id with the commit and the selection's hash. A
+  cursor then survives a restart and a compaction that keeps the commit, and the
+  report is recomputed at that commit when it is still readable through
+  [F06](F06-snapshots-and-point-in-time.md)'s point-in-time reads; when it is not,
+  the answer stays `409`. §4.5 and open question 5 describe this alternative.
+
+Acceptance: on the draft fixture of `sparkles-shacl/tests/draft.rs` with an added
+integer-or-decimal property, an address blank node and a class pointed at by another,
+the draft at support 1 contains the `sh:or`, the `ex:address/ex:city` path, the inverse
+shape and the `sh:node` reference, and the data conforms to it; a schema page fetched
+with a cursor before a restart continues after it.

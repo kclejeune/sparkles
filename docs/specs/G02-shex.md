@@ -1816,3 +1816,62 @@ schema in graphs merged with a file, and ShEx 2.2 (`EXTENDS`, `ABSTRACT`) are no
 built. The copy of shexTest that the harness runs, Jena's `jena-shex/src/test/files/spec`,
 has no test that uses `EXTENDS` or `ABSTRACT`, so ShEx 2.2 waits for a suite that covers
 it, as Open question 11 says.
+
+### Roadmap follow-ups (2026-10-12)
+
+**ShEx 2.2 and a persisted typing** (item 13, Tier 2, [ROADMAP](../ROADMAP.md)).
+*Deferred or rejected* above lists both.
+
+* **ShEx 2.2.** The language adds `EXTENDS` (a shape that includes another's
+  constraints, with the extended shape's triple expression matched on its own share of
+  the neighbourhood) and `ABSTRACT` (a shape that a node conforms to only through a
+  non-abstract extension). The parser reads both in ShExC, ShExJ (`extends`,
+  `abstract`) and ShExR, and the compiler checks that extensions are acyclic and that
+  an abstract shape is never the target of a shape map entry. The validator matches an
+  extending shape by splitting the node's arcs between the shape's own triple
+  expression and each extended one, the partition the 2.2 draft specifies, and a
+  reference to an abstract shape succeeds when the node conforms to one of its
+  extensions. *Typing-change propagation* above treats an extended shape as referred
+  to by its extensions. The jena-shex copy of shexTest has no 2.2 cases (Open question
+  11); the tests come from the upstream shexTest repository's 2.2 cases where they
+  exist, and from the draft's examples otherwise, each listed with its source.
+  Acceptance: shexTest's 2.1 results stay at 99.9 %, and every 2.2 case adopted passes
+  or is listed with a reason.
+* **Persisting the typing.** The head's typing lives in memory and is dropped by a
+  restart and by a compaction, which renumbers terms, so the first write after either
+  is validated in full (*Typing-change propagation* above). The guard writes the typing
+  to `validation/typing.bin` in the dataset's directory when the store syncs before a
+  generation switch and when it closes: a header with the commit, the generation, the
+  hash of the compiled schema and shape map, then the pairs as (node, shape label,
+  value, failed-in-discovery) with nodes as vocabulary keys, not ids, so a compaction
+  does not invalidate them. At open, the guard reads the file when the commit, the
+  schema hash and the shape map match the head, and maps the keys to the new ids;
+  any mismatch discards it and the next write runs in full as now. A commit the guard
+  did not judge still drops the typing. Acceptance: with `foaf:knows @ex:Person *` at
+  1.05M triples, the first person write after a restart takes the same 16 to 28 ms as
+  the next ones, against a full validation of 2.1 to 2.7 s before.
+
+**Guards, schema sources and CLI controls** (item 54, Tier 5,
+[ROADMAP](../ROADMAP.md)).
+
+* **SHACL and ShEx guards on one dataset.** `validation.json` holds one `language`
+  (`GuardLanguage` in `crates/sparkles-core/src/guard.rs`). It becomes a list of
+  guards, each with its own language, schema, mode and baseline; the single-guard form
+  stays valid and is read as a list of one. A write runs each guard on the same pending
+  state, in the listed order, and is rejected if any `reject` guard rejects; the
+  report holds one section per guard. The incremental paths are per guard, and a bulk
+  write's fallback applies to each. Metrics already carry the language label.
+* **A schema in graphs merged with a file.** `schema.graphs` and a copied schema file
+  exclude each other today. Both may be given: the file's ShExC or ShExJ is compiled
+  with the graphs' ShExR as one schema, labels from either may refer to the other, and
+  a label defined in both is an error at configuration time and at any write that
+  changes a schema graph. Imports stay refused for the graph part only.
+* **CLI outbound controls.** `sparkles shex validate` builds its import policy in
+  `shex_cmd.rs` with `allow_private: true` and the default outbound settings, and the
+  Outcome lists the `--outbound-*` flags as open. The command flattens the
+  server's `OutboundArgs` (`crates/sparkles-server/src/outbound.rs`:
+  `--outbound-allow-private` or `--outbound-block-private`, `--outbound-allow`,
+  `--outbound-timeout`, `--outbound-max-mb` and the per-request limits) and builds its
+  import policy from them. The local default stays `allow_private: true`, so existing
+  invocations keep working, and `--outbound-block-private` refuses imports from
+  private addresses.
