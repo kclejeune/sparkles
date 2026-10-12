@@ -1486,8 +1486,9 @@ What remains behind N3.js has these causes.
 * **Reusable plans** ([ROADMAP](../ROADMAP.md) item 32). [X10](X10-reusable-query-plans.md)
   adds `dataset.prepare(text)`, which parses on the worker and resolves to a
   `PreparedQuery` with `query(bindings?, options?)` and `cursor(...)`. Its handle keeps
-  the parsed query and the cached plan, so the worker skips parsing and planning, which
-  the Outcome above puts at most of a small query's 69% of user-space cycles.
+  the parsed query and the cached plan, so the worker skips parsing and planning. The
+  Outcome above puts 69% of a small query's user-space cycles on the worker, in parsing,
+  planning and evaluation.
 * **Per-call overhead** (item 33). The published benchmark has `has()` at 1.9 µs against
   N3.js's 1.3 µs ([BENCHMARKS](../BENCHMARKS.md)). On the laptop, in a hot loop, it took
   0.63 µs against 0.10 µs (Outcome above). The export of 500,000 rows takes 1.44 times

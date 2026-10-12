@@ -128,7 +128,7 @@ These items are smaller or narrower. Each has a design sketch in the linked spec
 | 46 | Notifications: an email channel, an administration UI, broader backup-failure coverage, and delivery that doesn't let a slow channel delay the others | [C21](specs/C21-outbound-notifications.md#roadmap-follow-ups-2026-10-12) | M |
 | 47 | Rust client: typed bodies for the remaining administration calls, proactive rate-limit pacing, and credential integration tests | [P02](specs/P02-rust-client.md#roadmap-follow-ups-2026-10-12) | S–M |
 | 48 | SHACLC formatting; linting of N-Triples, N-Quads, JSON-LD and embedded SHACL queries; linting in the shapes editor; an MCP lint tool | [X02](specs/X02-formatter.md#roadmap-follow-ups-2026-10-12), [X04](specs/X04-linter.md#roadmap-follow-ups-2026-10-12) | M |
-| 49 | Write previews: local dry-run flags, UI previews, and the handling of read-only servers and costly bulk previews | [C15](specs/C15-write-previews.md#roadmap-follow-ups-2026-10-12) | S–M |
+| 49 | Write previews: local dry-run flags, UI previews beyond the CSV import panel and merge page, `If-Match` on `/{ds}/update`, and the handling of read-only servers and costly bulk previews | [C15](specs/C15-write-previews.md#roadmap-follow-ups-2026-10-12) | S–M |
 | 50 | Restricted views: token scopes limited to graphs, validation and statistics for restricted views, and text scoring local to what a caller can see | [C12](specs/C12-graph-access-control.md#roadmap-follow-ups-2026-10-12) | M |
 | 51 | ARQ: parallel LATERAL, user DESCRIBE handlers, the remaining client options and builder methods, and `shortest(…)` evaluation | [G06](specs/G06-arq-query-extensions.md#roadmap-follow-ups-2026-10-12) | M |
 | 52 | History: pin rebasing, periods per quad, change feeds per graph, reconstructing expired states, and history of settings | [F06](specs/F06-snapshots-and-point-in-time.md#roadmap-follow-ups-2026-10-12) | M |
@@ -152,15 +152,15 @@ This work is done when the first release is cut.
 |---|---|---|---|
 | 58 | Packages: publishing to PyPI, Maven Central and npm, Windows and Intel macOS builds, a musl JVM build, PyPy and free-threaded wheels, and Python async wrappers. The workflows exist, with their publish jobs switched off. | [X12]({X12}), [P01](specs/P01-python-bindings.md#roadmap-follow-ups-2026-10-12), [P04](specs/P04-jvm-bindings.md#roadmap-follow-ups-2026-10-12), [P05](specs/P05-node-bindings.md#roadmap-follow-ups-2026-10-12) | M–L |
 | 59 | Server binaries and published container images | [X12]({X12}) | M |
-| 60 | A stability and migration policy for the on-disk format and the APIs. Today a format mismatch is refused with "dump and reload". | [X12]({X12}) | M–L |
+| 60 | A stability and migration policy for the on-disk format and the APIs. The index refuses a format mismatch with "dump and reload". `dataset.json` has a minimum reader version, but `wal.log`, the catalog's `config.json` and most settings files have no version marker. | [X12]({X12}) | M–L |
 | 61 | Whole-server backup and restore, all datasets in one request, a remote backup CLI, and repository copy | [F05](specs/F05-snapshot-repositories.md#roadmap-follow-ups-2026-10-12) | M |
-| 62 | Audit events for creating, deleting and cloning datasets | [C09](specs/C09-dataset-access-control.md#roadmap-follow-ups-2026-10-12) | S |
+| 62 | Audit events for creating, deleting and cloning datasets and for creating and deleting branches (restores already emit them) | [C09](specs/C09-dataset-access-control.md#roadmap-follow-ups-2026-10-12) | S |
 | 63 | Mutual TLS, OCSP, opaque-token introspection, front-channel logout and Cloudflare group lookup | [C09](specs/C09-dataset-access-control.md#roadmap-follow-ups-2026-10-12) | M |
 | 64 | Binding the listener before datasets open, and degraded startup when a dataset fails to open | [C01](specs/C01-observability-and-budgets.md#roadmap-follow-ups-2026-10-12) | M |
 | 65 | Encryption: key management workflows, Vault and cloud KMS, recovery export, and encryption of live datasets and derived indexes | [F11](specs/F11-encryption-at-rest.md#roadmap-follow-ups-2026-10-12) | L–XL |
 | 66 | Replication: read replicas, preserved primary IDs, promotion, failover, synchronous replication, and a patch log or continuous archive | [F10](specs/F10-replication.md#roadmap-follow-ups-2026-10-12) | XL |
 | 67 | MCP OAuth: RFC 9728 protected-resource metadata, audiences bound to the resource, and scope challenges. OIDC tokens are already audience-checked on every route. | [C11](specs/C11-mcp-server.md#roadmap-follow-ups-2026-10-12) | S–M |
-| 68 | Assistant secrets sealed by default (today they are plaintext unless `--secrets-key` is set) | [C19](specs/C19-layered-settings.md#roadmap-follow-ups-2026-10-12) | S–M |
+| 68 | Assistant secrets sealed by default. `--secrets-key` sealing exists and seals existing secrets in place, but only in builds with the `backup-encryption` feature: the Linux Nix package has it, and the Dockerfile and default builds don't. | [C19](specs/C19-layered-settings.md#roadmap-follow-ups-2026-10-12) | S–M |
 
 ## Tier 7: compatibility leftovers
 
