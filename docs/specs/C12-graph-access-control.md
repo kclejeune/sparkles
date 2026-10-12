@@ -730,3 +730,48 @@ caller's view like SPARQL queries.
 **Not built.** Graph restrictions on token scopes, validation of a view (§5.5), and a
 `/$/stats` answer for the visible graphs remain open questions 1–3. Full-text scores
 still use the statistics of the whole index.
+
+### Roadmap follow-ups (2026-10-12)
+
+**Restricted views: token scopes, validation, statistics and text scoring** (item 50,
+Tier 5, [ROADMAP](../ROADMAP.md)). *Not built* above leaves open questions 1 to 3 open
+and notes that full-text scores use the whole index's statistics.
+
+* **Graph-limited token scopes (question 1).** A token's `Scope`
+  (`crates/sparkles-server/src/auth/mod.rs`) maps datasets to a level and lists server
+  permissions; it cannot name graphs. A dataset entry may become an object,
+  `{"level": "read", "graphs": ["urn:tenant:a", …], "endpoints": ["query"]}`, using the
+  grant fields of §3. The effective view is the intersection of the owner's grant and
+  the scope's graphs, computed as §4 computes a grant's view, so a scope never widens
+  access, and a token whose scope names a graph its owner cannot see is refused at
+  minting. The plain level form stays valid and means all of the owner's graphs.
+  `sparkles token create --graph` and the UI's token dialog set it.
+* **Validating a view (question 2).** `/{ds}/shacl`, `/{ds}/shex` and the MCP validation
+  tools refuse a restricted principal (§5.5). Both validators read the data through
+  the engine's snapshot, so they can take the masked snapshot of the caller's view:
+  SHACL-SPARQL constraints and ShEx selectors run as the caller's queries do, and a
+  report can quote only visible focus nodes and values. The shapes graph is read with
+  the same view, and a shapes graph the caller cannot see is a `403`. The write-time
+  guard keeps validating the whole dataset and keeps its redacted `422`, since a
+  restricted writer must not change what the guard sees.
+* **Statistics for restricted views (question 3).** `/$/stats` answers `403` to a
+  restricted principal. It answers instead with the counts of the visible graphs:
+  quads per visible graph come from the per-graph counts the statistics already keep,
+  and predicate and class counts are computed over the view with the schema report's
+  graph filter ([C02](C02-schema-discovery.md)), under the same work limit. Totals
+  that would reveal hidden graphs (the dataset's quad count, disk bytes, the term
+  count) are left out of the answer rather than shown.
+* **Visibility-local text scoring.** A `text:query` under a view drops hidden hits, but
+  BM25 uses the document frequencies and average length of the whole index, so a
+  restricted caller's scores depend on hidden documents and could hint at them. With
+  the view's graphs as a filter, the search computes the term statistics over the
+  visible documents only: Tantivy's `Bm25Weight` is built from statistics the searcher
+  supplies, and a collector over the filter gathers document frequency and total field
+  length for the query's terms first. That costs a second pass over the matching
+  postings, so it applies only when a view hides some graph of the index, and the
+  plan reports it.
+
+Acceptance: a token scoped to `urn:tenant:a` reads only that graph although its owner
+reads all; `/{ds}/shacl` for a reader of one graph reports only that graph's results;
+`/$/stats` for the same reader lists one graph; and two datasets that differ only in a
+hidden graph give a restricted reader the same `text:query` scores.
