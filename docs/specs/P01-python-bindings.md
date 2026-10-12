@@ -1058,3 +1058,33 @@ intermediate result of 8 billion rows exceeded the budget after about 22 ms in 1
 runs, before the timeout fired. The test now checks each limit on its own. The timeout
 check raises the budget out of reach with `max_rows`, and the budget check sets no
 timeout and expects the budget's message.
+
+### Roadmap follow-ups (2026-10-12)
+
+* **Plan cache** ([ROADMAP](../ROADMAP.md) item 32). The plan cache sketched in the
+  Outcome above is now [X10](X10-reusable-query-plans.md). It keeps the sketch's key,
+  value, count classes and invalidation, adds a text level that skips parsing, records
+  which constants become parameters (triple-pattern positions, `VALUES` cells, initial
+  bindings), and adds `Dataset.prepare(text)` returning a `PreparedQuery` with
+  `query(bindings=...)` and `cursor(...)`. The query builder's `set_var` reaches the
+  cache through its text.
+* **Memory** (item 40). [X08](X08-disk-spill-and-server-memory.md) §8.2 measures a
+  smaller default cache profile for datasets opened from Python, a collection of
+  mimalloc's free memory after bulk loads, and mimalloc's purge delay, against the read
+  process's peak of 135 MiB to pyoxigraph's 97 MiB.
+* **Release work** (item 58), designed in [X12](X12-release-engineering.md):
+  * *PyPI.* `python-wheels.yml` already has a publish job that runs only for a `py-v*`
+    tag with the repository variable `PYPI_PUBLISH` set to `true`, through PyPI trusted
+    publishing. Switching it on needs the PyPI project, the pending publisher and the
+    release checklist of X12.
+  * *PyPy wheels.* abi3 does not apply to PyPy, so the matrix gains per-version PyPy 3.11
+    wheels built with PyO3's PyPy support, and the test suite runs on them. Behaviour that
+    depends on reference counting (finalizers of cursors and transactions) is checked
+    there, since PyPy collects later.
+  * *Free-threaded wheels.* A `cp314t` wheel per platform, built without abi3, with the
+    module declared as not using the GIL only after an audit of every `#[pyclass]` for
+    shared mutable state without a lock, and with the concurrency tests run under the
+    free-threaded interpreter.
+  * *Async wrappers.* A `sparkles.aio` module whose methods run the blocking calls with
+    `asyncio.to_thread` and connect task cancellation to the call's `CancelToken`, and
+    whose cursors are async iterators that fetch each batch the same way.
