@@ -107,6 +107,22 @@ class RecordTests(unittest.TestCase):
         q = self.find(rec, "sparkles", "explore-mix", "qmph")
         self.assertEqual(q["qmph"], 1234.5)
 
+    def test_answers_only_runs_carry_their_fingerprints(self):
+        write(self.res, "answers.json", {
+            "q1": {"sparkles": {"rows": 3, "exact": "a", "value": "a"}, "oxigraph": {"rows": 3, "exact": "a", "value": "a"},
+                   "qlever": {"rows": 2, "exact": "b", "value": "b"}, "jena-fuseki": {"rows": "error"}}})
+        out = os.path.join(self.tmp.name, "answers-only.json")
+        p = build(self.res, out, queries="q1")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        rec = jload(out)
+        r = {x["engine"]: x for x in rec["results"]}
+        self.assertTrue(all(x["mode"] == "answer" for x in r.values()))
+        self.assertEqual(r["sparkles"]["answer"]["hash"], r["oxigraph"]["answer"]["hash"])
+        self.assertEqual(r["sparkles"]["status"], "ok")
+        self.assertEqual(r["qlever"]["status"], "wrong-answer")
+        self.assertEqual(r["jena"]["status"], "error")
+        self.assertEqual(subprocess.run([sys.executable, RECORD, "validate", out], capture_output=True).returncode, 0)
+
     def test_a_server_side_timeout_is_a_timeout(self):
         # an HTTP error (curl exit 22) after the request limit is the server's own timeout
         write(self.res, "slow.json", {"results": [hyperfine("jena-fuseki", [5.0, 5.1], [22, 22]),

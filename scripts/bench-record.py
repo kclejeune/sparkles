@@ -39,7 +39,8 @@ Record 1 (every field is required unless marked optional):
     results     list of
         engine       sparkles | jena | qlever | fluree | oxigraph | …
         query        string
-        mode         warm | cold | update | throughput | qmph | load
+        mode         warm | cold | update | throughput | qmph | load | answer
+                     (answer: a query that was only answer-checked, with no timing)
         clients      integer
         durability   synced | written | memory | null
         status       ok | timeout | error | oom | wrong-answer
@@ -77,7 +78,7 @@ LICENSES = {
 # written (OS cache), synced or memory: docs/specs/X06 §5.1, from each engine's documentation
 DURABILITY = {"sparkles": "synced", "jena": "synced", "oxigraph": "written", "qlever": "memory", "fluree": "synced"}
 STATUSES = {"ok", "timeout", "error", "oom", "wrong-answer"}
-MODES = {"warm", "cold", "update", "throughput", "qmph", "load"}
+MODES = {"warm", "cold", "update", "throughput", "qmph", "load", "answer"}
 AUX = {"load", "load-details", "answers", "mem", "rss", "rss-probe", "churn", "mixed", "cold", "cold-runs",
        "qmph", "extra", "manifest", "record", "update-latency", "inference"}
 CURL_TIMEOUT = 28
@@ -350,6 +351,17 @@ def cmd_build(a):
     results = []
     for n in names:
         results += hyperfine_results(d, n, "warm", fps)
+    # a query that was answer-checked and not timed (ANSWERS_ONLY) still gets its fingerprint
+    timed = {(r["engine"], r["query"]) for r in results}
+    for q in names:
+        for e, v in ((answers or {}).get(q) or {}).items():
+            en = engine_name(e)
+            if (en, q) in timed:
+                continue
+            fp = fps.get((q, en))
+            st = "error" if v.get("rows") == "error" else "wrong-answer" if fp and fp["agrees"] is False else "ok"
+            results.append({"engine": en, "query": q, "mode": "answer", "clients": 1, "durability": None,
+                            "samples_ms": [], "median_ms": None, "p95_ms": None, "answer": fp, "status": st})
     results += hyperfine_results(d, "update-latency", "update", fps)
     for f in sorted(os.listdir(d)):
         if f.startswith("throughput") and f.endswith(".json"):
