@@ -656,7 +656,9 @@ Sparkles alone on a development machine. SP²Bench at 50k also ran with all five
 
 * The standard refresh of every existing suite at one head (A5), and the regeneration of the
   BENCHMARKS.md tables from records without a numeric change (A3). `bench-record.py` reads
-  the results of `bench.sh`, and `bench-summary.py` still reads the raw files.
+  the results of `bench.sh` and of a small `bench-watdiv.sh` run, and both produce valid
+  records. It does not read the DBpedia or full-text results yet, and `bench-summary.py`
+  still reads the raw files.
 * The published comparisons of BSBM, SP²Bench and LUBM(100) on the reference host, with a
   noise-floor control for each (§14). Their commands are in BENCHMARKING.md.
 * BSBM at 100M triples has not been tried, and the generator's heap defaults may need
