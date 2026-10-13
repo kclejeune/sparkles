@@ -23,6 +23,7 @@ mod csv;
 mod extract;
 mod html;
 pub mod http;
+mod link;
 pub mod maintain;
 #[cfg(feature = "office")]
 pub(crate) mod office;

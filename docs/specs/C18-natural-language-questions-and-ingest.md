@@ -1705,9 +1705,26 @@ header, 20 sample rows and the ingest profile, and drafts a C05 mapping, either 
 metadata or a CONSTRUCT template. A person reviews the mapping and a preview of the
 first 100 converted rows, and C05 then converts the whole file deterministically
 through an upload with a dry run. The model's cost is therefore independent of the
-file's length, and the conversion is reproducible. Entity linking runs on the values of
-columns that the mapping maps to IRIs of existing classes, and the mapping can use the
-link table as a lookup.
+file's length, and the conversion is reproducible.
+
+Entity linking runs on the values of the columns that the draft maps to IRIs of an
+existing class. The class comes from the predicate's declared range in the profile, or
+from the model's `linkClass` for that column when the profile declares none, and a
+column with neither mints its IRIs. The converter counts the distinct values of each
+such column, and the server links the most frequent ones with `link_entities` in batches
+of 20, at most 500 values for a column, 5 columns and 50 calls for a draft. Values that
+differ only in case and spacing are linked once. What was not tried is minted, and a note
+says how many were. The calls pass `vectors: false`, so linking reads labels and the
+full-text index only and no cell value is embedded by a provider.
+
+An exact link is written into the column's lookup in the mapping (C05 §3.7), so the
+preview and the upload write the existing entity's IRI, and a second upload of the same
+file with the same mapping links the same way. An ambiguous value is listed in the
+draft's `links` with its number of rows and its candidates, and stays a minted IRI until
+a person chooses. The choice is made by adding an entry to the lookup in the mapping and
+running the dry run again. The draft shows the candidates' labels, but the mapping holds
+only IRIs and the values of the file. The lookup is a snapshot of the dataset as the
+drafting person could read it, and the draft reports the commit it linked against.
 
 ### 7.9 Re-ingestion and supersession
 
@@ -4759,6 +4776,20 @@ badges on the dataset page and the sidebar.
   formats of their logs, so the adapters follow what the tools write and what other
   readers of them accept. Each skips a line or a block it does not understand. Cursor's
   SQLite chat store and Copilot Chat's editor storage are not read.
+- **CSV entity linking.** A model-drafted mapping now links its IRI columns as §7.8
+  describes. `sparkles::tabular` gained the lookup extension `urn:x-sparkles:lookup` on a
+  column (C05 §3.7), a list of `{ "rdf:value": value or values, "@id": IRI }` entries
+  that is valid CSVW and that other processors ignore, so the CLI converts with the same
+  links and other tools mint the `valueUrl` IRIs. The converter's new `tally` option
+  records the exact strings that the lookup is compared with. The draft's column schema
+  gained `linkClass`, `Vocabulary` now reads the profile's `ranges`, and the result has a
+  `links` array with, for each column, the classes, the commit, the distinct and tried
+  values, how many were linked and minted, how many had only weak candidates and the
+  ambiguous values with their candidates. The decision to keep the lookup in the mapping
+  and not in the dataset keeps C05's rule that a conversion reads nothing from the
+  target. `link_entities` gained `vectors`, which defaults to true, because the values of
+  a whole column are far more text than the 20 sample rows the model sees. The review
+  UI lists the ambiguous values and writes the candidate a person picks into the lookup.
 
 - **Office documents.** The new crate `sparkles-office` reads DOCX, PPTX, XLSX and the
   OpenDocument text, presentation and spreadsheet formats from their XML parts with

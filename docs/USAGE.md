@@ -2730,6 +2730,17 @@ Excel or OpenDocument spreadsheet (`.xlsx`, `.ods`) gets a mapping draft for eac
 visible sheet, with the sheet as CSV to upload with its mapping. These conversions share
 the `--pdf-workers` limit with PDF conversion.
 
+When the model drafts a mapping that maps a column to IRIs of a class the dataset has,
+the draft links that column's values to the existing entities. The most frequent values
+of the column, up to 500, are looked up by label, and an exact match is written into the
+column's lookup in the mapping (`urn:x-sparkles:lookup`), so the preview and the upload
+use the existing entity's IRI and a second upload with the same mapping links the same
+way. A value with several matching entities is listed under `links` in the draft with
+its candidates and keeps a minted IRI. To choose one, add an entry with the value and
+the candidate's IRI to the column's lookup, and run the dry run again. No cell value goes
+to the model or to an embedding provider while linking. Other CSVW tools ignore the
+lookup and mint the IRIs.
+
 `sparkles ingest` runs the same steps on a database directory while no server holds it,
 one file after another, and prints each result:
 

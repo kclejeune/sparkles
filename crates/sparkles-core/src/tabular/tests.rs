@@ -620,3 +620,90 @@ fn compressed_tables() {
     std::fs::write(&plain, &csv).unwrap();
     assert!(convert(open(&plain, Some(1000)).unwrap(), &o, &mut |_| Ok(())).is_ok());
 }
+
+const LOOKUP_META: &str = r#"{
+  "@context": "http://www.w3.org/ns/csvw",
+  "tableSchema": {
+    "aboutUrl": "http://e/p/{id}",
+    "columns": [
+      { "name": "id", "required": true, "suppressOutput": true },
+      { "name": "team", "propertyUrl": "http://e/memberOf", "valueUrl": "http://e/t/{team}",
+        "urn:x-sparkles:lookup": [
+          { "rdf:value": ["Payments", "payments"], "@id": "http://e/existing/payments" },
+          { "rdf:value": "Core", "@id": "http://e/existing/core" } ] }
+    ]
+  }
+}"#;
+
+/// C05 §3.6: a column's lookup gives the IRI of the values it lists, the `valueUrl`
+/// expands for the others, and the converter tallies the values it sees.
+#[test]
+fn lookups_replace_minted_iris() {
+    let mut o = csvw(LOOKUP_META, "t.csv");
+    o.tally = vec!["team".into(), "nope".into()];
+    let mut out = Vec::new();
+    let csv = "id,team\n1,payments\n2, Core \n3,Growth\n4,payments\n5,\n";
+    let s = convert(Cursor::new(csv.as_bytes().to_vec()), &o, &mut |t| {
+        out.push(t.to_string());
+        Ok(())
+    })
+    .unwrap();
+    out.sort();
+    assert_eq!(
+        out,
+        [
+            "<http://e/p/1> <http://e/memberOf> <http://e/existing/payments>",
+            "<http://e/p/2> <http://e/memberOf> <http://e/existing/core>",
+            "<http://e/p/3> <http://e/memberOf> <http://e/t/Growth>",
+            "<http://e/p/4> <http://e/memberOf> <http://e/existing/payments>",
+        ]
+    );
+    assert!(s.warnings.is_empty(), "{:?}", s.warnings);
+    // the values are the cells after trimming, counted for the columns asked for
+    assert_eq!(s.tallies[0].values.get("Core"), Some(&1));
+    assert_eq!(s.tallies[0].values.get("payments"), Some(&2));
+    assert_eq!(s.tallies[0].values.len(), 3);
+    assert!(s.tallies[1].values.is_empty());
+}
+
+/// A lookup needs a `valueUrl` and a plain column, names one IRI for a value, and holds
+/// absolute IRIs. A Sparkles key this version does not read warns.
+#[test]
+fn bad_lookups_and_unknown_extensions() {
+    let col = |c: &str| {
+        format!(r#"{{"@context":"http://www.w3.org/ns/csvw","tableSchema":{{"columns":[{c}]}}}}"#)
+    };
+    let bad = |c: &str| csvw::parse(&col(c), None).map(|_| ()).unwrap_err();
+    let e = bad(
+        r#"{"name":"a","virtual":true,"valueUrl":"http://e/x","propertyUrl":"http://e/p","urn:x-sparkles:lookup":[]}"#,
+    );
+    assert!(e.contains("cannot have a lookup"), "{e}");
+    let e = bad(
+        r#"{"name":"a","urn:x-sparkles:lookup":[{"rdf:value":"x","@id":"http://e/1"},{"rdf:value":"x","@id":"http://e/2"}]}"#,
+    );
+    assert!(e.contains("names two IRIs"), "{e}");
+    let e = bad(r#"{"name":"a","urn:x-sparkles:lookup":[{"rdf:value":"x","@id":"not an iri"}]}"#);
+    assert!(e.contains("not an absolute IRI"), "{e}");
+    // no valueUrl, or a separator: refused when the table is built
+    for c in [
+        r#"{"name":"a","urn:x-sparkles:lookup":[{"rdf:value":"x","@id":"http://e/1"}]}"#,
+        r#"{"name":"a","valueUrl":"http://e/{a}","separator":";","urn:x-sparkles:lookup":[{"rdf:value":"x","@id":"http://e/1"}]}"#,
+    ] {
+        let m = csvw::parse(&col(c), Some("file:///d/m.json")).unwrap();
+        let o = Options::new(Mapping::Csvw(Arc::new(m)), "t.csv");
+        let e = run("a\nx\n", &o).unwrap_err().to_string();
+        assert!(e.contains("lookup"), "{e}");
+    }
+    let m = csvw::parse(
+        &col(r#"{"name":"a","urn:x-sparkles:lokup":[]}"#),
+        Some("file:///d/m.json"),
+    )
+    .unwrap();
+    assert!(
+        m.warnings
+            .iter()
+            .any(|w| w.contains("urn:x-sparkles:lokup")),
+        "{:?}",
+        m.warnings
+    );
+}

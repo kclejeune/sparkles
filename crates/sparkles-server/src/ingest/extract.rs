@@ -39,6 +39,8 @@ pub struct Predicate {
     pub object: String,
     pub datatypes: Vec<String>,
     pub languages: Vec<String>,
+    /// the classes the profile declares for the object, as the profile writes them
+    pub ranges: Vec<String>,
 }
 
 /// The vocabulary of an extraction: the profile that `ingest_profile` answers.
@@ -101,6 +103,7 @@ impl Vocabulary {
                     object: x["object"].as_str().unwrap_or("any").to_string(),
                     datatypes: strings(&x["datatypes"]),
                     languages: strings(&x["languages"]),
+                    ranges: strings(&x["ranges"]),
                 })
             })
             .collect();
@@ -113,7 +116,7 @@ impl Vocabulary {
         })
     }
 
-    fn predicate(&self, iri: &str) -> Option<&Predicate> {
+    pub(super) fn predicate(&self, iri: &str) -> Option<&Predicate> {
         self.predicates.iter().find(|p| p.iri == iri)
     }
 
@@ -517,6 +520,7 @@ fn read_answer(
                 object: "any".into(),
                 datatypes: Vec::new(),
                 languages: Vec::new(),
+                ranges: Vec::new(),
             })
         }) else {
             fail(

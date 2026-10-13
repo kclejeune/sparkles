@@ -857,8 +857,8 @@ async fn a18_csv_mapping_draft() {
         let a = json!({
             "subjectColumn": "id", "class": class,
             "columns": [
-                { "column": "id", "predicate": "", "kind": "literal", "datatype": "", "lang": "" },
-                { "column": "team", "predicate": member, "kind": "iri", "datatype": "", "lang": "" }
+                { "column": "id", "predicate": "", "kind": "literal", "datatype": "", "lang": "", "linkClass": "" },
+                { "column": "team", "predicate": member, "kind": "iri", "datatype": "", "lang": "", "linkClass": "" }
             ]
         });
         (200, mock::openai(&a.to_string()))
@@ -1417,4 +1417,138 @@ async fn retention_task() {
     )
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+}
+
+/// §7.8: the values of an IRI column that names an existing class are linked with
+/// `link_entities`. An exact link goes into the mapping's lookup and replaces the minted
+/// IRI, an ambiguous value is listed with its candidates and stays minted, and the
+/// upload with the drafted mapping writes the same IRIs.
+#[tokio::test]
+async fn a_csv_draft_links_its_iri_columns() {
+    let m = MockModel::start(|r, _| {
+        let s = &r.body["response_format"]["json_schema"]["schema"]["properties"];
+        let pick = |e: &Value, needle: &str| {
+            e["enum"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_str)
+                .find(|v| v.contains(needle))
+                .unwrap_or_else(|| panic!("{e}"))
+                .to_string()
+        };
+        let col = &s["columns"]["items"]["properties"];
+        let a = json!({
+            "subjectColumn": "id", "class": pick(&s["class"], "Person"),
+            "columns": [
+                { "column": "id", "predicate": "", "kind": "literal", "datatype": "", "lang": "", "linkClass": "" },
+                { "column": "team", "predicate": pick(&col["predicate"], "memberOf"), "kind": "iri",
+                  "datatype": "", "lang": "", "linkClass": pick(&col["linkClass"], "OrganizationalUnit") }
+            ]
+        });
+        (200, mock::openai(&a.to_string()))
+    });
+    let (_st, app) = app(Some([&m.url(), &m.url()]));
+    enable(&app).await;
+    let r = Request::post("/org/update")
+        .header(header::CONTENT_TYPE, "application/sparql-update")
+        .body(Body::from(
+            r#"PREFIX ex: <http://example.org/> PREFIX org: <http://www.w3.org/ns/org#> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+               INSERT DATA { GRAPH <https://example.org/hr> {
+                 ex:plat1 a org:OrganizationalUnit ; rdfs:label "Platform"@en .
+                 ex:plat2 a org:OrganizationalUnit ; rdfs:label "Platform"@en . } }"#,
+        ))
+        .unwrap();
+    let (s, _) = send(&app, r).await;
+    assert!(s.is_success());
+    let csv = "id,team\n1,Payments team\n2,Payments team\n3,payments  TEAM\n4,Platform\n5,Platform\n6,Growth\n";
+    let v = ingest(
+        &app,
+        multipart(
+            "/$/ingest/org",
+            &[
+                ("base", None, None, b"http://example.org/people/"),
+                ("file", Some("people.csv"), Some("text/csv"), csv.as_bytes()),
+            ],
+        ),
+    )
+    .await;
+    assert_eq!(v["status"], "done", "{v}");
+    let r = &v["result"];
+    assert_eq!(r["outcome"], "mapping-draft", "{v}");
+    assert_eq!(r["rows"], 6);
+    let l = &r["links"][0];
+    assert_eq!(l["column"], "team", "{r}");
+    assert_eq!(l["distinct"], 4, "{l}");
+    assert_eq!(l["linked"], 2, "the two spellings of Payments team: {l}");
+    assert_eq!(l["minted"], 2, "{l}");
+    assert_eq!(l["ambiguousTotal"], 1, "{l}");
+    assert_eq!(l["ambiguous"][0]["value"], "Platform");
+    assert_eq!(l["ambiguous"][0]["rows"], 2);
+    assert_eq!(l["ambiguous"][0]["candidates"].as_array().unwrap().len(), 2);
+    // the preview uses the lookup, and the minted IRIs remain for the rest
+    let preview: Vec<&str> = r["preview"]["triples"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    let has = |s: &str| preview.iter().any(|t| t.contains(s));
+    assert!(
+        has(
+            "<http://example.org/people/1> <http://www.w3.org/ns/org#memberOf> <http://example.org/payments>"
+        ),
+        "{preview:?}"
+    );
+    assert!(
+        has(
+            "<http://example.org/people/3> <http://www.w3.org/ns/org#memberOf> <http://example.org/payments>"
+        ),
+        "{preview:?}"
+    );
+    assert!(
+        has(
+            "<http://example.org/people/6> <http://www.w3.org/ns/org#memberOf> <http://example.org/people/Growth>"
+        ),
+        "{preview:?}"
+    );
+    assert!(
+        has(
+            "<http://example.org/people/4> <http://www.w3.org/ns/org#memberOf> <http://example.org/people/Platform>"
+        ),
+        "{preview:?}"
+    );
+    // no cell value was embedded, and the lookup is in the mapping
+    let team = r["mapping"]["tableSchema"]["columns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "team")
+        .unwrap();
+    assert_eq!(
+        team["urn:x-sparkles:lookup"],
+        json!([{ "rdf:value": ["Payments team", "payments  TEAM"], "@id": "http://example.org/payments" }]),
+        "{team}"
+    );
+    // the same file with the same mapping converts to the same IRIs
+    let mapping = r["mapping"].to_string();
+    let up = Request::post("/org/upload?dryRun=true")
+        .header(
+            header::CONTENT_TYPE,
+            "multipart/form-data; boundary=sparkles-ingest-boundary",
+        )
+        .body(Body::from(
+            [
+                "--sparkles-ingest-boundary\r\nContent-Disposition: form-data; name=\"mapping\"\r\n\r\n",
+                &mapping,
+                "\r\n--sparkles-ingest-boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"people.csv\"\r\n\r\n",
+                csv,
+                "\r\n--sparkles-ingest-boundary--\r\n",
+            ]
+            .concat(),
+        ))
+        .unwrap();
+    let (s, d) = send(&app, up).await;
+    assert_eq!(s, StatusCode::OK, "{d}");
+    assert_eq!(d["commit"]["inserted"], 12, "{d}");
 }

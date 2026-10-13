@@ -9,6 +9,7 @@
   import { fmtInt } from '$lib/format';
   import { INGEST_STATUS, pageList, reviewHref } from '$lib/review';
   import * as review from '$lib/review-api';
+  import { chooseCandidate, chosen } from '$lib/lookup';
 
   let {
     ds,
@@ -307,6 +308,34 @@
                 <textarea class="input mono" rows="8" aria-label="Mapping" bind:value={mappingText}
                 ></textarea>
               </label>
+              {#each d.links ?? [] as l (l.column)}
+                <div class="small">
+                  <p class="msg">
+                    Column {l.column}: {fmtInt(l.linked)} of {fmtInt(l.distinct)} values link to existing
+                    entities, {fmtInt(l.minted)} get new IRIs{l.ambiguousTotal
+                      ? `, and ${fmtInt(l.ambiguousTotal)} match several entities`
+                      : ''}.
+                  </p>
+                  {#each l.ambiguous as a (a.value)}
+                    {@const pick = chosen(mappingText, l.column, a.value)}
+                    <div class="row">
+                      <span class="mono">{a.value}</span>
+                      <span class="muted">{fmtInt(a.rows)} rows</span>
+                      {#each a.candidates as c (c.iri)}
+                        <button
+                          class="btn sm"
+                          aria-pressed={pick === c.iri}
+                          title={c.iri}
+                          onclick={() => {
+                            mappingText = chooseCandidate(mappingText, l.column, a.value, c.iri);
+                            dryRun = null;
+                          }}>{c.label ?? c.iri}</button
+                        >
+                      {/each}
+                    </div>
+                  {/each}
+                </div>
+              {/each}
               {#if d.preview?.triples.length}
                 <details>
                   <summary class="small">Triples of the first {d.preview.rows} rows</summary>
