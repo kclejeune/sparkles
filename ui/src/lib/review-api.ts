@@ -300,6 +300,23 @@ export type IngestResult = {
   preview?: { rows: number; triples: string[] };
   drafted?: 'model' | 'default';
   warnings?: string[];
+  // a workbook's mapping drafts, one for each sheet (§7.8)
+  sheets?: IngestSheetDraft[];
+};
+
+/** The mapping draft of one sheet of a workbook, with the sheet as CSV to upload. */
+export type IngestSheetDraft = {
+  sheet: string;
+  index: number;
+  csv?: string;
+  file?: string;
+  rows?: number;
+  triples?: number;
+  mapping?: Record<string, unknown>;
+  preview?: { rows: number; triples: string[] };
+  drafted?: 'model' | 'default';
+  warnings?: string[];
+  error?: { code: string; message?: string };
 };
 
 export type IngestTask = {
@@ -326,7 +343,7 @@ export type IngestTask = {
 export type IngestTaskList = {
   dataset: string;
   tasks: IngestTask[];
-  capabilities: { pdf: boolean; ocr: boolean };
+  capabilities: { pdf: boolean; ocr: boolean; office: boolean };
 };
 
 const WAITING: IngestStatus[] = [

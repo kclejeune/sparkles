@@ -76,6 +76,7 @@ mise run lint:features # clippy -D warnings over feature combinations (in ci)
 mise run lint:doc-paths # every crates/sparkles… path cited in the docs exists (in ci)
 mise run fmt:wasm     # clippy for the formatter's wasm32 build (in ci)
 mise run fmt:fuzz     # fuzz the formatter with cargo-fuzz (needs nightly and cargo-fuzz; not in ci)
+mise run office:fuzz  # fuzz the Office converter of ingestion the same way
 mise run test         # all Rust tests with cargo-nextest, then doctests (test:cargo runs plain cargo test)
 mise run ui:wasm      # the formatter's WebAssembly module for the UI (optional)
 mise run ui:dev       # UI dev server, proxying the API to $SPARKLES_API (default http://localhost:3030)

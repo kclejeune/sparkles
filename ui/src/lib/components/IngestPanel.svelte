@@ -1,7 +1,8 @@
 <script lang="ts">
   // The dataset page's Ingest section (C18 §7.10): upload a document, follow its task,
   // confirm a large estimate, approve a preview, and open the review page. A CSV or TSV
-  // file gets a mapping draft, which a dry run and then an upload apply.
+  // file gets a mapping draft, which a dry run and then an upload apply. A workbook gets one
+  // draft for each sheet, and uploads the sheet as CSV.
   import { base } from '$app/paths';
   import * as api from '$lib/api';
   import { toasts } from '$lib/app.svelte';
@@ -15,11 +16,11 @@
     canAdmin = false,
   }: { ds: string; canWrite?: boolean; canAdmin?: boolean } = $props();
 
-  const ACCEPT = '.md,.markdown,.txt,.html,.htm,.pdf,.csv,.tsv';
+  const ACCEPT = '.md,.markdown,.txt,.html,.htm,.pdf,.csv,.tsv,.docx,.pptx,.xlsx,.odt,.odp,.ods';
 
   /** null until the first listing; false when the server has no ingestion. */
   let available = $state<boolean | null>(null);
-  let caps = $state({ pdf: false, ocr: false });
+  let caps = $state({ pdf: false, ocr: false, office: false });
   let tasks = $state<review.IngestTask[]>([]);
   let file = $state<File | null>(null);
   let mode = $state<review.IngestMode>('branch');
@@ -30,8 +31,27 @@
   /** The mapping draft as editable JSON, and what its dry run said. */
   let mappingText = $state('');
   let dryRun = $state<string | null>(null);
+  /** The sheet of a workbook whose draft is shown. */
+  let sheet = $state(0);
   let input: HTMLInputElement | undefined = $state();
   let poll: AbortController | null = null;
+
+  /** The mapping draft of a result: the table's own, or one sheet's of a workbook. */
+  function draftOf(res: review.IngestResult | undefined, i: number) {
+    if (res?.outcome === 'mapping-drafts') return res.sheets?.[i];
+    return res?.mapping ? res : undefined;
+  }
+
+  function mappingOf(res: review.IngestResult | undefined, i = 0) {
+    const m = draftOf(res, i)?.mapping;
+    return m ? JSON.stringify(m, null, 2) : '';
+  }
+
+  function pickSheet(i: number) {
+    sheet = i;
+    mappingText = mappingOf(task?.result, i);
+    dryRun = null;
+  }
 
   async function list() {
     try {
@@ -56,7 +76,8 @@
     const ctl = new AbortController();
     poll = ctl;
     task = t;
-    mappingText = t.result?.mapping ? JSON.stringify(t.result.mapping, null, 2) : '';
+    sheet = 0;
+    mappingText = mappingOf(t.result);
     dryRun = null;
     try {
       while (task && review.running(task) && !ctl.signal.aborted) {
@@ -64,7 +85,7 @@
         if (ctl.signal.aborted) return;
         task = next;
       }
-      if (task?.result?.mapping) mappingText = JSON.stringify(task.result.mapping, null, 2);
+      if (draftOf(task?.result, 0)?.mapping) mappingText = mappingOf(task?.result);
     } catch (e) {
       if (!(e instanceof DOMException && e.name === 'AbortError'))
         toasts.error('Lost track of the ingestion', e);
@@ -114,7 +135,8 @@
 
   /** Upload the table with the drafted mapping, as a dry run or for real. */
   async function applyMapping(dry: boolean) {
-    if (!file || !mappingText.trim()) return;
+    const table = tableFile;
+    if (!table || !mappingText.trim()) return;
     try {
       JSON.parse(mappingText);
     } catch (e) {
@@ -126,7 +148,7 @@
       const mapping = new File([mappingText], 'mapping.csv-metadata.json', {
         type: 'application/json',
       });
-      const r = await api.upload(ds, [file], { tables: { mapping }, dryRun: dry });
+      const r = await api.upload(ds, [table], { tables: { mapping }, dryRun: dry });
       const commit = (r as { commit?: { inserted?: number } }).commit;
       const n =
         typeof r === 'object' ? (commit?.inserted ?? r.tables?.[0]?.triples ?? r.count ?? 0) : 0;
@@ -145,6 +167,12 @@
   const pct = $derived(task ? Math.round(task.progress * 100) : 0);
   const r = $derived(task?.result);
   const err = $derived(task?.error);
+  /** The table to upload with the mapping: the file, or a workbook's sheet as CSV. */
+  const tableFile = $derived.by(() => {
+    if (r?.outcome !== 'mapping-drafts') return file;
+    const d = r.sheets?.[sheet];
+    return d?.csv ? new File([d.csv], `${d.sheet}.csv`, { type: 'text/csv' }) : null;
+  });
   const label = (t: review.IngestTask) => t.input.name ?? t.input.url ?? t.id;
 </script>
 
@@ -153,8 +181,10 @@
     <div class="panel-head"><h2>Ingest a document</h2></div>
     <div class="panel-body ingest">
       <p class="faint small">
-        Markdown, HTML, text{caps.pdf ? ', PDF' : ''}, CSV or TSV. A document becomes a source on a
-        review branch with the facts the dataset's model proposes; a table gets a mapping draft.{caps.pdf &&
+        Markdown, HTML, text{caps.pdf ? ', PDF' : ''}{caps.office
+          ? ', Word, PowerPoint, OpenDocument'
+          : ''}, CSV, TSV{caps.office ? ' or Excel' : ''}. A document becomes a source on a review
+        branch with the facts the dataset's model proposes; a table or a sheet gets a mapping draft.{caps.pdf &&
         !caps.ocr
           ? ' Scanned PDF pages are not read.'
           : ''}
@@ -245,34 +275,61 @@
             {/if}
           {/if}
 
-          {#if r && r.outcome === 'mapping-draft'}
-            <p class="msg">
-              Mapping draft ({r.drafted === 'model' ? 'by the model' : 'default'}): {fmtInt(
-                r.rows ?? 0,
-              )} rows become {fmtInt(r.triples ?? 0)} triples.
-            </p>
-            <label class="small"
-              >Mapping (CSVW)
-              <textarea class="input mono" rows="8" aria-label="Mapping" bind:value={mappingText}
-              ></textarea>
-            </label>
-            {#if r.preview?.triples.length}
-              <details>
-                <summary class="small">Triples of the first {r.preview.rows} rows</summary>
-                <pre class="mono small">{r.preview.triples.slice(0, 30).join('\n')}</pre>
-              </details>
+          {#if r && (r.outcome === 'mapping-draft' || r.outcome === 'mapping-drafts')}
+            {@const d = draftOf(r, sheet)}
+            {#if r.outcome === 'mapping-drafts'}
+              <div class="row small" role="tablist" aria-label="Sheets">
+                {#each r.sheets ?? [] as s, i (s.index)}
+                  <button
+                    class="btn sm"
+                    role="tab"
+                    aria-selected={i === sheet}
+                    disabled={busy}
+                    onclick={() => pickSheet(i)}>{s.sheet}</button
+                  >
+                {/each}
+              </div>
+              {#each r.notes ?? [] as n (n)}<p class="msg">{n}</p>{/each}
             {/if}
-            {#if dryRun}<p class="msg">{dryRun}</p>{/if}
-            <div class="row">
-              <button class="btn sm" disabled={busy || !file} onclick={() => applyMapping(true)}
-                >Dry run</button
-              >
-              <button
-                class="btn primary sm"
-                disabled={busy || !file}
-                onclick={() => applyMapping(false)}>Upload the table</button
-              >
-            </div>
+            {#if r.outcome === 'mapping-drafts' && r.sheets?.[sheet]?.error}
+              <p class="msg">
+                This sheet has no draft: {r.sheets[sheet].error?.message ??
+                  r.sheets[sheet].error?.code}
+              </p>
+            {:else if d}
+              <p class="msg">
+                Mapping draft ({d.drafted === 'model' ? 'by the model' : 'default'}): {fmtInt(
+                  d.rows ?? 0,
+                )} rows become {fmtInt(d.triples ?? 0)} triples.
+              </p>
+              <label class="small"
+                >Mapping (CSVW)
+                <textarea class="input mono" rows="8" aria-label="Mapping" bind:value={mappingText}
+                ></textarea>
+              </label>
+              {#if d.preview?.triples.length}
+                <details>
+                  <summary class="small">Triples of the first {d.preview.rows} rows</summary>
+                  <pre class="mono small">{d.preview.triples.slice(0, 30).join('\n')}</pre>
+                </details>
+              {/if}
+              {#if dryRun}<p class="msg">{dryRun}</p>{/if}
+              <div class="row">
+                <button
+                  class="btn sm"
+                  disabled={busy || !tableFile}
+                  onclick={() => applyMapping(true)}>Dry run</button
+                >
+                <button
+                  class="btn primary sm"
+                  disabled={busy || !tableFile}
+                  onclick={() => applyMapping(false)}
+                  >{r.outcome === 'mapping-drafts'
+                    ? 'Upload the sheet'
+                    : 'Upload the table'}</button
+                >
+              </div>
+            {/if}
           {:else if r}
             <p class="msg">
               {#if r.outcome === 'already-registered'}

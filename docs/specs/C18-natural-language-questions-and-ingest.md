@@ -1461,6 +1461,8 @@ reason, so a person can see what was tried.
 | Markdown | Kept as is, so headings guide chunking. | |
 | HTML | Main content extracted, scripts, styles and navigation removed, headings and lists kept as Markdown. | |
 | PDF | Markdown from pdf-inspector, with headings, lists, tables and reading order across columns, and a page marker before each page. | A page without usable text needs OCR. Without the `pdf-ocr` feature, such a PDF is refused with `needs-ocr` and the pages concerned (§7.1.1). |
+| Word, PowerPoint and OpenDocument text and presentations | Markdown from the XML parts of the file, with headings, lists, tables and footnotes. A presentation has a `<!-- Page N -->` marker and a `# Slide N: Title` heading for each slide, and its speaker notes follow the slide's text. | The marker is the page marker of §7.1.1, so a slide is a page for citations. A Word or ODT document has no page markers. A build without the `office` feature refuses these files with `unsupported-format`. |
+| Excel and OpenDocument spreadsheets | Not converted to text. Each visible sheet becomes CSV. | Each sheet is mapped like a table, one at a time (§7.8). |
 | CSV and TSV | Not converted to text. | The model drafts a C05 mapping, and C05 converts every row deterministically (§7.8). |
 | RDF in any format | Not ingested. | It goes through the existing upload. |
 
@@ -4734,6 +4736,42 @@ fact count in the maintenance answer and the brief, and an empty inbox after the
 in the Prometheus text and the JSON snapshot. `ui/src/lib/review-count.test.ts` covers
 the badge's words and the shared count store, and `ui/tests/e2e/pages.spec.ts` the
 badges on the dataset page and the sidebar.
+
+**Roadmap item 15 delivered on 2026-10-13, in the order of its bullets.**
+
+- **Office documents.** The new crate `sparkles-office` reads DOCX, PPTX, XLSX and the
+  OpenDocument text, presentation and spreadsheet formats from their XML parts with
+  `zip` and `quick-xml`, both MIT-licensed and already in the dependency tree. The
+  server uses it behind the `office` feature, which is on by default. A Word or ODT
+  document becomes Markdown with headings from the paragraph styles and outline levels,
+  lists with their numbering, tables, hyperlinks and footnotes. A presentation gets a
+  `<!-- Page N -->` marker and a `# Slide N: Title` heading for each slide, in the order
+  of the presentation, and the speaker notes follow the slide's text under `Notes:`.
+  Hidden slides are left out and keep their numbers. The marker is the page marker of
+  §7.1.1, so `spk:pageStart`, the review page and `factsByPage` work for slides without
+  a change. A line of document text that starts a comment is escaped, so a document
+  cannot forge a marker.
+- **Spreadsheets.** An XLSX or ODS upload is not converted to text. The server reads
+  each visible sheet as CSV and drafts a mapping for each one like an uploaded table
+  named `<workbook>-<sheet>.csv`. The result has the outcome `mapping-drafts`, with one
+  entry per sheet that holds the sheet's name and index, its draft and its CSV, which is
+  the file to upload with the mapping. The sheet's name and index are the marker of that
+  sheet. Cells with a date format become ISO 8601 text, and formulas give their cached
+  values. Hidden sheets and sheets without data are left out. A sheet whose draft fails
+  is reported with its error, and the others go on.
+- **Bounds and isolation.** The converter bounds the entries of the container, the
+  unpacked size of each part and of all parts, the nodes and depth of an XML tree, the
+  cells of a sheet and the size of the text. A ZIP bomb stops at the limit whatever its
+  headers claim, and a DOCTYPE is refused. A conversion runs on a thread of its own under
+  the task's deadline with a panic caught as `conversion-failed`, and shares the
+  `--pdf-workers` slots with PDF conversion. The converter has a cargo-fuzz target in
+  `crates/sparkles-office/fuzz`, started with `mise run office:fuzz`, and its normal
+  tests convert 400 seeded mutations of every format's fixture. A first run of 90
+  seconds executed 435,000 inputs and found nothing.
+- **Deviations.** The converter is a workspace crate rather than a module of the server,
+  so that the fuzz target does not need to build the server. Embedded pictures are read
+  by the image path below. Until a `describe` model is configured, a picture contributes
+  its alt text as `[Image: …]` and nothing else.
 
 ### Roadmap follow-ups (2026-10-12)
 

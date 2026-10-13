@@ -355,6 +355,17 @@ fn run_inner(r: &mut Run, req: &Request) -> Result<Value, Failed> {
     if matches!(format, Format::Csv | Format::Tsv) {
         return super::csv::draft(r, req, &ds, format, name.as_deref());
     }
+    if format.is_spreadsheet() {
+        #[cfg(feature = "office")]
+        return super::csv::workbook(r, req, &ds, format, name.as_deref());
+        #[cfg(not(feature = "office"))]
+        return Err(Refusal::new(
+            "unsupported-format",
+            415,
+            "this server was built without Office conversion (the office feature)",
+        )
+        .into());
+    }
     if req.mode == Mode::Auto && !ctx.principal.can(&ds.name, Level::Admin) {
         return Err(Failed::new(
             "forbidden",
@@ -390,6 +401,7 @@ fn run_inner(r: &mut Run, req: &Request) -> Result<Value, Failed> {
             max_text: convert::MAX_TEXT_BYTES,
             deadline: ctx.deadline,
             pdf: ctx.pdf.clone(),
+            max_images: 0,
         },
     )?;
     r.check()?;
@@ -831,6 +843,7 @@ fn run_existing(r: &mut Run, req: &Request, source: &str) -> Result<Value, Faile
             .to_string(),
         title: title.clone(),
         page_starts: Vec::new(),
+        images: Vec::new(),
         ocr_pages: Vec::new(),
         omitted_pages: Vec::new(),
         notes: Vec::new(),

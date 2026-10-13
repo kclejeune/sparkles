@@ -2705,6 +2705,16 @@ directory of `--pdf-ocr-models`. It loads PDFium from `--pdfium-lib` and ONNX Ru
 from `--onnxruntime-lib`, or from their usual library paths, and never downloads a model.
 `--pdf-workers` (2 by default) limits the conversions that run at once.
 
+Word, PowerPoint and OpenDocument files (`.docx`, `.pptx`, `.odt`, `.odp`) need a build
+with the `office` feature, which is on by default. The server converts them to Markdown
+with their headings, lists, tables and footnotes. Each slide of a presentation starts
+with a `<!-- Page N -->` marker and a `# Slide N: Title` heading, so the review page
+shows the slide of each fact, and the speaker notes follow the slide's text. A file
+that is encrypted or in an old binary format (`.doc`, `.ppt`, `.xls`) is refused. An
+Excel or OpenDocument spreadsheet (`.xlsx`, `.ods`) gets a mapping draft for each
+visible sheet, with the sheet as CSV to upload with its mapping. These conversions share
+the `--pdf-workers` limit with PDF conversion.
+
 `sparkles ingest` runs the same steps on a database directory while no server holds it,
 one file after another, and prints each result:
 

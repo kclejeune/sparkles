@@ -5748,6 +5748,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sparkles-office"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "quick-xml 0.37.5",
+ "zip",
+]
+
+[[package]]
 name = "sparkles-reasoner"
 version = "0.1.0"
 dependencies = [
@@ -5832,6 +5841,7 @@ dependencies = [
  "sparkles-graphql",
  "sparkles-memory-import",
  "sparkles-modelstore",
+ "sparkles-office",
  "sparkles-reasoner",
  "sparkles-shacl",
  "sparkles-shex",
@@ -7558,6 +7568,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c42e33efc22a0650c311c2ef19115ce232583abbe80850bc8b66509ebef02de0"
 dependencies = [
  "crc32fast",
+ "flate2",
  "indexmap",
  "memchr",
  "typed-path",

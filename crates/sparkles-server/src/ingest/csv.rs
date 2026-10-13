@@ -84,15 +84,124 @@ pub fn draft(
     format: Format,
     name: Option<&str>,
 ) -> Result<Value, Failed> {
-    let ctx = r.ctx;
     let tsv = format == Format::Tsv;
     let name = name.unwrap_or(if tsv { "table.tsv" } else { "table.csv" });
+    draft_table(r, req, ds, &req.bytes, tsv, format.name(), name)
+}
+
+/// The most CSV text a workbook's result carries inline, over all its sheets.
+#[cfg(feature = "office")]
+const INLINE_CSV_BYTES: usize = 2 << 20;
+
+/// Draft the mappings of a workbook, one for each visible sheet with data (§7.8). Each
+/// sheet is converted to CSV and drafted like an uploaded table named
+/// `<workbook>-<sheet>.csv`, so its rows get their own namespace. A sheet's CSV travels
+/// with its draft, up to a total of 2 MiB, because it is the file to upload with the
+/// mapping. A sheet whose draft fails is reported with its error and the others go on.
+#[cfg(feature = "office")]
+pub fn workbook(
+    r: &mut Run,
+    req: &Request,
+    ds: &Dataset,
+    format: Format,
+    name: Option<&str>,
+) -> Result<Value, Failed> {
+    let ctx = r.ctx;
+    let name = name.unwrap_or("workbook");
     if req.bytes.len() > super::convert::MAX_INPUT_BYTES {
         return Err(Failed::new(
             "too-large",
             format!(
-                "the table has {} bytes; a mapping draft reads at most {}: map it with sparkles csv",
+                "the workbook has {} bytes; ingestion takes at most {}",
                 req.bytes.len(),
+                super::convert::MAX_INPUT_BYTES
+            ),
+        ));
+    }
+    ctx.progress.status(super::Status::Converting, 0.05, None);
+    let o = super::convert::Options {
+        allow_partial: false,
+        max_input: super::convert::MAX_INPUT_BYTES,
+        max_text: super::convert::MAX_TEXT_BYTES,
+        deadline: ctx.deadline,
+        pdf: ctx.pdf.clone(),
+        max_images: 0,
+    };
+    let sheets = super::office::sheets(&req.bytes, format, &o)?;
+    if sheets.is_empty() {
+        return Err(Failed::new(
+            "empty",
+            "the workbook has no visible sheet with data",
+        ));
+    }
+    let stem = name.rsplit_once('.').map_or(name, |(s, _)| s);
+    let mut drafts: Vec<Value> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
+    let mut inline = 0usize;
+    for sh in sheets {
+        r.check()?;
+        let mut slug = super::pipeline::slug(&sh.name);
+        if slug.is_empty() {
+            slug = format!("sheet{}", sh.index);
+        }
+        let file = format!("{}-{slug}.csv", super::pipeline::slug(stem));
+        match draft_table(r, req, ds, sh.csv.as_bytes(), false, "csv", &file) {
+            Ok(mut d) => {
+                d["sheet"] = sh.name.clone().into();
+                d["index"] = sh.index.into();
+                if inline + sh.csv.len() <= INLINE_CSV_BYTES {
+                    inline += sh.csv.len();
+                    d["csv"] = sh.csv.clone().into();
+                } else {
+                    notes.push(format!(
+                        "the sheet {:?} is too long to send with its draft: convert it to CSV and upload that",
+                        sh.name
+                    ));
+                }
+                drafts.push(d);
+            }
+            Err(f) => {
+                let code = f.0["code"].as_str().unwrap_or("");
+                if matches!(code, "cancelled" | "timeout" | "budget-exceeded") {
+                    return Err(f);
+                }
+                drafts.push(json!({ "sheet": sh.name, "index": sh.index, "error": f.0 }));
+            }
+        }
+    }
+    if req.base.is_some() && drafts.len() > 1 {
+        notes.push("all sheets use the same base, so rows with the same key in two sheets name the same entity".into());
+    }
+    let mut out = json!({
+        "outcome": "mapping-drafts",
+        "format": format.name(),
+        "file": name,
+        "sheets": drafts,
+    });
+    if !notes.is_empty() {
+        out["notes"] = notes.into();
+    }
+    Ok(out)
+}
+
+/// Draft the mapping of a table given as bytes: a CSV or TSV upload, or one sheet of a
+/// workbook as CSV.
+fn draft_table(
+    r: &mut Run,
+    req: &Request,
+    ds: &Dataset,
+    bytes: &[u8],
+    tsv: bool,
+    format: &str,
+    name: &str,
+) -> Result<Value, Failed> {
+    let ctx = r.ctx;
+    if bytes.len() > super::convert::MAX_INPUT_BYTES {
+        return Err(Failed::new(
+            "too-large",
+            format!(
+                "the table has {} bytes; a mapping draft reads at most {}: map it with sparkles csv",
+                bytes.len(),
                 super::convert::MAX_INPUT_BYTES
             ),
         ));
@@ -104,7 +213,7 @@ pub fn draft(
     let mut o = Options::new(Mapping::Default { key: None }, name);
     o.tsv = tsv;
     o.base = Some(base.clone());
-    let default = tabular::default_metadata(&req.bytes[..], &o, None)
+    let default = tabular::default_metadata(bytes, &o, None)
         .map_err(|e| Failed::new("invalid-table", e.to_string()))?;
     let columns: Vec<(String, String)> = default["tableSchema"]["columns"]
         .as_array()
@@ -137,7 +246,7 @@ pub fn draft(
         let profile = req.profile.clone().unwrap_or_else(|| "default".into());
         let vocab = Vocabulary::read(r, &profile)?;
         let models = ctx.models.expect("pairs need models");
-        let sample = sample_lines(&req.bytes, SAMPLE_ROWS + 1);
+        let sample = sample_lines(bytes, SAMPLE_ROWS + 1);
         let user = prompt(&vocab, &sample, tsv);
         let out_schema = OutputSchema {
             name: "TableMapping",
@@ -242,8 +351,8 @@ pub fn draft(
         Ok(())
     }));
     let fail = |e: sparkles::error::Error| Failed::new("invalid-table", e.to_string());
-    let stats = tabular::convert(&req.bytes[..], &o, &mut |_| Ok(())).map_err(fail)?;
-    let head = sample_lines(&req.bytes, PREVIEW_ROWS + 1);
+    let stats = tabular::convert(bytes, &o, &mut |_| Ok(())).map_err(fail)?;
+    let head = sample_lines(bytes, PREVIEW_ROWS + 1);
     let mut preview: Vec<String> = Vec::new();
     let pstats = tabular::convert(head.as_bytes(), &o, &mut |t| {
         if preview.len() < PREVIEW_TRIPLES {
@@ -254,7 +363,7 @@ pub fn draft(
     .map_err(fail)?;
     let mut out = json!({
         "outcome": "mapping-draft",
-        "format": format.name(),
+        "format": format,
         "file": name,
         "base": base,
         "rows": stats.rows,

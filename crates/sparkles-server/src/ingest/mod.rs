@@ -3,7 +3,8 @@
 //!
 //! - [`convert`] turns Markdown, HTML and PDF into the text of a rendition (§7.1), with
 //!   PDF through pdf-inspector behind the `pdf` feature and OCR behind `pdf-ocr`
-//!   (§7.1.1).
+//!   (§7.1.1), and Word, PowerPoint and OpenDocument files through `sparkles-office`
+//!   behind `office`; spreadsheets are mapped sheet by sheet (§7.8).
 //! - [`pipeline`] runs one ingestion as its caller: conversion, `register_source` on the
 //!   review branch, the cost estimate and its confirmation (§7.9), extraction through the
 //!   `extract` role with escalation along its list (§7.4), linking (§7.5) and
@@ -23,6 +24,8 @@ mod extract;
 mod html;
 pub mod http;
 pub mod maintain;
+#[cfg(feature = "office")]
+pub(crate) mod office;
 #[cfg(feature = "pdf")]
 mod pdf;
 pub mod pipeline;
@@ -57,8 +60,8 @@ pub const MAX_ACTIVE: usize = 32;
 /// `serve` flags of ingestion.
 #[derive(clap::Args, Clone, Debug, Default)]
 pub struct IngestServeArgs {
-    /// How many PDF conversions may run at once; a conversion that overruns its
-    /// deadline keeps its slot until it ends (spec C18 §7.1.1)
+    /// How many PDF and Office conversions may run at once; a conversion that overruns
+    /// its deadline keeps its slot until it ends (spec C18 §7.1.1)
     #[arg(long, value_name = "N", default_value_t = DEFAULT_PDF_WORKERS)]
     pub pdf_workers: usize,
     #[command(flatten)]
@@ -135,11 +138,11 @@ pub struct PdfRuntime {
     ocr: Option<OcrConfig>,
 }
 
-/// One running PDF conversion's worker slot.
-#[cfg(feature = "pdf")]
+/// One running PDF or Office conversion's worker slot.
+#[cfg(any(feature = "pdf", feature = "office"))]
 pub struct PdfSlot(Arc<PdfRuntime>);
 
-#[cfg(feature = "pdf")]
+#[cfg(any(feature = "pdf", feature = "office"))]
 impl Drop for PdfSlot {
     fn drop(&mut self) {
         *self.0.used.lock() -= 1;
@@ -158,7 +161,7 @@ impl PdfRuntime {
     }
 
     /// A worker slot, waiting until `deadline` for one.
-    #[cfg(feature = "pdf")]
+    #[cfg(any(feature = "pdf", feature = "office"))]
     pub fn acquire(this: &Arc<PdfRuntime>, deadline: Instant) -> Option<PdfSlot> {
         let mut used = this.used.lock();
         while *used >= this.max {
@@ -175,9 +178,9 @@ impl PdfRuntime {
         self.ocr.as_ref()
     }
 
-    /// Whether this server converts PDFs, and reads scanned pages by OCR.
+    /// Whether this server converts PDFs and Office documents, and reads scanned pages by OCR.
     pub fn capabilities(&self) -> Value {
-        json!({ "pdf": cfg!(feature = "pdf"), "ocr": self.ocr.is_some() })
+        json!({ "pdf": cfg!(feature = "pdf"), "ocr": self.ocr.is_some(), "office": cfg!(feature = "office") })
     }
 }
 

@@ -421,6 +421,101 @@ async fn a54_pdf_pages_and_spans() {
     );
 }
 
+/// An Office file as an upload.
+#[cfg(feature = "office")]
+fn office_upload(bytes: &[u8], name: &str, extra: &[(&str, &str)]) -> Request<Body> {
+    let mut parts: Vec<Part> = extra
+        .iter()
+        .map(|(k, v)| (*k, None, None, v.as_bytes()))
+        .collect();
+    parts.push(("file", Some(name), Some("application/octet-stream"), bytes));
+    multipart("/$/ingest/org", &parts)
+}
+
+/// Word and PowerPoint files become Markdown renditions. A slide's marker is a page
+/// marker, so the rendition records the slides as pages, and a file is recognized by its
+/// contents when its name and type say nothing.
+#[cfg(feature = "office")]
+#[tokio::test]
+async fn office_documents_become_renditions() {
+    use sparkles_office::fixtures;
+    let (_st, app) = app(None);
+    let v = ingest(&app, office_upload(&fixtures::docx(), "report.docx", &[])).await;
+    assert_eq!(v["status"], "done", "{v}");
+    assert_eq!(v["result"]["outcome"], "registered", "{v}");
+    assert_eq!(v["result"]["format"], "docx", "{v}");
+    let rv = review(&app, v["result"]["branch"].as_str().unwrap()).await;
+    let src = &rv["sources"][0];
+    assert_eq!(src["title"], "Q3 report");
+    let text = src["text"].as_str().unwrap();
+    assert!(
+        text.starts_with("# Quarterly report\n\n# Teams\n\nAna Lima moved"),
+        "{text}"
+    );
+    assert!(text.contains("| Name | Team \\| unit |"), "{text}");
+    assert!(src["pages"].is_null(), "{src}");
+    // a presentation: slides are pages, and the file's name is not needed
+    let v = ingest(&app, office_upload(&fixtures::pptx(), "upload", &[])).await;
+    assert_eq!(v["status"], "done", "{v}");
+    assert_eq!(v["result"]["format"], "pptx", "{v}");
+    assert_eq!(v["result"]["pages"].as_array().unwrap().len(), 2, "{v}");
+    let rv = review(&app, v["result"]["branch"].as_str().unwrap()).await;
+    let src = &rv["sources"][0];
+    let text = src["text"].as_str().unwrap();
+    assert!(text.contains("<!-- Page 2 -->\n\n# Slide 2"), "{text}");
+    assert!(
+        text.contains("Notes:\n\nMention the Berlin office."),
+        "{text}"
+    );
+    let pages = src["pages"].as_array().unwrap();
+    assert_eq!(pages.len(), 2, "{src}");
+    assert_eq!(pages[1]["page"], 2);
+    // an OpenDocument presentation
+    let v = ingest(&app, office_upload(&fixtures::odp(), "deck.odp", &[])).await;
+    assert_eq!(v["result"]["pages"].as_array().unwrap().len(), 2, "{v}");
+    // a damaged file and a legacy file are refused with their reasons
+    let v = ingest(
+        &app,
+        office_upload(b"PK\x03\x04 not a zip", "bad.docx", &[]),
+    )
+    .await;
+    assert_eq!(v["status"], "failed", "{v}");
+    assert_eq!(v["error"]["code"], "conversion-failed", "{v}");
+    let mut ole = vec![0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
+    ole.extend_from_slice(&[0; 32]);
+    let v = ingest(&app, office_upload(&ole, "old.docx", &[])).await;
+    assert_eq!(v["error"]["code"], "unsupported-format", "{v}");
+}
+
+/// A workbook gets one mapping draft for each visible sheet with data (§7.8), each with
+/// the sheet's CSV to upload.
+#[cfg(feature = "office")]
+#[tokio::test]
+async fn a_workbook_is_drafted_sheet_by_sheet() {
+    use sparkles_office::fixtures;
+    let (_st, app) = app(None);
+    let v = ingest(&app, office_upload(&fixtures::xlsx(), "people.xlsx", &[])).await;
+    assert_eq!(v["status"], "done", "{v}");
+    let r = &v["result"];
+    assert_eq!(r["outcome"], "mapping-drafts", "{v}");
+    assert_eq!(r["format"], "xlsx");
+    let sheets = r["sheets"].as_array().unwrap();
+    assert_eq!(sheets.len(), 1, "{v}");
+    let s = &sheets[0];
+    assert_eq!(s["sheet"], "People");
+    assert_eq!(s["index"], 1);
+    assert_eq!(s["drafted"], "default");
+    assert_eq!(s["rows"], 3, "{s}");
+    assert!(
+        s["csv"]
+            .as_str()
+            .unwrap()
+            .starts_with("id,name,start,active\n")
+    );
+    let ods = ingest(&app, office_upload(&fixtures::ods(), "people.ods", &[])).await;
+    assert_eq!(ods["result"]["sheets"][0]["rows"], 1, "{ods}");
+}
+
 /// A55: without OCR, scanned pages are refused with their pages and reasons, and
 /// `allowPartial` registers the other pages.
 #[cfg(feature = "pdf")]
@@ -482,6 +577,7 @@ async fn a56_conversion_is_deterministic() {
         max_text: super::convert::MAX_TEXT_BYTES,
         deadline: std::time::Instant::now() + Duration::from_secs(30),
         pdf: Arc::default(),
+        max_images: 0,
     };
     let pdf = fixtures::report();
     let a = super::convert::convert(&pdf, super::convert::Format::Pdf, &o).unwrap();
@@ -516,6 +612,7 @@ fn ocr_without_models_fails() {
         max_text: super::convert::MAX_TEXT_BYTES,
         deadline: std::time::Instant::now() + Duration::from_secs(30),
         pdf: Arc::new(rt),
+        max_images: 0,
     };
     let e =
         super::convert::convert(&fixtures::scanned(), super::convert::Format::Pdf, &o).unwrap_err();
