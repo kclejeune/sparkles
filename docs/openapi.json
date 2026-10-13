@@ -331,6 +331,17 @@
           "type": "string"
         }
       },
+      "profile": {
+        "description": "`io` adds an `io` object to the metadata of the `application/x-sparkles+json` result, with what the query read from the index and vocabulary files and the time spent doing so. The counters are process-wide, so concurrent queries add to them.",
+        "in": "query",
+        "name": "profile",
+        "schema": {
+          "enum": [
+            "io"
+          ],
+          "type": "string"
+        }
+      },
       "reasoning": {
         "description": "Include materialized inferences. The default is true when the dataset has any.",
         "in": "query",
@@ -14389,6 +14400,11 @@
               },
               "datasetId": {
                 "type": "string"
+              },
+              "io": {
+                "additionalProperties": true,
+                "description": "Reads of the index and vocabulary files; present when the request has `profile=io`.",
+                "type": "object"
               },
               "memory": {
                 "type": "object"
@@ -31052,6 +31068,9 @@
             "$ref": "#/components/parameters/execution"
           },
           {
+            "$ref": "#/components/parameters/profile"
+          },
+          {
             "$ref": "#/components/parameters/nocache"
           },
           {
@@ -31259,6 +31278,9 @@
           },
           {
             "$ref": "#/components/parameters/execution"
+          },
+          {
+            "$ref": "#/components/parameters/profile"
           },
           {
             "$ref": "#/components/parameters/nocache"
@@ -35160,6 +35182,9 @@
             "$ref": "#/components/parameters/execution"
           },
           {
+            "$ref": "#/components/parameters/profile"
+          },
+          {
             "$ref": "#/components/parameters/nocache"
           },
           {
@@ -35278,6 +35303,9 @@
           },
           {
             "$ref": "#/components/parameters/execution"
+          },
+          {
+            "$ref": "#/components/parameters/profile"
           },
           {
             "$ref": "#/components/parameters/nocache"
@@ -36023,6 +36051,9 @@
             "$ref": "#/components/parameters/execution"
           },
           {
+            "$ref": "#/components/parameters/profile"
+          },
+          {
             "$ref": "#/components/parameters/nocache"
           },
           {
@@ -36141,6 +36172,9 @@
           },
           {
             "$ref": "#/components/parameters/execution"
+          },
+          {
+            "$ref": "#/components/parameters/profile"
           },
           {
             "$ref": "#/components/parameters/nocache"

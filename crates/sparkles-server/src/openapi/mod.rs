@@ -650,6 +650,14 @@ fn parameters() -> Map<String, J> {
         ),
     );
     put(
+        "profile",
+        q(
+            "profile",
+            json!({ "type": "string", "enum": ["io"] }),
+            "`io` adds an `io` object to the metadata of the `application/x-sparkles+json` result, with what the query read from the index and vocabulary files and the time spent doing so. The counters are process-wide, so concurrent queries add to them.",
+        ),
+    );
+    put(
         "send",
         q(
             "send",

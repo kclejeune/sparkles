@@ -1036,6 +1036,7 @@ fn native_json_writer_matches_document_values_for_all_result_kinds() {
         Some(results::NativeJsonMetadata {
             commit: 7,
             dataset_id: "dataset",
+            io: None,
         }),
     )
     .unwrap();

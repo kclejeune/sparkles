@@ -605,6 +605,9 @@ pub fn write_jena_graph(
 pub struct NativeJsonMetadata<'a> {
     pub commit: u64,
     pub dataset_id: &'a str,
+    /// the request asked for the I/O profile (`profile=io`): its report goes into the
+    /// metadata, written after the rows
+    pub io: Option<&'a crate::ioacct::Profile>,
 }
 
 /// Write the rich native result without building an intermediate JSON document.
@@ -651,6 +654,8 @@ pub fn write_cursor_native_json(
         commit: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         dataset_id: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        io: Option<crate::ioacct::IoReport>,
     }
     fn json(w: &mut impl Write, v: &impl Serialize) -> Result<()> {
         serde_json::to_writer(w, v).map_err(|e| Error::Io(e.into()))
@@ -726,6 +731,7 @@ pub fn write_cursor_native_json(
                     rows_produced: stats.rows_produced,
                     commit: metadata.as_ref().map(|m| m.commit),
                     dataset_id: metadata.as_ref().map(|m| m.dataset_id),
+                    io: metadata.as_ref().and_then(|m| m.io).map(|p| p.report()),
                 },
             )
         })?;
@@ -800,6 +806,10 @@ pub fn write_cursor_graph_native_json(
         if let Some(meta) = metadata {
             write!(writer, ",\"commit\":{},\"datasetId\":", meta.commit)?;
             serde_json::to_writer(&mut writer, meta.dataset_id).map_err(|e| Error::Io(e.into()))?;
+            if let Some(p) = meta.io {
+                writer.write_all(b",\"io\":")?;
+                serde_json::to_writer(&mut writer, &p.report()).map_err(|e| Error::Io(e.into()))?;
+            }
         }
         writer.write_all(b"}}")?;
         Ok(stats)
@@ -909,6 +919,11 @@ impl Serialize for NativeJson<'_> {
                 rows_produced: r.rows_produced,
                 commit: self.metadata.as_ref().map(|m| m.commit),
                 dataset_id: self.metadata.as_ref().map(|m| m.dataset_id),
+                io: self
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.io)
+                    .map(|p| p.report()),
             },
         )?;
         map.end()
@@ -928,6 +943,8 @@ struct NativeMeta<'a> {
     commit: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     dataset_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    io: Option<crate::ioacct::IoReport>,
 }
 
 #[derive(Serialize)]

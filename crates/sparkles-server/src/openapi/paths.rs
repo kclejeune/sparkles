@@ -113,6 +113,7 @@ fn query_params(o: Op) -> Op {
         "branch",
         "send",
         "execution",
+        "profile",
         "nocache",
         "memoryMb",
         "maxRows",

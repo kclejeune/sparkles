@@ -1531,6 +1531,8 @@ Query parameters beyond the standard protocol:
 
   A write whose client disconnects is cancelled and commits nothing, even while it waits
   for the dataset's writer lock. A commit that has already started completes.
+* `profile=io` adds an `io` object to the metadata of an `application/x-sparkles+json`
+  result. See [the I/O profile](#the-io-profile).
 * `execution=eager|streaming|auto` chooses how the query runs. The default is `eager`.
   `streaming` supports SELECT in JSON, XML, CSV, TSV and native Sparkles JSON, ASK,
   and CONSTRUCT and DESCRIBE in RDF or native Sparkles JSON. The query reads from a
@@ -6830,6 +6832,38 @@ first row. It reports `fullInputBeforeOutput` and a `reason`, but `materializes`
 false, so the strict policy that refuses eager fallback still accepts the sort.
 `growingState` warns that an operator keeps state that grows as it runs, such as
 generated strings. The batch size alone does not limit that state.
+
+### The I/O profile
+
+With `profile=io`, the metadata of a native result has an `io` object. It reports what the
+query read from the index and vocabulary files, which helps explain the time of a first
+query after a restart.
+
+```ts
+type IoProfile = {
+  index: Record<string, {                  // by permutation: spo, sop, pso, pos, osp, ops, gspo
+    columnsDecoded: number; decodedBytes: number; compressedBytes: number }>;
+  readahead: Record<string, {              // by file: the permutations, vocab.dat, vocab.off, vocab.num
+    requests: number; bytes: number }>;    // WILLNEED requests to the kernel
+  vocab: { finds: number; groupsHinted: number; blocksScanned: number };
+  numericPagesRequested: number;
+  timeMs?: { vocabLookup: number; vocabRead: number; indexDecode: number; indexWait: number };
+  majorFaults?: number; minorFaults?: number;
+  pages?: Record<string, { touched: number; residentBefore: number;
+                           residentAfter: number; broughtIn: number }>;
+  events?: { atUs: number; file: string; what: string; bytes: number }[];
+};
+```
+
+The counters are process-wide, so they include the reads of any query that runs at the
+same time. The profile is meant for one query on a quiet server. `vocabLookup` is the time
+in key lookups, which resolve the constants of the query. `vocabRead` is the time reading
+terms by id. `indexDecode` is the time decompressing index columns, and `indexWait` is the
+time to read their pages into memory before decoding. The times are summed over threads.
+`pages` comes from `mincore(2)` on the pages the query asked for or read, and `events`
+lists the first requests in order. Profiling slows the query a little. The same counters
+are in `/$/metrics` as `sparkles_index_columns_decoded_total`,
+`sparkles_index_readahead_bytes_total` and `sparkles_vocab_groups_read_total`.
 
 ## Explain
 

@@ -1183,6 +1183,7 @@ pub(crate) async fn run_query(
     query: String,
     bindings: Vec<(String, oxrdf::Term)>,
 ) -> ApiResult {
+    let io = io_profile(&params);
     let execution = match params.get("execution") {
         None | Some("eager") => sparkles::sparql::ExecutionMode::Eager,
         Some("streaming") => sparkles::sparql::ExecutionMode::Streaming,
@@ -1227,6 +1228,7 @@ pub(crate) async fn run_query(
                 native_graph,
                 execution,
                 prefixes,
+                io,
             },
         )
         .await;
@@ -1351,6 +1353,7 @@ pub(crate) async fn run_query(
                 &prefixes,
                 seq,
                 &dataset_id,
+                io.as_deref(),
             )
         };
         // phase spans once serialization has ended (the request span is current here)
@@ -1412,6 +1415,12 @@ pub(crate) async fn run_query(
     Ok(report.attach(resp))
 }
 
+/// The I/O profile a request asked for with `profile=io`, started before the query is
+/// parsed so that it covers the resolution of the query's constants.
+pub(crate) fn io_profile(params: &Params) -> Option<Arc<sparkles::ioacct::Profile>> {
+    (params.get("profile") == Some("io")).then(|| Arc::new(sparkles::ioacct::Profile::start()))
+}
+
 /// Query texts whose last run was quick (see `inline`).
 static QUICK: std::sync::LazyLock<inline::QuickQueries> =
     std::sync::LazyLock::new(Default::default);
@@ -1429,6 +1438,7 @@ fn serialize_result(
     prefixes: &std::collections::BTreeMap<String, String>,
     seq: u64,
     dataset_id: &str,
+    io: Option<&sparkles::ioacct::Profile>,
 ) -> sparkles::Result<()> {
     if sparkles_doc {
         results::write_native_json(
@@ -1438,6 +1448,7 @@ fn serialize_result(
             Some(results::NativeJsonMetadata {
                 commit: seq,
                 dataset_id,
+                io,
             }),
         )
     } else if is_graph {

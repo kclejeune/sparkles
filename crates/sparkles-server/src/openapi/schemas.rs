@@ -978,6 +978,7 @@ pub(super) fn schemas() -> Map<String, J> {
                         "rowsProduced": { "type": "integer" },
                         "commit": { "type": "integer" },
                         "datasetId": { "type": "string" },
+                        "io": { "type": "object", "additionalProperties": true, "description": "Reads of the index and vocabulary files; present when the request has `profile=io`." },
                     },
                 },
             },
