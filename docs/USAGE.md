@@ -2047,6 +2047,22 @@ data skips the build. `--algo-threads` and `--algo-max-threads-per-call` bound t
 that algorithms take, and a call that is over its memory budget fails with a message that
 names the parameter that would make it fit.
 
+The Rust library, Python and Node.js reach the same runs and projections through the
+dataset's `algorithms` handle. A request is the JSON of the HTTP route as a dict or an
+object:
+
+```python
+ds.algorithms.projections.put("people", {"predicates": ["http://xmlns.com/foaf/0.1/knows"]})
+rows = list(ds.algorithms.run({"algorithm": "pageRank", "projection": "people"}))
+ds.algorithms.run_write({"algorithm": "leiden", "projection": "people",
+                         "write": {"graph": "http://example.org/analytics",
+                                   "predicates": {"community": "http://example.org/community"}}})
+```
+
+In Node.js the calls are `ds.algorithms.run(request)` and `ds.algorithms.runWrite(request)`
+with the same `projections` methods. The JVM binding reaches algorithms only
+through `SERVICE algo:…` queries.
+
 ## Embeddings computed on write
 
 A vector index can compute its vectors from the dataset's text through an embeddings
