@@ -904,8 +904,10 @@ enum Cmd {
         /// Seal the runtime secret values of `/$/server/secrets` in the data directory
         /// with this key, read once at the start: file:PATH, env:VAR, credential:NAME
         /// (in $CREDENTIALS_DIRECTORY) or command:CMD. The key is 32 bytes as 64
-        /// hexadecimal digits or base64. Plaintext values are sealed at the start
-        /// (needs the backup-encryption feature)
+        /// hexadecimal digits or base64. Without it the server uses the credential
+        /// sparkles-secrets-key, then <data>/secrets.key, which it generates when it
+        /// first stores a value. Plaintext values are sealed at the start. `none` keeps
+        /// the values as plaintext files
         #[arg(long, value_name = "SOURCE", env = "SPARKLES_SECRETS_KEY")]
         secrets_key: Option<String>,
         #[cfg(feature = "mcp")]
@@ -2544,9 +2546,8 @@ fn run() -> Result<()> {
             // the model configuration is the `models` settings kind (spec C19 §11): the
             // declared --model-config, the runtime layer of the data directory and the
             // locks of the settings file
-            if let Some(source) = &secrets_key {
-                st.settings.server.sealing = settings::secrets::Sealing::load(source, &data)?;
-            }
+            st.settings.server.sealing =
+                settings::secrets::Sealing::start(secrets_key.as_deref(), &data)?;
             settings::server::start(&mut st, settings.as_deref(), &models)?;
             #[cfg(feature = "mcp")]
             {

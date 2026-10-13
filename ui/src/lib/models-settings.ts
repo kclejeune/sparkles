@@ -114,8 +114,15 @@ export type SecretInfo = {
 
 /** `GET /$/server/secrets`: how stored values are kept, and the secrets. */
 export type SecretList = {
-  /** `sealed` with the key of `serve --secrets-key`, else `plaintext` (mode 0600). */
+  /** `sealed` by default, `plaintext` (mode 0600) with `serve --secrets-key none`. */
   storage?: 'sealed' | 'plaintext';
+  /**
+   * `configured` for `serve --secrets-key` or the systemd credential, `generated` for the
+   * key the server keeps in `<dataDir>/secrets.key`, `null` for plaintext values.
+   */
+  keySource?: 'configured' | 'generated' | null;
+  /** `locked` or `heap`, where the server keeps the key, `null` until there is one. */
+  keyMemory?: 'locked' | 'heap' | null;
   secrets: SecretInfo[];
 };
 

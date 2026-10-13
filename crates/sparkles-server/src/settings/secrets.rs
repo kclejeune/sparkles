@@ -7,8 +7,10 @@
 //! `<dataDir>/secrets/NAME` with mode 0600, in a directory with mode 0700, and the model
 //! configuration reads it as a `file:` source at each request.
 //!
-//! With `serve --secrets-key SOURCE`, each runtime value is sealed with that key (see
-//! [`Sealing`]), and plaintext values found at the start are sealed in place.
+//! Each runtime value is sealed (see [`Sealing`]) with the key of `serve --secrets-key
+//! SOURCE`, the systemd credential `sparkles-secrets-key`, or a key that the server
+//! generates in `<dataDir>/secrets.key` when it first stores a value. Plaintext values
+//! found at the start are sealed in place. `--secrets-key none` keeps plaintext files.
 //!
 //! No route returns a value, and none is logged. The body of a `PUT` is read into a
 //! [`SecretValue`], whose `Debug` prints nothing of it, and errors about the body never
@@ -23,10 +25,11 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
 use axum::{Extension, Json, Router};
+use parking_lot::RwLock;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
-use std::path::Path as FsPath;
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -90,36 +93,48 @@ impl SecretValue {
     }
 }
 
-/// The start of a sealed value, as `sparkles_backup::crypto::SEALED_SECRET_PREFIX`
-/// writes it. A build without `backup-encryption` still recognizes sealed files.
+/// The start of a sealed value, as `sparkles_backup::SEALED_SECRET_PREFIX` writes it. A
+/// build without the `backup` feature still recognizes sealed files.
 const SEALED_MARK: &str = "sparkles-sealed-secret/";
 
 fn is_sealed(bytes: &[u8]) -> bool {
     bytes.starts_with(SEALED_MARK.as_bytes())
 }
 
-/// How runtime values are kept: sealed with the key of `serve --secrets-key`, or as
-/// plaintext files with mode 0600 without one.
-#[derive(Clone, Debug, Default)]
-pub struct Sealing {
-    #[cfg(feature = "backup-encryption")]
-    sealer: Option<sparkles_backup::crypto::SecretSealer>,
-}
+/// The file in the data directory that holds a key the server generated. Server backups
+/// leave it out, so that the sealed values they hold do not open without the key.
+pub const SECRETS_KEY_FILE: &str = "secrets.key";
 
-impl Sealing {
-    /// Read the key of `--secrets-key SOURCE` once. `SOURCE` is `file:PATH`,
-    /// `env:VAR`, `credential:NAME` (in `$CREDENTIALS_DIRECTORY`) or `command:CMD`,
-    /// where `CMD` is a JSON argv array or an absolute program and its arguments split
-    /// at spaces, run without a shell. The key is 32 bytes, as 64 hexadecimal digits,
-    /// base64 or raw bytes, like a backup repository key. A key file may not lie in
-    /// `data_dir`.
-    #[cfg(feature = "backup-encryption")]
-    pub fn load(source: &str, data_dir: &FsPath) -> anyhow::Result<Sealing> {
+/// The systemd credential that holds the secrets key when `--secrets-key` is absent.
+pub const SECRETS_KEY_CREDENTIAL: &str = "sparkles-secrets-key";
+
+/// The sealer of the backup crate, or an empty stand-in in a build without it.
+#[cfg(feature = "backup")]
+mod sealer {
+    use anyhow::Context as _;
+    pub use sparkles_backup::SecretSealer as Sealer;
+    use std::path::Path;
+    use zeroize::Zeroizing;
+
+    pub fn seal(s: &Sealer, name: &str, value: &[u8]) -> std::io::Result<Vec<u8>> {
+        s.seal(name, value).map_err(std::io::Error::other)
+    }
+
+    pub fn open(s: &Sealer, name: &str, stored: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
+        s.open(name, stored).ok()
+    }
+
+    pub fn memory(s: &Sealer) -> &'static str {
+        s.key_memory().as_str()
+    }
+
+    /// The key of `--secrets-key SOURCE`, read once. See [`super::Sealing::start`].
+    pub fn configured(source: &str, data_dir: &Path) -> anyhow::Result<Sealer> {
         use sparkles::backup::config::{KeyInput, KeySource, RepositoryEncryption};
-        use sparkles::backup::keys::{KeyContext, resolve};
+        use sparkles::backup::keys::{KeyContext, read_key};
         let bad = || {
             anyhow::anyhow!(
-                "--secrets-key takes file:PATH, env:VAR, credential:NAME or command:CMD"
+                "--secrets-key takes file:PATH, env:VAR, credential:NAME, command:CMD or none"
             )
         };
         let (kind, rest) = source.split_once(':').ok_or_else(bad)?;
@@ -149,7 +164,7 @@ impl Sealing {
         let settings = RepositoryEncryption {
             keys: vec![KeyInput {
                 label: "secrets-key".into(),
-                key,
+                key: key.clone(),
             }],
             single_key_ok: true,
         };
@@ -161,48 +176,289 @@ impl Sealing {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        let mut keys = rt
-            .block_on(resolve(&settings, &context, &ctl))
+        let key = rt
+            .block_on(read_key(&key, "secrets-key", &context, &ctl))
             .map_err(|e| anyhow::anyhow!("--secrets-key: {e}"))?;
-        let key = keys
-            .keys
-            .pop()
-            .ok_or_else(|| anyhow::anyhow!("--secrets-key: no key was read"))?;
-        Ok(Sealing {
-            sealer: Some(sparkles_backup::crypto::SecretSealer::new(&key)),
-        })
+        Ok(Sealer::from_key(key))
     }
 
-    /// `--secrets-key` in a build without `backup-encryption`.
-    #[cfg(not(feature = "backup-encryption"))]
-    pub fn load(_source: &str, _data_dir: &FsPath) -> anyhow::Result<Sealing> {
-        anyhow::bail!("--secrets-key needs a build with the backup-encryption feature")
+    /// The key in `path`, a file the server generated. It must be a regular file that
+    /// only its owner can read, owned by the user the server runs as or by root.
+    pub fn read_file(path: &Path) -> anyhow::Result<Sealer> {
+        use std::io::Read as _;
+        let shown = path.display();
+        let mut o = std::fs::OpenOptions::new();
+        o.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            o.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let f = o
+            .open(path)
+            .with_context(|| format!("cannot open the secrets key {shown}"))?;
+        let md = f.metadata()?;
+        if !md.is_file() || md.len() > 4096 {
+            anyhow::bail!("the secrets key {shown} must be a regular file of at most 4096 bytes");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            if md.permissions().mode() & 0o077 != 0 {
+                anyhow::bail!(
+                    "the secrets key {shown} must not be readable by its group or by others (chmod 0400)"
+                );
+            }
+            // SAFETY: geteuid has no preconditions and cannot fail.
+            let me = unsafe { libc::geteuid() };
+            if md.uid() != me && md.uid() != 0 {
+                anyhow::bail!(
+                    "the secrets key {shown} must belong to the user the server runs as, or to root"
+                );
+            }
+        }
+        let mut bytes = Zeroizing::new(Vec::with_capacity(129));
+        f.take(4097)
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("cannot read the secrets key {shown}"))?;
+        let key = sparkles::backup::keys::decode_key(&bytes, SECRETS_KEY_LABEL)
+            .map_err(|e| anyhow::anyhow!("{e} ({shown})"))?;
+        Ok(Sealer::from_key(key))
     }
 
-    /// `"sealed"` with a key, else `"plaintext"`.
+    const SECRETS_KEY_LABEL: &str = super::SECRETS_KEY_FILE;
+
+    /// Generate a key and write it to `path` with mode 0400, as 64 hexadecimal digits.
+    /// The data directory must belong to the user the server runs as. The file appears
+    /// whole or not at all, and an existing file is never replaced.
+    pub fn generate(path: &Path) -> std::io::Result<Sealer> {
+        use std::io::Write as _;
+        let dir = path.parent().unwrap_or(Path::new("."));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            // SAFETY: geteuid has no preconditions and cannot fail.
+            let me = unsafe { libc::geteuid() };
+            if std::fs::metadata(dir)?.uid() != me {
+                return Err(std::io::Error::other(format!(
+                    "the data directory {} belongs to another user, so the server does not keep a key in it: start it with --secrets-key",
+                    dir.display()
+                )));
+            }
+        }
+        let key = Sealer::generate_key().map_err(std::io::Error::other)?;
+        let mut text = Zeroizing::new(String::with_capacity(65));
+        for b in key.iter() {
+            text.push(char::from_digit(u32::from(b >> 4), 16).unwrap_or('0'));
+            text.push(char::from_digit(u32::from(b & 15), 16).unwrap_or('0'));
+        }
+        text.push('\n');
+        let tmp = dir.join(format!(
+            ".{}.{}.tmp",
+            super::SECRETS_KEY_FILE,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+        let mut o = std::fs::OpenOptions::new();
+        o.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            o.mode(0o400);
+        }
+        let written = (|| {
+            let mut f = o.open(&tmp)?;
+            f.write_all(text.as_bytes())?;
+            f.sync_all()?;
+            drop(f);
+            // a link fails when the name exists, where a rename would replace it
+            std::fs::hard_link(&tmp, path)
+        })();
+        let _ = std::fs::remove_file(&tmp);
+        written?;
+        #[cfg(unix)]
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+        Ok(Sealer::from_key(key))
+    }
+}
+
+#[cfg(not(feature = "backup"))]
+mod sealer {
+    use std::path::Path;
+
+    /// A build without the `backup` feature never makes a sealer: every constructor
+    /// below fails.
+    #[derive(Clone, Debug)]
+    #[allow(dead_code)]
+    pub struct Sealer(());
+
+    pub fn seal(_: &Sealer, _: &str, _: &[u8]) -> std::io::Result<Vec<u8>> {
+        Err(std::io::Error::other(
+            "sealed secrets need a build with the backup feature",
+        ))
+    }
+
+    pub fn open(_: &Sealer, _: &str, _: &[u8]) -> Option<Vec<u8>> {
+        None
+    }
+
+    pub fn memory(_: &Sealer) -> &'static str {
+        "heap"
+    }
+
+    pub fn configured(_: &str, _: &Path) -> anyhow::Result<Sealer> {
+        anyhow::bail!("--secrets-key needs a build with the backup feature")
+    }
+
+    pub fn read_file(_: &Path) -> anyhow::Result<Sealer> {
+        anyhow::bail!("sealed secrets need a build with the backup feature")
+    }
+
+    pub fn generate(_: &Path) -> std::io::Result<Sealer> {
+        Err(std::io::Error::other(
+            "sealed secrets need a build with the backup feature",
+        ))
+    }
+}
+
+/// Where the key that seals runtime values comes from.
+#[derive(Clone, Debug, Default)]
+enum Mode {
+    /// No key: values are plaintext files with mode 0600 (`--secrets-key none`, a server
+    /// without a data directory, or a build without the `backup` feature).
+    #[default]
+    Plaintext,
+    /// `--secrets-key SOURCE`, or the systemd credential `sparkles-secrets-key`.
+    Configured,
+    /// `<dataDir>/secrets.key`, generated when the first value is stored.
+    Generated(PathBuf),
+}
+
+#[derive(Debug, Default)]
+struct SealingState {
+    mode: Mode,
+    /// The sealer, once a key is read or generated.
+    sealer: RwLock<Option<sealer::Sealer>>,
+}
+
+/// How runtime values are kept: sealed with a key, which by default the server generates
+/// in its data directory, or as plaintext files with mode 0600 with `--secrets-key none`.
+/// Clones share the key, so a key generated for one request serves every reader.
+#[derive(Clone, Debug, Default)]
+pub struct Sealing {
+    state: Arc<SealingState>,
+}
+
+impl Sealing {
+    /// The sealing of `serve` with `--secrets-key SOURCE` or without it, read once at
+    /// the start, before the server's runtime starts.
+    ///
+    /// `SOURCE` is `file:PATH`, `env:VAR`, `credential:NAME` (in
+    /// `$CREDENTIALS_DIRECTORY`) or `command:CMD`, where `CMD` is a JSON argv array or an
+    /// absolute program and its arguments split at spaces, run without a shell. The key
+    /// is 32 bytes, as 64 hexadecimal digits, base64 or raw bytes, like a backup
+    /// repository key. A key file may not lie in `data_dir`. `none` keeps values as
+    /// plaintext.
+    ///
+    /// Without `SOURCE`, the key is the systemd credential `sparkles-secrets-key` when
+    /// there is one, then `<data_dir>/secrets.key`. When neither exists, the server
+    /// generates `secrets.key` when it first stores a value.
+    pub fn start(source: Option<&str>, data_dir: &FsPath) -> anyhow::Result<Sealing> {
+        let configured = |source: &str| -> anyhow::Result<Sealing> {
+            Ok(Sealing::with(
+                Mode::Configured,
+                Some(sealer::configured(source, data_dir)?),
+            ))
+        };
+        match source.map(str::trim) {
+            Some("none") => return Ok(Sealing::default()),
+            Some(source) => return configured(source),
+            None => {}
+        }
+        if data_dir.as_os_str().is_empty() || !cfg!(feature = "backup") {
+            return Ok(Sealing::default());
+        }
+        if let Some(creds) = std::env::var_os("CREDENTIALS_DIRECTORY")
+            && FsPath::new(&creds).join(SECRETS_KEY_CREDENTIAL).is_file()
+        {
+            return configured(&format!("credential:{SECRETS_KEY_CREDENTIAL}"));
+        }
+        let path = data_dir.join(SECRETS_KEY_FILE);
+        let sealer = match std::fs::symlink_metadata(&path) {
+            Ok(_) => Some(sealer::read_file(&path)?),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => anyhow::bail!("cannot read the secrets key {}: {e}", path.display()),
+        };
+        Ok(Sealing::with(Mode::Generated(path), sealer))
+    }
+
+    fn with(mode: Mode, sealer: Option<sealer::Sealer>) -> Sealing {
+        Sealing {
+            state: Arc::new(SealingState {
+                mode,
+                sealer: RwLock::new(sealer),
+            }),
+        }
+    }
+
+    /// `"sealed"` when values are sealed, else `"plaintext"`.
     pub fn storage(&self) -> &'static str {
         if self.sealed() { "sealed" } else { "plaintext" }
     }
 
+    /// Whether stored values are sealed, or will be once a key is generated.
     pub fn sealed(&self) -> bool {
-        #[cfg(feature = "backup-encryption")]
-        {
-            self.sealer.is_some()
-        }
-        #[cfg(not(feature = "backup-encryption"))]
-        {
-            false
+        !matches!(self.state.mode, Mode::Plaintext)
+    }
+
+    /// `"configured"` for `--secrets-key` or the systemd credential, `"generated"` for
+    /// `<dataDir>/secrets.key`, and `None` for plaintext values.
+    pub fn key_source(&self) -> Option<&'static str> {
+        match self.state.mode {
+            Mode::Plaintext => None,
+            Mode::Configured => Some("configured"),
+            Mode::Generated(_) => Some("generated"),
         }
     }
 
-    /// Store `value` as the runtime value of `name` in `dir`, sealed with a key.
-    pub(crate) fn write(&self, dir: &FsPath, name: &str, value: &[u8]) -> std::io::Result<()> {
-        #[cfg(feature = "backup-encryption")]
-        if let Some(s) = &self.sealer {
-            let sealed = s.seal(name, value).map_err(std::io::Error::other)?;
-            return write_atomic(&dir.join(name), &sealed, 0o600);
+    /// `"locked"` or `"heap"`, where the key is kept, once there is a key.
+    pub fn key_memory(&self) -> Option<&'static str> {
+        self.state.sealer.read().as_ref().map(sealer::memory)
+    }
+
+    /// The sealer for a write: the key that was read, or a key generated now in the data
+    /// directory. `None` for plaintext values.
+    fn sealer_for_write(&self) -> std::io::Result<Option<sealer::Sealer>> {
+        let path = match &self.state.mode {
+            Mode::Plaintext => return Ok(None),
+            Mode::Configured => return Ok(self.state.sealer.read().clone()),
+            Mode::Generated(path) => path,
+        };
+        if let Some(s) = self.state.sealer.read().clone() {
+            return Ok(Some(s));
         }
-        write_atomic(&dir.join(name), value, 0o600)
+        let mut slot = self.state.sealer.write();
+        if let Some(s) = slot.clone() {
+            return Ok(Some(s));
+        }
+        let s = sealer::generate(path)?;
+        tracing::info!(
+            "generated the secrets key {}; it seals the runtime secrets of this data directory",
+            path.display()
+        );
+        *slot = Some(s.clone());
+        Ok(Some(s))
+    }
+
+    /// Store `value` as the runtime value of `name` in `dir`, sealed unless the server
+    /// keeps plaintext values.
+    pub(crate) fn write(&self, dir: &FsPath, name: &str, value: &[u8]) -> std::io::Result<()> {
+        match self.sealer_for_write()? {
+            Some(s) => write_atomic(&dir.join(name), &sealer::seal(&s, name, value)?, 0o600),
+            None => write_atomic(&dir.join(name), value, 0o600),
+        }
     }
 
     /// The value in `stored` of the secret `name`, opened when it is sealed. The error
@@ -212,17 +468,16 @@ impl Sealing {
             return String::from_utf8(stored)
                 .map_err(|_| format!("the stored value of secret {name:?} is not text"));
         }
-        #[cfg(feature = "backup-encryption")]
-        if let Some(s) = &self.sealer {
-            let plain = s.open(name, &stored).map_err(|_| {
-                format!("the stored value of secret {name:?} does not open with the secrets key")
-            })?;
-            return String::from_utf8(plain.to_vec())
-                .map_err(|_| format!("the stored value of secret {name:?} is not text"));
-        }
-        Err(format!(
-            "the stored value of secret {name:?} is sealed, and the server has no --secrets-key"
-        ))
+        let Some(s) = self.state.sealer.read().clone() else {
+            return Err(format!(
+                "the stored value of secret {name:?} is sealed, and the server has no secrets key"
+            ));
+        };
+        let plain = sealer::open(&s, name, &stored).ok_or_else(|| {
+            format!("the stored value of secret {name:?} does not open with the secrets key")
+        })?;
+        String::from_utf8(plain.to_vec())
+            .map_err(|_| format!("the stored value of secret {name:?} is not text"))
     }
 
     /// The runtime value of `name` in the file `path`, trimmed.
@@ -232,45 +487,148 @@ impl Sealing {
         self.open(name, bytes).map(|v| v.trim().to_string())
     }
 
-    /// Check the runtime values in `dir` at the start. Every sealed value must open,
-    /// so a wrong key, a changed file or a file renamed to another secret stops the
-    /// start. With a key, each plaintext value is sealed in place. Without one, a sealed
-    /// value stops the start.
-    pub fn prepare(&self, dir: &FsPath) -> anyhow::Result<()> {
+    /// Every runtime value in `dir`, opened. A value that does not open stops it, with
+    /// the names of all such values.
+    fn open_all(&self, dir: &FsPath) -> anyhow::Result<Vec<(String, bool, String)>> {
+        let mut out = Vec::new();
         let mut failed = Vec::new();
-        let mut migrated = 0usize;
         for name in stored(dir).into_keys() {
             let bytes = std::fs::read(dir.join(&name))
                 .map_err(|e| anyhow::anyhow!("cannot read secret {name}: {e}"))?;
             let was_sealed = is_sealed(&bytes);
             match self.open(&name, bytes) {
+                Ok(v) => out.push((name, was_sealed, v)),
                 Err(_) => failed.push(name),
-                Ok(v) if !was_sealed && self.sealed() => {
-                    self.write(dir, &name, v.trim().as_bytes())
-                        .map_err(|e| anyhow::anyhow!("cannot seal secret {name}: {e}"))?;
-                    migrated += 1;
-                }
-                Ok(_) => {}
             }
         }
-        if !failed.is_empty() {
-            let names = failed.join(", ");
-            if self.sealed() {
-                anyhow::bail!(
-                    "the secrets key does not open the stored secrets {names} in {}: it is not the key they were sealed with, or a file was changed or renamed",
-                    dir.display()
-                );
+        if failed.is_empty() {
+            return Ok(out);
+        }
+        let names = failed.join(", ");
+        let shown = dir.display();
+        let has_key = self.state.sealer.read().is_some();
+        match &self.state.mode {
+            Mode::Configured => anyhow::bail!(
+                "the secrets key does not open the stored secrets {names} in {shown}: it is not the key they were sealed with, or a file was changed or renamed"
+            ),
+            Mode::Generated(path) if has_key => anyhow::bail!(
+                "the secrets key {} does not open the stored secrets {names} in {shown}: it is not the key they were sealed with, or a file was changed or renamed. Start the server with --secrets-key and the key they were sealed with",
+                path.display()
+            ),
+            Mode::Generated(path) => anyhow::bail!(
+                "the stored secrets {names} in {shown} are sealed, and there is no {}: start the server with --secrets-key and the key they were sealed with, or put the key file back",
+                path.display()
+            ),
+            Mode::Plaintext => anyhow::bail!(
+                "the stored secrets {names} in {shown} are sealed: start the server with --secrets-key and the key they were sealed with"
+            ),
+        }
+    }
+
+    /// Check the runtime values in `dir` at the start. Every sealed value must open,
+    /// so a wrong key, a changed file or a file renamed to another secret stops the
+    /// start. Unless the server keeps plaintext values, each plaintext value is sealed in
+    /// place, with a generated key when there is no other.
+    pub fn prepare(&self, dir: &FsPath) -> anyhow::Result<()> {
+        let mut migrated = 0usize;
+        for (name, was_sealed, v) in self.open_all(dir)? {
+            if !was_sealed && self.sealed() {
+                self.write(dir, &name, v.trim().as_bytes())
+                    .map_err(|e| anyhow::anyhow!("cannot seal secret {name}: {e}"))?;
+                migrated += 1;
             }
-            anyhow::bail!(
-                "the stored secrets {names} in {} are sealed: start the server with --secrets-key",
-                dir.display()
-            );
         }
         if migrated > 0 {
             tracing::info!("sealed {migrated} plaintext runtime secret(s) with the secrets key");
         }
         Ok(())
     }
+}
+
+/// What an offline change to the stored values did.
+#[derive(Debug)]
+pub struct Offline {
+    /// The values written.
+    pub values: usize,
+    /// The generated key file that `rekey` removed, since nothing uses it any more.
+    pub removed_key: Option<PathBuf>,
+}
+
+/// The stored values of a stopped server's data directory, opened, with its catalog
+/// lock held until this is dropped.
+struct OfflineValues {
+    _lock: std::fs::File,
+    current: Sealing,
+    dir: PathBuf,
+    /// Each value's name, whether it was sealed, and the value.
+    values: Vec<(String, bool, String)>,
+}
+
+/// Open every stored value of the stopped server's data directory `data` with the key
+/// that `serve` would use (`source` as for `--secrets-key`), holding its catalog lock.
+fn offline_values(data: &FsPath, source: Option<&str>) -> anyhow::Result<OfflineValues> {
+    if !data.is_dir() {
+        anyhow::bail!("{} is not a data directory", data.display());
+    }
+    let lock = sparkles::catalog::lock_data_dir(data)
+        .map_err(|e| anyhow::anyhow!("{e}: stop the server that uses {} first", data.display()))?;
+    let current = Sealing::start(source, data)?;
+    let dir = data.join(SECRETS_DIR);
+    let values = current.open_all(&dir)?;
+    Ok(OfflineValues {
+        _lock: lock,
+        current,
+        dir,
+        values,
+    })
+}
+
+/// `sparkles secrets unseal --data DIR`: write every stored value of a stopped server
+/// back as a plaintext file with mode 0600, for a release that does not seal them. The
+/// key file stays, so a later start of a sealing release seals them again with it.
+pub fn unseal(data: &FsPath, source: Option<&str>) -> anyhow::Result<Offline> {
+    let opened = offline_values(data, source)?;
+    let dir = &opened.dir;
+    let mut n = 0;
+    for (name, was_sealed, v) in &opened.values {
+        if *was_sealed {
+            write_atomic(&dir.join(name), v.trim().as_bytes(), 0o600)
+                .map_err(|e| anyhow::anyhow!("cannot write secret {name}: {e}"))?;
+            n += 1;
+        }
+    }
+    Ok(Offline {
+        values: n,
+        removed_key: None,
+    })
+}
+
+/// `sparkles secrets rekey --data DIR --new-key SOURCE`: seal every stored value of a
+/// stopped server again under the key of `new_key`. Every value is opened before any is
+/// written. When the old key was the generated `secrets.key`, the file is removed
+/// afterwards, so that a start without `--secrets-key` does not pick it up.
+pub fn rekey(data: &FsPath, source: Option<&str>, new_key: &str) -> anyhow::Result<Offline> {
+    if new_key.trim() == "none" {
+        anyhow::bail!("--new-key none would keep no key: use sparkles secrets unseal");
+    }
+    let opened = offline_values(data, source)?;
+    let new = Sealing::start(Some(new_key), data)?;
+    for (name, _, v) in &opened.values {
+        new.write(&opened.dir, name, v.trim().as_bytes())
+            .map_err(|e| anyhow::anyhow!("cannot seal secret {name}: {e}"))?;
+    }
+    let mut removed_key = None;
+    if let Mode::Generated(path) = &opened.current.state.mode
+        && path.exists()
+    {
+        std::fs::remove_file(path)
+            .map_err(|e| anyhow::anyhow!("cannot remove {}: {e}", path.display()))?;
+        removed_key = Some(path.clone());
+    }
+    Ok(Offline {
+        values: opened.values.len(),
+        removed_key,
+    })
 }
 
 /// Make `dir` with mode 0700, or set that mode on it.
@@ -420,9 +778,13 @@ async fn list(State(st): St) -> ApiResult<Json<Value>> {
                 })
             })
             .collect();
-        Ok(Json(
-            json!({ "storage": layers.sealing.storage(), "secrets": secrets }),
-        ))
+        let sealing = &layers.sealing;
+        Ok(Json(json!({
+            "storage": sealing.storage(),
+            "keySource": sealing.key_source(),
+            "keyMemory": sealing.key_memory(),
+            "secrets": secrets,
+        })))
     })
     .await
 }

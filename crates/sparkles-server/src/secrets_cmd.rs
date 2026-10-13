@@ -3,10 +3,15 @@
 //! input, or from a prompt with echo off on a terminal, and never from an argument or an
 //! environment variable, so that a key ends up neither in the shell history nor in the
 //! process list. No subcommand prints a value, and the server never returns one.
+//!
+//! `unseal` and `rekey` work offline on a stopped server's data directory, holding its
+//! catalog lock: `unseal` writes the sealed values back as plaintext for a downgrade, and
+//! `rekey` seals them again under another key.
 
 use crate::settings_cmd::ConnArgs;
 use anyhow::Result;
 use clap::{Args, Subcommand};
+use std::path::PathBuf;
 
 #[derive(Args, Debug)]
 pub struct SecretsArgs {
@@ -34,10 +39,66 @@ enum SecretsCmd {
         /// The secret's name
         name: String,
     },
+    /// Write the sealed values of a stopped server back as plaintext files with mode
+    /// 0600, for a release that does not seal them. Works offline and holds the data
+    /// directory's catalog lock. The key file stays
+    Unseal {
+        /// The stopped server's data directory
+        #[arg(long, value_name = "DIR")]
+        data: PathBuf,
+        /// The key the values are sealed with, as for serve --secrets-key. Without it,
+        /// the key that serve would use
+        #[arg(long, value_name = "SOURCE", env = "SPARKLES_SECRETS_KEY")]
+        secrets_key: Option<String>,
+    },
+    /// Seal the stored values of a stopped server again under another key. Every value
+    /// is opened before any is written. Works offline and holds the data directory's
+    /// catalog lock. A generated secrets.key is removed afterwards
+    Rekey {
+        /// The stopped server's data directory
+        #[arg(long, value_name = "DIR")]
+        data: PathBuf,
+        /// The key the values are sealed with now, as for serve --secrets-key. Without
+        /// it, the key that serve would use
+        #[arg(long, value_name = "SOURCE", env = "SPARKLES_SECRETS_KEY")]
+        secrets_key: Option<String>,
+        /// The new key: file:PATH, env:VAR, credential:NAME or command:CMD. Start the
+        /// server with --secrets-key and the same source afterwards
+        #[arg(long, value_name = "SOURCE")]
+        new_key: String,
+    },
 }
 
 pub fn run(args: SecretsArgs) -> Result<()> {
-    remote::run(args.cmd, &args.conn)
+    use crate::settings::secrets;
+    match args.cmd {
+        SecretsCmd::Unseal { data, secrets_key } => {
+            let done = secrets::unseal(&data, secrets_key.as_deref())?;
+            println!(
+                "wrote {} sealed value(s) in {} back as plaintext",
+                done.values,
+                data.join(secrets::SECRETS_DIR).display()
+            );
+            Ok(())
+        }
+        SecretsCmd::Rekey {
+            data,
+            secrets_key,
+            new_key,
+        } => {
+            let done = secrets::rekey(&data, secrets_key.as_deref(), &new_key)?;
+            println!(
+                "sealed {} value(s) in {} with the new key; start the server with --secrets-key {new_key}",
+                done.values,
+                data.join(secrets::SECRETS_DIR).display()
+            );
+            if let Some(p) = done.removed_key {
+                println!("removed the old generated key {}", p.display());
+            }
+            Ok(())
+        }
+        cmd => remote::run(cmd, &args.conn),
+    }
 }
 
 #[cfg(not(feature = "auth"))]
@@ -64,6 +125,9 @@ mod remote {
             SecretsCmd::List => list(&r, conn.json),
             SecretsCmd::Set { name } => set(&r, &name, conn.json),
             SecretsCmd::Unset { name } => unset(&r, &name, conn.json),
+            SecretsCmd::Unseal { .. } | SecretsCmd::Rekey { .. } => {
+                unreachable!("offline subcommands run without a server")
+            }
         }
     }
 
@@ -197,10 +261,16 @@ mod remote {
         Ok(())
     }
 
-    /// A line about how the server keeps stored values, when they are not sealed.
+    /// A line about how the server keeps stored values, when they are not sealed or are
+    /// sealed with a key that lives beside them.
     fn storage_note(v: &J) -> Option<&'static str> {
-        (v["storage"] == "plaintext").then_some(
-            "stored values are kept unencrypted in the data directory (files with mode 0600); start the server with --secrets-key to seal them",
+        if v["storage"] == "plaintext" {
+            return Some(
+                "stored values are kept unencrypted in the data directory (files with mode 0600), since the server runs with --secrets-key none",
+            );
+        }
+        (v["keySource"] == "generated").then_some(
+            "stored values are sealed with a key that the server generated in its data directory (secrets.key); it protects copies of the values made without that file, and --secrets-key keeps the key elsewhere",
         )
     }
 
