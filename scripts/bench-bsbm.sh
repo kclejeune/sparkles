@@ -96,15 +96,18 @@ GENPARAMS="products=$PRODUCTS forward-chaining seed=default"
 if [ -f bsbm/params ] && [ "$(cat bsbm/params)" != "$GENPARAMS" ]; then
   die "$WORK holds data generated with $(cat bsbm/params), not $GENPARAMS; use another workdir"
 fi
-if [ ! -f bsbm/dataset.nt ]; then
+# The data is generated in bsbm-gen and moved to bsbm when complete, with the params file
+# written last, so an interrupted generation is never mistaken for finished data.
+if [ ! -f bsbm/params ]; then
   log "generating BSBM data ($GENPARAMS)"
-  rm -rf bsbm
+  rm -rf bsbm bsbm-unpack bsbm-gen
   python3 -I -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' bsbmtools-v0.2.zip bsbm-unpack
-  mv bsbm-unpack/bsbmtools-0.2 bsbm
+  mv bsbm-unpack/bsbmtools-0.2 bsbm-gen
   rmdir bsbm-unpack
-  (cd bsbm && "$JAVA" -Xmx"${BSBM_GEN_HEAP:-4g}" -cp ".:lib/*" benchmark.generator.Generator \
+  (cd bsbm-gen && "$JAVA" -Xmx"${BSBM_GEN_HEAP:-4g}" -cp ".:lib/*" benchmark.generator.Generator \
     -fc -pc "$PRODUCTS" -s nt -fn dataset -dir td_data > ../logs/generate.log 2>&1)
-  echo "$GENPARAMS" > bsbm/params
+  echo "$GENPARAMS" > bsbm-gen/params
+  mv bsbm-gen bsbm
 fi
 DATAFILE=bsbm/dataset.nt
 log "dataset: $(wc -l < "$DATAFILE") triples"
