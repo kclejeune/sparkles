@@ -1,10 +1,15 @@
 # The 14 test queries of LUBM (Guo, Pan and Heflin, "LUBM: A benchmark for OWL knowledge
 # base systems", Journal of Web Semantics 3(2-3), 2005), written out as SPARQL from the
 # query descriptions in the paper. Each block starts with a line "## <name>".
-# scripts/bench-lubm.sh splits this file into queries/<name>.rq. Queries 5 to 14 return their
-# complete answers only with reasoning over the univ-bench ontology: subclasses and
-# subproperties (RDFS), transitive subOrganizationOf, the inverse hasAlumnus of
-# degreeFrom, and the Chair class defined by a restriction (OWL 2 RL).
+# scripts/bench-lubm.sh splits this file into queries/<name>.rq. Which queries need reasoning
+# over the univ-bench ontology, as measured on LUBM(1) with no inference, the rdfs profile and
+# the owl-rl profile of Sparkles:
+#   Queries 1, 2, 3 and 14 return the same rows with no inference.
+#   Queries 4 and 5 need the RDFS rules (subclasses such as the professor classes, and the
+#   subproperty memberOf of worksFor). The owl-rl profile adds no rows to them.
+#   Queries 6 to 13 need OWL 2 RL as well. Student is defined by a restriction on takesCourse
+#   (queries 6 to 10), subOrganizationOf is transitive (query 11), Chair is defined by a
+#   restriction on headOf (query 12), and hasAlumnus is the inverse of degreeFrom (query 13).
 ## q1
 PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
 PREFIX ub: <http://swat.cse.lehigh.edu/onto/univ-bench.owl#>
