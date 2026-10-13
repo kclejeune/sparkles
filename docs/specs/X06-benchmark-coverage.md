@@ -655,9 +655,19 @@ with a 20 second request timeout, on a machine that was compiling at the same ti
 times mean nothing. The run showed what the harness is for. Oxigraph and QLever returned
 other answers than the majority for several queries (q4, q5a, q5b, q6 and q8) and were
 marked and left out of the ranking, and Jena, Fluree and Oxigraph timed out on some
-queries and were recorded as `timeout`. The causes of the disagreements have not been
-looked into. Sparkles was slow on q5a and q12a at this size, which a run on the reference
-host should confirm before it is listed under "Where Sparkles loses".
+queries and were recorded as `timeout`.
+
+The Oxigraph disagreements came from the harness. `oxigraph load --file` parses N-Triples
+in parallel chunks and splits a blank node label that occurs in two chunks into two nodes,
+so it held 4,727 blank nodes for SP²Bench at 50k triples instead of 4,198, and 109,384
+instead of 86,870 at 1M. The harness now loads Oxigraph from standard input with
+`--format nt`, which keeps the labels whole and takes about 3x as long to load at 1M
+(6.6 s against 2.3 s). With that load Sparkles, Oxigraph and QLever agree on q4, q5a, q5b
+and q6. QLever still differs on q6 (1,959 rows against 1,769) and q8 (0 rows against 264),
+which looks like the engine's own behavior. The synthetic data and WatDiv contain no blank
+nodes, and the DBpedia load already read standard input, so no published Oxigraph result
+needs a rerun. Sparkles was slow on q5a and q12a at this size, which a run on the
+reference host should confirm before it is listed under "Where Sparkles loses".
 
 **Left for Phase 1.**
 

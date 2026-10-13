@@ -327,9 +327,13 @@ load_all() {
       # Fluree's bulk import (`create --from`) builds the index directly; without
       # --chunk-size-mb it parses the file as a single chunk (about 3x slower)
       fluree) cmd="mkdir -p fluree && cd fluree && '$FLUREE' init -q && '$FLUREE' --memory-budget-mb 8192 create bench --from ../$df --chunk-size-mb 16" ;;
-      # Oxigraph's bulk loader (parallel, writes RocksDB files directly), then the compaction
-      # it recommends before read-heavy workloads (`optimize`); both are timed as the load
-      oxigraph) cmd="'$OXIGRAPH' load --location oxigraph.db --file $df && '$OXIGRAPH' optimize --location oxigraph.db" ;;
+      # Oxigraph's bulk loader (writes RocksDB files directly), then the compaction it
+      # recommends before read-heavy workloads (`optimize`); both are timed as the load. The
+      # data goes in on standard input: with `--file`, Oxigraph 0.5.11 parses N-Triples in
+      # parallel chunks and gives a blank node label that occurs in two chunks two different
+      # nodes (SP2Bench at 1M triples: 109,384 blank nodes instead of 86,870), which changes
+      # query answers. On standard input the labels stay whole, at about 3x the load time.
+      oxigraph) cmd="'$OXIGRAPH' load --location oxigraph.db --format nt < $df && '$OXIGRAPH' optimize --location oxigraph.db" ;;
     esac
     rm -rf "${WORK:?}/${FILEOF[$e]}"
     log "$e: loading (log: logs/load-$e.log)"
