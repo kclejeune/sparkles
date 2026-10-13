@@ -700,6 +700,7 @@ fn prepare_query(
     ioacct::mark("plan");
     let node = planner.plan(&planned, &ActiveGraph::Default, Vec::new())?;
     ioacct::mark("planned");
+    exec::prefetch_scans(&ctx, &node);
     if let Some(automatic) = automatic
         && bound.is_empty()
         && cursor::auto_streaming(&ctx, &node, kind, automatic)

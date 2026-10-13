@@ -2258,6 +2258,8 @@ struct Scan {
 }
 
 struct BaseScan {
+    /// read-ahead over the blocks of the current range
+    ahead: crate::index::ReadAhead,
     next: usize,
     end: usize,
     block: Option<crate::index::Block>,
@@ -2330,6 +2332,7 @@ impl Scan {
             }
             let charge = OwnedCharge::new(ctx, cache_bytes)?;
             self.base = Some(BaseScan {
+                ahead: Default::default(),
                 next: 0,
                 end: 0,
                 block: None,
@@ -2356,6 +2359,7 @@ impl Scan {
                     self.at += 1;
                     base.next = 0;
                     base.end = 0;
+                    base.ahead = Default::default();
                     continue;
                 }
                 if Arc::strong_count(&base._charge) > 1 {
@@ -2366,7 +2370,17 @@ impl Scan {
                 }
                 let metadata = &index.blocks[base.next];
                 let whole = metadata.first >= lo && metadata.last <= hi;
-                let block = ctx.snap.cache.get_cols(
+                let columns = |b: usize| {
+                    let m = &index.blocks[b];
+                    if m.first >= lo && m.last <= hi {
+                        mask
+                    } else {
+                        mask | crate::index::bound_cols(&lo, &hi)
+                    }
+                };
+                base.ahead
+                    .before(index, &ctx.snap.cache, base.next, base.end, &columns);
+                let block = ctx.snap.cache.get_cols_hinted(
                     index,
                     base.next,
                     if whole {
@@ -2374,6 +2388,7 @@ impl Scan {
                     } else {
                         mask | crate::index::bound_cols(&lo, &hi)
                     },
+                    false,
                 )?;
                 (base.row, base.row_end) = if whole {
                     (0, block.len())
@@ -2410,6 +2425,7 @@ impl Scan {
                     self.at += 1;
                     base.next = 0;
                     base.end = 0;
+                    base.ahead = Default::default();
                 }
             }
             return Ok(SharedAttempt::Ready(Some(batch)));
@@ -2483,6 +2499,7 @@ impl Scan {
                     self.at += 1;
                     base.next = 0;
                     base.end = 0;
+                    base.ahead = Default::default();
                     break;
                 }
                 let metadata = &index.blocks[base.next];
@@ -2493,7 +2510,17 @@ impl Scan {
                         crate::index::BLOCK_ROWS as u64 * 32 + 512,
                     )?);
                 }
-                let block = ctx.snap.cache.get_cols(
+                let columns = |b: usize| {
+                    let m = &index.blocks[b];
+                    if m.first >= lo && m.last <= hi {
+                        mask
+                    } else {
+                        mask | crate::index::bound_cols(&lo, &hi)
+                    }
+                };
+                base.ahead
+                    .before(index, &ctx.snap.cache, base.next, base.end, &columns);
+                let block = ctx.snap.cache.get_cols_hinted(
                     index,
                     base.next,
                     if whole {
@@ -2501,6 +2528,7 @@ impl Scan {
                     } else {
                         mask | crate::index::bound_cols(&lo, &hi)
                     },
+                    false,
                 )?;
                 (base.row, base.row_end) = if whole {
                     (0, block.len())
@@ -2558,6 +2586,7 @@ impl Scan {
                 && let Ok(charge) = OwnedCharge::new(ctx, cache_bytes)
             {
                 self.base = Some(BaseScan {
+                    ahead: Default::default(),
                     next: 0,
                     end: 0,
                     block: None,

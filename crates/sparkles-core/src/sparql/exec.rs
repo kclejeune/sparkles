@@ -1082,6 +1082,39 @@ fn merge_counters(
 
 /// Key columns a scan reads: its variables, the graph (unless every graph passes) and
 /// the repeated-variable columns. The others are never decoded for whole blocks.
+/// Ask the kernel for the blocks of the scans of a plan before any operator runs (spec X07
+/// §5.2). A scan with few blocks is then read in parallel instead of one block after the
+/// other, and the two blocks at the ends of its range, which `count` decodes while the
+/// scan is set up, arrive together with the rest. A scan of many blocks reads ahead as it
+/// goes (see [`crate::index::ReadAhead`]).
+pub(super) fn prefetch_scans(ctx: &Ctx, n: &Node) {
+    /// scans of more blocks than this are left to their own read-ahead
+    const FEW_BLOCKS: usize = 64;
+    if !ctx.opt.prefetch_first_scan || !crate::index::io_hints() {
+        return;
+    }
+    fn walk(ctx: &Ctx, n: &Node) {
+        if let Kind::Scan(spec) | Kind::RangeScan(spec, _) | Kind::CountScan { spec, .. } = &n.kind
+        {
+            let index = ctx.snap.perm(spec.perm);
+            let (lo, hi) = index.block_range(&spec.prefix);
+            if lo < hi && hi - lo <= FEW_BLOCKS {
+                let bounds =
+                    crate::index::bound_cols(&pad(&spec.prefix, 0), &pad(&spec.prefix, u64::MAX));
+                let mask = scan_mask(ctx, spec) | bounds;
+                for b in lo..hi {
+                    index.prefetch(&ctx.snap.cache, b, mask);
+                }
+            }
+        }
+        for c in &n.children {
+            walk(ctx, c);
+        }
+    }
+    walk(ctx, n);
+    crate::ioacct::mark("scans prefetched");
+}
+
 pub(super) fn scan_mask(ctx: &Ctx, spec: &ScanSpec) -> crate::index::ColMask {
     if !ctx.opt.selective_columns {
         return crate::index::ALL_COLS;

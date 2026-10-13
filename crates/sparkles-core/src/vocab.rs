@@ -237,8 +237,6 @@ struct Ahead {
 }
 
 impl Ahead {
-    const WINDOW: usize = 1 << 20;
-
     /// The pass reads `block` next.
     #[inline]
     fn at(&mut self, v: &Vocab, block: usize) {
@@ -254,9 +252,10 @@ impl Ahead {
             self.offsets_until = to;
         }
         let pos = v.block_offset(block);
-        if self.until < self.end && pos + Self::WINDOW / 2 >= self.until {
+        let window = crate::index::read_window();
+        if self.until < self.end && pos + window / 2 >= self.until {
             let from = pos.max(self.until);
-            let to = (pos + Self::WINDOW).min(self.end);
+            let to = (pos + window).min(self.end);
             v.data.will_need(IoFile::VocabData, from, to);
             self.until = to;
         }

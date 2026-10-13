@@ -196,10 +196,12 @@ pub struct Optimizations {
     /// a FILTER, BIND or ORDER BY over a table of fewer than 4,096 rows asks for the
     /// vocabulary pages of the terms it evaluates before the first row
     pub prefetch_terms: bool,
+    /// the blocks of a plan's scans with few blocks are requested before any operator runs
+    pub prefetch_first_scan: bool,
 }
 
 impl Optimizations {
-    pub const NAMES: [&str; 36] = [
+    pub const NAMES: [&str; 37] = [
         "range_pushdown",
         "incremental_group",
         "count_join_runs",
@@ -236,6 +238,7 @@ impl Optimizations {
         "topk_heap",
         "prefetch_constants",
         "prefetch_terms",
+        "prefetch_first_scan",
     ];
 
     /// Everything on.
@@ -276,6 +279,7 @@ impl Optimizations {
         topk_heap: true,
         prefetch_constants: true,
         prefetch_terms: true,
+        prefetch_first_scan: true,
     };
 
     /// Everything off: the generic operators only.
@@ -316,6 +320,7 @@ impl Optimizations {
         topk_heap: false,
         prefetch_constants: false,
         prefetch_terms: false,
+        prefetch_first_scan: false,
     };
 
     fn flag(&mut self, name: &str) -> Option<&mut bool> {
@@ -356,6 +361,7 @@ impl Optimizations {
             "topk_heap" => &mut self.topk_heap,
             "prefetch_constants" => &mut self.prefetch_constants,
             "prefetch_terms" => &mut self.prefetch_terms,
+            "prefetch_first_scan" => &mut self.prefetch_first_scan,
             _ => return None,
         })
     }

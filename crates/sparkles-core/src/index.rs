@@ -143,6 +143,99 @@ pub(crate) fn will_need(file: IoFile, m: &Mmap, off: usize, len: usize) {
 
 pub type Key = [u64; 4];
 
+/// The most bytes of an index file that a [`ReadAhead`] has requested and not yet reached.
+/// `SPARKLES_READ_WINDOW_KB` changes it for experiments.
+pub fn read_window() -> usize {
+    static W: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *W.get_or_init(|| {
+        std::env::var("SPARKLES_READ_WINDOW_KB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map_or(4 << 20, |kb| (kb << 10).max(64 << 10))
+    })
+}
+
+/// Read-ahead of one pass over consecutive blocks of a permutation (spec X07 §5.3).
+///
+/// The files are mapped for random access (see [`io_hints`]), so the kernel reads nothing
+/// ahead of a page fault. A pass asks for its own bytes in a window that runs ahead of it:
+/// the first request covers about 1 MiB and each refill, made when the pass has used half of
+/// what was requested, doubles up to [`read_window`]. A short range is read by the first
+/// request alone, which overlaps the reads of its blocks as the plan-time prefetch does. A
+/// long one keeps a window of reads in flight, as the kernel's read-ahead would have, and
+/// a scan that stops early has requested at most the window beyond where it stopped. The
+/// window belongs to the pass, so concurrent passes over one file share no state and the
+/// mapping's advice never changes.
+#[derive(Default)]
+pub struct ReadAhead {
+    /// the blocks before this one have been requested
+    requested: usize,
+    /// request more when the pass reaches this block
+    refill_at: usize,
+    /// bytes of the next request
+    window: usize,
+}
+
+impl ReadAhead {
+    const FIRST: usize = 1 << 20;
+
+    /// The pass reads block `b` next, of the blocks up to `end`. `columns` gives the
+    /// columns the pass reads of a block.
+    pub fn before(
+        &mut self,
+        idx: &PermIndex,
+        cache: &BlockCache,
+        b: usize,
+        end: usize,
+        columns: &dyn Fn(usize) -> ColMask,
+    ) {
+        if b < self.refill_at || !io_hints() {
+            return;
+        }
+        let Some(data) = idx.data.as_ref() else {
+            return;
+        };
+        self.window = if self.window == 0 {
+            Self::FIRST.min(read_window())
+        } else {
+            (self.window * 2).min(read_window())
+        };
+        let file = IoFile::of_perm(idx.perm);
+        let first = b.max(self.requested);
+        let mut blk = first;
+        let mut bytes = 0usize;
+        let mut run: Option<(usize, usize)> = None;
+        // pages this close are asked for in one request
+        const GAP: usize = 64 << 10;
+        while blk < end && bytes < self.window {
+            let mask = columns(blk);
+            if let Some((from, to)) = idx.span(blk, mask) {
+                bytes += to - from;
+                if !cache.has_cols(idx, blk, mask) {
+                    run = match run {
+                        Some((a, z)) if from <= z + GAP => Some((a, z.max(to))),
+                        Some((a, z)) => {
+                            will_need(file, data, a, z - a);
+                            Some((from, to))
+                        }
+                        None => Some((from, to)),
+                    };
+                }
+            }
+            blk += 1;
+        }
+        if let Some((a, z)) = run {
+            will_need(file, data, a, z - a);
+        }
+        self.requested = blk;
+        self.refill_at = if blk >= end {
+            usize::MAX
+        } else {
+            first + ((blk - first) / 2).max(1)
+        };
+    }
+}
+
 /// Position of each component in a quad array `[s, p, o, g]`.
 pub const S: usize = 0;
 pub const P: usize = 1;
@@ -716,20 +809,36 @@ impl PermIndex {
         if mask == 0 || !io_hints() || cache.has_cols(self, b, mask) {
             return;
         }
-        let (Some(data), Some(m)) = (self.data.as_ref(), self.blocks.get(b)) else {
+        let (Some(data), Some((from, to))) = (self.data.as_ref(), self.span(b, mask)) else {
             return;
         };
+        will_need(IoFile::of_perm(self.perm), data, from, to - from);
+    }
+
+    /// The bytes of the file that hold the columns in `mask` of block `b` (and the columns
+    /// between them): `[from, to)`.
+    fn span(&self, b: usize, mask: ColMask) -> Option<(usize, usize)> {
+        let mask = mask & ALL_COLS;
+        let m = self.blocks.get(b)?;
+        if mask == 0 {
+            return None;
+        }
         let first = mask.trailing_zeros() as usize;
         let last = 7 - mask.leading_zeros() as usize;
         let at = |c: usize| {
             m.offset as usize + m.col_len[..c].iter().map(|&l| l as usize).sum::<usize>()
         };
-        let (from, to) = (at(first), at(last + 1));
-        will_need(IoFile::of_perm(self.perm), data, from, to - from);
+        Some((at(first), at(last + 1)))
     }
 
     /// Decode one column of a block (columns are compressed separately).
     pub fn decode_col(&self, b: usize, c: usize) -> Result<Arc<[u64]>> {
+        self.decode_col_hinted(b, c, true)
+    }
+
+    /// [`decode_col`](Self::decode_col), asking the kernel for the column's bytes first
+    /// only when `hint`: a pass that has read ahead (see [`ReadAhead`]) has asked already.
+    pub fn decode_col_hinted(&self, b: usize, c: usize, hint: bool) -> Result<Arc<[u64]>> {
         let m = &self.blocks[b];
         let data = self
             .data
@@ -738,12 +847,14 @@ impl PermIndex {
         let off = m.offset as usize + m.col_len[..c].iter().map(|&l| l as usize).sum::<usize>();
         // this column and the block's later ones, which a scan usually decodes next: one
         // read on a cold file instead of a page fault per page
-        will_need(
-            IoFile::of_perm(self.perm),
-            data,
-            off,
-            m.col_len[c..].iter().map(|&l| l as usize).sum::<usize>(),
-        );
+        if hint {
+            will_need(
+                IoFile::of_perm(self.perm),
+                data,
+                off,
+                m.col_len[c..].iter().map(|&l| l as usize).sum::<usize>(),
+            );
+        }
         let bytes = data.get(off..off + m.col_len[c] as usize).ok_or_else(|| {
             Error::Corrupt(format!(
                 "{}.dat: block {b} ends past the end of the file",
@@ -848,6 +959,18 @@ impl BlockCache {
 
     /// A block with the columns in `mask` (the others are empty).
     pub fn get_cols(&self, idx: &PermIndex, b: usize, mask: ColMask) -> Result<Block> {
+        self.get_cols_hinted(idx, b, mask, true)
+    }
+
+    /// [`get_cols`](Self::get_cols) for a pass that has read the block ahead (`hint`
+    /// false, see [`ReadAhead`]).
+    pub fn get_cols_hinted(
+        &self,
+        idx: &PermIndex,
+        b: usize,
+        mask: ColMask,
+        hint: bool,
+    ) -> Result<Block> {
         let mut cols: [Arc<[u64]>; 4] = std::array::from_fn(|_| empty_col());
         for (c, col) in cols.iter_mut().enumerate() {
             if mask & (1 << c) == 0 {
@@ -862,7 +985,7 @@ impl BlockCache {
                 None => {
                     self.misses
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let v = idx.decode_col(b, c)?;
+                    let v = idx.decode_col_hinted(b, c, hint)?;
                     if self.fill {
                         self.cache.insert(key, v.clone());
                     }
@@ -914,6 +1037,15 @@ impl PermIndex {
             return Ok(0);
         }
         let (lo_key, hi_key) = (*lo_key, *hi_key);
+        // the blocks at the two ends of the range are decoded one after the other below:
+        // ask for both first, so that a cold server reads them together
+        let bc = bound_cols(&lo_key, &hi_key);
+        for e in [lo, hi - 1] {
+            let m = &self.blocks[e];
+            if !(m.first >= lo_key && m.last <= hi_key) {
+                self.prefetch(cache, e, bc);
+            }
+        }
         let mut total = 0u64;
         // interior blocks fully contained in the range need no decoding
         let mut b = lo;
@@ -1023,11 +1155,22 @@ impl PermIndex {
     ) -> Result<()> {
         let (lo, hi) = self.key_block_range(lo_key, hi_key);
         let bounds = bound_cols(lo_key, hi_key);
-        for b in lo..hi {
+        let mut ahead = ReadAhead::default();
+        let columns = |b: usize| {
             let m = &self.blocks[b];
             let mask = mask_of(b);
+            if m.first >= *lo_key && m.last <= *hi_key {
+                mask
+            } else {
+                mask | bounds
+            }
+        };
+        for b in lo..hi {
+            let m = &self.blocks[b];
+            let mask = columns(b);
             let whole = m.first >= *lo_key && m.last <= *hi_key;
-            let blk = cache.get_cols(self, b, if whole { mask } else { mask | bounds })?;
+            ahead.before(self, cache, b, hi, &columns);
+            let blk = cache.get_cols_hinted(self, b, mask, false)?;
             let go_on = if whole {
                 f(&blk, 0, blk.len())?
             } else {
@@ -1097,6 +1240,50 @@ mod tests {
         assert!(!idx.contains(&cache, &[5, 5, 10, 0]).unwrap());
         let est = idx.estimate(&[7]);
         assert!(est > 0);
+    }
+
+    #[test]
+    fn read_ahead_covers_a_short_range_in_one_request_and_a_long_one_in_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = PermWriter::create(dir.path(), Perm::Spo).unwrap();
+        for s in 0..(6 * BLOCK_ROWS as u64) {
+            w.push([s, s % 7, s % 13, 0]).unwrap();
+        }
+        w.finish(dir.path(), Perm::Spo).unwrap();
+        let idx = PermIndex::open(dir.path(), Perm::Spo).unwrap();
+        let cache = BlockCache::new(1 << 26);
+        assert_eq!(idx.blocks.len(), 6);
+        let all = |_: usize| ALL_COLS;
+        // a short range: the first request covers every block
+        let mut ra = ReadAhead::default();
+        ra.before(&idx, &cache, 0, 6, &all);
+        assert_eq!(ra.requested, 6);
+        assert_eq!(ra.refill_at, usize::MAX);
+        // later calls ask for nothing more
+        ra.before(&idx, &cache, 1, 6, &all);
+        assert_eq!(ra.requested, 6);
+        // the blocks are 100s of KB each, so a request of the 1 MiB first window stops short
+        // of the sixth block, and the next one starts where it ended
+        let mut ra = ReadAhead::default();
+        let end = idx.blocks.len();
+        ra.window = 1; // the first window is the smallest allowed: one block per request
+        ra.before(&idx, &cache, 0, end, &all);
+        assert!(ra.requested >= 1 && ra.requested <= end);
+        let first = ra.requested;
+        if first < end {
+            assert!(ra.refill_at > 0 && ra.refill_at < end);
+            ra.before(&idx, &cache, ra.refill_at, end, &all);
+            assert!(ra.requested > first);
+        }
+        // scanning with read-ahead gives the rows of a scan without it
+        let mut n = 0u64;
+        idx.for_each_key_range_cols(&cache, &[0; 4], &[u64::MAX; 4], ALL_COLS, |blk, s, e| {
+            n += (e - s) as u64;
+            assert_eq!(blk.cols[0][s], blk.key(s)[0]);
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(n, 6 * BLOCK_ROWS as u64);
     }
 
     #[test]
