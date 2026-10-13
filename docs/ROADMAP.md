@@ -146,7 +146,9 @@ These items are smaller or narrower. Each has a design sketch in the linked spec
 
 ## Tier 6: release work
 
-This work is done when the first release is cut.
+This work is done when the first release is cut. The release waits until Tiers 1–5 have
+landed (decided 2026-10-13), because leading on performance and features matters more
+than releasing early.
 
 | # | Item | Spec | Size |
 |---|---|---|---|

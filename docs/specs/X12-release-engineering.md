@@ -586,18 +586,22 @@ Phase 3 should land before the first release so that 0.1's databases can be read
 ## 12. Open questions
 
 1. **Registry.** GHCR keeps images next to the repository and its attestations. Docker
-   Hub would be more visible. Default: GHCR only.
-2. **crates.io names.** `sparkles` may be taken on crates.io. Default: check before
-   Phase 1 and fall back to `sparkles-rdf` as the Python and npm names do.
+   Hub would be more visible. Decided (2026-10-13): Docker Hub is the primary registry,
+   and GHCR may carry the same images. The Docker Hub namespace `sparkles` belongs to
+   another account, so the image name is chosen at Phase 1.
+2. **crates.io names.** On 2026-10-13 the crate `sparkles` was taken by an unrelated
+   project (0.1.8, last updated July 2025). Decided: ask its owner for the name before
+   Phase 1, and fall back to `sparkles-rdf` as the Python and npm names do.
 3. **Code signing.** Unsigned macOS binaries downloaded with a browser are quarantined by
    Gatekeeper, and unsigned Windows binaries raise SmartScreen warnings. Both need paid
    certificates. Default: document `xattr -d com.apple.quarantine` and the Windows
-   prompt, and sign once the project has the certificates.
+   prompt, and sign once the project has the certificates. Decided (2026-10-13): keep
+   this default.
 4. **Windows file semantics.** Whether generation switches and catalog swaps need a
    deferred delete of mapped files on Windows. Default: defer deletes to the next start,
    as the JVM loader already does for its DLL copies.
 5. **The 0.x window.** One minor release may be too short if releases are frequent.
-   Default: one, revisited after three releases.
+   Default: one, revisited after three releases. Decided (2026-10-13): keep this default.
 
 ## Outcome
 
