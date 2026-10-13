@@ -5870,6 +5870,7 @@ dependencies = [
  "sha2",
  "spargebra",
  "sparkles-core",
+ "stacker",
  "tempfile",
  "tracing",
 ]

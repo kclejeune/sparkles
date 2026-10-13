@@ -72,6 +72,16 @@ pub mod sh {
         MIN_LIST_LENGTH = "minListLength",
         MAX_LIST_LENGTH = "maxListLength",
         UNIQUE_MEMBERS = "uniqueMembers",
+        // node expressions (SHACL 1.2 Node Expressions, SHACL-SPARQL)
+        EXPRESSION = "expression",
+        NODE_BY_EXPRESSION = "nodeByExpression",
+        VALUES = "values",
+        DEFAULT_VALUE = "defaultValue",
+        SPARQL_EXPR = "sparqlExpr",
+        BODY_EXPRESSION = "bodyExpression",
+        KEY_PARAMETER = "keyParameter",
+        NAMED_PARAMETER_EXPRESSION_FUNCTION = "NamedParameterExpressionFunction",
+        LIST_PARAMETER_EXPRESSION_FUNCTION = "ListParameterExpressionFunction",
         // node kinds
         BLANK_NODE = "BlankNode",
         IRI = "IRI",
@@ -144,6 +154,48 @@ pub mod sh {
         MIN_LIST_LENGTH_CC = "MinListLengthConstraintComponent",
         MAX_LIST_LENGTH_CC = "MaxListLengthConstraintComponent",
         UNIQUE_MEMBERS_CC = "UniqueMembersConstraintComponent",
+        EXPRESSION_CC = "ExpressionConstraintComponent",
+        NODE_BY_EXPRESSION_CC = "NodeByExpressionConstraintComponent",
+    }
+}
+
+/// The SHACL 1.2 Node Expressions namespace.
+pub const SHNEX_NS: &str = "http://www.w3.org/ns/shacl-node-expr#";
+
+/// The namespace of the SPARQL function expressions (`sparql:plus` and the like).
+pub const SPARQL_FN_NS: &str = "http://www.w3.org/ns/sparql#";
+
+pub mod shnex {
+    use super::NamedNodeRef;
+    terms! { "http://www.w3.org/ns/shacl-node-expr#";
+        VAR = "var",
+        PATH_VALUES = "pathValues",
+        FOCUS_NODE = "focusNode",
+        EXISTS = "exists",
+        IF = "if",
+        THEN = "then",
+        ELSE = "else",
+        DISTINCT = "distinct",
+        INTERSECTION = "intersection",
+        CONCAT = "concat",
+        REMOVE = "remove",
+        NODES = "nodes",
+        FILTER_SHAPE = "filterShape",
+        LIMIT = "limit",
+        OFFSET = "offset",
+        ORDER_BY = "orderBy",
+        DESC = "desc",
+        FLAT_MAP = "flatMap",
+        FIND_FIRST = "findFirst",
+        MATCH_ALL = "matchAll",
+        COUNT = "count",
+        MIN = "min",
+        MAX = "max",
+        SUM = "sum",
+        INSTANCES_OF = "instancesOf",
+        NODES_MATCHING = "nodesMatching",
+        CONFORMS_TO_SHAPE = "conformsToShape",
+        ARG = "arg",
     }
 }
 

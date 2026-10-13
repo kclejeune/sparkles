@@ -4,6 +4,7 @@
 //! kept in a small term table ([`Tid`] indices) that [`crate::validate`] resolves to
 //! store ids once per validation run.
 
+use crate::nodeexpr::{CustomFn, Expr, ExprId, FnIndex};
 use crate::path::PropertyPath;
 use crate::sparql::{ComponentConstraint, SparqlComponent, SparqlConstraint};
 use crate::syntax::ShapesSyntax;
@@ -24,8 +25,11 @@ pub type ShapeId = usize;
 /// Target declarations (SHACL §2.1.3).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Target {
-    /// `sh:targetNode`
+    /// `sh:targetNode` with an IRI, a literal or a triple term
     Node(Tid),
+    /// `sh:targetNode` with a node expression (SHACL 1.2 Core), evaluated with the shape
+    /// as the focus node
+    Expr(ExprId),
     /// `sh:targetClass`, or an implicit class target (the shape is also an `rdfs:Class`)
     Class(Tid),
     /// `sh:targetSubjectsOf`
@@ -171,6 +175,12 @@ pub enum Constraint {
     /// `sh:uniqueMembers` (SHACL 1.2 Core): with `true`, no member repeats; with either
     /// value, each value node must be a SHACL list
     UniqueMembers(bool),
+    /// `sh:expression` (SHACL 1.2 Node Expressions): for each value node, the expression
+    /// must evaluate to `true`
+    Expression(ExprId),
+    /// `sh:nodeByExpression` (SHACL 1.2 Node Expressions): each value node conforms to
+    /// each shape the expression computes
+    NodeByExpression(ExprId),
 }
 
 impl Constraint {
@@ -211,6 +221,8 @@ impl Constraint {
             Constraint::MinListLength(_) => sh::MIN_LIST_LENGTH_CC,
             Constraint::MaxListLength(_) => sh::MAX_LIST_LENGTH_CC,
             Constraint::UniqueMembers(_) => sh::UNIQUE_MEMBERS_CC,
+            Constraint::Expression(_) => sh::EXPRESSION_CC,
+            Constraint::NodeByExpression(_) => sh::NODE_BY_EXPRESSION_CC,
             Constraint::Component(c) => return c.component.iri.clone(),
         };
         c.into_owned()
@@ -226,6 +238,13 @@ pub struct Shape {
     pub path: Option<PropertyPath>,
     pub targets: Vec<Target>,
     pub deactivated: bool,
+    /// `sh:deactivated` with a node expression that is not a constant: the shape is
+    /// deactivated at the focus nodes where it evaluates to `true`
+    pub deactivated_expr: Option<ExprId>,
+    /// `sh:values` (property shapes): nodes added to the value nodes
+    pub values: Option<ExprId>,
+    /// `sh:defaultValue` (property shapes): the value nodes when there are none
+    pub default_value: Option<ExprId>,
     pub severity: NamedNode,
     pub messages: Vec<Literal>,
     pub constraints: Vec<Constraint>,
@@ -243,13 +262,19 @@ pub struct Shapes {
     pub(crate) terms: Vec<Term>,
     tindex: FxHashMap<Term, Tid>,
     pub(crate) shapes: Vec<Shape>,
-    by_node: FxHashMap<Term, ShapeId>,
+    pub(crate) by_node: FxHashMap<Term, ShapeId>,
     /// blank nodes of this shapes graph are store blank nodes (read via
     /// [`Shapes::from_store`]) and may be matched against data nodes
     pub(crate) bnodes_in_store: bool,
     /// the store graph the shapes were read from (`None` = default graph), for
     /// `$shapesGraph` in SHACL-SPARQL
     pub(crate) source_graph: Option<String>,
+    /// the node expressions of the shapes graph (see [`crate::nodeexpr`])
+    pub(crate) exprs: Vec<Expr>,
+    /// the node of the shapes graph each expression was read from
+    pub(crate) expr_nodes: Vec<Term>,
+    /// the custom node expression functions
+    pub(crate) functions: Vec<CustomFn>,
 }
 
 impl Shapes {
@@ -304,6 +329,17 @@ impl Shapes {
     /// Parse the shapes of an RDF graph.
     pub fn from_graph(graph: Graph) -> Result<Shapes> {
         Parser::new(&graph).parse(false)
+    }
+
+    /// Parse the shapes of an RDF graph, and the node expression `expr` of it, for
+    /// [`crate::eval_expression`].
+    pub fn from_graph_with_expression(
+        graph: Graph,
+        bnodes_in_store: bool,
+        expr: &Term,
+    ) -> Result<(Shapes, ExprId)> {
+        let (shapes, id) = Parser::new(&graph).parse_with(bnodes_in_store, Some(expr))?;
+        Ok((shapes, id.expect("an expression was asked for")))
     }
 
     /// Read the shapes graph from a graph of the store (`None` = the default graph; the
@@ -448,6 +484,10 @@ impl fmt::Display for Shapes {
             for t in &s.targets {
                 let (k, v) = match t {
                     Target::Node(t) => ("targetNode", t),
+                    Target::Expr(e) => {
+                        writeln!(f, "    targetNode {}", self.expr_nodes[*e])?;
+                        continue;
+                    }
                     Target::Class(t) => ("targetClass", t),
                     Target::SubjectsOf(t) => ("targetSubjectsOf", t),
                     Target::ObjectsOf(t) => ("targetObjectsOf", t),
@@ -552,7 +592,7 @@ impl<'g> G<'g> {
     }
 }
 
-fn literal_bool(t: &Term) -> Option<bool> {
+pub(crate) fn literal_bool(t: &Term) -> Option<bool> {
     match t {
         // only the literal `true` activates boolean parameters (W3C test uniqueLang-002:
         // "1"^^xsd:boolean does not)
@@ -616,12 +656,19 @@ const SHAPE_PARAMS: &[NamedNodeRef<'static>] = &[
     sh::MIN_LIST_LENGTH,
     sh::MAX_LIST_LENGTH,
     sh::UNIQUE_MEMBERS,
+    sh::EXPRESSION,
+    sh::NODE_BY_EXPRESSION,
+    sh::VALUES,
+    sh::DEFAULT_VALUE,
 ];
 
-struct Parser<'g> {
-    g: G<'g>,
-    out: Shapes,
+pub(crate) struct Parser<'g> {
+    pub(crate) g: G<'g>,
+    pub(crate) out: Shapes,
     components: Vec<std::sync::Arc<SparqlComponent>>,
+    pub(crate) fns: FnIndex,
+    pub(crate) expr_memo: FxHashMap<Term, ExprId>,
+    pub(crate) expr_stack: Vec<Term>,
 }
 
 impl<'g> Parser<'g> {
@@ -630,12 +677,26 @@ impl<'g> Parser<'g> {
             g: G { g: graph },
             out: Shapes::default(),
             components: Vec::new(),
+            fns: FnIndex::default(),
+            expr_memo: FxHashMap::default(),
+            expr_stack: Vec::new(),
         }
     }
 
-    fn parse(mut self, bnodes_in_store: bool) -> Result<Shapes> {
+    fn parse(self, bnodes_in_store: bool) -> Result<Shapes> {
+        Ok(self.parse_with(bnodes_in_store, None)?.0)
+    }
+
+    /// Parse the shapes, and the node expression `expr` besides them (for
+    /// [`Shapes::from_graph_with_expression`]).
+    pub(crate) fn parse_with(
+        mut self,
+        bnodes_in_store: bool,
+        expr: Option<&Term>,
+    ) -> Result<(Shapes, Option<ExprId>)> {
         self.out.bnodes_in_store = bnodes_in_store;
         self.components = crate::sparql::parse_components(&self.g)?;
+        self.parse_functions()?;
         // candidate shapes, in a deterministic order
         let mut roots: Vec<Term> = Vec::new();
         let mut seen = FxHashSet::default();
@@ -676,10 +737,17 @@ impl<'g> Parser<'g> {
         for r in roots {
             self.shape(&r)?;
         }
-        Ok(self.out)
+        let expr = match expr {
+            Some(node) => Some(
+                self.expr(node)
+                    .with_context(|| format!("node expression {node}"))?,
+            ),
+            None => None,
+        };
+        Ok((self.out, expr))
     }
 
-    fn shape(&mut self, node: &Term) -> Result<ShapeId> {
+    pub(crate) fn shape(&mut self, node: &Term) -> Result<ShapeId> {
         if let Some(&i) = self.out.by_node.get(node) {
             return Ok(i);
         }
@@ -716,12 +784,36 @@ impl<'g> Parser<'g> {
             path,
             targets: Vec::new(),
             deactivated,
+            deactivated_expr: None,
+            values: None,
+            default_value: None,
             severity,
             messages,
             constraints: Vec::new(),
         });
         self.out.by_node.insert(node.clone(), id);
 
+        // node expressions of the shape, read once the shape has its place
+        for t in self.g.objects(node, sh::DEACTIVATED) {
+            if self.is_function_expr(&t) {
+                let e = self
+                    .expr(&t)
+                    .with_context(|| format!("sh:deactivated of shape {node}"))?;
+                self.out.shapes[id].deactivated_expr = Some(e);
+            }
+        }
+        if let Some(t) = self.g.object(node, sh::VALUES) {
+            let e = self
+                .expr(&t)
+                .with_context(|| format!("sh:values of shape {node}"))?;
+            self.out.shapes[id].values = Some(e);
+        }
+        if let Some(t) = self.g.object(node, sh::DEFAULT_VALUE) {
+            let e = self
+                .expr(&t)
+                .with_context(|| format!("sh:defaultValue of shape {node}"))?;
+            self.out.shapes[id].default_value = Some(e);
+        }
         let targets = self.targets(node)?;
         self.out.shapes[id].targets = targets;
         let constraints = self
@@ -734,6 +826,14 @@ impl<'g> Parser<'g> {
     fn targets(&mut self, node: &Term) -> Result<Vec<Target>> {
         let mut out = Vec::new();
         for t in self.g.objects(node, sh::TARGET_NODE) {
+            // a blank node that is a node expression (SHACL 1.2); other blank nodes are
+            // plain nodes, as in SHACL 1.0
+            if self.is_function_expr(&t)
+                && let Ok(e) = self.expr(&t)
+            {
+                out.push(Target::Expr(e));
+                continue;
+            }
             out.push(Target::Node(self.out.intern(t)));
         }
         for t in self.g.objects(node, sh::TARGET_CLASS) {
@@ -985,6 +1085,18 @@ impl<'g> Parser<'g> {
             let b = literal_bool(&t)
                 .ok_or_else(|| anyhow!("sh:uniqueMembers expects a boolean literal, found {t}"))?;
             cs.push(Constraint::UniqueMembers(b));
+        }
+        for t in g.objects(node, sh::EXPRESSION) {
+            let e = self
+                .expr(&t)
+                .with_context(|| format!("sh:expression of shape {node}"))?;
+            cs.push(Constraint::Expression(e));
+        }
+        for t in g.objects(node, sh::NODE_BY_EXPRESSION) {
+            let e = self
+                .expr(&t)
+                .with_context(|| format!("sh:nodeByExpression of shape {node}"))?;
+            cs.push(Constraint::NodeByExpression(e));
         }
         for t in g.objects(node, sh::SPARQL) {
             let path = self.out.shapes[id].path.clone();

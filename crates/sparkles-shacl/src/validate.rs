@@ -1,6 +1,7 @@
 //! The validation engine (SHACL §3–4).
 
 use crate::data::DataGraph;
+use crate::nodeeval::Scope;
 use crate::path::{CPath, PropertyPath};
 use crate::report::{ValidationReport, ValidationResult};
 use crate::shapes::{Candidates, Constraint, Qualified, ShapeId, Shapes, Target};
@@ -199,6 +200,8 @@ impl Out {
 #[derive(Default)]
 pub(crate) struct Cx {
     stack: Vec<(ShapeId, Id)>,
+    /// nesting of node expression evaluations
+    pub depth: usize,
 }
 
 pub(crate) struct Engine<'a> {
@@ -207,6 +210,8 @@ pub(crate) struct Engine<'a> {
     /// store id of each term of the shapes' term table
     pub ids: Vec<Id>,
     paths: Vec<Option<CPath>>,
+    /// the compiled path of each `shnex:pathValues` expression
+    pub expr_paths: Vec<Option<CPath>>,
     parallel: bool,
     pool: Option<Arc<rayon::ThreadPool>>,
     pub deadline: Option<Instant>,
@@ -225,12 +230,36 @@ fn msg(s: String) -> Vec<Literal> {
 }
 
 impl<'a> Engine<'a> {
+    pub(crate) fn new_for_expressions(
+        shapes: &'a Shapes,
+        data: &'a DataGraph,
+        ids: Vec<Id>,
+        opts: &ValidateOptions,
+    ) -> Result<Engine<'a>> {
+        Engine::new(shapes, data, ids, opts)
+    }
+
     fn new(
         shapes: &'a Shapes,
         data: &'a DataGraph,
         ids: Vec<Id>,
         opts: &ValidateOptions,
     ) -> Result<Engine<'a>> {
+        let lookup = |n: &NamedNode| {
+            data.snap
+                .lookup_iri(n.as_str())
+                .unwrap_or(Id::local(u64::MAX >> 8))
+        };
+        let expr_paths = shapes
+            .exprs
+            .iter()
+            .map(|e| match e {
+                crate::nodeexpr::Expr::PathValues { path, .. } => {
+                    Some(CPath::compile(path, &mut |n| lookup(n)))
+                }
+                _ => None,
+            })
+            .collect();
         let paths = shapes
             .shapes
             .iter()
@@ -249,6 +278,7 @@ impl<'a> Engine<'a> {
             data,
             ids,
             paths,
+            expr_paths,
             parallel: opts.parallel,
             pool: opts.pool.clone(),
             deadline: opts.timeout.map(|t| Instant::now() + t),
@@ -258,7 +288,7 @@ impl<'a> Engine<'a> {
         })
     }
 
-    fn check_limits(&self) -> Result<()> {
+    pub(crate) fn check_limits(&self) -> Result<()> {
         if let Some(c) = &self.cancel
             && c.load(AtomicOrdering::Relaxed)
         {
@@ -381,6 +411,13 @@ impl<'a> Engine<'a> {
         for t in &self.shapes.shapes[si].targets {
             let nodes = match *t {
                 Target::Node(t) => vec![self.id(t)],
+                Target::Expr(e) => {
+                    // the shape is the focus node of its target expression
+                    let shape_node = self.shapes.shapes[si].node.clone();
+                    let focus = self.lit_id(&shape_node);
+                    let mut cx = Cx::default();
+                    self.eval(e, focus, &Scope::default(), &mut cx)?
+                }
                 Target::Class(c) => self.data.instances(self.id(c))?,
                 Target::SubjectsOf(p) => self.data.subjects_of(self.id(p))?,
                 Target::ObjectsOf(p) => self.data.objects_of(self.id(p))?,
@@ -411,6 +448,12 @@ impl<'a> Engine<'a> {
         for t in &self.shapes.shapes[si].targets {
             let hit = match *t {
                 Target::Node(t) => self.id(t) == f,
+                Target::Expr(e) => {
+                    let shape_node = self.shapes.shapes[si].node.clone();
+                    let focus = self.lit_id(&shape_node);
+                    self.eval(e, focus, &Scope::default(), &mut Cx::default())?
+                        .contains(&f)
+                }
                 Target::Class(c) => self.data.is_instance(f, self.id(c))?,
                 Target::SubjectsOf(p) => !self.data.objects(f, self.id(p))?.is_empty(),
                 Target::ObjectsOf(p) => !self.data.subjects(self.id(p), f)?.is_empty(),
@@ -432,7 +475,7 @@ impl<'a> Engine<'a> {
     }
 
     /// The nodes that may conform to shape `si` (see [`Shapes::candidates`]).
-    fn candidates(&self, si: ShapeId) -> Result<Vec<Id>> {
+    pub(crate) fn candidates(&self, si: ShapeId) -> Result<Vec<Id>> {
         let pred = |p: &NamedNode| {
             self.data
                 .snap
@@ -492,10 +535,13 @@ impl<'a> Engine<'a> {
         cx: &mut Cx,
     ) -> Result<()> {
         let shape = &self.shapes.shapes[si];
-        if shape.deactivated {
+        if self.deactivated_at(si, focus, cx)? {
             return Ok(());
         }
-        let values = self.value_nodes(si, focus)?;
+        let mut values = self.value_nodes(si, focus)?;
+        if shape.path.is_some() && (shape.values.is_some() || shape.default_value.is_some()) {
+            values = self.extend_values(si, focus, values, cx)?;
+        }
         for c in &shape.constraints {
             self.check(si, c, focus, &values, out, cx)?;
             if out.stop() {
@@ -507,7 +553,7 @@ impl<'a> Engine<'a> {
 
     /// Does `v` conform to shape `si`?
     pub(crate) fn conforms(&self, si: ShapeId, v: Id, cx: &mut Cx) -> Result<bool> {
-        if self.shapes.shapes[si].deactivated || cx.stack.contains(&(si, v)) {
+        if cx.stack.contains(&(si, v)) || self.deactivated_at(si, v, cx)? {
             return Ok(true);
         }
         if cx.stack.len() > 512 {
@@ -675,7 +721,7 @@ impl<'a> Engine<'a> {
         })
     }
 
-    fn show(&self, id: Id) -> String {
+    pub(crate) fn show(&self, id: Id) -> String {
         self.data
             .term(id)
             .map(|t| t.to_string())
@@ -1254,6 +1300,67 @@ impl<'a> Engine<'a> {
             }
             Constraint::Component(cc) => {
                 self.check_component(si, cc, focus, values, out)?;
+            }
+            Constraint::Expression(e) => {
+                // for each value node v, the expression evaluated at the focus node with
+                // `value` bound to v must give exactly ( true )
+                let source = Some(self.shapes.expr_nodes[*e].clone());
+                for &v in values {
+                    let r = self.eval(*e, focus, &Scope::with_var("value", v), cx)?;
+                    if !self.only_true(&r) {
+                        self.report(
+                            out,
+                            si,
+                            focus,
+                            path(),
+                            Some(v),
+                            comp(),
+                            source.clone(),
+                            || {
+                                msg(format!(
+                                    "Expression {} does not give true for {}",
+                                    self.shapes.expr_nodes[*e],
+                                    self.show(v)
+                                ))
+                            },
+                        )?;
+                        if out.stop() {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            Constraint::NodeByExpression(e) => {
+                for &v in values {
+                    let computed = self.eval(*e, v, &Scope::default(), cx)?;
+                    for s in computed {
+                        let term = self.term(s)?;
+                        // a node no shape declaration describes has no constraints
+                        let Some(&target) = self.shapes.by_node.get(&term) else {
+                            continue;
+                        };
+                        if !self.conforms(target, v, cx)? {
+                            self.report(
+                                out,
+                                si,
+                                focus,
+                                path(),
+                                Some(v),
+                                comp(),
+                                Some(term.clone()),
+                                || {
+                                    msg(format!(
+                                        "NodeByExpression[{term}] at focusNode {}",
+                                        self.show(v)
+                                    ))
+                                },
+                            )?;
+                            if out.stop() {
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
             }
         }
         Ok(())
