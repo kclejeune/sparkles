@@ -631,9 +631,13 @@ compared with the older registry lookup.
   document and agreed on the first queries, and the Sparkles-only smoke run completed.
 * *LUBM* (`scripts/bench-lubm.sh`). The generator and ontology are downloaded at run time
   against `scripts/bench-lubm/pins.tsv` because they carry no license text. The queries are
-  written out from the paper in `scripts/bench-lubm/queries.txt`. At LUBM(1) the Sparkles
-  run reads 100,866 triples plus the ontology and derives 43,575 triples with the `rdfs`
-  profile and 84,763 with `owl-rl`. Query 13 returns one row at LUBM(1), and a direct query
+  written out from the paper in `scripts/bench-lubm/queries.txt`. Two generations of
+  LUBM(1) in different directories gave the same N-Triples file. That needed two
+  normalizations after conversion. The two header triples that name each generated file by
+  its local path are dropped, and the ontology's blank nodes are relabeled in order of
+  appearance. The data has 103,380 triples with the ontology, and `sparkles infer` derives
+  43,557 triples with the `rdfs` profile and 84,748 with `owl-rl`. Query 13 returns one row
+  at LUBM(1), and a direct query
   over the generated data confirms that only one person has a degree from University0. The
   answers have not been compared with published reference counts, because the scripts use the
   majority of the engines as the reference. Jena's reasoners are not run.

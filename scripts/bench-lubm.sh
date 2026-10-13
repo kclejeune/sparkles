@@ -81,8 +81,22 @@ if [ ! -f base.nt ]; then
   (cd gen/out && "$JAVA" -cp ../uba/classes edu.lehigh.swat.bench.uba.Generator \
     -univ "$UNIV" -index 0 -seed 0 -onto http://swat.cse.lehigh.edu/onto/univ-bench.owl > ../../logs/generate.log)
   for f in gen/out\\*.owl; do mv "$f" "owl/${f#*\\}"; done
-  "$SPARKLES" convert --recursive --syntax rdfxml owl gen/univ-bench.owl -o base.nt.tmp.nt 2> logs/convert.log
-  mv base.nt.tmp.nt base.nt
+  "$SPARKLES" convert --recursive --syntax rdfxml owl gen/univ-bench.owl -o base.raw.nt 2> logs/convert.log
+  # Each generated file has an ontology header with the empty IRI as its subject, which names the file
+  # itself by a local path (file:///…/University0_0.owl) after conversion. Those two triples per file are
+  # dropped, so the data does not depend on where it was generated. The ontology's blank nodes
+  # get labels by order of appearance, because the converter picks random ones.
+  grep -v '^<file://' base.raw.nt | awk '{
+    s = $0; r = ""
+    while (match(s, /_:[A-Za-z0-9]+/)) {
+      l = substr(s, RSTART, RLENGTH)
+      if (!(l in m)) m[l] = "_:b" ++n
+      r = r substr(s, 1, RSTART - 1) m[l]
+      s = substr(s, RSTART + RLENGTH)
+    }
+    print r s }' > base.nt.tmp
+  mv base.nt.tmp base.nt
+  rm -f base.raw.nt
   echo "$GENPARAMS" > gen/params
   rm -rf owl gen/out* "gen/out\\log.txt"
 fi
