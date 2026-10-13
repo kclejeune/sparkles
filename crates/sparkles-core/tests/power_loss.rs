@@ -22,7 +22,7 @@
 //! 60) and `SPARKLES_POWER_LOSS_SEED` the seed of the random choices.
 #![cfg(target_os = "linux")]
 
-use oxrdf::{GraphName, Literal, NamedNode, Quad, Term};
+use oxrdf::{GraphName, Literal, NamedNode, Quad};
 use sparkles_core::check::{CheckOptions, Status, check};
 use sparkles_core::commit::CommitKind;
 use sparkles_core::store::{Store, StoreOptions};
@@ -77,7 +77,7 @@ fn holds(s: &Store, t: u32, k: u32) -> bool {
     let (Some(a), Some(b), Some(c)) = (
         snap.lookup_iri(&subject(t, k)),
         snap.lookup_iri("urn:p"),
-        snap.lookup_term(&Term::from(q.object.clone())),
+        snap.lookup_term(&q.object),
     ) else {
         return false;
     };
@@ -151,7 +151,7 @@ fn child_writer() {
                 let staged = w
                     .encode_quad(&quad(t, k), &mut Default::default())
                     .and_then(|ids| w.insert(ids));
-                match staged.and_then(|_| w.commit().map(|r| r)) {
+                match staged.and_then(|_| w.commit()) {
                     Ok(r) => {
                         let mut rec = [0u8; 16];
                         rec[..8].copy_from_slice(&r.commit.seq.to_le_bytes());

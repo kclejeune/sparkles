@@ -243,10 +243,12 @@ fn run_update(
     if wopts.deadline.is_none() {
         wopts.deadline = req.deadline;
     }
+    let after = wopts.clone();
     let mut txn = store.try_write_with(kind, wopts)?;
     for op in &parsed.operations {
         req.check()?;
-        run_op(&mut txn, op, &req, &mut stats)?;
+        // an error that rests on the data waits for the state it saw to be durable
+        run_op(&mut txn, op, &req, &mut stats).map_err(|e| store.after_refusal(e, Some(&after)))?;
     }
     // a request cancelled or timed out before this point publishes nothing
     req.check()?;

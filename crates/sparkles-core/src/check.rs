@@ -1252,6 +1252,11 @@ impl Checker<'_> {
         let torn_at = |i: usize, prev_seq: Option<u64>| {
             crate::store::wal_torn_from(buf, i, prev_seq.map_or(0, |s| s + 1))
         };
+        // the commits that have an annotation, to find a commit of a group that reached
+        // the disk without the one it asked for (see `commit::WAL_FLAG_ANNOTATED`)
+        let annotated = self
+            .dataset_id
+            .and_then(|id| crate::annotations::seqs_of(self.root, id));
         let (mut prev_seq, mut prev_ts) = (base_seq, base_ts);
         let mut commits: Vec<(u64, i64, u8)> = Vec::new();
         let (mut folded, mut data_recs) = (0usize, 0usize);
@@ -1312,6 +1317,31 @@ impl Checker<'_> {
                         );
                         torn = true;
                         break;
+                    }
+                    if let (Some(set), Some(Ok((seq, _, _, flags)))) = (&annotated, &meta)
+                        && flags & commit::WAL_FLAG_ANNOTATED != 0
+                        && !set.contains(seq)
+                    {
+                        if torn_at(i, prev_seq) {
+                            run.add(
+                                Issue::warning(format!(
+                                    "the annotation of commit {seq} is missing from annotations.bin, and no later commit shows it was durable: it did not reach the disk before a crash, so the commit is treated as torn and truncated on open"
+                                ))
+                                .file(&file)
+                                .offset(at)
+                                .row(i as u64)
+                                .seq(*seq),
+                            );
+                            torn = true;
+                            break;
+                        }
+                        run.add(
+                            Issue::warning(format!(
+                                "the annotation of commit {seq} is missing from annotations.bin; a later commit shows it was durable, so it keeps its place without its message"
+                            ))
+                            .file("annotations.bin")
+                            .seq(*seq),
+                        );
                     }
                     // a torn transaction is truncated whole, whatever ids it names
                     if !torn_here {

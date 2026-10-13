@@ -25,6 +25,12 @@ pub(super) struct Pending {
     pub wal_end: u64,
     pub bytes: u64,
     pub ticket: Arc<Ticket>,
+    /// what the write guard found, told to the guard once the commit is published
+    pub validation: Option<Arc<crate::guard::ValidationSummary>>,
+    /// the commit's message and change digest
+    pub annotation: crate::annotations::Annotation,
+    /// the annotations file, when this commit's record in it is not synced yet
+    pub ann_file: Option<Arc<File>>,
 }
 
 #[derive(Default)]
@@ -206,14 +212,33 @@ impl Coordinator {
         let injected = self.fail_next_sync.swap(false, Ordering::AcqRel);
         #[cfg(not(any(test, feature = "failpoints")))]
         let injected = false;
-        let synced = if injected {
-            Err(std::io::Error::from_raw_os_error(5).into())
-        } else {
+        let ann_file = batch.iter().rev().find_map(|p| p.ann_file.clone());
+        let sync_log = || {
             sync_commit_reused(
                 &last.wal,
                 &last.snapshot.generation.dvocab,
                 &mut self.vocab.lock(),
             )
+        };
+        let synced = if injected {
+            Err(std::io::Error::from_raw_os_error(5).into())
+        } else if let Some(ann) = ann_file {
+            // the annotations of the commits are synced with their records and terms
+            std::thread::scope(|sc| {
+                let annotations = std::thread::Builder::new()
+                    .name("annotations-sync".into())
+                    .spawn_scoped(sc, || ann.sync_data());
+                let log = sync_log();
+                let annotations = match annotations {
+                    Ok(h) => h.join().unwrap_or_else(|_| {
+                        Err(std::io::Error::other("the annotations sync panicked"))
+                    }),
+                    Err(_) => ann.sync_data(),
+                };
+                log.and(annotations.map_err(Error::from))
+            })
+        } else {
+            sync_log()
         };
         store
             .commit_stats
@@ -304,7 +329,11 @@ impl Store {
         }
         if let Some(log) = self.changelog.as_ref().filter(|l| l.is_enabled()) {
             log.push(changelog::Pending {
-                commit: changelog::ChangeCommit::of(&c, p.author.clone(), None),
+                commit: changelog::ChangeCommit::of(
+                    &c,
+                    p.author.clone(),
+                    p.annotation.message.clone(),
+                ),
                 body: changelog::PendingBody::Log {
                     generation: generation.clone(),
                     changes: p.changes.clone(),
@@ -313,6 +342,11 @@ impl Store {
         }
         self.catalog.lock().append(c);
         self.compaction.committed(c.timestamp_ms);
+        // The guard learns of the commit before anyone can see it published, so a writer
+        // that waited for the publication checks against the state this commit left.
+        if p.validation.is_some() {
+            self.guard_committed(c.seq);
+        }
         self.current.store(p.snapshot.clone());
         self.commits.send_replace(c.seq);
     }
@@ -328,9 +362,16 @@ impl WriteTxn<'_> {
             .saturating_sub(store.current.load().commit)
     }
 
-    pub(super) fn publish_grouped(&mut self) -> Result<Receipt> {
+    pub(super) fn publish_grouped(
+        &mut self,
+        validation: Option<Arc<crate::guard::ValidationSummary>>,
+    ) -> Result<Receipt> {
         let store = self.store;
         let group = store.group.as_ref().expect("grouped admission enabled");
+        let message = match &self.opts.message {
+            Some(m) => crate::annotations::validate_message(m)?,
+            None => None,
+        };
         // The commit record counts the commits before it that may not be durable yet
         // in one byte, which a full queue keeps far below its limit.
         if group.full(self.wal_bytes()) || self.unfenced(store) >= MAX_UNFENCED {
@@ -340,7 +381,7 @@ impl WriteTxn<'_> {
         let unfenced = u8::try_from(self.unfenced(store)).expect("drained above");
         self.check_storage()?;
         let generation = self.base.generation.clone();
-        let c = self.next_commit(None);
+        let c = self.next_commit(validation.as_deref());
         let bytes = self.wal_bytes();
         let prealloc = self.wal_prealloc();
         // the terms are in the file before the records that name them
@@ -349,10 +390,23 @@ impl WriteTxn<'_> {
         if generation.dvocab.needs_sync() {
             generation.dvocab.flush()?;
         }
+        // The descriptor clone fails before any byte of this transaction is written.
+        let owned_wal = self
+            .guard
+            .wal
+            .as_ref()
+            .expect("persistent grouped transaction")
+            .get_ref()
+            .try_clone()?;
+        // The annotation record is written, not synced, before the WAL records: the fence
+        // syncs both files, and the commit record says an annotation is expected. Nothing
+        // that can fail comes between this and the WAL write, and a failed write poisons
+        // the writer, so the record is never taken back: if the commit is recovered, its
+        // annotation is there.
+        let (annotation, ann_file) =
+            store.annotate_unsynced(&c, message, || Some(self.change_lines()))?;
         let w = &mut **self.guard;
         let wal = w.wal.as_mut().expect("persistent grouped transaction");
-        // The descriptor clone fails before any byte of this transaction is written.
-        let owned_wal = wal.get_ref().try_clone()?;
         let mut data = Vec::with_capacity(bytes as usize);
         let mut rec = [0u8; WAL_REC];
         for (op, q) in &self.log {
@@ -369,7 +423,15 @@ impl WriteTxn<'_> {
             c.seq,
             c.timestamp_ms,
             c.kind,
-            0,
+            (if c.unvalidated {
+                commit::WAL_FLAG_UNVALIDATED
+            } else {
+                0
+            }) | (if ann_file.is_some() {
+                commit::WAL_FLAG_ANNOTATED
+            } else {
+                0
+            }),
             unfenced,
             &data,
         );
@@ -409,6 +471,21 @@ impl WriteTxn<'_> {
             historical: false,
             change_log: self.base.change_log.clone(),
         });
+        // A compaction that is building carries this commit into its new generation. It
+        // takes commits only after the writer lock's drain has made the queue durable, so
+        // a commit that a failed fence drops never reaches the new generation: the drain
+        // fails first, and the compaction ends without switching.
+        if let Some(tap) = w.tap.as_mut() {
+            if tap.active.load(Ordering::Acquire) {
+                tap.commits.push(compaction::TapCommit {
+                    info: c,
+                    next_bnode: w.next_bnode,
+                    changes: self.log.clone(),
+                });
+            } else {
+                w.tap = None;
+            }
+        }
         let ticket = Arc::new(Ticket::default());
         let pending = Pending {
             info: c,
@@ -419,6 +496,9 @@ impl WriteTxn<'_> {
             wal_end: w.wal_len,
             bytes,
             ticket: ticket.clone(),
+            validation: validation.clone(),
+            annotation: annotation.clone(),
+            ann_file,
         };
         w.head = c;
         w.staged = Some(snapshot);
@@ -437,8 +517,8 @@ impl WriteTxn<'_> {
             dataset_id: store.owner_dataset_id(),
             committed: true,
             commit: c,
-            validation: None,
-            annotation: Default::default(),
+            validation,
+            annotation,
         })
     }
 }
@@ -751,15 +831,9 @@ mod tests {
         let s = Store::open(dir.path(), options()).unwrap();
         insert(&s, "plain").unwrap();
         assert_eq!(s.commit_metrics().fallbacks, [0; Fallback::ALL.len()]);
-        let mut t = s.write_with(
-            CommitKind::Update,
-            crate::guard::WriteOptions {
-                message: Some("why".into()),
-                ..Default::default()
-            },
-        );
+        let mut t = s.write_with(CommitKind::Reason, Default::default());
         let ids = t
-            .encode_quad(&quad("messaged"), &mut Default::default())
+            .encode_quad(&quad("inferred"), &mut Default::default())
             .unwrap();
         t.insert(ids).unwrap();
         t.commit().unwrap();
@@ -768,7 +842,7 @@ mod tests {
         t.commit().unwrap();
         let m = s.commit_metrics();
         assert!(m.group_commit);
-        assert_eq!(m.fallbacks[Fallback::Message as usize], 1);
+        assert_eq!(m.fallbacks[Fallback::Kind as usize], 1);
         assert_eq!(m.fallbacks[Fallback::Noop as usize], 1);
         assert_eq!(m.fallbacks.iter().sum::<u64>(), 2);
         // a store without group commit counts nothing
@@ -1049,57 +1123,6 @@ mod tests {
     }
 
     #[test]
-    fn message_fallback_waits_and_keeps_its_annotation() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = Arc::new(Store::open(dir.path(), options()).unwrap());
-        let (hit, go) = pause(&s, "group-sealed");
-        let first = {
-            let s = s.clone();
-            thread::spawn(move || insert(&s, "one").unwrap())
-        };
-        hit.recv_timeout(Duration::from_secs(5)).unwrap();
-        let (done, received) = mpsc::channel();
-        let second = {
-            let s = s.clone();
-            thread::spawn(move || {
-                let mut t = s.write_with(
-                    CommitKind::Update,
-                    crate::guard::WriteOptions {
-                        message: Some("kept message".into()),
-                        ..Default::default()
-                    },
-                );
-                let q = Quad::new(
-                    NamedNode::new("urn:two").unwrap(),
-                    NamedNode::new("urn:p").unwrap(),
-                    NamedNode::new("urn:o").unwrap(),
-                    GraphName::DefaultGraph,
-                );
-                let q = t.encode_quad(&q, &mut Default::default()).unwrap();
-                t.insert(q).unwrap();
-                done.send(t.commit()).unwrap();
-            })
-        };
-        assert!(received.recv_timeout(Duration::from_millis(50)).is_err());
-        go.send(()).unwrap();
-        assert_eq!(
-            received
-                .recv_timeout(Duration::from_secs(5))
-                .unwrap()
-                .unwrap()
-                .commit
-                .seq,
-            2
-        );
-        first.join().unwrap();
-        second.join().unwrap();
-        assert_eq!(
-            s.annotation(2).unwrap().message.as_deref(),
-            Some("kept message")
-        );
-        assert_eq!(s.group.as_ref().unwrap().fences.load(Ordering::Relaxed), 1);
-    }
-    #[test]
     fn concurrent_existing_and_fresh_terms_have_exact_receipts_and_state() {
         let dir = tempfile::tempdir().unwrap();
         let s = Arc::new(Store::open(dir.path(), options()).unwrap());
@@ -1266,8 +1289,25 @@ mod tests {
         );
     }
 
+    fn precondition_on(commit: u64, seen: Arc<AtomicBool>) -> crate::guard::WriteOptions {
+        crate::guard::WriteOptions {
+            precondition: Some(crate::guard::Precondition::new(move |snap| {
+                seen.store(true, Ordering::Relaxed);
+                if snap.commit == commit {
+                    Ok(())
+                } else {
+                    Err(Error::PreconditionFailed(format!(
+                        "head is {}",
+                        snap.commit
+                    )))
+                }
+            })),
+            ..Default::default()
+        }
+    }
+
     #[test]
-    fn precondition_fallback_observes_only_a_durable_head() {
+    fn a_precondition_that_holds_for_the_speculative_head_joins_the_group() {
         let dir = tempfile::tempdir().unwrap();
         let s = Arc::new(Store::open(dir.path(), options()).unwrap());
         let (hit, go) = pause(&s, "group-sealed");
@@ -1276,41 +1316,72 @@ mod tests {
             thread::spawn(move || insert(&s, "one").unwrap())
         };
         hit.recv_timeout(Duration::from_secs(5)).unwrap();
-        let checked = Arc::new(AtomicBool::new(false));
-        let opts = crate::guard::WriteOptions {
-            precondition: Some(crate::guard::Precondition::new({
-                let checked = checked.clone();
-                move |snap| {
-                    assert_eq!(snap.commit, 1);
-                    assert_eq!(snap.len(), 1);
-                    checked.store(true, Ordering::Relaxed);
-                    Ok(())
-                }
-            })),
-            ..Default::default()
-        };
-        let (done, received) = mpsc::channel();
+        // commit 1 is written but not durable: the precondition names it as the head
+        let seen = Arc::new(AtomicBool::new(false));
         let next = {
             let s = s.clone();
+            let opts = precondition_on(1, seen.clone());
             thread::spawn(move || {
-                done.send(s.try_write_with(CommitKind::Update, opts).unwrap().commit())
-                    .unwrap()
+                kind_insert(&s, CommitKind::Update, opts, in_graph("two", "urn:g"))
             })
         };
-        assert!(received.recv_timeout(Duration::from_millis(50)).is_err());
-        assert!(!checked.load(Ordering::Relaxed));
-        go.send(()).unwrap();
-        assert!(
-            !received
-                .recv_timeout(Duration::from_secs(5))
-                .unwrap()
-                .unwrap()
-                .committed
+        queued(&s, 1);
+        assert!(seen.load(Ordering::Relaxed));
+        assert_eq!(
+            s.snapshot().commit,
+            0,
+            "nothing is published before the fence"
         );
-        next.join().unwrap();
+        go.send(()).unwrap();
+        assert_eq!(next.join().unwrap().unwrap().commit.seq, 2);
         first.join().unwrap();
-        assert!(checked.load(Ordering::Relaxed));
+        assert_eq!(s.snapshot().commit, 2);
+        assert_eq!(s.commit_metrics().fallbacks.iter().sum::<u64>(), 0);
     }
+
+    #[test]
+    fn a_precondition_refusal_waits_for_the_durable_head() {
+        for fence_fails in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let s = Arc::new(Store::open(dir.path(), options()).unwrap());
+            let (hit, go) = pause(&s, "group-sealed");
+            let first = {
+                let s = s.clone();
+                thread::spawn(move || insert(&s, "one"))
+            };
+            hit.recv_timeout(Duration::from_secs(5)).unwrap();
+            // the tag matches the durable head (0) but not the speculative one (1)
+            let (done, received) = mpsc::channel();
+            let next = {
+                let s = s.clone();
+                let opts = precondition_on(0, Default::default());
+                thread::spawn(move || {
+                    done.send(s.try_write_with(CommitKind::Update, opts).map(|_| ()))
+                        .unwrap()
+                })
+            };
+            // the refusal is not reported while the head it was judged against may
+            // still be lost
+            assert!(received.recv_timeout(Duration::from_millis(100)).is_err());
+            if fence_fails {
+                s.fail_next_group_sync();
+            }
+            go.send(()).unwrap();
+            let answer = received.recv_timeout(Duration::from_secs(5)).unwrap();
+            if fence_fails {
+                assert!(matches!(answer, Err(Error::Poisoned)), "{answer:?}");
+                assert!(first.join().unwrap().is_err());
+            } else {
+                assert!(
+                    matches!(answer, Err(Error::PreconditionFailed(_))),
+                    "{answer:?}"
+                );
+                assert_eq!(first.join().unwrap().unwrap().commit.seq, 1);
+            }
+            next.join().unwrap();
+        }
+    }
+
     #[test]
     fn validation_bypass_never_bypasses_a_write_precondition() {
         for enabled in [false, true] {
@@ -1737,5 +1808,543 @@ mod tests {
         let s = Store::open(&torn, Default::default()).unwrap();
         assert_eq!(s.snapshot().commit, 5);
         assert!(has(&s.snapshot(), "five") && !has(&s.snapshot(), "six"));
+    }
+
+    fn kind_insert(
+        s: &Store,
+        kind: CommitKind,
+        o: crate::guard::WriteOptions,
+        q: Quad,
+    ) -> Result<Receipt> {
+        let mut t = s.try_write_with(kind, o)?;
+        let ids = t.encode_quad(&q, &mut Default::default())?;
+        t.insert(ids)?;
+        t.commit()
+    }
+
+    fn in_graph(name: &str, graph: &str) -> Quad {
+        Quad::new(
+            NamedNode::new(format!("urn:{name}")).unwrap(),
+            NamedNode::new("urn:p").unwrap(),
+            NamedNode::new("urn:o").unwrap(),
+            NamedNode::new(graph).unwrap(),
+        )
+    }
+
+    #[test]
+    fn graph_store_upload_patch_bypass_and_restricted_writes_join_the_group() {
+        use crate::access::{GraphAccess, GraphRule, Graphs};
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(Store::open(dir.path(), options()).unwrap());
+        let (hit, go) = pause(&s, "group-sealed");
+        let first = {
+            let s = s.clone();
+            thread::spawn(move || insert(&s, "first"))
+        };
+        hit.recv_timeout(Duration::from_secs(5)).unwrap();
+        let restricted = crate::guard::WriteOptions {
+            graphs: Some(Arc::new(GraphAccess::graphs(
+                Graphs::All,
+                Graphs::Only(GraphRule::new(["urn:g"], &[] as &[&str])),
+            ))),
+            ..Default::default()
+        };
+        let bypass = crate::guard::WriteOptions {
+            bypass_validation: true,
+            ..Default::default()
+        };
+        let writes = [
+            (CommitKind::GspPut, Default::default()),
+            (CommitKind::GspPost, bypass),
+            (CommitKind::GspDelete, Default::default()),
+            (CommitKind::Upload, Default::default()),
+            (CommitKind::Patch, Default::default()),
+            (CommitKind::Update, restricted),
+        ];
+        let handles: Vec<_> = writes
+            .into_iter()
+            .enumerate()
+            .map(|(n, (kind, o))| {
+                let s = s.clone();
+                thread::spawn(move || kind_insert(&s, kind, o, in_graph(&format!("w{n}"), "urn:g")))
+            })
+            .collect();
+        queued(&s, writes_len());
+        go.send(()).unwrap();
+        first.join().unwrap().unwrap();
+        let receipts: Vec<Receipt> = handles
+            .into_iter()
+            .map(|h| h.join().unwrap().unwrap())
+            .collect();
+        // one fence for the first commit, and one for the six that queued behind it
+        let m = s.commit_metrics();
+        assert_eq!(m.fallbacks.iter().sum::<u64>(), 0, "{:?}", m.fallbacks);
+        assert_eq!(s.group.as_ref().unwrap().fences.load(Ordering::Relaxed), 2);
+        // a bypassing write is recorded as unvalidated, in its receipt and in the log
+        let bypassed = receipts.iter().find(|r| r.validation.is_some()).unwrap();
+        assert_eq!(
+            bypassed.validation.as_ref().unwrap().status,
+            crate::guard::GuardStatus::Bypassed
+        );
+        assert!(bypassed.commit.unvalidated);
+        let seq = bypassed.commit.seq;
+        drop(s);
+        let reopened = Store::open(dir.path(), Default::default()).unwrap();
+        assert_eq!(reopened.snapshot().len(), 7);
+        assert!(reopened.catalog.lock().get(seq).unwrap().unvalidated);
+        let kinds: Vec<_> = (2..=7)
+            .map(|n| reopened.catalog.lock().get(n).unwrap().kind)
+            .collect();
+        for k in [CommitKind::GspPut, CommitKind::Upload, CommitKind::Patch] {
+            assert!(kinds.contains(&k), "{k:?} in {kinds:?}");
+        }
+    }
+
+    fn writes_len() -> usize {
+        6
+    }
+
+    #[test]
+    fn a_refused_quad_of_a_restricted_write_never_reaches_the_log() {
+        use crate::access::{GraphAccess, GraphRule, Graphs};
+        for grouped in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let s = Store::open(
+                dir.path(),
+                StoreOptions {
+                    experimental_group_commit: grouped,
+                    group_commit_idle_direct: false,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            insert(&s, "base").unwrap();
+            let wal_before = std::fs::metadata(wal_path(dir.path())).unwrap().len();
+            let only_g = crate::guard::WriteOptions {
+                graphs: Some(Arc::new(GraphAccess::graphs(
+                    Graphs::All,
+                    Graphs::Only(GraphRule::new(["urn:g"], &[] as &[&str])),
+                ))),
+                ..Default::default()
+            };
+            let refused = kind_insert(
+                &s,
+                CommitKind::Update,
+                only_g.clone(),
+                in_graph("refused", "urn:other"),
+            );
+            assert!(
+                matches!(refused, Err(Error::NotPermitted(_))),
+                "{refused:?}"
+            );
+            assert_eq!(s.snapshot().commit, 1);
+            assert_eq!(
+                std::fs::metadata(wal_path(dir.path())).unwrap().len(),
+                wal_before,
+                "grouped={grouped}"
+            );
+            // an allowed write of the same restriction commits
+            let allowed = kind_insert(&s, CommitKind::Update, only_g, in_graph("allowed", "urn:g"));
+            assert_eq!(allowed.unwrap().commit.seq, 2);
+            drop(s);
+            let reopened = Store::open(dir.path(), Default::default()).unwrap();
+            assert_eq!(reopened.snapshot().len(), 2);
+            assert!(!has(&reopened.snapshot(), "refused"));
+        }
+    }
+
+    fn current_gen(root: &Path) -> String {
+        std::fs::read_to_string(root.join("CURRENT"))
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+
+    #[test]
+    fn writes_during_a_compaction_group_and_a_failed_fence_aborts_it() {
+        for fence_fails in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("db");
+            let s = Arc::new(Store::open(&root, options()).unwrap());
+            for n in 0..3 {
+                insert(&s, &format!("seed{n}")).unwrap();
+            }
+            let before = current_gen(&root);
+            let (hit, go) = pause(&s, "compact-built");
+            let compaction = {
+                let s = s.clone();
+                thread::spawn(move || s.compact())
+            };
+            hit.recv_timeout(Duration::from_secs(10)).unwrap();
+            // writes made while the new generation builds are grouped, and the compaction
+            // carries them over
+            let fences = s.group.as_ref().unwrap().fences.load(Ordering::Relaxed);
+            if fence_fails {
+                s.fail_next_group_sync();
+                assert!(insert(&s, "during").is_err());
+            } else {
+                for n in 0..3 {
+                    insert(&s, &format!("during{n}")).unwrap();
+                }
+                let after = s.group.as_ref().unwrap().fences.load(Ordering::Relaxed);
+                assert_eq!(after, fences + 3);
+                assert_eq!(s.commit_metrics().fallbacks.iter().sum::<u64>(), 0);
+            }
+            go.send(()).unwrap();
+            let report = compaction.join().unwrap();
+            if fence_fails {
+                // the writer lock's drain finds the failed fence before any switch
+                assert!(report.is_err(), "{report:?}");
+                assert_eq!(current_gen(&root), before, "no generation was switched in");
+                assert!(matches!(insert(&s, "later"), Err(Error::Poisoned)));
+            } else {
+                report.unwrap();
+                assert_ne!(current_gen(&root), before);
+                assert_eq!(s.snapshot().commit, 6);
+            }
+            drop(s);
+            let reopened = Store::open(&root, Default::default()).unwrap();
+            let snap = reopened.snapshot();
+            if fence_fails {
+                assert_eq!(snap.len(), snap.commit);
+                assert!(snap.commit >= 3);
+            } else {
+                assert_eq!(snap.commit, 6);
+                assert_eq!(snap.len(), 6);
+                for name in ["seed0", "seed2", "during0", "during2"] {
+                    assert!(has(&snap, name), "{name}");
+                }
+            }
+        }
+    }
+
+    fn message_options(message: &str) -> crate::guard::WriteOptions {
+        crate::guard::WriteOptions {
+            message: Some(message.into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn commit_messages_and_digests_join_the_group_and_keep_their_annotations() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(
+            Store::open(
+                dir.path(),
+                StoreOptions {
+                    commit_digests: true,
+                    ..options()
+                },
+            )
+            .unwrap(),
+        );
+        let (hit, go) = pause(&s, "group-sealed");
+        let first = {
+            let s = s.clone();
+            thread::spawn(move || insert(&s, "one").unwrap())
+        };
+        hit.recv_timeout(Duration::from_secs(5)).unwrap();
+        let writes: Vec<_> = ["two", "three", "four"]
+            .into_iter()
+            .map(|name| {
+                let s = s.clone();
+                thread::spawn(move || {
+                    let o = message_options(&format!("message {name}"));
+                    kind_insert(&s, CommitKind::Update, o, in_graph(name, "urn:g"))
+                })
+            })
+            .collect();
+        // they queue behind the paused fence instead of waiting for it
+        queued(&s, 3);
+        assert_eq!(s.snapshot().commit, 0);
+        go.send(()).unwrap();
+        first.join().unwrap();
+        let receipts: Vec<Receipt> = writes
+            .into_iter()
+            .map(|h| h.join().unwrap().unwrap())
+            .collect();
+        let mut by_seq: Vec<_> = receipts.iter().map(|r| (r.commit.seq, r)).collect();
+        by_seq.sort_by_key(|r| r.0);
+        for (seq, r) in &by_seq {
+            let a = s.annotation(*seq).unwrap();
+            assert!(a.message.as_deref().unwrap().starts_with("message "));
+            assert_eq!(r.annotation, a, "the receipt carries the annotation");
+            assert!(a.digest.is_some());
+        }
+        // the digests chain from one commit to the next
+        let digests: Vec<_> = (1..=4).map(|n| s.annotation(n).unwrap().digest).collect();
+        assert!(digests.iter().all(Option::is_some));
+        assert_eq!(
+            digests
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            4
+        );
+        let m = s.commit_metrics();
+        assert_eq!(m.fallbacks.iter().sum::<u64>(), 0, "{:?}", m.fallbacks);
+        assert_eq!(s.group.as_ref().unwrap().fences.load(Ordering::Relaxed), 2);
+        drop(s);
+        let reopened = Store::open(dir.path(), Default::default()).unwrap();
+        for n in 1..=4 {
+            let a = reopened.annotation(n).unwrap();
+            assert_eq!(a.digest, digests[n as usize - 1]);
+        }
+        let mut messages: Vec<_> = (2..=4)
+            .map(|n| reopened.annotation(n).unwrap().message.unwrap().to_string())
+            .collect();
+        messages.sort();
+        assert_eq!(messages, ["message four", "message three", "message two"]);
+    }
+
+    /// Commits 2 to 4 of a store with a message each. Commits 3 and 4 queue behind commit
+    /// 2's fence, and the files are copied while the fence is held: the records of all
+    /// three are in them, unsynced. Returns the directory of the copy and the store.
+    fn annotated_suffix(dir: &Path) -> (PathBuf, PathBuf) {
+        let root = dir.join("db");
+        let s = Arc::new(Store::open(&root, options()).unwrap());
+        insert(&s, "one").unwrap();
+        let (hit, go) = pause(&s, "group-sealed");
+        let writes: Vec<_> = ["m2", "m3", "m4"]
+            .into_iter()
+            .enumerate()
+            .map(|(n, name)| {
+                let s = s.clone();
+                // commit 2 starts the fence, the others queue behind it
+                thread::spawn(move || {
+                    if n > 0 {
+                        thread::sleep(Duration::from_millis(30 * n as u64));
+                    }
+                    kind_insert(
+                        &s,
+                        CommitKind::Update,
+                        message_options(name),
+                        in_graph(name, "urn:g"),
+                    )
+                })
+            })
+            .collect();
+        hit.recv_timeout(Duration::from_secs(5)).unwrap();
+        queued(&s, 2);
+        let crashed = dir.join("crashed");
+        copy_dir(&root, &crashed);
+        go.send(()).unwrap();
+        for w in writes {
+            w.join().unwrap().unwrap();
+        }
+        (root, crashed)
+    }
+
+    #[test]
+    fn a_commit_that_reached_the_disk_without_its_annotation_is_a_torn_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_root, crashed) = annotated_suffix(dir.path());
+        // the records of commits 3 and 4 never reached annotations.bin: 17 bytes each
+        let path = crashed.join(crate::annotations::FILE);
+        let len = std::fs::metadata(&path).unwrap().len();
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(len - 34)
+            .unwrap();
+        // no later record shows commits 3 and 4 were durable: both are cut off, and the
+        // check reports it as a torn tail rather than damage
+        assert_eq!(wal_check(&crashed), crate::check::Status::Warning);
+        let s = Store::open(&crashed, Default::default()).unwrap();
+        let snap = s.snapshot();
+        assert_eq!(snap.commit, 2);
+        assert_eq!(snap.len(), 2);
+        assert_eq!(s.annotation(2).unwrap().message.as_deref(), Some("m2"));
+        assert!(s.annotation(3).is_none());
+    }
+
+    #[test]
+    fn a_lost_annotation_of_a_commit_a_later_record_shows_durable_keeps_the_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, _crashed) = annotated_suffix(dir.path());
+        {
+            // a later commit, made after the fence: its record says commits 2 to 4 are durable
+            let s = Store::open(&root, options()).unwrap();
+            kind_insert(
+                &s,
+                CommitKind::Update,
+                message_options("m5"),
+                in_graph("m5", "urn:g"),
+            )
+            .unwrap();
+        }
+        // the middle record is lost from the file afterwards (17 bytes for each message)
+        let path = root.join(crate::annotations::FILE);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let first = bytes.len() - 4 * 17;
+        bytes.drain(first + 17..first + 34);
+        std::fs::write(&path, bytes).unwrap();
+        // the commit stays, without its message
+        assert_eq!(wal_check(&root), crate::check::Status::Warning);
+        let s = Store::open(&root, Default::default()).unwrap();
+        assert_eq!(s.snapshot().commit, 5);
+        assert_eq!(s.snapshot().len(), 5);
+        assert!(s.annotation(3).is_none());
+        assert_eq!(s.annotation(4).unwrap().message.as_deref(), Some("m4"));
+    }
+
+    #[test]
+    fn a_missing_annotations_file_does_not_truncate_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_root, crashed) = annotated_suffix(dir.path());
+        std::fs::remove_file(crashed.join(crate::annotations::FILE)).unwrap();
+        let s = Store::open(&crashed, Default::default()).unwrap();
+        assert!(s.snapshot().commit >= 2);
+        assert_eq!(s.snapshot().len(), s.snapshot().commit);
+    }
+
+    /// Rejects every state that holds `urn:bad`.
+    struct Strict {
+        speculative: bool,
+    }
+
+    impl crate::guard::CommitGuard for Strict {
+        fn check(
+            &self,
+            c: &crate::guard::Candidate<'_>,
+        ) -> Result<crate::guard::ValidationSummary> {
+            use crate::guard::{GuardMode, GuardStatus, Severity, ValidationSummary};
+            let bad = c.view.lookup_iri("urn:bad");
+            let hit = matches!(
+                &c.changes,
+                crate::guard::Changes::Log(log) if log.iter().any(|(_, q)| Some(q[0]) == bad)
+            );
+            let status = if hit {
+                GuardStatus::Rejected
+            } else {
+                GuardStatus::Passed
+            };
+            Ok(ValidationSummary::empty(
+                status,
+                GuardMode::Reject,
+                Severity::Violation,
+            ))
+        }
+        fn describe(&self) -> String {
+            "strict".into()
+        }
+        fn speculative(&self) -> bool {
+            self.speculative
+        }
+    }
+
+    #[test]
+    fn a_guard_rejection_waits_for_the_state_it_was_judged_against_to_be_durable() {
+        for speculative in [true, false] {
+            for fence_fails in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let s = Arc::new(Store::open(dir.path(), options()).unwrap());
+                s.set_guard(Some(Arc::new(Strict { speculative })));
+                let (hit, go) = pause(&s, "group-sealed");
+                let first = {
+                    let s = s.clone();
+                    thread::spawn(move || insert(&s, "one"))
+                };
+                hit.recv_timeout(Duration::from_secs(5)).unwrap();
+                let (done, received) = mpsc::channel();
+                let bad = {
+                    let s = s.clone();
+                    thread::spawn(move || done.send(insert(&s, "bad")).unwrap())
+                };
+                // judged against a state that is not durable yet, or kept waiting for it
+                assert!(received.recv_timeout(Duration::from_millis(100)).is_err());
+                if fence_fails {
+                    s.fail_next_group_sync();
+                }
+                go.send(()).unwrap();
+                let answer = received.recv_timeout(Duration::from_secs(5)).unwrap();
+                if fence_fails {
+                    assert!(matches!(answer, Err(Error::Poisoned)), "{answer:?}");
+                    assert!(first.join().unwrap().is_err());
+                } else {
+                    assert!(matches!(answer, Err(Error::Rejected(_))), "{answer:?}");
+                    assert_eq!(first.join().unwrap().unwrap().commit.seq, 1);
+                    assert_eq!(s.snapshot().commit, 1);
+                    // the write is refused for good, and the next accepted one follows
+                    assert_eq!(insert(&s, "two").unwrap().commit.seq, 2);
+                }
+                bad.join().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn a_speculative_guard_follows_the_commits_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(Store::open(dir.path(), options()).unwrap());
+        s.set_guard(Some(Arc::new(Strict { speculative: true })));
+        let (hit, go) = pause(&s, "group-sealed");
+        let first = {
+            let s = s.clone();
+            thread::spawn(move || insert(&s, "one"))
+        };
+        hit.recv_timeout(Duration::from_secs(5)).unwrap();
+        let others: Vec<_> = ["two", "three", "four"]
+            .into_iter()
+            .map(|name| {
+                let s = s.clone();
+                thread::spawn(move || insert(&s, name).unwrap())
+            })
+            .collect();
+        queued(&s, 3);
+        assert_eq!(s.snapshot().commit, 0);
+        go.send(()).unwrap();
+        first.join().unwrap().unwrap();
+        for o in others {
+            let r = o.join().unwrap();
+            assert_eq!(
+                r.validation.as_ref().map(|v| v.status),
+                Some(crate::guard::GuardStatus::Passed)
+            );
+        }
+        assert_eq!(s.group.as_ref().unwrap().fences.load(Ordering::Relaxed), 2);
+        assert_eq!(s.commit_metrics().fallbacks.iter().sum::<u64>(), 0);
+    }
+
+    #[test]
+    fn a_patch_refused_for_the_speculative_head_waits_for_the_fence() {
+        use crate::store::PatchOptions;
+        for fence_fails in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let s = Arc::new(Store::open(dir.path(), options()).unwrap());
+            let id = s.dataset_id();
+            let (hit, go) = pause(&s, "group-sealed");
+            let first = {
+                let s = s.clone();
+                thread::spawn(move || insert(&s, "one"))
+            };
+            hit.recv_timeout(Duration::from_secs(5)).unwrap();
+            // a `prev` after the first data row names the durable head, and the head the
+            // patch starts from is the one that is not durable yet
+            let (done, received) = mpsc::channel();
+            let patch = {
+                let s = s.clone();
+                thread::spawn(move || {
+                    let text = format!("A <urn:d> <urn:p> 1 .\nH prev <urn:uuid:{id}#commit:0> .");
+                    done.send(s.apply_patch(text.as_bytes(), &PatchOptions::default()))
+                        .unwrap()
+                })
+            };
+            assert!(received.recv_timeout(Duration::from_millis(100)).is_err());
+            if fence_fails {
+                s.fail_next_group_sync();
+            }
+            go.send(()).unwrap();
+            let answer = received.recv_timeout(Duration::from_secs(5)).unwrap();
+            if fence_fails {
+                assert!(matches!(answer, Err(Error::Poisoned)), "{answer:?}");
+                assert!(first.join().unwrap().is_err());
+            } else {
+                assert!(matches!(answer, Err(Error::Patch(_))), "{answer:?}");
+                assert_eq!(first.join().unwrap().unwrap().commit.seq, 1);
+            }
+            patch.join().unwrap();
+        }
     }
 }

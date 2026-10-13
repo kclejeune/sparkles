@@ -14,11 +14,18 @@
 //! | +2, +n | message length (u16 LE) and UTF-8 bytes (when flagged) |
 //! | +4 | CRC-32 of the bytes before it |
 //!
-//! A record is appended and synced *before* the commit point (the WAL fsync, or the
-//! `CURRENT` switch of a bulk commit), so an acknowledged commit always has its
-//! annotation. A record whose commit never became durable has a `seq` above the head
-//! found at the next open, which truncates it away. A torn or damaged tail is truncated
-//! too. In-memory stores keep annotations in memory only.
+//! An ordinary commit appends and syncs its record *before* the commit point (the WAL
+//! write, or the `CURRENT` switch of a bulk commit), so a durable commit always has its
+//! annotation. A commit of a group (see `store/group.rs`) appends its record without a
+//! sync, before it writes its WAL records, and the group's fence syncs the file together
+//! with the log. An acknowledged commit therefore has its annotation too, but a commit
+//! that was not acknowledged can reach the disk without it. Its commit record carries
+//! the `WAL_FLAG_ANNOTATED` bit, and the next open truncates the log from the first
+//! such commit whose record is missing, when no later commit shows it was durable.
+//!
+//! A record whose commit never became durable has a `seq` above the head found at the
+//! next open, which truncates it away. A torn or damaged tail is truncated too.
+//! In-memory stores keep annotations in memory only.
 
 use crate::commit::{CommitInfo, rfc3339_ms};
 use crate::error::{Error, Result};
@@ -87,7 +94,7 @@ pub fn validate_message(m: &str) -> Result<Option<Arc<str>>> {
 /// `annotations.bin` for persistent stores.
 pub(crate) struct Annotations {
     path: Option<PathBuf>,
-    file: Option<File>,
+    file: Option<Arc<File>>,
     /// bytes of the file that hold complete, valid records
     len: u64,
     map: BTreeMap<u64, Annotation>,
@@ -178,7 +185,7 @@ impl Annotations {
             f.sync_all()?;
             crate::store::sync_dir(root)?;
             len = good as u64;
-            file = Some(f);
+            file = Some(Arc::new(f));
         }
         Ok(Annotations {
             path: Some(path),
@@ -201,9 +208,34 @@ impl Annotations {
     /// persistent store, sync it to disk. Undo it with [`Annotations::undo`] if the
     /// commit does not happen.
     pub fn append(&mut self, seq: u64, a: Annotation, dataset_id: uuid::Uuid) -> Result<()> {
-        if a.is_empty() {
-            return Ok(());
+        let before = self.len;
+        if let Some(f) = self.append_unsynced(seq, a, dataset_id)?
+            && let Err(e) = f.sync_data()
+        {
+            // leave no record behind that may not be on the disk
+            let _ = f.set_len(before);
+            self.len = before;
+            self.map.remove(&seq);
+            return Err(e.into());
         }
+        Ok(())
+    }
+
+    /// Record `a` for commit `seq` without syncing it, and return the file to sync (none
+    /// when there is nothing to sync: an empty annotation, or a store without a file).
+    /// The caller syncs the file before it acknowledges the commit. The record is written
+    /// at its own offset, so the descriptor can be shared with the thread that syncs.
+    /// The file's creation, which happens with the first record, is synced here.
+    pub fn append_unsynced(
+        &mut self,
+        seq: u64,
+        a: Annotation,
+        dataset_id: uuid::Uuid,
+    ) -> Result<Option<Arc<File>>> {
+        if a.is_empty() {
+            return Ok(None);
+        }
+        let mut synced = None;
         if let Some(path) = &self.path {
             if self.file.is_none() {
                 let mut f = OpenOptions::new()
@@ -219,24 +251,20 @@ impl Annotations {
                     crate::store::sync_dir(dir)?;
                 }
                 self.len = HEADER as u64;
-                self.file = Some(f);
+                self.file = Some(Arc::new(f));
             }
             let rec = encode_record(seq, &a);
-            let f = self.file.as_mut().expect("opened above");
-            use std::io::{Seek, SeekFrom};
-            let written = f
-                .seek(SeekFrom::Start(self.len))
-                .and_then(|_| f.write_all(&rec))
-                .and_then(|_| f.sync_data());
-            if let Err(e) = written {
+            let f = self.file.as_ref().expect("opened above");
+            if let Err(e) = crate::store::wal::write_all_at(f, &rec, self.len) {
                 // leave no partial record behind
                 let _ = f.set_len(self.len);
                 return Err(e.into());
             }
             self.len += rec.len() as u64;
+            synced = Some(f.clone());
         }
         self.map.insert(seq, a);
-        Ok(())
+        Ok(synced)
     }
 
     /// Take back the annotation of `seq`, appended for a commit that did not happen.
@@ -273,7 +301,9 @@ impl Annotations {
             buf.extend_from_slice(&encode_record(*seq, a));
         }
         crate::store::write_atomic(path, &buf)?;
-        self.file = Some(OpenOptions::new().read(true).write(true).open(path)?);
+        self.file = Some(Arc::new(
+            OpenOptions::new().read(true).write(true).open(path)?,
+        ));
         self.len = buf.len() as u64;
         Ok(())
     }
@@ -283,6 +313,24 @@ impl Annotations {
         if self.path.is_none() {
             self.map = self.map.split_off(&seq);
         }
+    }
+}
+
+/// The commits that have an annotation in `<root>/annotations.bin`, for the replay of the
+/// write-ahead log (see `WAL_FLAG_ANNOTATED`). `None` when the file is absent or does
+/// not belong to this dataset, in which case a flagged commit is not held against it: the
+/// file existed durably before the first flagged commit was written, so such a state is
+/// damage from outside, not a crash.
+pub(crate) fn seqs_of(
+    root: &Path,
+    dataset_id: uuid::Uuid,
+) -> Option<std::collections::BTreeSet<u64>> {
+    let buf = std::fs::read(root.join(FILE)).ok()?;
+    match decode_header(&buf) {
+        Some((id, _)) if id == dataset_id => {
+            Some(decode_records(&buf, None).0.into_keys().collect())
+        }
+        _ => None,
     }
 }
 

@@ -71,12 +71,12 @@ pub(crate) fn write_commit(
 }
 
 #[cfg(unix)]
-fn write_all_at(file: &File, buf: &[u8], at: u64) -> std::io::Result<()> {
+pub(crate) fn write_all_at(file: &File, buf: &[u8], at: u64) -> std::io::Result<()> {
     std::os::unix::fs::FileExt::write_all_at(file, buf, at)
 }
 
 #[cfg(windows)]
-fn write_all_at(file: &File, mut buf: &[u8], mut at: u64) -> std::io::Result<()> {
+pub(crate) fn write_all_at(file: &File, mut buf: &[u8], mut at: u64) -> std::io::Result<()> {
     while !buf.is_empty() {
         let n = std::os::windows::fs::FileExt::seek_write(file, buf, at)?;
         if n == 0 {
@@ -89,7 +89,7 @@ fn write_all_at(file: &File, mut buf: &[u8], mut at: u64) -> std::io::Result<()>
 }
 
 #[cfg(not(any(unix, windows)))]
-fn write_all_at(_: &File, _: &[u8], _: u64) -> std::io::Result<()> {
+pub(crate) fn write_all_at(_: &File, _: &[u8], _: u64) -> std::io::Result<()> {
     Err(std::io::ErrorKind::Unsupported.into())
 }
 

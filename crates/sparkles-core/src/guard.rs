@@ -24,6 +24,14 @@ pub trait CommitGuard: Send + Sync {
     fn committed(&self, _seq: u64) {}
     /// Called when a write bypassed the guard.
     fn bypassed(&self) {}
+    /// Whether the guard can check a commit against a state whose commit is not yet
+    /// durable, and keep track of the states of the commits in flight until each is
+    /// published ([`committed`](Self::committed) is called in commit order, possibly
+    /// after the next commit was checked). A guard that cannot has its commits checked
+    /// against the durable head, one group commit at a time.
+    fn speculative(&self) -> bool {
+        false
+    }
     /// A short description, for errors and status.
     fn describe(&self) -> String;
     /// The shape language this guard validates with.

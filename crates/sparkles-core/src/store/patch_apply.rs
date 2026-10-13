@@ -224,6 +224,11 @@ impl Store {
     /// A failed patch applies nothing: a syntax or term error is [`Error::Patch`], and so
     /// is a `prev` header that names a commit of this dataset other than the head.
     pub fn apply_patch(&self, r: impl Read, o: &PatchOptions) -> Result<PatchOutcome> {
+        self.apply_patch_inner(r, o)
+            .map_err(|e| self.after_refusal(e, Some(&o.write)))
+    }
+
+    fn apply_patch_inner(&self, r: impl Read, o: &PatchOptions) -> Result<PatchOutcome> {
         let mut reader = PatchReader::new(r, o.binary);
         let mut opts = o.write.clone();
         // the leading headers decide the precondition, the message and the blank nodes

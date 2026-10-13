@@ -722,6 +722,8 @@ impl CatchUp {
             }
             rec[0] = WAL_COMMIT;
             rec[1..9].copy_from_slice(&c.next_bnode.to_le_bytes());
+            // WAL_FLAG_ANNOTATED is not carried: the commits copied here were durable,
+            // annotation included, before the compaction took the writer lock.
             let flags = if c.info.unvalidated {
                 commit::WAL_FLAG_UNVALIDATED
             } else {

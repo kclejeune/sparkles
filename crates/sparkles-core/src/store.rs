@@ -1671,6 +1671,7 @@ impl Store {
             (gen_.meta.quads + delta.inserts() as u64).saturating_sub(delta.deletes() as u64);
         let mut wal_len = 0u64;
         let mut wal_index = wal::WalIndex::new(base.seq, fold_legacy);
+        let annotated = crate::annotations::seqs_of(root, dataset_id);
         if wal_path.exists() {
             let mut buf = Vec::new();
             File::open(&wal_path)?.read_to_end(&mut buf)?;
@@ -1685,6 +1686,7 @@ impl Store {
                 keep_touched: text_on,
                 path: &wal_path,
                 start: gen_.base_delta(),
+                annotated: annotated.as_ref(),
             };
             let r = replay_wal(&from, &buf, &mut |_, _| Ok(()))?;
             if r.good != buf.len() {
@@ -2837,6 +2839,32 @@ impl Store {
         changes: impl FnOnce() -> Option<(Vec<String>, Vec<String>)>,
     ) -> Result<crate::annotations::Annotation> {
         let mut a = self.annotations.lock();
+        let ann = self.annotation_of(&a, c, message, changes);
+        a.append(c.seq, ann.clone(), self.dataset_id)?;
+        Ok(ann)
+    }
+
+    /// [`annotate`](Self::annotate) for a commit of a group: the record is written but not
+    /// synced, and the file to sync before the commit is acknowledged comes with it.
+    fn annotate_unsynced(
+        &self,
+        c: &CommitInfo,
+        message: Option<Arc<str>>,
+        changes: impl FnOnce() -> Option<(Vec<String>, Vec<String>)>,
+    ) -> Result<(crate::annotations::Annotation, Option<Arc<File>>)> {
+        let mut a = self.annotations.lock();
+        let ann = self.annotation_of(&a, c, message, changes);
+        let file = a.append_unsynced(c.seq, ann.clone(), self.dataset_id)?;
+        Ok((ann, file))
+    }
+
+    fn annotation_of(
+        &self,
+        a: &crate::annotations::Annotations,
+        c: &CommitInfo,
+        message: Option<Arc<str>>,
+        changes: impl FnOnce() -> Option<(Vec<String>, Vec<String>)>,
+    ) -> crate::annotations::Annotation {
         let digest = if a.digests() {
             changes().map(|(deleted, inserted)| {
                 let parent = c.parent().and_then(|p| a.get(p)).and_then(|p| p.digest);
@@ -2851,9 +2879,7 @@ impl Store {
         } else {
             None
         };
-        let ann = crate::annotations::Annotation { message, digest };
-        a.append(c.seq, ann.clone(), self.dataset_id)?;
-        Ok(ann)
+        crate::annotations::Annotation { message, digest }
     }
 
     /// In-memory stores keep annotations only for the commits their catalog keeps.
@@ -3498,7 +3524,7 @@ impl Store {
         if !self.speculative_base(kind, &opts, &guard) {
             self.drain_group(&mut guard, Some(&opts))?;
         }
-        self.check_write_options(&opts)?;
+        self.check_write_options(&opts, &mut guard)?;
         if guard.poisoned {
             return Err(Error::Poisoned);
         }
@@ -3535,21 +3561,62 @@ impl Store {
     fn lock_writer(&self, o: &crate::guard::WriteOptions) -> Result<MutexGuard<'_, WriterState>> {
         let mut w = self.raw_writer(o)?;
         self.drain_group(&mut w, Some(o))?;
-        self.check_write_options(o)?;
+        self.check_write_options(o, &mut w)?;
         Ok(w)
     }
 
-    fn check_write_options(&self, o: &crate::guard::WriteOptions) -> Result<()> {
+    /// The write's precondition, checked against the head the transaction starts from:
+    /// the speculative head, when group commit has commits written but not yet synced. A
+    /// refusal never rests on state that a failed sync could still take back, so one that
+    /// the speculative head causes waits for the queue to become durable and is checked
+    /// again against the durable head. If the sync fails instead, the write is refused as
+    /// poisoned, not as a failed precondition.
+    fn check_write_options(
+        &self,
+        o: &crate::guard::WriteOptions,
+        w: &mut WriterState,
+    ) -> Result<()> {
         // a dry run reports the precondition with the rest of its preview
         if let Some(p) = &o.precondition
             && o.dry_run.is_none()
         {
-            p.check(&self.snapshot())?;
+            match w.staged.clone() {
+                None => p.check(&self.snapshot())?,
+                Some(speculative) => {
+                    if p.check(&speculative).is_err() {
+                        self.drain_group(w, Some(o))?;
+                        p.check(&self.snapshot())?;
+                    }
+                }
+            }
         }
         if let Some(m) = &o.message {
             crate::annotations::validate_message(m)?;
         }
         Ok(())
+    }
+
+    /// The error of a write that may have started from the speculative head of a group
+    /// commit, once it is known to rest on durable state: it waits until the commits in
+    /// flight are durable, and answers [`Error::Poisoned`] when their sync failed, so a
+    /// client is never told that a graph exists, or that its patch does not apply, because
+    /// of state that a failed sync took back. Errors that say nothing about the data pass
+    /// through at once.
+    pub(crate) fn after_refusal(&self, e: Error, o: Option<&crate::guard::WriteOptions>) -> Error {
+        let Some(group) = &self.group else {
+            return e;
+        };
+        if matches!(
+            e,
+            Error::Poisoned | Error::Cancelled | Error::Timeout | Error::WriterBusy
+        ) {
+            return e;
+        }
+        match group.drain(self, o) {
+            Ok(()) => e,
+            Err(_) if group.failed() => Error::Poisoned,
+            Err(drain) => drain,
+        }
     }
 
     fn drain_group(
@@ -3587,7 +3654,26 @@ impl Store {
         o: &crate::guard::WriteOptions,
         w: &WriterState,
     ) -> bool {
-        kind == CommitKind::Update && self.group_admission(kind, o, w)
+        Self::speculative_kind(kind)
+            && self.group_admission(kind, o, w)
+            // a guard that keeps one state only is told of each commit before the next is
+            // checked, which a speculative chain does not do
+            && self.guard().is_none_or(|g| g.speculative())
+    }
+
+    /// The writes whose result a caller sees only after the commit is acknowledged, so
+    /// that a transaction of this kind can start from the speculative head: SPARQL
+    /// Updates, Graph Store writes, uploads and RDF Patches.
+    fn speculative_kind(kind: CommitKind) -> bool {
+        matches!(
+            kind,
+            CommitKind::Update
+                | CommitKind::GspPut
+                | CommitKind::GspPost
+                | CommitKind::GspDelete
+                | CommitKind::Upload
+                | CommitKind::Patch
+        )
     }
 
     fn group_admission(
@@ -3615,23 +3701,12 @@ impl Store {
         }
         let first = if w.poisoned {
             Some(Poisoned)
-        } else if w.tap.is_some() {
-            Some(Compaction)
-        } else if !matches!(kind, CommitKind::Transaction | CommitKind::Update) {
+        } else if !(kind == CommitKind::Transaction || Self::speculative_kind(kind)) {
             Some(Kind)
-        } else if o.bypass_validation {
-            Some(Bypass)
-        } else if o.message.is_some() {
-            Some(Message)
-        } else if o.precondition.is_some() {
-            Some(Precondition)
-        } else if o.graphs.is_some() {
-            Some(Graphs)
-        } else if self.commit_digests() {
-            Some(Digests)
-        } else if self.guard_required() || self.guard.read().is_some() {
-            Some(Guard)
         } else if self.text_enabled() {
+            // the index follows each commit as it is published, which a group's
+            // coordinator does not do, and a build or recovery that installs a view under
+            // the writer lock must not meet a commit publishing an older one
             Some(Text)
         } else if self.geo.load().is_some() {
             Some(Geo)
@@ -5330,12 +5405,17 @@ impl WriteTxn<'_> {
                 crate::guard::Changes::Log(&self.log),
                 &self.opts,
                 head,
-            )?;
-            if grouped && validation.is_none() {
-                return self.publish_grouped();
-            }
+            );
+            let validation = match validation {
+                // A refusal is reported only when the state it was judged against is
+                // durable. If its fence fails instead, the write is refused as poisoned.
+                Err(e @ Error::Rejected(_)) if grouped => {
+                    return Err(self.store.after_refusal(e, Some(&self.opts)));
+                }
+                other => other?,
+            };
             if grouped {
-                self.store.drain_group(&mut self.guard, Some(&self.opts))?;
+                return self.publish_grouped(validation);
             }
             return self.publish_log(validation);
         }
@@ -6152,6 +6232,8 @@ pub(crate) struct ReplayFrom<'a> {
     pub path: &'a Path,
     /// the delta the generation's base holds (empty except for a linked generation)
     pub start: Delta,
+    /// the commits that have a record in `annotations.bin`, when the file can be read
+    pub annotated: Option<&'a std::collections::BTreeSet<u64>>,
 }
 
 /// What a WAL replay yields.
@@ -6303,6 +6385,25 @@ pub(crate) fn replay_wal(
                         (i + 1) * WAL_REC,
                         needs - 1
                     )));
+                }
+                // A commit of a group syncs its annotation together with its WAL records,
+                // and the kernel may write the records back first: after a crash, a commit
+                // that was not acknowledged can lack the annotation it asked for. It is
+                // then a torn tail like one that names terms the vocabulary lacks. When a
+                // later record shows the commit was durable, its fence synced the
+                // annotation as well, so the file lost it afterwards: the commit stays.
+                if let (Some(set), Some(Ok((seq, _, _, flags)))) = (from.annotated, &meta)
+                    && flags & commit::WAL_FLAG_ANNOTATED != 0
+                    && !set.contains(seq)
+                {
+                    if wal_torn_from(buf, i, next_seq(&out)) {
+                        break;
+                    }
+                    tracing::warn!(
+                        target: "sparkles::annotations",
+                        commit = *seq,
+                        "the annotation of a durable commit is missing from annotations.bin"
+                    );
                 }
                 let (mut ins, mut del) = (0i64, 0i64);
                 let touched: Vec<[Id; 4]> = if from.keep_touched {
