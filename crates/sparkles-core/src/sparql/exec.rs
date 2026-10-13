@@ -940,6 +940,21 @@ fn run_node(
             counters = Some(c);
             t
         }
+        Kind::AlgoCall(spec) => {
+            // the input when a source is a variable, then the nested pattern of edges
+            let reads_input = n.children.len() > spec.proj.pattern.is_some() as usize;
+            let input = match reads_input {
+                false => None,
+                true => Some(child(0, infos)?),
+            };
+            let edges = match spec.proj.pattern {
+                Some(_) => Some(child(n.children.len() - 1, infos)?),
+                None => None,
+            };
+            let (t, c) = super::algosvc::run(ctx, spec, input, edges, &n.vars)?;
+            counters = Some(c);
+            t
+        }
         Kind::HistoryChanges(spec) => {
             let input = match n.children.len() {
                 0 => None,

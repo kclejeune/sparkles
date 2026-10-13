@@ -156,10 +156,14 @@ impl PathSearchSpec {
 
 /// The parts of a search's block: the configuration triples (those with a `path:`
 /// predicate, list arguments taken out), and the rest, the pattern of the edges if any.
-fn split_block(inner: &GraphPattern) -> Result<(Vec<TriplePattern>, Option<GraphPattern>)> {
+pub(super) fn split_block(
+    inner: &GraphPattern,
+    ns: &str,
+    what: &str,
+) -> Result<(Vec<TriplePattern>, Option<GraphPattern>)> {
     // a FILTER of the block filters the pattern of the edges
     if let GraphPattern::Filter { expr, inner } = inner {
-        let (config, pattern) = split_block(inner)?;
+        let (config, pattern) = split_block(inner, ns, what)?;
         let Some(pattern) = pattern else {
             return Err(bad(
                 "a FILTER in the block needs a nested pattern of edges to filter",
@@ -190,7 +194,7 @@ fn split_block(inner: &GraphPattern) -> Result<(Vec<TriplePattern>, Option<Graph
             continue;
         };
         let mut patterns = patterns.clone();
-        let is_param = |t: &TriplePattern| matches!(&t.predicate, NamedNodePattern::NamedNode(n) if n.as_str().starts_with(NS));
+        let is_param = |t: &TriplePattern| matches!(&t.predicate, NamedNodePattern::NamedNode(n) if n.as_str().starts_with(ns));
         // a list argument's rdf:first / rdf:rest triples are part of its parameter
         let heads: Vec<TermPattern> = patterns
             .iter()
@@ -200,7 +204,7 @@ fn split_block(inner: &GraphPattern) -> Result<(Vec<TriplePattern>, Option<Graph
             .collect();
         let mut lists = Vec::new();
         for h in heads {
-            if let Some(items) = super::textpf::take_list(&mut patterns, &h, "path:search")? {
+            if let Some(items) = super::textpf::take_list(&mut patterns, &h, what)? {
                 lists.push((h, items));
             }
         }
@@ -250,7 +254,7 @@ fn list_term(items: &[TermPattern]) -> TermPattern {
 }
 
 /// The elements of a list kept by [`list_term`], or `None` when `t` is not one.
-fn list_items(t: &TermPattern) -> Option<Vec<TermPattern>> {
+pub(super) fn list_items(t: &TermPattern) -> Option<Vec<TermPattern>> {
     let mut items = Vec::new();
     let mut t = t;
     loop {
@@ -276,7 +280,7 @@ pub(super) fn path_search_leaf(
     inner: &GraphPattern,
     g: &ActiveGraph,
 ) -> Result<Node> {
-    let (patterns, edge_gp) = split_block(inner)?;
+    let (patterns, edge_gp) = split_block(inner, NS, "path:search")?;
     let patterns = &patterns;
     if patterns.is_empty() {
         return Err(bad("missing path:source and path:target"));

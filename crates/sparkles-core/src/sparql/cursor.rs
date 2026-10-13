@@ -1331,6 +1331,7 @@ fn ranked(kind: &Kind) -> bool {
             | Kind::SpatialKnn(_)
             | Kind::Service { .. }
             | Kind::PathSearch(_)
+            | Kind::AlgoCall(_)
     )
 }
 

@@ -104,6 +104,20 @@ impl Control {
         Ok(())
     }
 
+    /// Fail when `bytes` more would pass the limit, without holding them.
+    pub fn require(&self, bytes: u64) -> Result<()> {
+        let i = &self.inner;
+        let used = i.used.load(Ordering::Relaxed);
+        if used.saturating_add(bytes) > i.limit {
+            return Err(Error::BudgetExceeded(Budget {
+                kind: BudgetKind::Memory,
+                limit: i.limit,
+                requested: used.saturating_add(bytes),
+            }));
+        }
+        Ok(())
+    }
+
     /// Give back `bytes` of the memory charged.
     pub fn release(&self, bytes: u64) {
         let _ = self

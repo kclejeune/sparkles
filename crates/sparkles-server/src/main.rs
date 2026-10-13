@@ -122,6 +122,16 @@ struct Cli {
     /// per index generation, in MiB
     #[arg(long, global = true, default_value_t = 4096)]
     vector_memory_mb: u64,
+    /// Threads that graph algorithms (`SERVICE algo:…`) may use together, shared by all
+    /// calls (0: half the cores)
+    #[arg(long, global = true, default_value_t = 0)]
+    algo_threads: usize,
+    /// Threads one graph-algorithm call may take
+    #[arg(long, global = true, default_value_t = 4)]
+    algo_max_threads_per_call: usize,
+    /// Most nodes `algo:betweenness` runs on without `algo:samples`
+    #[arg(long, global = true, default_value_t = 100_000)]
+    algo_exact_betweenness_max: usize,
     /// Old index generations named snapshots may keep per dataset
     #[arg(long, global = true, default_value_t = 8)]
     history_max_generations: usize,
@@ -1888,6 +1898,8 @@ enum Cmd {
 
 fn store_opts(cli: &Cli) -> StoreOptions {
     sparkles::vector::set_budget(cli.vector_memory_mb << 20);
+    sparkles::algo::pool::configure(cli.algo_threads, cli.algo_max_threads_per_call);
+    sparkles::algo::pool::set_exact_betweenness_max(cli.algo_exact_betweenness_max);
     StoreOptions {
         cache_bytes: cli.cache_mb << 20,
         result_cache_bytes: cli.result_cache_mb << 20,

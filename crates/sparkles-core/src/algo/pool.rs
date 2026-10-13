@@ -14,6 +14,7 @@ use std::time::Duration;
 
 static CAPACITY: AtomicUsize = AtomicUsize::new(0);
 static PER_CALL: AtomicUsize = AtomicUsize::new(4);
+static EXACT_BETWEENNESS_MAX: AtomicUsize = AtomicUsize::new(100_000);
 
 struct Slots {
     in_use: Mutex<usize>,
@@ -32,6 +33,16 @@ pub fn configure(threads: usize, per_call: usize) {
     if per_call > 0 {
         PER_CALL.store(per_call, Ordering::Relaxed);
     }
+}
+
+/// Set the most nodes betweenness runs on without sampling (`--algo-exact-betweenness-max`).
+pub fn set_exact_betweenness_max(n: usize) {
+    EXACT_BETWEENNESS_MAX.store(n, Ordering::Relaxed);
+}
+
+/// The most nodes betweenness runs on without sampling.
+pub fn max_exact_betweenness() -> usize {
+    EXACT_BETWEENNESS_MAX.load(Ordering::Relaxed)
 }
 
 /// The threads all algorithm calls may use together.

@@ -362,6 +362,11 @@ fn write_node(n: &Node, ctx: &Ctx, s: &mut String) -> bool {
         }
         // the change log grows and retention trims it: not cached
         Kind::HistoryChanges(_) => false,
+        Kind::AlgoCall(spec) => {
+            // every parameter is in the spec, ids and variables included
+            let _ = write!(s, "{spec:?}");
+            true
+        }
         Kind::PathSearch(spec) => {
             // every parameter is in the spec, ids and variables included
             let _ = write!(s, "{spec:?}");

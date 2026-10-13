@@ -429,6 +429,9 @@ happens to materialized inferences, and the limits.
 | `--format-max-mb N` | `16` | Largest `POST /$/format` body; `0` means unlimited. |
 | `--format-timeout S` | `10` | Seconds a `POST /$/format` request may take, including the wait for a free slot (one per core). A slower request gets `408`. |
 | `--vector-memory-mb N` | `4096` | Memory for packed vectors and HNSW graphs (`spk:vectorSearch` and vector indexes), per index generation. A build past it leaves the index `over-budget`, and a search past it gets `507`. A global flag. |
+| `--algo-threads N` | half the cores | Threads that graph algorithms (`SERVICE algo:…`) may use together, shared by all calls. A call that asks for more than are free waits, and the wait counts against its timeout. A global flag. |
+| `--algo-max-threads-per-call N` | `4` | Threads one graph-algorithm call may take, whatever `algo:concurrency` asks for. A global flag. |
+| `--algo-exact-betweenness-max N` | `100000` | Most nodes `algo:betweenness` runs on without `algo:samples`. A larger projection is refused with a message that names the parameter. A global flag. |
 | `--text NAME[=FILE]` | | Enable full-text search for a dataset. `FILE` is a `text.json`-shaped configuration file. |
 | `--validate NAME[=FILE]` | | Set a dataset's write-time validation from `FILE`, a `PUT /$/validation/{ds}` body, or with `NAME` alone validate the dataset with the configuration it has. Shapes and schemas without inline text are read from the path in `source`, relative to `FILE`. The data is validated in full before the server listens, and the result is logged. A `reject` configuration the data does not pass stops the start ([API](API.md#write-time-validation)). |
 | `--rdfs NAME=FILE` | | Answer a dataset's queries over the RDFS closure of its graphs with respect to the schema in `FILE`, as Fuseki's `--rdfs` does. The setting is kept like one made with `PUT /$/rdfs/{ds}` ([API](API.md#rdfs-on-read)). |
