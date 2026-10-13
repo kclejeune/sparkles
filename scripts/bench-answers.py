@@ -41,8 +41,12 @@ to the engine.
 A query whose own ORDER BY uses only variables that the result projects also records
 `order`, a digest of the sequence of those key values in the returned order. Rows that tie
 on the keys have the same key values, so a correct engine gives the same sequence whatever
-it does with ties. ORDER BY with expressions, and ORDER BY inside subqueries, are not
-checked.
+it does with ties. The digest is recorded only for key columns whose order SPARQL defines.
+These hold IRIs, unbound values and one class of literal (strings, numbers, booleans,
+`xsd:dateTime` or `xsd:date`). A column with language-tagged strings, blank nodes, other
+datatypes or a mix of literal classes gets no digest. A mix of `xsd:dateTime` values with and
+without a time zone is not detected, although its order is partly undefined. ORDER BY with
+expressions, and ORDER BY inside subqueries, are not checked.
 
 The whole request, not each wait, is limited to MAX_TIME seconds (default 300). A slower
 answer is recorded as `error`.
@@ -426,6 +430,51 @@ def order_keys(query, head_vars):
     return keys
 
 
+# literal classes whose order SPARQL defines. xsd:date is outside the SPARQL 1.1 operator table, but
+# every compared engine orders it and BSBM query 8 sorts on it.
+LITERAL_CLASS = {XSD + "string": "str", XSD + "boolean": "bool", XSD + "dateTime": "dateTime",
+                 XSD + "date": "date"}
+
+
+def orderable(seq):
+    """Whether SPARQL defines the order of every key column of `seq`, a list of key tuples of
+    value-normalized terms. IRIs, unbound values and one class of literal are ordered, and a mix of
+    literal classes, language-tagged strings, blank nodes and other datatypes are not."""
+    for col in zip(*seq):
+        classes = set()
+        for t in col:
+            if t[0] in ("undef", "uri"):
+                continue
+            if t[0] == "num":
+                classes.add("num")
+            elif t[0] == "lit" and t[2] in LITERAL_CLASS:
+                classes.add(LITERAL_CLASS[t[2]])
+            else:
+                return False
+        if len(classes) > 1:
+            return False
+    return True
+
+
+def select_record(query, res, count_only):
+    """The answer record of a SELECT result in SPARQL JSON form."""
+    # variable order in the head is not part of a solution (engines differ)
+    vars_ = sorted(res["head"].get("vars", []))
+    bindings = res["results"]["bindings"]
+    rec = {"rows": len(bindings)}
+    if count_only:
+        return rec
+    for key, by_value in (("exact", False), ("value", True)):
+        rec[key] = canon(tuple(term(b.get(v), by_value) for v in vars_) for b in bindings)
+    keys = order_keys(query, vars_)
+    if keys:
+        seq = [tuple(term(b.get(v), True) for v in keys) for b in bindings]
+        if orderable(seq):
+            # the sequence of ORDER BY keys, which ties in the keys cannot change
+            rec["order"] = hashlib.sha256(repr(seq).encode()).hexdigest()[:16]
+    return rec
+
+
 def form(query):
     """select, ask, construct or describe: the first of these words outside IRIs and comments."""
     q = re.sub(r"#[^\n]*", "", re.sub(r"<[^<>\s]*>", "", query))
@@ -478,19 +527,7 @@ def main():
                 rec = {"rows": 1}
                 rec["exact"] = rec["value"] = digest([(bool(res["boolean"]),)])
             else:
-                # variable order in the head is not part of a solution (engines differ)
-                vars_ = sorted(res["head"].get("vars", []))
-                bindings = res["results"]["bindings"]
-                rec = {"rows": len(bindings)}
-                if not count_only:
-                    for key, by_value in (("exact", False), ("value", True)):
-                        rec[key] = canon(tuple(term(b.get(v), by_value) for v in vars_) for b in bindings)
-                    keys = order_keys(query, vars_)
-                    if keys:
-                        seq = [tuple(term(b.get(v), True) for v in keys) for b in bindings]
-                        if not any(t[0] == "bnode" for row in seq for t in row):
-                            # the sequence of ORDER BY keys, which ties in the keys cannot change
-                            rec["order"] = hashlib.sha256(repr(seq).encode()).hexdigest()[:16]
+                rec = select_record(query, res, count_only)
     except Exception as e:  # noqa: BLE001 - any failure is recorded, not raised
         rec = {"rows": "error", "error": str(e)[:200]}
     d = {}

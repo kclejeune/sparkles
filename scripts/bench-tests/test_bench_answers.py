@@ -109,6 +109,48 @@ class OrderTests(unittest.TestCase):
         self.assertIsNone(ba.order_keys("SELECT * { ?s ?p ?o }", ["s", "p", "o"]))
 
 
+def result(vars_, *rows):
+    """A SPARQL JSON result with one binding per row of (variable-ordered) term dicts."""
+    return {"head": {"vars": list(vars_)},
+            "results": {"bindings": [dict(zip(vars_, r)) for r in rows]}}
+
+
+def lit(v, dt=None, lang=None):
+    t = {"type": "literal", "value": v}
+    if dt:
+        t["datatype"] = ba.XSD + dt
+    if lang:
+        t["xml:lang"] = lang
+    return t
+
+
+class OrderableTests(unittest.TestCase):
+    def test_iri_keys_get_an_order_digest(self):
+        res = result(["x"], [u("urn:b")], [u("urn:a")])
+        self.assertIn("order", ba.select_record("SELECT ?x { ?s ?p ?x } ORDER BY ?x", res, False))
+
+    def test_language_tagged_keys_do_not(self):
+        res = result(["x"], [lit("a", lang="en")], [lit("b", lang="en")])
+        self.assertNotIn("order", ba.select_record("SELECT ?x { ?s ?p ?x } ORDER BY ?x", res, False))
+
+    def test_mixed_literal_classes_do_not(self):
+        res = result(["x"], [lit("1", "integer")], [lit("a")])
+        self.assertNotIn("order", ba.select_record("SELECT ?x { ?s ?p ?x } ORDER BY ?x", res, False))
+
+    def test_unknown_datatypes_and_blank_nodes_do_not(self):
+        q = "SELECT ?x { ?s ?p ?x } ORDER BY ?x"
+        self.assertNotIn("order", ba.select_record(q, result(["x"], [lit("a", "anyURI")]), False))
+        self.assertNotIn("order", ba.select_record(q, result(["x"], [b("n")]), False))
+
+    def test_iris_mix_with_one_literal_class_and_unbound(self):
+        res = result(["x"], [u("urn:a")], [lit("a")], [lit("b", "string")])
+        self.assertIn("order", ba.select_record("SELECT ?x { ?s ?p ?x } ORDER BY ?x", res, False))
+        res = result(["x", "y"], [u("urn:a"), lit("2024-01-01", "date")], [lit("b"), lit("x")])
+        self.assertNotIn("order", ba.select_record("SELECT ?x ?y { ?s ?p ?x } ORDER BY ?x ?y", res, False))
+        res = {"head": {"vars": ["x"]}, "results": {"bindings": [{}, {"x": u("urn:a")}]}}
+        self.assertIn("order", ba.select_record("SELECT ?x { ?s ?p ?x } ORDER BY ?x", res, False))
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
