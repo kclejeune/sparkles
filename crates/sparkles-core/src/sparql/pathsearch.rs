@@ -825,10 +825,17 @@ impl Tree {
 
     /// The paths between the root and `m` through the recorded parents, at most `cap`,
     /// each in path order.
-    fn paths(&self, m: u64, all: bool, cap: usize) -> Vec<Vec<Edge>> {
+    fn paths(
+        &self,
+        m: u64,
+        all: bool,
+        cap: usize,
+        cost: Option<&FxHashMap<u64, f64>>,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<Vec<Vec<Edge>>> {
         let mut out = Vec::new();
         if cap == 0 || !self.contains(m) {
-            return out;
+            return Ok(out);
         }
         let mut stack: Vec<(u64, usize)> = vec![(m, 0)];
         let mut links: Vec<(u64, Parent)> = Vec::new();
@@ -836,7 +843,12 @@ impl Tree {
         // on the path is skipped
         let mut on: FxHashSet<u64> = FxHashSet::default();
         on.insert(m);
+        let mut steps = 0u64;
         while let Some(top) = stack.last_mut() {
+            steps += 1;
+            if steps.is_multiple_of(4096) {
+                check()?;
+            }
             let x = top.0;
             if x == self.root {
                 let edges: Vec<Edge> = if self.forward {
@@ -874,6 +886,7 @@ impl Tree {
             top.1 += 1;
             match self.parent_at(x, i, all) {
                 Some(q) if on.contains(&q.node) && q.node != self.root => {}
+                Some(q) if !self.escapes(x, q.node, &on, cost, all) => {}
                 Some(q) => {
                     links.push((x, q));
                     stack.push((q.node, 0));
@@ -886,7 +899,55 @@ impl Tree {
                 }
             }
         }
-        out
+        Ok(out)
+    }
+
+    /// Whether parent `q` of `x` reaches the root through recorded parents without a
+    /// node of `on`. Costs never rise toward the root, so only a parent of the same
+    /// cost as `x` can fail: a cheaper one reaches the root through its first parents.
+    fn escapes(
+        &self,
+        x: u64,
+        q: u64,
+        on: &FxHashSet<u64>,
+        cost: Option<&FxHashMap<u64, f64>>,
+        all: bool,
+    ) -> bool {
+        let Some(cost) = cost else { return true };
+        if q == self.root {
+            return true;
+        }
+        let (Some(&c), Some(&cq)) = (cost.get(&x), cost.get(&q)) else {
+            return true;
+        };
+        if cq < c {
+            return true;
+        }
+        let mut seen: FxHashSet<u64> = FxHashSet::default();
+        seen.insert(q);
+        let mut todo = vec![q];
+        while let Some(z) = todo.pop() {
+            let mut i = 0;
+            while let Some(p) = self.parent_at(z, i, all) {
+                i += 1;
+                let y = p.node;
+                if y == self.root {
+                    return true;
+                }
+                if on.contains(&y) {
+                    continue;
+                }
+                match cost.get(&y) {
+                    Some(&cy) if cy < c => return true,
+                    None => return true,
+                    _ => {}
+                }
+                if seen.insert(y) {
+                    todo.push(y);
+                }
+            }
+        }
+        false
     }
 }
 
@@ -1493,8 +1554,8 @@ impl<'a> Engine<'a> {
                 if left == 0 {
                     break;
                 }
-                let fp = f.paths(m, all, left);
-                let bp = b.paths(m, all, left);
+                let fp = f.paths(m, all, left, None, &|| self.ctx.check())?;
+                let bp = b.paths(m, all, left, None, &|| self.ctx.check())?;
                 'combine: for a in &fp {
                     for z in &bp {
                         let mut e: Vec<Edge> = a.iter().chain(z).copied().collect();
@@ -1710,7 +1771,10 @@ impl<'a> Engine<'a> {
             let Some(&c) = dist.get(&to) else {
                 return Ok(None);
             };
-            return Ok(tree.paths(to, false, 1).pop().map(|p| (p, c)));
+            return Ok(tree
+                .paths(to, false, 1, None, &|| self.ctx.check())?
+                .pop()
+                .map(|p| (p, c)));
         }
         // bidirectional breadth-first search around the banned nodes and edges
         let bans = Bans {
@@ -2102,8 +2166,8 @@ pub fn run(
                 }
                 eng.begin();
                 let close = targets.any || tset.contains(&s);
-                let tree = if weighted {
-                    eng.dijkstra(
+                let (tree, cost) = if weighted {
+                    let (tree, cost) = eng.dijkstra(
                         s,
                         true,
                         (!targets.any).then_some(&tset),
@@ -2112,10 +2176,11 @@ pub fn run(
                         None,
                         None,
                         s,
-                    )?
-                    .0
+                    )?;
+                    (tree, Some(cost))
                 } else {
-                    eng.bfs(s, true, (!targets.any).then_some(&tset), all, close)?
+                    let tree = eng.bfs(s, true, (!targets.any).then_some(&tset), all, close)?;
+                    (tree, None)
                 };
                 // every node reached, nearest first, or the targets in id order
                 let mut ends: Vec<u64> = if targets.any {
@@ -2145,7 +2210,8 @@ pub fn run(
                         }
                         continue;
                     }
-                    for p in tree.paths(m, all, if all { cap(&eng) } else { 1 }) {
+                    let n = if all { cap(&eng) } else { 1 };
+                    for p in tree.paths(m, all, n, cost.as_ref(), &|| eng.ctx.check())? {
                         let p = p
                             .into_iter()
                             .map(|e| e.map(|x| if x == VIRT { s } else { x }))
@@ -2218,10 +2284,12 @@ pub fn run(
                         "path:maxLength with path:weight needs a bound source in the shortest modes",
                     ));
                 }
-                let tree = if weighted {
-                    eng.dijkstra(t, false, None, all, true, None, None, t)?.0
+                let (tree, cost) = if weighted {
+                    let (tree, cost) = eng.dijkstra(t, false, None, all, true, None, None, t)?;
+                    (tree, Some(cost))
                 } else {
-                    eng.bfs(t, false, None, all, true)?
+                    let tree = eng.bfs(t, false, None, all, true)?;
+                    (tree, None)
                 };
                 if spec.min_len == 0 && !add(&mut found, t, t, Vec::new(), None, false)? {
                     break 'targets;
@@ -2247,7 +2315,8 @@ pub fn run(
                         }
                         continue;
                     }
-                    for p in tree.paths(m, all, if all { cap(&eng) } else { 1 }) {
+                    let n = if all { cap(&eng) } else { 1 };
+                    for p in tree.paths(m, all, n, cost.as_ref(), &|| eng.ctx.check())? {
                         let p = p
                             .into_iter()
                             .map(|e| e.map(|x| if x == VIRT { t } else { x }))

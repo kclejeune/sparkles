@@ -613,7 +613,14 @@ keep their earlier behaviour. The regression test `all_shortest_over_zero_weight
 in `crates/sparkles-core/tests/path_search.rs` covers A-Z1 and A-Z2 with names that put
 the target before and after the middle node in the dictionary, and with an unbound
 target. The weighted differential test now draws zero weights too and runs 40 graphs
-instead of 6.
+instead of 6. A review found that the walk over recorded parents could explore
+exponentially many dead branches when a zero-weight cycle lies beyond the target, since
+those branches can only return through a node already on the path. `Tree::paths` now
+follows a parent of the same cost only when that parent reaches the root through parents
+off the path. A cheaper parent always does. The walk also checks the query's deadline and
+cancellation every 4096 steps, which bounds a search whose real paths are too many. The
+tests are `all_shortest_prunes_a_zero_weight_cycle_behind_the_target` and
+`all_shortest_path_enumeration_honours_the_timeout`.
 
 **Cypher integration** (with item 20, Tier 3, [F01](F01-cypher.md)). Phase 3, the Cypher frontend's use of this operator for
 `shortestPath` and `allShortestPaths`, waits for [F01](F01-cypher.md). Nothing in the

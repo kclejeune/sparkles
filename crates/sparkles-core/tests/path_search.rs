@@ -8,6 +8,7 @@ use sparkles_core::sparql::{QueryOptions, query};
 use sparkles_core::store::{Store, StoreOptions};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 const PREFIXES: &str = "PREFIX ex: <http://ex/> PREFIX path: <urn:x-sparkles:path#> ";
 
@@ -518,6 +519,79 @@ fn all_shortest_over_zero_weight_edges() {
             .collect();
         assert_eq!(to_t.len(), 2, "{m} {t} with an unbound target");
     }
+}
+
+/// `s -> a -> t` of weight 1, and a zero-weight clique of `n` nodes joined to `t`.
+fn clique_behind_target(n: usize) -> String {
+    let mut ttl = String::from("ex:s ex:p ex:a {| ex:w 1 |} . ex:a ex:p ex:t {| ex:w 1 |} . ");
+    for i in 0..n {
+        ttl += &format!("ex:t ex:p ex:c{i} {{| ex:w 0 |}} . ex:c{i} ex:p ex:t {{| ex:w 0 |}} . ");
+        for j in (0..n).filter(|&j| j != i) {
+            ttl += &format!("ex:c{i} ex:p ex:c{j} {{| ex:w 0 |}} . ");
+        }
+    }
+    ttl
+}
+
+#[test]
+fn all_shortest_prunes_a_zero_weight_cycle_behind_the_target() {
+    let s = store_of(&clique_behind_target(10));
+    let params = "path:source ex:s ; path:target ex:t ; path:weight ex:w ; \
+                  path:algorithm path:allShortest";
+    let opts = QueryOptions {
+        timeout: Some(Duration::from_secs(1)),
+        ..Default::default()
+    };
+    let q = format!(
+        "{PREFIXES}SELECT ?path WHERE {{ SERVICE path:search {{ [] {params} ; path:limit 2 ; \
+         path:pathIndex ?path }} }}"
+    );
+    let r = query(s.snapshot(), &q, &opts).expect("the search finishes inside its deadline");
+    assert_eq!(r.rows().len(), 1);
+    assert_eq!(sequences(&s, params), BTreeSet::from(["s a t".to_string()]));
+    // with an unbound target the clique's paths are real output, and pruning keeps them
+    let s = store_of(&clique_behind_target(4));
+    let r = rows(
+        &s,
+        "SELECT ?t ?path WHERE { SERVICE path:search { [] path:source ex:s ; \
+         path:weight ex:w ; path:algorithm path:allShortest ; path:target ?t ; \
+         path:pathIndex ?path } }",
+    );
+    let mut per: BTreeMap<String, usize> = BTreeMap::new();
+    for x in &r {
+        *per.entry(x["t"].clone()).or_default() += 1;
+    }
+    assert_eq!(per["t"], 1);
+    assert_eq!(per["a"], 1);
+    for i in 0..4 {
+        assert_eq!(per[&format!("c{i}")], 16, "c{i}");
+    }
+}
+
+#[test]
+fn all_shortest_path_enumeration_honours_the_timeout() {
+    let s = store_of(&clique_behind_target(9));
+    let opts = QueryOptions {
+        timeout: Some(Duration::from_millis(200)),
+        ..Default::default()
+    };
+    let started = Instant::now();
+    let r = query(
+        s.snapshot(),
+        &format!(
+            "{PREFIXES}SELECT (COUNT(*) AS ?n) WHERE {{ SERVICE path:search {{ [] \
+             path:source ex:s ; path:weight ex:w ; path:algorithm path:allShortest ; \
+             path:target ?t ; path:pathIndex ?path }} }}"
+        ),
+        &opts,
+    );
+    let err = r.err().expect("the enumeration is cut off").to_string();
+    assert!(err.contains("timed out"), "{err}");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
 }
 
 #[test]
