@@ -650,7 +650,14 @@ compared with the older registry lookup.
   is not built.
 
 **Smoke runs.** SP²Bench at 50k, LUBM(1) and BSBM with 2000 products ran end to end with
-Sparkles alone on a development machine. SP²Bench at 50k also ran with all five engines.
+Sparkles alone on a development machine. SP²Bench at 50k also ran with all five engines,
+with a 20 second request timeout, on a machine that was compiling at the same time, so its
+times mean nothing. The run showed what the harness is for. Oxigraph and QLever returned
+other answers than the majority for several queries (q4, q5a, q5b, q6 and q8) and were
+marked and left out of the ranking, and Jena, Fluree and Oxigraph timed out on some
+queries and were recorded as `timeout`. The causes of the disagreements have not been
+looked into. Sparkles was slow on q5a and q12a at this size, which a run on the reference
+host should confirm before it is listed under "Where Sparkles loses".
 
 **Left for Phase 1.**
 
