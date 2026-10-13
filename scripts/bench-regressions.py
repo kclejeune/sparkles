@@ -13,7 +13,8 @@ paired by suite, scale, engine, query, mode and clients. The tool prints the rat
 medians and whether the sample ranges overlap. A query of the compared engine (Sparkles by
 default) is a regression when its median is more than 10% slower and the ranges do not
 overlap, or more than 5% slower in two consecutive comparisons of a chain of three or more
-records. A changed answer hash is always reported. The exit status is 1 when anything was
+records. Throughput results (`qmph` and `qps`) have no samples, so they are
+compared by ratio, higher being better, with the same two thresholds. A changed answer hash is always reported. The exit status is 1 when anything was
 reported.
 """
 
@@ -68,6 +69,21 @@ def compare_main(argv):
                 findings.append(f'ANSWER CHANGED {label}: {oa.get("rows")} rows -> {na.get("rows")} rows')
             if o.get('status') == 'ok' and n.get('status') != 'ok':
                 findings.append(f'STATUS {label}: ok -> {n.get("status")}')
+            ot, nt = o.get('qmph') or o.get('qps'), n.get('qmph') or n.get('qps')
+            if ot and nt:
+                # throughput: higher is better and there are no samples, so only the thresholds apply
+                unit = 'QMpH' if o.get('qmph') else 'qps'
+                ratio = nt / ot
+                rows.append((label + f' ({unit})', ot, nt, ratio, 'n/a'))
+                if k[2] == a.engine:
+                    loss = 1 - ratio
+                    repeat = loss > a.repeat_threshold and slower_before.get(k, False)
+                    if loss > a.threshold or repeat:
+                        why = (f'more than {a.threshold:.0%} lower' if loss > a.threshold
+                               else f'more than {a.repeat_threshold:.0%} lower in two consecutive comparisons')
+                        findings.append(f'REGRESSION {label}: {ot:.1f} -> {nt:.1f} {unit} ({ratio:.2f}x, {why})')
+                    slower_before[k] = loss > a.repeat_threshold
+                continue
             om, nm = o.get('median_ms'), n.get('median_ms')
             if not om or not nm:
                 continue
@@ -87,7 +103,7 @@ def compare_main(argv):
             slower_before[k] = slower > a.repeat_threshold
         for k in set(slower_before) - set(inew):
             del slower_before[k]
-        print(f'{"result":<46} {"old ms":>10} {"new ms":>10} {"ratio":>7} overlap')
+        print(f'{"result":<46} {"old":>10} {"new":>10} {"ratio":>7} overlap')
         for label, om, nm, ratio, overlap in rows:
             if a.all or abs(ratio - 1) > 0.02:
                 print(f'{label:<46} {om:>10.2f} {nm:>10.2f} {ratio:>7.2f} {overlap}')

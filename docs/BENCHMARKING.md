@@ -274,7 +274,9 @@ and comparison methodology. [DEVELOPMENT.md](DEVELOPMENT.md) covers building and
   engine, query, mode and clients. For every pair it prints the ratio of the medians and
   whether the sample ranges overlap. A Sparkles result is a regression when its median is
   more than 10% slower and the ranges do not overlap, or when it is more than 5% slower in
-  two comparisons in a row. A changed answer fingerprint and a result that stopped being
+  two comparisons in a row. Throughput results (`qmph` and `qps`) have no samples, so they
+  are compared by ratio with the same two thresholds, and a drop is the bad direction. A
+  changed answer fingerprint and a result that stopped being
   `ok` are always reported. The exit status is 1 when anything is reported, so a
   refresh script can stop on it. `mise run test:bench-scripts` runs the tests of both tools.
 * `scripts/nsc-bench.sh A B` (`mise run bench:nsc A B`) compares the query times of two

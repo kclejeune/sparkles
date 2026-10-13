@@ -229,6 +229,30 @@ class CompareTests(unittest.TestCase):
         self.assertEqual(p.returncode, 1, p.stdout)
         self.assertIn("two consecutive", p.stdout)
 
+    def qmph_record(self, name, qmph, qps=None):
+        rec = {"record": 1, "suite": "t", "scale": "s", "manifest": {}, "settings": {}, "results": [
+            {"engine": "sparkles", "query": "mix", "mode": "qmph", "clients": 4, "durability": None,
+             "samples_ms": [], "median_ms": None, "p95_ms": None, "answer": None, "status": "ok", "qmph": qmph},
+            {"engine": "sparkles", "query": "star", "mode": "throughput", "clients": 16, "durability": None,
+             "samples_ms": [], "median_ms": None, "p95_ms": None, "answer": None, "status": "ok", "qps": qps or 100.0}]}
+        path = os.path.join(self.tmp.name, name + ".json")
+        write_path(path, rec)
+        return path
+
+    def test_throughput_drop_is_a_regression_and_a_rise_is_not(self):
+        a = self.qmph_record("qa", 10000.0)
+        p = self.compare(a, self.qmph_record("qb", 8500.0))
+        self.assertEqual(p.returncode, 1, p.stdout)
+        self.assertIn("REGRESSION sparkles mix qmph x4: 10000.0 -> 8500.0 QMpH", p.stdout)
+        self.assertEqual(self.compare(a, self.qmph_record("qc", 12000.0)).returncode, 0)
+        self.assertEqual(self.compare(a, self.qmph_record("qd", 9400.0)).returncode, 0)
+
+    def test_two_small_throughput_drops_in_a_row(self):
+        a, b, c = self.qmph_record("qa", 10000.0), self.qmph_record("qb", 9400.0), self.qmph_record("qc", 8800.0)
+        p = self.compare(a, b, c)
+        self.assertEqual(p.returncode, 1, p.stdout)
+        self.assertIn("two consecutive", p.stdout)
+
     def test_changed_answer_hash(self):
         a, b = self.rec("a"), self.rec("b", wrong=True)
         p = self.compare(a, b)
