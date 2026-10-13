@@ -349,13 +349,16 @@ load_all() {
 # queries/<name>.rq), RES (the results directory) and selected <name> before calling these.
 # qform <file>: select, ask, construct or describe (the first of these words outside IRIs and comments)
 qform() { sed -e 's/<[^<>[:space:]]*>//g' -e 's/#.*//' "$1" | grep -ioE '\b(select|construct|describe|ask)\b' | head -1 | tr '[:upper:]' '[:lower:]'; }
-q() { # curl command for endpoint + query name (fails on HTTP errors); the answer format follows the query form
-  local accept=text/tab-separated-values
-  case "$(qform "queries/$2.rq")" in
-    ask) accept=application/sparql-results+json ;;
-    construct | describe) accept=application/n-triples ;;
+# accept_of <query name>: the result format a timed request asks for, by the query form
+accept_of() {
+  case "$(qform "queries/$1.rq")" in
+    ask) echo application/sparql-results+json ;;
+    construct | describe) echo application/n-triples ;;
+    *) echo text/tab-separated-values ;;
   esac
-  echo "curl -sf --max-time ${MAX_TIME:-300} -o /dev/null -H 'Accept: $accept' --data-urlencode query@queries/$2.rq $1"
+}
+q() { # curl command for endpoint + query name (fails on HTTP errors)
+  echo "curl -sf --max-time ${MAX_TIME:-300} -o /dev/null -H 'Accept: $(accept_of "$2")' --data-urlencode query@queries/$2.rq $1"
 }
 # hyperfine arguments for every selected engine: engine_args <command-fn>
 engine_args() { for e in $ENGINES; do printf '%s\0' --command-name "${NAME[$e]}" "$($1 "$e")"; done; }
@@ -431,7 +434,7 @@ cold() {
       start "$e"
       ready+=("${READY_S[$e]}")
       # curl prints the time even when the request fails, so a failure replaces it
-      if ! t=$(curl -sf --max-time "${MAX_TIME:-300}" -o /dev/null -w '%{time_total}' -H 'Accept: text/tab-separated-values' \
+      if ! t=$(curl -sf --max-time "${MAX_TIME:-300}" -o /dev/null -w '%{time_total}' -H "Accept: $(accept_of "$n")" \
         --data-urlencode "query@queries/$n.rq" "${URL[$e]}"); then
         t=error
       fi

@@ -222,5 +222,36 @@ class CompareTests(unittest.TestCase):
         self.assertEqual(self.compare(a, b, **{"no-fail": True}).returncode, 0)
 
 
+class LibTests(unittest.TestCase):
+    """Shell functions of scripts/bench-lib.sh, called through bash."""
+
+    def bash(self, queries, script):
+        with tempfile.TemporaryDirectory() as d:
+            os.mkdir(os.path.join(d, "queries"))
+            for name, text in queries.items():
+                write_text(os.path.join(d, "queries", name + ".rq"), text)
+            env = dict(os.environ, ROOT=os.path.dirname(SCRIPTS), WORK=d, ENGINES="sparkles")
+            lib = os.path.join(SCRIPTS, "bench-lib.sh")
+            p = subprocess.run(["bash", "-c", f'source "{lib}"; {script}'], cwd=d, env=env,
+                               capture_output=True, text=True)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            return p.stdout.strip()
+
+    def test_accept_follows_the_query_form(self):
+        qs = {"s": "PREFIX a: <http://x/select#> SELECT * { ?s ?p ?o }", "a": "# ask\nASK { ?s ?p ?o }",
+              "c": "CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }", "d": "DESCRIBE <http://x/>"}
+        out = self.bash(qs, "for n in s a c d; do accept_of $n; done")
+        self.assertEqual(out.split(), ["text/tab-separated-values", "application/sparql-results+json",
+                                       "application/n-triples", "application/n-triples"])
+
+    def test_timed_request_and_cold_request_ask_for_the_same_format(self):
+        qs = {"a": "ASK { ?s ?p ?o }"}
+        out = self.bash(qs, "q localhost:1/x a")
+        self.assertIn("Accept: application/sparql-results+json", out)
+        with open(os.path.join(SCRIPTS, "bench-lib.sh")) as f:
+            lib = f.read()
+        self.assertIn('-H "Accept: $(accept_of "$n")"', lib)
+
+
 if __name__ == "__main__":
     unittest.main()
