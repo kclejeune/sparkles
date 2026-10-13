@@ -34,7 +34,7 @@ suite_manifest() {
 
 suite_time() {
   local n
-  # clears QLever's result cache before every run (a no-op without QLever)
+  # clears QLever's result cache before every run (a no-op without QLever); ENGINES is one engine here
   local clear=true
   has qlever && clear="curl -sf -o /dev/null 'localhost:${PORT[qlever]}/?cmd=clear-cache&access-token=bench'"
   for n in "${NAMES[@]}"; do
@@ -66,11 +66,20 @@ suite_run() {
   [ -n "${SKIP_LOAD:-}" ] || load_all
   start_all
   answer_check
-  if [ -z "${ANSWERS_ONLY:-}" ]; then
-    suite_time
-    if declare -F "${SUITE_EXTRA:-}" > /dev/null; then "$SUITE_EXTRA"; fi
-  fi
   stop_all
+  if [ -z "${ANSWERS_ONLY:-}" ]; then
+    # Each engine runs alone for the timings (docs/specs/X06 section 5.3). The answer check
+    # above may keep every server up, since it measures no time.
+    local all=$ENGINES e
+    for e in $all; do
+      ENGINES=$e
+      start "$e"
+      suite_time
+      if declare -F "${SUITE_EXTRA:-}" > /dev/null; then "$SUITE_EXTRA"; fi
+      stop "$e"
+    done
+    ENGINES=$all
+  fi
   if [ -z "${ANSWERS_ONLY:-}" ] && [ "$COLD_RUNS" -gt 0 ]; then
     local e
     for e in $ENGINES; do cold "$e"; done

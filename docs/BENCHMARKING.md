@@ -177,7 +177,10 @@ and comparison methodology. [DEVELOPMENT.md](DEVELOPMENT.md) covers building and
   `scripts/bench-suite-lib.sh`. Each one prepares pinned data and a fixed query set. The
   shared code then loads the data into every engine, starts the servers, checks every
   answer, times each query with hyperfine, and writes the run manifest, the result record
-  and `results/summary.md`. The options are the ones of `scripts/bench.sh`, which are
+  and `results/summary.md`. The answer check runs with every server up. After it, the
+  script stops them all and then starts, times and stops one engine at a time, so each
+  engine's queries and query mixes run with no other server running. The options are the
+  ones of `scripts/bench.sh`, which are
   `ENGINES`, `QUERIES`, `RUNS`, `WARMUP`, `SKIP_LOAD`, `ANSWERS_ONLY`, `PORT_BASE`,
   `SERVER_MEM_MAX` and `CLIENT_CPU`. `COLD_RUNS=3` adds the cold measurement, a restart
   with an evicted page cache before each sample. The suites default to the ports from
