@@ -777,14 +777,79 @@ pub(crate) fn next_uid() -> u64 {
     UID.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Process-wide cache of decoded blocks, weighted by bytes.
-/// Cache of decoded block columns, keyed by (permutation instance, block, column):
-/// readers decode and keep only the columns they use.
-/// Decoded columns by (permutation instance, block, column).
-type ColumnCache = quick_cache::sync::Cache<(u64, u32, u8), Arc<[u64]>, BlockWeighter>;
+/// Cache of decoded block columns, keyed by (permutation instance, block, column and
+/// namespace): readers decode and keep only the columns they use.
+///
+/// The third key field holds the column in its low 8 bits and the namespace of the
+/// store that decoded it above them. A permutation instance (`uid`) is unique in the
+/// process, so the namespace only attributes an entry to a dataset. It never separates
+/// entries that would otherwise collide.
+type ColumnCache = quick_cache::sync::Cache<(u64, u32, u32), Arc<[u64]>, BlockWeighter>;
 
+/// The decoded-column storage that stores can share. A server holds one for all its
+/// datasets, and each store reads through its own [`BlockCache`] view of it.
+pub struct SharedBlocks {
+    cache: Arc<ColumnCache>,
+}
+
+/// What one namespace holds in a shared cache.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NamespaceUsage {
+    pub bytes: u64,
+    pub entries: u64,
+}
+
+impl SharedBlocks {
+    pub fn new(bytes: u64) -> SharedBlocks {
+        SharedBlocks {
+            cache: Arc::new(new_column_cache(bytes)),
+        }
+    }
+
+    /// The bytes the cache may hold.
+    pub fn capacity(&self) -> u64 {
+        self.cache.capacity()
+    }
+
+    /// The bytes it holds now, for all namespaces.
+    pub fn bytes(&self) -> u64 {
+        self.cache.weight()
+    }
+
+    pub fn entries(&self) -> usize {
+        self.cache.len()
+    }
+
+    /// Bytes and entries by namespace, in one pass over the cache.
+    pub fn usage(&self) -> std::collections::HashMap<u32, NamespaceUsage> {
+        let mut out: std::collections::HashMap<u32, NamespaceUsage> = Default::default();
+        for ((_, _, c), v) in self.cache.iter() {
+            let u = out.entry(c >> 8).or_default();
+            u.bytes += (v.len() * 8).max(1) as u64;
+            u.entries += 1;
+        }
+        out
+    }
+}
+
+fn new_column_cache(bytes: u64) -> ColumnCache {
+    quick_cache::sync::Cache::with_weighter(
+        (bytes / (BLOCK_ROWS as u64 * 8)).max(64) as usize,
+        bytes,
+        BlockWeighter,
+    )
+}
+
+/// A store's view of the cache of decoded block columns. Hits and misses are the view's
+/// own. A view made by [`BlockCache::new`] owns its storage, and a view made by
+/// [`BlockCache::attach`] shares it with the other views of a [`SharedBlocks`].
 pub struct BlockCache {
     cache: Arc<ColumnCache>,
+    /// the namespace in the keys of the entries this view decodes
+    ns: u32,
+    /// the storage is shared with other views, so `bytes` and `entries` count the
+    /// namespace's entries only
+    shared: bool,
     hits: std::sync::atomic::AtomicU64,
     misses: std::sync::atomic::AtomicU64,
     /// decoded blocks are added (false: a read-through view, see [`BlockCache::read_through`])
@@ -793,8 +858,8 @@ pub struct BlockCache {
 
 #[derive(Clone)]
 struct BlockWeighter;
-impl quick_cache::Weighter<(u64, u32, u8), Arc<[u64]>> for BlockWeighter {
-    fn weight(&self, _k: &(u64, u32, u8), v: &Arc<[u64]>) -> u64 {
+impl quick_cache::Weighter<(u64, u32, u32), Arc<[u64]>> for BlockWeighter {
+    fn weight(&self, _k: &(u64, u32, u32), v: &Arc<[u64]>) -> u64 {
         (v.len() * 8).max(1) as u64
     }
 }
@@ -805,13 +870,24 @@ fn empty_col() -> Arc<[u64]> {
 }
 
 impl BlockCache {
+    /// A cache of its own, of at most `bytes`.
     pub fn new(bytes: u64) -> BlockCache {
         BlockCache {
-            cache: Arc::new(quick_cache::sync::Cache::with_weighter(
-                (bytes / (BLOCK_ROWS as u64 * 8)).max(64) as usize,
-                bytes,
-                BlockWeighter,
-            )),
+            cache: Arc::new(new_column_cache(bytes)),
+            ns: 0,
+            shared: false,
+            hits: Default::default(),
+            misses: Default::default(),
+            fill: true,
+        }
+    }
+
+    /// A view of `shared` whose entries belong to namespace `ns` (at most 2^24 - 1).
+    pub fn attach(shared: &SharedBlocks, ns: u32) -> BlockCache {
+        BlockCache {
+            cache: shared.cache.clone(),
+            ns: ns & 0xff_ffff,
+            shared: true,
             hits: Default::default(),
             misses: Default::default(),
             fill: true,
@@ -824,6 +900,8 @@ impl BlockCache {
     pub fn read_through(&self) -> BlockCache {
         BlockCache {
             cache: self.cache.clone(),
+            ns: self.ns,
+            shared: self.shared,
             hits: Default::default(),
             misses: Default::default(),
             fill: false,
@@ -842,7 +920,7 @@ impl BlockCache {
             if mask & (1 << c) == 0 {
                 continue;
             }
-            let key = (idx.uid, b as u32, c as u8);
+            let key = (idx.uid, b as u32, self.ns << 8 | c as u32);
             *col = match self.cache.get(&key) {
                 Some(v) => {
                     self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -869,15 +947,45 @@ impl BlockCache {
     /// decoding them or counting a hit or miss.
     pub fn has_cols(&self, idx: &PermIndex, b: usize, mask: ColMask) -> bool {
         (0..4).all(|c| {
-            mask & (1 << c) == 0 || self.cache.peek(&(idx.uid, b as u32, c as u8)).is_some()
+            mask & (1 << c) == 0
+                || self
+                    .cache
+                    .peek(&(idx.uid, b as u32, self.ns << 8 | c as u32))
+                    .is_some()
         })
     }
 
+    /// The bytes this view's namespace holds. A cache of its own counts all its entries.
     pub fn bytes(&self) -> u64 {
-        self.cache.weight()
+        if !self.shared {
+            return self.cache.weight();
+        }
+        self.usage().bytes
     }
+    /// The entries this view's namespace holds.
     pub fn entries(&self) -> usize {
-        self.cache.len()
+        if !self.shared {
+            return self.cache.len();
+        }
+        self.usage().entries as usize
+    }
+    /// The bytes the underlying cache may hold, shared with other views or not.
+    pub fn capacity(&self) -> u64 {
+        self.cache.capacity()
+    }
+    /// The namespace of this view's entries.
+    pub fn namespace(&self) -> u32 {
+        self.ns
+    }
+    fn usage(&self) -> NamespaceUsage {
+        let mut u = NamespaceUsage::default();
+        for ((_, _, c), v) in self.cache.iter() {
+            if c >> 8 == self.ns {
+                u.bytes += (v.len() * 8).max(1) as u64;
+                u.entries += 1;
+            }
+        }
+        u
     }
     pub fn hits(&self) -> u64 {
         self.hits.load(std::sync::atomic::Ordering::Relaxed)

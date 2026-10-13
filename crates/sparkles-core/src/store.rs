@@ -16,6 +16,7 @@ mod branch_ops_tests;
 #[cfg(test)]
 mod branch_tests;
 mod branching;
+pub mod caches;
 mod changelog;
 mod changes;
 mod clone;
@@ -1020,6 +1021,9 @@ pub struct StoreOptions {
     pub memory_commit_ring: usize,
     /// Memory for materialized past states (point-in-time reads).
     pub history_cache_bytes: u64,
+    /// Caches shared with other datasets. When set, the block, result, SERVICE and
+    /// history caches come from the scope and the size options above do not apply.
+    pub shared: Option<caches::CacheScope>,
     /// Non-current generations named snapshots may keep (the retention window shares it).
     pub history_max_generations: usize,
     /// Named snapshots per dataset.
@@ -1130,6 +1134,7 @@ impl Default for StoreOptions {
             bulk_threshold: 250_000,
             memory_commit_ring: 65_536,
             history_cache_bytes: 1 << 30,
+            shared: None,
             history_max_generations: 8,
             max_snapshots: 256,
             unvalidated_writes: false,
@@ -1383,12 +1388,8 @@ impl Store {
         dataset_id: uuid::Uuid,
         forked_from: Option<ForkedFrom>,
     ) -> Store {
-        let cache = Arc::new(BlockCache::new(opts.cache_bytes));
-        let results = Arc::new(crate::sparql::cache::ResultCache::with_service(
-            opts.result_cache_bytes,
-            opts.result_cache_min_ms,
-            opts.service_cache_bytes,
-        ));
+        let cache = Store::block_cache_for(&opts);
+        let results = Store::result_cache_for(&opts);
         let dvocab_len = gen_.dvocab.len();
         let mut limits = Store::log_limits(&opts);
         if limits.default_max_bytes == 0 || limits.default_max_bytes > 64 << 20 {
@@ -1557,7 +1558,7 @@ impl Store {
         let gen_no = commit::generation_number(&name);
         let cache = match &ctx {
             Some(c) => c.cache.clone(),
-            None => Arc::new(BlockCache::new(opts.cache_bytes)),
+            None => Store::block_cache_for(&opts),
         };
         let gen_dir = root.join(&name);
         let mut gen_ = match link::read_link(&gen_dir)? {
@@ -1577,11 +1578,7 @@ impl Store {
                 gen_.share_blocks_with(g);
             }
         }
-        let results = Arc::new(crate::sparql::cache::ResultCache::with_service(
-            opts.result_cache_bytes,
-            opts.result_cache_min_ms,
-            opts.service_cache_bytes,
-        ));
+        let results = Store::result_cache_for(&opts);
         let mut next_bnode = gen_.meta.next_bnode;
         // a branch numbers its blank nodes in its own range
         let bnode_floor = ctx
@@ -1812,7 +1809,14 @@ impl Store {
             geo: Default::default(),
             vector: Default::default(),
             embed: Default::default(),
-            history: Some(Arc::new(Mutex::new(history))),
+            history: Some(Arc::new(Mutex::new({
+                let mut history = history;
+                history.use_budget(match &opts.shared {
+                    Some(s) => s.caches.history().clone(),
+                    None => Arc::new(caches::ByteBudget::new(opts.history_cache_bytes)),
+                });
+                history
+            }))),
             mem_history: None,
             changelog,
             guard: parking_lot::RwLock::new(None),
@@ -2159,7 +2163,7 @@ impl Store {
         h.misses += 1;
         let entry = h.gens[&owner].clone();
         let generation = self.history_generation(&mut h, owner, current, &live, &entry)?;
-        let budget = self.opts.history_cache_bytes;
+        let budget = h.budget.capacity();
         let t0 = std::time::Instant::now();
         let mut check = |d: &Delta| -> Result<()> {
             if o.cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
@@ -2219,13 +2223,14 @@ impl Store {
             .filter(|p| p.warm)
             .filter_map(|p| h.owner(p.seq, current, r.head).map(|o| (o, p.seq)))
             .collect();
-        let mut total: u64 = h.cache.iter().map(|e| e.bytes).sum();
-        while total > budget && h.cache.len() > 1 {
+        h.settle();
+        while h.budget.over() && h.cache.len() > 1 {
             let i = (0..h.cache.len())
                 .rev()
                 .find(|&i| !warm.contains(&(h.cache[i].generation, h.cache[i].seq)))
                 .unwrap_or(h.cache.len() - 1);
-            total -= h.cache.remove(i).bytes;
+            h.cache.remove(i);
+            h.settle();
         }
         Ok((snap, r))
     }
@@ -3232,6 +3237,26 @@ impl Store {
     pub fn options(&self) -> &StoreOptions {
         &self.opts
     }
+    /// The block cache a store opened with `opts` reads through: its dataset's share of
+    /// the shared one, or one of its own.
+    fn block_cache_for(opts: &StoreOptions) -> Arc<BlockCache> {
+        match &opts.shared {
+            Some(s) => s.block_cache(),
+            None => Arc::new(BlockCache::new(opts.cache_bytes)),
+        }
+    }
+
+    fn result_cache_for(opts: &StoreOptions) -> Arc<crate::sparql::cache::ResultCache> {
+        match &opts.shared {
+            Some(s) => s.result_cache(opts.result_cache_min_ms),
+            None => Arc::new(crate::sparql::cache::ResultCache::with_service(
+                opts.result_cache_bytes,
+                opts.result_cache_min_ms,
+                opts.service_cache_bytes,
+            )),
+        }
+    }
+
     pub fn cache(&self) -> &Arc<BlockCache> {
         &self.cache
     }
@@ -5747,6 +5772,7 @@ fn collect_generations(
     for (no, dir) in doomed {
         h.open.retain(|(n, _)| *n != no);
         h.cache.retain(|c| c.generation != no);
+        h.settle();
         match crate::history::retire_generation(root, &dir) {
             Ok(d) => {
                 h.gens.remove(&no);

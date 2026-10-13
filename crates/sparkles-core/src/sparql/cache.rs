@@ -9,6 +9,7 @@
 use super::ctx::Ctx;
 use super::expr::{Expr, Func};
 use super::plan::{Kind, Node};
+use super::svccache::{NsKey, NsKeyRef, ServiceStore};
 use super::table::{Table, VarId};
 use crate::id::{Id, Tag};
 use spargebra::algebra::Function;
@@ -32,17 +33,72 @@ impl Entry {
 
 #[derive(Clone)]
 struct Weighter;
-impl quick_cache::Weighter<String, Arc<Entry>> for Weighter {
-    fn weight(&self, k: &String, v: &Arc<Entry>) -> u64 {
-        v.bytes() + k.len() as u64
+impl quick_cache::Weighter<NsKey, Arc<Entry>> for Weighter {
+    fn weight(&self, k: &NsKey, v: &Arc<Entry>) -> u64 {
+        v.bytes() + k.key.len() as u64
     }
 }
 
+/// The storage of cached results that stores can share, with the storage of remote
+/// SERVICE results. A server holds one for all its datasets.
+pub struct ResultStore {
+    cache: Option<quick_cache::sync::Cache<NsKey, Arc<Entry>, Weighter>>,
+    max_entry_bytes: u64,
+    service: Arc<ServiceStore>,
+}
+
+impl ResultStore {
+    /// Storage of at most `bytes` for results (0 turns it off) and `service_bytes` for
+    /// remote SERVICE results.
+    pub fn new(bytes: u64, service_bytes: u64) -> ResultStore {
+        ResultStore {
+            cache: (bytes > 0)
+                .then(|| quick_cache::sync::Cache::with_weighter(10_000, bytes, Weighter)),
+            max_entry_bytes: bytes / 8,
+            service: Arc::new(ServiceStore::new(service_bytes)),
+        }
+    }
+
+    pub fn capacity(&self) -> u64 {
+        self.cache.as_ref().map_or(0, |c| c.capacity())
+    }
+
+    pub fn bytes(&self) -> u64 {
+        self.cache.as_ref().map_or(0, |c| c.weight())
+    }
+
+    pub fn entries(&self) -> usize {
+        self.cache.as_ref().map_or(0, |c| c.len())
+    }
+
+    /// The remote SERVICE results' storage.
+    pub fn service(&self) -> &Arc<ServiceStore> {
+        &self.service
+    }
+
+    /// Bytes and entries by namespace, in one pass.
+    pub fn usage(&self) -> std::collections::HashMap<u32, crate::index::NamespaceUsage> {
+        let mut out: std::collections::HashMap<u32, crate::index::NamespaceUsage> =
+            Default::default();
+        if let Some(c) = &self.cache {
+            for (k, v) in c.iter() {
+                let u = out.entry(k.ns).or_default();
+                u.bytes += v.bytes() + k.key.len() as u64;
+                u.entries += 1;
+            }
+        }
+        out
+    }
+}
+
+/// A store's view of the cache of query results. Hits and misses are the view's own.
 pub struct ResultCache {
     /// the cache of remote SERVICE results, cleared with this one
     pub service: super::svccache::ServiceCache,
-    cache: Option<quick_cache::sync::Cache<String, Arc<Entry>, Weighter>>,
-    max_entry_bytes: u64,
+    store: Arc<ResultStore>,
+    ns: u32,
+    /// whether other views share the storage
+    shared: bool,
     /// minimum computation time (ms) for a result to be worth caching
     pub min_ms: f64,
     hits: AtomicU64,
@@ -54,30 +110,49 @@ impl ResultCache {
         ResultCache::with_service(bytes, min_ms, 0)
     }
 
-    /// A result cache with a cache of remote SERVICE results of `service_bytes`.
+    /// A result cache of its own with a cache of remote SERVICE results of
+    /// `service_bytes`.
     pub fn with_service(bytes: u64, min_ms: f64, service_bytes: u64) -> ResultCache {
+        let store = Arc::new(ResultStore::new(bytes, service_bytes));
         ResultCache {
-            service: super::svccache::ServiceCache::new(service_bytes),
+            service: super::svccache::ServiceCache::view(store.service().clone(), 0, false),
+            store,
+            ns: 0,
+            shared: false,
             min_ms,
-            cache: (bytes > 0)
-                .then(|| quick_cache::sync::Cache::with_weighter(10_000, bytes, Weighter)),
-            max_entry_bytes: bytes / 8,
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+        }
+    }
+
+    /// A view of `store` for namespace `ns`.
+    pub fn attach(store: &Arc<ResultStore>, ns: u32, min_ms: f64) -> ResultCache {
+        ResultCache {
+            service: super::svccache::ServiceCache::attach(store.service(), ns),
+            store: store.clone(),
+            ns,
+            shared: true,
+            min_ms,
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
         }
     }
 
     pub fn enabled(&self) -> bool {
-        self.cache.is_some()
+        self.store.cache.is_some()
     }
 
     /// Look up a cached result. The request's row and memory budgets apply before the
     /// columns are copied, exactly as they would to recomputing the result.
     pub fn get(&self, key: &CacheKey, ctx: &Ctx) -> crate::error::Result<Option<Table>> {
-        let Some(c) = self.cache.as_ref() else {
+        let Some(c) = self.store.cache.as_ref() else {
             return Ok(None);
         };
-        Ok(match c.get(&key.key) {
+        let lookup = NsKeyRef {
+            ns: self.ns,
+            key: &key.key,
+        };
+        Ok(match c.get(&lookup) {
             Some(e) => {
                 ctx.check_output(e.len, e.cols.len())?;
                 self.hits.fetch_add(1, Ordering::Relaxed);
@@ -99,9 +174,9 @@ impl ResultCache {
 
     /// Cache a result unless it holds query-local terms or is too large.
     pub fn put(&self, key: CacheKey, t: &Table, ctx: &Ctx) {
-        let Some(c) = &self.cache else { return };
+        let Some(c) = &self.store.cache else { return };
         let bytes = (t.len() * t.width() * 8) as u64;
-        if bytes > self.max_entry_bytes {
+        if bytes > self.store.max_entry_bytes {
             return;
         }
         let local = t.cols.iter().flatten().any(|id| {
@@ -113,7 +188,10 @@ impl ResultCache {
         }
         let store = |v: &VarId| key.canonical(&ctx.var_name(*v));
         c.insert(
-            key.key.clone(),
+            NsKey {
+                ns: self.ns,
+                key: key.key.clone(),
+            },
             Arc::new(Entry {
                 vars: t.vars.iter().map(store).collect(),
                 sorted: t.sorted.iter().map(store).collect(),
@@ -123,16 +201,39 @@ impl ResultCache {
         );
     }
 
+    /// Drop this view's entries. Another namespace's stay.
     pub fn clear(&self) {
-        if let Some(c) = &self.cache {
+        let Some(c) = &self.store.cache else { return };
+        if self.shared {
+            let ns = self.ns;
+            c.retain(|k, _| k.ns != ns);
+        } else {
             c.clear();
         }
     }
+    /// The entries of this view's namespace.
     pub fn entries(&self) -> usize {
-        self.cache.as_ref().map_or(0, |c| c.len())
+        match &self.store.cache {
+            Some(c) if self.shared => c.iter().filter(|(k, _)| k.ns == self.ns).count(),
+            Some(c) => c.len(),
+            None => 0,
+        }
     }
+    /// The bytes of this view's namespace.
     pub fn bytes(&self) -> u64 {
-        self.cache.as_ref().map_or(0, |c| c.weight())
+        match &self.store.cache {
+            Some(c) if self.shared => c
+                .iter()
+                .filter(|(k, _)| k.ns == self.ns)
+                .map(|(k, v)| v.bytes() + k.key.len() as u64)
+                .sum(),
+            Some(c) => c.weight(),
+            None => 0,
+        }
+    }
+    /// The bytes the storage may hold, shared with other views or not.
+    pub fn capacity(&self) -> u64 {
+        self.store.capacity()
     }
     pub fn hits(&self) -> u64 {
         self.hits.load(Ordering::Relaxed)
