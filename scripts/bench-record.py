@@ -19,6 +19,7 @@ pinning, the data hashes and the start time. `finish` adds the end time.
 * `answers.json`: the answer fingerprints of bench-answers.py,
 * `qmph.json`: query mixes per hour, `{engine: {clients: {"qmph": …, …}}}` (bench-bsbm.sh),
 * `load.json`, `load-details.json`, `rss.json` and `mem.json`: loads and memory,
+* `inference.json`: the materialization of the LUBM suite,
 * `extra.json`: optional `{"settings": {…}, "results": [ … ]}` merged into the record.
 
 Which query files count is decided by `--queries` (a list of names); without it every
@@ -48,6 +49,7 @@ Record 1 (every field is required unless marked optional):
         qps, qmph    numbers (optional; throughput results)
     load        optional: {engine: {seconds, max_rss_kib, index_bytes}}
     memory      optional: {engine: {rss_after_mib, peak_mib, cache_mib}}
+    inference   optional (LUBM): {profile: {seconds, max_rss_kib, derived_triples, …}, notes}
 """
 
 import argparse
@@ -76,7 +78,7 @@ DURABILITY = {"sparkles": "synced", "jena": "synced", "oxigraph": "written", "ql
 STATUSES = {"ok", "timeout", "error", "oom", "wrong-answer"}
 MODES = {"warm", "cold", "update", "throughput", "qmph", "load"}
 AUX = {"load", "load-details", "answers", "mem", "rss", "rss-probe", "churn", "mixed", "cold", "cold-runs",
-       "qmph", "extra", "manifest", "record", "update-latency"}
+       "qmph", "extra", "manifest", "record", "update-latency", "inference"}
 CURL_TIMEOUT = 28
 
 
@@ -364,6 +366,9 @@ def cmd_build(a):
     load = load_json(d, "load-details.json")
     if load:
         rec["load"] = {engine_name(e): v for e, v in load.items()}
+    inference = load_json(d, "inference.json")
+    if inference:
+        rec["inference"] = inference
     mem = {}
     for e, v in (load_json(d, "rss.json") or {}).items():
         mem.setdefault(engine_name(e), {})["rss_after_mib"] = v

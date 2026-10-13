@@ -462,3 +462,19 @@ pinned_build() {
       }) { };
     in import $1 { inherit pkgs; }"
 }
+
+# fetch_pinned <pins.tsv> <name> <dest>: download a file listed in a pins file (name, URL,
+# SHA-256 and license, tab separated) unless it is there, and check its checksum
+fetch_pinned() {
+  local url sum got
+  url=$(awk -F'\t' -v n="$2" '$1 == n {print $2}' "$1")
+  sum=$(awk -F'\t' -v n="$2" '$1 == n {print $3}' "$1")
+  [ -n "$url" ] || die "$2 is not in $1"
+  if [ ! -f "$3" ]; then
+    log "downloading $2"
+    curl -sfL "$url" -o "$3.part" || die "cannot download $url"
+    mv "$3.part" "$3"
+  fi
+  got=$(sha256sum "$3" 2> /dev/null || shasum -a 256 "$3")
+  [ "${got%% *}" = "$sum" ] || die "$2: checksum ${got%% *} does not match the pinned $sum"
+}
