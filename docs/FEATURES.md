@@ -305,9 +305,10 @@ that work by priority and links each item to its design spec.
   OCR models from the operator. A CSV mapping draft names its own IRIs for the values
   of IRI columns and does not link them to existing entities. [Roadmap](ROADMAP.md) items 15, 77.
 * **History.** A past state can be read only while a
-  retained generation holds it, even when the change log has its changes. A bulk commit
-  that adds and removes more than 1,000,000 quads is recorded in the change log with its
-  counts only. After a crash right after a bulk commit, the log can lack that commit's
+  retained generation holds it, even when the change log has its changes. A bulk
+  commit into a non-empty dataset is recorded in the change log with its counts only when
+  the quads it loads and the graphs it drops hold more than 1,000,000 quads, even if few
+  of them change. After a crash right after a bulk commit, the log can lack that commit's
   changes. Full-text search works at the head only. [Roadmap](ROADMAP.md) items 23, 52.
 * **Deployment.** Sparkles runs as a single node on local disk. There is no clustering,
   no replicas, and live RDF data stays on local disk without encryption at rest.

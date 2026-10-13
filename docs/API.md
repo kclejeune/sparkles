@@ -3608,8 +3608,8 @@ as `/{ds}/diff`.
 
 `unrecorded` names the commits whose changes the log does not hold. `before-log` commits
 are older than the log, because it started later or retention dropped them. A `bulk`
-commit loaded more than 1,000,000 quads into a non-empty dataset and is recorded with its
-counts only. A `gap` is a stretch the log could not record. A SPARQL history query skips
+commit loaded, or dropped graphs of, more than 1,000,000 quads in a non-empty dataset and
+is recorded with its counts only. A `gap` is a stretch the log could not record. A SPARQL history query skips
 these commits silently. `sparkles history --loc DB --subject IRI` prints the same changes
 from the command line.
 
