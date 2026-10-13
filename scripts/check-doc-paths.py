@@ -30,6 +30,48 @@ PLANNED = {
     "crates/sparkles-py/tests/test_parity.py",  # P06 Phase 1
     "crates/sparkles/bindings.toml",  # P06 Phase 1
     "crates/sparkles/tests/parity.rs",  # P06 Phase 1
+    # Roadmap specs (2026-10-12)
+    "crates/sparkles-core/src/algo",  # F14
+    "crates/sparkles-core/src/batch.rs",  # C23
+    "crates/sparkles-core/src/clock.rs",  # F20
+    "crates/sparkles-core/src/formats.rs",  # X12
+    "crates/sparkles-core/src/incr",  # F13
+    "crates/sparkles-core/src/jsonld_frame",  # C24
+    "crates/sparkles-core/src/jsonq",  # C24
+    "crates/sparkles-core/src/mapping/mod.rs",  # F19
+    "crates/sparkles-core/src/migrate",  # X12
+    "crates/sparkles-core/src/patterns.rs",  # X11
+    "crates/sparkles-core/src/sparql/algosvc.rs",  # F14
+    "crates/sparkles-core/src/sparql/plancache.rs",  # X10
+    "crates/sparkles-core/src/sparql/pool.rs",  # X08
+    "crates/sparkles-core/src/spill",  # X08
+    "crates/sparkles-core/src/storage",  # F20
+    "crates/sparkles-core/src/storage/mod.rs",  # F20
+    "crates/sparkles-core/src/store/derived.rs",  # F16
+    "crates/sparkles-core/src/stored_mappings.rs",  # F19
+    "crates/sparkles-fmt/src/shaclc",  # X02
+    "crates/sparkles-owl",  # F21
+    "crates/sparkles-py/src/ontology.rs",  # F21
+    "crates/sparkles-reasoner/src/datalog.rs",  # C24
+    "crates/sparkles-reasoner/src/demand.rs",  # F17
+    "crates/sparkles-reasoner/src/equality.rs",  # F16
+    "crates/sparkles-reasoner/src/explain.rs",  # F18
+    "crates/sparkles-reasoner/src/facts.rs",  # F16
+    "crates/sparkles-reasoner/src/justify.rs",  # F18
+    "crates/sparkles-reasoner/src/qlrewrite.rs",  # F17
+    "crates/sparkles-reasoner/src/tables.rs",  # F17
+    "crates/sparkles-server/src/graphrag",  # C22
+    "crates/sparkles-server/src/http/batch.rs",  # C23
+    "crates/sparkles-server/src/http/mappings.rs",  # F19
+    "crates/sparkles-server/src/http/ontology.rs",  # F21
+    "crates/sparkles-server/src/http/views.rs",  # F13
+    "crates/sparkles-server/src/map_cmd.rs",  # F19
+    "crates/sparkles-server/src/ontology_cmd.rs",  # F21
+    "crates/sparkles-server/src/triggers",  # C23
+    "crates/sparkles-wasm",  # F20
+    "crates/sparkles/src/handles/algorithms.rs",  # F14
+    "crates/sparkles/src/handles/ontology.rs",  # F21
+    "crates/sparkles/src/handles/views.rs",  # F13
 }
 
 
