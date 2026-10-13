@@ -63,10 +63,22 @@ keeps the handoff notes current.
 | Orchestration, validating review findings, remediation plans, consults | Claude Opus 5.5 |
 | Implementing lanes and fixes | Claude Sonnet 5.5 at high effort |
 | Code review | Codex with gpt-6.1-sol at high effort |
+| Mechanical tasks with a deterministic check | Claude Haiku 5.5 |
 
 A lane starts on Opus instead of Sonnet when its core is crash durability or WAL ordering,
 concurrency beyond a parallel iterator, an on-disk format, planner or executor cost
 decisions, or `unsafe` code.
+
+Haiku takes tasks that need a model to read or write language but little judgment, and
+that end in a check a script can run. Examples are triaging test and benchmark logs into
+failures with their first error, edits across many files under an exact rule (renumbering
+roadmap items, renaming a flag in the docs, adding a field to every fixture), fixtures
+generated from a documented format, and sweeps that list problems without fixing them. Each
+Haiku task states the rule, a fixed output format such as JSON rows of file, change and check
+result, and the check (`cargo check`, a test, a grep or a validator) before it starts. A task
+whose check fails twice moves to Sonnet. Haiku does not rewrite documentation prose, touch
+engine, durability, concurrency, planner or performance code, or review and validate
+findings. If a plain script can do the job, use the script.
 
 A Sonnet lane consults Opus by starting a read-only agent on Opus with its question, the
 relevant files and what it has tried, then applies the advice itself. It must consult when
