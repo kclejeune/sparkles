@@ -4,6 +4,7 @@
 """
 
 import copy
+import importlib.util
 import json
 import os
 import subprocess
@@ -164,11 +165,14 @@ class RecordTests(unittest.TestCase):
         data = os.path.join(self.tmp.name, "data.nt")
         write_text(data, "<a> <b> <c> .\n")
         p = subprocess.run([sys.executable, RECORD, "manifest", "--out", path, "--suite", "t", "--sparkles", binary,
-                            "--engine", f"jena-fuseki={binary}", "--data", f"d={data}|CC0|scale=1",
+                            "--engine", f"jena-fuseki={binary}", "--data", f"d={data}|CC0|scale=1", "--binary-commit", "abc123",
                             "--memory-limit", "12G", "--workdir", self.tmp.name], capture_output=True, text=True)
         self.assertEqual(p.returncode, 0, p.stderr)
         m = jload(path)
         self.assertEqual(m["sparkles"]["version"], "tool 1.2")
+        self.assertEqual(m["sparkles"]["binary_commit"], "abc123")
+        self.assertIn("scripts_commit", m["sparkles"])
+        self.assertNotIn("commit", m["sparkles"])
         self.assertEqual(len(m["sparkles"]["sha256"]), 64)
         self.assertEqual(m["engines"]["jena"]["license"], "Apache-2.0")
         self.assertEqual(m["data"]["d"]["license"], "CC0")
@@ -176,6 +180,17 @@ class RecordTests(unittest.TestCase):
         self.assertIsNone(m["ended"])
         subprocess.run([sys.executable, RECORD, "finish", path], check=True)
         self.assertIsNotNone(jload(path)["ended"])
+
+
+class NixPackageTests(unittest.TestCase):
+    def test_store_paths_give_package_and_version(self):
+        spec = importlib.util.spec_from_file_location("bench_record", RECORD)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        self.assertEqual(mod.nix_package("/nix/store/abc123-qlever-0.5.48/bin/qlever-server"),
+                         ("/nix/store/abc123-qlever-0.5.48", "qlever-0.5.48", "0.5.48"))
+        self.assertEqual(mod.nix_package("/nix/store/abc123-apache-jena-fuseki-5.1.0/bin/fuseki-server")[2], "5.1.0")
+        self.assertIsNone(mod.nix_package("/usr/bin/true"))
 
 
 class CompareTests(unittest.TestCase):

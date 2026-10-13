@@ -6,7 +6,8 @@
     bench-record.py build     --suite NAME --scale LABEL --results DIR --manifest FILE --out record.json
     bench-record.py validate  record.json...
 
-`manifest` writes the run manifest at the start of a run: the Sparkles commit and binary
+`manifest` writes the run manifest at the start of a run: the commit of the scripts' checkout,
+the commit of the Sparkles binary when it is known, and the binary
 hash, every engine's version, binary hash and license, the host, the memory limit, the CPU
 pinning, the data hashes and the start time. `finish` adds the end time.
 
@@ -152,17 +153,32 @@ def version_of(path, args):
     return out.splitlines()[0] if out else "unknown"
 
 
+def nix_package(path):
+    """(store path, package name, version) when the binary lives in the Nix store, else None.
+    Store paths look like /nix/store/<hash>-<name>-<version>/bin/<binary>."""
+    real = os.path.realpath(path)
+    parts = real.split("/")
+    if len(parts) < 4 or parts[1:3] != ["nix", "store"]:
+        return None
+    store = "/".join(parts[:4])
+    package = parts[3].split("-", 1)[1] if "-" in parts[3] else parts[3]
+    m = re.match(r".*?-(\d[\w.+]*)$", package)
+    return store, package, m.group(1) if m else None
+
+
 def cmd_manifest(a):
     m = {"suite": a.suite, "started": now(), "ended": None, "host": host_info(a.workdir)}
     sp = {"binary": a.sparkles, "version": version_of(a.sparkles, ["--version"])}
     if a.sparkles and os.path.exists(a.sparkles):
         sp["sha256"] = sha256(a.sparkles)
-    if a.commit:
-        sp["commit"] = a.commit
-    else:
-        sp["commit"] = run(["git", "-C", os.path.dirname(os.path.abspath(__file__)), "rev-parse", "HEAD"]) or "unknown"
-        if run(["git", "-C", os.path.dirname(os.path.abspath(__file__)), "status", "--porcelain", "--untracked-files=no"]):
-            sp["commit"] += "+dirty"
+    # The commit of the checkout that holds these scripts says nothing about the binary, which
+    # may be a release or a build of another revision. The binary's own commit is recorded only
+    # when the caller knows it (--binary-commit, or SPARKLES_COMMIT in the environment).
+    here = os.path.dirname(os.path.abspath(__file__))
+    sp["scripts_commit"] = run(["git", "-C", here, "rev-parse", "HEAD"]) or "unknown"
+    if run(["git", "-C", here, "status", "--porcelain", "--untracked-files=no"]):
+        sp["scripts_commit"] += "+dirty"
+    sp["binary_commit"] = a.binary_commit or os.environ.get("SPARKLES_COMMIT") or None
     m["sparkles"] = sp
     engines = {}
     for spec in a.engine:
@@ -172,6 +188,14 @@ def cmd_manifest(a):
         if path and os.path.exists(path):
             e["sha256"] = sha256(path)
             e["version"] = version_of(path, ["--version"])
+            store = nix_package(path)
+            if store:
+                # a package from nixpkgs is identified by its store path, and its version is the
+                # package's when the binary does not report a real one
+                e["store_path"], e["package"], pkg_version = store
+                e["reported_version"] = e["version"]
+                if pkg_version and (e["version"] == "unknown" or "unknown" in e["version"]):
+                    e["version"] = pkg_version
         else:
             e["version"] = "unknown"
         engines[name] = e
@@ -462,7 +486,7 @@ def main():
     m.add_argument("--out", required=True)
     m.add_argument("--suite", required=True)
     m.add_argument("--sparkles", default="")
-    m.add_argument("--commit", default="")
+    m.add_argument("--binary-commit", default="", help="the commit the Sparkles binary was built from, if known")
     m.add_argument("--engine", action="append", default=[], help="name=path of an engine's binary")
     m.add_argument("--data", action="append", default=[],
                    help="name=path|license|params, or name=sha256:HEX|license|params")

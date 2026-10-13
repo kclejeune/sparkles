@@ -255,8 +255,10 @@ and comparison methodology. [DEVELOPMENT.md](DEVELOPMENT.md) covers building and
   count with the samples in milliseconds, the median, the p95, the answer fingerprint and
   whether it agrees with the majority, a status (`ok`, `timeout`, `error`, `oom` or
   `wrong-answer`), and for write results the durability class. `results/manifest.json` next
-  to it records the Sparkles commit and binary checksum, each engine's version, binary
-  checksum and license, the host (CPU, memory, disk model, kernel, file system and mount
+  to it records the commit of the checkout that holds the scripts, the Sparkles binary's
+  checksum and, when the caller sets `SPARKLES_COMMIT`, the commit it was built from, each
+  engine's version, binary checksum and license (with the store path for an engine from
+  nixpkgs), the host (CPU, memory, disk model, kernel, file system and mount
   options), the memory limit, the client CPU, the data checksums and the start and end times.
   `bench-record.py build` also reads the results directory of `scripts/bench.sh`, and
   `--pool-instances` merges instance names such as WatDiv's `L1-3` into one result per

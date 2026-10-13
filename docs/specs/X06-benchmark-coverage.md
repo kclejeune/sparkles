@@ -592,8 +592,9 @@ Phase 1's tooling is built. The measurements it exists for have not been run on 
 publication host, so BENCHMARKS.md has no figures from it.
 
 **Record and manifest.** `scripts/bench-record.py` has four subcommands. `manifest` writes
-the run manifest of §6 with the Sparkles commit and binary checksum, every engine's version,
-binary checksum and license, the host, the memory limit, the client CPU, the data checksums
+the run manifest of §6 with the commit of the scripts' checkout, the Sparkles binary's
+checksum and its own commit when the caller knows it (`SPARKLES_COMMIT`), every engine's
+version, binary checksum and license, the Nix store path of an engine taken from nixpkgs, the host, the memory limit, the client CPU, the data checksums
 and the license check. `finish` adds the end time. `build` turns the results directory of
 `scripts/bench.sh` or of a suite into the record of §7, and `validate` checks a record
 against the shape described in the script's header. The record also carries the load
