@@ -907,9 +907,10 @@ in
         such as a sops-nix or agenix secret. systemd passes it to the service with
         `LoadCredential`, so it need not be readable by the service user, and the
         module passes `--secrets-key credential:secrets-key`. Values stored without
-        encryption are sealed at the next start. Without a key the values are kept in
-        files with mode 0600. The package must be built with the `backup-encryption`
-        feature, as the flake's packages are on Linux.
+        encryption are sealed at the next start. Without this option the server seals
+        the values with a key that it generates in the data directory
+        (`secrets.key`), which does not protect them from someone who can read that
+        directory.
       '';
     };
 

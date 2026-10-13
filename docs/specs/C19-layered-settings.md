@@ -1022,6 +1022,50 @@ These points settle what the addendum left open.
   configured key stops the start; `--secrets-key none` stores plaintext; the TRACE log
   check of A12 still finds no value.
 
+**Landed for item 68 (2026-10-13): secrets sealed by default.** The sealer moved from
+`crypto/secret.rs` to `crates/sparkles-backup/src/seal/`, which every build of the crate
+compiles, together with `LockedKey` and the AES-GCM and HKDF primitives. `aws-lc-rs`,
+`zeroize`, `getrandom` and `base64` are no longer optional in `sparkles-backup`, and the
+`encryption` feature now adds only `argon2`. The default server build already had all
+four through rustls and the `auth` feature, and `cargo tree` lists the same crates before
+and after. `SecretSealer::from_key` puts the key in a locked page and falls back to a
+zeroizing heap buffer when the page cannot be made, and `key_memory()` says which.
+Reading a key input moved out of `resolve` into `sparkles::backup::keys::read_key`, which
+the `backup` feature compiles and which works on every platform, while `resolve` stays
+behind `backup-encryption`. `sparkles::catalog::lock_data_dir` takes the catalog lock for
+offline commands.
+
+`Sealing::start` in `settings/secrets.rs` replaces `Sealing::load` and follows the
+design's order: `--secrets-key SOURCE`, `none`, the credential `sparkles-secrets-key`,
+then `<dataDir>/secrets.key`. A missing key file is generated, as 64 hexadecimal digits
+with mode 0400, under the settings write lock of the first `PUT` or in `prepare` when the
+start finds plaintext values. The file is written to a temporary name and hard-linked
+into place, so it appears whole and never replaces an existing key, and the server
+refuses to write it when the data directory belongs to another user. Clones of `Sealing`
+share the key through an `Arc`, so the model configuration and the notification channels
+read values sealed after they were built. `GET /$/server/secrets` adds `keySource` and
+`keyMemory`, both `null` for plaintext values, and `keyMemory` is also `null` before a
+generated key exists. `sparkles secrets list` and the UI's API keys panel say when the key
+was generated beside the data. `sparkles secrets unseal --data DIR` and `rekey --data DIR
+--new-key SOURCE` take `--secrets-key` for the current key, open every value before
+writing any, and refuse while a server holds the catalog lock. `unseal` keeps
+`secrets.key`, so a later start of this release seals the values again with it, and
+`rekey` removes a generated key once the values are sealed under the new one.
+
+Sealing needs the `backup` feature, which is a default feature, because the sealer lives
+in `sparkles-backup` as designed. A server built without `backup` keeps plaintext values
+and refuses `--secrets-key` other than `none` at the start. Server backups do not exist
+yet (item 61), so nothing copies `secrets.key` into a repository today. Dataset backups
+capture only dataset directories, and `SECRETS_KEY_FILE` names the file that item 61's
+manifest must leave out. The previous release's binary is not available to the tests, so
+`unseal` is followed by a start with `--secrets-key none`, whose `prepare` reads plaintext
+values exactly as the previous release does. The tests are `generated_secrets_key`,
+`sealed_runtime_secrets` and `unseal_and_rekey` in `settings/server_tests.rs`,
+`secrets_key_none_and_unseal` and the A12 log check of
+`server_settings_restart_reload_and_log` in `tests/cli_server_settings.rs`, which also
+checks that the generated key never reaches the log, and the heap and locked round trips
+in `sparkles-backup`'s `seal` module.
+
 **UI controls that turn on assistant ingestion** (item 77, Tier 5,
 [ROADMAP](../ROADMAP.md)). The other half of item 77, redaction beyond the fixed
 patterns, is in

@@ -9757,20 +9757,29 @@ the declared source unless the settings file locks `secrets.NAME`. A secret's na
 rule applies to `--model-secret` names and to `apiKey.secret`.
 
 A runtime value is kept in `<dataDir>/secrets/NAME` with mode 0600, in a directory with
-mode 0700, and is written to a temporary file and renamed into place. Without a secrets
-key the files hold the values as plaintext. An operator who does not want keys on disk
-locks the secrets in the settings file or starts the server with a secrets key.
+mode 0700, and is written to a temporary file and renamed into place. Every build with
+the default `backup` feature seals each value with a secrets key. An operator who does
+not want keys on disk at all locks the secrets in the settings file.
 
-`serve --secrets-key SOURCE`, or the environment variable `SPARKLES_SECRETS_KEY`, seals
-each runtime value with a key that the server reads once at the start. The source is
-`file:PATH`, `env:VARIABLE`, `credential:NAME` for a file in systemd's
-`$CREDENTIALS_DIRECTORY`, or `command:PROGRAM ARGS`, which runs an absolute program
-without a shell and reads the key from its standard output. `command:` also takes a JSON
-argv array. The key is 32 bytes written as 64 hexadecimal digits or base64, and the same
-rules apply as to a [backup repository key](USAGE.md#encrypted-repositories). A key file
-must not be readable by group or others and must not lie in the data directory. The
-option needs a build with the `backup-encryption` feature on Linux, and a build without
-it refuses the option at the start.
+`serve --secrets-key SOURCE`, or the environment variable `SPARKLES_SECRETS_KEY`, names
+the key, which the server reads once at the start. The source is `file:PATH`,
+`env:VARIABLE`, `credential:NAME` for a file in systemd's `$CREDENTIALS_DIRECTORY`, or
+`command:PROGRAM ARGS`, which runs an absolute program without a shell and reads the key
+from its standard output. `command:` also takes a JSON argv array. The key is 32 bytes
+written as 64 hexadecimal digits or base64, and the same rules apply as to a
+[backup repository key](USAGE.md#encrypted-repositories). A key file must not be
+readable by group or others and must not lie in the data directory.
+
+Without the option, the server uses the systemd credential `sparkles-secrets-key` when
+`$CREDENTIALS_DIRECTORY` holds one, then `<dataDir>/secrets.key`. When neither exists,
+the first value it stores, or the first plaintext value it finds at the start, makes it
+generate 32 random bytes and write them to `<dataDir>/secrets.key` as 64 hexadecimal
+digits with mode 0400. It writes the file only when the data directory belongs to the
+user the server runs as, and it never replaces an existing file. A generated key does
+not protect the values from someone who can read the whole data directory, but it
+protects copies of `secrets/` made without it. Server backups leave `secrets.key` out,
+so the sealed values in a backup open only with the same key. `--secrets-key none`
+keeps the values as plaintext files.
 
 A sealed file is one line, `sparkles-sealed-secret/1 SALT CIPHERTEXT`, in base64. Each
 value is encrypted with AES-256-GCM under a key that HKDF-SHA256 derives from the secrets
@@ -9778,12 +9787,21 @@ key and a fresh salt, and the secret's name is part of the authenticated data, s
 copied or renamed to another secret's name does not open. At the start the server opens
 every stored value. A plaintext value is sealed in place, and a value that does not open
 stops the start with an error that names the secrets, whether the key is wrong or a file
-was changed or renamed. A server started without a key refuses to start when it finds a
-sealed value. Declared sources of `--model-secret` are read as before and never sealed.
+was changed or renamed. A server that has no key for a sealed value, because it runs
+with `--secrets-key none` or `secrets.key` is missing, refuses to start. Declared
+sources of `--model-secret` are read as before and never sealed. The key stays in a
+locked page that core dumps leave out on Linux, and in a heap buffer that is zeroed on
+release on other platforms or when the page cannot be locked.
+
+`sparkles secrets unseal --data DIR` writes the sealed values of a stopped server back as
+plaintext, for a downgrade to a release that does not seal them, and
+`sparkles secrets rekey --data DIR --new-key SOURCE` seals them again under another key
+and removes a generated `secrets.key`. Both run offline and hold the data directory's
+catalog lock, and both take `--secrets-key SOURCE` for the current key.
 
 | Method | Path | Needs | Effect |
 |---|---|---|---|
-| GET | `/$/server/secrets` | `server-admin` | `{storage, secrets}`. `storage` is `sealed` with a secrets key and `plaintext` without one. Each secret has its `name`, `source` (`declared`, `runtime` or `missing`), whether a `declared` source exists, whether it is `locked`, `setAt` for a runtime value, `overridden` when a lock ignores a stored value, and the `providers` and notification `channels` that use it. |
+| GET | `/$/server/secrets` | `server-admin` | `{storage, keySource, keyMemory, secrets}`. `storage` is `sealed`, or `plaintext` with `--secrets-key none`. `keySource` is `configured` for `--secrets-key` or the systemd credential, `generated` for `<dataDir>/secrets.key`, and `null` for plaintext values. `keyMemory` is `locked` or `heap`, and `null` until there is a key. Each secret has its `name`, `source` (`declared`, `runtime` or `missing`), whether a `declared` source exists, whether it is `locked`, `setAt` for a runtime value, `overridden` when a lock ignores a stored value, and the `providers` and notification `channels` that use it. |
 | PUT | `/$/server/secrets/{name}` | `server-admin` | Stores a runtime value from `{"value": "..."}`, `204`. |
 | DELETE | `/$/server/secrets/{name}` | `server-admin` | Removes the runtime value, so the declared source applies again, `204` whether or not there was one. |
 

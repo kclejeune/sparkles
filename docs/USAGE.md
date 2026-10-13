@@ -3167,15 +3167,50 @@ argument or an environment variable, and it never prints it. `sparkles secrets l
 prints each secret with its source, whether it is locked, when its runtime value was
 set, the providers that use it, and whether a runtime value overrides the declared
 source. `--json` prints the server's answer. When the server keeps stored values
-without encryption, the list ends with a note that says so.
+without encryption, or seals them with a key it generated, the list ends with a note
+that says so.
 
-`serve --secrets-key SOURCE` seals the stored values with a 32-byte key, which the
-server reads once at the start from `file:PATH`, `env:VARIABLE`, `credential:NAME` or
-`command:PROGRAM ARGS`. The option needs a build with `backup-encryption`. Create a key
-with `openssl rand -hex 32 > /etc/sparkles/secrets.key` and `chmod 600` it, outside the
-data directory. Values stored before are sealed at the next start, and a start with a
-key that does not open them fails with an error that names them, as
-[Model secrets](API.md#model-secrets) describes.
+The server seals every stored value with a 32-byte key, in every build. It takes the
+key from the first of these that exists:
+
+1. `serve --secrets-key SOURCE`, read once at the start from `file:PATH`,
+   `env:VARIABLE`, `credential:NAME` or `command:PROGRAM ARGS`.
+2. The systemd credential `sparkles-secrets-key` in `$CREDENTIALS_DIRECTORY`.
+3. `<data>/secrets.key`, which the server generates with mode 0400 when it first stores
+   a value.
+
+A generated key lives beside the values it seals, so it does not protect them from
+someone who can read the whole data directory. It does protect copies of `secrets/`
+made without the key file, such as a backup, a support archive or a copy of the
+directory that leaves `secrets.key` out. To keep the key elsewhere, create one with
+`openssl rand -hex 32 > /etc/sparkles/secrets.key`, `chmod 600` it and start the
+server with `--secrets-key file:/etc/sparkles/secrets.key`. A configured key file may
+not lie inside the data directory. `--secrets-key none` keeps stored values as
+plaintext files with mode 0600, as releases before sealing did.
+
+Plaintext values stored before are sealed at the next start, and a start with a key
+that does not open the stored values fails with an error that names them, as
+[Model secrets](API.md#model-secrets) describes. On Linux the key is kept in a locked
+page that core dumps leave out. On other platforms, or when the page cannot be locked,
+it is kept in a heap buffer that is zeroed on release, and `GET /$/server/secrets`
+reports which as `keyMemory`.
+
+Two offline commands change the stored values of a stopped server. Both hold the
+catalog lock of the data directory, so they refuse to run while a server uses it, and
+both take `--secrets-key SOURCE` when the values are sealed with a key that `serve`
+would not find by itself.
+
+```sh
+# before a downgrade to a release that does not seal: plaintext files again
+sparkles secrets unseal --data /var/lib/sparkles
+# move the values from the generated key to a key outside the data directory
+sparkles secrets rekey --data /var/lib/sparkles --new-key file:/etc/sparkles/secrets.key
+```
+
+`unseal` leaves `secrets.key` in place, so the next start of a sealing release seals
+the values again with the same key. `rekey` opens every value before it writes any,
+then removes a generated `secrets.key`, since the values no longer open with it. Start
+the server with `--secrets-key` and the new source afterwards.
 
 The **Server** page of the web UI has a **Models** section for users with
 `server-admin`. It lists the providers with their protocol, endpoint and whether their
@@ -3189,8 +3224,8 @@ The **API keys** panel lists each secret and whether it is set. **Replace** open
 password field, and the key typed there is sent once and is not kept in the page. A
 runtime key over a declared one is marked "overrides server config" and has a **Use
 server config** button, and a key that only exists at runtime has **Remove runtime
-value**. The panel notes whether stored keys are encrypted with the server's secrets key
-or kept unencrypted.
+value**. The panel notes whether stored keys are encrypted with a configured key, with a
+key that the server generated beside the data, or kept unencrypted.
 
 `GET /$/server/settings/models` answers the effective configuration with the source of
 each field, as for a dataset's settings. A `PATCH` with `null` for a provider removes
@@ -5411,11 +5446,15 @@ keys = [
 ]
 ```
 
-`secretsKeyFile` seals the keys that administrators store at runtime through
+The server seals the keys that administrators store at runtime through
 `sparkles secrets set` or the UI, as [Model secrets](API.md#model-secrets) describes.
-The module passes the file with `LoadCredential` and the server reads it with
-`--secrets-key credential:secrets-key`. Values stored before are sealed at the next
-start:
+Without `secretsKeyFile` it seals them with a key that it generates in the data
+directory, `/var/lib/sparkles/secrets.key`. `secretsKeyFile` keeps the key outside the
+data directory instead. The module passes the file with `LoadCredential` and the server
+reads it with `--secrets-key credential:secrets-key`. Values stored before are sealed at
+the next start, and values sealed with a generated key need
+`sparkles secrets rekey --data /var/lib/sparkles --new-key file:PATH` with the service
+stopped before the server starts with the new key:
 
 ```nix
 services.sparkles.secretsKeyFile = config.sops.secrets."sparkles-secrets-key".path;
