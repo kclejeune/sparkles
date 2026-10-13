@@ -1574,3 +1574,57 @@ fn the_numeric_column_answers_as_decoding_does() {
     assert!(s.snapshot().generation.vocab.numeric().is_some());
     assert_eq!(answers(&s), with);
 }
+
+mod cold_reads {
+    use super::*;
+
+    fn people(n: usize) -> String {
+        let mut t = String::new();
+        for i in 0..n {
+            t.push_str(&format!(
+                "<http://ex.org/p{i}> <http://ex.org/worksFor> <http://ex.org/org{}> .\n\
+                 <http://ex.org/p{i}> <http://ex.org/name> \"person {i}\" .\n\
+                 <http://ex.org/p{i}> <http://ex.org/age> \"{}\"^^<http://www.w3.org/2001/XMLSchema#int> .\n",
+                i % 5,
+                20 + i % 40
+            ));
+        }
+        t
+    }
+
+    /// The read-path switches change how a cold server reads, never what a query answers.
+    #[test]
+    fn the_read_ahead_switches_leave_answers_alone() {
+        let s = Store::in_memory(StoreOptions::default());
+        load(&s, &people(3000), RdfFormat::NTriples);
+        let q = "SELECT ?p ?n ?a WHERE { ?p ex:worksFor <http://ex.org/org3> ; ex:name ?n ; ex:age ?a } \
+                 ORDER BY ?p";
+        let on = run(&s, q, Optimizations::ALL);
+        let off = run(
+            &s,
+            q,
+            Optimizations::ALL
+                .disable("prefetch_constants,prefetch_terms,prefetch_first_scan,parallel_decode")
+                .unwrap(),
+        );
+        assert_eq!(solutions(&on), solutions(&off));
+        assert_eq!(on.len(), 600);
+    }
+
+    /// A query's reads are counted: the columns it decoded and the vocabulary lookups.
+    #[test]
+    fn a_query_counts_the_columns_it_decodes() {
+        let s = Store::in_memory(StoreOptions::default());
+        load(&s, &people(2000), RdfFormat::NTriples);
+        let opts = QueryOptions {
+            no_cache: true,
+            ..Default::default()
+        };
+        let q = format!("{PREFIXES}SELECT ?p WHERE {{ ?p ex:worksFor <http://ex.org/org1> }}");
+        let r = query(s.snapshot(), &q, &opts).unwrap();
+        assert_eq!(r.len(), 400);
+        let io = r.ctx.io_stats();
+        assert!(io.columns_decoded() > 0, "{io:?}");
+        assert!(io.vocab_finds > 0, "{io:?}");
+    }
+}

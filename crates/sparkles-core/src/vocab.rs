@@ -1594,6 +1594,35 @@ mod tests {
     }
 
     #[test]
+    fn prefetch_keys_asks_for_every_group_before_the_lookups() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = write_keys(dir.path(), 64 * FC_BLOCK * IDX_BLOCKS);
+        let v = Vocab::open(dir.path()).unwrap();
+        let s = v.sparse.as_ref().unwrap();
+        let group = |i: usize| i / (FC_BLOCK * IDX_BLOCKS);
+        let picks = [
+            5 * FC_BLOCK * IDX_BLOCKS + 3,
+            9 * FC_BLOCK * IDX_BLOCKS,
+            70_000,
+        ];
+        v.prefetch_keys(&picks.iter().map(|&i| keys[i].clone()).collect::<Vec<_>>());
+        if crate::index::io_hints() {
+            // each group has been asked for, so the lookups and a second batch ask for none
+            for &i in &picks {
+                assert!(!s.first_hint(group(i)), "group of key {i}");
+            }
+            let before = crate::ioacct::IoSnapshot::now().vocab_groups_hinted;
+            v.prefetch_keys(&[keys[picks[0]].clone()]);
+            assert!(crate::ioacct::IoSnapshot::now().vocab_groups_hinted >= before);
+        }
+        for &i in &picks {
+            assert_eq!(v.find(&keys[i]), Ok(i as u64));
+        }
+        // keys outside the vocabulary, before its first key or in no group, do no harm
+        v.prefetch_keys(&[b"".to_vec(), b"\xff\xff".to_vec()]);
+    }
+
+    #[test]
     fn sparse_index_added_later_matches_the_written_one() {
         let dir = tempfile::tempdir().unwrap();
         write_keys(dir.path(), 3 * FC_BLOCK * IDX_BLOCKS + 77);
