@@ -130,7 +130,7 @@ POOL=1
 
 # ------------------------------------------------------------------------ query mixes
 bsbm_qmph() {
-  local e c
+  local e c rc
   [ -z "${SKIP_QMPH:-}" ] || return 0
   echo
   echo "== query mixes per hour ($BSBM_WARMUP warm-up and $BSBM_RUNS measured mixes)"
@@ -139,13 +139,26 @@ bsbm_qmph() {
       rm -f "results/driver-${NAME[$e]}-$c.xml"
       (cd bsbm && "$JAVA" -Xmx2g -cp ".:lib/*" benchmark.testdriver.TestDriver -runs "$BSBM_RUNS" -w "$BSBM_WARMUP" \
         -mt "$c" -idir td_data -ucf "$UCF" -t $((MAX_TIME * 1000)) -o "$WORK/results/driver-${NAME[$e]}-$c.xml" \
-        "http://${URL[$e]}") > "logs/driver-${NAME[$e]}-$c.log" 2>&1 || true
+        "http://${URL[$e]}") > "logs/driver-${NAME[$e]}-$c.log" 2>&1 && rc=0 || rc=$?
       python3 -I "$ROOT/scripts/bench-bsbm/qmph.py" "results/driver-${NAME[$e]}-$c.xml" results/qmph.json \
-        "${NAME[$e]}" "$c" "$USECASE-mix"
+        "${NAME[$e]}" "$c" "$USECASE-mix" "$rc"
     done
   done
 }
 SUITE_EXTRA=bsbm_qmph
+# the driver does not look at results, so the runs are compared by their average result counts
+# DESCRIBE results are left to the engine by the SPARQL specification, so those queries are skipped
+bsbm_check() {
+  local skip f
+  [ -f results/qmph.json ] || return 0
+  skip=""
+  while read -r f; do
+    f=${f##*/query}
+    skip="$skip,${f%.txt}"
+  done < <(grep -il '^ *describe' bsbm/queries/"$USECASE"/query[0-9]*.txt 2> /dev/null || true)
+  python3 -I "$ROOT/scripts/bench-bsbm/qmph.py" --check results/qmph.json "${skip#,}"
+}
+SUITE_AFTER=bsbm_check
 
 DATA_SPECS=("bsbm-$SCALE=$WORK/$DATAFILE|GPL-3.0 (generator)|BSBM tools 0.2 $GENPARAMS")
 LICENSE_NOTES=("BSBM tools 0.2: GPL-3.0, downloaded at run time, run as separate processes and not committed")

@@ -245,7 +245,12 @@ and comparison methodology. [DEVELOPMENT.md](DEVELOPMENT.md) covers building and
   result the SPARQL specification leaves to the engine. Each instance is then timed, and the
   record pools the instances of a template into one result. After that, the driver itself
   runs the query mix against each engine with 1, 4 and 16 clients (`--clients`) after 50
-  warm-up mixes and 500 measured ones, and the record gets its query mixes per hour.
+  warm-up mixes and 500 measured ones, and the record gets its query mixes per hour. The
+  driver does not look at what a query returns, so a failing or wrongly answering engine
+  would look fast. A run in which the driver exits with an error is recorded as `error`.
+  Afterwards the average result count of each query is compared across all runs, and a run
+  that differs from the majority is recorded as `wrong-answer` with the numbers of the
+  queries that differ.
   `--usecase bi` runs the Business Intelligence use case instead of Explore. The Explore
   and Update mix is not run yet.
 

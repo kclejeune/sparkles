@@ -11,7 +11,8 @@
 #   DATA_SPECS     bench-record.py --data arguments (name=path|license|params), as an array
 #   LICENSE_NOTES  optional array of notes for the manifest's license check
 #   COUNT_ONLY, NO_CHECK   optional query names compared by row count or not compared
-#   SUITE_EXTRA    optional function run after the timings, with the servers still up
+#   SUITE_EXTRA    optional function run after the timings of each engine, with its server up
+#   SUITE_AFTER    optional function run once every engine has been timed
 #   POOL=1         the queries are <template>-<i> instances, recorded per template
 # and the environment knobs of scripts/bench.sh: WARMUP, RUNS, ENGINES, QUERIES, SKIP_LOAD,
 # ANSWERS_ONLY, PORT_BASE, SERVER_MEM_MAX, CLIENT_CPU, MAX_TIME, plus COLD_RUNS (restarts
@@ -79,6 +80,7 @@ suite_run() {
       stop "$e"
     done
     ENGINES=$all
+    if declare -F "${SUITE_AFTER:-}" > /dev/null; then "$SUITE_AFTER"; fi
   fi
   if [ -z "${ANSWERS_ONLY:-}" ] && [ "$COLD_RUNS" -gt 0 ]; then
     local e

@@ -397,7 +397,7 @@ def cmd_build(a):
                 "engine": en, "query": v.get("query", "mix"), "mode": "qmph", "clients": int(clients),
                 "durability": None, "samples_ms": [], "median_ms": None, "p95_ms": None, "answer": None,
                 "status": v.get("status", "ok"), "qmph": v.get("qmph"),
-                **{k: v[k] for k in ("qps", "runs", "timeouts", "seconds") if k in v},
+                **{k: v[k] for k in ("qps", "runs", "timeouts", "seconds", "disagreeing_queries") if k in v},
             })
     if a.pool_instances:
         results = pool(results)
