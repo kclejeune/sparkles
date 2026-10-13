@@ -135,6 +135,35 @@ pub(super) fn schemas() -> Map<String, J> {
                 "auth": obj(&["enabled"], json!({ "enabled": { "type": "boolean" } })),
                 "startDateTime": { "type": "string", "description": "Fuseki's name for `startedAt`." },
                 "uptime": { "type": "number", "description": "Fuseki's uptime in seconds." },
+                "formats": {
+                    "type": "object",
+                    "description": "The on-disk file kinds and settings files, with the version this build writes and the versions it reads (`sparkles migrate --check` prints the same registry). Left out for anonymous callers when auth is on.",
+                    "properties": {
+                        "sparkles": { "type": "string" },
+                        "kinds": array(obj(&["id", "files", "marker", "class", "writes", "reads"], json!({
+                            "id": { "type": "string" },
+                            "files": { "type": "string" },
+                            "marker": { "type": "string" },
+                            "class": string_enum(&["primary", "derived", "config", "archive"]),
+                            "writes": { "type": "integer" },
+                            "reads": array(json!({ "type": "integer" })),
+                        }))),
+                        "settings": array(obj(&["name", "scope", "member", "writes"], json!({
+                            "name": { "type": "string" },
+                            "scope": string_enum(&["dataset", "server"]),
+                            "member": { "type": "string" },
+                            "writes": { "type": "integer" },
+                        }))),
+                        "unmarkedSettings": array(obj(&["name", "reason"], json!({
+                            "name": { "type": "string" },
+                            "reason": { "type": "string" },
+                        }))),
+                    },
+                },
+                "refusedDatasets": array(obj(&["name", "reason"], json!({
+                    "name": { "type": "string" },
+                    "reason": { "type": "string", "description": "Why the dataset is registered but not served, such as an index format this release does not read." },
+                }))),
             }),
         ),
     );

@@ -3432,6 +3432,16 @@ async fn server_info(State(st): St, Extension(p): Extension<Principal>) -> Json<
     if !p.is_anonymous() {
         doc["version"] = env!("CARGO_PKG_VERSION").into();
         doc["limits"] = st.limits.json(st.default_timeout);
+        // the file versions this build writes and reads, so an operator can see which
+        // databases it opens
+        doc["formats"] = sparkles::formats::report();
+        let refused = st.catalog.refused();
+        if !refused.is_empty() {
+            doc["refusedDatasets"] = refused
+                .into_iter()
+                .map(|(name, reason)| json!({ "name": name, "reason": reason }))
+                .collect();
+        }
     }
     Json(doc)
 }
