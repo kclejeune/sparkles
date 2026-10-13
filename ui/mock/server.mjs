@@ -12,6 +12,15 @@ import { performance } from 'node:perf_hooks';
 import ox from 'oxigraph';
 import { handleBackups } from './backups.mjs';
 import {
+  decorate,
+  handleHistoryChanges,
+  handleSnapshots,
+  pastView,
+  readableFields,
+  recordState,
+  resolveAt,
+} from './history.mjs';
+import {
   allCommits,
   chooseBranch,
   createBranch,
@@ -110,7 +119,10 @@ function addCommit(ds, kind, inserted, deleted, opts = {}) {
     branch: ds.branchName,
     branchId: ds.branchId,
   };
+  if (opts.message) c.message = opts.message;
   ds.commits.push(c);
+  // the seeded history of the demo datasets has no states, so that its commits answer 410
+  if (opts.state !== false) recordState(ds, c);
   return c;
 }
 
@@ -156,14 +168,15 @@ function seedHistory(ds) {
   let quads = size - net;
   ds.commits = [];
   const start = now - 12 * 86400_000;
-  addCommit(ds, 'create', 0, 0, { at: start, quads: 0 });
-  addCommit(ds, 'load', quads, 0, { at: start + 60_000, quads, bulk: true });
+  addCommit(ds, 'create', 0, 0, { at: start, quads: 0, state: false });
+  addCommit(ds, 'load', quads, 0, { at: start + 60_000, quads, bulk: true, state: false });
   updates.forEach((u, i) => {
     quads += u.inserted - u.deleted;
     const kind = i === 20 ? 'gsp-put' : i === 33 ? 'upload' : 'update';
     const at = start + 3600_000 + ((now - 3600_000 - start) * i) / updates.length;
     addCommit(ds, kind, u.inserted, u.deleted, {
       at,
+      state: false,
       quads,
       bulk: kind === 'upload',
       exact: !(kind === 'upload' && u.deleted > 0),
@@ -241,7 +254,7 @@ function send(res, status, body, type = 'application/json', headers = {}) {
     'Content-Type': type,
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Expose-Headers':
-      'X-Request-Id, Sparkles-Commit, Sparkles-Dataset-Id, Sparkles-Branch, Sparkles-Branch-Id',
+      'X-Request-Id, Sparkles-Commit, Sparkles-Dataset-Id, Sparkles-Branch, Sparkles-Branch-Id, Sparkles-At, Sparkles-Head, Memento-Datetime',
     'X-Request-Id': res.requestId ?? '',
     ...headers,
   });
@@ -1183,6 +1196,16 @@ function pickFormat(accept, candidates) {
 async function handleQuery(req, res, ds, p) {
   const query = p.get('query');
   if (!query) return fail(res, 400, 'Missing query parameter');
+  // a past state (`at=`): the same query over the store of that commit
+  let readSeq = headCommit(ds).seq;
+  let atHeaders = {};
+  if (p.has('at')) {
+    const at = resolveAt(ds, p.get('at'));
+    if (at.error) return send(res, ...at.error);
+    readSeq = at.seq;
+    atHeaders = at.headers;
+    if (at.store) ds = pastView(ds, at.store);
+  }
   if (handleSearchQuery(req, res, ds, p, query)) return;
   const near = geoQuery(ds, query, Number(p.get('send') ?? Infinity), headCommit(ds).seq);
   if (near) return send(res, 200, near, 'application/x-sparkles+json', commitHeaders(ds));
@@ -1287,12 +1310,12 @@ async function handleQuery(req, res, ds, p) {
           totalMs: +(parseMs + planMs + execMs + serializeMs).toFixed(3),
         },
         plan: plan(query, total, execMs, true),
-        commit: headCommit(ds).seq,
+        commit: readSeq,
         datasetId: ds.id,
       },
     },
     'application/x-sparkles+json',
-    commitHeaders(ds),
+    { ...commitHeaders(ds, readSeq), ...atHeaders },
   );
 }
 
@@ -1349,7 +1372,9 @@ function handleUpdate(req, res, ds, p) {
   } catch (e) {
     return send(res, 400, parseErr(e));
   }
-  const receipt = commitWrite(ds, 'update', before);
+  const receipt = commitWrite(ds, 'update', before, {
+    message: req.headers['sparkles-commit-message'] || undefined,
+  });
   ds.deltaInserts += receipt.committed ? receipt.commit.inserted : 0;
   ds.deltaDeletes += receipt.committed ? receipt.commit.deleted : 0;
   ds.cache = { entries: 0, bytes: 0, hits: ds.cache.hits, misses: ds.cache.misses };
@@ -2069,6 +2094,8 @@ const server = http.createServer(async (req, res) => {
     )
       return;
     if (handleDiff(req, res, url, seg, { datasets, send, fail })) return;
+    if (handleHistoryChanges(req, res, url, seg, { datasets, send, fail })) return;
+    if (await handleSnapshots(req, res, url, seg, { datasets, send, fail, readBody })) return;
     if (req.method === 'OPTIONS') {
       res.writeHead(204, {
         'Access-Control-Allow-Origin': '*',
@@ -2528,7 +2555,7 @@ const server = http.createServer(async (req, res) => {
           const after = num('after');
           if (before != null && after != null)
             return fail(res, 400, 'invalid commit range: use either before or after');
-          const list =
+          const list = (
             after != null
               ? allCommits(ds)
                   .filter((c) => c.seq > after)
@@ -2536,7 +2563,8 @@ const server = http.createServer(async (req, res) => {
               : allCommits(ds)
                   .filter((c) => before == null || c.seq < before)
                   .reverse()
-                  .slice(0, limit);
+                  .slice(0, limit)
+          ).map((c) => decorate(ds, c));
           const last = list[list.length - 1];
           const next = !last
             ? null
@@ -2556,6 +2584,7 @@ const server = http.createServer(async (req, res) => {
               head: head.seq,
               firstRetained: ds.firstRetained,
               complete: true,
+              ...readableFields(ds),
               commits: list,
               next,
             },

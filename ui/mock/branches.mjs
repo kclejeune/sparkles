@@ -395,7 +395,7 @@ function planMerge(ds, source, target, o = {}) {
 }
 
 /** A change of a merge as the diff JSON lists it. */
-const changeJson = ({ op, quad: q }) => ({
+export const changeJson = ({ op, quad: q }) => ({
   op,
   subject: String(q.subject),
   predicate: String(q.predicate),
@@ -803,7 +803,7 @@ function commitGraph(ds, url) {
 // the changes of commits, for `GET /{ds}/diff`
 
 /** The changes each commit made (`[{op, quad}]`), by commit object. */
-const changesOf = new WeakMap();
+export const changesOf = new WeakMap();
 
 /** Remember what `commit` changed: the N-Quads lines (without " .") it added and removed. */
 export function recordChanges(commit, added, removed) {

@@ -1,0 +1,166 @@
+// The time slider against a real server (docs/specs/U01-time-slider.md, acceptance examples
+// A1, A2 and A5, and a scrub of the History view as a smoke test). The dataset has three
+// updates: the first loads ex:alice ex:name "Alice" and ex:alice ex:knows ex:bob, the second
+// adds ex:bob ex:name "Bob", and the third replaces ex:alice ex:knows ex:bob with
+// ex:alice ex:knows ex:carol. The tests read commit numbers from the receipts, because the
+// numbering of the first commit is the server's business.
+
+import type { APIRequestContext, Page } from '@playwright/test';
+import { expect, open } from './fixtures';
+
+open.describe.configure({ mode: 'serial' });
+
+const EX = 'http://example.org/';
+const QUERY = `SELECT ?s ?o WHERE { ?s <${EX}knows> ?o }`;
+
+/** One update with a message; the number of the commit it made. */
+async function update(request: APIRequestContext, sparql: string, message: string) {
+  const r = await request.post('/chronology/update?receipt=true', {
+    headers: {
+      'Content-Type': 'application/sparql-update',
+      Accept: 'application/json',
+      'Sparkles-Commit-Message': message,
+    },
+    data: sparql,
+  });
+  expect(r.ok(), `${message}: ${await r.text()}`).toBe(true);
+  const body = await r.json();
+  expect(body.committed, message).toBe(true);
+  return body.commit.seq as number;
+}
+
+let first = 0;
+let second = 0;
+let third = 0;
+
+open.beforeAll(async ({ request }) => {
+  const r = await request.post('/$/datasets', {
+    data: { dbName: 'chronology', dbType: 'persistent' },
+  });
+  expect(r.ok(), await r.text()).toBe(true);
+  first = await update(
+    request,
+    `INSERT DATA { <${EX}alice> <${EX}name> "Alice" . <${EX}alice> <${EX}knows> <${EX}bob> }`,
+    'Load Alice',
+  );
+  second = await update(request, `INSERT DATA { <${EX}bob> <${EX}name> "Bob" }`, 'Add Bob');
+  third = await update(
+    request,
+    `DELETE DATA { <${EX}alice> <${EX}knows> <${EX}bob> } ; INSERT DATA { <${EX}alice> <${EX}knows> <${EX}carol> }`,
+    'Alice knows Carol now',
+  );
+  expect([second, third]).toEqual([first + 1, first + 2]);
+});
+
+open.beforeEach(async ({ page }) => {
+  await page.addInitScript(
+    ([query]) => {
+      localStorage.setItem('sparkles.dataset', 'chronology');
+      localStorage.setItem(
+        'sparkles.queryTabs',
+        JSON.stringify({ tabs: [{ id: 't1', title: 'Query 1', query }], active: 't1' }),
+      );
+    },
+    [QUERY],
+  );
+});
+
+const slider = (page: Page) => page.getByRole('region', { name: 'History time slider' });
+const right = (page: Page) => slider(page).getByRole('slider', { name: /^(Commit|Compared to)$/ });
+const left = (page: Page) => slider(page).getByRole('slider', { name: 'Compared from' });
+const grid = (page: Page) => page.getByRole('grid');
+const atField = (page: Page) => page.locator('input[list="at-options"]');
+
+async function openSlider(page: Page) {
+  await page.goto('/ui/query');
+  await page.getByRole('button', { name: /^Run/ }).click();
+  await expect(grid(page)).toContainText('/carol');
+  await page.getByRole('button', { name: 'History', exact: true }).click();
+  await expect(right(page)).toHaveAttribute('aria-valuenow', String(third));
+}
+
+open('A1: stepping back reads the earlier commits of the query', async ({ page }) => {
+  await openSlider(page);
+  await right(page).focus();
+  await page.keyboard.press('ArrowLeft');
+  await expect(right(page)).toHaveAttribute('aria-valuenow', String(second));
+  await page.keyboard.press('ArrowLeft');
+  await expect(right(page)).toHaveAttribute('aria-valuenow', String(first));
+  await expect(atField(page)).toHaveValue(`commit:${first}`);
+  await expect(grid(page)).toContainText('/bob');
+  await expect(grid(page)).not.toContainText('/carol');
+  await expect(grid(page).getByRole('row')).toHaveCount(2);
+  await expect(slider(page)).toContainText(`commit ${first}`);
+  // the result says which state it read
+  await expect(page.getByText(`at commit ${first}`, { exact: false }).first()).toBeVisible();
+  await page.keyboard.press('End');
+  await expect(grid(page)).toContainText('/carol');
+  await expect(atField(page)).toHaveValue('');
+});
+
+open('A2: compare marks the rows added and removed since the left commit', async ({ page }) => {
+  await openSlider(page);
+  await right(page).focus();
+  await page.keyboard.press('c');
+  await expect(left(page)).toHaveAttribute('aria-valuenow', String(second));
+  const added = grid(page).getByRole('row').filter({ hasText: '/carol' });
+  await expect(added.getByRole('gridcell', { name: 'added' })).toHaveText('+');
+  const removed = grid(page).getByRole('row').filter({ hasText: '/bob' });
+  await expect(removed.getByRole('gridcell', { name: 'removed' })).toHaveText('−');
+  await expect(slider(page).getByRole('status')).toHaveText(
+    `Commit ${third}: 1 row added, 1 removed`,
+  );
+  const chips = page.getByRole('group', { name: 'Changes between the two commits' });
+  await chips.getByRole('button', { name: /^added/ }).click();
+  await expect(grid(page)).toContainText('/carol');
+  await expect(grid(page)).not.toContainText('/bob');
+  // the link restores the comparison
+  await chips.getByRole('button', { name: /^all/ }).click();
+  const url = new URL(page.url());
+  expect(url.searchParams.get('from')).toBe(`commit:${second}`);
+  await page.reload();
+  await expect(left(page)).toHaveAttribute('aria-valuenow', String(second));
+  await expect(
+    grid(page)
+      .getByRole('row')
+      .filter({ hasText: '/carol' })
+      .getByRole('gridcell', { name: 'added' }),
+  ).toBeVisible();
+});
+
+open(
+  'A5: the history of an entity has a tick for each commit that changed it',
+  async ({ page }) => {
+    await page.goto(`/ui/explore?ds=chronology&iri=${encodeURIComponent(`${EX}alice`)}`);
+    const panel = page.getByRole('complementary', { name: 'Resource details' });
+    await expect(panel.getByRole('table').first()).toContainText('carol');
+    await panel.getByRole('button', { name: 'History', exact: true }).click();
+    const bar = panel.getByRole('region', { name: 'Resource history time slider' });
+    const handle = bar.getByRole('slider', { name: /^(Commit|Compared to)$/ });
+    // the second commit did not touch ex:alice
+    await expect(handle).toHaveAttribute('aria-valuemin', String(first));
+    await expect(handle).toHaveAttribute('aria-valuemax', String(third));
+    await handle.focus();
+    await page.keyboard.press('ArrowLeft');
+    await expect(handle).toHaveAttribute('aria-valuenow', String(first));
+    await expect(panel.getByRole('table').first()).toContainText('bob');
+    await page.keyboard.press('End');
+    await page.keyboard.press('c');
+    const net = panel.getByRole('region', { name: 'Changes between the two commits' });
+    await expect(net.locator('.net.add')).toContainText('carol');
+    await expect(net.locator('.net.add')).toContainText(`commit ${third}`);
+    await expect(net.locator('.net.add')).toContainText('Alice knows Carol now');
+    await expect(net.locator('.net.remove')).toContainText('bob');
+  },
+);
+
+open('the History panel scrubs a query to an earlier commit', async ({ page }) => {
+  await openSlider(page);
+  await right(page).focus();
+  await page.keyboard.press('Home');
+  // the oldest readable commit is before the data was loaded
+  await expect(page.getByText(`${EX}carol`)).toHaveCount(0);
+  await expect(atField(page)).not.toHaveValue('');
+  await page.keyboard.press('End');
+  await expect(grid(page)).toContainText('/carol');
+});
