@@ -342,3 +342,41 @@ Each of these can be switched off per query (`QueryOptions::optimizations`) or p
   one. Groups of more than 16 patterns keep the greedy plan, which costs each pair of
   plans once. Switched off, the program builds every candidate plan tree for every split
   of up to 12 patterns, and larger groups are planned greedily.
+
+## Cold reads
+
+These switches matter on a server whose index and vocabulary files are not in the page
+cache, such as the first queries after a restart. With the files in memory they cost
+little and change nothing. Each one has the same answers with it on and off.
+[X07](../specs/X07-cold-sparse-reads.md) has the design and the measurements.
+
+* **Constants requested together** (`prefetch_constants`). Before the planner looks up
+  the constants of a query one by one, it collects the IRIs and literals of the patterns,
+  paths, VALUES rows, graph names and the common FILTER comparisons. It asks for the
+  sparse-index group of every one of them in one pass (`Vocab::prefetch_keys`), so the
+  group reads overlap instead of following each other.
+* **Scans requested before they run** (`prefetch_first_scan`). When the plan is built,
+  every scan of 64 blocks or fewer, and every `COUNT` scan, asks the kernel for the
+  columns it will decode, including the two blocks at the ends of its key range that
+  `count` decodes while the scan is set up. A scan of more blocks reads ahead as it goes.
+* **A read-ahead window per scan.** Index and vocabulary files are mapped for random
+  access, so the kernel reads nothing ahead of a page fault. Every pass over consecutive
+  blocks of a permutation (`ReadAhead` in `index.rs`) keeps its own window of requests
+  ahead of it. The first request covers about 1 MiB and each refill, made when half of
+  the window has been used, doubles the window up to 4 MiB. A scan of a few blocks is
+  covered by the first request and a long scan keeps a window of reads in flight. A scan
+  that stops early has requested at most one window past its end. The window belongs to
+  the pass, so concurrent scans share no state and the mapping's advice never changes.
+  `SPARKLES_READ_WINDOW_KB` sets the largest window, 4096 by default, for experiments.
+  Passes over the vocabulary in id order use the same window size.
+* **Terms of small inputs** (`prefetch_terms`). A FILTER, BIND or ORDER BY over a table of
+  2 to 4,095 rows evaluates the rows one at a time. Before the first row, it asks for the
+  vocabulary blocks of the terms it will read. Larger tables decode their terms in id order
+  as before. The native JSON result writer asks for the blocks of the terms it prints, as
+  the other result writers do.
+* **Parallel decode** (`parallel_decode`). A join or a scan that has asked the kernel for
+  its blocks decodes their columns on a small thread pool of the block cache's own, before
+  the reader reaches them. It decodes only columns the reader decodes anyway and keeps them
+  in the cache. A lookup that touches dozens of blocks for a few rows each spends most of
+  its time decoding whole 32,768-row columns, and this spreads that time over several
+  cores. Reads through a view that keeps no blocks, such as an export, skip it.
