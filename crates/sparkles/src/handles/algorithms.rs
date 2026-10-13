@@ -37,6 +37,18 @@ impl Algorithms {
         p.into_iter().collect()
     }
 
+    /// The SPARQL query that a request without a write part stands for (with only the
+    /// summary as its result when `summary_only`), for a caller that runs it itself
+    /// with its own budgets and result format.
+    pub fn query_text(&self, req: &AlgoRequest, summary_only: bool) -> Result<String> {
+        if req.write.is_some() {
+            return Err(Error::invalid(
+                "the request writes its results; use run_write",
+            ));
+        }
+        crate::sparql::algorun::query_text(req, &self.prefixes(), summary_only).map(|(q, _)| q)
+    }
+
     /// Run a request and return its rows, one for each node (or node pair, or node and
     /// level), with a column for each output. The query it stands for runs with the
     /// dataset's query defaults and the budgets and access of `opts`.

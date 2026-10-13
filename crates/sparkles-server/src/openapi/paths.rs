@@ -420,6 +420,7 @@ pub(super) fn add_all(p: &mut Paths) {
     schema(p);
     admin(p);
     queries(p);
+    algorithms(p);
     graphql(p);
     history(p);
     branches(p);
@@ -1011,6 +1012,91 @@ fn admin(p: &mut Paths) {
         )
         .see("datasets-admin")
         .json("200", "What was dropped.", "CacheCleared"),
+    );
+}
+
+fn algorithms(p: &mut Paths) {
+    p.add(
+        op(
+            POST,
+            "/$/algo/{ds}/run",
+            "runAlgorithm",
+            "Graph algorithms",
+            "Run a graph algorithm",
+        )
+        .doc("Without `write` the run is the SPARQL query its request stands for, answered as `/{ds}/sparql` answers (`Accept`, `timeout`, `execution` and the budget overrides apply), one row per node, node pair or node and level. `summary=true` returns only the statistics of the run. With `write` the run is a task that computes at the head commit and writes the rows in batched commits, with a run record in the graph. It needs `write` on the dataset and can be cancelled with `DELETE /$/tasks/{id}`.")
+        .see("graph-algorithms")
+        .params(&["format", "timeout", "nocache", "execution"])
+        .query("summary", json!({ "type": "boolean" }), "Return only the summary of the run.")
+        .json_body(true, "AlgoRequest")
+        .resp_h(
+            "200",
+            "The rows of the run, or its summary.",
+            Some(json!({ "application/sparql-results+json": { "schema": { "type": "object" } } })),
+            json!({}),
+        )
+        .resp("202", "A run with `write`, started as a task.", Some(json!({ "application/json": { "schema": sref("Task") } })))
+        .errors(&[400, 409, 507]),
+    );
+    p.add(
+        op(
+            GET,
+            "/$/algo/{ds}/projections",
+            "listAlgorithmProjections",
+            "Graph algorithms",
+            "List the named projections",
+        )
+        .see("graph-algorithms")
+        .json(
+            "200",
+            "The definitions and the projection cache.",
+            "AlgoProjectionList",
+        ),
+    );
+    p.add(
+        op(
+            GET,
+            "/$/algo/{ds}/projections/{name}",
+            "getAlgorithmProjection",
+            "Graph algorithms",
+            "Get a named projection",
+        )
+        .see("graph-algorithms")
+        .resp_h(
+            "200",
+            "The definition with its revision.",
+            Some(json!({ "application/json": { "schema": sref("AlgoProjection") } })),
+            json!({ "ETag": { "description": "`\"r<N>\"`", "schema": { "type": "string" } } }),
+        ),
+    );
+    p.add(
+        op(
+            PUT,
+            "/$/algo/{ds}/projections/{name}",
+            "putAlgorithmProjection",
+            "Graph algorithms",
+            "Define a named projection",
+        )
+        .doc("Stores the definition as the next revision. `If-Match: \"r<N>\"` replaces only revision N, and `If-None-Match: *` only creates. A bare string in `predicates` is a predicate in the algorithm's own direction.")
+        .see("graph-algorithms")
+        .params(&["ifMatch", "ifNoneMatch"])
+        .json_body(true, "AlgoProjectionDefinition")
+        .json("200", "Replaced.", "AlgoProjection")
+        .json("201", "Created.", "AlgoProjection")
+        .errors(&[400, 412]),
+    );
+    p.add(
+        op(
+            DELETE,
+            "/$/algo/{ds}/projections/{name}",
+            "deleteAlgorithmProjection",
+            "Graph algorithms",
+            "Delete a named projection",
+        )
+        .see("graph-algorithms")
+        .param("ifMatch")
+        .no_content("Deleted.")
+        .errors(&[412]),
     );
 }
 

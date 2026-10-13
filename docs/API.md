@@ -31,6 +31,7 @@ A machine-readable description of this API is served at `/$/openapi.json`. See
 * [Full-text search](#full-text-search)
 * [Vector similarity](#vector-similarity)
 * [Path search](#path-search)
+* [Graph algorithms](#graph-algorithms)
 * [GeoSPARQL](#geosparql)
 * [Reasoning status and diagnostics](#reasoning-status-and-diagnostics)
 * [RDFS on read](#rdfs-on-read)
@@ -5151,6 +5152,183 @@ described under "Edges from a pattern" below.
 * **Plans.** EXPLAIN shows a `PathSearch` operator with the mode, the ends, the
   predicates and the limits. The executed plan adds the searches run, the nodes they
   visited and the paths found.
+
+## Graph algorithms
+
+`SERVICE algo:<name> { … }` runs a graph algorithm on a projection of the active graph
+and returns the result as solutions, one row for each node, node pair, or node and level.
+The service runs inside Sparkles, so it needs no outbound access and ignores
+`--no-service`. The design is in [F14](specs/F14-graph-algorithms.md).
+
+```sparql
+PREFIX algo: <urn:x-sparkles:algo#>
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+SELECT ?person ?rank WHERE {
+  SERVICE algo:pageRank {
+    [] algo:predicate foaf:knows ; algo:node ?person ; algo:score ?rank .
+  }
+}
+ORDER BY DESC(?rank) LIMIT 20
+```
+
+The block holds triples with one subject, usually `[]`. The predicates are the
+parameters and outputs below. An unknown parameter, or one that the algorithm does not
+take, fails with `400`.
+
+### Algorithms
+
+| Algorithm | Outputs | Parameters |
+|---|---|---|
+| `algo:pageRank` | `algo:score` | `dampingFactor` (0.85), `maxIterations` (20), `tolerance` (1e-7), `source`, `graphalytics` |
+| `algo:betweenness` | `algo:score` | `samples`, `seed` |
+| `algo:wcc`, `algo:scc` | `algo:component` | none |
+| `algo:labelPropagation` | `algo:community` | `maxIterations` |
+| `algo:louvain` | `algo:community`, `algo:level` | `resolution` (1), `maxLevels` (10), `tolerance` (1e-4), `maxIterations` |
+| `algo:leiden` | `algo:community`, `algo:level` | the Louvain parameters, `randomness` (0.01), `seed` |
+| `algo:nodeSimilarity` | `algo:otherNode`, `algo:similarity` | `metric` (`jaccard` or `overlap`), `topK` (10), `similarityCutoff`, `degreeCutoff`, `maxPairs` |
+| `algo:triangleCount` | `algo:triangles` | none |
+| `algo:clustering` | `algo:coefficient`, `algo:triangles` | `graphalytics` |
+| `algo:kCore` | `algo:core` | none |
+| `algo:bfs` | `algo:depth` | `source`, `graphalytics` |
+| `algo:sssp` | `algo:distance` | `source`, `graphalytics` |
+| `algo:fastRP` | `algo:embedding` | `dimension` (128), `iterationWeights`, `normalizationStrength`, `seed` |
+| `algo:node2vec` | `algo:embedding` | `dimension` (128), `walkLength` (80), `walksPerNode` (10), `windowSize` (10), `returnFactor`, `inOutFactor`, `negativeSamples` (5), `epochs` (1), `learningRate` (0.025), `seed` |
+
+Every algorithm also has `algo:node` and `algo:summary` as outputs, and takes
+`algo:concurrency`, `algo:maxMemory` and `algo:limit` as parameters. `algo:source` is a
+constant or a variable that another pattern of the group binds. The call then runs once
+for all its values and joins its rows with the group's.
+
+### Projections
+
+A projection is the graph the algorithm runs on, built from the active graph when the
+call starts. It holds what the caller may read.
+
+| Parameter | Value | Default | Meaning |
+|---|---|---|---|
+| `algo:predicate` | an IRI, or a list of an IRI and a direction, repeatable | every predicate between resources except `rdf:type` | The predicates whose triples are edges. |
+| `algo:direction` | `algo:forward`, `algo:backward` or `algo:undirected` | the algorithm's own | How an edge is followed. |
+| `algo:nodeClass` | an IRI, repeatable | any node | Keeps the nodes with that `rdf:type`. A node of the class without edges is a node of the projection. |
+| `algo:weight` | an IRI | none | The property of an edge's RDF 1.2 reifier that holds its weight. |
+| `algo:defaultWeight` | a non-negative number | 1 | The weight of an edge without one. |
+| `algo:aggregate` | `none`, `sum`, `max` or `count` | `none` | How several edges between the same nodes combine. `none` keeps them apart and `count` makes one edge whose weight is their number. |
+| `algo:projection` | a string | none | The name of a [stored projection](#named-projections). It cannot be combined with the parameters above. |
+
+A block can also hold a nested pattern whose solutions are the edges, with
+`algo:start` and `algo:end` naming the variables of an edge's two ends and
+`algo:edgeWeight` the variable of its weight. The pattern is evaluated once, and each
+distinct pair of ends is one edge. Under `GRAPH ?g` the call runs once for each named
+graph and `?g` is bound to it.
+
+### Results
+
+* **Doubles.** A score is an `xsd:double` whose lowest four mantissa bits are zero, a
+  relative difference below 2^-48 from the computed value. This keeps every score
+  inline in the index, so a run over millions of nodes adds nothing to the vocabulary.
+* **Limits.** `algo:limit N` keeps the N rows with the highest value of the algorithm's
+  main measure before the rows are joined with the rest of the group. Ties go to the node
+  with the lower term id. For `algo:bfs` and `algo:sssp` the nearest nodes come first.
+* **Node pairs.** `algo:nodeSimilarity` returns each pair in both orders, with the
+  `algo:topK` best partners for each node. `SELECT DISTINCT` over the two nodes in a
+  fixed order, for example with `FILTER(STR(?a) < STR(?b))`, keeps one of each pair.
+* **Summary.** `algo:summary ?s` binds an `rdf:JSON` literal with the statistics of the
+  run, such as `nodes`, `edges` and the iterations or modularity of the algorithm. A
+  block that asks only for `algo:summary` returns one row and skips the per-node work.
+* **Embeddings.** `algo:embedding` is an `spk:vector` literal, so it can be written
+  with an update and indexed (see [Vector similarity](#vector-similarity)).
+* **Budgets.** A call counts against the query's timeout and memory budget. A projection
+  or a result that does not fit fails the query with a message that names the parameter
+  to change. `algo:maxMemory` sets a lower budget for one call.
+* **Threads and cache.** `--algo-threads` and `--algo-max-threads-per-call` limit the
+  threads of all calls and of each call, and `--algo-cache-mb` sizes the cache of built
+  projections. A projection of unchanged data is built once, and a write to the dataset
+  makes the next call build a new one.
+* **Plans.** EXPLAIN shows an `AlgoCall` operator with the algorithm and its projection.
+  The executed plan adds the nodes, the edges, the milliseconds spent building and running,
+  the peak bytes, and the projections taken from the cache.
+
+### Runs over HTTP
+
+`POST /$/algo/{ds}/run` takes a JSON request and runs it as the query it stands for.
+
+```json
+{
+  "algorithm": "leiden",
+  "projection": { "predicates": ["http://xmlns.com/foaf/0.1/knows"], "direction": "undirected" },
+  "params": { "seed": 7, "resolution": 1.0 }
+}
+```
+
+Without a `write` member the answer is the result of the query, in the format that the
+`Accept` header or `format` parameter asks for, and the request parameters of
+`/{ds}/sparql` apply (`timeout`, `execution` and the budget overrides). With
+`summary=true` the answer holds only the summary. The `projection` is the name of a stored
+projection or a definition, and its `predicates` may be bare IRIs. Prefixed names in
+`params` and `write` use the standard prefixes and the dataset's.
+
+A request with a `write` member writes its results back as a task.
+
+```json
+{
+  "algorithm": "pageRank",
+  "projection": "people",
+  "write": {
+    "graph": "http://example.org/analytics",
+    "mode": "replace",
+    "predicates": { "score": "http://example.org/rank" },
+    "batchSize": 50000
+  }
+}
+```
+
+| Member | Meaning |
+|---|---|
+| `graph` | The graph that receives the results and the run record. |
+| `mode` | `replace` (the default) clears the graph in the first commit. `merge` replaces only the values of the written predicates for each node it writes. |
+| `predicates` | The predicate each output is written with, for at least one output. An output without a predicate is not written. |
+| `batchSize` | The triples in each commit, 100,000 by default. A batch holds whole nodes. |
+| `atomic` | One commit for the whole run. |
+
+The answer is `202` with a task of kind `algo-run`. The task computes at the head commit
+and then writes batches in commits with the message `algo run <uuid> batch i/n`. It needs
+`write` on the dataset, and only one such task runs for a dataset at a time. A run that is
+cancelled with `DELETE /$/tasks/{id}` keeps the batches it committed. When the task
+ends, its `detail` holds the IRI of the run, the commit it computed at, and the rows,
+triples and commits written.
+
+The run record is a resource in the output graph with `spk:algorithm`, `spk:parameters`,
+`spk:projection`, `spk:sourceCommit`, `prov:startedAtTime`, `spk:triplesPlanned` and
+`spk:batchesPlanned`. Each batch updates `spk:batchesWritten` and `spk:triplesWritten` in
+its own commit, and the last one adds `prov:endedAtTime` and `spk:status`, which is
+`complete`. A run that is cancelled or fails records `cancelled` or `failed` when it can.
+`louvain` and `leiden` write each community as the resource
+`urn:x-sparkles:algo:{run}:{level}:{id}`, with the level and a `skos:broader` link to its
+parent at the next level.
+
+A replace run commits its first batch before the others, so a reader sees a graph with
+part of the new results until the run ends. Use `atomic` for a graph that must change at
+once, at the price of one large commit.
+
+### Named projections
+
+| Route | Needs | Meaning |
+|---|---|---|
+| `GET /$/algo/{ds}/projections` | read | The definitions, and the size of the projection cache. |
+| `GET /$/algo/{ds}/projections/{name}` | read | One definition with its revision, as the `ETag` `"r3"`. |
+| `PUT /$/algo/{ds}/projections/{name}` | admin | Create or replace a definition. `If-Match: "r3"` replaces only that revision and `If-None-Match: *` only creates. A bare string in `predicates` means that predicate in the algorithm's direction. |
+| `DELETE /$/algo/{ds}/projections/{name}` | admin | Remove a definition. |
+
+A name has letters, digits, `_` and `-`, at most 64 characters. A definition has the
+members of a projection above in camel case: `predicates`, `direction`, `nodeClasses`,
+`weight`, `defaultWeight` and `aggregate`. An empty `predicates` list is refused with
+`400`, and leaving the member out means every predicate but `rdf:type`. `algo:projection
+"name"` in SPARQL and the `projection` of a run request refer to a definition by name.
+They read the definition as it is when the query is planned, so a query at an older commit
+uses today's definitions.
+
+The definitions are kept in `algo.json` of a persistent dataset, which backups and
+clones include. A file that cannot be read leaves the list empty, reports why in
+`warning`, and refuses changes, so that it is never overwritten.
 
 ## GeoSPARQL
 

@@ -885,6 +885,11 @@ fn tags() -> J {
             "stored-queries"
         ),
         t(
+            "Graph algorithms",
+            "PageRank, communities, similarity and embeddings on projections of a dataset.",
+            "graph-algorithms"
+        ),
+        t(
             "GraphQL",
             "Read-only GraphQL over a dataset, and its mapping schema.",
             "graphql"

@@ -129,6 +129,10 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/queries/{ds}/{name}", &["GET", "PUT", "DELETE"]),
     ("/$/queries/{ds}/{name}/versions", &["GET"]),
     ("/{ds}/queries/{name}", &["GET", "POST"]),
+    // graph algorithms (F14): a run that writes also needs write on the dataset
+    ("/$/algo/{ds}/run", &["POST"]),
+    ("/$/algo/{ds}/projections", &["GET"]),
+    ("/$/algo/{ds}/projections/{name}", &["GET", "PUT", "DELETE"]),
     ("/$/commits/{ds}", &["GET"]),
     ("/$/commits/{ds}/{reference}", &["GET"]),
     // branches and merges: the handlers check each branch a request names
@@ -302,6 +306,11 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         // a pure computation over the request's literals
         "/$/geo/convert" => Caller,
         "/$/metrics" => Server(ServerPerm::Metrics),
+        // a run reads (a run that writes is checked by the handler); projections are
+        // definitions that an admin sets
+        "/$/algo/{ds}/run" | "/$/algo/{ds}/projections" => Dataset(Read),
+        "/$/algo/{ds}/projections/{name}" if get => Dataset(Read),
+        "/$/algo/{ds}/projections/{name}" => Dataset(Admin),
         "/$/queries/{ds}/suggestions" if *method == Method::POST => Dataset(Read),
         "/$/queries/{ds}/suggestions" => Dataset(Admin),
         "/$/memory/{ds}" if get => Dataset(Read),

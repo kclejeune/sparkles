@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
+mod algo;
 pub(crate) mod branches;
 mod budgets;
 mod changes;
@@ -148,6 +149,14 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(budgets::get_quota)
                 .put(budgets::put_quota)
                 .delete(budgets::delete_quota),
+        )
+        .route("/$/algo/{ds}/run", post(algo::run))
+        .route("/$/algo/{ds}/projections", get(algo::list))
+        .route(
+            "/$/algo/{ds}/projections/{name}",
+            get(algo::get_one)
+                .put(algo::put_one)
+                .delete(algo::delete_one),
         )
         .route("/$/queries/{ds}", get(queries::list))
         .route(

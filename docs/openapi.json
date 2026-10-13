@@ -967,6 +967,231 @@
       }
     },
     "schemas": {
+      "AlgoProjection": {
+        "description": "A named projection of a dataset. A PUT sends the definition, or this object with its `definition` member.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#graph-algorithms"
+        },
+        "properties": {
+          "author": {
+            "type": "string"
+          },
+          "definition": {
+            "$ref": "#/components/schemas/AlgoProjectionDefinition"
+          },
+          "name": {
+            "type": "string"
+          },
+          "revision": {
+            "description": "1 for a new projection, one more for each replacement.",
+            "type": "integer"
+          },
+          "updated": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "revision",
+          "updated",
+          "definition"
+        ],
+        "type": "object"
+      },
+      "AlgoProjectionDefinition": {
+        "additionalProperties": false,
+        "description": "The edges of a projection. Without `predicates` every predicate between resources counts, except `rdf:type`. An empty `predicates` list is refused.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#graph-algorithms"
+        },
+        "properties": {
+          "aggregate": {
+            "enum": [
+              "none",
+              "sum",
+              "max",
+              "count"
+            ],
+            "type": "string"
+          },
+          "defaultWeight": {
+            "type": "number"
+          },
+          "direction": {
+            "enum": [
+              "forward",
+              "backward",
+              "undirected"
+            ],
+            "type": "string"
+          },
+          "nodeClasses": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "predicates": {
+            "items": {
+              "description": "An IRI (a prefixed name in a run request), or an object with the direction this predicate is read in.",
+              "oneOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "properties": {
+                    "direction": {
+                      "enum": [
+                        "forward",
+                        "backward",
+                        "undirected"
+                      ],
+                      "type": "string"
+                    },
+                    "iri": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "iri"
+                  ],
+                  "type": "object"
+                }
+              ]
+            },
+            "type": "array"
+          },
+          "weight": {
+            "description": "The property of an edge's reifier that holds its weight.",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "AlgoProjectionList": {
+        "description": "A dataset's named projections and the size of the cache of built projections.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#graph-algorithms"
+        },
+        "properties": {
+          "cache": {
+            "properties": {
+              "bytes": {
+                "type": "integer"
+              },
+              "entries": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "bytes",
+              "entries"
+            ],
+            "type": "object"
+          },
+          "dataset": {
+            "type": "string"
+          },
+          "projections": {
+            "items": {
+              "$ref": "#/components/schemas/AlgoProjection"
+            },
+            "type": "array"
+          },
+          "warning": {
+            "description": "Why `algo.json` could not be read. The list is then empty and refuses changes.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "dataset",
+          "projections",
+          "cache"
+        ],
+        "type": "object"
+      },
+      "AlgoRequest": {
+        "additionalProperties": false,
+        "description": "A run of one algorithm. With `write` the results are written to a graph in batched commits.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#graph-algorithms"
+        },
+        "properties": {
+          "algorithm": {
+            "enum": [
+              "pageRank",
+              "betweenness",
+              "wcc",
+              "scc",
+              "labelPropagation",
+              "louvain",
+              "leiden",
+              "nodeSimilarity",
+              "triangleCount",
+              "clustering",
+              "kCore",
+              "bfs",
+              "sssp",
+              "fastRP",
+              "node2vec"
+            ],
+            "type": "string"
+          },
+          "params": {
+            "additionalProperties": true,
+            "description": "The parameters of the algorithm, named as in `algo:` without the prefix, such as `maxIterations`, `seed` or `topK`.",
+            "type": "object"
+          },
+          "projection": {
+            "description": "The name of a stored projection, or a definition.",
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "$ref": "#/components/schemas/AlgoProjectionDefinition"
+              }
+            ]
+          },
+          "write": {
+            "additionalProperties": false,
+            "properties": {
+              "atomic": {
+                "type": "boolean"
+              },
+              "batchSize": {
+                "type": "integer"
+              },
+              "graph": {
+                "type": "string"
+              },
+              "mode": {
+                "enum": [
+                  "replace",
+                  "merge"
+                ],
+                "type": "string"
+              },
+              "predicates": {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "description": "The predicate that each output is written with, such as `{\"score\": \"ex:rank\"}`.",
+                "type": "object"
+              }
+            },
+            "required": [
+              "graph",
+              "predicates"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "algorithm"
+        ],
+        "type": "object"
+      },
       "AskFeedback": {
         "additionalProperties": false,
         "description": "Feedback on an answer.",
@@ -16830,6 +17055,368 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/$/algo/{ds}/projections": {
+      "get": {
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#graph-algorithms"
+        },
+        "operationId": "listAlgorithmProjections",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AlgoProjectionList"
+                }
+              }
+            },
+            "description": "The definitions and the projection cache."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "List the named projections",
+        "tags": [
+          "Graph algorithms"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
+    "/$/algo/{ds}/projections/{name}": {
+      "delete": {
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#graph-algorithms"
+        },
+        "operationId": "deleteAlgorithmProjection",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/name"
+          },
+          {
+            "$ref": "#/components/parameters/ifMatch"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Delete a named projection",
+        "tags": [
+          "Graph algorithms"
+        ],
+        "x-sparkles-permission": "admin"
+      },
+      "get": {
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#graph-algorithms"
+        },
+        "operationId": "getAlgorithmProjection",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/name"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AlgoProjection"
+                }
+              }
+            },
+            "description": "The definition with its revision.",
+            "headers": {
+              "ETag": {
+                "description": "`\"r<N>\"`",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Get a named projection",
+        "tags": [
+          "Graph algorithms"
+        ],
+        "x-sparkles-permission": "read"
+      },
+      "put": {
+        "description": "Stores the definition as the next revision. `If-Match: \"r<N>\"` replaces only revision N, and `If-None-Match: *` only creates. A bare string in `predicates` is a predicate in the algorithm's own direction.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#graph-algorithms"
+        },
+        "operationId": "putAlgorithmProjection",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/name"
+          },
+          {
+            "$ref": "#/components/parameters/ifMatch"
+          },
+          {
+            "$ref": "#/components/parameters/ifNoneMatch"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AlgoProjectionDefinition"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AlgoProjection"
+                }
+              }
+            },
+            "description": "Replaced."
+          },
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AlgoProjection"
+                }
+              }
+            },
+            "description": "Created."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Define a named projection",
+        "tags": [
+          "Graph algorithms"
+        ],
+        "x-sparkles-permission": "admin"
+      }
+    },
+    "/$/algo/{ds}/run": {
+      "post": {
+        "description": "Without `write` the run is the SPARQL query its request stands for, answered as `/{ds}/sparql` answers (`Accept`, `timeout`, `execution` and the budget overrides apply), one row per node, node pair or node and level. `summary=true` returns only the statistics of the run. With `write` the run is a task that computes at the head commit and writes the rows in batched commits, with a run record in the graph. It needs `write` on the dataset and can be cancelled with `DELETE /$/tasks/{id}`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#graph-algorithms"
+        },
+        "operationId": "runAlgorithm",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/format"
+          },
+          {
+            "$ref": "#/components/parameters/timeout"
+          },
+          {
+            "$ref": "#/components/parameters/nocache"
+          },
+          {
+            "$ref": "#/components/parameters/execution"
+          },
+          {
+            "description": "Return only the summary of the run.",
+            "in": "query",
+            "name": "summary",
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AlgoRequest"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/sparql-results+json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The rows of the run, or its summary.",
+            "headers": {}
+          },
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Task"
+                }
+              }
+            },
+            "description": "A run with `write`, started as a task."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Run a graph algorithm",
+        "tags": [
+          "Graph algorithms"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
     "/$/asks/{ds}": {
       "delete": {
         "description": "Removes the caller's entries, or the one entry `id` names.",
@@ -37606,6 +38193,13 @@
         "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#stored-queries"
       },
       "name": "Stored queries"
+    },
+    {
+      "description": "PageRank, communities, similarity and embeddings on projections of a dataset.",
+      "externalDocs": {
+        "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#graph-algorithms"
+      },
+      "name": "Graph algorithms"
     },
     {
       "description": "Read-only GraphQL over a dataset, and its mapping schema.",
