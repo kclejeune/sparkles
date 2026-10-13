@@ -87,7 +87,7 @@ log "dataset: $(wc -l < "$DATAFILE") triples"
 for n in "${NAMES[@]}"; do
   src=$SP2B/share/sp2b/queries/$n.sparql
   [ -f "$src" ] || die "the SP2Bench release has no $src"
-  cp "$src" "queries/$n.rq"
+  cat "$src" > "queries/$n.rq"
 done
 COUNT_ONLY=""
 DATA_SPECS=("sp2bench-$SCALE=$WORK/$DATAFILE|BSD|SP2Bench v1.01 $PARAMS")
