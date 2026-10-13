@@ -147,7 +147,18 @@ pub const DEFAULT_CLOSURE_CACHE_TRIPLES: usize = 10_000_000;
 /// The record kept in a database directory, if it has one that reads. The record lives
 /// in the directory, so it survives restarts however the database is opened.
 pub fn read_record(root: &Path) -> Option<ReasoningRecord> {
-    serde_json::from_slice(&std::fs::read(root.join(RECORD_FILE)).ok()?).ok()
+    let v: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join(RECORD_FILE)).ok()?).ok()?;
+    // A record that a newer release wrote is not used, since it may mean more than this
+    // build reads.
+    if let Err(e) = crate::formats::check_settings(RECORD_FILE, &v) {
+        tracing::warn!(
+            "{}: {e}; the dataset is treated as having no reasoning record",
+            root.join(RECORD_FILE).display()
+        );
+        return None;
+    }
+    serde_json::from_value(v).ok()
 }
 
 /// Write (or with `None` remove) the record of a database directory durably: a
@@ -158,7 +169,7 @@ pub fn write_record(root: &Path, record: Option<&ReasoningRecord>) -> Result<()>
     match record {
         Some(r) => {
             let mut r = r.clone();
-            r.reasoning_format = 2;
+            r.reasoning_format = crate::formats::settings_file(RECORD_FILE).map_or(2, |f| f.writes);
             let bytes = serde_json::to_vec_pretty(&r)
                 .map_err(|e| crate::Error::invalid(format!("reasoning record: {e}")))?;
             crate::guard::config::write_atomic(&path, &bytes)
@@ -179,4 +190,21 @@ pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
     #[cfg(not(unix))]
     let _ = dir;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_newer_reasoning_record_is_not_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(RECORD_FILE);
+        let newer = crate::formats::settings_file(RECORD_FILE).unwrap().writes + 1;
+        let body = |f: &str| format!(r#"{{{f} "profile": "rdfs", "inferred": 1, "at": "t"}}"#);
+        std::fs::write(&path, body(&format!(r#""reasoningFormat": {newer},"#))).unwrap();
+        assert!(read_record(dir.path()).is_none());
+        std::fs::write(&path, body("")).unwrap();
+        assert_eq!(read_record(dir.path()).unwrap().profile, "rdfs");
+    }
 }

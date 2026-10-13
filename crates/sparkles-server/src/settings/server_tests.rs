@@ -199,7 +199,10 @@ async fn models_layers_and_routes() {
     assert!(m.provider("gw").is_some());
     assert_eq!(m.pairs(crate::models::Role::Draft)[0].provider, "gw");
     let file = f.dir.path().join("data").join(server::MODELS_FILE);
-    let stored: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    let mut stored: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    // the file carries its version, which is not a setting
+    assert_eq!(stored["format"], 1);
+    stored.as_object_mut().unwrap().remove("format");
     assert_eq!(stored, v["runtime"]);
     // a request in flight keeps the configuration it started with
     let held = f.st.models().unwrap();

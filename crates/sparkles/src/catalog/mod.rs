@@ -90,6 +90,10 @@ struct Entry {
     kind: DatasetKind,
     attached: bool,
 }
+/// The catalog's registry of datasets in the data directory. Its `format` member
+/// ([`sparkles_core::formats::CATALOG`]) is added on write and checked on read.
+pub const CONFIG_FILE: &str = "config.json";
+
 #[derive(Serialize, Deserialize, Default)]
 struct Registry {
     datasets: Vec<RegistryEntry>,
@@ -117,6 +121,10 @@ pub(crate) struct Inner {
     /// Persistent datasets taken out of `entries` for an in-place restore, or left
     /// closed by a rename whose rollback could not reopen them.
     detached: Mutex<BTreeMap<String, Detached>>,
+    /// Datasets left closed at open because their files are in a format this release
+    /// does not read, with the refusal. They are also in `detached`, so they stay
+    /// registered.
+    refused: Mutex<BTreeMap<String, String>>,
     manage: Mutex<()>,
     #[cfg(feature = "backup")]
     pub(crate) repositories: Mutex<Option<crate::backup::Repositories>>,
@@ -178,6 +186,7 @@ impl Catalog {
                 entries: RwLock::new(BTreeMap::new()),
                 reservations: Mutex::new(BTreeMap::new()),
                 detached: Mutex::new(BTreeMap::new()),
+                refused: Mutex::new(BTreeMap::new()),
                 manage: Mutex::new(()),
                 #[cfg(feature = "backup")]
                 repositories: Mutex::new(None),
@@ -193,7 +202,29 @@ impl Catalog {
                     e.name
                 )));
             }
-            let ds = catalog.open_dataset(&e.name, e.kind, None)?;
+            let ds = match catalog.open_dataset(&e.name, e.kind, None) {
+                Ok(ds) => ds,
+                // A dataset in a format this release does not read is refused alone: it
+                // stays registered and closed, and the catalog serves the others.
+                Err(Error::Unsupported(msg)) if e.kind == DatasetKind::Persistent => {
+                    let msg = format!(
+                        "dataset \"{}\" is not served: {msg} (`sparkles migrate --data {} --dataset {} --check` lists its formats)",
+                        e.name,
+                        dir.display(),
+                        e.name
+                    );
+                    tracing::error!(target: "sparkles::catalog", "{msg}");
+                    catalog.inner.detached.lock().insert(
+                        e.name.clone(),
+                        Detached {
+                            reasoning: e.reasoning,
+                        },
+                    );
+                    catalog.inner.refused.lock().insert(e.name, msg);
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
             if ds.reasoning_record().is_none() {
                 *ds.state().reasoning.write() = e.reasoning;
             }
@@ -217,6 +248,7 @@ impl Catalog {
                 entries: RwLock::new(BTreeMap::new()),
                 reservations: Mutex::new(BTreeMap::new()),
                 detached: Mutex::new(BTreeMap::new()),
+                refused: Mutex::new(BTreeMap::new()),
                 manage: Mutex::new(()),
                 #[cfg(feature = "backup")]
                 repositories: Mutex::new(None),
@@ -807,6 +839,16 @@ impl Catalog {
         files.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(files)
     }
+    /// The registered datasets this catalog left closed when it opened, because their
+    /// files are in a format this release does not read, with the reason (name, message).
+    pub fn refused(&self) -> Vec<(String, String)> {
+        self.inner
+            .refused
+            .lock()
+            .iter()
+            .map(|(n, m)| (n.clone(), m.clone()))
+            .collect()
+    }
     /// Write `config.json` again, with each dataset's current reasoning record. The
     /// catalog saves after its own changes. Programs that change a dataset's reasoning
     /// record outside the catalog call this to persist it.
@@ -841,8 +883,8 @@ impl Catalog {
         datasets.sort_by(|a, b| a.name.cmp(&b.name));
         let reg = Registry { datasets };
         write_file_atomic(
-            &dir.join("config.json"),
-            &serde_json::to_vec_pretty(&reg).map_err(|e| Error::invalid(e.to_string()))?,
+            &dir.join(CONFIG_FILE),
+            &sparkles_core::formats::settings_to_vec(CONFIG_FILE, &reg)?,
         )
     }
     /// Take a managed persistent dataset out of the lookup map for an in-place
@@ -930,14 +972,20 @@ fn check_name(name: &str) -> Result<()> {
     }
 }
 fn read_registry(dir: &Path) -> Result<Registry> {
-    match std::fs::read(dir.join("config.json")) {
-        Ok(b) => {
-            serde_json::from_slice(&b).map_err(|e| Error::Corrupt(format!("config.json: {e}")))
-        }
+    match std::fs::read(dir.join(CONFIG_FILE)) {
+        // `format` is absent in catalogs written before it existed, which reads as 1
+        Ok(b) => sparkles_core::formats::settings_from_slice(CONFIG_FILE, &b),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Registry::default()),
         Err(e) => Err(e.into()),
     }
 }
+/// Take the catalog lock of a data directory without opening its datasets, for offline
+/// work on a stopped server's databases (`sparkles migrate`). The lock is held until
+/// the file is dropped.
+pub fn lock_data_dir(dir: &Path) -> Result<File> {
+    lock_dir(dir)
+}
+
 pub(crate) fn lock_dir(dir: &Path) -> Result<File> {
     let path = dir.join("catalog.lock");
     let mut file = OpenOptions::new()

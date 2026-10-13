@@ -50,7 +50,10 @@ pub(crate) fn load(store: &Store) -> Option<Arc<RdfsOnRead>> {
     let root = store.root()?;
     let bytes = std::fs::read(root.join(SETTING_FILE)).ok()?;
     let open = || -> Result<RdfsOnRead> {
-        let s: Setting = serde_json::from_slice(&bytes)
+        let v: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|e| Error::invalid(format!("{SETTING_FILE}: {e}")))?;
+        crate::formats::check_settings(SETTING_FILE, &v)?;
+        let s: Setting = serde_json::from_value(v)
             .map_err(|e| Error::invalid(format!("{SETTING_FILE}: {e}")))?;
         Ok(match s.graph {
             Some(g) => RdfsOnRead::new(graph_source(&g)),
@@ -105,7 +108,8 @@ pub fn set(ds: &Dataset, new: Option<NewSchema>) -> Result<()> {
         Some(NewSchema::Graph(g)) => {
             if let Some(root) = root {
                 let s = Setting {
-                    rdfs_format: 1,
+                    rdfs_format: crate::formats::settings_file(SETTING_FILE)
+                        .map_or(1, |f| f.writes),
                     graph: Some(g.clone()),
                 };
                 crate::guard::config::write_atomic(&root.join(SETTING_FILE), &json(&s)?)?;

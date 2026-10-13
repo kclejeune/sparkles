@@ -355,7 +355,7 @@ async fn runtime_values_persist_and_reset() {
             &std::fs::read(ds.store.root().unwrap().join("assistant.json")).unwrap(),
         )
         .unwrap();
-        assert_eq!(file, json!({"historyDays": 7}));
+        assert_eq!(file, json!({"format": 1, "historyDays": 7}));
     }
     // a restart
     let st = state(&data, Some(&f));
@@ -699,7 +699,7 @@ async fn ingest_settings_share_their_file_with_profiles() {
     .unwrap();
     assert_eq!(
         file,
-        json!({"keepText": false, "profiles": {"notes": {"language": "en"}}})
+        json!({"format": 1, "keepText": false, "profiles": {"notes": {"language": "en"}}})
     );
     let (_, v, _) = send(&app, req("GET", "/$/settings/slurp/ingest", None)).await;
     assert_eq!(v["runtime"], json!({"keepText": false}));
@@ -729,7 +729,10 @@ async fn ingest_settings_share_their_file_with_profiles() {
         &std::fs::read(ds.store.root().unwrap().join("ingest.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(file, json!({"profiles": {"notes": {"language": "en"}}}));
+    assert_eq!(
+        file,
+        json!({"format": 1, "profiles": {"notes": {"language": "en"}}})
+    );
 }
 
 /// The model configuration that SIGHUP reads again replaces the one requests start
