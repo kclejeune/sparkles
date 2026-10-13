@@ -65,9 +65,9 @@ shex = ["dep:sparkles-shex"]
 graphql = ["dep:sparkles-graphql"]
 # backup repositories: `ds.backups(&repo)` and `sparkles::backup` (file systems and S3,
 # the backup crate's defaults)
-backup = ["dep:sparkles-backup", "dep:tokio", "dep:toml", "dep:chrono"]
+backup = ["dep:sparkles-backup", "dep:tokio", "dep:toml", "dep:chrono", "dep:zeroize"]
 backup-s3 = ["backup", "sparkles-backup/s3"]
-backup-encryption = ["backup", "sparkles-backup/encryption", "dep:zeroize"]
+backup-encryption = ["backup", "sparkles-backup/encryption"]
 backup-gcs = ["backup", "sparkles-backup/gcs"]
 backup-azure = ["backup", "sparkles-backup/azure"]
 # the formatter and linter: `sparkles::fmt`

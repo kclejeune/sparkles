@@ -938,6 +938,14 @@ fn read_registry(dir: &Path) -> Result<Registry> {
         Err(e) => Err(e.into()),
     }
 }
+/// Take the catalog lock of the data directory `dir`, as [`Catalog::open`] does, for an
+/// offline command that changes files beside the catalog. The lock is held until the
+/// returned file is dropped. A running server holds it, so this fails with
+/// [`Error::Locked`] while one runs.
+pub fn lock_data_dir(dir: &Path) -> Result<File> {
+    lock_dir(dir)
+}
+
 pub(crate) fn lock_dir(dir: &Path) -> Result<File> {
     let path = dir.join("catalog.lock");
     let mut file = OpenOptions::new()
