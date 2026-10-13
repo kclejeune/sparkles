@@ -80,6 +80,62 @@ function stateStore(commit) {
   return st;
 }
 
+/**
+ * `GET /$/commits/{ds}/timeline`: the commits in buckets of consecutive numbers, with the
+ * quad counts and the readable ranges.
+ */
+export function timeline(ds, params) {
+  const buckets = Math.min(Math.max(Number(params.get('buckets') ?? 200) || 200, 1), 2000);
+  const lo = params.has('from') ? Number(params.get('from')) : 0;
+  const hi = params.has('to') ? Number(params.get('to')) : Infinity;
+  const all = allCommits(ds);
+  const list = all.filter((c) => c.seq >= lo && c.seq <= hi);
+  const first = list[0]?.seq ?? 0;
+  const last = list.at(-1)?.seq ?? 0;
+  const width = Math.max(1, Math.ceil((last - first + 1) / buckets));
+  const out = [];
+  let index = null;
+  for (const c of list) {
+    const i = Math.floor((c.seq - first) / width);
+    if (i !== index) {
+      out.push({
+        firstSeq: c.seq,
+        lastSeq: c.seq,
+        firstTime: c.timestamp,
+        lastTime: c.timestamp,
+        commits: 0,
+        inserted: 0,
+        deleted: 0,
+        kinds: {},
+        merges: 0,
+        snapshots: 0,
+      });
+      index = i;
+    }
+    const b = out.at(-1);
+    b.lastSeq = c.seq;
+    b.lastTime = c.timestamp;
+    b.commits++;
+    b.inserted += c.inserted ?? 0;
+    b.deleted += c.deleted ?? 0;
+    b.kinds[c.kind] = (b.kinds[c.kind] ?? 0) + 1;
+    if (c.kind === 'merge') b.merges++;
+    b.snapshots += pinned(ds, c.seq).length;
+  }
+  return {
+    dataset: ds.name,
+    datasetId: ds.id,
+    head: all.at(-1)?.seq ?? 0,
+    firstSeq: first,
+    lastSeq: last,
+    commits: list.length,
+    bucketWidth: width,
+    ...readableFields(ds),
+    readable: readableRanges(ds),
+    buckets: out,
+  };
+}
+
 const err = (status, error, extra = {}) => ({ error: [status, { error, ...extra }] });
 
 /**

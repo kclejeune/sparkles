@@ -19,6 +19,7 @@ import {
   readableFields,
   recordState,
   resolveAt,
+  timeline,
 } from './history.mjs';
 import {
   allCommits,
@@ -2383,7 +2384,14 @@ const server = http.createServer(async (req, res) => {
           const limit = Number(url.searchParams.get('limit') ?? 1000);
           if (!Number.isInteger(limit) || limit < 1 || limit > 10000)
             return fail(res, 400, 'limit must be an integer from 1 to 10000');
-          const r = schemaReport(ds, url.searchParams);
+          // a past state (`at=`): the report over the store of that commit
+          let view = ds;
+          if (url.searchParams.has('at')) {
+            const at = resolveAt(ds, url.searchParams.get('at'));
+            if (at.error) return send(res, ...at.error);
+            if (at.store) view = pastView(ds, at.store);
+          }
+          const r = schemaReport(view, url.searchParams);
           if (r.error) return fail(res, r.status, r.error);
           const cursor = url.searchParams.get('cursor');
           if (extra === 'shapes')
@@ -2549,6 +2557,7 @@ const server = http.createServer(async (req, res) => {
               return fail(res, 410, `commit metadata before ${seq + 1} is no longer retained`);
             return send(res, 200, { dataset: name, datasetId: ds.id, commit: c });
           }
+          if (extra === 'timeline') return send(res, 200, timeline(ds, url.searchParams));
           const limit = Math.min(num('limit') ?? 50, 1000);
           if (!(limit > 0)) return fail(res, 400, 'invalid commit range: limit=0');
           const before = num('before');

@@ -39,6 +39,7 @@
     onselect,
     onexpand,
     emptyText = 'Nothing to draw',
+    animate = false,
   }: {
     nodes: GNode[];
     edges: GEdge[];
@@ -46,10 +47,27 @@
     onselect?: (id: string | null) => void;
     onexpand?: (id: string) => void;
     emptyText?: string;
+    /**
+     * Fade added elements in and removed ones out, and keep the nodes that stay where they
+     * are (the time slider). Off with `prefers-reduced-motion`, then changes appear at once.
+     */
+    animate?: boolean;
   } = $props();
 
   let host: HTMLDivElement;
   let cy: Core | undefined;
+  /** Animations started so far, for tests: it stays 0 under reduced motion. */
+  let animations = 0;
+  let wrap: HTMLDivElement | undefined;
+  const started = () => {
+    animations++;
+    if (wrap) wrap.dataset.animations = String(animations);
+  };
+  const FADE_MS = 300;
+  const reduced = () =>
+    typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const motion = () => animate && !reduced();
+  let motionOn = $state(false);
   let themeObserver: MutationObserver | undefined;
   let media: MediaQueryList | undefined;
   const restyle = () => cy?.style(styles());
@@ -239,25 +257,58 @@
 
   let running: cytoscape.Layouts | undefined;
 
-  function layout(randomize: boolean) {
+  type El = cytoscape.CollectionReturnValue | cytoscape.SingularElementReturnValue;
+
+  /** Fade an element in. */
+  function fadeIn(el: El) {
+    started();
+    el.style('opacity', 0);
+    el.animate(
+      { style: { opacity: 1 } },
+      { duration: FADE_MS, complete: () => el.removeStyle('opacity') },
+    );
+  }
+
+  /** Fade an element out and remove it. */
+  function fadeOut(el: El) {
+    if (el.hasClass('leaving')) return;
+    started();
+    el.addClass('leaving');
+    el.animate({ style: { opacity: 0 } }, { duration: FADE_MS, complete: () => el.remove() });
+  }
+
+  function layout(randomize: boolean, keep?: cytoscape.NodeCollection) {
     if (!cy || cy.nodes().length === 0) return;
     const n = cy.nodes().length;
     // A layout still animating would fight the new one (e.g. focus a node, then its
     // expansion arrives a moment later).
     running?.stop();
-    running = cy.layout({
-      name: 'fcose',
-      quality: n > 400 ? 'draft' : 'default',
-      randomize,
-      animate: !randomize && n < 300,
-      animationDuration: 350,
-      fit: randomize || n < 30,
-      padding: 30,
-      nodeRepulsion: () => (n > 30 ? 12000 : 6500),
-      idealEdgeLength: () => (n > 30 ? 120 : 90),
-      nodeSeparation: 60,
-      packComponents: true,
-    } as cytoscape.LayoutOptions);
+    // an element that is fading out takes no part in the layout
+    running = cy
+      .elements()
+      .not('.leaving')
+      .layout({
+        name: 'fcose',
+        quality: n > 400 ? 'draft' : 'default',
+        randomize,
+        animate: !randomize && n < 300 && !reduced(),
+        animationDuration: 350,
+        fit: randomize || n < 30,
+        padding: 30,
+        nodeRepulsion: () => (n > 30 ? 12000 : 6500),
+        idealEdgeLength: () => (n > 30 ? 120 : 90),
+        nodeSeparation: 60,
+        packComponents: true,
+        // the nodes that stay do not move: only the new ones are placed
+        ...(keep && keep.length
+          ? {
+              fixedNodeConstraint: keep.map((k) => ({
+                nodeId: k.id(),
+                position: { ...k.position() },
+              })),
+            }
+          : {}),
+      } as cytoscape.LayoutOptions);
     running.run();
   }
 
@@ -269,14 +320,27 @@
       edges.filter((e) => wantNodes.has(e.source) && wantNodes.has(e.target)).map((e) => [e.id, e]),
     );
     let added = 0;
+    const fresh = new Set<string>();
+    const fade = motion() && !wasEmpty;
+    motionOn = motion();
     cy.batch(() => {
       cy!.elements().forEach((el) => {
         const id = el.id();
-        if (el.isNode() ? !wantNodes.has(id) : !wantEdges.has(id)) el.remove();
+        if (el.hasClass('leaving')) return;
+        if (el.isNode() ? !wantNodes.has(id) : !wantEdges.has(id)) {
+          if (fade) fadeOut(el);
+          else el.remove();
+        }
       });
       for (const n of wantNodes.values()) {
         const existing = cy!.getElementById(n.id);
         if (existing.nonempty()) {
+          if (existing.hasClass('leaving')) {
+            // wanted again before it faded out
+            existing.stop(true);
+            existing.removeClass('leaving');
+            existing.removeStyle('opacity');
+          }
           existing.data({
             label: sign(n.change) + n.label,
             change: n.change ?? '',
@@ -289,6 +353,8 @@
         } else {
           const el = cy!.add(toEl.node(n));
           added++;
+          fresh.add(n.id);
+          if (fade) fadeIn(el);
           // Seed position next to an existing neighbour so incremental layouts stay calm.
           const neighbour = edges.find((e) => e.target === n.id || e.source === n.id);
           const other = neighbour
@@ -305,15 +371,40 @@
       }
       for (const e of wantEdges.values()) {
         const have = cy!.getElementById(e.id);
-        if (have.empty()) cy!.add(toEl.edge(e));
-        else have.data({ change: e.change ?? '', label: sign(e.change) + e.label });
+        if (have.empty()) {
+          const el = cy!.add(toEl.edge(e));
+          if (fade) fadeIn(el);
+        } else {
+          if (have.hasClass('leaving')) {
+            have.stop(true);
+            have.removeClass('leaving');
+            have.removeStyle('opacity');
+          }
+          have.data({ change: e.change ?? '', label: sign(e.change) + e.label });
+        }
       }
     });
+    // what is drawn, as text, for the tests: the canvas has no elements to find
+    if (wrap && nodes.length <= 300)
+      wrap.dataset.graph = JSON.stringify({
+        nodes: [...wantNodes.values()].map((n) => [n.label, n.change ?? '']),
+        edges: [...wantEdges.values()].map((e) => [e.label, e.change ?? '']),
+      });
     // Too many edge labels turn into noise: show them only on hover/selection.
     cy.edges().toggleClass('quiet', cy.edges().length > 60);
     // Incremental layouts keep the user's arrangement, but when most of the graph is new
     // (a resource and then its neighbours) there is nothing to keep: lay it out afresh.
-    if (added) layout(wasEmpty || cy.nodes().length - added <= 2);
+    if (added) {
+      const randomize = wasEmpty || cy.nodes().length - added <= 2;
+      // in the time slider the nodes that stay keep their places
+      const keep = animate
+        ? cy
+            .nodes()
+            .not('.leaving')
+            .filter((k) => !fresh.has(k.id()))
+        : undefined;
+      layout(randomize, randomize ? undefined : keep);
+    }
   }
 
   /**
@@ -397,7 +488,7 @@
 
   export function center(id: string) {
     const n = cy?.getElementById(id);
-    if (n && n.nonempty()) cy!.animate({ center: { eles: n }, duration: 250 });
+    if (n && n.nonempty()) cy!.animate({ center: { eles: n }, duration: reduced() ? 0 : 250 });
   }
 
   export function relayout() {
@@ -405,7 +496,7 @@
   }
 </script>
 
-<div class="wrap">
+<div class="wrap" bind:this={wrap} data-motion={motionOn ? 'on' : 'off'} data-animations="0">
   <div class="cy" bind:this={host}></div>
   {#if nodes.length === 0}
     <div class="empty-overlay">{emptyText}</div>

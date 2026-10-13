@@ -2,7 +2,7 @@
 // slider moves over, the mapping between a pixel and a commit, buckets for long histories,
 // named-snapshot and merge marks, and the steps of Play. Nothing here touches the DOM or
 // the network, so Vitest covers it.
-import type { Commit } from './api';
+import type { Commit, CommitTimeline } from './api';
 import { commitKindLabel, fmtDelta } from './commits';
 import { fmtBytes, fmtInt } from './format';
 import { diffSummary, readable } from './history';
@@ -30,6 +30,9 @@ export type Stop = {
   fork: boolean;
   /** The live state, which the view follows when the slider rests on it. */
   head: boolean;
+  /** For a stop that stands for a bucket of commits: how many, and the number of the first. */
+  count?: number;
+  first?: number;
 };
 
 export type Track = {
@@ -95,6 +98,102 @@ export function buildTrack(commits: readonly Commit[], opts: TrackOptions = {}):
     });
   }
   return { stops, head, oldestReadable: oldestReadable(stops), gone: goneRanges(stops) };
+}
+
+/**
+ * The track of a timeline answer: one stop for each bucket, at the bucket's last commit
+ * (the state a read of the stop sees). A bucket of one commit is that commit's stop.
+ */
+export function buildBucketTrack(
+  tl: CommitTimeline,
+  opts: { fork?: number | null; readable?: readonly Range[] } = {},
+): Track {
+  const readableRanges = opts.readable ?? tl.readable;
+  const stops: Stop[] = tl.buckets.map((b) => {
+    const time = Date.parse(b.lastTime);
+    const kinds = Object.keys(b.kinds);
+    const single = b.commits === 1 || kinds.length === 1;
+    return {
+      seq: b.lastSeq,
+      time: Number.isNaN(time) ? 0 : time,
+      timestamp: b.lastTime,
+      kind: single ? (kinds[0] ?? 'update') : 'bucket',
+      inserted: b.inserted,
+      deleted: b.deleted,
+      readable: b.lastSeq === tl.head || inRanges(b.lastSeq, readableRanges),
+      snapshots: [],
+      merge: b.merges > 0,
+      fork: opts.fork != null && opts.fork >= b.firstSeq && opts.fork <= b.lastSeq,
+      head: b.lastSeq === tl.head,
+      count: b.commits,
+      first: b.firstSeq,
+    };
+  });
+  if (!stops.some((s) => s.head)) {
+    const last = stops.at(-1);
+    stops.push({
+      seq: tl.head,
+      time: last ? last.time : 0,
+      timestamp: last ? last.timestamp : '',
+      kind: 'head',
+      readable: true,
+      snapshots: [],
+      merge: false,
+      fork: false,
+      head: true,
+    });
+  }
+  return { stops, head: tl.head, oldestReadable: oldestReadable(stops), gone: goneRanges(stops) };
+}
+
+/** The commits a view of the track spans, as a range of commit numbers. */
+export function rangeOfView(track: Track, view: View): Range {
+  const a = track.stops[view.from];
+  const b = track.stops[view.to];
+  return { from: a?.first ?? a?.seq ?? 0, to: b?.seq ?? track.head };
+}
+
+/** Whether any stop in view stands for more than one commit. */
+export function isCoarse(track: Track, view: View): boolean {
+  return track.stops.slice(view.from, view.to + 1).some((s) => (s.count ?? 1) > 1);
+}
+
+/** The view that spans the stops inside a range of commit numbers. */
+export function viewOfRange(track: Track, r: Range): View {
+  const n = track.stops.length;
+  let from = track.stops.findIndex((s) => s.seq >= r.from);
+  if (from < 0) from = Math.max(0, n - 1);
+  let to = from;
+  for (let i = from; i < n && track.stops[i].seq <= r.to; i++) to = i;
+  return { from, to };
+}
+
+/**
+ * The track with the stops that lie inside `r` replaced by finer ones. The rest of the
+ * track keeps its coarse stops, so the handle and the head stay where they are.
+ */
+export function refineTrack(track: Track, r: Range, fine: readonly Stop[]): Track {
+  const inside = (s: Stop) => (s.first ?? s.seq) >= r.from && s.seq <= r.to;
+  const stops = [...track.stops.filter((s) => !inside(s)), ...fine].sort((a, b) => a.seq - b.seq);
+  // a coarse stop that overlaps the range's edge gives way to the fine one
+  const out = stops.filter((s, i) => i === 0 || s.seq !== stops[i - 1].seq || !s.count);
+  return {
+    stops: out,
+    head: track.head,
+    oldestReadable: oldestReadable(out),
+    gone: goneRanges(out),
+  };
+}
+
+/** The range after zooming a range by `factor` (above 1 narrows) around commit `centre`. */
+export function zoomRange(r: Range, factor: number, centre: number, limit: Range): Range {
+  const width = r.to - r.from + 1;
+  const next = Math.min(limit.to - limit.from + 1, Math.max(8, Math.round(width / factor)));
+  const c = Math.min(Math.max(centre, r.from), r.to);
+  const share = width > 1 ? (c - r.from) / (width - 1) : 0.5;
+  let from = Math.round(c - share * (next - 1));
+  from = Math.min(Math.max(limit.from, from), limit.to - next + 1);
+  return { from, to: from + next - 1 };
 }
 
 function oldestReadable(stops: readonly Stop[]): number | null {
@@ -395,12 +494,13 @@ export function bucketize(
       out.push(cur);
     }
     cur.last = s.seq;
+    cur.first = Math.min(cur.first, s.first ?? s.seq);
     sum += x;
     n++;
     // the bucket sits at the mean of its stops
     cur.x = sum / n;
     // the synthetic head stop is a position, not a commit
-    if (s.kind !== 'head') cur.commits++;
+    if (s.kind !== 'head') cur.commits += s.count ?? 1;
     cur.inserted += s.inserted ?? 0;
     cur.deleted += s.deleted ?? 0;
     cur.snapshots.push(...s.snapshots);
@@ -428,9 +528,14 @@ export function fmtMoment(iso: string): string {
 /** The caption under the track: "42 · update by ana · “fix titles” · +3 −1". */
 export function caption(s: Stop): string {
   if (s.kind === 'head' && !s.timestamp) return `${fmtInt(s.seq)} · head`;
-  const parts = [fmtInt(s.seq)];
-  const kind = commitKindLabel(s.kind);
-  parts.push(s.author ? `${kind} by ${s.author}` : kind);
+  const parts = [
+    s.count && s.count > 1 ? `${fmtInt(s.first ?? s.seq)}–${fmtInt(s.seq)}` : fmtInt(s.seq),
+  ];
+  if (s.count && s.count > 1) parts.push(`${fmtInt(s.count)} commits`);
+  if (s.kind !== 'bucket') {
+    const kind = commitKindLabel(s.kind);
+    parts.push(s.author ? `${kind} by ${s.author}` : kind);
+  }
   if (s.message) parts.push(`“${s.message}”`);
   if (s.inserted != null && s.deleted != null)
     parts.push(fmtDelta({ inserted: s.inserted, deleted: s.deleted }));
@@ -440,9 +545,10 @@ export function caption(s: Stop): string {
 
 /** The slider's `aria-valuetext`: "commit 42, 1 October 2026 14:03, update by ana, 3 added, 1 removed". */
 export function valueText(s: Stop): string {
-  const parts = [`commit ${s.seq}`];
+  const parts =
+    s.count && s.count > 1 ? [`commits ${s.first ?? s.seq} to ${s.seq}`] : [`commit ${s.seq}`];
   if (s.timestamp) parts.push(fmtMoment(s.timestamp));
-  if (s.kind !== 'head')
+  if (s.kind !== 'head' && s.kind !== 'bucket')
     parts.push(s.author ? `${commitKindLabel(s.kind)} by ${s.author}` : commitKindLabel(s.kind));
   if (s.head) parts.push('head');
   if (s.inserted != null && s.deleted != null)

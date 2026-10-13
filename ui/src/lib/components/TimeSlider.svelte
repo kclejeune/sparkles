@@ -21,6 +21,7 @@
   import { LatestRun } from '$lib/supersede';
   import {
     bucketize,
+    buildBucketTrack,
     buildTrack,
     caption,
     first,
@@ -28,11 +29,14 @@
     goneTitle,
     bucketTitle,
     indexOf,
+    isCoarse,
     markGone,
     nearestReadable,
     playDelay,
     playNext,
     positions,
+    refineTrack,
+    rangeOfView,
     seqOfSelector,
     selectorOf,
     snapshotStep,
@@ -40,6 +44,7 @@
     stopAt,
     stopAtOrBefore,
     valueText,
+    viewOfRange,
     zoomView,
     type Axis,
     type Range,
@@ -107,11 +112,18 @@
   const uid = $props.id();
   const MAX_COMMITS = 2000;
   const PAGE = 500;
+  /** A range of at most this many commits is read commit by commit when zoomed to. */
+  const DETAIL = 1000;
+  const BUCKETS = 200;
 
   let track = $state<Track>(buildTrack([]));
   let loading = $state(false);
   let loadError = $state<string | null>(null);
   let truncated = $state(false);
+  /** The track is made of buckets of commits (a history too long to list). */
+  let inBuckets = $state(false);
+  let total = $state(0);
+  let timelineReadable: Range[] | undefined;
   let width = $state(640);
   let axis = $state<Axis>('sequence');
   let view = $state<View>({ from: 0, to: 0 });
@@ -135,6 +147,22 @@
     loading = true;
     try {
       let page = await api.commits(ds, { limit: PAGE });
+      // a history too long to list comes as buckets, which zooming refines
+      if (page.head - page.firstRetained + 1 > MAX_COMMITS) {
+        const tl = await api.commitTimeline(ds, { buckets: BUCKETS }).catch(() => null);
+        if (!owns()) return;
+        if (tl) {
+          inBuckets = true;
+          total = tl.commits;
+          timelineReadable = tl.readable;
+          truncated = false;
+          zoomed = false;
+          setTrack(buildBucketTrack(tl, { fork }));
+          loadError = null;
+          return;
+        }
+      }
+      inBuckets = false;
       let shown = page.commits;
       let cut = false;
       while (page.next && owns()) {
@@ -162,6 +190,50 @@
       if (owns()) loadError = api.errorMessage(e);
     } finally {
       if (owns()) loading = false;
+    }
+  }
+
+  /** The finer stops of a range: each commit when there are few, else smaller buckets. */
+  async function fineStops(r: Range) {
+    if (r.to - r.from + 1 <= DETAIL) {
+      let page = await api.commits(ds, { limit: PAGE, before: r.to + 1 });
+      let shown = page.commits;
+      while (page.next && shown.length && shown[shown.length - 1].seq > r.from) {
+        const before = nextBefore(page, shown);
+        if (before == null) break;
+        page = await api.commits(ds, { limit: PAGE, before });
+        shown = mergeCommits(shown, page.commits);
+      }
+      return buildTrack(
+        shown.filter((c) => c.seq >= r.from),
+        { head: track.head, fork, readable: timelineReadable },
+      ).stops.filter((s) => s.kind !== 'head');
+    }
+    const tl = await api.commitTimeline(ds, { buckets: BUCKETS, from: r.from, to: r.to });
+    return buildBucketTrack(tl, { fork, readable: timelineReadable }).stops.filter(
+      (s) => s.kind !== 'head',
+    );
+  }
+
+  /** Zoom a bucketed track: read the commits of the range that comes into view. */
+  async function zoomBuckets(factor: number) {
+    const centre = indexOf(track, rightSeq);
+    const next = zoomView(track, view, factor, centre < 0 ? view.to : centre);
+    if (factor <= 1 || !isCoarse(track, next)) {
+      view = next;
+      zoomed = !(view.from === 0 && view.to === track.stops.length - 1);
+      return;
+    }
+    const owns = runs.claim('zoom');
+    const range = rangeOfView(track, next);
+    try {
+      const fine = await fineStops(range);
+      if (!owns()) return;
+      track = refineTrack(track, range, fine);
+      view = viewOfRange(track, range);
+      zoomed = true;
+    } catch (e) {
+      if (owns()) loadError = api.errorMessage(e);
     }
   }
 
@@ -494,6 +566,7 @@
   }
 
   function zoom(factor: number) {
+    if (inBuckets) return void zoomBuckets(factor);
     const centre = indexOf(track, rightSeq);
     view = zoomView(track, view, factor, centre < 0 ? view.to : centre);
     zoomed = !(view.from === 0 && view.to === track.stops.length - 1);
@@ -846,6 +919,11 @@
           ? ` · ${rightStop.timestamp.slice(0, 16).replace('T', ' ')}`
           : ''}</span
       >
+      {#if inBuckets}
+        <span class="faint small" title="Zoom in to see each commit"
+          >{fmtInt(total)} commits in buckets</span
+        >
+      {/if}
       {#if truncated}
         <span class="faint small" title="Only the newest {MAX_COMMITS} commits are on the track"
           >newest {fmtInt(MAX_COMMITS)} commits</span

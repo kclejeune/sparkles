@@ -843,6 +843,14 @@ export function handleDiff(req, res, url, seg, ctx) {
       if (had && had.op !== ch.op) net.delete(k);
       else net.set(k, ch);
     }
+  // `term=`: only the changes whose subject or object is one of the terms
+  const terms = url.searchParams
+    .getAll('term')
+    .map((t) => (/^[<"_]/.test(t.trim()) ? t.trim() : `<${t.trim()}>`));
+  if (terms.length)
+    for (const [k, ch] of net)
+      if (!terms.includes(String(ch.quad.subject)) && !terms.includes(String(ch.quad.object)))
+        net.delete(k);
   const changes = [...net.values()].sort((a, b) => (a.op === b.op ? 0 : a.op === '-' ? -1 : 1));
   const at = (seq) => list.find((c) => c.seq === seq) ?? { seq, ref: `commit:${seq}` };
   const limit = Number(url.searchParams.get('limit') ?? 1000);

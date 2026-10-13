@@ -1,17 +1,21 @@
 import { describe, expect, it } from 'vitest';
-import type { Commit } from './api';
+import type { Commit, CommitTimeline, TimelineBucket } from './api';
 import {
   bucketize,
+  buildBucketTrack,
   buildTrack,
   caption,
   first,
   fullView,
   goneRanges,
   goneTitle,
+  isCoarse,
   markGone,
   playDelay,
   playNext,
   positions,
+  rangeOfView,
+  refineTrack,
   selectorOf,
   seqOfSelector,
   snapshotStep,
@@ -19,6 +23,8 @@ import {
   stopAt,
   timeFailure,
   valueText,
+  viewOfRange,
+  zoomRange,
   zoomView,
 } from './timeline';
 
@@ -368,5 +374,118 @@ describe('timeFailure', () => {
     expect(timeFailure({ status: 400, body: {} })).toBeNull();
     expect(timeFailure(new Error('x'))).toBeNull();
     expect(timeFailure(null)).toBeNull();
+  });
+});
+
+// --- a history too long to list ---------------------------------------------------------------
+
+const bucket = (firstSeq: number, lastSeq: number, extra: Partial<TimelineBucket> = {}) => ({
+  firstSeq,
+  lastSeq,
+  firstTime: new Date(T0 + firstSeq * 60_000).toISOString(),
+  lastTime: new Date(T0 + lastSeq * 60_000).toISOString(),
+  commits: lastSeq - firstSeq + 1,
+  inserted: 10 * (lastSeq - firstSeq + 1),
+  deleted: 2,
+  kinds: { update: lastSeq - firstSeq + 1 },
+  merges: 0,
+  snapshots: 0,
+  ...extra,
+});
+
+const timeline = (buckets: TimelineBucket[], extra: Partial<CommitTimeline> = {}) => ({
+  dataset: 'ds',
+  datasetId: 'x',
+  head: buckets.at(-1)!.lastSeq,
+  firstSeq: buckets[0].firstSeq,
+  lastSeq: buckets.at(-1)!.lastSeq,
+  commits: buckets.reduce((n, b) => n + b.commits, 0),
+  bucketWidth: 500,
+  readable: [{ from: 1000, to: 4999 }],
+  buckets,
+  ...extra,
+});
+
+describe('buildBucketTrack', () => {
+  const tl = timeline([
+    bucket(0, 499),
+    bucket(500, 999),
+    bucket(1000, 1499, { kinds: { update: 400, load: 100 }, merges: 2 }),
+    bucket(4500, 4999),
+  ]);
+
+  it('makes a stop of each bucket at its last commit', () => {
+    const t = buildBucketTrack(tl);
+    expect(t.stops.map((s) => s.seq)).toEqual([499, 999, 1499, 4999]);
+    expect(t.stops.map((s) => s.count)).toEqual([500, 500, 500, 500]);
+    expect(t.stops[3].head).toBe(true);
+    expect(t.head).toBe(4999);
+  });
+
+  it('takes readability from the ranges and marks the unreadable stretch', () => {
+    const t = buildBucketTrack(tl);
+    expect(t.stops.map((s) => s.readable)).toEqual([false, false, true, true]);
+    expect(t.gone).toEqual([{ from: 499, to: 999 }]);
+    expect(t.oldestReadable).toBe(1499);
+  });
+
+  it('names a mixed bucket by its commits and flags merges', () => {
+    const t = buildBucketTrack(tl);
+    expect(t.stops[2].kind).toBe('bucket');
+    expect(t.stops[2].merge).toBe(true);
+    expect(t.stops[0].kind).toBe('update');
+    expect(caption(t.stops[2])).toBe('1,000–1,499 · 500 commits · +5,000 −2');
+    expect(valueText(t.stops[2])).toMatch(/^commits 1000 to 1499, .*, 5,000 added, 2 removed$/);
+  });
+
+  it('adds the head when the last bucket ends before it', () => {
+    const t = buildBucketTrack(timeline([bucket(0, 99)], { head: 120 }));
+    expect(t.stops.map((s) => s.seq)).toEqual([99, 120]);
+    expect(t.stops[1].kind).toBe('head');
+  });
+
+  it('counts the commits of a bucket of stops', () => {
+    const t = buildBucketTrack(tl);
+    const [b] = bucketize(t, fullView(t), 'sequence', 20, 7);
+    expect(b.commits).toBeGreaterThanOrEqual(500);
+    expect(b.first).toBe(0);
+  });
+});
+
+describe('refining a bucketed track', () => {
+  const tl = timeline([bucket(0, 499), bucket(500, 999), bucket(1000, 1499), bucket(1500, 1999)]);
+
+  it('knows which views are coarse', () => {
+    const t = buildBucketTrack(tl);
+    expect(isCoarse(t, fullView(t))).toBe(true);
+    expect(isCoarse(buildTrack(range(20)), { from: 0, to: 19 })).toBe(false);
+  });
+
+  it('gives the range of a view in commit numbers', () => {
+    const t = buildBucketTrack(tl);
+    expect(rangeOfView(t, { from: 1, to: 2 })).toEqual({ from: 500, to: 1499 });
+  });
+
+  it('replaces the coarse stops inside a range and keeps the rest', () => {
+    const t = buildBucketTrack(tl);
+    const fine = buildTrack(range(500, 500), { head: 1999 }).stops.filter((s) => s.kind !== 'head');
+    const r = refineTrack(t, { from: 500, to: 999 }, fine);
+    expect(r.stops.length).toBe(3 + 500);
+    expect(r.stops[0].seq).toBe(499);
+    expect(r.stops[1].seq).toBe(500);
+    expect(r.stops.at(-1)?.seq).toBe(1999);
+    expect(r.head).toBe(1999);
+    expect(viewOfRange(r, { from: 500, to: 999 })).toEqual({ from: 1, to: 500 });
+  });
+
+  it('zooms a range around a commit within its limits', () => {
+    const limit = { from: 0, to: 9999 };
+    const r = zoomRange(limit, 4, 5000, limit);
+    expect(r.to - r.from + 1).toBe(2500);
+    expect(r.from).toBeLessThanOrEqual(5000);
+    expect(r.to).toBeGreaterThanOrEqual(5000);
+    expect(zoomRange(limit, 4, 0, limit).from).toBe(0);
+    expect(zoomRange(limit, 4, 9999, limit).to).toBe(9999);
+    expect(zoomRange({ from: 10, to: 20 }, 100, 15, limit)).toEqual({ from: 12, to: 19 });
   });
 });

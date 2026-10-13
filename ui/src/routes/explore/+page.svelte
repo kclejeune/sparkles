@@ -24,6 +24,8 @@
   } from '$lib/entity-history';
   import { unrecordedNote } from '$lib/history';
   import { timeFailure, type Range } from '$lib/timeline';
+  import { deltaText, planDiff, schemaAnnouncement, schemaChanges } from '$lib/explore-time';
+  import type { SchemaChanges } from '$lib/explore-time';
   import ClassTree from '$components/ClassTree.svelte';
   import GeoMapCard from '$components/GeoMapCard.svelte';
   import GraphView, { type GEdge, type GNode } from '$components/GraphView.svelte';
@@ -96,12 +98,20 @@
   // requests started for an older graph are discarded instead of mutating the new one.
   const graphGen = new Generation();
 
+  /** The nodes the person expanded, in order, which a re-read at another commit replays. */
+  let expandLog: string[] = [];
+  /** Every resource the graph has drawn since it was focused, so that a replay can find it again. */
+  let seenTerms = new Map<string, Term>();
+
   function resetGraph() {
     graphGen.bump();
     nodes = {};
     edges = {};
     expanding = {};
     detailCache = {};
+    expandLog = [];
+    seenTerms = new Map();
+    changes = null;
   }
   let graphView: GraphView | undefined = $state();
 
@@ -110,13 +120,18 @@
   const urlAt = page.url.searchParams.get('at');
   const urlFrom = page.url.searchParams.get('from');
   /** The History strip of the selected resource. */
-  let stripOpen = $state(!!(urlAt || urlFrom));
+  let stripOpen = $state(!!(urlAt || urlFrom) && urlTab !== 'schema' && urlTab !== 'search');
   /** The state the resource's properties are read at (`at=`): empty for the head. */
   let exAt = $state(urlAt ?? '');
   /** Compare mode: the earlier state, and what changed since it. */
   let exFrom = $state(urlFrom ?? '');
   let exCompare = $state(!!urlFrom);
   let strip: TimeSlider | undefined = $state();
+  /** The slider over the whole graph, in the graph toolbar. It shares `exAt` and `exFrom`. */
+  let graphTimeOpen = $state(!!(urlAt || urlFrom) && urlTab !== 'schema' && urlTab !== 'search');
+  let graphSlider: TimeSlider | undefined = $state();
+  /** Either slider is open, so the properties are read at the state they name. */
+  const timeActive = $derived(stripOpen || graphTimeOpen);
   type EntityHistory = {
     iri: string;
     changes: EntityChange[];
@@ -188,38 +203,77 @@
     return t.type === 'uri' ? t.value : nt;
   }
 
-  function closeStrip() {
-    stripOpen = false;
+  /** Reset the shared state unless the other slider still uses it. */
+  function resetTime() {
+    if (stripOpen || graphTimeOpen || schemaTimeOpen) return;
     exAt = '';
     exFrom = '';
     exCompare = false;
   }
 
-  // the properties are read again when the strip moves
+  function closeStrip() {
+    stripOpen = false;
+    resetTime();
+  }
+
+  function openGraphTime() {
+    graphTimeOpen = true;
+  }
+
+  function closeGraphTime() {
+    graphTimeOpen = false;
+    resetTime();
+  }
+
+  // the properties are read again when a slider moves
   $effect(() => {
     void exAt;
-    void stripOpen;
+    void timeActive;
     const id = selectedId;
     if (id) untrack(() => void loadDetails(id));
   });
 
   // --- graph model -----------------------------------------------------------
 
-  const gNodes = $derived.by((): GNode[] =>
-    Object.values(nodes)
+  /**
+   * Comparing two commits: what the later state added to the drawn graph, and the ghosts of
+   * what it removed (nodes and edges only the earlier state had).
+   */
+  let changes = $state<{
+    addedNodes: Set<string>;
+    addedEdges: Set<string>;
+    ghostNodes: Record<string, ENode>;
+    ghostEdges: Record<string, EEdge>;
+  } | null>(null);
+
+  const gNodes = $derived.by((): GNode[] => {
+    const toG = (n: ENode, change?: 'added' | 'removed'): GNode => ({
+      id: n.id,
+      label: n.label,
+      kind: n.term.type === 'uri' ? 'iri' : n.term.type,
+      title: n.term.type === 'uri' ? n.term.value : undefined,
+      focus: n.id === focusId,
+      expanded: n.expanded,
+      change,
+    });
+    const real = Object.values(nodes)
       .filter((n) => showLiterals || !n.lit)
-      .map((n) => ({
-        id: n.id,
-        label: n.label,
-        kind: n.term.type === 'uri' ? 'iri' : n.term.type,
-        title: n.term.type === 'uri' ? n.term.value : undefined,
-        focus: n.id === focusId,
-        expanded: n.expanded,
-      })),
-  );
-  const gEdges = $derived(
-    Object.values(edges).filter((e) => (showLiterals || !e.lit) && (!hideTypes || !e.isType)),
-  );
+      .map((n) => toG(n, changes?.addedNodes.has(n.id) ? 'added' : undefined));
+    const ghosts = Object.values(changes?.ghostNodes ?? {})
+      .filter((n) => showLiterals || !n.lit)
+      .map((n) => toG(n, 'removed'));
+    return [...real, ...ghosts];
+  });
+  const gEdges = $derived.by((): GEdge[] => {
+    const keep = (e: EEdge) => (showLiterals || !e.lit) && (!hideTypes || !e.isType);
+    const real = Object.values(edges)
+      .filter(keep)
+      .map((e) => (changes?.addedEdges.has(e.id) ? { ...e, change: 'added' as const } : e));
+    const ghosts = Object.values(changes?.ghostEdges ?? {})
+      .filter(keep)
+      .map((e) => ({ ...e, change: 'removed' as const }));
+    return [...real, ...ghosts];
+  });
   const nodeCount = $derived(Object.keys(nodes).length);
 
   function labelFor(t: Term, label?: string) {
@@ -248,6 +302,7 @@
       lit: term.type === 'literal',
     };
     nodes[id] = n;
+    seenTerms.set(id, term);
     return nodes[id];
   }
 
@@ -265,6 +320,26 @@
     };
   }
 
+  /** Draw the neighbours of a node as `neighbours` answered them. */
+  function populate(n: ENode, r: Awaited<ReturnType<typeof ex.neighbours>>) {
+    const { out, inc, label } = r;
+    const id = n.id;
+    if (label) n.label = label;
+    for (const nb of out) {
+      const lit = nb.term.type === 'literal';
+      // Label literals are already the node's caption.
+      if (lit && ex.LABEL_IRIS.includes(nb.predicate) && nb.term.value === n.label) continue;
+      const oid = lit ? `lit:${id}|${nb.predicate}|${termKey(nb.term)}` : termKey(nb.term);
+      ensureNode(nb.term, nb.label, oid);
+      addEdge(id, nb.predicate, oid, lit);
+    }
+    for (const nb of inc) {
+      const sid = termKey(nb.term);
+      ensureNode(nb.term, nb.label, sid);
+      addEdge(sid, nb.predicate, id, false);
+    }
+  }
+
   async function expand(id: string) {
     const n = nodes[id];
     if (!n || n.term.type !== 'uri' || !ds || expanding[id]) return;
@@ -280,24 +355,18 @@
     }
     expanding[id] = gen;
     try {
-      const { out, inc, label } = await ex.neighbours(ds, n.iri);
+      const r = await ex.neighbours(
+        ds,
+        n.iri,
+        timeActive && graphTimeOpen ? exAt || undefined : undefined,
+      );
       if (stale()) return;
-      if (label) n.label = label;
-      for (const nb of out) {
-        const lit = nb.term.type === 'literal';
-        // Label literals are already the node's caption.
-        if (lit && ex.LABEL_IRIS.includes(nb.predicate) && nb.term.value === n.label) continue;
-        const oid = lit ? `lit:${id}|${nb.predicate}|${termKey(nb.term)}` : termKey(nb.term);
-        ensureNode(nb.term, nb.label, oid);
-        addEdge(id, nb.predicate, oid, lit);
-      }
-      for (const nb of inc) {
-        const sid = termKey(nb.term);
-        ensureNode(nb.term, nb.label, sid);
-        addEdge(sid, nb.predicate, id, false);
-      }
+      populate(n, r);
       n.expanded = true;
-      if (out.length >= 100 || inc.length >= 100) {
+      if (!expandLog.includes(id)) expandLog.push(id);
+      // comparing: the new neighbours are marked against the earlier state too
+      if (graphTimeOpen && exCompare) await markChanges(() => !stale());
+      if (r.out.length >= 100 || r.inc.length >= 100) {
         toasts.push(
           'info',
           'Showing the first 100 edges each way',
@@ -310,6 +379,157 @@
       if (expanding[id] === gen) delete expanding[id];
     }
   }
+
+  // --- the graph at a commit (docs/specs/U01-time-slider.md) ---------------------------------
+
+  const graphRuns = new LatestRun();
+  let graphReading = $state(false);
+  let graphReadMs = $state(0);
+  let graphNote = $state('');
+  let graphAnnounce = $state('');
+  /** What the graph slider last drew, so that only a move re-reads the graph. */
+  let drawnKey = 'head';
+
+  const timeKey = () =>
+    graphTimeOpen && (exAt || exCompare) ? `${exAt}|${exCompare ? exFrom : ''}` : 'head';
+
+  /** Mark what changed between the two handles, from the diff of the drawn resources. */
+  async function markChanges(owns: () => boolean) {
+    const name = ds;
+    if (!name || !graphTimeOpen || !exCompare || !exFrom) {
+      changes = null;
+      return;
+    }
+    const iris = Object.values(nodes)
+      .filter((n) => n.term.type === 'uri')
+      .map((n) => n.iri)
+      .slice(0, 1000);
+    const d = await api.diff(name, {
+      from: exFrom,
+      to: exAt || 'head',
+      terms: iris,
+      quads: true,
+      limit: 5000,
+    });
+    if (!owns()) return;
+    const plan = planDiff(
+      d.quads ?? [],
+      new Set(Object.keys(nodes)),
+      Object.values(edges),
+      focusId,
+    );
+    const ghostNodes: Record<string, ENode> = {};
+    for (const g of plan.ghostNodes) {
+      const lit = g.term.type === 'literal';
+      ghostNodes[g.id] = {
+        id: g.id,
+        term: g.term,
+        iri: g.term.type === 'uri' ? g.term.value : '',
+        label: labelFor(g.term),
+        expanded: false,
+        lit,
+      };
+    }
+    const ghostEdges: Record<string, EEdge> = {};
+    for (const g of plan.ghostEdges) {
+      ghostEdges[g.id] = {
+        id: g.id,
+        source: g.source,
+        target: g.target,
+        label: shortLabel(g.predicate, prefixes),
+        title: g.predicate,
+        isType: g.predicate === RDF_TYPE,
+        lit: g.lit,
+      };
+    }
+    changes = { addedNodes: plan.addedNodes, addedEdges: plan.addedEdges, ghostNodes, ghostEdges };
+    const added = plan.addedEdges.size;
+    const removed = plan.ghostEdges.length;
+    graphAnnounce = `Commit ${d.to.commit.seq}: ${added} ${added === 1 ? 'edge' : 'edges'} added, ${removed} removed`;
+    graphNote = plan.truncated ? `Only ${plan.ghostEdges.length} removed edges are drawn.` : '';
+  }
+
+  /**
+   * Read the graph again at the state the graph slider names: the focus and the nodes the
+   * person expanded, in the order they were expanded, are read at that commit, and an
+   * expanded node that did not exist then is skipped.
+   */
+  async function rereadGraph() {
+    const name = ds;
+    const root = focusId;
+    if (!name || !root) return;
+    const owns = graphRuns.claim('graph');
+    const at = graphTimeOpen && exAt ? exAt : undefined;
+    graphReading = true;
+    graphNote = '';
+    const t0 = performance.now();
+    try {
+      const present = new Set([root]);
+      const fetched = new Map<string, Awaited<ReturnType<typeof ex.neighbours>>>();
+      for (const id of [...expandLog]) {
+        const term = seenTerms.get(id);
+        if (!present.has(id) || !term || term.type !== 'uri') continue;
+        const r = await ex.neighbours(name, term.value, at);
+        if (!owns()) return;
+        fetched.set(id, r);
+        for (const nb of [...r.out, ...r.inc]) {
+          if (nb.term.type === 'literal') continue;
+          present.add(termKey(nb.term));
+        }
+      }
+      // the graph is rebuilt in one step, so that what stays keeps its place
+      const rootTerm = seenTerms.get(root);
+      if (!rootTerm) return;
+      const keepLabels = new Map(Object.values(nodes).map((n) => [n.id, n.label]));
+      nodes = {};
+      edges = {};
+      const rn = ensureNode(rootTerm, keepLabels.get(root), root);
+      for (const id of expandLog) {
+        const r = fetched.get(id);
+        const n = id === root ? rn : nodes[id];
+        if (!r || !n) continue;
+        populate(n, r);
+        n.expanded = true;
+      }
+      for (const [id, n] of Object.entries(nodes)) {
+        const kept = keepLabels.get(id);
+        if (kept && n.term.type === 'uri' && n.label === labelFor(n.term)) n.label = kept;
+      }
+      await markChanges(owns);
+      if (!owns()) return;
+      if (!graphTimeOpen) changes = null;
+      graphSlider?.accept();
+      graphReadMs = performance.now() - t0;
+      if (!(graphTimeOpen && exCompare)) {
+        graphAnnounce = at
+          ? `Commit ${at.replace(/^commit:/, '')}: ${Object.keys(nodes).length} nodes`
+          : 'The graph at the head';
+      }
+    } catch (e) {
+      if (!owns()) return;
+      const gone = at ? timeFailure(e) : null;
+      if (gone) {
+        toasts.push('error', gone.title, gone.detail);
+        graphSlider?.reject({ seq: gone.seq, readable: gone.readable });
+        strip?.reject({ seq: gone.seq, readable: gone.readable });
+        drawnKey = timeKey();
+        return;
+      }
+      toasts.error('Could not read the graph at that commit', e);
+    } finally {
+      if (owns()) graphReading = false;
+    }
+  }
+
+  // the graph follows the graph slider
+  $effect(() => {
+    const key = timeKey();
+    untrack(() => {
+      if (key === drawnKey) return;
+      drawnKey = key;
+      if (focusId) void rereadGraph();
+    });
+  });
 
   async function focusOn(iri: string, label?: string, fromUrl = false) {
     resetGraph();
@@ -331,7 +551,11 @@
     if (tab !== 'graph') p.set('tab', tab);
     if (tab === 'search' && textQuery.trim()) p.set('q', textQuery.trim());
     if (iri && sideTab === 'memory') p.set('view', 'memory');
-    if (iri && stripOpen && sideTab === 'props') {
+    const timed =
+      tab === 'schema'
+        ? schemaTimeOpen
+        : tab === 'graph' && (graphTimeOpen || (!!iri && stripOpen && sideTab === 'props'));
+    if (timed) {
       if (exAt) p.set('at', exAt);
       if (exCompare && exFrom) p.set('from', exFrom);
     }
@@ -345,20 +569,21 @@
 
   async function loadDetails(id: string) {
     const n = nodes[id];
-    const at = stripOpen ? exAt : '';
+    const at = timeActive ? exAt : '';
     const key = `${id}|${at}`;
     if (!n || n.term.type !== 'uri' || !ds || detailCache[key]) return;
     const gen = graphGen.current;
     let d: ex.Details | { error: string };
     try {
       d = await ex.details(ds, n.iri, at || undefined);
-      if (stripOpen && at === exAt) strip?.accept();
+      if (timeActive && at === exAt) strip?.accept();
     } catch (e) {
       // a state the server can no longer read: the handle goes back to the last one it read
       const gone = at ? timeFailure(e) : null;
       if (gone) {
         toasts.push('error', gone.title, gone.detail);
         strip?.reject({ seq: gone.seq, readable: gone.readable });
+        graphSlider?.reject({ seq: gone.seq, readable: gone.readable });
         return;
       }
       d = { error: api.errorMessage(e) };
@@ -413,7 +638,7 @@
 
   const selected = $derived(selectedId ? nodes[selectedId] : null);
   const detail = $derived(
-    selectedId ? detailCache[`${selectedId}|${stripOpen ? exAt : ''}`] : undefined,
+    selectedId ? detailCache[`${selectedId}|${timeActive ? exAt : ''}`] : undefined,
   );
   const grouped = $derived.by(() => {
     if (!detail || 'error' in detail) return [];
@@ -560,31 +785,86 @@
   const hasInferences = $derived(!!app.datasets.find((d) => d.name === ds)?.reasoning);
   // A newer load (reload, other graph, dataset switch) supersedes an older one.
   const schemaRuns = new LatestRun();
+  /** The slider over the schema tab. It shares `exAt` and `exFrom` with the graph's. */
+  let schemaTimeOpen = $state(!!(urlAt || urlFrom) && urlTab === 'schema');
+  let schemaSlider: TimeSlider | undefined = $state();
+  /** Comparing two commits: the change of each count, and what came and went. */
+  let schemaDelta = $state<SchemaChanges | null>(null);
+  let schemaAnnounce = $state('');
+  let schemaReadMs = $state(0);
+  let schemaDrawnKey = 'head';
+  const schemaKey = () =>
+    schemaTimeOpen && (exAt || exCompare) ? `${exAt}|${exCompare ? exFrom : ''}` : 'head';
 
   async function loadSchema(name: string) {
     const owns = schemaRuns.claim('schema');
     schemaLoading = true;
     schemaErr = null;
+    const at = schemaTimeOpen && exAt ? exAt : undefined;
+    const from = schemaTimeOpen && exCompare && exFrom ? exFrom : undefined;
+    const t0 = performance.now();
+    schemaDrawnKey = schemaKey();
     try {
-      const s = await ex.loadSchema(name, {
-        graph: schemaGraph,
-        reasoning: hasInferences ? schemaInferences : undefined,
-      });
+      const o = { graph: schemaGraph, reasoning: hasInferences ? schemaInferences : undefined };
+      const [s, before] = await Promise.all([
+        ex.loadSchema(name, { ...o, at }),
+        from ? ex.loadSchema(name, { ...o, at: from }) : Promise.resolve(null),
+      ]);
       if (!owns()) return;
+      const first = schemaFor !== name;
       schema = s;
       schemaFor = name;
+      schemaDelta = before ? schemaChanges(before, s) : null;
+      schemaAnnounce = schemaDelta ? schemaAnnouncement(schemaDelta) : '';
+      schemaReadMs = performance.now() - t0;
+      if (schemaTimeOpen) schemaSlider?.accept();
       // Open the first two levels by default.
-      const open = new Set<string>();
-      for (const r of schema.roots) {
-        open.add(r);
-        for (const s of schema.classes.get(r)?.subs ?? []) open.add(s);
+      if (first || !schemaTimeOpen) {
+        const open = new Set<string>();
+        for (const r of schema.roots) {
+          open.add(r);
+          for (const s of schema.classes.get(r)?.subs ?? []) open.add(s);
+        }
+        openClasses = open;
       }
-      openClasses = open;
     } catch (e) {
-      if (owns()) schemaErr = api.errorMessage(e);
+      if (!owns()) return;
+      const gone = at || from ? timeFailure(e) : null;
+      if (gone) {
+        toasts.push('error', gone.title, gone.detail);
+        schemaSlider?.reject({ seq: gone.seq, readable: gone.readable });
+        schemaDrawnKey = schemaKey();
+      } else {
+        schemaErr = api.errorMessage(e);
+      }
     } finally {
       if (owns()) schemaLoading = false;
     }
+  }
+
+  // the schema follows its slider
+  $effect(() => {
+    const key = schemaKey();
+    untrack(() => {
+      if (key === schemaDrawnKey || !ds) return;
+      void loadSchema(ds);
+    });
+  });
+
+  function openSchemaTime(from?: string, to?: string) {
+    if (from && to) {
+      exFrom = from;
+      exAt = to === 'head' ? '' : to;
+      exCompare = true;
+    }
+    schemaTimeOpen = true;
+    syncUrl(null);
+  }
+
+  function closeSchemaTime() {
+    schemaTimeOpen = false;
+    resetTime();
+    syncUrl(null);
   }
 
   function setSchemaGraph(g: string) {
@@ -746,12 +1026,20 @@
     const onDoc = (e: MouseEvent) => {
       if (searchOpen && !(e.target as HTMLElement).closest('.search')) searchOpen = false;
     };
-    // H opens and closes the History strip of the selected resource
+    // H opens and closes the History strip of the selected resource, Shift+H the one over the graph
     const onKey = (e: KeyboardEvent) => {
       if ((e.key !== 'h' && e.key !== 'H') || e.metaKey || e.ctrlKey || e.altKey) return;
       if ((e.target as HTMLElement)?.closest?.('input, textarea, select, [contenteditable]'))
         return;
-      if (tab !== 'graph' || selected?.term.type !== 'uri' || sideTab !== 'props') return;
+      if (tab !== 'graph') return;
+      if (e.shiftKey) {
+        if (!nodeCount) return;
+        e.preventDefault();
+        if (graphTimeOpen) closeGraphTime();
+        else openGraphTime();
+        return;
+      }
+      if (selected?.term.type !== 'uri' || sideTab !== 'props') return;
       e.preventDefault();
       if (stripOpen) closeStrip();
       else stripOpen = true;
@@ -873,10 +1161,43 @@
           >
           <span class="spacer"></span>
           <span class="faint">{gNodes.length} nodes, {gEdges.length} edges</span>
-          {#if nodeCount}<button class="btn sm ghost" onclick={clearGraph}
+          {#if nodeCount}
+            <button
+              class="btn sm"
+              aria-pressed={graphTimeOpen}
+              aria-label="Graph history"
+              title="Move the whole graph through the commits (Shift+H)"
+              onclick={() => (graphTimeOpen ? closeGraphTime() : openGraphTime())}
+              ><Icon name="clock" size={13} /> History</button
+            >
+            <button class="btn sm ghost" onclick={clearGraph}
               ><Icon name="trash" size={13} /> Clear</button
-            >{/if}
+            >
+          {/if}
         </div>
+        {#if graphTimeOpen && ds}
+          <div class="graph-time">
+            <TimeSlider
+              bind:this={graphSlider}
+              {ds}
+              bind:at={exAt}
+              bind:from={exFrom}
+              bind:compare={exCompare}
+              memory={app.datasets.find((d) => d.name === ds)?.type === 'mem'}
+              busy={graphReading}
+              lastReadMs={graphReadMs}
+              announcement={graphAnnounce}
+              label="Graph history"
+              canFollow={false}
+              onchange={() => syncUrl(selected?.term.type === 'uri' ? selected.iri : null)}
+              onclose={() => {
+                closeGraphTime();
+                syncUrl(selected?.term.type === 'uri' ? selected.iri : null);
+              }}
+            />
+            {#if graphNote}<p class="faint small graph-note">{graphNote}</p>{/if}
+          </div>
+        {/if}
         {#if nodeCount === 0}
           <div class="start">
             <Icon name="explore" size={26} />
@@ -902,6 +1223,7 @@
           <div class="cy-host">
             <GraphView
               bind:this={graphView}
+              animate={graphTimeOpen}
               nodes={gNodes}
               edges={gEdges}
               selected={selectedId}
@@ -1219,6 +1541,16 @@
           >
             <Icon name="clock" size={13} /> Compare
           </button>
+          <button
+            class="btn sm"
+            aria-pressed={schemaTimeOpen}
+            aria-label="Schema history"
+            onclick={() => (schemaTimeOpen ? closeSchemaTime() : openSchemaTime())}
+            disabled={!ds}
+            title="Read the schema at an earlier commit and see how its counts changed"
+          >
+            <Icon name="clock" size={13} /> History
+          </button>
         </div>
         <div class="schema-tools">
           <div class="tabs" role="tablist">
@@ -1264,6 +1596,23 @@
             <Icon name="refresh" size={13} />
           </button>
         </div>
+        {#if schemaTimeOpen && ds}
+          <TimeSlider
+            bind:this={schemaSlider}
+            {ds}
+            bind:at={exAt}
+            bind:from={exFrom}
+            bind:compare={exCompare}
+            memory={app.datasets.find((d) => d.name === ds)?.type === 'mem'}
+            busy={schemaLoading}
+            lastReadMs={schemaReadMs}
+            announcement={schemaAnnounce}
+            label="Schema history"
+            canFollow={false}
+            onchange={() => syncUrl(null)}
+            onclose={closeSchemaTime}
+          />
+        {/if}
         <div class="schema-body scroll">
           {#if schemaLoading && !schema}
             <div class="empty"><span class="spinner"></span> Reading the ontology…</div>
@@ -1287,9 +1636,21 @@
                   selected={selectedClass}
                   onselect={(i) => (selectedClass = i)}
                   ontoggle={revealClass}
+                  changes={schemaDelta?.classes}
                 />
               {:else}
                 <div class="legend faint"><span>Class</span><span>subclasses, instances</span></div>
+                {#if schemaDelta?.removedClasses.length}
+                  <section class="gone-list" aria-label="Classes removed since the earlier commit">
+                    {#each schemaDelta.removedClasses as c (c.iri)}
+                      <div class="gone-row" title={c.iri}>
+                        <span class="sign" aria-label="removed">−</span>
+                        <span class="gone-name">{c.label ?? shortLabel(c.iri, prefixes)}</span>
+                        <span class="faint small">removed, had {fmtInt(c.instances)}</span>
+                      </div>
+                    {/each}
+                  </section>
+                {/if}
                 <ClassTree
                   {schema}
                   iris={schema.roots}
@@ -1298,6 +1659,7 @@
                   selected={selectedClass}
                   onselect={(i) => (selectedClass = i)}
                   ontoggle={toggleClass}
+                  changes={schemaDelta?.classes}
                 />
               {/if}
             {:else}
@@ -1314,14 +1676,38 @@
                   </tr>
                 </thead>
                 <tbody>
+                  {#each schemaDelta?.removedProperties ?? [] as p (p.iri)}
+                    <tr class="gone-prop" title={p.iri}>
+                      <td>
+                        <div class="pname">
+                          <span class="sign" aria-label="removed">−</span>
+                          {p.label ?? shortLabel(p.iri, prefixes)}
+                        </div>
+                        <div class="mono faint small">{displayIri(p.iri, prefixes)}</div>
+                      </td>
+                      <td class="num">{fmtInt(p.triples)}</td>
+                      <td colspan="5" class="faint small">removed since the earlier commit</td>
+                    </tr>
+                  {/each}
                   {#each propMatches as p (p.iri)}
                     {@const o = p.observed}
+                    {@const ch = schemaDelta?.properties.get(p.iri)}
                     <tr>
                       <td title={p.iri}>
                         <div class="pname">{p.label ?? shortLabel(p.iri, prefixes)}</div>
                         <div class="mono faint small">{displayIri(p.iri, prefixes)}</div>
                       </td>
-                      <td class="num">{o.triples ? fmtInt(o.triples) : '—'}</td>
+                      <td class="num"
+                        >{o.triples ? fmtInt(o.triples) : '—'}{#if ch}
+                          <span
+                            class="delta"
+                            class:add={ch.delta > 0 || ch.mark === 'added'}
+                            class:del={ch.delta < 0}
+                            >{#if ch.mark === 'added'}<span class="tag">added</span>{/if}{deltaText(
+                              ch.delta,
+                            )}</span
+                          >{/if}</td
+                      >
                       <td class="num small"
                         >{o.triples
                           ? `${fmtCompact(o.distinctSubjects)} / ${fmtCompact(o.distinctObjects)}`
@@ -1581,6 +1967,7 @@
     graph={schemaGraph}
     reasoning={hasInferences ? schemaInferences : undefined}
     {prefixes}
+    onslider={(from, to) => openSchemaTime(from, to)}
   />
 {/if}
 
@@ -1703,6 +2090,59 @@
   .cy-host {
     flex: 1;
     min-height: 0;
+  }
+  .graph-time {
+    flex: none;
+    min-width: 0;
+  }
+  .delta {
+    margin-left: 6px;
+    font-size: var(--fs-xs);
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+  }
+  .delta.add {
+    color: var(--added);
+  }
+  .delta.del {
+    color: var(--removed);
+  }
+  .delta .tag {
+    margin-right: 4px;
+    padding: 0 5px;
+    border: 1px solid var(--added);
+    border-radius: 8px;
+    font-size: 10px;
+    font-weight: 400;
+  }
+  .gone-list {
+    padding: 2px 4px 6px;
+    border-bottom: 1px dashed var(--border);
+  }
+  .gone-row {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    padding: 2px 10px;
+    color: var(--removed);
+    text-decoration: line-through;
+    text-decoration-color: color-mix(in srgb, var(--removed) 60%, transparent);
+  }
+  .gone-row .faint {
+    text-decoration: none;
+  }
+  .gone-prop td {
+    border-bottom: 1px dashed var(--border);
+    color: var(--removed);
+    background: var(--removed-soft);
+  }
+  .sign {
+    font-weight: 700;
+    margin-right: 2px;
+  }
+  .graph-note {
+    margin: 0;
+    padding: 2px 12px;
   }
   .hint {
     padding: 4px 12px;

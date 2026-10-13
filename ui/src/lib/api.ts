@@ -1045,11 +1045,14 @@ export type SchemaOptions = {
   /** Page size (1–10000). */
   limit?: number;
   timeout?: number;
+  /** Read the state at a commit, time or snapshot (`42`, `commit:42`, `snapshot:NAME`). */
+  at?: string;
   signal?: AbortSignal;
 };
 
 function schemaParams(opts: SchemaOptions, cursor?: string): string {
   const p = new URLSearchParams();
+  if (opts.at) p.set('at', opts.at);
   if (opts.graph) p.set('graph', opts.graph);
   if (opts.declaredGraph) p.set('declaredGraph', opts.declaredGraph);
   if (opts.reasoning != null) p.set('reasoning', String(opts.reasoning));
@@ -1842,6 +1845,53 @@ export function commits(
   });
 }
 
+/** One run of consecutive commits of `GET /$/commits/{ds}/timeline`. */
+export type TimelineBucket = {
+  firstSeq: number;
+  lastSeq: number;
+  firstTime: string;
+  lastTime: string;
+  commits: number;
+  /** Quads added and removed by the commits; absent for a caller limited to some graphs. */
+  inserted?: number;
+  deleted?: number;
+  /** The commits of each kind (`update`, `merge`, ...). */
+  kinds: Record<string, number>;
+  merges: number;
+  snapshots: number;
+};
+
+export type CommitTimeline = {
+  dataset: string;
+  datasetId: string;
+  head: number;
+  firstSeq: number;
+  lastSeq: number;
+  /** The commits in range whose metadata is retained. */
+  commits: number;
+  /** The commit numbers each bucket spans. */
+  bucketWidth: number;
+  oldestReconstructable?: number | null;
+  readable: { from: number; to: number }[];
+  buckets: TimelineBucket[];
+};
+
+/** The commits of a branch in at most `buckets` runs, for a slider over a long history. */
+export function commitTimeline(
+  ds: string,
+  opts: { buckets?: number; from?: number; to?: number; signal?: AbortSignal } = {},
+): Promise<CommitTimeline> {
+  const p = new URLSearchParams();
+  if (opts.buckets != null) p.set('buckets', String(opts.buckets));
+  if (opts.from != null) p.set('from', String(opts.from));
+  if (opts.to != null) p.set('to', String(opts.to));
+  const qs = p.toString();
+  return json<CommitTimeline>(`/$/commits/${enc(ds)}/timeline${qs ? `?${qs}` : ''}`, {
+    signal: opts.signal,
+    cache: 'no-store',
+  });
+}
+
 // --- branches and merges (F09) -------------------------------------------------------
 
 /** A branch of a dataset (`GET /$/branches/{ds}`). */
@@ -2610,6 +2660,8 @@ export type DiffOptions = {
   /** list the changed quads (at most `limit` of them) */
   quads?: boolean;
   limit?: number;
+  /** only the changes whose subject or object is one of these terms (IRIs or N-Triples) */
+  terms?: string[];
   signal?: AbortSignal;
 };
 
@@ -2620,6 +2672,7 @@ export function diff(ds: string, opts: DiffOptions = {}): Promise<Diff> {
   if (opts.graph) p.set('graph', opts.graph);
   if (opts.quads) p.set('quads', 'true');
   if (opts.limit != null) p.set('limit', String(opts.limit));
+  for (const t of opts.terms ?? []) p.append('term', t);
   const qs = p.toString();
   return json<Diff>(`/${enc(ds)}/diff${qs ? `?${qs}` : ''}`, {
     signal: opts.signal,
@@ -2954,12 +3007,15 @@ export type ProfileOptions = {
   graph?: string;
   reasoning?: boolean;
   classes?: string[];
+  /** Read the state at a commit, time or snapshot. */
+  at?: string;
   signal?: AbortSignal;
 };
 
 /** The URL of a profiles request. */
 export function schemaProfilesPath(ds: string, opts: ProfileOptions = {}): string {
   const p = new URLSearchParams();
+  if (opts.at) p.set('at', opts.at);
   if (opts.graph && opts.graph !== 'default') p.set('graph', opts.graph);
   if (opts.reasoning != null) p.set('reasoning', String(opts.reasoning));
   for (const c of opts.classes ?? []) p.append('class', c);

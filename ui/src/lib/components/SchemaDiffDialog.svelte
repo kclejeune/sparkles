@@ -15,12 +15,15 @@
     graph = 'default',
     reasoning = undefined,
     prefixes = {},
+    onslider,
   }: {
     open?: boolean;
     ds: string;
     graph?: string;
     reasoning?: boolean;
     prefixes?: PrefixMap;
+    /** Open the time slider on the two states, so that the schema tab shows the changes. */
+    onslider?: (from: string, to: string) => void;
   } = $props();
 
   let fromText = $state('');
@@ -106,6 +109,19 @@
       />
     </label>
     <span class="spacer"></span>
+    {#if onslider}
+      <button
+        class="btn sm"
+        disabled={!from || !to}
+        title="Show the two states on the time slider, with the changes marked in the schema"
+        onclick={() => {
+          if (from && to) {
+            open = false;
+            onslider(from, to);
+          }
+        }}><Icon name="clock" size={13} /> Open on the slider</button
+      >
+    {/if}
     <button class="btn sm primary" onclick={run} disabled={loading || !from || !to}>
       {#if loading}<span class="spinner"></span>{:else}<Icon name="clock" size={13} />{/if}
       Compare

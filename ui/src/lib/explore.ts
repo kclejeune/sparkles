@@ -71,8 +71,10 @@ export type Neighbour = { predicate: string; term: Term; label?: string; incomin
 export async function neighbours(
   ds: string,
   iri: string,
+  at?: string,
 ): Promise<{ out: Neighbour[]; inc: Neighbour[]; label?: string }> {
   const node = sparqlIri(iri);
+  const o = at ? { ...opts, at } : opts;
   const [outRows, incRows] = await Promise.all([
     api.select(
       ds,
@@ -83,7 +85,7 @@ SELECT ?p ?o (SAMPLE(?l) AS ?label) WHERE {
 }
 GROUP BY ?p ?o
 LIMIT 100`,
-      opts,
+      o,
     ),
     api.select(
       ds,
@@ -94,7 +96,7 @@ SELECT ?s ?p (SAMPLE(?l) AS ?label) WHERE {
 }
 GROUP BY ?s ?p
 LIMIT 100`,
-      opts,
+      o,
     ),
   ]);
   const out = outRows
@@ -456,7 +458,7 @@ export function schemaFromSummary(s: api.SchemaSummary): Schema {
  */
 export async function loadSchema(
   ds: string,
-  opts: { graph?: string; reasoning?: boolean } = {},
+  opts: { graph?: string; reasoning?: boolean; at?: string } = {},
 ): Promise<Schema> {
   return schemaFromSummary(await api.schema(ds, { ...opts, limit: 5000 }));
 }
