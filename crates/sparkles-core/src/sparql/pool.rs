@@ -100,7 +100,7 @@ impl QueryPool {
         self.granted.load(Ordering::Relaxed)
     }
     pub fn waiting(&self) -> usize {
-        self.waiting.load(Ordering::Relaxed)
+        self.waiting.load(Ordering::SeqCst)
     }
     pub fn stats(&self) -> PoolStats {
         PoolStats {
@@ -121,7 +121,7 @@ impl QueryPool {
     /// may have granted after the call.
     fn reserve(&self, bytes: u64, limit: u64) -> bool {
         self.granted
-            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |g| {
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |g| {
                 g.checked_add(bytes).filter(|n| *n <= limit)
             })
             .is_ok()
@@ -131,27 +131,44 @@ impl QueryPool {
         if bytes == 0 {
             return;
         }
-        self.granted.fetch_sub(bytes, Ordering::AcqRel);
-        if self.waiting() > 0 {
+        // `granted` is written before `waiting` is read, and a waiter writes `waiting`
+        // before it reads `granted`. Sequential consistency on both makes sure that at
+        // least one side sees the other, so a release never skips the wake-up of a
+        // waiter that did not see the freed memory.
+        self.granted.fetch_sub(bytes, Ordering::SeqCst);
+        if self.waiting.load(Ordering::SeqCst) > 0 {
             self.wake();
         }
     }
 
     fn wake(&self) {
-        let q = self.queue.lock();
-        for w in &q.waiters {
-            if let Some(f) = &w.wake {
-                f();
-            }
+        // the callbacks run outside the lock, so that one may poll its ticket
+        let wakers: Vec<Waker> = self
+            .queue
+            .lock()
+            .waiters
+            .iter()
+            .filter_map(|w| w.wake.clone())
+            .collect();
+        for f in wakers {
+            f();
         }
-        drop(q);
         self.changed.notify_all();
+    }
+
+    /// The most a request can be granted at admission: a pool smaller than the usual
+    /// initial grant still serves requests.
+    fn clamp(&self, bytes: u64) -> u64 {
+        round_up(bytes).min(self.capacity)
     }
 
     /// A grant of `bytes` if the pool has them and nobody is queued ahead.
     pub fn try_grant(self: &Arc<Self>, bytes: u64) -> Option<PoolGrant> {
-        let bytes = round_up(bytes);
-        if self.waiting() == 0 && self.reserve(bytes, self.capacity) {
+        let bytes = self.clamp(bytes);
+        // under the queue's lock, so that a request cannot pass one that is queued
+        let q = self.queue.lock();
+        if q.waiters.is_empty() && self.reserve(bytes, self.capacity) {
+            drop(q);
             self.admitted.fetch_add(1, Ordering::Relaxed);
             return Some(PoolGrant::with(self.clone(), bytes));
         }
@@ -166,19 +183,20 @@ impl QueryPool {
     /// Join the admission queue for an initial grant of `bytes`. `wake` is called when
     /// the pool's state changes, so that an async caller can poll again.
     pub fn enter(self: &Arc<Self>, bytes: u64, wake: Option<Waker>) -> Ticket {
+        let bytes = self.clamp(bytes);
         let mut q = self.queue.lock();
         let ticket = q.next_ticket;
         q.next_ticket += 1;
         q.waiters.push_back(Waiter {
             ticket,
-            bytes: round_up(bytes),
+            bytes,
             wake,
         });
-        self.waiting.store(q.waiters.len(), Ordering::Relaxed);
+        self.waiting.store(q.waiters.len(), Ordering::SeqCst);
         Ticket {
             pool: self.clone(),
             ticket,
-            bytes: round_up(bytes),
+            bytes,
             done: false,
         }
     }
@@ -243,14 +261,20 @@ impl Ticket {
         let pool = self.pool.clone();
         let mut q = pool.queue.lock();
         let pos = q.waiters.iter().position(|w| w.ticket == self.ticket)?;
-        let head_bytes = q.waiters.front().map_or(0, |w| w.bytes);
-        let may_pass = pos == 0 || (self.bytes < head_bytes && q.bypassed < MAX_BYPASS);
+        // A waiter behind the head may pass only waiters that are larger and wait for
+        // memory (they do not fit now), and only a few times in a row.
+        let granted = pool.granted.load(Ordering::SeqCst);
+        let may_pass = pos == 0
+            || (q.bypassed < MAX_BYPASS
+                && q.waiters.iter().take(pos).all(|w| {
+                    w.bytes > self.bytes && granted.saturating_add(w.bytes) > pool.capacity
+                }));
         if !may_pass || !pool.reserve(self.bytes, pool.capacity) {
             return None;
         }
         q.waiters.remove(pos);
         q.bypassed = if pos == 0 { 0 } else { q.bypassed + 1 };
-        pool.waiting.store(q.waiters.len(), Ordering::Relaxed);
+        pool.waiting.store(q.waiters.len(), Ordering::SeqCst);
         pool.admitted.fetch_add(1, Ordering::Relaxed);
         self.done = true;
         // the next waiter may fit now
@@ -270,8 +294,12 @@ impl Drop for Ticket {
             return;
         }
         let mut q = self.pool.queue.lock();
+        if q.waiters.front().is_some_and(|w| w.ticket == self.ticket) {
+            // the next head starts with no bypasses behind it
+            q.bypassed = 0;
+        }
         q.waiters.retain(|w| w.ticket != self.ticket);
-        self.pool.waiting.store(q.waiters.len(), Ordering::Relaxed);
+        self.pool.waiting.store(q.waiters.len(), Ordering::SeqCst);
         drop(q);
         // a smaller request behind this one may fit now
         self.pool.wake();
@@ -282,6 +310,8 @@ impl Drop for Ticket {
 pub struct PoolGrant {
     pool: Arc<QueryPool>,
     granted: AtomicU64,
+    /// the most the grant has held
+    peak: AtomicU64,
 }
 
 impl std::fmt::Debug for PoolGrant {
@@ -297,6 +327,7 @@ impl PoolGrant {
         PoolGrant {
             pool,
             granted: AtomicU64::new(bytes),
+            peak: AtomicU64::new(bytes),
         }
     }
 
@@ -310,13 +341,21 @@ impl PoolGrant {
         self.granted.load(Ordering::Relaxed)
     }
 
+    /// The most bytes this grant has held at once.
+    pub fn peak(&self) -> u64 {
+        self.peak.load(Ordering::Relaxed)
+    }
+
     /// Make the grant cover `live` bytes. Fails when the pool cannot give the granules.
     /// While requests wait for admission, one query may not hold more than half the
     /// pool.
     pub fn cover(&self, live: u64) -> Result<(), Error> {
-        let target = round_up(live);
+        if live > self.pool.capacity {
+            return Err(self.pool.exhausted(live));
+        }
+        let target = round_up(live).min(self.pool.capacity);
         loop {
-            let cur = self.granted.load(Ordering::Acquire);
+            let cur = self.granted.load(Ordering::SeqCst);
             if cur >= target {
                 return Ok(());
             }
@@ -330,13 +369,18 @@ impl PoolGrant {
                 return Err(self.pool.exhausted(live));
             }
             if !self.pool.reserve(delta, self.pool.capacity) {
+                // another thread of the query may have grown the grant meanwhile
+                if self.granted.load(Ordering::SeqCst) >= target {
+                    return Ok(());
+                }
                 return Err(self.pool.exhausted(live));
             }
             if self
                 .granted
-                .compare_exchange(cur, target, Ordering::AcqRel, Ordering::Acquire)
+                .compare_exchange(cur, target, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
             {
+                self.peak.fetch_max(target, Ordering::Relaxed);
                 return Ok(());
             }
             // another thread of the query grew the grant first
@@ -345,26 +389,29 @@ impl PoolGrant {
     }
 
     /// Give back granules when the query holds well over what it uses.
+    ///
+    /// Returns whether it gave any back. The caller then checks its usage again, since
+    /// a charge on another thread may have grown past the grant in the meantime.
     #[inline]
-    pub fn trim(&self, live: u64) {
+    pub fn trim(&self, live: u64) -> bool {
         let cur = self.granted();
-        if cur > live.saturating_add(SHRINK_SLACK + GRANULE) {
-            self.trim_slow(live);
-        }
+        cur > live.saturating_add(SHRINK_SLACK + GRANULE) && self.trim_slow(live)
     }
 
     #[cold]
-    fn trim_slow(&self, live: u64) {
+    fn trim_slow(&self, live: u64) -> bool {
         let target = round_up(live).max(INITIAL_GRANT.min(self.granted()));
-        let cur = self.granted.load(Ordering::Acquire);
+        let cur = self.granted.load(Ordering::SeqCst);
         if cur > target
             && self
                 .granted
-                .compare_exchange(cur, target, Ordering::AcqRel, Ordering::Acquire)
+                .compare_exchange(cur, target, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
         {
             self.pool.release(cur - target);
+            return true;
         }
+        false
     }
 }
 
@@ -479,6 +526,36 @@ mod tests {
         drop(a);
         // with the pool free the head is served first
         assert!(big.poll().is_some());
+    }
+
+    #[test]
+    fn a_pool_smaller_than_the_initial_grant_still_admits() {
+        let pool = QueryPool::new(8 * MB);
+        let g = pool.try_grant(INITIAL_GRANT).unwrap();
+        assert_eq!(g.granted(), 8 * MB);
+        assert!(pool.try_grant(MB).is_none());
+        drop(g);
+        let g = pool.empty_grant();
+        g.cover(5 * MB).unwrap();
+        assert_eq!(g.granted(), 8 * MB);
+        assert!(g.cover(9 * MB).is_err());
+    }
+
+    #[test]
+    fn a_waiter_does_not_pass_a_head_that_fits() {
+        let pool = QueryPool::new(32 * MB);
+        let a = pool.try_grant(16 * MB).unwrap();
+        // the head wants 24 and waits. a smaller request behind it may pass
+        let mut head = pool.enter(24 * MB, None);
+        assert!(head.poll().is_none());
+        let mut small = pool.enter(8 * MB, None);
+        let s = small.poll().unwrap();
+        drop(s);
+        drop(a);
+        // the head now fits, so a request behind it waits its turn
+        let mut late = pool.enter(8 * MB, None);
+        assert!(late.poll().is_none());
+        assert!(head.poll().is_some());
     }
 
     #[test]

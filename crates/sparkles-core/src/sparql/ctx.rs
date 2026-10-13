@@ -832,9 +832,16 @@ impl Ctx {
     /// longer needs.
     #[inline]
     fn release_live(&self, bytes: u64) {
-        let prior = self.mem_live.fetch_sub(bytes, Ordering::Relaxed);
-        if let Some(g) = &self.grant {
-            g.trim(prior.saturating_sub(bytes));
+        let prior = self.mem_live.fetch_sub(bytes, Ordering::SeqCst);
+        if let Some(g) = &self.grant
+            && g.trim(prior.saturating_sub(bytes))
+        {
+            // a charge on another thread may have grown past the trimmed grant before
+            // it saw the trim
+            let live = self.mem_live.load(Ordering::SeqCst);
+            if live > g.granted() {
+                let _ = g.cover(live);
+            }
         }
     }
 
@@ -1499,7 +1506,7 @@ impl Charge<'_> {
             .ok_or_else(|| ctx.memory_exceeded(u64::MAX))?;
         let prior = ctx
             .mem_live
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |live| {
                 live.checked_add(bytes)
                     .filter(|next| *next <= ctx.mem_limit)
             })

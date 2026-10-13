@@ -494,6 +494,12 @@ fn server(p: &mut Paths) {
             ),
     );
     p.add(
+        op(GET, "/$/server/memory", "serverMemory", "Server", "Server memory")
+            .doc("The query memory pool (capacity, bytes granted, requests waiting) and the block, result, SERVICE and history caches, with the bytes each dataset holds in the shared ones.")
+            .see("budgets")
+            .json("200", "The memory state.", "ServerMemory"),
+    );
+    p.add(
         op(GET, "/$/ready", "ready", "Server", "Readiness check")
             .doc("`200` when the server is ready and `503` otherwise, both with `ReadyInfo`. Without `metrics`, only readable datasets are listed.")
             .see("server")

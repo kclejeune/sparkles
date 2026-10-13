@@ -86,12 +86,12 @@ pub(super) fn schemas() -> Map<String, J> {
             "allOf": [
                 sref("Error"),
                 obj(&["budget"], json!({
-                    "budget": string_enum(&["memory", "result-bytes", "outbound-bytes", "validation-work", "rows", "rows-produced", "dataset-bytes"]),
+                    "budget": string_enum(&["memory", "result-bytes", "outbound-bytes", "validation-work", "rows", "rows-produced", "dataset-bytes", "server-memory"]),
                     "limit": { "type": "integer", "description": "Bytes, or rows for `rows` and `rows-produced`." },
                     "requested": { "type": "integer" },
                 })),
             ],
-            "description": "A `507` for a request over one of its budgets.",
+            "description": "A `507` for a request over one of its budgets. The `server-memory` budget is a `503` with `Retry-After`, because the server's query memory pool is in use and a retry can succeed.",
             "externalDocs": { "url": api_doc("budgets") },
         }),
     );

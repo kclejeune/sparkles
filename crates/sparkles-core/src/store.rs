@@ -2232,6 +2232,12 @@ impl Store {
             h.cache.remove(i);
             h.settle();
         }
+        // The caches of other stores can leave the shared budget over its capacity even
+        // when this store holds only the state just built. It is then not cached.
+        if h.budget.over() && h.cache.len() == 1 && h.cache[0].seq == seq {
+            h.cache.clear();
+            h.settle();
+        }
         Ok((snap, r))
     }
 

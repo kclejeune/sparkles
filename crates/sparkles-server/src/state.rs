@@ -244,6 +244,8 @@ pub struct AppState {
     pub started: Instant,
     pub started_at: String,
     pub store_opts: StoreOptions,
+    /// the memory profile and the admission wait of the query memory pool
+    pub admission: crate::server_memory::Admission,
     pub default_timeout: std::time::Duration,
     pub read_only: bool,
     /// honor `validate=false` on writes (skips write-time validation)
@@ -488,15 +490,30 @@ impl Limits {
 }
 
 impl AppState {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(
         data_dir: &Path,
         store_opts: StoreOptions,
         default_timeout: std::time::Duration,
     ) -> Result<AppState> {
+        AppState::with_memory(data_dir, store_opts, default_timeout, None)
+    }
+
+    /// [`new`](Self::new) with a query memory pool of `pool_bytes` for the datasets'
+    /// queries (`None`: no pool).
+    pub fn with_memory(
+        data_dir: &Path,
+        store_opts: StoreOptions,
+        default_timeout: std::time::Duration,
+        pool_bytes: Option<u64>,
+    ) -> Result<AppState> {
         std::fs::create_dir_all(data_dir.join("databases"))?;
+        let mut options: sparkles::CatalogOptions = store_opts.clone().into();
+        options.memory.pool_bytes = pool_bytes;
         let state = AppState {
             data_dir: data_dir.to_path_buf(),
-            catalog: sparkles::Catalog::open(data_dir, store_opts.clone().into())?,
+            catalog: sparkles::Catalog::open(data_dir, options)?,
+            admission: Default::default(),
             routing: Mutex::new(BTreeMap::new()),
             leaving: Mutex::new(BTreeSet::new()),
             tasks: Mutex::new(Vec::new()),
@@ -556,6 +573,7 @@ impl AppState {
         AppState {
             data_dir: PathBuf::new(),
             catalog: sparkles::Catalog::memory(store_opts.clone().into()),
+            admission: Default::default(),
             routing: Mutex::new(BTreeMap::new()),
             leaving: Mutex::new(BTreeSet::new()),
             tasks: Mutex::new(Vec::new()),

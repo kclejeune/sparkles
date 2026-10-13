@@ -190,12 +190,17 @@ validators (`sparkles_shacl`, `sparkles_shex`).
 | `sparkles_rows_produced_total` | counter. The rows every operator of a query or an update produced, the work that `--max-rows-produced` limits. | `dataset` |
 | `sparkles_query_memory_peak_bytes` | histogram (1 MiB … 16 GiB, ×4). The estimated memory peak of each query, the measure that `--query-memory-mb` limits. | `dataset` |
 | `sparkles_budget_exceeded_total` | counter | `dataset`, `budget` |
+| `sparkles_query_pool_capacity_bytes`, `sparkles_query_pool_granted_bytes` | gauge. The [query memory pool](#query-memory-pool) and the part of it granted to running queries. Present while the pool is on. | |
+| `sparkles_query_admission_waiting` | gauge. Requests waiting for a share of the pool. | |
+| `sparkles_query_admission_wait_seconds` | histogram (1 ms … 2 s). How long each admitted request waited for its share. | |
+| `sparkles_query_admission_rejected_total` | counter. Requests answered `503` because the pool stayed full for `--query-admission-wait`. | |
 | `sparkles_dataset_quads`, `sparkles_wal_bytes`, `sparkles_disk_bytes` | gauge | `dataset` |
 | `sparkles_dataset_quota_bytes` | gauge. The storage quota of a persistent dataset, `0` when unlimited. | `dataset` |
 | `sparkles_delta_quads` | gauge | `dataset`, `kind` = `insert` \| `delete` |
-| `sparkles_block_cache_bytes`, `…_capacity_bytes` | gauge | `dataset` |
+| `sparkles_block_cache_bytes` | gauge. The bytes of the shared block cache that the dataset's blocks hold. | `dataset` |
+| `sparkles_block_cache_capacity_bytes`, `sparkles_result_cache_capacity_bytes` | gauge. The size of the shared cache. The caches are sized once for the server, so these carry no label. | |
 | `sparkles_block_cache_hits_total`, `…_misses_total` | counter | `dataset` |
-| `sparkles_result_cache_bytes`, `…_capacity_bytes`, `…_entries` | gauge | `dataset` |
+| `sparkles_result_cache_bytes`, `…_entries` | gauge. What the dataset holds in the shared result cache. | `dataset` |
 | `sparkles_result_cache_hits_total`, `…_misses_total` | counter | `dataset` |
 | `sparkles_validation_total` | counter | `dataset`, `language` = `shacl` \| `shex`, `status` = `passed` \| `warned` \| `rejected` \| `skipped` \| `bypassed` \| `timeout` \| `error` |
 | `sparkles_validation_duration_seconds` | histogram (1 ms … 300 s) | `dataset`, `language`, `strategy` = `full` \| `incremental` |
@@ -229,8 +234,11 @@ its first request, and from then on with all nine outcomes. The `denied` outcome
 refusal by the auth layer. Health checks (`/$/ping`, `/$/ready`), `/$/metrics` and UI
 assets are not counted. The validation series cover every validated write to a dataset
 with write-time validation, whether it comes over HTTP, over MCP or from a reasoning task.
-Deleting a dataset removes its series. Each dataset has its own block cache and result
-cache, each sized to the global `--cache-mb` / `--result-cache-mb`.
+Deleting a dataset removes its series. The block, result, SERVICE and history caches are
+shared by all datasets and sized once by `--cache-mb`, `--result-cache-mb`,
+`--service-cache-mb` and `--history-cache-mb`. The per-dataset cache series count the
+bytes, entries, hits and misses that the dataset caused. Before this sharing, the capacity
+series carried a `dataset` label and each dataset had its own cache of that size.
 
 When rate limits are configured or authentication is on, the counter
 `sparkles_rate_limited_total{dataset,class}` counts refused requests per limit class,
@@ -1574,7 +1582,7 @@ Query parameters beyond the standard protocol:
   `true` if the dataset has any.
 * `nocache=true` bypasses the query result cache, so nothing is read from it or stored in
   it. It is meant for benchmarking, and `explain` accepts it too. `sparkles serve
-  --result-cache-mb N` sets the server-wide cache budget (default 512, `0` disables the
+  --result-cache-mb N` sets the server-wide cache budget (default 256, `0` disables the
   cache). The cache is keyed by snapshot version, so updates invalidate it.
   `POST /$/cache/clear/{ds}` empties it. `nocache=true` also skips the cache of remote
   results that `SERVICE <cache:…>` uses ([SERVICE options](#service-options-loop-bulk-and-cache)).
@@ -2097,7 +2105,7 @@ budget. A caller without `federate`, or a server with SERVICE turned off, is ref
 when the cache holds the answer. Cache entries are kept per caller and per endpoint of
 the request, so callers with different credentials or graph views never read each
 other's entries. Library users choose the scope with `QueryOptions::service_scope`. The
-cache holds `--service-cache-mb` (64) per dataset, skips any entry larger than an eighth
+cache holds `--service-cache-mb` (64) for the whole server, skips any entry larger than an eighth
 of that, and keeps no entry for a response that was cut short. `POST /$/cache/clear/{ds}`
 empties it, the `no_cache` query option skips it, and the dataset's statistics report it
 as `serviceCache`.
@@ -3363,8 +3371,8 @@ longer kept is `410 history-gone`, and the body lists the readable ranges:
   "reconstructable": [ { "from": 40, "to": 57 } ], "metadata": { "seq": 12, … } }
 ```
 
-Materializing a past state is bounded by `--history-cache-mb` (default 1024, `507`
-beyond it) and by the request timeout. Results are cached, and one materialization runs
+Materializing a past state is bounded by `--history-cache-mb` (default 512 for the whole
+server, `507` beyond it) and by the request timeout. Results are cached, and one materialization runs
 at a time. A state starts from the nearest known state of its generation in the
 write-ahead log: the generation's base, a cached past state before or after it, or the
 live state. Later states replay the log forward, and earlier ones undo it backward, so a
@@ -7096,6 +7104,9 @@ fails the request with `507 Insufficient Storage` and a body like this:
   at once, at 8 bytes per value. It is checked before large intermediate results are
   built, so an oversized query fails fast. It is an estimate, not a limit on the
   process's memory.
+* `server-memory` is not one of the request's own budgets. It reports that the server's
+  [query memory pool](#query-memory-pool) is in use. It answers `503 Service Unavailable`
+  with `Retry-After: 1`, because a retry can succeed once other queries finish.
 * `result-bytes` (`--max-result-mb`, default 1024) is the serialized, uncompressed body of
   a SPARQL query response. Graph Store GET, the export path for a graph or the whole
   dataset, has its own budget, `--max-export-mb`, which is unlimited (`0`) by default.
@@ -7131,7 +7142,56 @@ fails the request with `507 Insufficient Storage` and a body like this:
 quads for `hidden-quads`. The
 response of `/{ds}/update` includes `memPeakBytes` and `rowsProduced`.
 `meta.memory.peakBytes` and `meta.rowsProduced` in `application/x-sparkles+json` report a
-query's peak memory estimate and the rows its operators produced.
+query's peak memory estimate and the rows its operators produced. With the query memory
+pool on, `meta.memory.grantedBytes` is the most the query held of the pool.
+
+#### Query memory pool
+
+The design is in [X08 Disk spill and server-wide memory](specs/X08-disk-spill-and-server-memory.md).
+The budgets above bound one query. The pool bounds all queries and updates together, so
+that many large queries cannot add up to more memory than the host has. It counts the same
+estimated bytes as `memory`, not the process's resident memory.
+
+`sparkles serve --total-query-memory-mb N` sets the pool. Without it, the pool is half of
+the memory available to the process, less the configured caches, and at least 256 MiB. The
+available memory is the cgroup v2 limit of the server's cgroup when one is set, and the
+physical memory otherwise. `--memory-profile small` sets 2048 MiB, and `0` turns the pool
+off. On a host where the available memory cannot be read, the pool is off until the flag
+sets it.
+
+Each query and update request is admitted before it parses, after the rate limiter's
+concurrency caps have let it through. Admission takes an initial grant of 16 MiB, or the
+request's whole `--query-memory-mb` budget if that is smaller. If the pool cannot give it,
+the request waits in arrival order. After `--query-admission-wait` seconds (default 2) it
+answers `503` with `Retry-After: 1` and the budget `server-memory`. A waiter behind a
+larger one may be served first when the pool has room for it, at most eight times in a
+row. A running query grows its grant in steps of 4 MiB as its estimate grows, and gives
+steps back as its estimate falls. A query never waits for memory once it runs. When the
+pool cannot cover its next step, the query fails with `server-memory`, and the pool
+therefore cannot deadlock. While requests wait, a query may not hold more than half of the
+pool. A query that exceeds its own `memory` budget still answers `507`.
+
+`GET /$/server/memory` needs the `metrics` permission and returns the pool and the shared
+caches.
+
+```json
+{ "profile": "default", "queryMemoryBytes": 8589934592,
+  "pool": { "enabled": true, "capacityBytes": 4294967296, "grantedBytes": 33554432,
+            "waiting": 0, "admitted": 120, "rejected": 0, "admissionWaitSeconds": 2.0 },
+  "caches": { "shared": true,
+              "block": { "capacityBytes": 1073741824, "bytes": 402653184, "entries": 1536 },
+              "result": { "capacityBytes": 268435456, "bytes": 0, "entries": 0 },
+              "service": { "capacityBytes": 67108864, "bytes": 0, "entries": 0 },
+              "history": { "capacityBytes": 536870912, "bytes": 0 } },
+  "datasets": [ { "name": "ds", "blockBytes": 402653184, "blockEntries": 1536,
+                  "resultBytes": 0, "resultEntries": 0,
+                  "serviceBytes": 0, "serviceEntries": 0 } ] }
+```
+
+Requests that are not queries or updates, such as administration, are not admitted. A
+query that such a request or an MCP tool call runs starts with an empty grant and grows it
+like any other. It does not queue, and it fails with `server-memory` when the pool is
+short.
 
 **Budgets per request.** A query can ask for lower budgets than the server's with
 `memory-mb`, `max-rows`, `max-rows-produced` and `max-result-mb`, in the query string or

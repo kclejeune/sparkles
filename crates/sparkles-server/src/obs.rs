@@ -681,6 +681,7 @@ fn budget_index(k: BudgetKind) -> usize {
         BudgetKind::RowsProduced => 6,
         BudgetKind::DatasetBytes => 7,
         BudgetKind::HiddenQuads => 8,
+        BudgetKind::ServerMemory => 9,
     }
 }
 
@@ -1637,6 +1638,7 @@ pub fn render_prometheus(st: &AppState) -> String {
         );
         let _ = writeln!(o, "sparkles_result_cache_capacity_bytes {result}");
     }
+    crate::server_memory::render_prometheus(st, &mut o);
     for (name, kind, help, f) in per_dataset {
         family(&mut o, name, kind, help);
         for (ds, g) in &gauges {

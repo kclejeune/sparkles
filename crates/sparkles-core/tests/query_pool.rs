@@ -129,7 +129,7 @@ fn a_cursor_returns_its_grant_when_it_is_dropped() {
     )
     .unwrap();
     let batch = c.next_batch().unwrap().unwrap();
-    assert!(batch.len() > 0);
+    assert!(!batch.is_empty());
     drop(c);
     // a batch kept past the cursor's close keeps its share until it drops
     drop(batch);

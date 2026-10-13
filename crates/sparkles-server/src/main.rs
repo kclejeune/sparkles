@@ -1008,6 +1008,18 @@ enum Cmd {
         /// (0: unlimited; default 8192, `small`: 1024)
         #[arg(long)]
         query_memory_mb: Option<u64>,
+        /// Estimated memory that all queries and updates may hold together, in MiB: the
+        /// query memory pool. A request waits for a share of it before it runs, and a
+        /// query whose state outgrows what is left fails with `503`. The default is
+        /// half of the memory available to the process (its cgroup limit or the physical
+        /// memory) less the caches, and at least 256 MiB; `small` sets 2048. 0 turns the
+        /// pool off.
+        #[arg(long)]
+        total_query_memory_mb: Option<u64>,
+        /// Seconds a request waits for the query memory pool before it answers `503`
+        /// with `Retry-After`
+        #[arg(long, default_value_t = 2.0)]
+        query_admission_wait: f64,
         /// Budget for the serialized body of a SPARQL query response, in MiB (0: unlimited)
         #[arg(long, default_value_t = 1024)]
         max_result_mb: u64,
@@ -2326,6 +2338,7 @@ fn run() -> Result<()> {
     }
     let opts = store_opts(&cli);
     let cli_memory_profile = cli.memory_profile;
+    let cli_cache_sizes = server_memory::cache_sizes(&cli);
     let no_validate = cli.no_validate;
     match cli.cmd {
         Cmd::Serve {
@@ -2370,6 +2383,8 @@ fn run() -> Result<()> {
             mut metrics_fuseki_names,
             metrics_addr,
             query_memory_mb,
+            total_query_memory_mb,
+            query_admission_wait,
             max_result_mb,
             max_export_mb,
             max_rows,
@@ -2510,7 +2525,30 @@ fn run() -> Result<()> {
             } else {
                 Vec::new()
             };
-            let mut st = state::AppState::new(&data, opts, Duration::from_secs_f64(timeout))?;
+            let caches = cli_cache_sizes;
+            let pool_bytes =
+                server_memory::pool_capacity(total_query_memory_mb, cli_memory_profile, &caches);
+            if !(query_admission_wait.is_finite() && query_admission_wait >= 0.0) {
+                bail!("--query-admission-wait must be a number of seconds, 0 or more");
+            }
+            tracing::info!(
+                "memory profile {}: block cache {} MiB, result cache {} MiB, SERVICE cache {} MiB, history cache {} MiB, query budget {} MiB, query pool {}",
+                cli_memory_profile.name(),
+                caches.blocks >> 20,
+                caches.results >> 20,
+                caches.service >> 20,
+                caches.history >> 20,
+                query_memory_mb.unwrap_or_else(|| cli_memory_profile.query_memory_mb()),
+                pool_bytes.map_or("off".to_string(), |b| format!("{} MiB", b >> 20)),
+            );
+            let mut st = state::AppState::with_memory(
+                &data,
+                opts,
+                Duration::from_secs_f64(timeout),
+                pool_bytes,
+            )?;
+            st.admission.profile = cli_memory_profile;
+            st.admission.wait = Duration::from_secs_f64(query_admission_wait);
             st.auth = auth;
             st.cors_origins = cors_origin;
             st.hosts = hosts;
