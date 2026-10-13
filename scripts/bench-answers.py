@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fingerprint an engine's answer to a benchmark query, for cross-engine comparison.
 
-    bench-answers.py <endpoint> <query-file> <answers.json> <query-name> <engine> [--count-only]
+    bench-answers.py <endpoint> <query-file> <answers.json> <query-name> <engine> [--count-only] [--no-check]
 
 Fetches SPARQL JSON results (`application/sparql-results+json`) and records three
 things for <engine> under <query-name> in <answers.json>:
@@ -25,6 +25,11 @@ Solutions are compared as multisets over variables sorted by name, since ORDER B
 may be broken differently and engines list the result variables in different orders.
 `--count-only` records just the row count, for LIMIT-without-ORDER probes whose
 solutions are legitimately engine-dependent. A failed request records `error`.
+
+ASK queries record a digest of the boolean. CONSTRUCT and DESCRIBE queries are fetched as
+N-Triples and compared as multisets of lines with blank node labels dropped. `--no-check`
+records the row count with a fixed digest, for DESCRIBE queries whose result the
+specification leaves to the engine.
 """
 
 import hashlib
@@ -276,26 +281,48 @@ def digest(rows):
     return h.hexdigest()[:16]
 
 
+def form(query):
+    """select, ask, construct or describe: the first of these words outside IRIs and comments."""
+    q = re.sub(r"#[^\n]*", "", re.sub(r"<[^<>\s]*>", "", query))
+    m = re.search(r"\b(select|construct|describe|ask)\b", q, re.I)
+    return m.group(1).lower() if m else "select"
+
+
 def main():
     endpoint, qfile, out, name, engine = sys.argv[1:6]
     count_only = "--count-only" in sys.argv[6:]
+    no_check = "--no-check" in sys.argv[6:]
     query = open(qfile).read()
+    kind = form(query)
+    graph = kind in ("construct", "describe")
     req = urllib.request.Request(
         endpoint if endpoint.startswith("http") else "http://" + endpoint,
         data=urllib.parse.urlencode({"query": query}).encode(),
-        headers={"Accept": "application/sparql-results+json",
+        headers={"Accept": "application/n-triples" if graph else "application/sparql-results+json",
                  "Content-Type": "application/x-www-form-urlencoded"},
     )
     try:
         with urllib.request.urlopen(req, timeout=float(os.environ.get("MAX_TIME", "300"))) as r:
-            res = json.load(r)
-        # variable order in the head is not part of a solution (engines differ)
-        vars_ = sorted(res["head"].get("vars", []))
-        bindings = res["results"]["bindings"]
-        rec = {"rows": len(bindings)}
-        if not count_only:
-            for key, by_value in (("exact", False), ("value", True)):
-                rec[key] = digest(tuple(term(b.get(v), by_value) for v in vars_) for b in bindings)
+            if graph:
+                # blank node labels are local to a response
+                lines = [re.sub(r"_:\S+", "_:b", l) for l in r.read().decode().splitlines() if l.strip()]
+                rec = {"rows": len(lines)}
+                if not count_only:
+                    rec["exact"] = rec["value"] = "unchecked" if no_check else digest((l,) for l in lines)
+                res = None
+            else:
+                res = json.load(r)
+        if res is not None and kind == "ask":
+            rec = {"rows": 1}
+            rec["exact"] = rec["value"] = digest([(bool(res["boolean"]),)])
+        elif res is not None:
+            # variable order in the head is not part of a solution (engines differ)
+            vars_ = sorted(res["head"].get("vars", []))
+            bindings = res["results"]["bindings"]
+            rec = {"rows": len(bindings)}
+            if not count_only:
+                for key, by_value in (("exact", False), ("value", True)):
+                    rec[key] = digest(tuple(term(b.get(v), by_value) for v in vars_) for b in bindings)
     except Exception as e:  # noqa: BLE001 - any failure is recorded, not raised
         rec = {"rows": "error", "error": str(e)[:200]}
     d = json.load(open(out)) if os.path.exists(out) else {}

@@ -1328,9 +1328,12 @@ so only its row count is checked.
   disk spill, so a query whose operator state outgrows its budget fails.
 * **Data larger than RAM.** Every store fits in memory except the DBpedia index of
   28.7 GiB under a 14 GiB limit.
-* **Other standard benchmarks.** LUBM, BSBM, SP²Bench, WatDiv's stress testing and the
-  Wikidata query log were not run. The synthetic suite has a regular shape, and its 28
-  queries are hand-picked.
+* **Other standard benchmarks.** The tables above include no figures for LUBM, BSBM or
+  SP²Bench. The harnesses for all three exist and are described in
+  [BENCHMARKING.md](BENCHMARKING.md), but their comparisons have not been run on the
+  reference machine. OWL2Bench, LDBC, WatDiv's stress testing and the Wikidata query log
+  have no harness yet. The synthetic suite has a regular shape, and its 28 queries are
+  hand-picked.
 * **Long runs.** Hours of sustained writes and compaction under load were not compared
   with other engines.
 * **Spatial and query-time reasoning.** GeoSPARQL workloads and query-time reasoning were
@@ -1351,6 +1354,12 @@ comparisons.
   the same settings as `ENGINES` and `ANSWERS_ONLY=1`.
 * `mise run bench:watdiv [scale]` runs WatDiv, and `scripts/bench-text.sh` the full-text
   comparison.
+* `mise run bench:sp2b 10m`, `mise run bench:lubm 100` and
+  `SPARKLES_ALLOW_GPL_BENCHMARK=1 mise run bench:bsbm 10m` run the standard suites. Each
+  writes a result record and a run manifest that name the Sparkles commit, the engine
+  versions and the data checksums, and `scripts/bench-regressions.py compare` compares two
+  records. A refresh puts the figures of its records into this document, with the
+  measurement window in the context table.
 * `mise run bench:billion full` runs DBpedia. Run it on a quiet machine right after
   `fstrim`, because an untrimmed SSD stalls the load's writes and slows cold lookups.
   `scripts/bench-billion.sh` records the last trim, the free space and the I/O pressure,

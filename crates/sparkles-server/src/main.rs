@@ -976,11 +976,19 @@ enum Cmd {
         // what the imports of a ShEx schema may read
         #[command(flatten)]
         shex_imports: shex_cmd::ImportArgs,
-        /// Fuseki's Graph Store direct naming on every dataset: a request to
-        /// /{ds}/{path} that names no endpoint reads or writes the graph whose IRI is
-        /// the request URL
-        #[arg(long)]
-        gsp_direct_naming: bool,
+        /// Fuseki's Graph Store direct naming: a request to /{ds}/{path} that names no
+        /// endpoint reads or writes the graph whose IRI is the request URL. Alone, the
+        /// flag turns it on for every dataset. `--gsp-direct-naming=NAME` does so for
+        /// one dataset, and `=NAME=read` or `=NAME=read-write` sets what it allows.
+        #[arg(
+            long,
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "",
+            action = clap::ArgAction::Append,
+            value_name = "NAME[=read|read-write]"
+        )]
+        gsp_direct_naming: Vec<String>,
         /// Do not log one line per request (target `sparkles::access`)
         #[arg(long)]
         no_access_log: bool,
@@ -2427,7 +2435,7 @@ fn run() -> Result<()> {
                 timeout = timeout.or(f.timeout);
                 update_timeout = update_timeout.or(f.update_timeout);
                 read_only |= f.read_only;
-                gsp_direct_naming |= f.gsp_direct_naming;
+                gsp_direct_naming.extend(f.gsp_direct_naming.iter().cloned());
                 metrics_fuseki_names |= f.metrics_fuseki_names && !no_metrics;
                 if auth_config.is_none() {
                     auth_config = f.auth_config.clone();
@@ -2565,7 +2573,8 @@ fn run() -> Result<()> {
             {
                 st.graphql_limits = graphql.limits();
             }
-            st.gsp_direct_naming = gsp_direct_naming;
+            st.gsp_direct_naming = state::GspDirectNaming::parse(&gsp_direct_naming)
+                .map_err(|e| anyhow::anyhow!(e))?;
             st.allow_unvalidated_writes = allow_unvalidated_writes;
             st.http_compression = compress::HttpCompression::parse(
                 &http_compression,
