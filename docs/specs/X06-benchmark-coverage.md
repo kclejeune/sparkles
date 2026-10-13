@@ -641,7 +641,10 @@ compared with the older registry lookup.
   at LUBM(1), and a direct query
   over the generated data confirms that only one person has a degree from University0. The
   answers have not been compared with published reference counts, because the scripts use the
-  majority of the engines as the reference. Jena's reasoners are not run.
+  majority of the engines as the reference. Jena's reasoners are not run. Fluree's public
+  documentation describes query-time reasoning, which the script does not enable, so Fluree
+  answers over the same materialized file as the other engines. Timing it with its own
+  reasoning on is not done.
 * *BSBM* (`scripts/bench-bsbm.sh`). The GPL-3.0 tools run as separate processes and are
   fetched only with `SPARKLES_ALLOW_GPL_BENCHMARK=1`. Generation is deterministic. The
   test driver's own query mixes are recorded through a stub endpoint
