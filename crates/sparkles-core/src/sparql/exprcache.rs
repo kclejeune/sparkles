@@ -720,7 +720,12 @@ fn cursor_numeric_filter(ctx: &Ctx, t: &Table, exprs: &[Expr]) -> Result<Option<
     let values = match cursor_dictionary_values(ctx, t, &Expr::Var(var)) {
         Ok(Some(values)) => values,
         Ok(None) => return Ok(None),
-        Err(crate::Error::BudgetExceeded(b)) if b.kind == crate::BudgetKind::Memory => {
+        Err(crate::Error::BudgetExceeded(b))
+            if matches!(
+                b.kind,
+                crate::BudgetKind::Memory | crate::BudgetKind::ServerMemory
+            ) =>
+        {
             return Ok(None);
         }
         Err(error) => return Err(error),
@@ -1305,7 +1310,12 @@ fn cursor_values(
             },
         );
         match decoded {
-            Err(crate::Error::BudgetExceeded(b)) if b.kind == crate::BudgetKind::Memory => {
+            Err(crate::Error::BudgetExceeded(b))
+                if matches!(
+                    b.kind,
+                    crate::BudgetKind::Memory | crate::BudgetKind::ServerMemory
+                ) =>
+            {
                 return Ok(None);
             }
             result => result?,

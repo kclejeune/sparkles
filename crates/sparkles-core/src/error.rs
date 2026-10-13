@@ -163,10 +163,13 @@ pub enum BudgetKind {
     DatasetBytes,
     /// quads a caller's triple-level access rules hide at one commit
     HiddenQuads,
+    /// the server-wide query memory pool could not admit a request or grow a query's
+    /// grant; a retry can succeed when the server is less busy
+    ServerMemory,
 }
 
 impl BudgetKind {
-    pub const ALL: [BudgetKind; 9] = [
+    pub const ALL: [BudgetKind; 10] = [
         BudgetKind::Rows,
         BudgetKind::Memory,
         BudgetKind::ResultBytes,
@@ -176,6 +179,7 @@ impl BudgetKind {
         BudgetKind::RowsProduced,
         BudgetKind::DatasetBytes,
         BudgetKind::HiddenQuads,
+        BudgetKind::ServerMemory,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -189,6 +193,7 @@ impl BudgetKind {
             BudgetKind::RowsProduced => "rows-produced",
             BudgetKind::DatasetBytes => "dataset-bytes",
             BudgetKind::HiddenQuads => "hidden-quads",
+            BudgetKind::ServerMemory => "server-memory",
         }
     }
 }
@@ -250,6 +255,12 @@ impl std::fmt::Display for Budget {
                 f,
                 "the access rules of this request hide more than {} quads at this commit",
                 self.limit
+            ),
+            BudgetKind::ServerMemory => write!(
+                f,
+                "the server's query memory is in use (pool of {}, request needs about {}); retry shortly",
+                human_bytes(self.limit),
+                human_bytes(self.requested)
             ),
         }
     }

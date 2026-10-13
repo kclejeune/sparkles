@@ -420,6 +420,9 @@ pub struct Ctx {
     pub mem_limit: u64,
     /// estimated bytes of the tables currently held by running operators
     mem_live: AtomicU64,
+    /// the bytes reserved from the server's query memory pool for this query, which
+    /// follows `mem_live` (`None`: no pool)
+    pub grant: Option<Arc<super::pool::PoolGrant>>,
     /// highest estimate seen (held tables plus an output under construction)
     mem_peak: AtomicU64,
     /// Budget for the rows all operators produce together (`u64::MAX`: unlimited). See
@@ -513,6 +516,7 @@ impl Ctx {
             max_rows: 200_000_000,
             mem_limit: u64::MAX,
             mem_live: AtomicU64::new(0),
+            grant: None,
             mem_peak: AtomicU64::new(0),
             max_rows_produced: u64::MAX,
             rows_produced: Arc::new(AtomicU64::new(0)),
@@ -824,6 +828,21 @@ impl Ctx {
             .get(self, pattern, flags)
     }
 
+    /// Give back `bytes` of estimated memory, and the pool's granules the query no
+    /// longer needs.
+    #[inline]
+    fn release_live(&self, bytes: u64) {
+        let prior = self.mem_live.fetch_sub(bytes, Ordering::Relaxed);
+        if let Some(g) = &self.grant {
+            g.trim(prior.saturating_sub(bytes));
+        }
+    }
+
+    /// The bytes this query holds in the server's query memory pool (0 without a pool).
+    pub fn granted_bytes(&self) -> u64 {
+        self.grant.as_ref().map_or(0, |g| g.granted())
+    }
+
     pub(super) fn memory_remaining(&self) -> u64 {
         self.mem_limit
             .saturating_sub(self.mem_live.load(Ordering::Relaxed))
@@ -834,7 +853,7 @@ impl Ctx {
             memory.regex.clear();
             let bytes = std::mem::take(&mut *memory.decode_peak.lock());
             memory.decoded_reserved.store(0, Ordering::Release);
-            self.mem_live.fetch_sub(bytes, Ordering::Relaxed);
+            self.release_live(bytes);
         }
     }
 
@@ -1486,6 +1505,13 @@ impl Charge<'_> {
             })
             .map_err(|live| ctx.memory_exceeded(live.saturating_add(bytes)))?;
         let live = prior + bytes;
+        if let Some(g) = &ctx.grant
+            && live > g.granted()
+            && let Err(e) = g.cover(live)
+        {
+            ctx.mem_live.fetch_sub(bytes, Ordering::Relaxed);
+            return Err(e);
+        }
         self.bytes.set(owned);
         ctx.note_peak(live);
         Ok(())
@@ -1494,9 +1520,7 @@ impl Charge<'_> {
 
 impl Drop for Charge<'_> {
     fn drop(&mut self) {
-        self.ctx
-            .mem_live
-            .fetch_sub(self.bytes.get(), Ordering::Relaxed);
+        self.ctx.release_live(self.bytes.get());
     }
 }
 
@@ -1529,8 +1553,7 @@ impl RetainedCharge {
             let added = ctx.charge(bytes - self.bytes)?;
             added.bytes.set(0);
         } else {
-            ctx.mem_live
-                .fetch_sub(self.bytes - bytes, Ordering::Relaxed);
+            ctx.release_live(self.bytes - bytes);
         }
         self.bytes = bytes;
         Ok(())
@@ -1540,7 +1563,7 @@ impl RetainedCharge {
 impl Drop for RetainedCharge {
     fn drop(&mut self) {
         if let Some(ctx) = self.owner.upgrade() {
-            ctx.mem_live.fetch_sub(self.bytes, Ordering::Relaxed);
+            ctx.release_live(self.bytes);
         }
     }
 }
@@ -1564,9 +1587,7 @@ impl OwnedCharge {
             let charge = self.ctx.charge(bytes - self.bytes)?;
             charge.bytes.set(0);
         } else {
-            self.ctx
-                .mem_live
-                .fetch_sub(self.bytes - bytes, Ordering::Relaxed);
+            self.ctx.release_live(self.bytes - bytes);
         }
         self.bytes = bytes;
         Ok(())
@@ -1579,7 +1600,7 @@ impl OwnedCharge {
 
 impl Drop for OwnedCharge {
     fn drop(&mut self) {
-        self.ctx.mem_live.fetch_sub(self.bytes, Ordering::Relaxed);
+        self.ctx.release_live(self.bytes);
     }
 }
 
