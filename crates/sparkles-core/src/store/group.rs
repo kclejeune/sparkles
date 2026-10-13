@@ -51,6 +51,13 @@ impl Coordinator {
         self.state.lock().failed
     }
 
+    /// No fence runs and nothing is queued, so a commit made now would be the only one
+    /// in its group.
+    pub fn idle(&self) -> bool {
+        let s = self.state.lock();
+        !s.active && s.queue.is_empty() && !s.failed
+    }
+
     pub fn full(&self, bytes: u64) -> bool {
         let s = self.state.lock();
         s.commits >= MAX_COMMITS || s.bytes.saturating_add(bytes) > MAX_BYTES
@@ -191,11 +198,15 @@ impl Coordinator {
         };
         store.failpoint("group-sealed");
         let last = batch.last().expect("nonempty sealed prefix");
+        let started = std::time::Instant::now();
         let synced = sync_commit_reused(
             &last.wal,
             &last.snapshot.generation.dvocab,
             &mut self.vocab.lock(),
         );
+        store
+            .commit_stats
+            .synced(SyncPath::Group, started.elapsed());
         #[cfg(test)]
         self.fences.fetch_add(1, Ordering::Relaxed);
         store.failpoint("group-synced");
@@ -211,11 +222,13 @@ impl Coordinator {
                     p.ticket.0.store(1, Ordering::Release);
                     store.failpoint("group-published");
                 }
+                store.commit_stats.fenced(batch.len());
                 s.commits -= batch.len();
                 s.bytes -= batch.iter().map(|p| p.bytes).sum::<u64>();
                 Ok(())
             }
             Err(e) => {
+                store.commit_stats.failed();
                 Self::fail_locked(&mut s);
                 Err(e)
             }
@@ -386,7 +399,9 @@ impl WriteTxn<'_> {
         // but releases the single writer for later speculative transactions.
         drop(self.guard.0.take());
         store.failpoint("group-appended");
+        let queued = std::time::Instant::now();
         group.wait(store, &ticket)?;
+        store.commit_stats.waited(queued.elapsed());
         Ok(Receipt {
             dataset_id: store.owner_dataset_id(),
             committed: true,
@@ -407,6 +422,7 @@ mod tests {
     fn options() -> StoreOptions {
         StoreOptions {
             experimental_group_commit: true,
+            group_commit_idle_direct: false,
             ..Default::default()
         }
     }
@@ -630,6 +646,108 @@ mod tests {
         let memory = Store::in_memory(options());
         assert!(memory.group.is_none());
         assert_eq!(insert(&memory, "memory").unwrap().commit.seq, 1);
+    }
+
+    fn quad(name: &str) -> Quad {
+        Quad::new(
+            NamedNode::new(format!("urn:{name}")).unwrap(),
+            NamedNode::new("urn:p").unwrap(),
+            NamedNode::new("urn:o").unwrap(),
+            GraphName::DefaultGraph,
+        )
+    }
+
+    fn synced(s: &Store, path: SyncPath) -> u64 {
+        s.commit_metrics().sync[path as usize].count()
+    }
+
+    #[test]
+    fn the_only_writer_commits_directly_and_a_contended_commit_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(
+            Store::open(
+                dir.path(),
+                StoreOptions {
+                    experimental_group_commit: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        // alone, a commit does not wait for a fence
+        for n in 0..3 {
+            assert_eq!(insert(&s, &format!("alone{n}")).unwrap().commit.seq, n + 1);
+        }
+        assert_eq!(s.group.as_ref().unwrap().fences.load(Ordering::Relaxed), 0);
+        assert_eq!(synced(&s, SyncPath::Group), 0);
+        assert_eq!(
+            synced(&s, SyncPath::Direct) + synced(&s, SyncPath::Buffered),
+            3
+        );
+        assert_eq!(s.commit_metrics().size.count(), 0);
+        // a commit that finds a writer waiting for the lock joins a group
+        let mut first = s.write_with(CommitKind::Update, Default::default());
+        let ids = first
+            .encode_quad(&quad("first"), &mut Default::default())
+            .unwrap();
+        first.insert(ids).unwrap();
+        let second = {
+            let s = s.clone();
+            thread::spawn(move || insert(&s, "second"))
+        };
+        let until = Instant::now() + Duration::from_secs(5);
+        while s.writers_waiting() == 0 {
+            assert!(Instant::now() < until, "the second writer did not wait");
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(first.commit().unwrap().commit.seq, 4);
+        assert_eq!(second.join().unwrap().unwrap().commit.seq, 5);
+        // the second writer starts while the first one's fence runs, so it groups as well
+        // unless that fence has finished
+        let fences = s.group.as_ref().unwrap().fences.load(Ordering::Relaxed);
+        assert!((1..=2).contains(&fences), "{fences} fences");
+        assert_eq!(synced(&s, SyncPath::Group), fences as u64);
+        assert_eq!(s.commit_metrics().size.count(), fences as u64);
+        assert!(s.commit_metrics().wait.count() >= 1);
+        drop(s);
+        let reopened = Store::open(dir.path(), Default::default()).unwrap();
+        assert_eq!(reopened.snapshot().len(), 5);
+    }
+
+    #[test]
+    fn fallbacks_are_counted_by_the_first_failing_condition() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(dir.path(), options()).unwrap();
+        insert(&s, "plain").unwrap();
+        assert_eq!(s.commit_metrics().fallbacks, [0; Fallback::ALL.len()]);
+        let mut t = s.write_with(
+            CommitKind::Update,
+            crate::guard::WriteOptions {
+                message: Some("why".into()),
+                ..Default::default()
+            },
+        );
+        let ids = t
+            .encode_quad(&quad("messaged"), &mut Default::default())
+            .unwrap();
+        t.insert(ids).unwrap();
+        t.commit().unwrap();
+        // a transaction without a net change is counted as a no-op
+        let t = s.write_with(CommitKind::Update, Default::default());
+        t.commit().unwrap();
+        let m = s.commit_metrics();
+        assert!(m.group_commit);
+        assert_eq!(m.fallbacks[Fallback::Message as usize], 1);
+        assert_eq!(m.fallbacks[Fallback::Noop as usize], 1);
+        assert_eq!(m.fallbacks.iter().sum::<u64>(), 2);
+        // a store without group commit counts nothing
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(dir.path(), Default::default()).unwrap();
+        insert(&s, "plain").unwrap();
+        let m = s.commit_metrics();
+        assert!(!m.group_commit);
+        assert_eq!(m.fallbacks.iter().sum::<u64>(), 0);
+        assert_eq!(m.sync[SyncPath::Group as usize].count(), 0);
     }
 
     #[test]

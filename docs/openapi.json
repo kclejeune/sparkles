@@ -9087,6 +9087,31 @@
                     }
                   ]
                 },
+                "commits": {
+                  "properties": {
+                    "failures": {
+                      "description": "Fences whose synchronization failed.",
+                      "type": "integer"
+                    },
+                    "fallbacks": {
+                      "additionalProperties": {
+                        "type": "integer"
+                      },
+                      "description": "Commits that took the ordinary path, by the first condition that kept them out of a group.",
+                      "type": "object"
+                    },
+                    "fences": {
+                      "description": "Group commit fences since the dataset was opened.",
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "fences",
+                    "failures",
+                    "fallbacks"
+                  ],
+                  "type": "object"
+                },
                 "deltaDeletes": {
                   "type": "integer"
                 },
@@ -9156,6 +9181,10 @@
                       "type": "null"
                     }
                   ]
+                },
+                "groupCommit": {
+                  "description": "Whether concurrent commits of this persistent dataset share one synchronization.",
+                  "type": "boolean"
                 },
                 "name": {
                   "type": "string"
@@ -9232,7 +9261,9 @@
                 "rateLimited",
                 "blockCache",
                 "resultCache",
-                "geo"
+                "geo",
+                "groupCommit",
+                "commits"
               ],
               "type": "object"
             },

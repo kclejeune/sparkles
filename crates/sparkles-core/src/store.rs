@@ -20,6 +20,7 @@ mod changelog;
 mod changes;
 mod clone;
 mod commit_graph;
+mod commit_stats;
 mod compaction;
 #[cfg(test)]
 mod compaction_tests;
@@ -66,6 +67,9 @@ pub use changelog::{
 pub use changes::{ChangePage, ChangesOptions, CommitChanges};
 pub use clone::{CloneMethod, CloneMode, CloneOptions, CloneReport};
 pub use commit_graph::{CommitGraph, CommitGraphOptions, GraphBranch, GraphCommit, GraphCursor};
+pub use commit_stats::{
+    CommitMetrics, Fallback, HistogramSnapshot, SIZE_BUCKETS, SYNC_BUCKETS, SyncPath,
+};
 pub use compaction::{
     Blocker, COMPACTION_FILE, CompactOptions, CompactReport, CompactionMeasures, CompactionPolicy,
     CompactionSettings, REBUILD_BUCKETS, RELINK_CATCHING_UP, RELINK_READING, RELINK_WRITING,
@@ -1079,6 +1083,11 @@ pub struct StoreOptions {
     /// Experimental durable prefix grouping for ordinary persistent WAL writes.
     /// Off by default; unsupported operations drain and use the ordinary commit path.
     pub experimental_group_commit: bool,
+    /// With group commit on, a commit that is the only writer (nothing queued, no fence
+    /// running, no transaction waiting for the writer lock) takes the ordinary path with
+    /// its write-through writes, which need no cache flush. On by default; off, every
+    /// admitted commit goes through the group, for comparing and for tests of the group.
+    pub group_commit_idle_direct: bool,
     /// Record each commit's net changes in the change log ([`ChangeLog`]), which history
     /// queries read and which outlives compactions. A dataset's `changelog.json` can
     /// turn it off or on.
@@ -1146,6 +1155,7 @@ impl Default for StoreOptions {
             wal_prealloc_bytes: DEFAULT_WAL_PREALLOC_BYTES,
             wal_direct_writes: true,
             experimental_group_commit: false,
+            group_commit_idle_direct: true,
             change_log: true,
             change_log_max_bytes: DEFAULT_CHANGE_LOG_MAX_BYTES,
             change_log_segment_bytes: 16 << 20,
@@ -1239,6 +1249,8 @@ pub struct Store {
     root: Option<PathBuf>,
     opts: StoreOptions,
     group: Option<Box<group::Coordinator>>,
+    /// synchronization, group size and fallback counters of the commit path
+    commit_stats: commit_stats::CommitStats,
     // `current`, `writer`, `catalog`, `clock` and `history` are shared (weakly) with
     // backup lease guards, whose drop collects history without a `&Store`
     current: Arc<ArcSwap<Snapshot>>,
@@ -1398,6 +1410,7 @@ impl Store {
         let store = Store {
             root: None,
             group: None,
+            commit_stats: Default::default(),
             current: Arc::new(ArcSwap::from_pointee(Snapshot {
                 dataset_id,
                 generation: gen_,
@@ -1759,6 +1772,7 @@ impl Store {
             group: opts
                 .experimental_group_commit
                 .then(|| Box::new(group::Coordinator::default())),
+            commit_stats: Default::default(),
             current: Arc::new(ArcSwap::from_pointee(Snapshot {
                 dataset_id: branching
                     .ident
@@ -3582,22 +3596,51 @@ impl Store {
         o: &crate::guard::WriteOptions,
         w: &WriterState,
     ) -> bool {
-        self.group.is_some()
-            && !w.poisoned
-            && w.wal.is_some()
-            && w.tap.is_none()
-            && matches!(kind, CommitKind::Transaction | CommitKind::Update)
-            && !o.bypass_validation
-            && o.dry_run.is_none()
-            && o.message.is_none()
-            && o.precondition.is_none()
-            && o.graphs.is_none()
-            && !self.commit_digests()
-            && !self.guard_required()
-            && self.guard.read().is_none()
-            && !self.text_enabled()
-            && self.geo.load().is_none()
-            && self.embed.works.lock().is_empty()
+        self.group_check(kind, o, w).is_ok()
+    }
+
+    /// `Ok` when a commit with these options may join a group. `Err(None)` when group
+    /// commit does not apply (it is off, the store has no WAL, or the write is a dry
+    /// run), and `Err(Some(why))` with the first condition that sends the commit down
+    /// the ordinary path.
+    fn group_check(
+        &self,
+        kind: CommitKind,
+        o: &crate::guard::WriteOptions,
+        w: &WriterState,
+    ) -> std::result::Result<(), Option<Fallback>> {
+        use Fallback::*;
+        if self.group.is_none() || w.wal.is_none() || o.dry_run.is_some() {
+            return Err(None);
+        }
+        let first = if w.poisoned {
+            Some(Poisoned)
+        } else if w.tap.is_some() {
+            Some(Compaction)
+        } else if !matches!(kind, CommitKind::Transaction | CommitKind::Update) {
+            Some(Kind)
+        } else if o.bypass_validation {
+            Some(Bypass)
+        } else if o.message.is_some() {
+            Some(Message)
+        } else if o.precondition.is_some() {
+            Some(Precondition)
+        } else if o.graphs.is_some() {
+            Some(Graphs)
+        } else if self.commit_digests() {
+            Some(Digests)
+        } else if self.guard_required() || self.guard.read().is_some() {
+            Some(Guard)
+        } else if self.text_enabled() {
+            Some(Text)
+        } else if self.geo.load().is_some() {
+            Some(Geo)
+        } else if !self.embed.works.lock().is_empty() {
+            Some(Embed)
+        } else {
+            None
+        };
+        first.map_or(Ok(()), |f| Err(Some(f)))
     }
 
     /// What stops a rebuild into `dir` early: the write's cancellation and deadline, and
@@ -5258,13 +5301,7 @@ impl WriteTxn<'_> {
         if self.guard.poisoned || self.store.group.as_ref().is_some_and(|g| g.failed()) {
             return Err(Error::Poisoned);
         }
-        let grouped = self.bulk.is_empty()
-            && !self.force
-            && self.merge.is_none()
-            && self.wal_bytes() <= group::MAX_BYTES
-            && self
-                .store
-                .group_admission(self.kind, &self.opts, &self.guard);
+        let grouped = self.group_admitted();
         // A dependent no-op, preview, validation, bulk rebuild or other fallback
         // cannot acknowledge or capture a speculative predecessor.
         if !grouped || (self.net_ins == 0 && self.net_del == 0) {
@@ -5338,6 +5375,34 @@ impl WriteTxn<'_> {
             check,
         )?;
         Ok(receipt)
+    }
+
+    /// Whether this commit joins a group. A commit of a store with group commit on that
+    /// does not is counted under the first reason it fell back for.
+    fn group_admitted(&self) -> bool {
+        let why = match self.store.group_check(self.kind, &self.opts, &self.guard) {
+            Err(None) => return false,
+            Err(Some(why)) => Some(why),
+            Ok(()) if !self.bulk.is_empty() => Some(Fallback::Bulk),
+            Ok(()) if self.force || self.merge.is_some() => Some(Fallback::Kind),
+            Ok(()) if self.wal_bytes() > group::MAX_BYTES => Some(Fallback::Size),
+            Ok(()) if self.net_ins == 0 && self.net_del == 0 => Some(Fallback::Noop),
+            Ok(()) => None,
+        };
+        if let Some(why) = why {
+            self.store.commit_stats.fell_back(why);
+        }
+        // a no-op is counted, but still drains and is answered by the ordinary path
+        if why.is_some() {
+            return why == Some(Fallback::Noop);
+        }
+        // Idle fast path: the only writer, with no fence running, commits as the ordinary
+        // writer does, with write-through writes that need no cache flush. A commit that
+        // finds another writer waiting for the lock groups instead.
+        let alone = self.store.opts.group_commit_idle_direct
+            && self.store.writers_waiting() == 0
+            && self.store.group.as_ref().is_some_and(|g| g.idle());
+        !alone
     }
 
     fn publish_log(
@@ -5420,7 +5485,11 @@ impl WriteTxn<'_> {
                 if wal::DirectLog::fits(w.wal_len, data.len(), w.wal_alloc)
                     && let Some(direct) = w.wal_direct.handle(path.as_deref(), wal.get_ref())
                 {
+                    let t = std::time::Instant::now();
                     if commit_direct(direct, w.wal_len, &data, &gen_.dvocab, &mut w.vocab_sync)? {
+                        self.store
+                            .commit_stats
+                            .synced(SyncPath::Direct, t.elapsed());
                         return Ok(());
                     }
                     // the file system refused direct I/O: write this commit and the
@@ -5434,7 +5503,12 @@ impl WriteTxn<'_> {
                     gen_.dvocab.flush()?;
                 }
                 wal::write_commit(wal.get_ref(), w.wal_len, &mut w.wal_alloc, &data, prealloc)?;
-                sync_commit_reused(wal.get_ref(), &gen_.dvocab, &mut w.vocab_sync)
+                let t = std::time::Instant::now();
+                let synced = sync_commit_reused(wal.get_ref(), &gen_.dvocab, &mut w.vocab_sync);
+                self.store
+                    .commit_stats
+                    .synced(SyncPath::Buffered, t.elapsed());
+                synced
             });
             if let Err(e) = written {
                 w.poisoned = true;
