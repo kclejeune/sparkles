@@ -4,6 +4,7 @@
 //! never enter the catalog namespace. A catalog is cheap to clone and shares its
 //! stores, reservations and lock with every clone.
 
+use crate::store::caches::{CacheSizes, SharedCaches};
 use crate::store::{Store, StoreOptions};
 use crate::{Dataset, DatasetOptions, Error, Result};
 use parking_lot::{Mutex, RwLock};
@@ -23,15 +24,59 @@ pub use restore::RESTORE_PREFIX;
 #[cfg(feature = "backup")]
 mod swap;
 
+/// How a catalog sizes the caches of its datasets (spec X08 §3).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CatalogCaches {
+    /// One set of caches for all datasets, sized by the `cache_bytes`,
+    /// `result_cache_bytes`, `service_cache_bytes` and `history_cache_bytes` of the
+    /// dataset options the catalog is created with.
+    #[default]
+    FromStore,
+    /// One set of caches for all datasets, of these sizes.
+    Sizes(CacheSizes),
+    /// Each dataset sizes its own caches by its store options, so memory grows with the
+    /// number of datasets.
+    PerDataset,
+}
+
+/// The memory a catalog's datasets share.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MemoryOptions {
+    pub caches: CatalogCaches,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct CatalogOptions {
     pub dataset: DatasetOptions,
+    pub memory: MemoryOptions,
 }
 impl From<StoreOptions> for CatalogOptions {
     fn from(store: StoreOptions) -> Self {
         Self {
             dataset: store.into(),
+            memory: MemoryOptions::default(),
         }
+    }
+}
+
+impl CatalogOptions {
+    /// The caches the catalog's datasets share, if any.
+    fn shared_caches(&self) -> Option<SharedCaches> {
+        let store = &self.dataset.store;
+        if store.shared.is_some() {
+            return None;
+        }
+        let sizes = match self.memory.caches {
+            CatalogCaches::PerDataset => return None,
+            CatalogCaches::Sizes(s) => s,
+            CatalogCaches::FromStore => CacheSizes {
+                blocks: store.cache_bytes,
+                results: store.result_cache_bytes,
+                service: store.service_cache_bytes,
+                history: store.history_cache_bytes,
+            },
+        };
+        Some(SharedCaches::new(sizes))
     }
 }
 
@@ -112,6 +157,8 @@ struct Detached {
 pub(crate) struct Inner {
     dir: Option<PathBuf>,
     options: RwLock<CatalogOptions>,
+    /// the caches every dataset opened by this catalog reads through
+    caches: Option<SharedCaches>,
     entries: RwLock<BTreeMap<String, Entry>>,
     reservations: Mutex<BTreeMap<String, (ReservationKind, String)>>,
     /// Persistent datasets taken out of `entries` for an in-place restore, or left
@@ -174,6 +221,7 @@ impl Catalog {
         let catalog = Self {
             inner: Arc::new(Inner {
                 dir: Some(dir.clone()),
+                caches: options.shared_caches(),
                 options: RwLock::new(options),
                 entries: RwLock::new(BTreeMap::new()),
                 reservations: Mutex::new(BTreeMap::new()),
@@ -213,6 +261,7 @@ impl Catalog {
         Self {
             inner: Arc::new(Inner {
                 dir: None,
+                caches: options.shared_caches(),
                 options: RwLock::new(options),
                 entries: RwLock::new(BTreeMap::new()),
                 reservations: Mutex::new(BTreeMap::new()),
@@ -223,6 +272,10 @@ impl Catalog {
                 _lock: None,
             }),
         }
+    }
+    /// The caches that the catalog's datasets share, unless it sizes them per dataset.
+    pub fn caches(&self) -> Option<&SharedCaches> {
+        self.inner.caches.as_ref()
     }
     /// Replace the options that datasets created or attached from now on open with.
     /// Datasets that are already open keep their options.
@@ -338,10 +391,13 @@ impl Catalog {
             .ok_or_else(|| Error::invalid("a persistent dataset needs a catalog directory"))
     }
     fn open_dataset(&self, name: &str, kind: DatasetKind, loc: Option<&Path>) -> Result<Dataset> {
-        let opts = DatasetOptions {
+        let mut opts = DatasetOptions {
             name: Some(name.into()),
             ..self.inner.options.read().dataset.clone()
         };
+        if let Some(c) = &self.inner.caches {
+            opts.store.shared = Some(c.scope());
+        }
         match kind {
             DatasetKind::Memory => Ok(Dataset::from_store_with(
                 Store::in_memory(opts.store.clone()),

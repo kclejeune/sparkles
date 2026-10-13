@@ -1126,14 +1126,14 @@ impl Default for StoreOptions {
     fn default() -> Self {
         StoreOptions {
             cache_bytes: 1 << 30,
-            result_cache_bytes: 512 << 20,
+            result_cache_bytes: 256 << 20,
             result_cache_min_ms: 1.0,
             service_cache_bytes: 64 << 20,
             union_default_graph: false,
             build: BuildOptions::default(),
             bulk_threshold: 250_000,
             memory_commit_ring: 65_536,
-            history_cache_bytes: 1 << 30,
+            history_cache_bytes: 512 << 20,
             shared: None,
             history_max_generations: 8,
             max_snapshots: 256,

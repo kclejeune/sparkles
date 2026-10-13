@@ -142,6 +142,11 @@ impl ResultCache {
         self.store.cache.is_some()
     }
 
+    /// The namespace of this view's entries.
+    pub fn namespace(&self) -> u32 {
+        self.ns
+    }
+
     /// Look up a cached result. The request's row and memory budgets apply before the
     /// columns are copied, exactly as they would to recomputing the result.
     pub fn get(&self, key: &CacheKey, ctx: &Ctx) -> crate::error::Result<Option<Table>> {
