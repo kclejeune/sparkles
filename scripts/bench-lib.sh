@@ -306,3 +306,35 @@ json.dump(j, open(f, "w"), indent=1)
 print(f"{engine}: {float(secs):.1f} s, peak RSS {rss >> 10} MiB, index {size / 2**20:.0f} MiB")
 EOF
 }
+
+# ------------------------------------------------------------------------------- load
+# load_all: DATAFILE (default data.nt, relative to WORK) into every selected engine
+# (LOADRES, default results, gets the numbers). Each load runs under GNU time for its
+# peak RSS (the largest of the processes it waits
+# for); load.json and load-details.json get the time, peak RSS and index size.
+load_all() {
+  local gtime e cmd t0 t1 df=${DATAFILE:-data.nt}
+  gtime=$(gnu_time)
+  for e in $ENGINES; do
+    case $e in
+      sparkles) cmd="'$SPARKLES' load --loc sparkles.db $df" ;;
+      jena) cmd="'$TDBLOADER' --loc jena.db $df" ;;
+      qlever)
+        cmd="mkdir -p qlever-index && cd qlever-index && echo '{\"num-triples-per-batch\": 1000000}' > settings.json &&
+          '$QINDEX' -i bench -F nt -f ../$df -p true -s settings.json"
+        ;;
+      # Fluree's bulk import (`create --from`) builds the index directly; without
+      # --chunk-size-mb it parses the file as a single chunk (about 3x slower)
+      fluree) cmd="mkdir -p fluree && cd fluree && '$FLUREE' init -q && '$FLUREE' --memory-budget-mb 8192 create bench --from ../$df --chunk-size-mb 16" ;;
+      # Oxigraph's bulk loader (parallel, writes RocksDB files directly), then the compaction
+      # it recommends before read-heavy workloads (`optimize`); both are timed as the load
+      oxigraph) cmd="'$OXIGRAPH' load --location oxigraph.db --file $df && '$OXIGRAPH' optimize --location oxigraph.db" ;;
+    esac
+    rm -rf "${WORK:?}/${FILEOF[$e]}"
+    log "$e: loading (log: logs/load-$e.log)"
+    t0=$(date +%s.%N)
+    "$gtime" -v -o "logs/load-$e.time" bash -c "$cmd" > "logs/load-$e.log" 2>&1 || die "$e: load failed, see logs/load-$e.log"
+    t1=$(date +%s.%N)
+    record_load "${LOADRES:-results}" "${LOADNAME[$e]}" "$(awk "BEGIN {print $t1 - $t0}")" "logs/load-$e.time" "$WORK/${FILEOF[$e]}"
+  done
+}

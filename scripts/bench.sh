@@ -141,36 +141,6 @@ minus() { if [[ $1 =~ ^[0-9]+$ && $2 =~ ^[0-9]+$ ]]; then echo $(($1 > $2 ? $1 -
 # a reading as JSON: the number, or "?"
 num() { if [[ $1 =~ ^[0-9]+$ ]]; then echo "$1"; else echo '"?"'; fi; }
 
-# ------------------------------------------------------------------------------- load
-# Each load runs under GNU time for its peak RSS (the largest of the processes it waits
-# for); load.json and load-details.json get the time, peak RSS and index size.
-load_all() {
-  local gtime e cmd t0 t1
-  gtime=$(gnu_time)
-  for e in $ENGINES; do
-    case $e in
-      sparkles) cmd="'$SPARKLES' load --loc sparkles.db data.nt" ;;
-      jena) cmd="'$TDBLOADER' --loc jena.db data.nt" ;;
-      qlever)
-        cmd="mkdir -p qlever-index && cd qlever-index && echo '{\"num-triples-per-batch\": 1000000}' > settings.json &&
-          '$QINDEX' -i bench -F nt -f ../data.nt -p true -s settings.json"
-        ;;
-      # Fluree's bulk import (`create --from`) builds the index directly; without
-      # --chunk-size-mb it parses the file as a single chunk (about 3x slower)
-      fluree) cmd="mkdir -p fluree && cd fluree && '$FLUREE' init -q && '$FLUREE' --memory-budget-mb 8192 create bench --from ../data.nt --chunk-size-mb 16" ;;
-      # Oxigraph's bulk loader (parallel, writes RocksDB files directly), then the compaction
-      # it recommends before read-heavy workloads (`optimize`); both are timed as the load
-      oxigraph) cmd="'$OXIGRAPH' load --location oxigraph.db --file data.nt && '$OXIGRAPH' optimize --location oxigraph.db" ;;
-    esac
-    rm -rf "${WORK:?}/${FILEOF[$e]}"
-    log "$e: loading (log: logs/load-$e.log)"
-    t0=$(date +%s.%N)
-    "$gtime" -v -o "logs/load-$e.time" bash -c "$cmd" > "logs/load-$e.log" 2>&1 || die "$e: load failed, see logs/load-$e.log"
-    t1=$(date +%s.%N)
-    record_load results "${LOADNAME[$e]}" "$(awk "BEGIN {print $t1 - $t0}")" "logs/load-$e.time" "$WORK/${FILEOF[$e]}"
-  done
-}
-
 # ------------------------------------------------------------------------- the suite
 # start_all: every selected engine's server on STORE; mem.json gets each one's RSS
 # 2 s after all are ready, before any query
