@@ -47,6 +47,7 @@ pub(crate) mod text_recovery;
 #[cfg(all(test, feature = "geo"))]
 mod test_support;
 mod vector;
+pub(crate) use diff::QuadKey;
 pub(crate) use embed::embed_query_text;
 pub use embed::embed_texts;
 pub(crate) mod wal;
@@ -1089,7 +1090,7 @@ pub struct StoreOptions {
     /// The size at which a change log segment is sealed and a new one started.
     pub change_log_segment_bytes: u64,
     /// A bulk commit's changes are recorded when the dataset was empty and the new state
-    /// holds at most this many quads, or when both states together hold at most this
+    /// holds at most this many quads, or when the commit adds and removes at most this
     /// many; a larger one is recorded with its counts only.
     pub change_log_bulk_max_quads: u64,
     /// Branches per dataset, `main` included ([`Store::create_branch`] refuses more).
@@ -4134,21 +4135,48 @@ impl Store {
         bopts.first_bnode = w.next_bnode;
         let wopts = check.as_ref().map(|(_, o)| (*o).clone());
         let interrupt = self.build_interrupt(wopts.clone(), &dir);
+        // What a bulk commit into a dataset that is not empty changes: the quads of its
+        // sources and of the graphs it drops are collected as the build reads them, up to
+        // the change log's limit, so the log need not compare the two states.
+        let change_cap = if bulk.is_some() && dry.is_none() && !prior.is_empty() {
+            self.bulk_change_cap()
+        } else {
+            None
+        };
+        let mut sourced: Option<Vec<QuadKey>> = None;
+        let mut dropped: Vec<[Id; 4]> = Vec::new();
+        let mut dropped_over = false;
         let built = (|| {
             let mut builder = Builder::new(&dir, bopts)?;
             if let Some(i) = interrupt.clone() {
                 builder = builder.with_interrupt(i);
             }
+            if let Some(cap) = change_cap {
+                builder = builder.with_change_tap(cap);
+            }
             write_snapshot(
                 &builder,
                 snap,
                 None,
-                |q| Ok(!drop_graphs.contains(&q[3])),
+                |q| {
+                    if !drop_graphs.contains(&q[3]) {
+                        return Ok(true);
+                    }
+                    if let Some(cap) = change_cap {
+                        if (dropped.len() as u64) < cap {
+                            dropped.push(*q);
+                        } else {
+                            dropped_over = true;
+                        }
+                    }
+                    Ok(false)
+                },
                 extra_quads,
             )?;
             for s in extra {
                 builder.add_source(s)?;
             }
+            sourced = builder.take_tapped();
             builder.add_prefixes(self.prefixes());
             let meta = builder.finish()?;
             // a write stopped while it was built publishes nothing
@@ -4346,7 +4374,25 @@ impl Store {
             self.rebuild_text_locked(&mut new_snap, &prior);
             // the bulk commit's changes, while the state before it is at hand
             let author = check.as_ref().and_then(|(_, o)| o.author.clone());
-            self.log_bulk_commit(&head, message.clone(), author, &prior, &new_snap);
+            let txn_log: &[(u8, [Id; 4])] = match check.as_ref().map(|c| c.0) {
+                Some(crate::guard::Changes::Rebuilt { log, .. }) => log,
+                _ => &[],
+            };
+            let candidates = change_cap.map(|_| changelog::BulkCandidates {
+                sources: sourced,
+                dropped: (!dropped_over).then_some(dropped),
+                view: snap,
+                log: txn_log,
+                bulk: extra_quads,
+            });
+            self.log_bulk_commit(
+                &head,
+                message.clone(),
+                author,
+                &prior,
+                &new_snap,
+                candidates,
+            );
         }
         // a new generation needs its own spatial base (bulk commits and compactions)
         self.rebuild_geo_locked(&mut new_snap, snap);
