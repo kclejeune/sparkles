@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { goto, replaceState } from '$app/navigation';
+  import { afterNavigate, goto, replaceState } from '$app/navigation';
   import { page } from '$app/state';
   import { resolve } from '$app/paths';
   import { onMount, untrack } from 'svelte';
@@ -9,6 +9,17 @@
   import { branchOption, branchParam, MAIN, onBranch, onBranchLabel } from '$lib/branches';
   import { receiptSummary } from '$lib/commits';
   import { atLabel, normalizeAt, validAt } from '$lib/history';
+  import {
+    CHANGE_FILTERS,
+    compareRows,
+    filterDiff,
+    isTooLarge,
+    ROW_DIFF_LIMIT,
+    rowAnnouncement,
+    type ChangeFilter,
+    type Mark,
+  } from '$lib/rowdiff';
+  import { timeFailure } from '$lib/timeline';
   import { EXAMPLES } from '$lib/examples';
   import { fmtInt, fmtMs, formatSse } from '$lib/format';
   import { geoColumns } from '$lib/geo';
@@ -27,6 +38,7 @@
   import ResultMap from '$components/ResultMap.svelte';
   import Modal from '$components/Modal.svelte';
   import ResultTable from '$components/ResultTable.svelte';
+  import TimeSlider, { type TimeChange } from '$components/TimeSlider.svelte';
   import SparqlEditor from '$components/SparqlEditor.svelte';
   import QuestionHeader from '$components/QuestionHeader.svelte';
   import AskBar from '$components/AskBar.svelte';
@@ -96,6 +108,8 @@
     branch: string | null;
     kind: string;
     result?: api.SparklesResult;
+    /** In compare mode: the same query read at the left handle's commit. */
+    base?: api.SparklesResult;
     explain?: api.ExplainResult;
     updated?: { ms: number; result: api.UpdateResult | null };
     /** Whether materialized inferences were included (null: dataset has none). */
@@ -174,6 +188,27 @@
   const reasoningInfo = $derived(app.datasets.find((d) => d.name === ds)?.reasoning ?? null);
   /** The `at` field: a past state to read, or empty for the head. */
   const atOk = $derived(validAt(app.queryAt));
+  // --- the time slider (docs/specs/U01-time-slider.md) ---------------------------------
+
+  const urlParams = page.url.searchParams;
+  const fromUrl = urlParams.has('at') || urlParams.has('from');
+  if (fromUrl) {
+    const urlDs = urlParams.get('ds');
+    if (urlDs && urlDs !== app.current) app.setDataset(urlDs);
+    const urlBranch = urlParams.get('branch');
+    if (urlBranch) app.queryBranch = urlBranch === MAIN ? '' : urlBranch;
+    app.queryAt = urlParams.get('at') ?? '';
+  }
+  /** The slider bar under the toolbar, opened by History (`H`). */
+  let timeOpen = $state(fromUrl);
+  /** Compare mode: the left handle's commit (`from`), with the right handle's marked against it. */
+  let compare = $state(urlParams.has('from'));
+  let timeFrom = $state(urlParams.get('from') ?? '');
+  let slider: TimeSlider | undefined = $state();
+  let changeFilter = $state<ChangeFilter>('all');
+  /** Focus is in the results, so Play waits. */
+  let resultsFocused = $state(false);
+
   /** The `branch` field: the branch to read and write, or empty for `main`. */
   const branch = $derived(branchParam(app.queryBranch));
   /** The dataset on that branch, as the API client takes it. */
@@ -1169,6 +1204,23 @@
       toasts.push('error', 'Updates always apply to the head', 'Clear the At field to run one.');
       return;
     }
+    // compare mode reads the query at the left handle too, and marks what differs
+    const compareOn = timeOpen && compare && !!timeFrom && k !== 'UPDATE' && k !== 'ASK';
+    let fromAt: string | undefined;
+    if (compareOn) {
+      try {
+        fromAt = normalizeAt(timeFrom) ?? undefined;
+      } catch (e) {
+        toasts.push('error', 'Invalid From', (e as Error).message);
+        return;
+      }
+    }
+    // while the slider moves, the last state stays on screen until the next one has arrived
+    const shown = outcomes[tabId];
+    const keepShown =
+      timeOpen && shown?.status === 'done' && !!shown.result && shown.ds === dsName
+        ? shown
+        : undefined;
     const controller = new AbortController();
     const prevView = outcomes[tabId]?.view;
     const prevKind = outcomes[tabId]?.result?.queryType;
@@ -1183,6 +1235,7 @@
       startedAt: started,
       controller,
       reasoning,
+      ...(keepShown ? { result: keepShown.result, base: keepShown.base } : {}),
     };
     try {
       if (k === 'UPDATE') {
@@ -1215,11 +1268,17 @@
         );
       } else {
         const opts = { send: limit, reasoning, at, signal: controller.signal };
-        const result = stored
-          ? await api.runStoredQuery(dsTarget, stored.name, stored.values, opts)
-          : await api.query(dsTarget, text, opts);
+        const read = (o: api.QueryOptions) =>
+          stored
+            ? api.runStoredQuery(dsTarget, stored.name, stored.values, o)
+            : api.query(dsTarget, text, o);
+        const [result, base] = await Promise.all([
+          read(opts),
+          compareOn ? read({ ...opts, at: fromAt }) : Promise.resolve(undefined),
+        ]);
         const elapsed = performance.now() - started;
         if (!owns()) return;
+        if (timeOpen) slider?.accept();
         // Keep the user's chosen view only when re-running the same kind of query.
         const sameKind = prevKind === result.queryType;
         const keep =
@@ -1234,6 +1293,7 @@
           branch: dsBranch,
           kind: result.queryType,
           result,
+          ...(base && base.queryType === result.queryType ? { base } : {}),
           view: keep ? prevView! : defaultView(result),
           startedAt: started,
           elapsed,
@@ -1248,8 +1308,26 @@
     } catch (e) {
       if (!owns()) return;
       if (e instanceof DOMException && e.name === 'AbortError') {
-        delete outcomes[tabId];
+        // a slider move that was superseded leaves the state that is on screen
+        if (keepShown) outcomes[tabId] = keepShown;
+        else delete outcomes[tabId];
         return;
+      }
+      // a state the server can no longer read: the handle goes back and the view keeps its state
+      const gone = timeOpen ? timeFailure(e) : null;
+      if (gone) {
+        toasts.push('error', gone.title, gone.detail);
+        slider?.reject({ seq: gone.seq, readable: gone.readable });
+        if (keepShown) {
+          outcomes[tabId] = keepShown;
+          return;
+        }
+        // nothing was on screen: read the state the handle went back to
+        if (!stored) {
+          delete outcomes[tabId];
+          queueMicrotask(() => onTimeChange({ at: app.queryAt, from: timeFrom, compare }));
+          return;
+        }
       }
       outcomes[tabId] = {
         status: 'error',
@@ -1375,24 +1453,131 @@
     gCols = { s, p, o };
   }
 
-  const graphTriples = $derived.by((): Triple[] => {
+  /** The triples the Graph view draws, and in compare mode the change of each. */
+  const graphData = $derived.by((): { triples: Triple[]; marks?: Mark[] } => {
     const r = outcome?.result;
-    if (!r) return [];
-    if (r.triples) return r.triples;
-    if (r.queryType !== 'SELECT' || !r.vars || !r.rows) return [];
+    if (!r) return { triples: [] };
+    const d = diffView && !isTooLarge(diffView) ? diffView : null;
+    if (r.triples)
+      return d ? { triples: d.rows as Triple[], marks: d.marks } : { triples: r.triples };
+    if (r.queryType !== 'SELECT' || !r.vars || !r.rows) return { triples: [] };
     const si = r.vars.indexOf(gCols.s);
     const pi = r.vars.indexOf(gCols.p);
     const oi = r.vars.indexOf(gCols.o);
-    if (si < 0 || oi < 0) return [];
+    if (si < 0 || oi < 0) return { triples: [] };
     const out: Triple[] = [];
+    const marks: Mark[] = [];
     const label: api.Term = { type: 'uri', value: `urn:var:${gCols.o}` };
-    for (const row of r.rows) {
+    (d ? d.rows : r.rows).forEach((row, i) => {
       const s = row[si];
       const o = row[oi];
       const p = pi >= 0 ? row[pi] : label;
-      if (s && o && p) out.push([s, p, o]);
+      if (s && o && p) {
+        out.push([s, p, o]);
+        if (d) marks.push(d.marks[i]);
+      }
+    });
+    return d ? { triples: out, marks } : { triples: out };
+  });
+  const graphTriples = $derived(graphData.triples);
+
+  // --- compare mode ----------------------------------------------------------------------
+
+  /** Whether the results are compared: the slider is open with two handles and both reads arrived. */
+  const comparing = $derived(timeOpen && compare && !!outcome?.base);
+  /** The two results as bags, or that they are too many to compare in the browser. */
+  const diffView = $derived.by(() => {
+    const o = outcome;
+    if (!comparing || !o?.result || !o.base) return null;
+    const r = o.result;
+    const b = o.base;
+    if (r.rows && b.rows) return compareRows(b.rows, r.rows);
+    if (r.triples && b.triples) return compareRows(b.triples, r.triples);
+    return null;
+  });
+  const shownDiff = $derived(
+    diffView && !isTooLarge(diffView) ? filterDiff(diffView, changeFilter) : null,
+  );
+  const filterCount = (f: ChangeFilter) =>
+    !diffView || isTooLarge(diffView)
+      ? 0
+      : f === 'all'
+        ? diffView.rows.length
+        : f === 'added'
+          ? diffView.added
+          : f === 'removed'
+            ? diffView.removed
+            : diffView.unchanged;
+  /** What the slider's live region says after a read. */
+  const announce = $derived.by(() => {
+    const o = outcome;
+    if (!timeOpen || !o || o.status !== 'done' || !o.result) return '';
+    const c = o.result.at?.commit ?? o.result.meta.commit;
+    const label = c != null ? `Commit ${c}` : 'Head';
+    if (diffView && !isTooLarge(diffView)) return rowAnnouncement(label, diffView);
+    const n = o.result.rows?.length ?? o.result.triples?.length;
+    return n == null
+      ? label
+      : `${label}: ${n} ${o.result.triples ? 'triple' : 'row'}${n === 1 ? '' : 's'}`;
+  });
+
+  function onTimeChange(c: TimeChange) {
+    void c;
+    if (!ds || !active.query.trim() || kind === 'UPDATE') return;
+    if (activeStored) runSaved();
+    else void run();
+  }
+
+  /** History is pressed: the bar opens, or closes and drops the comparison. */
+  function toggleTime() {
+    if (timeOpen) {
+      timeOpen = false;
+      compare = false;
+      timeFrom = '';
+    } else {
+      timeOpen = true;
     }
-    return out;
+  }
+
+  /** The bar's close button and Escape: back to the head. */
+  function closeTime() {
+    const moved = !!app.queryAt || compare;
+    timeOpen = false;
+    compare = false;
+    timeFrom = '';
+    app.queryAt = '';
+    if (moved && outcome?.result) onTimeChange({ at: '', from: '', compare: false });
+  }
+
+  // the slider's state is in the address while the bar is open, so that a link reproduces it
+  // the router takes `replaceState` once the first navigation has finished
+  let mounted = $state(false);
+  afterNavigate(() => (mounted = true));
+  $effect(() => {
+    if (!mounted) return;
+    const open = timeOpen;
+    const at = app.queryAt;
+    const from = timeFrom;
+    const comparing = compare;
+    const br = branch;
+    const name = ds;
+    untrack(() => {
+      const url = new URL(location.href);
+      for (const k of ['ds', 'at', 'from', 'branch']) url.searchParams.delete(k);
+      if (open) {
+        if (name) url.searchParams.set('ds', name);
+        if (at) url.searchParams.set('at', at);
+        if (comparing && from) url.searchParams.set('from', from);
+        if (br) url.searchParams.set('branch', br);
+      }
+      const next = url.pathname + url.search + url.hash;
+      if (next === location.pathname + location.search + location.hash) return;
+      try {
+        replaceState(next, page.state);
+      } catch {
+        history.replaceState(history.state, '', next);
+      }
+    });
   });
 
   /** The result's columns holding geometry literals (the Map view draws them). */
@@ -1404,7 +1589,12 @@
 
   const graph = $derived(
     outcome?.view === 'graph'
-      ? triplesToGraph(graphTriples, prefixes, { hideTypes, hideLiterals, maxNodes })
+      ? triplesToGraph(graphTriples, prefixes, {
+          hideTypes,
+          hideLiterals,
+          maxNodes,
+          marks: graphData.marks,
+        })
       : { nodes: [], edges: [], truncated: false, totalNodes: 0 },
   );
   const hasTypeEdges = $derived(
@@ -1541,6 +1731,18 @@
       }
     }
     const onKey = (e: KeyboardEvent) => {
+      const el = e.target as HTMLElement | null;
+      if (
+        (e.key === 'h' || e.key === 'H') &&
+        !e.metaKey &&
+        !e.ctrlKey &&
+        !e.altKey &&
+        !el?.closest?.('input, textarea, select, [contenteditable], .cm-editor')
+      ) {
+        e.preventDefault();
+        toggleTime();
+        return;
+      }
       if (
         (e.metaKey || e.ctrlKey) &&
         e.key === 'Enter' &&
@@ -1558,6 +1760,8 @@
     };
     window.addEventListener('keydown', onKey);
     document.addEventListener('mousedown', onDoc);
+    // a link with a commit reads it
+    if (fromUrl && kind !== 'UPDATE' && active.query.trim()) void run();
     return () => {
       window.removeEventListener('keydown', onKey);
       document.removeEventListener('mousedown', onDoc);
@@ -1713,330 +1917,358 @@
   </div>
 
   <!-- toolbar -->
-  <div class="toolbar">
-    <span class="kind" data-kind={kind ?? ''}>{kind ?? 'SPARQL'}</span>
-    <span class="target faint">
-      {kind === 'UPDATE' ? 'POST' : 'POST'}
-      <span class="mono">/{target ?? '…'}/{kind === 'UPDATE' ? 'update' : 'sparql'}</span>
-    </span>
-    <span class="spacer"></span>
-    <div class="examples">
-      <button
-        class="btn sm"
-        aria-haspopup="menu"
-        aria-expanded={examplesOpen}
-        onclick={() => (examplesOpen = !examplesOpen)}
-      >
-        Examples <Icon name="chevronDown" size={13} />
-      </button>
-      {#if examplesOpen}
-        <div class="menu" role="menu">
-          {#each EXAMPLES as ex, i (ex.title)}
-            <button role="menuitem" class="menu-item" onclick={() => openExample(i)}>
-              <span>{ex.title}</span>
-              <span class="faint">{ex.description}</span>
-            </button>
-          {/each}
-        </div>
-      {/if}
-    </div>
-    <div class="saved">
-      <button
-        class="btn sm"
-        aria-haspopup="menu"
-        aria-expanded={savedOpen}
-        disabled={!ds}
-        onclick={() => (savedOpen = !savedOpen)}
-      >
-        Saved <Icon name="chevronDown" size={13} />
-      </button>
-      {#if savedOpen}
-        <div class="menu" role="menu">
-          {#each savedList as q (q.name)}
-            <button role="menuitem" class="menu-item" onclick={() => openSaved(q)}>
-              <span
-                >{q.name}
-                <span class="faint mono small"
-                  >{q.kind ?? ''}{Object.keys(q.parameters ?? {}).length
-                    ? ` · ${Object.keys(q.parameters ?? {})
-                        .map((n) => `?${n}`)
-                        .join(' ')}`
-                    : ''}</span
-                ></span
-              >
-              <span class="faint">{q.description ?? ''}</span>
-            </button>
-          {:else}
-            <p class="faint small menu-note">
-              {savedError ?? `/${ds} has no saved queries.`}
-            </p>
-          {/each}
-          <button
-            role="menuitem"
-            class="menu-item"
-            onclick={openSave}
-            disabled={!canAdmin || !active.query.trim() || queryKind(active.query) === 'UPDATE'}
-            title={canAdmin ? undefined : `Requires admin access to /${ds}`}
-          >
-            <span><Icon name="plus" size={12} /> Save this query…</span>
-            <span class="faint">A named query with typed parameters, for HTTP, MCP and the CLI</span
+  <div class="toolstack">
+    <div class="toolbar">
+      <span class="kind" data-kind={kind ?? ''}>{kind ?? 'SPARQL'}</span>
+      <span class="target faint">
+        {kind === 'UPDATE' ? 'POST' : 'POST'}
+        <span class="mono">/{target ?? '…'}/{kind === 'UPDATE' ? 'update' : 'sparql'}</span>
+      </span>
+      <span class="spacer"></span>
+      <div class="examples">
+        <button
+          class="btn sm"
+          aria-haspopup="menu"
+          aria-expanded={examplesOpen}
+          onclick={() => (examplesOpen = !examplesOpen)}
+        >
+          Examples <Icon name="chevronDown" size={13} />
+        </button>
+        {#if examplesOpen}
+          <div class="menu" role="menu">
+            {#each EXAMPLES as ex, i (ex.title)}
+              <button role="menuitem" class="menu-item" onclick={() => openExample(i)}>
+                <span>{ex.title}</span>
+                <span class="faint">{ex.description}</span>
+              </button>
+            {/each}
+          </div>
+        {/if}
+      </div>
+      <div class="saved">
+        <button
+          class="btn sm"
+          aria-haspopup="menu"
+          aria-expanded={savedOpen}
+          disabled={!ds}
+          onclick={() => (savedOpen = !savedOpen)}
+        >
+          Saved <Icon name="chevronDown" size={13} />
+        </button>
+        {#if savedOpen}
+          <div class="menu" role="menu">
+            {#each savedList as q (q.name)}
+              <button role="menuitem" class="menu-item" onclick={() => openSaved(q)}>
+                <span
+                  >{q.name}
+                  <span class="faint mono small"
+                    >{q.kind ?? ''}{Object.keys(q.parameters ?? {}).length
+                      ? ` · ${Object.keys(q.parameters ?? {})
+                          .map((n) => `?${n}`)
+                          .join(' ')}`
+                      : ''}</span
+                  ></span
+                >
+                <span class="faint">{q.description ?? ''}</span>
+              </button>
+            {:else}
+              <p class="faint small menu-note">
+                {savedError ?? `/${ds} has no saved queries.`}
+              </p>
+            {/each}
+            <button
+              role="menuitem"
+              class="menu-item"
+              onclick={openSave}
+              disabled={!canAdmin || !active.query.trim() || queryKind(active.query) === 'UPDATE'}
+              title={canAdmin ? undefined : `Requires admin access to /${ds}`}
             >
-          </button>
-          {#if serverAsked?.length || askedList.length}
-            <div class="menu-head faint small" role="presentation">Asked</div>
-            <div class="menu-scroll" role="group" aria-label="Asked">
-              {#each serverAsked ?? [] as a (a.id)}
-                <div class="suggestion">
+              <span><Icon name="plus" size={12} /> Save this query…</span>
+              <span class="faint"
+                >A named query with typed parameters, for HTTP, MCP and the CLI</span
+              >
+            </button>
+            {#if serverAsked?.length || askedList.length}
+              <div class="menu-head faint small" role="presentation">Asked</div>
+              <div class="menu-scroll" role="group" aria-label="Asked">
+                {#each serverAsked ?? [] as a (a.id)}
+                  <div class="suggestion">
+                    <button
+                      role="menuitem"
+                      class="menu-item s-text"
+                      title={a.query}
+                      onclick={() => openAsked(a)}
+                    >
+                      <span>{a.question}</span>
+                      <span class="faint mono small one-line">{a.query.replace(/\s+/g, ' ')}</span>
+                    </button>
+                    <button
+                      class="btn ghost icon sm"
+                      aria-label="Forget this question"
+                      title="Remove it from your history on the server"
+                      onclick={() => void forgetAsked(a.id)}><Icon name="trash" size={12} /></button
+                    >
+                  </div>
+                {/each}
+                {#each localAsked as a (a.question + a.at)}
                   <button
                     role="menuitem"
-                    class="menu-item s-text"
+                    class="menu-item"
                     title={a.query}
                     onclick={() => openAsked(a)}
                   >
                     <span>{a.question}</span>
                     <span class="faint mono small one-line">{a.query.replace(/\s+/g, ' ')}</span>
                   </button>
-                  <button
-                    class="btn ghost icon sm"
-                    aria-label="Forget this question"
-                    title="Remove it from your history on the server"
-                    onclick={() => void forgetAsked(a.id)}><Icon name="trash" size={12} /></button
-                  >
-                </div>
-              {/each}
-              {#each localAsked as a (a.question + a.at)}
-                <button
-                  role="menuitem"
-                  class="menu-item"
-                  title={a.query}
-                  onclick={() => openAsked(a)}
-                >
-                  <span>{a.question}</span>
-                  <span class="faint mono small one-line">{a.query.replace(/\s+/g, ' ')}</span>
-                </button>
-              {/each}
-            </div>
-          {/if}
-          {#if canAdmin}
-            <div class="menu-head faint small" role="presentation">Suggestions</div>
-            <div class="menu-scroll" role="group" aria-label="Suggestions">
-              {#each suggestionList as s (s.id)}
-                <div class="suggestion">
-                  <span class="s-text" title={s.query}
-                    >{s.question}
-                    <span class="faint small">by {s.by}</span></span
-                  >
-                  <span class="s-actions">
-                    <button
-                      class="btn sm"
-                      onclick={() =>
-                        void openSaveExample(
-                          { question: s.question, query: s.query, explanation: s.explanation },
-                          undefined,
-                          s.id,
-                        )}>Promote</button
-                    >
-                    <button class="btn ghost sm" onclick={() => void dismissSuggestion(s)}
-                      >Dismiss</button
-                    >
-                  </span>
-                </div>
-              {:else}
-                <p class="faint small menu-note">
-                  {suggestionsError ?? 'No suggested examples.'}
-                </p>
-              {/each}
-            </div>
-          {/if}
-        </div>
-      {/if}
-    </div>
-    {#if reasoningInfo && kind !== 'UPDATE'}
-      <label
-        class="limit inf"
-        title="Include the {fmtInt(
-          reasoningInfo.inferred,
-        )} triples inferred by {reasoningInfo.profile} reasoning (reasoning={inferences})"
-      >
-        <input type="checkbox" bind:checked={inferences} />
-        <span>Use inferences</span>
-      </label>
-    {/if}
-    {#if branchList}
-      <label class="at" title="The branch queries read and updates change (branch=)">
-        <span class="faint">Branch</span>
-        <select class="select sm mono" bind:value={app.queryBranch} aria-label="Branch">
-          {#each branchList as b (b.name)}
-            <option value={b.name === MAIN ? '' : b.name}>{branchOption(b)}</option>
-          {/each}
-          {#if branch && !branchList.some((b) => b.name === branch)}
-            <option value={branch}>{branch}</option>
-          {/if}
-        </select>
-      </label>
-    {/if}
-    <label
-      class="at"
-      title="Read a past state (at=): a commit number, commit:N, time:<RFC 3339> or snapshot:NAME. Empty reads the head; updates always apply to the head."
-    >
-      <span class="faint">At</span>
-      <input
-        class="input sm mono"
-        class:invalid={!atOk}
-        placeholder="head"
-        list="at-options"
-        size="12"
-        aria-invalid={!atOk}
-        bind:value={app.queryAt}
-      />
-      <datalist id="at-options">
-        {#each snapshotNames as s (s)}<option value={s}></option>{/each}
-      </datalist>
-      {#if app.queryAt}
-        <button
-          class="btn ghost icon sm"
-          aria-label="Read the head"
-          title="Read the head"
-          onclick={() => (app.queryAt = '')}><Icon name="x" size={11} /></button
-        >
-      {/if}
-    </label>
-    <label class="limit" title="Maximum rows the server sends to the browser (send=)">
-      <span class="faint">Show</span>
-      <select class="select sm" bind:value={limit}>
-        {#each LIMITS as l (l)}<option value={l}>{fmtInt(l)} rows</option>{/each}
-      </select>
-    </label>
-    <div class="format-group">
-      <button
-        class="btn sm format"
-        onclick={() => formatQuery()}
-        disabled={!active.query.trim() || formatting}
-        title="Format (Shift+Alt+F)"
-      >
-        <Icon name="wand" size={14} /> Format
-      </button>
-      <button
-        class="btn sm format-more"
-        aria-label="Format options"
-        aria-haspopup="true"
-        aria-expanded={formatMenuOpen}
-        onclick={() => (formatMenuOpen = !formatMenuOpen)}
-      >
-        <Icon name="chevronDown" size={13} />
-      </button>
-      {#if formatMenuOpen}
-        <div class="menu format-menu">
-          <label class="menu-item check">
-            <input type="checkbox" bind:checked={formatOnRun} />
-            <span>Format on run</span>
-          </label>
-          <label class="menu-item check">
-            <input type="checkbox" bind:checked={lintOn} />
-            <span>Lint while typing</span>
-          </label>
-          <button class="menu-item" disabled={!fixable} onclick={() => void fixQuery()}>
-            Fix lint problems
-          </button>
-        </div>
-      {/if}
-    </div>
-    {#if lintOn && lintDiagnostics.length}
-      <span
-        class="lint-status"
-        class:error={lintCount.error > 0}
-        class:warning={lintCount.error === 0 && lintCount.warning > 0}
-        role="status"
-        title={lintDiagnostics
-          .map((d) => `${d.line}:${d.column} ${d.message} [${d.rule}]`)
-          .join('\n')}
-      >
-        <Icon name={lintCount.error || lintCount.warning ? 'alert' : 'info'} size={12} />
-        {lintSummary(lintDiagnostics)}
-      </span>
-    {/if}
-    <button
-      class="btn sm"
-      onclick={runExplain}
-      disabled={!ds || kind === 'UPDATE'}
-      title="Show algebra and plan without running"
-    >
-      <Icon name="plan" size={14} /> Explain
-    </button>
-    {#if outcome?.status === 'running' && outcome.controller}
-      <button class="btn sm danger" onclick={cancel}><Icon name="x" size={14} /> Cancel</button>
-    {:else}
-      <button
-        class="btn sm primary"
-        onclick={() => run()}
-        disabled={!ds || (kind === 'UPDATE' && !auth.can(ds, 'write'))}
-        title={kind === 'UPDATE' && ds && !auth.can(ds, 'write')
-          ? `Requires write access to /${ds}`
-          : undefined}
-      >
-        <Icon name="play" size={12} />
-        {kind === 'UPDATE' ? 'Run update' : 'Run'}
-        <span class="kbd">{isMac ? '⌘' : 'Ctrl'}↵</span>
-      </button>
-    {/if}
-    {#if activeStored}
-      {@const form = forms[activeId] ?? {}}
-      <div class="params" aria-label="Saved query parameters">
-        <span class="small" title={activeStored.description ?? ''}
-          ><Icon name="archive" size={12} /> <strong>{activeStored.name}</strong>
-          <span class="faint">v{activeStored.version.version}</span></span
-        >
-        {#each Object.entries(activeStored.parameters ?? {}) as [pname, p] (pname)}
-          <label class="param small" title={p.description ?? p.type}>
-            <span class="mono">?{pname}{isRequired(p) ? '*' : ''}</span>
-            {#if p.enum?.length}
-              <select class="select sm" bind:value={form[pname]}>
-                {#if !isRequired(p)}<option value="">—</option>{/if}
-                {#each p.enum as v (String(v))}<option value={String(v)}>{String(v)}</option>{/each}
-              </select>
-            {:else if inputType(p.type) === 'checkbox'}
-              <input
-                type="checkbox"
-                checked={form[pname] === true}
-                onchange={(e) => (form[pname] = e.currentTarget.checked)}
-              />
-            {:else}
-              <input
-                class="input sm"
-                type={inputType(p.type)}
-                step={p.type === 'integer' ? 1 : 'any'}
-                placeholder={placeholder(p.type)}
-                value={String(form[pname] ?? '')}
-                oninput={(e) => (form[pname] = e.currentTarget.value)}
-                onkeydown={(e) => e.key === 'Enter' && runSaved()}
-              />
+                {/each}
+              </div>
             {/if}
-          </label>
-        {/each}
-        <span class="spacer"></span>
-        <button
-          class="btn sm primary"
-          onclick={runSaved}
-          disabled={outcome?.status === 'running'}
-          title="Run the stored version with these values (/{ds}/queries/{activeStored.name})"
+            {#if canAdmin}
+              <div class="menu-head faint small" role="presentation">Suggestions</div>
+              <div class="menu-scroll" role="group" aria-label="Suggestions">
+                {#each suggestionList as s (s.id)}
+                  <div class="suggestion">
+                    <span class="s-text" title={s.query}
+                      >{s.question}
+                      <span class="faint small">by {s.by}</span></span
+                    >
+                    <span class="s-actions">
+                      <button
+                        class="btn sm"
+                        onclick={() =>
+                          void openSaveExample(
+                            { question: s.question, query: s.query, explanation: s.explanation },
+                            undefined,
+                            s.id,
+                          )}>Promote</button
+                      >
+                      <button class="btn ghost sm" onclick={() => void dismissSuggestion(s)}
+                        >Dismiss</button
+                      >
+                    </span>
+                  </div>
+                {:else}
+                  <p class="faint small menu-note">
+                    {suggestionsError ?? 'No suggested examples.'}
+                  </p>
+                {/each}
+              </div>
+            {/if}
+          </div>
+        {/if}
+      </div>
+      {#if reasoningInfo && kind !== 'UPDATE'}
+        <label
+          class="limit inf"
+          title="Include the {fmtInt(
+            reasoningInfo.inferred,
+          )} triples inferred by {reasoningInfo.profile} reasoning (reasoning={inferences})"
         >
-          <Icon name="play" size={12} /> Run saved query
-        </button>
-        {#if canAdmin}
+          <input type="checkbox" bind:checked={inferences} />
+          <span>Use inferences</span>
+        </label>
+      {/if}
+      {#if branchList}
+        <label class="at" title="The branch queries read and updates change (branch=)">
+          <span class="faint">Branch</span>
+          <select class="select sm mono" bind:value={app.queryBranch} aria-label="Branch">
+            {#each branchList as b (b.name)}
+              <option value={b.name === MAIN ? '' : b.name}>{branchOption(b)}</option>
+            {/each}
+            {#if branch && !branchList.some((b) => b.name === branch)}
+              <option value={branch}>{branch}</option>
+            {/if}
+          </select>
+        </label>
+      {/if}
+      <label
+        class="at"
+        title="Read a past state (at=): a commit number, commit:N, time:<RFC 3339> or snapshot:NAME. Empty reads the head; updates always apply to the head."
+      >
+        <span class="faint">At</span>
+        <input
+          class="input sm mono"
+          class:invalid={!atOk}
+          placeholder="head"
+          list="at-options"
+          size="12"
+          aria-invalid={!atOk}
+          bind:value={app.queryAt}
+        />
+        <datalist id="at-options">
+          {#each snapshotNames as s (s)}<option value={s}></option>{/each}
+        </datalist>
+        {#if app.queryAt}
           <button
             class="btn ghost icon sm"
-            aria-label="Delete the saved query"
-            title="Delete the saved query"
-            onclick={deleteSaved}><Icon name="trash" size={13} /></button
+            aria-label="Read the head"
+            title="Read the head"
+            onclick={() => (app.queryAt = '')}><Icon name="x" size={11} /></button
           >
         {/if}
+      </label>
+      <button
+        class="btn sm"
+        aria-pressed={timeOpen}
+        title="Move through the commits of the branch (H)"
+        onclick={toggleTime}
+      >
+        <Icon name="clock" size={13} /> History
+      </button>
+      <label class="limit" title="Maximum rows the server sends to the browser (send=)">
+        <span class="faint">Show</span>
+        <select class="select sm" bind:value={limit}>
+          {#each LIMITS as l (l)}<option value={l}>{fmtInt(l)} rows</option>{/each}
+        </select>
+      </label>
+      <div class="format-group">
         <button
-          class="btn ghost icon sm"
-          aria-label="Detach the tab from the saved query"
-          title="Detach the tab from the saved query"
-          onclick={() => (active.stored = undefined)}><Icon name="x" size={12} /></button
+          class="btn sm format"
+          onclick={() => formatQuery()}
+          disabled={!active.query.trim() || formatting}
+          title="Format (Shift+Alt+F)"
         >
+          <Icon name="wand" size={14} /> Format
+        </button>
+        <button
+          class="btn sm format-more"
+          aria-label="Format options"
+          aria-haspopup="true"
+          aria-expanded={formatMenuOpen}
+          onclick={() => (formatMenuOpen = !formatMenuOpen)}
+        >
+          <Icon name="chevronDown" size={13} />
+        </button>
+        {#if formatMenuOpen}
+          <div class="menu format-menu">
+            <label class="menu-item check">
+              <input type="checkbox" bind:checked={formatOnRun} />
+              <span>Format on run</span>
+            </label>
+            <label class="menu-item check">
+              <input type="checkbox" bind:checked={lintOn} />
+              <span>Lint while typing</span>
+            </label>
+            <button class="menu-item" disabled={!fixable} onclick={() => void fixQuery()}>
+              Fix lint problems
+            </button>
+          </div>
+        {/if}
       </div>
+      {#if lintOn && lintDiagnostics.length}
+        <span
+          class="lint-status"
+          class:error={lintCount.error > 0}
+          class:warning={lintCount.error === 0 && lintCount.warning > 0}
+          role="status"
+          title={lintDiagnostics
+            .map((d) => `${d.line}:${d.column} ${d.message} [${d.rule}]`)
+            .join('\n')}
+        >
+          <Icon name={lintCount.error || lintCount.warning ? 'alert' : 'info'} size={12} />
+          {lintSummary(lintDiagnostics)}
+        </span>
+      {/if}
+      <button
+        class="btn sm"
+        onclick={runExplain}
+        disabled={!ds || kind === 'UPDATE'}
+        title="Show algebra and plan without running"
+      >
+        <Icon name="plan" size={14} /> Explain
+      </button>
+      {#if outcome?.status === 'running' && outcome.controller}
+        <button class="btn sm danger" onclick={cancel}><Icon name="x" size={14} /> Cancel</button>
+      {:else}
+        <button
+          class="btn sm primary"
+          onclick={() => run()}
+          disabled={!ds || (kind === 'UPDATE' && !auth.can(ds, 'write'))}
+          title={kind === 'UPDATE' && ds && !auth.can(ds, 'write')
+            ? `Requires write access to /${ds}`
+            : undefined}
+        >
+          <Icon name="play" size={12} />
+          {kind === 'UPDATE' ? 'Run update' : 'Run'}
+          <span class="kbd">{isMac ? '⌘' : 'Ctrl'}↵</span>
+        </button>
+      {/if}
+      {#if activeStored}
+        {@const form = forms[activeId] ?? {}}
+        <div class="params" aria-label="Saved query parameters">
+          <span class="small" title={activeStored.description ?? ''}
+            ><Icon name="archive" size={12} /> <strong>{activeStored.name}</strong>
+            <span class="faint">v{activeStored.version.version}</span></span
+          >
+          {#each Object.entries(activeStored.parameters ?? {}) as [pname, p] (pname)}
+            <label class="param small" title={p.description ?? p.type}>
+              <span class="mono">?{pname}{isRequired(p) ? '*' : ''}</span>
+              {#if p.enum?.length}
+                <select class="select sm" bind:value={form[pname]}>
+                  {#if !isRequired(p)}<option value="">—</option>{/if}
+                  {#each p.enum as v (String(v))}<option value={String(v)}>{String(v)}</option
+                    >{/each}
+                </select>
+              {:else if inputType(p.type) === 'checkbox'}
+                <input
+                  type="checkbox"
+                  checked={form[pname] === true}
+                  onchange={(e) => (form[pname] = e.currentTarget.checked)}
+                />
+              {:else}
+                <input
+                  class="input sm"
+                  type={inputType(p.type)}
+                  step={p.type === 'integer' ? 1 : 'any'}
+                  placeholder={placeholder(p.type)}
+                  value={String(form[pname] ?? '')}
+                  oninput={(e) => (form[pname] = e.currentTarget.value)}
+                  onkeydown={(e) => e.key === 'Enter' && runSaved()}
+                />
+              {/if}
+            </label>
+          {/each}
+          <span class="spacer"></span>
+          <button
+            class="btn sm primary"
+            onclick={runSaved}
+            disabled={outcome?.status === 'running'}
+            title="Run the stored version with these values (/{ds}/queries/{activeStored.name})"
+          >
+            <Icon name="play" size={12} /> Run saved query
+          </button>
+          {#if canAdmin}
+            <button
+              class="btn ghost icon sm"
+              aria-label="Delete the saved query"
+              title="Delete the saved query"
+              onclick={deleteSaved}><Icon name="trash" size={13} /></button
+            >
+          {/if}
+          <button
+            class="btn ghost icon sm"
+            aria-label="Detach the tab from the saved query"
+            title="Detach the tab from the saved query"
+            onclick={() => (active.stored = undefined)}><Icon name="x" size={12} /></button
+          >
+        </div>
+      {/if}
+    </div>
+    {#if timeOpen && target}
+      <TimeSlider
+        bind:this={slider}
+        ds={target}
+        bind:at={app.queryAt}
+        bind:from={timeFrom}
+        bind:compare
+        memory={app.datasets.find((d) => d.name === ds)?.type === 'mem'}
+        busy={outcome?.status === 'running'}
+        lastReadMs={outcome?.elapsed ?? 0}
+        paused={resultsFocused}
+        announcement={announce}
+        onchange={onTimeChange}
+        onclose={closeTime}
+      />
     {/if}
   </div>
 
@@ -2061,7 +2293,12 @@
   ></div>
 
   <!-- results -->
-  <section class="results" aria-label="Results">
+  <section
+    class="results"
+    aria-label="Results"
+    onfocusin={() => (resultsFocused = true)}
+    onfocusout={() => (resultsFocused = false)}
+  >
     {#if showSummary && answer?.summary && outcome?.result}
       <AnswerSummary
         summary={answer.summary}
@@ -2225,6 +2462,42 @@
         </div>
       {/if}
 
+      {#if comparing && diffView && outcome.view !== 'explain'}
+        <div class="diffbar" role="group" aria-label="Changes between the two commits">
+          {#if isTooLarge(diffView)}
+            <Icon name="info" size={14} />
+            <span
+              >More than {fmtInt(ROW_DIFF_LIMIT)} rows on one side ({fmtInt(diffView.left)} before,
+              {fmtInt(diffView.right)} after), so the browser does not compare them and shows the later
+              state.</span
+            >
+          {:else}
+            {#if outcome.view !== 'table'}
+              <span
+                >{fmtInt(diffView.added)} added, {fmtInt(diffView.removed)} removed, {fmtInt(
+                  diffView.unchanged,
+                )} unchanged</span
+              >
+            {/if}
+            {#each outcome.view === 'table' ? CHANGE_FILTERS : [] as f (f)}
+              <button
+                class="chip"
+                class:on={changeFilter === f}
+                aria-pressed={changeFilter === f}
+                onclick={() => (changeFilter = f)}
+              >
+                {f}
+                <span class="faint">{fmtInt(filterCount(f))}</span>
+              </button>
+            {/each}
+            <span class="faint small">
+              {outcome.result?.triples ? 'triples' : 'rows'} added (<span class="plus">+</span>) or
+              removed (<span class="minus">−</span>) since the earlier commit
+            </span>
+          {/if}
+        </div>
+      {/if}
+
       <div class="rbody">
         {#if outcome.status === 'error' && outcome.error}
           {@const err = outcome.error}
@@ -2344,26 +2617,34 @@
                 {@render emptyWhy(outcome.diagnosis)}
               </div>
             {:else if r.triples}
-              {#if r.triples.length}
+              {#if (shownDiff ? shownDiff.rows : r.triples).length}
                 <ResultTable
                   vars={['subject', 'predicate', 'object']}
-                  rows={r.triples}
+                  rows={shownDiff ? shownDiff.rows : r.triples}
+                  marks={shownDiff?.marks}
                   {prefixes}
                   onopen={openIri}
                 />
+              {:else if shownDiff}
+                <div class="empty">No {changeFilter} triples between these commits.</div>
               {:else}
                 <div class="empty">The query matched no triples.</div>
               {/if}
-            {:else if r.rows && r.rows.length}
+            {:else if (shownDiff ? shownDiff.rows.length : r.rows?.length) ?? 0}
               <ResultTable
                 vars={r.vars ?? []}
-                rows={r.rows}
+                rows={shownDiff ? shownDiff.rows : (r.rows ?? [])}
+                marks={shownDiff?.marks}
                 {prefixes}
                 onopen={openIri}
-                cited={showSummary ? citedRows : undefined}
+                cited={showSummary && !shownDiff ? citedRows : undefined}
                 {highlight}
-                onhover={showSummary ? (row) => (hoverRow = row) : undefined}
+                onhover={showSummary && !shownDiff ? (row) => (hoverRow = row) : undefined}
               />
+            {:else if shownDiff}
+              <div class="empty">
+                No {changeFilter === 'all' ? '' : `${changeFilter} `}rows between these commits.
+              </div>
             {:else}
               <div class="empty">
                 <p>No results.</p>
@@ -2744,6 +3025,9 @@
   .add {
     margin: 0 0 3px 4px;
   }
+  .toolstack {
+    min-width: 0;
+  }
   .toolbar {
     display: flex;
     align-items: center;
@@ -3053,6 +3337,42 @@
     border-bottom: 1px solid var(--border);
     min-height: 38px;
     flex-wrap: wrap;
+  }
+  .diffbar {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px 8px;
+    padding: 5px 12px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface-2);
+    font-size: var(--fs-sm);
+  }
+  .diffbar .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    height: 22px;
+    padding: 0 9px;
+    border: 1px solid var(--border);
+    border-radius: 11px;
+    background: var(--surface);
+    color: var(--text);
+    font: inherit;
+    font-size: var(--fs-sm);
+    cursor: pointer;
+  }
+  .diffbar .chip.on {
+    background: var(--spark-soft);
+    border-color: var(--spark);
+  }
+  .diffbar .plus {
+    color: var(--added);
+    font-weight: 700;
+  }
+  .diffbar .minus {
+    color: var(--removed);
+    font-weight: 700;
   }
   .rbody {
     flex: 1;

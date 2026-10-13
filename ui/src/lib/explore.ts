@@ -113,12 +113,14 @@ export type Details = {
   incomingTotal: number;
 };
 
-export async function details(ds: string, iri: string): Promise<Details> {
+/** A resource's properties and referrers, at the state `at` names (the head by default). */
+export async function details(ds: string, iri: string, at?: string): Promise<Details> {
   const node = sparqlIri(iri);
+  const o = at ? { ...opts, at } : opts;
   const [props, incoming, count] = await Promise.all([
-    api.select(ds, `SELECT ?p ?o WHERE { ${node} ?p ?o } LIMIT 1000`, opts),
-    api.select(ds, `SELECT ?s ?p WHERE { ?s ?p ${node} } LIMIT 200`, opts),
-    api.select(ds, `SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ${node} }`, opts),
+    api.select(ds, `SELECT ?p ?o WHERE { ${node} ?p ?o } LIMIT 1000`, o),
+    api.select(ds, `SELECT ?s ?p WHERE { ?s ?p ${node} } LIMIT 200`, o),
+    api.select(ds, `SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ${node} }`, o),
   ]);
   return {
     props: props.filter((r) => r.p && r.o).map((r) => ({ p: v(r.p)!, o: r.o! })),

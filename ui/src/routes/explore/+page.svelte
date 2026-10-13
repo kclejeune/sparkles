@@ -12,6 +12,18 @@
   import { shortLabel } from '$lib/graph';
   import { displayIri, isVectorLiteral, literalText, RDF_TYPE, termKey } from '$lib/rdf';
   import { Generation, LatestRun } from '$lib/supersede';
+  import { parseCompact } from '$lib/compact';
+  import {
+    authorsOf,
+    entityChanges,
+    entityCommits,
+    isReadable,
+    netChanges,
+    selectorSeq,
+    type EntityChange,
+  } from '$lib/entity-history';
+  import { unrecordedNote } from '$lib/history';
+  import { timeFailure, type Range } from '$lib/timeline';
   import ClassTree from '$components/ClassTree.svelte';
   import GeoMapCard from '$components/GeoMapCard.svelte';
   import GraphView, { type GEdge, type GNode } from '$components/GraphView.svelte';
@@ -21,6 +33,7 @@
   import { coverage, objectKinds, shortenExpression, valuesRange } from '$lib/schema-history';
   import SimilarPanel from '$components/SimilarPanel.svelte';
   import TermView from '$components/TermView.svelte';
+  import TimeSlider from '$components/TimeSlider.svelte';
   import MemoryTab from '$components/MemoryTab.svelte';
   import TextSearchView from '$components/TextSearchView.svelte';
 
@@ -91,6 +104,104 @@
     detailCache = {};
   }
   let graphView: GraphView | undefined = $state();
+
+  // --- time: a resource's history strip (docs/specs/U01-time-slider.md) ----------------
+
+  const urlAt = page.url.searchParams.get('at');
+  const urlFrom = page.url.searchParams.get('from');
+  /** The History strip of the selected resource. */
+  let stripOpen = $state(!!(urlAt || urlFrom));
+  /** The state the resource's properties are read at (`at=`): empty for the head. */
+  let exAt = $state(urlAt ?? '');
+  /** Compare mode: the earlier state, and what changed since it. */
+  let exFrom = $state(urlFrom ?? '');
+  let exCompare = $state(!!urlFrom);
+  let strip: TimeSlider | undefined = $state();
+  type EntityHistory = {
+    iri: string;
+    changes: EntityChange[];
+    commits: api.Commit[];
+    authors: Map<number, string>;
+    head: number;
+    readable: Range[];
+    truncated: boolean;
+    note: string;
+  };
+  let hist = $state<EntityHistory | null>(null);
+  let histError = $state<string | null>(null);
+  let histFor = '';
+  const histRuns = new LatestRun();
+
+  /** The commits that changed a resource, as subject or object, from the change log. */
+  async function loadHistory(name: string, iri: string) {
+    const owns = histRuns.claim('history');
+    if (histFor && histFor !== iri) {
+      exAt = '';
+      exFrom = '';
+      exCompare = false;
+    }
+    histFor = iri;
+    hist = null;
+    histError = null;
+    try {
+      const [subj, obj, head] = await Promise.all([
+        api.historyChanges(name, { subject: iri, order: 'asc', limit: 5000 }),
+        api.historyChanges(name, { object: iri, order: 'asc', limit: 5000 }),
+        api.commits(name, { limit: 1 }),
+      ]);
+      if (!owns()) return;
+      const changes = entityChanges(subj.changes, obj.changes);
+      const kinds = new Map([...subj.changes, ...obj.changes].map((c) => [c.commit, c.kind]));
+      hist = {
+        iri,
+        changes,
+        commits: entityCommits(changes, kinds),
+        authors: authorsOf(changes),
+        head: head.head,
+        readable: head.reconstructable ?? [{ from: 0, to: head.head }],
+        truncated: subj.truncated || obj.truncated,
+        note: [unrecordedNote(subj), unrecordedNote(obj)].filter(Boolean)[0] ?? '',
+      };
+    } catch (e) {
+      if (owns()) histError = api.errorMessage(e);
+    }
+  }
+
+  $effect(() => {
+    const name = ds;
+    const iri = selected?.term.type === 'uri' ? selected.iri : null;
+    if (!stripOpen || !name || !iri) return;
+    untrack(() => void loadHistory(name, iri));
+  });
+
+  /** What changed between the two handles, with who changed it and why. */
+  const histNet = $derived.by(() => {
+    if (!hist || !stripOpen || !exCompare) return null;
+    const to = selectorSeq(exAt, hist.head);
+    const from = selectorSeq(exFrom, hist.head);
+    return to == null || from == null ? null : netChanges(hist.changes, from, to);
+  });
+
+  /** The IRI of a predicate the change log gives in N-Triples. */
+  function predIri(nt: string): string {
+    const t = parseCompact(nt, {});
+    return t.type === 'uri' ? t.value : nt;
+  }
+
+  function closeStrip() {
+    stripOpen = false;
+    exAt = '';
+    exFrom = '';
+    exCompare = false;
+  }
+
+  // the properties are read again when the strip moves
+  $effect(() => {
+    void exAt;
+    void stripOpen;
+    const id = selectedId;
+    if (id) untrack(() => void loadDetails(id));
+  });
 
   // --- graph model -----------------------------------------------------------
 
@@ -220,6 +331,10 @@
     if (tab !== 'graph') p.set('tab', tab);
     if (tab === 'search' && textQuery.trim()) p.set('q', textQuery.trim());
     if (iri && sideTab === 'memory') p.set('view', 'memory');
+    if (iri && stripOpen && sideTab === 'props') {
+      if (exAt) p.set('at', exAt);
+      if (exCompare && exFrom) p.set('from', exFrom);
+    }
     goto(`${resolve('/explore')}?${p}`, { replaceState: true, keepFocus: true, noScroll: true });
   }
 
@@ -230,15 +345,25 @@
 
   async function loadDetails(id: string) {
     const n = nodes[id];
-    if (!n || n.term.type !== 'uri' || !ds || detailCache[id]) return;
+    const at = stripOpen ? exAt : '';
+    const key = `${id}|${at}`;
+    if (!n || n.term.type !== 'uri' || !ds || detailCache[key]) return;
     const gen = graphGen.current;
     let d: ex.Details | { error: string };
     try {
-      d = await ex.details(ds, n.iri);
+      d = await ex.details(ds, n.iri, at || undefined);
+      if (stripOpen && at === exAt) strip?.accept();
     } catch (e) {
+      // a state the server can no longer read: the handle goes back to the last one it read
+      const gone = at ? timeFailure(e) : null;
+      if (gone) {
+        toasts.push('error', gone.title, gone.detail);
+        strip?.reject({ seq: gone.seq, readable: gone.readable });
+        return;
+      }
       d = { error: api.errorMessage(e) };
     }
-    if (graphGen.isCurrent(gen) && nodes[id] === n) detailCache[id] = d;
+    if (graphGen.isCurrent(gen) && nodes[id] === n) detailCache[key] = d;
   }
 
   function removeNode(id: string) {
@@ -287,7 +412,9 @@
   // --- selected resource panel ---------------------------------------------------
 
   const selected = $derived(selectedId ? nodes[selectedId] : null);
-  const detail = $derived(selectedId ? detailCache[selectedId] : undefined);
+  const detail = $derived(
+    selectedId ? detailCache[`${selectedId}|${stripOpen ? exAt : ''}`] : undefined,
+  );
   const grouped = $derived.by(() => {
     if (!detail || 'error' in detail) return [];
     const by: Record<string, Term[]> = {};
@@ -619,8 +746,22 @@
     const onDoc = (e: MouseEvent) => {
       if (searchOpen && !(e.target as HTMLElement).closest('.search')) searchOpen = false;
     };
+    // H opens and closes the History strip of the selected resource
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.key !== 'h' && e.key !== 'H') || e.metaKey || e.ctrlKey || e.altKey) return;
+      if ((e.target as HTMLElement)?.closest?.('input, textarea, select, [contenteditable]'))
+        return;
+      if (tab !== 'graph' || selected?.term.type !== 'uri' || sideTab !== 'props') return;
+      e.preventDefault();
+      if (stripOpen) closeStrip();
+      else stripOpen = true;
+    };
     document.addEventListener('mousedown', onDoc);
-    return () => document.removeEventListener('mousedown', onDoc);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDoc);
+      document.removeEventListener('keydown', onKey);
+    };
   });
 </script>
 
@@ -825,6 +966,13 @@
                   ><Icon name="query" size={13} /> Describe</button
                 >
                 <button
+                  class="btn sm"
+                  aria-pressed={stripOpen}
+                  title="Move through the commits that changed this resource (H)"
+                  onclick={() => (stripOpen ? closeStrip() : (stripOpen = true))}
+                  ><Icon name="clock" size={13} /> History</button
+                >
+                <button
                   class="btn sm ghost icon"
                   title="Remove from graph"
                   aria-label="Remove from graph"
@@ -849,6 +997,40 @@
                   ><Icon name="brain" size={13} /> Memory</button
                 >
               </div>
+              {#if stripOpen && sideTab === 'props'}
+                {#if hist}
+                  <TimeSlider
+                    bind:this={strip}
+                    {ds}
+                    commits={hist.commits}
+                    head={hist.head}
+                    authors={hist.authors}
+                    readable={hist.readable}
+                    bind:at={exAt}
+                    bind:from={exFrom}
+                    bind:compare={exCompare}
+                    busy={!detail}
+                    label="Resource history"
+                    canFollow={false}
+                    onchange={() => syncUrl(n.iri)}
+                    onclose={() => {
+                      closeStrip();
+                      syncUrl(n.iri);
+                    }}
+                  />
+                  {#if hist.commits.length === 0}
+                    <p class="faint small">The change log holds no change of this resource.</p>
+                  {/if}
+                  {#if hist.truncated}
+                    <p class="faint small">Only the first 5,000 changes of each kind are listed.</p>
+                  {/if}
+                  {#if hist.note}<p class="faint small">{hist.note}</p>{/if}
+                {:else if histError}
+                  <div class="error-box">{histError}</div>
+                {:else}
+                  <p class="faint row"><span class="spinner"></span> Reading the history…</p>
+                {/if}
+              {/if}
             {/if}
           </div>
 
@@ -875,6 +1057,39 @@
             <div class="side-body"><div class="error-box">{detail.error}</div></div>
           {:else}
             <div class="side-body scroll">
+              {#if histNet && hist}
+                <section class="hist-net" aria-label="Changes between the two commits">
+                  <h3 class="sub">
+                    Changed since commit {selectorSeq(exFrom, hist.head)}
+                    <span class="faint">{histNet.length}</span>
+                  </h3>
+                  {#if histNet.length === 0}
+                    <p class="faint small">Nothing about this resource differs between them.</p>
+                  {:else}
+                    <ul>
+                      {#each histNet as c (c.op + c.dir + c.predicate + c.term + c.graph)}
+                        <li class="net {c.op}">
+                          <span class="sign" aria-label={c.op === 'add' ? 'added' : 'removed'}
+                            >{c.op === 'add' ? '+' : '−'}</span
+                          >
+                          <span class="mono net-body">
+                            <span class="faint">{c.dir === 'out' ? '' : 'referenced by '}</span
+                            ><span class="t-iri">{displayIri(predIri(c.predicate), prefixes)}</span>
+                            <TermView term={parseCompact(c.term, prefixes)} {prefixes} />
+                          </span>
+                          <span class="faint small net-by">
+                            commit {c.commit}{c.author ? ` · ${c.author}` : ''}{c.message
+                              ? ` · “${c.message}”`
+                              : ''}{isReadable(c.commit, hist.readable)
+                              ? ''
+                              : ' · state not readable'}
+                          </span>
+                        </li>
+                      {/each}
+                    </ul>
+                  {/if}
+                </section>
+              {/if}
               <h3 class="sub">Properties <span class="faint">{detail.props.length}</span></h3>
               {#if grouped.length === 0}
                 <p class="faint">No outgoing triples. This IRI is only used as an object.</p>
@@ -1547,6 +1762,7 @@
     padding: 14px 16px 12px;
     border-bottom: 1px solid var(--border);
     display: grid;
+    grid-template-columns: minmax(0, 1fr);
     gap: 8px;
   }
   .side-title h2 {
@@ -1591,6 +1807,46 @@
   }
   .side-tabs {
     margin-top: 8px;
+  }
+  .hist-net ul {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    gap: 6px;
+    font-size: 12px;
+  }
+  .net {
+    display: grid;
+    grid-template-columns: 1.4em minmax(0, 1fr);
+    column-gap: 4px;
+    padding-left: 6px;
+    border-left: 3px solid var(--border);
+  }
+  .net.add {
+    border-left-color: var(--added);
+  }
+  .net.remove {
+    border-left-color: var(--removed);
+  }
+  .net .sign {
+    font-weight: 700;
+  }
+  .net.add .sign {
+    color: var(--added);
+  }
+  .net.remove .sign {
+    color: var(--removed);
+  }
+  .net.remove .net-body {
+    text-decoration: line-through;
+    text-decoration-thickness: 1px;
+  }
+  .net-body {
+    overflow-wrap: anywhere;
+  }
+  .net-by {
+    grid-column: 2;
   }
   .side-body {
     padding: 8px 16px 16px;
