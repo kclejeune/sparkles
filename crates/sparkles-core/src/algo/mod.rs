@@ -14,6 +14,7 @@
 #![cfg_attr(test, allow(clippy::needless_range_loop))]
 
 pub mod betweenness;
+pub mod cache;
 pub mod community;
 pub mod components;
 pub mod fastrp;

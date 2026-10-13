@@ -129,6 +129,10 @@ struct Cli {
     /// Threads one graph-algorithm call may take
     #[arg(long, global = true, default_value_t = 4)]
     algo_max_threads_per_call: usize,
+    /// Memory for built projections of graph algorithms, shared by all datasets, in MiB (0
+    /// disables the cache)
+    #[arg(long, global = true, default_value_t = 256)]
+    algo_cache_mb: u64,
     /// Most nodes `algo:betweenness` runs on without `algo:samples`
     #[arg(long, global = true, default_value_t = 100_000)]
     algo_exact_betweenness_max: usize,
@@ -1899,6 +1903,7 @@ enum Cmd {
 fn store_opts(cli: &Cli) -> StoreOptions {
     sparkles::vector::set_budget(cli.vector_memory_mb << 20);
     sparkles::algo::pool::configure(cli.algo_threads, cli.algo_max_threads_per_call);
+    sparkles::algo::cache::set_limit(cli.algo_cache_mb << 20);
     sparkles::algo::pool::set_exact_betweenness_max(cli.algo_exact_betweenness_max);
     StoreOptions {
         cache_bytes: cli.cache_mb << 20,

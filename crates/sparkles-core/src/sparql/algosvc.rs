@@ -882,13 +882,14 @@ pub(super) fn run(
     };
     let mut t = Table::empty(result_vars.clone());
     let mut built = std::time::Duration::ZERO;
-    let (mut nodes, mut edge_count) = (0usize, 0usize);
+    let (mut nodes, mut edge_count, mut cache_hits) = (0usize, 0usize, 0usize);
     for (filter, gid) in graphs {
         let at = Instant::now();
         let mut one = spec.clone();
         one.proj.graph = filter;
-        let g = build_graph(ctx, &one, edges.as_ref(), &par, &ctl)?;
+        let (g, hit) = projection(ctx, &one, edges.as_ref(), &par, &ctl)?;
         built += at.elapsed();
+        cache_hits += hit as usize;
         nodes += g.n();
         edge_count += g.m();
         // the sources: node indexes of the constants and of the group's bound values
@@ -933,6 +934,7 @@ pub(super) fn run(
         t.append(part);
     }
     counters.insert("nodes".into(), nodes.into());
+    counters.insert("cachedProjections".into(), cache_hits.into());
     counters.insert("edges".into(), edge_count.into());
     counters.insert("projectionMs".into(), (built.as_secs_f64() * 1000.0).into());
     counters.insert(
@@ -1502,6 +1504,37 @@ fn weights(
         }
     }
     Ok(map)
+}
+
+/// The projection of a call: a cached build of the same data and edges, or a new one.
+/// Projections from a nested pattern depend on the query and are not cached.
+fn projection(
+    ctx: &Ctx,
+    spec: &AlgoSpec,
+    edges: Option<&Table>,
+    par: &Par,
+    ctl: &Control,
+) -> Result<(std::sync::Arc<Graph>, bool)> {
+    let key = (spec.proj.pattern.is_none() && ctx.use_cache).then(|| {
+        format!(
+            "{}{:?}|{}",
+            super::cache::view_key(ctx),
+            spec.proj,
+            spec.direction().name()
+        )
+    });
+    if let Some(k) = &key
+        && let Some(g) = algo::cache::get(k)
+    {
+        // the call holds the build while it runs, as if it had made it
+        ctl.charge(g.bytes())?;
+        return Ok((g, true));
+    }
+    let g = std::sync::Arc::new(build_graph(ctx, spec, edges, par, ctl)?);
+    if let Some(k) = key {
+        algo::cache::put(k, g.clone());
+    }
+    Ok((g, false))
 }
 
 /// Build the projection of a call from the store, or from the rows of a nested pattern.

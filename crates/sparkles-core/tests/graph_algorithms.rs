@@ -9,7 +9,7 @@ use sparkles_core::store::{Store, StoreOptions};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-const PREFIXES: &str = "PREFIX ex: <http://ex/> PREFIX algo: <urn:x-sparkles:algo#> \
+const PREFIXES: &str = "PREFIX ex: <http://ex/> PREFIX algo: <urn:x-sparkles:algo#> PREFIX spk: <urn:x-sparkles:> \
                         PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> ";
 
 fn store_of(ttl: &str) -> Store {
@@ -521,4 +521,44 @@ fn graph_variable_runs_once_per_named_graph() {
         "SELECT ?n WHERE { GRAPH ex:g2 { SERVICE algo:wcc { [] algo:predicate ex:p ; algo:node ?n } } }",
     );
     assert_eq!(r.len(), 3);
+}
+
+#[test]
+fn a12_embeddings_written_back_are_searchable() {
+    // two triangles joined by nothing: a b c and f g h
+    let s =
+        store_of("ex:a ex:p ex:b, ex:c . ex:b ex:p ex:c . ex:f ex:p ex:g, ex:h . ex:g ex:p ex:h .");
+    update(
+        &s,
+        &format!(
+            "{PREFIXES} INSERT {{ ?n ex:emb ?e }} WHERE {{ SERVICE algo:fastRP {{ [] algo:predicate ex:p ; \
+             algo:dimension 16 ; algo:seed 4 ; algo:node ?n ; algo:embedding ?e }} }}"
+        ),
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    let r = rows(
+        &s,
+        "SELECT ?s ?score WHERE { ?q ex:emb ?v . FILTER(?q = ex:a) \
+         (?s ?score) spk:vectorSearch (ex:emb ?v 6) } ORDER BY DESC(?score)",
+    );
+    let order: Vec<&str> = r.iter().map(|x| x["s"].as_str()).collect();
+    assert_eq!(order[0], "a");
+    let pos = |n: &str| order.iter().position(|x| *x == n).unwrap();
+    for near in ["b", "c"] {
+        for far in ["f", "g", "h"] {
+            assert!(pos(near) < pos(far), "{near} before {far}: {order:?}");
+        }
+    }
+}
+
+#[test]
+fn projections_are_cached_between_calls() {
+    let s = store_of(A);
+    let q = "SELECT ?n ?c WHERE { SERVICE algo:kCore { [] algo:predicate ex:p ; algo:node ?n ; algo:core ?c } }";
+    let first = rows(&s, q);
+    assert!(sparkles_core::algo::cache::stats().1 >= 1);
+    // the second call reads the cached build or the cached result
+    let second = rows(&s, q);
+    assert_eq!(first, second);
 }
