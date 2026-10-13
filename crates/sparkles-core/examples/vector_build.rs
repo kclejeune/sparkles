@@ -172,10 +172,18 @@ fn main() {
     for src in sources(&extra, n, 1000) {
         s.load(&[src]).unwrap();
     }
+    let committed = t.elapsed().as_secs_f64();
+    let caught = s.wait_vector_catch_up(std::time::Duration::from_secs(3600));
+    let st = s.vector_index("emb").unwrap();
     println!(
-        "insert {inserts} in commits of 1000: {:.2} s",
-        t.elapsed().as_secs_f64()
+        "insert {inserts} in commits of 1000: {committed:.2} s; in the graph {:.2} s after the \
+         first commit (caught up {caught}, indexed {}, pending {})",
+        t.elapsed().as_secs_f64(),
+        st.overlay.indexed,
+        st.overlay.pending
     );
+    let (r, ms, m) = recall(&s, &queries, ef);
+    println!("recall@10 at ef={ef} with the inserts: {r:.4}, {ms:.3} ms per query ({m})");
     let t = Instant::now();
     s.compact().unwrap();
     let compact = t.elapsed().as_secs_f64();

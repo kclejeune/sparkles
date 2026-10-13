@@ -650,6 +650,7 @@ pub mod config;
 pub mod embed;
 pub mod hnsw;
 mod index;
+pub mod live;
 pub mod persist;
 mod search;
 

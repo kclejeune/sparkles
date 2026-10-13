@@ -7,6 +7,11 @@
 //!   build first publishes the packed vectors (searches then scan them exactly) and then
 //!   the graph. Until then searches pack the predicate themselves, as without a
 //!   configuration. Commits never wait for a build and do no index work.
+//! * **Catch-up.** A thread per store ([`Store::start_vector_catch_up`]) wakes after
+//!   each commit and after each build and inserts the rows that commits added to an
+//!   indexed predicate into the graph's live layer ([`crate::vector::live`]), in batches,
+//!   so searches find them through the graph instead of scoring them exactly. It works
+//!   from the published snapshot, after the commit, so writes never wait for it.
 //! * **Generation switches** (bulk commits, compactions) start a build for the new
 //!   generation of every index; the replaced generation's files are written no more.
 //! * **Files.** A persistent store writes each build to `gen-NNNN/vectors/<name>.spkv`
@@ -35,6 +40,12 @@ pub(crate) struct VectorRegistry {
     paused: AtomicBool,
     /// test hook: builds insert graph nodes one at a time, so graphs are reproducible
     sequential: AtomicBool,
+    /// the catch-up thread was started
+    catch_up: AtomicBool,
+    /// test hook: the catch-up thread inserts nothing
+    catch_up_paused: AtomicBool,
+    /// wakes the catch-up thread (a build was installed, or catch-up resumed)
+    kick: Arc<tokio::sync::Notify>,
 }
 
 /// One configured index and the state of its builds.
@@ -357,6 +368,41 @@ impl Store {
         self.vector.paused.store(on, Ordering::SeqCst);
     }
 
+    /// Test hook: hold (or release) the background insertion of new rows into the
+    /// graphs. While held, searches score the rows that commits added exactly.
+    #[doc(hidden)]
+    pub fn pause_vector_catch_up(&self, on: bool) {
+        self.vector.catch_up_paused.store(on, Ordering::SeqCst);
+        if !on {
+            self.vector.kick.notify_one();
+        }
+    }
+
+    /// Wait until the graphs of every ready index hold the rows of the current snapshot
+    /// that they can hold (the overlay's `pending` count is 0), or `timeout` passes.
+    /// Returns whether they do.
+    pub fn wait_vector_catch_up(&self, timeout: std::time::Duration) -> bool {
+        let end = std::time::Instant::now() + timeout;
+        loop {
+            let snap = self.snapshot();
+            let names: Vec<String> = self.vector.indexes.read().keys().cloned().collect();
+            let done = names.iter().all(|n| {
+                snap.generation
+                    .vectors
+                    .built(n)
+                    .is_none_or(|b| crate::vector::live::overlay_split(&snap, &b).1 == 0)
+            });
+            if done {
+                return true;
+            }
+            if std::time::Instant::now() >= end {
+                return false;
+            }
+            self.vector.kick.notify_one();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
     /// Test hook: build the HNSW graphs of later builds one node at a time. A parallel
     /// build's graph depends on the order in which its threads insert nodes, and so on
     /// the machine's load; a sequential one is the same every time.
@@ -371,6 +417,9 @@ impl Store {
         let c = &e.config;
         let pred = snap.lookup_iri(&c.predicate).map(|i| i.0);
         let (inserts, deletes) = crate::vector::overlay_counts(snap, pred);
+        let (indexed, pending) = built
+            .as_ref()
+            .map_or((0, 0), |b| crate::vector::live::overlay_split(snap, b));
         let state = if info.state == "ready" && built.as_ref().is_none_or(|b| b.hnsw_pending) {
             "building"
         } else {
@@ -388,12 +437,19 @@ impl Store {
             message: info.message.clone(),
             generation: snap.generation.name.clone(),
             rows: built.as_ref().map_or(0, |b| b.segment.rows() as u64),
-            overlay: VectorOverlay { inserts, deletes },
+            overlay: VectorOverlay {
+                inserts,
+                deletes,
+                indexed,
+                pending,
+            },
             skipped: built.as_ref().map(|b| b.skipped).unwrap_or_default(),
             memory: VectorMemory {
                 segment_bytes: built.as_ref().map_or(0, |b| b.segment.bytes()),
                 hnsw_bytes: built.as_ref().map_or(0, |b| {
-                    b.graph.as_ref().map_or(0, |g| g.bytes()) + b.node_rows.len() as u64 * 4
+                    b.graph.as_ref().map_or(0, |g| g.bytes())
+                        + b.node_rows.len() as u64 * 4
+                        + b.live.read().bytes()
                 }),
                 residency: if built.as_ref().is_some_and(|b| b.mapped()) {
                     "mmap"
@@ -406,10 +462,9 @@ impl Store {
                 m: h.m,
                 ef_construction: h.ef_construction,
                 ef_search: h.ef_search,
-                nodes: built
-                    .as_ref()
-                    .and_then(|b| b.graph.as_ref())
-                    .map_or(0, |g| g.nodes as u64),
+                nodes: built.as_ref().map_or(0, |b| {
+                    b.graph.as_ref().map_or(0, |g| g.nodes as u64) + b.live.read().nodes() as u64
+                }),
                 layers: built
                     .as_ref()
                     .and_then(|b| b.graph.as_ref())
@@ -522,10 +577,72 @@ impl Store {
         Some(persist::dir_of(gdir))
     }
 
+    /// Start the store's catch-up thread, once. It runs a pass over the current
+    /// snapshot's ready indexes, inserting the rows their graphs lack, then sleeps until
+    /// the next commit or a kick. It holds no strong reference to the store between
+    /// passes and ends when the store's commit channel closes.
+    fn start_vector_catch_up(&self) {
+        if self.vector.catch_up.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let mut commits = self.commits.subscribe();
+        let current = Arc::downgrade(&self.current);
+        let registry = Arc::downgrade(&self.vector);
+        let kick = self.vector.kick.clone();
+        let spawned = std::thread::Builder::new()
+            .name("vector-catch-up".into())
+            .spawn(move || {
+                loop {
+                    let (Some(cur), Some(reg)) = (current.upgrade(), registry.upgrade()) else {
+                        return;
+                    };
+                    if !reg.catch_up_paused.load(Ordering::SeqCst) {
+                        let snap = cur.load_full();
+                        let uid = snap.generation.uid;
+                        drop(cur);
+                        let names: Vec<String> = reg.indexes.read().keys().cloned().collect();
+                        for name in names {
+                            let Some(b) = snap.generation.vectors.built(&name) else {
+                                continue;
+                            };
+                            let gv = &snap.generation.vectors;
+                            let stop = || {
+                                reg.catch_up_paused.load(Ordering::SeqCst)
+                                    || current
+                                        .upgrade()
+                                        .is_none_or(|c| c.load().generation.uid != uid)
+                                    || gv.built(&name).is_none_or(|n| !Arc::ptr_eq(&n, &b))
+                            };
+                            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                crate::vector::live::catch_up(&snap, &b, &stop)
+                            }));
+                            if r.is_err() {
+                                tracing::error!(target: "sparkles::store::vector", "vector index {name}: inserting new rows failed");
+                            }
+                        }
+                    } else {
+                        drop(cur);
+                    }
+                    drop(reg);
+                    if !wait_commit_or_kick(&mut commits, &kick) {
+                        return;
+                    }
+                }
+            });
+        if let Err(e) = spawned {
+            self.vector.catch_up.store(false, Ordering::SeqCst);
+            tracing::error!(target: "sparkles::store::vector", "cannot start the vector catch-up thread: {e}");
+        }
+    }
+
     /// Build index `entry` for `snap`'s generation on a background thread (with `load`,
     /// from its file when it fits) and install it, unless it was superseded: by a newer
     /// build, a drop, a generation switch or the store's closing.
     fn spawn_vector_build(&self, entry: Arc<IndexEntry>, snap: Arc<Snapshot>, load: bool) {
+        if entry.config.hnsw.is_some() {
+            self.start_vector_catch_up();
+        }
+        let kick = self.vector.kick.clone();
         let epoch = entry.epoch.fetch_add(1, Ordering::SeqCst) + 1;
         {
             let mut i = entry.info.lock();
@@ -608,6 +725,8 @@ impl Store {
                     Ok(Ok(Outcome::Ready(b))) => {
                         let rows = b.segment.rows() as u64;
                         install(b);
+                        // the rows committed during the build go into the graph
+                        kick.notify_one();
                         tracing::info!(
                             target: "sparkles::store::vector",
                             "vector index {}: {rows} rows ready in {:?}",
@@ -657,5 +776,33 @@ impl Store {
             tracing::error!(target: "sparkles::store::vector", "cannot start the vector index build: {e}");
             failed.finish(epoch, "failed", Some(format!("build failed: {e}")), None);
         }
+    }
+}
+
+/// Block until a commit is published or `kick` is notified (`false`: the store is gone).
+fn wait_commit_or_kick(
+    commits: &mut tokio::sync::watch::Receiver<u64>,
+    kick: &tokio::sync::Notify,
+) -> bool {
+    use std::future::Future;
+    use std::task::{Context, Poll, Wake};
+    struct Unpark(std::thread::Thread);
+    impl Wake for Unpark {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    let waker = Arc::new(Unpark(std::thread::current())).into();
+    let mut cx = Context::from_waker(&waker);
+    let mut changed = std::pin::pin!(commits.changed());
+    let mut notified = std::pin::pin!(kick.notified());
+    loop {
+        if let Poll::Ready(r) = changed.as_mut().poll(&mut cx) {
+            return r.is_ok();
+        }
+        if notified.as_mut().poll(&mut cx).is_ready() {
+            return true;
+        }
+        std::thread::park();
     }
 }

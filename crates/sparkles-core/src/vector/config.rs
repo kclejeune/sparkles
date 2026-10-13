@@ -309,6 +309,14 @@ pub struct VectorIndexStatus {
 pub struct VectorOverlay {
     pub inserts: u64,
     pub deletes: u64,
+    /// inserted rows the graph holds since the background task added them, so searches
+    /// find them through it
+    #[serde(default)]
+    pub indexed: u64,
+    /// inserted rows the background task has yet to add to the graph, which searches
+    /// score exactly meanwhile
+    #[serde(default)]
+    pub pending: u64,
 }
 
 /// Literals of the predicate that are not indexed, by reason (rows).

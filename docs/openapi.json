@@ -16474,13 +16474,21 @@
               "deletes": {
                 "type": "integer"
               },
+              "indexed": {
+                "type": "integer"
+              },
               "inserts": {
+                "type": "integer"
+              },
+              "pending": {
                 "type": "integer"
               }
             },
             "required": [
               "inserts",
-              "deletes"
+              "deletes",
+              "indexed",
+              "pending"
             ],
             "type": "object"
           },

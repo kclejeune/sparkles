@@ -480,7 +480,15 @@
                 <span class="faint">Since the build</span>
                 <span>
                   +{fmtInt(ix.overlay.inserts)} −{fmtInt(ix.overlay.deletes)}
-                  <span class="faint">searched exactly</span>
+                  {#if ix.overlay.indexed}
+                    <span class="faint"
+                      >· {fmtInt(ix.overlay.indexed)} added to the graph{ix.overlay.pending
+                        ? `, ${fmtInt(ix.overlay.pending)} pending`
+                        : ''}</span
+                    >
+                  {:else}
+                    <span class="faint">searched exactly</span>
+                  {/if}
                   {#if share > 0.1}<span class="warn small"
                       >· compacting the dataset folds them into the index</span
                     >{/if}

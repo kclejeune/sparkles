@@ -543,3 +543,146 @@ fn linked_branches_reuse_immutable_vector_files_with_independent_overlays() {
     work.wait_vector_index("emb").unwrap();
     assert_eq!(std::fs::read(path).unwrap(), before);
 }
+
+/// Rows inserted after the build join the graph in the background: searches then find
+/// them through it, each snapshot sees exactly its own rows, and their scores are the
+/// exact ones.
+#[test]
+fn inserted_rows_join_the_graph() {
+    let all = clustered(6_300, 13);
+    let (vs, rest) = all.split_at(5_000);
+    let (extra, queries) = rest.split_at(1_200);
+    let s = store_with(Store::in_memory(StoreOptions::default()), vs);
+    s.create_vector_index("emb", config(0)).unwrap();
+    s.wait_vector_index("emb").unwrap();
+    // held: the new rows are scored exactly
+    s.pause_vector_catch_up(true);
+    for (c, chunk) in extra.chunks(200).enumerate() {
+        let rows: Vec<(usize, &Vec<f32>)> = chunk
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (100_000 + c * 200 + i, v))
+            .collect();
+        load(&s, nt(&rows));
+    }
+    let st = s.vector_index("emb").unwrap();
+    assert_eq!(
+        (st.overlay.inserts, st.overlay.indexed, st.overlay.pending),
+        (1_200, 0, 1_200)
+    );
+    let (_, info) = search(&s.snapshot(), &extra[7], 10, SearchMode::default());
+    assert_eq!(
+        (info.method, info.inserted, info.pending),
+        ("hnsw", 1_200, 1_200)
+    );
+    // released: they join the graph
+    s.pause_vector_catch_up(false);
+    assert!(s.wait_vector_catch_up(std::time::Duration::from_secs(120)));
+    let st = s.vector_index("emb").unwrap();
+    assert_eq!(
+        (st.overlay.inserts, st.overlay.indexed, st.overlay.pending),
+        (1_200, 1_200, 0)
+    );
+    assert_eq!(st.hnsw.unwrap().nodes, 6_200);
+    let snap = s.snapshot();
+    // every inserted row is found for itself through the graph
+    for (i, v) in extra.iter().enumerate().step_by(37) {
+        let (hits, info) = search(&snap, v, 1, SearchMode::default());
+        assert_eq!((info.method, info.pending), ("hnsw", 0));
+        let id = snap.lookup_iri(&format!("urn:n{}", 100_000 + i)).unwrap().0;
+        assert_eq!(hits[0].0, id, "row {i}");
+    }
+    // recall over base and inserted rows, with the exact scores
+    let mut sum = 0.0;
+    for q in queries {
+        let (exact, _) = search(&snap, q, 10, EXACT);
+        let (ann, info) = search(&snap, q, 10, SearchMode::default());
+        assert_eq!(info.method, "hnsw");
+        for a in &ann {
+            if let Some(e) = exact.iter().find(|e| e.0 == a.0) {
+                assert_eq!(a.1.to_bits(), e.1.to_bits());
+            }
+        }
+        sum += recall(&ann, &exact);
+    }
+    let r = sum / queries.len() as f64;
+    assert!(r >= 0.95, "recall@10 with inserted rows: {r}");
+    // a deleted inserted row stays a node that no search returns; the snapshot from
+    // before the delete still finds it
+    let before = s.snapshot();
+    let gone = snap.lookup_iri("urn:n100007").unwrap().0;
+    update(
+        &s,
+        &format!(
+            "DELETE DATA {{ <urn:n100007> <{EMB}> \"{}\"^^<urn:x-sparkles:vector> }}",
+            vector::canonical(&extra[7])
+        ),
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    let wide = SearchMode {
+        exact: false,
+        ef: Some(200),
+    };
+    let (hits, info) = search(&s.snapshot(), &extra[7], 10, wide);
+    assert_eq!((info.method, info.pending), ("hnsw", 0));
+    assert!(hits.iter().all(|h| h.0 != gone));
+    let (hits, _) = search(&before, &extra[7], 1, wide);
+    assert_eq!(hits[0].0, gone);
+    // a row inserted later is not seen by the older snapshot, through the graph or not
+    let near: Vec<f32> = (0..DIM)
+        .map(|i| if i % 2 == 0 { 3.0 } else { -3.0 })
+        .collect();
+    load(&s, nt(&[(900_001, &near)]));
+    assert!(s.wait_vector_catch_up(std::time::Duration::from_secs(60)));
+    let late = s.snapshot().lookup_iri("urn:n900001").unwrap().0;
+    let (hits, info) = search(&s.snapshot(), &near, 1, SearchMode::default());
+    assert_eq!((hits[0].0, info.pending), (late, 0));
+    let (hits, _) = search(&before, &near, 10, wide);
+    assert!(hits.iter().all(|h| h.0 != late));
+    // the plan counters split the overlay
+    let r = query(
+        s.snapshot(),
+        &format!(
+            "SELECT ?s {{ (?s ?score) <urn:x-sparkles:vectorSearch> (<{EMB}> <urn:n900001> 3) }}"
+        ),
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    let plan = format!("{:?}", r.plan);
+    assert!(plan.contains("overlayPending"), "{plan}");
+}
+
+/// Reopening a store inserts its delta's rows into the graph again.
+#[test]
+fn reopened_stores_catch_up_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let all = clustered(2_300, 17);
+    let (vs, extra) = all.split_at(2_000);
+    let rows: Vec<(usize, &Vec<f32>)> = extra
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (50_000 + i, v))
+        .collect();
+    {
+        let s = store_with(
+            Store::open(dir.path(), StoreOptions::default()).unwrap(),
+            vs,
+        );
+        s.create_vector_index("emb", config(0)).unwrap();
+        s.wait_vector_index("emb").unwrap();
+        load(&s, nt(&rows));
+        assert!(s.wait_vector_catch_up(std::time::Duration::from_secs(60)));
+        assert_eq!(s.vector_index("emb").unwrap().overlay.indexed, 300);
+    }
+    let s = Store::open(dir.path(), StoreOptions::default()).unwrap();
+    let st = s.wait_vector_index("emb").unwrap();
+    assert!(st.files.unwrap().opened);
+    assert!(s.wait_vector_catch_up(std::time::Duration::from_secs(60)));
+    let st = s.vector_index("emb").unwrap();
+    assert_eq!((st.overlay.indexed, st.overlay.pending), (300, 0));
+    let snap = s.snapshot();
+    let (hits, info) = search(&snap, &extra[5], 1, SearchMode::default());
+    assert_eq!((info.method, info.pending), ("hnsw", 0));
+    assert_eq!(hits[0].0, snap.lookup_iri("urn:n50005").unwrap().0);
+}

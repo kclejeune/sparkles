@@ -97,6 +97,8 @@ pub struct Built {
     pub file_bytes: u64,
     /// the segment is usable and the graph is still being built
     pub hnsw_pending: bool,
+    /// the nodes inserted into the graph since the build ([`super::live`])
+    pub live: Arc<super::live::Live>,
 }
 
 impl Built {
@@ -578,7 +580,7 @@ pub(crate) enum Outcome {
 }
 
 /// The seed of every graph build (builds are reproducible).
-const SEED: u64 = 0x5eed_5eed;
+pub(crate) const SEED: u64 = 0x5eed_5eed;
 
 /// Build index `name` for `snap`'s generation from its base: read it from its file when
 /// `ctl.load` and the file fits, else pack the predicate's vectors, publish them through
@@ -682,6 +684,7 @@ pub(crate) fn build_index(
         opened: false,
         file_bytes: 0,
         hnsw_pending: cfg.hnsw.is_some(),
+        live: Default::default(),
     };
     if let Some(h) = cfg.hnsw {
         partial(Arc::new(Built {
@@ -721,6 +724,7 @@ pub(crate) fn build_index(
         ) else {
             return Ok(Outcome::Cancelled);
         };
+        built.live = Arc::new(super::live::Live::new(g.nodes, segment.dim));
         built.graph = Some(Arc::new(g));
         built.node_rows = Arc::new(Slice::Owned(nodes));
         built.hnsw_pending = false;
@@ -772,6 +776,7 @@ fn clone_meta(b: &Built) -> Built {
         opened: b.opened,
         file_bytes: b.file_bytes,
         hnsw_pending: b.hnsw_pending,
+        live: b.live.clone(),
     }
 }
 
@@ -906,6 +911,10 @@ fn read_file(
         (None, Slice::Owned(Vec::new()))
     };
     let zero = seg.norms.iter().filter(|&&n| n == 0.0).count() as u64;
+    let live = Arc::new(super::live::Live::new(
+        graph.as_ref().map_or(0, |g| g.nodes),
+        dim,
+    ));
     Ok(Built {
         name: name.to_string(),
         config: cfg.clone(),
@@ -923,6 +932,7 @@ fn read_file(
         opened: true,
         file_bytes: f.file_len(),
         hnsw_pending: false,
+        live,
     })
 }
 

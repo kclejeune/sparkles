@@ -7984,7 +7984,9 @@ export interface components {
             name: string;
             overlay: {
                 deletes: number;
+                indexed: number;
                 inserts: number;
+                pending: number;
             };
             predicate: string;
             progress?: number;

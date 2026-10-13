@@ -2359,8 +2359,11 @@ export type VectorIndexStatus = {
   generation: string;
   /** Vectors in the generation's base (the packed rows). */
   rows: number;
-  /** Changes since the base that searches add exactly. */
-  overlay: { inserts: number; deletes: number };
+  /**
+   * Changes since the base. Of the inserts, `indexed` are in the graph, which the server
+   * adds them to in the background, and `pending` are still searched exactly.
+   */
+  overlay: { inserts: number; deletes: number; indexed?: number; pending?: number };
   skipped: { malformed: number; wrongDimension: number; zeroNorm: number };
   /** `residency`: `heap` (built in this process) or `mmap` (read in place from the file). */
   memory: { segmentBytes: number; hnswBytes: number; residency: string };

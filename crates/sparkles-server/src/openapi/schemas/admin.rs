@@ -423,7 +423,10 @@ fn indexes(put: &mut dyn FnMut(&str, J)) {
                     "message": string(),
                     "generation": string(),
                     "rows": int(),
-                    "overlay": obj(&["inserts", "deletes"], json!({ "inserts": int(), "deletes": int() })),
+                    "overlay": obj(
+                        &["inserts", "deletes", "indexed", "pending"],
+                        json!({ "inserts": int(), "deletes": int(), "indexed": int(), "pending": int() }),
+                    ),
                     "skipped": obj(
                         &["malformed", "wrongDimension", "zeroNorm"],
                         json!({ "malformed": int(), "wrongDimension": int(), "zeroNorm": int() }),
