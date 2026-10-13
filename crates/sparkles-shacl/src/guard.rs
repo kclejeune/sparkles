@@ -298,7 +298,8 @@ pub struct FullShape {
 pub struct ShaclGuard {
     cfg: ValidationConfig,
     loaded: RwLock<Loaded>,
-    pending: Mutex<Option<Pending>>,
+    /// the states of the commits checked and not yet published, in commit order
+    pending: Mutex<Vec<Pending>>,
     baseline: Mutex<Option<Baseline>>,
     exact: Mutex<Option<Exact>>,
     counters: DecisionCounts,
@@ -325,7 +326,7 @@ impl ShaclGuard {
         ShaclGuard {
             cfg,
             loaded: RwLock::new(loaded),
-            pending: Mutex::new(None),
+            pending: Mutex::new(Vec::new()),
             baseline: Mutex::new(None),
             exact: Mutex::new(None),
             counters: DecisionCounts::default(),
@@ -425,6 +426,36 @@ impl ShaclGuard {
             last_check: self.history.last(),
             recent_rejections: self.history.rejected(),
         }
+    }
+
+    /// What the guard knows of the state at commit `base`: the shapes in force, and the
+    /// baseline and exact counts when they are known. A commit of a group is checked
+    /// while the commits before it wait for their fence, so the state comes from the
+    /// commit in flight when there is one, and from the published state otherwise.
+    fn state_at(&self, base: u64) -> (Loaded, Option<Baseline>, Option<Exact>) {
+        let pending = self.pending.lock();
+        let loaded = pending
+            .iter()
+            .rev()
+            .filter(|p| p.seq <= base)
+            .find_map(|p| p.loaded.clone())
+            .unwrap_or_else(|| self.loaded.read().clone());
+        match pending.iter().find(|p| p.seq == base) {
+            Some(p) => (loaded, Some(p.baseline.clone()), p.exact.clone()),
+            None => (
+                loaded,
+                self.baseline.lock().clone(),
+                self.exact.lock().clone().filter(|e| e.commit == base),
+            ),
+        }
+    }
+
+    /// Keep the state commit `p.seq` leaves until it is published. A state kept for
+    /// that commit or a later one belongs to a write that did not happen.
+    fn stage(&self, p: Pending) {
+        let mut pending = self.pending.lock();
+        pending.retain(|q| q.seq < p.seq);
+        pending.push(p);
     }
 
     fn deadline(&self, t0: Instant, o: &WriteOptions) -> Instant {
@@ -685,7 +716,13 @@ impl ShaclGuard {
 
     /// A write that cannot change the results: the state of the head carries over
     /// (unless the write is a dry run, which records nothing).
-    fn skipped(&self, seq: u64, live: bool) -> ValidationSummary {
+    fn skipped(
+        &self,
+        seq: u64,
+        live: bool,
+        baseline: Option<Baseline>,
+        exact: Option<Exact>,
+    ) -> ValidationSummary {
         if !live {
             let mut s =
                 ValidationSummary::empty(GuardStatus::Skipped, self.cfg.mode, self.cfg.threshold);
@@ -693,18 +730,10 @@ impl ShaclGuard {
             return s;
         }
         self.count(GuardStatus::Skipped);
-        let baseline = self
-            .baseline
-            .lock()
-            .clone()
-            .map(|b| Baseline { commit: seq, ..b });
-        let exact = self
-            .exact
-            .lock()
-            .clone()
-            .map(|e| Exact { commit: seq, ..e });
+        let baseline = baseline.map(|b| Baseline { commit: seq, ..b });
+        let exact = exact.map(|e| Exact { commit: seq, ..e });
         if let Some(baseline) = baseline {
-            *self.pending.lock() = Some(Pending {
+            self.stage(Pending {
                 seq,
                 loaded: None,
                 baseline,
@@ -719,7 +748,12 @@ impl ShaclGuard {
 
     /// Validate a write to the data graph with unchanged shapes: incrementally when the
     /// guard knows the state of the head exactly, in full otherwise.
-    fn check_data(&self, c: &Candidate<'_>, loaded: &Loaded) -> sparkles_core::Result<Checked> {
+    fn check_data(
+        &self,
+        c: &Candidate<'_>,
+        loaded: &Loaded,
+        exact: Option<Exact>,
+    ) -> sparkles_core::Result<Checked> {
         let seq = c.base.commit + 1;
         let base = Arc::new(c.base.clone());
         let full = |reason| {
@@ -735,8 +769,7 @@ impl ShaclGuard {
         let Changes::Log(log) = c.changes else {
             return full(Fallback::Bulk);
         };
-        let exact = self.exact.lock().clone();
-        let Some(exact) = exact.filter(|e| e.commit == c.base.commit) else {
+        let Some(exact) = exact else {
             return full(Fallback::Baseline);
         };
         if self.cfg.mode == GuardMode::Reject
@@ -1033,10 +1066,10 @@ impl CommitGuard for ShaclGuard {
             }
             None => (data, shapes_changed) = (true, !self.cfg.shapes_graphs().is_empty()),
         }
+        let (loaded, base_baseline, base_exact) = self.state_at(c.base.commit);
         if !data && !shapes_changed {
-            return Ok(self.skipped(seq, live));
+            return Ok(self.skipped(seq, live, base_baseline, base_exact));
         }
-        let loaded = self.loaded.read().clone();
         let (checked, new_loaded) = if shapes_changed {
             // changed shapes are read from the new state, and must parse
             let new = match Shapes::from_store_graphs_with(
@@ -1076,15 +1109,10 @@ impl CommitGuard for ShaclGuard {
             (checked, Some(new))
         } else {
             // a write no shape can read: with the state of the head known, it carries over
-            let known = self
-                .exact
-                .lock()
-                .as_ref()
-                .is_some_and(|e| e.commit == c.base.commit);
-            if known && !self.reads_changes(c, &loaded) {
-                return Ok(self.skipped(seq, live));
+            if base_exact.is_some() && !self.reads_changes(c, &loaded) {
+                return Ok(self.skipped(seq, live, base_baseline, base_exact));
             }
-            (self.check_data(c, &loaded)?, None)
+            (self.check_data(c, &loaded, base_exact)?, None)
         };
         let summary = checked.summary;
         if !live {
@@ -1093,7 +1121,7 @@ impl CommitGuard for ShaclGuard {
         self.count(summary.status);
         self.history.record(c.kind, &summary);
         if summary.status != GuardStatus::Rejected {
-            *self.pending.lock() = Some(Pending {
+            self.stage(Pending {
                 seq,
                 loaded: new_loaded,
                 baseline: baseline_of(&summary, seq),
@@ -1104,22 +1132,31 @@ impl CommitGuard for ShaclGuard {
     }
 
     fn committed(&self, seq: u64) {
-        let p = self.pending.lock().take();
-        match p {
-            Some(p) if p.seq == seq => {
-                if let Some(l) = p.loaded {
+        // the state moves from the commits in flight to the published one under the lock
+        // the checks read both under
+        let mut pending = self.pending.lock();
+        let at = pending
+            .iter()
+            .position(|p| p.seq == seq)
+            .map(|i| pending.remove(i));
+        // a state kept for an earlier commit belongs to one that was never published
+        pending.retain(|p| p.seq > seq);
+        match at {
+            Some(p) => {
+                if let Some(l) = p.loaded.clone() {
                     *self.loaded.write() = l;
                 }
+                *self.baseline.lock() = Some(p.baseline.clone());
+                *self.exact.lock() = p.exact.clone();
+                drop(pending);
                 if let (Some((root, hash)), Some(_)) = (&self.persist, &p.exact)
                     && let Err(e) = StatusFile::of(&p.baseline, hash).write(root)
                 {
                     tracing::warn!("cannot write {STATUS_FILE}: {e}");
                 }
-                *self.baseline.lock() = Some(p.baseline);
-                *self.exact.lock() = p.exact;
             }
             // a commit the guard did not judge: the state is unknown
-            _ => {
+            None => {
                 if let Some(b) = self.baseline.lock().as_mut() {
                     b.commit = seq;
                     b.conforms = None;
@@ -1127,6 +1164,10 @@ impl CommitGuard for ShaclGuard {
                 *self.exact.lock() = None;
             }
         }
+    }
+
+    fn speculative(&self) -> bool {
+        true
     }
 
     fn bypassed(&self) {
