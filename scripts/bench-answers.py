@@ -26,16 +26,31 @@ may be broken differently and engines list the result variables in different ord
 `--count-only` records just the row count, for LIMIT-without-ORDER probes whose
 solutions are legitimately engine-dependent. A failed request records `error`.
 
+Blank nodes compare by structure. Each response is canonicalized on its own, so a blank
+node label (which only has meaning inside one response) never decides equality, and two
+different arrangements of blank nodes do not compare equal.
+
 ASK queries record a digest of the boolean. CONSTRUCT and DESCRIBE queries are fetched as
-N-Triples and compared as multisets of lines with blank node labels dropped. `--no-check`
-records the row count with a fixed digest, for DESCRIBE queries whose result the
-specification leaves to the engine.
+N-Triples, parsed, and compared as a set of triples (a graph has no duplicates). Spacing,
+escapes in literals and an explicit `xsd:string` do not matter. `--no-check` records the
+row count with a fixed digest, for DESCRIBE queries whose result the specification leaves
+to the engine.
+
+A query whose own ORDER BY uses only variables that the result projects also records
+`order`, a digest of the sequence of those key values in the returned order. Rows that tie
+on the keys have the same key values, so a correct engine gives the same sequence whatever
+it does with ties. ORDER BY with expressions, and ORDER BY inside subqueries, are not
+checked.
+
+The whole request, not each wait, is limited to MAX_TIME seconds (default 300). A slower
+answer is recorded as `error`.
 """
 
 import hashlib
 import json
 import os
 import re
+import signal
 import sys
 import urllib.parse
 import urllib.request
@@ -247,7 +262,7 @@ def term(t, by_value):
     if kind == "uri":
         return ("uri", t["value"])
     if kind == "bnode":
-        return ("bnode",)
+        return ("bnode", t.get("value", ""))
     if kind in ("literal", "typed-literal"):
         lang = t.get("xml:lang")
         if lang:
@@ -281,6 +296,102 @@ def digest(rows):
     return h.hexdigest()[:16]
 
 
+def canon(rows):
+    """The digest of a solution multiset or a set of triples that does not depend on blank node
+    labels. Each blank node gets a colour from the rows it occurs in (the other blank nodes shown
+    by their own colour), refined four times, and the rows are digested with colours for labels.
+    It tells apart the graphs that matter here, though it is not a full isomorphism test."""
+    rows = list(rows)
+    labels = {t[1] for r in rows for t in r if t and t[0] == "bnode"}
+    if not labels:
+        return digest(rows)
+    color = {l: "" for l in labels}
+
+    def show(t, own=None):
+        if t and t[0] == "bnode":
+            return ("bnode", "*" if t[1] == own else color[t[1]])
+        return t
+
+    for _ in range(4):
+        sig = {l: [] for l in labels}
+        for r in rows:
+            for l in {t[1] for t in r if t and t[0] == "bnode"}:
+                sig[l].append(tuple(show(t, l) for t in r))
+        color = {l: hashlib.sha256(repr(sorted(sig[l])).encode()).hexdigest()[:12] for l in labels}
+    return digest(tuple(show(t) for t in r) for r in rows)
+
+
+UNESCAPE = re.compile(r"\\(u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8}|[tbnrf\"'\\])")
+ESCAPES = {"t": "\t", "b": "\b", "n": "\n", "r": "\r", "f": "\f", '"': '"', "'": "'", "\\": "\\"}
+NT_LINE = re.compile(r"^(<[^>]*>|_:\S+)\s+(<[^>]*>)\s+(.+?)\s*\.\s*$")
+NT_LITERAL = re.compile(r'^"((?:[^"\\]|\\.)*)"(?:@([A-Za-z0-9-]+)|\^\^<([^>]*)>)?$')
+
+
+def _unescape(text):
+    return UNESCAPE.sub(lambda m: chr(int(m.group(1)[1:], 16)) if m.group(1)[0] in "uU" else ESCAPES[m.group(1)], text)
+
+
+def nt_term(tok):
+    """An N-Triples term as the JSON form of a SPARQL result, so that `term` normalizes it. The
+    lexical form is unescaped, so `\\u00e9` and `é` are the same literal."""
+    if tok.startswith("<<"):
+        return {"type": "other", "value": tok}
+    if tok.startswith("<"):
+        return {"type": "uri", "value": tok[1:-1]}
+    if tok.startswith("_:"):
+        return {"type": "bnode", "value": tok[2:]}
+    m = NT_LITERAL.match(tok)
+    if not m:
+        return {"type": "other", "value": tok}
+    t = {"type": "literal", "value": _unescape(m.group(1))}
+    if m.group(2):
+        t["xml:lang"] = m.group(2)
+    elif m.group(3):
+        t["datatype"] = m.group(3)
+    return t
+
+
+def nt_triples(text, by_value):
+    """The set of triples of an N-Triples document: a graph has no duplicate triples, and the
+    spacing and escapes of a line are not part of it."""
+    out = set()
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = NT_LINE.match(line)
+        if not m:
+            out.add((("line", line),))
+            continue
+        out.add(tuple(term(nt_term(tok), by_value) for tok in m.groups()))
+    return out
+
+
+def order_keys(query, head_vars):
+    """The variables of the query's own ORDER BY when it uses only plain variables, `ASC(?v)` or
+    `DESC(?v)` that are in the result, else None. Strings, comments and IRIs are blanked first,
+    and only an ORDER BY outside every group counts."""
+    q = re.sub(r"<[^<>\s]*>", "<>", query)
+    q = re.sub(r'"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'', '""', q)
+    q = re.sub(r"#[^\n]*", "", q)
+    depth, start = 0, None
+    for m in re.finditer(r"[{}]|\border\s+by\b", q, re.I):
+        if m.group() == "{":
+            depth += 1
+        elif m.group() == "}":
+            depth -= 1
+        elif depth == 0:
+            start = m.end()
+    if start is None:
+        return None
+    clause = re.split(r"\b(?:limit|offset)\b", q[start:], flags=re.I)[0].strip()
+    keys = re.findall(r"(?:(?:asc|desc)\s*\(\s*)?\?(\w+)\s*\)?", clause, re.I)
+    rest = re.sub(r"(?:(?:asc|desc)\s*\(\s*)?\?\w+\s*\)?", "", clause, flags=re.I).strip()
+    if not keys or rest or any(k not in head_vars for k in keys):
+        return None
+    return keys
+
+
 def form(query):
     """select, ask, construct or describe: the first of these words outside IRIs and comments."""
     q = re.sub(r"#[^\n]*", "", re.sub(r"<[^<>\s]*>", "", query))
@@ -288,11 +399,33 @@ def form(query):
     return m.group(1).lower() if m else "select"
 
 
+class Deadline(Exception):
+    pass
+
+
+def fetch(req, seconds):
+    """The whole response body, or Deadline when it takes longer than `seconds` altogether. The
+    socket timeout of urlopen limits each wait, and a server that keeps sending slowly would
+    pass it, so an interval timer enforces the total."""
+    def expire(*_):
+        raise Deadline(f"no complete answer in {seconds:g} s")
+
+    old = signal.signal(signal.SIGALRM, expire)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        with urllib.request.urlopen(req, timeout=seconds) as r:
+            return r.read()
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old)
+
+
 def main():
     endpoint, qfile, out, name, engine = sys.argv[1:6]
     count_only = "--count-only" in sys.argv[6:]
     no_check = "--no-check" in sys.argv[6:]
-    query = open(qfile).read()
+    with open(qfile) as f:
+        query = f.read()
     kind = form(query)
     graph = kind in ("construct", "describe")
     req = urllib.request.Request(
@@ -302,32 +435,44 @@ def main():
                  "Content-Type": "application/x-www-form-urlencoded"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=float(os.environ.get("MAX_TIME", "300"))) as r:
-            if graph:
-                # blank node labels are local to a response
-                lines = [re.sub(r"_:\S+", "_:b", l) for l in r.read().decode().splitlines() if l.strip()]
-                rec = {"rows": len(lines)}
-                if not count_only:
-                    rec["exact"] = rec["value"] = "unchecked" if no_check else digest((l,) for l in lines)
-                res = None
-            else:
-                res = json.load(r)
-        if res is not None and kind == "ask":
-            rec = {"rows": 1}
-            rec["exact"] = rec["value"] = digest([(bool(res["boolean"]),)])
-        elif res is not None:
-            # variable order in the head is not part of a solution (engines differ)
-            vars_ = sorted(res["head"].get("vars", []))
-            bindings = res["results"]["bindings"]
-            rec = {"rows": len(bindings)}
+        body = fetch(req, float(os.environ.get("MAX_TIME", "300")))
+        if graph:
+            triples = nt_triples(body.decode(), True)
+            rec = {"rows": len(triples)}
             if not count_only:
-                for key, by_value in (("exact", False), ("value", True)):
-                    rec[key] = digest(tuple(term(b.get(v), by_value) for v in vars_) for b in bindings)
+                if no_check:
+                    rec["exact"] = rec["value"] = "unchecked"
+                else:
+                    rec["exact"] = canon(nt_triples(body.decode(), False))
+                    rec["value"] = canon(triples)
+        else:
+            res = json.loads(body)
+            if kind == "ask":
+                rec = {"rows": 1}
+                rec["exact"] = rec["value"] = digest([(bool(res["boolean"]),)])
+            else:
+                # variable order in the head is not part of a solution (engines differ)
+                vars_ = sorted(res["head"].get("vars", []))
+                bindings = res["results"]["bindings"]
+                rec = {"rows": len(bindings)}
+                if not count_only:
+                    for key, by_value in (("exact", False), ("value", True)):
+                        rec[key] = canon(tuple(term(b.get(v), by_value) for v in vars_) for b in bindings)
+                    keys = order_keys(query, vars_)
+                    if keys:
+                        seq = [tuple(term(b.get(v), True) for v in keys) for b in bindings]
+                        if not any(t[0] == "bnode" for row in seq for t in row):
+                            # the sequence of ORDER BY keys, which ties in the keys cannot change
+                            rec["order"] = hashlib.sha256(repr(seq).encode()).hexdigest()[:16]
     except Exception as e:  # noqa: BLE001 - any failure is recorded, not raised
         rec = {"rows": "error", "error": str(e)[:200]}
-    d = json.load(open(out)) if os.path.exists(out) else {}
+    d = {}
+    if os.path.exists(out):
+        with open(out) as f:
+            d = json.load(f)
     d.setdefault(name, {})[engine] = rec
-    json.dump(d, open(out, "w"), indent=1)
+    with open(out, "w") as f:
+        json.dump(d, f, indent=1)
     print(rec["rows"])
 
 

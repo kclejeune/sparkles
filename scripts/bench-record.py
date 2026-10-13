@@ -219,7 +219,8 @@ def fingerprints(answers):
     out = {}
     for q, per in (answers or {}).items():
         ok = {e: v for e, v in per.items() if v.get("rows") != "error"}
-        digest = {e: v.get("value") or v.get("exact") or str(v.get("rows")) for e, v in ok.items()}
+        digest = {e: (v.get("value") or v.get("exact") or str(v.get("rows"))) + ("/" + v["order"] if v.get("order") else "")
+                  for e, v in ok.items()}
         vals = list(digest.values())
         ref = None
         if vals:
