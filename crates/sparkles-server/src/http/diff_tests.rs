@@ -1149,3 +1149,103 @@ async fn history_queries_over_http() {
     assert_eq!(r.status, StatusCode::NOT_IMPLEMENTED, "{}", r.text());
     assert_eq!(r.json()["code"], "history-unsupported");
 }
+
+#[tokio::test]
+async fn diffs_keep_the_changes_of_some_terms() {
+    let s = server(|_| {}).await;
+    let count = |j: &J| (j["added"].as_u64().unwrap(), j["removed"].as_u64().unwrap());
+    // a subject, an object, and the terms of both
+    let j = get(&s.app, "/h/diff?from=0&term=urn:c").await.json();
+    assert_eq!(count(&j), (1, 0));
+    let j = get(&s.app, "/h/diff?from=0&term=%22three%22").await.json();
+    assert_eq!(count(&j), (1, 0));
+    let j = get(&s.app, "/h/diff?from=0&term=urn:c&term=urn:b")
+        .await
+        .json();
+    assert_eq!(count(&j), (2, 0));
+    // a quad added and removed is no change; a removal alone is
+    let j = get(&s.app, "/h/diff?from=0&term=urn:a").await.json();
+    assert_eq!(count(&j), (0, 0));
+    let j = get(&s.app, "/h/diff?from=1&to=4&term=urn:a&quads=true")
+        .await
+        .json();
+    assert_eq!(count(&j), (0, 1));
+    assert_eq!(j["quads"][0]["subject"], "<urn:a>");
+    // the filter is part of the entity tag
+    let all = get(&s.app, "/h/diff?from=1&to=4").await;
+    let some = get(&s.app, "/h/diff?from=1&to=4&term=urn:a").await;
+    assert_ne!(all.header("etag"), some.header("etag"));
+    // a patch lists every change
+    let r = get(&s.app, "/h/diff?from=1&to=4&term=urn:a&format=patch").await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    let r = get(&s.app, "/h/diff?from=1&to=4&term=not%20an%20iri").await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    // states compared rather than logs read
+    s.state.attach("m", DbType::Mem, None).unwrap();
+    let r = put_json(&s.app, "/$/history/m", r#"{"keepCommits":5}"#).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    update(&s.app, "m", "INSERT DATA { <urn:x> <urn:p> 1 }").await;
+    update(&s.app, "m", "INSERT DATA { <urn:y> <urn:p> 2 }").await;
+    update(&s.app, "m", "DELETE DATA { <urn:x> <urn:p> 1 }").await;
+    let j = get(&s.app, "/m/diff?from=1&to=3&term=urn:y").await.json();
+    assert_eq!(j["method"], "compare");
+    assert_eq!(count(&j), (1, 0));
+    let j = get(&s.app, "/m/diff?from=1&to=3&term=urn:x").await.json();
+    assert_eq!(count(&j), (0, 1));
+}
+
+#[tokio::test]
+async fn the_timeline_buckets_the_commits() {
+    let s = server(|_| {}).await;
+    let list = get(&s.app, "/$/commits/h?limit=100").await.json();
+    let commits = list["commits"].as_array().unwrap();
+    assert_eq!(commits.len(), 5);
+    let j = get(&s.app, "/$/commits/h/timeline").await.json();
+    assert_eq!(j["head"], 4);
+    assert_eq!(j["commits"], 5);
+    // by default every commit has a bucket of its own
+    let b = j["buckets"].as_array().unwrap();
+    assert_eq!(b.len(), 5);
+    assert_eq!(b[0]["firstSeq"], 0);
+    assert_eq!(b[4]["lastSeq"], 4);
+    assert_eq!(b[1]["kinds"]["update"], 1);
+    assert_eq!(b[1]["inserted"], commits[3]["inserted"]);
+    assert!(j["readable"].as_array().is_some());
+    // two buckets of three and two commits
+    let j = get(&s.app, "/$/commits/h/timeline?buckets=2").await.json();
+    assert_eq!(j["bucketWidth"], 3);
+    let b = j["buckets"].as_array().unwrap();
+    assert_eq!(b.len(), 2);
+    let ends = |x: &J| {
+        (
+            x["firstSeq"].as_u64().unwrap(),
+            x["lastSeq"].as_u64().unwrap(),
+        )
+    };
+    assert_eq!((ends(&b[0]), ends(&b[1])), ((0, 2), (3, 4)));
+    assert_eq!(b[0]["commits"], 3);
+    let sum: u64 = b.iter().map(|x| x["inserted"].as_u64().unwrap()).sum();
+    let total: u64 = commits
+        .iter()
+        .map(|c| c["inserted"].as_u64().unwrap())
+        .sum();
+    assert_eq!(sum, total);
+    // a range
+    let j = get(&s.app, "/$/commits/h/timeline?from=2&to=3")
+        .await
+        .json();
+    assert_eq!(
+        (j["firstSeq"].as_u64(), j["lastSeq"].as_u64()),
+        (Some(2), Some(3))
+    );
+    assert_eq!(j["buckets"].as_array().unwrap().len(), 2);
+    for bad in ["buckets=0", "buckets=2001", "from=x", "from=3&to=2"] {
+        let r = get(&s.app, &format!("/$/commits/h/timeline?{bad}")).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{bad}: {}", r.text());
+    }
+    // an in-memory dataset
+    s.state.attach("m", DbType::Mem, None).unwrap();
+    update(&s.app, "m", "INSERT DATA { <urn:x> <urn:p> 1 }").await;
+    let j = get(&s.app, "/$/commits/m/timeline").await.json();
+    assert!(j["commits"].as_u64().unwrap() >= 1);
+}

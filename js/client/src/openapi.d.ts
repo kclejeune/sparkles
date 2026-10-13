@@ -736,6 +736,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/$/commits/{ds}/timeline": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Commit timeline
+         * @description The commits of the branch in buckets of consecutive numbers, with the commits' times, kinds and quad counts, and the ranges whose state can still be read. For a time slider over a long history.
+         */
+        get: operations["commitTimeline"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/commits/{ds}/{reference}": {
         parameters: {
             query?: never;
@@ -4378,6 +4398,38 @@ export interface components {
             commit: components["schemas"]["Commit"];
             dataset: string;
             datasetId: string;
+        };
+        CommitTimeline: {
+            /** @description The commit numbers each bucket spans. */
+            bucketWidth: number;
+            buckets: {
+                commits: number;
+                /** @description Quads removed by the bucket's commits; left out for a caller limited to some graphs. */
+                deleted?: number;
+                firstSeq: number;
+                firstTime: string;
+                /** @description Quads added by the bucket's commits; left out for a caller limited to some graphs. */
+                inserted?: number;
+                kinds: {
+                    [key: string]: number;
+                };
+                lastSeq: number;
+                lastTime: string;
+                merges: number;
+                snapshots: number;
+            }[];
+            /** @description The commits in range whose metadata is retained. */
+            commits: number;
+            dataset: string;
+            datasetId: string;
+            firstSeq: number;
+            head: number;
+            lastSeq: number;
+            oldestReconstructable?: number | null;
+            readable: {
+                from?: number;
+                to?: number;
+            }[];
         };
         /** @description The settings a dataset overrides. `0` turns off the size, idle and age triggers it is the limit of. An unknown setting is a `400`. */
         CompactionPolicy: {
@@ -10083,6 +10135,43 @@ export interface operations {
                     "application/json": components["schemas"]["CommitList"];
                 };
             };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    commitTimeline: {
+        parameters: {
+            query?: {
+                /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
+                branch?: components["parameters"]["branch"];
+                /** @description The most buckets. */
+                buckets?: number;
+                /** @description The first commit number; the first by default. */
+                from?: number;
+                /** @description The last commit number; the head by default. */
+                to?: number;
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The buckets. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommitTimeline"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
@@ -15963,6 +16052,8 @@ export interface operations {
                 to?: string;
                 /** @description A graph IRI or `default`. */
                 graph?: string;
+                /** @description Only the changes whose subject or object is this term, an N-Triples term or a bare IRI. Repeat for several, up to 1,000. Not for RDF Patch. */
+                term?: string;
                 /** @description JSON: list the quads. */
                 quads?: boolean;
                 /** @description The most quads listed. */

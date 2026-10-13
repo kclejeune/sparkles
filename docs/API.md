@@ -2774,7 +2774,35 @@ digest chains from 32 zero bytes. The exact input is defined in
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/$/commits/{ds}` | Lists commits, newest first. `?limit=` sets the page size (default 50, max 1000). `?before=<seq>` pages backwards, and `?after=<seq>` lists the commits after `seq`, oldest first. Returns `{dataset, datasetId, head, firstRetained, complete, commits: Commit[], next: string \| null}`. |
+| GET | `/$/commits/{ds}/timeline` | The commits of a branch in buckets, for a time slider over a long history. See [the commit timeline](#the-commit-timeline). |
 | GET | `/$/commits/{ds}/{ref}` | One commit. `ref` is `42`, `commit:42` or `head`. `404` beyond the head, `410` if the commit is no longer retained. |
+
+### The commit timeline
+
+`GET /$/commits/{ds}/timeline` cuts the commits of a branch into runs of consecutive
+numbers, so that a client can draw a history of any length. It reads the commit catalog
+once and needs read permission. `branch=` names the branch, as for the other commit
+routes. `from` and `to` are commit numbers that limit the range, and by default it covers
+the first retained commit to the head. `buckets` is the most buckets, 200 by default and
+at most 2,000. Every bucket spans `bucketWidth` commit numbers, which is the width of the
+range divided by `buckets` and rounded up, so a position on a track maps to a commit by
+arithmetic. A bucket with no retained commit is left out.
+
+```json
+{ "dataset": "ds", "datasetId": "3f1c9a2e-…", "head": 4999, "firstSeq": 0, "lastSeq": 4999,
+  "commits": 5000, "bucketWidth": 25, "oldestReconstructable": 1200,
+  "readable": [ { "from": 1200, "to": 4999 } ],
+  "buckets": [ { "firstSeq": 0, "lastSeq": 24, "firstTime": "2026-09-01T08:00:00.000Z",
+                 "lastTime": "2026-09-01T09:12:41.310Z", "commits": 25,
+                 "inserted": 1200, "deleted": 40, "kinds": { "update": 24, "load": 1 },
+                 "merges": 0, "snapshots": 0 }, … ] }
+```
+
+`inserted` and `deleted` add up the quads the bucket's commits changed. A caller whose
+grants cover only some graphs gets no quad counts, because they cover every graph, as for
+[commits](#commits). `readable` lists the ranges of commits whose state a
+[point-in-time read](#point-in-time-reads-and-snapshots) can still see. A `400` names a
+parameter that is out of range.
 
 Entries of `GET /$/datasets[/{ds}]` gain `id`, `head` and `modified`, the head's timestamp.
 `sparkles log --loc DB [--limit N] [--before SEQ | --after SEQ | --at REF] [--format json]`
@@ -3386,7 +3414,12 @@ added quads are those `to` has and `from` lacks, and the removed quads are the r
 Both parameters take
 the selectors of `at`. `to` defaults to the head and `from` to the commit before `to`, so
 `?to=commit:42` shows what commit 42 changed. The two may come in either order.
-`graph=IRI` or `default` limits the diff to one graph.
+`graph=IRI` or `default` limits the diff to one graph. `term=` keeps the changes whose
+subject or object is that term, as an N-Triples term or a bare IRI. It may repeat, up to
+1,000 times. The UI uses it to diff only the resources a graph draws. The filter applies
+while the commits' changes are read, so the memory a diff needs follows the changes that
+match, but the time still follows every change in range. It does not combine with the RDF
+Patch formats, which must list every change and answer `400`.
 
 | Format | How to ask | Body |
 |---|---|---|

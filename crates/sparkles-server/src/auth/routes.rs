@@ -131,6 +131,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/queries/{ds}/{name}/versions", &["GET"]),
     ("/{ds}/queries/{name}", &["GET", "POST"]),
     ("/$/commits/{ds}", &["GET"]),
+    ("/$/commits/{ds}/timeline", &["GET"]),
     ("/$/commits/{ds}/{reference}", &["GET"]),
     // branches and merges: the handlers check each branch a request names
     ("/$/branches/{ds}", &["GET", "POST", "PATCH"]),
@@ -369,6 +370,7 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/reason/{ds}/diagnostics"
         | "/$/prefixes/{ds}"
         | "/$/commits/{ds}"
+        | "/$/commits/{ds}/timeline"
         | "/$/commits/{ds}/{reference}"
         | "/$/queries/{ds}"
         | "/$/queries/{ds}/{name}/versions"

@@ -50,6 +50,7 @@ pub(crate) mod sd;
 mod shex;
 mod stream;
 mod tabular;
+mod timeline;
 mod validation;
 
 pub use sparkles::reasoning::INFERRED_GRAPH;
@@ -160,6 +161,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/$/queries/{ds}/{name}/versions", get(queries::versions))
         .route("/{ds}/queries/{name}", get(queries::run).post(queries::run))
         .route("/$/commits/{ds}", get(list_commits))
+        .route("/$/commits/{ds}/timeline", get(timeline::timeline))
         .route("/$/commits/{ds}/{reference}", get(get_commit))
         .route(
             "/$/branches/{ds}",

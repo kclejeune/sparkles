@@ -1491,6 +1491,27 @@ fn history(p: &mut Paths) {
     p.add(
         op(
             GET,
+            "/$/commits/{ds}/timeline",
+            "commitTimeline",
+            "History",
+            "Commit timeline",
+        )
+        .doc("The commits of the branch in buckets of consecutive numbers, with the commits' times, kinds and quad counts, and the ranges whose state can still be read. For a time slider over a long history.")
+        .see("commits")
+        .param("branch")
+        .query(
+            "buckets",
+            json!({ "type": "integer", "minimum": 1, "maximum": 2000, "default": 200 }),
+            "The most buckets.",
+        )
+        .query("from", int(), "The first commit number; the first by default.")
+        .query("to", int(), "The last commit number; the head by default.")
+        .json("200", "The buckets.", "CommitTimeline")
+        .errors(&[400]),
+    );
+    p.add(
+        op(
+            GET,
             "/$/commits/{ds}/{reference}",
             "getCommit",
             "History",
@@ -1590,6 +1611,11 @@ fn history(p: &mut Paths) {
             )
             .query("to", s(), "A selector; by default the head.")
             .query("graph", s(), "A graph IRI or `default`.")
+            .query(
+                "term",
+                s(),
+                "Only the changes whose subject or object is this term, an N-Triples term or a bare IRI. Repeat for several, up to 1,000. Not for RDF Patch.",
+            )
             .query("quads", boolean(), "JSON: list the quads.")
             .query("limit", int(), "The most quads listed.")
             .param("format")

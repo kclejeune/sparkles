@@ -592,6 +592,40 @@ pub(super) fn schemas() -> Map<String, J> {
             },
         }),
     );
+    put(
+        "CommitTimeline",
+        json!({
+            "type": "object",
+            "required": ["dataset", "datasetId", "head", "firstSeq", "lastSeq", "commits", "bucketWidth", "readable", "buckets"],
+            "properties": {
+                "dataset": { "type": "string" },
+                "datasetId": { "type": "string" },
+                "head": { "type": "integer" },
+                "firstSeq": { "type": "integer" },
+                "lastSeq": { "type": "integer" },
+                "commits": { "type": "integer", "description": "The commits in range whose metadata is retained." },
+                "bucketWidth": { "type": "integer", "description": "The commit numbers each bucket spans." },
+                "oldestReconstructable": nullable("integer"),
+                "readable": { "type": "array", "items": { "type": "object", "properties": { "from": { "type": "integer" }, "to": { "type": "integer" } } } },
+                "buckets": array(json!({
+                    "type": "object",
+                    "required": ["firstSeq", "lastSeq", "firstTime", "lastTime", "commits", "kinds", "merges", "snapshots"],
+                    "properties": {
+                        "firstSeq": { "type": "integer" },
+                        "lastSeq": { "type": "integer" },
+                        "firstTime": { "type": "string" },
+                        "lastTime": { "type": "string" },
+                        "commits": { "type": "integer" },
+                        "inserted": { "type": "integer", "description": "Quads added by the bucket's commits; left out for a caller limited to some graphs." },
+                        "deleted": { "type": "integer", "description": "Quads removed by the bucket's commits; left out for a caller limited to some graphs." },
+                        "kinds": { "type": "object", "additionalProperties": { "type": "integer" } },
+                        "merges": { "type": "integer" },
+                        "snapshots": { "type": "integer" },
+                    },
+                })),
+            },
+        }),
+    );
     // ---------------------------------------------------------------- branches --
     let commit_ref = || {
         json!({

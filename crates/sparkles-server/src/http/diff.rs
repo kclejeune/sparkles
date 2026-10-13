@@ -19,6 +19,9 @@ use std::io::Write;
 /// The diff line format.
 pub(super) const DIFF_MEDIA_TYPE: &str = "text/x-sparkles-diff";
 
+/// The most terms one diff request may name.
+const MAX_TERMS: usize = 1_000;
+
 /// FNV-1a of a graph view's rule (part of a diff's entity tag).
 fn fnv(s: &str) -> u64 {
     s.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| {
@@ -196,6 +199,25 @@ pub(super) async fn diff(
             "limit does not apply to RDF Patch: a patch lists every change",
         ));
     }
+    // the changes that touch these resources as subject or object
+    let term_params = params.all("term");
+    if term_params.len() > MAX_TERMS {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            format!("term: at most {MAX_TERMS} terms"),
+        ));
+    }
+    if fmt.is_patch() && !term_params.is_empty() {
+        // a patch without some of its changes would apply to a wrong state
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "term does not apply to RDF Patch: a patch lists every change",
+        ));
+    }
+    let terms = term_params
+        .iter()
+        .map(|v| super::hist::term_param("term", v))
+        .collect::<ApiResult<Vec<_>>>()?;
     let with_quads = fmt != DiffFormat::Json || params.get("quads").is_some_and(truthy);
     let limit = match params.get("limit") {
         None => usize::MAX,
@@ -213,6 +235,12 @@ pub(super) async fn diff(
         cancel: opts.cancel.clone(),
         deadline: opts.timeout.map(|t| std::time::Instant::now() + t),
         graphs: view.clone(),
+        terms: None,
+    };
+    let o = if terms.is_empty() {
+        o
+    } else {
+        o.only_terms(&terms)
     };
     // a diff across branches: `fromBranch` and `toBranch`, each the request's branch
     // by default; without `from`, from the head of `fromBranch`
@@ -274,7 +302,7 @@ pub(super) async fn diff(
     // everything that shapes the body: the commits, the format, the quads listed and the
     // graph
     let tag = format!(
-        "W/\"{id}:{}..{}:{}{}{}\"",
+        "W/\"{id}:{}..{}:{}{}{}{}\"",
         d.from.commit.seq,
         d.to.commit.seq,
         match (fmt, with_quads) {
@@ -287,6 +315,13 @@ pub(super) async fn diff(
         match params.get("limit") {
             Some(_) if with_quads => format!(":limit={limit}"),
             _ => String::new(),
+        },
+        if term_params.is_empty() {
+            String::new()
+        } else {
+            let mut ts = term_params.clone();
+            ts.sort();
+            format!(":terms={:016x}", fnv(&ts.join("\n")))
         },
         match (&params.get("graph"), params.has("default")) {
             (Some(g), _) => format!(

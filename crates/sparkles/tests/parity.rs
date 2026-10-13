@@ -244,6 +244,11 @@ fn entries() -> Vec<(&'static str, Entry)> {
             ds.history()
                 .commits(sparkles::commit::CommitRange::Latest, 10);
         }),
+        // the timeline buckets the same commit listing
+        op!("commitTimeline", "history.commits", |ds| {
+            ds.history()
+                .commits(sparkles::commit::CommitRange::Latest, usize::MAX);
+        }),
         op!("getCommit", "history.commit", |ds| {
             ds.history().commit(&sparkles::handles::CommitRef::Head);
         }),

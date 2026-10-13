@@ -4118,6 +4118,118 @@
         ],
         "type": "object"
       },
+      "CommitTimeline": {
+        "properties": {
+          "bucketWidth": {
+            "description": "The commit numbers each bucket spans.",
+            "type": "integer"
+          },
+          "buckets": {
+            "items": {
+              "properties": {
+                "commits": {
+                  "type": "integer"
+                },
+                "deleted": {
+                  "description": "Quads removed by the bucket's commits; left out for a caller limited to some graphs.",
+                  "type": "integer"
+                },
+                "firstSeq": {
+                  "type": "integer"
+                },
+                "firstTime": {
+                  "type": "string"
+                },
+                "inserted": {
+                  "description": "Quads added by the bucket's commits; left out for a caller limited to some graphs.",
+                  "type": "integer"
+                },
+                "kinds": {
+                  "additionalProperties": {
+                    "type": "integer"
+                  },
+                  "type": "object"
+                },
+                "lastSeq": {
+                  "type": "integer"
+                },
+                "lastTime": {
+                  "type": "string"
+                },
+                "merges": {
+                  "type": "integer"
+                },
+                "snapshots": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "firstSeq",
+                "lastSeq",
+                "firstTime",
+                "lastTime",
+                "commits",
+                "kinds",
+                "merges",
+                "snapshots"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "commits": {
+            "description": "The commits in range whose metadata is retained.",
+            "type": "integer"
+          },
+          "dataset": {
+            "type": "string"
+          },
+          "datasetId": {
+            "type": "string"
+          },
+          "firstSeq": {
+            "type": "integer"
+          },
+          "head": {
+            "type": "integer"
+          },
+          "lastSeq": {
+            "type": "integer"
+          },
+          "oldestReconstructable": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "readable": {
+            "items": {
+              "properties": {
+                "from": {
+                  "type": "integer"
+                },
+                "to": {
+                  "type": "integer"
+                }
+              },
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "dataset",
+          "datasetId",
+          "head",
+          "firstSeq",
+          "lastSeq",
+          "commits",
+          "bucketWidth",
+          "readable",
+          "buckets"
+        ],
+        "type": "object"
+      },
       "CompactionPolicy": {
         "additionalProperties": false,
         "description": "The settings a dataset overrides. `0` turns off the size, idle and age triggers it is the limit of. An unknown setting is a `400`.",
@@ -20485,6 +20597,82 @@
         "x-sparkles-permission": "read"
       }
     },
+    "/$/commits/{ds}/timeline": {
+      "get": {
+        "description": "The commits of the branch in buckets of consecutive numbers, with the commits' times, kinds and quad counts, and the ranges whose state can still be read. For a time slider over a long history.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#commits"
+        },
+        "operationId": "commitTimeline",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/branch"
+          },
+          {
+            "description": "The most buckets.",
+            "in": "query",
+            "name": "buckets",
+            "schema": {
+              "default": 200,
+              "maximum": 2000,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The first commit number; the first by default.",
+            "in": "query",
+            "name": "from",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The last commit number; the head by default.",
+            "in": "query",
+            "name": "to",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommitTimeline"
+                }
+              }
+            },
+            "description": "The buckets."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Commit timeline",
+        "tags": [
+          "History"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
     "/$/commits/{ds}/{reference}": {
       "get": {
         "externalDocs": {
@@ -32973,6 +33161,14 @@
             "description": "A graph IRI or `default`.",
             "in": "query",
             "name": "graph",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only the changes whose subject or object is this term, an N-Triples term or a bare IRI. Repeat for several, up to 1,000. Not for RDF Patch.",
+            "in": "query",
+            "name": "term",
             "schema": {
               "type": "string"
             }
