@@ -8,7 +8,9 @@
 #
 # A variant is a name, a git revision of this repository or a path to a built `sparkles`
 # binary, and optionally the global flags (before `serve`) to run it with, so one binary
-# can be compared with itself under different flags:
+# can be compared with itself under different flags. The token delay-us=N among the flags
+# adds N microseconds to every synchronization and write-through write of the store's files
+# (through tests/support/iofault.c), to stand in for a device slower than the instance's:
 #
 #   scripts/nsc-writes.sh off=HEAD on=HEAD:--experimental-group-commit
 #   scripts/nsc-writes.sh base=main head=HEAD
@@ -90,7 +92,7 @@ while [ $# -gt 0 ]; do
   shift 2
 done
 [ ${#ARGS[@]} -ge 2 ] || usage 1
-for t in nsc zstd python3 cargo rustc; do command -v "$t" > /dev/null || die "$t is not on PATH"; done
+for t in nsc zstd python3 cargo rustc cc; do command -v "$t" > /dev/null || die "$t is not on PATH"; done
 OUT=$(realpath -m "${OUT:-$ROOT/target/nsc-writes/$(date -u +%Y%m%dT%H%M%SZ)}")
 mkdir -p "$OUT/stage" "$OUT/logs" "$CACHE"/{bin,data,src}
 STAGE=$OUT/stage
@@ -155,6 +157,7 @@ done
 
 # ---------------------------------------------------------------------- client, data
 rustc --edition 2024 -O -o "$STAGE/write-bench" "$ROOT/scripts/write-bench.rs" 2> "$OUT/logs/rustc.log" || die "write-bench did not build, see $OUT/logs/rustc.log"
+cc -shared -fPIC -O1 -o "$STAGE/libiofault.so" "$ROOT/crates/sparkles-core/tests/support/iofault.c" -ldl 2> "$OUT/logs/cc.log" || die "the I/O shim did not build, see $OUT/logs/cc.log"
 if ldd "$STAGE/write-bench" > /dev/null 2>&1; then echo "DYNAMIC_CLIENT=1" >> "$STAGE/run.env"; else echo "DYNAMIC_CLIENT=0" >> "$STAGE/run.env"; fi
 DATA=$CACHE/data/people-$PEOPLE.nt.zst
 if [ ! -f "$DATA" ]; then
@@ -211,7 +214,7 @@ note "instance: $ID ($MACHINE, capped at $DURATION)"
 note "phase create: $(secs "$T_CREATE" "$T_UP") s"
 
 rsh() { nsc ssh -T "$ID" -- "$@"; }
-for f in "$STAGE"/bin-*.zst "$STAGE/data.nt.zst" "$STAGE/write-bench" "$STAGE/nsc-writes-remote.sh" "$STAGE/run.env"; do
+for f in "$STAGE"/bin-*.zst "$STAGE/data.nt.zst" "$STAGE/write-bench" "$STAGE/libiofault.so" "$STAGE/nsc-writes-remote.sh" "$STAGE/run.env"; do
   nsc instance upload "$ID" "$f" "$REMOTE/$(basename "$f")" --mkdir > "$OUT/logs/upload.log" 2>&1 || die "upload of $f failed"
 done
 T_SENT=$(now)

@@ -98,13 +98,22 @@ for round in $(seq "$ROUNDS"); do
       b=V_${v}_BIN
       b=${!b}
       f=V_${v}_FLAGS
-      flags=${!f}
+      flags=
+      venv=()
+      # the token delay-us=N adds N microseconds to every sync and write-through write of
+      # the store's files (tests/support/iofault.c), standing in for a slower device
+      for tok in ${!f}; do
+        case $tok in
+          delay-us=*) venv=(LD_PRELOAD="$PWD/libiofault.so" SPARKLES_IO_ROOT="$PWD/work" SPARKLES_IO_DELAY_US="${tok#delay-us=}") ;;
+          *) flags+=" $tok" ;;
+        esac
+      done
       d=DYNAMIC_$b
       rm -rf srv work
       mkdir -p work
       cp -r "stores/$b" work/store
       # shellcheck disable=SC2046,SC2086 # the loader and the flags are command lines
-      taskset -c "$SERVER_CPUS" $(loader "${!d}" "$b/sparkles") --result-cache-mb 0 $flags serve --data srv \
+      taskset -c "$SERVER_CPUS" env ${venv[@]+"${venv[@]}"} $(loader "${!d}" "$b/sparkles") --result-cache-mb 0 $flags serve --data srv \
         --loc bench=work/store --port "$PORT" --timeout 600 --no-access-log > "$R/server-$run.log" 2>&1 &
       SPID=$!
       for _ in $(seq 300); do
