@@ -7,7 +7,7 @@ use rustc_hash::FxHashMap;
 use sparkles_core::id::{self, Id, Tag};
 use sparkles_core::sparql::value::Value;
 use sparkles_core::store::Snapshot;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Kind {
@@ -40,7 +40,42 @@ pub(crate) enum LocalTerm {
 #[derive(Default)]
 struct Locals {
     map: FxHashMap<Vec<u8>, u64>,
-    terms: Vec<LocalTerm>,
+    /// local ids handed out
+    len: u64,
+}
+
+/// The local terms by local id, append-only, read without a lock: segment `k` holds
+/// `SEGMENT << k` slots.
+struct LocalTable {
+    segments: Vec<OnceLock<Box<[OnceLock<LocalTerm>]>>>,
+}
+
+const SEGMENT: u64 = 1024;
+
+impl LocalTable {
+    fn new() -> LocalTable {
+        LocalTable {
+            segments: (0..40).map(|_| OnceLock::new()).collect(),
+        }
+    }
+
+    fn at(i: u64) -> (usize, usize) {
+        let k = 63 - (i / SEGMENT + 1).leading_zeros() as u64;
+        (k as usize, (i - SEGMENT * ((1 << k) - 1)) as usize)
+    }
+
+    fn get(&self, i: u64) -> Option<&LocalTerm> {
+        let (k, off) = Self::at(i);
+        self.segments.get(k)?.get()?.get(off)?.get()
+    }
+
+    /// Set slot `i` (each slot once, by the holder of the write lock).
+    fn set(&self, i: u64, t: LocalTerm) {
+        let (k, off) = Self::at(i);
+        let seg =
+            self.segments[k].get_or_init(|| (0..(SEGMENT << k)).map(|_| OnceLock::new()).collect());
+        let _ = seg[off].set(t);
+    }
 }
 
 /// Term context shared by all evaluation threads.
@@ -49,6 +84,7 @@ pub(crate) struct Terms {
     /// base vocabulary id range `[lo, hi)` holding literals
     lit_range: (u64, u64),
     locals: RwLock<Locals>,
+    table: LocalTable,
     regex_cache: Mutex<FxHashMap<String, Option<regex::Regex>>>,
     pub rdf_first: u64,
     pub rdf_rest: u64,
@@ -63,6 +99,7 @@ impl Terms {
             snap,
             lit_range,
             locals: RwLock::new(Locals::default()),
+            table: LocalTable::new(),
             regex_cache: Mutex::new(FxHashMap::default()),
             rdf_first: 0,
             rdf_rest: 0,
@@ -115,8 +152,10 @@ impl Terms {
         if let Some(&id) = l.map.get(&key) {
             return id;
         }
-        let id = Id::local(l.terms.len() as u64).0;
-        l.terms.push(term);
+        let n = l.len;
+        self.table.set(n, term);
+        l.len += 1;
+        let id = Id::local(n).0;
         l.map.insert(key, id);
         id
     }
@@ -124,9 +163,10 @@ impl Terms {
     /// A fresh blank node (`makeTemp`).
     pub fn fresh_bnode(&self) -> u64 {
         let mut l = self.locals.write().unwrap();
-        let id = Id::local(l.terms.len() as u64).0;
-        l.terms.push(LocalTerm::BNode);
-        id
+        let n = l.len;
+        self.table.set(n, LocalTerm::BNode);
+        l.len += 1;
+        Id::local(n).0
     }
 
     /// A blank node determined by `args` (`makeSkolem`).
@@ -140,14 +180,18 @@ impl Terms {
 
     pub fn local(&self, id: u64) -> Option<LocalTerm> {
         let i = Id(id);
-        (i.tag() == Tag::Local).then(|| {
-            self.locals
-                .read()
-                .unwrap()
-                .terms
-                .get(i.payload() as usize)
-                .cloned()
-        })?
+        (i.tag() == Tag::Local)
+            .then(|| self.table.get(i.payload()).cloned())
+            .flatten()
+    }
+
+    /// The kind of a local id's term, without cloning it.
+    fn local_kind(&self, id: u64) -> Kind {
+        match self.table.get(Id(id).payload()) {
+            Some(LocalTerm::BNode) => Kind::BNode,
+            Some(LocalTerm::Key(k)) => key_kind(k),
+            None => Kind::Other,
+        }
     }
 
     pub fn kind(&self, id: u64) -> Kind {
@@ -172,11 +216,7 @@ impl Terms {
                 }
             }
             Tag::Delta => self.snap.key(i).map_or(Kind::Other, |k| key_kind(&k)),
-            Tag::Local => match self.local(id) {
-                Some(LocalTerm::BNode) => Kind::BNode,
-                Some(LocalTerm::Key(k)) => key_kind(&k),
-                None => Kind::Other,
-            },
+            Tag::Local => self.local_kind(id),
             _ => Kind::Other,
         }
     }

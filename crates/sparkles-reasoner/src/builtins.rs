@@ -161,17 +161,15 @@ impl HeadAction {
 }
 
 pub(crate) fn head_action(ev: &mut Eval<'_>, action: HeadAction, vals: &[u64]) {
-    let t = ev.terms;
-    let list_of = |ev: &Eval<'_>, l: u64| ev.g.list(l, t.rdf_first, t.rdf_rest, t.rdf_nil, ev.end);
     match action {
         HeadAction::ListMapAsSubject => {
-            if let Some(ms) = list_of(ev, vals[0]) {
-                ev.out.extend(ms.into_iter().map(|m| [m, vals[1], vals[2]]));
+            if let Some(ms) = ev.list(vals[0]) {
+                ev.out.extend(ms.iter().map(|&m| [m, vals[1], vals[2]]));
             }
         }
         HeadAction::ListMapAsObject => {
-            if let Some(ms) = list_of(ev, vals[2]) {
-                ev.out.extend(ms.into_iter().map(|m| [vals[0], vals[1], m]));
+            if let Some(ms) = ev.list(vals[2]) {
+                ev.out.extend(ms.iter().map(|&m| [vals[0], vals[1], m]));
             }
         }
     }
@@ -321,30 +319,24 @@ pub(crate) fn eval(ev: &mut Eval<'_>, j: usize, k: usize, b: &mut [u64]) {
         NoValue => {
             let opt = |i: usize| bi.args.get(i).map(|s| ev.val(*s, b)).filter(|&v| v != 0);
             let (s, p, o) = (opt(0), opt(1), opt(2));
-            let c = ev.g.cands(s, p, o, 0, ev.end);
-            !(0..c.len()).filter(|&i| ev.g.alive(c.get(i))).any(|i| {
-                let tr = ev.g.triples[c.get(i) as usize];
-                s.is_none_or(|x| x == tr[0])
-                    && p.is_none_or(|x| x == tr[1])
-                    && o.is_none_or(|x| x == tr[2])
-            })
+            !ev.exists(s, p, o)
         }
         ListContains | ListNotContains => {
-            let found =
-                ev.g.list(a(0), t.rdf_first, t.rdf_rest, t.rdf_nil, ev.end)
-                    .is_some_and(|ms| ms.iter().any(|&m| same_value(t, m, a(1))));
+            let (l, x) = (a(0), a(1));
+            let found = ev
+                .list(l)
+                .is_some_and(|ms| ms.iter().any(|&m| same_value(t, m, x)));
             found == (bi.kind == ListContains)
         }
         ListForAll => {
-            let (s, p) = (a(1), a(2));
-            let Some(ms) = ev.g.list(a(0), t.rdf_first, t.rdf_rest, t.rdf_nil, ev.end) else {
+            let (l, s, p) = (a(0), a(1), a(2));
+            let Some(ms) = ev.list(l) else {
                 return;
             };
-            if !ms
-                .iter()
-                .all(|&m| ev.g.position(&[s, p, m]).is_some_and(|i| i < ev.end))
-            {
-                return;
+            for &m in ms.iter() {
+                if !ev.holds(&[s, p, m]) {
+                    return;
+                }
             }
             if ev.collecting() {
                 // the facts read are part of the instance's body
@@ -443,11 +435,12 @@ pub(crate) fn eval(ev: &mut Eval<'_>, j: usize, k: usize, b: &mut [u64]) {
             return;
         }
         ListMember => {
-            let Some(ms) = ev.g.list(a(0), t.rdf_first, t.rdf_rest, t.rdf_nil, ev.end) else {
+            let l = a(0);
+            let Some(ms) = ev.list(l) else {
                 return;
             };
             let mut seen = rustc_hash::FxHashSet::default();
-            for m in ms {
+            for &m in ms.iter() {
                 if seen.insert(m) {
                     ev.bind_and_continue(bi.args[1], m, k, b);
                 }
@@ -455,7 +448,8 @@ pub(crate) fn eval(ev: &mut Eval<'_>, j: usize, k: usize, b: &mut [u64]) {
             return;
         }
         ListLength => {
-            let Some(ms) = ev.g.list(a(0), t.rdf_first, t.rdf_rest, t.rdf_nil, ev.end) else {
+            let l = a(0);
+            let Some(ms) = ev.list(l) else {
                 return;
             };
             let n = sparkles_core::id::Id::from_i64(ms.len() as i64).unwrap().0;
@@ -485,7 +479,8 @@ pub(crate) fn eval(ev: &mut Eval<'_>, j: usize, k: usize, b: &mut [u64]) {
                 return;
             };
             let i: i64 = i.into();
-            let Some(ms) = ev.g.list(a(0), t.rdf_first, t.rdf_rest, t.rdf_nil, ev.end) else {
+            let l = a(0);
+            let Some(ms) = ev.list(l) else {
                 return;
             };
             if let Some(&m) = usize::try_from(i).ok().and_then(|i| ms.get(i)) {

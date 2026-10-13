@@ -19,6 +19,7 @@ mod builtins;
 pub mod diagnostics;
 mod engine;
 pub mod extras;
+mod facts;
 mod graph;
 mod incremental;
 pub mod inputs;
@@ -134,6 +135,14 @@ pub struct ReasonOptions {
     pub progress: Option<ProgressFn>,
     /// The graphs the rules read (the default graph and its imports by default).
     pub inputs: Inputs,
+    /// The largest estimated heap of the run's derived facts and candidates, in bytes,
+    /// before it fails. `None` sets no limit.
+    pub max_memory: Option<usize>,
+    /// Threads for rule evaluation: at most the size of [`pool`](Self::pool) when there
+    /// is one. `None` uses the pool, or the caller's threads.
+    pub threads: Option<usize>,
+    /// The thread pool runs evaluate on (the server's reasoning pool).
+    pub pool: Option<Arc<rayon::ThreadPool>>,
 }
 
 impl Default for ReasonOptions {
@@ -144,6 +153,9 @@ impl Default for ReasonOptions {
             cancel: None,
             progress: None,
             inputs: Inputs::default(),
+            max_memory: None,
+            threads: None,
+            pool: None,
         }
     }
 }
@@ -156,6 +168,9 @@ impl fmt::Debug for ReasonOptions {
             .field("cancel", &self.cancel)
             .field("progress", &self.progress.as_ref().map(|_| "…"))
             .field("inputs", &self.inputs)
+            .field("max_memory", &self.max_memory)
+            .field("threads", &self.threads)
+            .field("pool", &self.pool.as_ref().map(|p| p.current_num_threads()))
             .finish()
     }
 }
@@ -187,6 +202,12 @@ pub struct ReasonReport {
     pub inferred_removed: u64,
     /// the graphs the run read, with its imports
     pub inputs: Option<Resolved>,
+    /// the largest estimated heap of the run's derived facts and candidates
+    pub peak_bytes: u64,
+    /// index scans of the input graphs that rule evaluation issued
+    pub base_scans: u64,
+    /// threads the rules were evaluated on
+    pub threads: usize,
 }
 
 /// How a run materialized.
@@ -231,18 +252,21 @@ fn progress(opts: &ReasonOptions, f: f32, msg: &str) {
     }
 }
 
-/// In-memory reasoning result (before writing).
+/// In-memory reasoning result (before writing): the derived facts, with the input graphs
+/// as the graph's base tier.
 struct Derivation {
     graph: graph::Graph,
     terms: Terms,
-    base_len: u32,
     rules: usize,
     iterations: usize,
     warnings: Vec<String>,
+    peak_bytes: usize,
+    base_scans: u64,
+    threads: usize,
 }
 
-/// The union of the triples of graphs `graphs`.
-fn load_graphs(snap: &Snapshot, graphs: &[Id]) -> anyhow::Result<graph::Graph> {
+/// The union of the triples of graphs `graphs`, in memory.
+fn load_graphs(snap: &Snapshot, graphs: &[Id], extra: usize) -> anyhow::Result<graph::Graph> {
     let mut n = 0;
     for g in graphs {
         n += snap.count(Perm::Gspo, &[g.0]).unwrap_or(0) as usize;
@@ -259,9 +283,27 @@ fn load_graphs(snap: &Snapshot, graphs: &[Id]) -> anyhow::Result<graph::Graph> {
             Ok(true)
         })?;
     }
-    let mut g = graph::Graph::with_capacity(n + n / 2);
+    let mut g = graph::Graph::with_capacity(n + extra);
     g.add_batch(triples);
     Ok(g)
+}
+
+/// Run `f` on the threads the options ask for: a pool of [`ReasonOptions::threads`]
+/// threads (at most the size of [`ReasonOptions::pool`]), the pool itself, or the
+/// caller's.
+fn on_threads<T: Send>(opts: &ReasonOptions, f: impl FnOnce() -> T + Send) -> anyhow::Result<T> {
+    let limit = opts.pool.as_ref().map(|p| p.current_num_threads());
+    match (opts.threads, &opts.pool) {
+        (Some(n), _) if n > 0 && limit.is_none_or(|l| n < l) => {
+            let p = rayon::ThreadPoolBuilder::new()
+                .num_threads(n)
+                .thread_name(|i| format!("sparkles-reason-{i}"))
+                .build()?;
+            Ok(p.install(f))
+        }
+        (_, Some(pool)) => Ok(pool.install(f)),
+        _ => Ok(f()),
+    }
 }
 
 fn derive(
@@ -271,14 +313,23 @@ fn derive(
     graphs: &[Id],
     opts: &ReasonOptions,
 ) -> anyhow::Result<Derivation> {
+    on_threads(opts, || derive_here(snap, profile, extras, graphs, opts))?
+}
+
+fn derive_here(
+    snap: Arc<Snapshot>,
+    profile: &Profile,
+    extras: &Extras,
+    graphs: &[Id],
+    opts: &ReasonOptions,
+) -> anyhow::Result<Derivation> {
     let rules = profile_rules(profile, extras)?;
-    progress(opts, 0.0, "loading the input graphs");
-    let mut g = load_graphs(&snap, graphs)?;
-    // rows from here on are derived
-    let base_len = g.len();
+    progress(opts, 0.0, "reading the input graphs");
+    let base = Arc::new(facts::Base::new(snap.clone(), graphs)?);
+    let mut g = graph::Graph::with_base(base.clone());
     let terms = Terms::new(snap);
     if extras.geo_default_geometry {
-        let defaults = default_geometries(&g, &terms);
+        let defaults = default_geometries(&base, &terms)?;
         g.add_batch(defaults);
     }
     let mut warnings = Vec::new();
@@ -286,25 +337,28 @@ fn derive(
     let limits = engine::Limits {
         max_iterations: opts.max_iterations,
         max_inferred: opts.max_inferred,
+        max_memory: opts.max_memory,
         cancel: opts.cancel.clone(),
         progress: opts.progress.clone(),
     };
     progress(opts, 0.1, "reasoning");
     let out = engine::run(&mut g, &compiled, &terms, &limits, None)?;
     Ok(Derivation {
-        base_len,
         graph: g,
         terms,
         rules: compiled.len(),
         iterations: out.iterations,
         warnings,
+        peak_bytes: out.peak_bytes,
+        base_scans: base.scans(),
+        threads: rayon::current_num_threads(),
     })
 }
 
 /// `F geo:hasDefaultGeometry G` for every `F` of the input graphs with exactly one
 /// `geo:hasGeometry` (`G`) and no `geo:hasDefaultGeometry` (Jena's
 /// `applyDefaultGeometry`).
-fn default_geometries(g: &graph::Graph, terms: &Terms) -> Vec<[u64; 3]> {
+fn default_geometries(base: &facts::Base, terms: &Terms) -> anyhow::Result<Vec<[u64; 3]>> {
     const GEO: &str = "http://www.opengis.net/ont/geosparql#";
     let iri = |l: &str| {
         terms.id_for(&Term::NamedNode(NamedNode::new_unchecked(format!(
@@ -315,36 +369,56 @@ fn default_geometries(g: &graph::Graph, terms: &Terms) -> Vec<[u64; 3]> {
     // feature → its only geometry (`None` once it has a second)
     let mut one: FxHashMap<u64, Option<u64>> = FxHashMap::default();
     let mut with_default: FxHashSet<u64> = FxHashSet::default();
-    for t in &g.triples {
-        if t[1] == has {
-            one.entry(t[0])
-                .and_modify(|x| {
-                    if *x != Some(t[2]) {
-                        *x = None;
-                    }
-                })
-                .or_insert(Some(t[2]));
-        } else if t[1] == default {
-            with_default.insert(t[0]);
-        }
-    }
+    base.for_each(None, Some(has), None, |t| {
+        one.entry(t[0])
+            .and_modify(|x| {
+                if *x != Some(t[2]) {
+                    *x = None;
+                }
+            })
+            .or_insert(Some(t[2]));
+        true
+    })?;
+    base.for_each(None, Some(default), None, |t| {
+        with_default.insert(t[0]);
+        true
+    })?;
     let mut out: Vec<[u64; 3]> = one
         .into_iter()
         .filter(|(f, _)| !with_default.contains(f))
         .filter_map(|(f, geom)| Some([f, default, geom?]))
         .collect();
     out.sort_unstable();
-    out
+    Ok(out)
 }
 
 impl Derivation {
     fn derived(&self) -> &[[u64; 3]] {
-        &self.graph.triples[self.base_len as usize..]
+        self.graph.derived()
     }
 
     /// Is this (possibly generalized) triple valid RDF?
     fn valid(&self, t: &[u64; 3]) -> bool {
         self.terms.valid(t)
+    }
+
+    /// The facts of the base tier and the derived ones.
+    fn closure_len(&self) -> usize {
+        self.graph.len() as usize
+    }
+
+    /// The closure in memory, for incremental runs: the input graphs, read into memory,
+    /// then the derived facts.
+    fn into_closure(self) -> anyhow::Result<incremental::Closure> {
+        let Derivation { graph, terms, .. } = self;
+        let derived = graph.derived();
+        let Some(base) = graph.base() else {
+            anyhow::bail!("a derivation without a base tier");
+        };
+        let mut g = load_graphs(&base.snap, &base.graph_ids(), derived.len())?;
+        let n = g.len();
+        g.add_batch(derived.iter().copied());
+        Ok(incremental::Closure::new(g, terms, n))
     }
 }
 
@@ -475,13 +549,15 @@ pub fn materialize_incremental(
         .copied()
         .collect();
     let done = Done {
-        closure: (!extras.geo_default_geometry)
-            .then(|| incremental::Closure::new(d.graph, d.terms, d.base_len)),
+        rules: d.rules,
+        iterations: d.iterations,
+        peak_bytes: d.peak_bytes,
+        base_scans: d.base_scans,
+        threads: d.threads,
+        closure: (!extras.geo_default_geometry).then_some(ClosureState::Derived(d)),
         generalized,
         generalized_saved: None,
         written: w,
-        rules: d.rules,
-        iterations: d.iterations,
         warnings,
         method: Method::Full,
         fallback,
@@ -546,10 +622,43 @@ fn lock_with_changes<'s>(
     )
 }
 
+/// The closure a run ends with, for the next incremental run.
+enum ClosureState {
+    /// in memory, explicit facts included (an incremental run's)
+    Ready(incremental::Closure),
+    /// the derived facts over the input graphs (a full run's), read into memory only
+    /// when the closure is kept
+    Derived(Derivation),
+}
+
+impl ClosureState {
+    fn terms(&self) -> &Terms {
+        match self {
+            ClosureState::Ready(c) => &c.terms,
+            ClosureState::Derived(d) => &d.terms,
+        }
+    }
+
+    /// The closure in memory, when a cache would keep it.
+    fn for_cache(self, cache: &Cache) -> Option<incremental::Closure> {
+        match self {
+            ClosureState::Ready(c) => Some(c),
+            ClosureState::Derived(d) if d.closure_len() <= cache.limit() => d
+                .into_closure()
+                .map_err(|e| tracing::warn!("keeping the closure for incremental runs: {e:#}"))
+                .ok(),
+            ClosureState::Derived(_) => None,
+        }
+    }
+}
+
 /// A run's result before its commit.
 struct Done {
     /// the closure, for the next incremental run
-    closure: Option<incremental::Closure>,
+    closure: Option<ClosureState>,
+    peak_bytes: usize,
+    base_scans: u64,
+    threads: usize,
     generalized: FxHashSet<[u64; 3]>,
     /// the saved generalized facts the run started from, and its changes to them
     generalized_saved: Option<(maintain::SavedMeta, maintain::GeneralizedChanges)>,
@@ -600,13 +709,14 @@ fn finish(
     let mut warnings = resolved.warnings.clone();
     warnings.extend(done.warnings);
     let graphs = resolved.graph_set();
-    if let Some(closure) = done.closure {
+    let mut kept = false;
+    if let Some(state) = done.closure {
         let saved = maintain::save(
             store,
             &receipt,
             digest,
             &graphs,
-            &closure.terms,
+            state.terms(),
             &done.generalized,
             done.generalized_saved.as_ref().map(|(m, c)| (m, c)),
         )
@@ -614,19 +724,25 @@ fn finish(
             tracing::warn!("saving the closure state for incremental runs: {e:#}");
             None
         });
-        maintain::keep(
-            store,
-            inc.cache,
-            &receipt,
-            snap,
-            digest,
-            &graphs,
-            closure,
-            done.generalized,
-            &done.written.stored,
-            saved,
-        );
-    } else if let Some(c) = inc.cache {
+        if let Some(cache) = inc.cache
+            && let Some(closure) = state.for_cache(cache)
+        {
+            maintain::keep(
+                store,
+                inc.cache,
+                &receipt,
+                snap,
+                digest,
+                &graphs,
+                closure,
+                done.generalized,
+                &done.written.stored,
+                saved,
+            );
+            kept = true;
+        }
+    }
+    if !kept && let Some(c) = inc.cache {
         c.clear();
     }
     let report = ReasonReport {
@@ -643,6 +759,9 @@ fn finish(
         inferred_added: done.written.added,
         inferred_removed: done.written.removed,
         inputs: Some(resolved.clone()),
+        peak_bytes: done.peak_bytes as u64,
+        base_scans: done.base_scans,
+        threads: done.threads,
     };
     tracing::info!(
         profile = %report.profile,
@@ -806,18 +925,23 @@ fn update_closure(
     let limits = engine::Limits {
         max_iterations: opts.max_iterations,
         max_inferred: opts.max_inferred,
+        max_memory: opts.max_memory,
         cancel: opts.cancel.clone(),
         progress: opts.progress.clone(),
     };
     let ch = &prev.changes;
     progress(opts, 0.1, "updating the closure");
-    let up = incremental::update(
-        &mut closure,
-        &compiled,
-        &limits,
-        &ch.base_added,
-        &ch.base_removed,
-    )?;
+    let (up, threads) = on_threads(opts, || {
+        let up = incremental::update(
+            &mut closure,
+            &compiled,
+            &limits,
+            &ch.base_added,
+            &ch.base_removed,
+        );
+        (up, rayon::current_num_threads())
+    })?;
+    let up = up?;
     let mut generalized = prev.generalized;
     let mut gen_changes = maintain::GeneralizedChanges::default();
     for t in &up.deleted {
@@ -857,7 +981,10 @@ fn update_closure(
         ));
     }
     Ok(Done {
-        closure: Some(closure),
+        peak_bytes: closure.graph.approx_bytes(),
+        base_scans: 0,
+        threads,
+        closure: Some(ClosureState::Ready(closure)),
         generalized_saved: prev.saved.map(|m| (m, gen_changes)),
         generalized,
         written,
@@ -990,10 +1117,11 @@ pub fn dred_overdeletion(
     let limits = engine::Limits {
         max_iterations: usize::MAX,
         max_inferred: usize::MAX,
+        max_memory: None,
         cancel: None,
         progress: None,
     };
-    let mut c = incremental::Closure::new(d.graph, d.terms, d.base_len);
+    let mut c = d.into_closure()?;
     Ok(incremental::dred_overdeletion(
         &mut c, &rules, &limits, &removed,
     ))
@@ -1038,7 +1166,40 @@ pub fn infer(
         warnings: d.warnings,
         receipt: None,
         inputs: Some(resolved),
+        peak_bytes: d.peak_bytes as u64,
+        base_scans: d.base_scans,
+        threads: d.threads,
         ..Default::default()
     };
     Ok((out, report))
+}
+
+/// Run the rules over a snapshot's input graphs and return the number of derived facts
+/// (generalized ones included), the iterations, and a digest of the derived facts that
+/// does not depend on their order or ids. `derived` is called when the rules are done,
+/// before the digest is worked out. For benchmarks.
+#[doc(hidden)]
+pub fn bench_derive(
+    snap: Arc<Snapshot>,
+    profile: &Profile,
+    opts: &ReasonOptions,
+    derived: &dyn Fn(),
+) -> anyhow::Result<(usize, usize, u64)> {
+    opts.inputs.validate()?;
+    let resolved = inputs::resolve(&snap, &opts.inputs);
+    let ids = resolved.ids(&snap);
+    let d = derive(snap, profile, &Extras::default(), &ids, opts)?;
+    derived();
+    let facts = d.derived();
+    let mut digest = 0u64;
+    for t in facts {
+        let mut h = maintain::FNV_START;
+        for x in t {
+            let s = d.terms.term(*x).map_or(String::new(), |t| t.to_string());
+            h = maintain::fnv(s.as_bytes(), h);
+            h = maintain::fnv(b"\0", h);
+        }
+        digest = digest.wrapping_add(h.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    }
+    Ok((facts.len(), d.iterations, digest))
 }

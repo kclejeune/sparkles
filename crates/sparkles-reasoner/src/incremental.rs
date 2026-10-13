@@ -22,7 +22,7 @@
 //! finds no proof and has explored every instance it reached, none of the facts it
 //! reached has a proof, and they are all remembered as unprovable.
 
-use crate::engine::{self, CHead, CRule, Eval, Limits, Mode, Slot, Step};
+use crate::engine::{self, CHead, CRule, Eval, First, Limits, Mode, Slot, Step};
 use crate::graph::{Cands, Graph, Triple};
 use crate::terms::Terms;
 use rayon::prelude::*;
@@ -83,7 +83,7 @@ impl Closure {
     /// The live triples, explicit ones first, each group in row order.
     pub fn live(&self) -> impl Iterator<Item = (Triple, bool)> + '_ {
         let rows = (0..self.graph.len()).filter(|&r| self.graph.alive(r));
-        rows.map(|r| (self.graph.triples[r as usize], self.is_base(r)))
+        rows.map(|r| (self.graph.triple(r), self.is_base(r)))
     }
 
     /// Replace local ids by store ids (`moved`) in every live row.
@@ -155,7 +155,7 @@ impl Update {
         let g = &c.graph;
         (self.added_from..g.len())
             .filter(|&r| g.alive(r))
-            .map(|r| g.triples[r as usize])
+            .map(|r| g.triple(r))
     }
 }
 
@@ -428,7 +428,7 @@ fn consequences(
                 .iter()
                 .copied()
                 .filter(|&row| {
-                    let t = g.triples[row as usize];
+                    let t = g.triple(row);
                     fits(a.s, t[0]) && fits(a.p, t[1]) && fits(a.o, t[2])
                 })
                 .collect();
@@ -455,8 +455,8 @@ fn consequences(
                 Mode::Existing,
             );
             let mut b = vec![0u64; r.nvars];
-            ev.run(0, &mut b, Some(Cands::Slice(rows)));
-            ev.out
+            ev.run(0, &mut b, Some(First::Rows(Cands::Slice(rows))));
+            std::mem::take(&mut ev.out)
         })
         .collect();
     let mut seen: FxHashSet<Triple> = FxHashSet::default();
@@ -616,8 +616,8 @@ impl Search {
                 continue;
             };
             {
-                let mut sink = |rows: &[u32], implicit: &[Triple]| -> bool {
-                    self.instance(cx, n, root, depth, rows, implicit)
+                let mut sink = |body: &[Triple], implicit: &[Triple]| -> bool {
+                    self.instance(cx, n, root, depth, body, implicit)
                 };
                 let mut ev = Eval::new(
                     g,
@@ -653,16 +653,12 @@ impl Search {
         n: u32,
         root: u32,
         depth: u32,
-        rows: &[u32],
+        matched: &[Triple],
         implicit: &[Triple],
     ) -> bool {
-        let g = &cx.c.graph;
         let t = self.nodes[n as usize].t;
-        let body = rows
-            .iter()
-            .map(|&r| g.triples[r as usize])
-            .chain(implicit.iter().copied());
-        let mut facts: Vec<Triple> = Vec::with_capacity(rows.len() + implicit.len());
+        let body = matched.iter().chain(implicit).copied();
+        let mut facts: Vec<Triple> = Vec::with_capacity(matched.len() + implicit.len());
         for u in body {
             // an instance that uses its own head or an unprovable fact proves nothing
             if u == t || self.unprovable.contains(&u) {
@@ -937,6 +933,7 @@ mod tests {
         Limits {
             max_iterations: 10_000,
             max_inferred: 10_000_000,
+            max_memory: None,
             cancel: None,
             progress: None,
         }

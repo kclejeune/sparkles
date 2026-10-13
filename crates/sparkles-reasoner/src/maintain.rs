@@ -59,6 +59,11 @@ impl Cache {
         self.max_triples.store(n, Ordering::Relaxed);
     }
 
+    /// The largest closure kept, in facts.
+    pub(crate) fn limit(&self) -> usize {
+        self.max_triples.load(Ordering::Relaxed)
+    }
+
     /// Drop the kept closure.
     pub fn clear(&self) {
         *self.kept.lock() = None;
