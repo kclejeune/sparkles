@@ -10,7 +10,8 @@ die() {
   log "error: $*"
   exit 1
 }
-# nixbin <pkg> <bin>: the binary on PATH, or from nixpkgs. The build's out-link in
+# nixbin <pkg> <bin>: the binary on PATH, or from the nixpkgs that flake.lock pins (so the
+# engines' versions follow the repository, not the user's registry). The build's out-link in
 # WORK/gcroots is a garbage-collector root, so a `nix store gc` during a long run cannot
 # remove the binary.
 nixbin() {
@@ -18,7 +19,7 @@ nixbin() {
     command -v "$2"
   else
     mkdir -p "$WORK/gcroots"
-    nix build "nixpkgs#$1" --out-link "$WORK/gcroots/$1" > /dev/null
+    nix build --inputs-from "$ROOT" "nixpkgs#$1" --out-link "$WORK/gcroots/$1" > /dev/null
     echo "$WORK/gcroots/$1/bin/$2"
   fi
 }
@@ -65,7 +66,7 @@ gnu_time() {
   [ -x /usr/bin/time ] && echo /usr/bin/time && return
   # not nixbin: `command -v time` finds the shell keyword
   mkdir -p "$WORK/gcroots"
-  nix build nixpkgs#time --out-link "$WORK/gcroots/time" > /dev/null
+  nix build --inputs-from "$ROOT" nixpkgs#time --out-link "$WORK/gcroots/time" > /dev/null
   echo "$WORK/gcroots/time/bin/time"
 }
 
