@@ -420,8 +420,10 @@ fn to_schema(shapes: &[Shape]) -> sparkles_shex::Schema {
             .iter()
             .enumerate()
             .map(|(i, s)| ShapeDecl {
+                is_abstract: false,
                 label: Label::Iri(shape_iri(i)),
                 expr: ShapeExpr::Shape(Box::new(AstShape {
+                    extends: vec![],
                     closed: s.closed.then_some(true),
                     extra: s.extra.iter().map(|p| pred_iri(*p)).collect(),
                     expression: Some(if s.tcs.len() == 1 {

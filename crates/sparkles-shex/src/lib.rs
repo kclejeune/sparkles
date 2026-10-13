@@ -47,6 +47,7 @@ pub mod compile;
 pub mod engine;
 #[doc(hidden)]
 pub mod explain;
+mod ext;
 pub mod guard;
 #[doc(hidden)]
 pub mod ir;

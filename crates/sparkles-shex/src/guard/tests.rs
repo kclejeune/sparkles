@@ -532,6 +532,39 @@ fn closed_shapes_read_every_predicate() {
     );
 }
 
+/// A shape that extends another reads every outgoing arc of its nodes (its parts and
+/// its remainder), so no write is skipped for its predicate and a write to a parent's
+/// arcs is validated.
+#[test]
+fn extending_shapes_are_revalidated_on_every_write() {
+    let schema = "PREFIX ex: <http://ex.org/>
+        ex:P { ex:name . } ex:S EXTENDS @ex:P { ex:school . }";
+    let compiled = crate::compile(
+        &crate::parse_schema(schema, None, None).unwrap(),
+        &NoImports,
+    )
+    .unwrap();
+    let map = parse_map(
+        &MapSource::Compact("{FOCUS ex:school _}@ex:S".into()),
+        &compiled,
+    )
+    .unwrap();
+    assert_eq!(read_predicates(compiled.ir(), &map), None);
+    let dir = tempfile::tempdir().unwrap();
+    let s = open(&dir.path().join("db"));
+    s.load(&[Source::from_bytes(
+        b"@prefix ex: <http://ex.org/> . ex:a ex:name \"A\" ; ex:school 1 .".to_vec(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    let c = cfg("warn", schema, "{FOCUS ex:school _}@ex:S");
+    let (_, sum) = installed(set_config(&s, Some(c), &NoImports).unwrap());
+    assert_eq!((sum.blocking, sum.total), (0, 1));
+    let v = summary(&upd(&s, "DELETE DATA { ex:a ex:name \"A\" }").unwrap());
+    assert_eq!((v.blocking, v.total), (1, 1));
+}
+
 // ---------------------------------------------------- the predicate skip ---------
 
 const EX: &str = "http://ex.org/";

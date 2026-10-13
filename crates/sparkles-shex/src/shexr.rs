@@ -286,9 +286,11 @@ impl Reader<'_> {
         };
         let mut shapes = Vec::with_capacity(decls.len());
         for d in &decls {
+            let (expr, is_abstract) = self.declaration(d)?;
             shapes.push(ShapeDecl {
                 label: label(d)?,
-                expr: self.declaration(d)?,
+                expr,
+                is_abstract,
             });
         }
         Ok(Schema {
@@ -301,15 +303,20 @@ impl Reader<'_> {
         })
     }
 
-    /// The shape expression a declared node defines.
-    fn declaration(&mut self, d: &Term) -> R<ShapeExpr> {
+    /// The shape expression a declared node defines, and whether the declaration is
+    /// abstract.
+    fn declaration(&mut self, d: &Term) -> R<(ShapeExpr, bool)> {
         match self.sx_type(d)?.as_deref() {
             Some("ShapeDecl") => {
                 self.no_2_2(d)?;
+                let is_abstract = match self.one(d, "abstract")? {
+                    Some(t) => boolean(&t, "abstract")?,
+                    None => false,
+                };
                 let e = self.required(d, "shapeExpr")?;
-                self.shape_expr(&e)
+                Ok((self.shape_expr(&e)?, is_abstract))
             }
-            Some(t) => self.shape_expr_at(d, t),
+            Some(t) => Ok((self.shape_expr_at(d, t)?, false)),
             None => Err(format!(
                 "{} is declared in sx:shapes but has no shape expression type",
                 name(d)
@@ -388,17 +395,14 @@ impl Reader<'_> {
         })
     }
 
-    /// ShEx 2.2 members are errors that name the feature.
+    /// The members of ShEx 2.2 drafts that no published form kept are errors that name
+    /// the feature.
     fn no_2_2(&self, n: &Term) -> R<()> {
-        for p in ["abstract", "extends", "restricts"] {
-            for v in self.objects(n, p) {
-                if !(p == "abstract" && boolean(&v, p).is_ok_and(|b| !b)) {
-                    return Err(format!(
-                        "{}: sx:{p} is ShEx 2.2, which is not supported",
-                        name(n)
-                    ));
-                }
-            }
+        if !self.objects(n, "restricts").is_empty() {
+            return Err(format!(
+                "{}: sx:restricts is ShEx 2.2, which is not supported",
+                name(n)
+            ));
         }
         Ok(())
     }
@@ -594,7 +598,13 @@ impl Reader<'_> {
             Some(e) => Some(self.triple_expr(&e)?),
             None => None,
         };
+        let extends = self
+            .list_of(n, "extends")?
+            .iter()
+            .map(label)
+            .collect::<R<Vec<_>>>()?;
         Ok(Shape {
+            extends,
             closed: self
                 .one(n, "closed")?
                 .map(|t| boolean(&t, "closed"))
@@ -918,8 +928,17 @@ impl Writer {
             match &d.expr {
                 ShapeExpr::Ref(l) => {
                     self.typed(n, "ShapeDecl");
+                    if d.is_abstract {
+                        self.add(n, "abstract", Literal::from(true));
+                    }
                     let r = self.node(l);
                     self.add(n, "shapeExpr", r);
+                }
+                e if d.is_abstract => {
+                    self.typed(n, "ShapeDecl");
+                    self.add(n, "abstract", Literal::from(true));
+                    let x = self.shape_expr(e);
+                    self.add(n, "shapeExpr", x);
                 }
                 e => self.shape_expr_at(n, e),
             }
@@ -961,6 +980,8 @@ impl Writer {
             ShapeExpr::Nc(nc) => self.node_constraint(n, nc),
             ShapeExpr::Shape(s) => {
                 self.typed(n, "Shape");
+                let extends = s.extends.iter().map(|l| self.node(l).into()).collect();
+                self.put_list(n, "extends", extends);
                 if let Some(c) = s.closed {
                     self.add(n, "closed", Literal::from(c));
                 }

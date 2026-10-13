@@ -1032,7 +1032,8 @@ impl ShexGuard {
 /// the map's `{FOCUS p …}` selectors; `None` when it may read any (a CLOSED shape reads
 /// every outgoing arc of its nodes, a SPARQL selector anything).
 fn read_predicates(ir: &Ir, map: &ShapeMap) -> Option<Vec<String>> {
-    if ir.shapes.iter().any(|s| s.closed) {
+    // a shape that extends others reads every outgoing arc of its nodes
+    if ir.shapes.iter().any(|s| s.closed || s.ext.is_some()) {
         return None;
     }
     let mut ps: Vec<String> = ir

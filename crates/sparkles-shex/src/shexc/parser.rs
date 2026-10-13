@@ -1,6 +1,7 @@
-//! The ShExC 2.1 parser: recursive descent over the lexer's tokens, with errors that
-//! give the 1-based line and column and the tokens that were expected. ShEx 2.2 syntax
-//! (`EXTENDS`, `ABSTRACT`, `RESTRICTS`) is an error that names the feature.
+//! The ShExC 2.2 parser: recursive descent over the lexer's tokens, with errors that
+//! give the 1-based line and column and the tokens that were expected. `EXTENDS` and
+//! `ABSTRACT` are read; `RESTRICTS`, which an early draft had, is an error that names the
+//! feature.
 //!
 //! Prefixed names and relative IRIs are resolved here (against `BASE`, then the base the
 //! text was given with; without either a relative IRI stays relative), escapes in
@@ -53,12 +54,9 @@ pub fn line_col(src: &str, offset: usize) -> (usize, usize) {
     (line, 1 + before[line_start..].chars().count())
 }
 
-/// The ShEx 2.2 keywords, with the feature each one belongs to.
-const SHEX_2_2: &[(&str, &str)] = &[
-    ("EXTENDS", "extending shapes"),
-    ("ABSTRACT", "abstract shapes"),
-    ("RESTRICTS", "restricting shapes"),
-];
+/// The ShEx 2.2 drafts' keywords that no published form of ShEx 2.2 kept, with the
+/// feature each one belongs to.
+const SHEX_2_2: &[(&str, &str)] = &[("RESTRICTS", "restricting shapes")];
 
 struct Parser<'a> {
     src: &'a str,
@@ -211,14 +209,19 @@ impl<'a> Parser<'a> {
                 acts_open = false;
             } else if t.kind == TokenKind::Code && acts_open {
                 schema.start_acts.push(self.sem_act()?);
-            } else if self.starts_label() {
+            } else if self.starts_label() || self.at_kw("ABSTRACT") {
+                let is_abstract = self.eat_kw("ABSTRACT");
                 let label = self.label()?;
                 let expr = if self.eat_kw("EXTERNAL") {
                     ShapeExpr::External
                 } else {
                     self.shape_expression(false)?
                 };
-                schema.shapes.push(ShapeDecl { label, expr });
+                schema.shapes.push(ShapeDecl {
+                    label,
+                    expr,
+                    is_abstract,
+                });
                 acts_open = false;
             } else {
                 let mut what = vec!["BASE", "PREFIX", "IMPORT", "start", "a shape label"];
@@ -455,7 +458,7 @@ impl<'a> Parser<'a> {
         matches!(
             self.kind(),
             TokenKind::LBrace | TokenKind::At | TokenKind::AtPnameLn | TokenKind::AtPnameNs
-        ) || self.at_any_kw(&["CLOSED", "EXTRA"])
+        ) || self.at_any_kw(&["CLOSED", "EXTRA", "EXTENDS"])
     }
 
     fn shape_or_ref(&mut self, inline: bool) -> Result<ShapeExpr> {
@@ -489,6 +492,17 @@ impl<'a> Parser<'a> {
         loop {
             if self.eat_kw("CLOSED") {
                 shape.closed = Some(true);
+            } else if self.eat_kw("EXTENDS") {
+                if !matches!(
+                    self.kind(),
+                    TokenKind::At | TokenKind::AtPnameLn | TokenKind::AtPnameNs
+                ) {
+                    return Err(self.expected(&["a shape reference ('@') after EXTENDS"]));
+                }
+                match self.shape_ref()? {
+                    ShapeExpr::Ref(label) => shape.extends.push(label),
+                    _ => unreachable!("a shape reference"),
+                }
             } else if self.eat_kw("EXTRA") {
                 shape.extra.push(self.predicate()?);
                 while self.starts_iri() || self.at_a() {
@@ -498,7 +512,7 @@ impl<'a> Parser<'a> {
                 self.bump();
                 break;
             } else {
-                return Err(self.expected(&["CLOSED", "EXTRA", "'{'"]));
+                return Err(self.expected(&["CLOSED", "EXTRA", "EXTENDS", "'{'"]));
             }
         }
         if self.kind() != TokenKind::RBrace {

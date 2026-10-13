@@ -49,7 +49,8 @@ pub fn write(schema: &Schema) -> String {
             ShapeExpr::External => "EXTERNAL".to_string(),
             e => w.expr(e, 0),
         };
-        writeln!(out, "{} {body}", w.label(&d.label)).unwrap();
+        let abstract_ = if d.is_abstract { "ABSTRACT " } else { "" };
+        writeln!(out, "{abstract_}{} {body}", w.label(&d.label)).unwrap();
     }
     out
 }
@@ -403,6 +404,11 @@ impl W<'_> {
     /// expression), otherwise the caller made sure it has none.
     fn shape(&self, s: &Shape, depth: usize, tail: bool) -> String {
         let mut out = String::new();
+        for l in &s.extends {
+            out.push_str("EXTENDS @");
+            out.push_str(&self.label(l));
+            out.push(' ');
+        }
         if s.is_closed() {
             out.push_str("CLOSED ");
         }

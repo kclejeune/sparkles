@@ -78,6 +78,7 @@ fn escapes() {
     // a backslash before a slash survives the round trip through the parser
     let s = Schema {
         shapes: vec![ShapeDecl {
+            is_abstract: false,
             label: Label::Iri("http://ex.org/S".into()),
             expr: ShapeExpr::Nc(Box::new(NodeConstraint {
                 pattern: Some("a\\/b/c".into()),
@@ -96,6 +97,7 @@ fn split_node_constraints() {
     let nc = |n: NodeConstraint| {
         let s = Schema {
             shapes: vec![ShapeDecl {
+                is_abstract: false,
                 label: Label::Iri("http://ex.org/S".into()),
                 expr: ShapeExpr::Nc(Box::new(n)),
             }],

@@ -332,7 +332,7 @@ description = "W3C SHACL Core + SHACL-SPARQL conformance, the SHACL 1.2 list and
 run = "cargo test -p sparkles-shacl --test w3c_shacl -- --nocapture"
 
 [tasks."test:shex"]
-description = "shexTest conformance (syntax, negative syntax and structure, representation, validation)"
+description = "shexTest conformance (syntax, negative syntax and structure, representation, validation) with the ShEx 2.2 tests under crates/sparkles-shex/tests/shex22"
 run = "cargo test -p sparkles-shex --test shextest -- --nocapture"
 
 [tasks."test:bench-scripts"]
