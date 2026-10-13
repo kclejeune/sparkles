@@ -843,6 +843,18 @@ export function handleDiff(req, res, url, seg, ctx) {
       if (had && had.op !== ch.op) net.delete(k);
       else net.set(k, ch);
     }
+  // across branches (`fromBranch`, `toBranch`): the heads of the two are compared
+  if (url.searchParams.has('fromBranch') || url.searchParams.has('toBranch')) {
+    const pick = (name) => (!name || name === MAIN ? ds : ds.branchSet.get(name));
+    const a = pick(url.searchParams.get('fromBranch'));
+    const b = pick(url.searchParams.get('toBranch'));
+    if (!a || !b) return (ctx.fail(res, 404, 'no such branch'), true);
+    net.clear();
+    const qa = quadMap(a.store);
+    const qb = quadMap(b.store);
+    for (const [k, q] of qa) if (!qb.has(k)) net.set(k, { op: '-', quad: q });
+    for (const [k, q] of qb) if (!qa.has(k)) net.set(k, { op: '+', quad: q });
+  }
   // `term=`: only the changes whose subject or object is one of the terms
   const terms = url.searchParams
     .getAll('term')

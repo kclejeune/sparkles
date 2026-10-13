@@ -2,7 +2,7 @@
 // §4.2). Two results are compared as bags of rows, as C18 §6.7.5 compares them: a row is
 // its terms in column order, and a row that occurs twice on one side and once on the other
 // is one added or removed row.
-import type { Term } from './api';
+import type { SparqlDiff, Term } from './api';
 import { termKey } from './rdf';
 
 export type Row = (Term | null)[];
@@ -156,3 +156,35 @@ export const MARK_WORD: Record<Mark, string> = {
   removed: 'removed',
   kept: 'unchanged',
 };
+
+/**
+ * The rows a server comparison lists, as a table: the rows only the earlier state has, then
+ * the rows only the later one has, each marked. A list the server cut is shorter than its
+ * count.
+ */
+export function serverRows(d: Pick<SparqlDiff, 'vars' | 'addedRows' | 'removedRows'>): {
+  vars: string[];
+  rows: Row[];
+  marks: Mark[];
+} {
+  const row = (r: Partial<Record<string, Term>>): Row => d.vars.map((v) => r[v] ?? null);
+  return {
+    vars: d.vars,
+    rows: [...d.removedRows.map(row), ...d.addedRows.map(row)],
+    marks: [...d.removedRows.map((): Mark => 'removed'), ...d.addedRows.map((): Mark => 'added')],
+  };
+}
+
+/** "1,204 rows added, 87 removed, 18,000 unchanged", and what the lists hold. */
+export function serverSummary(
+  d: Pick<SparqlDiff, 'added' | 'removed' | 'same' | 'addedRows' | 'removedRows' | 'truncated'>,
+): string {
+  const fmt = (n: number) => n.toLocaleString('en-US');
+  const head = `${fmt(d.added)} ${d.added === 1 ? 'row' : 'rows'} added, ${fmt(d.removed)} removed, ${fmt(d.same)} unchanged`;
+  if (!d.truncated.added && !d.truncated.removed) return head;
+  const cut = [
+    d.truncated.added ? `${fmt(d.addedRows.length)} of the added` : '',
+    d.truncated.removed ? `${fmt(d.removedRows.length)} of the removed` : '',
+  ].filter(Boolean);
+  return `${head}. Listing ${cut.join(' and ')}`;
+}

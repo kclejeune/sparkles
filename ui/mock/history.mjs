@@ -374,3 +374,91 @@ export function handleHistoryChanges(req, res, url, seg, ctx) {
   });
   return true;
 }
+
+// ---------------------------------------------------------------------------
+// POST /{ds}/sparql/diff: the rows a SELECT query returns at one state and not the other
+
+/**
+ * Runs the query (the request body) at `from` and `to`, and lists the rows only one of
+ * them has, comparing the two results as bags like the server does.
+ */
+export async function handleSparqlDiff(req, res, url, seg, ctx) {
+  if (seg[0] === '$' || seg[1] !== 'sparql' || seg[2] !== 'diff' || seg.length !== 3) return false;
+  if (req.method !== 'POST') return false;
+  const ds = ctx.datasets.get(seg[0]);
+  if (!ds) return false;
+  const query = (await ctx.readBody(req)).toString();
+  const p = url.searchParams;
+  const bad = (msg) => (ctx.fail(res, 400, msg), true);
+  if (!query.trim()) return bad('missing query: send it as application/sparql-query');
+  if (!p.get('from')) return bad('from: required, a commit, time or snapshot as for at');
+  const limit = p.has('limit') ? Number(p.get('limit')) : 100;
+  if (!Number.isInteger(limit) || limit < 1 || limit > 10000)
+    return bad('limit must be from 1 to 10000');
+  const a = resolveAt(ds, p.get('from'));
+  if (a.error) return (ctx.send(res, ...a.error), true);
+  const b = resolveAt(ds, p.get('to') ?? 'head');
+  if (b.error) return (ctx.send(res, ...b.error), true);
+  const read = (at) => {
+    const out = at.store ?? ds.store;
+    const rows = out.query(query);
+    if (!Array.isArray(rows)) throw new Error('sparql/diff compares the rows of a SELECT query');
+    return rows;
+  };
+  let left;
+  let right;
+  try {
+    left = read(a);
+    right = read(b);
+  } catch (e) {
+    return bad(String(e?.message ?? e));
+  }
+  const vars = [];
+  for (const r of [...left, ...right])
+    for (const k of r.keys()) if (!vars.includes(k)) vars.push(k);
+  const key = (r) => vars.map((v) => (r.has(v) ? String(r.get(v)) : '\u0002')).join('\u0001');
+  const json = (r) => Object.fromEntries([...r].map(([k, t]) => [k, ctx.termJson(t)]));
+  const pending = new Map();
+  for (const r of left) pending.set(key(r), (pending.get(key(r)) ?? 0) + 1);
+  let same = 0;
+  const addedRows = [];
+  let added = 0;
+  for (const r of right) {
+    const k = key(r);
+    const n = pending.get(k) ?? 0;
+    if (n > 0) {
+      pending.set(k, n - 1);
+      same++;
+    } else {
+      added++;
+      if (addedRows.length < limit) addedRows.push(json(r));
+    }
+  }
+  const removedRows = [];
+  let removed = 0;
+  for (const r of left) {
+    const k = key(r);
+    const n = pending.get(k) ?? 0;
+    if (n > 0) {
+      pending.set(k, n - 1);
+      removed++;
+      if (removedRows.length < limit) removedRows.push(json(r));
+    }
+  }
+  ctx.send(res, 200, {
+    dataset: ds.name,
+    datasetId: ds.id,
+    from: { selector: p.get('from'), commit: a.commit },
+    to: { selector: p.get('to') ?? 'head', commit: b.commit },
+    vars,
+    fromRows: left.length,
+    toRows: right.length,
+    same,
+    added,
+    removed,
+    addedRows,
+    removedRows,
+    truncated: { added: added > addedRows.length, removed: removed > removedRows.length },
+  });
+  return true;
+}

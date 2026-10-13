@@ -15,6 +15,7 @@ import {
   decorate,
   handleHistoryChanges,
   handleSnapshots,
+  handleSparqlDiff,
   pastView,
   readableFields,
   recordState,
@@ -2096,6 +2097,8 @@ const server = http.createServer(async (req, res) => {
       return;
     if (handleDiff(req, res, url, seg, { datasets, send, fail })) return;
     if (handleHistoryChanges(req, res, url, seg, { datasets, send, fail })) return;
+    if (await handleSparqlDiff(req, res, url, seg, { datasets, send, fail, readBody, termJson }))
+      return;
     if (await handleSnapshots(req, res, url, seg, { datasets, send, fail, readBody })) return;
     if (req.method === 'OPTIONS') {
       res.writeHead(204, {

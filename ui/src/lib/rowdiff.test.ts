@@ -8,6 +8,8 @@ import {
   isTooLarge,
   rowAnnouncement,
   rowKey,
+  serverRows,
+  serverSummary,
 } from './rowdiff';
 
 const u = (v: string): Term => ({ type: 'uri', value: v });
@@ -117,5 +119,34 @@ describe('rowAnnouncement', () => {
     expect(rowAnnouncement('Commit 3', { added: 0, removed: 2 })).toBe('Commit 3: 2 rows removed');
     expect(rowAnnouncement('Commit 3', { added: 0, removed: 0 })).toBe('Commit 3: no rows changed');
     expect(rowAnnouncement('Commit 3', null)).toBe('Commit 3');
+  });
+});
+
+describe('a comparison made on the server', () => {
+  const d = {
+    vars: ['s', 'o'],
+    addedRows: [{ s: u('a'), o: lit('1') }, { s: u('b') }],
+    removedRows: [{ s: u('c'), o: lit('2') }],
+  };
+
+  it('lists the removed rows first, then the added ones, with unbound cells left empty', () => {
+    const t = serverRows(d);
+    expect(t.vars).toEqual(['s', 'o']);
+    expect(t.marks).toEqual(['removed', 'added', 'added']);
+    expect(t.rows[0]).toEqual([u('c'), lit('2')]);
+    expect(t.rows[2]).toEqual([u('b'), null]);
+  });
+
+  it('summarizes the counts and says when a list is cut', () => {
+    const base = { added: 1204, removed: 87, same: 18000, ...d };
+    expect(serverSummary({ ...base, truncated: { added: false, removed: false } })).toBe(
+      '1,204 rows added, 87 removed, 18,000 unchanged',
+    );
+    expect(serverSummary({ ...base, truncated: { added: true, removed: false } })).toBe(
+      '1,204 rows added, 87 removed, 18,000 unchanged. Listing 2 of the added',
+    );
+    expect(
+      serverSummary({ ...base, added: 1, truncated: { added: false, removed: false } }),
+    ).toMatch(/^1 row added/);
   });
 });

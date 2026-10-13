@@ -14,6 +14,8 @@
     compareRows,
     filterDiff,
     isTooLarge,
+    serverRows,
+    serverSummary,
     ROW_DIFF_LIMIT,
     rowAnnouncement,
     type ChangeFilter,
@@ -191,7 +193,7 @@
   // --- the time slider (docs/specs/U01-time-slider.md) ---------------------------------
 
   const urlParams = page.url.searchParams;
-  const fromUrl = urlParams.has('at') || urlParams.has('from');
+  const fromUrl = urlParams.has('at') || urlParams.has('from') || urlParams.has('against');
   if (fromUrl) {
     const urlDs = urlParams.get('ds');
     if (urlDs && urlDs !== app.current) app.setDataset(urlDs);
@@ -202,8 +204,10 @@
   /** The slider bar under the toolbar, opened by History (`H`). */
   let timeOpen = $state(fromUrl);
   /** Compare mode: the left handle's commit (`from`), with the right handle's marked against it. */
-  let compare = $state(urlParams.has('from'));
+  let compare = $state(urlParams.has('from') || urlParams.has('against'));
   let timeFrom = $state(urlParams.get('from') ?? '');
+  /** Compare with the head of another branch instead of an earlier commit (`against`). */
+  let timeAgainst = $state(urlParams.get('against') ?? '');
   let slider: TimeSlider | undefined = $state();
   let changeFilter = $state<ChangeFilter>('all');
   /** Focus is in the results, so Play waits. */
@@ -1205,9 +1209,11 @@
       return;
     }
     // compare mode reads the query at the left handle too, and marks what differs
-    const compareOn = timeOpen && compare && !!timeFrom && k !== 'UPDATE' && k !== 'ASK';
+    const against = timeOpen && compare ? timeAgainst : '';
+    const compareOn =
+      timeOpen && compare && (!!timeFrom || !!against) && k !== 'UPDATE' && k !== 'ASK';
     let fromAt: string | undefined;
-    if (compareOn) {
+    if (compareOn && !against) {
       try {
         fromAt = normalizeAt(timeFrom) ?? undefined;
       } catch (e) {
@@ -1268,13 +1274,18 @@
         );
       } else {
         const opts = { send: limit, reasoning, at, signal: controller.signal };
-        const read = (o: api.QueryOptions) =>
+        const read = (o: api.QueryOptions, target = dsTarget) =>
           stored
-            ? api.runStoredQuery(dsTarget, stored.name, stored.values, o)
-            : api.query(dsTarget, text, o);
+            ? api.runStoredQuery(target, stored.name, stored.values, o)
+            : api.query(target, text, o);
+        // the left side is an earlier commit, or the head of another branch
         const [result, base] = await Promise.all([
           read(opts),
-          compareOn ? read({ ...opts, at: fromAt }) : Promise.resolve(undefined),
+          compareOn
+            ? against
+              ? read({ ...opts, at: undefined }, onBranch(dsName, against))
+              : read({ ...opts, at: fromAt })
+            : Promise.resolve(undefined),
         ]);
         const elapsed = performance.now() - started;
         if (!owns()) return;
@@ -1325,7 +1336,9 @@
         // nothing was on screen: read the state the handle went back to
         if (!stored) {
           delete outcomes[tabId];
-          queueMicrotask(() => onTimeChange({ at: app.queryAt, from: timeFrom, compare }));
+          queueMicrotask(() =>
+            onTimeChange({ at: app.queryAt, from: timeFrom, compare, against: timeAgainst }),
+          );
           return;
         }
       }
@@ -1495,6 +1508,8 @@
     if (r.triples && b.triples) return compareRows(b.triples, r.triples);
     return null;
   });
+  /** The Map view draws both states in compare mode, the changed rows marked. */
+  const mapDiff = $derived(diffView && !isTooLarge(diffView) ? diffView : null);
   const shownDiff = $derived(
     diffView && !isTooLarge(diffView) ? filterDiff(diffView, changeFilter) : null,
   );
@@ -1521,6 +1536,50 @@
       : `${label}: ${n} ${o.result.triples ? 'triple' : 'row'}${n === 1 ? '' : 's'}`;
   });
 
+  // --- comparing on the server ---------------------------------------------------------
+
+  type ServerDiffState = {
+    /** The run it compares, so that a newer run drops it. */
+    key: number;
+    status: 'running' | 'done' | 'error';
+    data?: api.SparqlDiff;
+    error?: string;
+  };
+  let serverDiff = $state<ServerDiffState | null>(null);
+  const serverNow = $derived(
+    serverDiff && outcome && serverDiff.key === outcome.startedAt ? serverDiff : null,
+  );
+  const serverTable = $derived(
+    serverNow?.status === 'done' && serverNow.data ? serverRows(serverNow.data) : null,
+  );
+  /** The results cannot be compared in the browser: too many rows, or the read cut them. */
+  const needsServer = $derived.by(() => {
+    const o = outcome;
+    if (!comparing || !o?.result || !o.base || !o.query || timeAgainst) return false;
+    if (diffView && isTooLarge(diffView)) return true;
+    const cut = (r: api.SparklesResult) => r.meta.sentRows < r.meta.totalRows;
+    return cut(o.result) || cut(o.base);
+  });
+
+  async function compareOnServer() {
+    const o = outcome;
+    if (!o?.query || !timeFrom) return;
+    const key = o.startedAt;
+    serverDiff = { key, status: 'running' };
+    try {
+      const data = await api.sparqlDiff(onBranch(o.ds, o.branch), {
+        query: o.query,
+        from: normalizeAt(timeFrom) ?? timeFrom,
+        to: normalizeAt(app.queryAt) ?? undefined,
+        reasoning: o.reasoning ?? undefined,
+      });
+      if (serverDiff?.key === key) serverDiff = { key, status: 'done', data };
+    } catch (e) {
+      if (serverDiff?.key === key)
+        serverDiff = { key, status: 'error', error: api.errorMessage(e) };
+    }
+  }
+
   function onTimeChange(c: TimeChange) {
     void c;
     if (!ds || !active.query.trim() || kind === 'UPDATE') return;
@@ -1534,6 +1593,7 @@
       timeOpen = false;
       compare = false;
       timeFrom = '';
+      timeAgainst = '';
     } else {
       timeOpen = true;
     }
@@ -1545,8 +1605,9 @@
     timeOpen = false;
     compare = false;
     timeFrom = '';
+    timeAgainst = '';
     app.queryAt = '';
-    if (moved && outcome?.result) onTimeChange({ at: '', from: '', compare: false });
+    if (moved && outcome?.result) onTimeChange({ at: '', from: '', compare: false, against: '' });
   }
 
   // the slider's state is in the address while the bar is open, so that a link reproduces it
@@ -1559,15 +1620,17 @@
     const at = app.queryAt;
     const from = timeFrom;
     const comparing = compare;
+    const against = timeAgainst;
     const br = branch;
     const name = ds;
     untrack(() => {
       const url = new URL(location.href);
-      for (const k of ['ds', 'at', 'from', 'branch']) url.searchParams.delete(k);
+      for (const k of ['ds', 'at', 'from', 'against', 'branch']) url.searchParams.delete(k);
       if (open) {
         if (name) url.searchParams.set('ds', name);
         if (at) url.searchParams.set('at', at);
         if (comparing && from) url.searchParams.set('from', from);
+        if (comparing && against) url.searchParams.set('against', against);
         if (br) url.searchParams.set('branch', br);
       }
       const next = url.pathname + url.search + url.hash;
@@ -2260,6 +2323,8 @@
         ds={target}
         bind:at={app.queryAt}
         bind:from={timeFrom}
+        bind:against={timeAgainst}
+        branches={(branchList ?? []).map((b) => b.name).filter((n) => n !== (branch || MAIN))}
         bind:compare
         memory={app.datasets.find((d) => d.name === ds)?.type === 'mem'}
         busy={outcome?.status === 'running'}
@@ -2471,6 +2536,7 @@
               {fmtInt(diffView.right)} after), so the browser does not compare them and shows the later
               state.</span
             >
+            {@render serverCompare()}
           {:else}
             {#if outcome.view !== 'table'}
               <span
@@ -2492,9 +2558,25 @@
             {/each}
             <span class="faint small">
               {outcome.result?.triples ? 'triples' : 'rows'} added (<span class="plus">+</span>) or
-              removed (<span class="minus">−</span>) since the earlier commit
+              removed (<span class="minus">−</span>) {timeAgainst
+                ? `against the head of ${timeAgainst}`
+                : 'since the earlier commit'}
             </span>
+            {#if needsServer}
+              <span class="faint small">The read cut the rows, so this comparison is partial.</span>
+              {@render serverCompare()}
+            {/if}
           {/if}
+        </div>
+      {/if}
+      {#if serverNow?.status === 'done' && serverNow.data}
+        <div class="diffbar" role="status">
+          <Icon name="check" size={14} />
+          <span>{serverSummary(serverNow.data)}</span>
+          <span class="faint small"
+            >Compared on the server, commit {serverNow.data.from.commit.seq} to commit {serverNow
+              .data.to.commit.seq}. The table lists the differing rows.</span
+          >
         </div>
       {/if}
 
@@ -2616,6 +2698,18 @@
                 <span class="faint">ASK result</span>
                 {@render emptyWhy(outcome.diagnosis)}
               </div>
+            {:else if serverTable}
+              {#if serverTable.rows.length}
+                <ResultTable
+                  vars={serverTable.vars}
+                  rows={serverTable.rows}
+                  marks={serverTable.marks}
+                  {prefixes}
+                  onopen={openIri}
+                />
+              {:else}
+                <div class="empty">The two commits return the same rows.</div>
+              {/if}
             {:else if r.triples}
               {#if (shownDiff ? shownDiff.rows : r.triples).length}
                 <ResultTable
@@ -2715,7 +2809,8 @@
           {:else if outcome.view === 'map'}
             <ResultMap
               vars={r.vars ?? []}
-              rows={r.rows ?? []}
+              rows={(mapDiff ? mapDiff.rows : r.rows) ?? []}
+              marks={mapDiff?.marks}
               columns={mapColumns}
               {prefixes}
               onopen={openIri}
@@ -2810,6 +2905,21 @@
     {/if}
   </section>
 </div>
+
+{#snippet serverCompare()}
+  <button
+    class="btn sm"
+    disabled={serverNow?.status === 'running'}
+    title="Run the query at both commits on the server and list the rows that differ"
+    onclick={() => void compareOnServer()}
+  >
+    {#if serverNow?.status === 'running'}<span class="spinner"></span>{/if}
+    Compare on the server
+  </button>
+  {#if serverNow?.status === 'error'}
+    <span class="error-text small">{serverNow.error}</span>
+  {/if}
+{/snippet}
 
 {#snippet emptyWhy(diag: EmptyDiagnosis | undefined)}
   {#if diag?.state === 'loading'}

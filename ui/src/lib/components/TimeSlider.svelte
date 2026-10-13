@@ -6,6 +6,8 @@
     /** The `at` selector of the left handle in compare mode, or empty. */
     from: string;
     compare: boolean;
+    /** In compare mode, the branch whose head the left side is, instead of an earlier commit. */
+    against: string;
   };
 </script>
 
@@ -64,6 +66,8 @@
     at = $bindable(''),
     from = $bindable(''),
     compare = $bindable(false),
+    branches = [],
+    against = $bindable(''),
     busy = false,
     lastReadMs = 0,
     paused = false,
@@ -93,6 +97,10 @@
     /** The `at` selector of the left handle while comparing. */
     from?: string;
     compare?: boolean;
+    /** Other branches the view can compare this one with. */
+    branches?: string[];
+    /** The branch compared with: its head is the left side. Empty compares two commits. */
+    against?: string;
     /** The view is reading a state. Play waits for it. */
     busy?: boolean;
     /** How long the last read took, so that Play never starts sooner than 1.5 times it. */
@@ -301,7 +309,7 @@
   const oneCommit = $derived(realStops.length <= 1);
   const readableStops = $derived(track.stops.filter((s) => s.readable));
   const noPast = $derived(memory && readableStops.length <= 1);
-  const canCompare = $derived(readableStops.length >= 2);
+  const canCompare = $derived(readableStops.length >= 2 || branches.length > 0);
   const rightStop = $derived(track.stops[indexOf(track, rightSeq)] ?? track.stops.at(-1));
   const leftStop = $derived(track.stops[indexOf(track, leftSeq)] ?? track.stops[0]);
   const firstSeq = $derived(track.stops[0]?.seq ?? 0);
@@ -352,10 +360,10 @@
   function emit() {
     clearTimeout(timer);
     const nextAt = selectorOf(track, rightSeq);
-    const nextFrom = compare ? fromSelector(leftSeq) : '';
+    const nextFrom = compare && !against ? fromSelector(leftSeq) : '';
     at = nextAt;
     from = nextFrom;
-    onchange?.({ at: nextAt, from: nextFrom, compare });
+    onchange?.({ at: nextAt, from: nextFrom, compare, against: compare ? against : '' });
   }
 
   /** Emit after the handle has rested for 250 ms (a drag). */
@@ -391,6 +399,7 @@
   function setCompare(on: boolean) {
     if (on && !canCompare) return;
     compare = on;
+    if (!on) against = '';
     if (on)
       leftSeq = step(track, rightSeq, -1) === rightSeq ? first(track) : step(track, rightSeq, -1);
     if (on && leftSeq >= rightSeq) {
@@ -510,7 +519,7 @@
     const x = xOf(e);
     const hit = (e.target as HTMLElement).closest('[data-handle]')?.getAttribute('data-handle');
     let which: 'left' | 'right' | 'band' = 'right';
-    if (compare) {
+    if (compare && !against) {
       if (hit === 'left' || hit === 'right' || hit === 'band') which = hit;
       else which = Math.abs(x - xLeft) < Math.abs(x - xRight) ? 'left' : 'right';
     }
@@ -643,9 +652,11 @@
     4 + 14 * Math.sqrt((b.inserted + b.deleted) / maxChange);
 
   const rangeText = $derived(
-    compare
-      ? `from commit ${fmtInt(leftSeq)} to commit ${fmtInt(rightSeq)}`
-      : `commit ${fmtInt(rightSeq)}`,
+    compare && against
+      ? `from the head of ${against} to commit ${fmtInt(rightSeq)}`
+      : compare
+        ? `from commit ${fmtInt(leftSeq)} to commit ${fmtInt(rightSeq)}`
+        : `commit ${fmtInt(rightSeq)}`,
   );
 </script>
 
@@ -716,6 +727,18 @@
     >
       <Icon name="layers" size={13} /> Compare
     </button>
+    {#if compare && branches.length}
+      <select
+        class="select sm"
+        aria-label="Compare with"
+        title="Compare with an earlier commit of this branch, or with the head of another branch"
+        bind:value={against}
+        onchange={emit}
+      >
+        <option value="">an earlier commit</option>
+        {#each branches as b (b)}<option value={b}>head of {b}</option>{/each}
+      </select>
+    {/if}
     <span class="faint small branch mono" title="The branch the view reads">{ds}</span>
     <span class="spacer"></span>
     <select
@@ -809,7 +832,7 @@
             {/if}
           </g>
         {/each}
-        {#if compare}
+        {#if compare && !against}
           <rect
             x={Math.min(xLeft, xRight)}
             y="24"
@@ -864,7 +887,7 @@
         {/each}
         <text x={width - pad + 6} y="56" class="head-label" text-anchor="end">head</text>
       </svg>
-      {#if compare}
+      {#if compare && !against}
         <div
           class="band"
           data-handle="band"
@@ -907,6 +930,9 @@
     <div class="caption">
       {#if oneCommit}
         <span class="faint">No earlier commits</span>
+      {:else if compare && against}
+        <span class="mono"><span class="from-tag">from</span> head of {against}</span>
+        <span class="mono"><span class="to-tag">to</span> {caption(rightStop)}</span>
       {:else if compare}
         <span class="mono"><span class="from-tag">from</span> {caption(leftStop)}</span>
         <span class="mono"><span class="to-tag">to</span> {caption(rightStop)}</span>

@@ -2660,6 +2660,9 @@ export type DiffOptions = {
   /** list the changed quads (at most `limit` of them) */
   quads?: boolean;
   limit?: number;
+  /** a diff across branches: `from` is read on `fromBranch` (its head by default), `to` on `toBranch` */
+  fromBranch?: string;
+  toBranch?: string;
   /** only the changes whose subject or object is one of these terms (IRIs or N-Triples) */
   terms?: string[];
   signal?: AbortSignal;
@@ -2672,9 +2675,58 @@ export function diff(ds: string, opts: DiffOptions = {}): Promise<Diff> {
   if (opts.graph) p.set('graph', opts.graph);
   if (opts.quads) p.set('quads', 'true');
   if (opts.limit != null) p.set('limit', String(opts.limit));
+  if (opts.fromBranch) p.set('fromBranch', opts.fromBranch);
+  if (opts.toBranch) p.set('toBranch', opts.toBranch);
   for (const t of opts.terms ?? []) p.append('term', t);
   const qs = p.toString();
   return json<Diff>(`/${enc(ds)}/diff${qs ? `?${qs}` : ''}`, {
+    signal: opts.signal,
+  });
+}
+
+/** `POST /{ds}/sparql/diff`: the rows a SELECT query returns at one state and not the other. */
+export type SparqlDiff = {
+  dataset: string;
+  datasetId: string;
+  from: { selector: string; commit: Commit };
+  to: { selector: string; commit: Commit };
+  vars: string[];
+  /** Rows at the earlier and the later state. */
+  fromRows: number;
+  toRows: number;
+  /** Rows both have, counted as a bag. */
+  same: number;
+  /** Rows only the later state has, and only the earlier one has. */
+  added: number;
+  removed: number;
+  addedRows: Partial<Record<string, Term>>[];
+  removedRows: Partial<Record<string, Term>>[];
+  /** A list was cut at `limit` rows. */
+  truncated: { added: boolean; removed: boolean };
+};
+
+export type SparqlDiffOptions = {
+  query: string;
+  /** The earlier state, as a selector of `at`. */
+  from: string;
+  /** The later state (default: the head). */
+  to?: string;
+  /** The most rows listed for each side (default 100). */
+  limit?: number;
+  reasoning?: boolean;
+  signal?: AbortSignal;
+};
+
+/** Compare a SELECT query between two states on the server. */
+export function sparqlDiff(ds: string, opts: SparqlDiffOptions): Promise<SparqlDiff> {
+  const p = new URLSearchParams({ from: opts.from });
+  if (opts.to) p.set('to', opts.to);
+  if (opts.limit != null) p.set('limit', String(opts.limit));
+  if (opts.reasoning != null) p.set('reasoning', String(opts.reasoning));
+  return json<SparqlDiff>(`/${enc(ds)}/sparql/diff?${p}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/sparql-query' },
+    body: opts.query,
     signal: opts.signal,
   });
 }

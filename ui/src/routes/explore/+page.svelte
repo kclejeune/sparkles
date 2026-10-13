@@ -119,16 +119,38 @@
 
   const urlAt = page.url.searchParams.get('at');
   const urlFrom = page.url.searchParams.get('from');
+  const urlAgainst = page.url.searchParams.get('against');
   /** The History strip of the selected resource. */
-  let stripOpen = $state(!!(urlAt || urlFrom) && urlTab !== 'schema' && urlTab !== 'search');
+  let stripOpen = $state(
+    !!(urlAt || urlFrom || urlAgainst) && urlTab !== 'schema' && urlTab !== 'search',
+  );
   /** The state the resource's properties are read at (`at=`): empty for the head. */
   let exAt = $state(urlAt ?? '');
   /** Compare mode: the earlier state, and what changed since it. */
   let exFrom = $state(urlFrom ?? '');
-  let exCompare = $state(!!urlFrom);
+  let exCompare = $state(!!(urlFrom || urlAgainst));
+  /** Compare with the head of another branch instead of an earlier commit. */
+  let exAgainst = $state(urlAgainst ?? '');
+  /** The branches of the dataset, to compare the graph and the schema across. */
+  let branchNames = $state<string[]>([]);
+  $effect(() => {
+    const name = ds;
+    branchNames = [];
+    if (!name) return;
+    const ctl = new AbortController();
+    api
+      .branches(name, ctl.signal)
+      .then((l) => {
+        if (ds === name) branchNames = l.branches.map((b) => b.name).filter((n) => n !== 'main');
+      })
+      .catch(() => {});
+    return () => ctl.abort();
+  });
   let strip: TimeSlider | undefined = $state();
   /** The slider over the whole graph, in the graph toolbar. It shares `exAt` and `exFrom`. */
-  let graphTimeOpen = $state(!!(urlAt || urlFrom) && urlTab !== 'schema' && urlTab !== 'search');
+  let graphTimeOpen = $state(
+    !!(urlAt || urlFrom || urlAgainst) && urlTab !== 'schema' && urlTab !== 'search',
+  );
   let graphSlider: TimeSlider | undefined = $state();
   /** Either slider is open, so the properties are read at the state they name. */
   const timeActive = $derived(stripOpen || graphTimeOpen);
@@ -209,6 +231,7 @@
     exAt = '';
     exFrom = '';
     exCompare = false;
+    exAgainst = '';
   }
 
   function closeStrip() {
@@ -391,12 +414,14 @@
   let drawnKey = 'head';
 
   const timeKey = () =>
-    graphTimeOpen && (exAt || exCompare) ? `${exAt}|${exCompare ? exFrom : ''}` : 'head';
+    graphTimeOpen && (exAt || exCompare)
+      ? `${exAt}|${exCompare ? exFrom : ''}|${exCompare ? exAgainst : ''}`
+      : 'head';
 
   /** Mark what changed between the two handles, from the diff of the drawn resources. */
   async function markChanges(owns: () => boolean) {
     const name = ds;
-    if (!name || !graphTimeOpen || !exCompare || !exFrom) {
+    if (!name || !graphTimeOpen || !exCompare || !(exFrom || exAgainst)) {
       changes = null;
       return;
     }
@@ -405,7 +430,8 @@
       .map((n) => n.iri)
       .slice(0, 1000);
     const d = await api.diff(name, {
-      from: exFrom,
+      // across branches, the later side is this branch (main here) and the earlier one the other's head
+      ...(exAgainst ? { fromBranch: exAgainst, toBranch: 'main' } : { from: exFrom }),
       to: exAt || 'head',
       terms: iris,
       quads: true,
@@ -558,6 +584,7 @@
     if (timed) {
       if (exAt) p.set('at', exAt);
       if (exCompare && exFrom) p.set('from', exFrom);
+      if (exCompare && exAgainst) p.set('against', exAgainst);
     }
     goto(`${resolve('/explore')}?${p}`, { replaceState: true, keepFocus: true, noScroll: true });
   }
@@ -794,21 +821,28 @@
   let schemaReadMs = $state(0);
   let schemaDrawnKey = 'head';
   const schemaKey = () =>
-    schemaTimeOpen && (exAt || exCompare) ? `${exAt}|${exCompare ? exFrom : ''}` : 'head';
+    schemaTimeOpen && (exAt || exCompare)
+      ? `${exAt}|${exCompare ? exFrom : ''}|${exCompare ? exAgainst : ''}`
+      : 'head';
 
   async function loadSchema(name: string) {
     const owns = schemaRuns.claim('schema');
     schemaLoading = true;
     schemaErr = null;
     const at = schemaTimeOpen && exAt ? exAt : undefined;
-    const from = schemaTimeOpen && exCompare && exFrom ? exFrom : undefined;
+    const from = schemaTimeOpen && exCompare && exFrom && !exAgainst ? exFrom : undefined;
+    const other = schemaTimeOpen && exCompare && exAgainst ? exAgainst : undefined;
     const t0 = performance.now();
     schemaDrawnKey = schemaKey();
     try {
       const o = { graph: schemaGraph, reasoning: hasInferences ? schemaInferences : undefined };
       const [s, before] = await Promise.all([
         ex.loadSchema(name, { ...o, at }),
-        from ? ex.loadSchema(name, { ...o, at: from }) : Promise.resolve(null),
+        from
+          ? ex.loadSchema(name, { ...o, at: from })
+          : other
+            ? ex.loadSchema(`${name}@${other}`, o)
+            : Promise.resolve(null),
       ]);
       if (!owns()) return;
       const first = schemaFor !== name;
@@ -855,6 +889,7 @@
     if (from && to) {
       exFrom = from;
       exAt = to === 'head' ? '' : to;
+      exAgainst = '';
       exCompare = true;
     }
     schemaTimeOpen = true;
@@ -1187,6 +1222,8 @@
               busy={graphReading}
               lastReadMs={graphReadMs}
               announcement={graphAnnounce}
+              branches={branchNames}
+              bind:against={exAgainst}
               label="Graph history"
               canFollow={false}
               onchange={() => syncUrl(selected?.term.type === 'uri' ? selected.iri : null)}
@@ -1607,6 +1644,8 @@
             busy={schemaLoading}
             lastReadMs={schemaReadMs}
             announcement={schemaAnnounce}
+            branches={branchNames}
+            bind:against={exAgainst}
             label="Schema history"
             canFollow={false}
             onchange={() => syncUrl(null)}
