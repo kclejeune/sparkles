@@ -621,3 +621,62 @@ fn sparkles_graphql_request(q: &str) -> sparkles::handles::graphql::Request {
         variables: Default::default(),
     }
 }
+
+#[test]
+fn algorithms_and_named_projections() {
+    use sparkles::algo::catalog::{PredicateDef, ProjectionDef};
+    use sparkles::sparql::QueryOptions;
+    use sparkles::sparql::algorun::{AlgoRequest, ProjectionRef};
+    const ALGO: &str = "urn:x-sparkles:algo#";
+    let (dir, ds) = persistent();
+    ds.update(
+        "INSERT DATA { <http://ex.org/b> <http://ex.org/p> <http://ex.org/a> . \
+         <http://ex.org/a> <http://ex.org/p> <http://ex.org/b> }",
+    )
+    .unwrap();
+    let def = ProjectionDef {
+        predicates: Some(vec![PredicateDef::new("http://ex.org/p", None)]),
+        ..Default::default()
+    };
+    let (st, created) = ds
+        .algorithms()
+        .projections()
+        .put("p", def.clone(), None, None)
+        .unwrap();
+    assert!(created && st.revision == 1);
+    // the definition survives a reopen
+    drop(ds);
+    let ds = Dataset::open(dir.path().join("db")).unwrap();
+    assert_eq!(
+        ds.algorithms().projections().get("p").unwrap().definition,
+        def
+    );
+    // a SPARQL query and an update find it
+    let wcc = format!(
+        "SERVICE <{ALGO}wcc> {{ [] <{ALGO}projection> \"p\" ; <{ALGO}node> ?n ; <{ALGO}component> ?c }}"
+    );
+    let r = ds
+        .query(&format!("SELECT ?n ?c WHERE {{ {wcc} }}"))
+        .unwrap();
+    assert_eq!(r.rows().len(), 2);
+    ds.update(&format!(
+        "INSERT {{ <urn:out> <urn:n> ?n }} WHERE {{ {wcc} }}"
+    ))
+    .unwrap();
+    // a request
+    let req = AlgoRequest {
+        algorithm: "pageRank".into(),
+        projection: Some(ProjectionRef::Named("p".into())),
+        params: Default::default(),
+        write: None,
+    };
+    let r = ds.algorithms().run(&req, &QueryOptions::default()).unwrap();
+    assert_eq!(r.rows().len(), 2);
+    let stats = ds
+        .algorithms()
+        .stats(&req, &QueryOptions::default())
+        .unwrap();
+    assert!(stats.contains("\"nodes\":2"), "{stats}");
+    assert!(ds.algorithms().projections().delete("p", None).unwrap());
+    assert!(ds.algorithms().projections().list().is_empty());
+}

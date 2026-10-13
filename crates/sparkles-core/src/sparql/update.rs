@@ -298,6 +298,7 @@ impl Request<'_> {
         #[cfg(feature = "geo")]
         let op_vertices = snap.geo_op_vertices;
         let mut ctx = Ctx::new(snap);
+        ctx.algo_projections = self.opts.algo_projections.clone();
         #[cfg(feature = "geo")]
         ctx.geo.set_op_vertices(op_vertices);
         ctx.deadline = self.deadline;
