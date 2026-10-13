@@ -150,6 +150,8 @@ fn harness_name(iri: &str) -> Option<&'static str> {
         "Codex" => "codex",
         "GeminiCli" => "gemini-cli",
         "Cursor" => "cursor",
+        "Copilot" => "copilot",
+        "Aider" => "aider",
         "Generic" => "generic",
         _ => return None,
     })

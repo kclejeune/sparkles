@@ -2108,6 +2108,11 @@ its roots from flags or from the harness's own environment variables, such as
 | Codex | `~/.codex/AGENTS.md` or `AGENTS.override.md`, and `AGENTS.md`, `AGENTS.override.md` or a configured fallback name in each directory from the repository root down | Instructions in plain Markdown. Codex reads one file per directory and concatenates them from the root down. | `codex` instructions |
 | Codex | `~/.codex/sessions/YYYY/MM/DD/rollout-<time>-<id>.jsonl` | Session logs, one object per line with `timestamp`, `type` and `payload`. The types include `session_meta` with the id, `cwd` and git state, `turn_context`, `response_item` for messages, reasoning and tool calls, and `event_msg`. | `codex` transcript, opt-in |
 | Codex | `~/.codex/memories/` | Memories that Codex generates from idle sessions when its memories feature is on. OpenAI documents the directory but not the files' format, and asks people not to edit them. | `generic`, read-only, kind `generated` |
+| Gemini CLI | `~/.gemini/tmp/<project hash>/chats/session-<time>-<id>.jsonl`, and `GEMINI_CLI_HOME` moves `~/.gemini` | Session recordings. The project hash is the SHA-256 of the project's root path. The first record holds `sessionId`, `projectHash`, `startTime` and `lastUpdated`, and each message record has `id`, `timestamp`, `type` (`user` or `gemini`), `content`, `model`, `thoughts` and `toolCalls`. Records that start with `$` rewind or patch the log. Older versions wrote one JSON object to a `.json` file, and `/chat save` writes a checkpoint of `{role, parts}` contents. | `gemini-cli` transcript, opt-in |
+| Cursor | `~/.cursor/projects/<project>/agent-transcripts/<id>/<id>.jsonl` or `<id>.txt` | The directory name is the project's path with every character other than a letter or a digit turned into `-`. A JSONL entry has a `role` and a `message` with `text` and `tool_use` blocks, and the person's words are inside `<user_query>` tags. The older text form starts each block with `user:` or `A:` and marks reasoning and tools with `[Thinking]`, `[Tool call]` and `[Tool result]`. Cursor's SQLite chat store is not read. | `cursor` transcript, opt-in |
+| GitHub Copilot | `~/.copilot/session-state/<session>/events.jsonl` and `workspace.yaml`, and `COPILOT_HOME` moves `~/.copilot` | The Copilot CLI's event log, which GitHub does not document. An event has `type`, `timestamp` and `data`. The types read are `session.start` with the context's `cwd` and branch, `user.message`, `assistant.message` and `tool.execution_complete`. Copilot Chat in an editor is not read. | `copilot` transcript, opt-in |
+| Aider | `.aider.chat.history.md` in the project, or the file `AIDER_CHAT_HISTORY_FILE` names | Markdown that Aider appends to for every run. A line `# aider chat started at DATE TIME` starts a run, lines that start with `#### ` are the person's input, lines that start with `> ` are Aider's notices, and the rest is the model's reply. | `aider` transcript, opt-in |
+| Any other transcript | A file given with `--transcript FILE` | JSON lines or one JSON value of messages with a speaker and a text, Markdown with `## User` and `## Assistant` headings, or text with `User:` and `Assistant:` lines. A file that matches none of these gives no turns and is skipped. | `generic` transcript, opt-in |
 | Others | `GEMINI.md` at the user and project scopes, `.cursor/rules/**/*.mdc`, `.cursorrules`, `.github/copilot-instructions.md`, and any Markdown file given with `--path` | Markdown, with or without YAML frontmatter. Cursor's rules carry `description`, `globs` and `alwaysApply`. | `generic` |
 
 Claude Code names a project's directory after the repository's path with each
@@ -2189,7 +2194,7 @@ Core terms and schema.org, as C17 and §7.2 do, and add a small namespace `mem:`
 | `mem:Instructions` | class, a subclass of `prov:Entity` | An instruction file such as `CLAUDE.md`, `AGENTS.md`, `GEMINI.md` or a rule. |
 | `mem:Project` | class | A repository or directory that memories belong to. |
 | `mem:Session` | class, a subclass of `prov:Activity` | One session of a harness, from its transcript. |
-| `mem:Harness` | class, a subclass of `prov:SoftwareAgent` | A harness. The vocabulary declares `mem:ClaudeCode`, `mem:Codex`, `mem:GeminiCli`, `mem:Cursor` and `mem:Generic`. |
+| `mem:Harness` | class, a subclass of `prov:SoftwareAgent` | A harness. The vocabulary declares `mem:ClaudeCode`, `mem:Codex`, `mem:GeminiCli`, `mem:Cursor`, `mem:Copilot`, `mem:Aider` and `mem:Generic`. |
 | `mem:kind` | property, literal | The kind exactly as the file states it, such as `"feedback"`, kept also when it maps to no class. |
 | `mem:harness` | property | The harness of a memory, an instruction file, a session or a source. |
 | `mem:project` | property | The project of a memory, a session or a source. |
@@ -4738,6 +4743,22 @@ the badge's words and the shared count store, and `ui/tests/e2e/pages.spec.ts` t
 badges on the dataset page and the sidebar.
 
 **Roadmap item 15 delivered on 2026-10-13, in the order of its bullets.**
+
+- **Transcript adapters.** The transcript parsers moved from the server's
+  `memory_cmd/transcripts.rs` into `sparkles_memory_import::transcripts`, one module for
+  each harness with Claude Code and Codex among them. Gemini CLI, Cursor, GitHub
+  Copilot's CLI and Aider each have a module that finds the logs of a project and parses
+  them into the same sessions of turns, so redaction, the `## user` and `## assistant`
+  rendering, the size limits, the `--since` and in-progress rules, the opt-in of §8.10.7
+  and the graph layout apply to them unchanged. §8.10.1 documents each location and
+  format. The generic adapter reads any other file given with `--transcript FILE`, which
+  is no longer a hidden flag, when no specific adapter recognizes it. The adapter names
+  `gemini-cli`, `cursor`, `copilot` and `aider` select transcripts only, because their
+  instruction files already belong to the generic adapter. `mem:Copilot` and `mem:Aider`
+  join the harnesses of the vocabulary. Gemini CLI, Cursor and Copilot do not publish the
+  formats of their logs, so the adapters follow what the tools write and what other
+  readers of them accept. Each skips a line or a block it does not understand. Cursor's
+  SQLite chat store and Copilot Chat's editor storage are not read.
 
 - **Office documents.** The new crate `sparkles-office` reads DOCX, PPTX, XLSX and the
   OpenDocument text, presentation and spreadsheet formats from their XML parts with

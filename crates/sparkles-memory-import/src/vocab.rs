@@ -116,6 +116,8 @@ mem:ClaudeCode a mem:Harness ; rdfs:label "Claude Code" .
 mem:Codex a mem:Harness ; rdfs:label "Codex" .
 mem:GeminiCli a mem:Harness ; rdfs:label "Gemini CLI" .
 mem:Cursor a mem:Harness ; rdfs:label "Cursor" .
+mem:Copilot a mem:Harness ; rdfs:label "GitHub Copilot" .
+mem:Aider a mem:Harness ; rdfs:label "Aider" .
 mem:Generic a mem:Harness ; rdfs:label "Generic" .
 
 mem:UserScope a mem:Scope ; rdfs:label "user" .

@@ -117,6 +117,8 @@ impl Fixture {
             )
             .env("USER", "kc")
             .env_remove("CLAUDE_CONFIG_DIR")
+            .env_remove("GEMINI_CLI_HOME")
+            .env_remove("COPILOT_HOME")
             .env_remove("SPARKLES_SERVER")
             .env_remove("SPARKLES_TOKEN")
             .env_remove("SPARKLES_MEMORY_DATASET")
@@ -1123,6 +1125,177 @@ impl Server {
             serde_json::from_str(&text).unwrap_or(Value::String(text)),
         )
     }
+}
+
+/// Transcripts of Gemini CLI, Cursor, GitHub Copilot and Aider are found for the project,
+/// redacted like the others, and a file the person names is read by the generic adapter
+/// when no specific one claims it.
+#[test]
+fn memory_transcripts_of_other_harnesses() {
+    use sha2::{Digest, Sha256};
+    let s = start_server(&["--mem", DS]);
+    let f = Fixture::new();
+    let p = f.project();
+    let ps = p.to_str().unwrap().to_string();
+    mem_json(&f, &s, "admin", &["init", "--import-base", BASE]);
+    let (st, mut settings) = s.json("admin", "GET", &format!("/$/memory/{DS}"), None);
+    assert_eq!(st, 200);
+    settings["imports"]["transcripts"] = true.into();
+    let (st, _) = s.json("admin", "PUT", &format!("/$/memory/{DS}"), Some(&settings));
+    assert_eq!(st, 200);
+    let token = format!("ghp_{}", "b".repeat(36));
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 3600);
+    let write = |path: PathBuf, text: String| {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, text).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+    };
+    // Gemini CLI: the project's hash names the directory
+    let hash: String = Sha256::digest(ps.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let t = (chrono::Utc::now() - chrono::Duration::hours(2))
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    write(
+        f.home().join(format!(".gemini/tmp/{hash}/chats/session-2026-10-01T10-00-g1.jsonl")),
+        [
+            json!({"sessionId":"g1","projectHash":hash,"startTime":t,"lastUpdated":t}),
+            json!({"id":"1","timestamp":t,"type":"user","content":format!("Use {token} for the deploy")}),
+            json!({"id":"2","timestamp":t,"type":"gemini","content":"Deploying.","model":"gemini-test"}),
+        ]
+        .map(|j| j.to_string())
+        .join("\n")
+            + "\n",
+    );
+    // Cursor: the path with its separators turned into dashes
+    let slug: String = ps
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    write(
+        f.home().join(format!(
+            ".cursor/projects/{}/agent-transcripts/c1/c1.jsonl",
+            slug.trim_start_matches('-')
+        )),
+        [
+            json!({"role":"user","message":{"content":[{"type":"text","text":"<user_query>Where are the tests?</user_query>"}]}}),
+            json!({"role":"assistant","message":{"content":[{"type":"text","text":"In tests/."}]}}),
+        ]
+        .map(|j| j.to_string())
+        .join("\n")
+            + "\n",
+    );
+    // Copilot: the session's workspace names the directory
+    write(
+        f.home().join(".copilot/session-state/cp1/workspace.yaml"),
+        format!("id: cp1\ncwd: {ps}\n"),
+    );
+    write(
+        f.home().join(".copilot/session-state/cp1/events.jsonl"),
+        [
+            json!({"type":"session.start","timestamp":t,"data":{"sessionId":"cp1","context":{"cwd":ps}}}),
+            json!({"type":"user.message","timestamp":t,"data":{"content":"Add a retry"}}),
+            json!({"type":"assistant.message","timestamp":t,"data":{"content":"Added.","reasoningText":"private"}}),
+        ]
+        .map(|j| j.to_string())
+        .join("\n")
+            + "\n",
+    );
+    // Aider: the history file in the project
+    write(
+        p.join(".aider.chat.history.md"),
+        "# aider chat started at 2026-09-01 10:00:00\n\n#### Rename the helper\n\nDone.\n".into(),
+    );
+    // a file that no adapter claims, outside the project
+    let export = f.dir.path().join("export.md");
+    write(
+        export.clone(),
+        "## User\n\nWhere is the key?\n\n## Assistant\n\nIn the vault.\n".into(),
+    );
+    let sy = mem_json(
+        &f,
+        &s,
+        "ana",
+        &[
+            "sync",
+            "--project",
+            &ps,
+            "--transcripts",
+            "--transcript",
+            export.to_str().unwrap(),
+        ],
+    );
+    for (end, harness) in [
+        ("g1.jsonl", "gemini-cli"),
+        ("c1.jsonl", "cursor"),
+        ("events.jsonl", "copilot"),
+        (".aider.chat.history.md", "aider"),
+        ("export.md", "generic"),
+    ] {
+        let r = report(&sy, end);
+        assert_eq!(r["status"], "new", "{end}: {sy:#}");
+        assert_eq!(r["kind"], "transcript", "{end}");
+        assert_eq!(r["harness"], harness, "{end}");
+    }
+    assert_eq!(
+        report(&sy, "g1.jsonl")["redactions"],
+        json!(["github-token"]),
+        "{sy:#}"
+    );
+    let text_of = |graph: &str| -> String {
+        s.select(&format!(
+            "SELECT ?t WHERE {{ GRAPH <{graph}> {{ <{graph}> <urn:x-sparkles:rendition> ?r . ?c <urn:x-sparkles:chunkOf> ?r ; <urn:x-sparkles:start> ?a ; <urn:x-sparkles:text> ?t }} }} ORDER BY ?a"
+        ))
+        .iter()
+        .map(|r| r["t"]["value"].as_str().unwrap().to_string())
+        .collect()
+    };
+    let gem = text_of(report(&sy, "g1.jsonl")["graph"].as_str().unwrap());
+    assert!(
+        gem.contains("[redacted:github-token]") && !gem.contains("ghp_"),
+        "{gem}"
+    );
+    assert!(gem.contains("## assistant"), "{gem}");
+    assert!(
+        text_of(report(&sy, "c1.jsonl")["graph"].as_str().unwrap())
+            .contains("Where are the tests?")
+    );
+    let cp = text_of(report(&sy, "events.jsonl")["graph"].as_str().unwrap());
+    assert!(
+        cp.contains("Add a retry") && !cp.contains("private"),
+        "{cp}"
+    );
+    assert!(
+        text_of(
+            report(&sy, ".aider.chat.history.md")["graph"]
+                .as_str()
+                .unwrap()
+        )
+        .contains("Rename the helper")
+    );
+    assert!(text_of(report(&sy, "export.md")["graph"].as_str().unwrap()).contains("In the vault."));
+    // a second sync changes nothing
+    let sy = mem_json(
+        &f,
+        &s,
+        "ana",
+        &[
+            "sync",
+            "--project",
+            &ps,
+            "--transcripts",
+            "--transcript",
+            export.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(report(&sy, "g1.jsonl")["status"], "unchanged", "{sy:#}");
+    assert_eq!(report(&sy, "export.md")["status"], "unchanged", "{sy:#}");
 }
 
 /// A66, A67, A75 and A76: transcripts with their opt-ins and redaction, the server's

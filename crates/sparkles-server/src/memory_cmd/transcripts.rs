@@ -1,7 +1,9 @@
-//! Session transcripts (spec C18 §8.10.7): read Claude Code's and Codex's JSONL session
-//! logs, render each session as Markdown with one `## user` or `## assistant` heading
-//! per turn, redact it, and register it as the source of the session's graph with the
-//! `transcript` profile, which starts a chunk at every heading.
+//! Session transcripts (spec C18 §8.10.7): find the session logs of Claude Code, Codex,
+//! Gemini CLI, Cursor, GitHub Copilot and Aider, and of a file the person names, parse
+//! each with its adapter in `sparkles_memory_import::transcripts`, render each session as
+//! Markdown with one `## user` or `## assistant` heading per turn, redact it, and register
+//! it as the source of the session's graph with the `transcript` profile, which starts a
+//! chunk at every heading.
 //!
 //! A transcript becomes an episode, not facts: the graph holds the session's description
 //! (`mem:Session` with its id, branch, model, harness version and times) and the link
@@ -12,14 +14,15 @@
 //! By default a rendition keeps the text of the user's and the assistant's messages on
 //! the main chain. Thinking and reasoning, tool calls and results, attachments, system
 //! and bookkeeping lines are left out. `--transcript-content tools` adds tool calls and
-//! the first 2,000 characters of each tool result. A session longer than a source holds
-//! is split at turn boundaries into at most [`MAX_PARTS`] parts, `<graph>/part-N` after
+//! the first 2,000 characters of each tool result. A file that no adapter claims is read
+//! by the generic adapter. A session longer than a source holds is split at turn boundaries into at most [`MAX_PARTS`] parts, `<graph>/part-N` after
 //! the first.
 
 use super::conn::{CmdError, Conn, val};
 use super::sync::{self, Cache, CacheEntry, FileReport, RegisterText, SyncOpts, count, normalize};
 use serde_json::Value;
 use sparkles_memory_import::redact::{self, Pattern};
+use sparkles_memory_import::transcripts::{self, Format, Session, render, split};
 use sparkles_memory_import::vocab::{self, XSD_DATETIME, XSD_INTEGER, mem};
 use sparkles_memory_import::{Ctx, Fact, FileImport, FileKind, Harness, Obj, Project, Roots};
 use std::collections::{BTreeMap, HashMap};
@@ -32,8 +35,6 @@ pub const MAX_PARTS: usize = 8;
 const PART_BYTES: usize = (2 << 20) - 4096;
 /// A session whose last line is younger than this is in progress.
 const IN_PROGRESS: Duration = Duration::from_secs(600);
-/// The characters of a tool result kept with `--transcript-content tools`.
-const TOOL_RESULT_CHARS: usize = 2000;
 /// The format that makes every heading start a chunk.
 pub const FORMAT: &str = "text/markdown;profile=transcript";
 
@@ -63,306 +64,6 @@ pub fn parse_duration(s: &str) -> Option<Duration> {
     Some(Duration::from_secs(secs))
 }
 
-/// One turn of a session.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Turn {
-    /// `user`, `assistant` or `tool`
-    pub role: String,
-    pub time: Option<String>,
-    pub text: String,
-}
-
-/// A parsed session.
-#[derive(Clone, Debug, Default)]
-pub struct Session {
-    pub id: Option<String>,
-    pub cwd: Option<String>,
-    pub branch: Option<String>,
-    pub model: Option<String>,
-    pub version: Option<String>,
-    pub started: Option<String>,
-    pub ended: Option<String>,
-    pub turns: Vec<Turn>,
-    /// the files the session wrote with `Write`, `Edit`, `MultiEdit` or `NotebookEdit`
-    pub writes: Vec<String>,
-}
-
-impl Session {
-    fn push(&mut self, role: &str, time: Option<&str>, text: String) {
-        let text = text.trim().to_string();
-        if text.is_empty() {
-            return;
-        }
-        match self.turns.last_mut() {
-            Some(t) if t.role == role => {
-                t.text.push_str("\n\n");
-                t.text.push_str(&text);
-            }
-            _ => self.turns.push(Turn {
-                role: role.to_string(),
-                time: time.map(str::to_string),
-                text,
-            }),
-        }
-    }
-
-    fn saw(&mut self, time: Option<&str>) {
-        if let Some(t) = time {
-            if self.started.is_none() {
-                self.started = Some(t.to_string());
-            }
-            self.ended = Some(t.to_string());
-        }
-    }
-}
-
-fn cut(s: &str, n: usize) -> String {
-    if s.chars().count() <= n {
-        s.to_string()
-    } else {
-        let mut t: String = s.chars().take(n).collect();
-        t.push_str(" …");
-        t
-    }
-}
-
-fn set(slot: &mut Option<String>, v: Option<&str>) {
-    if slot.is_none()
-        && let Some(v) = v.filter(|v| !v.is_empty())
-    {
-        *slot = Some(v.to_string());
-    }
-}
-
-/// The text of a tool result's content: a string, or text blocks.
-fn result_text(c: &Value) -> String {
-    match c {
-        Value::String(s) => s.clone(),
-        Value::Array(a) => a
-            .iter()
-            .filter_map(|b| b["text"].as_str())
-            .collect::<Vec<_>>()
-            .join("\n"),
-        _ => String::new(),
-    }
-}
-
-/// A Claude Code transcript. `sidechain` reads a subagent's file, whose lines are all
-/// on its own chain.
-pub fn parse_claude(text: &str, tools: bool, sidechain: bool) -> Session {
-    let mut s = Session::default();
-    for line in text.lines() {
-        let Ok(j) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        let kind = j["type"].as_str().unwrap_or("");
-        if kind != "user" && kind != "assistant" {
-            continue;
-        }
-        if (j["isSidechain"] == true && !sidechain) || j["isMeta"] == true {
-            continue;
-        }
-        let time = j["timestamp"].as_str();
-        s.saw(time);
-        set(&mut s.id, j["sessionId"].as_str());
-        set(&mut s.cwd, j["cwd"].as_str());
-        set(&mut s.branch, j["gitBranch"].as_str());
-        set(&mut s.version, j["version"].as_str());
-        let msg = &j["message"];
-        if kind == "assistant" {
-            set(&mut s.model, msg["model"].as_str());
-        }
-        let mut texts: Vec<String> = Vec::new();
-        let mut results: Vec<String> = Vec::new();
-        match &msg["content"] {
-            Value::String(t) => texts.push(t.clone()),
-            Value::Array(blocks) => {
-                for b in blocks {
-                    match b["type"].as_str().unwrap_or("") {
-                        "text" => texts.push(b["text"].as_str().unwrap_or("").to_string()),
-                        "tool_use" => {
-                            let name = b["name"].as_str().unwrap_or("tool");
-                            if matches!(name, "Write" | "Edit" | "MultiEdit" | "NotebookEdit")
-                                && let Some(p) = b["input"]["file_path"]
-                                    .as_str()
-                                    .or(b["input"]["notebook_path"].as_str())
-                            {
-                                s.writes.push(p.to_string());
-                            }
-                            if tools {
-                                texts.push(format!(
-                                    "Tool call {name}: {}",
-                                    cut(&b["input"].to_string(), TOOL_RESULT_CHARS)
-                                ));
-                            }
-                        }
-                        "tool_result" if tools => {
-                            results.push(cut(&result_text(&b["content"]), TOOL_RESULT_CHARS));
-                        }
-                        // thinking, tool results without --transcript-content tools,
-                        // images and documents
-                        _ => {}
-                    }
-                }
-            }
-            _ => {}
-        }
-        let role = if kind == "assistant" {
-            "assistant"
-        } else {
-            "user"
-        };
-        s.push(role, time, texts.join("\n\n"));
-        if !results.is_empty() {
-            s.push("tool", time, results.join("\n\n"));
-        }
-    }
-    s
-}
-
-/// A Codex session log.
-pub fn parse_codex(text: &str, tools: bool) -> Session {
-    let mut s = Session::default();
-    for line in text.lines() {
-        let Ok(j) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        let time = j["timestamp"].as_str();
-        let p = &j["payload"];
-        match j["type"].as_str().unwrap_or("") {
-            "session_meta" => {
-                set(&mut s.id, p["id"].as_str());
-                set(&mut s.cwd, p["cwd"].as_str());
-                set(&mut s.branch, p["git"]["branch"].as_str());
-                set(&mut s.version, p["cli_version"].as_str());
-                set(&mut s.started, p["timestamp"].as_str().or(time));
-            }
-            "turn_context" => set(&mut s.model, p["model"].as_str()),
-            "response_item" => {
-                s.saw(time);
-                match p["type"].as_str().unwrap_or("") {
-                    "message" => {
-                        let role = p["role"].as_str().unwrap_or("");
-                        if role != "user" && role != "assistant" {
-                            continue;
-                        }
-                        let t: Vec<&str> = p["content"]
-                            .as_array()
-                            .into_iter()
-                            .flatten()
-                            .filter_map(|c| c["text"].as_str())
-                            .collect();
-                        let t = t.join("\n\n");
-                        // the harness's own context, not the person's words
-                        let lead = t.trim_start();
-                        if lead.starts_with("<environment_context>")
-                            || lead.starts_with("<user_instructions>")
-                        {
-                            continue;
-                        }
-                        s.push(role, time, t);
-                    }
-                    "function_call" | "custom_tool_call" if tools => {
-                        let name = p["name"].as_str().unwrap_or("tool");
-                        let args = p["arguments"]
-                            .as_str()
-                            .or(p["input"].as_str())
-                            .unwrap_or("");
-                        s.push(
-                            "assistant",
-                            time,
-                            format!("Tool call {name}: {}", cut(args, TOOL_RESULT_CHARS)),
-                        );
-                    }
-                    "function_call_output" | "custom_tool_call_output" if tools => {
-                        let out = match &p["output"] {
-                            Value::String(o) => o.clone(),
-                            o => o["content"].as_str().unwrap_or("").to_string(),
-                        };
-                        s.push("tool", time, cut(&out, TOOL_RESULT_CHARS));
-                    }
-                    // reasoning, encrypted or not, is never kept
-                    _ => {}
-                }
-            }
-            _ => {}
-        }
-    }
-    s
-}
-
-/// The session as Markdown: one heading per turn with its time. A line of a message that
-/// starts with `#` is escaped, so only the turn headings are headings.
-pub fn render(s: &Session) -> Vec<String> {
-    s.turns
-        .iter()
-        .map(|t| {
-            let mut out = format!("## {}", t.role);
-            if let Some(time) = &t.time {
-                out.push(' ');
-                out.push_str(time);
-            }
-            out.push_str("\n\n");
-            for l in t.text.lines() {
-                if l.trim_start().starts_with('#') {
-                    out.push('\\');
-                }
-                out.push_str(l);
-                out.push('\n');
-            }
-            out.push('\n');
-            out
-        })
-        .collect()
-}
-
-/// The longest prefix of `s` of at most `n` bytes that ends on a character boundary.
-fn prefix_bytes(s: &str, n: usize) -> &str {
-    if s.len() <= n {
-        return s;
-    }
-    let mut i = n;
-    while !s.is_char_boundary(i) {
-        i -= 1;
-    }
-    &s[..i]
-}
-
-/// Split rendered turns into parts of at most `max` bytes at turn boundaries, at most
-/// `parts` of them. What does not fit is left out with a note at the end of the last
-/// part.
-pub fn split(turns: &[String], max: usize, parts: usize) -> Vec<String> {
-    let mut out: Vec<String> = vec![String::new()];
-    let mut left = 0;
-    for (i, t) in turns.iter().enumerate() {
-        let t = if t.len() > max {
-            let mut c = prefix_bytes(t, max - 64).to_string();
-            c.push_str("\n[the rest of this turn is left out]\n\n");
-            c
-        } else {
-            t.clone()
-        };
-        let cur = out.last_mut().expect("one part");
-        if cur.len() + t.len() <= max {
-            cur.push_str(&t);
-            continue;
-        }
-        if out.len() == parts {
-            left = turns.len() - i;
-            break;
-        }
-        out.push(t);
-    }
-    if left > 0 {
-        let last = out.last_mut().expect("one part");
-        last.push_str(&format!(
-            "[{left} more turns of this session are left out of the import]\n"
-        ));
-    }
-    out.retain(|p| !p.is_empty());
-    out
-}
-
 /// One transcript file found for a project.
 #[derive(Clone, Debug)]
 pub struct Found {
@@ -373,7 +74,8 @@ pub struct Found {
 }
 
 /// The transcripts of a project: Claude Code's under the project's directory, with
-/// subagents when asked, and Codex's sessions whose `cwd` lies in the project.
+/// subagents when asked, Codex's sessions whose `cwd` lies in the project, and the logs
+/// that each adapter of `sparkles_memory_import::transcripts` finds for the project.
 pub fn find(
     roots: &Roots,
     project: &Project,
@@ -447,8 +149,24 @@ pub fn find(
             }
         }
     }
+    for (harness, locate) in [
+        (Harness::GeminiCli, transcripts::gemini::locate as Locate),
+        (Harness::Cursor, transcripts::cursor::locate),
+        (Harness::Copilot, transcripts::copilot::locate),
+        (Harness::Aider, transcripts::aider::locate),
+    ] {
+        if harnesses.contains(&harness) {
+            out.extend(locate(roots, project).into_iter().map(|path| Found {
+                harness,
+                path,
+                parent: None,
+            }));
+        }
+    }
     out
 }
+
+type Locate = fn(&Roots, &Project) -> Vec<PathBuf>;
 
 /// The `cwd` of a Codex session's first lines.
 fn codex_cwd(p: &Path) -> Option<String> {
@@ -557,12 +275,24 @@ fn session_digests(
 
 /// Import the project's transcripts. Returns a report per transcript.
 pub fn sync(run: &Run, cache: &mut Cache) -> Result<Vec<FileReport>, CmdError> {
-    let found = find(run.roots, run.project, &run.harnesses, run.opts.subagents);
+    let mut found = find(run.roots, run.project, &run.harnesses, run.opts.subagents);
     let named = run
         .opts
         .named
         .as_ref()
         .map(|p| sparkles_memory_import::project::absolute(p));
+    // a file the person names that no adapter located is read by its detected format,
+    // and by the generic adapter when none claims it
+    if let Some(n) = &named
+        && n.is_file()
+        && !found.iter().any(|f| f.path == *n)
+    {
+        found.push(Found {
+            harness: Harness::Generic,
+            path: n.clone(),
+            parent: None,
+        });
+    }
     let digests = session_digests(run.conn, &run.sync.prefix)?;
     let mut reports = Vec::new();
     let mut budget = run.opts.max_bytes;
@@ -594,10 +324,22 @@ pub fn sync(run: &Run, cache: &mut Cache) -> Result<Vec<FileReport>, CmdError> {
             reports.push(rep);
             continue;
         };
-        let mut s = match f.harness {
-            Harness::Codex => parse_codex(&raw, run.opts.tools),
-            _ => parse_claude(&raw, run.opts.tools, f.parent.is_some()),
+        let format = if f.harness == Harness::Generic {
+            transcripts::detect(&f.path, &raw)
+        } else {
+            Format::of(f.harness)
         };
+        let f = Found {
+            harness: format.harness(),
+            ..f
+        };
+        let mut s = format.parse(
+            &raw,
+            &transcripts::Opts {
+                tools: run.opts.tools,
+                sidechain: f.parent.is_some(),
+            },
+        );
         drop(raw);
         let stem = f
             .path
@@ -879,62 +621,8 @@ fn session_facts(
 mod tests {
     use super::*;
 
-    const CLAUDE: &str = r##"{"type":"summary","summary":"x"}
-{"type":"user","sessionId":"s1","cwd":"/p","gitBranch":"main","version":"2.1.0","timestamp":"2026-10-01T10:00:00Z","message":{"role":"user","content":"Where is the staging database?"}}
-{"type":"assistant","sessionId":"s1","timestamp":"2026-10-01T10:00:05Z","message":{"role":"assistant","model":"claude-x","content":[{"type":"thinking","thinking":"secret thoughts"},{"type":"text","text":"It runs on port 5433."},{"type":"tool_use","name":"Write","input":{"file_path":"/mem/staging-db.md","content":"..."}}]}}
-{"type":"user","sessionId":"s1","timestamp":"2026-10-01T10:00:06Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t","content":"written"}]}}
-{"type":"assistant","sessionId":"s1","timestamp":"2026-10-01T10:00:07Z","message":{"role":"assistant","content":[{"type":"text","text":"# Done\nSaved."}]}}
-{"type":"user","isSidechain":true,"sessionId":"s1","timestamp":"2026-10-01T10:00:08Z","message":{"role":"user","content":"side"}}
-"##;
-
     #[test]
-    fn claude_turns() {
-        let s = parse_claude(CLAUDE, false, false);
-        assert_eq!(s.id.as_deref(), Some("s1"));
-        assert_eq!(s.model.as_deref(), Some("claude-x"));
-        assert_eq!(s.branch.as_deref(), Some("main"));
-        assert_eq!(s.writes, ["/mem/staging-db.md"]);
-        let roles: Vec<&str> = s.turns.iter().map(|t| t.role.as_str()).collect();
-        assert_eq!(roles, ["user", "assistant"]);
-        let r = render(&s).concat();
-        assert!(!r.contains("secret thoughts") && !r.contains("written") && !r.contains("side"));
-        assert!(r.contains("\\# Done"), "{r}");
-        assert!(r.starts_with("## user 2026-10-01T10:00:00Z\n\nWhere is"));
-        let t = parse_claude(CLAUDE, true, false);
-        let r = render(&t).concat();
-        assert!(
-            r.contains("Tool call Write") && r.contains("## tool"),
-            "{r}"
-        );
-    }
-
-    #[test]
-    fn codex_turns() {
-        let log = r#"{"timestamp":"2026-10-01T10:00:00Z","type":"session_meta","payload":{"id":"c1","cwd":"/p","cli_version":"0.50.0","git":{"branch":"dev"}}}
-{"timestamp":"2026-10-01T10:00:00Z","type":"turn_context","payload":{"model":"gpt-x"}}
-{"timestamp":"2026-10-01T10:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>cwd</environment_context>"}]}}
-{"timestamp":"2026-10-01T10:00:02Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Run the tests"}]}}
-{"timestamp":"2026-10-01T10:00:03Z","type":"response_item","payload":{"type":"reasoning","encrypted_content":"zzz"}}
-{"timestamp":"2026-10-01T10:00:04Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"All pass."}]}}
-"#;
-        let s = parse_codex(log, false);
-        assert_eq!(s.id.as_deref(), Some("c1"));
-        assert_eq!(s.model.as_deref(), Some("gpt-x"));
-        assert_eq!(s.turns.len(), 2);
-        assert_eq!(s.turns[0].text, "Run the tests");
-    }
-
-    #[test]
-    fn parts() {
-        let turns: Vec<String> = (0..10)
-            .map(|i| format!("## user\n\n{}\n\n", "x".repeat(100 + i)))
-            .collect();
-        let p = split(&turns, 300, 8);
-        assert!(p.iter().all(|x| x.len() <= 300 + 80));
-        assert_eq!(p.concat().matches("## user").count(), 10);
-        let p = split(&turns, 300, 2);
-        assert_eq!(p.len(), 2);
-        assert!(p[1].contains("more turns"), "{}", p[1]);
+    fn durations() {
         assert_eq!(
             parse_duration("30d"),
             Some(Duration::from_secs(30 * 86_400))

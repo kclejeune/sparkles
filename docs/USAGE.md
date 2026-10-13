@@ -2537,6 +2537,21 @@ is less than 10 minutes old unless the session's end hook named it. `status` war
 Claude Code transcripts that its `cleanupPeriodDays` will delete soon. `setup
 --transcripts` adds `--transcripts` to the session end hook.
 
+Besides Claude Code and Codex, the import finds the transcripts of Gemini CLI
+(`~/.gemini/tmp/<project hash>/chats`), Cursor
+(`~/.cursor/projects/<project>/agent-transcripts`), the GitHub Copilot CLI
+(`~/.copilot/session-state/<session>/events.jsonl`, for sessions that ran in the
+project) and Aider (`.aider.chat.history.md` in the project). `GEMINI_CLI_HOME` and
+`COPILOT_HOME` move the first and the last of those directories, and
+`AIDER_CHAT_HISTORY_FILE` names Aider's file. The adapter names `gemini-cli`, `cursor`,
+`copilot` and `aider` select them, and a sync without a name reads all of them. Their
+instruction files are the generic adapter's. Gemini CLI, Cursor and Copilot do not
+document their log formats, so a version that writes something new may leave turns out.
+`--transcript FILE` imports one file, wherever it is. A file that none of these
+adapters recognizes is read by the generic adapter, which understands JSON lines or a
+JSON value of messages with a speaker and a text, Markdown with `## User` and
+`## Assistant` headings, and text with `User:` and `Assistant:` lines.
+
 ### Reviewing imported memory in the terminal
 
 `sparkles memory inbox` lists the review inbox with the signals of each fact and a short
