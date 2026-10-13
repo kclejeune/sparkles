@@ -832,6 +832,10 @@ impl Tree {
         }
         let mut stack: Vec<(u64, usize)> = vec![(m, 0)];
         let mut links: Vec<(u64, Parent)> = Vec::new();
+        // zero-weight edges can make nodes parents of each other, so a parent already
+        // on the path is skipped
+        let mut on: FxHashSet<u64> = FxHashSet::default();
+        on.insert(m);
         while let Some(top) = stack.last_mut() {
             let x = top.0;
             if x == self.root {
@@ -860,6 +864,7 @@ impl Tree {
                 out.push(edges);
                 stack.pop();
                 links.pop();
+                on.remove(&x);
                 if out.len() >= cap {
                     break;
                 }
@@ -868,13 +873,16 @@ impl Tree {
             let i = top.1;
             top.1 += 1;
             match self.parent_at(x, i, all) {
+                Some(q) if on.contains(&q.node) && q.node != self.root => {}
                 Some(q) => {
                     links.push((x, q));
                     stack.push((q.node, 0));
+                    on.insert(q.node);
                 }
                 None => {
                     stack.pop();
                     links.pop();
+                    on.remove(&x);
                 }
             }
         }
@@ -1571,7 +1579,14 @@ impl<'a> Engine<'a> {
         dist.insert(root, 0.0);
         heap.push(Reverse((OrdF64(0.0), root)));
         let mut n = 0u64;
+        // once every target is settled, a search for all the cheapest paths goes on
+        // through the nodes of the last cost: a zero-weight edge from one of them can
+        // still reach a settled target at that cost
+        let mut last_cost: Option<f64> = None;
         while let Some(Reverse((OrdF64(d), u))) = heap.pop() {
+            if last_cost.is_some_and(|c| d > c) {
+                break;
+            }
             if !settled.insert(u) {
                 continue;
             }
@@ -1586,7 +1601,10 @@ impl<'a> Engine<'a> {
             if targets.is_some() {
                 missing.remove(&u);
                 if missing.is_empty() {
-                    break;
+                    if !all {
+                        break;
+                    }
+                    last_cost = Some(d);
                 }
             }
             // a virtual end is not expanded
@@ -1608,7 +1626,13 @@ impl<'a> Engine<'a> {
                 } else {
                     st.node
                 };
-                if settled.contains(&y) || banned_nodes.is_some_and(|b| b.contains(&y)) {
+                if banned_nodes.is_some_and(|b| b.contains(&y)) {
+                    continue;
+                }
+                // a settled node has its final cost, and only a parent of the same cost
+                // is still of use, which a zero-weight edge from a node settled later can be
+                let tied = settled.contains(&y);
+                if tied && !all {
                     continue;
                 }
                 let e = if forward {
@@ -1639,10 +1663,11 @@ impl<'a> Engine<'a> {
                 match dist.get(&y) {
                     Some(&cur) if nd > cur => {}
                     Some(&cur) if nd == cur => {
-                        if all {
+                        if all && y != root {
                             tree.extra.entry(y).or_default().push(parent);
                         }
                     }
+                    _ if tied => {}
                     _ => {
                         dist.insert(y, nd);
                         tree.first.insert(y, (parent, 0));

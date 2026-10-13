@@ -476,6 +476,51 @@ fn weights_from_reifiers() {
 }
 
 #[test]
+fn all_shortest_over_zero_weight_edges() {
+    // A-Z1: s -> m and s -> t cost 1, and m -> t costs 0. Both `s t` and `s m t` cost 1.
+    // The dictionary numbers terms in sorted order, so the two names decide whether the
+    // search settles m or t first.
+    for (m, t) in [("a", "t"), ("z", "t"), ("t", "a"), ("t", "z")] {
+        let (m, t) = (format!("n{m}"), format!("n{t}"));
+        let edges = format!(
+            "ex:s ex:p ex:{m} {{| ex:w 1 |}} . ex:s ex:p ex:{t} {{| ex:w 1 |}} . \
+             ex:{m} ex:p ex:{t} {{| ex:w 0 |}} ."
+        );
+        let params = format!(
+            "path:source ex:s ; path:target ex:{t} ; path:weight ex:w ; \
+             path:algorithm path:allShortest"
+        );
+        let want: BTreeSet<String> = [format!("s {t}"), format!("s {m} {t}")].into();
+        let s = store_of(&edges);
+        assert_eq!(sequences(&s, &params), want, "{m} {t}");
+        let costs = rows(
+            &s,
+            &format!("SELECT ?c WHERE {{ SERVICE path:search {{ [] {params} ; path:cost ?c }} }}"),
+        );
+        assert_eq!(costs.len(), 2, "{m} {t}");
+        for r in costs {
+            assert_eq!(r["c"].parse::<f64>().unwrap(), 1.0, "{m} {t}");
+        }
+        // A-Z2: a zero-weight edge back from t to m makes a cycle, which is not followed
+        let s = store_of(&format!("{edges} ex:{t} ex:p ex:{m} {{| ex:w 0 |}} ."));
+        assert_eq!(sequences(&s, &params), want, "{m} {t} with a cycle");
+        // an unbound target gets every cheapest simple path to each node
+        let r = rows(
+            &s,
+            "SELECT ?t ?path WHERE { SERVICE path:search { [] path:source ex:s ; \
+             path:weight ex:w ; path:algorithm path:allShortest ; path:target ?t ; \
+             path:pathIndex ?path } }",
+        );
+        let to_t: BTreeSet<&String> = r
+            .iter()
+            .filter(|x| x["t"] == t)
+            .map(|x| &x["path"])
+            .collect();
+        assert_eq!(to_t.len(), 2, "{m} {t} with an unbound target");
+    }
+}
+
+#[test]
 fn hidden_triples_are_not_edges() {
     // A9: a protection hides the triples of e, so the path through e is gone
     let s = store_of(&format!("{GRAPH} ex:e a ex:Hidden ."));
@@ -720,13 +765,19 @@ fn random_graphs_against_brute_force() {
 #[test]
 fn random_weighted_graphs_against_brute_force() {
     let mut r = Rng(0x0dd_ba11_7e57);
-    for case in 0..6 {
+    for case in 0..40 {
         let n = 5 + r.below(3);
         let m = n + r.below(2 * n);
         let mut triples: BTreeMap<E, Option<usize>> = BTreeMap::new();
         for _ in 0..m {
-            let w = r.below(4);
-            triples.insert((r.below(n), 0, r.below(n)), (w > 0).then_some(w));
+            // 0 stands for an edge without a weight, 4 for a weight of zero (A-Z3)
+            let w = r.below(5);
+            let w = match w {
+                0 => None,
+                4 => Some(0),
+                w => Some(w),
+            };
+            triples.insert((r.below(n), 0, r.below(n)), w);
         }
         let ttl: String = triples
             .iter()
