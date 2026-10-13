@@ -1105,6 +1105,10 @@ pub(super) fn prefetch_scans(ctx: &Ctx, n: &Node) {
                 for b in lo..hi {
                     index.prefetch(&ctx.snap.cache, b, mask);
                 }
+                if ctx.opt.parallel_decode {
+                    let blocks: Vec<usize> = (lo..hi).collect();
+                    ctx.snap.cache.warm(index, &blocks, mask);
+                }
             }
         }
         for c in &n.children {

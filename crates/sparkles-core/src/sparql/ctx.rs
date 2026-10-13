@@ -198,10 +198,13 @@ pub struct Optimizations {
     pub prefetch_terms: bool,
     /// the blocks of a plan's scans with few blocks are requested before any operator runs
     pub prefetch_first_scan: bool,
+    /// the columns of the blocks that a join or a scan has asked the kernel for are decoded
+    /// in parallel on a pool of the cache's own, before the reader gets to them
+    pub parallel_decode: bool,
 }
 
 impl Optimizations {
-    pub const NAMES: [&str; 37] = [
+    pub const NAMES: [&str; 38] = [
         "range_pushdown",
         "incremental_group",
         "count_join_runs",
@@ -239,6 +242,7 @@ impl Optimizations {
         "prefetch_constants",
         "prefetch_terms",
         "prefetch_first_scan",
+        "parallel_decode",
     ];
 
     /// Everything on.
@@ -280,6 +284,7 @@ impl Optimizations {
         prefetch_constants: true,
         prefetch_terms: true,
         prefetch_first_scan: true,
+        parallel_decode: true,
     };
 
     /// Everything off: the generic operators only.
@@ -321,6 +326,7 @@ impl Optimizations {
         prefetch_constants: false,
         prefetch_terms: false,
         prefetch_first_scan: false,
+        parallel_decode: false,
     };
 
     fn flag(&mut self, name: &str) -> Option<&mut bool> {
@@ -362,6 +368,7 @@ impl Optimizations {
             "prefetch_constants" => &mut self.prefetch_constants,
             "prefetch_terms" => &mut self.prefetch_terms,
             "prefetch_first_scan" => &mut self.prefetch_first_scan,
+            "parallel_decode" => &mut self.parallel_decode,
             _ => return None,
         })
     }

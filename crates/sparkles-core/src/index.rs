@@ -913,6 +913,20 @@ pub struct BlockCache {
     fill: bool,
 }
 
+/// The threads that decode blocks ahead of a reader (see [`BlockCache::warm`]). They are
+/// not the global pool, so a parallel scan that uses it does not queue point lookups.
+fn decode_pool() -> &'static rayon::ThreadPool {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let cpus = std::thread::available_parallelism().map_or(2, |n| n.get());
+        rayon::ThreadPoolBuilder::new()
+            .num_threads((cpus / 2).clamp(2, 8))
+            .thread_name(|i| format!("sparkles-decode-{i}"))
+            .build()
+            .expect("decode thread pool")
+    })
+}
+
 #[derive(Clone)]
 struct BlockWeighter;
 impl quick_cache::Weighter<(u64, u32, u8), Arc<[u64]>> for BlockWeighter {
@@ -997,6 +1011,38 @@ impl BlockCache {
             cols,
             rows: idx.blocks[b].rows as usize,
         })
+    }
+
+    /// Decode the columns in `mask` of `blocks` that the cache lacks, in parallel on a pool
+    /// of its own, and keep them. A scan or join that has asked the kernel for these
+    /// blocks decodes them one by one otherwise, and on a lookup that touches dozens of
+    /// blocks for a few rows each the decoding is most of the time. Only columns the reader
+    /// decodes anyway are decoded. Does nothing for a read-through view, which keeps no
+    /// blocks, or for few columns, which are not worth the hand-off.
+    pub fn warm(&self, idx: &PermIndex, blocks: &[usize], mask: ColMask) {
+        use rayon::prelude::*;
+        const MIN_COLUMNS: usize = 4;
+        if !self.fill {
+            return;
+        }
+        let work: Vec<(usize, u8)> = blocks
+            .iter()
+            .flat_map(|&b| {
+                (0..4u8)
+                    .filter(move |c| mask & (1 << c) != 0)
+                    .filter(move |&c| self.cache.peek(&(idx.uid, b as u32, c)).is_none())
+                    .map(move |c| (b, c))
+            })
+            .collect();
+        if work.len() < MIN_COLUMNS {
+            return;
+        }
+        decode_pool().install(|| {
+            work.par_iter().for_each(|&(b, c)| {
+                // a failure shows again when the reader decodes the column
+                let _ = self.get_cols_hinted(idx, b, 1 << c, false);
+            });
+        });
     }
 
     /// Whether the columns in `mask` of block `b` are decoded in the cache, without
@@ -1284,6 +1330,37 @@ mod tests {
         })
         .unwrap();
         assert_eq!(n, 6 * BLOCK_ROWS as u64);
+    }
+
+    #[test]
+    fn warm_decodes_the_columns_in_parallel_and_keeps_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = PermWriter::create(dir.path(), Perm::Spo).unwrap();
+        for s in 0..(4 * BLOCK_ROWS as u64) {
+            w.push([s, s % 7, s % 13, 0]).unwrap();
+        }
+        w.finish(dir.path(), Perm::Spo).unwrap();
+        let idx = PermIndex::open(dir.path(), Perm::Spo).unwrap();
+        let cache = BlockCache::new(1 << 26);
+        let mask = 0b0111;
+        let blocks: Vec<usize> = (0..idx.blocks.len()).collect();
+        assert!(!cache.has_cols(&idx, 2, mask));
+        cache.warm(&idx, &blocks, mask);
+        for b in &blocks {
+            assert!(cache.has_cols(&idx, *b, mask));
+            assert!(!cache.has_cols(&idx, *b, 0b1000));
+        }
+        // the warmed columns equal a direct decode
+        let blk = cache.get_cols(&idx, 3, mask).unwrap();
+        for c in 0..3 {
+            assert_eq!(&*blk.cols[c], &*idx.decode_col(3, c).unwrap());
+        }
+        // a read-through view keeps nothing
+        let through = cache.read_through();
+        let empty = BlockCache::new(1 << 26);
+        empty.read_through().warm(&idx, &blocks, mask);
+        assert!(!empty.has_cols(&idx, 0, mask));
+        let _ = through;
     }
 
     #[test]

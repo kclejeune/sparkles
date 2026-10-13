@@ -811,6 +811,7 @@ fn prefetch(ctx: &Ctx, perm: Perm, ranges: &Ranges, cols: ColMask) {
     let idx = ctx.snap.perm(perm);
     let mask = cols | ranges.bound_mask() | (1 << perm.col_of(G));
     let mut last = None;
+    let mut visited = Vec::new();
     for i in 0..ranges.len() {
         let (lo, hi) = ranges.get(i);
         let (b0, b1) = idx.key_block_range(&lo, &hi);
@@ -819,8 +820,15 @@ fn prefetch(ctx: &Ctx, perm: Perm, ranges: &Ranges, cols: ColMask) {
             if last != Some(b) {
                 idx.prefetch(&ctx.snap.cache, b, mask);
                 last = Some(b);
+                if ctx.opt.parallel_decode {
+                    visited.push(b);
+                }
             }
         }
+    }
+    if ctx.opt.parallel_decode {
+        visited.dedup();
+        ctx.snap.cache.warm(idx, &visited, mask);
     }
 }
 
