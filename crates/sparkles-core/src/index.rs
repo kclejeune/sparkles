@@ -9,6 +9,7 @@
 
 use crate::error::{Error, Result};
 use crate::id::Id;
+use crate::ioacct::IoFile;
 use crate::vocab::write_varint;
 use memmap2::Mmap;
 use std::fs::File;
@@ -120,9 +121,10 @@ pub(crate) fn map_random(f: &File) -> std::io::Result<Mmap> {
 
 /// Ask the kernel to start reading `len` bytes of `m` at `off` (see [`io_hints`]).
 #[inline]
-pub(crate) fn will_need(m: &Mmap, off: usize, len: usize) {
+pub(crate) fn will_need(file: IoFile, m: &Mmap, off: usize, len: usize) {
     #[cfg(unix)]
     if len > 0 && off <= m.len() && len <= m.len() - off && io_hints() {
+        crate::ioacct::willneed(file, m.as_ptr(), off, len);
         // Linux caps a WILLNEED request's read-ahead. A single hint for an export's
         // tens of MiB leaves its tail to synchronous faults on a Random mapping.
         // Issue bounded requests so the entire requested range is covered.
@@ -136,7 +138,7 @@ pub(crate) fn will_need(m: &Mmap, off: usize, len: usize) {
         }
     }
     #[cfg(not(unix))]
-    let _ = (m, off, len);
+    let _ = (file, m, off, len);
 }
 
 pub type Key = [u64; 4];
@@ -723,7 +725,7 @@ impl PermIndex {
             m.offset as usize + m.col_len[..c].iter().map(|&l| l as usize).sum::<usize>()
         };
         let (from, to) = (at(first), at(last + 1));
-        will_need(data, from, to - from);
+        will_need(IoFile::of_perm(self.perm), data, from, to - from);
     }
 
     /// Decode one column of a block (columns are compressed separately).
@@ -737,6 +739,7 @@ impl PermIndex {
         // this column and the block's later ones, which a scan usually decodes next: one
         // read on a cold file instead of a page fault per page
         will_need(
+            IoFile::of_perm(self.perm),
             data,
             off,
             m.col_len[c..].iter().map(|&l| l as usize).sum::<usize>(),
@@ -747,6 +750,14 @@ impl PermIndex {
                 self.perm.name()
             ))
         })?;
+        crate::ioacct::column_decoded(self.perm, m.rows as usize, bytes.len());
+        if crate::ioacct::profiling() {
+            crate::ioacct::touch(IoFile::of_perm(self.perm), data.as_ptr(), off, bytes.len());
+            // the wait for the pages, apart from the decoding
+            let _wait = crate::ioacct::timer(crate::ioacct::Phase::IndexWait);
+            crate::ioacct::fault_in(bytes);
+        }
+        let _decode = crate::ioacct::timer(crate::ioacct::Phase::IndexDecode);
         decode_column(bytes, m.rows as usize)
     }
 

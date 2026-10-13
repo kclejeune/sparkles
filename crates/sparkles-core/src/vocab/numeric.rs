@@ -399,6 +399,7 @@ impl NumColumn {
         let (Some(&first), Some(&last)) = (fresh.first(), fresh.last()) else {
             return;
         };
+        crate::ioacct::numeric_pages(fresh.len() as u64);
         // When the chunks cover a good part of their span, one request for the whole
         // span reads faster than many small ones, at the cost of the gaps between them.
         let gap = if fresh.len() * DENSE >= last + 1 - first {
@@ -411,13 +412,19 @@ impl NumColumn {
             if c >= cur.0 && c <= cur.1.saturating_add(gap) {
                 cur.1 = cur.1.max(c + 1);
             } else {
-                self.bytes
-                    .will_need(cur.0 * HINT_CHUNK, (cur.1 * HINT_CHUNK).min(len));
+                self.bytes.will_need(
+                    crate::ioacct::IoFile::VocabNum,
+                    cur.0 * HINT_CHUNK,
+                    (cur.1 * HINT_CHUNK).min(len),
+                );
                 cur = (c, c + 1);
             }
         }
-        self.bytes
-            .will_need(cur.0 * HINT_CHUNK, (cur.1 * HINT_CHUNK).min(len));
+        self.bytes.will_need(
+            crate::ioacct::IoFile::VocabNum,
+            cur.0 * HINT_CHUNK,
+            (cur.1 * HINT_CHUNK).min(len),
+        );
     }
 
     /// What the column says about each of `ids` (best sorted ascending), reading a cold

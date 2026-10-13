@@ -445,6 +445,8 @@ pub struct Ctx {
     /// RDFS on read (see [`super::rdfs`])
     pub rdfs: Option<Arc<super::rdfs::RdfsSchema>>,
     pub opt: Optimizations,
+    /// the I/O counters when the query began (see [`Ctx::io_stats`])
+    io_start: crate::ioacct::IoSnapshot,
     /// parsed geometries of this query
     pub geo: crate::geo::memo::GeoMemo,
     /// notes for the plan's reader, without duplicates (see [`Ctx::warn`])
@@ -524,6 +526,7 @@ impl Ctx {
             service_scope: Arc::from(""),
             rdfs: None,
             opt: Optimizations::default(),
+            io_start: crate::ioacct::IoSnapshot::now(),
             geo: Default::default(),
             warnings: Default::default(),
             failed: Default::default(),
@@ -531,6 +534,14 @@ impl Ctx {
             stars: Default::default(),
             probes: Default::default(),
         }
+    }
+
+    /// What the read path counted since this context was made: index columns decoded,
+    /// bytes asked of the kernel and vocabulary lookups (see [`crate::ioacct`]). The
+    /// counters are process-wide, so reads of queries that run at the same time are
+    /// included.
+    pub fn io_stats(&self) -> crate::ioacct::IoSnapshot {
+        crate::ioacct::IoSnapshot::now().since(&self.io_start)
     }
 
     /// The query's `NOW()`: the clock at its first call, the same value at every later

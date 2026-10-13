@@ -19,6 +19,7 @@ pub(crate) use sync::{LazySync, PendingSync};
 
 use crate::disk::WritebackFile;
 use crate::error::Result;
+use crate::ioacct::{self, IoFile, Phase};
 use memmap2::Mmap;
 use rustc_hash::FxHashMap;
 use std::fs::File;
@@ -84,8 +85,12 @@ impl Sparse {
     fn first_hint(&self, g: usize) -> bool {
         let (word, bit) = (&self.hinted[g / 64], 1u64 << (g % 64));
         // a plain load first, so that warm lookups do not write the shared word
-        word.load(AtomicOrdering::Relaxed) & bit == 0
-            && word.fetch_or(bit, AtomicOrdering::Relaxed) & bit == 0
+        let first = word.load(AtomicOrdering::Relaxed) & bit == 0
+            && word.fetch_or(bit, AtomicOrdering::Relaxed) & bit == 0;
+        if first {
+            ioacct::vocab_group_hinted();
+        }
+        first
     }
     fn key(&self, g: usize) -> &[u8] {
         let end = self
@@ -212,9 +217,9 @@ impl Bytes {
     }
 
     /// Ask for bytes `[start, end)` to be read ahead (a mapped file only).
-    fn will_need(&self, start: usize, end: usize) {
+    fn will_need(&self, file: IoFile, start: usize, end: usize) {
         if let Bytes::Map(m) = self {
-            crate::index::will_need(m, start, end.saturating_sub(start));
+            crate::index::will_need(file, m, start, end.saturating_sub(start));
         }
     }
 }
@@ -245,14 +250,14 @@ impl Ahead {
         if offset + OFFSETS_WINDOW / 2 >= self.offsets_until {
             let from = offset.max(self.offsets_until);
             let to = (offset + OFFSETS_WINDOW).min(v.offsets.as_slice().len());
-            v.offsets.will_need(from, to);
+            v.offsets.will_need(IoFile::VocabOff, from, to);
             self.offsets_until = to;
         }
         let pos = v.block_offset(block);
         if self.until < self.end && pos + Self::WINDOW / 2 >= self.until {
             let from = pos.max(self.until);
             let to = (pos + Self::WINDOW).min(self.end);
-            v.data.will_need(from, to);
+            v.data.will_need(IoFile::VocabData, from, to);
             self.until = to;
         }
     }
@@ -396,12 +401,36 @@ impl Vocab {
         &data[pos..pos + len]
     }
 
+    /// Record the pages of front-coded block `b` as read (profile only).
+    #[inline]
+    fn touch_block(&self, b: usize) {
+        if ioacct::profiling()
+            && let (Bytes::Map(m), Bytes::Map(o)) = (&self.data, &self.offsets)
+        {
+            let start = self.block_offset(b);
+            let end = if b + 1 < self.num_blocks() {
+                self.block_offset(b + 1)
+            } else {
+                m.len()
+            };
+            ioacct::touch(IoFile::VocabOff, o.as_ptr(), b * 8, 16);
+            ioacct::touch(
+                IoFile::VocabData,
+                m.as_ptr(),
+                start,
+                end.saturating_sub(start),
+            );
+        }
+    }
+
     /// Decode a whole block, invoking `f(index_in_block, key)`; stops when `f` returns false.
     fn scan_block(&self, b: usize, mut f: impl FnMut(usize, &[u8]) -> bool) {
         let data = self.data.as_slice();
         let mut pos = self.block_offset(b);
         let start = b * FC_BLOCK;
         let n = FC_BLOCK.min((self.len as usize) - start);
+        ioacct::vocab_blocks_scanned(1);
+        self.touch_block(b);
         // Single-key callers own this fresh buffer throughout their scan.
         let mut key = Vec::with_capacity(64);
         for i in 0..n {
@@ -434,6 +463,7 @@ impl Vocab {
         key.clear();
         let data = self.data.as_slice();
         let mut pos = self.block_offset(b);
+        ioacct::vocab_blocks_scanned(1);
         let start = b * FC_BLOCK;
         let n = FC_BLOCK.min((self.len as usize) - start);
         for i in 0..n {
@@ -454,6 +484,7 @@ impl Vocab {
         if id >= self.len {
             return None;
         }
+        let _t = ioacct::timer(Phase::VocabRead);
         let b = (id as usize) / FC_BLOCK;
         let want = (id as usize) % FC_BLOCK;
         let mut out = None;
@@ -482,6 +513,7 @@ impl Vocab {
         mut reserve: impl FnMut(usize) -> std::result::Result<(), E>,
         mut f: impl FnMut(u64, &[u8]) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), E> {
+        let _t = ioacct::timer(Phase::VocabRead);
         let mut ahead = self.ahead_for(ids);
         if ahead.end == 0 && ids.len() > 1 {
             // scattered ids: ask for their blocks at once, so that a cold vocabulary
@@ -546,6 +578,7 @@ impl Vocab {
         mut f: impl FnMut(u64, &[u8]),
         read_ahead: bool,
     ) {
+        let _t = ioacct::timer(Phase::VocabRead);
         let mut ahead = if read_ahead {
             self.ahead_for(ids)
         } else {
@@ -595,7 +628,7 @@ impl Vocab {
             return;
         }
         const GAP: usize = 64 << 10;
-        fn advise(m: &Mmap, ranges: impl Iterator<Item = (usize, usize)>) {
+        fn advise(file: IoFile, m: &Mmap, ranges: impl Iterator<Item = (usize, usize)>) {
             let mut cur: Option<(usize, usize)> = None;
             for (s, e) in ranges {
                 let e = e.min(m.len());
@@ -605,14 +638,14 @@ impl Vocab {
                 cur = match cur {
                     Some((cs, ce)) if s <= ce + GAP => Some((cs, ce.max(e))),
                     Some((cs, ce)) => {
-                        crate::index::will_need(m, cs, ce - cs);
+                        crate::index::will_need(file, m, cs, ce - cs);
                         Some((s, e))
                     }
                     None => Some((s, e)),
                 };
             }
             if let Some((cs, ce)) = cur {
-                crate::index::will_need(m, cs, ce - cs);
+                crate::index::will_need(file, m, cs, ce - cs);
             }
         }
         let (Bytes::Map(data), Bytes::Map(offsets)) = (&self.data, &self.offsets) else {
@@ -640,8 +673,13 @@ impl Vocab {
             seen |= bit;
             word.fetch_or(bit, AtomicOrdering::Relaxed) & bit == 0
         });
-        advise(offsets, blocks.iter().map(|&b| (b * 8, b * 8 + 16)));
         advise(
+            IoFile::VocabOff,
+            offsets,
+            blocks.iter().map(|&b| (b * 8, b * 8 + 16)),
+        );
+        advise(
+            IoFile::VocabData,
             data,
             blocks.iter().map(|&b| {
                 let end = if b + 1 < self.num_blocks() {
@@ -701,17 +739,21 @@ impl Vocab {
         for g in groups {
             let lo = g * IDX_BLOCKS;
             let hi = ((g + 1) * IDX_BLOCKS).min(self.num_blocks());
-            self.offsets.will_need(lo * 8, (hi + 1) * 8);
+            self.offsets
+                .will_need(IoFile::VocabOff, lo * 8, (hi + 1) * 8);
             let end = s
                 .offsets
                 .get(g + 1)
                 .map_or(self.data.as_slice().len(), |&o| o as usize);
-            self.data.will_need(s.offsets[g] as usize, end);
+            self.data
+                .will_need(IoFile::VocabData, s.offsets[g] as usize, end);
         }
     }
 
     /// Binary search: `Ok(id)` if present, `Err(insertion point)` otherwise.
     pub fn find(&self, key: &[u8]) -> std::result::Result<u64, u64> {
+        ioacct::vocab_find();
+        let _t = ioacct::timer(Phase::VocabFind);
         let nb = self.num_blocks();
         if nb == 0 {
             return Err(0);
@@ -730,13 +772,14 @@ impl Vocab {
             hi = ((g + 1) * IDX_BLOCKS).min(nb);
             if crate::index::io_hints() && s.first_hint(g) {
                 if let Bytes::Map(m) = &self.offsets {
-                    crate::index::will_need(m, lo * 8, (hi - lo) * 8);
+                    crate::index::will_need(IoFile::VocabOff, m, lo * 8, (hi - lo) * 8);
                 }
                 let end = s
                     .offsets
                     .get(g + 1)
                     .map_or(self.data.as_slice().len(), |&o| o as usize);
-                self.data.will_need(s.offsets[g] as usize, end);
+                self.data
+                    .will_need(IoFile::VocabData, s.offsets[g] as usize, end);
             }
             // block `lo` starts with the group's key, which is not above `key`
             lo += 1;
