@@ -89,7 +89,7 @@ suite_run() {
   for n in "${NAMES[@]}"; do selected "$n" && names+=("$n"); done
   [ -n "${POOL:-}" ] && pool=(--pool-instances)
   python3 "$ROOT/scripts/bench-record.py" build --suite "$SUITE" --scale "$SCALE" --results "$RES" \
-    --manifest "$RES/manifest.json" --out "$RES/record.json" --warmup "$WARMUP" --runs "$RUNS" \
+    --manifest "$RES/manifest.json" --out "$RES/record.json" --warmup "$WARMUP" --runs "$RUNS" --max-time "$MAX_TIME" \
     --queries "${names[@]}" "${pool[@]}"
   python3 "$ROOT/scripts/bench-summary.py" "$RES" "${names[@]}" > /dev/null || log "bench-summary.py failed"
   log "record: $WORK/$RES/record.json, table: $WORK/$RES/summary.md"

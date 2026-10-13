@@ -179,7 +179,12 @@ and comparison methodology. [DEVELOPMENT.md](DEVELOPMENT.md) covers building and
   answer, times each query with hyperfine, and writes the run manifest, the result record
   and `results/summary.md`. The answer check runs with every server up. After it, the
   script stops them all and then starts, times and stops one engine at a time, so each
-  engine's queries and query mixes run with no other server running. The options are the
+  engine's queries and query mixes run with no other server running. `MAX_TIME` is the
+  longest a request may take, and each suite sets its own default. The clients give up
+  after `MAX_TIME`, and every server's query timeout is `MAX_TIME` plus a margin of 15
+  seconds (`TIMEOUT_MARGIN`), so a server stops a query that the client has abandoned. A
+  run that fails after taking as long as `MAX_TIME` is recorded as a `timeout`, whichever
+  side stopped it. The options are the
   ones of `scripts/bench.sh`, which are
   `ENGINES`, `QUERIES`, `RUNS`, `WARMUP`, `SKIP_LOAD`, `ANSWERS_ONLY`, `PORT_BASE`,
   `SERVER_MEM_MAX` and `CLIENT_CPU`. `COLD_RUNS=3` adds the cold measurement, a restart

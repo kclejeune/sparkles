@@ -80,6 +80,7 @@ MODES = {"warm", "cold", "update", "throughput", "qmph", "load"}
 AUX = {"load", "load-details", "answers", "mem", "rss", "rss-probe", "churn", "mixed", "cold", "cold-runs",
        "qmph", "extra", "manifest", "record", "update-latency", "inference"}
 CURL_TIMEOUT = 28
+MAX_TIME_S = None  # the harness's request limit in seconds, set by `build --max-time`
 
 
 def engine_name(n):
@@ -238,9 +239,16 @@ def fingerprints(answers):
     return out
 
 
-def status_of(codes, answer):
-    if codes and any(c != 0 for c in codes):
-        return "timeout" if all(c in (0, CURL_TIMEOUT) for c in codes) and CURL_TIMEOUT in codes else "error"
+def status_of(codes, samples_s, answer):
+    """ok, timeout, error or wrong-answer. A failed run is a timeout when curl gave up (exit 28)
+    or when it took as long as the harness's request limit (--max-time), which is how a server's
+    own timeout shows, since it answers with an HTTP error."""
+    failed = [(c, t) for c, t in zip(codes or [], samples_s) if c != 0]
+    if failed:
+        limit = MAX_TIME_S * 0.95 if MAX_TIME_S else None
+        if all(c == CURL_TIMEOUT or (limit is not None and t >= limit) for c, t in failed):
+            return "timeout"
+        return "error"
     if answer is not None and answer["agrees"] is False:
         return "wrong-answer"
     return "ok"
@@ -248,7 +256,7 @@ def status_of(codes, answer):
 
 def result(engine, query, mode, samples_s, codes, answer, clients=1, **extra):
     ok = [s * 1000 for s, c in zip(samples_s, codes or [0] * len(samples_s)) if c == 0]
-    st = status_of(codes, answer)
+    st = status_of(codes, samples_s, answer)
     r = {
         "engine": engine,
         "query": query,
@@ -305,6 +313,8 @@ def pool(results):
 
 
 def cmd_build(a):
+    global MAX_TIME_S
+    MAX_TIME_S = float(a.max_time) if a.max_time else None
     d = a.results
     man = json.load(open(a.manifest)) if a.manifest else {}
     answers = load_json(d, "answers.json")
@@ -336,8 +346,10 @@ def cmd_build(a):
         for q, med in per.items():
             runs = cold_runs.get(e, {}).get(q, {})
             times = runs.get("times") or ([med] if med != "error" else ["error"])
-            rec = result(en, q, "cold", [t if t != "error" else 0 for t in times],
-                         [0 if t != "error" else 1 for t in times], fps.get((q, en)))
+            num = [isinstance(t, (int, float)) for t in times]
+            rec = result(en, q, "cold", [t if n else 0 for t, n in zip(times, num)],
+                         [0 if n else (CURL_TIMEOUT if t == "timeout" else 1) for t, n in zip(times, num)],
+                         fps.get((q, en)))
             if runs.get("ready"):
                 rec["ready_s"] = runs["ready"]
             results.append(rec)
@@ -473,6 +485,7 @@ def main():
     b.add_argument("--timer", default="hyperfine+curl")
     b.add_argument("--pool-instances", action="store_true",
                    help="one result per template for queries named <template>-<i> (samples pooled)")
+    b.add_argument("--max-time", default="", help="the request limit in seconds: a failed run that took this long is a timeout")
     b.add_argument("--throughput-requests", default="")
     b.add_argument("--throughput-clients", default="16")
     b.set_defaults(f=cmd_build)

@@ -106,6 +106,21 @@ class RecordTests(unittest.TestCase):
         q = self.find(rec, "sparkles", "explore-mix", "qmph")
         self.assertEqual(q["qmph"], 1234.5)
 
+    def test_a_server_side_timeout_is_a_timeout(self):
+        # an HTTP error (curl exit 22) after the request limit is the server's own timeout
+        write(self.res, "slow.json", {"results": [hyperfine("jena-fuseki", [5.0, 5.1], [22, 22]),
+                                                  hyperfine("oxigraph", [0.2, 0.2], [22, 22])]})
+        write(self.res, "cold.json", {"jena-fuseki": {"slow": "error"}})
+        write(self.res, "cold-runs.json", {"jena-fuseki": {"slow": {"times": ["timeout", "error"], "ready": [0.1, 0.1]}}})
+        out = os.path.join(self.tmp.name, "r.json")
+        p = build(self.res, out, **{"max-time": 5})
+        self.assertEqual(p.returncode, 0, p.stderr)
+        rec = jload(out)
+        self.assertEqual(self.find(rec, "jena", "slow")["status"], "timeout")
+        self.assertEqual(self.find(rec, "oxigraph", "slow")["status"], "error")
+        # one cold run timed out and the other failed otherwise: not all timeouts
+        self.assertEqual(self.find(rec, "jena", "slow", "cold")["status"], "error")
+
     def test_wrong_answer_is_marked(self):
         rec, _ = self.record(wrong=True)
         self.assertEqual(self.find(rec, "oxigraph", "q1")["status"], "wrong-answer")
