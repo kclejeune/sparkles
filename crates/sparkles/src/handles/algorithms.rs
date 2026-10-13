@@ -49,6 +49,17 @@ impl Algorithms {
         crate::sparql::algorun::query_text(req, &self.prefixes(), summary_only).map(|(q, _)| q)
     }
 
+    /// The query of a request without a write part that selects its rows and, as the last
+    /// variable `?summary`, the statistics of the run.
+    pub fn query_text_with_summary(&self, req: &AlgoRequest) -> Result<String> {
+        if req.write.is_some() {
+            return Err(Error::invalid(
+                "the request writes its results; use run_write",
+            ));
+        }
+        crate::sparql::algorun::query_text_with_summary(req, &self.prefixes()).map(|(q, _)| q)
+    }
+
     /// Run a request and return its rows, one for each node (or node pair, or node and
     /// level), with a column for each output. The query it stands for runs with the
     /// dataset's query defaults and the budgets and access of `opts`.

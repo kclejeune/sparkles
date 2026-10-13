@@ -176,6 +176,24 @@ pub fn query_text(
     prefixes: &[(String, String)],
     stats: bool,
 ) -> Result<(String, Vec<&'static str>)> {
+    build(req, prefixes, !stats, stats)
+}
+
+/// The query of a request that selects the rows and, as the last variable `?summary`, the
+/// summary of the run (the same literal in every row).
+pub fn query_text_with_summary(
+    req: &AlgoRequest,
+    prefixes: &[(String, String)],
+) -> Result<(String, Vec<&'static str>)> {
+    build(req, prefixes, true, true)
+}
+
+fn build(
+    req: &AlgoRequest,
+    prefixes: &[(String, String)],
+    rows: bool,
+    summary: bool,
+) -> Result<(String, Vec<&'static str>)> {
     let algo = super::algosvc::Algo::from_name(&req.algorithm)
         .ok_or_else(|| invalid(format!("unknown algorithm '{}'", req.algorithm)))?;
     let mut triples: Vec<String> = Vec::new();
@@ -224,7 +242,10 @@ pub fn query_text(
         }
     }
     let outs = outputs(&req.algorithm)?;
-    let selected: Vec<&'static str> = if stats { vec!["summary"] } else { outs.clone() };
+    let mut selected: Vec<&'static str> = if rows { outs } else { Vec::new() };
+    if summary {
+        selected.push("summary");
+    }
     for o in &selected {
         triples.push(format!("algo:{o} ?{o}"));
     }

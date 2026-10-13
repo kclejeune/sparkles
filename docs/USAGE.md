@@ -39,6 +39,7 @@ without a migration path, so keep backups of anything you cannot regenerate.
 * [Outbound requests (SERVICE and LOAD)](#outbound-requests-service-and-load)
   * [Correlated, bulk and cached SERVICE](#correlated-bulk-and-cached-service)
 * [Finding paths](#finding-paths)
+* [Graph algorithms](#graph-algorithms)
 * [Embeddings computed on write](#embeddings-computed-on-write)
 * [Checking a database](#checking-a-database)
 * [MCP server (LLM agents)](#mcp-server-llm-agents)
@@ -1996,6 +1997,56 @@ benchmark data, the shortest path between two people 17 edges apart takes about 
 where `ASK { … foaf:knows+ … }` for the same pair takes about 125 ms, because the search
 runs from both ends at once ([BENCHMARKS.md](BENCHMARKS.md#path-search)).
 
+## Graph algorithms
+
+PageRank, betweenness, components, communities, node similarity, triangle counts,
+k-cores, breadth-first and shortest-path distances, and two kinds of node embeddings run
+inside the server on a projection of the graph. A query reaches them through
+`SERVICE algo:<name>`, and `sparkles algo` and `POST /$/algo/{ds}/run` run them without
+writing a query. The parameters and outputs of each algorithm are in
+[API.md](API.md#graph-algorithms), and the design is in
+[F14](specs/F14-graph-algorithms.md).
+
+The ten most central people of a social graph:
+
+```sh
+sparkles query --loc ./db '
+PREFIX algo: <urn:x-sparkles:algo#>
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+SELECT ?person ?rank WHERE {
+  SERVICE algo:pageRank { [] algo:predicate foaf:knows ; algo:node ?person ; algo:score ?rank }
+} ORDER BY DESC(?rank) LIMIT 10'
+```
+
+The same run from the command line, and a community detection that is written back to a
+graph in commits of 50,000 triples:
+
+```sh
+sparkles algo run --loc ./db pageRank --predicate http://xmlns.com/foaf/0.1/knows --param maxIterations=30
+sparkles algo run --loc ./db leiden --predicate http://xmlns.com/foaf/0.1/knows --direction undirected \
+  --param seed=7 --write-graph http://example.org/analytics \
+  --write community=http://example.org/community --write level=http://example.org/level --batch-size 50000
+```
+
+`--summary` prints the statistics of the run instead of its rows, and `--request FILE`
+takes the whole request as JSON, as the HTTP route does. A write-back run records itself
+in the output graph with the commit it computed at, so a reader knows which state the
+numbers describe. It commits in batches so that a large result does not hold the writer
+lock for long, and it can be cancelled between batches.
+
+Define a projection once under a name when several queries use it:
+
+```sh
+sparkles algo projections put --loc ./db people --predicate http://xmlns.com/foaf/0.1/knows --direction undirected
+sparkles algo projections list --loc ./db
+```
+
+A query then writes `algo:projection "people"` instead of the predicates. The server
+keeps built projections in memory (`--algo-cache-mb`), so a second call on unchanged
+data skips the build. `--algo-threads` and `--algo-max-threads-per-call` bound the CPU
+that algorithms take, and a call that is over its memory budget fails with a message that
+names the parameter that would make it fit.
+
 ## Embeddings computed on write
 
 A vector index can compute its vectors from the dataset's text through an embeddings
@@ -2200,6 +2251,9 @@ The tools are read-only unless the operator turns on the write tool:
 * `find_paths` finds the shortest path, all shortest paths, the k shortest or all paths
   up to a length between two nodes, or from one node, as
   [`SERVICE path:search`](#finding-paths) does, and returns each path's edges.
+* `graph_algorithm` runs PageRank, communities, similarity, components or embeddings on
+  a projection of the graph, as [`SERVICE algo:…`](#graph-algorithms) does, and returns
+  the best rows with the statistics of the run. It never writes.
 * `list_changes` lists the recorded changes of a range of commits, each quad added or
   removed with its commit, time, author and message, filtered by subject, predicate,
   object and graph. It answers when a fact changed and who changed it.

@@ -4,6 +4,7 @@
 //! `infer` ≈ riot --infer, `shacl` ≈ jena `shacl validate`, `shex` ≈ jena `shex
 //! validate|parse`).
 
+mod algo_cmd;
 mod alloc;
 #[cfg(feature = "mcp")]
 mod ask;
@@ -1500,6 +1501,12 @@ enum Cmd {
     Snapshot {
         #[command(subcommand)]
         cmd: SnapshotCmd,
+    },
+    /// Graph algorithms on a database: run PageRank, communities, similarity and
+    /// embeddings, write the results back, and manage named projections
+    Algo {
+        #[command(subcommand)]
+        cmd: algo_cmd::AlgoCmd,
     },
     /// Stored, parameterized queries of a database: list, get, put, delete and run them
     Queries {
@@ -3443,6 +3450,7 @@ fn run() -> Result<()> {
         }
         Cmd::Dump(args) => dump_cmd::run(args, opts),
         Cmd::Snapshot { cmd } => snapshot_cmd(cmd, opts),
+        Cmd::Algo { cmd } => algo_cmd::run(cmd, opts),
         Cmd::Queries { cmd } => queries_cmd::run(cmd, opts),
         #[cfg(feature = "graphql")]
         Cmd::Graphql(args) => graphql::run(args, opts),
