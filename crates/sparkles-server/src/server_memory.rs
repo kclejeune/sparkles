@@ -401,12 +401,20 @@ mod tests {
 
     #[test]
     fn profiles_set_defaults_and_flags_override_them() {
-        assert_eq!(sizes(&[]), CacheSizes::default());
-        assert_eq!(sizes(&["--memory-profile", "small"]), CacheSizes::small());
-        let s = sizes(&["--memory-profile", "small", "--cache-mb", "512"]);
-        assert_eq!(s.blocks, 512 << 20);
-        assert_eq!(s.results, CacheSizes::small().results);
-        assert_eq!(sizes(&["--result-cache-mb", "0"]).results, 0);
+        // the complete CLI parser needs the stack of the server's workers
+        std::thread::Builder::new()
+            .stack_size(crate::THREAD_STACK)
+            .spawn(|| {
+                assert_eq!(sizes(&[]), CacheSizes::default());
+                assert_eq!(sizes(&["--memory-profile", "small"]), CacheSizes::small());
+                let s = sizes(&["--memory-profile", "small", "--cache-mb", "512"]);
+                assert_eq!(s.blocks, 512 << 20);
+                assert_eq!(s.results, CacheSizes::small().results);
+                assert_eq!(sizes(&["--result-cache-mb", "0"]).results, 0);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]
