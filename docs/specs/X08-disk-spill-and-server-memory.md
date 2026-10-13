@@ -1,17 +1,19 @@
 # X08: Disk spill and server-wide memory
 
-> **Status:** specified
+> **Status:** Phase 1 shipped, Phases 2 and 3 specified
 >
-> **Phases:** None shipped. Phase 1 is server-wide cache sizing, a smaller memory
+> **Phases:** Phase 1 is shipped. It is server-wide cache sizing, a smaller memory
 > profile and the server-wide query memory pool with admission control. Phase 2 adds
 > batch-oriented hash join and grouping kernels in the cursor engine, then disk spill for
 > hash joins, sorts, grouping and DISTINCT. Phase 3 reduces the idle server footprint,
 > the Python process footprint and the size of the full-text index.
 >
-> **User docs:** none, because nothing is built.
+> **User docs:** [USAGE](../USAGE.md#memory-and-caches) and
+> [API](../API.md#query-memory-pool) for Phase 1. Phases 2 and 3 have none, because
+> nothing is built.
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
-> the end will record how it lands.
+> the end records how Phase 1 landed and where it differs from the text above.
 
 This design was written from the Sparkles code at `fc123d04` (the store's caches, the
 query context and its charges, the cursor operators, the server's limits and flags), the
@@ -690,4 +692,135 @@ index.
 
 ## Outcome
 
-Not built. See [ROADMAP](../ROADMAP.md) items 2, 7 and 40.
+Phase 1 is built (roadmap item 2). Phases 2 and 3 are not (items 7 and 40).
+
+### Phase 1a: shared caches
+
+The block, result, SERVICE and history caches are sized once per server and per embedded
+`Catalog`. `serve` builds one `SharedCaches` through its catalog, and every dataset, with
+its branches, reads through a `CacheScope` of it that `StoreOptions::shared` carries. The
+spec named the field's type `SharedCaches`. The type is `Option<CacheScope>`, which is a
+`SharedCaches` plus the dataset's namespace, because a dataset and its branches share one
+namespace and so one set of counters.
+
+* **Block cache.** The key stays 16 bytes. Its third field holds the column in the low 8
+  bits and the 24-bit namespace above it, so the hot path pays no extra hashing. Each
+  store has a `BlockCache` view with its own hit and miss counters. A view's `bytes` and
+  `entries` count its namespace by walking the cache, which `/$/server/memory` and the
+  metrics do once per scrape for all datasets. This replaces the lifecycle hook of §3.2,
+  because quick_cache does not call a hook for replaced entries, and a walk is exact. A
+  walk costs microseconds for a cache of a few thousand columns.
+* **Result and SERVICE caches.** Keys are `(namespace, string)` and a lookup borrows the
+  string. `POST /$/cache/clear/{ds}` removes the namespace's entries with `retain` instead
+  of bumping an epoch. It is exact, so the counters report what was cleared, and it costs
+  a pass over the cache.
+* **History cache.** Each store's materialized states stay a list, charged to a shared
+  `ByteBudget` that every mutation settles. A store that finds the budget over evicts its
+  own oldest states, and when it still holds only the state it just built, that state is
+  returned without being cached.
+* **Defaults and profiles.** The defaults are the block cache at 1 GiB, the result cache at
+  256 MiB, the SERVICE cache at 64 MiB and the history cache at 512 MiB, all for the
+  server. `StoreOptions::default` takes the same result and history sizes. `--memory-profile
+  small` sets 256, 64, 16 and 128 MiB, a query budget of 1 GiB and a pool of 2 GiB. A flag
+  overrides the profile, and `serve` logs the resolved values once at start. The C19
+  settings file cannot name a profile, and the bindings default to the `default`
+  profile. §8.2 of this spec covers that change.
+* **Capacity series.** `sparkles_block_cache_capacity_bytes` and
+  `sparkles_result_cache_capacity_bytes` carry no `dataset` label. The JSON snapshot keeps
+  `capacityBytes` in each dataset's block and result cache, with the shared capacity.
+* **Catalogs.** `CatalogOptions::memory.caches` is `FromStore` (the default, sized by the
+  store options), `Sizes` or `PerDataset`. A `Dataset` opened on its own keeps its caches.
+
+### Phase 1b: the query memory pool
+
+`QueryPool` and `PoolGrant` are in `sparkles-core` (`sparql/pool.rs`) as §4.1 describes.
+`Charge::add` checks the grant only after its own `mem_live` update, `Ctx::release_live`
+replaces the direct decrements and trims the grant, and the pool never makes a running
+query wait. The differences from the text:
+
+* **Admission** is an axum layer inside the rate limiter, as §4.2 says, and passes the
+  grant to handlers through a task-local that `query_options` reads. A request is a query
+  or an update by the rate limiter's classes. Other requests are not admitted. A query
+  they run, MCP tool calls included, starts with an empty grant from its dataset's pool,
+  does not queue and fails with `server-memory` when the pool is short.
+* **The initial grant** is 16 MiB, the server's `--query-memory-mb` if that is lower, and
+  never more than the pool. It does not follow a request's own `memory-mb`, because the
+  parameters are read after admission. The effect is that a request that lowers its budget
+  still reserves 16 MiB until it runs.
+* **Fairness.** Waiters are served in arrival order. A waiter behind the head may pass
+  only waiters that are larger than it and do not fit in the pool now, at most eight times
+  in a row. While requests wait, a query may not grow its grant past half of the pool,
+  and it always keeps the initial grant. A grant gives back memory only when it holds more
+  than 20 MiB beyond its use, and keeps its first 16 MiB.
+* **Default size.** Half of the memory the process may use (the cgroup v2 limit of the
+  server's cgroup and its ancestors, or `MemTotal`) less the configured caches, and at
+  least 256 MiB with a warning. The pool is on by default, which is the answer to open
+  question 1. On a host where the memory cannot be read the pool is off until
+  `--total-query-memory-mb` sets it.
+* **`NeedsSpill`**, `spilledBytes` and the spill reservation in `/$/server/memory` belong
+  to Phase 2 and are not built. `meta.memory.grantedBytes` is the most the query held.
+* **Not covered.** SHACL-SPARQL, `/$/reason` and ShEx do not take grants, because they run
+  through the engine's contexts without a request grant. A SERVICE call from a query to
+  its own server is admitted like any request, so it can wait for memory that its caller
+  holds, and it ends with `503` at the admission deadline.
+* **Errors.** `BudgetKind::ServerMemory` (`server-memory`) answers `503` with
+  `Retry-After: 1`, counts as a budget in `sparkles_budget_exceeded_total`, and is
+  `budget-server-memory` in the MCP tools. The optional operator caches that fall back on
+  a memory failure treat it like `memory`.
+* **Embedded.** `MemoryOptions::pool_bytes` gives a catalog a pool. Its datasets' queries
+  start with an empty grant and fail with `server-memory` without queueing, and a caller
+  that wants admission uses `QueryPool::admit_blocking`. Python
+  (`total_query_memory_bytes`) and Node (`totalQueryMemoryBytes`) pass the option. The JVM
+  bindings do not.
+
+A review by a second model found no deadlock and no leak of granted bytes, and its
+findings changed the code before it shipped. A pool smaller than 16 MiB refused every
+request, so admission now clamps the initial grant to the pool. A trim that raced a
+growing charge could leave the grant below the query's use, so a trim that gives memory
+back is followed by a check of the live bytes, and the counters that decide wake-ups use
+sequentially consistent ordering. A newcomer could overtake a queued request, so the
+check and the reservation of `try_grant` happen under the queue's lock. The bypass rule
+was looser than §4.2, and the history eviction left one state per store over a full
+budget.
+
+### Gates
+
+* **A1.** With ten datasets of 1.05M triples each and `--cache-mb 256`, the block cache
+  held 251 MiB in 1,063 columns after each dataset ran two queries, and the per-dataset
+  bytes added up to that figure. RSS was 770 MiB, against 467 MiB for one dataset and
+  1,074 MiB for the build before this change, whose ten caches held about 450 MiB of
+  blocks. The spec's bound of 1.1 times one dataset's RSS does not hold. Each dataset's
+  own pages, vocabulary and statistics are resident, and only the cache is capped.
+* **A2.** Covered by `shared_caches.rs`. Clearing one namespace leaves the other's entries,
+  and only its own queries miss afterwards. The HTTP route reports the namespace's counts.
+* **A3.** `serve --memory-profile small --cache-mb 512` logs `block cache 512 MiB, result
+  cache 64 MiB, SERVICE cache 16 MiB, history cache 128 MiB, query budget 1024 MiB, query
+  pool 2048 MiB`.
+* **A4 and A5.** `http/pool_tests.rs` holds 56 of 64 MiB, and a request answers `503` after
+  the wait with `Retry-After: 1` and the budget `server-memory`. Another request waits
+  while `sparkles_query_admission_waiting` reads 1 and then succeeds when the memory
+  returns. The rate limiter's caps answer first, as before.
+* **A6.** `pool.rs` runs 64 threads for five rounds each that ask for 40% of the pool
+  under a 300 ms wait. Every one ends with a grant or `server-memory`, and the pool
+  returns to zero.
+* **A7.** `query_pool.rs` drops a cursor with a batch in hand and then the batch, and the
+  pool returns to zero.
+* **Latency.** `mise run bench:nsc 899fb251 23807e08` at 1.05M triples, 27 queries, four
+  rounds on an AMD EPYC instance with the pool on in the candidate. The geometric mean of
+  the server times was 0.951 and of the client times 0.963, and no query over 0.3 ms was
+  slower by more than 3.0%. The smallest queries showed more. `values-star` (0.018 ms) read +29.9%
+  and +24.4%, and `types-grouped` +7.7% on the client. A rerun of the six smallest
+  queries with 300 requests and six rounds read +12.3% for `values-star`, +8.2% for
+  `star-lookup` and +5.5% for `types-grouped` on the server, and `star-lookup` had read
+  -6.2% in the first run. The spread between server processes of one binary is 60 to 150%
+  for these queries, larger than the effect, so the screen cannot settle the 2% gate for
+  queries under 0.3 ms. That needs a quiet Intel host.
+
+### What remains
+
+* The latency gate for queries under 0.3 ms on a quiet Intel host.
+* The 10.5M and DBpedia runs of the profile gate in §3.3, warm and cold. Only the
+  1.05M screen ran.
+* A settings-file profile (C19) and the `small` default for the bindings (§8.2).
+* Admitting SHACL-SPARQL, reasoning and ShEx through the pool, an initial grant that
+  follows `memory-mb`, and the JVM option.
