@@ -35,6 +35,51 @@ export function groupByPredicate(facts: RecallEntity['facts']): PredicateGroup[]
   return [...groups].map(([p, values]) => ({ p, values: [...values.values()] }));
 }
 
+/** A fact that differs between two commits. */
+export type FactChange = {
+  kind: 'added' | 'superseded' | 'retracted';
+  p: string;
+  o: string;
+  citations: (number | string)[];
+  status?: FactStatus;
+};
+
+/**
+ * What changed in an entity's facts between an earlier read (`before`) and a later one
+ * (`after`), as the time slider's compare mode shows it. A fact only the later read has is
+ * added. A fact only the earlier read has is superseded when the later read states another
+ * value of the same predicate, and retracted when it states none.
+ */
+export function factChanges(
+  before: RecallEntity['facts'] | undefined,
+  after: RecallEntity['facts'] | undefined,
+): FactChange[] {
+  const keyOf = (f: { p: string; o: string }) => `${f.p}\u0000${f.o}`;
+  const was = new Map((before ?? []).map((f) => [keyOf(f), f]));
+  const is = new Map((after ?? []).map((f) => [keyOf(f), f]));
+  const predicatesNow = new Set((after ?? []).map((f) => f.p));
+  const out: FactChange[] = [];
+  for (const g of groupByPredicate(after ?? [])) {
+    for (const v of g.values) {
+      if (!was.has(keyOf({ p: g.p, o: v.o })))
+        out.push({ kind: 'added', p: g.p, o: v.o, citations: v.citations, status: v.status });
+    }
+  }
+  for (const g of groupByPredicate(before ?? [])) {
+    for (const v of g.values) {
+      if (is.has(keyOf({ p: g.p, o: v.o }))) continue;
+      out.push({
+        kind: predicatesNow.has(g.p) ? 'superseded' : 'retracted',
+        p: g.p,
+        o: v.o,
+        citations: v.citations,
+        status: v.status,
+      });
+    }
+  }
+  return out;
+}
+
 /** The filters of the Memory tab: empty sets mean everything. */
 export type MemoryFilter = { graphs: Set<string>; agents: Set<string> };
 
