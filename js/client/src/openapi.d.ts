@@ -3365,6 +3365,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/{ds}/sparql/diff": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Diff a query between two states
+         * @description Runs one SELECT query at two states and returns the rows only one of them has, as bags of their terms. The server keeps a hash for each row of the earlier result and no row, then reads the later result against them and the earlier query once more to list up to `limit` differing rows of each side. The request counts twice against the `query` rate limit.
+         */
+        post: operations["sparqlDiff"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/{ds}/sparql/explain": {
         parameters: {
             query?: never;
@@ -7549,6 +7569,39 @@ export interface components {
             rows?: (null | components["schemas"]["RdfTerm"])[][];
             triples?: components["schemas"]["RdfTerm"][][];
             vars?: string[];
+        };
+        SparqlDiff: {
+            /** @description Rows only the later state has. */
+            added: number;
+            addedRows: {
+                [key: string]: unknown;
+            }[];
+            dataset: string;
+            datasetId: string;
+            from: {
+                commit?: components["schemas"]["Commit"];
+                selector?: string;
+            };
+            /** @description Rows at the earlier state. */
+            fromRows: number;
+            /** @description Rows only the earlier state has. */
+            removed: number;
+            removedRows: {
+                [key: string]: unknown;
+            }[];
+            /** @description Rows both states have, counted as a bag. */
+            same: number;
+            to: {
+                commit?: components["schemas"]["Commit"];
+                selector?: string;
+            };
+            /** @description Rows at the later state. */
+            toRows: number;
+            truncated: {
+                added?: boolean;
+                removed?: boolean;
+            };
+            vars: string[];
         };
         /** @description SPARQL 1.1 Query Results JSON: `results` for SELECT, `boolean` for ASK. */
         SparqlResults: {
@@ -17643,6 +17696,62 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             408: components["responses"]["Timeout"];
+            default: components["responses"]["Error"];
+        };
+    };
+    sparqlDiff: {
+        parameters: {
+            query?: {
+                /** @description A selector of the earlier state. */
+                from?: string;
+                /** @description A selector of the later state; the head by default. */
+                to?: string;
+                /** @description The most differing rows listed for each side. */
+                limit?: number;
+                /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
+                branch?: components["parameters"]["branch"];
+                /** @description Include materialized inferences. The default is true when the dataset has any. */
+                reasoning?: components["parameters"]["reasoning"];
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        /** @description The SELECT query. */
+        requestBody: {
+            content: {
+                "application/json": {
+                    from?: string;
+                    limit?: number;
+                    query: string;
+                    to?: string;
+                };
+                "application/sparql-query": string;
+                "application/x-www-form-urlencoded": {
+                    query: string;
+                };
+            };
+        };
+        responses: {
+            /** @description The differing rows and the counts. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SparqlDiff"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            410: components["responses"]["Gone"];
+            507: components["responses"]["InsufficientStorage"];
             default: components["responses"]["Error"];
         };
     };

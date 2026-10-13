@@ -1633,6 +1633,26 @@ fn history(p: &mut Paths) {
             .errors(&[400, 410, 507]),
     );
     p.add(
+        op(POST, "/{ds}/sparql/diff", "sparqlDiff", "History", "Diff a query between two states")
+            .doc("Runs one SELECT query at two states and returns the rows only one of them has, as bags of their terms. The server keeps a hash for each row of the earlier result and no row, then reads the later result against them and the earlier query once more to list up to `limit` differing rows of each side. The request counts twice against the `query` rate limit.")
+            .see("comparing-a-query-between-two-states")
+            .query("from", s(), "A selector of the earlier state.")
+            .query("to", s(), "A selector of the later state; the head by default.")
+            .query("limit", json!({ "type": "integer", "minimum": 1, "maximum": 10000, "default": 100 }), "The most differing rows listed for each side.")
+            .params(&["branch", "reasoning"])
+            .body(
+                true,
+                "The SELECT query.",
+                json!({
+                    "application/sparql-query": { "schema": { "type": "string" } },
+                    "application/x-www-form-urlencoded": { "schema": { "type": "object", "required": ["query"], "properties": { "query": { "type": "string" } } } },
+                    "application/json": { "schema": { "type": "object", "required": ["query"], "properties": { "query": { "type": "string" }, "from": { "type": "string" }, "to": { "type": "string" }, "limit": { "type": "integer" } } } },
+                }),
+            )
+            .json("200", "The differing rows and the counts.", "SparqlDiff")
+            .errors(&[400, 408, 410, 507]),
+    );
+    p.add(
         op(GET, "/{ds}/changes", "changes", "History", "Change feed")
             .doc("The commits after `after`, oldest first, with their changes. `wait` long-polls, and `Accept: text/event-stream` streams the commits as server-sent events.")
             .see("change-feed")

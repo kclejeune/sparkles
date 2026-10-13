@@ -48,6 +48,7 @@ pub(crate) mod schema;
 pub(crate) use schema::constraints::ShapesRequest;
 pub(crate) mod sd;
 mod shex;
+mod sparql_diff;
 mod stream;
 mod tabular;
 mod timeline;
@@ -192,6 +193,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/{ds}", any(dataset_root))
         .route("/{ds}/sparql", any(query_endpoint))
         .route("/{ds}/query", any(query_endpoint))
+        .route("/{ds}/sparql/diff", post(sparql_diff::sparql_diff))
         .route("/{ds}/update", post(update_endpoint))
         .route("/{ds}/data", any(gsp))
         .route("/{ds}/get", get(gsp).head(gsp))

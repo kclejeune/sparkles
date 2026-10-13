@@ -1249,3 +1249,111 @@ async fn the_timeline_buckets_the_commits() {
     let j = get(&s.app, "/$/commits/m/timeline").await.json();
     assert!(j["commits"].as_u64().unwrap() >= 1);
 }
+
+async fn sparql_diff(app: &Router, uri: &str, query: &str) -> Resp {
+    send(
+        app,
+        Request::post(uri)
+            .header(header::CONTENT_TYPE, "application/sparql-query")
+            .body(Body::from(query.to_string()))
+            .unwrap(),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn sparql_diff_lists_the_rows_one_state_lacks() {
+    let s = server(|_| {}).await;
+    let q = "SELECT ?s ?o WHERE { ?s <urn:p> ?o }";
+    // commit 1 has (a, 1) and commit 4 has (c, "three")
+    let r = sparql_diff(&s.app, "/h/sparql/diff?from=1&to=4", q).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(
+        (
+            j["fromRows"].as_u64(),
+            j["toRows"].as_u64(),
+            j["same"].as_u64(),
+            j["added"].as_u64(),
+            j["removed"].as_u64()
+        ),
+        (Some(1), Some(1), Some(0), Some(1), Some(1))
+    );
+    assert_eq!(j["vars"], serde_json::json!(["s", "o"]));
+    assert_eq!(j["addedRows"][0]["s"]["value"], "urn:c");
+    assert_eq!(j["addedRows"][0]["o"]["value"], "three");
+    assert_eq!(j["removedRows"][0]["s"]["value"], "urn:a");
+    assert_eq!(j["from"]["commit"]["seq"], 1);
+    assert_eq!(j["to"]["selector"], "commit:4");
+    assert_eq!(j["truncated"]["added"], false);
+    // commits 1 and 2 hold the same rows of the default graph
+    let j = sparql_diff(&s.app, "/h/sparql/diff?from=1&to=2", q)
+        .await
+        .json();
+    assert_eq!(
+        (
+            j["same"].as_u64(),
+            j["added"].as_u64(),
+            j["removed"].as_u64()
+        ),
+        (Some(1), Some(0), Some(0))
+    );
+    // the other way round
+    let j = sparql_diff(&s.app, "/h/sparql/diff?from=4&to=1", q)
+        .await
+        .json();
+    assert_eq!(j["addedRows"][0]["s"]["value"], "urn:a");
+    assert_eq!(j["removedRows"][0]["s"]["value"], "urn:c");
+    // rows are a bag: two rows against one differ once
+    update(
+        &s.app,
+        "h",
+        "INSERT DATA { <urn:d> <urn:p> 5 . <urn:e> <urn:p> 6 }",
+    )
+    .await;
+    let p = "SELECT ?p WHERE { ?s ?p ?o }";
+    let j = sparql_diff(&s.app, "/h/sparql/diff?from=4&to=5", p)
+        .await
+        .json();
+    assert_eq!(
+        (
+            j["same"].as_u64(),
+            j["added"].as_u64(),
+            j["removed"].as_u64()
+        ),
+        (Some(1), Some(2), Some(0))
+    );
+    // `limit` caps the rows listed, not the counts
+    let j = sparql_diff(&s.app, "/h/sparql/diff?from=4&to=5&limit=1", p)
+        .await
+        .json();
+    assert_eq!(j["added"], 2);
+    assert_eq!(j["addedRows"].as_array().unwrap().len(), 1);
+    assert_eq!(j["truncated"]["added"], true);
+    // the query and the selectors may come in a form or in JSON
+    let r = send(
+        &s.app,
+        Request::post("/h/sparql/diff")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({ "query": q, "from": "1", "to": "4" }).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["added"], 1);
+    // errors
+    let r = sparql_diff(&s.app, "/h/sparql/diff", q).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    let r = sparql_diff(&s.app, "/h/sparql/diff?from=1", "ASK {}").await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    let r = sparql_diff(&s.app, "/h/sparql/diff?from=1&limit=0", q).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    let r = sparql_diff(&s.app, "/h/sparql/diff?from=1", "SELECT nonsense").await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    let r = sparql_diff(&s.app, "/h/sparql/diff?from=1", "").await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    let r = sparql_diff(&s.app, "/h/sparql/diff?from=99", q).await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.text());
+}

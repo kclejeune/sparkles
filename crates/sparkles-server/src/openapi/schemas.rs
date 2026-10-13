@@ -593,6 +593,28 @@ pub(super) fn schemas() -> Map<String, J> {
         }),
     );
     put(
+        "SparqlDiff",
+        json!({
+            "type": "object",
+            "required": ["dataset", "datasetId", "from", "to", "vars", "fromRows", "toRows", "same", "added", "removed", "addedRows", "removedRows", "truncated"],
+            "properties": {
+                "dataset": { "type": "string" },
+                "datasetId": { "type": "string" },
+                "from": { "type": "object", "properties": { "selector": { "type": "string" }, "commit": sref("Commit") } },
+                "to": { "type": "object", "properties": { "selector": { "type": "string" }, "commit": sref("Commit") } },
+                "vars": array(json!({ "type": "string" })),
+                "fromRows": { "type": "integer", "description": "Rows at the earlier state." },
+                "toRows": { "type": "integer", "description": "Rows at the later state." },
+                "same": { "type": "integer", "description": "Rows both states have, counted as a bag." },
+                "added": { "type": "integer", "description": "Rows only the later state has." },
+                "removed": { "type": "integer", "description": "Rows only the earlier state has." },
+                "addedRows": array(json!({ "type": "object", "description": "The bound variables as SPARQL JSON terms.", "additionalProperties": true })),
+                "removedRows": array(json!({ "type": "object", "additionalProperties": true })),
+                "truncated": { "type": "object", "properties": { "added": { "type": "boolean" }, "removed": { "type": "boolean" } } },
+            },
+        }),
+    );
+    put(
         "CommitTimeline",
         json!({
             "type": "object",

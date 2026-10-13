@@ -1117,3 +1117,36 @@ async fn reload_keeps_debts_and_counts_requests_in_flight() {
     drop(held);
     assert_eq!(s.get(Q, "192.0.2.9").await.status(), StatusCode::OK);
 }
+
+#[tokio::test]
+async fn a_query_diff_counts_twice_against_the_query_class() {
+    let (rl, _) = limiter(&["query=1/min,burst=4"]);
+    assert_eq!(weight("/{ds}/sparql/diff"), 2);
+    assert_eq!(weight("/{ds}/sparql"), 1);
+    assert_eq!(
+        classify(
+            Some("/{ds}/sparql/diff"),
+            &Method::POST,
+            &"/ds/sparql/diff".parse().unwrap(),
+            &HeaderMap::new()
+        ),
+        Some(Class::Query)
+    );
+    let app = Router::new()
+        .route("/{ds}/sparql", axum::routing::post(|| async { "ok" }))
+        .route("/{ds}/sparql/diff", axum::routing::post(|| async { "ok" }))
+        .layer(axum::middleware::from_fn_with_state(rl, limit));
+    let call = |path: &'static str| {
+        let app = app.clone();
+        async move {
+            let mut req = HttpRequest::post(path).body(Body::empty()).unwrap();
+            let addr: SocketAddr = "192.0.2.1:1".parse().unwrap();
+            req.extensions_mut().insert(ConnectInfo(addr));
+            app.oneshot(req).await.unwrap().status()
+        }
+    };
+    // two diffs use the burst of four, and one more request of the class is over it
+    assert_eq!(call("/ds/sparql/diff").await, StatusCode::OK);
+    assert_eq!(call("/ds/sparql/diff").await, StatusCode::OK);
+    assert_eq!(call("/ds/sparql").await, StatusCode::TOO_MANY_REQUESTS);
+}

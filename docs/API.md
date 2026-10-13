@@ -3486,6 +3486,43 @@ schema in the Thrift compact protocol. Its literals carry the base direction of
 directional language strings, which Jena's binary reader ignores. A patch always lists
 every change, so `limit` with a patch format is `400`.
 
+### Comparing a query between two states
+
+`POST /{ds}/sparql/diff?from=SEL&to=SEL` runs one SELECT query at two states and returns
+the rows only one of them has. The query is the body, as `application/sparql-query`, a
+form with `query`, or JSON with `query` and the parameters. `from` is required. `to`
+defaults to the head, and both take the selectors of `at`. `branch` and `reasoning` are as
+for [the query endpoint](#per-dataset-sparql-protocol-fuseki-compatible). The caller
+needs read permission, and an ASK, CONSTRUCT or DESCRIBE query is a `400`. The UI offers
+this comparison when a result is too large to compare in the browser.
+
+Rows are compared as bags of their terms in column order. A row that occurs twice in one
+result and once in the other differs once. Blank nodes compare by label, so a query that
+makes new blank nodes for each run reports them as different.
+
+```json
+{ "dataset": "ds", "datasetId": "3f1c9a2e-…",
+  "from": { "selector": "commit:1", "commit": { "seq": 1, … } },
+  "to": { "selector": "commit:4", "commit": { "seq": 4, … } },
+  "vars": ["s", "o"], "fromRows": 1, "toRows": 1, "same": 0, "added": 1, "removed": 1,
+  "addedRows": [ { "s": { "type": "uri", "value": "urn:c" }, "o": { "type": "literal", "value": "three" } } ],
+  "removedRows": [ { "s": { "type": "uri", "value": "urn:a" }, "o": { "type": "literal", "value": "1", "datatype": "http://www.w3.org/2001/XMLSchema#integer" } } ],
+  "truncated": { "added": false, "removed": false } }
+```
+
+`addedRows` are the rows only the later state has and `removedRows` those only the earlier
+state has, each as SPARQL JSON terms with unbound variables left out. `limit` caps each
+list, 100 by default and at most 10,000, and `truncated` says that a list is cut. The
+counts are always complete.
+
+The server keeps a 128-bit hash for each distinct row of the earlier result and no row.
+It reads the later result against those hashes, which finds its own rows as they go by,
+and runs the earlier query once more to list the rows that no row of the later result
+matched. That is three executions of the query, each with the request's timeout and
+budgets, so the request counts twice against the `query` rate limit. The hashes count
+against the rows budget (`--max-rows`), and a comparison beyond it fails with `507` and
+`budget: "rows"`.
+
 ### Change feed
 
 `GET /{ds}/changes?after=SEL` lists the commits after a commit, oldest first, each with

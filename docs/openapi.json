@@ -14920,6 +14920,106 @@
         ],
         "type": "object"
       },
+      "SparqlDiff": {
+        "properties": {
+          "added": {
+            "description": "Rows only the later state has.",
+            "type": "integer"
+          },
+          "addedRows": {
+            "items": {
+              "additionalProperties": true,
+              "description": "The bound variables as SPARQL JSON terms.",
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "dataset": {
+            "type": "string"
+          },
+          "datasetId": {
+            "type": "string"
+          },
+          "from": {
+            "properties": {
+              "commit": {
+                "$ref": "#/components/schemas/Commit"
+              },
+              "selector": {
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "fromRows": {
+            "description": "Rows at the earlier state.",
+            "type": "integer"
+          },
+          "removed": {
+            "description": "Rows only the earlier state has.",
+            "type": "integer"
+          },
+          "removedRows": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "same": {
+            "description": "Rows both states have, counted as a bag.",
+            "type": "integer"
+          },
+          "to": {
+            "properties": {
+              "commit": {
+                "$ref": "#/components/schemas/Commit"
+              },
+              "selector": {
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "toRows": {
+            "description": "Rows at the later state.",
+            "type": "integer"
+          },
+          "truncated": {
+            "properties": {
+              "added": {
+                "type": "boolean"
+              },
+              "removed": {
+                "type": "boolean"
+              }
+            },
+            "type": "object"
+          },
+          "vars": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "dataset",
+          "datasetId",
+          "from",
+          "to",
+          "vars",
+          "fromRows",
+          "toRows",
+          "same",
+          "added",
+          "removed",
+          "addedRows",
+          "removedRows",
+          "truncated"
+        ],
+        "type": "object"
+      },
       "SparqlResults": {
         "description": "SPARQL 1.1 Query Results JSON: `results` for SELECT, `boolean` for ASK.",
         "properties": {
@@ -36883,6 +36983,158 @@
         "summary": "Explain an empty result",
         "tags": [
           "SPARQL"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
+    "/{ds}/sparql/diff": {
+      "post": {
+        "description": "Runs one SELECT query at two states and returns the rows only one of them has, as bags of their terms. The server keeps a hash for each row of the earlier result and no row, then reads the later result against them and the earlier query once more to list up to `limit` differing rows of each side. The request counts twice against the `query` rate limit.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#comparing-a-query-between-two-states"
+        },
+        "operationId": "sparqlDiff",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "description": "A selector of the earlier state.",
+            "in": "query",
+            "name": "from",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A selector of the later state; the head by default.",
+            "in": "query",
+            "name": "to",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The most differing rows listed for each side.",
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "default": 100,
+              "maximum": 10000,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/branch"
+          },
+          {
+            "$ref": "#/components/parameters/reasoning"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "from": {
+                    "type": "string"
+                  },
+                  "limit": {
+                    "type": "integer"
+                  },
+                  "query": {
+                    "type": "string"
+                  },
+                  "to": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "query"
+                ],
+                "type": "object"
+              }
+            },
+            "application/sparql-query": {
+              "schema": {
+                "type": "string"
+              }
+            },
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "properties": {
+                  "query": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "query"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "description": "The SELECT query.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SparqlDiff"
+                }
+              }
+            },
+            "description": "The differing rows and the counts."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "410": {
+            "$ref": "#/components/responses/Gone"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Diff a query between two states",
+        "tags": [
+          "History"
         ],
         "x-sparkles-permission": "read"
       }
