@@ -1,4 +1,5 @@
 pub mod access;
+pub mod algo;
 pub mod annotations;
 pub mod branch;
 pub mod builder;
