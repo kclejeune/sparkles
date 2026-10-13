@@ -671,7 +671,7 @@ type DatasetInfo = {
   "ds.state": boolean;     // false while offline
   "ds.services": { "srv.type": string; "srv.description": string; "srv.endpoints": string[] }[];
                            // query, update, gsp-rw, gsp-r, upload, prefixes-rw, SHACL, and
-                           // gsp-direct-rw with --gsp-direct-naming; "" is the dataset URL
+                           // gsp-direct-rw or gsp-direct-r with --gsp-direct-naming; "" is the dataset URL
 };
 
 type FusekiCounters = {
@@ -864,7 +864,8 @@ way older Fuseki versions did. Fuseki 6 itself refuses such bodies. The syntaxes
   `data` and `get`. `patch` is served at the dataset URL and `patch`. `upload` and
   `shacl` keep their names, and `prefixes-r` and
   `prefixes-rw` are served at `prefixes`. `gsp-direct-rw` and `gsp-direct-r` need a
-  server started with `--gsp-direct-naming`.
+  server started with `--gsp-direct-naming`. A `gsp-direct-r` endpoint makes its dataset
+  read-only at the graph's own URL.
 * A dataset of type `tdb2:DatasetTDB2` or `tdb:DatasetTDB` becomes a persistent dataset,
   unless its location is `--mem--`. A `ja:MemoryDataset`, `ja:DatasetTxnMem` or
   `ja:RDFDataset` becomes an in-memory dataset.
@@ -1476,7 +1477,7 @@ leaves a `DST.clone-tmp-PID` directory, which the next run into `DST` removes.
 | any        | `/{ds}`               | Also the update endpoint (`update=` or `application/sparql-update`), the patch endpoint for a `POST` of `application/rdf-patch` or `application/rdf-patch+thrift`, and the Graph Store endpoint for any other body. A form body (`application/x-www-form-urlencoded`) must hold `query` or `update`. A form with neither is refused and never read as RDF. The refusal is a `400`, or a write's authorization error for a caller without write access. |
 | POST       | `/{ds}/update`        | SPARQL 1.1 Update protocol, with an `update=` form or an `application/sparql-update` body. `using-graph-uri` and `using-named-graph-uri` are the `USING` and `USING NAMED` of every `DELETE`/`INSERT` operation. An operation with `USING`, `USING NAMED` or `WITH` of its own makes them a `400`. An update sent with GET (`/{ds}?update=…`) gets `405`. |
 | GET/PUT/POST/DELETE/HEAD | `/{ds}/data` , `/{ds}/get` | Graph Store Protocol, with `?default` or `?graph=<iri>`. `?graph=default` and `?graph=urn:x-arq:DefaultGraph` name the default graph. `?graph=union` and `?graph=urn:x-arq:UnionGraph` read the union of the named graphs, each triple once. Writing to it is a `400`. A GET with neither parameter returns the whole dataset as N-Quads or TriG. GET is streamed from one snapshot (see [Budgets](#budgets)). |
-| any        | `/{ds}/{path}`        | Fuseki's direct naming, with `sparkles serve --gsp-direct-naming`: the Graph Store Protocol on the graph whose IRI is the request URL without its query, such as `http://host:3030/ds/graphs/one`. The scheme and host are `X-Forwarded-Proto` and `X-Forwarded-Host` when a proxy sends them, else `http` and `Host`. Endpoint names (`sparql`, `data`, `shacl`, …) keep their meaning, so a graph cannot be named by one of them. `?graph=` and `?default` are a `400`. Without the flag the path is a `404`. |
+| any        | `/{ds}/{path}`        | Fuseki's direct naming, with `sparkles serve --gsp-direct-naming`: the Graph Store Protocol on the graph whose IRI is the request URL without its query, such as `http://host:3030/ds/graphs/one`. The scheme and host are `X-Forwarded-Proto` and `X-Forwarded-Host` when a proxy sends them, else `http` and `Host`. Endpoint names (`sparql`, `data`, `shacl`, …) keep their meaning, so a graph cannot be named by one of them. `?graph=` and `?default` are a `400`. Without the flag the path is a `404`. With `--gsp-direct-naming=NAME=read` the dataset is read-only there, and a write answers `405` with `Allow: GET, HEAD, OPTIONS`. |
 | POST       | `/{ds}/upload`        | Multipart file upload. The format comes from the file name extension or the content type. Optional `graph` field. CSV and TSV tables are mapped to triples, as [CSV and TSV uploads](#csv-and-tsv-uploads) describes. |
 | POST/PATCH | `/{ds}/patch`         | Applies an RDF Patch in one commit, as Fuseki's `patch` operation. See [Applying RDF Patch](#applying-rdf-patch). |
 | POST       | `/{ds}/shacl`         | SHACL validation, as in Fuseki's `/{ds}/shacl`. See [SHACL validation](#shacl-validation). |

@@ -278,13 +278,13 @@ that work by priority and links each item to its design spec.
 * **Stored queries.** There are no stored updates, no parameters bound to several values
   at once, and no private queries per user. [Roadmap](ROADMAP.md) item 39.
 * **Operations.** There are no JVM metrics and no ontology object API. Assembler bodies
-  are read only for the part that maps to a dataset, and direct Graph Store naming is on
-  for every dataset or none. A read-only `gsp-direct-r` endpoint is served read-write,
-  and only grants limit its writes. Validation endpoints refuse callers whose grants cover only
+  are read only for the part that maps to a dataset, and direct Graph Store naming is
+  chosen per dataset at start with `--gsp-direct-naming` and not through the settings
+  API. Validation endpoints refuse callers whose grants cover only
   some graphs or triples. The change feed refuses callers whose protections depend on the
   data, and protections hide triples, not the IRIs that visible triples mention. Backups
   cover individual datasets. There is no whole-server backup, and encryption keys for
-  backup repositories cannot be managed through the API, Vault or a cloud KMS. [Roadmap](ROADMAP.md) items 5, 61, 65, 71, 75, 76.
+  backup repositories cannot be managed through the API, Vault or a cloud KMS. [Roadmap](ROADMAP.md) items 61, 65, 71, 75, 76.
 * **Assistant configuration.** Dataset assistant settings, including `enabled`,
   `ingest` and `send: "documents"`, can be declared for every dataset or by name in the
   settings file of `serve --settings`, which can also lock them, and changed through

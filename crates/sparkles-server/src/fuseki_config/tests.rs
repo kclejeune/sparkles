@@ -479,3 +479,75 @@ fn every_configuration_converts() {
         }
     }
 }
+
+/// A read-only direct endpoint (`fuseki:gsp-direct-r`) becomes a read-only direct naming
+/// of its own dataset, a read-write one a read-write naming, and a dataset without either
+/// serves none (spec G08).
+#[test]
+fn direct_naming_is_per_dataset_and_keeps_its_mode() {
+    let ttl = r#"
+PREFIX fuseki: <http://jena.apache.org/fuseki#>
+PREFIX ja: <http://jena.hpl.hp.com/2005/11/Assembler#>
+[] a fuseki:Server ; fuseki:services ( <#ro> <#rw> <#both> <#none> ) .
+<#ro> a fuseki:Service ; fuseki:name "ro" ;
+    fuseki:endpoint [ fuseki:operation fuseki:query ] ;
+    fuseki:endpoint [ fuseki:operation fuseki:gsp-direct-r ] ;
+    fuseki:dataset <#dsro> .
+<#rw> a fuseki:Service ; fuseki:name "rw" ;
+    fuseki:endpoint [ fuseki:operation fuseki:gsp-direct-rw ] ;
+    fuseki:dataset <#dsrw> .
+<#both> a fuseki:Service ; fuseki:name "both" ;
+    fuseki:endpoint [ fuseki:operation fuseki:gsp-direct-r ] ;
+    fuseki:endpoint [ fuseki:operation fuseki:gsp-direct-rw ] ;
+    fuseki:dataset <#dsboth> .
+<#none> a fuseki:Service ; fuseki:name "none" ;
+    fuseki:endpoint [ fuseki:operation fuseki:query ] ;
+    fuseki:dataset <#dsnone> .
+<#dsro> a ja:MemoryDataset . <#dsrw> a ja:MemoryDataset .
+<#dsboth> a ja:MemoryDataset . <#dsnone> a ja:MemoryDataset .
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("config.ttl");
+    std::fs::write(&f, ttl).unwrap();
+    let p = plan_for(&[f], &UserSource::default(), Mode::Files).unwrap();
+    assert!(!p.report.has_unsupported(), "{}", p.report.text());
+    assert!(!has(&p, Kind::Approximated, "every dataset"));
+    let a = args(&p);
+    for want in [
+        "--gsp-direct-naming=both=read-write",
+        "--gsp-direct-naming=ro=read",
+        "--gsp-direct-naming=rw=read-write",
+    ] {
+        assert!(a.contains(want), "{want} in {a}");
+    }
+    assert!(!a.contains("none="), "{a}");
+    // the server reads the values back as one mode per dataset
+    let n = crate::state::GspDirectNaming::parse(&write::direct_naming_values(&p.server)).unwrap();
+    use crate::state::DirectMode::{Read, ReadWrite};
+    assert_eq!(n.mode("ro"), Some(Read));
+    assert_eq!(n.mode("rw"), Some(ReadWrite));
+    assert_eq!(n.mode("both"), Some(ReadWrite));
+    assert_eq!(n.mode("none"), None);
+}
+
+#[test]
+fn direct_naming_values_parse() {
+    use crate::state::DirectMode::{Read, ReadWrite};
+    use crate::state::GspDirectNaming;
+    let v = |x: &[&str]| x.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let all = GspDirectNaming::parse(&v(&[""])).unwrap();
+    assert_eq!((all.mode("a"), all.is_on()), (Some(ReadWrite), true));
+    let n = GspDirectNaming::parse(&v(&["a=read", "b", ""])).unwrap();
+    assert_eq!(n.mode("a"), Some(Read));
+    assert_eq!(n.mode("b"), Some(ReadWrite));
+    assert_eq!(
+        n.mode("c"),
+        Some(ReadWrite),
+        "the bare flag covers the rest"
+    );
+    let only = GspDirectNaming::parse(&v(&["a=read"])).unwrap();
+    assert_eq!(only.mode("b"), None);
+    assert!(!GspDirectNaming::default().is_on());
+    assert!(GspDirectNaming::parse(&v(&["a=write"])).is_err());
+    assert!(GspDirectNaming::parse(&v(&["=read"])).is_err());
+}

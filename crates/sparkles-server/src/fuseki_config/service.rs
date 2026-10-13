@@ -301,14 +301,20 @@ impl Converter<'_> {
                 ),
                 Some(names) if names.contains(&e.name.as_str()) => {
                     if e.op.starts_with("gsp-direct") {
-                        server.gsp_direct_naming = true;
-                        self.report.approximated(
-                            place,
-                            format!(
-                                "fuseki:{}: --gsp-direct-naming, which applies to every dataset",
-                                e.op
-                            ),
-                        );
+                        // read-write covers read, whichever endpoint comes first
+                        let mode = if e.op == "gsp-direct-r" {
+                            crate::state::DirectMode::Read
+                        } else {
+                            crate::state::DirectMode::ReadWrite
+                        };
+                        let at = server
+                            .gsp_direct_naming
+                            .entry(name.to_string())
+                            .or_insert(mode);
+                        if mode == crate::state::DirectMode::ReadWrite {
+                            *at = mode;
+                        }
+                        served.push(format!("{} at {shown}", e.op));
                     } else if e.op != "no-op" {
                         served.push(format!("{} at {shown}", e.op));
                     }

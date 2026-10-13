@@ -50,7 +50,7 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
 
 /// Fuseki's operations and the endpoint names Sparkles serves them at: (`srv.type`,
 /// `srv.description`, endpoints; `""` is the dataset URL itself).
-fn services(st: &AppState) -> Vec<(&'static str, &'static str, Vec<&'static str>)> {
+fn services(st: &AppState, ds: &str) -> Vec<(&'static str, &'static str, Vec<&'static str>)> {
     let mut s = vec![
         ("query", "SPARQL Query", vec!["", "sparql", "query"]),
         ("update", "SPARQL Update", vec!["", "update"]),
@@ -63,12 +63,18 @@ fn services(st: &AppState) -> Vec<(&'static str, &'static str, Vec<&'static str>
     if cfg!(feature = "shacl") {
         s.push(("SHACL", "SHACL Validation", vec!["shacl"]));
     }
-    if st.gsp_direct_naming {
-        s.push((
+    match st.gsp_direct_naming.mode(ds) {
+        Some(crate::state::DirectMode::ReadWrite) => s.push((
             "gsp-direct-rw",
             "Graph Store Protocol (Direct naming)",
             vec![""],
-        ));
+        )),
+        Some(crate::state::DirectMode::Read) => s.push((
+            "gsp-direct-r",
+            "Graph Store Protocol (Direct naming, read)",
+            vec![""],
+        )),
+        None => {}
     }
     s
 }
@@ -76,7 +82,7 @@ fn services(st: &AppState) -> Vec<(&'static str, &'static str, Vec<&'static str>
 /// The members Fuseki's dataset descriptions have (`/$/datasets`, `/$/server`), added
 /// to Sparkles' `DatasetInfo`.
 pub(super) fn describe(st: &AppState, ds: &Dataset) -> Map<String, J> {
-    let services: Vec<J> = services(st)
+    let services: Vec<J> = services(st, &ds.name)
         .into_iter()
         .map(|(t, d, e)| json!({ "srv.type": t, "srv.description": d, "srv.endpoints": e }))
         .collect();
@@ -231,8 +237,22 @@ async fn direct(
     headers: axum::http::HeaderMap,
     body: axum::body::Body,
 ) -> ApiResult {
-    if !st.gsp_direct_naming || name == "$" {
+    let Some(mode) = st.gsp_direct_naming.mode(&name).filter(|_| name != "$") else {
         return Ok(StatusCode::NOT_FOUND.into_response());
+    };
+    // a read-only endpoint (`fuseki:gsp-direct-r`) takes no write, whoever asks
+    if mode == crate::state::DirectMode::Read
+        && !matches!(
+            method,
+            axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
+        )
+    {
+        return Ok((
+            StatusCode::METHOD_NOT_ALLOWED,
+            [(axum::http::header::ALLOW, "GET, HEAD, OPTIONS")],
+            format!("/{name} serves direct graph names read-only\n"),
+        )
+            .into_response());
     }
     let params = Params::from_query(&uri);
     if params.has("graph") || params.has("default") {
