@@ -2388,7 +2388,7 @@ impl Scan {
                     } else {
                         mask | crate::index::bound_cols(&lo, &hi)
                     },
-                    false,
+                    crate::index::read_window() == 0,
                 )?;
                 (base.row, base.row_end) = if whole {
                     (0, block.len())
@@ -2528,7 +2528,7 @@ impl Scan {
                     } else {
                         mask | crate::index::bound_cols(&lo, &hi)
                     },
-                    false,
+                    crate::index::read_window() == 0,
                 )?;
                 (base.row, base.row_end) = if whole {
                     (0, block.len())

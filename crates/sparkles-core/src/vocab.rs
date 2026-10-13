@@ -252,7 +252,10 @@ impl Ahead {
             self.offsets_until = to;
         }
         let pos = v.block_offset(block);
-        let window = crate::index::read_window();
+        let window = match crate::index::read_window() {
+            0 => 1 << 20,
+            w => w,
+        };
         if self.until < self.end && pos + window / 2 >= self.until {
             let from = pos.max(self.until);
             let to = (pos + window).min(self.end);

@@ -1085,7 +1085,8 @@ fn merge_counters(
 /// Ask the kernel for the blocks of the scans of a plan before any operator runs (spec X07
 /// §5.2). A scan with few blocks is then read in parallel instead of one block after the
 /// other, and the two blocks at the ends of its range, which `count` decodes while the
-/// scan is set up, arrive together with the rest. A scan of many blocks reads ahead as it
+/// scan is set up, arrive together with the rest. The scan still decodes its blocks as it
+/// goes, so that decoding overlaps the reads of the blocks after them. A scan of many blocks reads ahead as it
 /// goes (see [`crate::index::ReadAhead`]).
 pub(super) fn prefetch_scans(ctx: &Ctx, n: &Node) {
     /// scans of more blocks than this are left to their own read-ahead
@@ -1094,8 +1095,9 @@ pub(super) fn prefetch_scans(ctx: &Ctx, n: &Node) {
         return;
     }
     fn walk(ctx: &Ctx, n: &Node) {
-        if let Kind::Scan(spec) | Kind::RangeScan(spec, _) | Kind::CountScan { spec, .. } = &n.kind
-        {
+        // (a `COUNT` scan answers from the block metadata and decodes at most the blocks at
+        // the ends of its range, which `count` asks for itself)
+        if let Kind::Scan(spec) | Kind::RangeScan(spec, _) = &n.kind {
             let index = ctx.snap.perm(spec.perm);
             let (lo, hi) = index.block_range(&spec.prefix);
             if lo < hi && hi - lo <= FEW_BLOCKS {
@@ -1104,10 +1106,6 @@ pub(super) fn prefetch_scans(ctx: &Ctx, n: &Node) {
                 let mask = scan_mask(ctx, spec) | bounds;
                 for b in lo..hi {
                     index.prefetch(&ctx.snap.cache, b, mask);
-                }
-                if ctx.opt.parallel_decode {
-                    let blocks: Vec<usize> = (lo..hi).collect();
-                    ctx.snap.cache.warm(index, &blocks, mask);
                 }
             }
         }

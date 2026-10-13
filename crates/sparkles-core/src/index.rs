@@ -144,14 +144,18 @@ pub(crate) fn will_need(file: IoFile, m: &Mmap, off: usize, len: usize) {
 pub type Key = [u64; 4];
 
 /// The most bytes of an index file that a [`ReadAhead`] has requested and not yet reached.
-/// `SPARKLES_READ_WINDOW_KB` changes it for experiments.
+/// `SPARKLES_READ_WINDOW_KB` changes it for experiments, and 0 turns the windows off: every
+/// block then asks for its own columns just before it is decoded, as before the windows.
 pub fn read_window() -> usize {
     static W: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *W.get_or_init(|| {
         std::env::var("SPARKLES_READ_WINDOW_KB")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
-            .map_or(4 << 20, |kb| (kb << 10).max(64 << 10))
+            .map_or(
+                4 << 20,
+                |kb| if kb == 0 { 0 } else { (kb << 10).max(64 << 10) },
+            )
     })
 }
 
@@ -189,7 +193,7 @@ impl ReadAhead {
         end: usize,
         columns: &dyn Fn(usize) -> ColMask,
     ) {
-        if b < self.refill_at || !io_hints() {
+        if b < self.refill_at || !io_hints() || read_window() == 0 {
             return;
         }
         let Some(data) = idx.data.as_ref() else {
@@ -942,6 +946,8 @@ fn empty_col() -> Arc<[u64]> {
 
 impl BlockCache {
     pub fn new(bytes: u64) -> BlockCache {
+        // start the decode threads now, not inside the first query that uses them
+        let _ = decode_pool();
         BlockCache {
             cache: Arc::new(quick_cache::sync::Cache::with_weighter(
                 (bytes / (BLOCK_ROWS as u64 * 8)).max(64) as usize,
@@ -1021,7 +1027,9 @@ impl BlockCache {
     /// blocks, or for few columns, which are not worth the hand-off.
     pub fn warm(&self, idx: &PermIndex, blocks: &[usize], mask: ColMask) {
         use rayon::prelude::*;
-        const MIN_COLUMNS: usize = 4;
+        // Below this the hand-off costs about what the decoding saves: a column of 32,768
+        // rows takes about 0.25 ms, and waking the pool about 1 ms on a small machine.
+        const MIN_COLUMNS: usize = 16;
         if !self.fill {
             return;
         }
@@ -1216,7 +1224,7 @@ impl PermIndex {
             let mask = columns(b);
             let whole = m.first >= *lo_key && m.last <= *hi_key;
             ahead.before(self, cache, b, hi, &columns);
-            let blk = cache.get_cols_hinted(self, b, mask, false)?;
+            let blk = cache.get_cols_hinted(self, b, mask, read_window() == 0)?;
             let go_on = if whole {
                 f(&blk, 0, blk.len())?
             } else {
@@ -1342,17 +1350,19 @@ mod tests {
         w.finish(dir.path(), Perm::Spo).unwrap();
         let idx = PermIndex::open(dir.path(), Perm::Spo).unwrap();
         let cache = BlockCache::new(1 << 26);
-        let mask = 0b0111;
+        let mask = ALL_COLS;
         let blocks: Vec<usize> = (0..idx.blocks.len()).collect();
         assert!(!cache.has_cols(&idx, 2, mask));
+        // too few columns to be worth the hand-off: nothing is decoded
+        cache.warm(&idx, &blocks[..2], mask);
+        assert!(!cache.has_cols(&idx, 0, mask));
         cache.warm(&idx, &blocks, mask);
         for b in &blocks {
             assert!(cache.has_cols(&idx, *b, mask));
-            assert!(!cache.has_cols(&idx, *b, 0b1000));
         }
         // the warmed columns equal a direct decode
         let blk = cache.get_cols(&idx, 3, mask).unwrap();
-        for c in 0..3 {
+        for c in 0..4 {
             assert_eq!(&*blk.cols[c], &*idx.decode_col(3, c).unwrap());
         }
         // a read-through view keeps nothing
