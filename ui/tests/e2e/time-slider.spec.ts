@@ -1,5 +1,5 @@
 // The time slider against a real server (docs/specs/U01-time-slider.md, acceptance examples
-// A1, A2 and A5, and a scrub of the History view as a smoke test). The dataset has three
+// A1, A2, A5, A7 and A9, and a scrub of the History view as a smoke test). The dataset has three
 // updates: the first loads ex:alice ex:name "Alice" and ex:alice ex:knows ex:bob, the second
 // adds ex:bob ex:name "Bob", and the third replaces ex:alice ex:knows ex:bob with
 // ex:alice ex:knows ex:carol. The tests read commit numbers from the receipts, because the
@@ -164,3 +164,71 @@ open('the History panel scrubs a query to an earlier commit', async ({ page }) =
   await page.keyboard.press('End');
   await expect(grid(page)).toContainText('/carol');
 });
+
+// --- the Explore graph and the schema tab (Phase 2) --------------------------------------------
+
+type Drawn = { nodes: [string, string][]; edges: [string, string][] };
+
+/** What the graph draws, from the text the view keeps for the tests. */
+const drawn = async (page: Page): Promise<Drawn> => {
+  const raw = await page.locator('.wrap[data-graph]').getAttribute('data-graph');
+  return raw ? JSON.parse(raw) : { nodes: [], edges: [] };
+};
+const labels = async (page: Page) => (await drawn(page)).nodes.map(([l]) => l).join(' ');
+const changeOf = async (page: Page, re: RegExp) =>
+  (await drawn(page)).nodes.find(([l]) => re.test(l))?.[1];
+const graphBar = (page: Page) => page.getByRole('region', { name: 'Graph history time slider' });
+const graphHandle = (page: Page) =>
+  graphBar(page).getByRole('slider', { name: /^(Commit|Compared to)$/ });
+
+open(
+  'A7: the graph is read at a commit, and compare marks added and removed edges',
+  async ({ page }) => {
+    await page.goto(`/ui/explore?ds=chronology&iri=${encodeURIComponent(`${EX}alice`)}`);
+    await expect.poll(() => labels(page)).toMatch(/carol/);
+    await page.getByRole('button', { name: 'Graph history' }).click();
+    await expect(graphHandle(page)).toHaveAttribute('aria-valuenow', String(third));
+    await graphHandle(page).focus();
+    await page.keyboard.press('ArrowLeft');
+    await page.keyboard.press('ArrowLeft');
+    await expect(graphHandle(page)).toHaveAttribute('aria-valuenow', String(first));
+    await expect.poll(() => labels(page)).toMatch(/bob/);
+    expect(await labels(page)).not.toMatch(/carol/);
+    // compare the second commit with the head
+    await page.keyboard.press('End');
+    await expect.poll(() => labels(page)).toMatch(/carol/);
+    await page.keyboard.press('c');
+    await expect(graphBar(page).getByRole('slider', { name: 'Compared from' })).toHaveAttribute(
+      'aria-valuenow',
+      String(second),
+    );
+    await expect.poll(() => changeOf(page, /carol/)).toBe('added');
+    await expect.poll(() => changeOf(page, /bob/)).toBe('removed');
+    await expect(graphBar(page).getByRole('status')).toHaveText(
+      `Commit ${third}: 1 edge added, 1 removed`,
+    );
+  },
+);
+
+open(
+  'A9: the schema is read at a commit and compare shows the counts that changed',
+  async ({ page }) => {
+    const nameRow = () => page.getByRole('row').filter({ hasText: 'example.org/name' }).first();
+    await page.goto('/ui/explore?ds=chronology&tab=schema');
+    await page.getByRole('button', { name: 'Schema history' }).click();
+    await page.getByRole('tab', { name: /^Properties/ }).click();
+    const bar = page.getByRole('region', { name: 'Schema history time slider' });
+    const handle = bar.getByRole('slider', { name: /^(Commit|Compared to)$/ });
+    await expect(handle).toHaveAttribute('aria-valuenow', String(third));
+    await expect(nameRow().getByRole('cell').nth(1)).toContainText('2');
+    await handle.focus();
+    await page.keyboard.press('ArrowLeft');
+    await page.keyboard.press('ArrowLeft');
+    await expect(handle).toHaveAttribute('aria-valuenow', String(first));
+    await expect(nameRow().getByRole('cell').nth(1)).toHaveText('1');
+    // compare the first commit with the head
+    await page.goto(`/ui/explore?ds=chronology&tab=schema&from=commit:${first}`);
+    await page.getByRole('tab', { name: /^Properties/ }).click();
+    await expect(nameRow().getByRole('cell').nth(1)).toContainText('+1');
+  },
+);
