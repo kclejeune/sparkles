@@ -314,6 +314,15 @@ class LibTests(unittest.TestCase):
         self.assertEqual(out.split(), ["text/tab-separated-values", "application/sparql-results+json",
                                        "application/n-triples", "application/n-triples"])
 
+    def test_suite_settings_in_the_environment_do_not_leak_into_bench_sh_runs(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = dict(os.environ, ROOT=os.path.dirname(SCRIPTS), WORK=d, ENGINES="sparkles",
+                       COUNT_ONLY="q1", NO_CHECK="q2", DATAFILE="other.nt", LOADRES="elsewhere")
+            lib = os.path.join(SCRIPTS, "bench-lib.sh")
+            p = subprocess.run(["bash", "-c", f'source "{lib}"; echo "[$COUNT_ONLY] [$NO_CHECK] [$DATAFILE] [$LOADRES]"'],
+                               cwd=d, env=env, capture_output=True, text=True)
+        self.assertEqual(p.stdout.strip(), "[export-500k] [] [data.nt] [results]")
+
     def test_timed_request_and_cold_request_ask_for_the_same_format(self):
         qs = {"a": "ASK { ?s ?p ?o }"}
         out = self.bash(qs, "q localhost:1/x a")

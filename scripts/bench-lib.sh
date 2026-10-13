@@ -80,6 +80,13 @@ LOADNAME=([sparkles]=sparkles [jena]=jena-tdb2 [qlever]=qlever [fluree]=fluree [
 PORT=([sparkles]=$PORT_BASE [qlever]=$((PORT_BASE + 1)) [jena]=$((PORT_BASE + 2)) [fluree]=$((PORT_BASE + 3)) [oxigraph]=$((PORT_BASE + 4)))
 FILEOF=([sparkles]=sparkles.db [jena]=jena.db [qlever]=qlever-index [fluree]=fluree [oxigraph]=oxigraph.db)
 STORE=${STORE:-$WORK}
+# Settings of the shared functions below. They are plain assignments, so an exported value of
+# the same name in the caller's environment cannot change a run. A suite script reassigns them
+# after sourcing this file.
+DATAFILE=data.nt         # the file load_all loads, relative to WORK
+LOADRES=results          # the directory load_all writes the load numbers to
+COUNT_ONLY="export-500k" # queries whose answers are compared by row count only (bench.sh's)
+NO_CHECK=""              # queries whose answers are not compared (DESCRIBE)
 # The longest a request may take, in seconds. The clients (curl, the answer check, the BSBM
 # driver) give up after MAX_TIME and record a timeout. The servers' own query timeouts are
 # MAX_TIME plus a margin, so that a server stops a query the client has already given up on
@@ -316,12 +323,12 @@ EOF
 }
 
 # ------------------------------------------------------------------------------- load
-# load_all: DATAFILE (default data.nt, relative to WORK) into every selected engine
-# (LOADRES, default results, gets the numbers). Each load runs under GNU time for its
+# load_all: DATAFILE (relative to WORK) into every selected engine
+# (LOADRES gets the numbers). Each load runs under GNU time for its
 # peak RSS (the largest of the processes it waits
 # for); load.json and load-details.json get the time, peak RSS and index size.
 load_all() {
-  local gtime e cmd t0 t1 df=${DATAFILE:-data.nt}
+  local gtime e cmd t0 t1 df=$DATAFILE
   gtime=$(gnu_time)
   for e in $ENGINES; do
     case $e in
@@ -347,7 +354,7 @@ load_all() {
     t0=$(date +%s.%N)
     "$gtime" -v -o "logs/load-$e.time" bash -c "$cmd" > "logs/load-$e.log" 2>&1 || die "$e: load failed, see logs/load-$e.log"
     t1=$(date +%s.%N)
-    record_load "${LOADRES:-results}" "${LOADNAME[$e]}" "$(awk "BEGIN {print $t1 - $t0}")" "logs/load-$e.time" "$WORK/${FILEOF[$e]}"
+    record_load "$LOADRES" "${LOADNAME[$e]}" "$(awk "BEGIN {print $t1 - $t0}")" "logs/load-$e.time" "$WORK/${FILEOF[$e]}"
   done
 }
 
@@ -391,7 +398,6 @@ start_all() {
 # Each request is also the query's memory reading: the server's peak RSS is reset
 # (clear_refs) before it, and mem.json gets the peak (VmHWM) after it and its rise over
 # the RSS at the reset.
-COUNT_ONLY=${COUNT_ONLY-export-500k}
 answer_check() {
   local n e r before peak kv
   echo
@@ -402,7 +408,7 @@ answer_check() {
     selected "$n" || continue
     local flag=()
     [[ " $COUNT_ONLY " == *" $n "* ]] && flag=(--count-only)
-    [[ " ${NO_CHECK:-} " == *" $n "* ]] && flag+=(--no-check)
+    [[ " $NO_CHECK " == *" $n "* ]] && flag+=(--no-check)
     printf '%-16s' "$n"
     kv=()
     for e in $ENGINES; do
