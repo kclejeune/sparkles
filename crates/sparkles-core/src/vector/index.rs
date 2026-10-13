@@ -466,6 +466,79 @@ impl hnsw::Space for SegSpace<'_> {
     }
 }
 
+/// Half-precision copies of the nodes' vectors in node order, which a graph build reads
+/// instead of the segment's `f32` rows. The build is limited by memory bandwidth (a
+/// node's insertion reads a few thousand rows spread over the whole segment), so half
+/// the bytes per row makes it faster, and node order drops the step from node to row.
+/// Under cosine the copies are of the unit vectors, so the distance is `1 − dot`. The
+/// graph's distances round differently from the `f32` ones, which can only change which
+/// links it keeps. Searches still read the `f32` rows, and scores never come from here.
+///
+/// The copy takes 2 bytes per dimension per node for as long as the build runs (768 MB
+/// at 1M × 384), on top of the segment.
+pub(crate) struct HalfSpace {
+    dim: usize,
+    metric: Metric,
+    data: Vec<u16>,
+}
+
+impl HalfSpace {
+    /// The copies of `rows` of `seg` (`None`: the CPU has no fast half-precision path,
+    /// or a value is beyond binary16's range for the dot or euclidean metric).
+    pub(crate) fn new(seg: &Segment, rows: &[u32], metric: Metric) -> Option<HalfSpace> {
+        use rayon::prelude::*;
+        let dim = seg.dim;
+        if !super::fast::f16_fast() || dim == 0 {
+            return None;
+        }
+        if metric != Metric::Cosine
+            && rows
+                .par_iter()
+                .any(|&r| seg.row(r as usize).iter().any(|x| x.abs() > 65_000.0))
+        {
+            return None;
+        }
+        let mut data = vec![0u16; rows.len() * dim];
+        data.par_chunks_mut(dim).zip(rows.par_iter()).for_each_init(
+            || vec![0f32; dim],
+            |buf, (out, &r)| {
+                let row = seg.row(r as usize);
+                if metric == Metric::Cosine {
+                    let n = seg.norms[r as usize];
+                    for (b, x) in buf.iter_mut().zip(row) {
+                        *b = x / n;
+                    }
+                    super::fast::to_f16(buf, out);
+                } else {
+                    super::fast::to_f16(row, out);
+                }
+            },
+        );
+        Some(HalfSpace { dim, metric, data })
+    }
+
+    #[inline]
+    fn row(&self, x: u32) -> &[u16] {
+        &self.data[x as usize * self.dim..(x as usize + 1) * self.dim]
+    }
+}
+
+impl hnsw::Space for HalfSpace {
+    fn len(&self) -> usize {
+        self.data.len() / self.dim
+    }
+
+    fn dist(&self, a: u32, b: u32) -> f32 {
+        let (x, y) = (self.row(a), self.row(b));
+        let d = match self.metric {
+            Metric::Cosine => 1.0 - super::fast::dot_f16(x, y),
+            Metric::Dot => -super::fast::dot_f16(x, y),
+            Metric::Euclidean => super::fast::l2sq_f16(x, y),
+        };
+        if d.is_nan() { f32::INFINITY } else { d }
+    }
+}
+
 /// The rows per graph of a segment.
 fn graph_rows(seg: &Segment) -> Vec<(u64, u64)> {
     let mut m: FxHashMap<u64, u64> = FxHashMap::default();
@@ -615,10 +688,19 @@ pub(crate) fn build_index(
             node_rows: Arc::new(Slice::Owned(Vec::new())),
             ..clone_meta(&built)
         }));
-        let space = SegSpace {
+        let seg_space = SegSpace {
             seg: &segment,
             nodes: &nodes,
             metric: cfg.metric,
+        };
+        // the half-precision copy only when it fits in the budget beside the index
+        let half_bytes = (nodes.len() * segment.dim * 2) as u64;
+        let half = (used + need + half_bytes <= ctl.budget)
+            .then(|| HalfSpace::new(&segment, &nodes, cfg.metric))
+            .flatten();
+        let space: &dyn hnsw::Space = match &half {
+            Some(h) => h,
+            None => &seg_space,
         };
         let n = nodes.len().max(1);
         let progress =
@@ -630,7 +712,7 @@ pub(crate) fn build_index(
             sequential: ctl.sequential,
         };
         let Some(g) = Graph::build(
-            &space,
+            space,
             &params,
             &hnsw::Ctl {
                 progress: &progress,

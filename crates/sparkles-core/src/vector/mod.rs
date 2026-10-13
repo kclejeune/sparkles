@@ -292,6 +292,10 @@ pub(crate) fn l2sq(a: &[f32], b: &[f32]) -> f32 {
 /// The distance the HNSW graph orders by (lower is nearer): `1 − cosine`, `−dot` or the
 /// squared L2 distance. Rows a metric cannot score (a zero norm with cosine) are
 /// infinitely far.
+///
+/// It sums with the faster [`fast`] kernels, whose rounding differs from [`dot`]'s. The
+/// graph only chooses which rows to score, and every score comes from [`score`], so the
+/// difference never reaches a result.
 #[inline]
 pub(crate) fn graph_dist(m: Metric, a: &[f32], a_norm: f32, b: &[f32], b_norm: f32) -> f32 {
     let d = match m {
@@ -300,12 +304,307 @@ pub(crate) fn graph_dist(m: Metric, a: &[f32], a_norm: f32, b: &[f32], b_norm: f
             if n == 0.0 {
                 return f32::INFINITY;
             }
-            1.0 - dot(a, b) / n
+            1.0 - fast::dot(a, b) / n
         }
-        Metric::Dot => -dot(a, b),
-        Metric::Euclidean => l2sq(a, b),
+        Metric::Dot => -fast::dot(a, b),
+        Metric::Euclidean => fast::l2sq(a, b),
     };
     if d.is_nan() { f32::INFINITY } else { d }
+}
+
+/// Dot products and squared distances for the HNSW graph, where only the order matters.
+///
+/// The [`dot`] that scores results keeps eight lanes summed in a fixed order, so a score
+/// is the same on every machine, but its one addition chain per lane limits it to about
+/// one addition every four cycles. These keep 32 independent lanes. On x86-64 CPUs with
+/// AVX2 and FMA, detected at run time, they use fused multiply-adds over 256-bit
+/// registers.
+pub(crate) mod fast {
+    /// Σ aᵢ·bᵢ.
+    #[inline]
+    pub fn dot(a: &[f32], b: &[f32]) -> f32 {
+        #[cfg(target_arch = "x86_64")]
+        if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+        {
+            // SAFETY: the CPU has the features the function is compiled for.
+            return unsafe { x86::dot(a, b) };
+        }
+        portable(a, b, |x, y| x * y)
+    }
+
+    /// Σ (aᵢ − bᵢ)².
+    #[inline]
+    pub fn l2sq(a: &[f32], b: &[f32]) -> f32 {
+        #[cfg(target_arch = "x86_64")]
+        if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+        {
+            // SAFETY: as above.
+            return unsafe { x86::l2sq(a, b) };
+        }
+        portable(a, b, |x, y| (x - y) * (x - y))
+    }
+
+    /// Whether the CPU computes over half-precision copies quickly ([`dot_f16`]): x86-64
+    /// with F16C, AVX2 and FMA. Elsewhere the conversions would cost more than the
+    /// memory they save, so graphs are built over the `f32` rows.
+    pub fn f16_fast() -> bool {
+        #[cfg(target_arch = "x86_64")]
+        {
+            std::arch::is_x86_feature_detected!("avx2")
+                && std::arch::is_x86_feature_detected!("fma")
+                && std::arch::is_x86_feature_detected!("f16c")
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        false
+    }
+
+    /// `src` in IEEE 754 binary16, rounded to nearest, ties to even; values beyond the
+    /// format's range become infinities.
+    pub fn to_f16(src: &[f32], dst: &mut [u16]) {
+        #[cfg(target_arch = "x86_64")]
+        if f16_fast() {
+            // SAFETY: the CPU has the features the function is compiled for.
+            return unsafe { x86::to_f16(src, dst) };
+        }
+        for (d, &x) in dst.iter_mut().zip(src) {
+            *d = f16_of(x);
+        }
+    }
+
+    /// Σ aᵢ·bᵢ over binary16 values ([`f16_fast`] CPUs only, else a slow loop).
+    #[inline]
+    pub fn dot_f16(a: &[u16], b: &[u16]) -> f32 {
+        #[cfg(target_arch = "x86_64")]
+        if f16_fast() {
+            // SAFETY: as above.
+            return unsafe { x86::dot_f16(a, b) };
+        }
+        a.iter().zip(b).map(|(&x, &y)| f32_of(x) * f32_of(y)).sum()
+    }
+
+    /// Σ (aᵢ − bᵢ)² over binary16 values.
+    #[inline]
+    pub fn l2sq_f16(a: &[u16], b: &[u16]) -> f32 {
+        #[cfg(target_arch = "x86_64")]
+        if f16_fast() {
+            // SAFETY: as above.
+            return unsafe { x86::l2sq_f16(a, b) };
+        }
+        a.iter()
+            .zip(b)
+            .map(|(&x, &y)| (f32_of(x) - f32_of(y)) * (f32_of(x) - f32_of(y)))
+            .sum()
+    }
+
+    /// One `f32` in binary16, rounded to nearest, ties to even.
+    pub fn f16_of(x: f32) -> u16 {
+        let b = x.to_bits();
+        let sign = ((b >> 16) & 0x8000) as u16;
+        let exp = ((b >> 23) & 0xff) as i32;
+        let man = b & 0x7f_ffff;
+        if exp == 0xff {
+            return sign | 0x7c00 | if man != 0 { 0x200 } else { 0 };
+        }
+        let e = exp - 127 + 15;
+        if e >= 0x1f {
+            return sign | 0x7c00;
+        }
+        // round the dropped bits of `m >> shift` to nearest, ties to even
+        let round = |m: u32, shift: u32| -> u32 {
+            let r = m >> shift;
+            let rem = m & ((1 << shift) - 1);
+            let half = 1 << (shift - 1);
+            if rem > half || (rem == half && r & 1 == 1) {
+                r + 1
+            } else {
+                r
+            }
+        };
+        if e <= 0 {
+            if e < -10 {
+                return sign;
+            }
+            // a subnormal: the implicit bit joins the mantissa
+            return sign | round(man | 0x80_0000, (14 - e) as u32) as u16;
+        }
+        // a carry out of the mantissa rounds into the exponent, up to infinity
+        sign | round(((e as u32) << 23) | man, 13) as u16
+    }
+
+    /// One binary16 value as an `f32` (exact).
+    pub fn f32_of(h: u16) -> f32 {
+        let sign = ((h & 0x8000) as u32) << 16;
+        let exp = ((h >> 10) & 0x1f) as u32;
+        let man = (h & 0x3ff) as u32;
+        let bits = match (exp, man) {
+            (0, 0) => sign,
+            (0, _) => {
+                // a subnormal: shift the leading bit into the implicit place
+                let lead = 31 - man.leading_zeros();
+                sign | ((lead + 103) << 23) | ((man << (23 - lead)) & 0x7f_ffff)
+            }
+            (0x1f, _) => sign | 0x7f80_0000 | (man << 13),
+            _ => sign | ((exp + 112) << 23) | (man << 13),
+        };
+        f32::from_bits(bits)
+    }
+
+    /// 32 independent lanes, which the compiler vectorizes for the baseline target.
+    #[inline]
+    pub(super) fn portable(a: &[f32], b: &[f32], f: impl Fn(f32, f32) -> f32) -> f32 {
+        let mut acc = [0f32; 32];
+        let (ca, ra) = a.as_chunks::<32>();
+        let (cb, rb) = b.as_chunks::<32>();
+        for (x, y) in ca.iter().zip(cb) {
+            for l in 0..32 {
+                acc[l] += f(x[l], y[l]);
+            }
+        }
+        let mut s: f32 = acc.iter().sum();
+        for (x, y) in ra.iter().zip(rb) {
+            s += f(*x, *y);
+        }
+        s
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    mod x86 {
+        use std::arch::x86_64::*;
+
+        #[target_feature(enable = "avx2,fma")]
+        fn hsum(v: __m256) -> f32 {
+            let s = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+            let s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+            let s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
+            _mm_cvtss_f32(s)
+        }
+
+        /// The sum over 32 lanes of `step` (one fused update of 8 lanes), then the tail.
+        #[target_feature(enable = "avx2,fma")]
+        #[inline]
+        fn run(
+            a: &[f32],
+            b: &[f32],
+            step: impl Fn(__m256, __m256, __m256) -> __m256,
+            tail: impl Fn(f32, f32) -> f32,
+        ) -> f32 {
+            let n = a.len().min(b.len());
+            let (pa, pb) = (a.as_ptr(), b.as_ptr());
+            // SAFETY: every load reads 8 values below `n`, inside both slices.
+            let load = |p: *const f32, o: usize| unsafe { _mm256_loadu_ps(p.add(o)) };
+            let mut acc = [_mm256_setzero_ps(); 4];
+            let mut i = 0;
+            while i + 32 <= n {
+                for (k, c) in acc.iter_mut().enumerate() {
+                    let o = i + 8 * k;
+                    *c = step(*c, load(pa, o), load(pb, o));
+                }
+                i += 32;
+            }
+            while i + 8 <= n {
+                acc[0] = step(acc[0], load(pa, i), load(pb, i));
+                i += 8;
+            }
+            let v = _mm256_add_ps(_mm256_add_ps(acc[0], acc[1]), _mm256_add_ps(acc[2], acc[3]));
+            let mut s = hsum(v);
+            while i < n {
+                s += tail(a[i], b[i]);
+                i += 1;
+            }
+            s
+        }
+
+        #[target_feature(enable = "avx2,fma")]
+        pub fn dot(a: &[f32], b: &[f32]) -> f32 {
+            run(a, b, |c, x, y| _mm256_fmadd_ps(x, y, c), |x, y| x * y)
+        }
+
+        #[target_feature(enable = "avx2,fma")]
+        pub fn l2sq(a: &[f32], b: &[f32]) -> f32 {
+            run(
+                a,
+                b,
+                |c, x, y| {
+                    let d = _mm256_sub_ps(x, y);
+                    _mm256_fmadd_ps(d, d, c)
+                },
+                |x, y| (x - y) * (x - y),
+            )
+        }
+
+        #[target_feature(enable = "avx2,fma,f16c")]
+        pub fn to_f16(src: &[f32], dst: &mut [u16]) {
+            let n = src.len().min(dst.len());
+            let mut i = 0;
+            while i + 8 <= n {
+                // SAFETY: reads and writes 8 values below `n`, inside both slices.
+                unsafe {
+                    let v = _mm256_loadu_ps(src.as_ptr().add(i));
+                    let h = _mm256_cvtps_ph::<_MM_FROUND_TO_NEAREST_INT>(v);
+                    _mm_storeu_si128(dst.as_mut_ptr().add(i).cast(), h);
+                }
+                i += 8;
+            }
+            for j in i..n {
+                dst[j] = super::f16_of(src[j]);
+            }
+        }
+
+        /// The sum over 32 lanes of `step` over binary16 values widened to `f32`.
+        #[target_feature(enable = "avx2,fma,f16c")]
+        #[inline]
+        fn run_f16(
+            a: &[u16],
+            b: &[u16],
+            step: impl Fn(__m256, __m256, __m256) -> __m256,
+            tail: impl Fn(f32, f32) -> f32,
+        ) -> f32 {
+            let n = a.len().min(b.len());
+            let (pa, pb) = (a.as_ptr(), b.as_ptr());
+            // SAFETY: every load reads 8 values below `n`, inside both slices.
+            let load = |p: *const u16, o: usize| {
+                _mm256_cvtph_ps(unsafe { _mm_loadu_si128(p.add(o).cast()) })
+            };
+            let mut acc = [_mm256_setzero_ps(); 4];
+            let mut i = 0;
+            while i + 32 <= n {
+                for (k, c) in acc.iter_mut().enumerate() {
+                    let o = i + 8 * k;
+                    *c = step(*c, load(pa, o), load(pb, o));
+                }
+                i += 32;
+            }
+            while i + 8 <= n {
+                acc[0] = step(acc[0], load(pa, i), load(pb, i));
+                i += 8;
+            }
+            let v = _mm256_add_ps(_mm256_add_ps(acc[0], acc[1]), _mm256_add_ps(acc[2], acc[3]));
+            let mut s = hsum(v);
+            while i < n {
+                s += tail(super::f32_of(a[i]), super::f32_of(b[i]));
+                i += 1;
+            }
+            s
+        }
+
+        #[target_feature(enable = "avx2,fma,f16c")]
+        pub fn dot_f16(a: &[u16], b: &[u16]) -> f32 {
+            run_f16(a, b, |c, x, y| _mm256_fmadd_ps(x, y, c), |x, y| x * y)
+        }
+
+        #[target_feature(enable = "avx2,fma,f16c")]
+        pub fn l2sq_f16(a: &[u16], b: &[u16]) -> f32 {
+            run_f16(
+                a,
+                b,
+                |c, x, y| {
+                    let d = _mm256_sub_ps(x, y);
+                    _mm256_fmadd_ps(d, d, c)
+                },
+                |x, y| (x - y) * (x - y),
+            )
+        }
+    }
 }
 
 /// Euclidean norm.
@@ -321,7 +620,7 @@ pub fn score(m: Metric, a: &[f32], a_norm: f32, b: &[f32], b_norm: f32) -> Optio
     }
     let s = match m {
         Metric::Dot => dot(a, b),
-        Metric::Euclidean => lanes(a, b, |x, y| (x - y) * (x - y)).sqrt(),
+        Metric::Euclidean => l2sq(a, b).sqrt(),
         Metric::Cosine => {
             if a_norm == 0.0 || b_norm == 0.0 {
                 return None;
@@ -440,5 +739,84 @@ mod tests {
         assert_eq!(dot(&long, &long), dot(&long, &long));
         let c = score(Metric::Cosine, &long, norm(&long), &long, norm(&long)).unwrap();
         assert!((c - 1.0).abs() < 1e-6);
+    }
+
+    /// The graph's kernels agree with the scoring ones up to rounding, at every length
+    /// around the vector widths.
+    #[test]
+    fn graph_kernels() {
+        for n in [0, 1, 7, 8, 9, 31, 32, 33, 63, 64, 100, 384, 385] {
+            let a: Vec<f32> = (0..n).map(|i| (i as f32 * 0.37).sin()).collect();
+            let b: Vec<f32> = (0..n).map(|i| (i as f32 * 0.11).cos()).collect();
+            let close = |x: f32, y: f32| (x - y).abs() <= 1e-4 * (1.0 + y.abs());
+            assert!(close(fast::dot(&a, &b), dot(&a, &b)), "dot {n}");
+            assert!(close(fast::l2sq(&a, &b), l2sq(&a, &b)), "l2sq {n}");
+            let p = fast::portable(&a, &b, |x, y| x * y);
+            assert!(close(p, dot(&a, &b)), "portable {n}");
+            let (mut ha, mut hb) = (vec![0u16; n], vec![0u16; n]);
+            fast::to_f16(&a, &mut ha);
+            fast::to_f16(&b, &mut hb);
+            let near = |x: f32, y: f32| (x - y).abs() <= 2e-3 * (1.0 + y.abs());
+            assert!(near(fast::dot_f16(&ha, &hb), dot(&a, &b)), "dot_f16 {n}");
+            assert!(near(fast::l2sq_f16(&ha, &hb), l2sq(&a, &b)), "l2sq_f16 {n}");
+        }
+    }
+
+    /// The binary16 conversions round to nearest, ties to even, and agree with the
+    /// hardware's (where it has them) on normal, subnormal, tied and huge values.
+    #[test]
+    fn f16_conversions() {
+        let mut vals: Vec<f32> = vec![
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            0.5,
+            65504.0,
+            65520.0,
+            1e6,
+            -1e6,
+            6.1e-5,
+            5.96e-8,
+            2.9e-8,
+            3e-8,
+            1e-9,
+            1.0 + 1.0 / 2048.0,
+            1.0 + 3.0 / 2048.0,
+            f32::INFINITY,
+        ];
+        let mut z = 1u64;
+        for _ in 0..20_000 {
+            z = z
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let x = f32::from_bits((z >> 32) as u32);
+            if x.is_finite() {
+                vals.push(x);
+            }
+        }
+        let mut hw = vec![0u16; vals.len()];
+        fast::to_f16(&vals, &mut hw);
+        for (i, &x) in vals.iter().enumerate() {
+            let h = fast::f16_of(x);
+            assert_eq!(h, hw[i], "{x:e}");
+            let back = fast::f32_of(h);
+            if x.abs() < 65504.0 {
+                // within half a unit in the last place: 2⁻¹¹ relative for normal
+                // values, 2⁻²⁵ absolute for subnormal ones
+                let tol = (x.abs() / 2048.0).max(1.0 / (1u64 << 25) as f32);
+                assert!((back - x).abs() <= tol, "{x:e} -> {back:e}");
+            }
+        }
+        // every binary16 value converts back to itself
+        for h in 0..=u16::MAX {
+            let x = fast::f32_of(h);
+            if !x.is_nan() {
+                assert_eq!(fast::f16_of(x), h, "{h:#x}");
+            }
+        }
+        assert_eq!(fast::f16_of(1.0 + 1.0 / 2048.0), 0x3c00); // a tie rounds to even
+        assert_eq!(fast::f16_of(1.0 + 3.0 / 2048.0), 0x3c02);
+        assert_eq!(fast::f16_of(65520.0), 0x7c00);
     }
 }
