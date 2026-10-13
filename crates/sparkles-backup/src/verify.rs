@@ -145,7 +145,7 @@ impl Repository {
             let bad = match crate::manifest::validate(
                 m,
                 self.marker.piece_bytes,
-                sparkles_core::builder::FORMAT_VERSION,
+                sparkles_core::formats::READABLE_INDEX_FORMATS,
             ) {
                 // another index format is intact, only not restorable by this build
                 Ok(()) => None,

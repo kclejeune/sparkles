@@ -201,7 +201,12 @@ async fn unsupported_dataset_metadata_is_refused_even_without_integrity_checks()
                 )
                 .await
                 .unwrap_err();
-            assert!(error.message().contains("this build supports"), "{error}");
+            assert!(
+                error
+                    .message()
+                    .contains("Open the database with a newer release"),
+                "{error}"
+            );
             assert!(!destination.exists());
             assert_eq!(
                 std::fs::read(source.join("dataset.json")).unwrap(),

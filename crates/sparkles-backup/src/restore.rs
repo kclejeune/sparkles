@@ -110,7 +110,7 @@ impl Repository {
     /// Restore backup `name` into `tmp`, which must not exist (the caller picks a
     /// sibling of the final location and publishes it by rename):
     /// 1. a shared lock (none for read-only repositories); `manifest::validate`;
-    ///    `422 incompatible-format` unless `indexFormat == builder::FORMAT_VERSION`;
+    ///    `422 incompatible-format` unless `formats::READABLE_INDEX_FORMATS` holds `indexFormat`;
     ///    `507 insufficient-storage` unless the free space of `tmp`'s filesystem is at
     ///    least 1.1 × the logical size;
     /// 2. download every file (parallel, download throttle), verifying each blob's
@@ -191,7 +191,7 @@ impl Repository {
         manifest::validate(
             &m,
             self.marker.piece_bytes,
-            sparkles_core::builder::FORMAT_VERSION,
+            sparkles_core::formats::READABLE_INDEX_FORMATS,
         )?;
         let keep = identity_rule(&m, o)?;
         check_free_space(
