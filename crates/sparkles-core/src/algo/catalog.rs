@@ -74,6 +74,24 @@ pub struct ProjectionDef {
 }
 
 impl ProjectionDef {
+    /// A definition from JSON, where a bare string in `predicates` stands for that
+    /// predicate with the algorithm's direction.
+    pub fn from_json(mut v: serde_json::Value) -> Result<ProjectionDef> {
+        Self::bare_predicates(&mut v);
+        serde_json::from_value(v).map_err(|e| invalid(format!("invalid definition: {e}")))
+    }
+
+    /// Rewrite the bare strings of a JSON definition's `predicates` as objects.
+    pub fn bare_predicates(v: &mut serde_json::Value) {
+        if let Some(ps) = v.get_mut("predicates").and_then(|p| p.as_array_mut()) {
+            for p in ps {
+                if let serde_json::Value::String(s) = p {
+                    *p = serde_json::json!({ "iri": s });
+                }
+            }
+        }
+    }
+
     /// Check the definition: absolute IRIs and known words.
     pub fn check(&self) -> Result<()> {
         let iri = |what: &str, i: &str| {

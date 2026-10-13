@@ -140,10 +140,7 @@ fn request(a: &RunArgs) -> Result<AlgoRequest> {
             &std::fs::read(f).with_context(|| format!("reading {}", f.display()))?,
         )
         .with_context(|| format!("{}: not JSON", f.display()))?;
-        if let Some(def) = j.get_mut("projection").filter(|p| p.is_object()) {
-            bare_predicates(def);
-        }
-        return serde_json::from_value(j).context("invalid request");
+        return Ok(AlgoRequest::from_json(j)?);
     }
     let projection = match (
         &a.projection,
@@ -186,17 +183,6 @@ fn request(a: &RunArgs) -> Result<AlgoRequest> {
         params,
         write,
     })
-}
-
-/// Bare strings in `predicates` are IRIs.
-fn bare_predicates(def: &mut Value) {
-    if let Some(ps) = def.get_mut("predicates").and_then(Value::as_array_mut) {
-        for p in ps {
-            if let Value::String(s) = p {
-                *p = serde_json::json!({ "iri": s });
-            }
-        }
-    }
 }
 
 fn open_dataset(loc: &Path, opts: StoreOptions) -> Result<sparkles::Dataset> {
@@ -290,8 +276,7 @@ pub fn run(cmd: AlgoCmd, opts: StoreOptions) -> Result<()> {
                         if let Some(d) = j.get_mut("definition").map(Value::take) {
                             j = d;
                         }
-                        bare_predicates(&mut j);
-                        serde_json::from_value(j).context("invalid definition")?
+                        ProjectionDef::from_json(j)?
                     }
                     None => ProjectionDef {
                         predicates: (!predicate.is_empty()).then(|| {

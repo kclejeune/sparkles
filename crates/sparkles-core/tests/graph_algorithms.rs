@@ -601,3 +601,131 @@ fn named_projections() {
     assert!(fail("algo:projection \"nope\"").contains("no named projection"));
     assert!(fail("algo:projection \"chain\" ; algo:predicate ex:p").contains("cannot be combined"));
 }
+
+fn plan_of(s: &Store, q: &str) -> sparkles_core::sparql::PlanInfo {
+    query(
+        s.snapshot(),
+        &format!("{PREFIXES}{q}"),
+        &QueryOptions::default(),
+    )
+    .unwrap()
+    .plan
+}
+
+fn find<'a>(
+    p: &'a sparkles_core::sparql::PlanInfo,
+    op: &str,
+) -> Option<&'a sparkles_core::sparql::PlanInfo> {
+    if p.operator == op {
+        return Some(p);
+    }
+    p.children.iter().find_map(|c| find(c, op))
+}
+
+#[test]
+fn explain_shows_the_counters_of_the_call() {
+    let s = store_of(A);
+    let plan = plan_of(
+        &s,
+        "SELECT ?n ?r WHERE { SERVICE algo:pageRank { [] algo:predicate ex:p ; algo:node ?n ; algo:score ?r } }",
+    );
+    let leaf = find(&plan, "AlgoCall").unwrap_or_else(|| panic!("no AlgoCall in {plan:#?}"));
+    assert!(
+        leaf.description.contains("pageRank"),
+        "{}",
+        leaf.description
+    );
+    let c = leaf.counters.as_ref().expect("counters");
+    assert_eq!(c["nodes"], 7);
+    assert_eq!(c["edges"], 7);
+    for k in ["projectionMs", "runMs", "peakBytes", "cachedProjections"] {
+        assert!(c.contains_key(k), "{k} in {c:?}");
+    }
+}
+
+/// A random graph large enough for an algorithm to run for a while.
+fn big(n: usize, m: usize) -> Store {
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    let mut ttl = String::with_capacity(m * 24);
+    for _ in 0..m {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let (a, b) = (x % n as u64, (x >> 20) % n as u64);
+        ttl.push_str(&format!("ex:n{a} ex:p ex:n{b} .\n"));
+    }
+    store_of(&ttl)
+}
+
+#[test]
+fn a_running_algorithm_stops_on_cancel_and_on_timeout() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+    let s = big(20_000, 100_000);
+    let q = format!(
+        "{PREFIXES}SELECT ?n ?e WHERE {{ SERVICE algo:node2vec {{ [] algo:predicate ex:p ; \
+         algo:walksPerNode 200 ; algo:epochs 20 ; algo:node ?n ; algo:embedding ?e }} }}"
+    );
+    // a deadline
+    let t = Instant::now();
+    let e = query(
+        s.snapshot(),
+        &q,
+        &QueryOptions {
+            timeout: Some(Duration::from_millis(100)),
+            ..Default::default()
+        },
+    )
+    .map(|_| ())
+    .unwrap_err();
+    assert!(matches!(e, sparkles_core::Error::Timeout), "{e}");
+    assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
+    // a cancel flag set while it runs
+    let flag = Arc::new(AtomicBool::new(false));
+    let f2 = flag.clone();
+    let h = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        f2.store(true, Ordering::Relaxed);
+    });
+    let t = Instant::now();
+    let e = query(
+        s.snapshot(),
+        &q,
+        &QueryOptions {
+            cancel: Some(flag),
+            ..Default::default()
+        },
+    )
+    .map(|_| ())
+    .unwrap_err();
+    h.join().unwrap();
+    assert!(matches!(e, sparkles_core::Error::Cancelled), "{e}");
+    assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
+}
+
+#[test]
+fn concurrent_calls_agree_and_share_the_thread_budget() {
+    let s = Arc::new(big(5_000, 40_000));
+    let q = format!(
+        "{PREFIXES}SELECT ?n ?r WHERE {{ SERVICE algo:pageRank {{ [] algo:predicate ex:p ; \
+         algo:concurrency 4 ; algo:node ?n ; algo:score ?r }} }}"
+    );
+    let run = |s: Arc<Store>, q: String| {
+        std::thread::spawn(move || {
+            let r = query(s.snapshot(), &q, &QueryOptions::default()).unwrap();
+            let mut rows: Vec<String> = r
+                .rows()
+                .iter()
+                .map(|row| format!("{} {}", short(&row[0]), short(&row[1])))
+                .collect();
+            rows.sort();
+            rows
+        })
+    };
+    let handles: Vec<_> = (0..8).map(|_| run(s.clone(), q.clone())).collect();
+    let results: Vec<Vec<String>> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    assert!(!results[0].is_empty());
+    for r in &results[1..] {
+        assert_eq!(r, &results[0]);
+    }
+}

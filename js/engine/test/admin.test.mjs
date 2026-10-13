@@ -242,6 +242,38 @@ test('stored queries and paged schema/history admin surfaces', async (t) => {
   assert.notEqual(clone.id, ds.id);
   assert.equal(await clone.count(), 2n);
 });
+test('graph algorithms and named projections', async (t) => {
+  const ds = t.resource(Dataset.memory());
+  await ds.update(
+    'INSERT DATA {<urn:a> <urn:p> <urn:b>. <urn:b> <urn:p> <urn:c>. <urn:c> <urn:p> <urn:a>. <urn:d> <urn:p> <urn:e>}',
+  );
+  const saved = await ds.algorithms.projections.put('p', {
+    predicates: ['urn:p'],
+    direction: 'undirected',
+  });
+  assert.equal(saved.created, true);
+  assert.equal(saved.stored.revision, 1);
+  assert.equal((await ds.algorithms.projections.list()).length, 1);
+  const request = { algorithm: 'wcc', projection: 'p' };
+  const rows = await (await ds.algorithms.run(request)).toArray();
+  assert.equal(rows.length, 5);
+  assert.equal(new Set(rows.map((r) => r.get('component').value)).size, 2);
+  const stats = await ds.algorithms.stats({ algorithm: 'pageRank', projection: 'p' });
+  assert.equal(stats.nodes, 5);
+  await assert.rejects(ds.algorithms.run({ algorithm: 'nope' }));
+  await assert.rejects(
+    ds.algorithms.projections.put('p', { direction: 'forward' }, { ifRevision: 7 }),
+  );
+  const report = await ds.algorithms.runWrite({
+    algorithm: 'pageRank',
+    projection: 'p',
+    write: { graph: 'urn:out', predicates: { score: 'urn:rank' }, batchSize: 2 },
+  });
+  assert.equal(report.status, 'complete');
+  assert.equal(report.triples, 5);
+  assert.equal(await ds.algorithms.projections.delete('p'), true);
+  assert.equal((await ds.algorithms.projections.list()).length, 0);
+});
 test('replacement is atomic and callback snapshot capture is rejected', async (t) => {
   const ds = t.resource(Dataset.memory());
   await ds.update('INSERT DATA {<urn:old> <urn:p> 1}');

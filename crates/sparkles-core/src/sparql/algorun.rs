@@ -89,6 +89,17 @@ pub struct AlgoRequest {
     pub write: Option<WriteSpec>,
 }
 
+impl AlgoRequest {
+    /// A request from JSON, where the predicates of an inline projection may be bare
+    /// strings.
+    pub fn from_json(mut v: Value) -> Result<AlgoRequest> {
+        if let Some(p) = v.get_mut("projection").filter(|p| p.is_object()) {
+            ProjectionDef::bare_predicates(p);
+        }
+        serde_json::from_value(v).map_err(|e| invalid(format!("invalid request: {e}")))
+    }
+}
+
 fn invalid(m: impl Into<String>) -> Error {
     Error::invalid(m)
 }

@@ -168,6 +168,7 @@ pub fn apply_defaults(
     args: &QueryArgs<'_>,
 ) -> PyResult<()> {
     opts.rdfs = defaults.rdfs.clone();
+    opts.algo_projections = defaults.algo_projections.clone();
     opts.describe = describe_options(defaults.describe.clone(), args.describe.as_ref())?;
     opts.defaults_applied = true;
     Ok(())
@@ -1370,6 +1371,11 @@ impl PyDataset {
             Ok(r)
         })?;
         admin::to_py(py, &r)
+    }
+
+    #[getter]
+    fn algorithms(slf: Py<Self>) -> crate::algorithms::PyAlgorithms {
+        crate::algorithms::PyAlgorithms { owner: slf }
     }
 
     #[getter]

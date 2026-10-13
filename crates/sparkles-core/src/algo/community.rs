@@ -514,6 +514,61 @@ mod tests {
         assert!(*lou.modularity.last().unwrap() >= 0.38);
     }
 
+    /// Planted groups with noisy links between them, from a fixed generator.
+    fn planted(n: u32, groups: u32, seed: u64) -> Graph {
+        let mut x = seed | 1;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut e = Vec::new();
+        for a in 0..n {
+            for _ in 0..4 {
+                let same = next() % 10 < 7;
+                let b = if same {
+                    (next() % (n / groups) as u64) as u32 * groups + a % groups
+                } else {
+                    (next() % n as u64) as u32
+                };
+                if a != b && b < n {
+                    e.push((a.min(b), a.max(b)));
+                }
+            }
+        }
+        e.sort_unstable();
+        e.dedup();
+        ugraph(n, &e)
+    }
+
+    #[test]
+    fn leiden_is_connected_and_no_worse_than_louvain_on_random_graphs() {
+        for (n, groups, seed) in [(200, 5, 11), (300, 8, 12), (400, 4, 13), (150, 3, 14)] {
+            let g = planted(n, groups, seed);
+            let lou = run(&g, &Params::default(), &Control::unlimited()).unwrap();
+            let lei = run(
+                &g,
+                &Params {
+                    leiden: true,
+                    seed: 3,
+                    ..Params::default()
+                },
+                &Control::unlimited(),
+            )
+            .unwrap();
+            let (ql, qe) = (
+                *lou.modularity.last().unwrap(),
+                *lei.modularity.last().unwrap(),
+            );
+            // Leiden refines each level, so it may only differ from Louvain by a small margin
+            assert!(qe >= ql - 0.01, "n={n}: leiden {qe} against louvain {ql}");
+            for l in &lei.levels {
+                assert!(connected(&g, l), "n={n}: a community is split");
+            }
+        }
+    }
+
     #[test]
     fn isolated_nodes_and_empty_graph() {
         let g = ugraph(3, &[]);

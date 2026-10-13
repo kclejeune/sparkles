@@ -30,26 +30,6 @@ fn bad(m: impl Into<String>) -> super::ApiError {
     err(StatusCode::BAD_REQUEST, m)
 }
 
-/// A predicate of a projection may be a bare string, which means the predicate with
-/// the algorithm's direction. The stored form is always an object.
-fn normalize_predicates(def: &mut J) {
-    if let Some(ps) = def.get_mut("predicates").and_then(J::as_array_mut) {
-        for p in ps {
-            if let J::String(s) = p {
-                *p = json!({ "iri": s });
-            }
-        }
-    }
-}
-
-fn normalize_request(req: &mut J) {
-    if let Some(def) = req.get_mut("projection")
-        && def.is_object()
-    {
-        normalize_predicates(def);
-    }
-}
-
 fn etag(revision: u64) -> HeaderValue {
     HeaderValue::from_str(&format!("\"r{revision}\"")).unwrap_or(HeaderValue::from_static("\"r0\""))
 }
@@ -72,10 +52,8 @@ pub(super) async fn run(
     AdminBody(body): AdminBody,
 ) -> ApiResult {
     let ds = dataset(&st, &name)?;
-    let mut j: J = serde_json::from_slice(&body).map_err(|e| bad(format!("invalid JSON: {e}")))?;
-    normalize_request(&mut j);
-    let req: AlgoRequest =
-        serde_json::from_value(j).map_err(|e| bad(format!("invalid request: {e}")))?;
+    let j: J = serde_json::from_slice(&body).map_err(|e| bad(format!("invalid JSON: {e}")))?;
+    let req = AlgoRequest::from_json(j)?;
     let params = Params::from_query(&uri);
     if req.write.is_none() {
         let summary = params
@@ -209,9 +187,7 @@ pub(super) async fn put_one(
     if let Some(d) = j.get_mut("definition").map(J::take) {
         j = d;
     }
-    normalize_predicates(&mut j);
-    let def: ProjectionDef =
-        serde_json::from_value(j).map_err(|e| bad(format!("invalid definition: {e}")))?;
+    let def = ProjectionDef::from_json(j)?;
     let exists = ds.dataset.algorithms().projections().get(&name).is_some();
     let if_revision = precondition(&headers, exists)?;
     let author = (!p.name.is_empty()).then(|| p.name.to_string());

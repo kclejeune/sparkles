@@ -116,6 +116,7 @@ export class Administration {
   readonly settings;
   readonly prefixes;
   readonly queries;
+  readonly algorithms;
   readonly branches;
   readonly indexes;
   readonly reasoning;
@@ -283,6 +284,45 @@ export class Administration {
           options,
           true,
         ),
+    };
+    const unsignedRevision = (v: number | bigint | undefined) =>
+      v === undefined ? undefined : unsigned(v);
+    this.algorithms = {
+      projections: {
+        list: (o?: OperationOptions) =>
+          call<{ name: string; stored: Configuration }[]>('algo.projections.list', {}, o, false),
+        get: (name: string, o?: OperationOptions) =>
+          call<Configuration | null>('algo.projections.get', { name }, o, false),
+        put: (
+          name: string,
+          definition: Configuration,
+          options: UpdateOptions & { author?: string; ifRevision?: number | bigint } = {},
+        ) =>
+          call<{ stored: Configuration; created: boolean }>(
+            'algo.projections.put',
+            {
+              name,
+              definition,
+              author: options.author,
+              ifRevision: unsignedRevision(options.ifRevision),
+            },
+            options,
+            true,
+          ),
+        delete: (name: string, options: UpdateOptions & { ifRevision?: number | bigint } = {}) =>
+          call<boolean>(
+            'algo.projections.delete',
+            { name, ifRevision: unsignedRevision(options.ifRevision) },
+            options,
+            true,
+          ),
+      },
+      queryText: (request: Configuration, summary = false, o?: OperationOptions) =>
+        call<string>('algo.queryText', { request, summary }, o, false),
+      stats: (request: Configuration, o?: OperationOptions) =>
+        call<Configuration>('algo.stats', { request }, o, false),
+      runWrite: (request: Configuration, options: UpdateOptions & { author?: string } = {}) =>
+        call<Configuration>('algo.runWrite', { request, author: options.author }, options, true),
     };
     this.branches = {
       commitGraph: (
