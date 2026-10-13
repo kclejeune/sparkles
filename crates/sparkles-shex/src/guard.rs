@@ -229,6 +229,7 @@ pub struct ShexValidationStatus {
 }
 
 mod incremental;
+mod persist;
 
 /// Affected nodes past which a write is validated in full (the walk that finds them
 /// stops there).
@@ -347,6 +348,9 @@ pub struct ShexGuard {
     baseline: Mutex<Option<Baseline>>,
     exact: Mutex<Option<Exact>>,
     typing: Mutex<Option<HeadTyping>>,
+    /// the commit whose typing `validation-typing.bin` holds (see [`persist`]), while it
+    /// is there
+    saved: Mutex<Option<u64>>,
     /// the database directory and the SHA-256 of its `validation.json`, where the state
     /// of each validated commit is kept
     persist: Option<(PathBuf, String)>,
@@ -373,6 +377,7 @@ impl ShexGuard {
             model: parking_lot::RwLock::new(Arc::new(Model::new(loaded, map))),
             exact: Mutex::new(None),
             typing: Mutex::new(None),
+            saved: Mutex::new(None),
             persist,
             cfg,
             pending: Mutex::new(None),
@@ -400,6 +405,7 @@ impl ShexGuard {
             baseline: Mutex::new(None),
             exact: Mutex::new(None),
             typing: Mutex::new(None),
+            saved: Mutex::new(None),
             persist: None,
             counters: DecisionCounts::default(),
             last_full: AtomicU64::new(u64::MAX),
@@ -1125,6 +1131,7 @@ impl CommitGuard for ShexGuard {
     }
 
     fn committed(&self, seq: u64) {
+        self.forget_saved_typing();
         let p = self.pending.lock().take();
         match p {
             Some(p) if p.seq == seq => {
@@ -1169,7 +1176,16 @@ impl CommitGuard for ShexGuard {
         }
     }
 
+    fn close(&self, head: &sparkles_core::commit::CommitInfo, snapshot: &Snapshot) {
+        self.save_typing(head, snapshot);
+    }
+
+    fn rekey(&self, old: &Snapshot, new: &Snapshot) {
+        self.rekey_typing(old, new);
+    }
+
     fn bypassed(&self) {
+        self.forget_saved_typing();
         self.counters.count(GuardStatus::Bypassed);
         if let Some(b) = self.baseline.lock().as_mut() {
             b.conforms = None;
@@ -1491,7 +1507,9 @@ pub fn install(store: &Store) -> Result<Option<Arc<ShexGuard>>> {
         Some((root.to_path_buf(), hash.clone())),
     ));
     // the state of the head, when the status file records it for this configuration
-    let head = store.head_commit().seq;
+    let snap = store.snapshot();
+    let head_commit = store.head_commit();
+    let head = head_commit.seq;
     if let Some(b) = StatusFile::read(root, head, &hash) {
         *g.exact.lock() = Some(Exact {
             commit: head,
@@ -1500,6 +1518,8 @@ pub fn install(store: &Store) -> Result<Option<Arc<ShexGuard>>> {
         });
         g.associations.store(b.total, Ordering::Relaxed);
         *g.baseline.lock() = Some(b);
+        // the typing of the head, when the last close kept it
+        g.restore_typing(&snap, &head_commit);
     }
     store.set_guard(Some(g.clone()));
     store.set_guard_required(true);

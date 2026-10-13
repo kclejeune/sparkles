@@ -4,6 +4,7 @@ use oxrdf::{Literal, NamedNode, Term};
 use proptest::prelude::{Strategy as Gen, *};
 use sparkles_core::Error;
 use sparkles_core::guard::Strategy;
+use sparkles_core::guard::config::TYPING_FILE;
 use sparkles_core::io::{RdfFormat, Source};
 use sparkles_core::sparql::QueryOptions;
 use sparkles_core::sparql::update::{UpdateStats, update};
@@ -1024,6 +1025,139 @@ fn typing_changes_propagate_along_references() {
         (v.strategy, v.focus_nodes, v.blocking),
         (Strategy::Incremental, Some(n + 1), 0)
     );
+}
+
+/// A ring of `n` people, each knowing the next, as Turtle.
+fn ring(n: u64) -> String {
+    let mut data = String::from(
+        "@prefix ex: <http://ex.org/> . @prefix foaf: <http://xmlns.com/foaf/0.1/> .\n",
+    );
+    for i in 0..n {
+        data.push_str(&format!(
+            "ex:p{i} a ex:Person ; foaf:name \"P{i}\" ; foaf:knows ex:p{} .\n",
+            (i + 1) % n
+        ));
+    }
+    data
+}
+
+fn typing_commit(g: &ShexGuard) -> Option<u64> {
+    g.typing.lock().as_ref().map(|t| t.commit)
+}
+
+/// The typing of the head is written when the store closes and read when the guard is
+/// installed, so the first write after a restart propagates as every other one. The
+/// first commit removes the file, a file that is not the head's is never trusted, and a
+/// compaction renumbers the typing in memory.
+#[test]
+fn the_typing_survives_a_restart() {
+    let n = 200;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let s = open(&root);
+    s.load(&[Source::from_bytes(
+        ring(n).into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    let (g, sum) = installed(set_config(&s, Some(cfg("warn", SCHEMA, MAP)), &NoImports).unwrap());
+    assert_eq!(sum.total, n);
+    assert!(
+        !exists(&root, TYPING_FILE),
+        "nothing is written before a close"
+    );
+    upd(&s, "INSERT DATA { ex:p0 foaf:knows ex:p7 }").unwrap();
+    let head = s.head_commit().seq;
+    assert_eq!(typing_commit(&g), Some(head));
+    drop(g);
+    drop(s);
+    assert!(exists(&root, TYPING_FILE));
+
+    // the next open has the typing of the head
+    let s = open(&root);
+    let g = install(&s).unwrap().unwrap();
+    assert_eq!(typing_commit(&g), Some(head));
+    assert!(exists(&root, TYPING_FILE), "reading leaves the file");
+    // a write after the restart is judged as in a store that never closed
+    let v = summary(
+        &upd(
+            &s,
+            "INSERT DATA { ex:bad a ex:Person . ex:p3 foaf:knows ex:bad }",
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        (v.strategy, v.focus_nodes, v.blocking, v.total),
+        (Strategy::Incremental, Some(n + 1), n + 1, n + 1)
+    );
+    assert!(!exists(&root, TYPING_FILE), "the first commit removes it");
+    assert_eq!(typing_commit(&g), Some(head + 1));
+    let v = summary(&upd(&s, "INSERT DATA { ex:bad foaf:name \"B\" }").unwrap());
+    assert_eq!((v.focus_nodes, v.blocking), (Some(n + 1), 0));
+
+    // a compaction renumbers the terms: the typing follows
+    s.compact().unwrap();
+    let head = s.head_commit().seq;
+    assert_eq!(typing_commit(&g), Some(head));
+    assert_eq!(
+        g.typing.lock().as_ref().map(|t| t.generation),
+        Some(s.snapshot().generation.uid),
+        "the typing uses the new generation's ids"
+    );
+    let v = summary(&upd(&s, "DELETE DATA { ex:bad foaf:name \"B\" }").unwrap());
+    assert_eq!(
+        (v.strategy, v.focus_nodes, v.blocking),
+        (Strategy::Incremental, Some(n + 1), n + 1)
+    );
+    drop(g);
+    drop(s);
+    assert!(exists(&root, TYPING_FILE));
+
+    // a changed file is not trusted, and goes
+    let path = root.join(TYPING_FILE);
+    let good = std::fs::read(&path).unwrap();
+    let mut bytes = good.clone();
+    let mid = bytes.len() / 2;
+    bytes[mid] ^= 0x55;
+    std::fs::write(&path, &bytes).unwrap();
+    let s = open(&root);
+    let g = install(&s).unwrap().unwrap();
+    assert_eq!(typing_commit(&g), None);
+    assert!(!exists(&root, TYPING_FILE));
+    let v = summary(&upd(&s, "INSERT DATA { ex:bad foaf:name \"B\" }").unwrap());
+    assert_eq!(v.blocking, 0);
+    drop(g);
+    drop(s);
+
+    // another head, another configuration: the file is for neither
+    let s = open(&root);
+    let g = install(&s).unwrap().unwrap();
+    upd(&s, "INSERT DATA { ex:p1 foaf:knows ex:p9 }").unwrap();
+    drop(g);
+    drop(s);
+    std::fs::write(&path, &good).unwrap();
+    let s = open(&root);
+    let g = install(&s).unwrap().unwrap();
+    assert_eq!(typing_commit(&g), None, "the file is of an older commit");
+    drop(g);
+    drop(s);
+    let s = open(&root);
+    let (g, _) = installed(set_config(&s, Some(cfg("reject", SCHEMA, MAP)), &NoImports).unwrap());
+    assert!(
+        !exists(&root, TYPING_FILE),
+        "a new configuration removes it"
+    );
+    drop(g);
+    drop(s);
+    let s = open(&root);
+    let g = install(&s).unwrap().unwrap();
+    assert!(typing_commit(&g).is_some());
+    assert!(matches!(
+        set_config(&s, None, &NoImports).unwrap(),
+        SetOutcome::Removed
+    ));
+    assert!(!exists(&root, TYPING_FILE));
 }
 
 /// Writes after enabling are incremental; the state survives a restart; a bulk load
