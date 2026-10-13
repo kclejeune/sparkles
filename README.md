@@ -208,53 +208,57 @@ departs from Jena and QLever on purpose.
 
 The web UI is embedded in the server. It has a query editor with results as tables,
 graphs and maps, a resource explorer, schema and validation views, branch history and
-merges, the Ask bar, and agent memory.
+merges, the Ask bar, and agent memory. The first screenshots show an answered question,
+agent memory, the map view and a merge preview.
 
 <table>
   <tr>
     <td><img src="docs/images/ask-answer.png" alt="The Ask bar with a drafted SPARQL query, its results and a summary whose numbered citations point to result rows"></td>
-    <td><img src="docs/images/handoff.png" alt="A query handed over by an agent, open in the query editor with its question, explanation and the terms it uses"></td>
+    <td><img src="docs/images/memory.png" alt="The Memory page listing facts that agents recorded, each with its source and review status, and a conflict between two values"></td>
   </tr>
   <tr>
     <td>A question answered with a checked query and a cited summary</td>
-    <td>A query an agent handed over for review</td>
+    <td>What agent memory holds, with sources and review status</td>
   </tr>
   <tr>
-    <td><img src="docs/images/branches.png" alt="A dataset page listing its branches beside a commit graph of their history and a merge"></td>
-    <td><img src="docs/images/merge.png" alt="The merge page previewing a branch merge into main, with a conflict and the choice of which side to take"></td>
+    <td><img src="docs/images/map.png" alt="GeoSPARQL query results drawn on a map beside a list of the places"></td>
+    <td><img src="docs/images/merge.png" alt="The merge page previewing a merge of one branch into main, with two conflicts and a choice of which side to take for each"></td>
   </tr>
   <tr>
-    <td>Branches and their history</td>
-    <td>A merge preview with a conflict to resolve</td>
+    <td>GeoSPARQL results on a map</td>
+    <td>A merge preview with conflicts to resolve</td>
   </tr>
+</table>
+
+<details>
+<summary>More screenshots and UI workflows</summary>
+
+<table>
   <tr>
     <td><img src="docs/images/query.png" alt="The query editor with a SPARQL query and its results"></td>
-    <td><img src="docs/images/explore.png" alt="The resource explorer showing one resource's properties and links"></td>
+    <td><img src="docs/images/explore.png" alt="The resource explorer showing one resource as a graph, with its properties and the resources that refer to it"></td>
   </tr>
   <tr>
     <td>The query editor and its results</td>
     <td>The resource explorer</td>
   </tr>
   <tr>
-    <td><img src="docs/images/schema.png" alt="The schema browser with classes, their counts and their properties"></td>
-    <td><img src="docs/images/map.png" alt="GeoSPARQL query results drawn on a map"></td>
+    <td><img src="docs/images/schema.png" alt="The schema browser with a class hierarchy, instance counts and the properties of the selected class"></td>
+    <td><img src="docs/images/branches.png" alt="A dataset page listing its branches above a commit history graph that includes a merge"></td>
   </tr>
   <tr>
     <td>The schema browser</td>
-    <td>GeoSPARQL results on a map</td>
+    <td>Branches and their history</td>
   </tr>
   <tr>
-    <td colspan="2" align="center"><img src="docs/images/memory.png" width="50%" alt="The Memory page listing facts an agent recorded, each with its source and review status"></td>
+    <td><img src="docs/images/handoff.png" alt="A query handed over by an agent, open in the query editor with its question, assumptions, terms and a warning"></td>
+    <td><img src="docs/images/ask-steps.png" alt="The Ask bar while it works, showing Summarizing after the query results have arrived"></td>
   </tr>
   <tr>
-    <td colspan="2" align="center">What agent memory holds, with sources</td>
+    <td>A query an agent handed over for review</td>
+    <td>An answer in progress, at the summary step</td>
   </tr>
 </table>
-
-<details>
-<summary>More screenshots: Ask progress</summary>
-
-![The Ask bar while it works, with the step indicator showing the summary step in progress](docs/images/ask-steps.png)
 
 </details>
 
