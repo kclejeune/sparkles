@@ -42,6 +42,9 @@ pub(super) struct Coordinator {
     state: Mutex<State>,
     changed: Condvar,
     vocab: Mutex<crate::vocab::LazySync>,
+    /// the next fence's synchronization fails, as a failed `fdatasync` would
+    #[cfg(any(test, feature = "failpoints"))]
+    fail_next_sync: AtomicBool,
     #[cfg(test)]
     fences: AtomicUsize,
 }
@@ -199,11 +202,19 @@ impl Coordinator {
         store.failpoint("group-sealed");
         let last = batch.last().expect("nonempty sealed prefix");
         let started = std::time::Instant::now();
-        let synced = sync_commit_reused(
-            &last.wal,
-            &last.snapshot.generation.dvocab,
-            &mut self.vocab.lock(),
-        );
+        #[cfg(any(test, feature = "failpoints"))]
+        let injected = self.fail_next_sync.swap(false, Ordering::AcqRel);
+        #[cfg(not(any(test, feature = "failpoints")))]
+        let injected = false;
+        let synced = if injected {
+            Err(std::io::Error::from_raw_os_error(5).into())
+        } else {
+            sync_commit_reused(
+                &last.wal,
+                &last.snapshot.generation.dvocab,
+                &mut self.vocab.lock(),
+            )
+        };
         store
             .commit_stats
             .synced(SyncPath::Group, started.elapsed());
@@ -227,10 +238,21 @@ impl Coordinator {
                 s.bytes -= batch.iter().map(|p| p.bytes).sum::<u64>();
                 Ok(())
             }
+            // Every commit of the fence reports the same failure, the one that led it
+            // included. The cause is logged, since the error says only that the writer
+            // is poisoned.
             Err(e) => {
                 store.commit_stats.failed();
                 Self::fail_locked(&mut s);
-                Err(e)
+                tracing::error!(
+                    target: "sparkles::store",
+                    error = %e,
+                    commits = batch.len(),
+                    first = batch[0].info.seq,
+                    last = last.info.seq,
+                    "group commit fence failed to synchronize; writes are refused until the store is reopened"
+                );
+                Err(Error::Poisoned)
             }
         };
         s.inflight.clear();
@@ -258,6 +280,15 @@ impl Drop for Leader<'_> {
 }
 
 impl Store {
+    /// Make the next group commit fence fail its synchronization (for tests).
+    #[cfg(any(test, feature = "failpoints"))]
+    #[doc(hidden)]
+    pub fn fail_next_group_sync(&self) {
+        if let Some(g) = &self.group {
+            g.fail_next_sync.store(true, Ordering::Release);
+        }
+    }
+
     /// Publish only a successfully fenced prefix, in commit order. Aux indexes and
     /// annotation/digest/guard paths are excluded at admission and drain first.
     fn publish_group_prefix(&self, p: &Pending) {
@@ -1636,5 +1667,75 @@ mod tests {
             Err(e) => panic!("expected corruption, got {e}"),
             Ok(_) => panic!("damage before the durable point must not be truncated"),
         }
+    }
+
+    #[test]
+    fn an_idle_direct_commit_after_grouped_ones_proves_them_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        {
+            let s = Arc::new(Store::open(&root, options()).unwrap());
+            insert(&s, "one").unwrap();
+            let (hit, go) = pause(&s, "group-sealed");
+            let second = {
+                let s = s.clone();
+                thread::spawn(move || insert(&s, "two"))
+            };
+            hit.recv_timeout(Duration::from_secs(5)).unwrap();
+            let later: Vec<_> = ["three", "four", "five"]
+                .into_iter()
+                .map(|name| {
+                    let s = s.clone();
+                    thread::spawn(move || insert(&s, name))
+                })
+                .collect();
+            queued(&s, 3);
+            go.send(()).unwrap();
+            second.join().unwrap().unwrap();
+            for t in later {
+                t.join().unwrap().unwrap();
+            }
+        }
+        // the only writer of a reopened store commits directly, with a record that says
+        // every commit before it is durable
+        {
+            let s = Store::open(
+                &root,
+                StoreOptions {
+                    experimental_group_commit: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(insert(&s, "six").unwrap().commit.seq, 6);
+            assert_eq!(s.group.as_ref().unwrap().fences.load(Ordering::Relaxed), 0);
+            assert_eq!(s.commit_metrics().sync[SyncPath::Group as usize].count(), 0);
+        }
+        let buf = std::fs::read(wal_path(&root)).unwrap();
+        let txns = transactions(&buf);
+        assert_eq!(txns.len(), 6);
+        let case = |name: &str, txn: usize| {
+            let case = dir.path().join(name);
+            copy_dir(&root, &case);
+            let mut bad = buf.clone();
+            // a checksum mismatch, which is not taken for preallocated zeros
+            bad[txns[txn].start * WAL_REC + 5] ^= 0x55;
+            std::fs::write(wal_path(&case), &bad).unwrap();
+            case
+        };
+        // damage inside the grouped region, before a record that proves it durable
+        let bad = case("grouped", 2);
+        assert_eq!(wal_check(&bad), crate::check::Status::Error);
+        match Store::open(&bad, Default::default()) {
+            Err(Error::Corrupt(m)) => assert!(m.contains("wal.log"), "{m}"),
+            Err(e) => panic!("expected corruption, got {e}"),
+            Ok(_) => panic!("damage before the durable point must not be truncated"),
+        }
+        // damage in the last commit is a torn tail
+        let torn = case("direct", 5);
+        assert_eq!(wal_check(&torn), crate::check::Status::Warning);
+        let s = Store::open(&torn, Default::default()).unwrap();
+        assert_eq!(s.snapshot().commit, 5);
+        assert!(has(&s.snapshot(), "five") && !has(&s.snapshot(), "six"));
     }
 }

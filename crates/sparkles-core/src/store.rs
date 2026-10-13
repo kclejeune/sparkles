@@ -5468,6 +5468,16 @@ impl WriteTxn<'_> {
             } else {
                 0
             };
+            // the record says no earlier commit may be missing from disk, so a fence
+            // that is still running would make that untrue
+            debug_assert!(
+                self.store
+                    .group
+                    .as_ref()
+                    .is_none_or(|g| g.idle() || g.failed())
+                    && w.head.seq == self.store.current.load().commit,
+                "an ordinary commit while group commit has commits in flight"
+            );
             commit::seal_wal_commit(&mut rec, c.seq, c.timestamp_ms, c.kind, flags, &data);
             data.extend_from_slice(&rec);
             // once the first byte is written, a failure leaves the WAL in an unknown
