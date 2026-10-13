@@ -3669,7 +3669,7 @@ fn anti_join(
 /// each front-coded block is touched once (in parallel); per-row lookups are then O(1)
 /// and lock-free.
 fn decode_for(ctx: &Ctx, t: &Table, exprs: &[&Expr]) -> Option<super::expr::DecodedCols> {
-    if ctx.is_cursor() || t.len() < 4096 || !exprs.iter().any(|e| super::expr::needs_values(e)) {
+    if t.len() < 2 || !exprs.iter().any(|e| super::expr::needs_values(e)) {
         return None;
     }
     let mut vars = Vec::new();
@@ -3678,6 +3678,18 @@ fn decode_for(ctx: &Ctx, t: &Table, exprs: &[&Expr]) -> Option<super::expr::Deco
     }
     vars.sort_unstable();
     vars.dedup();
+    if t.len() < 4096 {
+        // The rows are evaluated one at a time, each reading the terms it needs. On a
+        // cold vocabulary every term is a page fault that waits for the one before it.
+        // Ask for all their blocks first, so that the reads overlap.
+        if ctx.opt.prefetch_terms && crate::index::io_hints() {
+            prefetch_column_terms(ctx, t, &vars);
+        }
+        return None;
+    }
+    if ctx.is_cursor() {
+        return None;
+    }
     let vocab = &ctx.snap.generation.vocab;
     let mut out: super::expr::DecodedCols = vec![None; t.width()];
     for v in vars {
@@ -3715,6 +3727,23 @@ fn decode_for(ctx: &Ctx, t: &Table, exprs: &[&Expr]) -> Option<super::expr::Deco
         out[c] = Some(vals);
     }
     Some(out)
+}
+
+/// Ask for the vocabulary pages of the terms in the columns of `vars` of a small table
+/// (see [`decode_for`]).
+fn prefetch_column_terms(ctx: &Ctx, t: &Table, vars: &[VarId]) {
+    let mut ids: Vec<u64> = vars
+        .iter()
+        .filter_map(|&v| t.col_of(v))
+        .flat_map(|c| t.cols[c].iter())
+        .filter(|id| id.tag() == crate::id::Tag::Vocab)
+        .map(|id| id.payload())
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.len() >= 2 {
+        ctx.snap.generation.vocab.prefetch_values(&ids);
+    }
 }
 
 /// The values of base vocabulary ids (sorted, distinct), in their order: numbers from

@@ -750,6 +750,42 @@ impl Vocab {
         }
     }
 
+    /// Ask for the sparse-index groups that hold these keys, all at once, before the keys
+    /// are looked up one after the other with [`Vocab::find`] (which would wait for each
+    /// group before looking for the next key). Groups read before are left alone. Does
+    /// nothing without a sparse index or with the read hints off.
+    pub fn prefetch_keys<K: AsRef<[u8]>>(&self, keys: &[K]) {
+        let Some(s) = &self.sparse else { return };
+        if !crate::index::io_hints() || self.num_blocks() == 0 {
+            return;
+        }
+        let mut groups: Vec<usize> = keys
+            .iter()
+            .filter_map(|k| {
+                let key = k.as_ref();
+                let g = partition_point_by(s.len(), |g| s.key(g) <= key);
+                g.checked_sub(1)
+            })
+            .collect();
+        groups.sort_unstable();
+        groups.dedup();
+        let nb = self.num_blocks();
+        for g in groups {
+            if !s.first_hint(g) {
+                continue;
+            }
+            let (lo, hi) = (g * IDX_BLOCKS, ((g + 1) * IDX_BLOCKS).min(nb));
+            self.offsets
+                .will_need(IoFile::VocabOff, lo * 8, (hi + 1) * 8);
+            let end = s
+                .offsets
+                .get(g + 1)
+                .map_or(self.data.as_slice().len(), |&o| o as usize);
+            self.data
+                .will_need(IoFile::VocabData, s.offsets[g] as usize, end);
+        }
+    }
+
     /// Binary search: `Ok(id)` if present, `Err(insertion point)` otherwise.
     pub fn find(&self, key: &[u8]) -> std::result::Result<u64, u64> {
         ioacct::vocab_find();

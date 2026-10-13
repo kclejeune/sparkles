@@ -392,6 +392,8 @@ pub struct IoEvent {
     pub file: &'static str,
     pub what: &'static str,
     pub bytes: u64,
+    /// index columns decoded in the process before this event, from the start of the profile
+    pub columns_decoded: u64,
 }
 
 /// The `io` object of a query's metadata (see [`IoSnapshot::report`]).
@@ -460,7 +462,7 @@ impl Profile {
         if !pages.is_empty() {
             r.pages = Some(pages);
         }
-        let events = profile::events(self.began);
+        let events = profile::events(self.began, self.base.columns_decoded());
         if !events.is_empty() {
             r.events = Some(events);
         }
@@ -496,7 +498,7 @@ mod profile {
         seen: BTreeSet<(IoFile, usize, usize)>,
         /// of the pages recorded, how many were in memory when recorded
         before: BTreeMap<IoFile, u64>,
-        events: Vec<(Instant, &'static str, &'static str, u64)>,
+        events: Vec<(Instant, &'static str, &'static str, u64, u64)>,
     }
 
     fn state() -> MutexGuard<'static, Option<State>> {
@@ -517,7 +519,7 @@ mod profile {
         if let Some(s) = state().as_mut()
             && s.events.len() < MAX_EVENTS
         {
-            s.events.push((Instant::now(), "-", what, 0));
+            s.events.push((Instant::now(), "-", what, 0, columns_now()));
         }
     }
 
@@ -537,8 +539,10 @@ mod profile {
         let ps = page_size();
         let n = last - first;
         let mut vec = vec![0u8; n];
-        // SAFETY: the range lies inside a live mapping whose base `addr` is page aligned,
-        // and `vec` has a byte per page
+        // SAFETY: mincore only reads the page tables for the range and writes one byte per
+        // page into `vec`, which has that many. The range was inside a mapping when it was
+        // recorded. If the mapping has been unmapped since (a new generation replaced it),
+        // the kernel answers ENOMEM and the count is 0, so the numbers are diagnostic only.
         let r = unsafe {
             libc::mincore(
                 (addr + first * ps) as *mut libc::c_void,
@@ -573,7 +577,7 @@ mod profile {
             && s.events.len() < MAX_EVENTS
         {
             s.events
-                .push((Instant::now(), file.name(), what, len as u64));
+                .push((Instant::now(), file.name(), what, len as u64, columns_now()));
         }
         // only pages not recorded yet, in runs, so that a page that an earlier request of
         // this query brought in does not count as in memory before the query
@@ -642,16 +646,21 @@ mod profile {
         BTreeMap::new()
     }
 
-    pub(super) fn events(began: Instant) -> Vec<IoEvent> {
+    fn columns_now() -> u64 {
+        IoSnapshot::now().columns_decoded()
+    }
+
+    pub(super) fn events(began: Instant, base_columns: u64) -> Vec<IoEvent> {
         let guard = state();
         guard.as_ref().map_or_else(Vec::new, |s| {
             s.events
                 .iter()
-                .map(|&(at, file, what, bytes)| IoEvent {
+                .map(|&(at, file, what, bytes, cols)| IoEvent {
                     at_us: at.saturating_duration_since(began).as_micros() as u64,
                     file,
                     what,
                     bytes,
+                    columns_decoded: cols.saturating_sub(base_columns),
                 })
                 .collect()
         })

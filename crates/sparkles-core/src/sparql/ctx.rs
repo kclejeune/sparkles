@@ -190,10 +190,16 @@ pub struct Optimizations {
     /// ORDER BY with LIMIT keeps the best rows in a bounded heap of offset + limit rows,
     /// evaluating the later keys only for rows whose first key can still enter
     pub topk_heap: bool,
+    /// the vocabulary groups that hold a query's constants are requested together before
+    /// the planner looks the constants up one after the other
+    pub prefetch_constants: bool,
+    /// a FILTER, BIND or ORDER BY over a table of fewer than 4,096 rows asks for the
+    /// vocabulary pages of the terms it evaluates before the first row
+    pub prefetch_terms: bool,
 }
 
 impl Optimizations {
-    pub const NAMES: [&str; 34] = [
+    pub const NAMES: [&str; 36] = [
         "range_pushdown",
         "incremental_group",
         "count_join_runs",
@@ -228,6 +234,8 @@ impl Optimizations {
         "text_subject_pushdown",
         "vector_topk",
         "topk_heap",
+        "prefetch_constants",
+        "prefetch_terms",
     ];
 
     /// Everything on.
@@ -266,6 +274,8 @@ impl Optimizations {
         text_subject_pushdown: true,
         vector_topk: true,
         topk_heap: true,
+        prefetch_constants: true,
+        prefetch_terms: true,
     };
 
     /// Everything off: the generic operators only.
@@ -304,6 +314,8 @@ impl Optimizations {
         text_subject_pushdown: false,
         vector_topk: false,
         topk_heap: false,
+        prefetch_constants: false,
+        prefetch_terms: false,
     };
 
     fn flag(&mut self, name: &str) -> Option<&mut bool> {
@@ -342,6 +354,8 @@ impl Optimizations {
             "text_subject_pushdown" => &mut self.text_subject_pushdown,
             "vector_topk" => &mut self.vector_topk,
             "topk_heap" => &mut self.topk_heap,
+            "prefetch_constants" => &mut self.prefetch_constants,
+            "prefetch_terms" => &mut self.prefetch_terms,
             _ => return None,
         })
     }

@@ -410,7 +410,7 @@ pub fn write_solutions(
 #[inline(never)]
 fn prefetch_answer(r: &QueryResult, n: usize) {
     let ids = r.table.cols.iter().flat_map(|col| {
-        col[..n]
+        col[..n.min(col.len())]
             .iter()
             .filter(|id| id.tag() == Tag::Vocab)
             .map(|id| id.payload())
@@ -961,6 +961,12 @@ struct NativeRows<'a> {
 impl Serialize for NativeRows<'_> {
     fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
         let mut seq = s.serialize_seq(Some(self.n))?;
+        // the terms of a small answer lie on scattered vocabulary pages: overlap their
+        // cold reads as the other result writers do
+        let ahead = self.n.min(DECODE_ROWS).min(self.r.table.len());
+        if ahead >= 2 && crate::index::io_hints() {
+            prefetch_answer(self.r, ahead);
+        }
         for i in 0..self.n {
             seq.serialize_element(&NativeRow { r: self.r, i })?;
         }
