@@ -1,4 +1,4 @@
-# shellcheck shell=bash disable=SC2034 # the variables set here are used by the sourcing script
+# shellcheck shell=bash disable=SC2034,SC2153 # the variables set here are used by the sourcing script
 # Shared code of scripts/bench.sh: tool lookup, the engines' servers (start, stop, ports),
 # memory readings from /proc and the JSON result files. Sourced, never run.
 #
@@ -336,5 +336,107 @@ load_all() {
     "$gtime" -v -o "logs/load-$e.time" bash -c "$cmd" > "logs/load-$e.log" 2>&1 || die "$e: load failed, see logs/load-$e.log"
     t1=$(date +%s.%N)
     record_load "${LOADRES:-results}" "${LOADNAME[$e]}" "$(awk "BEGIN {print $t1 - $t0}")" "logs/load-$e.time" "$WORK/${FILEOF[$e]}"
+  done
+}
+
+# ------------------------------------------------------------------ query suites
+# Shared by scripts/bench.sh and the suite scripts: they set NAMES (query names, texts in
+# queries/<name>.rq), RES (the results directory) and selected <name> before calling these.
+q() { # curl command for endpoint + query name (fails on HTTP errors)
+  echo "curl -sf --max-time ${MAX_TIME:-300} -o /dev/null -H 'Accept: text/tab-separated-values' --data-urlencode query@queries/$2.rq $1"
+}
+# hyperfine arguments for every selected engine: engine_args <command-fn>
+engine_args() { for e in $ENGINES; do printf '%s\0' --command-name "${NAME[$e]}" "$($1 "$e")"; done; }
+# the rise a - b as JSON (0 if negative: the kernel's RSS counters are approximate), or "?"
+minus() { if [[ $1 =~ ^[0-9]+$ && $2 =~ ^[0-9]+$ ]]; then echo $(($1 > $2 ? $1 - $2 : 0)); else echo '"?"'; fi; }
+# a reading as JSON: the number, or "?"
+num() { if [[ $1 =~ ^[0-9]+$ ]]; then echo "$1"; else echo '"?"'; fi; }
+
+# start_all: every selected engine's server on STORE; mem.json gets each one's RSS
+# 2 s after all are ready, before any query
+start_all() {
+  local e kv=()
+  for e in $ENGINES; do start "$e"; done
+  sleep 2
+  for e in $ENGINES; do kv+=("${NAME[$e]}=$(rss_of "$e")"); done
+  setj "$RES/mem.json" idle "${kv[@]}"
+}
+
+# answer check: every engine's answer to every query is fingerprinted (row count, exact
+# RDF terms, numeric values) into answers.json; the summary compares engines. An engine
+# that errors (HTTP failure) is reported as "error" instead of a time. LIMIT without
+# ORDER BY may legitimately return different solutions: row counts only.
+# Each request is also the query's memory reading: the server's peak RSS is reset
+# (clear_refs) before it, and mem.json gets the peak (VmHWM) after it and its rise over
+# the RSS at the reset.
+COUNT_ONLY="export-500k"
+answer_check() {
+  local n e r before peak kv
+  echo
+  printf '%-16s' rows
+  for e in $ENGINES; do printf ' %12s' "${NAME[$e]}"; done
+  echo
+  for n in "${NAMES[@]}"; do
+    selected "$n" || continue
+    local flag=()
+    [[ " $COUNT_ONLY " == *" $n "* ]] && flag=(--count-only)
+    printf '%-16s' "$n"
+    kv=()
+    for e in $ENGINES; do
+      # right after the reset, the peak is the RSS: the baseline (a JVM may shrink between
+      # a separate RSS reading and the reset)
+      reset_peak "$e"
+      before=$(hwm_of "$e")
+      r=$(python3 "$ROOT/scripts/bench-answers.py" "${URL[$e]}" "queries/$n.rq" "$RES/answers.json" "$n" "${NAME[$e]}" "${flag[@]}")
+      peak=$(hwm_of "$e")
+      kv+=("${NAME[$e]}={\"before\": $(num "$before"), \"peak\": $(num "$peak"), \"delta\": $(minus "$peak" "$before")}")
+      printf ' %12s' "$r"
+    done
+    setj "$RES/mem.json" "queries.$n" "${kv[@]}"
+    echo
+  done
+  # the RSS after every query ran once (a fixed warm-up), read once the servers are idle
+  sleep 2
+  kv=()
+  for e in $ENGINES; do kv+=("${NAME[$e]}=$(rss_of "$e")"); done
+  setj "$RES/mem.json" warm "${kv[@]}"
+}
+
+# --------------------------------------------------------------------------- cold
+# cold <engine>: per query, COLD_RUNS times: stop, evict, start, one timed query.
+# cold.json gets the median time (the format bench-billion.sh writes), cold-runs.json
+# every run's time and time to ready.
+cold() {
+  local e=$1 n i t times ready
+  for n in "${NAMES[@]}"; do
+    selected "$n" || continue
+    times=()
+    ready=()
+    for i in $(seq 1 "$COLD_RUNS"); do
+      stop "$e"
+      evict "$e"
+      start "$e"
+      ready+=("${READY_S[$e]}")
+      # curl prints the time even when the request fails, so a failure replaces it
+      if ! t=$(curl -sf --max-time "${MAX_TIME:-300}" -o /dev/null -w '%{time_total}' -H 'Accept: text/tab-separated-values' \
+        --data-urlencode "query@queries/$n.rq" "${URL[$e]}"); then
+        t=error
+      fi
+      times+=("$t")
+      log "cold $e $n run $i: ready ${READY_S[$e]} s, query $t s"
+    done
+    stop "$e"
+    python3 - "$RES" "${NAME[$e]}" "$n" "${times[*]}" "${ready[*]}" << 'EOF'
+import json, os, statistics, sys
+d, e, n, times, ready = sys.argv[1:]
+times, ready = times.split(), [float(r) for r in ready.split()]
+ok = [float(t) for t in times if t != "error"]
+def put(f, v):
+    j = json.load(open(f)) if os.path.exists(f) else {}
+    j.setdefault(e, {})[n] = v
+    json.dump(j, open(f, "w"), indent=1)
+put(f"{d}/cold.json", statistics.median(ok) if ok else "error")
+put(f"{d}/cold-runs.json", {"times": [float(t) if t != "error" else t for t in times], "ready": ready})
+EOF
   done
 }
