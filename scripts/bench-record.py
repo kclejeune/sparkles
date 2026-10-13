@@ -273,6 +273,35 @@ def hyperfine_results(d, name, mode, fps, clients=1, query=None):
     return out
 
 
+def pool(results):
+    """Results of the instances `<template>-<i>` of one template, as one result per template: the
+    samples of all instances together, the worst status, and one answer for the whole template."""
+    order = {"ok": 0, "wrong-answer": 1, "timeout": 2, "oom": 3, "error": 4}
+    groups, out = {}, []
+    for r in results:
+        m = re.fullmatch(r"(.+)-(\d+)", r["query"])
+        if r["mode"] not in ("warm", "cold") or not m:
+            out.append(r)
+            continue
+        groups.setdefault((r["engine"], m.group(1), r["mode"], r["clients"]), []).append(r)
+    for (engine, template, mode, clients), rs in groups.items():
+        samples = [x for r in rs for x in r["samples_ms"]]
+        answers = [r["answer"] for r in rs]
+        answer = None
+        if all(answers):
+            agrees = None if any(x["agrees"] is None for x in answers) else all(x["agrees"] for x in answers)
+            h = hashlib.sha256("".join(sorted(str(x["hash"]) for x in answers)).encode()).hexdigest()[:16]
+            answer = {"rows": sum(x["rows"] for x in answers), "hash": h, "agrees": agrees, "instances": len(rs)}
+        out.append({
+            "engine": engine, "query": template, "mode": mode, "clients": clients,
+            "durability": None, "samples_ms": samples,
+            "median_ms": round(statistics.median(samples), 3) if samples else None,
+            "p95_ms": round(percentile(samples, 0.95), 3) if samples else None,
+            "answer": answer, "status": max((r["status"] for r in rs), key=order.get), "instances": len(rs),
+        })
+    return out
+
+
 def cmd_build(a):
     d = a.results
     man = json.load(open(a.manifest)) if a.manifest else {}
@@ -319,6 +348,8 @@ def cmd_build(a):
                 "status": v.get("status", "ok"), "qmph": v.get("qmph"),
                 **{k: v[k] for k in ("qps", "runs", "timeouts", "seconds") if k in v},
             })
+    if a.pool_instances:
+        results = pool(results)
     extra = load_json(d, "extra.json") or {}
     results += extra.get("results", [])
     rec = {
@@ -435,6 +466,8 @@ def main():
     b.add_argument("--warmup", type=int, default=2)
     b.add_argument("--runs", type=int, default=10)
     b.add_argument("--timer", default="hyperfine+curl")
+    b.add_argument("--pool-instances", action="store_true",
+                   help="one result per template for queries named <template>-<i> (samples pooled)")
     b.add_argument("--throughput-requests", default="")
     b.add_argument("--throughput-clients", default="16")
     b.set_defaults(f=cmd_build)

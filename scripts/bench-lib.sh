@@ -342,8 +342,15 @@ load_all() {
 # ------------------------------------------------------------------ query suites
 # Shared by scripts/bench.sh and the suite scripts: they set NAMES (query names, texts in
 # queries/<name>.rq), RES (the results directory) and selected <name> before calling these.
-q() { # curl command for endpoint + query name (fails on HTTP errors)
-  echo "curl -sf --max-time ${MAX_TIME:-300} -o /dev/null -H 'Accept: text/tab-separated-values' --data-urlencode query@queries/$2.rq $1"
+# qform <file>: select, ask, construct or describe (the first of these words outside IRIs and comments)
+qform() { sed -e 's/<[^<>[:space:]]*>//g' -e 's/#.*//' "$1" | grep -ioE '\b(select|construct|describe|ask)\b' | head -1 | tr '[:upper:]' '[:lower:]'; }
+q() { # curl command for endpoint + query name (fails on HTTP errors); the answer format follows the query form
+  local accept=text/tab-separated-values
+  case "$(qform "queries/$2.rq")" in
+    ask) accept=application/sparql-results+json ;;
+    construct | describe) accept=application/n-triples ;;
+  esac
+  echo "curl -sf --max-time ${MAX_TIME:-300} -o /dev/null -H 'Accept: $accept' --data-urlencode query@queries/$2.rq $1"
 }
 # hyperfine arguments for every selected engine: engine_args <command-fn>
 engine_args() { for e in $ENGINES; do printf '%s\0' --command-name "${NAME[$e]}" "$($1 "$e")"; done; }
@@ -369,7 +376,7 @@ start_all() {
 # Each request is also the query's memory reading: the server's peak RSS is reset
 # (clear_refs) before it, and mem.json gets the peak (VmHWM) after it and its rise over
 # the RSS at the reset.
-COUNT_ONLY="export-500k"
+COUNT_ONLY=${COUNT_ONLY-export-500k}
 answer_check() {
   local n e r before peak kv
   echo
@@ -380,6 +387,7 @@ answer_check() {
     selected "$n" || continue
     local flag=()
     [[ " $COUNT_ONLY " == *" $n "* ]] && flag=(--count-only)
+    [[ " ${NO_CHECK:-} " == *" $n "* ]] && flag+=(--no-check)
     printf '%-16s' "$n"
     kv=()
     for e in $ENGINES; do
@@ -439,4 +447,18 @@ put(f"{d}/cold.json", statistics.median(ok) if ok else "error")
 put(f"{d}/cold-runs.json", {"times": [float(t) if t != "error" else t for t in times], "ready": ready})
 EOF
   done
+}
+
+# pinned_build <nix file> <out-link>: build a generator's derivation (the file takes
+# { pkgs }) against the nixpkgs revision locked in flake.lock, so the compiler and the
+# libraries are pinned too (as scripts/bench-watdiv.sh does).
+pinned_build() {
+  nix build --impure --out-link "$2" --expr "
+    let
+      n = (builtins.fromJSON (builtins.readFile $ROOT/flake.lock)).nodes.nixpkgs.locked;
+      pkgs = import (builtins.fetchTarball {
+        url = \"https://github.com/\${n.owner}/\${n.repo}/archive/\${n.rev}.tar.gz\";
+        sha256 = n.narHash;
+      }) { };
+    in import $1 { inherit pkgs; }"
 }
