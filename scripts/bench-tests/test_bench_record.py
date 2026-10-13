@@ -62,7 +62,7 @@ def fixture(d, slow=1.0, wrong=False):
 
 def build(d, out, **kw):
     cmd = [sys.executable, RECORD, "build", "--suite", "test", "--scale", "tiny", "--results", d, "--out", out]
-    cmd += sum(([f"--{k}", str(v)] for k, v in kw.items()), [])
+    cmd += sum(([f"--{k}"] if v is True else [f"--{k}", str(v)] for k, v in kw.items()), [])
     return subprocess.run(cmd, capture_output=True, text=True)
 
 
@@ -111,6 +111,23 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(self.find(rec, "oxigraph", "q1")["status"], "wrong-answer")
         self.assertEqual(self.find(rec, "oxigraph", "q1")["answer"]["agrees"], False)
         self.assertEqual(self.find(rec, "sparkles", "q1")["status"], "ok")
+
+    def test_instances_pool_into_one_result_per_template(self):
+        write(self.res, "t-1.json", {"results": [hyperfine("sparkles", [0.001, 0.002, 0.003])]})
+        write(self.res, "t-2.json", {"results": [hyperfine("sparkles", [0.004, 0.005, 0.006])]})
+        write(self.res, "answers.json", {"t-1": {"sparkles": {"rows": 1, "exact": "a", "value": "a"}},
+                                         "t-2": {"sparkles": {"rows": 2, "exact": "b", "value": "b"}}})
+        out = os.path.join(self.tmp.name, "pooled.json")
+        p = build(self.res, out, **{"pool-instances": True})
+        self.assertEqual(p.returncode, 0, p.stderr)
+        rec = jload(out)
+        self.assertEqual([r["query"] for r in rec["results"]], ["t"])
+        r = rec["results"][0]
+        self.assertEqual(r["instances"], 2)
+        self.assertEqual(len(r["samples_ms"]), 6)
+        self.assertEqual(r["median_ms"], 3.5)
+        self.assertEqual(r["p95_ms"], 6)
+        self.assertEqual(r["answer"]["rows"], 3)
 
     def test_validate_rejects_a_broken_record(self):
         rec, out = self.record()
