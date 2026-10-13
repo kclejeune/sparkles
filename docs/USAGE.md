@@ -3988,6 +3988,18 @@ cannot start with `.` and cannot be `ui` or `$`. Renaming a persistent dataset f
 while handles to it are open. Otherwise the rename closes the store, moves its
 directory and updates the registry.
 
+A catalog builds one block cache, result cache, SERVICE cache and history cache for all
+the datasets it opens, sized by the cache options of the `StoreOptions` it was created
+with, so its memory does not grow with the number of datasets. `CatalogOptions::memory`
+can size them separately (`CatalogCaches::Sizes`) or give each dataset its own
+(`CatalogCaches::PerDataset`). `MemoryOptions::pool_bytes` adds a query memory pool, the
+estimated bytes that all the catalog's queries and updates may hold together. A query
+that the pool cannot cover fails with `BudgetKind::ServerMemory`, and nothing queues.
+There is no pool by default. A dataset opened on its own keeps its own caches. Python
+takes `total_query_memory_bytes` in `Catalog(...)` and `Catalog.memory(...)`, and
+Node takes `totalQueryMemoryBytes` in the catalog options. The JVM bindings do not expose
+the pool.
+
 With the feature `backup`, `catalog.repositories()` manages `backup/repositories.json`.
 Its `list`, `get`, `add`, `update`, `remove` and `open` calls share the configuration
 and the opened repositories. `with_fixed` adds read-only entries defined by the

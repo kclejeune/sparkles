@@ -571,6 +571,46 @@ mod tests {
         assert!(waiter.poll().is_some());
     }
 
+    /// A6: many clients that each want 40% of the pool end with a result or a
+    /// server-memory failure, none hangs, and the pool returns to zero.
+    #[test]
+    fn many_large_queries_never_deadlock() {
+        let pool = QueryPool::new(100 * MB);
+        let outcomes = std::sync::Mutex::new((0u32, 0u32));
+        std::thread::scope(|s| {
+            for _ in 0..64 {
+                s.spawn(|| {
+                    for _ in 0..5 {
+                        match pool.admit_blocking(16 * MB, Duration::from_millis(300), || false) {
+                            Ok(g) => {
+                                let r = g.cover(40 * MB);
+                                std::thread::sleep(Duration::from_millis(2));
+                                let mut o = outcomes.lock().unwrap();
+                                if r.is_ok() {
+                                    o.0 += 1;
+                                } else {
+                                    o.1 += 1;
+                                }
+                            }
+                            Err(e) => {
+                                assert!(matches!(
+                                    e,
+                                    Error::BudgetExceeded(b) if b.kind == BudgetKind::ServerMemory
+                                ));
+                                outcomes.lock().unwrap().1 += 1;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        let o = outcomes.lock().unwrap();
+        assert_eq!(o.0 + o.1, 320);
+        assert!(o.0 > 0);
+        assert_eq!(pool.granted(), 0);
+        assert_eq!(pool.waiting(), 0);
+    }
+
     #[test]
     fn concurrent_growth_and_release_balance_to_zero() {
         let pool = QueryPool::new(512 * MB);
