@@ -31,8 +31,10 @@ node label (which only has meaning inside one response) never decides equality, 
 different arrangements of blank nodes do not compare equal.
 
 ASK queries record a digest of the boolean. CONSTRUCT and DESCRIBE queries are fetched as
-N-Triples, parsed, and compared as a set of triples (a graph has no duplicates). Spacing,
-escapes in literals and an explicit `xsd:string` do not matter. `--no-check` records the
+N-Triples, parsed, and compared as a set of triples by RDF term identity (a graph has no
+duplicates). The value digest normalizes the terms of that set without merging triples, so
+`"1"^^xsd:integer` and `"1.0"^^xsd:decimal` stay two triples. Spacing, escapes in literals
+and an explicit `xsd:string` do not matter. `--no-check` records the
 row count with a fixed digest, for DESCRIBE queries whose result the specification leaves
 to the engine.
 
@@ -367,6 +369,38 @@ def nt_triples(text, by_value):
     return out
 
 
+def nt_rows(text):
+    """The triples of an N-Triples document as lists of JSON-form terms, each triple once by RDF
+    term identity (the first occurrence is kept). A line that is not a triple is one `other` item."""
+    out, seen = [], set()
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = NT_LINE.match(line)
+        triple = tuple(nt_term(tok) for tok in m.groups()) if m else ({"type": "other", "value": line},)
+        key = tuple(term(d, False) for d in triple)
+        if key not in seen:
+            seen.add(key)
+            out.append(triple)
+    return out
+
+
+def graph_record(text, count_only, no_check):
+    """The answer record of a CONSTRUCT or DESCRIBE result. The graph is a set of triples by term
+    identity. The value digest normalizes the terms of that set without merging triples."""
+    triples = nt_rows(text)
+    rec = {"rows": len(triples)}
+    if count_only:
+        return rec
+    if no_check:
+        rec["exact"] = rec["value"] = "unchecked"
+        return rec
+    rec["exact"] = canon([tuple(term(d, False) for d in r) for r in triples])
+    rec["value"] = canon([tuple(term(d, True) for d in r) for r in triples])
+    return rec
+
+
 def order_keys(query, head_vars):
     """The variables of the query's own ORDER BY when it uses only plain variables, `ASC(?v)` or
     `DESC(?v)` that are in the result, else None. Strings, comments and IRIs are blanked first,
@@ -437,14 +471,7 @@ def main():
     try:
         body = fetch(req, float(os.environ.get("MAX_TIME", "300")))
         if graph:
-            triples = nt_triples(body.decode(), True)
-            rec = {"rows": len(triples)}
-            if not count_only:
-                if no_check:
-                    rec["exact"] = rec["value"] = "unchecked"
-                else:
-                    rec["exact"] = canon(nt_triples(body.decode(), False))
-                    rec["value"] = canon(triples)
+            rec = graph_record(body.decode(), count_only, no_check)
         else:
             res = json.loads(body)
             if kind == "ask":

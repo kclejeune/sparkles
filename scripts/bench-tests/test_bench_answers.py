@@ -69,6 +69,23 @@ class NTriplesTests(unittest.TestCase):
         two = ba.nt_triples('<http://x/s> <http://x/p> "see _:b2" .\n', False)
         self.assertNotEqual(ba.canon(one), ba.canon(two))
 
+    def test_value_normalization_does_not_merge_triples(self):
+        xsd = "http://www.w3.org/2001/XMLSchema#"
+        one = f'<urn:s> <urn:p> "1"^^<{xsd}integer> .\n'
+        full = one + f'<urn:s> <urn:p> "1.0"^^<{xsd}decimal> .\n'
+        a = ba.graph_record(full, False, False)
+        d = ba.graph_record(one, False, False)
+        self.assertEqual(a["rows"], 2)
+        self.assertEqual(d["rows"], 1)
+        self.assertNotEqual(a["value"], d["value"])
+        self.assertNotEqual(a["exact"], d["exact"])
+
+    def test_graph_record_modes(self):
+        text = '<urn:s> <urn:p> "1" .\n<urn:s> <urn:p> "1" .\n'
+        self.assertEqual(ba.graph_record(text, True, False), {"rows": 1})
+        r = ba.graph_record(text, False, True)
+        self.assertEqual((r["rows"], r["exact"], r["value"]), (1, "unchecked", "unchecked"))
+
     def test_construct_blank_nodes_by_structure(self):
         one = ba.nt_triples("_:a <http://x/p> _:b .\n_:b <http://x/q> \"1\" .\n", False)
         two = ba.nt_triples("_:m <http://x/p> _:n .\n_:n <http://x/q> \"1\" .\n", False)
