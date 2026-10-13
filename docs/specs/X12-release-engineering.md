@@ -1,19 +1,20 @@
 # X12: Distribution and format compatibility
 
-> **Status:** specified
+> **Status:** partially implemented (Phase 3)
 >
-> **Phases:** None shipped. Phase 1 is one release workflow for every artifact, a single
-> version across the server, crates and bindings, server binaries with checksums and
-> provenance attestations, and published container images. Phase 2 widens the platform
-> matrix to Windows, Intel macOS, musl for the JVM, and PyPy and free-threaded CPython
-> wheels. Phase 3 is the on-disk format policy with older-format fixtures, in-place
-> upgrades and `sparkles migrate`. Phase 4 is the HTTP, CLI and library compatibility
+> **Phases:** Phase 3 shipped: the on-disk format policy with older-format fixtures,
+> in-place upgrades and `sparkles migrate`. Phase 1 is one release workflow for every
+> artifact, a single version across the server, crates and bindings, server binaries
+> with checksums and provenance attestations, and published container images. Phase 2
+> widens the platform matrix to Windows, Intel macOS, musl for the JVM, and PyPy and
+> free-threaded CPython wheels. Phase 4 is the HTTP, CLI and library compatibility
 > policy with its checks.
 >
-> **User docs:** none, because nothing is built.
+> **User docs:** [USAGE: Upgrading databases](../USAGE.md#upgrading-databases) and
+> [DEVELOPMENT: Changing an on-disk format](../DEVELOPMENT.md#changing-an-on-disk-format).
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
-> the end will record how it lands.
+> the end records how it lands.
 
 This design was written from the Sparkles code at `537e048`: the four workflows in
 `.github/workflows`, the `Dockerfile`, `nix/image.nix`, `nix/package.nix`, the Helm chart
@@ -605,4 +606,97 @@ Phase 3 should land before the first release so that 0.1's databases can be read
 
 ## Outcome
 
-Not built. See [ROADMAP](../ROADMAP.md) items 58–60.
+Phases 1, 2 and 4 are not built. See [ROADMAP](../ROADMAP.md) items 58–60.
+
+### Phase 3 (2026-10-13)
+
+**The registry.** `crates/sparkles-core/src/formats.rs` declares every file kind of §4.1
+with its class, its marker, the version this build writes and the versions it reads,
+and a second table lists every settings and state file with the member that holds its
+version. Thirty-five settings files carry a member. Six cannot, because their top level
+is a map of user keys or an array, or because they are a cache or a transient intent,
+and the registry lists them with the reason. The module documentation describes the
+four kinds of change of §4.3. `GET /$/server` reports the registry in a `formats` member
+for callers that see the version, and `sparkles migrate --check --format json` prints it.
+The backup crate's layout, blob and key-slot constants are now defined from the
+registry, and the module constants of the core files are checked against it by a test.
+
+**Version markers.** A write-ahead log created by this build starts with a header
+record: the magic `\x89SPKWAL\n`, the version (1) and zeros. The spec asked for a 16-byte
+header. The header is instead 33 bytes, the size of every record, so the records after
+it keep their alignment. Every reader that steps through records at multiples of 33
+from the start of the log, and every saved position of byte 0 meaning "before the first
+commit" (the history index, branch link segments, the backward replay), works unchanged
+by skipping the record where the log starts. A log without the header is version 0 and
+reads as before. Existing logs are never rewritten. The header arrives with the next
+generation, at a compaction, a bulk load, a branch or a clone. Because an older release
+would read the header as a damaged record and could truncate the log as a torn tail,
+`dataset.json` gains reader capability 5 (`DATASET_READER`), and a store raises
+`minimumReader` to 5 when it opens a database for writing, after every file it read
+proved readable.
+
+The catalog's `config.json` and the settings files gain a member, absent meaning 1, read
+and written through `formats::settings_from_slice`, `settings_to_vec`,
+`check_settings` and `stamp_settings`. The server's dataset settings kinds go through
+one pair of helpers (`assist::read_file` and `write_file`), and its server-wide kinds
+through another, so `assistant.json`, `memory.json`, `ingest.json`, `asks.json`,
+`query-suggestions.json`, `maintenance.json`, `review.json`, `models.json` and
+`notifications.json` are covered in two places. Files whose types already had a member
+(`reasoningFormat`, `rdfsFormat`, `originFormat`, `restoreFormat`, `version`) keep it, and
+the registry names it. A newer version is refused, except for the informational
+`origin.json` and `restore.json`, which are then ignored with a warning.
+
+**`writtenBy`.** `dataset.json` records the release that last opened the database for
+writing, and refusals name it.
+
+**Readable sets.** `formats::READABLE_INDEX_FORMATS` replaces the equality test with
+`FORMAT_VERSION` in `store.rs`, `check.rs` and the backup manifest's validation, which
+now takes the set. A refusal says whether the database is newer than the release, can be
+upgraded with `sparkles migrate`, or must be dumped with the release that wrote it.
+
+**Refusing one dataset.** When `Catalog::open` meets a persistent dataset in a format
+this release does not read (`Error::Unsupported`), it logs the reason, leaves the
+dataset closed and registered, and serves the others. `GET /$/server` lists such datasets
+under `refusedDatasets`. This is the part of §2.5 that roadmap item 64 needs only for
+format refusals. Other open failures still stop the catalog.
+
+**`sparkles migrate`.** `crates/sparkles-core/src/migrate.rs` holds the step registry,
+`plan`, `migrate` and `recover`, and `crates/sparkles-server/src/migrate_cmd.rs` the
+command of §4.4 with `--data`, `--loc`, `--dataset`, `--check`, `--keep-old` and `--format
+json`. The swap is not the catalog's `swap.rs`, which needs a live catalog. The command
+works on a stopped data directory, so it takes the catalog lock and the database's own
+lock, copies the database to `.migrate-<name>`, runs the steps, checks the copy with
+`check::check`, and swaps it in with two renames. `recover` removes a copy that was not
+swapped in and finishes a run that stopped between the renames. A unit test interrupts
+the run at each point and checks the result. One step is registered: a legacy delta
+vocabulary to the framed format, which is the lazy upgrade of §4.3 run ahead of time. The
+log header has no step, because the byte offsets of branch link segments and of backup
+manifests point into existing logs, and rewriting a log would move them. A generation
+index step will be a compaction into the new format when an index format change needs
+one.
+
+**Backups.** A restore accepts any index format in the readable set. The `422
+incompatible-format` message names the release in `server.version` and says what to do.
+
+**Fixtures.** `scripts/format-fixture.sh BIN LABEL` writes a data directory with a
+catalog, a dataset `books` with two generations, a delta, named graphs, blank nodes, an
+RDF 1.2 triple term, a named snapshot that keeps the first generation, a branch with its
+own commit, a stored query, DESCRIBE and compaction settings, the full-text, spatial and
+vector indexes (with literal vectors, so no embedding provider is needed), and a
+plaintext and an encrypted backup repository, with the answers of twelve recorded query
+cases. The first fixture, `testsuite/formats/c7a6811c/` (36 KB), was written by the
+commit before this phase, so it holds headerless logs, settings without members and a
+`dataset.json` without `writtenBy`. `crates/sparkles-core/tests/formats.rs` opens each
+fixture's dataset, checks it, compares the quad counts at the head and at the snapshot,
+writes, compacts and opens it again. `crates/sparkles-server/tests/cli_formats.rs` runs
+the binary over each fixture: `migrate --check` places it inside the window, `check`
+finds no error, every case answers as recorded (past states and the branch included),
+the stored query runs, the catalog lists the dataset, both backups restore to the same
+count, and after a write and a compaction the new log has its header and `dataset.json`
+names this release. A second test raises the fixture's index format to 99 and checks
+the refusals of `migrate --check`, `query` and the catalog.
+
+Not built in this phase: the CHANGELOG's **Format** heading (Phase 1 adds the
+CHANGELOG), the fixture job of the release workflow, `sparkles --version --verbose`, and
+the background rebuild of a vector or spatial index whose file version is unknown, which
+already happens for the full-text index (A12).
