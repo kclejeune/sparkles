@@ -1132,3 +1132,80 @@ was not built either.
   with `spk:dot` 21 ms against 568 ms, and with the score bound by a BIND 21 ms
   against 536 ms. The compact form takes about 5.3 bytes per dimension where the JSON
   literals of these vectors take about 9.
+
+### Roadmap follow-ups (2026-10-12)
+
+**Index maintenance and build speed** (item 10, Tier 2, [ROADMAP](../ROADMAP.md)).
+*Not built at first* above lists background catch-up and keeping the graph across
+compactions. The code has no incremental path: `vector/hnsw.rs` offers only
+`Graph::build`, `check`, `bytes` and `search` over a frozen graph (`level0` and `upper`
+are flat slices), and `Store::vectors_switched` in `store/vector.rs` retires the old
+generation's indexes and calls `spawn_vector_build` for every configured index after
+each compaction or bulk commit. Until that build ends the searches scan exactly, and
+rows inserted since the build are scored exactly as the overlay on every query.
+
+* **Incremental inserts.** A built index gains a mutable layer: the overlay's rows
+  become nodes numbered after the frozen ones, inserted by the same Algorithm 1 that
+  `build` runs, with their links in growable lists and the reverse links they add to
+  frozen nodes kept in a side table that `search` reads after the frozen list. A
+  background task per index inserts the overlay's rows in commit order, after the
+  commit is published, so writes do not wait. A search reads the layer as of its
+  snapshot by skipping nodes newer than the snapshot's commit, and still scores
+  overlay rows not yet inserted exactly. Deleted rows stay as nodes that the accept
+  filter skips, as deleted base rows are today. The overlay counts on the index card
+  then split into inserted and pending.
+* **Keeping the graph across compactions.** Nodes are rows of the PSO-ordered packed
+  segment, whose ids and order change at a compaction. The new generation's build
+  first packs the segment, then maps each old node to its new row by (subject term,
+  vector) and carries the links over by renumbering. Nodes of deleted rows are dropped
+  and their in-neighbours re-selected from their two-hop neighbourhood (the repair
+  that Algorithm 4 runs on insert); the mutable layer's nodes become frozen nodes; new
+  rows are inserted. A full rebuild remains when more than a set share of the rows
+  changed (a default of 30 %), when `m` or `efConstruction` changed, or when the old
+  graph is gone. `vectors_switched` keeps the previous `Built` alive until the carried
+  graph is installed, so searches between the switch and the end of the carry-over use
+  the old graph through the same row mapping rather than the exact scan.
+* **Build speed.** At 1M × 384 the Sparkles build took 176 s in the text above and
+  175 s in the table, against 70 s for USearch on the same kind of data; the two
+  Sparkles figures come from different runs, and the next measurement should report
+  one, with the run count. Candidate costs to measure first: every distance goes
+  through `SegSpace::dist`, an indirection from node to row plus `graph_dist`, which
+  divides by both norms for cosine (vectors normalized once at pack time would make
+  cosine a dot product); the per-node `Mutex<Vec<Vec<u32>>>` allocates a vector per
+  layer per node; and the visited marks are `u32` per node per thread. An
+  `efConstruction` lower than 128 trades recall, so it is not the first lever. The
+  target is a build within 1.5 times USearch's time at equal recall, measured by
+  `scripts/bench-vector.sh` and reported in X06's vector benchmarks.
+
+Acceptance examples: after 10,000 inserts into an index of 100,000 vectors, a search
+of an inserted vector finds it at rank 1 through the graph (`method` is `hnsw`, the
+overlay's pending count is 0) within a few seconds of the commit. After a compaction
+that changed 1 % of the rows, the plan of the next search reports `method: hnsw`
+without an exact-scan window, and recall@10 at ef = 128 is within 0.005 of a full
+rebuild's.
+
+**Quantization, result caching and statistics** (item 34, Tier 4,
+[ROADMAP](../ROADMAP.md)). *Deviations* above records that there is no quantization
+(§2.4 `quantization`), that vector search results are not cached, and that
+`DatasetStats.vector` is not built.
+
+* **Quantization.** The index configuration gains `quantization: f32 | f16 | i8`, with
+  f32 the default so existing indexes keep their recall. The graph is built and searched
+  over a second packed copy in the chosen type (i8 with a scale per dimension computed
+  at pack time), and its `ef` candidates are re-scored with the §4.3 kernel over the
+  f32 rows, so scores stay exact. The f32 rows can then stay mapped and cold. The
+  configuration hash includes the setting, so a change rebuilds.
+* **Result caching.** `write_node` in `sparql/cache.rs` refuses to key any plan that
+  holds a `VectorSearch` or `HybridSearch` node, so such queries are never cached. Two
+  things make the result depend on more than the snapshot: whether the graph or the
+  exact scan answered (a build in progress), and, with [F08](F08-embeddings-on-write.md),
+  the embedding computed for a text query. The key gains the index's build epoch and
+  configuration hash, the query vector's bytes (after embedding), `k`, `ef`, the metric
+  and the options. A search answered while its index is building, or one whose text
+  could not be embedded, stays uncacheable. Once incremental inserts exist, the key
+  also takes the index's inserted-through commit.
+* **Statistics.** `DatasetStats` (`crates/sparkles/src/stats.rs`) has no vector member,
+  and the UI reads `GET /$/vector/{ds}`. It gains `vector`, per index: predicate,
+  dimension, rows, nodes, overlay and pending counts, bytes and state, from the data
+  that route already returns, so `GET /$/stats/{ds}` reports it with the rest of the
+  dataset's counts.

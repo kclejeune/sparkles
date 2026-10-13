@@ -1480,3 +1480,38 @@ What remains behind N3.js has these causes.
   description and resolving promises. The rest of the wall time is the hop to a worker
   and back, which a profile of cycles does not show. Queries are already far ahead of
   both other engines, so the round left them alone.
+
+### Roadmap follow-ups (2026-10-12)
+
+* **Reusable plans** ([ROADMAP](../ROADMAP.md) item 32). [X10](X10-reusable-query-plans.md)
+  adds `dataset.prepare(text)`, which parses on the worker and resolves to a
+  `PreparedQuery` with `query(bindings?, options?)` and `cursor(...)`. Its handle keeps
+  the parsed query and the cached plan, so the worker skips parsing and planning. The
+  Outcome above puts 69% of a small query's user-space cycles on the worker, in parsing,
+  planning and evaluation.
+* **Per-call overhead** (item 33). The published benchmark has `has()` at 1.9 µs against
+  N3.js's 1.3 µs ([BENCHMARKS](../BENCHMARKS.md)). On the laptop, in a hot loop, it took
+  0.63 µs against 0.10 µs (Outcome above). The export of 500,000 rows takes 1.44 times
+  N3.js with Comunica, because each row's terms cross into JavaScript. Sketch:
+  * *Term ids on the JavaScript side.* The term table remembers the engine id of each term
+    it has sent, keyed by the snapshot's generation and the delta vocabulary's length, as
+    the remembered misses already are. A `has()` whose terms are all known sends four ids
+    in a fixed-size request, which skips encoding.
+  * *Batched probes.* `hasAll(quads)` answers many probes in one call as a bit array.
+  * *Lazy terms in exports.* A result batch crosses as its term table and id columns, as
+    it does now, and the RDF/JS term objects of a row are created when a property of the
+    row is first read, with one object per distinct term in the batch. An export that
+    writes bytes keeps using §3.7's byte streams, which create no term objects.
+* **Release work** (item 58), designed in [X12](X12-release-engineering.md):
+  * *npm publishing.* `node-packages.yml` builds and checks the packages, and publishing
+    needs an explicitly enabled npm environment. Switching it on needs the npm scope,
+    provenance statements and X12's checklist.
+  * *Progress hooks.* The engine's `Control` (`crates/sparkles-core/src/task.rs`) carries
+    a `Progress` that backups already report through. Loads, compaction and index builds
+    report through it too (the bulk builder's `report` messages and a count of quads
+    applied in the delta path), and the addon passes it to an `onProgress` option through
+    a ThreadsafeFunction that keeps only the latest value while JavaScript is busy, as
+    §5.2 specifies.
+* **Browser build.** §12 describes what a WebAssembly build would take. The local-first
+  engine in WebAssembly that syncs through RDF Patch and branches is now ROADMAP item 44,
+  [F20](F20-local-first-engine.md).

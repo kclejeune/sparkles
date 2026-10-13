@@ -865,3 +865,53 @@ later work. The vector indexes' graphs are still built after the switch, so thei
 searches are exact for a while after each compaction. A bulk commit still builds the
 spatial index's base under the writer lock, because it holds the lock for its whole
 rebuild anyway.
+
+### Roadmap follow-ups (2026-10-12)
+
+[ROADMAP](../ROADMAP.md) item 14 takes up the work listed as not built above. None of it
+has a spec of its own yet. These are design sketches.
+
+* **Delta changes located per block.** Each of the delta's seven permutations gains a
+  persistent map from base block number to the counts of inserted and deleted keys in that
+  block, kept up to date by `Delta::insert_quad` and its removal paths with one binary
+  search over the permutation's block metadata per key. A scan then knows which blocks of
+  its range no change reaches. It reads those as in a compacted base, with selective
+  decoding and the shared decoded columns of X05's Outcome, and merges the delta only into
+  the touched blocks. Partial compaction (§10.2) takes its runs from the map instead of
+  locating every delta key again. The gate is the write cost measured in the Outcome
+  (105,300 quads in commits of 10,000) rising by at most 5%, and a measured gain on scans
+  over a dataset with a 1% delta.
+* **New vocabulary terms without a full build.** Partial compaction needs a delta that
+  adds no term, because a base id is the term's position. The sketch spaces base ids:
+  a build gives term `i` the id `i << g`, with `g` chosen so that the largest id fits in
+  60 bits, and a partial compaction gives a new term an unused id between its neighbours.
+  The vocabulary is rewritten by a linear merge of the old keys and the sorted new ones,
+  and no index block changes. A lookup from id to key, which divides by `FC_BLOCK` today,
+  needs an index from id to position (a sorted id array per group of blocks, beside the
+  sparse index), and the numeric column is addressed the same way. When a gap fills, the
+  compaction is full. This changes the vocabulary's files, so it follows the format rules
+  of [X11](X11-index-compression-and-predicate-patterns.md) §7 and needs its own
+  measurement of lookup cost before any decision.
+* **Adaptive thresholds.** The cost model's units (about 0.65 ms per rewritten block,
+  6.5 µs per delta quad and 1 µs per quad of a full build, §10.3) become running averages
+  per dataset, updated from each compaction's measured phases and kept in the compaction
+  status. The delta's cost to readers is measured as the time scans spend merging the
+  delta, sampled per query. The policy compacts when that cost, times the dataset's query
+  rate since the last compaction, exceeds the estimated compaction time, within the
+  existing minimum interval and size bounds.
+* **Automatic compaction in embedded use.** The scheduler in
+  `crates/sparkles-server/src/compaction.rs` moves into the library as a
+  `CompactionScheduler` owned by a `Catalog`, with one background thread per catalog that
+  evaluates each persistent dataset's `compaction.json` policy and runs the existing
+  background build. The server uses the same scheduler. Python, the JVM and Node expose it
+  as a catalog option, off by default for in-memory datasets and on for persistent ones
+  opened through a catalog. A `Dataset` opened alone gets it only when asked.
+* **Derived-index work at generation switches.** The spatial index's base is already built
+  before the switch (`Store::prebuild_geo`). The vector indexes are built after it, so
+  their searches are exact for a while. A `prebuild` step for each derived index runs
+  between the build and the catch-up: for HNSW, the graph of the old generation is carried
+  over by mapping its node ids through the terms to the new generation's ids and applying
+  the delta's changes, which [F04](F04-vector-search.md)'s follow-up on incremental inserts
+  (ROADMAP item 10) provides. The write-time ShEx typing cache and the full-text
+  checkpoint get the same hook, so that the switch under the writer lock does only the
+  swap.

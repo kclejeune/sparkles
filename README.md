@@ -204,6 +204,38 @@ tradeoff and every case where Sparkles loses.
 [docs/COMPARISON.md](docs/COMPARISON.md) lists the gaps per engine and where Sparkles
 departs from Jena and QLever on purpose.
 
+## Roadmap
+
+The goal of the current work is the best graph database on the published benchmarks
+and in practical use, with the real feature gaps filled. The first release, its packages
+and its stability contract come after that work. [docs/ROADMAP.md](docs/ROADMAP.md)
+orders every item by difficulty and impact and links each to its design spec.
+
+* **Now.**
+  * Benchmarks: BSBM, SP²Bench, LUBM, LDBC and Wikidata query logs, with every
+    comparison refreshed at the current head.
+  * Memory: caches sized across the whole server and a shared query memory pool.
+  * Writes: group commit as the default.
+  * Reads: faster cold sparse lookups.
+* **Next.**
+  * Execution: batch-oriented joins with disk spill, and QLever's predicate patterns
+    and FSST vocabulary compression.
+  * Graph algorithms: a library with node embeddings, and GraphRAG summaries built on
+    it.
+  * Reasoning: materialization fast enough to leave on, with `owl:sameAs` handled by
+    representatives and rules evaluated over the compressed indexes.
+  * Data model: SHACL 1.2 and ShEx 2.2.
+  * UI: a time slider over history.
+* **Later.**
+  * An incremental computation core for materialized views, live queries and
+    provenance per fact. It also drives explanations and query-time reasoning.
+  * openCypher.
+  * Editing forms generated from shapes.
+  * RML mappings and virtual graphs.
+  * A local-first WebAssembly engine.
+* **Lower tiers.** Smaller backlog items, the release work (packages, server binaries,
+  images, format stability, replication) and leftover Jena compatibility features.
+
 ## Web UI
 
 The web UI is embedded in the server. It has a query editor with results as tables,
@@ -272,6 +304,7 @@ including benchmarks, editor setup, design specs and UI development.
 | [Usage](docs/USAGE.md) | Server and CLI workflows, libraries and bindings, MCP, backups, and deployment with Docker, Kubernetes and NixOS. |
 | [Architecture](docs/ARCHITECTURE.md) | Library boundaries, storage, execution, optimizations and implemented design decisions. |
 | [Features](docs/FEATURES.md) | The capability inventory and known gaps. |
+| [Roadmap](docs/ROADMAP.md) | Planned work in priority order, linked to the design specs. |
 | [HTTP API](docs/API.md) | Fuseki endpoints and Sparkles administration extensions. |
 | [Development](docs/DEVELOPMENT.md) | Project layout, builds, tests, mise tasks, Nix and third-party licenses. |
 

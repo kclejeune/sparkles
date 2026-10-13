@@ -575,3 +575,64 @@ with 188 MB resident.
 * Verifying a snapshot at load, and sharing one loaded model between processes.
 * The container image's build argument, which belongs to the change that owns the
   Dockerfile.
+
+### Roadmap follow-ups (2026-10-12)
+
+**Local models** (item 26, Tier 3, [ROADMAP](../ROADMAP.md)). *Deferred* above lists
+these. One of its items has since landed: the `Dockerfile` takes
+`ARG FEATURES=embed-local` in both build stages, as recommended above.
+
+* **GPUs.** `crates/sparkles-embed/src/model.rs` builds every model on `Device::Cpu`.
+  Candle has CUDA and Metal back ends behind its own `cuda` and `metal` features. Two
+  new cargo features of sparkles-embed, `embed-cuda` and `embed-metal`, turn them on,
+  and the `local` provider gains `device: "cpu" | "cuda:N" | "metal"`, default `cpu`.
+  A device the build lacks, or one that fails to initialize, is the provider's error at
+  load, reported in the model state and not a fallback to the CPU, so that a slow
+  silent fallback cannot hide a misconfiguration. The flake keeps building the CPU
+  package; a `sparkles-cuda` package adds the feature for NixOS hosts with CUDA.
+  Acceptance: Qwen3-Embedding-0.6B in bf16 reproduces the model card's matrix on a GPU
+  as it does on the CPU, with the 256-paragraph batch of `embed-bench` reported beside
+  the CPU rows.
+* **ONNX and GGUF weights.** The snapshot reader takes safetensors only. GGUF weights
+  load through candle's quantized tensors (`candle_core::quantized::gguf_file`) into
+  the same encoders, with `q8_0` and `q4_k` as the measured formats; the default file
+  selection of `sparkles-modelstore` gains a `format` choice so that a pull fetches the
+  `.gguf` file instead of the safetensors. ONNX needs a runtime that Candle is not; it
+  is a separate feature (`embed-onnx`) over a pure-Rust ONNX runtime if one passes the
+  same reference tests, and is not built otherwise, since ONNX Runtime is a C++
+  library, which the 0.9.2 choice above avoided for Oniguruma.
+* **Dense modules.** `SnapshotConfig` reads `modules.json` and refuses any module other
+  than Transformer, Pooling and Normalize (`snapshot.rs`, `Error::Unsupported`). A
+  `Dense` module is a linear layer with an activation after pooling, in its own
+  directory with `config.json` (`in_features`, `out_features`, `activation_function`)
+  and weights. The reader loads it with the layer code of `lin.rs`, checks
+  `in_features` against the pooled dimension, and the provider's dimension becomes
+  `out_features`. Acceptance: a tiny random model with a Dense module matches
+  sentence-transformers' output from a fixture computed once in Python.
+* **Rerankers.** A cross-encoder scores a (query, passage) pair. A new provider use,
+  `rerank`, takes a local BERT- or XLM-RoBERTa-based cross-encoder snapshot (a
+  classification head over the pooled output), and `spk:rerank` re-orders the top n of
+  a `spk:hybridSearch` or `text:query` by the model's score of the query text against
+  each subject's text from a named predicate. It is bounded by n (default 50, at most
+  500) and by the query's deadline.
+* **Sharing a loaded model between processes.** Each server process loads its own
+  weights. `model.rs` maps the safetensors files
+  (`VarBuilder::from_mmaped_safetensors`), but the tensors it keeps are copies: in
+  another dtype, and transposed by *Linear layers* above. The loader writes the
+  transposed weights once to a cache file beside the snapshot (keyed by the snapshot's
+  digest and the dtype) and maps it, so several processes, such as the server and a
+  `sparkles vector embed` run, share the pages through the page cache. A read-only
+  store skips the cache.
+* **Verification at load.** `ModelStore::verify` in `sparkles-modelstore` checks every
+  file against the manifest, but only when `sparkles models verify` runs; a load reads
+  the files as they are. A load checks the size and modification time of each file
+  against those recorded at the last verification, kept in the store beside the
+  manifest, and runs the full hash check when any differs or no record exists. An
+  operator can require the full check every time with `--models-verify always`.
+* **Local model state in the Models settings.** `ui/src/lib/components/ModelsSettings.svelte`
+  lists providers without the state of `local` ones; the index card and
+  `GET /$/models` carry it. The Models section shows, for each `local` provider, its
+  snapshot, state as `GET /$/models` reports it (`absent`, `downloading`, `present`,
+  `loading`, `loaded`, `unloaded`), `weightBytes`, the queue and `lastError` or
+  `downloadError`, from the same response, with a Pull action for an
+  absent snapshot when downloads are on.

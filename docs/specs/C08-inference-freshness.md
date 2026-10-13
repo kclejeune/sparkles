@@ -1096,3 +1096,86 @@ stored triples only, and Graph Store reads and DESCRIBE's descriptions show stor
 triples. Diagnostics still include the inferences by default only when the default graph
 is checked. Jena's ontology document manager also reads an `ont-policy.rdf`, can skip
 imports by IRI and caches models in memory, and Sparkles has none of these.
+
+### Roadmap follow-ups (2026-10-12)
+
+The [ROADMAP](../ROADMAP.md) of 2026-10-12 takes up what this spec left out, in new specs
+and in the items below. The design above and the earlier Outcome stay as they were.
+
+- **Materialization at scale, item 9 →
+  [F16](F16-materialization-at-scale.md).** Rule evaluation over the store's index
+  permutations instead of the copy that `load_graphs` makes (memory then follows the
+  derived facts), a parallel merge and deduplication on top of the per-iteration rayon
+  evaluation that `engine::run` already does, a derived-fact layer kept apart from the
+  base indexes so that compaction, the WAL, the change log and backups do not carry the
+  inferred graph, and `owl:sameAs` through canonical representatives with expansion at
+  query time in place of the `eq-sym`, `eq-trans` and `eq-rep-*` rules. F16 §7.3 revisits
+  the Phase 3 fallbacks listed under "Not built" above: GeoSPARQL default geometries
+  become incremental in its Phase 1; rules with `noValue` (by strata) and changed RDF lists
+  (by tracking list members) in its Phase 4; the large-deletion rule becomes a cost
+  estimate capped by today's constant; `now`, `makeTemp`, `makeSkolem`, head actions and
+  blank nodes in heads keep running in full. Equality maintained under deletion follows
+  Motik et al. (IJCAI 2015) in F16 Phase 4. Measurements on LUBM and OWL2Bench go through
+  [X06](X06-benchmark-coverage.md), and the remap of the layer at a generation switch is
+  part of item 14 (the C13 addendum).
+- **`dt-not-type`, item 9 → [F16 §8](F16-materialization-at-scale.md#8-the-dt-not-type-check).**
+  §4.3 above says `dt-not-type` is never checked, and the Phase 3 Outcome repeats it. F16
+  adds the check `literal-not-in-datatype`: ill-typed literals of the OWL 2 RL datatype
+  map, and literal objects of properties whose `rdfs:range` is such a datatype, closed
+  over `rdfs:subPropertyOf*`, whose value is outside the range's value space. A literal
+  the value-space table cannot decide is not reported, so the check stays sound and the
+  report still never claims consistency.
+- **Query-time reasoning, item 19 → [F17](F17-query-time-reasoning.md).** Derivation on
+  demand through the magic-sets transformation of the rule program, a per-pattern choice
+  between fresh materialized facts and derived ones (`reasoning=auto`), so a stale
+  materialization is no longer the only answer between re-runs, Jena backward and hybrid
+  rules (skipped with a warning by `engine::compile` today), OWL 2 QL rewriting, tables
+  cached per snapshot, and budgets. RDFS on read (§11.5) stays the Jena-compatible RDFS
+  mode, and F17 §4.4 makes the two exclusive per query. F17 §9 takes Jena's rule
+  language as the Datalog syntax for rules over triples.
+- **Explanations, item 18 → [F18](F18-explanations-and-entailment-diffs.md).** §1 left
+  out "explanations beyond the matched evidence". F18 adds derivation trees for any
+  inferred triple, bounded "why not?", entailment diffs between commits and branches in
+  F09 merge previews and C15 write previews, minimal justifications for diagnostics
+  findings and unsatisfiable classes, and, with [F13](F13-incremental-views-and-provenance.md)'s
+  per-fact provenance (item 17), protections and `reviewedOnly` that keep the inferred
+  triples a caller's visible facts support.
+- **Item 53: inference settings in the UI, the remaining RDFS-on-read surfaces and
+  import-policy controls.** The Phase 4 Outcome lists them as not built. Each is a short
+  piece of work on this spec's code.
+  1. *UI settings.* The reasoning panel's run form gains data-graph and ontology-graph
+     pickers filled from the dataset's graph list, the imports mode (`none`, `dataset`,
+     `fetch`), an upload for a location-mapping file and a **Refresh imports** action.
+     The status line shows `inputGraphs`, `watchedGraphs` and `fetchedImports` when the
+     status has them, and the last run's method, fallback reason and counts from `run`,
+     which today appear only in the task message. An **RDFS on read** card reads and
+     writes `/$/rdfs/{ds}`: off, a schema graph of the dataset, or an uploaded schema, with
+     the schema's counts and its warnings about blank-node terms. Locked C19 fields show
+     as read-only.
+  2. *RDFS-on-read surfaces.* Inside `*`, `+` and `?`, `rdf:type` links and negated
+     property sets match stored triples only, because `rdfs.rs` rewrites a path's links
+     only by their subproperties (`links`, `path_changes`). The fix gives the path
+     evaluator a virtual link: for `rdf:type` it enumerates a node's `MatchRDFS` types
+     (stored types, domains, ranges and their superclasses) from the schema and the
+     node's triples, and for a negated property set it enumerates the node's triples plus
+     the subproperty and type triples one rule step adds, as the `s ?p o` row of the
+     §11.5 table does. Graph Store reads and DESCRIBE's descriptions read stored triples
+     today. Jena's RDFS dataset wrapper answers its finds through `MatchRDFS`, so a
+     Graph Store `GET` and DESCRIBE over it include the closure. Sparkles follows that
+     for datasets with RDFS on read: a Graph Store `GET` becomes the rewritten
+     `CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }` for the graph, DESCRIBE's pattern for the
+     resource is rewritten the same way, and `rdfs=false` on either request reads stored
+     triples. The Jena fixtures of §11.5 gain these requests. Diagnostics keep their rule
+     of including inferences by default only when the default graph is checked.
+  3. *Import-policy controls.* Jena's ontology document manager reads an
+     `ont-policy.rdf`, can skip imports by IRI and caches models. The input options gain
+     `skipImports: [IRI]`, which drops those imports and their graph names from the
+     watched graphs, and `maxImports`, which replaces the fixed `MAX_IMPORTS` of 100 in
+     `crates/sparkles-reasoner/src/inputs.rs` up to a server ceiling. `sparkles infer
+     --ont-policy FILE` and the request field `ontPolicy` read an `ont-policy.rdf`: its
+     `publicURI` and `altURL` pairs become exact location-mapping entries, its prefix
+     entries prefix rewrites, and its switch for processing imports the `imports` mode.
+     Entries Sparkles cannot use are listed as warnings. Jena's in-memory model cache
+     needs no counterpart, because fetched imports are kept as graphs of the dataset and
+     a later run does not fetch them again. G08's converter maps a configuration's policy
+     file to these fields.

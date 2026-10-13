@@ -1259,3 +1259,64 @@ document on a dataset with a schema installed, refuses mutations, and returns th
 schema when called without a document ([C11](C11-mcp-server.md#outcome)). It answers
 with the GraphQL response as JSON, not compacted as tables are, and there is no separate
 `graphql_schema` tool. Stored GraphQL queries and their tools are still not built.
+
+### Roadmap follow-ups (2026-10-12)
+
+**Execution: seeded child groups and per-parent top-k** (item 37, Tier 4,
+[ROADMAP](../ROADMAP.md)). Both are Phase 2 items of §16 and *Not built* above.
+
+* **What happens today.** `run_groups` in `crates/sparkles-graphql/src/exec.rs` passes a
+  child group the distinct node terms of its parent group (`node_ids`), and
+  `algebra::seed` turns them into a `VALUES` block of IRIs that the engine looks up in
+  its dictionary again. Each blank-node parent becomes its own `UNION` branch with a
+  bound variable, so a page of 1,000 blank-node parents plans a union of 1,000
+  branches. The child query has no limit per parent: `slice` (`exec.rs`, applied to
+  `FieldPlan::Multi` and list `FieldPlan::Object` fields in `resolve_field`) cuts each
+  parent's values to `offset` and `first` after the engine produced all of them.
+* **`QueryOptions::seed`** (§6.2). The parent group's result keeps its node column as
+  engine ids (the `QueryResult` table already holds ids, decoded only for assembly).
+  The child query declares the seed variable, and `QueryOptions::seed` binds it to that
+  id column before planning, as a leaf with a known size that the join planner orders
+  first. Ids are only valid within one snapshot, which every group of a request
+  shares, so no check beyond the snapshot identity is needed. Blank nodes need no
+  special case. `explain` renders the seed as `VALUES ?p { … }` with the decoded terms,
+  so the text stays runnable SPARQL.
+* **Per-parent top-k.** A `TopKPerGroup { key, order, offset, limit }` plan node keeps,
+  for each value of `key`, the rows ranked `offset` to `offset + limit` by `order`,
+  with a bounded heap per key, or by a streaming cut when its input is already sorted
+  by `(key, order)`, as a child group's PSO scan seeded by parent ids is. The
+  adapter emits it for nested `first` and `offset`, and `slice` becomes a no-op check.
+  The node estimate of §7.1 then counts the values produced, not only those returned.
+  The operator is not exposed in SPARQL syntax; F13 and U03 may reuse it.
+* **Acceptance.** The benchmark row `allPerson(first: 1000) { nodes { name knows(first:
+  10) { name } } }` produces at most 10,000 `knows` rows (the plan counter of the
+  child group says so) and its time drops toward the "groups as SPARQL" column, and
+  every document of the random differential test returns the same response.
+
+**Nested connections.** Nested lists are plain lists (*Not built* above). A list field
+whose target type is a node type gains a connection form, `knowsConnection(first:,
+after:, last:, before:, filter:, orderBy:)` with `edges { cursor node }`, `pageInfo`
+and `totalCount`, generated beside the list field. The cursor is the parent's id with
+the item's position, bound to the request's commit as top-level cursors are. Per-parent
+windows are the top-k operator above; `totalCount` per parent is a grouped count over
+the same seeded query.
+
+**Persisted queries, `persistedOnly` and their MCP tools.** §11 designs stored GraphQL
+queries, `persistedOnly` and A16; `PUT` refuses `persistedOnly: true` today. They are
+built on [C16](C16-stored-queries.md)'s stored queries, with a `language: "graphql"`
+member, so versions, runs by name, parameters (GraphQL variables typed by the schema)
+and the MCP tools of stored queries come from C16 and C11 unchanged. A document is
+validated against the installed schema when stored and again when the schema changes;
+a document the new schema breaks is marked `invalid` and refuses to run.
+
+**Mutations.** §12 keeps them out of scope. A design would generate, per node type,
+`create<T>`, `update<T>` and `delete<T>` from the same `@rdf` mapping, each compiled to
+one SPARQL update under the caller's write grant and protections, run as one commit
+per request through the guard of C10 and the previews of C15 (`dryRun: true`), with the
+commit receipt in the response's `extensions`. It waits for a user who needs writes
+through GraphQL rather than SPARQL or the Graph Store.
+
+**Subscriptions.** §13's design re-runs a document after each commit that touches its
+read predicates. [F13](F13-incremental-views-and-provenance.md)'s live queries give the
+incremental form: a subscription compiles its groups to F13 views and sends the
+changed nodes. It is built on F13 rather than as a re-run loop.

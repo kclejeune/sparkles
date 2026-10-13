@@ -1222,3 +1222,26 @@ ex:carol ex:WORKS_FOR ex:acme ~ ex:job2 {| ex:role "Advisor" |} .
 ## Outcome
 
 Nothing is built.
+
+### Roadmap follow-ups (2026-10-12)
+
+**Item 20** of the [roadmap](../ROADMAP.md) keeps this design and adds three links to it.
+
+- **Graph algorithms as procedures.** [F14](F14-graph-algorithms.md) adds a library of
+  graph algorithms through `SERVICE algo:…` leaves. Its Phase 3 lets this frontend
+  compile `CALL algo.pageRank({predicates: ['foaf:knows']}) YIELD node, score` and the
+  other algorithms to the same leaf, with the projection's parameters given as a map,
+  names resolved by §3, and the yielded columns bound to the leaf's output variables.
+  `CALL` with `YIELD` is then the one procedure form in the subset, and an unknown
+  procedure fails with the error code of §5.6. Path functions keep compiling to F07.
+- **Search phrases.** [U03](U03-query-by-example.md) maps search phrases, in the manner of
+  Neo4j Bloom, to stored queries. A stored Cypher query of Phase 3 can be the target of
+  a phrase like a stored SPARQL query, since both are stored queries of C16.
+- **LDBC SNB as acceptance.** Besides the TCK subset of §12, the frontend is measured on
+  the LDBC Social Network Benchmark's Interactive short and complex reads that fall in
+  the read subset, run through `/{ds}/cypher` against the RDF conversion of the SNB data
+  that [X06](X06-benchmark-coverage.md) loads. Each query's results must equal those of
+  the SPARQL formulation of the same query on the same data, and the report gives the
+  compile time and the run time beside the SPARQL query's, so the cost of the frontend
+  is measured. Queries outside the subset are listed with the feature that excludes
+  them.

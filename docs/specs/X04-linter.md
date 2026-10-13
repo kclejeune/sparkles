@@ -260,3 +260,35 @@ tree, and the reference parse that the formatter also runs dominates the cost.
 
 **Not built.** Linting N-Triples, N-Quads and JSON-LD, linting the SPARQL inside SHACL
 literals, an MCP tool, and linting in the shapes editor.
+
+### Roadmap follow-ups (2026-10-12)
+
+**More formats, embedded SHACL queries, the shapes editor and an MCP tool** (item 48,
+Tier 5, [ROADMAP](../ROADMAP.md)). SHACLC formatting, the other half of item 48, is in
+[X02](X02-formatter.md#roadmap-follow-ups-2026-10-12).
+
+* **What is missing today.** The Outcome's "Not built" list still holds:
+  `sparkles_fmt::lint` accepts SPARQL, Turtle and TriG only (`lint/mod.rs`, the
+  `matches!` on `Language`), the shapes editor does not lint, and `sparkles mcp` has a
+  `format` tool but no `lint` tool. The linter is reached from MCP only indirectly:
+  `explain_query` merges lint findings into its notes with `source: "lint"`
+  (`crates/sparkles-server/src/explain/mod.rs`).
+* **N-Triples, N-Quads and JSON-LD.** The term rules of §3.4 (`iri-space`, language
+  tags, datatype lexical forms) apply to each term the line parser and the JSON-LD
+  tree already produce. Rules about prefixes do not apply. JSON-LD adds two rules: a
+  term in `@context` that no key uses (hint, with a fix that removes it), and a key that
+  the context does not map, which JSON-LD drops silently (warning).
+* **SPARQL inside SHACL.** In Turtle, TriG and JSON-LD, the literal objects of
+  `sh:select`, `sh:ask`, `sh:construct` and `sh:update` are linted as SPARQL with the
+  prefixes that `sh:prefixes`/`sh:declare` give them, plus the document's own. A
+  finding's range maps back into the literal, accounting for escapes and long quotes
+  as the formatter's cursor mapping does. `$this` and the pre-bound variables of SHACL
+  (`$value`, `$PATH`, `$currentShape`, `$shapesGraph`) count as bound, so
+  `unbound-variable` does not report them. Fixes are offered only when the literal is a
+  long string without escapes, so that the edit is exact.
+* **The shapes editor.** It lints Turtle shapes now and SHACLC once X02's SHACLC tree
+  exists, through the WebAssembly module, as the query editor does.
+* **MCP tool.** `lint` takes `text`, `language` and the `[lint]` options as camelCase,
+  like `format`, and returns the findings with rule, severity, range and message, and
+  `fixed` text when `fix` is true. It reads no dataset, is capped by `--mcp-max-bytes`,
+  and runs within `timeoutSeconds`.

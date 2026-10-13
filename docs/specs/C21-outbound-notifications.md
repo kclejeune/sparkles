@@ -513,3 +513,45 @@ These points differ from the design or settle what it left open.
   was changing in parallel work, and the API and CLI cover the operations.
 - The NixOS module needed no new option. Its option descriptions and the user docs show
   `settings.server.notifications` with a secret from sops-nix, and no VM test was added.
+
+### Roadmap follow-ups (2026-10-12)
+
+**Email, the UI section, backup coverage and independent delivery** (item 46, Tier 5,
+[ROADMAP](../ROADMAP.md)).
+
+* **The email channel (Phase 2).** §4.3 designs it: submission over STARTTLS or implicit
+  TLS, SASL PLAIN, a plain connection refused, the outbound policy's host check before
+  connecting, `4xx` retried and `5xx` not. It is built as written. The remaining choice
+  is the crate: `lettre` with its rustls back end and without its native-tls and
+  sendmail features, recorded in PROVENANCE with its dependency count, or a small SMTP
+  client in `notify/` if that tree is large, since the channel needs only EHLO,
+  STARTTLS, AUTH PLAIN, MAIL, RCPT and DATA. The tests run a local SMTP receiver as the
+  webhook tests run an HTTP one, and cover A-level cases for STARTTLS, a refused plain
+  server, a `451` retried and a `550` not, and a password from a secret that never
+  appears in the status.
+* **The administration UI (Phase 3).** §11 designs a Notifications section on the server
+  page next to Models, showing `GET /$/notifications`, editing the kind with C19's
+  settings components and a Send test button per channel. The Models section that
+  delayed it has since settled (`ui/src/lib/components/ModelsSettings.svelte`), so the
+  section follows its layout. The mock server serves the notifications kind and the
+  status, and a Playwright test adds a webhook channel, sends a test and sees its
+  status.
+* **Broader backup-failure coverage.** `events::backup_run` fires only at the end of a
+  policy run in `crates/sparkles-server/src/backup/policies.rs`; a backup started by
+  hand, a policy run that fails before it records a result, a failed verification and
+  a failed GC send nothing (Outcome above). Each gets an event of its own kind with a
+  key per repository and operation: `backup.failed` gains the manual and early-failure
+  cases with `trigger: "manual"` or the failing stage, and `backup.verify.failed` and
+  `backup.gc.failed` are new kinds that operators can route separately. A policy run
+  that is cancelled sends nothing, as now. A policy whose last success is older than twice
+  its schedule's interval raises `backup.overdue`, which clears on the next success as
+  other conditions do.
+* **Delivery that a slow channel cannot delay.** One worker thread (`worker` in
+  `notify/mod.rs`) sends every delivery in turn, so a channel that times out delays
+  the others by up to `timeoutSecs` per attempt. The queue becomes one queue per
+  channel, each with its own worker thread and its share of the 1,000 entries (at
+  least 50), so a slow or failing channel holds only its own deliveries. Retries wait
+  in the channel's own queue. The settings have no cap on channels today, so the
+  kind gains one (32), which bounds the threads. Acceptance: with one webhook that never
+  answers and one that answers at once, a test send to the second arrives within a
+  second while the first is timing out.

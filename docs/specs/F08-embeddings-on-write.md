@@ -633,3 +633,46 @@ characters against bytes, tokens, and the validation.
 options, and `--embedding-secret` goes through its `extraArgs`. The Similar page and the
 MCP tool `similar_entities` do not search with text. A chunk's offsets are not stored
 next to its vector.
+
+### Roadmap follow-ups (2026-10-12)
+
+**Text queries in the UI and MCP, chunk offsets, NixOS settings** (item 41, Tier 4,
+[ROADMAP](../ROADMAP.md)). *Not built* above lists the three.
+
+* **Text in Similar and `similar_entities`.** `spk:vectorSearch` already takes a text as
+  its query when the index embeds query text, through `embed_query_text` in
+  `crates/sparkles-core/src/store/embed.rs`. The MCP tool's arguments
+  (`similar_entities` in `crates/sparkles-server/src/mcp/search.rs`) accept only
+  `entity` or `vector`, and its description still says "Exact nearest-neighbour
+  search", which the HNSW indexes of F04 made out of date. The tool gains `text`, a
+  third choice of exactly one, written into the search as a plain string literal, so
+  the engine embeds it with the index's `queryPrefix` and cache. An index without
+  query embedding answers the engine's `400`, which the tool maps to `no-vectors` with
+  the hint to give an entity or a vector. `describe_schema` marks an embedding
+  predicate whose index embeds text with `text=true`. The Similar page
+  (`ui/src/routes/similar`) gains a third query mode, "Text", shown when the chosen
+  index has an `embedding` object, and it puts the text into the generated SPARQL in
+  the same way. Acceptance: with the mock endpoint, `similar_entities` with
+  `{"predicate": …, "text": "brown fox"}` returns the subject whose label is "brown
+  fox" first, and the Similar page does the same against the UI mock.
+* **Chunk offsets.** A chunked text gives several vectors under the index's predicate,
+  and *Chunking and token limits* above records that a result cannot say which passage
+  matched. The worker knows each chunk's character range when `Chunking::split` cuts
+  it. The embedding commit adds, for each chunk vector, an RDF 1.2 annotation on its
+  triple: `spk:chunkStart` and `spk:chunkEnd` (character offsets, as `xsd:integer`) and
+  `spk:chunkSource`, the source literal's predicate. A text left whole gets no
+  annotation, so unchunked indexes do not grow. The reconciliation already replaces a
+  subject's vectors when its inputs change and removes the annotations with them.
+  `spk:vectorSearch` gains optional outputs for the three values, read through the
+  reifier of the matched row, and `similar_entities` returns the passage cut from the
+  current source literal. The record file and the inputs hash are unchanged, since the
+  offsets follow from the inputs and the chunking configuration.
+* **NixOS settings.** `nix/module.nix` has options for the model store (`models.dir`,
+  `models.download`) from [F12](F12-local-embeddings.md), but none for
+  `--vector-memory-mb`, `--embedding-secret` or `--no-embedding`, which go through
+  `extraArgs`. The module gains `vector.memoryMB`, `embedding.enable` (mapped to
+  `--no-embedding` when false) and `embedding.secrets`, an attribute set from a secret
+  name to an environment variable or a file path, the file added to the unit's
+  `LoadCredential` so that it is read from the systemd credentials directory. The
+  module test checks the generated arguments and that a file secret is readable by the
+  service user only through the credential.

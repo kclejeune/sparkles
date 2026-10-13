@@ -1811,3 +1811,41 @@ branch, unknown body fields, a branch that owns its index and an in-memory datas
 grants that allow and refuse it, and the read-only server. The JVM and Node binding
 tests relink a persistent branch after `main` compacts and check its id, head and
 data.
+
+### Roadmap follow-ups (2026-10-12)
+
+**Remote relink from the CLI, cross-server clones and archive transfer** (item 45,
+Tier 5, [ROADMAP](../ROADMAP.md)).
+
+* **`sparkles branch relink --server`.** The subcommand takes a required `--loc` and
+  refuses a server (`crates/sparkles-server/src/branch_cmd.rs`), although
+  `POST /$/branches/{ds}/{name}/relink` exists. With `--server URL --dataset DS`, it
+  sends that request with `Prefer: respond-async`, follows the `relink` task with the
+  CLI's usual task progress, and prints the `RelinkResult` in the same text and JSON
+  forms as the offline report. `--loc` and `--server` exclude each other. The CLI's
+  saved login and `--token` apply as for other remote commands. Acceptance: relinking
+  a branch over HTTP after `main` compacts prints the same id, head and quad count as
+  the offline command does on a copy of the database.
+* **Cross-server clones.** §2.11 designs Phase 3: `GET /$/export/{ds}?branch=&at=`
+  streaming a JSON header, the quads as RDF Thrift with stored blank-node labels and a
+  trailer with the count and SHA-256, and `POST /$/datasets/{ds}/clone` with a
+  `remote` source that reads it through the outbound policy and a named credential.
+  None of it is built (the status block and §2.11's Phase 1 note that backups are the
+  way across servers today). The design stands as written; the one addition is that
+  the export runs as a task on the source with the clone's deadline, and a cut stream
+  (no trailer, or a mismatched hash) leaves no dataset on the destination, as a failed
+  local clone leaves none.
+* **Archive transfer.** For servers that cannot reach each other, the same stream is a
+  file: `sparkles export --server URL --dataset DS [--branch B] [--at REF] -o
+  ds.spkx` writes the export response as it arrives, `sparkles export --loc DB …`
+  writes it offline, and `POST /$/datasets/{ds}/clone` takes the file as the body
+  (`Content-Type: application/vnd.sparkles.export`) or `sparkles clone --from-archive
+  ds.spkx --to DIR`, in place of `--loc`, builds a database directory from it. The trailer's hash is checked before the new
+  dataset is published. Since the stream does not depend on the index format, an
+  archive also moves a dataset between Sparkles versions whose formats differ, which
+  the deferred on-disk format policy (item 60) can name as the migration path.
+
+Acceptance: a clone of `dev` at `commit:57` from server A to server B through `remote`,
+and through an archive file, gives a dataset whose quads, blank-node labels, prefixes
+and configuration equal A's at that commit, with `forkedFrom` naming A's dataset,
+branch and seq.

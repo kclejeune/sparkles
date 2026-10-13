@@ -374,3 +374,47 @@ function suites at 642 of 655 and 39 of 48. `mise run ci` passes.
 **Not built.** Jena's slice-aware cache and result-size learning, `se:cacheRm` and
 `se:cacheLs`, a disk cache, requests in parallel, Prometheus series for the cache, and
 cross-dataset SERVICE.
+
+### Roadmap follow-ups (2026-10-12)
+
+**Cache, parallel requests and metrics** (item 38, Tier 4, [ROADMAP](../ROADMAP.md)).
+*Not built* above lists these; §10 rejected three of them for the first version. Each
+sketch below states how it answers that objection.
+
+* **Slice-aware cache.** §10 rejected Jena's paging layer, and a cut bulk response is
+  re-sent per input instead (§5). The narrower form keeps that: a cache entry records
+  whether it is complete or holds the first n rows of its request. A later request for
+  the same pattern and input with `LIMIT m` is answered from a complete entry, or from a
+  partial one with n ≥ m, without a request; `OFFSET o LIMIT m` the same when
+  o + m ≤ n. A miss sends the user's request as written, so no slice is rewritten, and
+  result-size learning stays out. Keys drop the outer slice of the pattern for this
+  lookup and keep it as the entry's bound.
+* **Cache functions.** §10 rejected `se:cacheRm` and `se:cacheLs` as side effects that
+  any reader could use. They are added as read-only and scoped: `se:cacheLs` lists the
+  caller's own entries (the scope already in every key, `svccache.rs`), with endpoint,
+  pattern hash, rows, bytes and age, and `se:cacheRm` is accepted only for callers with
+  `admin` on the dataset and only with `enableMgmt` set in the query's context as in
+  Jena, and removes entries within the caller's scope. Everyone else gets an error,
+  not a silent no-op.
+* **Disk cache.** The cache is in memory, bounded by `--service-cache-mb`, and lost on
+  restart. A dataset can set `serviceCache.disk` in its settings to keep entries in
+  `service-cache/` under the dataset's directory: one file per entry holding its solutions as
+  length-prefixed term strings, named by the key's hash, with a size cap and least-recently-used eviction. A `ttl` setting (default one
+  hour) bounds staleness for both tiers, since a remote endpoint's data changes without
+  telling Sparkles. Scope prefixes stay in the key, and the directory is excluded from
+  backups and clones.
+* **Requests in parallel.** §10 kept one request at a time for the budget and the
+  endpoint's load. A `loop:` or bulk plan gains `parallel+n` (default 1, capped by
+  `--service-parallel-max`, default 4) that keeps up to n requests in flight to one
+  endpoint. Each request reserves its share of the per-request time and bytes before
+  it starts, and the shared outbound budget of the query still bounds the total, so the
+  budget stays as simple to reason about. Results are merged in input order, so the
+  answer does not depend on timing. Acceptance: the "Top label per department, `loop:`"
+  row of the measurements with 5 ms per request drops at least 3 times with
+  `parallel+4`, with the same answer.
+* **Metrics.** The service cache has JSON statistics only. `/$/metrics` gains
+  `sparkles_service_cache_hits_total`, `…_misses_total`, `…_entries`, `…_bytes` and
+  `…_capacity_bytes` per dataset label, named as the result cache's series in `obs.rs`, and `sparkles_service_requests_total` and
+  `sparkles_service_request_seconds` per endpoint host, bounded by
+  `--metrics-max-datasets` and a cap of 100 hosts with the rest under `$other`.
+  OpenTelemetry follows the same names.

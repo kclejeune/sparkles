@@ -555,3 +555,55 @@ edges ([C11](C11-mcp-server.md#outcome)).
   backward took 12 ms. The same shortest path over the nested pattern
   `?x foaf:knows ?y` took 1.4 s, because the pattern's 2.6 million edges are read and
   kept in maps first, so a pattern is for edges that predicates cannot describe.
+
+### Roadmap follow-ups (2026-10-12)
+
+**Zero-weight edges in `path:allShortest`** (item 5, Tier 1, [ROADMAP](../ROADMAP.md)).
+§9 and *Not built at first* above record the gap. In
+`crates/sparkles-core/src/sparql/pathsearch.rs`, `Engine::dijkstra` skips an edge whose
+end is already settled (`if settled.contains(&y) ... continue`), and it stops as soon as
+the last target is settled. Both drop equally cheap parents when an edge weighs zero:
+with `s → a` and `s → t` of weight 1 and `a → t` of weight 0, `a` and `t` both reach
+cost 1. If `t` leaves the heap first it is settled and, as the only target, ends the
+search, so `s a t` is never found; if the search went on, the edge `a → t` would still be
+skipped because `t` is settled. With positive weights every equally cheap parent of a
+node has a lower cost and is settled first, which is why the result is exact there.
+`Tree::paths` has no guard against a cycle in the recorded parents, which a plain fix
+would introduce: zero-weight edges `a → b` and `b → a` at the same cost make `a` and `b`
+parents of each other.
+
+The fix, in `dijkstra` when `all` is set:
+
+* An edge into a settled node is not skipped when `d + w == dist[y]`. The edge's start
+  is pushed to `tree.extra[y]` as another parent. A cheaper cost cannot occur for a
+  settled node, and a higher one is ignored as now.
+* The search does not stop when the last target is settled. It goes on popping nodes
+  until the heap's next cost exceeds the largest settled target cost, so every node of
+  that cost is expanded and has offered its parents. Without zero-weight edges this pops
+  only the nodes of the final cost, so the measured searches change little.
+* `Tree::paths` keeps the set of nodes on its current stack and skips a parent already
+  in it. The paths it returns are then simple, as the other modes' paths are, and the
+  enumeration ends.
+* `path:shortest` keeps today's behaviour, and the weighted search with
+  `path:maxLength` keeps Yen's algorithm, which already compares whole path costs.
+
+A 0-1 breadth-first search over a deque would also settle zero-weight edges first, but it
+fits only weights of 0 and 1. Recording equal-cost parents after settlement works for
+any non-negative weight and keeps one code path.
+
+Acceptance examples:
+
+* **A-Z1.** Edges `ex:s ex:p ex:a`, `ex:s ex:p ex:t` and `ex:a ex:p ex:t`, with weights
+  1, 1 and 0. `path:allShortest` from `ex:s` to `ex:t` returns two paths of cost 1,
+  `s t` and `s a t`, whatever the ids of `ex:a` and `ex:t`.
+* **A-Z2.** Add `ex:t ex:p ex:a` with weight 0. The result is still those two paths; the
+  cycle `a t a` is not followed and the search ends.
+* **A-Z3.** A search from `ex:s` with an unbound target returns, for each node, every
+  simple path of its least cost, as the brute-force enumeration in
+  `crates/sparkles-core/tests/path_search.rs` computes it. The weighted differential
+  test gains a weight of 0 among the random weights.
+
+**Cypher integration** (with item 20, Tier 3, [F01](F01-cypher.md)). Phase 3, the Cypher frontend's use of this operator for
+`shortestPath` and `allShortestPaths`, waits for [F01](F01-cypher.md). Nothing in the
+operator needs to change for it beyond the fix above, since Cypher's
+`allShortestPaths` counts hops and would use the unweighted search.

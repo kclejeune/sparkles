@@ -892,3 +892,47 @@ On full DBpedia the cold `geo-box` query fell from 255 to 108 ms, and the answer
 identical with the column switched off (`SPARKLES_NUMERIC_COLUMN=off`).
 [BENCHMARKS.md](../BENCHMARKS.md#numeric-literals-in-the-vocabulary) has the
 measurements.
+
+### Roadmap follow-ups (2026-10-12)
+
+[ROADMAP](../ROADMAP.md) item 7 takes up the follow-ups listed above. Disk spill and the
+batch kernels now have their own spec, [X08](X08-disk-spill-and-server-memory.md), and
+the rest are sketched here.
+
+* **Batch-oriented hash joins and grouping.** X08 §5 replaces the hash join's per-row
+  chain walk with build rows grouped into contiguous slices per key and a two-pass probe
+  (pairs, then a gather per column), and the cursor group's per-row updates with a group
+  slot vector and column-wise aggregate updates. Its gate is streaming within 10% of eager
+  on `optional-chain`, `group-avg`, `minus`, `expr-bind-group` and `distinct-join`.
+* **Disk spill.** X08 §6 is the implementation design that §4.3 above asks for: reserved
+  disk per query and per server, files opened unnamed in a directory owned by the process
+  and swept only when positively identified, a frame format with checksums, AES-256-GCM
+  with an ephemeral key for encrypted spill, hybrid hash join, external sort, partitioned
+  aggregation and DISTINCT.
+* **LIMIT into the remaining fallbacks.** Each fallback gains a property
+  `prefix_sufficient`, false by default. It is set only with a proof for the operator: a
+  non-correlated SERVICE without OFFSET whose remote query the enhancer can wrap in a
+  `LIMIT` (G10's bulk mode excluded), a full-text search whose hits arrive in score order
+  with no later filter on the score, and a spatial nearest-neighbour search, which is
+  ordered by distance. Registered property functions keep draining unless their
+  registration declares that a prefix of the input yields a prefix of the output.
+* **Running state for registered and fold aggregates.** When the group's input is sorted
+  on the group keys (index order or a prior sort), groups arrive whole and in input order,
+  so the cursor can run one accumulator per group and emit each group when its key
+  changes. Otherwise the operator sorts its input on the keys with a stable sort, which
+  keeps input order within each group, using X08's external sort when the input exceeds
+  memory. The eager path stays for registries whose callbacks need the whole input.
+* **Parallel decoding and prefetch.** The batch writer decodes batch n+1 on a Rayon task
+  while it serializes batch n, at most one batch ahead, with both batches charged and the
+  task cancelled on close. It is off with one Rayon worker and when callbacks own the
+  terms. It is kept only if the full ordering and the 500,000-row TSV export gain more than
+  the tie threshold with four workers.
+* **Earlier first bytes.** Explicit streaming commits the response after the first
+  batch or 64 KiB, whichever comes first, instead of after 1 MiB. A later failure aborts
+  the transport as §6 specifies. Slow streaming bodies count against the X08 pool through
+  their retained batches, and a `--stream-idle-timeout` (default 60 s) ends a body whose
+  reader takes nothing for that long.
+* **Broader automatic selection.** X08 §6.8 lets `auto` stream SELECT plans whose
+  estimate exceeds half the memory budget, and retries an eager query that fails its
+  budget before output as a cursor with spill. Each widening needs the matched
+  measurements of §10.

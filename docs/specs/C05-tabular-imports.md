@@ -576,3 +576,32 @@ to a mapping, and keeps the Upload button disabled until it is fixed. It remembe
 base IRI per dataset. `ui/src/lib/upload.test.ts` tests the checks and the parameters,
 and `ui/tests/mock/upload-csv.spec.ts` runs the form against the mock server, which maps
 tables with the default mapping.
+
+### Roadmap follow-ups (2026-10-12)
+
+The items this spec left out are now designed in
+[F19 Phase 1](F19-mappings-and-virtual-graphs.md), roadmap item 22 in
+[ROADMAP](../ROADMAP.md). The converter of this spec stays in place, and F19 extends it.
+
+- **RML, R2RML and YARRRML mappings** (§8's first rejected alternative). One mapping
+  engine, `sparkles::mapping`, reads all three into one model, with CSV and TSV sources
+  read through this spec's reader and dialects, JSON and JSON Lines, Parquet, and
+  PostgreSQL and SQLite through named connections. Its quads reach the store through the
+  same temporary-file path as §2.1. See F19 §3 to §5.
+- **CSVW standard mode** (§8). `--csvw-mode standard` adds the `csvw:TableGroup`,
+  `csvw:Table` and `csvw:Row` triples around the minimal-mode output. See F19 §6.1.
+- **Primary-key and foreign-key checks.** `primaryKey` and `foreignKeys`, read and
+  ignored today (§3.1), are checked with `--csvw-check keys`, on by default in standard
+  mode. See F19 §6.2 and §6.3.
+- **Templates over the target dataset** (§8). With `--lookup` or `lookup=true`, a
+  template's WHERE clause reads the snapshot of the head when the conversion starts, and
+  the receipt records it as `lookupCommit`. See F19 §7.2.
+- **Tarql's functions.** `tarql:expandPrefix` and `tarql:expandPrefixedName` are added.
+  `apf:strSplit` is already one of the engine's ARQ property functions
+  (`sparql/arqpf.rs`, from [G06](G06-arq-query-extensions.md)), and templates run on the
+  engine's evaluator, so it needs only a test. See F19 §7.1.
+- **Mappings stored on the server** (§7). `<db>/mappings.json` holds versioned mappings
+  of every kind, run by `POST /{ds}/mappings/{name}/run` or named by `mapping=NAME` on
+  uploads. See F19 §2.2 and §8.
+- **CSV in the Graph Store protocol** (§7, §8). `PUT` and `POST` on `/{ds}/data` take
+  `text/csv` with `mapping=NAME` or `base`. See F19 §2.3.

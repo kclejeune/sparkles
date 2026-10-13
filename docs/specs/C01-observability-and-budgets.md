@@ -1010,3 +1010,30 @@ triples differ by 0.6% from a run with `--no-access-log --no-metrics`. That is n
   changes how the server's state attaches datasets;
 - a server-wide query memory pool;
 - the new Phase 2 metrics in the JSON snapshot and as OTLP metrics.
+
+### Roadmap follow-ups (2026-10-12)
+
+* **Server-wide query memory pool** ([ROADMAP](../ROADMAP.md) item 2).
+  [X08](X08-disk-spill-and-server-memory.md) Phase 1 specifies the pool of Phase 3 above:
+  `--total-query-memory-mb`, grants of 4 MiB granules taken by `Charge::add` only when a
+  query's live bytes pass its grant, FIFO admission with an initial grant and a
+  `--query-admission-wait`, `503` with `Retry-After` and the budget kind `server-memory`.
+  The concurrency limit of Phase 3 already exists as the rate limiter's per-class and
+  per-client concurrency caps (Outcome above), so X08 adds the shared byte budget and
+  admission on bytes, not another request count. X08 also makes the block, result,
+  SERVICE and history caches server-wide, which changes the capacity gauges of §4.5 to
+  carry no `dataset` label.
+* **Bind-before-open and degraded startup** (item 64, release tier). OTLP metric export
+  and the separate metrics listener (`--metrics-addr`) already shipped, as the Outcome
+  records, so this item is the startup states alone. Sketch: `serve` binds its listeners,
+  then opens datasets on a bounded pool of threads. `AppState` keeps each dataset in a
+  state of `opening`, `open`, `failed(error)` or `degraded(reason)`, where degraded means
+  open with a derived index (full-text, vector, spatial) unavailable. A request to an
+  opening dataset answers `503` with `Retry-After`, and one to a failed dataset answers
+  `503` with the error's kind. `/$/ready` reports each state and is ready when every
+  declared dataset is open or degraded. Today the server opens every dataset in
+  `Catalog::open` before it binds (`state.rs`), so one dataset that fails to open stops
+  the server. `--require-all-datasets` keeps that behaviour. WAL replay reports its progress in the dataset's state. The
+  release work around it is in [X12](X12-release-engineering.md).
+* The Phase 2 metrics that are missing from `/$/metrics?format=json`, and therefore from
+  the OTLP export that reads it, are a small separate fix.

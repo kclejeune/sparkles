@@ -1842,3 +1842,122 @@ from `forge` on 2026-10-08, with the index 1.3 to 68 times faster than without i
 the same answers both ways. The cell grid made 200,000 `sfContains` tests against a 1,024-vertex polygon
 4.3 times faster (60 ms instead of 256 ms) and 5.4 times faster against a 16,384-vertex
 one, for about 16 bytes per region vertex, up to 64 KiB per region.
+
+### Roadmap follow-ups (2026-10-12)
+
+**The rest of Phase 3 and geometry limits** (item 24, Tier 3,
+[ROADMAP](../ROADMAP.md)). The Outcome lists the first items below as not built, and
+FEATURES.md lists the geometry limits. The deliberate divergences in
+[COMPARISON.md](../COMPARISON.md#geosparql) stay the default; item 70 below adds an
+opt-in mode for Jena's answers.
+
+* **k-NN with arbitrary joins.** `geojoin.rs` turns `ORDER BY ASC(geof:distance(?w, C,
+  u)) LIMIT k` into a `SpatialKnnSpec` only when `C` is a constant in longitude and
+  latitude and the group's other patterns connect to one indexed scan (a star on its
+  subject or a path from it); every other shape keeps the generic plan with a
+  `geo-not-knn` warning. Two shapes are added. First, a group with patterns that do
+  not connect to the scan: the scan's side runs in increasing distance as now, and the
+  rest of the group is planned on its own and joined with each batch, so a batch can
+  yield no rows and the search goes on until `k` rows are proven, bounded by the
+  query's budget. Second, a k-NN join, where the query geometry is bound per row:
+  `?a` from one pattern and the `k` nearest `?b` per `?a`, written as a `LATERAL`
+  subquery with `ORDER BY … LIMIT k` (the [G06](G06-arq-query-extensions.md)
+  operator) or with QLever's syntax below. The planner runs one k-NN search per
+  distinct left geometry over the right side's tree. Acceptance: the five nearest
+  restaurants of every station in a dataset of 10,000 stations and 100,000 restaurants
+  equal the generic plan's answer and run at least 50 times faster.
+* **Polygon approximations.** `geo/ops/cells.rs` already approximates a region of 32
+  or more vertices by a grid of interior, outside and boundary cells, which decides
+  most points and small geometries against it. Two cases still run the exact test for
+  most pairs: two large regions, whose envelopes rarely cover only interior or only
+  outside cells of each other, and a region whose boundary cells are a large share of
+  its grid (long thin shapes, coastlines). The improvement keeps, per indexed region,
+  the grid and two more approximations: a simplified outer ring (Douglas-Peucker on an
+  outward buffer, at most 64 vertices) and a few large interior rectangles, from the
+  grid's interior cells merged into maximal rectangles. A pair whose outers do not meet
+  is disjoint, a pair whose interior rectangles meet intersects, and a region inside
+  another's interior rectangles is contained; only the rest run the exact test. The
+  approximations count toward the index's bytes and its identity hash. Acceptance: a
+  join of 10,000 administrative regions against 10,000 parcels returns the exact
+  plan's pairs with at least half of the exact tests skipped, the counter of skipped
+  tests in the plan.
+* **Datum shift grids.** `geo/crs.rs` refuses a definition whose shift needs grids
+  (`+nadgrids`, or `+datum=NAD27`), 239 of the EPSG table's definitions. The server
+  gains `--geo-grids DIR`, a directory of NTv2 (`.gsb`) and NADCON grid files that the
+  operator provides; Sparkles ships none, since the national grids carry their own
+  licenses. A definition whose grids are all present is accepted and transformed with
+  the grid's bilinear interpolation, as PROJ does; one whose grids are missing is
+  refused as now, with the missing file named. The grid files join the index files'
+  identity. Acceptance: EPSG:27700 with OSTN15's NTv2 file is within 0.1 m of PROJ 9.9
+  at the three points the Outcome measured.
+* **QLever's spatial SERVICE syntax.** §11 q14 left a shim open. `SERVICE
+  spatialSearch: { … }` with QLever's configuration (`spatialSearch:left`,
+  `spatialSearch:right`, `spatialSearch:numNearestNeighbors`,
+  `spatialSearch:maxDistance`, `spatialSearch:bindDistance`, and the right side as a
+  nested group) is translated at planning time into the FILTER or k-NN forms above,
+  the way `SERVICE path:search` became a leaf in [F07](F07-path-search.md). It is
+  recognized before remote SERVICE planning, so the outbound policy does not apply,
+  and an option without a translation is a `400` naming it. The test runs QLever's
+  documented examples and compares them with the FILTER form.
+* **Metric-property rewrites.** GeoSPARQL 1.1 defines `geo:hasMetricArea`,
+  `geo:hasMetricLength`, `geo:hasMetricPerimeterLength`, `geo:hasMetricSize` and
+  related properties, which data seldom asserts. With query rewrite on, a triple
+  pattern `?g geo:hasMetricArea ?a` over a geometry with no asserted value binds
+  `?a` to `geof:metricArea` of its serialization, as the topological rewrite does for
+  the relations; an asserted value wins. The rewrite is in `georewrite.rs` and shares
+  its switch.
+* **The Compliance Benchmark outside the repository's CI.** The benchmark is
+  GPL-2.0-only, and `scripts/geosparql-benchmark.sh` states that it is never part of the
+  repository, its releases or its CI; it is cloned on request into a git-ignored
+  directory. That policy stays. The score is tracked instead by X06's benchmark runs
+  on the benchmark machine, outside the repository's CI, which run the script with
+  `SPARKLES_ALLOW_GPL_BENCHMARK=1` at each refresh and record the score per
+  requirement in BENCHMARKS.md. A drop below the recorded 187 of 206, or a query that
+  passed and now fails, is reported in the refresh like any other regression.
+* **Geometry limits.** [FEATURES.md](../FEATURES.md#known-gaps) lists them, and each is
+  a separate piece of work:
+  * *Geographic CRSs on datums other than WGS 84.* The EPSG table's 956 geographic and
+    geocentric definitions are refused (*EPSG definitions* above), so a literal in,
+    say, EPSG:4277 (OSGB36 latitude and longitude) is in an unknown CRS. Geographic
+    definitions are accepted with the datum shift of their projected siblings
+    (Helmert or grid, as below), and measures run on WGS 84 after the shift.
+  * *Exact Helmert shifts.* A Helmert shift is exact for the published parameters; the
+    approximation the warning reports is the parameters' own error against the national
+    grids, not the computation. The `geo-crs-approximate` warning stays for definitions
+    whose shift is a stand-in for a grid (OSGB36 for OSTN15) and is dropped for those
+    whose authority defines the Helmert transformation as the exact one.
+  * *Curved GML segments and solids.* `geo/xml.rs` reads straight segments only. Arcs
+    (`gml:Arc`, `gml:ArcString`, `gml:Circle`) are linearized at read time with a
+    chord error bound (default 0.1 m, or 1e-6 of the extent in a CRS without units),
+    recorded as a plan warning; `gml:Solid` reads as its boundary surfaces.
+  * *3D constructions.* Constructed geometries are 2D (*Deviations* above). Buffers,
+    hulls and overlays keep the Z values of input vertices that survive unchanged and
+    interpolate Z along the input segment for new vertices; a construction whose
+    output has new vertices in an area interior returns 2D, as now, with a warning.
+  * *Splitting lines at crossings.* `geof:union` of two crossing lines keeps the
+    covered points but does not split the lines at each crossing, unlike JTS. The
+    curve-against-curve step of `geo/ops/overlay.rs` already computes the crossings by
+    segment intersection; it nodes both lines at them before assembling the result,
+    so the output's line strings meet only at their ends, as in JTS.
+**A Jena compatibility mode** (item 70, Tier 7, [ROADMAP](../ROADMAP.md)). The decisions in
+[COMPARISON.md](../COMPARISON.md#geosparql) give different answers from Jena on purpose,
+and the Compliance Benchmark's misses trace to some of them (the Conformance paragraph
+above: empty-geometry equality, distances, a metre buffer and rewrite answers). Two are
+already switches: `geo.json` `"distance": "haversine"` gives Jena's sphere and
+`"queryRewrite": true` gives its rewrite. A per-dataset `"compat": "jena"` in `geo.json`
+sets both and adds the rest:
+
+* every relation is false when either side is empty, and `sfEquals` compares with the
+  `TFFFTFFFT` pattern, so two equal points are not equal, as in Jena;
+* a literal in an unknown CRS is read as CRS84 degrees with a warning in the plan,
+  instead of being left out of metric functions and the index;
+* `geof:getSRID` returns `xsd:string`;
+* `spatialF:angle` returns Jena's value in every quadrant, including the quarter turn
+  off south-east and north-west of the first point;
+* `spatial:withinBox` and `spatial:intersectBox` with an unbound subject return the
+  index's envelope hits without the exact refinement.
+
+The mode is part of the index files' identity where it changes what is indexed (unknown
+CRSs). It never changes a dataset without the setting. Acceptance: with the mode on,
+each of the benchmark's misses that the Conformance paragraph attributes to these
+choices passes, and the score with the mode is reported beside the default's.

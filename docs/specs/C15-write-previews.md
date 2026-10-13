@@ -719,3 +719,49 @@ the same flags, so a patch can be previewed like any other write.
 read-only servers, and a bulk dry run builds its generation. Only dry runs rolled their
 vocabulary back at first. A failed load now removes its terms too. The local `update`,
 `load` and `infer` commands have no `--dry-run`, and the UI does not offer previews.
+
+### Roadmap follow-ups (2026-10-12)
+
+**Local dry-run flags, previews in the UI, read-only servers and costly bulk previews**
+(item 49, Tier 5, [ROADMAP](../ROADMAP.md)).
+
+* **What is missing today.** `sparkles update`, `sparkles load` and `sparkles infer`
+  take no `--dry-run` (`main.rs` has no such flag), whether `update` and `load` work on
+  `--loc` or on `--server`; `infer` works on `--loc` only. The UI uses `dryRun` in two places only: the tabular import in
+  `IngestPanel.svelte`, which shows the count of triples a CSV would add, and the merge
+  page (`POST /$/merge/{ds}` with `dryRun: true`). The query editor's updates, Graph
+  Store uploads and RDF Patch uploads have no preview. A read-only server refuses dry
+  runs (`http/dry_run_tests.rs`, `read_only_servers_refuse_dry_runs`), and a bulk dry
+  run builds a whole candidate generation before discarding it.
+* **CLI.** `--dry-run` on `update`, `load`, `patch` and `infer`, with `--changes N` to
+  list up to N changes. With `--loc` it calls `WriteOptions::dry_run` and prints the
+  `Preview`; with `--server` (not available for `infer`) it sends `dryRun=true` and `changes=N`. The output is the
+  preview document with `--format json` and a summary otherwise: the commit that would
+  be made, the counts per graph, the validation outcome, quota and precondition
+  checks. The exit status is 0 for a write that would commit, 1 for one that would be
+  refused, as `sparkles shacl` uses for a non-conforming report. `infer --dry-run`
+  reports the inferred quads that would be added and removed, from the reasoner's
+  incremental maintenance, without committing them.
+* **UI.** The query editor's Run on an update gains a Preview action that sends the
+  update with `dryRun=true&changes=200` and shows the preview panel: per-graph counts,
+  the first changes as a diff table, the validation summary with a link to the rejected
+  write report, and Commit and Cancel. Commit sends the same update with `If-Match` set
+  to the preview's commit, so a write that landed in between turns the commit into a
+  `412` and asks for a new preview. Graph Store writes already take `If-Match`;
+  `POST /{ds}/update` does not, and gains it here with the same meaning. The Graph Store upload dialog and the patch upload
+  get the same panel.
+* **Read-only servers.** A dry run on a `--read-only` server stays refused by default,
+  since the guard and quota checks read state that a read-only server may not keep
+  current. `serve --read-only --allow-dry-runs` lets them through. The dry run takes
+  the writer lock like any write, which a read-only server otherwise never does, so the
+  flag is off by default.
+* **Costly bulk previews.** A bulk dry run reports its cost before it runs: with
+  `dryRun=estimate`, the server answers from the request's size and the dataset's
+  statistics without building, with the estimated quads, disk and time, and whether the
+  bulk path would be taken. `dryRun=true` on the bulk path is refused with `413
+  preview-too-large` above `--max-bulk-preview-quads` (default 10M), naming
+  `dryRun=estimate` and a clone ([C06](C06-clone-to-sandbox.md)) as alternatives. For
+  validation of a bulk write, which is what a preview is most often for, the preview
+  can skip building the index permutations that only queries need: it builds the
+  candidate's vocabulary and the SPO order, runs the guard over that, and discards
+  them.

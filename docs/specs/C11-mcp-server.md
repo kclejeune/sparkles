@@ -1646,3 +1646,67 @@ challenges (deviation 3 of Phase 2) are still not built. Neither are `--allow-lo
 Phase 2). Legacy `resources/subscribe` is not served, and no tool sends progress
 notifications (deviations 1 and 3 of Phase 3). MCP has no measurements in
 [BENCHMARKS](../BENCHMARKS.md).
+
+### Roadmap follow-ups (2026-10-12)
+
+**Progress, tool metrics, load enablement and measurements** (item 42, Tier 4,
+[ROADMAP](../ROADMAP.md)). The last *Not built* paragraph above lists these.
+
+* **Progress notifications.** No tool sends `notifications/progress` (deviation 3 of
+  Phase 3), because the tasks extension covers long calls. Clients that do not use
+  tasks still show nothing during a long call. When a request carries
+  `_meta.progressToken`, the server sends progress from the same `Control` that
+  reports a task's progress (P06): `sparql_query` reports rows produced and the
+  deadline's share used, `sparql_update` the phase (parse, evaluate, validate,
+  commit), and `find_paths` the visited count against `maxVisited`. Notifications are
+  rate-limited to one per 500 ms per call, sent on the call's own stream, and stop at
+  completion or cancellation. A tool without a measure sends none.
+* **Per-tool metrics and log fields.** The access log and request metrics count MCP
+  messages as requests to `/$/mcp` (Phase 1), without the tool. `/$/metrics` gains
+  `sparkles_mcp_tool_calls_total{tool,outcome}` (`ok`, `tool-error` with its code
+  class, `protocol-error`) and `sparkles_mcp_tool_seconds{tool}`, with stored-query
+  tools counted under `stored_query` so the label set stays bounded. The access log
+  gains `mcp_method`, `mcp_tool` and `mcp_error_code` on lines for `/$/mcp`, and the
+  stdio server writes the same fields to its log.
+* **Load enablement.** `sparql_update` refuses `LOAD` with `load-disabled`
+  (`crates/sparkles-server/src/mcp/update.rs`). `serve --mcp-allow-load` (and
+  `sparkles mcp --allow-load`) lets the tool run `LOAD`, still under the outbound
+  policy and its budgets, the caller's `update` grant, the guard of C10 and `dryRun`.
+  It is off by default because a `LOAD` makes the server fetch a URL an agent chose.
+  The tool's description states whether it is on.
+* **Measurements.** BENCHMARKS.md has no MCP figures. X06's runs add the overhead of
+  `sparql_query` over `/$/mcp` against the same query on `/{ds}/sparql` (small and
+  10,000-row results, compacted), `describe_schema` on the 10.5M dataset, a stored-query
+  tool call, and the stdio bridge's added latency.
+
+**Legacy resource subscriptions** (item 56, Tier 5, [ROADMAP](../ROADMAP.md)). Legacy
+`resources/subscribe` is not served (deviation 1 of Phase 3); updates come only through
+`subscriptions/listen`. A legacy session gains `resources.subscribe` in its capabilities,
+and `resources/subscribe` and `resources/unsubscribe` register the URI on the session's
+watcher, the same one `subscriptions/listen` uses with its 2-second comparison and its
+limit of 64 watchers. Updates go out as `notifications/resources/updated` on the
+session's stream. A request without a session has no stream to deliver to, so it
+gets the protocol's error for an unsupported method.
+
+**OAuth for the MCP endpoint** (item 67, Tier 6, release work, [ROADMAP](../ROADMAP.md)).
+Deviation 3 of Phase 2 records that protected-resource metadata, audience validation and
+scope challenges were not built. Part of it has since landed: OIDC access tokens are
+accepted as bearer credentials on every route, `/$/mcp` included, when their audience
+is one of the provider's `api_audience` values and they grant every `api_scopes` value
+(`crates/sparkles-server/src/auth/config.rs`). What remains:
+
+* **Protected-resource metadata (RFC 9728).** `GET /.well-known/oauth-protected-resource`
+  (and the path-suffixed form for `/$/mcp`) returns the resource identifier, the OIDC
+  issuer as `authorization_servers`, `scopes_supported` and `bearer_methods_supported`.
+  A `401` from `/$/mcp` carries `WWW-Authenticate: Bearer resource_metadata="…"`, so
+  MCP clients discover the authorization server.
+* **Resource-bound audiences.** The audience check accepts any configured
+  `api_audience`, the same for every route. The MCP endpoint's canonical URL becomes an
+  accepted audience of its own, so a client that requests a token for the resource
+  (RFC 8707's `resource` parameter, which the MCP authorization profile requires) gets
+  one that works at `/$/mcp` and nowhere else unless the provider adds the API's
+  audience too.
+* **Scope challenges.** A token that lacks a scope a tool needs gets `403` with
+  `WWW-Authenticate: Bearer error="insufficient_scope", scope="…"`. Scopes map to the
+  existing grants: `sparkles:read`, `sparkles:update` and `sparkles:admin`, optionally
+  per dataset, intersected with the principal's grants, so a scope never adds access.

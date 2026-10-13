@@ -1303,3 +1303,34 @@ endpoint, and the Graph Store endpoints are `gsp-r` and `gsp-rw`.
   `list_branches`.
 - The server's tests, the OpenAPI check, the feature lint and Clippy over all targets
   pass.
+
+### Roadmap follow-ups (2026-10-12)
+
+**Item 57: scratch-branch expiry as a dataset setting, and expiry under stdio.** Expiry
+of idle scratch branches is the `serve` flag `--mcp-scratch-branch-ttl`, read in
+`crates/sparkles-server/src/mcp/http.rs` and run by the background task of
+`mcp/branches.rs`, which counts deletions in
+`sparkles_mcp_scratch_branches_expired_total`. The dataset setting of decision 4 (§13)
+is not built, and `sparkles mcp` over stdio has no expiry (Outcome, deviations of
+Phases 1b and 1c). See the [roadmap](../ROADMAP.md).
+
+- **A dataset setting.** A `scratchBranches` object in the dataset's settings, a field
+  of the C19 layers with its usual locks: `ttl` (a duration, or `null` for none),
+  `maxPerPrincipal` (an integer, or `null`), and `notifyBefore` (a duration). The
+  server flag becomes the default of the built-in layer, so existing deployments keep
+  their behaviour, and a dataset's value overrides it. The background task reads the
+  effective value per dataset at each pass. `list_branches` reports each scratch
+  branch's expiry from the dataset's value, as it does now from the flag.
+- **Expiry under stdio.** `sparkles mcp --loc DB` opens the store itself and has no
+  background task. It runs the same expiry pass once when it opens the dataset and
+  then every ten minutes while the session lasts, under the dataset's setting, so a
+  local agent's abandoned branches go away on the next session. `--no-scratch-expiry`
+  turns it off for one session. A branch is idle by the same rule as on the server,
+  the time of its last commit or its creation.
+- **Warnings before deletion.** With `notifyBefore`, the brief of C18 §8.10.9 and the
+  MCP resource of a caller's branches list the scratch branches that expire within the
+  window, and the C21 event `memory.review.pending` names them when they hold
+  unreviewed proposals, so a person can merge or keep them.
+- **Keeping a branch.** `create_branch` takes `keep: true` for a branch that should not
+  expire, and a caller with `admin` can clear the scratch mark with
+  `Store::set_branch_scratch`, which turns it into an ordinary branch.

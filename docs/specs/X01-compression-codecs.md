@@ -523,3 +523,23 @@ keys to merge.
 
 **Not built.** The Phase 2 codecs for index blocks and the vocabulary, dictionaries, the
 pure-Rust zstd decoder and zstd repository blobs were not built.
+
+### Roadmap follow-ups (2026-10-12)
+
+[ROADMAP](../ROADMAP.md) item 16 takes up the storage codecs of Phase 2 in
+[X11](X11-index-compression-and-predicate-patterns.md), together with QLever's predicate
+patterns.
+
+* **U7, index blocks.** X11 §5 keeps this spec's zstd blocks with optional dictionaries
+  per permutation and adds a patched frame-of-reference codec (`pfor`) whose second column
+  restarts its deltas at each run of the leading key. The gate stays this spec's: at most
+  5% warm and 15% cold, for at least 25% less disk.
+* **U8, the vocabulary.** X11 §4 compares FSST with front coding as §U8 asked, keeping the
+  front coding and encoding the suffixes of each block with FSST, with separate symbol
+  tables for literals and for IRIs. It adds encoded IRIs, which keep IRIs made of a fixed
+  prefix and a decimal number in the id under a new tag.
+* **Format.** X11 §7 records each codec as a feature in `IndexMeta` and raises the index
+  format to 3 only for generations that use one. Default builds stay at version 2 until a
+  codec passes its gate.
+* **Spill files.** The query spill files of [X08](X08-disk-spill-and-server-memory.md)
+  §6.6 encode their columns with `encode_column` and LZ4, the index blocks' codec.

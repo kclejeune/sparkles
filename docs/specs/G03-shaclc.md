@@ -487,3 +487,49 @@ A list constraint costs two index scans per list cell and value node.
 **Not built.** A comment-preserving SHACLC formatter for `sparkles fmt`, `POST /$/format`
 and the editor. §9 makes it wait for users who ask for it, and it needs a lossless
 SHACLC parser in `sparkles-fmt` next to the one in `sparkles-shacl`.
+
+### Roadmap follow-ups (2026-10-12)
+
+**SHACL 1.2 node expressions** (item 13, Tier 2, [ROADMAP](../ROADMAP.md)). What
+Sparkles supports of SHACL 1.2 today: the four list constraints of this spec, with
+`sh:detail`; `sh:targetWhere` and the `sh:Debug` and `sh:Trace` severities, from
+[C10](C10-write-time-validation.md) (`crates/sparkles-shacl/src/lib.rs`, `shapes.rs`,
+`guard.rs`). The validator has no node expressions: nothing in `sparkles-shacl` reads
+an expression where SHACL 1.2 allows one.
+
+A node expression computes a set of nodes from a focus node. The SHACL 1.2 drafts
+define constants, the focus node, path expressions, filters by a shape, union,
+intersection, distinct, counts and other aggregates, ordering with limit and offset,
+conditionals, and function calls, including SPARQL-based functions. The design pins the
+vocabulary to the Working Draft fetched when the work starts, as C10 §2 did for
+`sh:targetWhere`, and records the draft's date.
+
+* **Evaluator.** A `NodeExpr` enum in `sparkles-shacl` is parsed from the shapes graph
+  with the other shape parameters and evaluated against the data graph's index-backed
+  reads (`data.rs`), returning a sorted, deduplicated set of terms. Path expressions
+  reuse `path.rs`; filters by a shape reuse conformance checking; SPARQL-based
+  functions run through the SHACL-SPARQL engine already used for `sh:sparql`, with the
+  same prebinding rules. A cycle through filter shapes is a shapes-graph error.
+* **Where expressions are read.** First, as targets: a target whose value is a node
+  expression evaluated with no focus node. Second, as values of the constraint
+  parameters that the draft allows to be computed, such as `sh:hasValue` and `sh:in`.
+  Third, as the expression constraint that reports a result for each focus node whose
+  expression yields a value other than `true`. Inference rules that write computed
+  values (`sh:values`) are left out: Sparkles' reasoner owns inferred triples, and the
+  roadmap's F16 and F17 decide how rules enter it.
+* **Write-time validation.** The incremental guard needs the predicates an expression
+  reads to decide whether a write can affect a focus node, as it does for anchored
+  SHACL-SPARQL queries. An expression made of paths, shapes, sets and aggregates
+  declares them exactly; one with a SPARQL function falls back to full validation on
+  every write that touches a read predicate of the shapes graph, as unanchored
+  SHACL-SPARQL does today.
+* **SHACLC.** The compact syntax has no node expression syntax in the current Note;
+  shapes with expressions are written as Turtle by `sparkles shacl parse`, which
+  already reports a graph that SHACLC cannot express.
+* **Tests.** The Working Group's node expression tests, when the suite publishes them,
+  and otherwise the draft's examples, each run through the validator and the guard's
+  differential test.
+
+Other SHACL 1.2 Core additions that are not supported, such as constraints on RDF 1.2
+reifiers, are listed against the same draft when this work starts, each with whether
+it is built here or left out and why.

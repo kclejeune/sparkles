@@ -406,3 +406,72 @@ custom operations and Java code (§1 non-goals and §9). Jetty's `OBF:` password
 decoded, although the obfuscation is reversible, so that the converter never handles a
 recoverable secret that the operator did not write in plain text. `ja:literalContent`
 is unsupported.
+
+### Roadmap follow-ups (2026-10-12)
+
+**Item 76 (Tier 5, [ROADMAP](../ROADMAP.md)): complete assembler bodies, and Graph Store
+direct naming per dataset.** The item's third part, JVM metrics, belongs to
+[P04](P04-jvm-bindings.md).
+
+* **What is missing today: assembler bodies.** `POST /$/datasets` with a Fuseki service
+  description is read by `crates/sparkles-server/src/http/fuseki/assembler.rs`, not by the
+  converter. Its module comment lists what it refuses with a `400` that names the
+  element: dataset types other than TDB1, TDB2 and the in-memory ones (so text indexes,
+  inference models and GeoSPARQL datasets), `ja:data`, access control, contexts, custom
+  endpoint names and services without a write endpoint. The converter of this spec reads
+  all of those (`parts.rs` for text indexes, GeoSPARQL, registries, assembled datasets and
+  reasoners; `service.rs` for wrappers and endpoints), and `serve --fuseki-config` applies
+  them at start through `fuseki_config::for_serve` and `fuseki_config::start`. So the same
+  `config.ttl` works at start and fails at runtime.
+  [COMPARISON](../COMPARISON.md) says assembler bodies are read "for the part that maps to
+  a Sparkles dataset".
+* **Design: one reader for both paths.** The assembler body handler calls the converter
+  on the body as a one-service configuration, in a new entry point
+  `fuseki_config::for_dataset(body, format, server) -> DatasetPlan`, which returns the
+  dataset's kind and name, its settings (text, GeoSPARQL, RDFS on read, reasoning with its
+  schema), data to load and a report. The handler then:
+  1. refuses the body with the converter's report when any element is `unsupported`, as
+     today, and answers with the report when `?dryRun=true`;
+  2. creates the dataset, writes its settings through the same library calls that
+     `/$/text/{ds}`, `/$/geo/{ds}`, `/$/rdfs/{ds}` and `/$/reason/{ds}` use, so they are
+     the dataset's runtime settings like any others;
+  3. runs the loads of `ja:data` and the first materialization as a task under
+     `/$/tasks`, as `fuseki_config::start` runs them at start, and answers `202` with the
+     task when there is work, `200` otherwise.
+  `ja:data` reads files on the server, so it needs `server-admin` and a path under
+  `serve --load-dir`, the rule SPARQL `LOAD <file:…>` follows (`FileLoads` in
+  `crates/sparkles-core/src/sparql/mod.rs`).
+* **What stays refused.** Access control in the description (`fuseki:allowedUsers` and
+  graph access), because grants live in the auth configuration file and have no runtime
+  API; the report says which `auth.toml` entries the converter would write. Per-dataset
+  timeouts and custom endpoint names, which §1's non-goals and the Outcome's "Not built"
+  keep out. Java classes in `ja:` descriptions.
+* **What is missing today: direct naming.** `serve --gsp-direct-naming` sets one
+  server-wide `AppState::gsp_direct_naming` (`crates/sparkles-server/src/state.rs`), and
+  `http/fuseki.rs` serves `/{ds}/{path}` as the graph named by the request URL for every
+  dataset when it is on. The converter turns a `fuseki:gsp-direct-rw` or
+  `fuseki:gsp-direct-r` endpoint on any one service into that flag and reports it as
+  approximated ("--gsp-direct-naming, which applies to every dataset", `service.rs`), and
+  an assembler body with such an endpoint is refused unless the flag is on. A read-only
+  `gsp-direct-r` endpoint gets the same routes as `gsp-direct-rw`; only grants limit
+  writes.
+* **Design: a per-dataset setting.** Direct naming becomes a dataset setting,
+  `gspDirectNaming: "off" | "read" | "read-write"`, stored with the dataset's other
+  Fuseki-compatibility settings and changed through C19's settings routes as a member of
+  a new `fuseki` settings kind, so the settings file can declare and lock it. The flag
+  takes values: `--gsp-direct-naming` alone keeps meaning every dataset with
+  `read-write`, and `--gsp-direct-naming NAME[=read|read-write]` (repeatable) names
+  datasets. The `direct` handler reads the dataset's value: `off` is `404` as today, and
+  `read` answers `405` with `Allow: GET, HEAD, OPTIONS` to writes, before authorization
+  decides anything else. The converter writes the per-dataset form for each service
+  that has a direct endpoint and stops reporting it as approximated, and assembler
+  bodies with such an endpoint set the dataset's value.
+* **Order.** Direct naming per dataset first (S), since it changes one handler and one
+  setting. Assembler bodies second (M), since they need the task path and the
+  settings writes.
+* **Tests.** A10's comparison of Jena's examples with assembler bodies extends to the
+  text, GeoSPARQL and inference examples of `testsuite/fuseki/jena`, which must now be
+  accepted and produce the settings `serve --fuseki-config` produces for the same file.
+  A body with `fuseki:allowedUsers` is still refused with its report. Two datasets, one
+  with `read` and one with `off`, answer a direct `GET`, a direct `PUT` and a request to
+  the other dataset as the setting says.

@@ -1837,3 +1837,61 @@ for TIM, 185 µs on the star lookup against 341 and 126 µs, and 42 to 44 µs on
 `update-modify` was measured without changes. It took 4.2 ms on the in-memory store
 against 3.9 ms for TDB2 and 0.07 ms for TIM, down from the 13 to 15 ms of the previous
 round. The time is still in the engine's write path.
+
+### Roadmap follow-ups (2026-10-12)
+
+* **Reusable plans** ([ROADMAP](../ROADMAP.md) item 32). [X10](X10-reusable-query-plans.md)
+  adds `FfiPlan`: `prepare_plan` parses once, and `FfiPlan::bind` returns an `FfiQuery`
+  that instantiates a cached plan with new bindings. `QueryEngineSparkles` keeps a map
+  from a parsed Jena `Query` to its `FfiPlan`, so substitution on a parsed query skips
+  Sparkles' parsing and planning. Text from `ParameterizedSparqlString` hits X10's shape
+  level after a parse. The Outcome above attributes about 50 of the 62 µs that the engine
+  spends on a small query to parsing and planning, which this removes on a hit.
+* **Per-call overhead** (item 33). After the hand-written JNI calls, single-thread medians
+  on atlas were 1.68 µs for `Graph.contains` against TIM's 0.53, 2.64 µs for
+  `getProperty` against 0.68 and 5.20 µs for `find` on a subject against 1.71, about 3 to 4
+  times TIM. TIM answers from Java maps without a native call. Sketch, each change kept
+  only if it removes more than 10% of an operation under the rule of §5.4:
+  * *Fewer crossings.* A `contains` or `find` outside a transaction makes separate calls
+    to begin a read transaction, to look up and to free it. One JNI entry point on the
+    head snapshot does all three.
+  * *Cached term ids.* A Kotlin cache from Jena `Node` to the engine's id, keyed by the
+    generation's identity and the delta vocabulary's length, lets a pattern cross as 8-byte
+    ids instead of encoded terms. A miss or a changed generation falls back to the term.
+  * *Batched calls.* `containsAll` and a `find` over several subjects in one call, used
+    by `SmallQueries` when ARQ asks for a run of patterns, return their answers in one
+    buffer.
+* **JVM metrics** ([ROADMAP](../ROADMAP.md) item 76). [FEATURES](../FEATURES.md) lists no
+  JVM metrics. The server's metrics are counted in `crates/sparkles-server/src/obs.rs` and
+  are not reachable from the library, and the FFI exposes no dataset statistics. The
+  library already has the counters: `Dataset::stats` (`crates/sparkles/src/stats.rs`)
+  returns quads, delta inserts and deletes, disk bytes and the block, result and SERVICE
+  cache counts, and the store has `wal_bytes`, `disk_bytes`, `Store::rebuilds(reason)` and
+  the compaction status. Sketch:
+  * *FFI.* `FfiDataset::metrics()` returns a record of these counters only, without the
+    lists of graphs, predicates and classes that `DatasetStats` also computes, so a scrape
+    is a few atomic loads and stays cheap enough to call every few seconds.
+  * *Kotlin counters.* The library counts what only the JVM side sees: queries and updates
+    by outcome, their durations, budget failures by kind, queries routed to ARQ by
+    `SmallQueries` and fallbacks to ARQ, and calls by bridge (JNI or UniFFI).
+  * *Micrometer.* An optional `SparklesMetrics : MeterBinder`, with Micrometer as a
+    `compileOnly` dependency, registers gauges and function counters tagged with the
+    dataset's name. Their names follow the server's (`sparkles.block.cache.bytes` for
+    `sparkles_block_cache_bytes`), so the same dashboards work. The Fuseki assembler binds
+    it to Fuseki's Micrometer registry when one is present.
+  * *JMX.* `SparklesJmx.register(dataset)` registers a `SparklesDatasetMXBean` with the
+    same values under `io.github.kclejeune.sparkles:type=Dataset,name=<name>`, for
+    programs without Micrometer.
+  With [X08](X08-disk-spill-and-server-memory.md), the cache gauges become catalog-wide,
+  as on the server.
+* **Release work** (item 58), designed in [X12](X12-release-engineering.md):
+  * *Maven Central.* `jvm-bindings.yml` has a publish job for `jvm-v*` tags behind the
+    repository variable `MAVEN_PUBLISH`, which uploads through the Central Portal's staging
+    API and leaves the deployment for a person to release. Switching it on needs the
+    namespace, signing keys and X12's checklist.
+  * *musl.* The natives jar gains `linux-x86_64-musl` and `linux-aarch64-musl`
+    directories, built in an Alpine container, and the loader, which already detects musl
+    and refuses, picks them instead.
+  * *JPMS descriptor.* The main artifact supplies an automatic module name. An explicit
+    `module-info.class` would require JNA's and Jena's module names and export the
+    public packages only, and it needs a test that runs the library on the module path.

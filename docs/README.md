@@ -26,6 +26,7 @@ Start with the guide for the task you are doing. The repository's
 | [Running benchmarks](BENCHMARKING.md) | Harness commands, modes, outputs and regression-measurement instructions |
 | [Query optimizations](internals/OPTIMIZATIONS.md) | Detailed operator fast paths, applicability rules and local cost-model measurements |
 | [Design specs](specs/README.md) | Feature rationale, delivery status and implementation Outcomes |
+| [Roadmap](ROADMAP.md) | Planned work in priority order, with size, impact and the spec that holds each design |
 | [Source audit](AUDIT.md) | The historical audit of Jena, QLever and Oxigraph, and the original design choices |
 | [Provenance](specs/PROVENANCE.md) | Design sources, adopted dependencies, licenses and rejected alternatives |
 
