@@ -510,7 +510,7 @@ impl Store {
             &gdir.join("commit.json"),
             &crate::commit::gen_commit_bytes(self.dataset_id, "memory", &commit),
         )?;
-        File::create(gdir.join("wal.log"))?.sync_all()?;
+        super::wal::create(&gdir.join("wal.log"))?;
         super::sync_dir(&gdir)?;
         crate::commit::Catalog::create(&dir.join("commits.bin"), self.dataset_id, commit)?;
         let mut files = Vec::new();
@@ -825,7 +825,13 @@ impl Store {
 fn check_wal_prefix(wal: Option<&CapturedFile>, gdir: &Path, head: &CommitInfo) -> Result<()> {
     let len = wal.map_or(0, |f| f.len);
     let bad = |m: String| Err(Error::Corrupt(format!("{}: {m}", gdir.display())));
-    if len == 0 {
+    // a log that holds only its header record has no commits either
+    let header_only = len == super::WAL_REC as u64 && {
+        let mut rec = [0u8; super::WAL_REC];
+        wal.unwrap().read_exact_at(0, &mut rec)?;
+        rec[0] == super::WAL_HEADER
+    };
+    if len == 0 || header_only {
         return match crate::commit::read_gen_commit(gdir)? {
             Some((_, base, _)) if base.seq == head.seq => Ok(()),
             _ => bad(format!(

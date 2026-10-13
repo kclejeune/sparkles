@@ -24,14 +24,14 @@
 //! first key of each vocabulary block instead of every key, and segment files' presence
 //! instead of their checksums. The WAL and the catalog are checked fully in both modes.
 
-use crate::builder::{FORMAT_VERSION, IndexMeta, Stats};
+use crate::builder::{IndexMeta, Stats};
 use crate::commit::{self, CommitInfo};
 use crate::error::{Error, Result};
 use crate::id::{Id, Tag};
 use crate::index::{
     BLOCK_ROWS, BlockMeta, Key, META_BYTES, Perm, decode_column, read_varint_checked,
 };
-use crate::store::{WAL_COMMIT, WAL_DELETE, WAL_INSERT, WAL_REC};
+use crate::store::{WAL_COMMIT, WAL_DELETE, WAL_HEADER, WAL_INSERT, WAL_REC};
 use crate::vocab::{FC_BLOCK, parse_delta};
 use rayon::prelude::*;
 use serde::Serialize;
@@ -716,14 +716,11 @@ impl Checker<'_> {
             Ok(b) => match serde_json::from_slice::<IndexMeta>(&b) {
                 Err(e) => run.add(Issue::error(format!("does not parse: {e}")).file(&meta_file)),
                 Ok(m) => {
-                    if m.format_version != FORMAT_VERSION {
-                        run.add(
-                            Issue::error(format!(
-                                "index format {} but this build reads {FORMAT_VERSION}: dump and reload the data",
-                                m.format_version
-                            ))
-                            .file(&meta_file),
-                        );
+                    let written_by = dir.parent().and_then(crate::commit::read_written_by);
+                    if let Err(e) =
+                        crate::formats::INDEX.check(name, m.format_version, written_by.as_deref())
+                    {
+                        run.add(Issue::error(e.to_string()).file(&meta_file));
                     }
                     self.meta = Some(m);
                 }
@@ -1259,6 +1256,8 @@ impl Checker<'_> {
         let mut good = 0usize;
         let mut seen_v2 = false;
         let mut torn = false;
+        // the log's version: 0 without a header record
+        let mut version = 0u32;
         let mut ids_checked = 0u64;
         // the id problems of the current transaction, reported when its commit record
         // shows whether it is torn; and whether one is a delta id beyond delta.vocab
@@ -1272,6 +1271,19 @@ impl Checker<'_> {
                 ))
             });
             match rec[0] {
+                // the header record of a log written by a release with log versions
+                WAL_HEADER if i == 0 => {
+                    match crate::store::wal::header_version(rec, &dir.join("wal.log")) {
+                        Ok(v) => version = v,
+                        Err(e) => {
+                            run.add(Issue::error(e.to_string()).file(&file).offset(0));
+                            torn = true;
+                            break;
+                        }
+                    }
+                    txn_start = 1;
+                    good = WAL_REC;
+                }
                 WAL_INSERT | WAL_DELETE => {
                     data_recs += 1;
                     for (pos, id) in q.iter().enumerate() {
@@ -1459,7 +1471,7 @@ impl Checker<'_> {
                 " and {folded} older-version commits that open folds into a baseline"
             ));
         }
-        summary.push_str(&format!("; head {head}"));
+        summary.push_str(&format!("; head {head}; version {version}"));
         if preallocated > 0 {
             summary.push_str(&format!("; {preallocated} bytes preallocated"));
         }

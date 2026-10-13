@@ -425,20 +425,74 @@ pub(crate) fn parse_rfc3339_offset(s: &str) -> Option<i64> {
 
 /// Dataset capabilities supported by this reader (1: legacy, 2: branches,
 /// 3: relinked generations with an immutable base overlay, 4: framed delta
-/// vocabularies, see [`crate::vocab::delta`]).
-pub const DATASET_READER: u32 = 4;
+/// vocabularies, see [`crate::vocab::delta`], 5: write-ahead logs with a header record,
+/// see [`crate::store::wal`]). [`crate::formats::DATASET`] lists them.
+pub const DATASET_READER: u32 = 5;
 fn legacy_reader() -> u32 {
     1
 }
 
 fn check_dataset(f: DatasetFile) -> Result<DatasetFile> {
     if f.format != 1 || f.minimum_reader > DATASET_READER {
+        let by = f
+            .written_by
+            .as_deref()
+            .map(|v| format!(", written by Sparkles {v},"))
+            .unwrap_or_default();
         return Err(Error::Unsupported(format!(
-            "dataset format {} requires reader {}, this build supports format 1 and reader {}",
-            f.format, f.minimum_reader, DATASET_READER
+            "dataset.json{by} has format {} and requires reader {}; Sparkles {} reads format 1 up to reader {}. Open the database with a newer release",
+            f.format,
+            f.minimum_reader,
+            crate::formats::SPARKLES_VERSION,
+            DATASET_READER
         )));
     }
     Ok(f)
+}
+
+/// The versions `<root>/dataset.json` records, if it exists and this build reads it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DatasetVersions {
+    pub format: u32,
+    pub minimum_reader: u32,
+    /// the release that last opened the database for writing, when one recorded it
+    pub written_by: Option<String>,
+}
+
+/// The versions of `<root>/dataset.json` (`None` without one).
+pub fn read_dataset_versions(root: &Path) -> Result<Option<DatasetVersions>> {
+    Ok(read_dataset(root)?.map(|f| DatasetVersions {
+        format: f.format,
+        minimum_reader: f.minimum_reader,
+        written_by: f.written_by,
+    }))
+}
+
+/// `writtenBy` of `<root>/dataset.json` without checking its reader, for messages about
+/// a database this build may not read.
+pub fn read_written_by(root: &Path) -> Option<String> {
+    let b = std::fs::read(root.join("dataset.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&b).ok()?;
+    v.get("writtenBy")?.as_str().map(str::to_string)
+}
+
+/// Record that this release opens the database at `root` for writing: `writtenBy`
+/// becomes this release, and `minimumReader` rises to the reader of the files this
+/// release creates (a log with a header record, [`crate::store::wal::HEADER_READER`]).
+/// `dataset.json` is rewritten only when either changes.
+pub(crate) fn note_writer(root: &Path) -> Result<()> {
+    let Some(mut ds) = read_dataset(root)? else {
+        return Ok(());
+    };
+    let reader = ds.minimum_reader.max(crate::store::wal::HEADER_READER);
+    let version = crate::formats::SPARKLES_VERSION;
+    if ds.minimum_reader == reader && ds.written_by.as_deref() == Some(version) {
+        return Ok(());
+    }
+    ds.minimum_reader = reader;
+    ds.written_by = Some(version.to_string());
+    write_dataset(root, &ds)
 }
 
 /// Check compatibility without changing any database files.
@@ -467,6 +521,10 @@ struct DatasetFile {
     format: u32,
     #[serde(default = "legacy_reader", rename = "minimumReader")]
     minimum_reader: u32,
+    /// the release that last opened the database for writing (absent before releases
+    /// recorded it)
+    #[serde(default, rename = "writtenBy", skip_serializing_if = "Option::is_none")]
+    written_by: Option<String>,
     id: uuid::Uuid,
     created: String,
     origin: String,
@@ -625,7 +683,8 @@ pub(crate) fn clone_dataset_file_bytes(
 ) -> Vec<u8> {
     serde_json::to_vec_pretty(&DatasetFile {
         format: 1,
-        minimum_reader: 1,
+        minimum_reader: crate::store::wal::HEADER_READER,
+        written_by: Some(crate::formats::SPARKLES_VERSION.to_string()),
         id,
         created: rfc3339_ms(created_ms),
         origin: "clone".to_string(),
@@ -659,7 +718,8 @@ pub(crate) fn read_dataset_file(root: &Path) -> Result<Option<uuid::Uuid>> {
 pub(crate) fn dataset_file_bytes(id: uuid::Uuid, origin: &str, created_ms: i64) -> Vec<u8> {
     serde_json::to_vec_pretty(&DatasetFile {
         format: 1,
-        minimum_reader: 1,
+        minimum_reader: crate::store::wal::HEADER_READER,
+        written_by: Some(crate::formats::SPARKLES_VERSION.to_string()),
         id,
         created: rfc3339_ms(created_ms),
         origin: origin.to_string(),

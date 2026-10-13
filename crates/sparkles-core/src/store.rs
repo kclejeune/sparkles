@@ -197,14 +197,13 @@ impl Generation {
     fn open_with(dir: &Path, name: &str, dvocab: DeltaVocab) -> Result<Generation> {
         let meta: IndexMeta = serde_json::from_slice(&std::fs::read(dir.join("meta.json"))?)
             .map_err(|e| Error::Corrupt(format!("meta.json: {e}")))?;
-        if meta.format_version != crate::builder::FORMAT_VERSION {
-            return Err(Error::Corrupt(format!(
-                "{} has index format {} but this build uses {}; dump and reload the data",
-                dir.display(),
-                meta.format_version,
-                crate::builder::FORMAT_VERSION
-            )));
-        }
+        // the database's directory holds the generation (a branch's holds its own)
+        let written_by = || dir.parent().and_then(commit::read_written_by);
+        crate::formats::INDEX.check(
+            &dir.display().to_string(),
+            meta.format_version,
+            written_by().as_deref(),
+        )?;
         let stats: Stats = serde_json::from_slice(&std::fs::read(dir.join("stats.json"))?)
             .map_err(|e| Error::Corrupt(format!("stats.json: {e}")))?;
         Ok(Generation {
@@ -1313,6 +1312,12 @@ pub struct Store {
 
 pub(crate) const WAL_INSERT: u8 = 1;
 
+/// Take the exclusive process lock of a database directory, for offline work on a
+/// closed database (`sparkles migrate`).
+pub(crate) fn lock_database(root: &Path) -> Result<File> {
+    lock_dir(root)
+}
+
 /// Take the exclusive process lock of a database directory.
 fn lock_dir(root: &Path) -> Result<File> {
     let path = root.join("sparkles.lock");
@@ -1341,6 +1346,9 @@ fn lock_dir(root: &Path) -> Result<File> {
 }
 pub(crate) const WAL_DELETE: u8 = 2;
 pub(crate) const WAL_COMMIT: u8 = 3;
+/// The type byte of the header record that starts a log written by this release (see
+/// [`wal::header_record`]). It is never a data or commit record type.
+pub(crate) const WAL_HEADER: u8 = 0x89;
 pub(crate) const WAL_REC: usize = 1 + 32;
 
 impl Store {
@@ -1711,7 +1719,16 @@ impl Store {
             .last()
             .map(|c| catalog.get(c.seq).filter(|r| r.seq == c.seq).unwrap_or(*c))
             .unwrap_or(base);
+        // Every file this open read is in a version this build reads. The release now
+        // writes the database: record it in dataset.json, and require the reader of the
+        // files it creates (a log with a header record) before it creates any.
+        commit::note_writer(root)?;
+        let wal_existed = wal_path.exists();
         let wal = wal::open_for_append(&wal_path)?;
+        if !wal_existed {
+            // a new log starts with its header record
+            wal_len = wal::HEADER_BYTES;
+        }
         // What this open read is where the writes to come start, so it must be durable
         // first. A process that stopped without syncing can leave bytes that are only
         // in the page cache, and a direct write after them would be durable while
@@ -2907,7 +2924,7 @@ impl Store {
             let first_wal_seq = snap
                 .generation
                 .linked()
-                .and_then(|link| link.file.segments.iter().find(|s| s.wal_end > 0))
+                .and_then(|link| link.file.segments.iter().find(|s| s.end_seq > s.base_seq))
                 .and_then(|segment| segment.base_seq.checked_add(1))
                 .or_else(|| wal.first().map(|(seq, _)| *seq));
             let load_wal = || {
@@ -3058,7 +3075,7 @@ impl Store {
         if let Some(root) = &self.root {
             write_atomic(
                 &root.join("text.json"),
-                &serde_json::to_vec_pretty(&cfg).unwrap(),
+                &crate::formats::settings_to_vec("text.json", &cfg)?,
             )?;
         }
         let snap = self.snapshot();
@@ -4297,8 +4314,9 @@ impl Store {
             w.wal_alloc = wal.metadata()?.len();
             w.wal = Some(BufWriter::new(wal));
             w.wal_direct = Default::default();
-            w.wal_len = 0;
-            self.wal_end.store(0, Ordering::Relaxed);
+            // the new log holds its header record
+            w.wal_len = wal::HEADER_BYTES;
+            self.wal_end.store(wal::HEADER_BYTES, Ordering::Relaxed);
             self.quota.set_preallocated(0);
             *gen_.wal_index.lock() = Some(wal::WalIndex::new(head.seq, false));
         } else if bulk.is_some() {
@@ -6033,6 +6051,7 @@ pub(crate) fn wal_end(dir: &Path, base: &CommitInfo, fold_legacy: bool) -> u64 {
     for (i, rec) in recs.iter().enumerate() {
         match rec[0] {
             WAL_INSERT | WAL_DELETE => {}
+            WAL_HEADER if i == 0 => txn_start = 1,
             WAL_COMMIT => {
                 match commit::open_wal_commit(rec, &buf[txn_start * WAL_REC..i * WAL_REC]) {
                     Some(Ok((seq, _, _, _))) => {
@@ -6193,6 +6212,13 @@ pub(crate) fn replay_wal(
         });
         match rec[0] {
             WAL_INSERT | WAL_DELETE => pending.push((rec[0], q)),
+            // the header record that starts a log written by this release: the replay
+            // accepts it as the log's first complete part
+            WAL_HEADER if i == 0 => {
+                wal::header_version(rec, from.path)?;
+                txn_start = 1;
+                out.good = WAL_REC;
+            }
             WAL_COMMIT => {
                 let meta = commit::open_wal_commit(rec, &buf[txn_start * WAL_REC..i * WAL_REC]);
                 if matches!(meta, Some(Err(()))) {

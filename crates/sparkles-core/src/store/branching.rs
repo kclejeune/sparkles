@@ -215,9 +215,18 @@ pub(crate) struct BranchFile {
 pub(crate) fn read_branch_file(root: &Path) -> Result<Option<BranchFile>> {
     let path = root.join(BRANCH_FILE);
     match std::fs::read(&path) {
-        Ok(b) => serde_json::from_slice(&b)
-            .map(Some)
-            .map_err(|e| Error::Corrupt(format!("{}: {e}", path.display()))),
+        Ok(b) => {
+            let mut v: serde_json::Value = serde_json::from_slice(&b)
+                .map_err(|e| Error::Corrupt(format!("{}: {e}", path.display())))?;
+            crate::formats::check_settings(BRANCH_FILE, &v)?;
+            // a file without the member is format 1
+            if let Some(o) = v.as_object_mut() {
+                o.entry("format").or_insert(1.into());
+            }
+            serde_json::from_value(v)
+                .map(Some)
+                .map_err(|e| Error::Corrupt(format!("{}: {e}", path.display())))
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.into()),
     }
@@ -1978,7 +1987,7 @@ impl Store {
                 )?;
                 write_synced(&gdir.join("delta.vocab"), &[])?;
             }
-            write_synced(&gdir.join("wal.log"), &[])?;
+            super::wal::create(&gdir.join("wal.log"))?;
             write_synced(
                 &gdir.join("commit.json"),
                 &commit::gen_commit_bytes(e.id, "branch", &base),
@@ -2594,4 +2603,31 @@ pub(crate) enum Captured {
     Here(Start),
     /// the commit belongs to an upstream branch
     Inherited(CommitRef),
+}
+
+#[cfg(test)]
+mod branch_file_format_tests {
+    use super::*;
+
+    fn body(format: Option<u32>) -> String {
+        let id = uuid::Uuid::nil();
+        let format = format.map_or(String::new(), |f| format!(r#""format": {f},"#));
+        format!(
+            r#"{{{format} "datasetId": "{id}", "name": "dev", "id": "{id}", "ordinal": 1,
+                "from": {{"branchId": "{id}", "seq": 0}}, "created": "2026-01-01T00:00:00Z"}}"#
+        )
+    }
+
+    #[test]
+    fn a_newer_branch_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let newer = crate::formats::settings_file(BRANCH_FILE).unwrap().writes + 1;
+        std::fs::write(dir.path().join(BRANCH_FILE), body(Some(newer))).unwrap();
+        assert!(matches!(
+            read_branch_file(dir.path()),
+            Err(Error::Unsupported(_))
+        ));
+        std::fs::write(dir.path().join(BRANCH_FILE), body(None)).unwrap();
+        assert_eq!(read_branch_file(dir.path()).unwrap().unwrap().name, "dev");
+    }
 }
