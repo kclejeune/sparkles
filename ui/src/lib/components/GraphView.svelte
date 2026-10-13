@@ -2,6 +2,8 @@
   import cytoscape, { type Core, type ElementDefinition, type StylesheetJson } from 'cytoscape';
   import fcose from 'cytoscape-fcose';
 
+  import type { Mark } from '$lib/rowdiff';
+
   cytoscape.use(fcose);
 
   export type GNodeKind = 'iri' | 'literal' | 'bnode' | 'triple';
@@ -12,6 +14,8 @@
     title?: string;
     focus?: boolean;
     expanded?: boolean;
+    /** Between two states of the time slider: added, removed or kept. */
+    change?: Mark;
   };
   export type GEdge = {
     id: string;
@@ -20,6 +24,7 @@
     label: string;
     title?: string;
     isType?: boolean;
+    change?: Mark;
   };
 </script>
 
@@ -63,6 +68,8 @@
     const bnode = cssVar('--bnode');
     const spark = cssVar('--spark');
     const font = cssVar('--font-ui').replace(/["']/g, '');
+    const added = cssVar('--added');
+    const removed = cssVar('--removed');
     return [
       {
         selector: 'node',
@@ -123,6 +130,21 @@
           'font-weight': 600,
         },
       },
+      // compare mode: a solid green outline and "+" for what a later state added, a dashed
+      // red outline and "−" for what it removed (the label carries the sign too)
+      {
+        selector: 'node[change = "added"]',
+        style: { 'border-color': added, 'border-width': 3, 'border-style': 'solid' },
+      },
+      {
+        selector: 'node[change = "removed"]',
+        style: {
+          'border-color': removed,
+          'border-width': 3,
+          'border-style': 'dashed',
+          'background-opacity': 0.35,
+        },
+      },
       {
         selector: 'node:selected',
         style: {
@@ -155,6 +177,20 @@
         },
       },
       { selector: 'edge[?isType]', style: { 'line-style': 'dashed', 'line-dash-pattern': [4, 3] } },
+      {
+        selector: 'edge[change = "added"]',
+        style: { 'line-color': added, 'target-arrow-color': added, width: 2.4 },
+      },
+      {
+        selector: 'edge[change = "removed"]',
+        style: {
+          'line-color': removed,
+          'target-arrow-color': removed,
+          'line-style': 'dashed',
+          'line-dash-pattern': [5, 3],
+          width: 2,
+        },
+      },
       { selector: 'edge.quiet', style: { 'text-opacity': 0 } },
       {
         selector: 'edge:selected, edge.hl',
@@ -170,12 +206,16 @@
     ];
   }
 
+  /** The sign a changed element's label starts with, so that colour is not the only cue. */
+  const sign = (c: Mark | undefined) => (c === 'added' ? '+ ' : c === 'removed' ? '− ' : '');
+
   const toEl = {
     node: (n: GNode): ElementDefinition => ({
       group: 'nodes',
       data: {
         id: n.id,
-        label: n.label,
+        label: sign(n.change) + n.label,
+        change: n.change ?? '',
         kind: n.kind,
         title: n.title,
         focus: !!n.focus,
@@ -189,7 +229,8 @@
         id: e.id,
         source: e.source,
         target: e.target,
-        label: e.label,
+        label: sign(e.change) + e.label,
+        change: e.change ?? '',
         title: e.title,
         isType: !!e.isType,
       },
@@ -237,7 +278,8 @@
         const existing = cy!.getElementById(n.id);
         if (existing.nonempty()) {
           existing.data({
-            label: n.label,
+            label: sign(n.change) + n.label,
+            change: n.change ?? '',
             kind: n.kind,
             focus: !!n.focus,
             expanded: !!n.expanded,
@@ -262,7 +304,9 @@
         }
       }
       for (const e of wantEdges.values()) {
-        if (cy!.getElementById(e.id).empty()) cy!.add(toEl.edge(e));
+        const have = cy!.getElementById(e.id);
+        if (have.empty()) cy!.add(toEl.edge(e));
+        else have.data({ change: e.change ?? '', label: sign(e.change) + e.label });
       }
     });
     // Too many edge labels turn into noise: show them only on hover/selection.
