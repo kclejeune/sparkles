@@ -16,8 +16,11 @@
 //! can be added again as a new row.
 
 use crate::facts::{Base, Memo, ProbeFilter};
+use hashbrown::HashTable;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
+use std::hash::BuildHasher;
 use std::sync::Arc;
 
 pub(crate) type Triple = [u64; 3];
@@ -26,7 +29,14 @@ const SHARDS: usize = 64;
 /// Batches smaller than this are merged on the calling thread.
 const PAR_MIN: usize = 1 << 14;
 
-type Lists<K> = FxHashMap<K, Vec<u32>>;
+/// Rows by key; most keys of the per-subject and per-object indexes have a few rows,
+/// which fit without an allocation of their own.
+type Lists<K> = FxHashMap<K, SmallVec<[u32; 4]>>;
+
+#[inline]
+fn hash3(t: &Triple) -> u64 {
+    rustc_hash::FxBuildHasher.hash_one(t)
+}
 
 #[inline]
 fn mix(x: u64) -> usize {
@@ -60,8 +70,8 @@ pub(crate) struct Graph {
     base: Option<Arc<Base>>,
     /// the in-memory rows, from `offset` on
     triples: Vec<Triple>,
-    /// triple → row, by [`shard3`]
-    index: Vec<FxHashMap<Triple, u32>>,
+    /// the rows of the live triples, hashed by triple, by [`shard3`]
+    index: Vec<HashTable<u32>>,
     /// facts a merge found in the base tier, by [`shard3`], so that evaluation does not
     /// emit them again
     in_base: Vec<FxHashSet<Triple>>,
@@ -174,7 +184,7 @@ impl Graph {
         let mut g = Graph::default();
         g.triples.reserve(n);
         for m in &mut g.index {
-            m.reserve(n / SHARDS);
+            *m = HashTable::with_capacity(n / SHARDS);
         }
         g
     }
@@ -222,11 +232,20 @@ impl Graph {
     /// it.
     pub fn add_batch(&mut self, ts: impl IntoIterator<Item = Triple>) -> usize {
         let start = self.triples.len();
+        let Graph {
+            index,
+            triples,
+            offset,
+            ..
+        } = self;
+        let off = *offset;
         for t in ts {
-            let i = self.len();
-            if let std::collections::hash_map::Entry::Vacant(v) = self.index[shard3(&t)].entry(t) {
-                v.insert(i);
-                self.triples.push(t);
+            let h = hash3(&t);
+            let tbl = &mut index[shard3(&t)];
+            if tbl.find(h, |&r| triples[(r - off) as usize] == t).is_none() {
+                let row = off + triples.len() as u32;
+                triples.push(t);
+                tbl.insert_unique(h, row, |&r| hash3(&triples[(r - off) as usize]));
             }
         }
         let new = self.triples.len() - start;
@@ -239,56 +258,85 @@ impl Graph {
     /// yet, the base tier included, gets the next row, in the order of its first
     /// occurrence. Returns the number of new triples. Deduplication and the index updates
     /// run with one task per shard.
-    pub fn merge(&mut self, outs: Vec<Vec<Triple>>) -> anyhow::Result<usize> {
+    pub fn merge(&mut self, mut outs: Vec<Vec<Triple>>) -> anyhow::Result<usize> {
+        outs.retain(|o| !o.is_empty());
         let total: usize = outs.iter().map(Vec::len).sum();
-        if (total < PAR_MIN && self.base.is_none()) || total >= u32::MAX as usize {
+        if (total < PAR_MIN && self.base.is_none())
+            || outs.len() >= u32::MAX as usize
+            || outs.iter().any(|o| o.len() >= u32::MAX as usize)
+        {
             return Ok(self.add_batch(outs.into_iter().flatten()));
         }
         let t0 = std::time::Instant::now();
-        let all: Vec<Triple> = {
-            let mut v = Vec::with_capacity(total);
-            for o in outs {
-                v.extend(o);
-            }
-            v
-        };
+        // a candidate is named by its output and its place there; `offsets` give its
+        // position in the order of the outputs
+        let mut offsets = Vec::with_capacity(outs.len() + 1);
+        let mut n = 0;
+        for o in &outs {
+            offsets.push(n);
+            n += o.len();
+        }
+        offsets.push(n);
+        let outs_ref = &outs;
+        let get = |h: u64| outs_ref[(h >> 32) as usize][(h as u32) as usize];
+        let offsets_ref = &offsets;
+        let gpos = |h: u64| offsets_ref[(h >> 32) as usize] + (h as u32) as usize;
         let threads = rayon::current_num_threads().max(1);
-        let piece = all.len().div_ceil(threads * 4).max(4096);
-        // positions of the candidates by shard, piece by piece
-        let buckets: Vec<Vec<Vec<u32>>> = all
-            .par_chunks(piece)
-            .enumerate()
-            .map(|(k, c)| {
-                let mut b: Vec<Vec<u32>> = vec![Vec::new(); SHARDS];
-                let at = (k * piece) as u32;
-                for (j, t) in c.iter().enumerate() {
-                    b[shard3(t)].push(at + j as u32);
+        // contiguous groups of outputs with about `piece` candidates each
+        let piece = total.div_ceil(threads * 4).max(4096);
+        let mut groups: Vec<(usize, usize)> = Vec::new();
+        let mut from = 0;
+        for i in 0..outs.len() {
+            if offsets[i + 1] - offsets[from] >= piece || i + 1 == outs.len() {
+                groups.push((from, i + 1));
+                from = i + 1;
+            }
+        }
+        // the candidates of each group by shard
+        let buckets: Vec<Vec<Vec<u64>>> = groups
+            .par_iter()
+            .map(|&(a, z)| {
+                let mut b: Vec<Vec<u64>> = vec![Vec::new(); SHARDS];
+                for i in a..z {
+                    for (j, t) in outs_ref[i].iter().enumerate() {
+                        b[shard3(t)].push(((i as u64) << 32) | j as u64);
+                    }
                 }
                 b
             })
             .collect();
         let t_bucket = std::time::Instant::now();
         let base = self.base.clone();
-        let all_ref = &all;
         let buckets_ref = &buckets;
+        let (triples, off) = (&self.triples, self.offset);
         // per shard: the first occurrence of each triple that is new, in position order,
         // and those of them the base tier may hold
-        let (mut kept, maybe): (Vec<Vec<u32>>, Vec<Vec<u32>>) = self
+        let (mut kept, maybe): (Vec<Vec<u64>>, Vec<Vec<u64>>) = self
             .index
-            .par_iter_mut()
+            .par_iter()
             .zip(self.in_base.par_iter())
             .enumerate()
-            .map(|(s, (idx, known))| {
-                let mut kept: Vec<u32> = Vec::new();
+            .map(|(s, (tbl, known))| {
+                let mut batch: HashTable<u64> = HashTable::new();
+                let mut kept: Vec<u64> = Vec::new();
                 for b in buckets_ref {
-                    for &pos in &b[s] {
-                        let t = all_ref[pos as usize];
+                    for &h in &b[s] {
+                        let t = get(h);
                         if !known.is_empty() && known.contains(&t) {
                             continue;
                         }
-                        if let std::collections::hash_map::Entry::Vacant(v) = idx.entry(t) {
-                            v.insert(u32::MAX);
-                            kept.push(pos);
+                        let hash = hash3(&t);
+                        if tbl
+                            .find(hash, |&r| triples[(r - off) as usize] == t)
+                            .is_some()
+                        {
+                            continue;
+                        }
+                        if let hashbrown::hash_table::Entry::Vacant(v) =
+                            batch.entry(hash, |&x| get(x) == t, |&x| hash3(&get(x)))
+                        {
+                            v.insert(h);
+                            kept.push(h);
                         }
                     }
                 }
@@ -297,7 +345,7 @@ impl Graph {
                         let mut f = ProbeFilter::default();
                         kept.iter()
                             .copied()
-                            .filter(|&p| b.may_contain(&all_ref[p as usize], &mut f))
+                            .filter(|&h| b.may_contain(&get(h), &mut f))
                             .collect()
                     }
                     None => Vec::new(),
@@ -305,17 +353,16 @@ impl Graph {
                 (kept, maybe)
             })
             .unzip();
+        drop(buckets);
         // the new triples that are in the base tier: probed in key order, a contiguous
         // range of keys per task, so that each task reads few blocks
         if let Some(base) = &base {
-            let mut probe: Vec<(Triple, u32)> = maybe
-                .iter()
-                .flatten()
-                .map(|&p| (all_ref[p as usize], p))
-                .collect();
+            let mut probe: Vec<(Triple, u64)> =
+                maybe.iter().flatten().map(|&h| (get(h), h)).collect();
+            drop(maybe);
             probe.par_sort_unstable();
             let size = probe.len().div_ceil(threads * 4).max(1024);
-            let found: Vec<anyhow::Result<Vec<u32>>> = probe
+            let found: Vec<anyhow::Result<Vec<u64>>> = probe
                 .par_chunks(size)
                 .map(|c| {
                     let ts: Vec<Triple> = c.iter().map(|x| x.0).collect();
@@ -323,43 +370,41 @@ impl Graph {
                     Ok(c.iter().zip(f).filter(|x| x.1).map(|x| x.0.1).collect())
                 })
                 .collect();
-            let mut gone: Vec<u32> = Vec::new();
+            let mut gone: Vec<u64> = Vec::new();
             for f in found {
                 gone.extend(f?);
             }
             if !gone.is_empty() {
                 gone.sort_unstable();
-                let mut by_shard: Vec<Vec<u32>> = vec![Vec::new(); SHARDS];
-                for &p in &gone {
-                    by_shard[shard3(&all_ref[p as usize])].push(p);
+                let mut by_shard: Vec<Vec<u64>> = vec![Vec::new(); SHARDS];
+                for &h in &gone {
+                    by_shard[shard3(&get(h))].push(h);
                 }
                 let gone_ref = &gone;
-                self.index
+                self.in_base
                     .par_iter_mut()
-                    .zip(self.in_base.par_iter_mut())
                     .zip(kept.par_iter_mut())
                     .zip(by_shard.par_iter())
-                    .for_each(|(((idx, known), ks), g)| {
+                    .for_each(|((known, ks), g)| {
                         if g.is_empty() {
                             return;
                         }
-                        for &p in g {
-                            let t = all_ref[p as usize];
-                            idx.remove(&t);
-                            known.insert(t);
+                        for &h in g {
+                            known.insert(get(h));
                         }
-                        ks.retain(|p| gone_ref.binary_search(p).is_err());
+                        ks.retain(|h| gone_ref.binary_search(h).is_err());
                     });
             }
         }
         let t_dedup = std::time::Instant::now();
         // the kept positions as a bitset with a running count per word: a position's
         // rank among them is its new row
-        let words = all.len().div_ceil(64);
+        let words = total.div_ceil(64);
         let mut bits = vec![0u64; words];
         for k in &kept {
-            for &p in k {
-                bits[p as usize / 64] |= 1 << (p % 64);
+            for &h in k {
+                let p = gpos(h);
+                bits[p / 64] |= 1 << (p % 64);
             }
         }
         let mut before = Vec::with_capacity(words);
@@ -371,30 +416,40 @@ impl Graph {
         let new = n as usize;
         let start = self.triples.len();
         let first_row = self.len();
-        self.triples.reserve(new);
+        self.triples.reserve_exact(new);
+        let mut item = 0;
         for (i, &w) in bits.iter().enumerate() {
             let mut w = w;
             while w != 0 {
-                let b = w.trailing_zeros() as usize;
-                self.triples.push(all[i * 64 + b]);
+                let p = i * 64 + w.trailing_zeros() as usize;
+                while p >= offsets[item + 1] {
+                    item += 1;
+                }
+                self.triples.push(outs[item][p - offsets[item]]);
                 w &= w - 1;
             }
         }
-        // the rows of the new triples in the index
+        drop(outs);
+        // the new rows in the triple index
         let (bits_ref, before_ref) = (&bits, &before);
+        let triples = &self.triples;
+        let gpos = |h: u64| offsets_ref[(h >> 32) as usize] + (h as u32) as usize;
         self.index
             .par_iter_mut()
             .zip(kept.par_iter())
-            .for_each(|(idx, ks)| {
-                for &pos in ks {
-                    let (w, b) = (pos as usize / 64, pos % 64);
-                    let r = before_ref[w] + (bits_ref[w] & ((1u64 << b) - 1)).count_ones();
-                    *idx.get_mut(&all_ref[pos as usize]).expect("kept") = first_row + r;
+            .for_each(|(tbl, ks)| {
+                let hasher = |&r: &u32| hash3(&triples[(r - off) as usize]);
+                tbl.reserve(ks.len(), hasher);
+                for &h in ks {
+                    let p = gpos(h);
+                    let (w, b) = (p / 64, p % 64);
+                    let r =
+                        first_row + before_ref[w] + (bits_ref[w] & ((1u64 << b) - 1)).count_ones();
+                    tbl.insert_unique(hasher(&r), r, hasher);
                 }
             });
         let t_rows = std::time::Instant::now();
-        drop(buckets);
-        drop(all);
+        drop(kept);
         self.live += new;
         self.fill(start);
         tracing::trace!(
@@ -586,7 +641,9 @@ impl Graph {
     /// The row of a live in-memory triple.
     #[inline]
     pub fn position(&self, t: &Triple) -> Option<u32> {
-        self.index[shard3(t)].get(t).copied()
+        self.index[shard3(t)]
+            .find(hash3(t), |&r| self.triple(r) == *t)
+            .copied()
     }
 
     /// Whether a triple is a fact of either tier.
@@ -602,8 +659,7 @@ impl Graph {
     /// tier. Facts of the base tier that no merge met are not known.
     #[inline]
     pub fn known(&self, t: &Triple) -> bool {
-        let s = shard3(t);
-        self.index[s].contains_key(t) || (self.base.is_some() && self.in_base[s].contains(t))
+        self.position(t).is_some() || (self.base.is_some() && self.in_base[shard3(t)].contains(t))
     }
 
     /// Whether row `i` holds a live triple.
@@ -620,9 +676,13 @@ impl Graph {
     /// Mark the row of a live in-memory triple dead; returns false if the triple is not
     /// live.
     pub fn kill(&mut self, t: &Triple) -> bool {
-        let Some(i) = self.index[shard3(t)].remove(t) else {
+        let (triples, off) = (&self.triples, self.offset);
+        let Ok(e) =
+            self.index[shard3(t)].find_entry(hash3(t), |&r| triples[(r - off) as usize] == *t)
+        else {
             return false;
         };
+        let (i, _) = e.remove();
         let i = i - self.offset;
         let w = i as usize / 64;
         if self.dead.len() <= w {
@@ -659,15 +719,18 @@ impl Graph {
         if lo >= hi {
             return Cands::EMPTY;
         }
-        fn sl(v: Option<&Vec<u32>>, lo: u32, hi: u32) -> Cands<'_> {
+        fn sl(v: Option<&SmallVec<[u32; 4]>>, lo: u32, hi: u32) -> Cands<'_> {
             v.map_or(Cands::EMPTY, |l| Cands::Slice(restrict(l, lo, hi)))
         }
         let slice = |v| sl(v, lo, hi);
         match (s, p, o) {
-            (Some(s), Some(p), Some(o)) => match self.index[shard3(&[s, p, o])].get(&[s, p, o]) {
-                Some(i) if *i >= lo && *i < hi => Cands::Slice(std::slice::from_ref(i)),
-                _ => Cands::EMPTY,
-            },
+            (Some(s), Some(p), Some(o)) => {
+                let t = [s, p, o];
+                match self.index[shard3(&t)].find(hash3(&t), |&r| self.triple(r) == t) {
+                    Some(i) if *i >= lo && *i < hi => Cands::Slice(std::slice::from_ref(i)),
+                    _ => Cands::EMPTY,
+                }
+            }
             (Some(s), Some(p), None) => slice(self.by_ps[shard2(p, s)].get(&(p, s))),
             (None, Some(p), Some(o)) => slice(self.by_po[shard2(p, o)].get(&(p, o))),
             (None, Some(p), None) => slice(self.by_p[shard1(p)].get(&p)),

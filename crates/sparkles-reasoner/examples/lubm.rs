@@ -141,7 +141,7 @@ fn main() {
             let t = Instant::now();
             if cmd == "infer" {
                 let done = std::sync::Mutex::new((0usize, 0u128));
-                let (derived, iterations, digest) =
+                let (derived, iterations, digest, order) =
                     bench_derive(snap, &profile, &ReasonOptions::default(), &|| {
                         *done.lock().unwrap() = (
                             PEAK.load(Ordering::Relaxed) - before,
@@ -151,7 +151,7 @@ fn main() {
                     .unwrap();
                 let (peak, ms) = *done.lock().unwrap();
                 println!(
-                    "infer {} threads={threads} derived={derived} iterations={iterations} ms={ms} peak_heap_mib={:.1} vm_hwm={} digest={digest:016x}",
+                    "infer {} threads={threads} derived={derived} iterations={iterations} ms={ms} peak_heap_mib={:.1} vm_hwm={} digest={digest:016x} order={order:016x}",
                     profile.name(),
                     mib(peak),
                     vm_hwm()

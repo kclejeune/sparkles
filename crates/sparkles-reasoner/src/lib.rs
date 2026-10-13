@@ -1175,23 +1175,24 @@ pub fn infer(
 }
 
 /// Run the rules over a snapshot's input graphs and return the number of derived facts
-/// (generalized ones included), the iterations, and a digest of the derived facts that
-/// does not depend on their order or ids. `derived` is called when the rules are done,
-/// before the digest is worked out. For benchmarks.
+/// (generalized ones included), the iterations, a digest of the derived facts that does
+/// not depend on their order or ids, and one that depends on their order but not their
+/// ids. `derived` is called when the rules are done, before the digests are worked out.
+/// For benchmarks.
 #[doc(hidden)]
 pub fn bench_derive(
     snap: Arc<Snapshot>,
     profile: &Profile,
     opts: &ReasonOptions,
     derived: &dyn Fn(),
-) -> anyhow::Result<(usize, usize, u64)> {
+) -> anyhow::Result<(usize, usize, u64, u64)> {
     opts.inputs.validate()?;
     let resolved = inputs::resolve(&snap, &opts.inputs);
     let ids = resolved.ids(&snap);
     let d = derive(snap, profile, &Extras::default(), &ids, opts)?;
     derived();
     let facts = d.derived();
-    let mut digest = 0u64;
+    let (mut set, mut seq) = (0u64, maintain::FNV_START);
     for t in facts {
         let mut h = maintain::FNV_START;
         for x in t {
@@ -1199,7 +1200,8 @@ pub fn bench_derive(
             h = maintain::fnv(s.as_bytes(), h);
             h = maintain::fnv(b"\0", h);
         }
-        digest = digest.wrapping_add(h.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        set = set.wrapping_add(h.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        seq = maintain::fnv(&h.to_le_bytes(), seq);
     }
-    Ok((facts.len(), d.iterations, digest))
+    Ok((facts.len(), d.iterations, set, seq))
 }
