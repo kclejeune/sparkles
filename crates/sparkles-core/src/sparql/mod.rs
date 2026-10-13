@@ -1,6 +1,7 @@
 //! SPARQL 1.1 query & update engine (ARQ equivalent).
 
 pub mod aggext;
+pub mod algorun;
 pub mod algosvc;
 pub mod arqpf;
 pub mod cache;
@@ -134,6 +135,9 @@ pub struct QueryOptions {
     /// RDFS on read: patterns match the RDFS closure of each graph with respect to this
     /// schema (see [`rdfs`]).
     pub rdfs: Option<Arc<rdfs::RdfsOnRead>>,
+    /// The named projections of the dataset, for `algo:projection` in a graph algorithm
+    /// call (see [`crate::algo::catalog`]).
+    pub algo_projections: Option<Arc<crate::algo::catalog::Catalog>>,
     /// The outbound budget the request spends (`None`: a new one from
     /// [`outbound`](Self::outbound)), shared by several requests that count as one.
     pub outbound_budget: Option<Arc<crate::outbound::RequestBudget>>,
@@ -430,6 +434,7 @@ fn make_ctx(
         None => None,
     };
     ctx.use_cache = !opts.no_cache;
+    ctx.algo_projections = opts.algo_projections.clone();
     ctx.extensions = opts.extensions.clone();
     if let Some(s) = &opts.service_scope {
         ctx.service_scope = s.clone();

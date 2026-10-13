@@ -15,6 +15,7 @@
 
 pub mod betweenness;
 pub mod cache;
+pub mod catalog;
 pub mod community;
 pub mod components;
 pub mod fastrp;

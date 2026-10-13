@@ -73,7 +73,7 @@ pub enum Algo {
 
 /// How a parameter's value is read.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Kd {
+pub(super) enum Kd {
     /// a non-negative integer
     Int,
     /// a finite number
@@ -81,7 +81,7 @@ enum Kd {
 }
 
 /// The numeric parameters the algorithms take.
-const NUMERIC: &[(&str, Kd)] = &[
+pub(super) const NUMERIC: &[(&str, Kd)] = &[
     ("dampingFactor", Kd::Float),
     ("maxIterations", Kd::Int),
     ("tolerance", Kd::Float),
@@ -113,6 +113,11 @@ const NUMERIC: &[(&str, Kd)] = &[
 const COMMON: &[&str] = &["concurrency", "maxMemory", "limit"];
 
 impl Algo {
+    /// The algorithm named `name` (`pageRank`, `fastRP`, …).
+    pub fn from_name(name: &str) -> Option<Algo> {
+        Algo::from_iri(&format!("{NS}{name}"))
+    }
+
     fn from_iri(iri: &str) -> Option<Algo> {
         Some(match iri.strip_prefix(NS)? {
             "pageRank" => Algo::PageRank,
@@ -168,7 +173,7 @@ impl Algo {
     }
 
     /// The outputs of the algorithm besides `node` and `summary`.
-    fn outputs(self) -> &'static [&'static str] {
+    pub fn outputs(self) -> &'static [&'static str] {
         match self {
             Algo::PageRank | Algo::Betweenness => &["score"],
             Algo::Wcc | Algo::Scc => &["component"],
@@ -446,6 +451,7 @@ pub(super) fn algo_leaf(
     let (mut start, mut end_var, mut edge_weight) = (None, None, None);
     let mut seen: Vec<String> = Vec::new();
     let mut default_weight_given = false;
+    let mut named: Option<String> = None;
     let mut pred_names: Vec<String> = Vec::new();
     let subject = patterns.first().map(|t| t.subject.clone());
     let output = |p: &Planner<'_>, t: &TermPattern, name: &str| -> Result<VarId> {
@@ -577,9 +583,12 @@ pub(super) fn algo_leaf(
             "end" => end_var = Some(output(p, o, name)?),
             "edgeWeight" => edge_weight = Some(output(p, o, name)?),
             "projection" => {
-                return Err(bad(
-                    "named projections are not defined on this dataset; spell the projection out in the block",
-                ));
+                let TermPattern::Literal(l) = o else {
+                    return Err(bad(
+                        "algo:projection takes the name of a projection as a string",
+                    ));
+                };
+                named = Some(l.value().to_string());
             }
             "source" => match o {
                 TermPattern::Triple(_) => return Err(bad("algo:source takes a term")),
@@ -625,6 +634,65 @@ pub(super) fn algo_leaf(
                 nums.insert(n.to_string(), number(o, name, *kind)?);
             }
         }
+    }
+    if let Some(name) = &named {
+        let explicit = seen.iter().any(|s| {
+            matches!(
+                s.as_str(),
+                "predicate"
+                    | "direction"
+                    | "nodeClass"
+                    | "weight"
+                    | "defaultWeight"
+                    | "aggregate"
+                    | "start"
+                    | "end"
+                    | "edgeWeight"
+            )
+        });
+        if explicit || edge_gp.is_some() {
+            return Err(bad(
+                "algo:projection cannot be combined with other projection parameters or a nested pattern",
+            ));
+        }
+        let def = ctx
+            .algo_projections
+            .as_ref()
+            .and_then(|c| c.get(name))
+            .ok_or_else(|| bad(format!("no named projection '{name}' on this dataset")))?;
+        let dir = |d: &str| match d {
+            "forward" => Dir::Forward,
+            "backward" => Dir::Backward,
+            _ => Dir::Undirected,
+        };
+        if let Some(preds) = &def.predicates {
+            let list = proj.predicates.get_or_insert_with(Vec::new);
+            for pd in preds {
+                pred_names.push(pd.iri().to_string());
+                if let Some(id) = ctx.snap.lookup_iri(pd.iri()) {
+                    list.push((id.0, pd.direction().map(dir)));
+                }
+            }
+        }
+        proj.direction = def.direction.as_deref().map(dir);
+        for c in &def.node_classes {
+            proj.node_class_names.push(c.clone());
+            if let Some(id) = ctx.snap.lookup_iri(c) {
+                proj.node_classes.push(id.0);
+            }
+        }
+        if let Some(w) = &def.weight {
+            proj.weight = Some(ctx.snap.lookup_iri(w).map(|i| i.0));
+        }
+        if let Some(w) = def.default_weight {
+            proj.default_weight = w;
+        }
+        proj.aggregate = match def.aggregate.as_deref() {
+            Some("sum") => Aggregate::Sum,
+            Some("max") => Aggregate::Max,
+            Some("count") => Aggregate::Count,
+            _ => Aggregate::None,
+        };
     }
     if default_weight_given && proj.weight.is_none() && edge_weight.is_none() {
         return Err(bad("algo:defaultWeight needs algo:weight"));

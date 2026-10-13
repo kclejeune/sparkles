@@ -442,6 +442,8 @@ pub struct Ctx {
     /// the caller's scope in the cache of remote SERVICE results (see
     /// [`QueryOptions::service_scope`](super::QueryOptions::service_scope))
     pub service_scope: Arc<str>,
+    /// the dataset's named projections (see [`crate::algo::catalog`])
+    pub algo_projections: Option<Arc<crate::algo::catalog::Catalog>>,
     /// RDFS on read (see [`super::rdfs`])
     pub rdfs: Option<Arc<super::rdfs::RdfsSchema>>,
     pub opt: Optimizations,
@@ -522,6 +524,7 @@ impl Ctx {
             outbound_budget: crate::outbound::RequestBudget::new(&Default::default()),
             use_cache: true,
             service_scope: Arc::from(""),
+            algo_projections: None,
             rdfs: None,
             opt: Optimizations::default(),
             geo: Default::default(),

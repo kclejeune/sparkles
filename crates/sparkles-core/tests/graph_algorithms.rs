@@ -562,3 +562,42 @@ fn projections_are_cached_between_calls() {
     let second = rows(&s, q);
     assert_eq!(first, second);
 }
+
+#[test]
+fn named_projections() {
+    use sparkles_core::algo::catalog::{Catalog, PredicateDef, ProjectionDef};
+    let s = store_of(A);
+    let cat = Arc::new(Catalog::memory());
+    cat.put(
+        "chain",
+        ProjectionDef {
+            predicates: Some(vec![PredicateDef::new("http://ex/p", None)]),
+            ..Default::default()
+        },
+        None,
+        None,
+    )
+    .unwrap();
+    let opts = QueryOptions {
+        algo_projections: Some(cat),
+        ..Default::default()
+    };
+    let r = rows_with(
+        &s,
+        "SELECT ?n ?c WHERE { SERVICE algo:wcc { [] algo:projection \"chain\" ; algo:node ?n ; algo:component ?c } }",
+        &opts,
+    );
+    assert_eq!(
+        groups(&by_node(&r, "c")),
+        set(&[&["a", "b", "c", "d", "e"], &["f", "g"]])
+    );
+    let q = |body: &str| {
+        format!("{PREFIXES}SELECT ?n WHERE {{ SERVICE algo:wcc {{ [] {body} ; algo:node ?n }} }}")
+    };
+    let fail = |body: &str| match query(s.snapshot(), &q(body), &opts) {
+        Ok(_) => panic!("{body}: expected an error"),
+        Err(e) => e.to_string(),
+    };
+    assert!(fail("algo:projection \"nope\"").contains("no named projection"));
+    assert!(fail("algo:projection \"chain\" ; algo:predicate ex:p").contains("cannot be combined"));
+}
