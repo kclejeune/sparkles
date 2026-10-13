@@ -36,7 +36,8 @@ pub struct ServerPlan {
     pub update_timeout: Option<f64>,
     pub union_default_graph: bool,
     pub read_only: bool,
-    pub gsp_direct_naming: bool,
+    /// the datasets with a direct naming endpoint, and what each allows
+    pub gsp_direct_naming: std::collections::BTreeMap<String, crate::state::DirectMode>,
     pub auto_reason: bool,
     pub metrics_fuseki_names: bool,
     /// `fuseki:realm`

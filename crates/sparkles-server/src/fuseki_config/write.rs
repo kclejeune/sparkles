@@ -42,6 +42,17 @@ pub fn db_dir(ds: &DatasetPlan) -> PathBuf {
     PathBuf::from("db").join(&ds.name)
 }
 
+/// The values of `--gsp-direct-naming`: a dataset and what its direct endpoint allows.
+pub fn direct_naming_values(s: &super::convert::ServerPlan) -> Vec<String> {
+    s.gsp_direct_naming
+        .iter()
+        .map(|(name, mode)| match mode {
+            crate::state::DirectMode::Read => format!("{name}=read"),
+            crate::state::DirectMode::ReadWrite => format!("{name}=read-write"),
+        })
+        .collect()
+}
+
 /// The arguments of `sparkles serve`, with paths relative to the output directory.
 pub fn serve_args(plan: &Plan) -> Vec<String> {
     let mut a: Vec<String> = vec!["serve".into(), "--data".into(), "data".into()];
@@ -61,8 +72,8 @@ pub fn serve_args(plan: &Plan) -> Vec<String> {
     if s.read_only {
         a.push("--read-only".into());
     }
-    if s.gsp_direct_naming {
-        a.push("--gsp-direct-naming".into());
+    for v in direct_naming_values(s) {
+        a.push(format!("--gsp-direct-naming={v}"));
     }
     if s.metrics_fuseki_names {
         a.push("--metrics-fuseki-names".into());
