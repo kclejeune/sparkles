@@ -859,6 +859,28 @@ run = '''
 RUNS="$usage_runs" COMMITS="$usage_commits" scripts/backup-bench.sh "$usage_db" "$(realpath -m "$usage_workdir")"
 '''
 
+[tasks."bench:nsc-writes"]
+description = "Interleaved A/B of durable-commit workloads (serial commits, concurrent writers, writers with readers) of variants NAME=REV[:FLAGS] on an ephemeral Namespace instance (nsc)"
+usage = '''
+arg "<variants>" var=#true help="NAME=REF[:FLAGS]: a revision or sparkles binary, and optional global flags to run it with"
+flag "--people <n>" default="100000" help="dataset size in people (~10.5 triples each)"
+flag "--scenarios <list>" default="serial-literal writers mixed" help="from serial-literal serial-iri serial-delete writers writers16 mixed"
+flag "--rounds <n>" default="3" help="runs of every variant and scenario, each in a fresh server process"
+flag "--changes <n>" default="3000" help="requests of the serial scenarios"
+flag "--writer-changes <n>" default="20000" help="requests of the writers scenarios"
+flag "--mixed-changes <n>" default="5000" help="requests of the mixed scenario"
+flag "--cargo-args <flags>" help="extra cargo build flags for revisions"
+flag "--duration <d>" default="2h" help="the instance's lifetime cap"
+flag "--out <dir>" help="results directory (default target/nsc-writes/<UTC time>)"
+'''
+run = '''
+# shellcheck disable=SC2154,SC2086 # usage_variants is a list of variants
+scripts/nsc-writes.sh --people "$usage_people" --scenarios "$usage_scenarios" --rounds "$usage_rounds" \
+  --changes "$usage_changes" --writer-changes "$usage_writer_changes" --mixed-changes "$usage_mixed_changes" \
+  --duration "$usage_duration" ${usage_cargo_args:+--cargo-args "$usage_cargo_args"} \
+  ${usage_out:+--out "$usage_out"} $usage_variants
+'''
+
 [tasks."bench:nsc"]
 description = "Interleaved A/B query benchmark of two revisions or binaries on an ephemeral Namespace instance (nsc): fresh pinned servers in A,B,B,A rounds, medians, per-round ratios and the geometric mean"
 usage = '''
