@@ -970,6 +970,7 @@ mod tests {
         std::fs::write(root.join("validation-schema.shex"), b"# schema\n").unwrap();
         std::fs::write(root.join("validation-schema.json"), b"{}").unwrap();
         std::fs::write(root.join("origin.json"), b"{}").unwrap();
+        std::fs::write(root.join(".migrate-checked"), b"remove-old").unwrap();
         let c = s.backup_capture("b1").unwrap();
         assert_eq!(c.commit.seq, 3);
         assert_eq!(c.generation, "gen-0001");

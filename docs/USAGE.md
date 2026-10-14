@@ -2223,7 +2223,9 @@ next run renames the checked copy into place. A server, or any other open of the
 database, refuses a database with a pending `.migrate-<name>` until `sparkles migrate`
 has run on it again, so a stopped run never leads to an empty database. A copy that
 carries no mark of a passed check is never renamed into place. The command reports it and
-leaves both directories alone.
+leaves both directories alone. A backup restore also refuses to replace the database while
+a migration is pending, including when the database directory is missing between the two
+renames.
 
 The only step today rewrites a legacy update vocabulary (`delta.vocab`) in the framed
 format, which the first write to it would also do. A server opens such a database

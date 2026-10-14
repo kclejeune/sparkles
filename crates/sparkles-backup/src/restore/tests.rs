@@ -695,6 +695,40 @@ fn swap_dir_replaces_a_directory() {
 }
 
 #[test]
+fn swap_dir_refuses_a_target_with_a_pending_migration() {
+    for present in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("db");
+        if present {
+            db_with(dir.path(), "db", "original");
+        }
+        let work = db_with(dir.path(), ".migrate-db", "checked copy");
+        std::fs::write(work.join(".migrate-checked"), "remove-old").unwrap();
+        let restored = db_with(dir.path(), "db.restore-1", "backup");
+        let e = swap_dir(&target, &restored, false).unwrap_err();
+        assert_eq!(e.code(), Code::DatasetBusy);
+        assert!(e.message().contains("sparkles migrate"), "{e}");
+        assert!(e.message().contains(".migrate-db"), "{e}");
+        assert_eq!(target.exists(), present);
+        if present {
+            assert_eq!(
+                std::fs::read_to_string(target.join("marker")).unwrap(),
+                "original"
+            );
+            assert!(!target.join("sparkles.lock").exists());
+        }
+        assert_eq!(
+            std::fs::read_to_string(work.join("marker")).unwrap(),
+            "checked copy"
+        );
+        assert_eq!(
+            std::fs::read_to_string(restored.join("marker")).unwrap(),
+            "backup"
+        );
+    }
+}
+
+#[test]
 fn swap_dir_refuses_an_open_database() {
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join("db");

@@ -680,9 +680,11 @@ a lock file `.migrate.lock-<name>` next to the database for planning, recovery, 
 and the swap, and the database's own lock until the renames start. `plan` is read-only
 and reports a pending run as `interrupted`, so `--check` changes nothing. A store refuses
 to open a database whose `.migrate-<name>` exists, before it creates the directory and
-again under its lock, so a stopped run never leaves an empty database. The command
-resolves a relative `--loc` to an absolute path, refuses symlinks and special files, and
-does not start while `.pre-migrate-<version>-<name>` exists. Unit tests interrupt the run
+again under its lock, so a stopped run never leaves an empty database. A backup restore
+also refuses to publish over a database with a pending migration, even when the target
+directory is missing. Backup captures and clones leave out the migration check mark.
+The command resolves a relative `--loc` to an absolute path, refuses symlinks and special
+files, and does not start while `.pre-migrate-<version>-<name>` exists. Unit tests interrupt the run
 at each point and check the result, and cover a check during a copy, a live store, the
 lock file's name and a root that reappears next to a checked copy. One step is registered: a legacy delta
 vocabulary to the framed format, which is the lazy upgrade of §4.3 run ahead of time. The

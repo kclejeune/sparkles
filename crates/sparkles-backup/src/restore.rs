@@ -695,7 +695,8 @@ pub fn check_free_space(dir: &Path, logical: u64, reserve: u64, what: &str) -> R
 ///
 /// A `target` that does not exist is simply `restored` renamed. The "in use" error is
 /// `409 dataset-busy`; a leftover `<target>.replaced-<pid>` is refused
-/// (`409 dataset-exists`).
+/// (`409 dataset-exists`). A pending migration refuses the swap, including when
+/// its target is missing between the migration's two renames.
 pub fn swap_dir(target: &Path, restored: &Path, keep_replaced: bool) -> Result<()> {
     let parent = match target.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
@@ -707,12 +708,14 @@ pub fn swap_dir(target: &Path, restored: &Path, keep_replaced: bool) -> Result<(
             format!("{} is not a directory", restored.display()),
         ));
     }
+    check_not_migrating(target)?;
     if !target.exists() {
         std::fs::rename(restored, target)?;
         sync_dir(&parent)?;
         return Ok(());
     }
     let lock = lock_database(target)?;
+    check_not_migrating(target)?;
     let file_name = target
         .file_name()
         .ok_or_else(|| {
@@ -754,6 +757,22 @@ pub fn swap_dir(target: &Path, restored: &Path, keep_replaced: bool) -> Result<(
             dir = %replaced.display(),
             "could not remove the replaced database: {e}"
         );
+    }
+    Ok(())
+}
+
+/// A restore must not fill the missing root of an interrupted migration or replace
+/// the database while a migration copy is pending.
+fn check_not_migrating(target: &Path) -> Result<()> {
+    if let Some(work) = sparkles_core::migrate::pending(target)? {
+        return Err(BackupError::new(
+            Code::DatasetBusy,
+            format!(
+                "{}: an interrupted `sparkles migrate` left {}; run `sparkles migrate` on this database again (without --check) before restoring over it",
+                target.display(),
+                work.display()
+            ),
+        ));
     }
     Ok(())
 }
