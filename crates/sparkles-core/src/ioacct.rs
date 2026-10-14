@@ -18,7 +18,10 @@
 use crate::index::Perm;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{
+    AtomicU64, AtomicUsize,
+    Ordering::{Acquire, Relaxed, Release},
+};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Instant;
 
@@ -102,7 +105,7 @@ static PROFILING: AtomicUsize = AtomicUsize::new(0);
 /// Whether a [`Profile`] is alive, which turns the timers and the page records on.
 #[inline]
 pub fn profiling() -> bool {
-    PROFILING.load(Relaxed) != 0
+    PROFILING.load(Acquire) != 0
 }
 
 /// A column of a block was decoded: `rows` values from `compressed` bytes.
@@ -451,9 +454,7 @@ impl Profile {
     /// Start profiling. Profiles are process-wide: reads of other queries that run at the
     /// same time are counted too.
     pub fn start() -> Profile {
-        if PROFILING.fetch_add(1, Relaxed) == 0 {
-            profile::reset();
-        }
+        profile::start();
         Profile {
             base: IoSnapshot::now(),
             began: Instant::now(),
@@ -482,9 +483,7 @@ impl Profile {
 
 impl Drop for Profile {
     fn drop(&mut self) {
-        if PROFILING.fetch_sub(1, Relaxed) == 1 {
-            profile::reset();
-        }
+        profile::stop();
     }
 }
 
@@ -492,6 +491,35 @@ impl Drop for Profile {
 pub fn mark(what: &'static str) {
     if profiling() {
         profile::mark(what);
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_test {
+    use std::{cell::RefCell, rc::Rc};
+
+    #[derive(Clone, Copy, PartialEq)]
+    pub(super) enum Point {
+        FirstBeforeInit,
+        LastBeforeReset,
+        Contended,
+    }
+    type Callback = Rc<dyn Fn(Point)>;
+    thread_local! { static HOOK: RefCell<Option<Callback>> = const { RefCell::new(None) }; }
+    pub(super) struct Scope(Option<Callback>);
+    pub(super) fn install(f: impl Fn(Point) + 'static) -> Scope {
+        Scope(HOOK.with(|h| h.replace(Some(Rc::new(f)))))
+    }
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            HOOK.with(|h| *h.borrow_mut() = self.0.take());
+        }
+    }
+    pub(super) fn at(point: Point) {
+        let hook = HOOK.with(|h| h.borrow().clone());
+        if let Some(hook) = hook {
+            hook(point);
+        }
     }
 }
 
@@ -513,11 +541,43 @@ mod profile {
 
     fn state() -> MutexGuard<'static, Option<State>> {
         static S: Mutex<Option<State>> = Mutex::new(None);
+        #[cfg(test)]
+        match S.try_lock() {
+            Ok(guard) => return guard,
+            Err(std::sync::TryLockError::Poisoned(e)) => return e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                lifecycle_test::at(lifecycle_test::Point::Contended)
+            }
+        }
         S.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    pub(super) fn reset() {
-        *state() = Some(State {
+    /// Lifetime transitions own the same lock as page and event observations.
+    pub(super) fn start() {
+        let mut guard = state();
+        let active = PROFILING.load(Relaxed);
+        if active == 0 {
+            #[cfg(test)]
+            lifecycle_test::at(lifecycle_test::Point::FirstBeforeInit);
+            reset(&mut guard);
+        }
+        // Publish enabled only after initialization, without locking read hot paths.
+        PROFILING.store(active + 1, Release);
+    }
+
+    pub(super) fn stop() {
+        let mut guard = state();
+        let active = PROFILING.load(Relaxed);
+        PROFILING.store(active - 1, Release);
+        if active == 1 {
+            #[cfg(test)]
+            lifecycle_test::at(lifecycle_test::Point::LastBeforeReset);
+            reset(&mut guard);
+        }
+    }
+
+    fn reset(guard: &mut Option<State>) {
+        *guard = Some(State {
             began: Instant::now(),
             seen: BTreeSet::new(),
             before: BTreeMap::new(),
@@ -698,6 +758,247 @@ mod profile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
+
+    /// Exact process isolation keeps process-wide profiling out of other tests.
+    fn isolated_profile_test(name: &str) -> bool {
+        if std::env::var_os("SPARKLES_PROFILE_LIFETIME_CHILD").is_some() {
+            return false;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &format!("ioacct::tests::{name}"), "--nocapture"])
+            .env("SPARKLES_PROFILE_LIFETIME_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
+    }
+
+    #[derive(Default)]
+    struct Pause {
+        open: (Mutex<bool>, std::sync::Condvar),
+        expired: std::sync::atomic::AtomicBool,
+    }
+    impl Pause {
+        fn wait(&self) {
+            let guard = self.open.0.lock().unwrap();
+            let (guard, timeout) = self
+                .open
+                .1
+                .wait_timeout_while(guard, std::time::Duration::from_secs(5), |open| !*open)
+                .unwrap();
+            if timeout.timed_out() && !*guard {
+                self.expired.store(true, Relaxed);
+            }
+        }
+        fn release(&self) {
+            *self.open.0.lock().unwrap() = true;
+            self.open.1.notify_all();
+        }
+    }
+    impl Drop for Pause {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    fn profile_mapping() -> (File, std::sync::Arc<memmap2::Mmap>, usize) {
+        #[cfg(unix)]
+        // SAFETY: sysconf has no pointer arguments or other preconditions.
+        let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
+        #[cfg(not(unix))]
+        let page = 4096;
+        let f = tempfile::tempfile().unwrap();
+        f.set_len((2 * page) as u64).unwrap();
+        // SAFETY: this private file stays unchanged and alive while mapped.
+        let mapping = unsafe { memmap2::Mmap::map(&f).unwrap() };
+        (f, std::sync::Arc::new(mapping), page)
+    }
+
+    fn has_mark(report: &IoReport, name: &str) -> bool {
+        report
+            .events
+            .as_ref()
+            .is_some_and(|events| events.iter().any(|e| e.what == name))
+    }
+    fn assert_observation(report: &IoReport, name: &str, pages: u64) {
+        assert!(has_mark(report, name), "missing {name}: {report:?}");
+        #[cfg(unix)]
+        assert_eq!(
+            report.pages.as_ref().unwrap()["vocab.dat"].touched,
+            pages,
+            "{report:?}"
+        );
+        #[cfg(not(unix))]
+        let _ = pages;
+    }
+
+    #[test]
+    fn profile_first_start_initializes_before_enabling() {
+        if isolated_profile_test("profile_first_start_initializes_before_enabling") {
+            return;
+        }
+        use lifecycle_test::Point;
+        use std::sync::{Arc, mpsc};
+        // Leave the same inactive state a real preceding last drop leaves behind.
+        drop(Profile::start());
+        let (_file, mapping, _) = profile_mapping();
+        let pause = Arc::new(Pause::default());
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn({
+            let pause = pause.clone();
+            move || {
+                let _hook = lifecycle_test::install(move |point| {
+                    if point == Point::FirstBeforeInit {
+                        let _ = tx.send(());
+                        pause.wait();
+                    }
+                });
+                Profile::start()
+            }
+        });
+        let entered = rx.recv_timeout(std::time::Duration::from_secs(3));
+        let enabled_during_init = entered.is_ok() && profiling();
+        let mut recorded_before_reset = false;
+        if enabled_during_init {
+            mark("during-first-init");
+            touch(IoFile::VocabData, mapping.as_ptr(), 0, 1);
+            recorded_before_reset = profile::events(Instant::now(), 0)
+                .iter()
+                .any(|e| e.what == "during-first-init");
+        }
+        pause.release();
+        let joined = worker.join();
+        // Cleanup and observation precede assertions, including on the old failure.
+        let p = joined.unwrap();
+        mark("after-first-init");
+        touch(IoFile::VocabData, mapping.as_ptr(), 0, 1);
+        let report = p.report();
+        drop(p);
+        eprintln!(
+            "first init paused: enabled={enabled_during_init}, recorded during pause={recorded_before_reset}, retained during-pause mark={}; {report:?}",
+            has_mark(&report, "during-first-init")
+        );
+        assert!(entered.is_ok());
+        assert!(!pause.expired.load(Relaxed));
+        assert!(
+            !enabled_during_init,
+            "profiling enabled before first initialization"
+        );
+        assert_observation(&report, "after-first-init", 1);
+        assert!(!profiling());
+    }
+
+    #[test]
+    fn profile_last_drop_cannot_erase_a_new_epoch() {
+        if isolated_profile_test("profile_last_drop_cannot_erase_a_new_epoch") {
+            return;
+        }
+        use lifecycle_test::Point;
+        use std::sync::{Arc, mpsc};
+        enum Event {
+            Contended,
+            Ready(Box<(Profile, IoReport)>),
+        }
+        let (_file, mapping, _) = profile_mapping();
+        let old = Profile::start();
+        let pause = Arc::new(Pause::default());
+        let (paused_tx, paused_rx) = mpsc::channel();
+        let dropping = std::thread::spawn({
+            let pause = pause.clone();
+            move || {
+                let _hook = lifecycle_test::install(move |point| {
+                    if point == Point::LastBeforeReset {
+                        let _ = paused_tx.send(());
+                        pause.wait();
+                    }
+                });
+                drop(old);
+            }
+        });
+        let entered = paused_rx.recv_timeout(std::time::Duration::from_secs(3));
+        let (tx, rx) = mpsc::channel();
+        let starting = std::thread::spawn(move || {
+            let hook_tx = tx.clone();
+            let _hook = lifecycle_test::install(move |point| {
+                if point == Point::Contended {
+                    let _ = hook_tx.send(Event::Contended);
+                }
+            });
+            let fresh = Profile::start();
+            mark("fresh-epoch");
+            touch(IoFile::VocabData, mapping.as_ptr(), 0, 1);
+            let before = fresh.report();
+            let _ = tx.send(Event::Ready(Box::new((fresh, before))));
+        });
+        let first = rx.recv_timeout(std::time::Duration::from_secs(3));
+        let contended = matches!(first, Ok(Event::Contended));
+        // The repaired start is blocked by the old transition's mutex. Release it
+        // before awaiting Ready; the old implementation is already Ready here.
+        pause.release();
+        let dropped = dropping.join();
+        let ready = match first {
+            Ok(Event::Ready(pair)) => Some(*pair),
+            _ => match rx.recv_timeout(std::time::Duration::from_secs(3)) {
+                Ok(Event::Ready(pair)) => Some(*pair),
+                _ => None,
+            },
+        };
+        let started = starting.join();
+        let (p, before) = ready.expect("new profile did not finish after releasing old drop");
+        let after = p.report();
+        drop(p);
+        eprintln!(
+            "last-drop schedule: contended={contended}, fresh startup report={before:?}, after={after:?}"
+        );
+        assert!(entered.is_ok());
+        assert!(dropped.is_ok() && started.is_ok());
+        assert!(!pause.expired.load(Relaxed));
+        assert_observation(&before, "fresh-epoch", 1);
+        assert_observation(&after, "fresh-epoch", 1);
+        assert!(contended, "new epoch bypassed the old transition lock");
+        assert!(!profiling());
+    }
+
+    #[test]
+    fn overlapping_profiles_preserve_the_live_epoch() {
+        if isolated_profile_test("overlapping_profiles_preserve_the_live_epoch") {
+            return;
+        }
+        let (_file, mapping, page) = profile_mapping();
+        let first = Profile::start();
+        mark("first-live");
+        touch(IoFile::VocabData, mapping.as_ptr(), 0, 1);
+        let worker = std::thread::spawn(move || {
+            let second = Profile::start();
+            mark("second-live");
+            touch(IoFile::VocabData, mapping.as_ptr(), page, 1);
+            let report = second.report();
+            drop(second);
+            report
+        });
+        let during = worker.join().unwrap();
+        let enabled_with_first_alive = profiling();
+        mark("first-still-live");
+        let after = first.report();
+        drop(first);
+        assert!(enabled_with_first_alive);
+        for name in ["first-live", "second-live"] {
+            assert_observation(&during, name, 2);
+            assert_observation(&after, name, 2);
+        }
+        assert_observation(&after, "first-still-live", 2);
+        assert!(!profiling());
+        let fresh = Profile::start();
+        let empty = fresh.report();
+        drop(fresh);
+        assert!(empty.events.is_none() && empty.pages.is_none());
+    }
 
     #[test]
     fn snapshots_subtract() {
@@ -715,6 +1016,9 @@ mod tests {
 
     #[test]
     fn profile_counts_resident_pages() {
+        if isolated_profile_test("profile_counts_resident_pages") {
+            return;
+        }
         use std::io::Write;
         let mut f = tempfile::tempfile().unwrap();
         f.write_all(&vec![7u8; 64 * 4096]).unwrap();

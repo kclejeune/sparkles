@@ -485,8 +485,8 @@ target. It permits at most one next-block extension with a bridged gap of at mos
 A separate examined-span cap bounds traversal through cached or empty spans without
 claiming they were hinted. Repeated calls at one position add no window. The bound is
 on requested coverage rather than physical device I/O. Default, disabled and small-window
-configuration tests retain the same scan-answer assertions. Profile lifetime
-synchronization and corrected-source performance gates remain pending.
+configuration tests retain the same scan-answer assertions. Corrected-source
+performance gates remain pending.
 
 Coverage lookup uses the sorted intervals to stop at the first future interval beyond
 the required start. It retains complete-span containment and consumed-prefix pruning.
@@ -505,8 +505,17 @@ hints, disabled automatic look-ahead, advice issued before the profile, partial 
 invalid IDs and early callback or reservation errors. A Linux test evicts only a private
 file's offset pages and independently checks a middle page with `mincore` before lookup.
 The profile then reports that page absent before the read and resident afterward.
-Profile lifetime synchronization remains pending, as do the corrected-source cold,
-warm and no-profile performance gates. These checks establish no speed result.
+Corrected-source cold, warm and no-profile performance gates remain pending. These
+checks establish no speed result.
+
+Profile lifetime transitions now share the page and event state lock. The first start
+initializes that state before publishing profiling as enabled. The last drop disables
+profiling and completes cleanup before a new epoch can start. Overlapping profiles
+retain their shared process-wide observations. Isolated tests pause the actual first
+start and last drop transitions and verify initialization ordering, preservation of a
+new epoch's observations and preservation while another profile remains alive. The
+read path still checks an atomic flag without acquiring this lock when profiling is
+disabled. These correctness checks do not establish the counter-cost performance gate.
 
 ### Phase 1 breakdown
 
