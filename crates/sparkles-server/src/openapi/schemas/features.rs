@@ -36,6 +36,7 @@ fn reasoning(put: &mut dyn FnMut(&str, J)) {
                         ],
                     })),
                     "refreshImports": { "type": "boolean", "description": "Load again the imports that earlier runs fetched." },
+                    "threads": { "type": "integer", "minimum": 1, "description": "Threads the run evaluates rules on, at most those of the server's reasoning pool." },
                 }),
             ),
             "A reasoning run: the profile, its rules and extras, and the input graphs.",

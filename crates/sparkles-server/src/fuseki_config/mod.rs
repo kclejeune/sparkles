@@ -394,6 +394,7 @@ pub fn start(st: &std::sync::Arc<crate::state::AppState>, add: &ServeAdditions) 
             crate::reasoning::Trigger::Request,
             false,
             false,
+            None,
         );
         tracing::info!(
             "fuseki-config: materializing the inferences of /{name} (task {})",

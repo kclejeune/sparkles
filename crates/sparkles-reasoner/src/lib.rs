@@ -288,19 +288,27 @@ fn load_graphs(snap: &Snapshot, graphs: &[Id], extra: usize) -> anyhow::Result<g
     Ok(g)
 }
 
+/// The thread pool type of [`ReasonOptions::pool`].
+pub use rayon::ThreadPool;
+
+/// A thread pool for rule evaluation, of `threads` threads, for
+/// [`ReasonOptions::pool`].
+pub fn thread_pool(threads: usize) -> anyhow::Result<Arc<rayon::ThreadPool>> {
+    Ok(Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads.max(1))
+            .thread_name(|i| format!("sparkles-reason-{i}"))
+            .build()?,
+    ))
+}
+
 /// Run `f` on the threads the options ask for: a pool of [`ReasonOptions::threads`]
 /// threads (at most the size of [`ReasonOptions::pool`]), the pool itself, or the
 /// caller's.
 fn on_threads<T: Send>(opts: &ReasonOptions, f: impl FnOnce() -> T + Send) -> anyhow::Result<T> {
     let limit = opts.pool.as_ref().map(|p| p.current_num_threads());
     match (opts.threads, &opts.pool) {
-        (Some(n), _) if n > 0 && limit.is_none_or(|l| n < l) => {
-            let p = rayon::ThreadPoolBuilder::new()
-                .num_threads(n)
-                .thread_name(|i| format!("sparkles-reason-{i}"))
-                .build()?;
-            Ok(p.install(f))
-        }
+        (Some(n), _) if n > 0 && limit.is_none_or(|l| n < l) => Ok(thread_pool(n)?.install(f)),
         (_, Some(pool)) => Ok(pool.install(f)),
         _ => Ok(f()),
     }
@@ -390,6 +398,102 @@ fn default_geometries(base: &facts::Base, terms: &Terms) -> anyhow::Result<Vec<[
         .collect();
     out.sort_unstable();
     Ok(out)
+}
+
+/// Flag the default geometries of the previous run explicit in `closure`, and add the
+/// changes of the default geometries of the features that `ch` changes to `ch`: a
+/// default geometry is added as an explicit fact, and one that no longer holds is
+/// removed as one. Returns the default geometries now, and those that changed, which the
+/// inferred graph may have to follow even when the explicit facts do not change.
+///
+/// The previous ones are those of now, except for the features whose `geo:hasGeometry`
+/// or `geo:hasDefaultGeometry` facts changed. For those, the input graphs then are the
+/// input graphs now without the added facts and with the removed ones.
+fn default_geometry_changes(
+    base: &facts::Base,
+    closure: &mut incremental::Closure,
+    ch: &mut maintain::Changes,
+) -> anyhow::Result<(FxHashSet<[u64; 3]>, Vec<[u64; 3]>)> {
+    const GEO: &str = "http://www.opengis.net/ont/geosparql#";
+    let terms = &closure.terms;
+    let iri = |l: &str| {
+        terms.id_for(&Term::NamedNode(NamedNode::new_unchecked(format!(
+            "{GEO}{l}"
+        ))))
+    };
+    let (has, default) = (iri("hasGeometry"), iri("hasDefaultGeometry"));
+    let now: FxHashSet<[u64; 3]> = default_geometries(base, terms)?.into_iter().collect();
+    let geo = |t: &&[u64; 3]| t[1] == has || t[1] == default;
+    let mut changed: Vec<u64> = ch
+        .base_added
+        .iter()
+        .chain(&ch.base_removed)
+        .filter(geo)
+        .map(|t| t[0])
+        .collect();
+    changed.sort_unstable();
+    changed.dedup();
+    let added: FxHashSet<[u64; 3]> = ch.base_added.iter().filter(geo).copied().collect();
+    let removed: FxHashSet<[u64; 3]> = ch.base_removed.iter().filter(geo).copied().collect();
+    // the default geometry of a feature, given its facts of the two properties
+    let of = |f: u64, facts: &[[u64; 3]]| -> Option<[u64; 3]> {
+        if facts.iter().any(|t| t[1] == default) {
+            return None;
+        }
+        let mut g = facts.iter().filter(|t| t[1] == has).map(|t| t[2]);
+        let first = g.next()?;
+        g.all(|x| x == first).then_some([f, default, first])
+    };
+    let mut before: FxHashSet<[u64; 3]> = now
+        .iter()
+        .filter(|t| changed.binary_search(&t[0]).is_err())
+        .copied()
+        .collect();
+    let (mut gone, mut new) = (Vec::new(), Vec::new());
+    for &f in &changed {
+        let mut facts: Vec<[u64; 3]> = Vec::new();
+        for p in [has, default] {
+            base.for_each(Some(f), Some(p), None, |t| {
+                facts.push(t);
+                true
+            })?;
+        }
+        let after = of(f, &facts);
+        facts.retain(|t| !added.contains(t));
+        facts.extend(removed.iter().filter(|t| t[0] == f));
+        let then = of(f, &facts);
+        if let Some(d) = then {
+            before.insert(d);
+        }
+        if then != after {
+            gone.extend(then);
+            new.extend(after);
+        }
+    }
+    for d in &before {
+        if let Some(r) = closure.graph.position(d) {
+            closure.set_base(r, true);
+        }
+    }
+    let touched: Vec<[u64; 3]> = gone.iter().chain(&new).copied().collect();
+    // a default geometry that is also stated, or no longer stated, does not change
+    for d in gone {
+        match ch.base_added.iter().position(|t| *t == d) {
+            Some(i) => {
+                ch.base_added.swap_remove(i);
+            }
+            None => ch.base_removed.push(d),
+        }
+    }
+    for d in new {
+        match ch.base_removed.iter().position(|t| *t == d) {
+            Some(i) => {
+                ch.base_removed.swap_remove(i);
+            }
+            None => ch.base_added.push(d),
+        }
+    }
+    Ok((now, touched))
 }
 
 impl Derivation {
@@ -554,7 +658,7 @@ pub fn materialize_incremental(
         peak_bytes: d.peak_bytes,
         base_scans: d.base_scans,
         threads: d.threads,
-        closure: (!extras.geo_default_geometry).then_some(ClosureState::Derived(d)),
+        closure: Some(ClosureState::Derived(d)),
         generalized,
         generalized_saved: None,
         written: w,
@@ -887,9 +991,6 @@ fn update_closure(
     raw: Result<maintain::RawChanges, String>,
     opts: &ReasonOptions,
 ) -> anyhow::Result<Done> {
-    if extras.geo_default_geometry {
-        return Err(Fallback("GeoSPARQL default geometries are not monotonic".into()).into());
-    }
     if since > snap.commit {
         return Err(Fallback("the store position moved backwards".into()).into());
     }
@@ -920,6 +1021,16 @@ fn update_closure(
     progress(opts, 0.0, "reading the previous closure");
     let prev = maintain::previous(store, snap, since, digest, &graphs, inc.cache, raw)?;
     let mut closure = prev.closure;
+    let mut ch = prev.changes;
+    // the default geometries count as explicit facts, so that the update keeps the facts
+    // derived from them; those of the changed features change with the explicit ones
+    let (defaults, touched) = if extras.geo_default_geometry {
+        let base = facts::Base::new(snap.clone(), &resolved.ids(snap))?;
+        let (now, touched) = default_geometry_changes(&base, &mut closure, &mut ch)?;
+        (Some(now), touched)
+    } else {
+        (None, Vec::new())
+    };
     let mut warnings = Vec::new();
     let compiled = engine::compile(&rules, &closure.terms, &mut warnings);
     let limits = engine::Limits {
@@ -929,7 +1040,7 @@ fn update_closure(
         cancel: opts.cancel.clone(),
         progress: opts.progress.clone(),
     };
-    let ch = &prev.changes;
+    let ch = &ch;
     progress(opts, 0.1, "updating the closure");
     let (up, threads) = on_threads(opts, || {
         let up = incremental::update(
@@ -963,8 +1074,9 @@ fn update_closure(
         .chain(&ch.base_added)
         .chain(&ch.base_removed)
         .chain(&ch.inferred_added)
-        .chain(&ch.inferred_removed);
-    let written = write_changes(txn, snap, &closure, candidates)?;
+        .chain(&ch.inferred_removed)
+        .chain(&touched);
+    let written = write_changes(txn, snap, &closure, candidates, defaults.as_ref())?;
     let changes = Changes {
         base_added: ch.base_added.len() as u64,
         base_removed: ch.base_removed.len() as u64,
@@ -1004,6 +1116,7 @@ fn write_changes<'a>(
     snap: &Snapshot,
     c: &incremental::Closure,
     candidates: impl Iterator<Item = &'a [u64; 3]>,
+    defaults: Option<&FxHashSet<[u64; 3]>>,
 ) -> anyhow::Result<Written> {
     let mut w = Written::default();
     let graph = snap.lookup_iri(INFERRED_GRAPH);
@@ -1013,7 +1126,13 @@ fn write_changes<'a>(
         if !seen.insert(*t) {
             continue;
         }
-        let want = c.graph.position(t).is_some_and(|r| !c.is_base(r)) && c.terms.valid(t);
+        // the default geometries are flagged explicit in the closure but belong to the
+        // inferred graph
+        let want = c
+            .graph
+            .position(t)
+            .is_some_and(|r| !c.is_base(r) || defaults.is_some_and(|d| d.contains(t)))
+            && c.terms.valid(t);
         let local = t.iter().any(|&x| Id(x).tag() == Tag::Local);
         let have = match graph {
             Some(g) if !local => txn.contains(&[Id(t[0]), Id(t[1]), Id(t[2]), g])?,

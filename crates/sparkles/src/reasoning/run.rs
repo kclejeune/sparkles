@@ -33,6 +33,13 @@ pub struct ReasonRequest {
     /// rules, the timeouts and the response ceiling of a SPARQL `LOAD`. Its `cancel` is
     /// the run's.
     pub load: QueryOptions,
+    /// Threads for rule evaluation, at most those of the reasoning pool
+    /// ([`set_reason_threads`](crate::reasoning::set_reason_threads)). `None` uses the
+    /// whole pool.
+    pub threads: Option<usize>,
+    /// The largest estimated heap of the derived facts and their candidates, in bytes,
+    /// before the run fails. `None` sets no limit.
+    pub max_memory: Option<usize>,
 }
 
 impl Default for ReasonRequest {
@@ -46,6 +53,8 @@ impl Default for ReasonRequest {
             refresh_imports: false,
             yield_to_writers: false,
             load: QueryOptions::default(),
+            threads: None,
+            max_memory: None,
         }
     }
 }
@@ -106,6 +115,9 @@ pub(crate) fn run(ds: &Dataset, req: &ReasonRequest, ctl: &Control) -> Result<Re
         progress: Some(progress),
         cancel: Some(cancel),
         inputs: req.inputs.clone(),
+        threads: req.threads,
+        max_memory: req.max_memory,
+        pool: super::reason_pool(),
         ..Default::default()
     };
     let superseded = AtomicBool::new(false);
@@ -253,6 +265,9 @@ pub fn run_info(report: &ReasonReport) -> RunInfo {
             derived: c.derived,
             source: c.source.clone(),
         }),
+        peak_bytes: report.peak_bytes,
+        base_scans: report.base_scans,
+        threads: report.threads as u64,
     }
 }
 

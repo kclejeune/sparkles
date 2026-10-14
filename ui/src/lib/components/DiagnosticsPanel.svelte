@@ -44,6 +44,7 @@
     { id: 'all-disjoint-properties', label: 'AllDisjointProperties' },
     { id: 'negative-property-assertion', label: 'Negative property assertions' },
     { id: 'thing-empty', label: 'Empty owl:Thing' },
+    { id: 'literal-not-in-datatype', label: 'Literals outside their datatype' },
     { id: 'unsatisfiable-class', label: 'Unsatisfiable classes (warning)' },
   ];
   /** OWL 2 RL rule table (OWL 2 Profiles §4.3). */

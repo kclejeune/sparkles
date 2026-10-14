@@ -204,3 +204,94 @@ fn geometries_are_typed_from_their_serializations() {
     run(&s2, &[], false);
     assert!(select(&s2, "SELECT ?x { ?x a sf:Point }", true).is_empty());
 }
+
+/// Incremental runs with default geometries write what a full run writes, from a closure
+/// kept in memory and from one read back from the dataset.
+#[test]
+fn default_geometries_follow_changes_incrementally() {
+    use sparkles_reasoner::{Cache, Incremental, Method, materialize_incremental};
+    let inferred = |s: &Store| {
+        let mut v = select_all(s);
+        v.sort();
+        v
+    };
+    let changes = [
+        "INSERT DATA { ex:p1 geo:hasGeometry ex:g1b }",
+        "INSERT DATA { ex:p4 geo:hasGeometry ex:g4 }",
+        "DELETE DATA { ex:p2 geo:hasGeometry ex:g2b }",
+        "INSERT DATA { ex:p4 geo:hasDefaultGeometry ex:g4 }",
+        "DELETE DATA { ex:p4 geo:hasDefaultGeometry ex:g4 }",
+        "DELETE DATA { ex:p3 geo:hasDefaultGeometry ex:g3b }",
+        "DELETE DATA { ex:p1 geo:hasGeometry ex:g1b }",
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let persistent = Store::open(&dir.path().join("db"), StoreOptions::default()).unwrap();
+    persistent
+        .load(&[Source::from_bytes(
+            DATA.as_bytes().to_vec(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    for (s, cache) in [(store(), Some(Cache::new(1 << 20))), (persistent, None)] {
+        let extras = Extras::parse(&["geosparql"], true).unwrap();
+        let go = |since: Option<u64>| {
+            materialize_incremental(
+                &s,
+                &Profile::Rdfs,
+                &extras,
+                Incremental {
+                    since,
+                    cache: cache.as_ref(),
+                },
+                &ReasonOptions::default(),
+            )
+            .unwrap_or_else(|e| panic!("{e:#}"))
+        };
+        let mut since = go(None).receipt.unwrap().commit.seq;
+        for (i, u) in changes.iter().enumerate() {
+            sparkles_core::sparql::update::update(&s, &format!("{P}{u}"), &QueryOptions::default())
+                .unwrap();
+            let r = go(Some(since));
+            assert_eq!(r.method, Method::Incremental, "{u}: {:?}", r.fallback);
+            let got = inferred(&s);
+            // every other step continues from a full run's closure
+            let r = go(None);
+            assert_eq!(got, inferred(&s), "{u}");
+            if i % 2 == 0 {
+                since = r.receipt.unwrap().commit.seq;
+            } else {
+                sparkles_core::sparql::update::update(
+                    &s,
+                    &format!("{P}INSERT DATA {{ ex:z ex:step {i} }}"),
+                    &QueryOptions::default(),
+                )
+                .unwrap();
+                since = go(Some(r.receipt.unwrap().commit.seq))
+                    .receipt
+                    .unwrap()
+                    .commit
+                    .seq;
+            }
+        }
+        assert_eq!(
+            select(&s, "SELECT ?x { ?x geo:hasDefaultGeometry ?g }", true),
+            ["A", "p1", "p2", "p3", "p4"]
+        );
+    }
+}
+
+/// The triples of the inferred graph, as N-Triples.
+fn select_all(s: &Store) -> Vec<String> {
+    let q = format!("SELECT ?s ?p ?o {{ GRAPH <{INFERRED_GRAPH}> {{ ?s ?p ?o }} }}");
+    let r = query(s.snapshot(), &q, &QueryOptions::default()).unwrap();
+    r.rows()
+        .into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|t| t.map_or(String::new(), |t| t.to_string()))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect()
+}

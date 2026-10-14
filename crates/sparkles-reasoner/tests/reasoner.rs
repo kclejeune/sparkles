@@ -660,6 +660,34 @@ fn limits_and_cancellation() {
     )
     .unwrap_err();
     assert!(e.to_string().contains("fixpoint"), "{e}");
+    let e = materialize(
+        &s,
+        &Profile::OwlRl,
+        &ReasonOptions {
+            max_memory: Some(64),
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(e.to_string().contains("memory limit"), "{e}");
+    // a run within the limit, on a pool of its own, reports its peak and threads
+    let r = materialize(
+        &s,
+        &Profile::OwlRl,
+        &ReasonOptions {
+            max_memory: Some(1 << 30),
+            threads: Some(2),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        r.peak_bytes > 0 && r.peak_bytes < 1 << 30,
+        "{}",
+        r.peak_bytes
+    );
+    assert_eq!(r.threads, 2);
+    clear(&s).unwrap();
     let cancel = Arc::new(AtomicBool::new(true));
     let e = materialize(
         &s,

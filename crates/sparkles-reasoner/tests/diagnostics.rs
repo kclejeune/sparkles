@@ -702,3 +702,56 @@ fn property_checks_see_inferred_assertions_with_their_basis() {
     assert_eq!(f.len(), 1);
     assert_eq!(f[0]["basis"], "uses-inferences");
 }
+
+#[test]
+fn dt_not_type_literals_outside_their_datatype() {
+    // F16 A10: a range violation and an ill-typed literal, but not 1.0 for xsd:integer
+    let mut f = only(
+        r#"ex:age rdfs:range xsd:integer .
+           ex:p ex:age "abc" .
+           ex:q ex:age "1.0"^^xsd:decimal .
+           ex:r ex:height "tall"^^xsd:decimal ."#,
+        "literal-not-in-datatype",
+    );
+    f.sort_by_key(|x| x["focus"]["value"].as_str().unwrap_or("").to_string());
+    assert_eq!(f.len(), 2, "{f:#?}");
+    assert_eq!(f[0]["focus"], uri("p"));
+    assert_eq!(f[0]["rule"], "dt-not-type");
+    assert_eq!(
+        f[0]["evidence"]["range"]["value"],
+        "http://www.w3.org/2001/XMLSchema#integer"
+    );
+    assert_eq!(f[0]["evidence"]["literal"]["value"], "abc");
+    assert_eq!(f[1]["focus"], uri("r"));
+    assert_eq!(f[1]["evidence"]["literal"]["value"], "tall");
+    // ranges through a subproperty, and the value spaces of the table
+    let f = only(
+        r#"ex:size rdfs:range xsd:byte . ex:width rdfs:subPropertyOf ex:size .
+           ex:a ex:width 300 .
+           ex:b ex:width 12 .
+           ex:name rdfs:range rdf:langString .
+           ex:c ex:name "plain" .
+           ex:d ex:name "tagged"@en .
+           ex:w rdfs:range xsd:double .
+           ex:e ex:w 1.5e0 .
+           ex:f ex:w 1.5 .
+           ex:g ex:flag "maybe"^^xsd:boolean .
+           ex:h ex:flag "1"^^xsd:boolean .
+           ex:i ex:other "x"^^ex:custom ."#,
+        "literal-not-in-datatype",
+    );
+    let mut foci: Vec<String> = f
+        .iter()
+        .map(|x| x["focus"]["value"].as_str().unwrap().to_string())
+        .collect();
+    foci.sort();
+    assert_eq!(
+        foci,
+        [
+            "http://ex.org/a",
+            "http://ex.org/c",
+            "http://ex.org/f",
+            "http://ex.org/g"
+        ]
+    );
+}

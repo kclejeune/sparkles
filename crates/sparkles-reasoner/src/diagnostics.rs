@@ -182,6 +182,12 @@ pub const CHECKS: &[Check] = &[
         query: include_str!("../diagnostics/thing-empty.rq"),
     },
     Check {
+        id: "literal-not-in-datatype",
+        rules: &["dt-not-type", "dt-type2", "prp-rng"],
+        severity: Severity::Inconsistency,
+        query: include_str!("../diagnostics/datatype-range.rq"),
+    },
+    Check {
         id: "unsatisfiable-class",
         rules: &["lint"],
         severity: Severity::Warning,
@@ -827,6 +833,9 @@ impl Run<'_> {
                 format!("{} {} {} {}", t("d")?, t("x")?, t("y")?, pair("p1", "p2")?)
             }
             "negative-property-assertion" => t("a")?,
+            "literal-not-in-datatype" => {
+                format!("{} {} {} {}", t("x")?, t("p")?, t("lit")?, t("range")?)
+            }
             _ => return None,
         })
     }
@@ -1178,6 +1187,49 @@ impl Run<'_> {
                     msg,
                 )
             }
+            "literal-not-in-datatype" => {
+                let (Some(x), Some(p), Some(range), Some(Term::Literal(lit))) =
+                    (get("x"), get("p"), get("range"), get("lit"))
+                else {
+                    return Ok(None);
+                };
+                let Term::NamedNode(r) = &range else {
+                    return Ok(None);
+                };
+                // only a literal the table decides is outside is reported
+                if in_value_space(&lit, r.as_str()) != Some(false) {
+                    return Ok(None);
+                }
+                let by_range = matches!(get("via"), Some(Term::Literal(v)) if v.value() == "range");
+                let l = Term::Literal(lit);
+                let msg = if by_range {
+                    format!(
+                        "{} {} {}: the value is not in the value space of {}, a range of {}",
+                        n(&x),
+                        n(&p),
+                        n(&l),
+                        n(&range),
+                        n(&p)
+                    )
+                } else {
+                    format!(
+                        "{} {} {}: the literal is ill-typed for its datatype {}",
+                        n(&x),
+                        n(&p),
+                        n(&l),
+                        n(&range)
+                    )
+                };
+                (
+                    x,
+                    vec![
+                        ("property", Evidence::One(p)),
+                        ("range", Evidence::One(range)),
+                        ("literal", Evidence::One(l)),
+                    ],
+                    msg,
+                )
+            }
             _ => return Ok(None),
         };
         Ok(Some(Finding {
@@ -1261,5 +1313,309 @@ impl Names {
             }
             t => t.to_string(),
         }
+    }
+}
+
+const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
+const RDF_LANG_STRING: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString";
+const RDF_PLAIN_LITERAL: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#PlainLiteral";
+
+/// The bounds of xsd:integer and its derived types, `None` for no bound.
+fn integer_bounds(local: &str) -> Option<(Option<i128>, Option<i128>)> {
+    Some(match local {
+        "integer" => (None, None),
+        "long" => (Some(i64::MIN as i128), Some(i64::MAX as i128)),
+        "int" => (Some(i32::MIN as i128), Some(i32::MAX as i128)),
+        "short" => (Some(i16::MIN as i128), Some(i16::MAX as i128)),
+        "byte" => (Some(i8::MIN as i128), Some(i8::MAX as i128)),
+        "nonNegativeInteger" => (Some(0), None),
+        "nonPositiveInteger" => (None, Some(0)),
+        "positiveInteger" => (Some(1), None),
+        "negativeInteger" => (None, Some(-1)),
+        "unsignedLong" => (Some(0), Some(u64::MAX as i128)),
+        "unsignedInt" => (Some(0), Some(u32::MAX as i128)),
+        "unsignedShort" => (Some(0), Some(u16::MAX as i128)),
+        "unsignedByte" => (Some(0), Some(u8::MAX as i128)),
+        _ => return None,
+    })
+}
+
+const STRING_TYPES: &[&str] = &[
+    "string",
+    "normalizedString",
+    "token",
+    "language",
+    "Name",
+    "NCName",
+    "NMTOKEN",
+];
+
+/// The number a literal of xsd:decimal, xsd:integer or a type derived from xsd:integer
+/// denotes: an integer, or a decimal that is not one (`Err`). `None` when the literal is
+/// ill-typed.
+fn decimal_value(lex: &str, local: &str) -> Option<Result<i128, ()>> {
+    let lex = lex.trim();
+    if local == "decimal" {
+        let body = lex.strip_prefix(['+', '-']).unwrap_or(lex);
+        let (int, frac) = body.split_once('.').unwrap_or((body, ""));
+        if (int.is_empty() && frac.is_empty())
+            || !int.bytes().all(|b| b.is_ascii_digit())
+            || !frac.bytes().all(|b| b.is_ascii_digit())
+        {
+            return None;
+        }
+        if frac.bytes().any(|b| b != b'0') {
+            return Some(Err(()));
+        }
+        let int = if int.is_empty() { "0" } else { int };
+        let v = int.parse::<i128>().map_or(Err(()), Ok);
+        return Some(v.map(|v| if lex.starts_with('-') { -v } else { v }));
+    }
+    let (lo, hi) = integer_bounds(local)?;
+    let body = lex.strip_prefix(['+', '-']).unwrap_or(lex);
+    if body.is_empty() || !body.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    // a magnitude beyond i128 is in no bounded type and is an integer
+    let v = match lex.parse::<i128>() {
+        Ok(v) => v,
+        Err(_) => {
+            return if lo.is_none() && hi.is_none() {
+                Some(Ok(0))
+            } else {
+                None
+            };
+        }
+    };
+    if lo.is_some_and(|lo| v < lo) || hi.is_some_and(|hi| v > hi) {
+        return None;
+    }
+    Some(Ok(v))
+}
+
+fn name_char(c: char, first: bool) -> bool {
+    c.is_alphabetic()
+        || c == '_'
+        || c == ':'
+        || (!first && (c.is_numeric() || c == '-' || c == '.'))
+}
+
+/// Whether a string lies in the value space of a string type: xsd:string or one derived
+/// from it by facets.
+fn string_in(v: &str, local: &str) -> bool {
+    let normalized = !v.contains(['\r', '\n', '\t']);
+    let token = normalized && !v.starts_with(' ') && !v.ends_with(' ') && !v.contains("  ");
+    match local {
+        "string" => true,
+        "normalizedString" => normalized,
+        "token" => token,
+        "language" => {
+            let mut parts = v.split('-');
+            let first = parts.next().unwrap_or("");
+            (1..=8).contains(&first.len())
+                && first.bytes().all(|b| b.is_ascii_alphabetic())
+                && parts.all(|p| {
+                    (1..=8).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_alphanumeric())
+                })
+        }
+        "NMTOKEN" => !v.is_empty() && v.chars().all(|c| name_char(c, false)),
+        "Name" | "NCName" => {
+            let mut cs = v.chars();
+            cs.next().is_some_and(|c| name_char(c, true))
+                && cs.all(|c| name_char(c, false))
+                && (local == "Name" || !v.contains(':'))
+        }
+        _ => false,
+    }
+}
+
+/// Whether a literal of `dt` (an XSD local name) is well typed, for the datatypes of the
+/// last row of the check's table, or `None` for the others.
+fn well_typed_other(lex: &str, local: &str) -> Option<bool> {
+    let lex_t = lex.trim();
+    Some(match local {
+        "boolean" => matches!(lex_t, "true" | "false" | "1" | "0"),
+        "dateTime" => matches!(
+            sparkles_core::sparql::value::Value::from_typed(lex_t, &format!("{XSD}dateTime")),
+            sparkles_core::sparql::value::Value::DateTime(_)
+        ),
+        "dateTimeStamp" => {
+            well_typed_other(lex_t, "dateTime")?
+                && (lex_t.ends_with('Z') || {
+                    let b = lex_t.as_bytes();
+                    b.len() > 6 && matches!(b[b.len() - 6], b'+' | b'-') && b[b.len() - 3] == b':'
+                })
+        }
+        "anyURI" => true,
+        "hexBinary" => lex_t.len() % 2 == 0 && lex_t.bytes().all(|b| b.is_ascii_hexdigit()),
+        "base64Binary" => {
+            let s: Vec<u8> = lex_t.bytes().filter(|b| *b != b' ').collect();
+            let body = s.iter().take_while(|b| **b != b'=').count();
+            s.len() % 4 == 0
+                && s.len() - body <= 2
+                && s[..body]
+                    .iter()
+                    .all(|b| b.is_ascii_alphanumeric() || *b == b'+' || *b == b'/')
+                && s[body..].iter().all(|b| *b == b'=')
+        }
+        _ => return None,
+    })
+}
+
+/// Whether `lit` is in the value space of the datatype `range` (OWL 2 RL `dt-not-type`),
+/// or `None` when the check's table does not decide it: for ranges outside the table and
+/// for literals of datatypes outside the XSD and RDF string types.
+pub fn in_value_space(lit: &Literal, range: &str) -> Option<bool> {
+    let lang = lit.language().is_some();
+    let dt = lit.datatype();
+    let dt = dt.as_str();
+    // the literal's own datatype as an XSD local name; a datatype the table does not
+    // know leaves the answer open, unless the literal has a language tag
+    let local = dt.strip_prefix(XSD);
+    let known = lang || local.is_some();
+    let lex = lit.value();
+    if range == RDF_LANG_STRING {
+        return if lang {
+            Some(true)
+        } else {
+            known.then_some(false)
+        };
+    }
+    if range == RDF_PLAIN_LITERAL {
+        return if lang || local == Some("string") {
+            Some(true)
+        } else {
+            known.then_some(false)
+        };
+    }
+    let r = range.strip_prefix(XSD)?;
+    if lang {
+        // a language-tagged string is in none of the XSD value spaces
+        return (r == "decimal"
+            || integer_bounds(r).is_some()
+            || matches!(r, "double" | "float")
+            || STRING_TYPES.contains(&r)
+            || well_typed_other("", r).is_some())
+        .then_some(false);
+    }
+    let local = local?;
+    let numeric_dt = local == "decimal" || integer_bounds(local).is_some();
+    if r == "decimal" || integer_bounds(r).is_some() {
+        if matches!(local, "double" | "float") {
+            return Some(false);
+        }
+        if !numeric_dt {
+            return Some(false);
+        }
+        let v = match decimal_value(lex, local) {
+            None => return Some(false),
+            Some(Err(())) => return Some(r == "decimal"),
+            Some(Ok(v)) => v,
+        };
+        if r == "decimal" {
+            return Some(true);
+        }
+        let (lo, hi) = integer_bounds(r)?;
+        // a magnitude beyond i128 was mapped to 0 for the unbounded xsd:integer only
+        return Some(!(lo.is_some_and(|lo| v < lo) || hi.is_some_and(|hi| v > hi)));
+    }
+    if matches!(r, "double" | "float") {
+        if !matches!(local, "double" | "float") {
+            return Some(false);
+        }
+        let v = sparkles_core::sparql::value::Value::from_typed(lex, dt);
+        return Some(v.is_numeric());
+    }
+    if STRING_TYPES.contains(&r) {
+        if !STRING_TYPES.contains(&local) {
+            return Some(false);
+        }
+        // the literal must be well typed for its own type and in the range's
+        return Some(string_in(lex, local) && string_in(lex, r));
+    }
+    well_typed_other("", r)?;
+    let same = local == r || (r == "dateTime" && local == "dateTimeStamp");
+    if !same {
+        return Some(false);
+    }
+    well_typed_other(lex, local)
+}
+
+#[cfg(test)]
+mod value_space_tests {
+    use super::in_value_space;
+    use oxrdf::{Literal, NamedNode};
+
+    fn typed(lex: &str, dt: &str) -> Literal {
+        Literal::new_typed_literal(
+            lex,
+            NamedNode::new_unchecked(format!("http://www.w3.org/2001/XMLSchema#{dt}")),
+        )
+    }
+
+    fn xsd(local: &str) -> String {
+        format!("http://www.w3.org/2001/XMLSchema#{local}")
+    }
+
+    #[test]
+    fn the_table_decides_value_space_membership() {
+        let yes =
+            |l: Literal, r: &str| assert_eq!(in_value_space(&l, &xsd(r)), Some(true), "{l} {r}");
+        let no =
+            |l: Literal, r: &str| assert_eq!(in_value_space(&l, &xsd(r)), Some(false), "{l} {r}");
+        yes(typed("1.0", "decimal"), "integer");
+        no(typed("1.5", "decimal"), "integer");
+        yes(typed("1.5", "decimal"), "decimal");
+        no(typed("abc", "integer"), "integer");
+        no(typed("300", "integer"), "byte");
+        yes(typed("-128", "integer"), "byte");
+        yes(
+            typed("18446744073709551615", "unsignedLong"),
+            "unsignedLong",
+        );
+        no(typed("-1", "integer"), "nonNegativeInteger");
+        no(typed("1", "integer"), "double");
+        yes(typed("1", "float"), "double");
+        no(typed("NaNx", "double"), "double");
+        no(typed("1", "integer"), "string");
+        yes(typed("en-US", "string"), "language");
+        no(typed("not a token ", "string"), "token");
+        no(typed("1abc", "string"), "NCName");
+        no(typed("a:b", "string"), "NCName");
+        yes(typed("a:b", "string"), "Name");
+        no(typed("yes", "boolean"), "boolean");
+        yes(typed("0", "boolean"), "boolean");
+        yes(typed("2020-01-01T00:00:00Z", "dateTimeStamp"), "dateTime");
+        no(typed("2020-01-01T00:00:00", "dateTime"), "dateTimeStamp");
+        no(typed("2020-13-01T00:00:00", "dateTime"), "dateTime");
+        no(typed("abc", "hexBinary"), "hexBinary");
+        yes(typed("0FAB", "hexBinary"), "hexBinary");
+        yes(typed("aGk=", "base64Binary"), "base64Binary");
+        no(typed("true", "boolean"), "dateTime");
+        let tagged = Literal::new_language_tagged_literal_unchecked("x", "en");
+        no(tagged.clone(), "string");
+        let lang = "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString";
+        let plain = "http://www.w3.org/1999/02/22-rdf-syntax-ns#PlainLiteral";
+        assert_eq!(in_value_space(&tagged, lang), Some(true));
+        assert_eq!(in_value_space(&tagged, plain), Some(true));
+        assert_eq!(
+            in_value_space(&Literal::new_simple_literal("x"), lang),
+            Some(false)
+        );
+        assert_eq!(
+            in_value_space(&Literal::new_simple_literal("x"), plain),
+            Some(true)
+        );
+        // what the table leaves open
+        let custom = Literal::new_typed_literal("x", NamedNode::new_unchecked("http://ex.org/dt"));
+        assert_eq!(in_value_space(&custom, &xsd("integer")), None);
+        assert_eq!(in_value_space(&typed("1", "integer"), &xsd("date")), None);
+        assert_eq!(
+            in_value_space(
+                &typed("1", "integer"),
+                "http://www.w3.org/2000/01/rdf-schema#Literal"
+            ),
+            None
+        );
     }
 }

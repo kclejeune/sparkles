@@ -1247,6 +1247,7 @@ pub(crate) fn run(
         } else {
             Vec::new()
         };
+        let t_eval = std::time::Instant::now();
         let results: Vec<(usize, Vec<Triple>, Option<anyhow::Error>)> = work
             .par_iter()
             .map(|item| {
@@ -1277,6 +1278,17 @@ pub(crate) fn run(
             })
             .collect();
         if timed {
+            // the threads' busy time against the wall time of the evaluation: the rest is
+            // the wait at the iteration's barrier, and scheduling
+            let busy: usize = item_time.iter().map(|t| t.load(Ordering::Relaxed)).sum();
+            let wall = t_eval.elapsed().as_micros() as usize;
+            tracing::trace!(
+                iteration,
+                busy_ms = busy / 1000,
+                wall_ms = wall / 1000,
+                threads = rayon::current_num_threads(),
+                "evaluation busy time"
+            );
             let mut by_rule: Vec<(usize, usize)> = item_time
                 .iter()
                 .enumerate()

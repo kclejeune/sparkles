@@ -1641,6 +1641,7 @@ export const DIAGNOSTIC_CHECKS = [
   'all-disjoint-properties',
   'negative-property-assertion',
   'thing-empty',
+  'literal-not-in-datatype',
   'unsatisfiable-class',
 ] as const;
 export type DiagnosticCheck = (typeof DIAGNOSTIC_CHECKS)[number];
