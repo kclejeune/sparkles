@@ -10,7 +10,8 @@ use oxrdf::Term;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use sparkles::schema::draft::{
-    DEFAULT_MAX_COUNT, DEFAULT_MAX_IN, DraftOptions, TRACKED_VALUES, default_base,
+    DEFAULT_MAX_COUNT, DEFAULT_MAX_IN, DEFAULT_MAX_INVERSE, DraftOptions, MAX_INVERSE_LIMIT,
+    TRACKED_VALUES, default_base,
 };
 use sparkles::schema::{GraphSelection, SchemaOptions, draft_shapes};
 
@@ -27,6 +28,7 @@ struct DraftArgs {
     min_instances: Option<u64>,
     max_in: Option<u64>,
     max_count: Option<u64>,
+    max_inverse: Option<u64>,
     closed: Option<bool>,
     at_commit: Option<u64>,
     at: Option<Value>,
@@ -67,6 +69,13 @@ impl Tools<'_> {
             TRACKED_VALUES as u64,
         )? as usize;
         let max_count = bounded("maxCount", a.max_count, DEFAULT_MAX_COUNT, 0, u64::MAX >> 1)?;
+        let max_inverse = bounded(
+            "maxInverse",
+            a.max_inverse,
+            DEFAULT_MAX_INVERSE as u64,
+            0,
+            MAX_INVERSE_LIMIT as u64,
+        )? as usize;
         let min_instances = bounded("minInstances", a.min_instances, 1, 1, u64::MAX >> 1)?;
         let timeout = self.timeout(a.timeout_seconds)?;
         let ds = self.dataset(a.dataset.as_deref())?;
@@ -118,6 +127,7 @@ impl Tools<'_> {
             min_instances,
             max_in,
             max_count,
+            max_inverse,
             closed: a.closed.unwrap_or(false),
             base: default_base(&ds.name),
             prefixes: prefix_map.into_iter().collect(),
@@ -132,10 +142,16 @@ impl Tools<'_> {
                     .properties
                     .iter()
                     .flat_map(|p| {
+                        // `^p` for an inverse path, `p/q` for a sequence
+                        let path = match (&p.then, p.inverse) {
+                            (Some(q), _) => format!("{}/{q}", p.path),
+                            (None, true) => format!("^{}", p.path),
+                            (None, false) => p.path.clone(),
+                        };
                         p.constraints
                             .iter()
                             .filter(|c| c.excluded > 0)
-                            .map(move |c| json!({"path": p.path, "component": c.component, "excluded": c.excluded}))
+                            .map(move |c| json!({"path": path, "component": c.component, "excluded": c.excluded}))
                     })
                     .collect();
                 json!({

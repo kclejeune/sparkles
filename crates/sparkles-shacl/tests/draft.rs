@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 #[path = "draft_fixture/mod.rs"]
 mod draft_fixture;
-use draft_fixture::{EX, fixture, random_data, store};
+use draft_fixture::{EX, extended, fixture, random_data, store};
 
 pub fn draft(s: &Store, support: f64, closed: bool, classes: &[&str]) -> ShapesDraft {
     let mut o = DraftOptions {
@@ -60,7 +60,11 @@ fn constraint<'a>(d: &'a ShapesDraft, class: &str, path: &str, c: &str) -> &'a C
     d.shapes
         .iter()
         .find(|s| s.class == format!("{EX}{class}"))
-        .and_then(|s| s.properties.iter().find(|p| p.path == path))
+        .and_then(|s| {
+            s.properties
+                .iter()
+                .find(|p| p.path == path && !p.inverse && p.then.is_none())
+        })
         .and_then(|p| p.constraints.iter().find(|x| x.component == c))
         .unwrap_or_else(|| panic!("no {c} on {path} of {class}:\n{}", d.shacl))
 }
@@ -69,7 +73,11 @@ fn rejected<'a>(d: &'a ShapesDraft, class: &str, path: &str, c: &str) -> &'a Con
     d.shapes
         .iter()
         .find(|s| s.class == format!("{EX}{class}"))
-        .and_then(|s| s.properties.iter().find(|p| p.path == path))
+        .and_then(|s| {
+            s.properties
+                .iter()
+                .find(|p| p.path == path && !p.inverse && p.then.is_none())
+        })
         .and_then(|p| p.rejected.iter().find(|x| x.component == c))
         .unwrap_or_else(|| panic!("no rejected {c} on {path} of {class}:\n{}", d.shacl))
 }
@@ -254,9 +262,14 @@ fn reported(r: &ValidationReport) -> Counts {
 fn promised(d: &ShapesDraft) -> Counts {
     let mut expected = Counts::new();
     for p in &d.shapes[0].properties {
+        let path = match (&p.then, p.inverse) {
+            (Some(q), _) => format!("<{}>/<{}>", p.path, q),
+            (None, true) => format!("^<{}>", p.path),
+            (None, false) => format!("<{}>", p.path),
+        };
         for c in p.constraints.iter().filter(|c| c.excluded > 0) {
             expected.insert(
-                (format!("<{}>", p.path), component_iri(c.component)),
+                (path.clone(), component_iri(c.component)),
                 c.excluded as usize,
             );
         }
@@ -292,4 +305,170 @@ fn random_drafts_conform_and_count_exactly() {
             }
         }
     }
+}
+
+fn property<'a>(
+    d: &'a ShapesDraft,
+    class: &str,
+    path: &str,
+    inverse: bool,
+    then: Option<&str>,
+) -> &'a sparkles_core::schema::draft::PropertyDraft {
+    d.shapes
+        .iter()
+        .find(|s| s.class == format!("{EX}{class}"))
+        .and_then(|s| {
+            s.properties.iter().find(|p| {
+                p.path == format!("{EX}{path}")
+                    && p.inverse == inverse
+                    && p.then.as_deref() == then.map(|t| format!("{EX}{t}")).as_deref()
+            })
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "no property {path} (inverse {inverse}, then {then:?}) of {class}:\n{}",
+                d.shacl
+            )
+        })
+}
+
+/// Datatype alternatives, inverse paths, a sequence through a blank node, patterns,
+/// ranges and references to the shape of a class, all of which the data conforms to at
+/// full support.
+#[test]
+fn richer_drafts_at_full_support_conform() {
+    let s = store(&extended());
+    for closed in [false, true] {
+        let d = draft(&s, 1.0, closed, &[]);
+        let r = check(&s, &d);
+        assert!(
+            r.conforms,
+            "closed={closed}: {:#?}\n{}",
+            r.results.iter().take(5).collect::<Vec<_>>(),
+            d.shacl
+        );
+    }
+    let d = draft(&s, 1.0, false, &[]);
+    // integers and decimals together
+    let c = constraint(&d, "Doc", &format!("{EX}rating"), "or");
+    assert_eq!(
+        c.value,
+        sparkles_core::schema::draft::ConstraintValue::List(vec![
+            "http://www.w3.org/2001/XMLSchema#decimal".into(),
+            "http://www.w3.org/2001/XMLSchema#integer".into()
+        ])
+    );
+    assert_eq!((c.applicable, c.satisfied), (4, 4));
+    assert!(
+        d.shacl
+            .contains("sh:or ( [ sh:datatype xsd:decimal ] [ sh:datatype xsd:integer ] )"),
+        "{}",
+        d.shacl
+    );
+    // the address blank node has no class, so its city is drafted as a path
+    let seq = property(&d, "Org", "address", false, Some("city"));
+    assert_eq!(seq.instances, 5);
+    assert!(
+        d.shacl.contains("sh:path ( ex:address ex:city )"),
+        "{}",
+        d.shacl
+    );
+    assert!(d.shaclc.contains("ex:address/ex:city"), "{}", d.shaclc);
+    // the teams are pointed at by every organisation
+    let inv = property(&d, "Team", "team", true, None);
+    assert_eq!(inv.instances, 2);
+    assert!(
+        d.shacl.contains("sh:path [ sh:inversePath ex:team ]"),
+        "{}",
+        d.shacl
+    );
+    assert!(d.shaclc.contains("^ex:team"), "{}", d.shaclc);
+    // the class of the values has a shape, and the property refers to it
+    let node = constraint(&d, "Org", &format!("{EX}team"), "node");
+    let team = d
+        .shapes
+        .iter()
+        .find(|s| s.class == format!("{EX}Team"))
+        .unwrap();
+    assert_eq!(
+        node.value,
+        sparkles_core::schema::draft::ConstraintValue::Iri(team.shape.clone())
+    );
+    assert!(d.shacl.contains("sh:node shape:TeamShape"), "{}", d.shacl);
+    // a code of two letters and four digits, and the observed weights
+    let pattern = constraint(&d, "Team", &format!("{EX}code"), "pattern");
+    assert_eq!(
+        pattern.value,
+        sparkles_core::schema::draft::ConstraintValue::Text("^[A-Z]{2}[0-9]{4}$".into())
+    );
+    let min = constraint(&d, "Org", &format!("{EX}weight"), "minInclusive");
+    assert_eq!((min.satisfied, min.excluded), (5, 0));
+    assert!(
+        d.shacl.contains("sh:minInclusive \"10\"^^xsd:integer"),
+        "{}",
+        d.shacl
+    );
+    assert!(
+        d.shacl.contains("sh:maxInclusive \"30\"^^xsd:integer"),
+        "{}",
+        d.shacl
+    );
+}
+
+/// Below full support, the richer constraints exclude exactly the focus nodes that
+/// validation reports.
+#[test]
+fn richer_excluded_counts_match_validation() {
+    let mut data = extended();
+    // a rating that is a string, a code and a weight that break the rule, an organisation
+    // without a team
+    data.push_str("ex:d1 ex:rating \"high\" .\nex:t0 ex:code \"xyz\" .\nex:o3 ex:weight 500 .\nex:o9 a ex:Org ; ex:weight 12 .\nex:t2 a ex:Team ; ex:code \"EF9012\" .\nex:t3 a ex:Team ; ex:code \"GH3456\" .\n");
+    let s = store(&data);
+    let mut seen = BTreeSet::new();
+    for support in [0.95, 0.8, 0.6] {
+        for class in ["Doc", "Team", "Org"] {
+            let d = draft(&s, support, false, &[class]);
+            let r = check(&s, &d);
+            assert_eq!(
+                reported(&r),
+                promised(&d),
+                "{class} at support {support}:\n{}",
+                d.shacl
+            );
+            seen.extend(promised(&d).into_keys().map(|(path, c)| {
+                let kind = if path.starts_with('^') {
+                    "inverse "
+                } else if path.contains(">/<") {
+                    "sequence "
+                } else {
+                    ""
+                };
+                format!("{kind}{}", c.rsplit('#').next().unwrap_or(&c))
+            }));
+        }
+    }
+    // the draft excluded something with each new kind of constraint
+    for kind in [
+        "OrConstraintComponent",
+        "PatternConstraintComponent",
+        "MinInclusiveConstraintComponent",
+        "MaxInclusiveConstraintComponent",
+    ] {
+        assert!(seen.contains(kind), "{kind} in {seen:?}");
+    }
+}
+
+/// The references to other shapes are drafted at full support only: below it, a value
+/// the shape of its class excludes would exclude the instance that has it, and the draft
+/// could not count those.
+#[test]
+fn references_need_full_support() {
+    let s = store(&extended());
+    let d = draft(&s, 0.9, false, &[]);
+    assert!(
+        d.shapes
+            .iter()
+            .flat_map(|s| &s.properties)
+            .all(|p| p.constraints.iter().all(|c| c.component != "node"))
+    );
 }

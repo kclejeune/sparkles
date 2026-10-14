@@ -1692,7 +1692,7 @@ fn constraints_json(
             let mut ce = json!({
                 "class": terms.iri(&c.class),
                 "properties": c.properties.iter().map(|p| json!({
-                    "path": terms.iri(&p.path),
+                    "path": if p.inverse { format!("^{}", terms.iri(&p.path)) } else { terms.iri(&p.path) },
                     "constraints": p.summary(|i| terms.iri(i)),
                     "enforcement": p.enforcement,
                 })).collect::<Vec<_>>(),

@@ -43,6 +43,7 @@ mod error;
 pub mod check;
 #[doc(hidden)]
 pub mod compile;
+pub mod constraints;
 #[doc(hidden)]
 pub mod engine;
 #[doc(hidden)]

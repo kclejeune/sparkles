@@ -317,6 +317,8 @@ pub fn read_observed(
             fields: s
                 .properties
                 .iter()
+                // inverse paths and sequences are not fields of the drafted type
+                .filter(|p| !p.inverse && p.then.is_none())
                 .map(|p| {
                     let get = |c: &str| p.constraints.iter().find(|x| x.component == c).map(|x| &x.value);
                     let range = match (get("datatype"), get("class"), get("in"), get("nodeKind")) {

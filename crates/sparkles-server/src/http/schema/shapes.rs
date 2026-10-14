@@ -11,7 +11,8 @@ use axum::extract::Path;
 use axum::http::{HeaderMap, Uri, header};
 use axum::response::IntoResponse;
 use sparkles::schema::draft::{
-    DEFAULT_MAX_COUNT, DEFAULT_MAX_IN, DraftOptions, TRACKED_VALUES, default_base,
+    DEFAULT_MAX_COUNT, DEFAULT_MAX_IN, DEFAULT_MAX_INVERSE, DraftOptions, MAX_INVERSE_LIMIT,
+    TRACKED_VALUES, default_base,
 };
 use sparkles::schema::{GraphSelection, SchemaOptions};
 use std::time::{Duration, Instant};
@@ -92,6 +93,12 @@ fn options(st: &crate::state::AppState, name: &str, params: &Params) -> ApiResul
     if max_in > TRACKED_VALUES {
         return Err(bad(format!("maxIn must be at most {TRACKED_VALUES}")));
     }
+    let max_inverse: usize = number(params, "maxInverse", DEFAULT_MAX_INVERSE)?;
+    if max_inverse > MAX_INVERSE_LIMIT {
+        return Err(bad(format!(
+            "maxInverse must be at most {MAX_INVERSE_LIMIT}"
+        )));
+    }
     let mut classes = Vec::new();
     for c in params.all("class") {
         let c = c.trim();
@@ -124,6 +131,7 @@ fn options(st: &crate::state::AppState, name: &str, params: &Params) -> ApiResul
         min_instances: number(params, "minInstances", 1u64)?,
         max_in,
         max_count: number(params, "maxCount", DEFAULT_MAX_COUNT)?,
+        max_inverse,
         closed: flag(params, "closed", false)?,
         base,
         prefixes: Vec::new(),
