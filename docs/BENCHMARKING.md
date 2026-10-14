@@ -361,6 +361,21 @@ and comparison methodology. [DEVELOPMENT.md](DEVELOPMENT.md) covers building and
   `c4b49fab`, also measured +1.0% on Namespace, against +15% on Atlas. The other queries
   agreed with Atlas within the noise. A result that depends on how one CPU schedules a
   loop has to be measured on that CPU.
+* `scripts/nsc-writes.sh` stages write workloads before creating a capped Namespace
+  instance. Its revision builds use `SPARKLES_NSC_CACHE/writes-v1`, separately from
+  the query harness. Each source commit and exact `--cargo-args` string has its own
+  build key, target directory and cross-process lock. The lock covers publication,
+  verification and compressed staging. Each staged revision binary has a
+  `bin-<id>.build.json` recording its source, flags, original compiler information
+  and binary hash. A cache hit reuses that original provenance. Missing or inconsistent
+  receipts refuse reuse without deleting the entry.
+
+  This cache identifies source and build arguments. It does not make compiler,
+  environment or external configuration changes hermetic. Use a new cache root for
+  a rebuild under a changed environment. File arguments are recorded as externally
+  built snapshots with their supplied path and staged hash. The launcher gives each
+  default run a unique results directory. `--out` requires a new destination and
+  refuses any existing file, directory or symlink before opening evidence files.
 * `scripts/gen-data.py N` generates a synthetic dataset for benchmarking.
 * `scripts/gen-geo.py N` generates a GeoSPARQL dataset and its queries. The data has
   points around cities, lines, polygons and an administrative hierarchy.

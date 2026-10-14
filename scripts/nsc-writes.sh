@@ -16,7 +16,10 @@
 #   scripts/nsc-writes.sh base=main head=HEAD
 #
 # Revisions are built here with `cargo build --release -p sparkles-server` from a
-# `git archive` and cached under $SPARKLES_NSC_CACHE/bin/<commit> like nsc-bench.sh does.
+# `git archive` and cached under $SPARKLES_NSC_CACHE/writes-v1, separately from query
+# builds. Each commit and exact --cargo-args string has its own locked source, target
+# and binary entry. A verified build.json records the artifact's original build, also
+# on cache hits. This identifies source and flags, not a hermetic toolchain or environment.
 # The client is scripts/write-bench.rs, built with rustc. The remote script loads one store
 # per binary, then runs ROUNDS rounds in which every variant runs once, the order
 # reversed on every other round, each run in a fresh server process on a fresh copy of the
@@ -39,7 +42,8 @@
 #   --cargo-args "..."  extra `cargo build` flags
 #   --machine-type T    Namespace machine type (default linux/amd64:8x16)
 #   --duration D        instance lifetime cap, as nsc takes it (default 2h)
-#   --out DIR           results directory (default target/nsc-writes/<UTC time>)
+#   --out DIR           new results directory; any existing path is refused
+#                       (default target/nsc-writes/<UTC time>.<unique suffix>)
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -94,9 +98,22 @@ while [ $# -gt 0 ]; do
   shift 2
 done
 [ ${#ARGS[@]} -ge 2 ] || usage 1
-for t in nsc zstd python3 cargo rustc cc; do command -v "$t" > /dev/null || die "$t is not on PATH"; done
-OUT=$(realpath -m "${OUT:-$ROOT/target/nsc-writes/$(date -u +%Y%m%dT%H%M%SZ)}")
-mkdir -p "$OUT/stage" "$OUT/logs" "$CACHE"/{bin,data,src}
+for t in nsc zstd python3 cargo rustc cc flock; do command -v "$t" > /dev/null || die "$t is not on PATH"; done
+if [ -n "$OUT" ]; then
+  # Resolve symlinks and .. in the parent, while preserving the final name so
+  # even a dangling destination symlink must be refused by the exclusive mkdir.
+  OUT_PARENT=$(realpath -m -- "$(dirname -- "$OUT")")
+  OUT_NAME=$(basename -- "$OUT")
+  mkdir -p -- "$OUT_PARENT"
+  OUT=$OUT_PARENT/$OUT_NAME
+  mkdir -- "$OUT" || die "results directory already exists or cannot be created: $OUT"
+else
+  mkdir -p "$ROOT/target/nsc-writes"
+  OUT=$(mktemp -d "$ROOT/target/nsc-writes/$(date -u +%Y%m%dT%H%M%SZ).XXXXXXXX")
+fi
+CACHE=$(realpath -m "$CACHE")
+WRITE_CACHE=$CACHE/writes-v1
+mkdir -p "$OUT/stage" "$OUT/logs" "$CACHE/data" "$WRITE_CACHE"/{bin,src,target,locks}
 STAGE=$OUT/stage
 MANIFEST=$OUT/manifest.txt
 : > "$MANIFEST"
@@ -106,37 +123,130 @@ secs() { awk "BEGIN {printf \"%.1f\", $2 - $1}"; }
 
 # ------------------------------------------------------------------------- binaries
 # binary <rev|path> <id>: stages bin-<id>.zst and notes its source and SHA-256
-binary() {
-  local ref=$1 id=$2 bin sha src
+binary() (
+  local ref=$1 id=$2 bin sha src='' publish='' snapshot='' key entry target args_hash
+  # All temporary paths are unique and owned by this invocation. The subshell keeps
+  # its lock and cleanup independent of the eventual Namespace instance EXIT trap.
+  trap '[ -z "$src" ] || rm -rf -- "$src"; [ -z "$publish" ] || rm -rf -- "$publish"; [ -z "$snapshot" ] || rm -f -- "$snapshot"' EXIT
   if [ -f "$ref" ]; then
     bin=$(realpath "$ref")
-    src="file $bin"
+    snapshot=$(mktemp "$STAGE/.binary-$id.XXXXXXXX")
+    cp -- "$bin" "$snapshot"
+    note "binary $id: externally built file $bin (staged snapshot)"
+    bin=$snapshot
   else
     sha=$(git -C "$ROOT" rev-parse --verify --quiet "$ref^{commit}") || die "$ref is neither a file nor a commit"
-    bin=$CACHE/bin/$sha/sparkles
-    if [ ! -x "$bin" ]; then
+    args_hash=$(printf '%s' "$CARGO_ARGS" | sha256sum | cut -d' ' -f1)
+    key=$sha-$args_hash
+    entry=$WRITE_CACHE/bin/$key
+    target=$WRITE_CACHE/target/$key
+    exec {build_lock}> "$WRITE_CACHE/locks/$key.lock"
+    flock "$build_lock"
+    # Recheck only after acquiring the lock. Old query builds use neither this
+    # namespace nor these per-key targets and cannot replace a build's output.
+    if [ ! -e "$entry" ] && [ ! -L "$entry" ]; then
       echo "building $ref ($sha); log: $OUT/logs/build-$id.log"
-      rm -rf "${CACHE:?}/src/$sha"
-      mkdir -p "$CACHE/src/$sha" "$CACHE/bin/$sha"
-      git -C "$ROOT" archive "$sha" | tar -x -m -C "$CACHE/src/$sha"
-      mkdir -p "$CACHE/src/$sha/ui/build"
+      src=$(mktemp -d "$WRITE_CACHE/src/$key.XXXXXXXX")
+      publish=$(mktemp -d "$WRITE_CACHE/bin/.$key.XXXXXXXX")
+      git -C "$ROOT" archive "$sha" | tar -x -m -C "$src"
+      mkdir -p "$src/ui/build" "$target/release"
       echo '<!doctype html><title>Sparkles</title><p>The UI was not built for this benchmark binary.</p>' \
-        > "$CACHE/src/$sha/ui/build/index.html"
+        > "$src/ui/build/index.html"
+      (cd "$src" && rustc -vV) > "$publish/rustc.txt"
+      (cd "$src" && cargo -V) > "$publish/cargo.txt"
+      # An option selecting another profile or target must not reuse stale output
+      # at our expected path. Explicit paths also make conflicting CLI overrides
+      # fail in Cargo rather than redirecting into a shared target or other source.
+      rm -f -- "$target/release/sparkles"
       # shellcheck disable=SC2086 # CARGO_ARGS is a list of flags
-      (cd "$CACHE/src/$sha" && CARGO_TARGET_DIR=$CACHE/target cargo build --release -p sparkles-server $CARGO_ARGS) \
-        > "$OUT/logs/build-$id.log" 2>&1 || die "build of $ref failed, see $OUT/logs/build-$id.log"
-      cp "$CACHE/target/release/sparkles" "$bin.tmp"
-      mv "$bin.tmp" "$bin"
-      rm -rf "${CACHE:?}/src/$sha"
+      (cd "$src" && CARGO_TARGET_DIR=$target cargo build --release -p sparkles-server \
+        --manifest-path "$src/Cargo.toml" --target-dir "$target" \
+        --message-format=json-render-diagnostics $CARGO_ARGS) \
+        > "$OUT/logs/build-$id.jsonl" 2> "$OUT/logs/build-$id.log" ||
+        die "build of $ref failed, see $OUT/logs/build-$id.log and build-$id.jsonl"
+      [ -f "$target/release/sparkles" ] && [ -x "$target/release/sparkles" ] && [ ! -L "$target/release/sparkles" ] ||
+        die "build of $ref did not produce the expected release/sparkles"
+      cp -- "$target/release/sparkles" "$publish/sparkles"
+      python3 - "$publish" "$sha" "$CARGO_ARGS" "$args_hash" "$OUT/logs/build-$id.jsonl" "$src" "$target" << 'PY'
+import datetime, hashlib, json, os, pathlib, sys
+directory, revision, arguments, args_hash, build_log, source, target = sys.argv[1:]
+path = pathlib.Path(directory)
+expected = (pathlib.Path(target) / 'release/sparkles').resolve()
+try:
+    artifacts = []
+    for line in pathlib.Path(build_log).read_text().splitlines():
+        event = json.loads(line)
+        if (event.get('reason') == 'compiler-artifact' and event.get('executable')
+                and pathlib.Path(event['executable']).resolve() == expected):
+            artifacts.append(event)
+    if len(artifacts) != 1:
+        raise ValueError('expected exactly one artifact at the owned executable path')
+    artifact = artifacts[0]
+    if (pathlib.Path(artifact['manifest_path']).resolve()
+            != (pathlib.Path(source) / 'crates/sparkles-server/Cargo.toml').resolve()
+            or artifact['target']['name'] != 'sparkles'
+            or 'bin' not in artifact['target']['kind']):
+        raise ValueError('executable did not come from the archived sparkles-server binary')
+except (OSError, ValueError, KeyError, TypeError) as error:
+    sys.exit(f'nsc-writes: cannot verify Cargo executable provenance: {error}')
+record = {
+    'schema': 1, 'revision': revision, 'cargo_args': arguments,
+    'cargo_args_sha256': args_hash,
+    'binary_sha256': hashlib.sha256((path / 'sparkles').read_bytes()).hexdigest(),
+    'built_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    'rustc': (path / 'rustc.txt').read_text(), 'cargo': (path / 'cargo.txt').read_text(),
+    'version_commands': 'rustc -vV and cargo -V in the extracted source directory',
+    'command': 'cargo build --release -p sparkles-server --manifest-path <owned source>/Cargo.toml --target-dir <key target> --message-format=json-render-diagnostics $CARGO_ARGS',
+    'artifact': {'manifest': 'crates/sparkles-server/Cargo.toml', 'name': 'sparkles', 'kind': artifact['target']['kind']},
+    'environment': {name: os.environ.get(name) for name in (
+        'RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS', 'RUSTUP_TOOLCHAIN', 'CARGO_BUILD_TARGET',
+        'RUSTC', 'RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER')},
+}
+(path / 'build.json').write_text(json.dumps(record, indent=2) + '\n')
+(path / 'rustc.txt').unlink()
+(path / 'cargo.txt').unlink()
+PY
+      # Publishing the directory makes the executable and its receipt visible
+      # together. No uncooperative query-cache writer uses this location.
+      mv -T -- "$publish" "$entry"
+      publish=
+      rm -rf -- "$src"
+      src=
     fi
-    src="commit $sha ($ref)"
-    [ -z "$CARGO_ARGS" ] || src+=", cargo $CARGO_ARGS"
+    bin=$entry/sparkles
+    python3 - "$entry" "$sha" "$CARGO_ARGS" "$args_hash" << 'PY'
+import hashlib, json, pathlib, sys
+directory, revision, arguments, args_hash = sys.argv[1:]
+path = pathlib.Path(directory)
+try:
+    if not path.is_dir() or path.is_symlink():
+        raise ValueError('entry is not a regular directory')
+    binary = path / 'sparkles'
+    receipt = path / 'build.json'
+    if not binary.is_file() or binary.is_symlink() or not receipt.is_file() or receipt.is_symlink():
+        raise ValueError('binary or receipt is not a regular file')
+    record = json.loads(receipt.read_text())
+    if (record['schema'] != 1 or record['revision'] != revision
+            or record['cargo_args'] != arguments or record['cargo_args_sha256'] != args_hash
+            or record['binary_sha256'] != hashlib.sha256(binary.read_bytes()).hexdigest()
+            or not all(isinstance(record[key], str) and record[key] for key in ('rustc', 'cargo', 'built_at', 'command'))
+            or not isinstance(record['environment'], dict)
+            or record['artifact']['manifest'] != 'crates/sparkles-server/Cargo.toml'
+            or record['artifact']['name'] != 'sparkles' or 'bin' not in record['artifact']['kind']):
+        raise ValueError('build receipt does not match the requested key and binary')
+except (AssertionError, OSError, ValueError, KeyError, TypeError) as error:
+    sys.exit(f'nsc-writes: untrusted write-cache entry {path}: {type(error).__name__}; preserve it for inspection and use a new cache root')
+PY
+    [ -x "$bin" ] || die "cached binary is not executable: $bin"
+    cp -- "$entry/build.json" "$STAGE/bin-$id.build.json"
+    note "binary $id: commit $sha ($ref), build key $key"
+    note "binary $id provenance: stage/bin-$id.build.json (original build, not a fresh-build claim)"
   fi
-  note "binary $id: $src"
   note "binary $id sha256: $(sha256sum "$bin" | cut -d' ' -f1)"
   if ldd "$bin" > /dev/null 2>&1; then echo "DYNAMIC_$id=1" >> "$STAGE/run.env"; else echo "DYNAMIC_$id=0" >> "$STAGE/run.env"; fi
   zstd -q -T0 -3 -f "$bin" -o "$STAGE/bin-$id.zst"
-}
+  # The per-key lock remains held through hashing and compression, not only build.
+)
 : > "$STAGE/run.env"
 declare -A BINID
 NEXT=0
