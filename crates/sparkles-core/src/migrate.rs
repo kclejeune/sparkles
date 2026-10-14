@@ -152,6 +152,7 @@ fn generations(dir: &Path) -> Result<Vec<String>> {
 /// Read the versions of a database's files and list the steps an upgrade would run.
 /// Nothing is changed, except that an interrupted [`migrate`] is finished first.
 pub fn plan(root: &Path) -> Result<Plan> {
+    let root = &absolute(root)?;
     recover(root)?;
     let written_by = crate::commit::read_written_by(root);
     let by = written_by.as_deref();
@@ -277,6 +278,7 @@ fn sibling(root: &Path, prefix: &str) -> PathBuf {
 /// swapped in yet is removed. When the database's directory is missing because the run
 /// stopped between its two renames, the checked copy takes its place.
 pub fn recover(root: &Path) -> Result<()> {
+    let root = &absolute(root)?;
     let work = work_dir(root);
     if !work.exists() {
         return Ok(());
@@ -293,8 +295,19 @@ pub fn recover(root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The path as an absolute one, without resolving symlinks and without the path having
+/// to exist. A relative root would otherwise name a different directory once the
+/// database is moved aside, and recovery has to work on a root that is missing.
+fn absolute(root: &Path) -> Result<PathBuf> {
+    Ok(std::path::absolute(root)?)
+}
+
 fn sync_parent(root: &Path) -> Result<()> {
-    crate::store::sync_dir(root.parent().unwrap_or(Path::new(".")))
+    let parent = match root.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    crate::store::sync_dir(parent)
 }
 
 fn copy_dir(from: &Path, to: &Path) -> Result<()> {
@@ -334,6 +347,7 @@ pub fn migrate_with(
     keep_old: bool,
     hook: &mut dyn FnMut(&str) -> Result<()>,
 ) -> Result<Outcome> {
+    let root = &absolute(root)?;
     let plan = plan(root)?;
     if !plan.in_window() {
         return Err(Error::Unsupported(plan.refused.join("; ")));
@@ -466,6 +480,43 @@ mod tests {
             assert_eq!(v, if at == "moved-aside" { 2 } else { 1 }, "{at}");
             assert_eq!(count(&root), 1, "{at}");
         }
+    }
+
+    #[test]
+    fn sync_parent_of_a_single_component_path() {
+        sync_parent(Path::new("db")).unwrap();
+    }
+
+    /// Serializes the tests that change the working directory.
+    static CWD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct RestoreCwd(PathBuf);
+    impl Drop for RestoreCwd {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_relative_root_is_migrated() {
+        let _g = CWD.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        let g = legacy_database(&root);
+        let _restore = RestoreCwd(std::env::current_dir().unwrap());
+        std::env::set_current_dir(dir.path()).unwrap();
+        let out = migrate(Path::new("db"), false).unwrap();
+        assert_eq!(out.steps.len(), 1);
+        assert!(root.exists());
+        assert_eq!(
+            crate::vocab::delta::file_version(&root.join(&g).join("delta.vocab")).unwrap(),
+            2
+        );
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, vec!["db".to_string()], "{left:?}");
     }
 
     #[test]
