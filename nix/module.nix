@@ -1287,7 +1287,12 @@ in
           "@system-service"
           "~@privileged"
           "~@resources"
+          # Background compaction and local-embedding threads lower their own CPU
+          # priority. Raising it still needs CAP_SYS_NICE, which the service lacks.
+          "setpriority"
         ];
+        # A filtered call fails with EPERM instead of killing the server.
+        SystemCallErrorNumber = "EPERM";
         UMask = "0027";
       };
     };
