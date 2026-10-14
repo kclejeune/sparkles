@@ -1052,6 +1052,11 @@ impl Ctx {
         if need <= self.eager_reserved.load(Ordering::Acquire) {
             return Ok(());
         }
+        self.retain_eager_estimate_slow(grant, need)
+    }
+
+    #[inline(never)]
+    fn retain_eager_estimate_slow(&self, grant: &super::pool::PoolGrant, need: u64) -> Result<()> {
         let _lock = self.eager_resize.lock();
         let held = self.eager_reserved.load(Ordering::Relaxed);
         if need > held {
