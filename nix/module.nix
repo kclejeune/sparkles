@@ -1249,6 +1249,10 @@ in
           ++ lib.optional (modelsDirOutside && cfg.models.download == "off") modelsDir;
         Restart = "on-failure";
         RestartSec = 5;
+        # A server that fails at every start (a refused data format, a denied syscall)
+        # backs off to one attempt every 5 minutes instead of retrying every 5 s.
+        RestartSteps = 6;
+        RestartMaxDelaySec = "5min";
         # the grace period for requests in flight, then up to 5 s for cancelled ones to
         # stop and the final flush (commits are durable either way)
         TimeoutStopSec = cfg.shutdownGrace + 15;
