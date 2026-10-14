@@ -533,3 +533,49 @@ vocabulary to the Working Draft fetched when the work starts, as C10 §2 did for
 Other SHACL 1.2 Core additions that are not supported, such as constraints on RDF 1.2
 reifiers, are listed against the same draft when this work starts, each with whether
 it is built here or left out and why.
+
+**Outcome of the node expression work (2026-10-13).** Node expressions are built against the
+Working Group's `shacl12-node-expr` draft as it stood in the `w3c/data-shapes` repository
+at commit 056ab61a on 13 October 2026, and the vocabulary is that draft's `shnex:`
+namespace. The code is `nodeexpr.rs`, the expression tree and its parser, and
+`nodeeval.rs`, the evaluator, in `sparkles-shacl`.
+
+* *What is read.* A blank node that has triples is a named parameter function, such as
+  `shnex:pathValues`, a list parameter function, such as `sparql:plus`, or a list
+  expression. Constants are IRIs, literals and triple terms, and a blank node without
+  triples is the empty expression. Functions declared in the shapes graph with
+  `sh:bodyExpression` are called the same way. Expressions are read as targets, as the
+  values of constraint parameters, as `sh:deactivated`, and as the expression
+  constraint that reports each focus node whose result is not `true`. A `sh:targetNode`
+  whose blank node value is not a valid expression stays a plain node.
+* *Where it differs from the design above.* `sh:values` and `sh:defaultValue` are built,
+  as derivations made during validation that add nothing to the data, so the reasoner
+  still owns every inferred triple. An argument of a custom function is evaluated in the
+  focus node and the variable scope of the call. `sh:hasValue` compares RDF terms. The
+  two-argument `shnex:hasLang` is `LANGMATCHES(LANG(x), range)`, and `shnex:sameValue` is
+  `COALESCE(a = b, false)`. Nesting is limited to 128 levels when parsing and 192 when
+  evaluating, and deep evaluation grows its stack.
+* *Write-time validation.* The incremental guard works out the predicates an expression
+  reads from the focus node, as it does for anchored SHACL-SPARQL queries. An expression
+  that reads the graph away from the focus node falls back to full validation. The
+  differential test of the guard now includes shapes with expressions.
+* *SHACLC.* Unchanged, as designed. Shapes with expressions are Turtle.
+* *Tests.* The Working Group's node expression library is vendored under
+  `crates/sparkles-shacl/tests/shacl12/node-expr`. All 143 `sht:EvalNodeExpr` tests
+  and the 3 validation tests of the suite pass, in `w3c_shacl12_node_expr`, and
+  `tests/node_expr.rs` adds eight tests. The earlier suites are unchanged, with SHACLC at
+  32 pairs and no failures, Core at 98 of 98, SHACL-SPARQL at 20 of 20 and the list
+  constraints at 8 of 8.
+* *Not built.* The Working Group's own SHACL 1.2 Core tests, run with
+  `SPARKLES_SHACL_TESTS` pointing at `shacl12-test-suite/tests`, pass 115 of 144 and are
+  not part of the repository's runner. This work does not change that number. The 29
+  failures are Core additions of SHACL 1.2 that are not expression syntax, namely the
+  constraints on reifiers (`sh:reifierShape` and the reified forms of deactivation),
+  `sh:uniqueValuesFor`, `sh:subsetOf`, `sh:someValue`, `sh:rootClass`, `sh:singleLine`,
+  `equals`, `disjoint` and `lessThan` with paths, the new severity cases, a few
+  closed, datatype, class, node-kind and unique-language cases, and implicit class
+  targets. The same suite's SHACL-SPARQL group passes 21 of 26, and three of the five
+  failures are custom functions that SPARQL queries call. Each is left out here because it
+  is a separate change to the constraint model, and none of them blocks node
+  expressions.
+
