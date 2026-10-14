@@ -422,7 +422,10 @@ mode, before authorization is consulted. The converter writes one value per data
 as approximated. A dataset's description lists `gsp-direct-r` or `gsp-direct-rw` as its
 mode says. The tests are `read_only_direct_naming_refuses_writes` in
 `http/router_tests/fuseki.rs` and `direct_naming_is_per_dataset_and_keeps_its_mode` in
-`fuseki_config/tests.rs`. The modes come from the command line, so the setting and its
+`fuseki_config/tests.rs`. Under `--fuseki-config`, a command-line value for a dataset wins
+over the converted one in both directions, and a bare flag covers only the datasets that no
+entry names. The test is `direct_naming_flags_win_over_the_fuseki_config` in `state.rs`.
+The modes come from the command line, so the setting and its
 route in C19's settings, and assembler bodies, remain with item 76 below.
 
 **Item 76 (Tier 5, [ROADMAP](../ROADMAP.md)): complete assembler bodies, and Graph Store
