@@ -335,7 +335,7 @@ sparkles migrate --loc DIR [--check] [--keep-old]
 * `--check` lists each dataset, its formats, whether it is inside the window, and which
   steps an upgrade would run, and changes nothing.
 * For each dataset it runs the registered steps in order. A step is a function from one
-  version of a file kind to the next, registered in `crates/sparkles-core/src/migrate/`.
+  version of a file kind to the next, registered in `crates/sparkles-core/src/migrate.rs`.
   Steps run on copies in a sibling directory, the result is checked with `sparkles check`,
   and the directory is swapped in with the catalog's existing swap
   (`crates/sparkles/src/catalog/swap.rs`). `--keep-old` keeps the previous directory as

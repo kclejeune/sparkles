@@ -353,9 +353,8 @@ pub fn migrate_with(
     hook("copied")?;
     for p in &plan.steps {
         let s = step(p.kind, p.from).expect("planned from STEPS");
-        (s.run)(&work, Path::new(&p.file)).map_err(|e| {
+        (s.run)(&work, Path::new(&p.file)).inspect_err(|_| {
             let _ = std::fs::remove_dir_all(&work);
-            e
         })?;
     }
     let report = crate::check::check(&work, &crate::check::CheckOptions { quick: false })?;
