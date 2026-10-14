@@ -129,6 +129,8 @@ COUNT_ONLY=""
 POOL=1
 
 # ------------------------------------------------------------------------ query mixes
+# the driver's request timeout in whole milliseconds, rounded up from a possibly fractional MAX_TIME
+DRIVER_TIMEOUT_MS=$(awk -v m="$MAX_TIME" 'BEGIN { t = m * 1000; s = int(t); if (s < t) s++; print s }')
 bsbm_qmph() {
   local e c rc
   [ -z "${SKIP_QMPH:-}" ] || return 0
@@ -138,7 +140,7 @@ bsbm_qmph() {
     for c in $CLIENTS; do
       rm -f "results/driver-${NAME[$e]}-$c.xml"
       (cd bsbm && "$JAVA" -Xmx2g -cp ".:lib/*" benchmark.testdriver.TestDriver -runs "$BSBM_RUNS" -w "$BSBM_WARMUP" \
-        -mt "$c" -idir td_data -ucf "$UCF" -t $((MAX_TIME * 1000)) -o "$WORK/results/driver-${NAME[$e]}-$c.xml" \
+        -mt "$c" -idir td_data -ucf "$UCF" -t "$DRIVER_TIMEOUT_MS" -o "$WORK/results/driver-${NAME[$e]}-$c.xml" \
         "http://${URL[$e]}") > "logs/driver-${NAME[$e]}-$c.log" 2>&1 && rc=0 || rc=$?
       python3 -I "$ROOT/scripts/bench-bsbm/qmph.py" "results/driver-${NAME[$e]}-$c.xml" results/qmph.json \
         "${NAME[$e]}" "$c" "$USECASE-mix" "$rc"

@@ -93,7 +93,14 @@ NO_CHECK=""              # queries whose answers are not compared (DESCRIBE)
 # and the next measurement does not start behind it.
 MAX_TIME=${MAX_TIME:-300}
 export MAX_TIME
-SERVER_TIMEOUT=$((MAX_TIME + ${TIMEOUT_MARGIN:-15}))
+# MAX_TIME and TIMEOUT_MARGIN may be fractional. The servers take whole seconds, so their
+# timeout is rounded up.
+if ! { [[ $MAX_TIME =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]] && awk -v m="$MAX_TIME" 'BEGIN { exit !(m > 0) }'; }; then
+  die "MAX_TIME must be a positive number of seconds, not '$MAX_TIME'"
+fi
+[[ ${TIMEOUT_MARGIN:-15} =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]] ||
+  die "TIMEOUT_MARGIN must be a nonnegative number of seconds, not '${TIMEOUT_MARGIN}'"
+SERVER_TIMEOUT=$(awk -v m="$MAX_TIME" -v g="${TIMEOUT_MARGIN:-15}" 'BEGIN { t = m + g; s = int(t); if (s < t) s++; print s }')
 
 # the loaded store of an engine in WORK (SPARKLES_DB overrides Sparkles')
 source_store() {

@@ -322,12 +322,12 @@ class CompareTests(unittest.TestCase):
 class LibTests(unittest.TestCase):
     """Shell functions of scripts/bench-lib.sh, called through bash."""
 
-    def bash(self, queries, script):
+    def bash(self, queries, script, **extra_env):
         with tempfile.TemporaryDirectory() as d:
             os.mkdir(os.path.join(d, "queries"))
             for name, text in queries.items():
                 write_text(os.path.join(d, "queries", name + ".rq"), text)
-            env = dict(os.environ, ROOT=os.path.dirname(SCRIPTS), WORK=d, ENGINES="sparkles")
+            env = dict(os.environ, ROOT=os.path.dirname(SCRIPTS), WORK=d, ENGINES="sparkles", **extra_env)
             lib = os.path.join(SCRIPTS, "bench-lib.sh")
             p = subprocess.run(["bash", "-c", f'source "{lib}"; {script}'], cwd=d, env=env,
                                capture_output=True, text=True)
@@ -340,6 +340,22 @@ class LibTests(unittest.TestCase):
         out = self.bash(qs, "for n in s a c d; do accept_of $n; done")
         self.assertEqual(out.split(), ["text/tab-separated-values", "application/sparql-results+json",
                                        "application/n-triples", "application/n-triples"])
+
+    def test_fractional_request_limits_round_the_server_timeout_up(self):
+        self.assertEqual(self.bash({}, 'echo "$SERVER_TIMEOUT"', MAX_TIME="0.5"), "16")
+        self.assertEqual(self.bash({}, 'echo "$SERVER_TIMEOUT"', MAX_TIME="2.2", TIMEOUT_MARGIN="0"), "3")
+        self.assertEqual(self.bash({}, 'echo "$SERVER_TIMEOUT"', MAX_TIME="300"), "315")
+
+    def test_an_invalid_request_limit_stops_the_run(self):
+        with tempfile.TemporaryDirectory() as d:
+            lib = os.path.join(SCRIPTS, "bench-lib.sh")
+            for bad in ("abc", "0", "-1"):
+                env = dict(os.environ, ROOT=os.path.dirname(SCRIPTS), WORK=d, ENGINES="sparkles", MAX_TIME=bad)
+                p = subprocess.run(["bash", "-c", f'source "{lib}"; echo reached'], cwd=d, env=env,
+                                   capture_output=True, text=True)
+                self.assertNotEqual(p.returncode, 0, bad)
+                self.assertIn("MAX_TIME must be a positive number", p.stderr)
+                self.assertNotIn("reached", p.stdout)
 
     def test_suite_settings_in_the_environment_do_not_leak_into_bench_sh_runs(self):
         with tempfile.TemporaryDirectory() as d:
