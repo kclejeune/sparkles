@@ -169,3 +169,20 @@ def test_branch_backups_restore_independent_main_and_preserve_provenance(tmp_pat
         with pytest.raises(sparkles.BackupError, match="new dataset identity"):
             cat.restore(repo, "branch", name="duplicate", identity="keep")
         assert cat.get("duplicate") is None
+
+
+def test_catalog_pool_bounds_queries() -> None:
+    cross = "SELECT ?a ?b ?x ?y WHERE { ?a <urn:p> ?x . ?b <urn:p> ?y } ORDER BY ?x ?y"
+    cat = Catalog.memory(total_query_memory_bytes=1 << 20)
+    ds = cat.create("pooled", kind="mem")
+    body = " ".join(f"<urn:s{i}> <urn:p> {i} ." for i in range(1000))
+    ds.update(f"INSERT DATA {{ {body} }}")
+    with pytest.raises(sparkles.BudgetExceededError) as e:
+        ds.query(cross)
+    assert e.value.kind == "server-memory"  # type: ignore[attr-defined]
+    with pytest.raises(sparkles.BudgetExceededError) as e:
+        list(ds.select_cursor(cross))
+    assert e.value.kind == "server-memory"  # type: ignore[attr-defined]
+    with pytest.raises(sparkles.BudgetExceededError) as e:
+        ds.query(cross, at="head")
+    assert e.value.kind == "server-memory"  # type: ignore[attr-defined]
