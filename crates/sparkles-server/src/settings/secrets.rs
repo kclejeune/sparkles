@@ -473,9 +473,12 @@ impl Sealing {
 
     /// The value in `stored` of the secret `name`, opened when it is sealed. The error
     /// never holds the value.
-    fn open(&self, name: &str, stored: Vec<u8>) -> Result<String, String> {
+    fn open(&self, name: &str, stored: Vec<u8>) -> Result<Plain, String> {
         if !is_sealed(&stored) {
-            return String::from_utf8(stored)
+            #[cfg(feature = "backup")]
+            let stored = zeroize::Zeroizing::new(stored);
+            return std::str::from_utf8(&stored)
+                .map(|v| plain(v.to_owned()))
                 .map_err(|_| format!("the stored value of secret {name:?} is not text"));
         }
         let Some(s) = self.state.sealer.read().clone() else {
@@ -483,10 +486,11 @@ impl Sealing {
                 "the stored value of secret {name:?} is sealed, and the server has no secrets key"
             ));
         };
-        let plain = sealer::open(&s, name, &stored).ok_or_else(|| {
+        let opened = sealer::open(&s, name, &stored).ok_or_else(|| {
             format!("the stored value of secret {name:?} does not open with the secrets key")
         })?;
-        String::from_utf8(plain.to_vec())
+        std::str::from_utf8(&opened)
+            .map(|v| plain(v.to_owned()))
             .map_err(|_| format!("the stored value of secret {name:?} is not text"))
     }
 
@@ -513,7 +517,7 @@ impl Sealing {
             let bytes = std::fs::read(dir.join(&name))
                 .map_err(|e| anyhow::anyhow!("cannot read secret {name}: {e}"))?;
             let was_sealed = is_sealed(&bytes);
-            let kept = bytes.clone();
+            let kept = (was_sealed && next.is_some()).then(|| bytes.clone());
             let (held, value) = match self.open(&name, bytes) {
                 Ok(v) => (
                     if was_sealed {
@@ -523,7 +527,7 @@ impl Sealing {
                     },
                     v,
                 ),
-                Err(_) => match next.map(|n| n.open(&name, kept)) {
+                Err(_) => match next.zip(kept).map(|(n, b)| n.open(&name, b)) {
                     Some(Ok(v)) => (Held::Next, v),
                     _ => {
                         failed.push(name);
@@ -531,11 +535,7 @@ impl Sealing {
                     }
                 },
             };
-            out.push(Opened {
-                name,
-                held,
-                value: plain(value),
-            });
+            out.push(Opened { name, held, value });
         }
         if failed.is_empty() {
             return Ok(out);
@@ -1319,6 +1319,68 @@ mod tests {
         assert!(e.contains("cannot flush"), "{e}");
         assert_eq!(probe.calls(), 1);
         assert_eq!(std::fs::read(key).unwrap(), old);
+    }
+
+    #[cfg(all(feature = "backup", unix))]
+    #[test]
+    fn migration_and_retry_preserve_key_classification() {
+        let (_t, data, source) = offline_fixture();
+        let dir = data.join(SECRETS_DIR);
+        let current = Sealing::start(None, &data).unwrap();
+        current.write(&dir, "a", b"current").unwrap();
+        let next = Sealing::start(Some(&source), &data).unwrap();
+        next.write(&dir, "b", b"next").unwrap();
+        std::fs::write(dir.join("c"), "plaintext").unwrap();
+        let values = current.open_all_with(&dir, Some(&next)).unwrap();
+        let got: Vec<_> = values
+            .iter()
+            .map(|v| (v.name.as_str(), v.held, v.value.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("a", Held::Current, "current"),
+                ("b", Held::Next, "next"),
+                ("c", Held::Plain, "plaintext")
+            ]
+        );
+        // A normal server does not accept the retry key as a fallback.
+        assert!(current.open_all(&dir).is_err());
+        std::fs::remove_file(dir.join("b")).unwrap();
+        let values = current.open_all_with(&dir, Some(&current)).unwrap();
+        assert_eq!(
+            values[0].held,
+            Held::Current,
+            "equal keys prefer the current key"
+        );
+        assert_eq!(values[1].held, Held::Plain);
+    }
+
+    #[cfg(all(feature = "backup", unix))]
+    #[test]
+    fn malformed_utf8_is_refused_before_rekey_changes_any_value() {
+        for sealed in [false, true] {
+            let (_t, data, source) = offline_fixture();
+            let dir = data.join(SECRETS_DIR);
+            let current = Sealing::start(None, &data).unwrap();
+            current.write(&dir, "a", b"valid").unwrap();
+            let invalid = b"invalid-text-\xff";
+            if sealed {
+                current.write(&dir, "b", invalid).unwrap();
+            } else {
+                std::fs::write(dir.join("b"), invalid).unwrap();
+            }
+            let before = std::fs::read(dir.join("a")).unwrap();
+            let key = data.join(SECRETS_KEY_FILE);
+            let old = std::fs::read(&key).unwrap();
+            let e = current
+                .open("b", std::fs::read(dir.join("b")).unwrap())
+                .unwrap_err();
+            assert!(e.contains("not text"), "{e}");
+            assert!(rekey(&data, None, &source).is_err());
+            assert_eq!(std::fs::read(dir.join("a")).unwrap(), before);
+            assert_eq!(std::fs::read(key).unwrap(), old);
+        }
     }
 
     #[test]
