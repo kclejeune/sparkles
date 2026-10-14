@@ -7075,8 +7075,37 @@ export interface components {
                 enabled: boolean;
             };
             datasets: components["schemas"]["DatasetInfo"][];
+            /** @description The on-disk file kinds and settings files, with the version this build writes and the versions it reads (`sparkles migrate --check` prints the same registry). Left out for anonymous callers when auth is on. */
+            formats?: {
+                kinds?: {
+                    /** @enum {string} */
+                    class: "primary" | "derived" | "config" | "archive";
+                    files: string;
+                    id: string;
+                    marker: string;
+                    reads: number[];
+                    writes: number;
+                }[];
+                settings?: {
+                    member: string;
+                    name: string;
+                    /** @enum {string} */
+                    scope: "dataset" | "server";
+                    writes: number;
+                }[];
+                sparkles?: string;
+                unmarkedSettings?: {
+                    name: string;
+                    reason: string;
+                }[];
+            };
             limits?: components["schemas"]["Limits"];
             readOnly: boolean;
+            refusedDatasets?: {
+                name: string;
+                /** @description Why the dataset is registered but not served, such as an index format this release does not read. */
+                reason: string;
+            }[];
             /** @description Fuseki's name for `startedAt`. */
             startDateTime?: string;
             /** Format: date-time */
