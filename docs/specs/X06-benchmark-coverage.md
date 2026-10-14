@@ -617,11 +617,17 @@ They cover A4 on fixture records and the marking of a wrong answer from A2.
 **Suites.** `scripts/bench-suite-lib.sh` is the common run of the three suites. It loads one
 N-Triples file into the selected engines, serves them, checks every answer, times each query
 with hyperfine, optionally measures cold restarts, and writes the manifest, the record and
-`summary.md`. To share this code with the existing harness, the load, the server start-up,
+`summary.md`. The timed server of each engine first answers every selected query once, so
+it is as warm as the one that was checked, and then each engine's queries and query mixes
+run with no other server up. To share this code with the existing harness, the load, the server start-up,
 the answer check and the cold mode moved from `scripts/bench.sh` into `scripts/bench-lib.sh`.
 `bench.sh` was checked afterwards in its default and cold modes. `bench-answers.py` now
-also fingerprints ASK, CONSTRUCT and DESCRIBE results, and `bench-lib.sh` picks the Accept
-type of a timed request from the query form. `nixbin` now builds engines from the nixpkgs
+also fingerprints ASK, CONSTRUCT and DESCRIBE results. A CONSTRUCT or DESCRIBE answer is a
+set of triples compared by term identity before the value digest normalizes the terms, so
+`1` as an integer and `1.0` as a decimal stay two triples. An `order` digest is recorded only
+for ORDER BY columns whose order SPARQL defines, and rows that tie at a LIMIT or OFFSET
+boundary are compared by their key values only. `bench-lib.sh` picks the Accept type of a
+timed request from the query form. `nixbin` now builds engines from the nixpkgs
 revision in `flake.lock`, so engine versions follow the repository and the manifest records
 them. This can change the Jena, QLever and Oxigraph versions of an existing harness run
 compared with the older registry lookup.
@@ -651,7 +657,12 @@ compared with the older registry lookup.
   (`scripts/bench-bsbm/instantiate.py`) to get the query instances for the answer check and
   the per-template timings, and the driver itself measures query mixes per hour with 1, 4
   and 16 clients. The Explore and BI use cases both instantiate. The Explore and Update mix
-  is not built.
+  is not built. The scale labels follow BSBM's published dataset sizes, which are 2,785
+  products for 1m, 28,480 for 10m and 284,826 for 100m, and the manifest records the triple
+  count that was generated. At 1m the generator gives 1,000,312 triples, against 1,000,313
+  in the V2.0 specification. The query mix check compares only runs in which the driver
+  succeeded, gives each engine one vote, and does not compare runs with different mix
+  counts.
 
 **Smoke runs.** SP²Bench at 50k, LUBM(1) and BSBM with 2000 products ran end to end with
 Sparkles alone on a development machine. SP²Bench at 50k also ran with all five engines,
@@ -676,7 +687,9 @@ reference host should confirm before it is listed under "Where Sparkles loses".
 **Left for Phase 1.**
 
 * The standard refresh of every existing suite at one head (A5), and the regeneration of the
-  BENCHMARKS.md tables from records without a numeric change (A3). `bench-record.py` reads
+  BENCHMARKS.md tables from records without a numeric change (A3). The per-engine loop of
+  `suite_run` is not in `bench.sh` yet, and adding it is part of this refresh. The published
+  runs invoke `bench.sh` once per engine, so each engine ran alone. `bench-record.py` reads
   the results of `bench.sh` and of a small `bench-watdiv.sh` run, and both produce valid
   records. It does not read the DBpedia or full-text results yet, and `bench-summary.py`
   still reads the raw files.
