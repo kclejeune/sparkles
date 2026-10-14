@@ -42,7 +42,6 @@ fn refusal_before_writes(retained: bool) {
                     &crate::branch::DeleteOptions {
                         force: true,
                         reparent: true,
-                        ..Default::default()
                     },
                 )
                 .unwrap();

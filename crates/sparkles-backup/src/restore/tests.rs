@@ -884,7 +884,7 @@ fn swap_dir_rejects_a_lock_from_the_previous_root() {
     let mut legacy = Vec::new();
     for key in parsed.keys {
         legacy.extend_from_slice(&(key.len() as u32).to_le_bytes());
-        legacy.extend_from_slice(&key);
+        legacy.extend_from_slice(key);
     }
     assert!(!legacy.is_empty());
     std::fs::write(vocab, legacy).unwrap();
