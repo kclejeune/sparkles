@@ -409,15 +409,20 @@ impl Catalog {
             .map(|d| d.join("databases").join(name))
             .ok_or_else(|| Error::invalid("a persistent dataset needs a catalog directory"))
     }
-    fn open_dataset(&self, name: &str, kind: DatasetKind, loc: Option<&Path>) -> Result<Dataset> {
-        let mut opts = DatasetOptions {
+    /// The catalog's default dataset options for the dataset `name`, under the catalog's
+    /// query memory pool. A dataset that opens its own store also takes a cache scope.
+    fn dataset_options(&self, name: &str) -> DatasetOptions {
+        DatasetOptions {
             name: Some(name.into()),
+            pool: self.inner.pool.clone(),
             ..self.inner.options.read().dataset.clone()
-        };
+        }
+    }
+    fn open_dataset(&self, name: &str, kind: DatasetKind, loc: Option<&Path>) -> Result<Dataset> {
+        let mut opts = self.dataset_options(name);
         if let Some(c) = &self.inner.caches {
             opts.store.shared = Some(c.scope());
         }
-        opts.pool = self.inner.pool.clone();
         match kind {
             DatasetKind::Memory => Ok(Dataset::from_store_with(
                 Store::in_memory(opts.store.clone()),
@@ -770,9 +775,8 @@ impl Catalog {
         self.check_reservation(&reservation)?;
         let name = reservation.name();
         let opts = DatasetOptions {
-            name: Some(name.into()),
             origin: Some(origin),
-            ..self.inner.options.read().dataset.clone()
+            ..self.dataset_options(name)
         };
         let ds = Dataset::from_store_with(store, opts);
         *ds.state().reasoning.write() = reasoning;

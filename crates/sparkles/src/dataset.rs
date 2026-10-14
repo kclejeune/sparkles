@@ -1267,7 +1267,7 @@ impl Transaction<'_> {
     /// transaction's changes, and they commit or roll back with it. A `text:query` call
     /// fails once the transaction has changed data, as in [`Transaction::query_with`].
     pub fn update_with(&mut self, update: &str, opts: &QueryOptions) -> Result<UpdateStats> {
-        crate::sparql::update::update_in(&mut self.txn, update, opts)
+        crate::sparql::update::update_in(&mut self.txn, update, &self.ds.with_pool(opts))
     }
 }
 

@@ -186,3 +186,10 @@ def test_catalog_pool_bounds_queries() -> None:
     with pytest.raises(sparkles.BudgetExceededError) as e:
         ds.query(cross, at="head")
     assert e.value.kind == "server-memory"  # type: ignore[attr-defined]
+    # a transaction's update takes the same pool
+    tx = ds.transaction()
+    with pytest.raises(sparkles.BudgetExceededError) as e:
+        tx.update(
+            "DELETE { ?a <urn:none> ?b } WHERE { SELECT ?a ?b WHERE { ?a <urn:p> ?x . ?b <urn:p> ?y } ORDER BY ?x ?y }"
+        )
+    assert e.value.kind == "server-memory"  # type: ignore[attr-defined]
