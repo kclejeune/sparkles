@@ -3351,6 +3351,11 @@ values as plaintext. The Docker image runs as uid 10001, so a bind mount that be
 the host user and was made writable with `chmod 0777` stops an upgrade this way. Running
 `chown -R 10001 DIR` on the mount fixes it.
 
+A generated key's parent directory is synced before any value is sealed with it.
+Loading an existing generated key repeats that check before migration or use, so a
+restart finishes an interrupted key publication. If the sync fails, startup refuses
+and preserves the key and stored values. Retry after resolving the filesystem error.
+
 The first start of a release that seals by default seals the plaintext values it finds
 and generates `secrets.key` for them. An older release then refuses to start on the
 sealed values until `sparkles secrets unseal --data DIR` writes them back as plaintext.

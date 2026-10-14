@@ -1071,9 +1071,12 @@ or, failing that, with the new one, so a run that stopped partway is finished by
 the same command again. It reads every file back and opens it with the new key, and
 syncs the directory, before it removes the old generated key. A generated key is
 installed and its directory synced before any value is sealed with it, directory syncs
-report their errors, and the key file is set to mode 0400 whatever the umask. A start,
-`unseal` and `rekey` remove the `.secrets.key.PID.tmp` and `secrets/.NAME.PID.tmp` files
-that a crashed write can leave. The settings CLI test gates its sealing assertions on
+report their errors, and the key file is set to mode 0400 whatever the umask. Loading
+an existing generated key also syncs its parent before migration or use, so a restart
+finishes an interrupted publication. A failed sync refuses startup and preserves the
+key and stored values for retry. A start, `unseal` and `rekey` remove the
+`.secrets.key.PID.tmp` and `secrets/.NAME.PID.tmp` files that a crashed write can leave.
+The settings CLI test gates its sealing assertions on
 the `backup` feature, and the errors for a build without it and for a data directory
 owned by another user say what to do. The new tests are
 `generated_key_must_be_durable_before_sealing`, `generated_key_mode_ignores_umask` and

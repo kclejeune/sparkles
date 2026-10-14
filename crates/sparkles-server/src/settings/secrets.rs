@@ -397,7 +397,16 @@ impl Sealing {
         }
         let path = data_dir.join(SECRETS_KEY_FILE);
         let sealer = match std::fs::symlink_metadata(&path) {
-            Ok(_) => Some(sealer::read_file(&path)?),
+            Ok(_) => {
+                let loaded = sealer::read_file(&path)?;
+                sync_dir(data_dir).map_err(|e| {
+                    anyhow::anyhow!(
+                        "cannot make the loaded generated key {} durable: {e}",
+                        path.display()
+                    )
+                })?;
+                Some(loaded)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => anyhow::bail!("cannot read the secrets key {}: {e}", path.display()),
         };
@@ -779,7 +788,12 @@ pub fn rekey(data: &FsPath, source: Option<&str>, new_key: &str) -> anyhow::Resu
             Err(e) => anyhow::bail!("cannot remove {}: {e}", path.display()),
         }
         remove_stale_temps(data, is_key_temp);
-        sync_dir(data).map_err(|e| anyhow::anyhow!("cannot flush {}: {e}", data.display()))?;
+        #[cfg(test)]
+        let previous_phase = SYNC_PHASE.with(|phase| phase.replace(SyncPhase::RekeyFinal));
+        let synced = sync_dir(data);
+        #[cfg(test)]
+        SYNC_PHASE.with(|phase| phase.set(previous_phase));
+        synced.map_err(|e| anyhow::anyhow!("cannot flush {}: {e}", data.display()))?;
     }
     Ok(Offline {
         values: written,
@@ -792,9 +806,25 @@ pub fn rekey(data: &FsPath, source: Option<&str>, new_key: &str) -> anyhow::Resu
 thread_local! {
     /// Makes [`sync_dir`] fail on this thread, to test the paths that must report it.
     pub(crate) static FAIL_DIR_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    static DIR_SYNC_PROBE: std::cell::RefCell<Option<(PathBuf, bool, usize)>> = const { std::cell::RefCell::new(None) };
+    static DIR_SYNC_PROBE: std::cell::RefCell<Option<SyncObservation>> = const { std::cell::RefCell::new(None) };
+    static SYNC_PHASE: std::cell::Cell<SyncPhase> = const { std::cell::Cell::new(SyncPhase::Other) };
     static SCAN_PHASE: std::cell::Cell<ScanPhase> = const { std::cell::Cell::new(ScanPhase::Open) };
     static SCAN_FAULT: std::cell::Cell<Option<(ScanPhase, ScanPoint)>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+struct SyncObservation {
+    path: PathBuf,
+    fail: bool,
+    calls: usize,
+    phase: Option<SyncPhase>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SyncPhase {
+    Other,
+    RekeyFinal,
 }
 
 #[cfg(test)]
@@ -829,11 +859,14 @@ pub(crate) fn sync_dir(dir: &FsPath) -> std::io::Result<()> {
     }
     #[cfg(test)]
     DIR_SYNC_PROBE.with(|slot| {
-        if let Some((path, fail, calls)) = slot.borrow_mut().as_mut()
-            && path == dir
+        if let Some(probe) = slot.borrow_mut().as_mut()
+            && probe.path == dir
+            && probe
+                .phase
+                .is_none_or(|expected| SYNC_PHASE.with(|actual| actual.get()) == expected)
         {
-            *calls += 1;
-            if *fail {
+            probe.calls += 1;
+            if probe.fail {
                 return Err(std::io::Error::other(
                     "injected targeted directory sync failure",
                 ));
@@ -1201,20 +1234,35 @@ mod tests {
     use super::*;
 
     #[cfg(all(feature = "backup", unix))]
-    struct SyncProbe(Option<(PathBuf, bool, usize)>);
+    struct SyncProbe(Option<SyncObservation>);
 
     #[cfg(all(feature = "backup", unix))]
     impl SyncProbe {
         fn new(path: &FsPath, fail: bool) -> Self {
-            Self(DIR_SYNC_PROBE.with(|slot| slot.replace(Some((path.to_path_buf(), fail, 0)))))
+            Self::with_phase(path, fail, None)
+        }
+
+        fn finalization(path: &FsPath, fail: bool) -> Self {
+            Self::with_phase(path, fail, Some(SyncPhase::RekeyFinal))
+        }
+
+        fn with_phase(path: &FsPath, fail: bool, phase: Option<SyncPhase>) -> Self {
+            Self(DIR_SYNC_PROBE.with(|slot| {
+                slot.replace(Some(SyncObservation {
+                    path: path.to_path_buf(),
+                    fail,
+                    calls: 0,
+                    phase,
+                }))
+            }))
         }
 
         fn calls(&self) -> usize {
-            DIR_SYNC_PROBE.with(|slot| slot.borrow().as_ref().unwrap().2)
+            DIR_SYNC_PROBE.with(|slot| slot.borrow().as_ref().unwrap().calls)
         }
 
         fn allow(&self) {
-            DIR_SYNC_PROBE.with(|slot| slot.borrow_mut().as_mut().unwrap().1 = false);
+            DIR_SYNC_PROBE.with(|slot| slot.borrow_mut().as_mut().unwrap().fail = false);
         }
     }
 
@@ -1247,7 +1295,7 @@ mod tests {
             .unwrap()
             .write(&dir, "a", b"value-a")
             .unwrap();
-        let probe = SyncProbe::new(&data, true);
+        let probe = SyncProbe::finalization(&data, true);
         let e = rekey(&data, None, &source).unwrap_err().to_string();
         assert!(e.contains("cannot flush"), "{e}");
         assert_eq!(probe.calls(), 1);
@@ -1339,7 +1387,7 @@ mod tests {
             if generated {
                 sealer::generate(&key).unwrap();
             }
-            let probe = SyncProbe::new(&data, false);
+            let probe = SyncProbe::finalization(&data, false);
             let done = rekey(&data, None, &source).unwrap();
             assert_eq!((done.values, done.already), (0, 0));
             assert_eq!(done.removed_key, generated.then_some(key.clone()));
@@ -1736,6 +1784,85 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o400);
+    }
+
+    /// Recover publication interrupted after hard-linking the synced key file, before
+    /// its parent was synced. Refusing startup must preserve both key names and values.
+    #[cfg(all(feature = "backup", unix))]
+    #[test]
+    fn loaded_generated_key_must_be_durable_before_migration() {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let (_t, data, _) = offline_fixture();
+        let dir = data.join(SECRETS_DIR);
+        let tmp = data.join(".secrets.key.4242.tmp");
+        let key = data.join(SECRETS_KEY_FILE);
+        let bytes = "07".repeat(32);
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o400)
+            .open(&tmp)
+            .unwrap();
+        file.write_all(bytes.as_bytes()).unwrap();
+        file.set_permissions(std::fs::Permissions::from_mode(0o400))
+            .unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        std::fs::hard_link(&tmp, &key).unwrap();
+        std::fs::write(dir.join("a"), "plain-a").unwrap();
+        let probe = SyncProbe::new(&data, true);
+        let error = Sealing::start(None, &data).expect_err("loaded key was not made durable");
+        assert!(error.to_string().contains("durable"), "{error}");
+        assert_eq!(probe.calls(), 1);
+        assert_eq!(std::fs::read(&key).unwrap(), bytes.as_bytes());
+        assert_eq!(std::fs::read(&tmp).unwrap(), bytes.as_bytes());
+        assert_eq!(std::fs::read(dir.join("a")).unwrap(), b"plain-a");
+        assert_eq!(std::fs::read_dir(&data).unwrap().count(), 3);
+        probe.allow();
+        let recovered = Sealing::start(None, &data).unwrap();
+        assert_eq!(probe.calls(), 2);
+        recovered.prepare(&dir).unwrap();
+        assert!(is_sealed(&std::fs::read(dir.join("a")).unwrap()));
+        assert_eq!(recovered.read(&dir.join("a"), "a").unwrap(), "plain-a");
+        assert_eq!(std::fs::read(&key).unwrap(), bytes.as_bytes());
+        assert!(!tmp.exists());
+    }
+
+    #[cfg(all(feature = "backup", unix))]
+    #[test]
+    fn loaded_generated_key_restart_reads_and_writes_without_resyncing() {
+        let (_t, data, source) = offline_fixture();
+        let dir = data.join(SECRETS_DIR);
+        Sealing::start(None, &data)
+            .unwrap()
+            .write(&dir, "a", b"first")
+            .unwrap();
+        let key = data.join(SECRETS_KEY_FILE);
+        let bytes = std::fs::read(&key).unwrap();
+        let probe = SyncProbe::new(&data, false);
+        let loaded = Sealing::start(None, &data).unwrap();
+        assert_eq!(probe.calls(), 1);
+        assert_eq!(loaded.read(&dir.join("a"), "a").unwrap(), "first");
+        probe.allow();
+        loaded.write(&dir, "b", b"second").unwrap();
+        assert_eq!(
+            probe.calls(),
+            1,
+            "loaded writes must not resync the key parent"
+        );
+        assert_eq!(loaded.read(&dir.join("b"), "b").unwrap(), "second");
+        assert_eq!(std::fs::read(&key).unwrap(), bytes);
+        Sealing::start(Some(&source), &data).unwrap();
+        Sealing::start(Some("none"), &data).unwrap();
+        assert_eq!(
+            probe.calls(),
+            1,
+            "explicit sources bypass generated-key loading"
+        );
+        std::fs::remove_file(key).unwrap();
+        Sealing::start(None, &data).unwrap();
+        assert_eq!(probe.calls(), 1, "absent keys remain lazy");
+        assert!(!data.join(SECRETS_KEY_FILE).exists());
     }
 
     /// The generated key is readable by its owner under any umask. The umask is
