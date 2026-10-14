@@ -794,8 +794,12 @@ Four environment variables change I/O paths for comparisons.
 `SPARKLES_IO_HINTS=off` maps the index and vocabulary files without access hints, so
 that a page fault reads the device's whole read-ahead window and blocks are not read
 ahead. `SPARKLES_SPARSE_VOCAB=off` looks terms up without `vocab.idx`.
-`SPARKLES_READ_WINDOW_KB` sets the largest window of read requests that a scan keeps
-ahead of itself, 4096 by default.
+`SPARKLES_READ_WINDOW_KB` sets the target compressed bytes requested ahead by one scan,
+4096 KiB by default. A refill includes existing unconsumed advice and coalesced gaps in
+that budget. Whole-block progress can extend it through one next block and its bridged
+gap, which is at most 64 KiB. It bounds requested coverage rather than physical I/O in
+flight. Zero restores per-block hints. Cached columns that are evicted before consumption
+receive fallback advice at the block they need.
 `SPARKLES_WRITEBACK=off` leaves the permutation and vocabulary files of an index build
 to the kernel's own writeback. By default the build sends them to the device as it
 writes them.

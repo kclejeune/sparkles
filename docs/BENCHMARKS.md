@@ -468,6 +468,12 @@ every new read feature is off. The cold targets of the spec, such as `star-looku
 10.5M within 17.3 ms, are confirmed only by a run on the benchmark host, which has not
 been made.
 
+These measurements predate the cancellation, decoded-cache budget and advised-coverage
+repairs. The corrected read-ahead path counts existing outstanding bytes and coalesced
+gaps, allows one next-block extension and restores advice after cache eviction. Its
+warm and cold measurements and no-profile overhead gate remain pending on integrated
+source. The correctness tests establish no new speed result.
+
 ### Full-text search
 
 The comparison uses Sparkles' Tantivy-backed `text:query`, Fuseki's Lucene-backed

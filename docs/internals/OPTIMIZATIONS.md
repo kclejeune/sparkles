@@ -365,10 +365,16 @@ little and change nothing. Each one has the same answers with it on and off.
   ahead of it. The first request covers about 1 MiB and each refill, made when half of
   the window has been used, doubles the window up to 4 MiB. A scan of a few blocks is
   covered by the first request and a long scan keeps a window of reads in flight. A scan
-  that stops early has requested at most one window past its end. The window belongs to
-  the pass, so concurrent scans share no state and the mapping's advice never changes.
-  `SPARKLES_READ_WINDOW_KB` sets the largest window, 4096 by default, for experiments.
-  Passes over the vocabulary in id order use the same window size.
+  that stops early has requested at most the target plus one next-block extension,
+  including its bridged gap of at most 64 KiB. Each refill counts existing unconsumed
+  advice and actual coalesced bytes against the target. Coverage is tracked separately
+  from examined cached blocks and pruned as the pass advances. An evicted column that
+  received no advice gets current-block fallback advice in eager and cursor readers.
+  Cached and empty spans also have a finite traversal budget, so repeated calls at one
+  position do not add another window. Concurrent scans share no coverage state and do
+  not change the mapping's random-access advice. `SPARKLES_READ_WINDOW_KB` sets the
+  target, 4096 KiB by default. This bounds requested bytes, not physical I/O completion.
+  Passes over the vocabulary in id order use the same configured size.
 * **Terms of small inputs** (`prefetch_terms`). A FILTER, BIND or ORDER BY over a table of
   2 to 4,095 rows evaluates the rows one at a time. Before the first row, it asks for the
   vocabulary blocks of the terms it will read. Larger tables decode their terms in id order

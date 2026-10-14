@@ -477,6 +477,17 @@ tails, cached columns and read-through caches. Remaining source-review repairs a
 warm, cold and no-profile performance gates are pending on corrected integrated source.
 These correctness checks establish no new performance result or Phase 3 clearance.
 
+Read-ahead now keeps actual advised compressed-byte coverage separately from examined
+cached blocks. Eager and both cursor consumers use current-block fallback advice if a
+skipped cached column is later evicted. Consumed coverage is pruned, and a refill charges
+old unconsumed advice, unneeded intermediate columns and coalesced gaps against its
+target. It permits at most one next-block extension with a bridged gap of at most 64 KiB.
+A separate examined-span cap bounds traversal through cached or empty spans without
+claiming they were hinted. Repeated calls at one position add no window. The bound is
+on requested coverage rather than physical device I/O. Default, disabled and small-window
+configuration tests retain the same scan-answer assertions. Further profile-accounting
+repairs and corrected-source performance gates remain pending.
+
 ### Phase 1 breakdown
 
 These are server-reported times from a cold `profile=io` request on the Namespace
