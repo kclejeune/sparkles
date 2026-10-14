@@ -50,6 +50,13 @@ datatypes or a mix of literal classes gets no digest. A mix of `xsd:dateTime` va
 without a time zone is not detected, although its order is partly undefined. ORDER BY with
 expressions, and ORDER BY inside subqueries, are not checked.
 
+With a LIMIT or an OFFSET, the rows that tie on the keys at the cut may be any of the tied rows.
+For such a query, when the order digest applies, `exact` and `value` leave out the rows whose
+keys equal those of the first row (with an OFFSET) or of the last row (when the result reaches
+the LIMIT), and `boundary_rows` says how many were left out. The `order` digest still covers
+every row, so the key values and the number of rows in each boundary group are checked. A query
+with other keys, such as an expression, can still be rejected when rows tie at the cut.
+
 The whole request, not each wait, is limited to MAX_TIME seconds (default 300). A slower
 answer is recorded as `error`.
 """
@@ -418,10 +425,9 @@ def graph_record(text, count_only, no_check):
     return rec
 
 
-def order_keys(query, head_vars):
-    """The variables of the query's own ORDER BY when it uses only plain variables, `ASC(?v)` or
-    `DESC(?v)` that are in the result, else None. Strings, comments and IRIs are blanked first,
-    and only an ORDER BY outside every group counts."""
+def _after_order_by(query):
+    """The text after the query's last top-level ORDER BY, with strings, comments and IRIs blanked,
+    or None. Only an ORDER BY outside every group counts."""
     q = re.sub(r"<[^<>\s]*>", "<>", query)
     q = re.sub(r'"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'', '""', q)
     q = re.sub(r"#[^\n]*", "", q)
@@ -433,14 +439,31 @@ def order_keys(query, head_vars):
             depth -= 1
         elif depth == 0:
             start = m.end()
-    if start is None:
+    return None if start is None else q[start:]
+
+
+def order_keys(query, head_vars):
+    """The variables of the query's own ORDER BY when it uses only plain variables, `ASC(?v)` or
+    `DESC(?v)` that are in the result, else None."""
+    tail = _after_order_by(query)
+    if tail is None:
         return None
-    clause = re.split(r"\b(?:limit|offset)\b", q[start:], flags=re.I)[0].strip()
+    clause = re.split(r"\b(?:limit|offset)\b", tail, flags=re.I)[0].strip()
     keys = re.findall(r"(?:(?:asc|desc)\s*\(\s*)?\?(\w+)\s*\)?", clause, re.I)
     rest = re.sub(r"(?:(?:asc|desc)\s*\(\s*)?\?\w+\s*\)?", "", clause, flags=re.I).strip()
     if not keys or rest or any(k not in head_vars for k in keys):
         return None
     return keys
+
+
+def slice_of(query):
+    """(limit, has_offset) of the query's own top-level ORDER BY ... LIMIT ... OFFSET ..., where
+    limit is an integer or None. A query without a top-level ORDER BY gives (None, False)."""
+    tail = _after_order_by(query)
+    if tail is None:
+        return None, False
+    m = re.search(r"\blimit\s+(\d+)", tail, re.I)
+    return (int(m.group(1)) if m else None), bool(re.search(r"\boffset\b", tail, re.I))
 
 
 # literal classes whose order SPARQL defines. xsd:date is outside the SPARQL 1.1 operator table, but
@@ -477,14 +500,25 @@ def select_record(query, res, count_only):
     rec = {"rows": len(bindings)}
     if count_only:
         return rec
-    for key, by_value in (("exact", False), ("value", True)):
-        rec[key] = canon(tuple(term(b.get(v), by_value) for v in vars_) for b in bindings)
     keys = order_keys(query, vars_)
-    if keys:
-        seq = [tuple(term(b.get(v), True) for v in keys) for b in bindings]
-        if orderable(seq):
-            # the sequence of ORDER BY keys, which ties in the keys cannot change
-            rec["order"] = hashlib.sha256(repr(seq).encode()).hexdigest()[:16]
+    seq = [tuple(term(b.get(v), True) for v in keys) for b in bindings] if keys else None
+    ordered = seq is not None and orderable(seq)
+    kept = bindings
+    if ordered:
+        # the sequence of ORDER BY keys, which ties in the keys cannot change
+        rec["order"] = hashlib.sha256(repr(seq).encode()).hexdigest()[:16]
+        limit, offset = slice_of(query)
+        edge = set()
+        if offset and seq:
+            edge.add(seq[0])
+        if limit is not None and len(bindings) >= limit and seq:
+            edge.add(seq[-1])
+        if limit is not None or offset:
+            # rows that tie on the key at the cut may be any of the tied rows, so only their keys count
+            kept = [b for b, k in zip(bindings, seq) if k not in edge]
+            rec["boundary_rows"] = len(bindings) - len(kept)
+    for key, by_value in (("exact", False), ("value", True)):
+        rec[key] = canon(tuple(term(b.get(v), by_value) for v in vars_) for b in kept)
     return rec
 
 

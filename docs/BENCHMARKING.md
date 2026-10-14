@@ -253,7 +253,10 @@ and comparison methodology. [DEVELOPMENT.md](DEVELOPMENT.md) covers building and
   script runs the driver once against a stub endpoint to record the queries of its own query
   mixes, and it keeps three distinct instances of each template. The answers to these
   instances are compared across engines before timing, except for the DESCRIBE query, whose
-  result the SPARQL specification leaves to the engine. Each instance is then timed, and the
+  result the SPARQL specification leaves to the engine. When a query with an ORDER BY on
+  plain variables also has a LIMIT or an OFFSET, the rows that tie with the row at the cut
+  may legitimately differ between engines, so the comparison leaves those rows out and
+  compares only their key values. Each instance is then timed, and the
   record pools the instances of a template into one result. After that, the driver itself
   runs the query mix against each engine with 1, 4 and 16 clients (`--clients`) after 50
   warm-up mixes and 500 measured ones, and the record gets its query mixes per hour. The

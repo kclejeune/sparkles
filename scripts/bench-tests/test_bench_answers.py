@@ -160,6 +160,55 @@ class OrderableTests(unittest.TestCase):
         self.assertIn("order", ba.select_record("SELECT ?x { ?s ?p ?x } ORDER BY ?x", res, False))
 
 
+class SliceTests(unittest.TestCase):
+    Q = "SELECT ?x ?y { ?x ?p ?y } ORDER BY ?x LIMIT 2"
+
+    def rec(self, query, *pairs):
+        res = result(["x", "y"], *[[lit(str(x), "integer"), lit(y)] for x, y in pairs])
+        return ba.select_record(query, res, False)
+
+    def test_rows_tied_at_the_limit_boundary_are_compared_by_key_only(self):
+        a = self.rec(self.Q, (1, "a"), (2, "b"))
+        b = self.rec(self.Q, (1, "a"), (2, "c"))
+        for k in ("exact", "value", "order"):
+            self.assertEqual(a[k], b[k], k)
+        self.assertEqual(a["boundary_rows"], 1)
+        self.assertEqual(a["rows"], 2)
+
+    def test_a_row_away_from_the_boundary_still_counts(self):
+        self.assertNotEqual(self.rec(self.Q, (1, "z"), (2, "b"))["value"], self.rec(self.Q, (1, "a"), (2, "b"))["value"])
+
+    def test_a_boundary_key_with_another_number_of_rows_differs(self):
+        a = self.rec("SELECT ?x ?y { ?x ?p ?y } ORDER BY ?x LIMIT 3", (1, "a"), (2, "b"), (2, "c"))
+        b = self.rec("SELECT ?x ?y { ?x ?p ?y } ORDER BY ?x LIMIT 3", (1, "a"), (2, "b"), (3, "c"))
+        self.assertNotEqual(a["order"], b["order"])
+
+    def test_fewer_rows_than_the_limit_leave_nothing_out(self):
+        r = self.rec(self.Q, (1, "a"))
+        self.assertEqual(r["boundary_rows"], 0)
+        self.assertEqual(r["exact"], self.rec("SELECT ?x ?y { ?x ?p ?y } ORDER BY ?x", (1, "a"))["exact"])
+
+    def test_with_an_offset_the_rows_tied_with_the_first_key_are_left_out(self):
+        q = "SELECT ?x ?y { ?x ?p ?y } ORDER BY ?x OFFSET 1 LIMIT 5"
+        a = self.rec(q, (1, "a"), (1, "b"), (2, "c"))
+        b = self.rec(q, (1, "x"), (1, "y"), (2, "c"))
+        self.assertEqual(a["boundary_rows"], 2)
+        self.assertEqual(a["value"], b["value"])
+        self.assertEqual(a["order"], b["order"])
+
+    def test_queries_without_a_slice_or_with_unordered_keys_are_unchanged(self):
+        r = self.rec("SELECT ?x ?y { ?x ?p ?y } ORDER BY ?x", (1, "a"), (2, "b"))
+        self.assertNotIn("boundary_rows", r)
+        r = self.rec("SELECT ?x ?y { ?x ?p ?y } ORDER BY ABS(?x) LIMIT 2", (1, "a"), (2, "b"))
+        self.assertNotIn("boundary_rows", r)
+
+    def test_slice_of(self):
+        self.assertEqual(ba.slice_of("SELECT * { ?s ?p ?o } ORDER BY ?s LIMIT 7"), (7, False))
+        self.assertEqual(ba.slice_of("SELECT * { ?s ?p ?o } ORDER BY ?s OFFSET 3"), (None, True))
+        self.assertEqual(ba.slice_of("SELECT * { ?s ?p ?o } LIMIT 7"), (None, False))
+        self.assertEqual(ba.slice_of("SELECT * { { SELECT ?s { ?s ?p ?o } ORDER BY ?s LIMIT 7 } }"), (None, False))
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
