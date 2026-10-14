@@ -2663,7 +2663,7 @@ fn assist(p: &mut Paths) {
     );
     p.add(
         op(PUT, "/$/server/secrets/{name}", "putSecret", "Server", "Store a model secret")
-            .doc("Stores a runtime value for the secret in the data directory with mode 0600, sealed unless the server runs with `--secrets-key none`. The first value a server without a configured key stores generates `<dataDir>/secrets.key`. It overrides the `--model-secret` source, and requests that start after it use it. A secret that `server.locked` locks is a `409` with `locked-by-config`. Needs server `admin`.")
+            .doc("Stores a runtime value for the secret in the data directory with mode 0600. Builds with the default `backup` feature seal values unless the server runs with `--secrets-key none`. Builds without it keep plaintext. When sealing is enabled, the first value stored without a configured key generates `<dataDir>/secrets.key`. It overrides the `--model-secret` source, and requests that start after it use it. A secret that `server.locked` locks is a `409` with `locked-by-config`. Needs server `admin`.")
             .see("model-secrets")
             .json_body(true, "SecretValue")
             .no_content("Stored.")

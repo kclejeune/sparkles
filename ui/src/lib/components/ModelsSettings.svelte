@@ -497,8 +497,8 @@
         </p>
       {:else if storage === 'plaintext'}
         <p class="faint" data-testid="secrets-storage">
-          Stored keys are kept unencrypted, readable by anyone who can read the data directory,
-          because the server runs with <code>--secrets-key none</code>.
+          Stored keys are kept unencrypted and are readable by anyone who can read the data
+          directory.
         </p>
       {/if}
       {#if secretsError}

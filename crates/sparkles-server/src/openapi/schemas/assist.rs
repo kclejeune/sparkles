@@ -1602,9 +1602,9 @@ fn server_settings(put: &mut dyn FnMut(&str, J)) {
             obj(
                 &["storage", "keySource", "keyMemory", "secrets"],
                 json!({
-                    "storage": with_desc(string_enum(&["sealed", "plaintext"]), "How runtime values are kept in the data directory: `sealed`, the default, or `plaintext` in files with mode 0600 when the server runs with `--secrets-key none`."),
-                    "keySource": with_desc(or_null(string_enum(&["configured", "generated"])), "Where the key that seals the values comes from: `configured` for `serve --secrets-key` or the systemd credential `sparkles-secrets-key`, `generated` for the key the server keeps in `<dataDir>/secrets.key`, which it writes when it first stores a value. `null` for plaintext values."),
-                    "keyMemory": with_desc(or_null(string_enum(&["locked", "heap"])), "Where the server keeps the key: `locked` in a locked page that core dumps leave out, or `heap` in a buffer that is zeroed on release, on platforms without such pages. `null` until there is a key."),
+                    "storage": with_desc(string_enum(&["sealed", "plaintext"]), "How runtime values are kept in the data directory: `sealed` by default in builds with the `backup` feature, or `plaintext` in files with mode 0600 when the server runs with `--secrets-key none` or was built without that feature."),
+                    "keySource": with_desc(or_null(string_enum(&["configured", "generated"])), "Where the key that seals the values comes from: `configured` for `serve --secrets-key` or the systemd credential `sparkles-secrets-key`, `generated` for the key the server keeps in `<dataDir>/secrets.key`, which it writes when it first stores a value with sealing enabled. `null` for plaintext values."),
+                    "keyMemory": with_desc(or_null(string_enum(&["locked", "heap"])), "Where the server keeps the key: `locked` in a locked page that core dumps leave out, or `heap` in a buffer that is zeroed on release when a protected page is unavailable. `null` until there is a key."),
                     "secrets": array(obj(
                         &["name", "source", "declared", "locked", "setAt", "overridden", "providers"],
                         json!({

@@ -191,7 +191,9 @@ Every binary uses one feature set: the defaults of `sparkles-server`, `embed-loc
 `backup-encryption`. Today the three image paths disagree. The `Dockerfile` adds
 `embed-local` only, `nix/package.nix` adds `embed-local` and, on Linux,
 `backup-encryption`, and a plain `cargo build` adds neither. §8's C19 dependency on
-sealed secrets needs `backup-encryption` in every published build. The `pdf-ocr`
+sealed runtime secrets needs the default `backup` feature in published builds.
+Repository encryption keeps its separate `backup-encryption` feature and platform
+requirements. The `pdf-ocr`
 feature is in the `-ocr` image only, because it needs PDFium and ONNX Runtime at run time.
 
 The release profile keeps line tables (`debug = 1`), which the `Dockerfile` notes make
@@ -259,6 +261,8 @@ locking whose semantics differ from `flock`.
 | Change log | segments and index | magics `SPKCHGL\0`, `SPKCHGI\0`, `FORMAT` 1 | primary |
 | Annotations | `annotations.bin` | magic `SPKANNO\0`, `FORMAT` 1 | primary |
 | Catalog | `config.json`, `catalog.lock` | none | primary |
+| Runtime secrets | `secrets/NAME` in the server data directory | Raw plaintext is version 0 at the server wrapper. Sealed values use `sparkles-sealed-secret/1 `, and encrypted version 0 is refused. | primary |
+| Generated secrets key | `secrets.key` in the server data directory | The existing opaque key representation is unversioned format 0. | primary |
 | Full-text index | Tantivy directory and `text.json` | `FORMAT` 2 (`text.rs`); another format is rebuilt on open | derived |
 | Vector index | `vector.json`, index files | config `FORMAT_VERSION` 1, file `SPKVEC` `FILE_VERSION` 1 | derived |
 | Spatial index | `geo.json`, index files | config `FORMAT_VERSION` 1, `LITERALS_VERSION` 2, file `SPKGEO` `FILE_VERSION` 1 | derived |
@@ -621,6 +625,13 @@ four kinds of change of §4.3. `GET /$/server` reports the registry in a `format
 for callers that see the version, and `sparkles migrate --check --format json` prints it.
 The backup crate's layout, blob and key-slot constants are now defined from the
 registry, and the module constants of the core files are checked against it by a test.
+
+The registry also records the server's existing runtime-secret envelope and generated
+key. The server wrapper accepts legacy plaintext as version 0 and sealed version 1, but
+an encrypted version-zero envelope is refused. The generated key remains opaque format
+0 and is not a JSON settings file. Envelope versions are checked before authentication
+fallback, and the sealer recognizes the whole family while decoding only v1. This
+registration changes neither the v1 encoding and AAD nor the dataset reader capability.
 
 **Version markers.** A write-ahead log created by this build starts with a header
 record: the magic `\x89SPKWAL\n`, the version (1) and zeros. The spec asked for a 16-byte

@@ -1080,6 +1080,24 @@ owned by another user say what to do. The new tests are
 `stale_temporary_files_are_removed` in `settings/secrets.rs`, and
 `rekey_resumes_after_a_failed_write` in `settings/server_tests.rs`.
 
+A second review tightened offline finalization. A rekey retry cleans stale key files
+and syncs the data directory even after an earlier attempt unlinked the generated key.
+A stopped catalog with no runtime-secret directory is a valid empty case. Opening and
+verification require complete secret enumeration, so an unreadable entry or directory
+cannot authorize key removal. The internal migration and verification plaintext owners
+are zeroizing through UTF-8 validation in builds with `backup`. The encryption buffer
+reserves tag capacity before copying plaintext, so tag appending does not grow a buffer
+that already holds plaintext. Public request reads still return ordinary strings, and
+this does not claim to wipe every heap allocation.
+
+The X12 registry records the existing sealed v1 envelope and the separate raw generated
+key. Unknown, malformed and encrypted version-zero envelopes are refused before
+fallback, preserving live values and keys. The v1 bytes and authenticated name binding
+are unchanged. Regression tests cover final-sync retries, stale-key cleanup, missing
+secret directories, incomplete enumeration, UTF-8 refusal and key classification. A
+legacy v1 fixture and the safe append-tag observer cover compatibility and buffer growth.
+Arbitrary allocator scanning was omitted because it could read uninitialized padding.
+
 Two decisions are recorded. Sealing needs the default `backup` feature, so the docs say
 that every build with it seals, and a build without it keeps plaintext (D1). A start
 that must generate a key in a data directory owned by another user still fails, with an

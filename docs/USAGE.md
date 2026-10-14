@@ -3372,14 +3372,18 @@ the values again with the same key. `rekey` opens every value before it writes a
 it stops partway, running the same command again finishes it, because it keeps the
 values that already open with the new key. It removes a generated `secrets.key` only
 after every value opens with the new key. Start the server with `--secrets-key` and the
-new source afterwards.
+new source afterwards. A retry also finishes stale-key cleanup and the data-directory
+sync when an earlier attempt already removed the canonical key. A stopped catalog with
+no runtime secrets can be rekeyed without creating a secrets directory. A directory or
+entry that cannot be completely enumerated stops opening or verification before key
+removal. Fix its permissions or I/O error and run the same command again.
 
 Sealing a plaintext value in place and `rekey` write a new file and rename it over the
 old one. They do not erase the plaintext or the old key from freed disk blocks, from
 filesystem snapshots or from earlier copies of the directory. After a migration from
 plaintext, replace any API keys that an earlier copy may hold. Sealing also does not
 stop someone with write access to `secrets/` from putting back an older sealed value of
-the same secret, because the files carry no version.
+the same secret, because sealing does not record a value's revision.
 
 The **Server** page of the web UI has a **Models** section for users with
 `server-admin`. It lists the providers with their protocol, endpoint and whether their
