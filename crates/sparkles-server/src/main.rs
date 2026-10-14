@@ -67,6 +67,7 @@ mod reasoning;
 #[cfg(feature = "auth")]
 mod remote;
 mod secrets_cmd;
+mod server_memory;
 mod settings;
 mod settings_cmd;
 #[cfg(feature = "shacl")]
@@ -103,22 +104,28 @@ use std::time::{Duration, Instant};
     about = "High-performance RDF/SPARQL database (Jena/Fuseki compatible)"
 )]
 struct Cli {
-    /// Block cache size in MiB
-    #[arg(long, global = true, default_value_t = 1024)]
-    cache_mb: u64,
-    /// Query result cache size in MiB (0 disables it)
-    #[arg(long, global = true, default_value_t = 512)]
-    result_cache_mb: u64,
-    /// Cache of remote SERVICE results (`SERVICE <cache:…>`) per dataset, in MiB (0
-    /// disables it)
-    #[arg(long, global = true, default_value_t = 64)]
-    service_cache_mb: u64,
+    /// Defaults for the cache sizes (and, with `serve`, the query memory limits): `default`
+    /// or `small` for constrained hosts. A flag given on the command line overrides it.
+    #[arg(long, global = true, value_enum, default_value_t = server_memory::Profile::Default)]
+    memory_profile: server_memory::Profile,
+    /// Block cache size in MiB, for the whole server (default 1024, `small`: 256)
+    #[arg(long, global = true)]
+    cache_mb: Option<u64>,
+    /// Query result cache size in MiB, for the whole server (0 disables it; default 256,
+    /// `small`: 64)
+    #[arg(long, global = true)]
+    result_cache_mb: Option<u64>,
+    /// Cache of remote SERVICE results (`SERVICE <cache:…>`) for the whole server, in MiB
+    /// (0 disables it; default 64, `small`: 16)
+    #[arg(long, global = true)]
+    service_cache_mb: Option<u64>,
     /// Treat the default graph as the union of all named graphs
     #[arg(long, global = true)]
     union_default_graph: bool,
-    /// Memory for materialized past states (point-in-time reads), in MiB
-    #[arg(long, global = true, default_value_t = 1024)]
-    history_cache_mb: u64,
+    /// Memory for materialized past states (point-in-time reads), for the whole server,
+    /// in MiB (default 512, `small`: 128)
+    #[arg(long, global = true)]
+    history_cache_mb: Option<u64>,
     /// Memory for packed vectors and HNSW graphs (`spk:vectorSearch`, vector indexes),
     /// per index generation, in MiB
     #[arg(long, global = true, default_value_t = 4096)]
@@ -1007,9 +1014,21 @@ enum Cmd {
         #[arg(long, value_name = "HOST:PORT", conflicts_with = "no_metrics")]
         metrics_addr: Option<String>,
         /// Budget for the estimated memory of a query's intermediate results, in MiB
-        /// (0: unlimited)
-        #[arg(long, default_value_t = 8192)]
-        query_memory_mb: u64,
+        /// (0: unlimited; default 8192, `small`: 1024)
+        #[arg(long)]
+        query_memory_mb: Option<u64>,
+        /// Estimated memory that all queries and updates may hold together, in MiB: the
+        /// query memory pool. A request waits for a share of it before it runs, and a
+        /// query whose state outgrows what is left fails with `503`. The default is
+        /// half of the memory available to the process (its cgroup limit or the physical
+        /// memory) less the caches, and at least 256 MiB; `small` sets 2048. 0 turns the
+        /// pool off.
+        #[arg(long)]
+        total_query_memory_mb: Option<u64>,
+        /// Seconds a request waits for the query memory pool before it answers `503`
+        /// with `Retry-After`
+        #[arg(long, default_value_t = 2.0)]
+        query_admission_wait: f64,
         /// Budget for the serialized body of a SPARQL query response, in MiB (0: unlimited)
         #[arg(long, default_value_t = 1024)]
         max_result_mb: u64,
@@ -1901,12 +1920,13 @@ enum Cmd {
 
 fn store_opts(cli: &Cli) -> StoreOptions {
     sparkles::vector::set_budget(cli.vector_memory_mb << 20);
+    let sizes = server_memory::cache_sizes(cli);
     StoreOptions {
-        cache_bytes: cli.cache_mb << 20,
-        result_cache_bytes: cli.result_cache_mb << 20,
-        service_cache_bytes: cli.service_cache_mb << 20,
+        cache_bytes: sizes.blocks,
+        result_cache_bytes: sizes.results,
+        service_cache_bytes: sizes.service,
         union_default_graph: cli.union_default_graph,
-        history_cache_bytes: cli.history_cache_mb << 20,
+        history_cache_bytes: sizes.history,
         history_max_generations: cli.history_max_generations,
         max_snapshots: cli.max_snapshots,
         max_branches: cli.max_branches,
@@ -2330,6 +2350,8 @@ fn run() -> Result<()> {
         geo::register_crs_file(path)?;
     }
     let opts = store_opts(&cli);
+    let cli_memory_profile = cli.memory_profile;
+    let cli_cache_sizes = server_memory::cache_sizes(&cli);
     let no_validate = cli.no_validate;
     match cli.cmd {
         Cmd::Serve {
@@ -2374,6 +2396,8 @@ fn run() -> Result<()> {
             mut metrics_fuseki_names,
             metrics_addr,
             query_memory_mb,
+            total_query_memory_mb,
+            query_admission_wait,
             max_result_mb,
             max_export_mb,
             max_rows,
@@ -2515,7 +2539,30 @@ fn run() -> Result<()> {
             } else {
                 Vec::new()
             };
-            let mut st = state::AppState::new(&data, opts, Duration::from_secs_f64(timeout))?;
+            let caches = cli_cache_sizes;
+            let pool_bytes =
+                server_memory::pool_capacity(total_query_memory_mb, cli_memory_profile, &caches);
+            if !(query_admission_wait.is_finite() && query_admission_wait >= 0.0) {
+                bail!("--query-admission-wait must be a number of seconds, 0 or more");
+            }
+            tracing::info!(
+                "memory profile {}: block cache {} MiB, result cache {} MiB, SERVICE cache {} MiB, history cache {} MiB, query budget {} MiB, query pool {}",
+                cli_memory_profile.name(),
+                caches.blocks >> 20,
+                caches.results >> 20,
+                caches.service >> 20,
+                caches.history >> 20,
+                query_memory_mb.unwrap_or_else(|| cli_memory_profile.query_memory_mb()),
+                pool_bytes.map_or("off".to_string(), |b| format!("{} MiB", b >> 20)),
+            );
+            let mut st = state::AppState::with_memory(
+                &data,
+                opts,
+                Duration::from_secs_f64(timeout),
+                pool_bytes,
+            )?;
+            st.admission.profile = cli_memory_profile;
+            st.admission.wait = Duration::from_secs_f64(query_admission_wait);
             st.auth = auth;
             st.cors_origins = cors_origin;
             st.hosts = hosts;
@@ -2595,7 +2642,9 @@ fn run() -> Result<()> {
             st.compaction = auto_compact.state()?;
             let mib = |m: u64| (m > 0).then_some(m << 20);
             st.limits = state::Limits {
-                query_memory_bytes: mib(query_memory_mb),
+                query_memory_bytes: mib(
+                    query_memory_mb.unwrap_or_else(|| cli_memory_profile.query_memory_mb())
+                ),
                 max_result_bytes: mib(max_result_mb),
                 max_export_bytes: mib(max_export_mb),
                 max_rows,

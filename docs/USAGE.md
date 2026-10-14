@@ -407,7 +407,9 @@ happens to materialized inferences, and the limits.
 | `--timeout S` | `60` | Default query timeout in seconds. `timeout=` sets it per request. |
 | `--update-timeout S` | `0` | Default SPARQL update timeout in seconds; `0` means none. `timeout=` sets it per request. An update that times out changes nothing. |
 | `--max-timeout S` | `1800` | Largest `timeout=` a query or update may ask for; `0` means unlimited. Never below `--timeout` or `--update-timeout`. |
-| `--query-memory-mb N` | `8192` | Budget for the estimated memory of a query's intermediate results; `0` means unlimited. |
+| `--query-memory-mb N` | `8192` (`small`: `1024`) | Budget for the estimated memory of a query's intermediate results; `0` means unlimited. |
+| `--total-query-memory-mb N` | half the available memory, less the caches (`small`: `2048`) | The query memory pool, the estimated memory of all queries and updates together. A request waits for a share of it before it runs. `0` turns the pool off. See [Memory and caches](#memory-and-caches). |
+| `--query-admission-wait S` | `2` | Seconds a request waits for its share of the pool before it answers `503` with `Retry-After: 1`. |
 | `--max-result-mb N` | `1024` | Budget for the body of a SPARQL query response; `0` means unlimited. |
 | `--max-export-mb N` | `0` | Budget for the body of a Graph Store GET, which exports a graph or the whole dataset; `0` means unlimited. |
 | `--max-rows N` | `200000000` | Rows in any intermediate result. |
@@ -463,7 +465,11 @@ happens to materialized inferences, and the limits.
 | `--outbound-request-timeout S` | 4 × `--outbound-timeout` (`240`) | Time that all the SERVICE calls and LOADs of one query or update may take, summed. |
 | `--service-bulk-size N` | `10` | Inputs per request of `SERVICE <loop:bulk:…>` (see [Correlated and cached SERVICE](#correlated-bulk-and-cached-service)). |
 | `--service-bulk-max N` | `100` | The most inputs per request of any bulk SERVICE. `bulk+n` is capped to it. |
-| `--service-cache-mb N` | `64` | The cache of remote results that `SERVICE <cache:…>` uses, per dataset. `0` turns it off. A global flag. |
+| `--service-cache-mb N` | `64` (`small`: `16`) | The cache of remote results that `SERVICE <cache:…>` uses, for the whole server. `0` turns it off. A global flag. |
+| `--cache-mb N` | `1024` (`small`: `256`) | The block cache, for the whole server. Each dataset used to have a cache of this size. A global flag. |
+| `--result-cache-mb N` | `256` (`small`: `64`) | The query result cache, for the whole server. `0` turns it off. A global flag. |
+| `--history-cache-mb N` | `512` (`small`: `128`) | Materialized past states for point-in-time reads, for the whole server. A global flag. |
+| `--memory-profile NAME` | `default` | `default` or `small`. A profile sets the defaults of the cache, query budget and pool flags above, and a flag given on the command line overrides it. A global flag. |
 | `--shex-max-imports N` | `64` | Most schemas that the imports of one ShEx schema may bring in, directly or through other imports. `shex validate` and `validation` take it too. |
 | `--shex-max-import-mb N` | `16` | Most schema text that the imports of one ShEx schema may read, from files and the network together. `shex validate` and `validation` take it too. |
 | `--shex-import-timeout S` | `10` | Time that one http(s) import may take. The import is also held to `--outbound-timeout` and the request's budget. |
@@ -475,8 +481,7 @@ happens to materialized inferences, and the limits.
 | `--reason-cache-triples N` | `10000000` | The largest closure of a materialization that a dataset keeps in memory, so that the next re-run or automatic run updates it incrementally. A closure takes about 135 bytes per triple. With `0`, a run reads the closure back from a persistent dataset, and an in-memory dataset runs in full. |
 
 `sparkles serve --help` lists the other options. They include `--read-only`,
-`--union-default-graph`, the cache sizes (`--cache-mb`, `--result-cache-mb`,
-`--history-cache-mb`), `--auto-reason`, `--auth-config`, `--unix-socket`,
+`--union-default-graph`, `--auto-reason`, `--auth-config`, `--unix-socket`,
 `--map-style-url`, the GraphQL limits ([GraphQL](#graphql)), the `--mcp-*` options
 ([MCP over HTTP](#over-http)), response compression (`--http-compression`) and the
 schema limits.
@@ -494,6 +499,40 @@ the same text took under 10 ms, and updates of up to 64 KiB that only use `INSER
 and `DELETE DATA`, on a dataset without write-time validation, when no other write holds
 the dataset. Such a request runs to its end even if its client disconnects, though its
 timeout still applies. Everything else runs on the pool and stops on a disconnect.
+
+### Memory and caches
+
+The server keeps four caches for all its datasets together. The block cache holds decoded
+index blocks (`--cache-mb`), the result cache holds results of query subtrees
+(`--result-cache-mb`), the SERVICE cache holds remote results (`--service-cache-mb`), and
+the history cache holds materialized past states (`--history-cache-mb`). Their memory
+therefore does not grow with the number of datasets. A dataset that is queried keeps its
+blocks, and one that is idle loses them to the others. `/$/server/memory` shows how much of
+each cache every dataset holds, and `POST /$/cache/clear/{ds}` empties the result and
+SERVICE entries of one dataset only.
+
+`--memory-profile small` is for hosts with little memory. It shrinks the caches to 256 MiB
+of blocks, 64 MiB of results, 16 MiB of SERVICE results and 128 MiB of history, lowers the
+budget of one query to 1 GiB, and sets the pool to 2 GiB. The default profile keeps the
+block cache at 1 GiB. The 10.5M-triple benchmark touched about 378 MiB of blocks and ran
+at the same speed with 256 MiB as with 1 GiB, but data at the scale of DBpedia touches
+more, and a smaller cache costs speed when the working set no longer fits. Use `small`
+when memory matters more than the last bit of speed, and read the resolved values in the
+log line that `serve` writes at start.
+
+The query memory pool bounds what all running queries may hold together, so that sixteen
+queries that each stay within `--query-memory-mb` cannot add up to more than the host has.
+A request that finds the pool full waits up to `--query-admission-wait` seconds and then
+receives `503` with `Retry-After`. The pool costs a few atomic operations per request and
+nothing per row while a query stays inside its grant. The default pool is half of the
+available memory less the caches, so a server that ran many large queries at once may now
+see `503` where it used to run them until the host ran out of memory. Every request
+reserves 16 MiB when it starts, so on a small host the pool is the 256 MiB floor, and
+concurrent queries beyond the sixteenth wait and then receive `503` with `Retry-After`.
+Set `--total-query-memory-mb 0` to turn the pool off, which restores the earlier
+behaviour. A SERVICE call from a query to its own server counts as a request of its own,
+so it can wait while its caller holds memory and then answer `503`. The mechanism is
+described in [API.md](API.md#query-memory-pool).
 
 ## Command-line tools
 
@@ -1919,8 +1958,8 @@ every film gets the same label. With `loop:` and no `bulk`, it gets one request 
 With `bulk+50`, 1,000 films take 20 requests, and with `cache:` a second run takes none.
 The requests follow the outbound policy and its budgets like any SERVICE call.
 
-The cache belongs to the dataset, holds `--service-cache-mb` (64), and keeps each caller's
-entries apart. `cache+clear:` refreshes the entries a query reads, and
+The cache is shared by the datasets, holds `--service-cache-mb` (64) in all, and keeps each
+caller's entries apart. `cache+clear:` refreshes the entries a query reads, and
 `POST /$/cache/clear/{ds}` drops them all. `SERVICE <loop:> { … }` and
 `SERVICE <urn:x-arq:self> { … }` read the dataset itself without a request. The options
 and the request shapes are in [API.md](API.md#service-options-loop-bulk-and-cache).
@@ -4058,6 +4097,18 @@ it when dropped. A dataset name has 1 to 64 ASCII letters, digits, `_`, `-` and 
 cannot start with `.` and cannot be `ui` or `$`. Renaming a persistent dataset fails
 while handles to it are open. Otherwise the rename closes the store, moves its
 directory and updates the registry.
+
+A catalog builds one block cache, result cache, SERVICE cache and history cache for all
+the datasets it opens, sized by the cache options of the `StoreOptions` it was created
+with, so its memory does not grow with the number of datasets. `CatalogOptions::memory`
+can size them separately (`CatalogCaches::Sizes`) or give each dataset its own
+(`CatalogCaches::PerDataset`). `MemoryOptions::pool_bytes` adds a query memory pool, the
+estimated bytes that all the catalog's queries and updates may hold together. A query
+that the pool cannot cover fails with `BudgetKind::ServerMemory`, and nothing queues.
+There is no pool by default. A dataset opened on its own keeps its own caches. Python
+takes `total_query_memory_bytes` in `Catalog(...)` and `Catalog.memory(...)`, and
+Node takes `totalQueryMemoryBytes` in the catalog options. The JVM bindings do not expose
+the pool.
 
 With the feature `backup`, `catalog.repositories()` manages `backup/repositories.json`.
 Its `list`, `get`, `add`, `update`, `remove` and `open` calls share the configuration

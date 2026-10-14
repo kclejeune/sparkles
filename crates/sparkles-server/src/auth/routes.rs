@@ -41,6 +41,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/openapi.yaml", &["GET"]),
     ("/$/server", &["GET", "POST"]),
     ("/$/metrics", &["GET"]),
+    ("/$/server/memory", &["GET"]),
     ("/$/ready", &["GET"]),
     ("/$/ready/{ds}", &["GET"]),
     ("/$/datasets", &["GET", "POST"]),
@@ -301,7 +302,7 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         "/$/mcp" => Caller,
         // a pure computation over the request's literals
         "/$/geo/convert" => Caller,
-        "/$/metrics" => Server(ServerPerm::Metrics),
+        "/$/metrics" | "/$/server/memory" => Server(ServerPerm::Metrics),
         "/$/queries/{ds}/suggestions" if *method == Method::POST => Dataset(Read),
         "/$/queries/{ds}/suggestions" => Dataset(Admin),
         "/$/memory/{ds}" if get => Dataset(Read),

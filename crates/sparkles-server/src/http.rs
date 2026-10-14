@@ -103,6 +103,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/$/openapi.yaml", get(crate::openapi::serve_yaml))
         .merge(crate::auth::routes())
         .route("/$/server", get(server_info).post(server_info))
+        .route("/$/server/memory", get(server_memory))
         .route("/$/metrics", get(crate::obs::metrics_endpoint))
         .route("/$/ready", get(crate::obs::ready_endpoint))
         .route("/$/ready/{ds}", get(crate::obs::ready_dataset))
@@ -312,6 +313,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         ))
         .layer(tower_http::decompression::RequestDecompressionLayer::new())
         .layer(axum::middleware::from_fn(crate::compress::mark_encoded));
+    // admission to the query memory pool, inside the rate limiter so that its
+    // concurrency caps answer first
+    let app = app.layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        crate::server_memory::admit,
+    ));
     // inside `observe` (limited requests are logged and counted) and CORS (browsers
     // can read the 429); inside the auth layer, which puts the principal in the request
     let app = match &state.rate_limit {
@@ -389,6 +396,9 @@ impl IntoResponse for ApiError {
             .and_then(|b| BudgetKind::ALL.into_iter().find(|k| k.as_str() == b));
         let outcome = match self.0 {
             StatusCode::REQUEST_TIMEOUT => Some(Outcome::Timeout),
+            StatusCode::SERVICE_UNAVAILABLE if budget == Some(BudgetKind::ServerMemory) => {
+                Some(Outcome::Budget)
+            }
             StatusCode::SERVICE_UNAVAILABLE => Some(Outcome::Cancelled),
             StatusCode::INSUFFICIENT_STORAGE if budget.is_some() => Some(Outcome::Budget),
             _ => None,
@@ -414,6 +424,10 @@ impl IntoResponse for ApiError {
         if let Some(t) = turtle.as_ref().and_then(J::as_str) {
             resp.extensions_mut()
                 .insert(validation::RejectionTurtle(t.to_string()));
+        }
+        if budget == Some(BudgetKind::ServerMemory) {
+            resp.headers_mut()
+                .insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
         }
         resp.extensions_mut().insert(ErrorJson(body));
         resp
@@ -577,6 +591,10 @@ impl From<Error> for ApiError {
             Error::Cancelled => StatusCode::SERVICE_UNAVAILABLE,
             Error::BudgetExceeded(b) if b.kind == BudgetKind::DecompressedBytes => {
                 StatusCode::PAYLOAD_TOO_LARGE
+            }
+            // the server's query memory is in use: a retry can succeed
+            Error::BudgetExceeded(b) if b.kind == BudgetKind::ServerMemory => {
+                StatusCode::SERVICE_UNAVAILABLE
             }
             Error::BudgetExceeded(_) => StatusCode::INSUFFICIENT_STORAGE,
             Error::Poisoned | Error::TextUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
@@ -1029,6 +1047,8 @@ fn query_options(st: &AppState, ds: &Dataset, params: &Params) -> QueryOptions {
         timeout: Some(timeout_param(st, params)),
         max_rows: Some(st.limits.max_rows),
         max_memory_bytes: st.limits.query_memory_bytes,
+        // the grant the request was admitted with, if the server has a memory pool
+        grant: crate::server_memory::current_grant(),
         max_rows_produced: st.limits.max_rows_produced,
         no_cache: params.get("nocache").is_some_and(truthy),
         default_graph_uris: params.all("default-graph-uri"),
@@ -2042,6 +2062,10 @@ async fn update_endpoint(
         max_rows: Some(st.limits.max_rows),
         max_memory_bytes: st.limits.query_memory_bytes,
         max_rows_produced: st.limits.max_rows_produced,
+        // the grant the request was admitted with. The dataset's pool serves a server
+        // where admission did not run
+        grant: crate::server_memory::current_grant(),
+        pool: ds.dataset.query_options().pool,
         ..Default::default()
     };
     budgets::Overrides::parse(&params)?.apply(&mut opts);
@@ -3462,6 +3486,12 @@ async fn server_info(State(st): St, Extension(p): Extension<Principal>) -> Json<
         }
     }
     Json(doc)
+}
+
+/// `GET /$/server/memory`: the query memory pool, the shared caches and their bytes per
+/// dataset (permission `metrics`).
+async fn server_memory(State(st): St) -> Json<J> {
+    Json(crate::server_memory::report(&st))
 }
 
 async fn list_datasets(State(st): St, Extension(p): Extension<Principal>) -> Json<J> {
@@ -4910,6 +4940,8 @@ mod nesting_tests;
 mod obs_tests;
 #[cfg(test)]
 mod patch_tests;
+#[cfg(test)]
+mod pool_tests;
 #[cfg(test)]
 mod router_tests;
 #[cfg(all(test, feature = "text"))]

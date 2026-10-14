@@ -1023,6 +1023,11 @@ triples differ by 0.6% from a run with `--no-access-log --no-metrics`. That is n
   admission on bytes, not another request count. X08 also makes the block, result,
   SERVICE and history caches server-wide, which changes the capacity gauges of §4.5 to
   carry no `dataset` label.
+
+  *Shipped (2026-10-13).* The pool, its admission queue, the `server-memory` budget and the
+  capacity gauges without a `dataset` label are built as X08 Phase 1 specifies. The
+  [X08 Outcome](X08-disk-spill-and-server-memory.md#outcome) records the differences. Phase 3's
+  concurrency limit stays with the rate limiter's per-class caps, as written above.
 * **Bind-before-open and degraded startup** (item 64, release tier). OTLP metric export
   and the separate metrics listener (`--metrics-addr`) already shipped, as the Outcome
   records, so this item is the startup states alone. Sketch: `serve` binds its listeners,

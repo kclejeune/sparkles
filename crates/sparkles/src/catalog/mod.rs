@@ -4,6 +4,7 @@
 //! never enter the catalog namespace. A catalog is cheap to clone and shares its
 //! stores, reservations and lock with every clone.
 
+use crate::store::caches::{CacheSizes, SharedCaches};
 use crate::store::{Store, StoreOptions};
 use crate::{Dataset, DatasetOptions, Error, Result};
 use parking_lot::{Mutex, RwLock};
@@ -23,15 +24,64 @@ pub use restore::RESTORE_PREFIX;
 #[cfg(feature = "backup")]
 mod swap;
 
+/// How a catalog sizes the caches of its datasets (spec X08 §3).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CatalogCaches {
+    /// One set of caches for all datasets, sized by the `cache_bytes`,
+    /// `result_cache_bytes`, `service_cache_bytes` and `history_cache_bytes` of the
+    /// dataset options the catalog is created with.
+    #[default]
+    FromStore,
+    /// One set of caches for all datasets, of these sizes.
+    Sizes(CacheSizes),
+    /// Each dataset sizes its own caches by its store options, so memory grows with the
+    /// number of datasets.
+    PerDataset,
+}
+
+/// The memory a catalog's datasets share.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MemoryOptions {
+    pub caches: CatalogCaches,
+    /// The bytes the estimated memory of all the catalog's queries and updates may
+    /// reach together (the query memory pool, spec X08 §4). `None` has no pool, so only
+    /// each query's own budget applies. A query that the pool cannot cover fails with
+    /// [`BudgetKind::ServerMemory`](crate::BudgetKind).
+    pub pool_bytes: Option<u64>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct CatalogOptions {
     pub dataset: DatasetOptions,
+    pub memory: MemoryOptions,
 }
 impl From<StoreOptions> for CatalogOptions {
     fn from(store: StoreOptions) -> Self {
         Self {
             dataset: store.into(),
+            memory: MemoryOptions::default(),
         }
+    }
+}
+
+impl CatalogOptions {
+    /// The caches the catalog's datasets share, if any.
+    fn shared_caches(&self) -> Option<SharedCaches> {
+        let store = &self.dataset.store;
+        if store.shared.is_some() {
+            return None;
+        }
+        let sizes = match self.memory.caches {
+            CatalogCaches::PerDataset => return None,
+            CatalogCaches::Sizes(s) => s,
+            CatalogCaches::FromStore => CacheSizes {
+                blocks: store.cache_bytes,
+                results: store.result_cache_bytes,
+                service: store.service_cache_bytes,
+                history: store.history_cache_bytes,
+            },
+        };
+        Some(SharedCaches::new(sizes))
     }
 }
 
@@ -116,6 +166,10 @@ struct Detached {
 pub(crate) struct Inner {
     dir: Option<PathBuf>,
     options: RwLock<CatalogOptions>,
+    /// the caches every dataset opened by this catalog reads through
+    caches: Option<SharedCaches>,
+    /// the pool its datasets' queries take grants from
+    pool: Option<Arc<crate::sparql::pool::QueryPool>>,
     entries: RwLock<BTreeMap<String, Entry>>,
     reservations: Mutex<BTreeMap<String, (ReservationKind, String)>>,
     /// Persistent datasets taken out of `entries` for an in-place restore, or left
@@ -182,6 +236,11 @@ impl Catalog {
         let catalog = Self {
             inner: Arc::new(Inner {
                 dir: Some(dir.clone()),
+                caches: options.shared_caches(),
+                pool: options
+                    .memory
+                    .pool_bytes
+                    .map(crate::sparql::pool::QueryPool::new),
                 options: RwLock::new(options),
                 entries: RwLock::new(BTreeMap::new()),
                 reservations: Mutex::new(BTreeMap::new()),
@@ -244,6 +303,11 @@ impl Catalog {
         Self {
             inner: Arc::new(Inner {
                 dir: None,
+                caches: options.shared_caches(),
+                pool: options
+                    .memory
+                    .pool_bytes
+                    .map(crate::sparql::pool::QueryPool::new),
                 options: RwLock::new(options),
                 entries: RwLock::new(BTreeMap::new()),
                 reservations: Mutex::new(BTreeMap::new()),
@@ -255,6 +319,14 @@ impl Catalog {
                 _lock: None,
             }),
         }
+    }
+    /// The caches that the catalog's datasets share, unless it sizes them per dataset.
+    pub fn caches(&self) -> Option<&SharedCaches> {
+        self.inner.caches.as_ref()
+    }
+    /// The pool that bounds the memory of the catalog's queries, if it has one.
+    pub fn pool(&self) -> Option<&Arc<crate::sparql::pool::QueryPool>> {
+        self.inner.pool.as_ref()
     }
     /// Replace the options that datasets created or attached from now on open with.
     /// Datasets that are already open keep their options.
@@ -369,11 +441,20 @@ impl Catalog {
             .map(|d| d.join("databases").join(name))
             .ok_or_else(|| Error::invalid("a persistent dataset needs a catalog directory"))
     }
-    fn open_dataset(&self, name: &str, kind: DatasetKind, loc: Option<&Path>) -> Result<Dataset> {
-        let opts = DatasetOptions {
+    /// The catalog's default dataset options for the dataset `name`, under the catalog's
+    /// query memory pool. A dataset that opens its own store also takes a cache scope.
+    fn dataset_options(&self, name: &str) -> DatasetOptions {
+        DatasetOptions {
             name: Some(name.into()),
+            pool: self.inner.pool.clone(),
             ..self.inner.options.read().dataset.clone()
-        };
+        }
+    }
+    fn open_dataset(&self, name: &str, kind: DatasetKind, loc: Option<&Path>) -> Result<Dataset> {
+        let mut opts = self.dataset_options(name);
+        if let Some(c) = &self.inner.caches {
+            opts.store.shared = Some(c.scope());
+        }
         match kind {
             DatasetKind::Memory => Ok(Dataset::from_store_with(
                 Store::in_memory(opts.store.clone()),
@@ -726,9 +807,8 @@ impl Catalog {
         self.check_reservation(&reservation)?;
         let name = reservation.name();
         let opts = DatasetOptions {
-            name: Some(name.into()),
             origin: Some(origin),
-            ..self.inner.options.read().dataset.clone()
+            ..self.dataset_options(name)
         };
         let ds = Dataset::from_store_with(store, opts);
         *ds.state().reasoning.write() = reasoning;

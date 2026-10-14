@@ -52,15 +52,36 @@ fn term_bytes(t: &Term) -> usize {
     }
 }
 
-#[derive(Clone)]
-struct Weighter;
-impl quick_cache::Weighter<String, Arc<Rows>> for Weighter {
-    fn weight(&self, k: &String, v: &Arc<Rows>) -> u64 {
-        v.bytes() + k.len() as u64
+/// A cache key: the namespace of the store that put the entry, then the request's key.
+/// A lookup by [`NsKeyRef`] needs no allocation.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(crate) struct NsKey {
+    pub ns: u32,
+    pub key: String,
+}
+
+/// A borrowed [`NsKey`]. It hashes as the owned key does.
+#[derive(Hash)]
+pub(crate) struct NsKeyRef<'a> {
+    pub ns: u32,
+    pub key: &'a str,
+}
+
+impl quick_cache::Equivalent<NsKey> for NsKeyRef<'_> {
+    fn equivalent(&self, k: &NsKey) -> bool {
+        self.ns == k.ns && self.key == k.key
     }
 }
 
-type Inner = quick_cache::sync::Cache<String, Arc<Rows>, Weighter>;
+#[derive(Clone)]
+pub(crate) struct Weighter;
+impl quick_cache::Weighter<NsKey, Arc<Rows>> for Weighter {
+    fn weight(&self, k: &NsKey, v: &Arc<Rows>) -> u64 {
+        v.bytes() + k.key.len() as u64
+    }
+}
+
+type Inner = quick_cache::sync::Cache<NsKey, Arc<Rows>, Weighter>;
 
 /// The most shards the cache has. quick_cache splits the byte budget evenly between its
 /// shards and refuses an entry heavier than 97% of one shard's share. An entry is kept
@@ -82,37 +103,91 @@ fn build_cache(bytes: u64, shards: usize) -> Inner {
     Inner::with_options(options, Weighter, Default::default(), Default::default())
 }
 
-/// A store's cache of remote SERVICE results.
-pub struct ServiceCache {
+/// The storage of remote SERVICE results that stores can share.
+pub struct ServiceStore {
     cache: Option<Inner>,
     max_entry_bytes: u64,
+}
+
+impl ServiceStore {
+    /// Storage of at most `bytes` (0 turns it off).
+    pub fn new(bytes: u64) -> ServiceStore {
+        let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
+        Self::with_shards(bytes, cpus * 4)
+    }
+
+    fn with_shards(bytes: u64, shards: usize) -> ServiceStore {
+        ServiceStore {
+            cache: (bytes > 0).then(|| build_cache(bytes, shards)),
+            max_entry_bytes: bytes / 8,
+        }
+    }
+
+    pub fn capacity(&self) -> u64 {
+        self.cache.as_ref().map_or(0, |c| c.capacity())
+    }
+
+    pub fn bytes(&self) -> u64 {
+        self.cache.as_ref().map_or(0, |c| c.weight())
+    }
+
+    pub fn entries(&self) -> usize {
+        self.cache.as_ref().map_or(0, |c| c.len())
+    }
+
+    /// Bytes and entries by namespace, in one pass.
+    pub fn usage(&self) -> std::collections::HashMap<u32, crate::index::NamespaceUsage> {
+        let mut out: std::collections::HashMap<u32, crate::index::NamespaceUsage> =
+            Default::default();
+        if let Some(c) = &self.cache {
+            for (k, v) in c.iter() {
+                let u = out.entry(k.ns).or_default();
+                u.bytes += v.bytes() + k.key.len() as u64;
+                u.entries += 1;
+            }
+        }
+        out
+    }
+}
+
+/// A store's view of the cache of remote SERVICE results.
+pub struct ServiceCache {
+    store: Arc<ServiceStore>,
+    ns: u32,
+    /// whether other views share the storage
+    shared: bool,
     hits: AtomicU64,
     misses: AtomicU64,
 }
 
 impl ServiceCache {
-    /// A cache of at most `bytes` (0 turns it off).
+    /// A cache of its own, of at most `bytes` (0 turns it off).
     pub fn new(bytes: u64) -> ServiceCache {
-        let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
-        Self::with_shards(bytes, cpus * 4)
+        ServiceCache::view(Arc::new(ServiceStore::new(bytes)), 0, false)
     }
 
-    fn with_shards(bytes: u64, shards: usize) -> ServiceCache {
+    /// A view of `store` for namespace `ns`.
+    pub fn attach(store: &Arc<ServiceStore>, ns: u32) -> ServiceCache {
+        ServiceCache::view(store.clone(), ns, true)
+    }
+
+    pub(crate) fn view(store: Arc<ServiceStore>, ns: u32, shared: bool) -> ServiceCache {
         ServiceCache {
-            cache: (bytes > 0).then(|| build_cache(bytes, shards)),
-            max_entry_bytes: bytes / 8,
+            store,
+            ns,
+            shared,
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
         }
     }
 
     pub fn enabled(&self) -> bool {
-        self.cache.is_some()
+        self.store.cache.is_some()
     }
 
     pub fn get(&self, key: &str) -> Option<Arc<Rows>> {
-        let c = self.cache.as_ref()?;
-        let r = c.get(key);
+        let c = self.store.cache.as_ref()?;
+        let r = c.get(&NsKeyRef { ns: self.ns, key });
         let n = if r.is_some() {
             &self.hits
         } else {
@@ -124,35 +199,55 @@ impl ServiceCache {
 
     /// Keep `rows` under `key` unless they are larger than an eighth of the budget.
     pub fn put(&self, key: String, rows: Arc<Rows>) {
-        let Some(c) = &self.cache else { return };
-        if rows.bytes() + key.len() as u64 > self.max_entry_bytes {
+        let Some(c) = &self.store.cache else { return };
+        if rows.bytes() + key.len() as u64 > self.store.max_entry_bytes {
             return;
         }
-        c.insert(key, rows);
+        c.insert(NsKey { ns: self.ns, key }, rows);
     }
 
     pub fn remove(&self, key: &str) {
-        if let Some(c) = &self.cache {
-            c.remove(key);
+        if let Some(c) = &self.store.cache {
+            c.remove(&NsKeyRef { ns: self.ns, key });
         }
     }
 
+    /// Drop this view's entries. Another namespace's stay.
     pub fn clear(&self) {
-        if let Some(c) = &self.cache {
+        let Some(c) = &self.store.cache else { return };
+        if self.shared {
+            let ns = self.ns;
+            c.retain(|k, _| k.ns != ns);
+        } else {
             c.clear();
         }
     }
 
+    /// The entries of this view's namespace.
     pub fn entries(&self) -> usize {
-        self.cache.as_ref().map_or(0, |c| c.len())
+        match &self.store.cache {
+            Some(c) if self.shared => c.iter().filter(|(k, _)| k.ns == self.ns).count(),
+            Some(c) => c.len(),
+            None => 0,
+        }
     }
 
+    /// The bytes of this view's namespace.
     pub fn bytes(&self) -> u64 {
-        self.cache.as_ref().map_or(0, |c| c.weight())
+        match &self.store.cache {
+            Some(c) if self.shared => c
+                .iter()
+                .filter(|(k, _)| k.ns == self.ns)
+                .map(|(k, v)| v.bytes() + k.key.len() as u64)
+                .sum(),
+            Some(c) => c.weight(),
+            None => 0,
+        }
     }
 
+    /// The bytes the storage may hold, shared with other views or not.
     pub fn capacity(&self) -> u64 {
-        self.cache.as_ref().map_or(0, |c| c.capacity())
+        self.store.capacity()
     }
 
     pub fn hits(&self) -> u64 {
@@ -223,9 +318,41 @@ mod tests {
             n += 1;
         }
         for shards in [1, 4, 16, 64, 128, 256, 1024] {
-            let c = ServiceCache::with_shards(budget, shards);
+            let store = Arc::new(ServiceStore::with_shards(budget, shards));
+            let c = ServiceCache::view(store, 0, false);
             c.put(key.clone(), rows(n));
             assert!(c.get(&key).is_some(), "{shards} shards dropped the entry");
+        }
+    }
+
+    #[test]
+    fn bounded_shared_storage_keeps_namespaces_isolated() {
+        for shards in [1, 4, 16, 64, 128, 256, 1024] {
+            let store = Arc::new(ServiceStore::with_shards(64 << 10, shards));
+            let one = ServiceCache::attach(&store, 11);
+            let two = ServiceCache::attach(&store, 22);
+            let first = rows(3);
+            let second = rows(4);
+            one.put("same key".into(), first.clone());
+            assert!(two.get("same key").is_none());
+            two.put("same key".into(), second.clone());
+            assert!(Arc::ptr_eq(&one.get("same key").unwrap(), &first));
+            assert!(Arc::ptr_eq(&two.get("same key").unwrap(), &second));
+            let usage = store.usage();
+            assert_eq!(usage[&11].entries, 1);
+            assert_eq!(usage[&22].entries, 1);
+            assert_eq!(one.bytes() + two.bytes(), store.bytes());
+            one.remove("same key");
+            assert!(one.get("same key").is_none());
+            assert!(Arc::ptr_eq(&two.get("same key").unwrap(), &second));
+            one.put("same key".into(), first);
+            one.clear();
+            assert_eq!(one.entries(), 0);
+            assert_eq!(one.bytes(), 0);
+            assert!(Arc::ptr_eq(&two.get("same key").unwrap(), &second));
+            assert_eq!(two.entries(), store.entries());
+            assert_eq!(two.bytes(), store.bytes());
+            assert!(store.bytes() <= store.capacity());
         }
     }
 
