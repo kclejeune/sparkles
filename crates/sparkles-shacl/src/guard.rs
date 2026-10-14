@@ -442,9 +442,21 @@ impl ShaclGuard {
             .unwrap_or_else(|| self.loaded.read().clone());
         match pending.iter().find(|p| p.seq == base) {
             Some(p) => (loaded, Some(p.baseline.clone()), p.exact.clone()),
+            // A baseline of another commit says nothing of this one: a write that bypassed
+            // the guard sits between them (its mark is on the published baseline, and
+            // the publication of an earlier commit may have put the old one back).
             None => (
                 loaded,
-                self.baseline.lock().clone(),
+                self.baseline.lock().clone().map(|b| {
+                    if b.commit == base {
+                        b
+                    } else {
+                        Baseline {
+                            conforms: None,
+                            ..b
+                        }
+                    }
+                }),
                 self.exact.lock().clone().filter(|e| e.commit == base),
             ),
         }

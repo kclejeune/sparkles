@@ -2347,4 +2347,61 @@ mod tests {
             patch.join().unwrap();
         }
     }
+
+    /// A guard that keeps one state: it must be told of every commit before the next is
+    /// checked.
+    struct Settled {
+        told: AtomicU64,
+        stale: AtomicU64,
+    }
+
+    impl crate::guard::CommitGuard for Settled {
+        fn check(
+            &self,
+            c: &crate::guard::Candidate<'_>,
+        ) -> Result<crate::guard::ValidationSummary> {
+            use crate::guard::{GuardMode, GuardStatus, Severity, ValidationSummary};
+            if self.told.load(Ordering::SeqCst) != c.base.commit {
+                self.stale.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(ValidationSummary::empty(
+                GuardStatus::Passed,
+                GuardMode::Reject,
+                Severity::Violation,
+            ))
+        }
+        fn committed(&self, seq: u64) {
+            self.told.store(seq, Ordering::SeqCst);
+        }
+        fn describe(&self) -> String {
+            "settled".into()
+        }
+    }
+
+    #[test]
+    fn a_guard_that_keeps_one_state_is_told_of_each_commit_before_the_next_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(Store::open(dir.path(), options()).unwrap());
+        let guard = Arc::new(Settled {
+            told: AtomicU64::new(0),
+            stale: AtomicU64::new(0),
+        });
+        s.set_guard(Some(guard.clone()));
+        let workers: Vec<_> = (0..4)
+            .map(|t| {
+                let s = s.clone();
+                thread::spawn(move || {
+                    for k in 0..15 {
+                        insert(&s, &format!("w{t}-{k}")).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for w in workers {
+            w.join().unwrap();
+        }
+        assert_eq!(s.snapshot().commit, 60);
+        assert_eq!(guard.told.load(Ordering::SeqCst), 60);
+        assert_eq!(guard.stale.load(Ordering::SeqCst), 0);
+    }
 }
