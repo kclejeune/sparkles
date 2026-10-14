@@ -11,8 +11,9 @@
 //!
 //! Every update is one HTTP request that inserts or deletes one triple, sent on a kept-alive
 //! connection, so a latency is the server's whole answer. The receipts (the
-//! `Sparkles-Commit` header) of all writes are collected, and the run fails unless they
-//! are distinct and contiguous. The result is one JSON object on stdout.
+//! `Sparkles-Commit` header) of all successful workload writes, including warmups, are
+//! required, and the run fails unless they are distinct and contiguous. The result is one
+//! JSON object on stdout.
 //!
 //! Scenarios
 //!   serial   one client, `--changes` requests after `--warmup` untimed ones
@@ -327,6 +328,7 @@ fn main() {
             let mut lat = Vec::new();
             let mut mine = Vec::new();
             let mut errors = 0usize;
+            let mut missing_receipts = 0usize;
             gate.wait();
             loop {
                 let i = next.fetch_add(1, Ordering::Relaxed);
@@ -347,10 +349,12 @@ fn main() {
                 }
                 if let Some(commit) = r.commit {
                     mine.push(commit);
+                } else {
+                    missing_receipts += 1;
                 }
             }
             receipts.lock().unwrap().extend(mine);
-            (lat, errors)
+            (lat, errors, missing_receipts)
         }));
     }
     let mut readers = Vec::new();
@@ -402,11 +406,13 @@ fn main() {
     let mut lat = Vec::new();
     let mut per_client = Vec::new();
     let mut errors = 0;
+    let mut missing_receipts = 0;
     for w in writers {
-        let (l, e) = w.join().unwrap();
+        let (l, e, missing) = w.join().unwrap();
         per_client.push(l.len());
         lat.extend(l);
         errors += e;
+        missing_receipts += missing;
     }
     let elapsed = t0.elapsed().as_secs_f64();
     done.store(true, Ordering::Relaxed);
@@ -431,12 +437,13 @@ fn main() {
         .map(|n| (*n as f64 - mean_share).abs() / mean_share.max(1.0))
         .fold(0.0, f64::max);
     println!(
-        "{{\"scenario\":\"{}\",\"op\":\"{}\",\"clients\":{},\"changes\":{},\"errors\":{},\"seconds\":{:.3},\"tps\":{:.1},\"writers\":{},\"receipts_contiguous\":{},\"receipts_distinct\":{},\"first_receipt\":{},\"per_client\":{:?},\"max_share_deviation\":{:.3},\"readers\":{},\"reader_violations\":{}}}",
+        "{{\"scenario\":\"{}\",\"op\":\"{}\",\"clients\":{},\"changes\":{},\"errors\":{},\"missing_receipts\":{},\"seconds\":{:.3},\"tps\":{:.1},\"writers\":{},\"receipts_contiguous\":{},\"receipts_distinct\":{},\"first_receipt\":{},\"per_client\":{:?},\"max_share_deviation\":{:.3},\"readers\":{},\"reader_violations\":{}}}",
         a.scenario,
         op,
         clients,
         timed,
         errors,
+        missing_receipts,
         elapsed,
         timed as f64 / elapsed,
         stats(lat),
@@ -452,7 +459,13 @@ fn main() {
         },
         rbad
     );
-    if errors > 0 || !contiguous || !distinct || rbad > 0 {
+    if errors > 0
+        || missing_receipts > 0
+        || rc.len() != total - errors
+        || !contiguous
+        || !distinct
+        || rbad > 0
+    {
         std::process::exit(2);
     }
 }
