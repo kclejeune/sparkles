@@ -634,7 +634,7 @@ impl BranchSet {
                 let e = e?;
                 let name = e.file_name().to_string_lossy().into_owned();
                 let path = e.path();
-                if name.starts_with(".create-") || name.ends_with(".deleting") {
+                if crate::formats::transient_branch_directory(&name) {
                     std::fs::remove_dir_all(&path)?;
                     continue;
                 }

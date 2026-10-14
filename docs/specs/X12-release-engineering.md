@@ -650,7 +650,12 @@ every settings file and `dataset.json` of a dataset and each physical branch dir
 including retained branches, before it writes dataset metadata. The process lock may
 record its holder, but a refused open leaves every metadata file unchanged and agrees
 with `migrate --check`. Startup and planning share the read-only branch enumeration,
-which surfaces directory errors and never opens or prunes a branch just to preflight it. `dataset.json` keeps the members it does not know when a release
+which surfaces directory errors and never opens or prunes a branch just to preflight it.
+Recognized unpublished `.create-*` staging and `.deleting` tombstones are excluded from
+that enumeration with the same classification as branch startup recovery. Planning
+leaves them untouched, and startup recovers them only after real branch compatibility
+checks succeed. An empty or partial unpublished dataset.json therefore does not block
+recovery, while an incompatible active or retained branch still refuses before cleanup. `dataset.json` keeps the members it does not know when a release
 rewrites it. Settings files that a release writes through a typed struct drop unknown
 members, so an additive member of such a file must be safe to lose or needs a `format`
 bump.

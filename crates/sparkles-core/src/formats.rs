@@ -492,8 +492,14 @@ pub fn informational(name: &str) -> bool {
     INFORMATIONAL_SETTINGS.contains(&name)
 }
 
-/// Physical branch directories, including retained branches. Startup and migration
-/// use the same enumeration, and directory or entry errors are never silently skipped.
+/// Unpublished branch scratch that existing startup recovery removes by name.
+pub(crate) fn transient_branch_directory(name: &str) -> bool {
+    name.starts_with(".create-") || name.ends_with(".deleting")
+}
+
+/// Physical branch directories, including retained branches, without unpublished
+/// scratch. Startup and migration use the same enumeration and transient classification
+/// as branch recovery. Directory and entry errors are never silently skipped.
 pub(crate) fn branch_directories(root: &std::path::Path) -> Result<Vec<std::path::PathBuf>> {
     let entries = match std::fs::read_dir(root.join("branches")) {
         Ok(entries) => entries,
@@ -503,7 +509,9 @@ pub(crate) fn branch_directories(root: &std::path::Path) -> Result<Vec<std::path
     let mut branches = Vec::new();
     for entry in entries {
         let entry = entry?;
-        if entry.file_type()?.is_dir() {
+        if entry.file_type()?.is_dir()
+            && !transient_branch_directory(&entry.file_name().to_string_lossy())
+        {
             branches.push(entry.path());
         }
     }

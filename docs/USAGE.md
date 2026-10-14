@@ -2200,8 +2200,10 @@ and 0 otherwise. The window covers the root of a database and every branch, and 
 settings file of a dataset or of one of its branches puts the database outside it.
 Startup checks dataset metadata and settings in every active and retained branch before
 rewriting root metadata, using the same physical branch directories as migration
-planning. An incompatible branch refuses its dataset while other datasets remain
-available.
+planning. Unpublished `.create-*` directories and `.deleting` tombstones are excluded
+from these checks and left unchanged by migration planning. Startup's existing branch
+recovery removes them after compatibility preflight succeeds. An incompatible real
+branch refuses its dataset before cleanup while other datasets remain available.
 The informational files `origin.json` and `restore.json` are the exception, because a
 store ignores a newer one with a warning.
 
