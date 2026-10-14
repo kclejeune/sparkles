@@ -594,6 +594,40 @@ fn all_shortest_path_enumeration_honours_the_timeout() {
     );
 }
 
+/// A zero-weight chain `ex:n0 ... ex:n{len}` with an edge in each direction.
+fn two_way_zero_weight_chain(len: usize) -> String {
+    let mut ttl = String::new();
+    for i in 0..len {
+        ttl += &format!("ex:n{i} ex:p ex:n{} {{| ex:w 0 |}} . ", i + 1);
+        ttl += &format!("ex:n{} ex:p ex:n{i} {{| ex:w 0 |}} . ", i + 1);
+    }
+    ttl
+}
+
+#[test]
+fn zero_weight_chains_reconstruct_inside_the_deadline() {
+    const LEN: usize = 2000;
+    let s = store_of(&two_way_zero_weight_chain(LEN));
+    let opts = QueryOptions {
+        timeout: Some(Duration::from_secs(5)),
+        ..Default::default()
+    };
+    let want: Vec<String> = (0..=LEN).map(|i| format!("n{i}")).collect();
+    for algorithm in ["path:shortest", "path:allShortest"] {
+        let r = rows_with(
+            &s,
+            &search(&format!(
+                "path:source ex:n0 ; path:target ex:n{LEN} ; path:weight ex:w ; \
+                 path:algorithm {algorithm}"
+            )),
+            &opts,
+        );
+        let paths = node_paths(&r);
+        assert_eq!(paths.len(), 1, "{algorithm}");
+        assert_eq!(paths.into_values().next().unwrap(), want, "{algorithm}");
+    }
+}
+
 #[test]
 fn hidden_triples_are_not_edges() {
     // A9: a protection hides the triples of e, so the path through e is gone

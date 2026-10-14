@@ -819,6 +819,13 @@ impl Budget<'_> {
     }
 }
 
+/// What `Tree::paths` needs to skip parents that cannot reach the root: the cost of
+/// each node and the position at which the search settled it.
+struct Prune<'a> {
+    cost: &'a FxHashMap<u64, f64>,
+    rank: FxHashMap<u64, u32>,
+}
+
 impl Tree {
     fn new(root: u64, forward: bool) -> Tree {
         Tree {
@@ -828,6 +835,14 @@ impl Tree {
             extra: FxHashMap::default(),
             order: Vec::new(),
         }
+    }
+    /// The position of each node in the order the search settled it.
+    fn ranks(&self) -> FxHashMap<u64, u32> {
+        self.order
+            .iter()
+            .enumerate()
+            .map(|(i, &(n, _))| (n, i as u32))
+            .collect()
     }
     fn contains(&self, x: u64) -> bool {
         x == self.root || self.first.contains_key(&x)
@@ -847,16 +862,19 @@ impl Tree {
         m: u64,
         all: bool,
         cap: usize,
-        cost: Option<&FxHashMap<u64, f64>>,
+        prune: Option<&Prune>,
         check: &dyn Fn() -> Result<()>,
     ) -> Result<Vec<Vec<Edge>>> {
         // with one parent per node the parents form a tree, and every one reaches the root
-        let cost = cost.filter(|_| all);
+        let prune = prune.filter(|_| all);
+        let rank_of = |n: u64| prune.and_then(|p| p.rank.get(&n).copied()).unwrap_or(0);
         let mut out = Vec::new();
         if cap == 0 || !self.contains(m) {
             return Ok(out);
         }
         let mut stack: Vec<(u64, usize)> = vec![(m, 0)];
+        // low[j] is the least rank of the nodes stack[0..=j]
+        let mut low: Vec<u32> = vec![rank_of(m)];
         let mut links: Vec<(u64, Parent)> = Vec::new();
         // zero-weight edges can make nodes parents of each other, so a parent already
         // on the path is skipped
@@ -891,6 +909,7 @@ impl Tree {
                 };
                 out.push(edges);
                 stack.pop();
+                low.pop();
                 links.pop();
                 on.remove(&x);
                 if out.len() >= cap {
@@ -903,15 +922,20 @@ impl Tree {
             match self.parent_at(x, i, all) {
                 Some(q) if on.contains(&q.node) && q.node != self.root => {}
                 Some(q) => {
-                    if !self.escapes(x, q.node, &on, cost, all, &mut budget)? {
+                    let low_top = low.last().copied().unwrap_or(0);
+                    if let Some(pr) = prune
+                        && !self.escapes(x, q.node, &on, low_top, pr, &mut budget)?
+                    {
                         continue;
                     }
                     links.push((x, q));
                     stack.push((q.node, 0));
+                    low.push(low_top.min(rank_of(q.node)));
                     on.insert(q.node);
                 }
                 None => {
                     stack.pop();
+                    low.pop();
                     links.pop();
                     on.remove(&x);
                 }
@@ -921,20 +945,27 @@ impl Tree {
     }
 
     /// Whether parent `q` of `x` reaches the root through recorded parents without a
-    /// node of `on`. Costs never rise toward the root, so only a parent of the same
-    /// cost as `x` can fail: a cheaper one reaches the root through its first parents.
-    /// Each parent the search examines counts against the deadline.
+    /// node of `on`. A parent the search settled before every node on the path, whose
+    /// least rank is `low`, escapes at once, because its first parents were settled
+    /// still earlier. Costs never rise toward the root, so a cheaper parent escapes at
+    /// once too, through its first parents. Otherwise the recorded parents are searched,
+    /// and each parent the search examines counts against the deadline.
     fn escapes(
         &self,
         x: u64,
         q: u64,
         on: &FxHashSet<u64>,
-        cost: Option<&FxHashMap<u64, f64>>,
-        all: bool,
+        low: u32,
+        pr: &Prune,
         budget: &mut Budget<'_>,
     ) -> Result<bool> {
-        let Some(cost) = cost else { return Ok(true) };
+        let cost = pr.cost;
         if q == self.root {
+            return Ok(true);
+        }
+        // first parents were settled before their nodes, so the chain of first parents
+        // from a node settled before every node on the path stays off the path
+        if pr.rank.get(&q).is_some_and(|&r| r < low) {
             return Ok(true);
         }
         let (Some(&c), Some(&cq)) = (cost.get(&x), cost.get(&q)) else {
@@ -948,7 +979,7 @@ impl Tree {
         let mut todo = vec![q];
         while let Some(z) = todo.pop() {
             let mut i = 0;
-            while let Some(p) = self.parent_at(z, i, all) {
+            while let Some(p) = self.parent_at(z, i, true) {
                 i += 1;
                 budget.tick()?;
                 let y = p.node;
@@ -2203,7 +2234,10 @@ pub fn run(
                     let tree = eng.bfs(s, true, (!targets.any).then_some(&tset), all, close)?;
                     (tree, None)
                 };
-                let cost = cost.as_ref().filter(|_| all);
+                let prune = cost.as_ref().filter(|_| all).map(|c| Prune {
+                    cost: c,
+                    rank: tree.ranks(),
+                });
                 // every node reached, nearest first, or the targets in id order
                 let mut ends: Vec<u64> = if targets.any {
                     tree.order.iter().map(|e| e.0).collect()
@@ -2233,7 +2267,7 @@ pub fn run(
                         continue;
                     }
                     let n = if all { cap(&eng) } else { 1 };
-                    for p in tree.paths(m, all, n, cost, &|| eng.ctx.check())? {
+                    for p in tree.paths(m, all, n, prune.as_ref(), &|| eng.ctx.check())? {
                         let p = p
                             .into_iter()
                             .map(|e| e.map(|x| if x == VIRT { s } else { x }))
@@ -2313,7 +2347,10 @@ pub fn run(
                     let tree = eng.bfs(t, false, None, all, true)?;
                     (tree, None)
                 };
-                let cost = cost.as_ref().filter(|_| all);
+                let prune = cost.as_ref().filter(|_| all).map(|c| Prune {
+                    cost: c,
+                    rank: tree.ranks(),
+                });
                 if spec.min_len == 0 && !add(&mut found, t, t, Vec::new(), None, false)? {
                     break 'targets;
                 }
@@ -2339,7 +2376,7 @@ pub fn run(
                         continue;
                     }
                     let n = if all { cap(&eng) } else { 1 };
-                    for p in tree.paths(m, all, n, cost, &|| eng.ctx.check())? {
+                    for p in tree.paths(m, all, n, prune.as_ref(), &|| eng.ctx.check())? {
                         let p = p
                             .into_iter()
                             .map(|e| e.map(|x| if x == VIRT { t } else { x }))
@@ -2511,7 +2548,11 @@ mod tree_tests {
         t.order = (1..=K + 1).map(|i| (i, 0)).collect();
         let cost: FxHashMap<u64, f64> = (1..=K + 1).map(|i| (i, 0.0)).collect();
         let check = || Err(Error::Timeout);
-        let r = t.paths(1, true, 10, Some(&cost), &check);
+        let prune = Prune {
+            cost: &cost,
+            rank: t.ranks(),
+        };
+        let r = t.paths(1, true, 10, Some(&prune), &check);
         assert!(matches!(r, Err(Error::Timeout)), "{:?}", r.map(|p| p.len()));
     }
 
@@ -2535,7 +2576,58 @@ mod tree_tests {
             calls.set(calls.get() + 1);
             Ok(())
         };
-        let r = t.paths(L, false, 1, Some(&cost), &check).unwrap();
+        // an empty rank map disables the settling-order test, so only the `all` test
+        // keeps this reconstruction linear
+        let prune = Prune {
+            cost: &cost,
+            rank: FxHashMap::default(),
+        };
+        let r = t.paths(L, false, 1, Some(&prune), &check).unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].len(), L as usize);
+        assert!(calls.get() <= 2, "{} checks", calls.get());
+    }
+
+    #[test]
+    fn all_shortest_reconstruction_of_a_two_way_zero_weight_chain_is_linear() {
+        const L: u64 = 5000;
+        let mut t = chain(L);
+        for i in 1..L {
+            t.extra.insert(i, vec![parent(i + 1)]);
+        }
+        let cost: FxHashMap<u64, f64> = (1..=L).map(|i| (i, 0.0)).collect();
+        let calls = Cell::new(0u32);
+        let check = || {
+            calls.set(calls.get() + 1);
+            Ok(())
+        };
+        let prune = Prune {
+            cost: &cost,
+            rank: t.ranks(),
+        };
+        // the walk takes three steps per node, which are a push of the first parent, a
+        // skip of the extra parent on the path and a pop, so 3L + 1 steps make three checks
+        let r = t.paths(L, true, 10, Some(&prune), &check).unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].len(), L as usize);
+        assert!(calls.get() <= 3, "{} checks", calls.get());
+    }
+
+    #[test]
+    fn all_shortest_reconstruction_of_a_one_way_zero_weight_chain_is_linear() {
+        const L: u64 = 5000;
+        let t = chain(L);
+        let cost: FxHashMap<u64, f64> = (1..=L).map(|i| (i, 0.0)).collect();
+        let calls = Cell::new(0u32);
+        let check = || {
+            calls.set(calls.get() + 1);
+            Ok(())
+        };
+        let prune = Prune {
+            cost: &cost,
+            rank: t.ranks(),
+        };
+        let r = t.paths(L, true, 10, Some(&prune), &check).unwrap();
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].len(), L as usize);
         assert!(calls.get() <= 2, "{} checks", calls.get());
