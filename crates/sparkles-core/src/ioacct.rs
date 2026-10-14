@@ -1,7 +1,9 @@
 //! I/O accounting of the read path (spec X07 §4).
 //!
 //! The readers of the permutation files, the vocabulary and the numeric column count what
-//! they ask the kernel for and what they decode. The counters are process-wide atomics, so
+//! they ask the kernel for and what they decode. Per-block and per-lookup events, which many
+//! threads produce by the million in a scan of the vocabulary, are counted only while a
+//! [`Profile`] is alive. The counters are process-wide atomics, so
 //! each costs one relaxed add and they are always on. A query's share is the difference
 //! between two [`IoSnapshot`]s ([`Ctx::io_stats`](crate::sparql::Ctx::io_stats)), which is
 //! exact when no other query runs at the same time, as on a cold benchmark, and includes the
@@ -131,9 +133,12 @@ pub(crate) fn touch(file: IoFile, base: *const u8, off: usize, len: usize) {
     }
 }
 
+/// Vocabulary lookups, counted by a profile only for the same reason as the blocks.
 #[inline]
 pub(crate) fn vocab_find() {
-    counters().vocab_finds.fetch_add(1, Relaxed);
+    if profiling() {
+        counters().vocab_finds.fetch_add(1, Relaxed);
+    }
 }
 
 #[inline]
@@ -141,9 +146,14 @@ pub(crate) fn vocab_group_hinted() {
     counters().vocab_groups_hinted.fetch_add(1, Relaxed);
 }
 
+/// Front-coded blocks scanned. Only a profile counts them: a pass over the vocabulary scans
+/// millions of blocks on many threads, and one shared counter that all of them add to costs
+/// more than the scans (10 to 20% of a cold `CONTAINS` over 100M triples).
 #[inline]
 pub(crate) fn vocab_blocks_scanned(n: u64) {
-    counters().vocab_blocks_scanned.fetch_add(n, Relaxed);
+    if profiling() {
+        counters().vocab_blocks_scanned.fetch_add(n, Relaxed);
+    }
 }
 
 #[inline]
@@ -694,12 +704,10 @@ mod tests {
         let a = IoSnapshot::now();
         column_decoded(Perm::Pos, 100, 40);
         willneed(IoFile::VocabData, std::ptr::null(), 0, 4096);
-        vocab_find();
         let d = IoSnapshot::now().since(&a);
         assert!(d.cols_decoded[Perm::Pos.index()] >= 1);
         assert!(d.decoded_bytes[Perm::Pos.index()] >= 800);
         assert!(d.willneed_bytes[IoFile::VocabData as usize] >= 4096);
-        assert!(d.vocab_finds >= 1);
         let r = d.report();
         assert!(r.index.contains_key("pos"));
         assert!(r.readahead.contains_key("vocab.dat"));

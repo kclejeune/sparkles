@@ -6856,7 +6856,9 @@ type IoProfile = {
 ```
 
 The counters are process-wide, so they include the reads of any query that runs at the
-same time. The profile is meant for one query on a quiet server. `vocabLookup` is the time
+same time. The profile is meant for one query on a quiet server. `vocab.finds` and
+`vocab.blocksScanned` are counted only while a profile runs, because a scan of the
+vocabulary adds to them millions of times from many threads. `vocabLookup` is the time
 in key lookups, which resolve the constants of the query. `vocabRead` is the time reading
 terms by id. `indexDecode` is the time decompressing index columns, and `indexWait` is the
 time to read their pages into memory before decoding. The times are summed over threads.

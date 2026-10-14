@@ -1611,7 +1611,7 @@ mod cold_reads {
         assert_eq!(on.len(), 600);
     }
 
-    /// A query's reads are counted: the columns it decoded and the vocabulary lookups.
+    /// A query's reads are counted: the columns it decoded.
     #[test]
     fn a_query_counts_the_columns_it_decodes() {
         let s = Store::in_memory(StoreOptions::default());
@@ -1625,6 +1625,5 @@ mod cold_reads {
         assert_eq!(r.len(), 400);
         let io = r.ctx.io_stats();
         assert!(io.columns_decoded() > 0, "{io:?}");
-        assert!(io.vocab_finds > 0, "{io:?}");
     }
 }
