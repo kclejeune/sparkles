@@ -1094,8 +1094,10 @@ pub struct StoreOptions {
     /// The size at which a change log segment is sealed and a new one started.
     pub change_log_segment_bytes: u64,
     /// A bulk commit's changes are recorded when the dataset was empty and the new state
-    /// holds at most this many quads, or when the commit adds and removes at most this
-    /// many; a larger one is recorded with its counts only.
+    /// holds at most this many quads, when both states together hold at most this many, or
+    /// when the quads the commit can have changed number at most this many: the quads it
+    /// loads, the quads of the graphs it drops and its transaction's own changes, counted
+    /// with duplicates. A larger one is recorded with its counts only.
     pub change_log_bulk_max_quads: u64,
     /// Branches per dataset, `main` included ([`Store::create_branch`] refuses more).
     pub max_branches: usize,

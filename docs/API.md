@@ -871,9 +871,9 @@ way older Fuseki versions did. Fuseki 6 itself refuses such bodies. The syntaxes
   served at the dataset URL and `update`, and `gsp-rw` and `gsp-r` at the dataset URL,
   `data` and `get`. `patch` is served at the dataset URL and `patch`. `upload` and
   `shacl` keep their names, and `prefixes-r` and
-  `prefixes-rw` are served at `prefixes`. `gsp-direct-rw` and `gsp-direct-r` need a
-  server started with `--gsp-direct-naming`. A `gsp-direct-r` endpoint makes its dataset
-  read-only at the graph's own URL.
+  `prefixes-rw` are served at `prefixes`. `gsp-direct-rw` and `gsp-direct-r` need the
+  server's `--gsp-direct-naming` to cover the dataset, which sets its mode. A
+  `gsp-direct-rw` endpoint is refused for a dataset the flag makes read-only.
 * A dataset of type `tdb2:DatasetTDB2` or `tdb:DatasetTDB` becomes a persistent dataset,
   unless its location is `--mem--`. A `ja:MemoryDataset`, `ja:DatasetTxnMem` or
   `ja:RDFDataset` becomes an in-memory dataset.
@@ -1485,7 +1485,7 @@ leaves a `DST.clone-tmp-PID` directory, which the next run into `DST` removes.
 | any        | `/{ds}`               | Also the update endpoint (`update=` or `application/sparql-update`), the patch endpoint for a `POST` of `application/rdf-patch` or `application/rdf-patch+thrift`, and the Graph Store endpoint for any other body. A form body (`application/x-www-form-urlencoded`) must hold `query` or `update`. A form with neither is refused and never read as RDF. The refusal is a `400`, or a write's authorization error for a caller without write access. |
 | POST       | `/{ds}/update`        | SPARQL 1.1 Update protocol, with an `update=` form or an `application/sparql-update` body. `using-graph-uri` and `using-named-graph-uri` are the `USING` and `USING NAMED` of every `DELETE`/`INSERT` operation. An operation with `USING`, `USING NAMED` or `WITH` of its own makes them a `400`. An update sent with GET (`/{ds}?update=…`) gets `405`. |
 | GET/PUT/POST/DELETE/HEAD | `/{ds}/data` , `/{ds}/get` | Graph Store Protocol, with `?default` or `?graph=<iri>`. `?graph=default` and `?graph=urn:x-arq:DefaultGraph` name the default graph. `?graph=union` and `?graph=urn:x-arq:UnionGraph` read the union of the named graphs, each triple once. Writing to it is a `400`. A GET with neither parameter returns the whole dataset as N-Quads or TriG. GET is streamed from one snapshot (see [Budgets](#budgets)). |
-| any        | `/{ds}/{path}`        | Fuseki's direct naming, with `sparkles serve --gsp-direct-naming`: the Graph Store Protocol on the graph whose IRI is the request URL without its query, such as `http://host:3030/ds/graphs/one`. The scheme and host are `X-Forwarded-Proto` and `X-Forwarded-Host` when a proxy sends them, else `http` and `Host`. Endpoint names (`sparql`, `data`, `shacl`, …) keep their meaning, so a graph cannot be named by one of them. `?graph=` and `?default` are a `400`. Without the flag the path is a `404`. With `--gsp-direct-naming=NAME=read` the dataset is read-only there, and a write answers `405` with `Allow: GET, HEAD, OPTIONS`. |
+| any        | `/{ds}/{path}`        | Fuseki's direct naming, with `sparkles serve --gsp-direct-naming`: the Graph Store Protocol on the graph whose IRI is the request URL without its query, such as `http://host:3030/ds/graphs/one`. The scheme and host are `X-Forwarded-Proto` and `X-Forwarded-Host` when a proxy sends them, else `http` and `Host`. Endpoint names (`sparql`, `data`, `shacl`, …) keep their meaning, so a graph cannot be named by one of them. `?graph=` and `?default` are a `400`. Without the flag the path is a `404`. With `--gsp-direct-naming=NAME=read` the dataset is read-only there, and a write answers `405` with `Allow: GET, HEAD, OPTIONS` for any caller who may read the dataset. |
 | POST       | `/{ds}/upload`        | Multipart file upload. The format comes from the file name extension or the content type. Optional `graph` field. CSV and TSV tables are mapped to triples, as [CSV and TSV uploads](#csv-and-tsv-uploads) describes. |
 | POST/PATCH | `/{ds}/patch`         | Applies an RDF Patch in one commit, as Fuseki's `patch` operation. See [Applying RDF Patch](#applying-rdf-patch). |
 | POST       | `/{ds}/shacl`         | SHACL validation, as in Fuseki's `/{ds}/shacl`. See [SHACL validation](#shacl-validation). |
@@ -3616,8 +3616,8 @@ as `/{ds}/diff`.
 
 `unrecorded` names the commits whose changes the log does not hold. `before-log` commits
 are older than the log, because it started later or retention dropped them. A `bulk`
-commit loaded more than 1,000,000 quads into a non-empty dataset and is recorded with its
-counts only. A `gap` is a stretch the log could not record. A SPARQL history query skips
+commit loaded, or dropped graphs of, more than 1,000,000 quads in a non-empty dataset and
+is recorded with its counts only. A `gap` is a stretch the log could not record. A SPARQL history query skips
 these commits silently. `sparkles history --loc DB --subject IRI` prints the same changes
 from the command line.
 

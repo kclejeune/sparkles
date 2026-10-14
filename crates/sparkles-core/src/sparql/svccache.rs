@@ -81,18 +81,44 @@ impl quick_cache::Weighter<NsKey, Arc<Rows>> for Weighter {
     }
 }
 
+type Inner = quick_cache::sync::Cache<NsKey, Arc<Rows>, Weighter>;
+
+/// The most shards the cache has. quick_cache splits the byte budget evenly between its
+/// shards and refuses an entry heavier than 97% of one shard's share. An entry is kept
+/// up to an eighth of the whole budget, so every kept entry fits its shard only when a
+/// shard holds at least twice that, which means at most four shards. The default of four
+/// shards per CPU gave a shard less than an eighth of a small budget on a host with 32 or
+/// more CPUs, and the cache dropped entries that `put` had accepted. Four shards cost
+/// little here, because a lookup takes a read lock and each miss costs a remote request.
+const MAX_SHARDS: usize = 4;
+
+/// A cache of at most `bytes` with `shards` shards, at most [`MAX_SHARDS`].
+fn build_cache(bytes: u64, shards: usize) -> Inner {
+    let options = quick_cache::OptionsBuilder::new()
+        .estimated_items_capacity(10_000)
+        .weight_capacity(bytes)
+        .shards(shards.min(MAX_SHARDS))
+        .build()
+        .expect("the cache options are complete");
+    Inner::with_options(options, Weighter, Default::default(), Default::default())
+}
+
 /// The storage of remote SERVICE results that stores can share.
 pub struct ServiceStore {
-    cache: Option<quick_cache::sync::Cache<NsKey, Arc<Rows>, Weighter>>,
+    cache: Option<Inner>,
     max_entry_bytes: u64,
 }
 
 impl ServiceStore {
     /// Storage of at most `bytes` (0 turns it off).
     pub fn new(bytes: u64) -> ServiceStore {
+        let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
+        Self::with_shards(bytes, cpus * 4)
+    }
+
+    fn with_shards(bytes: u64, shards: usize) -> ServiceStore {
         ServiceStore {
-            cache: (bytes > 0)
-                .then(|| quick_cache::sync::Cache::with_weighter(10_000, bytes, Weighter)),
+            cache: (bytes > 0).then(|| build_cache(bytes, shards)),
             max_entry_bytes: bytes / 8,
         }
     }
@@ -279,6 +305,55 @@ mod tests {
         c.remove(&k);
         assert!(c.get(&k).is_none());
         assert!(!ServiceCache::new(0).enabled());
+    }
+
+    /// The largest entry `put` accepts is kept, whatever number of shards the host asks
+    /// for. The default asks for four per CPU, so 128 on a host with 32 CPUs.
+    #[test]
+    fn entries_up_to_an_eighth_fit_their_shard_on_any_host() {
+        let budget = 64u64 << 10;
+        let key = "k0".to_string();
+        let mut n = 1;
+        while rows(n + 1).bytes() + key.len() as u64 <= budget / 8 {
+            n += 1;
+        }
+        for shards in [1, 4, 16, 64, 128, 256, 1024] {
+            let store = Arc::new(ServiceStore::with_shards(budget, shards));
+            let c = ServiceCache::view(store, 0, false);
+            c.put(key.clone(), rows(n));
+            assert!(c.get(&key).is_some(), "{shards} shards dropped the entry");
+        }
+    }
+
+    #[test]
+    fn bounded_shared_storage_keeps_namespaces_isolated() {
+        for shards in [1, 4, 16, 64, 128, 256, 1024] {
+            let store = Arc::new(ServiceStore::with_shards(64 << 10, shards));
+            let one = ServiceCache::attach(&store, 11);
+            let two = ServiceCache::attach(&store, 22);
+            let first = rows(3);
+            let second = rows(4);
+            one.put("same key".into(), first.clone());
+            assert!(two.get("same key").is_none());
+            two.put("same key".into(), second.clone());
+            assert!(Arc::ptr_eq(&one.get("same key").unwrap(), &first));
+            assert!(Arc::ptr_eq(&two.get("same key").unwrap(), &second));
+            let usage = store.usage();
+            assert_eq!(usage[&11].entries, 1);
+            assert_eq!(usage[&22].entries, 1);
+            assert_eq!(one.bytes() + two.bytes(), store.bytes());
+            one.remove("same key");
+            assert!(one.get("same key").is_none());
+            assert!(Arc::ptr_eq(&two.get("same key").unwrap(), &second));
+            one.put("same key".into(), first);
+            one.clear();
+            assert_eq!(one.entries(), 0);
+            assert_eq!(one.bytes(), 0);
+            assert!(Arc::ptr_eq(&two.get("same key").unwrap(), &second));
+            assert_eq!(two.entries(), store.entries());
+            assert_eq!(two.bytes(), store.bytes());
+            assert!(store.bytes() <= store.capacity());
+        }
     }
 
     #[test]

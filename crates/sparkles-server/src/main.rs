@@ -2384,7 +2384,7 @@ fn run() -> Result<()> {
             #[cfg(feature = "graphql")]
             graphql,
             shex_imports,
-            mut gsp_direct_naming,
+            gsp_direct_naming,
             no_access_log,
             no_metrics,
             metrics_max_datasets,
@@ -2446,6 +2446,7 @@ fn run() -> Result<()> {
             // a Fuseki configuration adds datasets, settings and access rules; the flags
             // given on the command line win
             let mut fuseki = None;
+            let mut config_direct: Vec<String> = Vec::new();
             let (mut timeout, mut update_timeout) = (timeout, update_timeout);
             if let Some(path) = &fuseki_config {
                 let f = fuseki_config::for_serve(path, &data, auth_config.is_some())?;
@@ -2457,7 +2458,7 @@ fn run() -> Result<()> {
                 timeout = timeout.or(f.timeout);
                 update_timeout = update_timeout.or(f.update_timeout);
                 read_only |= f.read_only;
-                gsp_direct_naming.extend(f.gsp_direct_naming.iter().cloned());
+                config_direct = f.gsp_direct_naming.clone();
                 metrics_fuseki_names |= f.metrics_fuseki_names && !no_metrics;
                 if auth_config.is_none() {
                     auth_config = f.auth_config.clone();
@@ -2619,8 +2620,9 @@ fn run() -> Result<()> {
             {
                 st.graphql_limits = graphql.limits();
             }
-            st.gsp_direct_naming = state::GspDirectNaming::parse(&gsp_direct_naming)
-                .map_err(|e| anyhow::anyhow!(e))?;
+            st.gsp_direct_naming =
+                state::GspDirectNaming::layered(&config_direct, &gsp_direct_naming)
+                    .map_err(|e| anyhow::anyhow!(e))?;
             st.allow_unvalidated_writes = allow_unvalidated_writes;
             st.http_compression = compress::HttpCompression::parse(
                 &http_compression,

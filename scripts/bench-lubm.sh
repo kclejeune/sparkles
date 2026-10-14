@@ -127,7 +127,7 @@ d = json.load(open(f)) if os.path.exists(f) else {}
 d[p] = {"seconds": float(secs), "max_rss_kib": rss, "derived_triples": int(derived),
         "base_triples": int(base), "total_triples": int(total)}
 d["notes"] = ["Sparkles' reasoner (sparkles infer); Jena's rule reasoners were not run",
-              "QLever, Oxigraph and Fluree have no reasoner for this data and answer over the materialized file"]
+              "QLever and Oxigraph have no reasoner. Fluree documents query-time reasoning but it is not enabled here. All three answer over the materialized file"]
 json.dump(d, open(f, "w"), indent=1)
 print(f"{p}: {float(secs):.1f} s, peak RSS {rss >> 10} MiB, {derived} derived triples")
 EOF

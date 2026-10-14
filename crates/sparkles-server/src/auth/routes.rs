@@ -903,6 +903,17 @@ fn ds_of(route: &str, uri: &Uri) -> Option<String> {
     )
 }
 
+/// Whether a request goes to the direct Graph Store names of a dataset that serves them
+/// read-only (`serve --gsp-direct-naming=NAME=read`). The handler answers every write
+/// with a `405`, so the request needs only read, as a refused method of `/{ds}/patch` does.
+#[cfg(feature = "auth")]
+fn direct_read_only(st: &AppState, route: &str, uri: &Uri) -> bool {
+    route == "/{ds}/{*graph}"
+        && ds_of(route, uri).is_some_and(|ds| {
+            ds != "$" && st.gsp_direct_naming.mode(&ds) == Some(crate::state::DirectMode::Read)
+        })
+}
+
 /// The CSRF header of ambient principals.
 pub const CSRF_HEADER: &str = "x-sparkles-csrf";
 
@@ -1111,6 +1122,12 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
     let method = req.method().clone();
     let need = need(&route, &method, req.uri(), req.headers())
         .unwrap_or(Need::Server(ServerPerm::ServerAdmin));
+    // a write to a read-only direct endpoint is refused by its handler, so it needs read
+    let direct_read = direct_read_only(st, &route, req.uri());
+    let need = match need {
+        Need::Dataset(Level::Write) if direct_read => Need::Dataset(Level::Read),
+        n => n,
+    };
 
     // 3. CSRF gates: (a) the origin, (b) the synchronizer token of ambient principals
     if origin_gated(&method, need)
@@ -1185,6 +1202,8 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
             // through the route's endpoint, for grants limited to some endpoints
             let e = if branch_routes {
                 None
+            } else if direct_read {
+                Some(Endpoint::GspR)
             } else {
                 endpoint(&route, &method, req.uri(), req.headers())
             };

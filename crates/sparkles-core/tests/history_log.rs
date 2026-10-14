@@ -608,6 +608,65 @@ fn small_bulk_commits_into_large_datasets_are_recorded() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn a_lookup_error_makes_a_bulk_commit_a_summary() {
+    use sparkles_core::store::ReplaceTarget;
+    use std::os::unix::fs::FileExt;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let s = Store::open(
+        &root,
+        StoreOptions {
+            bulk_threshold: 1,
+            change_log_bulk_max_quads: 100,
+            ..opts()
+        },
+    )
+    .unwrap();
+    let nq = |lines: Vec<String>| {
+        Source::from_bytes(lines.join("\n").into_bytes(), RdfFormat::NQuads, None)
+    };
+    // commit 1: 20,000 default-graph quads and 10 quads of a named graph
+    let mut first: Vec<String> = (0..20_000)
+        .map(|i| format!("<urn:s{i:06}> <urn:p> <urn:o> ."))
+        .collect();
+    first.extend((0..10).map(|i| format!("<urn:a{i}> <urn:p> <urn:o> <urn:g> .")));
+    s.load(&[nq(first)]).unwrap();
+    // the first block of the SPO index becomes unreadable
+    let current = std::fs::read_to_string(root.join("CURRENT")).unwrap();
+    let spo = root.join(current.trim()).join("spo.dat");
+    let f = std::fs::OpenOptions::new().write(true).open(&spo).unwrap();
+    f.write_all_at(&[255; 4], 0).unwrap();
+    f.sync_all().unwrap();
+    // commit 2: the graph is replaced by 10 others
+    let new: Vec<String> = (0..10)
+        .map(|i| format!("<urn:z{i}> <urn:p> <urn:o> <urn:g> ."))
+        .collect();
+    s.replace(
+        ReplaceTarget::Named(NamedNode::new("urn:g").unwrap()),
+        &[nq(new)],
+    )
+    .expect("the build reads GSPO, so a corrupt SPO block must not fail the replace");
+    let r = s.history_changes(&HistoryQuery::default()).unwrap();
+    let in2 = r.changes.iter().filter(|c| c.commit.seq == 2);
+    let (adds, removes) = in2.fold((0, 0), |(a, d), c| match c.op {
+        DiffOp::Add => (a + 1, d),
+        _ => (a, d + 1),
+    });
+    if (adds, removes) == (0, 0) {
+        assert!(
+            r.unrecorded
+                .iter()
+                .any(|u| u.from <= 2 && 2 <= u.to && u.reason == UnrecordedReason::Bulk),
+            "{:?}",
+            r.unrecorded
+        );
+    } else {
+        assert_eq!((adds, removes), (10, 10), "{:?}", r.unrecorded);
+    }
+}
+
 #[test]
 fn retention_drops_whole_segments_from_the_oldest() {
     let dir = tempfile::tempdir().unwrap();
