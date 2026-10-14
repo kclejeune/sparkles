@@ -14,15 +14,15 @@ SCRIPTS = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 QMPH = os.path.join(SCRIPTS, "bench-bsbm", "qmph.py")
 
 
-def driver_xml(avg, qmph=100.0, timeouts=0):
+def driver_xml(avg, qmph=100.0, timeouts=0, runs=10):
     queries = "".join(
         f'<query nr="{nr}"><executecount>10</executecount><avgresults>{x}</avgresults>'
         f"<timeoutcount>{timeouts}</timeoutcount></query>"
         for nr, x in avg.items()
     )
     return (
-        "<?xml version='1.0'?><bsbm><querymix><qmph>%s</qmph><querymixruns>10</querymixruns>"
-        "<actualtotalruntime>3.0</actualtotalruntime></querymix><queries>%s</queries></bsbm>" % (qmph, queries)
+        "<?xml version='1.0'?><bsbm><querymix><qmph>%s</qmph><querymixruns>%d</querymixruns>"
+        "<actualtotalruntime>3.0</actualtotalruntime></querymix><queries>%s</queries></bsbm>" % (qmph, runs, queries)
     )
 
 
@@ -69,10 +69,12 @@ class QmphTests(unittest.TestCase):
         self.add("a", 1, {"1": 5.0, "2": 7.0})
         self.add("a", 4, {"1": 5.0, "2": 7.0})
         self.add("b", 1, {"1": 5.0, "2": 0.0}, qmph=9999.0)
+        self.add("c", 1, {"1": 5.0, "2": 7.0})
         self.run_qmph("--check", self.out)
         d = self.result()
         self.assertEqual(d["a"]["1"]["status"], "ok")
         self.assertEqual(d["a"]["4"]["status"], "ok")
+        self.assertEqual(d["c"]["1"]["status"], "ok")
         self.assertEqual(d["b"]["1"]["status"], "wrong-answer")
         self.assertEqual(d["b"]["1"]["disagreeing_queries"], ["2"])
 
@@ -90,6 +92,76 @@ class QmphTests(unittest.TestCase):
         d = self.result()
         self.assertEqual(d["a"]["1"]["status"], "ok")
         self.assertEqual(d["b"]["1"]["status"], "ok")
+
+    def test_failed_runs_do_not_vote(self):
+        self.add("e1", 1, {"1": 0.0}, status=255)
+        self.add("e1", 4, {"1": 0.0}, status=255)
+        self.add("e2", 1, {"1": 20.0})
+        self.run_qmph("--check", self.out)
+        d = self.result()
+        self.assertEqual(d["e2"]["1"]["status"], "ok")
+        for c in ("1", "4"):
+            self.assertEqual(d["e1"][c]["status"], "error")
+            self.assertNotIn("disagreeing_queries", d["e1"][c])
+
+    def test_a_timeout_keeps_its_status(self):
+        self.add("a", 1, {"1": 5.0})
+        self.add("b", 1, {"1": 5.0})
+        self.add("c", 1, {"1": 0.0}, timeouts=1)
+        self.run_qmph("--check", self.out)
+        self.assertEqual(self.result()["c"]["1"]["status"], "timeout")
+
+    def test_a_recheck_clears_a_stale_label(self):
+        self.add("a", 1, {"1": 5.0})
+        self.add("b", 1, {"1": 5.0})
+        self.add("c", 1, {"1": 0.0})
+        self.run_qmph("--check", self.out)
+        self.assertEqual(self.result()["c"]["1"]["status"], "wrong-answer")
+        self.add("a", 1, {"1": 0.0})
+        self.add("b", 1, {"1": 0.0})
+        self.run_qmph("--check", self.out)
+        c = self.result()["c"]["1"]
+        self.assertEqual(c["status"], "ok")
+        self.assertNotIn("disagreeing_queries", c)
+
+    def test_an_engine_votes_once(self):
+        for clients in (1, 4, 16):
+            self.add("A", clients, {"1": 0.0})
+        self.add("B", 1, {"1": 5.0})
+        self.add("C", 1, {"1": 5.0})
+        self.run_qmph("--check", self.out)
+        d = self.result()
+        for clients in ("1", "4", "16"):
+            self.assertEqual(d["A"][clients]["status"], "wrong-answer")
+        self.assertEqual(d["B"]["1"]["status"], "ok")
+        self.assertEqual(d["C"]["1"]["status"], "ok")
+
+    def test_runs_with_different_mix_counts_are_not_compared(self):
+        self.add("a", 1, {"1": 5.0}, runs=10)
+        self.add("b", 1, {"1": 0.0}, runs=20)
+        self.add("c", 1, {"1": 0.0}, runs=20)
+        self.run_qmph("--check", self.out)
+        d = self.result()
+        self.assertEqual(d["a"]["1"]["status"], "ok")
+        self.assertEqual(d["b"]["1"]["status"], "ok")
+
+    def test_two_engines_that_disagree_are_a_tie_and_neither_is_flagged(self):
+        self.add("a", 1, {"1": 5.0})
+        self.add("a", 4, {"1": 5.0})
+        self.add("b", 1, {"1": 0.0})
+        self.run_qmph("--check", self.out)
+        d = self.result()
+        self.assertEqual(d["a"]["1"]["status"], "ok")
+        self.assertEqual(d["b"]["1"]["status"], "ok")
+
+    def test_one_engine_still_checks_its_runs_against_each_other(self):
+        self.add("a", 1, {"1": 5.0})
+        self.add("a", 4, {"1": 5.0})
+        self.add("a", 16, {"1": 0.0})
+        self.run_qmph("--check", self.out)
+        d = self.result()["a"]
+        self.assertEqual(d["16"]["status"], "wrong-answer")
+        self.assertEqual(d["1"]["status"], "ok")
 
 
 if __name__ == "__main__":

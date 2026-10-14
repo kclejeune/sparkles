@@ -250,9 +250,11 @@ and comparison methodology. [DEVELOPMENT.md](DEVELOPMENT.md) covers building and
   warm-up mixes and 500 measured ones, and the record gets its query mixes per hour. The
   driver does not look at what a query returns, so a failing or wrongly answering engine
   would look fast. A run in which the driver exits with an error is recorded as `error`.
-  Afterwards the average result count of each query is compared across all runs, and a run
-  that differs from the majority is recorded as `wrong-answer` with the numbers of the
-  queries that differ.
+  Afterwards the average result count of each query is compared across the runs in which the
+  driver succeeded without a timeout. Each engine counts once, and runs with different mix
+  counts are not compared with each other. A run that differs from the majority is recorded
+  as `wrong-answer` with the numbers of the queries that differ, and a failed run keeps its
+  `error` or `timeout`.
   `--usecase bi` runs the Business Intelligence use case instead of Explore. The Explore
   and Update mix is not run yet.
 
