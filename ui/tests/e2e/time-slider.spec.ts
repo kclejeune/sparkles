@@ -232,3 +232,97 @@ open(
     await expect(nameRow().getByRole('cell').nth(1)).toContainText('+1');
   },
 );
+
+/** An update against any dataset or branch path. */
+async function updateAt(request: APIRequestContext, path: string, sparql: string) {
+  const r = await request.post(`/${path}/update`, {
+    headers: { 'Content-Type': 'application/sparql-update' },
+    data: sparql,
+  });
+  expect(r.ok(), `${path}: ${await r.text()}`).toBe(true);
+}
+
+open('compare reads the head of another branch', async ({ page, request }) => {
+  const made = await request.post('/$/datasets', {
+    data: { dbName: 'forked', dbType: 'persistent' },
+  });
+  expect(made.ok(), await made.text()).toBe(true);
+  await updateAt(request, 'forked', `INSERT DATA { <${EX}root> <${EX}link> <${EX}base> }`);
+  const b = await request.post('/$/branches/forked', { data: { name: 'dev' } });
+  expect(b.status()).toBe(201);
+  await updateAt(request, 'forked', `INSERT DATA { <${EX}root> <${EX}link> <${EX}m> }`);
+  await updateAt(request, 'forked@dev', `INSERT DATA { <${EX}root> <${EX}link> <${EX}d> }`);
+  await page.addInitScript(
+    ([query]) => {
+      localStorage.setItem('sparkles.dataset', 'forked');
+      localStorage.setItem(
+        'sparkles.queryTabs',
+        JSON.stringify({ tabs: [{ id: 't1', title: 'Query 1', query }], active: 't1' }),
+      );
+    },
+    [`SELECT ?o WHERE { <${EX}root> <${EX}link> ?o } ORDER BY ?o`],
+  );
+  await page.goto('/ui/query');
+  await page.getByRole('button', { name: /^Run/ }).click();
+  await expect(grid(page)).toContainText('/m');
+  await page.getByRole('button', { name: 'History', exact: true }).click();
+  await right(page).focus();
+  await page.keyboard.press('c');
+  await slider(page).getByRole('combobox', { name: 'Compare with' }).selectOption('dev');
+  await expect(
+    grid(page).getByRole('row').filter({ hasText: '/m' }).getByRole('gridcell', { name: 'added' }),
+  ).toHaveText('+');
+  await expect(
+    grid(page)
+      .getByRole('row')
+      .filter({ hasText: '/d' })
+      .getByRole('gridcell', { name: 'removed' }),
+  ).toHaveText('−');
+  // the Explore graph of the same resource compares the same two heads
+  await page.goto(`/ui/explore?ds=forked&iri=${encodeURIComponent(`${EX}root`)}&against=dev`);
+  await expect.poll(() => changeOf(page, /\bm\b/)).toBe('added');
+  await expect.poll(() => changeOf(page, /\bd\b/)).toBe('removed');
+});
+
+open('Compare on the server lists the rows the read cut', async ({ page, request }) => {
+  const made = await request.post('/$/datasets', {
+    data: { dbName: 'bulky', dbType: 'persistent' },
+  });
+  expect(made.ok(), await made.text()).toBe(true);
+  const rows = Array.from({ length: 1100 }, (_, i) => `<${EX}n${i}> <${EX}v> ${i} .`).join(' ');
+  await updateAt(request, 'bulky', `INSERT DATA { ${rows} }`);
+  await updateAt(
+    request,
+    'bulky',
+    `INSERT DATA { <${EX}x1> <${EX}v> 5000 . <${EX}x2> <${EX}v> 5001 . <${EX}x3> <${EX}v> 5002 }`,
+  );
+  await page.addInitScript(
+    ([query]) => {
+      localStorage.setItem('sparkles.dataset', 'bulky');
+      localStorage.setItem(
+        'sparkles.queryTabs',
+        JSON.stringify({
+          tabs: [{ id: 't1', title: 'Query 1', query }],
+          active: 't1',
+          limit: 1000,
+        }),
+      );
+    },
+    [`SELECT ?s ?v WHERE { ?s <${EX}v> ?v } ORDER BY ?v`],
+  );
+  await page.goto('/ui/query');
+  await page.getByRole('button', { name: /^Run/ }).click();
+  await expect(grid(page)).toBeVisible();
+  await page.getByRole('button', { name: 'History', exact: true }).click();
+  await right(page).focus();
+  await page.keyboard.press('c');
+  await page.getByRole('button', { name: 'Compare on the server' }).click();
+  await expect(grid(page).getByRole('row')).toHaveCount(4);
+  await expect(
+    grid(page)
+      .getByRole('row')
+      .filter({ hasText: '5000' })
+      .getByRole('gridcell', { name: 'added' }),
+  ).toHaveText('+');
+  await expect(page.getByText('Compared on the server')).toBeVisible();
+});

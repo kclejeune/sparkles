@@ -239,7 +239,7 @@ orders every item by difficulty and impact and links each to its design spec.
 
 The web UI is embedded in the server. It has a query editor with results as tables,
 graphs and maps, a resource explorer, schema and validation views, branch history and
-merges, the Ask bar, and agent memory. The first screenshots show an answered question,
+merges, a time slider over past commits, the Ask bar, and agent memory. The first screenshots show an answered question,
 agent memory, the map view and a merge preview.
 
 <table>
@@ -288,6 +288,14 @@ agent memory, the map view and a merge preview.
   <tr>
     <td>A query an agent handed over for review</td>
     <td>An answer in progress, at the summary step</td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/time-slider.png" alt="The query page with the time slider in compare mode, marking one team membership as added and one as removed between two commits"></td>
+    <td><img src="docs/images/time-slider-graph.png" alt="The resource explorer with the time slider in compare mode, drawing a new edge in green and a removed one as a dashed ghost"></td>
+  </tr>
+  <tr>
+    <td>A query compared between two commits</td>
+    <td>A graph compared between two commits</td>
   </tr>
 </table>
 
