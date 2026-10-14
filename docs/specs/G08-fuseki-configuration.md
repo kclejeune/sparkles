@@ -473,7 +473,7 @@ direct naming per dataset.** The item's third part, JVM metrics, belongs to
   approximated ("--gsp-direct-naming, which applies to every dataset", `service.rs`), and
   an assembler body with such an endpoint is refused unless the flag is on. A read-only
   `gsp-direct-r` endpoint gets the same routes as `gsp-direct-rw`; only grants limit
-  writes.
+  writes. The mode follows the name, so a renamed dataset loses it.
 * **Design: a per-dataset setting.** Direct naming becomes a dataset setting,
   `gspDirectNaming: "off" | "read" | "read-write"`, stored with the dataset's other
   Fuseki-compatibility settings and changed through C19's settings routes as a member of
