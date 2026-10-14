@@ -60,9 +60,31 @@ impl quick_cache::Weighter<String, Arc<Rows>> for Weighter {
     }
 }
 
+type Inner = quick_cache::sync::Cache<String, Arc<Rows>, Weighter>;
+
+/// The most shards the cache has. quick_cache splits the byte budget evenly between its
+/// shards and refuses an entry heavier than 97% of one shard's share. An entry is kept
+/// up to an eighth of the whole budget, so every kept entry fits its shard only when a
+/// shard holds at least twice that, which means at most four shards. The default of four
+/// shards per CPU gave a shard less than an eighth of a small budget on a host with 32 or
+/// more CPUs, and the cache dropped entries that `put` had accepted. Four shards cost
+/// little here, because a lookup takes a read lock and each miss costs a remote request.
+const MAX_SHARDS: usize = 4;
+
+/// A cache of at most `bytes` with `shards` shards, at most [`MAX_SHARDS`].
+fn build_cache(bytes: u64, shards: usize) -> Inner {
+    let options = quick_cache::OptionsBuilder::new()
+        .estimated_items_capacity(10_000)
+        .weight_capacity(bytes)
+        .shards(shards.min(MAX_SHARDS))
+        .build()
+        .expect("the cache options are complete");
+    Inner::with_options(options, Weighter, Default::default(), Default::default())
+}
+
 /// A store's cache of remote SERVICE results.
 pub struct ServiceCache {
-    cache: Option<quick_cache::sync::Cache<String, Arc<Rows>, Weighter>>,
+    cache: Option<Inner>,
     max_entry_bytes: u64,
     hits: AtomicU64,
     misses: AtomicU64,
@@ -71,9 +93,13 @@ pub struct ServiceCache {
 impl ServiceCache {
     /// A cache of at most `bytes` (0 turns it off).
     pub fn new(bytes: u64) -> ServiceCache {
+        let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
+        Self::with_shards(bytes, cpus * 4)
+    }
+
+    fn with_shards(bytes: u64, shards: usize) -> ServiceCache {
         ServiceCache {
-            cache: (bytes > 0)
-                .then(|| quick_cache::sync::Cache::with_weighter(10_000, bytes, Weighter)),
+            cache: (bytes > 0).then(|| build_cache(bytes, shards)),
             max_entry_bytes: bytes / 8,
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
@@ -184,6 +210,23 @@ mod tests {
         c.remove(&k);
         assert!(c.get(&k).is_none());
         assert!(!ServiceCache::new(0).enabled());
+    }
+
+    /// The largest entry `put` accepts is kept, whatever number of shards the host asks
+    /// for. The default asks for four per CPU, so 128 on a host with 32 CPUs.
+    #[test]
+    fn entries_up_to_an_eighth_fit_their_shard_on_any_host() {
+        let budget = 64u64 << 10;
+        let key = "k0".to_string();
+        let mut n = 1;
+        while rows(n + 1).bytes() + key.len() as u64 <= budget / 8 {
+            n += 1;
+        }
+        for shards in [1, 4, 16, 64, 128, 256, 1024] {
+            let c = ServiceCache::with_shards(budget, shards);
+            c.put(key.clone(), rows(n));
+            assert!(c.get(&key).is_some(), "{shards} shards dropped the entry");
+        }
     }
 
     #[test]
