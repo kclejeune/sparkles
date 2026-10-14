@@ -299,6 +299,12 @@ class CompareTests(unittest.TestCase):
         self.assertEqual(self.compare(a, self.qmph_record("qc", 12000.0)).returncode, 0)
         self.assertEqual(self.compare(a, self.qmph_record("qd", 9400.0)).returncode, 0)
 
+    def test_a_throughput_drop_to_zero_is_a_regression(self):
+        a = self.qmph_record("qa", 100.0)
+        p = self.compare(a, self.qmph_record("qz", 0.0))
+        self.assertEqual(p.returncode, 1, p.stdout)
+        self.assertIn("REGRESSION", p.stdout)
+
     def test_two_small_throughput_drops_in_a_row(self):
         a, b, c = self.qmph_record("qa", 10000.0), self.qmph_record("qb", 9400.0), self.qmph_record("qc", 8800.0)
         p = self.compare(a, b, c)

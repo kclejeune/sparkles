@@ -69,10 +69,13 @@ def compare_main(argv):
                 findings.append(f'ANSWER CHANGED {label}: {oa.get("rows")} rows -> {na.get("rows")} rows')
             if o.get('status') == 'ok' and n.get('status') != 'ok':
                 findings.append(f'STATUS {label}: ok -> {n.get("status")}')
-            ot, nt = o.get('qmph') or o.get('qps'), n.get('qmph') or n.get('qps')
-            if ot and nt:
+            metric = next((m for m in ('qmph', 'qps') if o.get(m) is not None and n.get(m) is not None), None)
+            if metric:
                 # throughput: higher is better and there are no samples, so only the thresholds apply
-                unit = 'QMpH' if o.get('qmph') else 'qps'
+                ot, nt = o[metric], n[metric]
+                if ot <= 0:
+                    continue
+                unit = 'QMpH' if metric == 'qmph' else 'qps'
                 ratio = nt / ot
                 rows.append((label + f' ({unit})', ot, nt, ratio, 'n/a'))
                 if k[2] == a.engine:
@@ -85,7 +88,7 @@ def compare_main(argv):
                     slower_before[k] = loss > a.repeat_threshold
                 continue
             om, nm = o.get('median_ms'), n.get('median_ms')
-            if not om or not nm:
+            if om is None or nm is None or om <= 0:
                 continue
             ratio = nm / om
             so, sn = span(o), span(n)
