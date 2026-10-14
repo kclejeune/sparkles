@@ -28,7 +28,9 @@ solutions are legitimately engine-dependent. A failed request records `error`.
 
 Blank nodes compare by structure. Each response is canonicalized on its own, so a blank
 node label (which only has meaning inside one response) never decides equality, and two
-different arrangements of blank nodes do not compare equal.
+different arrangements of blank nodes do not compare equal. This includes blank nodes inside
+SELECT triple terms. Triple terms in N-Triples output (`<< ... >>`) are compared as text,
+labels included. This is a limitation, and no suite returns them.
 
 ASK queries record a digest of the boolean. CONSTRUCT and DESCRIBE queries are fetched as
 N-Triples, parsed, and compared as a set of triples by RDF term identity (a graph has no
@@ -302,13 +304,22 @@ def digest(rows):
     return h.hexdigest()[:16]
 
 
+def _bnodes(t):
+    """The blank node labels of a term, including those inside a triple term."""
+    if t and t[0] == "bnode":
+        yield t[1]
+    elif t and t[0] == "triple":
+        for x in t[1:]:
+            yield from _bnodes(x)
+
+
 def canon(rows):
     """The digest of a solution multiset or a set of triples that does not depend on blank node
     labels. Each blank node gets a colour from the rows it occurs in (the other blank nodes shown
     by their own colour), refined four times, and the rows are digested with colours for labels.
     It tells apart the graphs that matter here, though it is not a full isomorphism test."""
     rows = list(rows)
-    labels = {t[1] for r in rows for t in r if t and t[0] == "bnode"}
+    labels = {l for r in rows for t in r for l in _bnodes(t)}
     if not labels:
         return digest(rows)
     color = {l: "" for l in labels}
@@ -316,12 +327,14 @@ def canon(rows):
     def show(t, own=None):
         if t and t[0] == "bnode":
             return ("bnode", "*" if t[1] == own else color[t[1]])
+        if t and t[0] == "triple":
+            return ("triple",) + tuple(show(x, own) for x in t[1:])
         return t
 
     for _ in range(4):
         sig = {l: [] for l in labels}
         for r in rows:
-            for l in {t[1] for t in r if t and t[0] == "bnode"}:
+            for l in {l for t in r for l in _bnodes(t)}:
                 sig[l].append(tuple(show(t, l) for t in r))
         color = {l: hashlib.sha256(repr(sorted(sig[l])).encode()).hexdigest()[:12] for l in labels}
     return digest(tuple(show(t) for t in r) for r in rows)

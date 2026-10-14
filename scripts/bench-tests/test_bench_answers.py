@@ -51,6 +51,15 @@ class CanonTests(unittest.TestCase):
         two = rows([b("x"), b("y")])
         self.assertNotEqual(ba.canon(one), ba.canon(two))
 
+    def test_blank_nodes_inside_triple_terms_are_canonicalized(self):
+        def tt(label):
+            return {"type": "triple", "value": {"subject": b(label), "predicate": u("p"), "object": u("o")}}
+
+        self.assertEqual(ba.canon(rows([tt("a")])), ba.canon(rows([tt("b")])))
+        shared = rows([tt("a")], [tt("a")])
+        apart = rows([tt("a")], [tt("b")])
+        self.assertNotEqual(ba.canon(shared), ba.canon(apart))
+
     def test_without_blank_nodes_the_digest_is_the_plain_one(self):
         r = rows([u("a"), u("b")], [u("c"), u("d")])
         self.assertEqual(ba.canon(r), ba.digest(r))
