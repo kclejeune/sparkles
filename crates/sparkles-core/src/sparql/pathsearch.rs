@@ -802,6 +802,23 @@ struct Tree {
     order: Vec<(u64, u32)>,
 }
 
+/// The work of one path enumeration, checked against the query's deadline and
+/// cancellation every 4096 units.
+struct Budget<'c> {
+    steps: u64,
+    check: &'c dyn Fn() -> Result<()>,
+}
+
+impl Budget<'_> {
+    fn tick(&mut self) -> Result<()> {
+        self.steps += 1;
+        if self.steps.is_multiple_of(4096) {
+            (self.check)()?;
+        }
+        Ok(())
+    }
+}
+
 impl Tree {
     fn new(root: u64, forward: bool) -> Tree {
         Tree {
@@ -843,12 +860,9 @@ impl Tree {
         // on the path is skipped
         let mut on: FxHashSet<u64> = FxHashSet::default();
         on.insert(m);
-        let mut steps = 0u64;
+        let mut budget = Budget { steps: 0, check };
         while let Some(top) = stack.last_mut() {
-            steps += 1;
-            if steps.is_multiple_of(4096) {
-                check()?;
-            }
+            budget.tick()?;
             let x = top.0;
             if x == self.root {
                 let edges: Vec<Edge> = if self.forward {
@@ -886,8 +900,10 @@ impl Tree {
             top.1 += 1;
             match self.parent_at(x, i, all) {
                 Some(q) if on.contains(&q.node) && q.node != self.root => {}
-                Some(q) if !self.escapes(x, q.node, &on, cost, all) => {}
                 Some(q) => {
+                    if !self.escapes(x, q.node, &on, cost, all, &mut budget)? {
+                        continue;
+                    }
                     links.push((x, q));
                     stack.push((q.node, 0));
                     on.insert(q.node);
@@ -905,6 +921,7 @@ impl Tree {
     /// Whether parent `q` of `x` reaches the root through recorded parents without a
     /// node of `on`. Costs never rise toward the root, so only a parent of the same
     /// cost as `x` can fail: a cheaper one reaches the root through its first parents.
+    /// Each parent the search examines counts against the deadline.
     fn escapes(
         &self,
         x: u64,
@@ -912,16 +929,17 @@ impl Tree {
         on: &FxHashSet<u64>,
         cost: Option<&FxHashMap<u64, f64>>,
         all: bool,
-    ) -> bool {
-        let Some(cost) = cost else { return true };
+        budget: &mut Budget<'_>,
+    ) -> Result<bool> {
+        let Some(cost) = cost else { return Ok(true) };
         if q == self.root {
-            return true;
+            return Ok(true);
         }
         let (Some(&c), Some(&cq)) = (cost.get(&x), cost.get(&q)) else {
-            return true;
+            return Ok(true);
         };
         if cq < c {
-            return true;
+            return Ok(true);
         }
         let mut seen: FxHashSet<u64> = FxHashSet::default();
         seen.insert(q);
@@ -930,16 +948,17 @@ impl Tree {
             let mut i = 0;
             while let Some(p) = self.parent_at(z, i, all) {
                 i += 1;
+                budget.tick()?;
                 let y = p.node;
                 if y == self.root {
-                    return true;
+                    return Ok(true);
                 }
                 if on.contains(&y) {
                     continue;
                 }
                 match cost.get(&y) {
-                    Some(&cy) if cy < c => return true,
-                    None => return true,
+                    Some(&cy) if cy < c => return Ok(true),
+                    None => return Ok(true),
                     _ => {}
                 }
                 if seen.insert(y) {
@@ -947,7 +966,7 @@ impl Tree {
                 }
             }
         }
-        false
+        Ok(false)
     }
 }
 
@@ -2459,4 +2478,36 @@ pub fn run(
         counters.insert("sweeps".into(), eng.sweeps.get().into());
     }
     Ok((out, counters))
+}
+
+#[cfg(test)]
+mod tree_tests {
+    use super::*;
+
+    fn parent(node: u64) -> Parent {
+        Parent {
+            node,
+            p: 0,
+            rev: false,
+        }
+    }
+
+    #[test]
+    fn pruning_work_is_checked_against_the_deadline() {
+        // node 1 has the root as its first parent and K + 1 as an extra one, and K + 1
+        // reaches 1 only through a chain of first parents, so the search for a way out
+        // of K + 1 visits K parents and finds none
+        const K: u64 = 3 * 4096;
+        let mut t = Tree::new(0, true);
+        t.first.insert(1, (parent(0), 0));
+        for i in 2..=K + 1 {
+            t.first.insert(i, (parent(i - 1), 0));
+        }
+        t.extra.insert(1, vec![parent(K + 1)]);
+        t.order = (1..=K + 1).map(|i| (i, 0)).collect();
+        let cost: FxHashMap<u64, f64> = (1..=K + 1).map(|i| (i, 0.0)).collect();
+        let check = || Err(Error::Timeout);
+        let r = t.paths(1, true, 10, Some(&cost), &check);
+        assert!(matches!(r, Err(Error::Timeout)), "{:?}", r.map(|p| p.len()));
+    }
 }
