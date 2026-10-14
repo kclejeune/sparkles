@@ -464,6 +464,14 @@ version through `FileKind::check` or `formats::check_settings`. A change that an
 release would misread also raises `minimumReader` before the first file in the new form
 is written ([`commit::require_reader`](../crates/sparkles-core/src/commit.rs)).
 
+A store checks every settings file of a dataset against the registry when it opens the
+dataset, before it writes any file, so a settings file from a newer release refuses the
+whole dataset. A settings file that a release rewrites through a typed struct drops the
+members that struct does not know, so an additive member of such a file must be safe to
+lose when an older release rewrites the file, or the change needs a `format` bump.
+`dataset.json` keeps unknown members on a rewrite, and so do the files that the server
+writes as raw JSON values.
+
 `testsuite/formats/<label>/` holds databases written by earlier commits or releases,
 made by `scripts/format-fixture.sh BIN LABEL` with that release's binary. The tests
 `crates/sparkles-core/tests/formats.rs` and `crates/sparkles-server/tests/cli_formats.rs`

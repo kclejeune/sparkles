@@ -47,7 +47,7 @@
 //! struct does not know. An additive member of such a file must therefore be safe to lose
 //! when an older release rewrites the file, or it needs a `format` bump. `dataset.json`
 //! keeps unknown members on a rewrite, and so do the files that the server writes as raw
-//! JSON values (the assistant settings and the runtime layers).
+//! JSON values, such as the assistant settings and the runtime layers.
 //!
 //! Every version that changes is listed under the **Format** heading of the release's
 //! CHANGELOG entry.

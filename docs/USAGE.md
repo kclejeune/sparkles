@@ -2194,27 +2194,52 @@ while a server holds the data directory, and it upgrades the persistent datasets
 `config.json` registers, or those that `--dataset` names. `--check` lists each
 database's `dataset.json` versions, the version of every generation's index, log and
 update vocabulary, whether the release opens the database, and the steps an upgrade
-would run, and it changes nothing. The exit status is 1 when a database is outside the
-window and 0 otherwise.
+would run. It never changes a database and does not finish or undo an earlier run, which
+it reports as `interrupted`. The exit status is 1 when a database is outside the window
+and 0 otherwise. The window covers the root of a database and every branch, and a newer
+settings file of a dataset or of one of its branches puts the database outside it.
+The informational files `origin.json` and `restore.json` are the exception, because a
+store ignores a newer one with a warning.
 
 Without `--check`, the command copies each database that has steps to run into a
 sibling directory named `.migrate-<name>` and runs the steps on the copy. It then checks
-the copy as `sparkles check` does and swaps it in with two renames. The dataset id, the
-commit numbers, the commit catalog, the branches and the snapshots stay as they were.
-`--keep-old` keeps the database as it was in `.pre-migrate-<version>-<name>`, and
-without it that directory is removed. If the command stops before the swap, the copy is
-removed at the next run and the database is unchanged. If it stops between the two
-renames, the next run renames the checked copy into place. A copy that fails the check
-is removed, and the database is left as it was.
+the copy as `sparkles check` does and swaps it in with two renames. The copy needs as much
+free space as the database. The dataset id, the commit numbers, the commit catalog, the
+branches and the snapshots stay as they were. `--keep-old` keeps the database as it was
+in `.pre-migrate-<version>-<name>`, and without it that directory is removed. The
+command refuses to start while that directory exists, so it never deletes an earlier
+kept copy. It also refuses a database that holds a symlink or another entry that is not a
+regular file or directory, because the copy would leave it out. Replace the entry with the
+files it points to and run again.
+
+The command takes the lock file `.migrate.lock-<name>` next to the database, which a
+second `sparkles migrate` and a `--check` of the same database respect, and the
+database's own lock, which a server or any other process that has the database open
+holds. It therefore fails with a locked error while a server runs on the database, and it
+leaves the lock file in place after it finishes. A copy that fails the check is removed,
+and the database is left as it was. If the command stops before the swap, the next run
+removes the copy and the database is unchanged. If it stops between the two renames, the
+next run renames the checked copy into place. A server, or any other open of the
+database, refuses a database with a pending `.migrate-<name>` until `sparkles migrate`
+has run on it again, so a stopped run never leads to an empty database. A copy that
+carries no mark of a passed check is never renamed into place. The command reports it and
+leaves both directories alone.
 
 The only step today rewrites a legacy update vocabulary (`delta.vocab`) in the framed
 format, which the first write to it would also do. A server opens such a database
 without the step.
 
 A server that finds a dataset in a version it does not read leaves that dataset closed,
-logs why, and serves the others. The dataset stays registered, and `GET /$/server` lists
-it under `refusedDatasets` with the reason. After `sparkles migrate`, or after the
-database is replaced, the next start opens it.
+logs why, and serves the others. That covers an index or a log in a newer version, a
+`dataset.json` that needs a later reader, and a settings file such as `describe.json`,
+`rdfs.json` or `assistant.json` with a newer `format`, which a store checks at open before
+it writes any file. The dataset stays registered, and `GET /$/server` lists it under
+`refusedDatasets`. A caller sees the refused datasets it may read, and a server
+administrator sees all of them and alone gets the full reason, which names paths. The
+other callers get a fixed sentence. A refused dataset cannot be deleted or renamed through
+the API while it is closed. Stop the server and run `sparkles migrate`, or edit
+`config.json`. After `sparkles migrate`, or after the database is replaced, the next start
+opens it.
 
 ## MCP server (LLM agents)
 

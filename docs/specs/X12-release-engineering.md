@@ -644,7 +644,13 @@ through another, so `assistant.json`, `memory.json`, `ingest.json`, `asks.json`,
 `notifications.json` are covered in two places. Files whose types already had a member
 (`reasoningFormat`, `rdfsFormat`, `originFormat`, `restoreFormat`, `version`) keep it, and
 the registry names it. A newer version is refused, except for the informational
-`origin.json` and `restore.json`, which are then ignored with a warning.
+`origin.json` and `restore.json`, which are then ignored with a warning. A store checks
+every settings file of a dataset, and of each branch, when it opens the dataset, before it
+writes any file, so a refused open leaves `dataset.json` unchanged and agrees with
+`migrate --check`. `dataset.json` keeps the members it does not know when a release
+rewrites it. Settings files that a release writes through a typed struct drop unknown
+members, so an additive member of such a file must be safe to lose or needs a `format`
+bump.
 
 **`writtenBy`.** `dataset.json` records the release that last opened the database for
 writing, and refusals name it.
@@ -657,7 +663,8 @@ upgraded with `sparkles migrate`, or must be dumped with the release that wrote 
 **Refusing one dataset.** When `Catalog::open` meets a persistent dataset in a format
 this release does not read (`Error::Unsupported`), it logs the reason, leaves the
 dataset closed and registered, and serves the others. `GET /$/server` lists such datasets
-under `refusedDatasets`. This is the part of §2.5 that roadmap item 64 needs only for
+under `refusedDatasets` to the callers that may read them, with the reason only for server
+administrators. This is the part of §2.5 that roadmap item 64 needs only for
 format refusals. Other open failures still stop the catalog.
 
 **`sparkles migrate`.** `crates/sparkles-core/src/migrate.rs` holds the step registry,
@@ -666,9 +673,18 @@ command of §4.4 with `--data`, `--loc`, `--dataset`, `--check`, `--keep-old` an
 json`. The swap is not the catalog's `swap.rs`, which needs a live catalog. The command
 works on a stopped data directory, so it takes the catalog lock and the database's own
 lock, copies the database to `.migrate-<name>`, runs the steps, checks the copy with
-`check::check`, and swaps it in with two renames. `recover` removes a copy that was not
-swapped in and finishes a run that stopped between the renames. A unit test interrupts
-the run at each point and checks the result. One step is registered: a legacy delta
+`check::check`, and swaps it in with two renames. A copy that passed the check carries a
+`.migrate-checked` mark, and recovery renames a copy into place only when it has the mark,
+so a run that stopped between the renames is finished by the next run. The command takes
+a lock file `.migrate.lock-<name>` next to the database for planning, recovery, the copy
+and the swap, and the database's own lock until the renames start. `plan` is read-only
+and reports a pending run as `interrupted`, so `--check` changes nothing. A store refuses
+to open a database whose `.migrate-<name>` exists, before it creates the directory and
+again under its lock, so a stopped run never leaves an empty database. The command
+resolves a relative `--loc` to an absolute path, refuses symlinks and special files, and
+does not start while `.pre-migrate-<version>-<name>` exists. Unit tests interrupt the run
+at each point and check the result, and cover a check during a copy, a live store, the
+lock file's name and a root that reappears next to a checked copy. One step is registered: a legacy delta
 vocabulary to the framed format, which is the lazy upgrade of §4.3 run ahead of time. The
 log header has no step, because the byte offsets of branch link segments and of backup
 manifests point into existing logs, and rewriting a log would move them. A generation
