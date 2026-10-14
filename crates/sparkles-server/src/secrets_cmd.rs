@@ -87,8 +87,13 @@ pub fn run(args: SecretsArgs) -> Result<()> {
             new_key,
         } => {
             let done = secrets::rekey(&data, secrets_key.as_deref(), &new_key)?;
+            let already = if done.already > 0 {
+                format!(" ({} already sealed with the new key)", done.already)
+            } else {
+                String::new()
+            };
             println!(
-                "sealed {} value(s) in {} with the new key; start the server with --secrets-key {new_key}",
+                "sealed {} value(s){already} in {} with the new key; start the server with --secrets-key {new_key}",
                 done.values,
                 data.join(secrets::SECRETS_DIR).display()
             );

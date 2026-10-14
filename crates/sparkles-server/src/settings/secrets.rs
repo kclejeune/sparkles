@@ -499,17 +499,43 @@ impl Sealing {
 
     /// Every runtime value in `dir`, opened. A value that does not open stops it, with
     /// the names of all such values.
-    fn open_all(&self, dir: &FsPath) -> anyhow::Result<Vec<(String, bool, String)>> {
+    fn open_all(&self, dir: &FsPath) -> anyhow::Result<Vec<Opened>> {
+        self.open_all_with(dir, None)
+    }
+
+    /// Like [`Sealing::open_all`], and a sealed value that does not open with this key
+    /// may open with `next`, the key of a `rekey` that stopped partway. The server never
+    /// passes `next`, so it never accepts two keys.
+    fn open_all_with(&self, dir: &FsPath, next: Option<&Sealing>) -> anyhow::Result<Vec<Opened>> {
         let mut out = Vec::new();
         let mut failed = Vec::new();
         for name in stored(dir).into_keys() {
             let bytes = std::fs::read(dir.join(&name))
                 .map_err(|e| anyhow::anyhow!("cannot read secret {name}: {e}"))?;
             let was_sealed = is_sealed(&bytes);
-            match self.open(&name, bytes) {
-                Ok(v) => out.push((name, was_sealed, v)),
-                Err(_) => failed.push(name),
-            }
+            let kept = bytes.clone();
+            let (held, value) = match self.open(&name, bytes) {
+                Ok(v) => (
+                    if was_sealed {
+                        Held::Current
+                    } else {
+                        Held::Plain
+                    },
+                    v,
+                ),
+                Err(_) => match next.map(|n| n.open(&name, kept)) {
+                    Some(Ok(v)) => (Held::Next, v),
+                    _ => {
+                        failed.push(name);
+                        continue;
+                    }
+                },
+            };
+            out.push(Opened {
+                name,
+                held,
+                value: plain(value),
+            });
         }
         if failed.is_empty() {
             return Ok(out);
@@ -519,10 +545,10 @@ impl Sealing {
         let has_key = self.state.sealer.read().is_some();
         match &self.state.mode {
             Mode::Configured => anyhow::bail!(
-                "the secrets key does not open the stored secrets {names} in {shown}: it is not the key they were sealed with, or a file was changed or renamed"
+                "the secrets key does not open the stored secrets {names} in {shown}: it is not the key they were sealed with, or a file was changed or renamed. If a sparkles secrets rekey was interrupted, run the same command again to finish it."
             ),
             Mode::Generated(path) if has_key => anyhow::bail!(
-                "the secrets key {} does not open the stored secrets {names} in {shown}: it is not the key they were sealed with, or a file was changed or renamed. Start the server with --secrets-key and the key they were sealed with",
+                "the secrets key {} does not open the stored secrets {names} in {shown}: it is not the key they were sealed with, or a file was changed or renamed. Start the server with --secrets-key and the key they were sealed with. If a sparkles secrets rekey was interrupted, run the same command again to finish it.",
                 path.display()
             ),
             Mode::Generated(path) => anyhow::bail!(
@@ -541,9 +567,10 @@ impl Sealing {
     /// place, with a generated key when there is no other.
     pub fn prepare(&self, dir: &FsPath) -> anyhow::Result<()> {
         let mut migrated = 0usize;
-        for (name, was_sealed, v) in self.open_all(dir)? {
-            if !was_sealed && self.sealed() {
-                self.write(dir, &name, v.trim().as_bytes())
+        for o in self.open_all(dir)? {
+            if o.held == Held::Plain && self.sealed() {
+                let name = &o.name;
+                self.write(dir, name, o.value.trim().as_bytes())
                     .map_err(|e| anyhow::anyhow!("cannot seal secret {name}: {e}"))?;
                 migrated += 1;
             }
@@ -555,11 +582,43 @@ impl Sealing {
     }
 }
 
+/// How an opened value was kept.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Held {
+    /// A plaintext file.
+    Plain,
+    /// Sealed, and opened with the current key.
+    Current,
+    /// Sealed, and opened only with the target key of a `rekey` that stopped partway.
+    Next,
+}
+
+/// An opened value is zeroed when dropped, in a build that has `zeroize`.
+#[cfg(feature = "backup")]
+type Plain = zeroize::Zeroizing<String>;
+#[cfg(not(feature = "backup"))]
+type Plain = String;
+
+fn plain(s: String) -> Plain {
+    #[cfg(feature = "backup")]
+    return zeroize::Zeroizing::new(s);
+    #[cfg(not(feature = "backup"))]
+    return s;
+}
+
+struct Opened {
+    name: String,
+    held: Held,
+    value: Plain,
+}
+
 /// What an offline change to the stored values did.
 #[derive(Debug)]
 pub struct Offline {
     /// The values written.
     pub values: usize,
+    /// The values that an earlier, interrupted `rekey` had sealed with the new key.
+    pub already: usize,
     /// The generated key file that `rekey` removed, since nothing uses it any more.
     pub removed_key: Option<PathBuf>,
 }
@@ -570,21 +629,30 @@ struct OfflineValues {
     _lock: std::fs::File,
     current: Sealing,
     dir: PathBuf,
-    /// Each value's name, whether it was sealed, and the value.
-    values: Vec<(String, bool, String)>,
+    values: Vec<Opened>,
 }
 
-/// Open every stored value of the stopped server's data directory `data` with the key
-/// that `serve` would use (`source` as for `--secrets-key`), holding its catalog lock.
-fn offline_values(data: &FsPath, source: Option<&str>) -> anyhow::Result<OfflineValues> {
+/// Take the catalog lock of the stopped server's data directory `data`.
+fn lock_data(data: &FsPath) -> anyhow::Result<std::fs::File> {
     if !data.is_dir() {
         anyhow::bail!("{} is not a data directory", data.display());
     }
-    let lock = sparkles::catalog::lock_data_dir(data)
-        .map_err(|e| anyhow::anyhow!("{e}: stop the server that uses {} first", data.display()))?;
+    sparkles::catalog::lock_data_dir(data)
+        .map_err(|e| anyhow::anyhow!("{e}: stop the server that uses {} first", data.display()))
+}
+
+/// Open every stored value of `data` with the key that `serve` would use (`source` as
+/// for `--secrets-key`), holding `lock`. A value that opens only with `next` is
+/// `Held::Next`.
+fn offline_values(
+    lock: std::fs::File,
+    data: &FsPath,
+    source: Option<&str>,
+    next: Option<&Sealing>,
+) -> anyhow::Result<OfflineValues> {
     let current = Sealing::start(source, data)?;
     let dir = data.join(SECRETS_DIR);
-    let values = current.open_all(&dir)?;
+    let values = current.open_all_with(&dir, next)?;
     Ok(OfflineValues {
         _lock: lock,
         current,
@@ -597,46 +665,84 @@ fn offline_values(data: &FsPath, source: Option<&str>) -> anyhow::Result<Offline
 /// back as a plaintext file with mode 0600, for a release that does not seal them. The
 /// key file stays, so a later start of a sealing release seals them again with it.
 pub fn unseal(data: &FsPath, source: Option<&str>) -> anyhow::Result<Offline> {
-    let opened = offline_values(data, source)?;
+    let opened = offline_values(lock_data(data)?, data, source, None)?;
     let dir = &opened.dir;
     let mut n = 0;
-    for (name, was_sealed, v) in &opened.values {
-        if *was_sealed {
-            write_atomic(&dir.join(name), v.trim().as_bytes(), 0o600)
-                .map_err(|e| anyhow::anyhow!("cannot write secret {name}: {e}"))?;
+    for o in &opened.values {
+        if o.held == Held::Current {
+            write_atomic(&dir.join(&o.name), o.value.trim().as_bytes(), 0o600)
+                .map_err(|e| anyhow::anyhow!("cannot write secret {}: {e}", o.name))?;
             n += 1;
         }
     }
     Ok(Offline {
         values: n,
+        already: 0,
         removed_key: None,
     })
 }
 
 /// `sparkles secrets rekey --data DIR --new-key SOURCE`: seal every stored value of a
 /// stopped server again under the key of `new_key`. Every value is opened before any is
-/// written. When the old key was the generated `secrets.key`, the file is removed
-/// afterwards, so that a start without `--secrets-key` does not pick it up.
+/// written. A value that an earlier, interrupted run sealed with the new key is kept,
+/// so running the same command again finishes it. When the old key was the generated
+/// `secrets.key`, the file is removed once every value opens with the new key, so that
+/// a start without `--secrets-key` does not pick it up.
 pub fn rekey(data: &FsPath, source: Option<&str>, new_key: &str) -> anyhow::Result<Offline> {
     if new_key.trim() == "none" {
         anyhow::bail!("--new-key none would keep no key: use sparkles secrets unseal");
     }
-    let opened = offline_values(data, source)?;
+    // the lock comes first, so that a running server is refused before any key is read
+    let lock = lock_data(data)?;
     let new = Sealing::start(Some(new_key), data)?;
-    for (name, _, v) in &opened.values {
-        new.write(&opened.dir, name, v.trim().as_bytes())
-            .map_err(|e| anyhow::anyhow!("cannot seal secret {name}: {e}"))?;
+    let opened = offline_values(lock, data, source, Some(&new))?;
+    let dir = &opened.dir;
+    let mut written = 0usize;
+    let mut already = 0usize;
+    for o in &opened.values {
+        if o.held == Held::Next {
+            already += 1;
+            continue;
+        }
+        new.write(dir, &o.name, o.value.trim().as_bytes())
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "cannot seal secret {}: {e}. The secrets before it are sealed with the new key and the others with the old one: run the same sparkles secrets rekey command again to finish",
+                    o.name
+                )
+            })?;
+        written += 1;
     }
+    // every file must open with the new key before the old key goes
+    let mut unsealed = Vec::new();
+    for name in stored(dir).into_keys() {
+        let ok = std::fs::read(dir.join(&name))
+            .ok()
+            .is_some_and(|b| is_sealed(&b) && new.open(&name, b).is_ok());
+        if !ok {
+            unsealed.push(name);
+        }
+    }
+    if !unsealed.is_empty() {
+        anyhow::bail!(
+            "the stored secrets {} in {} do not open with the new key after the rekey, so the old key stays: run the same sparkles secrets rekey command again",
+            unsealed.join(", "),
+            dir.display()
+        );
+    }
+    sync_dir(dir).map_err(|e| anyhow::anyhow!("cannot flush {}: {e}", dir.display()))?;
     let mut removed_key = None;
     if let Mode::Generated(path) = &opened.current.state.mode
         && path.exists()
     {
         std::fs::remove_file(path)
             .map_err(|e| anyhow::anyhow!("cannot remove {}: {e}", path.display()))?;
+        sync_dir(data).map_err(|e| anyhow::anyhow!("cannot flush {}: {e}", data.display()))?;
         removed_key = Some(path.clone());
     }
     Ok(Offline {
-        values: opened.values.len(),
+        values: written,
+        already,
         removed_key,
     })
 }

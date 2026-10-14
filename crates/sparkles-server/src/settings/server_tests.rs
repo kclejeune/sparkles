@@ -1315,3 +1315,76 @@ async fn unseal_and_rekey() {
         .to_string();
     assert!(e.contains("unseal"), "{e}");
 }
+
+/// A `rekey` that stops partway is finished by running it again. The values already
+/// sealed with the new key are kept, the old generated key stays until every value opens
+/// with the new one, and a start in between says what to do.
+#[cfg(all(feature = "backup", unix))]
+#[tokio::test(flavor = "multi_thread")]
+async fn rekey_resumes_after_a_failed_write() {
+    use super::secrets::{Sealing, rekey};
+    use std::os::unix::fs::PermissionsExt;
+    let m = key_mock();
+    let models = declared_models(&format!("{}/v1", m.url()));
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let (st, app) = open_sealed(dir.path(), &models, None).unwrap();
+    for (name, value) in [("a", "value-a"), ("b", "value-b")] {
+        let (s, _, _) = send(
+            &app,
+            "PUT",
+            &format!("/$/server/secrets/{name}"),
+            Some(json!({"value": value})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::NO_CONTENT);
+    }
+    drop((st, app));
+    let new = dir.path().join("new.key");
+    std::fs::write(&new, format!("{}\n", "07".repeat(32))).unwrap();
+    std::fs::set_permissions(&new, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let source = format!("file:{}", new.display());
+    let run = |data: std::path::PathBuf, source: String| {
+        std::thread::spawn(move || rekey(&data, None, &source))
+            .join()
+            .unwrap()
+    };
+
+    // the write of b fails, after a is sealed with the new key
+    let block = data.join(format!("secrets/.b.{}.tmp", std::process::id()));
+    std::fs::create_dir(&block).unwrap();
+    let e = run(data.clone(), source.clone()).unwrap_err().to_string();
+    assert!(e.contains("secret b") && e.contains("run the same"), "{e}");
+    assert!(data.join("secrets.key").exists());
+    // a start now says that the rekey can be finished
+    let e = open_sealed(dir.path(), &models, None)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(e.contains("run the same command again"), "{e}");
+
+    // the same command finishes it
+    std::fs::remove_dir(&block).unwrap();
+    let done = run(data.clone(), source.clone()).unwrap();
+    assert_eq!(done.values, 1);
+    assert_eq!(done.already, 1);
+    assert_eq!(done.removed_key, Some(data.join("secrets.key")));
+    assert!(!data.join("secrets.key").exists());
+    let (_st, _app) = open_sealed(dir.path(), &models, Some(&source)).unwrap();
+    for (name, value) in [("a", "value-a"), ("b", "value-b")] {
+        let (d, s, path) = (
+            data.clone(),
+            source.clone(),
+            data.join("secrets").join(name),
+        );
+        let got = std::thread::spawn(move || {
+            Sealing::start(Some(&s), &d)
+                .unwrap()
+                .read(&path, name)
+                .unwrap()
+        })
+        .join()
+        .unwrap();
+        assert_eq!(got, value);
+    }
+}
