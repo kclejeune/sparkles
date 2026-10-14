@@ -240,8 +240,12 @@ and comparison methodology. [DEVELOPMENT.md](DEVELOPMENT.md) covers building and
   modes), but the script does not turn it on, so Fluree also answers over the materialized
   file. QLever and Oxigraph have no reasoner. Only Sparkles has an inference time.
 
-  *BSBM.* The scale is a product count or a size such as `10m`, which is about 53,000
-  products. The BSBM tools are GPL-3.0, so the script runs them only when
+  *BSBM.* The scale is a product count or a size such as `10m`. The sizes `1m`, `10m` and
+  `100m` use the product counts of the datasets that BSBM publishes, which are 2,785,
+  28,480 and 284,826 products (the V2.0 specification for 1m and 100m, and the 2013 V3.1
+  results for 10m). Other sizes get 2,848 products per million. The generator makes about
+  360 triples per product, so 2000 products give about 725,000 triples, and the manifest
+  records the triple count of the data that was generated. The BSBM tools are GPL-3.0, so the script runs them only when
   `SPARKLES_ALLOW_GPL_BENCHMARK=1` is set. It downloads them into the workdir, checks them
   against `scripts/bench-bsbm/pins.tsv` and runs the generator and the test driver as
   separate processes. The generator uses forward chaining and its default seed. The test

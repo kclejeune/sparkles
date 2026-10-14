@@ -748,7 +748,7 @@ scripts/bench-lubm.sh "$usage_universities" "$(realpath -m "$usage_workdir")"
 description = "BSBM Explore or Business Intelligence: per-template times and query mixes per hour with 1, 4 and 16 clients on the five engines of bench (the GPL-3.0 BSBM tools are downloaded when SPARKLES_ALLOW_GPL_BENCHMARK=1)"
 depends = ["build"]
 usage = '''
-arg "[scale]" default="2000" help="products (2000 is about 377k triples) or a size: 1m, 10m or 100m"
+arg "[scale]" default="2000" help="products (2000 is about 725k triples) or a size: 1m, 10m or 100m"
 arg "[workdir]" default="target/bench-bsbm" help="tools, data, queries, indexes and results/ (summary.md, record.json, driver XML)"
 flag "--usecase <u>" default="explore" help="explore or bi"
 flag "--instances <n>" default="3" help="query instances per template"

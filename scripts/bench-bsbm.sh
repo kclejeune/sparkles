@@ -4,9 +4,12 @@
 #
 #   SPARKLES_ALLOW_GPL_BENCHMARK=1 scripts/bench-bsbm.sh [SCALE] [WORKDIR]
 #
-# SCALE is the number of products (2000, the smoke default, gives about 377k triples) or an
-# approximate size in triples with an m suffix: 1m, 10m or 100m (about 190 triples per
-# product, so 10m is 53,000 products). USECASE=explore (default) or bi picks the use case.
+# SCALE is the number of products (2000, the smoke default, gives about 725k triples) or a
+# size in millions of triples with an m suffix. The sizes follow the dataset sizes that BSBM
+# publishes, 2,785 products for 1m, 28,480 for 10m and 284,826 for 100m, and other sizes get
+# 2,848 products per million. The generator makes about 360 triples per product (measured with
+# the options below, 2000 products give 725,305 triples). USECASE=explore (default) or bi picks
+# the use case.
 #
 # The BSBM tools (data generator and test driver, version 0.2) are GPL-3.0. The script
 # downloads them into WORKDIR only when SPARKLES_ALLOW_GPL_BENCHMARK=1 is set, checks them
@@ -70,7 +73,16 @@ case $USECASE in
     ;;
 esac
 case $SCALE_ARG in
-  *m) PRODUCTS=$((${SCALE_ARG%m} * 5300)) ;;
+  1m) PRODUCTS=2785 ;;
+  10m) PRODUCTS=28480 ;;
+  100m) PRODUCTS=284826 ;;
+  [0-9]*m)
+    [[ ${SCALE_ARG%m} =~ ^[0-9]+$ ]] || {
+      echo "SCALE must be a product count or a size such as 10m" >&2
+      exit 1
+    }
+    PRODUCTS=$((${SCALE_ARG%m} * 2848))
+    ;;
   *[!0-9]*)
     echo "SCALE must be a product count or a size such as 10m" >&2
     exit 1
@@ -110,7 +122,8 @@ if [ ! -f bsbm/params ]; then
   mv bsbm-gen bsbm
 fi
 DATAFILE=bsbm/dataset.nt
-log "dataset: $(wc -l < "$DATAFILE") triples"
+TRIPLES=$(wc -l < "$DATAFILE")
+log "dataset: $TRIPLES triples"
 
 # --------------------------------------------------------------------------- queries
 if [ ! -f "queries/names-$USECASE-$INSTANCES" ]; then
@@ -162,6 +175,6 @@ bsbm_check() {
 }
 SUITE_AFTER=bsbm_check
 
-DATA_SPECS=("bsbm-$SCALE=$WORK/$DATAFILE|GPL-3.0 (generator)|BSBM tools 0.2 $GENPARAMS")
+DATA_SPECS=("bsbm-$SCALE=$WORK/$DATAFILE|GPL-3.0 (generator)|BSBM tools 0.2 $GENPARAMS triples=$TRIPLES")
 LICENSE_NOTES=("BSBM tools 0.2: GPL-3.0, downloaded at run time, run as separate processes and not committed")
 suite_run
