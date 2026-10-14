@@ -217,13 +217,22 @@ mod sealer {
                 );
             }
         }
-        let mut bytes = Zeroizing::new(Vec::with_capacity(129));
+        // Allocate the entire bounded read before any key bytes can enter the Vec.
+        let mut bytes = Zeroizing::new(Vec::with_capacity(4097));
+        #[cfg(test)]
+        KEY_READ_CAPACITY.with(|capacity| capacity.set(Some(bytes.capacity())));
         f.take(4097)
             .read_to_end(&mut bytes)
             .with_context(|| format!("cannot read the secrets key {shown}"))?;
         let key = sparkles::backup::keys::decode_key(&bytes, SECRETS_KEY_LABEL)
             .map_err(|e| anyhow::anyhow!("{e} ({shown})"))?;
         Ok(Sealer::from_key(key))
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        // Observe only owned Vec metadata immediately before the actual file read.
+        pub(super) static KEY_READ_CAPACITY: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     }
 
     const SECRETS_KEY_LABEL: &str = super::SECRETS_KEY_FILE;
@@ -1784,6 +1793,50 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o400);
+    }
+
+    #[cfg(all(feature = "backup", unix))]
+    #[test]
+    fn generated_key_reader_allocates_its_bound_before_reading() {
+        use std::os::unix::fs::PermissionsExt;
+        struct ReadProbe(Option<usize>);
+        impl Drop for ReadProbe {
+            fn drop(&mut self) {
+                sealer::KEY_READ_CAPACITY.with(|capacity| capacity.set(self.0));
+            }
+        }
+        let _probe = ReadProbe(sealer::KEY_READ_CAPACITY.with(|capacity| capacity.replace(None)));
+        let t = tempfile::tempdir().unwrap();
+        for len in [129, 130, 1024, 4096, 4097] {
+            let path = t.path().join(format!("key-{len}"));
+            let mut input = "07".repeat(32);
+            input.extend(std::iter::repeat_n(' ', len - input.len()));
+            std::fs::write(&path, input).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+            sealer::KEY_READ_CAPACITY.with(|capacity| capacity.set(None));
+            let result = sealer::read_file(&path);
+            let before_read = sealer::KEY_READ_CAPACITY.with(|capacity| capacity.get());
+            if len > 4096 {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("at most 4096 bytes")
+                );
+                assert_eq!(before_read, None, "oversized input reached the read");
+                continue;
+            }
+            let key = result.unwrap();
+            let sealed = sealer::seal(&key, "a", b"padded-key-value").unwrap();
+            let opened = sealer::open(&key, "a", &sealed).unwrap();
+            assert_eq!(opened.as_slice(), b"padded-key-value");
+            // This guards pre-read capacity on the actual reader, not physical
+            // realloc movement or erasure of every key copy.
+            assert!(
+                before_read.is_some_and(|capacity| capacity >= 4097),
+                "{len}-byte key input was read before its full bound was allocated: {before_read:?}"
+            );
+        }
     }
 
     /// Recover publication interrupted after hard-linking the synced key file, before

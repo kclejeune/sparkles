@@ -1088,9 +1088,12 @@ and syncs the data directory even after an earlier attempt unlinked the generate
 A stopped catalog with no runtime-secret directory is a valid empty case. Opening and
 verification require complete secret enumeration, so an unreadable entry or directory
 cannot authorize key removal. The internal migration and verification plaintext owners
-are zeroizing through UTF-8 validation in builds with `backup`. The encryption buffer
-reserves tag capacity before copying plaintext, so tag appending does not grow a buffer
-that already holds plaintext. Public request reads still return ordinary strings, and
+are zeroizing through UTF-8 validation in builds with `backup`. The generated-key
+reader allocates its full 4097-byte input bound before reading into its zeroizing
+buffer, so accepted padded key input does not grow a buffer that already holds key
+bytes. This requests up to 3968 additional bytes for a one-time key read. The encryption
+buffer reserves tag capacity before copying plaintext, so tag appending does not grow
+a buffer that already holds plaintext. Public request reads still return ordinary strings, and
 this does not claim to wipe every heap allocation.
 
 The X12 registry records the existing sealed v1 envelope and the separate raw generated
