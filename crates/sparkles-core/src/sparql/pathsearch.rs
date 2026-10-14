@@ -57,6 +57,10 @@ const SWEEP_RATIO: u64 = 512;
 /// Estimated bytes per visited node (map entry and parent) and per cached neighbour.
 const NODE_BYTES: u64 = 48;
 const STEP_BYTES: u64 = 24;
+/// Estimated bytes per entry of the settling-order map `path:allShortest` builds, a
+/// `u64` key and a `u32` rank padded to 16 bytes, with the table's control byte and
+/// room to grow.
+const RANK_BYTES: u64 = 32;
 
 /// Whether a SERVICE name is the path search.
 pub fn is_search(name: &NamedNodePattern) -> bool {
@@ -1212,6 +1216,25 @@ impl<'a> Engine<'a> {
         self.searches.set(self.searches.get() + 1);
     }
 
+    /// The pruning data for the paths of `tree` when all the cheapest ones are wanted. The
+    /// settling-order map trades memory for speed, so its estimated size is charged to the
+    /// memory budget before it is built.
+    fn prune<'c>(
+        &self,
+        tree: &Tree,
+        cost: Option<&'c FxHashMap<u64, f64>>,
+        all: bool,
+    ) -> Result<Option<Prune<'c>>> {
+        let Some(cost) = cost.filter(|_| all) else {
+            return Ok(None);
+        };
+        self.charge.add(tree.order.len() as u64 * RANK_BYTES)?;
+        Ok(Some(Prune {
+            cost,
+            rank: tree.ranks(),
+        }))
+    }
+
     /// Count `n` more visited nodes against `path:maxVisited` and the memory budget.
     fn visit(&self, n: u64) -> Result<()> {
         let v = self.visited.get() + n;
@@ -2234,10 +2257,7 @@ pub fn run(
                     let tree = eng.bfs(s, true, (!targets.any).then_some(&tset), all, close)?;
                     (tree, None)
                 };
-                let prune = cost.as_ref().filter(|_| all).map(|c| Prune {
-                    cost: c,
-                    rank: tree.ranks(),
-                });
+                let prune = eng.prune(&tree, cost.as_ref(), all)?;
                 // every node reached, nearest first, or the targets in id order
                 let mut ends: Vec<u64> = if targets.any {
                     tree.order.iter().map(|e| e.0).collect()
@@ -2347,10 +2367,7 @@ pub fn run(
                     let tree = eng.bfs(t, false, None, all, true)?;
                     (tree, None)
                 };
-                let prune = cost.as_ref().filter(|_| all).map(|c| Prune {
-                    cost: c,
-                    rank: tree.ranks(),
-                });
+                let prune = eng.prune(&tree, cost.as_ref(), all)?;
                 if spec.min_len == 0 && !add(&mut found, t, t, Vec::new(), None, false)? {
                     break 'targets;
                 }

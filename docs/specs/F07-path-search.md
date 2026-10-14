@@ -624,11 +624,14 @@ parents form a tree. A second review found that the search over other parents di
 count toward the deadline, and that pruning made reconstruction quadratic on a long
 zero-weight chain. The walk and the pruning search now count their steps together and
 check the deadline and cancellation every 4096 steps, which bounds a search whose real
-paths are too many. The tests are `all_shortest_prunes_a_zero_weight_cycle_behind_the_target`,
+paths are too many. The settling-order map that makes the quick test possible costs about 32 bytes
+per settled node, which is charged to the query's memory budget, and it buys linear
+reconstruction on zero-weight chains. The tests are `all_shortest_prunes_a_zero_weight_cycle_behind_the_target`,
 `all_shortest_path_enumeration_honours_the_timeout`, the `tree_tests` unit tests
 `pruning_work_is_checked_against_the_deadline`, `single_path_reconstruction_is_linear` and
 `all_shortest_reconstruction_of_a_two_way_zero_weight_chain_is_linear` with its one-way
-twin, and `zero_weight_chains_reconstruct_inside_the_deadline`.
+twin, and `zero_weight_chains_reconstruct_inside_the_deadline` and
+`all_shortest_charges_its_settling_order_to_the_memory_budget`.
 
 **Cypher integration** (with item 20, Tier 3, [F01](F01-cypher.md)). Phase 3, the Cypher frontend's use of this operator for
 `shortestPath` and `allShortestPaths`, waits for [F01](F01-cypher.md). Nothing in the

@@ -629,6 +629,50 @@ fn zero_weight_chains_reconstruct_inside_the_deadline() {
 }
 
 #[test]
+fn all_shortest_charges_its_settling_order_to_the_memory_budget() {
+    // a zero-weight star: with an unbound target both shortest modes settle every leaf,
+    // and path:limit 1 stops the output after the first path
+    let mut ttl = String::new();
+    for i in 0..10_000 {
+        ttl += &format!("ex:c ex:p ex:l{i} {{| ex:w 0 |}} . ");
+    }
+    let s = store_of(&ttl);
+    let run = |algorithm: &str, memory: Option<u64>| {
+        let opts = QueryOptions {
+            max_memory_bytes: memory,
+            ..Default::default()
+        };
+        query(
+            s.snapshot(),
+            &format!(
+                "{PREFIXES}SELECT ?t WHERE {{ SERVICE path:search {{ [] path:source ex:c ; \
+                 path:target ?t ; path:weight ex:w ; path:algorithm {algorithm} ; \
+                 path:limit 1 }} }}"
+            ),
+            &opts,
+        )
+    };
+    let shortest = run("path:shortest", None).unwrap();
+    let peak = shortest.mem_peak_bytes;
+    assert!(peak > 0);
+    // the settling-order map that allShortest builds is held in memory, so the budget
+    // that was enough for the shortest mode is not enough for it
+    run("path:shortest", Some(peak)).expect("the shortest mode fits its own peak");
+    match run("path:allShortest", Some(peak)) {
+        Err(sparkles_core::Error::BudgetExceeded(b)) => {
+            assert_eq!(b.kind, sparkles_core::BudgetKind::Memory);
+        }
+        r => panic!("expected a memory error: {:?}", r.map(|r| r.len())),
+    }
+    let all = run("path:allShortest", None).unwrap();
+    assert!(
+        all.mem_peak_bytes >= peak + 10_000 * 16,
+        "{}",
+        all.mem_peak_bytes
+    );
+}
+
+#[test]
 fn hidden_triples_are_not_edges() {
     // A9: a protection hides the triples of e, so the path through e is gone
     let s = store_of(&format!("{GRAPH} ex:e a ex:Hidden ."));
