@@ -706,6 +706,20 @@ pub fn rekey(data: &FsPath, source: Option<&str>, new_key: &str) -> anyhow::Resu
     let lock = lock_data(data)?;
     remove_stale_temps(&data.join(SECRETS_DIR), is_secret_temp);
     let new = Sealing::start(Some(new_key), data)?;
+    let dir = data.join(SECRETS_DIR);
+    let has_dir = match std::fs::symlink_metadata(&dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => anyhow::bail!("cannot inspect {}: {e}", dir.display()),
+        Ok(_) => {
+            // Follow an existing symlink, but never treat a dangling one as absent.
+            let md = std::fs::metadata(&dir)
+                .map_err(|e| anyhow::anyhow!("cannot inspect {}: {e}", dir.display()))?;
+            if !md.is_dir() {
+                anyhow::bail!("{} is not a secrets directory", dir.display());
+            }
+            true
+        }
+    };
     let opened = offline_values(lock, data, source, Some(&new))?;
     let dir = &opened.dir;
     let mut written = 0usize;
@@ -741,7 +755,9 @@ pub fn rekey(data: &FsPath, source: Option<&str>, new_key: &str) -> anyhow::Resu
             dir.display()
         );
     }
-    sync_dir(dir).map_err(|e| anyhow::anyhow!("cannot flush {}: {e}", dir.display()))?;
+    if has_dir {
+        sync_dir(dir).map_err(|e| anyhow::anyhow!("cannot flush {}: {e}", dir.display()))?;
+    }
     let mut removed_key = None;
     if let Mode::Generated(path) = &opened.current.state.mode {
         match std::fs::remove_file(path) {
@@ -1228,6 +1244,81 @@ mod tests {
         assert_eq!(std::fs::read_to_string(dir.join("a")).unwrap(), "value-a");
         assert_eq!(std::fs::read_to_string(keep).unwrap(), "keep");
         assert!(keep_dir.is_dir());
+    }
+
+    #[cfg(all(feature = "backup", unix))]
+    #[test]
+    fn rekey_allows_an_absent_secrets_directory() {
+        for generated in [false, true] {
+            let (_t, data, source) = offline_fixture();
+            std::fs::remove_dir(data.join(SECRETS_DIR)).unwrap();
+            let key = data.join(SECRETS_KEY_FILE);
+            if generated {
+                sealer::generate(&key).unwrap();
+            }
+            let probe = SyncProbe::new(&data, false);
+            let done = rekey(&data, None, &source).unwrap();
+            assert_eq!((done.values, done.already), (0, 0));
+            assert_eq!(done.removed_key, generated.then_some(key.clone()));
+            assert!(!key.exists());
+            assert!(!data.join(SECRETS_DIR).exists());
+            assert_eq!(probe.calls(), 1);
+        }
+    }
+
+    #[cfg(all(feature = "backup", unix))]
+    #[test]
+    fn rekey_empty_directories_and_configured_keys_keep_their_semantics() {
+        for present in [false, true] {
+            let (t, data, source) = offline_fixture();
+            if !present {
+                std::fs::remove_dir(data.join(SECRETS_DIR)).unwrap();
+            }
+            let configured_key = t.path().join("new.key");
+            let key_bytes = std::fs::read(&configured_key).unwrap();
+            let probe = SyncProbe::new(&data, false);
+            let done = rekey(&data, Some(&source), &source).unwrap();
+            assert_eq!((done.values, done.already, done.removed_key), (0, 0, None));
+            assert_eq!(std::fs::read(configured_key).unwrap(), key_bytes);
+            assert!(!data.join(SECRETS_KEY_FILE).exists());
+            assert_eq!(data.join(SECRETS_DIR).is_dir(), present);
+            assert_eq!(probe.calls(), 0);
+        }
+    }
+
+    #[cfg(all(feature = "backup", unix))]
+    #[test]
+    fn rekey_refuses_non_directory_and_dangling_secrets_paths() {
+        use std::os::unix::fs::symlink;
+        for kind in ["file", "dangling", "loop"] {
+            let (_t, data, source) = offline_fixture();
+            let dir = data.join(SECRETS_DIR);
+            let key = data.join(SECRETS_KEY_FILE);
+            sealer::generate(&key).unwrap();
+            let old = std::fs::read(&key).unwrap();
+            std::fs::remove_dir(&dir).unwrap();
+            match kind {
+                "dangling" => symlink(data.join("missing"), &dir).unwrap(),
+                "loop" => symlink(&dir, &dir).unwrap(),
+                _ => std::fs::write(&dir, "not a directory").unwrap(),
+            }
+            assert!(rekey(&data, None, &source).is_err());
+            assert_eq!(std::fs::read(key).unwrap(), old);
+        }
+    }
+
+    #[cfg(all(feature = "backup", unix))]
+    #[test]
+    fn rekey_empty_directory_sync_error_keeps_the_generated_key() {
+        let (_t, data, source) = offline_fixture();
+        let key = data.join(SECRETS_KEY_FILE);
+        sealer::generate(&key).unwrap();
+        let old = std::fs::read(&key).unwrap();
+        let probe = SyncProbe::new(&data.join(SECRETS_DIR), true);
+        let e = rekey(&data, None, &source).unwrap_err().to_string();
+        assert!(e.contains("cannot flush"), "{e}");
+        assert_eq!(probe.calls(), 1);
+        assert_eq!(std::fs::read(key).unwrap(), old);
     }
 
     #[test]
