@@ -506,6 +506,11 @@ full-text indexes. See [ROADMAP](../ROADMAP.md) item 3.
   quiet Namespace instance were within 2.3% of the default writer at p90 and 0.5% at p50
   (5,000 commits, 8 rounds). A noisier instance showed up to 19% at p90 inside a 3.7× spread
   in the default writer's own runs. The idle path needs a recheck on `forge`.
+  The Namespace serial throughput figures for literal, IRI and message commits are
+  withdrawn because the client included warmups in their elapsed denominator. The timed
+  latency samples excluded warmups and remain the serial latency evidence above. Delete
+  seeding was already outside the timer. New serial throughput figures require a new run.
+
 - **Concurrent gain (A2).** With 4 ms added to every synchronization, which reproduces the
   default writer's 230 transactions/s of `forge`, four writers reach 466 transactions/s
   (2.0×) and sixteen writers 1,783 (7.8×). The absolute `forge` ranges of section 9 are not

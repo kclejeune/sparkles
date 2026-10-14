@@ -796,10 +796,14 @@ writer does.
 
 | Serial commits, 10.5M, 8 rounds of 5,000 | Default | Group commit | Ratio |
 |---|---:|---:|---:|
-| Literal insert, transactions/s | 5,064 | 4,991 | 0.986 |
 | Literal insert, p50 / p90 (ms) | 0.183 / 0.218 | 0.184 / 0.223 | 1.005 / 1.021 |
-| IRI insert, transactions/s | 4,609 | 4,555 | 0.988 |
 | IRI insert, p50 / p90 (ms) | 0.177 / 0.217 | 0.178 / 0.222 | 1.003 / 1.023 |
+
+The serial literal, IRI and commit-message throughput figures from these runs are
+withdrawn. The client excluded warmups from latency samples but included them in the
+elapsed denominator used for serial transactions per second. Delete seeding was already
+untimed. The retained latency rows excluded warmups and remain provisional Namespace evidence.
+Corrected serial throughput requires new measurements.
 
 An earlier serial run on a noisier instance had group commit 6.5% above at p50 and 19% above at
 p90 for literal inserts, with a spread of 3.7× between the fastest and slowest default-writer
@@ -818,10 +822,10 @@ The instances sync in about 0.2 ms, which hides the cost of a slow device. The r
 | Sixteen writers, transactions/s | 229 | 1,783 | 7.8 |
 | Four writers, commit message on every update, transactions/s | 112.8 | 429.0 | 3.8 |
 | Sixteen writers, commit message on every update, transactions/s | 112.7 | 1,636.6 | 14.5 |
-| Serial, commit message on every update, transactions/s | 96.4 | 96.5 | 1.00 |
 
 A commit message costs the default writer a second synchronization, for the annotation
-file, so its throughput halves. Group commit synchronizes both files in one fence. In the
+file. The concurrent message rows show the cost of that additional synchronization.
+Group commit synchronizes both files in one fence. In the
 sixteen-writer message run, the largest deviation of a writer's share from the mean was 0.002 for
 group commit and 0.063 for the default writer.
 

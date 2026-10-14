@@ -12,7 +12,9 @@
 //! Every update is one HTTP request that inserts or deletes one triple, sent on a kept-alive
 //! connection, so a latency is the server's whole answer. The receipts (the
 //! `Sparkles-Commit` header) of all successful workload writes, including warmups, are
-//! required, and the run fails unless they are distinct and contiguous. The result is one
+//! required, and the run fails unless they are distinct and contiguous. Untimed delete
+//! seeds also require exactly one valid receipt. Serial throughput excludes warmups.
+//! The result is one
 //! JSON object on stdout.
 //!
 //! Scenarios
@@ -86,6 +88,7 @@ impl Conn {
         let mut lines = head.split("\r\n");
         let status: u16 = lines.next()?.split(' ').nth(1)?.parse().ok()?;
         let (mut len, mut chunked, mut commit) = (0usize, false, None);
+        let mut receipt_headers = 0usize;
         for l in lines {
             let Some((k, v)) = l.split_once(':') else {
                 continue;
@@ -94,7 +97,14 @@ impl Conn {
             match k.as_str() {
                 "content-length" => len = v.parse().ok()?,
                 "transfer-encoding" => chunked = v.contains("chunked"),
-                "sparkles-commit" => commit = v.parse().ok(),
+                "sparkles-commit" => {
+                    receipt_headers += 1;
+                    commit = if receipt_headers == 1 {
+                        v.parse().ok()
+                    } else {
+                        None
+                    };
+                }
                 _ => {}
             }
         }
@@ -301,7 +311,16 @@ fn main() {
         let mut c = Conn::new(&a.addr);
         for i in 0..a.changes + a.warmup {
             let r = c.request(&update_request(&a.ds, &a.addr, &update(&a, "iri", i)));
-            assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+            if r.status != 200 || r.commit.is_none() {
+                eprintln!(
+                    "delete setup request {} failed: HTTP {}, valid Sparkles-Commit receipt {}, {}",
+                    i + 1,
+                    r.status,
+                    r.commit.is_some(),
+                    String::from_utf8_lossy(&r.body)
+                );
+                std::process::exit(2);
+            }
         }
     }
     let total = if a.scenario == "serial" {
@@ -329,6 +348,7 @@ fn main() {
             let mut mine = Vec::new();
             let mut errors = 0usize;
             let mut missing_receipts = 0usize;
+            let (mut timed_start, mut timed_end) = (None, None);
             gate.wait();
             loop {
                 let i = next.fetch_add(1, Ordering::Relaxed);
@@ -336,9 +356,15 @@ fn main() {
                     break;
                 }
                 let req = update_request(&a.ds, &a.addr, &update(&a, &op, i));
+                if a.scenario == "serial" && i == a.warmup {
+                    timed_start = Some(Instant::now());
+                }
                 let t = Instant::now();
                 let r = c.request(&req);
                 let ms = t.elapsed().as_secs_f64() * 1e3;
+                if a.scenario == "serial" && i >= a.warmup {
+                    timed_end = Some(Instant::now());
+                }
                 if r.status != 200 {
                     errors += 1;
                     continue;
@@ -354,7 +380,10 @@ fn main() {
                 }
             }
             receipts.lock().unwrap().extend(mine);
-            (lat, errors, missing_receipts)
+            let timed_span = timed_start
+                .zip(timed_end)
+                .map(|(start, end)| end.duration_since(start));
+            (lat, errors, missing_receipts, timed_span)
         }));
     }
     let mut readers = Vec::new();
@@ -407,14 +436,20 @@ fn main() {
     let mut per_client = Vec::new();
     let mut errors = 0;
     let mut missing_receipts = 0;
+    let mut serial_elapsed = None;
     for w in writers {
-        let (l, e, missing) = w.join().unwrap();
+        let (l, e, missing, span) = w.join().unwrap();
+        serial_elapsed = serial_elapsed.or(span);
         per_client.push(l.len());
         lat.extend(l);
         errors += e;
         missing_receipts += missing;
     }
-    let elapsed = t0.elapsed().as_secs_f64();
+    let elapsed = if a.scenario == "serial" {
+        serial_elapsed.unwrap_or_default().as_secs_f64()
+    } else {
+        t0.elapsed().as_secs_f64()
+    };
     done.store(true, Ordering::Relaxed);
     let (mut rlat, mut rbad) = (Vec::new(), 0);
     for r in readers {
@@ -445,7 +480,11 @@ fn main() {
         errors,
         missing_receipts,
         elapsed,
-        timed as f64 / elapsed,
+        if elapsed > 0.0 {
+            timed as f64 / elapsed
+        } else {
+            0.0
+        },
         stats(lat),
         contiguous,
         distinct,
