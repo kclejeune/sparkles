@@ -1447,11 +1447,13 @@ fn well_typed_other(lex: &str, local: &str) -> Option<bool> {
                 })
         }
         "anyURI" => true,
-        "hexBinary" => lex_t.len() % 2 == 0 && lex_t.bytes().all(|b| b.is_ascii_hexdigit()),
+        "hexBinary" => {
+            lex_t.len().is_multiple_of(2) && lex_t.bytes().all(|b| b.is_ascii_hexdigit())
+        }
         "base64Binary" => {
             let s: Vec<u8> = lex_t.bytes().filter(|b| *b != b' ').collect();
             let body = s.iter().take_while(|b| **b != b'=').count();
-            s.len() % 4 == 0
+            s.len().is_multiple_of(4)
                 && s.len() - body <= 2
                 && s[..body]
                     .iter()

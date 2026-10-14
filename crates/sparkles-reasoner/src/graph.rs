@@ -297,8 +297,8 @@ impl Graph {
             .par_iter()
             .map(|&(a, z)| {
                 let mut b: Vec<Vec<u64>> = vec![Vec::new(); SHARDS];
-                for i in a..z {
-                    for (j, t) in outs_ref[i].iter().enumerate() {
+                for (i, o) in outs_ref.iter().enumerate().take(z).skip(a) {
+                    for (j, t) in o.iter().enumerate() {
                         b[shard3(t)].push(((i as u64) << 32) | j as u64);
                     }
                 }

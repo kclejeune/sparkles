@@ -400,6 +400,9 @@ fn default_geometries(base: &facts::Base, terms: &Terms) -> anyhow::Result<Vec<[
     Ok(out)
 }
 
+/// The default geometries now, and those that changed.
+type DefaultGeometries = (FxHashSet<[u64; 3]>, Vec<[u64; 3]>);
+
 /// Flag the default geometries of the previous run explicit in `closure`, and add the
 /// changes of the default geometries of the features that `ch` changes to `ch`: a
 /// default geometry is added as an explicit fact, and one that no longer holds is
@@ -413,7 +416,7 @@ fn default_geometry_changes(
     base: &facts::Base,
     closure: &mut incremental::Closure,
     ch: &mut maintain::Changes,
-) -> anyhow::Result<(FxHashSet<[u64; 3]>, Vec<[u64; 3]>)> {
+) -> anyhow::Result<DefaultGeometries> {
     const GEO: &str = "http://www.opengis.net/ont/geosparql#";
     let terms = &closure.terms;
     let iri = |l: &str| {
