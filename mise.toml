@@ -454,6 +454,16 @@ run = "nix build .#sparkles-jena.mitmCache.updateScript -o target/jvm-nix-deps-u
 
 # --------------------------------------------------------------------- Node bindings ----
 
+[tasks."node:install"]
+description = "Install Node workspace dependencies"
+dir = "js"
+run = "pnpm install --frozen-lockfile"
+sources = ["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", "*/package.json", "engine/npm/*/package.json"]
+outputs = ["node_modules/.modules.yaml"]
+# The output above marks a finished run; the task writes more than it, so the task
+# cache, which restores only declared outputs, stays off.
+cache = { enabled = false }
+
 [tasks."node:native"]
 tools = { node = "24" }
 description = "Build and stage the host's Node-API addon (NODE_PROFILE=dev for a debug build)"
@@ -462,7 +472,7 @@ run = "scripts/node-native.sh"
 [tasks."node:build"]
 tools = { node = "24" }
 description = "Build the shared RDF/JS contracts, remote client and native engine packages"
-depends = ["node:native"]
+depends = ["node:install", "node:native"]
 run = "pnpm --dir js build"
 
 [tasks."node:test"]
@@ -490,6 +500,7 @@ run = [
 [tasks."node:client:gen"]
 tools = { node = "24" }
 description = "Regenerate the remote TypeScript client's OpenAPI types"
+depends = ["node:install"]
 run = "pnpm --dir js client:gen"
 
 [tasks."node:client:check"]
@@ -497,11 +508,13 @@ sources = ["@group:js", "docs/openapi.json"]
 outputs = []
 tools = { node = "24" }
 description = "Check that the TypeScript client's generated OpenAPI types are current"
+depends = ["node:install"]
 run = "pnpm --dir js client:check"
 
 [tasks."node:fmt"]
 tools = { node = "24" }
 description = "Format the JavaScript and TypeScript bindings"
+depends = ["node:install"]
 run = "pnpm --dir js format"
 
 [tasks."node:fmt:check"]
@@ -509,6 +522,7 @@ sources = ["@group:js"]
 outputs = []
 tools = { node = "24" }
 description = "Check JavaScript and TypeScript formatting"
+depends = ["node:install"]
 run = "pnpm --dir js format:check"
 
 [tasks."node:lock"]
