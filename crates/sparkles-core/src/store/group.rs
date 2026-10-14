@@ -2396,17 +2396,29 @@ mod tests {
         let root = dir.join("db");
         let s = Arc::new(Store::open(&root, options()).unwrap());
         insert(&s, "one").unwrap();
-        let (hit, go) = pause(&s, "group-sealed");
-        let writes: Vec<_> = ["m2", "m3", "m4"]
-            .into_iter()
-            .enumerate()
-            .map(|(n, name)| {
-                let s = s.clone();
-                // commit 2 starts the fence, the others queue behind it
-                thread::spawn(move || {
-                    if n > 0 {
-                        thread::sleep(Duration::from_millis(30 * n as u64));
+        let (hit_tx, hit) = mpsc::channel();
+        let (go_tx, go) = mpsc::channel();
+        let go = Mutex::new(go);
+        let first = AtomicBool::new(true);
+        let expired = Arc::new(AtomicBool::new(false));
+        let deadline = expired.clone();
+        s.set_failpoint(
+            "group-sealed",
+            Some(Arc::new(move |_| {
+                if first.swap(false, Ordering::SeqCst) {
+                    let _ = hit_tx.send(());
+                    if go.lock().recv_timeout(Duration::from_secs(10)).is_err() {
+                        deadline.store(true, Ordering::SeqCst);
                     }
+                }
+            })),
+        );
+        let mut writes = Vec::new();
+        let spawn = |writes: &mut Vec<_>, name: &'static str| {
+            let s = s.clone();
+            let w = thread::Builder::new()
+                .name(name.into())
+                .spawn(move || {
                     kind_insert(
                         &s,
                         CommitKind::Update,
@@ -2414,15 +2426,60 @@ mod tests {
                         in_graph(name, "urn:g"),
                     )
                 })
-            })
-            .collect();
-        hit.recv_timeout(Duration::from_secs(5)).unwrap();
-        queued(&s, 2);
+                .map_err(|e| e.to_string())?;
+            writes.push(w);
+            Ok::<_, String>(())
+        };
         let crashed = dir.join("crashed");
-        copy_dir(&root, &crashed);
-        go.send(()).unwrap();
+        let observed = (|| -> std::result::Result<_, String> {
+            // No later writer starts until m2 owns the held fence.
+            spawn(&mut writes, "m2")?;
+            hit.recv_timeout(Duration::from_secs(5))
+                .map_err(|e| format!("m2 seal: {e}"))?;
+            let (tx, appended) = mpsc::channel();
+            s.set_failpoint(
+                "group-appended",
+                Some(Arc::new(move |_| match thread::current().name() {
+                    Some("m3") => {
+                        let _ = tx.send("m3");
+                    }
+                    Some("m4") => {
+                        let _ = tx.send("m4");
+                    }
+                    _ => {}
+                })),
+            );
+            for name in ["m3", "m4"] {
+                spawn(&mut writes, name)?;
+                let actual = appended
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(|e| format!("{name} append: {e}"))?;
+                if actual != name {
+                    return Err(format!("expected {name}, observed {actual}"));
+                }
+            }
+            let queued = s.group.as_ref().unwrap().state.lock().queue.len();
+            // If copying panics, still release and join every writer before unwinding.
+            let copied = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                copy_dir(&root, &crashed)
+            }));
+            Ok((queued, copied))
+        })();
+        let _ = go_tx.send(());
+        s.set_failpoint("group-sealed", None);
+        s.set_failpoint("group-appended", None);
+        let writes: Vec<_> = writes.into_iter().map(|w| w.join()).collect();
+        assert!(
+            !expired.load(Ordering::SeqCst),
+            "annotation fence exceeded its deadline"
+        );
+        let (queued, copied) = observed.unwrap();
+        assert_eq!(queued, 2, "m3 and m4 queued behind m2");
         for w in writes {
-            w.join().unwrap().unwrap();
+            w.unwrap().unwrap();
+        }
+        if let Err(panic) = copied {
+            std::panic::resume_unwind(panic);
         }
         (root, crashed)
     }
