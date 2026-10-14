@@ -203,15 +203,11 @@ impl Catalog {
         let doc = match root {
             Some(r) => match std::fs::read(r.join(FILE)) {
                 Ok(b) => {
-                    let d: FileDoc = serde_json::from_slice(&b)
+                    let v: serde_json::Value = serde_json::from_slice(&b)
                         .map_err(|e| Error::Invalid(format!("{FILE}: {e}")))?;
-                    if d.format != FORMAT {
-                        return Err(Error::Invalid(format!(
-                            "{FILE}: unknown format {} (this version reads {FORMAT})",
-                            d.format
-                        )));
-                    }
-                    d
+                    // a newer format is Unsupported, a malformed one is not
+                    sparkles_core::formats::check_settings(FILE, &v)?;
+                    serde_json::from_value(v).map_err(|e| Error::Invalid(format!("{FILE}: {e}")))?
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => empty(),
                 Err(e) => return Err(e.into()),

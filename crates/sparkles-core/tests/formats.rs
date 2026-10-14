@@ -92,3 +92,63 @@ fn every_fixture_opens_in_place() {
         assert_eq!(n, recorded_count(&fixture, "count") + 1);
     }
 }
+
+// ---------------------------------------------------------- refused datasets ------
+
+/// A closed database whose `dataset.json` an older release wrote: `minimumReader` 1 and
+/// no `writtenBy`. A write-open by this build would change it.
+fn old_stamped_database(root: &Path) {
+    drop(Store::open(root, StoreOptions::default()).unwrap());
+    let path = root.join("dataset.json");
+    let mut v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    v["minimumReader"] = 1.into();
+    v.as_object_mut().unwrap().remove("writtenBy");
+    std::fs::write(&path, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
+}
+
+#[test]
+fn a_refused_open_changes_no_files() {
+    let newer: &[(&str, serde_json::Value)] = &[
+        ("compaction.json", serde_json::json!({"format": 2})),
+        ("describe.json", serde_json::json!({"format": 2})),
+        ("history.json", serde_json::json!({"format": 2})),
+        ("quota.json", serde_json::json!({"format": 2})),
+        ("branches.json", serde_json::json!({"format": 3})),
+        (
+            "rdfs.json",
+            serde_json::json!({"rdfsFormat": 2, "graph": "default"}),
+        ),
+        ("reasoning.json", serde_json::json!({"reasoningFormat": 3})),
+    ];
+    let mut failures = Vec::new();
+    for (name, content) in newer {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("db");
+        old_stamped_database(&root);
+        let before = std::fs::read(root.join("dataset.json")).unwrap();
+        std::fs::write(root.join(name), serde_json::to_vec(content).unwrap()).unwrap();
+        match Store::open(&root, StoreOptions::default()) {
+            Err(sparkles_core::error::Error::Unsupported(_)) => {}
+            Err(e) => failures.push(format!("{name}: {e:?} is not Unsupported")),
+            Ok(_) => failures.push(format!("{name}: the open succeeded")),
+        }
+        if std::fs::read(root.join("dataset.json")).unwrap() != before {
+            failures.push(format!("{name}: dataset.json changed"));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[test]
+fn a_newer_informational_file_does_not_refuse() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("db");
+    old_stamped_database(&root);
+    for (name, body) in [
+        ("origin.json", r#"{"originFormat": 9}"#),
+        ("restore.json", r#"{"restoreFormat": 9}"#),
+    ] {
+        std::fs::write(root.join(name), body).unwrap();
+        drop(Store::open(&root, StoreOptions::default()).unwrap());
+    }
+}

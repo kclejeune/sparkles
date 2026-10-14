@@ -149,8 +149,9 @@ pub const DEFAULT_CLOSURE_CACHE_TRIPLES: usize = 10_000_000;
 pub fn read_record(root: &Path) -> Option<ReasoningRecord> {
     let v: serde_json::Value =
         serde_json::from_slice(&std::fs::read(root.join(RECORD_FILE)).ok()?).ok()?;
-    // A record that a newer release wrote is not used, since it may mean more than this
-    // build reads.
+    // The store refused a newer file at open, so this fallback covers a file that does
+    // not parse. A record that a newer release wrote is still not used, since it may
+    // mean more than this build reads.
     if let Err(e) = crate::formats::check_settings(RECORD_FILE, &v) {
         tracing::warn!(
             "{}: {e}; the dataset is treated as having no reasoning record",

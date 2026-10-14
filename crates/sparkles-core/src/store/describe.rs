@@ -50,17 +50,24 @@ pub(crate) fn read_settings(root: &Path) -> Result<DescribeOptions> {
         Ok(b) => {
             let v: serde_json::Value = serde_json::from_slice(&b)
                 .map_err(|e| Error::Corrupt(format!("{DESCRIBE_FILE}: {e}")))?;
-            if let Some(f) = v.get("format").and_then(|f| f.as_u64())
-                && f != 1
-            {
-                return Err(Error::Corrupt(format!(
-                    "{DESCRIBE_FILE} has format {f}, this build reads 1"
-                )));
-            }
+            crate::formats::check_settings(DESCRIBE_FILE, &v)?;
             DescribeOptions::from_json(&v)
                 .map_err(|e| Error::Corrupt(format!("{DESCRIBE_FILE}: {e}")))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(DescribeOptions::default()),
         Err(e) => Err(e.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_newer_describe_file_is_unsupported() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(DESCRIBE_FILE), br#"{"format": 2}"#).unwrap();
+        let e = read_settings(dir.path()).err().expect("refused");
+        assert!(matches!(e, Error::Unsupported(_)), "{e:?}");
     }
 }

@@ -432,22 +432,35 @@ fn legacy_reader() -> u32 {
     1
 }
 
-fn check_dataset(f: DatasetFile) -> Result<DatasetFile> {
-    if f.format != 1 || f.minimum_reader > DATASET_READER {
-        let by = f
-            .written_by
-            .as_deref()
+/// Parse the content of a `dataset.json`. The version members are checked on the raw
+/// JSON first, so that a file from a newer release whose other members changed shape is
+/// refused as [`Error::Unsupported`] and not reported as damaged.
+fn parse_dataset(bytes: &[u8]) -> Result<DatasetFile> {
+    let v: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|e| Error::Corrupt(format!("dataset.json: {e}")))?;
+    let member = |name: &str| -> Result<u64> {
+        match v.get(name) {
+            None | Some(serde_json::Value::Null) => Ok(1),
+            Some(n) => n.as_u64().ok_or_else(|| {
+                Error::Corrupt(format!("dataset.json: {name} {n} is not a version"))
+            }),
+        }
+    };
+    let format = member("format")?;
+    let minimum_reader = member("minimumReader")?;
+    if format != 1 || minimum_reader > u64::from(DATASET_READER) {
+        let by = v
+            .get("writtenBy")
+            .and_then(|w| w.as_str())
             .map(|v| format!(", written by Sparkles {v},"))
             .unwrap_or_default();
         return Err(Error::Unsupported(format!(
-            "dataset.json{by} has format {} and requires reader {}; Sparkles {} reads format 1 up to reader {}. Open the database with a newer release",
-            f.format,
-            f.minimum_reader,
+            "dataset.json{by} has format {format} and requires reader {minimum_reader}; Sparkles {} reads format 1 up to reader {}. Open the database with a newer release",
             crate::formats::SPARKLES_VERSION,
             DATASET_READER
         )));
     }
-    Ok(f)
+    serde_json::from_value(v).map_err(|e| Error::Corrupt(format!("dataset.json: {e}")))
 }
 
 /// The versions `<root>/dataset.json` records, if it exists and this build reads it.
@@ -654,10 +667,7 @@ pub fn set_restored_from(root: &Path, from: &RestoredFrom) -> Result<()> {
 
 fn read_dataset(root: &Path) -> Result<Option<DatasetFile>> {
     match std::fs::read(root.join("dataset.json")) {
-        Ok(b) => check_dataset(
-            serde_json::from_slice(&b).map_err(|e| Error::Corrupt(format!("dataset.json: {e}")))?,
-        )
-        .map(Some),
+        Ok(b) => parse_dataset(&b).map(Some),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.into()),
     }
@@ -696,9 +706,7 @@ pub(crate) fn clone_dataset_file_bytes(
 
 /// The dataset id of `dataset.json`'s content.
 pub(crate) fn dataset_id_of(bytes: &[u8]) -> Result<uuid::Uuid> {
-    let f: DatasetFile =
-        serde_json::from_slice(bytes).map_err(|e| Error::Corrupt(format!("dataset.json: {e}")))?;
-    Ok(check_dataset(f)?.id)
+    Ok(parse_dataset(bytes)?.id)
 }
 
 /// When `<root>/dataset.json` says the dataset was created (milliseconds since the
@@ -1404,5 +1412,21 @@ mod tests {
             assert_eq!(CommitKind::from_code(k.code()), k);
             assert_eq!(CommitKind::from_name(k.name()), Some(k));
         }
+    }
+
+    #[test]
+    fn a_newer_dataset_json_with_other_members_is_unsupported() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("dataset.json"),
+            br#"{"format": 2, "minimumReader": 9, "id": 5}"#,
+        )
+        .unwrap();
+        let e = read_dataset(dir.path()).err().expect("refused");
+        assert!(matches!(e, Error::Unsupported(_)), "{e:?}");
+        let e = dataset_id_of(br#"{"format": 2, "minimumReader": 9, "id": 5}"#)
+            .err()
+            .expect("refused");
+        assert!(matches!(e, Error::Unsupported(_)), "{e:?}");
     }
 }

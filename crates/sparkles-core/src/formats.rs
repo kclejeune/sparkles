@@ -36,6 +36,19 @@
 //! `format` member is absent in files written before markers existed, which reads as 1.
 //! [`settings_to_vec`] and [`settings_from_slice`] add and check the member.
 //!
+//! A store refuses a dataset whose settings file is newer than this build writes. It does
+//! so at open, after it has the database's lock and before it writes any file, with the
+//! same check ([`check_dataset_dir`]) that `sparkles migrate --check` applies. Opening a
+//! database and checking it for an upgrade therefore agree, and a refused open leaves
+//! every file as it was. The informational files in [`INFORMATIONAL_SETTINGS`] never
+//! refuse a dataset.
+//!
+//! Settings files that a release rewrites through a typed struct drop the members that
+//! struct does not know. An additive member of such a file must therefore be safe to lose
+//! when an older release rewrites the file, or it needs a `format` bump. `dataset.json`
+//! keeps unknown members on a rewrite, and so do the files that the server writes as raw
+//! JSON values (the assistant settings and the runtime layers).
+//!
 //! Every version that changes is listed under the **Format** heading of the release's
 //! CHANGELOG entry.
 
@@ -458,6 +471,60 @@ pub const SETTINGS: &[SettingsFile] = &[
     server("runs.json", 1),
     server(".key-epoch.json", 1),
 ];
+
+/// Dataset settings files that are read when they are readable and ignored with a warning
+/// otherwise. A newer version of one of them never refuses a dataset.
+pub const INFORMATIONAL_SETTINGS: &[&str] = &["origin.json", "restore.json"];
+
+/// Whether `name` is one of the [`INFORMATIONAL_SETTINGS`].
+pub fn informational(name: &str) -> bool {
+    INFORMATIONAL_SETTINGS.contains(&name)
+}
+
+/// Every reason this build refuses the dataset directory `dir` because of a settings
+/// file (the registered files of [`Scope::Dataset`] other than the informational ones).
+/// A file that does not exist is skipped. One that is not JSON is skipped too, since its
+/// own reader reports the damage. A file with a version this build does not read
+/// gives an error that names the directory and keeps its variant.
+pub fn dataset_dir_refusals(dir: &std::path::Path) -> Vec<Error> {
+    let mut out = Vec::new();
+    for s in SETTINGS
+        .iter()
+        .filter(|s| s.scope == Scope::Dataset && !informational(s.name))
+    {
+        let bytes = match std::fs::read(dir.join(s.name)) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                out.push(Error::Io(e));
+                continue;
+            }
+        };
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            continue;
+        };
+        match check_settings(s.name, &v) {
+            Ok(_) => {}
+            Err(Error::Unsupported(m)) => {
+                out.push(Error::Unsupported(format!("{}: {m}", dir.display())))
+            }
+            Err(Error::Corrupt(m)) => out.push(Error::Corrupt(format!("{}: {m}", dir.display()))),
+            Err(e) => out.push(e),
+        }
+    }
+    out
+}
+
+/// `Ok` when no settings file of the dataset directory `dir` refuses it, else the first
+/// of [`dataset_dir_refusals`], preferring one about a newer version.
+pub fn check_dataset_dir(dir: &std::path::Path) -> Result<()> {
+    let mut all = dataset_dir_refusals(dir);
+    match all.iter().position(|e| matches!(e, Error::Unsupported(_))) {
+        Some(i) => Err(all.swap_remove(i)),
+        None if all.is_empty() => Ok(()),
+        None => Err(all.swap_remove(0)),
+    }
+}
 
 /// Settings and state files without a version member, each with the reason. A breaking
 /// change to one of them moves it to a new file name, which older releases do not read.

@@ -1522,6 +1522,9 @@ impl Store {
         std::fs::create_dir_all(root)?;
         let lock = lock_dir(root)?;
         commit::check_dataset_compatibility(root)?;
+        // a settings file from a newer release refuses the dataset before any file of it
+        // changes, the same verdict as `sparkles migrate --check`
+        crate::formats::check_dataset_dir(root)?;
         let current_file = root.join("CURRENT");
         if !current_file.exists() {
             // a new database: its id, an empty generation holding the root commit, the
@@ -1719,8 +1722,9 @@ impl Store {
             .last()
             .map(|c| catalog.get(c.seq).filter(|r| r.seq == c.seq).unwrap_or(*c))
             .unwrap_or(base);
-        // Every file this open read is in a version this build reads. The release now
-        // writes the database: record it in dataset.json, and require the reader of the
+        // The settings files were checked by the preflight after the lock, and every file
+        // this open read is in a version this build reads. The release now writes the
+        // database: record it in dataset.json, and require the reader of the
         // files it creates (a log with a header record) before it creates any.
         commit::note_writer(root)?;
         let wal_existed = wal_path.exists();

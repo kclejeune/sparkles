@@ -272,14 +272,11 @@ fn read_file(root: &Path) -> Result<Option<u64>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
-    let f: QuotaFile =
+    let v: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|e| Error::Corrupt(format!("{QUOTA_FILE}: {e}")))?;
-    if f.format != 1 {
-        return Err(Error::Corrupt(format!(
-            "{QUOTA_FILE} has format {}, this build reads 1",
-            f.format
-        )));
-    }
+    crate::formats::check_settings(QUOTA_FILE, &v)?;
+    let f: QuotaFile =
+        serde_json::from_value(v).map_err(|e| Error::Corrupt(format!("{QUOTA_FILE}: {e}")))?;
     Ok(Some(f.max_bytes))
 }
 
@@ -310,6 +307,7 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::io::{RdfFormat, Source};
     use crate::store::{QuotaSource, ReplaceTarget, Store, StoreOptions};
     use crate::{BudgetKind, Error};
@@ -417,5 +415,17 @@ mod tests {
         let m = Store::in_memory(StoreOptions::default());
         assert!(m.set_quota(Some(1)).is_err());
         assert_eq!(m.quota().used_bytes, 0);
+    }
+
+    #[test]
+    fn a_newer_quota_file_is_unsupported() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(QUOTA_FILE),
+            br#"{"format": 2, "maxBytes": 1}"#,
+        )
+        .unwrap();
+        let e = read_file(dir.path()).err().expect("refused");
+        assert!(matches!(e, Error::Unsupported(_)), "{e:?}");
     }
 }

@@ -239,15 +239,11 @@ fn read_table(root: &Path) -> Result<Option<TableFile>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
-    let t: TableFile = serde_json::from_slice(&bytes)
+    let v: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|e| Error::Corrupt(format!("{}: {e}", path.display())))?;
-    if t.format != 1 && t.format != 2 {
-        return Err(Error::Corrupt(format!(
-            "{} has format {}, this build reads 1 and 2",
-            path.display(),
-            t.format
-        )));
-    }
+    crate::formats::check_settings(BRANCHES_FILE, &v)?;
+    let t: TableFile = serde_json::from_value(v)
+        .map_err(|e| Error::Corrupt(format!("{}: {e}", path.display())))?;
     Ok(Some(t))
 }
 

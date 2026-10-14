@@ -1138,4 +1138,29 @@ mod tests {
             .collect();
         assert_eq!(names, ["b"]);
     }
+
+    #[test]
+    fn a_dataset_with_a_newer_settings_file_is_refused_alone() {
+        for (file, body) in [
+            ("describe.json", r#"{"format": 2}"#),
+            ("rdfs.json", r#"{"rdfsFormat": 2, "graph": "default"}"#),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let cat = Catalog::open(dir.path(), Default::default()).unwrap();
+            drop(cat.create("a", &Default::default()).unwrap());
+            drop(cat.create("b", &Default::default()).unwrap());
+            drop(cat);
+            std::fs::write(dir.path().join("databases/b").join(file), body).unwrap();
+            let cat = Catalog::open(dir.path(), Default::default()).unwrap();
+            assert!(cat.get("a").is_some(), "{file}");
+            assert!(cat.get("b").is_none(), "{file}: b is served");
+            let refused = cat.refused();
+            assert_eq!(refused.len(), 1, "{file}: {refused:?}");
+            assert_eq!(refused[0].0, "b");
+            assert!(refused[0].1.contains(file), "{file}: {refused:?}");
+            cat.save().unwrap();
+            let reg = std::fs::read_to_string(dir.path().join(CONFIG_FILE)).unwrap();
+            assert!(reg.contains("\"b\""), "{file}: {reg}");
+        }
+    }
 }

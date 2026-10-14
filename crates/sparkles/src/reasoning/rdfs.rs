@@ -44,8 +44,9 @@ fn graph_source(g: &str) -> SchemaSource {
     SchemaSource::Graph((g != "default").then(|| g.to_string()))
 }
 
-/// The setting kept in a store's directory, if any. A setting that cannot be read is
-/// logged and ignored, and queries run without it.
+/// The setting kept in a store's directory, if any. The store refused a newer file at
+/// open, so this fallback covers a file that does not parse: it is logged and ignored,
+/// and queries run without it.
 pub(crate) fn load(store: &Store) -> Option<Arc<RdfsOnRead>> {
     let root = store.root()?;
     let bytes = std::fs::read(root.join(SETTING_FILE)).ok()?;
