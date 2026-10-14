@@ -307,17 +307,27 @@ impl Drop for Ticket {
 }
 
 /// Bytes reserved from a [`QueryPool`] for one query, returned when the last owner drops.
+///
+/// The grant keeps the live total of every context that holds it, so that contexts which
+/// share a grant (the WHERE contexts of an update, the contexts of one request) add up.
 pub struct PoolGrant {
     pool: Arc<QueryPool>,
     granted: AtomicU64,
+    /// bytes charged by every context that holds this grant
+    used: AtomicU64,
+    /// the grant never trims below this (eager peaks)
+    floor: AtomicU64,
     /// the most the grant has held
     peak: AtomicU64,
+    /// serializes growth and trimming of this grant
+    resize: Mutex<()>,
 }
 
 impl std::fmt::Debug for PoolGrant {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PoolGrant")
             .field("granted", &self.granted())
+            .field("used", &self.used())
             .finish()
     }
 }
@@ -327,7 +337,10 @@ impl PoolGrant {
         PoolGrant {
             pool,
             granted: AtomicU64::new(bytes),
+            used: AtomicU64::new(0),
+            floor: AtomicU64::new(0),
             peak: AtomicU64::new(bytes),
+            resize: Mutex::new(()),
         }
     }
 
@@ -341,77 +354,112 @@ impl PoolGrant {
         self.granted.load(Ordering::Relaxed)
     }
 
+    /// The bytes charged against this grant now.
+    #[inline]
+    pub fn used(&self) -> u64 {
+        self.used.load(Ordering::SeqCst)
+    }
+
     /// The most bytes this grant has held at once.
     pub fn peak(&self) -> u64 {
         self.peak.load(Ordering::Relaxed)
     }
 
-    /// Make the grant cover `live` bytes. Fails when the pool cannot give the granules.
-    /// While requests wait for admission, one query may not hold more than half the
-    /// pool.
-    pub fn cover(&self, live: u64) -> Result<(), Error> {
-        if live > self.pool.capacity {
-            return Err(self.pool.exhausted(live));
-        }
-        let target = round_up(live).min(self.pool.capacity);
-        loop {
-            let cur = self.granted.load(Ordering::SeqCst);
-            if cur >= target {
-                return Ok(());
-            }
-            let delta = target - cur;
-            let share = if self.pool.waiting() > 0 {
-                self.pool.capacity / 2
-            } else {
-                self.pool.capacity
-            };
-            if target > share.max(INITIAL_GRANT.min(self.pool.capacity)) {
-                return Err(self.pool.exhausted(live));
-            }
-            if !self.pool.reserve(delta, self.pool.capacity) {
-                // another thread of the query may have grown the grant meanwhile
-                if self.granted.load(Ordering::SeqCst) >= target {
-                    return Ok(());
-                }
-                return Err(self.pool.exhausted(live));
-            }
-            if self
-                .granted
-                .compare_exchange(cur, target, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
-                self.peak.fetch_max(target, Ordering::Relaxed);
-                return Ok(());
-            }
-            // another thread of the query grew the grant first
-            self.pool.release(delta);
-        }
-    }
-
-    /// Give back granules when the query holds well over what it uses.
-    ///
-    /// Returns whether it gave any back. The caller then checks its usage again, since
-    /// a charge on another thread may have grown past the grant in the meantime.
+    /// Account for `bytes` more and make the grant cover them. Fails, accounting for
+    /// nothing, when the pool cannot give the granules. While requests wait for
+    /// admission, one query may not hold more than half the pool.
     #[inline]
-    pub fn trim(&self, live: u64) -> bool {
-        let cur = self.granted();
-        cur > live.saturating_add(SHRINK_SLACK + GRANULE) && self.trim_slow(live)
+    pub fn charge(&self, bytes: u64) -> Result<(), Error> {
+        let used = self.used.fetch_add(bytes, Ordering::SeqCst) + bytes;
+        if used > self.granted.load(Ordering::SeqCst) {
+            return self.charge_slow(bytes);
+        }
+        Ok(())
     }
 
+    /// The charge that the fast path could not cover. It takes its bytes back out of
+    /// `used` before it waits for the lock, so that a charge that is about to fail does
+    /// not make another thread's charge fail with it, and adds them again under the
+    /// lock once the grant covers them.
     #[cold]
-    fn trim_slow(&self, live: u64) -> bool {
-        let target = round_up(live).max(INITIAL_GRANT.min(self.granted()));
-        let cur = self.granted.load(Ordering::SeqCst);
-        if cur > target
-            && self
-                .granted
-                .compare_exchange(cur, target, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-        {
-            self.pool.release(cur - target);
-            return true;
+    fn charge_slow(&self, bytes: u64) -> Result<(), Error> {
+        self.used.fetch_sub(bytes, Ordering::SeqCst);
+        let _lock = self.resize.lock();
+        let need = self.used.load(Ordering::SeqCst).saturating_add(bytes);
+        self.grow_locked(need)?;
+        self.used.fetch_add(bytes, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Account for `bytes` less, and give back granules the query no longer needs.
+    #[inline]
+    pub fn release(&self, bytes: u64) {
+        let prior = self.used.fetch_sub(bytes, Ordering::SeqCst);
+        debug_assert!(prior >= bytes, "grant released {bytes} of {prior} bytes");
+        let used = prior.wrapping_sub(bytes);
+        if self.granted.load(Ordering::Relaxed) > used.saturating_add(SHRINK_SLACK + GRANULE) {
+            self.trim_slow();
         }
-        false
+    }
+
+    /// Make the grant cover `need` bytes, reserving the granules from the pool. Runs
+    /// under the grant's lock, so a second thread that needs the same granules sees the
+    /// new total instead of competing for them.
+    fn grow_locked(&self, need: u64) -> Result<(), Error> {
+        let capacity = self.pool.capacity;
+        let need = need.max(self.used.load(Ordering::SeqCst));
+        let cur = self.granted.load(Ordering::SeqCst);
+        if cur >= need {
+            return Ok(());
+        }
+        if need > capacity {
+            return Err(self.pool.exhausted(need));
+        }
+        let target = round_up(need).min(capacity);
+        let share = if self.pool.waiting() > 0 {
+            capacity / 2
+        } else {
+            capacity
+        };
+        if target > share.max(INITIAL_GRANT.min(capacity)) {
+            return Err(self.pool.exhausted(need));
+        }
+        if !self.pool.reserve(target - cur, capacity) {
+            return Err(self.pool.exhausted(need));
+        }
+        self.granted.store(target, Ordering::SeqCst);
+        self.peak.fetch_max(target, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Give back granules when the query holds well over what it uses. The pool wakes
+    /// waiting requests while the grant's lock is held, so a waker must never charge or
+    /// release this grant.
+    #[cold]
+    fn trim_slow(&self) {
+        let _lock = self.resize.lock();
+        let cur = self.granted.load(Ordering::SeqCst);
+        let keep = |used: u64| {
+            round_up(used)
+                .max(self.floor.load(Ordering::SeqCst))
+                .max(INITIAL_GRANT.min(cur))
+                .min(cur)
+        };
+        let t1 = keep(self.used.load(Ordering::SeqCst));
+        if t1 >= cur {
+            return;
+        }
+        // A charger writes `used` and then reads `granted`. The trimmer writes
+        // `granted` and then reads `used`. Both are sequentially consistent, so either
+        // the trimmer sees the charge and keeps its bytes, or the charger sees the lower
+        // grant and goes to `grow`, which waits for the lock. The bytes go back to the
+        // pool only after the second read.
+        self.granted.store(t1, Ordering::SeqCst);
+        let t2 = keep(self.used.load(Ordering::SeqCst)).max(t1);
+        if t2 != t1 {
+            self.granted.store(t2, Ordering::SeqCst);
+        }
+        self.pool.release(cur - t2);
     }
 }
 
@@ -433,7 +481,7 @@ mod tests {
         let g = pool.try_grant(5 * MB).unwrap();
         assert_eq!(g.granted(), 8 * MB);
         assert_eq!(pool.granted(), 8 * MB);
-        g.cover(9 * MB).unwrap();
+        g.charge(9 * MB).unwrap();
         assert_eq!(g.granted(), 12 * MB);
         assert_eq!(pool.granted(), 12 * MB);
         drop(g);
@@ -445,7 +493,7 @@ mod tests {
         let pool = QueryPool::new(32 * MB);
         let a = pool.try_grant(16 * MB).unwrap();
         let b = pool.try_grant(8 * MB).unwrap();
-        match b.cover(20 * MB) {
+        match b.charge(20 * MB) {
             Err(Error::BudgetExceeded(x)) => {
                 assert_eq!(x.kind, BudgetKind::ServerMemory);
                 assert_eq!(x.limit, 32 * MB);
@@ -454,19 +502,20 @@ mod tests {
         }
         // the failed growth took nothing
         assert_eq!(pool.granted(), 24 * MB);
+        assert_eq!(b.used(), 0);
         drop(a);
-        b.cover(20 * MB).unwrap();
+        b.charge(20 * MB).unwrap();
     }
 
     #[test]
     fn grants_shrink_when_the_query_releases_a_lot() {
         let pool = QueryPool::new(256 * MB);
         let g = pool.empty_grant();
-        g.cover(100 * MB).unwrap();
-        g.trim(90 * MB);
+        g.charge(100 * MB).unwrap();
+        g.release(10 * MB);
         assert_eq!(g.granted(), 100 * MB);
         // a grant keeps its first 16 MiB, so that small queries do not churn the pool
-        g.trim(10 * MB);
+        g.release(80 * MB);
         assert_eq!(g.granted(), 16 * MB);
         assert_eq!(pool.granted(), 16 * MB);
     }
@@ -536,9 +585,9 @@ mod tests {
         assert!(pool.try_grant(MB).is_none());
         drop(g);
         let g = pool.empty_grant();
-        g.cover(5 * MB).unwrap();
+        g.charge(5 * MB).unwrap();
         assert_eq!(g.granted(), 8 * MB);
-        assert!(g.cover(9 * MB).is_err());
+        assert!(g.charge(9 * MB).is_err());
     }
 
     #[test]
@@ -562,11 +611,11 @@ mod tests {
     fn growth_is_limited_to_half_the_pool_while_requests_wait() {
         let pool = QueryPool::new(64 * MB);
         let g = pool.empty_grant();
-        g.cover(40 * MB).unwrap();
+        g.charge(40 * MB).unwrap();
         let other = pool.try_grant(24 * MB).unwrap();
         let mut waiter = pool.enter(16 * MB, None);
         assert!(waiter.poll().is_none());
-        assert!(g.cover(44 * MB).is_err());
+        assert!(g.charge(4 * MB).is_err());
         drop(other);
         assert!(waiter.poll().is_some());
     }
@@ -583,7 +632,7 @@ mod tests {
                     for _ in 0..5 {
                         match pool.admit_blocking(16 * MB, Duration::from_millis(300), || false) {
                             Ok(g) => {
-                                let r = g.cover(40 * MB);
+                                let r = g.charge(40 * MB);
                                 std::thread::sleep(Duration::from_millis(2));
                                 let mut o = outcomes.lock().unwrap();
                                 if r.is_ok() {
@@ -612,6 +661,70 @@ mod tests {
     }
 
     #[test]
+    fn growth_of_one_grant_from_two_threads_never_fails_spuriously() {
+        let pool = QueryPool::new(20 * MB);
+        let barrier = std::sync::Barrier::new(2);
+        let failures = AtomicU64::new(0);
+        let slot: Mutex<Option<Arc<PoolGrant>>> = Mutex::new(None);
+        std::thread::scope(|s| {
+            for bytes in [MB, 2 * MB] {
+                let (pool, barrier, failures, slot) = (&pool, &barrier, &failures, &slot);
+                s.spawn(move || {
+                    for _ in 0..20_000 {
+                        barrier.wait();
+                        if bytes == MB {
+                            let g = pool.try_grant(16 * MB).unwrap();
+                            g.charge(16 * MB).unwrap();
+                            *slot.lock() = Some(Arc::new(g));
+                        }
+                        barrier.wait();
+                        let g = slot.lock().clone().unwrap();
+                        barrier.wait();
+                        // used goes from 16 to 19 MiB, which needs the same granule
+                        if g.charge(bytes).is_err() {
+                            failures.fetch_add(1, Ordering::SeqCst);
+                        } else {
+                            g.release(bytes);
+                        }
+                        barrier.wait();
+                        if bytes == MB {
+                            slot.lock().take();
+                        }
+                        drop(g);
+                    }
+                });
+            }
+        });
+        assert_eq!(failures.load(Ordering::SeqCst), 0);
+        assert_eq!(pool.granted(), 0);
+    }
+
+    #[test]
+    fn trim_rereads_usage_before_returning_memory() {
+        let pool = QueryPool::new(64 * MB);
+        let g = pool.empty_grant();
+        g.charge(48 * MB).unwrap();
+        // a trim that starts after a charge must keep the charge covered
+        g.trim_slow();
+        assert!(g.granted() >= 48 * MB, "{}", g.granted());
+        assert!(pool.granted() >= 48 * MB, "{}", pool.granted());
+        g.release(48 * MB);
+        assert_eq!(g.granted(), 16 * MB);
+        assert_eq!(pool.granted(), 16 * MB);
+        assert_eq!(g.used(), 0);
+    }
+
+    #[test]
+    fn an_empty_grant_never_trims_and_zero_releases_change_nothing() {
+        let pool = QueryPool::new(64 * MB);
+        let g = pool.empty_grant();
+        g.release(0);
+        assert_eq!((g.granted(), g.used()), (0, 0));
+        g.charge(0).unwrap();
+        assert_eq!((g.granted(), g.used()), (0, 0));
+    }
+
+    #[test]
     fn concurrent_growth_and_release_balance_to_zero() {
         let pool = QueryPool::new(512 * MB);
         std::thread::scope(|s| {
@@ -620,8 +733,10 @@ mod tests {
                 s.spawn(move || {
                     for i in 0..200 {
                         let g = pool.empty_grant();
-                        let _ = g.cover(((t + i) % 40 + 1) * MB);
-                        g.trim(MB);
+                        let bytes = ((t + i) % 40 + 1) * MB;
+                        if g.charge(bytes).is_ok() {
+                            g.release(bytes);
+                        }
                     }
                 });
             }

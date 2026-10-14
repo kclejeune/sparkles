@@ -832,16 +832,9 @@ impl Ctx {
     /// longer needs.
     #[inline]
     fn release_live(&self, bytes: u64) {
-        let prior = self.mem_live.fetch_sub(bytes, Ordering::SeqCst);
-        if let Some(g) = &self.grant
-            && g.trim(prior.saturating_sub(bytes))
-        {
-            // a charge on another thread may have grown past the trimmed grant before
-            // it saw the trim
-            let live = self.mem_live.load(Ordering::SeqCst);
-            if live > g.granted() {
-                let _ = g.cover(live);
-            }
+        self.mem_live.fetch_sub(bytes, Ordering::SeqCst);
+        if let Some(g) = &self.grant {
+            g.release(bytes);
         }
     }
 
@@ -1513,15 +1506,24 @@ impl Charge<'_> {
             .map_err(|live| ctx.memory_exceeded(live.saturating_add(bytes)))?;
         let live = prior + bytes;
         if let Some(g) = &ctx.grant
-            && live > g.granted()
-            && let Err(e) = g.cover(live)
+            && let Err(e) = g.charge(bytes)
         {
-            ctx.mem_live.fetch_sub(bytes, Ordering::Relaxed);
+            ctx.mem_live.fetch_sub(bytes, Ordering::SeqCst);
             return Err(e);
         }
         self.bytes.set(owned);
         ctx.note_peak(live);
         Ok(())
+    }
+}
+
+impl Drop for Ctx {
+    /// Return what the context still holds in its grant. That covers bytes that
+    /// `retain_cursor_bytes` forgot, and retained charges whose owner is gone.
+    fn drop(&mut self) {
+        if let Some(g) = &self.grant {
+            g.release(*self.mem_live.get_mut());
+        }
     }
 }
 
@@ -1708,5 +1710,63 @@ mod charge_tests {
             drop(owner);
             assert_eq!(ctx.mem_live.load(Ordering::Relaxed), 0);
         }
+    }
+
+    const MIB: u64 = 1 << 20;
+
+    fn pooled(store: &Store, grant: &Arc<super::super::pool::PoolGrant>) -> Ctx {
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.grant = Some(grant.clone());
+        ctx
+    }
+
+    #[test]
+    fn a_grant_shared_by_two_contexts_follows_their_sum() {
+        let store = Store::in_memory(StoreOptions::default());
+        let pool = super::super::pool::QueryPool::new(256 * MIB);
+        let grant = Arc::new(pool.empty_grant());
+        let one = pooled(&store, &grant);
+        let two = pooled(&store, &grant);
+        let held = one.charge(50 * MIB).unwrap();
+        drop(two.charge(40 * MIB).unwrap());
+        assert!(grant.granted() >= 50 * MIB, "{}", grant.granted());
+        drop(held);
+    }
+
+    #[test]
+    fn a_trim_never_unbacks_an_accepted_charge() {
+        use std::sync::atomic::AtomicBool;
+        let store = Store::in_memory(StoreOptions::default());
+        let pool = super::super::pool::QueryPool::new(64 * MIB);
+        let g1 = Arc::new(pool.empty_grant());
+        let g2 = Arc::new(pool.empty_grant());
+        let ctx1 = pooled(&store, &g1);
+        let ctx2 = pooled(&store, &g2);
+        let accepted = AtomicU64::new(0);
+        let stop = AtomicBool::new(false);
+        let worker = |ctx: &Ctx, bytes: u64, hold: bool| {
+            while !stop.load(Ordering::Relaxed) {
+                if let Ok(charge) = ctx.charge(bytes) {
+                    let now = accepted.fetch_add(bytes, Ordering::SeqCst) + bytes;
+                    assert!(now <= 64 * MIB, "accepted {now} bytes in a 64 MiB pool");
+                    if hold {
+                        std::thread::yield_now();
+                    }
+                    accepted.fetch_sub(bytes, Ordering::SeqCst);
+                    drop(charge);
+                }
+            }
+        };
+        std::thread::scope(|s| {
+            s.spawn(|| worker(&ctx1, 48 * MIB, true));
+            s.spawn(|| worker(&ctx1, MIB, false));
+            s.spawn(|| worker(&ctx2, 48 * MIB, true));
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            stop.store(true, Ordering::Relaxed);
+        });
+        drop((ctx1, ctx2));
+        assert_eq!(accepted.load(Ordering::SeqCst), 0);
+        drop((g1, g2));
+        assert_eq!(pool.granted(), 0);
     }
 }
