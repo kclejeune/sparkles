@@ -236,8 +236,8 @@ and comparison methodology. [DEVELOPMENT.md](DEVELOPMENT.md) covers building and
   and the number of derived triples of each go to `results/inference.json` and the
   record. Then it dumps the data with the inferred triples of `--profile` (default
   `owl-rl`), and every engine loads that one file. Jena's rule reasoners are not run. Fluree's
-  documentation describes query-time reasoning (`rdfs`, `owl2ql`, `owl2rl` and `datalog`
-  modes), but the script does not turn it on, so Fluree also answers over the materialized
+  documentation describes query-time reasoning with RDFS, OWL 2 QL, OWL 2 RL and Datalog
+  profiles, but the script does not turn it on, so Fluree also answers over the materialized
   file. QLever and Oxigraph have no reasoner. Only Sparkles has an inference time.
 
   *BSBM.* The scale is a product count or a size such as `10m`. The sizes `1m`, `10m` and
