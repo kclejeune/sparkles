@@ -241,7 +241,7 @@ mod sealer {
             let me = unsafe { libc::geteuid() };
             if std::fs::metadata(dir)?.uid() != me {
                 return Err(std::io::Error::other(format!(
-                    "the data directory {} belongs to another user, so the server does not keep a key in it: start it with --secrets-key",
+                    "the data directory {} belongs to another user, so the server does not keep a key in it: change its owner to the user the server runs as, start it with --secrets-key SOURCE, or start it with --secrets-key none to keep the values as plaintext",
                     dir.display()
                 )));
             }
@@ -554,6 +554,9 @@ impl Sealing {
             Mode::Generated(path) => anyhow::bail!(
                 "the stored secrets {names} in {shown} are sealed, and there is no {}: start the server with --secrets-key and the key they were sealed with, or put the key file back",
                 path.display()
+            ),
+            Mode::Plaintext if !cfg!(feature = "backup") => anyhow::bail!(
+                "the stored secrets {names} in {shown} are sealed, and this build has no backup feature to open them: use a build with it, and run sparkles secrets unseal there to go back to plaintext"
             ),
             Mode::Plaintext => anyhow::bail!(
                 "the stored secrets {names} in {shown} are sealed: start the server with --secrets-key and the key they were sealed with"
