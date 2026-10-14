@@ -262,6 +262,7 @@ locking whose semantics differ from `flock`.
 | Full-text index | Tantivy directory and `text.json` | `FORMAT` 2 (`text.rs`); another format is rebuilt on open | derived |
 | Vector index | `vector.json`, index files | config `FORMAT_VERSION` 1, file `SPKVEC` `FILE_VERSION` 1 | derived |
 | Spatial index | `geo.json`, index files | config `FORMAT_VERSION` 1, `LITERALS_VERSION` 2, file `SPKGEO` `FILE_VERSION` 1 | derived |
+| Checked migration state | `.migrate-checked` at the root or checked copy | JSON format 1 records the cleanup mode and the exact old sibling directory. Unknown versions and ambiguous bare legacy markers are refused. | config |
 | Settings and state | `describe.json`, `compaction.json`, `queries.json`, `validation.json`, `models.json`, `assistant.json` and others | `FORMAT` fields on some (stored queries 1, GraphQL 1, ShEx guard 2), none on most | config |
 | Backup repository | layout, blobs, manifests, key slots | layout `FORMAT` 1, blob `FORMAT` 1, slot `SLOT_FORMAT` 2, manifest `indexFormat` | archive |
 
@@ -674,8 +675,15 @@ json`. The swap is not the catalog's `swap.rs`, which needs a live catalog. The 
 works on a stopped data directory, so it takes the catalog lock and the database's own
 lock, copies the database to `.migrate-<name>`, runs the steps, checks the copy with
 `check::check`, and swaps it in with two renames. A copy that passed the check carries a
-`.migrate-checked` mark, and recovery renames a copy into place only when it has the mark,
-so a run that stopped between the renames is finished by the next run. The command takes
+`.migrate-checked` mark in JSON format 1. It records a strict cleanup mode and the exact
+old sibling basename, so a later release recovers and cleans up the originating copy
+without guessing from its own version or deleting an unrelated kept copy. Recovery
+validates the version and safe sibling name before creating lock files or changing
+recovery state, and rereads the marker before publication or cleanup. Unknown
+versions, malformed state and bare legacy mode markers refuse recovery while preserving
+every directory and byte. Legacy markers require inspection of the sibling copies and
+manual recovery through a known original location or a restore. A run that stopped
+between the renames is finished by the next run only with understood checked state. The command takes
 a lock file `.migrate.lock-<name>` next to the database for planning, recovery, the copy
 and the swap, and the database's own lock until the renames start. `plan` is read-only
 and reports a pending run as `interrupted`, so `--check` changes nothing. A store refuses

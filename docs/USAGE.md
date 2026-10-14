@@ -2221,7 +2221,13 @@ and the database is left as it was. If the command stops before the swap, the ne
 removes the copy and the database is unchanged. If it stops between the two renames, the
 next run renames the checked copy into place. A server, or any other open of the
 database, refuses a database with a pending `.migrate-<name>` until `sparkles migrate`
-has run on it again, so a stopped run never leads to an empty database. After checking
+has run on it again, so a stopped run never leads to an empty database. The checked
+copy records a versioned marker with the exact old sibling directory and whether to
+keep it. Recovery uses that recorded directory even when another release finishes the
+run, so it preserves unrelated kept copies. Unknown or damaged markers refuse recovery
+without changing the copies. Bare legacy `keep-old` or `remove-old` markers also refuse
+automatic recovery because they do not identify the original old directory. Inspect
+the sibling copies and recover through a known original location or restore by hand. After checking
 for a pending migration, startup verifies that its locked file still belongs to the
 current database directory. If migration replaced that directory while startup was
 acquiring its lock, the open refuses with a locked error and can be retried. An offline

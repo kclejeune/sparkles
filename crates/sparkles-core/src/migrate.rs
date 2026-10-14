@@ -26,7 +26,7 @@
 
 use crate::error::{Error, Result};
 use crate::formats::{self, FileKind};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// An upgrade of one file kind from one version to the next.
@@ -296,12 +296,64 @@ pub struct Outcome {
     pub kept: Option<PathBuf>,
 }
 
-/// The file that marks a work directory as checked. It is written inside the work
-/// directory after the copy passes [`crate::check::check`], with `keep-old` or
-/// `remove-old`, and removed from the database's directory once the swap is done.
+/// The checked copy's recovery state, removed after publication and cleanup.
 const CHECKED_MARK: &str = ".migrate-checked";
-const MARK_KEEP_OLD: &str = "keep-old";
-const MARK_REMOVE_OLD: &str = "remove-old";
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum CleanupMode {
+    KeepOld,
+    RemoveOld,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CheckedMark {
+    format: u32,
+    mode: CleanupMode,
+    old_directory: String,
+}
+
+impl CheckedMark {
+    /// Only the originating run's single generated sibling can be removed.
+    fn old_path(&self, root: &Path) -> Result<PathBuf> {
+        let name = &self.old_directory;
+        let root_name = root.file_name().unwrap_or_default().to_string_lossy();
+        let version = name
+            .strip_prefix(".pre-migrate-")
+            .and_then(|s| s.strip_suffix(&format!("-{root_name}")));
+        let valid = !name.contains(['/', '\\', ':'])
+            && matches!(
+                Path::new(name).components().collect::<Vec<_>>().as_slice(),
+                [std::path::Component::Normal(_)]
+            )
+            && version.is_some_and(|v| {
+                !v.is_empty()
+                    && v.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b".-+".contains(&b))
+            })
+            && name != root_name.as_ref()
+            && name
+                != work_dir(root)
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .as_ref()
+            && name
+                != sibling(root, ".migrate.lock-")
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .as_ref();
+        if !valid {
+            return Err(Error::Corrupt(format!(
+                "{}: unsafe oldDirectory in {CHECKED_MARK}; inspect the migration copies and restore by hand",
+                root.display()
+            )));
+        }
+        Ok(root.with_file_name(name))
+    }
+}
 
 /// The sibling directory a migration builds the upgraded copy in.
 fn work_dir(root: &Path) -> PathBuf {
@@ -361,65 +413,101 @@ pub(crate) fn check_not_pending(root: &Path) -> Result<()> {
 ///   not touched and is reported, because only outside interference produces it.
 fn recover_locked(root: &Path) -> Result<Option<std::fs::File>> {
     let work = work_dir(root);
-    let old = old_dir(root);
     if !work.is_dir() {
-        // the run stopped after the second rename and before it removed its mark
-        if let Some(mode) = read_mark(root)? {
-            finish_swap(root, &old, &mode)?;
+        // The originating marker, rather than this binary's version, names the old copy.
+        if let Some(mark) = read_mark(root, root)? {
+            finish_swap(root, &mark)?;
         }
         return Ok(None);
     }
+    let mark = read_mark(&work, root)?;
     if root.exists() {
-        if read_mark(&work)?.is_some() && old.exists() {
-            // The first rename has happened, because a run does not start while the old
-            // directory exists, and something created the root again since, such as an
-            // open that was already past its checks. Neither side is removed.
-            return Err(Error::Corrupt(format!(
-                "{} exists next to the checked copy {} and the previous files {}; move the new {} away and run again, or restore the previous files by hand",
-                root.display(),
-                work.display(),
-                old.display(),
-                root.display()
-            )));
+        if let Some(mark) = &mark {
+            let old = mark.old_path(root)?;
+            if old.exists() {
+                return Err(Error::Corrupt(format!(
+                    "{} exists next to the checked copy {} and the previous files {}; move the new {} away and run again, or restore the previous files by hand",
+                    root.display(),
+                    work.display(),
+                    old.display(),
+                    root.display()
+                )));
+            }
         }
-        // the copy was never swapped in: the database is as it was
+        // A valid or unchecked copy next to the unchanged root was never swapped in.
         std::fs::remove_dir_all(&work)?;
         return Ok(None);
     }
-    let Some(mode) = read_mark(&work)? else {
+    let Some(mark) = mark else {
         return Err(Error::Corrupt(format!(
-            "{} is missing and {} has no mark of a passed check; the previous files may be in {}. Restore the database by hand",
+            "{} is missing and {} has no mark of a passed check; inspect the previous sibling copies and restore the database by hand",
             root.display(),
-            work.display(),
-            old.display()
+            work.display()
         )));
     };
-    // the old directory was moved aside and the copy, already checked, was not yet
-    // renamed into place
     std::fs::rename(&work, root)?;
     sync_parent(root)?;
-    // the database is locked before anything else can open it
     let lock = crate::store::lock_database(root)?;
-    finish_swap(root, &old, &mode)?;
+    finish_swap(root, &mark)?;
     Ok(Some(lock))
 }
 
-/// The content of the checked mark in `dir`, if it has one.
-fn read_mark(dir: &Path) -> Result<Option<String>> {
-    match std::fs::read_to_string(dir.join(CHECKED_MARK)) {
-        Ok(m) => Ok(Some(m.trim().to_string())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e.into()),
-    }
+/// Validate recovery metadata before a database lock could create or update a file.
+/// Recovery rereads it under that lock before changing the directory state.
+fn check_recovery_marks(root: &Path) -> Result<()> {
+    read_mark(root, root)?;
+    read_mark(&work_dir(root), root)?;
+    Ok(())
 }
 
-/// After the checked copy is in place at `root`: remove its mark, and the old directory
-/// unless the run kept it.
-fn finish_swap(root: &Path, old: &Path, mode: &str) -> Result<()> {
-    // the old directory goes first, so that the mark still records the unfinished
-    // cleanup if the removal is interrupted, and the next run retries it
-    if mode != MARK_KEEP_OLD && old.exists() {
-        std::fs::remove_dir_all(old)?;
+/// Read only understood checked state. Bare legacy modes cannot name their old copy.
+fn read_mark(dir: &Path, root: &Path) -> Result<Option<CheckedMark>> {
+    let path = dir.join(CHECKED_MARK);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    if matches!(bytes.trim_ascii(), b"keep-old" | b"remove-old") {
+        return Err(Error::Unsupported(format!(
+            "{}: legacy checked state does not record the original old directory; inspect the sibling copies and recover through a known original location or restore by hand; no migration files were changed",
+            path.display()
+        )));
+    }
+    let invalid = |e| {
+        Error::Corrupt(format!(
+            "{}: invalid checked migration state: {e}",
+            path.display()
+        ))
+    };
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(invalid)?;
+    let version = value
+        .get("format")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| {
+            Error::Corrupt(format!(
+                "{}: checked migration state has no unsigned format version",
+                path.display()
+            ))
+        })?;
+    // Check the version before decoding fields whose schema may change in that version.
+    if version != u64::from(formats::MIGRATION_STATE.writes) {
+        return Err(Error::Unsupported(format!(
+            "{} has checked migration format {version}; this build reads format {}; recover with a release that reads the recorded format",
+            path.display(),
+            formats::MIGRATION_STATE.writes
+        )));
+    }
+    let mark: CheckedMark = serde_json::from_value(value).map_err(invalid)?;
+    mark.old_path(root)?;
+    Ok(Some(mark))
+}
+
+/// Keep the marker until cleanup succeeds, so interrupted cleanup can be retried.
+fn finish_swap(root: &Path, mark: &CheckedMark) -> Result<()> {
+    let old = mark.old_path(root)?;
+    if mark.mode == CleanupMode::RemoveOld && old.exists() {
+        std::fs::remove_dir_all(&old)?;
         sync_parent(root)?;
     }
     std::fs::remove_file(root.join(CHECKED_MARK))?;
@@ -432,6 +520,7 @@ pub fn recover(root: &Path) -> Result<()> {
     let root = &absolute(root)?;
     require_named(root)?;
     let _mlock = lock_migration(root)?;
+    check_recovery_marks(root)?;
     let db = if root.exists() {
         Some(crate::store::lock_database(root)?)
     } else {
@@ -502,10 +591,13 @@ fn sync_parent(root: &Path) -> Result<()> {
 }
 
 /// Mark the work directory as checked, durably.
-fn write_mark(work: &Path, mode: &str) -> Result<()> {
+fn write_mark(work: &Path, mark: &CheckedMark) -> Result<()> {
     let path = work.join(CHECKED_MARK);
     let mut f = std::fs::File::create(&path)?;
-    std::io::Write::write_all(&mut f, mode.as_bytes())?;
+    std::io::Write::write_all(
+        &mut f,
+        &serde_json::to_vec(mark).map_err(|e| Error::Invalid(e.to_string()))?,
+    )?;
     f.sync_all()?;
     crate::store::sync_dir(work)?;
     // the work directory's own entry must be durable before the root is moved aside
@@ -582,6 +674,7 @@ fn migrate_planned_with(
     // recovery, the copy and both renames. The database's own lock comes before recovery
     // so that a live store makes the command fail before anything is touched.
     let _mlock = lock_migration(root)?;
+    check_recovery_marks(root)?;
     let mut db_lock = if root.exists() {
         Some(crate::store::lock_database(root)?)
     } else {
@@ -611,6 +704,16 @@ fn migrate_planned_with(
             old.display()
         )));
     }
+    let mark = CheckedMark {
+        format: formats::MIGRATION_STATE.writes,
+        mode: if keep_old {
+            CleanupMode::KeepOld
+        } else {
+            CleanupMode::RemoveOld
+        },
+        old_directory: old.file_name().unwrap().to_string_lossy().into_owned(),
+    };
+    mark.old_path(root)?;
     let work = work_dir(root);
     std::fs::create_dir(&work)?;
     copy_contents(root, &work).inspect_err(|_| {
@@ -632,12 +735,7 @@ fn migrate_planned_with(
             report.errors
         )));
     }
-    let mode = if keep_old {
-        MARK_KEEP_OLD
-    } else {
-        MARK_REMOVE_OLD
-    };
-    write_mark(&work, mode)?;
+    write_mark(&work, &mark)?;
     hook("checked")?;
     // The database's lock is released before its directory is renamed, since a directory
     // with an open handle cannot be renamed on every platform. From here on exclusion
@@ -651,12 +749,15 @@ fn migrate_planned_with(
     std::fs::rename(&work, root)?;
     sync_parent(root)?;
     hook("swapped")?;
-    finish_swap(root, &old, mode)?;
+    finish_swap(root, &mark)?;
     if keep_old {
         out.kept = Some(old);
     }
     Ok((plan, Some(out)))
 }
+
+#[cfg(test)]
+mod recovery_tests;
 
 #[cfg(test)]
 mod tests {
@@ -665,7 +766,7 @@ mod tests {
 
     /// A database whose current delta vocabulary is legacy (as a release before framed
     /// files wrote it), with one commit that uses its terms.
-    fn legacy_database(root: &Path) -> String {
+    pub(super) fn legacy_database(root: &Path) -> String {
         let s = Store::open(root, StoreOptions::default()).unwrap();
         crate::sparql::update::update(
             &s,

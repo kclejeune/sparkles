@@ -347,6 +347,16 @@ pub const BACKUP_MANIFEST: FileKind = FileKind {
     reads: &[1],
 };
 
+/// Checked offline migration state, including the originating old sibling.
+pub const MIGRATION_STATE: FileKind = FileKind {
+    id: "migration-state",
+    files: ".migrate-checked at the database or migration-copy root",
+    marker: "JSON `format`, with `mode` and `oldDirectory`; bare legacy modes are refused",
+    class: Class::Config,
+    writes: 1,
+    reads: &[1],
+};
+
 /// Every file kind except the settings files, which [`SETTINGS`] lists.
 pub const KINDS: &[&FileKind] = &[
     &DATASET,
@@ -360,6 +370,7 @@ pub const KINDS: &[&FileKind] = &[
     &ANNOTATIONS,
     &LINK,
     &CATALOG,
+    &MIGRATION_STATE,
     &TEXT,
     &VECTOR,
     &GEO,
