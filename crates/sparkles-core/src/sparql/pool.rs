@@ -391,6 +391,25 @@ impl PoolGrant {
         Ok(())
     }
 
+    /// Cover an eager operator's checked output of `bytes` and keep that coverage until
+    /// the grant drops. The grant never trims below the highest peak held this way, so a
+    /// result that outlives the charges that built it keeps its share of the pool. On
+    /// failure the floor is unchanged.
+    pub fn hold_peak(&self, bytes: u64) -> Result<(), Error> {
+        let _lock = self.resize.lock();
+        self.grow_locked(bytes)?;
+        let floor = round_up(bytes).min(self.pool.capacity);
+        self.floor.fetch_max(floor, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Cover a cursor operator's checked output of `bytes` for now. The coverage goes
+    /// back with the next trim, since cursor operators charge what they keep.
+    pub fn cover_transient(&self, bytes: u64) -> Result<(), Error> {
+        let _lock = self.resize.lock();
+        self.grow_locked(bytes)
+    }
+
     /// Account for `bytes` less, and give back granules the query no longer needs.
     #[inline]
     pub fn release(&self, bytes: u64) {

@@ -1011,6 +1011,20 @@ impl Ctx {
         if need > self.mem_limit {
             return Err(self.memory_exceeded(need));
         }
+        if let Some(g) = &self.grant {
+            // The pool sees at least what the budget sees. An eager context keeps its
+            // highest checked estimate until it drops, since its result outlives the
+            // charges that built it. A cursor context covers it for now, since cursor
+            // operators charge what they keep.
+            let need = g.used().saturating_add(table_bytes(rows, width));
+            if need > g.granted() {
+                if self.is_cursor() {
+                    g.cover_transient(need)?;
+                } else {
+                    g.hold_peak(need)?;
+                }
+            }
+        }
         Ok(())
     }
 

@@ -135,3 +135,95 @@ fn a_cursor_returns_its_grant_when_it_is_dropped() {
     drop(batch);
     assert_eq!(pool.granted(), 0);
 }
+
+#[test]
+fn a_cursor_grant_still_shrinks() {
+    use sparkles_core::sparql::{CursorOptions, FallbackPolicy, select_cursor};
+    let s = store();
+    let pool = QueryPool::new(1024 * MB);
+    let opts = QueryOptions {
+        pool: Some(pool.clone()),
+        ..Default::default()
+    };
+    let cursor = CursorOptions {
+        batch_rows: 1024,
+        fallback: FallbackPolicy::RejectMaterialization,
+        ..Default::default()
+    };
+    let mut c = select_cursor(
+        s.snapshot(),
+        "SELECT ?a ?x WHERE { ?a <urn:p> ?x . ?b <urn:p> ?y }",
+        &opts,
+        &cursor,
+    )
+    .unwrap();
+    let mut rows = 0;
+    while let Some(batch) = c.next_batch().unwrap() {
+        rows += batch.len();
+    }
+    assert_eq!(rows, 1_000_000);
+    // cursor grants must not pin their peak
+    assert!(pool.granted() <= 32 * MB, "{} granted", pool.granted());
+    drop(c);
+    assert_eq!(pool.granted(), 0);
+}
+
+#[test]
+fn an_update_where_clause_is_bounded_by_the_pool() {
+    let s = store();
+    let pool = QueryPool::new(MB);
+    let opts = QueryOptions {
+        pool: Some(pool.clone()),
+        ..Default::default()
+    };
+    match update(
+        &s,
+        "DELETE { ?a <urn:none> ?b } WHERE { ?a <urn:p> ?x . ?b <urn:p> ?y }",
+        &opts,
+    ) {
+        Err(Error::BudgetExceeded(b)) => assert_eq!(b.kind, BudgetKind::ServerMemory),
+        Err(e) => panic!("{e}"),
+        Ok(stats) => panic!("succeeded with a peak of {} bytes", stats.mem_peak_bytes),
+    }
+    assert_eq!(pool.granted(), 0);
+}
+
+#[test]
+fn retained_eager_results_keep_their_grant() {
+    let s = store();
+    let pool = QueryPool::new(128 * MB);
+    let opts = QueryOptions {
+        pool: Some(pool.clone()),
+        ..Default::default()
+    };
+    let mut held = Vec::new();
+    let mut stopped = None;
+    for _ in 0..5 {
+        match query(
+            s.snapshot(),
+            "SELECT ?a ?b ?x ?y WHERE { ?a <urn:p> ?x . ?b <urn:p> ?y }",
+            &opts,
+        ) {
+            Ok(r) => held.push(r),
+            Err(Error::BudgetExceeded(b)) => {
+                stopped = Some(b.kind);
+                break;
+            }
+            Err(e) => panic!("{e}"),
+        }
+    }
+    assert_eq!(
+        stopped,
+        Some(BudgetKind::ServerMemory),
+        "{} results kept",
+        held.len()
+    );
+    let peaks: u64 = held.iter().map(|r| r.mem_peak_bytes).sum();
+    assert!(
+        pool.granted() >= peaks,
+        "{} granted for {peaks} bytes of peaks",
+        pool.granted()
+    );
+    drop(held);
+    assert_eq!(pool.granted(), 0);
+}
