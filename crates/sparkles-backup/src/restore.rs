@@ -696,7 +696,9 @@ pub fn check_free_space(dir: &Path, logical: u64, reserve: u64, what: &str) -> R
 /// A `target` that does not exist is simply `restored` renamed. The "in use" error is
 /// `409 dataset-busy`; a leftover `<target>.replaced-<pid>` is refused
 /// (`409 dataset-exists`). A pending migration refuses the swap, including when
-/// its target is missing between the migration's two renames.
+/// its target is missing between the migration's two renames. After the pending check,
+/// the locked file must still be the current target's lock; a stale handle also refuses
+/// publication with `dataset-busy` and leaves both directories untouched.
 pub fn swap_dir(target: &Path, restored: &Path, keep_replaced: bool) -> Result<()> {
     let parent = match target.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
@@ -716,6 +718,9 @@ pub fn swap_dir(target: &Path, restored: &Path, keep_replaced: bool) -> Result<(
     }
     let lock = lock_database(target)?;
     check_not_migrating(target)?;
+    // Check pending state before identity, so a descriptor opened before migration
+    // cannot authorize replacing the published copy after the work directory is gone.
+    sparkles_core::store::verify_database_lock(target, &lock)?;
     let file_name = target
         .file_name()
         .ok_or_else(|| {
@@ -796,6 +801,8 @@ fn lock_database(root: &Path) -> Result<File> {
         .read(true)
         .write(true)
         .open(&path)?;
+    #[cfg(test)]
+    tests::after_lock_open();
     match f.try_lock() {
         Ok(()) => Ok(f),
         Err(std::fs::TryLockError::WouldBlock) => {

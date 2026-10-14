@@ -2221,7 +2221,12 @@ and the database is left as it was. If the command stops before the swap, the ne
 removes the copy and the database is unchanged. If it stops between the two renames, the
 next run renames the checked copy into place. A server, or any other open of the
 database, refuses a database with a pending `.migrate-<name>` until `sparkles migrate`
-has run on it again, so a stopped run never leads to an empty database. A copy that
+has run on it again, so a stopped run never leads to an empty database. After checking
+for a pending migration, startup verifies that its locked file still belongs to the
+current database directory. If migration replaced that directory while startup was
+acquiring its lock, the open refuses with a locked error and can be retried. An offline
+backup restore makes the same check before publication and refuses a stale lock with
+`dataset-busy`, leaving both directories intact. A copy that
 carries no mark of a passed check is never renamed into place. The command reports it and
 leaves both directories alone. A backup restore also refuses to replace the database while
 a migration is pending, including when the database directory is missing between the two

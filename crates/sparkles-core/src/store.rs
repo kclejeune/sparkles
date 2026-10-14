@@ -31,6 +31,8 @@ mod group;
 mod history_query;
 pub mod keyset;
 mod link;
+#[cfg(test)]
+mod lock_tests;
 mod mem_history;
 #[cfg(test)]
 mod memory_branch_tests;
@@ -1313,9 +1315,36 @@ pub struct Store {
 pub(crate) const WAL_INSERT: u8 = 1;
 
 /// Take the exclusive process lock of a database directory, for offline work on a
-/// closed database (`sparkles migrate`).
+/// closed database (`sparkles migrate`). Checks the locked file's identity but allows
+/// pending migration state, which the caller may be recovering.
 pub(crate) fn lock_database(root: &Path) -> Result<File> {
-    lock_dir(root)
+    let lock = lock_dir(root)?;
+    verify_database_lock(root, &lock)?;
+    Ok(lock)
+}
+
+/// Verify that an acquired database lock still names `root/sparkles.lock`.
+///
+/// An offline directory swap can move a lock file between opening and locking it.
+/// Callers must check pending migration state before this final identity comparison,
+/// unless they own migration exclusion and are recovering that state themselves.
+/// The handles used for comparison are dropped before returning, including on Windows.
+/// A missing or replaced lock file returns [`Error::Locked`]; retry with a fresh lock.
+pub fn verify_database_lock(root: &Path, lock: &File) -> Result<()> {
+    let stale = || Error::Locked {
+        path: root.to_path_buf(),
+        pid: None,
+    };
+    let current = match same_file::Handle::from_path(root.join("sparkles.lock")) {
+        Ok(current) => current,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(stale()),
+        Err(e) => return Err(e.into()),
+    };
+    let locked = same_file::Handle::from_file(lock.try_clone()?)?;
+    if locked != current {
+        return Err(stale());
+    }
+    Ok(())
 }
 
 /// Take the exclusive process lock of a database directory.
@@ -1327,6 +1356,8 @@ fn lock_dir(root: &Path) -> Result<File> {
         .read(true)
         .write(true)
         .open(&path)?;
+    #[cfg(test)]
+    lock_tests::after_open();
     match f.try_lock() {
         Ok(()) => {
             f.set_len(0)?;
@@ -1530,6 +1561,10 @@ impl Store {
         if ctx.is_none() {
             crate::migrate::check_not_pending(root)?;
         }
+        // Pending state must be checked first: an old descriptor can survive both
+        // migration renames, after which only file identity detects the stale lock.
+        // Branch roots follow the same identity rule under their parent's exclusion.
+        verify_database_lock(root, &lock)?;
         commit::check_dataset_compatibility(root)?;
         // a settings file from a newer release refuses the dataset before any file of it
         // changes, the same verdict as `sparkles migrate --check`

@@ -853,3 +853,62 @@ async fn branch_ordinal_reservation_reads_legacy_and_current_manifest_metadata()
         assert_ne!(store.dataset_id(), manifest.dataset.id);
     }
 }
+
+thread_local! {
+    static AFTER_LOCK_OPEN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(super) fn after_lock_open() {
+    let hook = AFTER_LOCK_OPEN.with(|h| h.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn swap_dir_rejects_a_lock_from_the_previous_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("db");
+    let restored = dir.path().join("restored");
+    fixture::make_db(&target);
+    std::fs::create_dir(&restored).unwrap();
+    std::fs::write(restored.join("sentinel"), b"restored copy").unwrap();
+    let store = Store::open(&target, StoreOptions::default()).unwrap();
+    let vocab = target
+        .join(&store.snapshot().generation.name)
+        .join("delta.vocab");
+    drop(store);
+    let bytes = std::fs::read(&vocab).unwrap();
+    let parsed = sparkles_core::vocab::delta::parse_delta(&bytes).unwrap();
+    let mut legacy = Vec::new();
+    for key in parsed.keys {
+        legacy.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        legacy.extend_from_slice(&key);
+    }
+    assert!(!legacy.is_empty());
+    std::fs::write(vocab, legacy).unwrap();
+    let expected = nquads(&target);
+    let migrate_target = target.clone();
+    AFTER_LOCK_OPEN.with(|h| {
+        *h.borrow_mut() = Some(Box::new(move || {
+            let migrated = sparkles_core::migrate::migrate(&migrate_target, true).unwrap();
+            assert_eq!(migrated.steps.len(), 1);
+            assert!(
+                sparkles_core::migrate::pending(&migrate_target)
+                    .unwrap()
+                    .is_none()
+            );
+        }));
+    });
+    let result = swap_dir(&target, &restored, false);
+    assert!(
+        matches!(&result, Err(e) if e.code() == Code::DatasetBusy),
+        "stale lock authorized restore: {result:?}"
+    );
+    assert_eq!(nquads(&target), expected);
+    assert_eq!(
+        std::fs::read(restored.join("sentinel")).unwrap(),
+        b"restored copy"
+    );
+}

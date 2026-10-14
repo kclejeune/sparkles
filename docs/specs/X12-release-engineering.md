@@ -680,9 +680,13 @@ a lock file `.migrate.lock-<name>` next to the database for planning, recovery, 
 and the swap, and the database's own lock until the renames start. `plan` is read-only
 and reports a pending run as `interrupted`, so `--check` changes nothing. A store refuses
 to open a database whose `.migrate-<name>` exists, before it creates the directory and
-again under its lock, so a stopped run never leaves an empty database. A backup restore
-also refuses to publish over a database with a pending migration, even when the target
-directory is missing. Backup captures and clones leave out the migration check mark.
+again under its lock, so a stopped run never leaves an empty database. After the pending
+check, startup compares file identities to verify that its acquired lock still belongs
+to the current directory. It refuses an old descriptor that survived a migration swap,
+including for branch roots. Migration recovery checks the locked file's identity while
+allowing the pending state it must finish. A backup restore also refuses to publish over
+a database with a pending migration, even when the target directory is missing, and
+verifies its target lock's identity after checking pending state. Backup captures and clones leave out the migration check mark.
 The command resolves a relative `--loc` to an absolute path, refuses symlinks and special
 files, and does not start while `.pre-migrate-<version>-<name>` exists. Unit tests interrupt the run
 at each point and check the result, and cover a check during a copy, a live store, the
