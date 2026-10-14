@@ -22,7 +22,7 @@
   # runtime of spec F12 by default, which adds about 5 MB to the binary and runs nothing
   # until a local provider is configured, and on Linux encrypted backup repositories,
   # whose protected key memory needs Linux; [ ] leaves them out. Runtime secrets are
-  # sealed in every build
+  # sealed in every build with the default `backup` feature, which this package keeps
   features ? [ "embed-local" ] ++ lib.optional stdenv.hostPlatform.isLinux "backup-encryption",
 }:
 let

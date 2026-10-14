@@ -3170,8 +3170,11 @@ source. `--json` prints the server's answer. When the server keeps stored values
 without encryption, or seals them with a key it generated, the list ends with a note
 that says so.
 
-The server seals every stored value with a 32-byte key, in every build. It takes the
-key from the first of these that exists:
+Every build with the default `backup` feature (the default cargo build, the Docker
+image and the Nix package) seals every stored value with a 32-byte key. A build without
+that feature keeps the values as plaintext files with mode 0600 and refuses
+`--secrets-key` with any source other than `none`. The key comes from the first of
+these that exists:
 
 1. `serve --secrets-key SOURCE`, read once at the start from `file:PATH`,
    `env:VARIABLE`, `credential:NAME` or `command:PROGRAM ARGS`.
@@ -3195,6 +3198,18 @@ page that core dumps leave out. On other platforms, or when the page cannot be l
 it is kept in a heap buffer that is zeroed on release, and `GET /$/server/secrets`
 reports which as `keyMemory`.
 
+The server generates `secrets.key` only in a data directory that belongs to the user it
+runs as. In any other directory, the first `PUT` of a value fails, and so does a start
+that finds plaintext values. The operator can give the directory to that user, start the
+server with `--secrets-key SOURCE`, or start it with `--secrets-key none` to keep the
+values as plaintext. The Docker image runs as uid 10001, so a bind mount that belongs to
+the host user and was made writable with `chmod 0777` stops an upgrade this way. Running
+`chown -R 10001 DIR` on the mount fixes it.
+
+The first start of a release that seals by default seals the plaintext values it finds
+and generates `secrets.key` for them. An older release then refuses to start on the
+sealed values until `sparkles secrets unseal --data DIR` writes them back as plaintext.
+
 Two offline commands change the stored values of a stopped server. Both hold the
 catalog lock of the data directory, so they refuse to run while a server uses it, and
 both take `--secrets-key SOURCE` when the values are sealed with a key that `serve`
@@ -3208,9 +3223,18 @@ sparkles secrets rekey --data /var/lib/sparkles --new-key file:/etc/sparkles/sec
 ```
 
 `unseal` leaves `secrets.key` in place, so the next start of a sealing release seals
-the values again with the same key. `rekey` opens every value before it writes any,
-then removes a generated `secrets.key`, since the values no longer open with it. Start
-the server with `--secrets-key` and the new source afterwards.
+the values again with the same key. `rekey` opens every value before it writes any. If
+it stops partway, running the same command again finishes it, because it keeps the
+values that already open with the new key. It removes a generated `secrets.key` only
+after every value opens with the new key. Start the server with `--secrets-key` and the
+new source afterwards.
+
+Sealing a plaintext value in place and `rekey` write a new file and rename it over the
+old one. They do not erase the plaintext or the old key from freed disk blocks, from
+filesystem snapshots or from earlier copies of the directory. After a migration from
+plaintext, replace any API keys that an earlier copy may hold. Sealing also does not
+stop someone with write access to `secrets/` from putting back an older sealed value of
+the same secret, because the files carry no version.
 
 The **Server** page of the web UI has a **Models** section for users with
 `server-admin`. It lists the providers with their protocol, endpoint and whether their

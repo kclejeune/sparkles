@@ -1066,6 +1066,32 @@ values exactly as the previous release does. The tests are `generated_secrets_ke
 checks that the generated key never reaches the log, and the heap and locked round trips
 in `sparkles-backup`'s `seal` module.
 
+A review of this work led to follow-up fixes. `rekey` opens each value with the old key
+or, failing that, with the new one, so a run that stopped partway is finished by running
+the same command again. It reads every file back and opens it with the new key, and
+syncs the directory, before it removes the old generated key. A generated key is
+installed and its directory synced before any value is sealed with it, directory syncs
+report their errors, and the key file is set to mode 0400 whatever the umask. A start,
+`unseal` and `rekey` remove the `.secrets.key.PID.tmp` and `secrets/.NAME.PID.tmp` files
+that a crashed write can leave. The settings CLI test gates its sealing assertions on
+the `backup` feature, and the errors for a build without it and for a data directory
+owned by another user say what to do. The new tests are
+`generated_key_must_be_durable_before_sealing`, `generated_key_mode_ignores_umask` and
+`stale_temporary_files_are_removed` in `settings/secrets.rs`, and
+`rekey_resumes_after_a_failed_write` in `settings/server_tests.rs`.
+
+Two decisions are recorded. Sealing needs the default `backup` feature, so the docs say
+that every build with it seals, and a build without it keeps plaintext (D1). A start
+that must generate a key in a data directory owned by another user still fails, with an
+error that names the ownership fix, `--secrets-key SOURCE` and `--secrets-key none`, and
+USAGE describes the Docker bind-mount case under its upgrade notes (D2).
+
+* **Follow-up.** Refuse to generate `secrets.key` in a data directory that is group- or
+  world-writable, since another user could then delete the key and stop the server. They
+  cannot put in a key of their own, because the server rejects a key file owned by
+  another user. The check needs a test that sets mode 0o777 on a temporary directory and
+  expects the refusal (D3).
+
 **UI controls that turn on assistant ingestion** (item 77, Tier 5,
 [ROADMAP](../ROADMAP.md)). The other half of item 77, redaction beyond the fixed
 patterns, is in

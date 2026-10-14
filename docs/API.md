@@ -9759,8 +9759,10 @@ rule applies to `--model-secret` names and to `apiKey.secret`.
 
 A runtime value is kept in `<dataDir>/secrets/NAME` with mode 0600, in a directory with
 mode 0700, and is written to a temporary file and renamed into place. Every build with
-the default `backup` feature seals each value with a secrets key. An operator who does
-not want keys on disk at all locks the secrets in the settings file.
+the default `backup` feature seals each value with a secrets key. A build without that
+feature keeps plaintext files and refuses `--secrets-key` with any source other than
+`none`. An operator who does not want keys on disk at all locks the secrets in the
+settings file.
 
 `serve --secrets-key SOURCE`, or the environment variable `SPARKLES_SECRETS_KEY`, names
 the key, which the server reads once at the start. The source is `file:PATH`,
@@ -9778,9 +9780,9 @@ generate 32 random bytes and write them to `<dataDir>/secrets.key` as 64 hexadec
 digits with mode 0400. It writes the file only when the data directory belongs to the
 user the server runs as, and it never replaces an existing file. A generated key does
 not protect the values from someone who can read the whole data directory, but it
-protects copies of `secrets/` made without it. Server backups leave `secrets.key` out,
-so the sealed values in a backup open only with the same key. `--secrets-key none`
-keeps the values as plaintext files.
+protects copies of `secrets/` made without it. There is no whole-server backup yet
+(roadmap item 61), and dataset backups include neither `secrets/` nor `secrets.key`.
+`--secrets-key none` keeps the values as plaintext files.
 
 A sealed file is one line, `sparkles-sealed-secret/1 SALT CIPHERTEXT`, in base64. Each
 value is encrypted with AES-256-GCM under a key that HKDF-SHA256 derives from the secrets
@@ -9797,7 +9799,8 @@ release on other platforms or when the page cannot be locked.
 `sparkles secrets unseal --data DIR` writes the sealed values of a stopped server back as
 plaintext, for a downgrade to a release that does not seal them, and
 `sparkles secrets rekey --data DIR --new-key SOURCE` seals them again under another key
-and removes a generated `secrets.key`. Both run offline and hold the data directory's
+and removes a generated `secrets.key` once every value opens with the new key. Running
+an interrupted `rekey` again finishes it. Both run offline and hold the data directory's
 catalog lock, and both take `--secrets-key SOURCE` for the current key.
 
 | Method | Path | Needs | Effect |

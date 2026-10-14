@@ -162,7 +162,7 @@ than releasing early.
 | 65 | Encryption: key management workflows, Vault and cloud KMS, recovery export, and encryption of live datasets and derived indexes | [F11](specs/F11-encryption-at-rest.md#roadmap-follow-ups-2026-10-12) | L–XL |
 | 66 | Replication: read replicas, preserved primary IDs, promotion, failover, synchronous replication, and a patch log or continuous archive | [F10](specs/F10-replication.md#roadmap-follow-ups-2026-10-12) | XL |
 | 67 | MCP OAuth: RFC 9728 protected-resource metadata, audiences bound to the resource, and scope challenges. OIDC tokens are already audience-checked on every route. | [C11](specs/C11-mcp-server.md#roadmap-follow-ups-2026-10-12) | S–M |
-| 68 | **Done (2026-10-13).** Assistant secrets sealed by default. `--secrets-key` sealing exists and seals existing secrets in place, but only in builds with the `backup-encryption` feature: the Linux Nix package has it, and the Dockerfile and default builds don't. | [C19](specs/C19-layered-settings.md#roadmap-follow-ups-2026-10-12) | S–M |
+| 68 | **Done (2026-10-13).** Runtime secrets are sealed by default with a configured key, a systemd credential or a key that the server generates in its data directory, offline `unseal` and `rekey` commands move the values, and a build without the `backup` feature keeps plaintext. | [C19](specs/C19-layered-settings.md#roadmap-follow-ups-2026-10-12) | S–M |
 
 ## Tier 7: compatibility leftovers
 
