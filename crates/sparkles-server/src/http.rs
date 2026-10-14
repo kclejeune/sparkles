@@ -3507,7 +3507,7 @@ async fn create_dataset(
     let (name, kind, geo, text) = if let Some(format) = assembler {
         let server = fuseki::assembler::Server {
             union_default_graph: st.store_opts.union_default_graph,
-            gsp_direct_naming: st.gsp_direct_naming,
+            gsp_direct_naming: st.gsp_direct_naming.is_on(),
         };
         let spec = fuseki::assembler::parse(&body, format, &server)
             .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;

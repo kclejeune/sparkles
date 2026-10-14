@@ -20,6 +20,73 @@ pub use sparkles::reasoning::{
     AutoSetting, ReasoningRecord as ReasoningInfo, read_record as read_reasoning_file,
 };
 
+/// What Fuseki's direct Graph Store naming allows on a dataset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DirectMode {
+    /// reads only (`fuseki:gsp-direct-r`): a write is a `405`
+    Read,
+    /// reads and writes (`fuseki:gsp-direct-rw`)
+    ReadWrite,
+}
+
+/// The datasets that serve direct Graph Store naming (`serve --gsp-direct-naming`), and
+/// whether they take writes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GspDirectNaming {
+    /// the mode of the datasets that name none
+    all: Option<DirectMode>,
+    datasets: BTreeMap<String, DirectMode>,
+}
+
+impl GspDirectNaming {
+    /// The values of `--gsp-direct-naming`. An empty value turns direct naming on for
+    /// every dataset, `NAME` for one dataset, and `NAME=read` or `NAME=read-write` sets
+    /// what the dataset allows. Without a mode a dataset is read-write.
+    pub fn parse(values: &[String]) -> Result<GspDirectNaming, String> {
+        let mut out = GspDirectNaming::default();
+        for v in values {
+            if v.is_empty() {
+                out.all = Some(DirectMode::ReadWrite);
+                continue;
+            }
+            let (name, mode) = match v.split_once('=') {
+                None => (v.as_str(), DirectMode::ReadWrite),
+                Some((n, "read")) => (n, DirectMode::Read),
+                Some((n, "read-write")) => (n, DirectMode::ReadWrite),
+                Some((_, m)) => {
+                    return Err(format!(
+                        "--gsp-direct-naming: the mode of a dataset is read or read-write, not '{m}'"
+                    ));
+                }
+            };
+            if name.is_empty() {
+                return Err("--gsp-direct-naming: a dataset name is empty".into());
+            }
+            out.datasets.insert(name.to_string(), mode);
+        }
+        Ok(out)
+    }
+
+    /// Direct naming on every dataset that no entry names, with read and write.
+    #[cfg(test)]
+    pub fn everywhere() -> GspDirectNaming {
+        GspDirectNaming {
+            all: Some(DirectMode::ReadWrite),
+            datasets: BTreeMap::new(),
+        }
+    }
+
+    /// What dataset `name` allows, if it serves direct naming.
+    pub fn mode(&self, name: &str) -> Option<DirectMode> {
+        self.datasets.get(name).copied().or(self.all)
+    }
+
+    /// Whether any dataset serves direct naming.
+    pub fn is_on(&self) -> bool {
+        self.all.is_some() || !self.datasets.is_empty()
+    }
+}
+
 /// A dataset of the server: the library's [`sparkles::Dataset`], which holds the store
 /// and the state its directory configures (the write guard, RDFS on read, the stored
 /// queries, the GraphQL configuration, the reasoning record, the closure cache, the
@@ -285,7 +352,7 @@ pub struct AppState {
     pub map_style_url: Option<String>,
     /// Fuseki's Graph Store direct naming (`serve --gsp-direct-naming`): `/{ds}/{path}`
     /// names the graph whose IRI is the request URL
-    pub gsp_direct_naming: bool,
+    pub gsp_direct_naming: GspDirectNaming,
     /// automatic re-materialization of stale inferences (`serve --auto-reason`)
     pub auto_reason: Option<crate::reasoning::AutoReason>,
     /// the largest closure a dataset keeps in memory for incremental reasoning, in
@@ -540,7 +607,7 @@ impl AppState {
             cors_origins: Vec::new(),
             hosts: crate::exposure::Hosts::default(),
             map_style_url: None,
-            gsp_direct_naming: false,
+            gsp_direct_naming: GspDirectNaming::default(),
             allow_unvalidated_writes: false,
             http_compression: Default::default(),
             auto_reason: None,
@@ -618,7 +685,7 @@ impl AppState {
             cors_origins: Vec::new(),
             hosts: crate::exposure::Hosts::default(),
             map_style_url: None,
-            gsp_direct_naming: false,
+            gsp_direct_naming: GspDirectNaming::default(),
             allow_unvalidated_writes: false,
             http_compression: Default::default(),
         }

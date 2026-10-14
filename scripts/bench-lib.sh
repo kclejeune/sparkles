@@ -1,4 +1,4 @@
-# shellcheck shell=bash disable=SC2034 # the variables set here are used by the sourcing script
+# shellcheck shell=bash disable=SC2034,SC2153 # the variables set here are used by the sourcing script
 # Shared code of scripts/bench.sh: tool lookup, the engines' servers (start, stop, ports),
 # memory readings from /proc and the JSON result files. Sourced, never run.
 #
@@ -10,7 +10,8 @@ die() {
   log "error: $*"
   exit 1
 }
-# nixbin <pkg> <bin>: the binary on PATH, or from nixpkgs. The build's out-link in
+# nixbin <pkg> <bin>: the binary on PATH, or from the nixpkgs that flake.lock pins (so the
+# engines' versions follow the repository, not the user's registry). The build's out-link in
 # WORK/gcroots is a garbage-collector root, so a `nix store gc` during a long run cannot
 # remove the binary.
 nixbin() {
@@ -18,7 +19,7 @@ nixbin() {
     command -v "$2"
   else
     mkdir -p "$WORK/gcroots"
-    nix build "nixpkgs#$1" --out-link "$WORK/gcroots/$1" > /dev/null
+    nix build --inputs-from "$ROOT" "nixpkgs#$1" --out-link "$WORK/gcroots/$1" > /dev/null
     echo "$WORK/gcroots/$1/bin/$2"
   fi
 }
@@ -65,7 +66,7 @@ gnu_time() {
   [ -x /usr/bin/time ] && echo /usr/bin/time && return
   # not nixbin: `command -v time` finds the shell keyword
   mkdir -p "$WORK/gcroots"
-  nix build nixpkgs#time --out-link "$WORK/gcroots/time" > /dev/null
+  nix build --inputs-from "$ROOT" nixpkgs#time --out-link "$WORK/gcroots/time" > /dev/null
   echo "$WORK/gcroots/time/bin/time"
 }
 
@@ -305,4 +306,176 @@ j[engine] = {"seconds": float(secs), "max_rss_kib": rss, "index_bytes": size, "i
 json.dump(j, open(f, "w"), indent=1)
 print(f"{engine}: {float(secs):.1f} s, peak RSS {rss >> 10} MiB, index {size / 2**20:.0f} MiB")
 EOF
+}
+
+# ------------------------------------------------------------------------------- load
+# load_all: DATAFILE (default data.nt, relative to WORK) into every selected engine
+# (LOADRES, default results, gets the numbers). Each load runs under GNU time for its
+# peak RSS (the largest of the processes it waits
+# for); load.json and load-details.json get the time, peak RSS and index size.
+load_all() {
+  local gtime e cmd t0 t1 df=${DATAFILE:-data.nt}
+  gtime=$(gnu_time)
+  for e in $ENGINES; do
+    case $e in
+      sparkles) cmd="'$SPARKLES' load --loc sparkles.db $df" ;;
+      jena) cmd="'$TDBLOADER' --loc jena.db $df" ;;
+      qlever)
+        cmd="mkdir -p qlever-index && cd qlever-index && echo '{\"num-triples-per-batch\": 1000000}' > settings.json &&
+          '$QINDEX' -i bench -F nt -f ../$df -p true -s settings.json"
+        ;;
+      # Fluree's bulk import (`create --from`) builds the index directly; without
+      # --chunk-size-mb it parses the file as a single chunk (about 3x slower)
+      fluree) cmd="mkdir -p fluree && cd fluree && '$FLUREE' init -q && '$FLUREE' --memory-budget-mb 8192 create bench --from ../$df --chunk-size-mb 16" ;;
+      # Oxigraph's bulk loader (parallel, writes RocksDB files directly), then the compaction
+      # it recommends before read-heavy workloads (`optimize`); both are timed as the load
+      oxigraph) cmd="'$OXIGRAPH' load --location oxigraph.db --file $df && '$OXIGRAPH' optimize --location oxigraph.db" ;;
+    esac
+    rm -rf "${WORK:?}/${FILEOF[$e]}"
+    log "$e: loading (log: logs/load-$e.log)"
+    t0=$(date +%s.%N)
+    "$gtime" -v -o "logs/load-$e.time" bash -c "$cmd" > "logs/load-$e.log" 2>&1 || die "$e: load failed, see logs/load-$e.log"
+    t1=$(date +%s.%N)
+    record_load "${LOADRES:-results}" "${LOADNAME[$e]}" "$(awk "BEGIN {print $t1 - $t0}")" "logs/load-$e.time" "$WORK/${FILEOF[$e]}"
+  done
+}
+
+# ------------------------------------------------------------------ query suites
+# Shared by scripts/bench.sh and the suite scripts: they set NAMES (query names, texts in
+# queries/<name>.rq), RES (the results directory) and selected <name> before calling these.
+# qform <file>: select, ask, construct or describe (the first of these words outside IRIs and comments)
+qform() { sed -e 's/<[^<>[:space:]]*>//g' -e 's/#.*//' "$1" | grep -ioE '\b(select|construct|describe|ask)\b' | head -1 | tr '[:upper:]' '[:lower:]'; }
+q() { # curl command for endpoint + query name (fails on HTTP errors); the answer format follows the query form
+  local accept=text/tab-separated-values
+  case "$(qform "queries/$2.rq")" in
+    ask) accept=application/sparql-results+json ;;
+    construct | describe) accept=application/n-triples ;;
+  esac
+  echo "curl -sf --max-time ${MAX_TIME:-300} -o /dev/null -H 'Accept: $accept' --data-urlencode query@queries/$2.rq $1"
+}
+# hyperfine arguments for every selected engine: engine_args <command-fn>
+engine_args() { for e in $ENGINES; do printf '%s\0' --command-name "${NAME[$e]}" "$($1 "$e")"; done; }
+# the rise a - b as JSON (0 if negative: the kernel's RSS counters are approximate), or "?"
+minus() { if [[ $1 =~ ^[0-9]+$ && $2 =~ ^[0-9]+$ ]]; then echo $(($1 > $2 ? $1 - $2 : 0)); else echo '"?"'; fi; }
+# a reading as JSON: the number, or "?"
+num() { if [[ $1 =~ ^[0-9]+$ ]]; then echo "$1"; else echo '"?"'; fi; }
+
+# start_all: every selected engine's server on STORE; mem.json gets each one's RSS
+# 2 s after all are ready, before any query
+start_all() {
+  local e kv=()
+  for e in $ENGINES; do start "$e"; done
+  sleep 2
+  for e in $ENGINES; do kv+=("${NAME[$e]}=$(rss_of "$e")"); done
+  setj "$RES/mem.json" idle "${kv[@]}"
+}
+
+# answer check: every engine's answer to every query is fingerprinted (row count, exact
+# RDF terms, numeric values) into answers.json; the summary compares engines. An engine
+# that errors (HTTP failure) is reported as "error" instead of a time. LIMIT without
+# ORDER BY may legitimately return different solutions: row counts only.
+# Each request is also the query's memory reading: the server's peak RSS is reset
+# (clear_refs) before it, and mem.json gets the peak (VmHWM) after it and its rise over
+# the RSS at the reset.
+COUNT_ONLY=${COUNT_ONLY-export-500k}
+answer_check() {
+  local n e r before peak kv
+  echo
+  printf '%-16s' rows
+  for e in $ENGINES; do printf ' %12s' "${NAME[$e]}"; done
+  echo
+  for n in "${NAMES[@]}"; do
+    selected "$n" || continue
+    local flag=()
+    [[ " $COUNT_ONLY " == *" $n "* ]] && flag=(--count-only)
+    [[ " ${NO_CHECK:-} " == *" $n "* ]] && flag+=(--no-check)
+    printf '%-16s' "$n"
+    kv=()
+    for e in $ENGINES; do
+      # right after the reset, the peak is the RSS: the baseline (a JVM may shrink between
+      # a separate RSS reading and the reset)
+      reset_peak "$e"
+      before=$(hwm_of "$e")
+      r=$(python3 "$ROOT/scripts/bench-answers.py" "${URL[$e]}" "queries/$n.rq" "$RES/answers.json" "$n" "${NAME[$e]}" "${flag[@]}")
+      peak=$(hwm_of "$e")
+      kv+=("${NAME[$e]}={\"before\": $(num "$before"), \"peak\": $(num "$peak"), \"delta\": $(minus "$peak" "$before")}")
+      printf ' %12s' "$r"
+    done
+    setj "$RES/mem.json" "queries.$n" "${kv[@]}"
+    echo
+  done
+  # the RSS after every query ran once (a fixed warm-up), read once the servers are idle
+  sleep 2
+  kv=()
+  for e in $ENGINES; do kv+=("${NAME[$e]}=$(rss_of "$e")"); done
+  setj "$RES/mem.json" warm "${kv[@]}"
+}
+
+# --------------------------------------------------------------------------- cold
+# cold <engine>: per query, COLD_RUNS times: stop, evict, start, one timed query.
+# cold.json gets the median time (the format bench-billion.sh writes), cold-runs.json
+# every run's time and time to ready.
+cold() {
+  local e=$1 n i t times ready
+  for n in "${NAMES[@]}"; do
+    selected "$n" || continue
+    times=()
+    ready=()
+    for i in $(seq 1 "$COLD_RUNS"); do
+      stop "$e"
+      evict "$e"
+      start "$e"
+      ready+=("${READY_S[$e]}")
+      # curl prints the time even when the request fails, so a failure replaces it
+      if ! t=$(curl -sf --max-time "${MAX_TIME:-300}" -o /dev/null -w '%{time_total}' -H 'Accept: text/tab-separated-values' \
+        --data-urlencode "query@queries/$n.rq" "${URL[$e]}"); then
+        t=error
+      fi
+      times+=("$t")
+      log "cold $e $n run $i: ready ${READY_S[$e]} s, query $t s"
+    done
+    stop "$e"
+    python3 - "$RES" "${NAME[$e]}" "$n" "${times[*]}" "${ready[*]}" << 'EOF'
+import json, os, statistics, sys
+d, e, n, times, ready = sys.argv[1:]
+times, ready = times.split(), [float(r) for r in ready.split()]
+ok = [float(t) for t in times if t != "error"]
+def put(f, v):
+    j = json.load(open(f)) if os.path.exists(f) else {}
+    j.setdefault(e, {})[n] = v
+    json.dump(j, open(f, "w"), indent=1)
+put(f"{d}/cold.json", statistics.median(ok) if ok else "error")
+put(f"{d}/cold-runs.json", {"times": [float(t) if t != "error" else t for t in times], "ready": ready})
+EOF
+  done
+}
+
+# pinned_build <nix file> <out-link>: build a generator's derivation (the file takes
+# { pkgs }) against the nixpkgs revision locked in flake.lock, so the compiler and the
+# libraries are pinned too (as scripts/bench-watdiv.sh does).
+pinned_build() {
+  nix build --impure --out-link "$2" --expr "
+    let
+      n = (builtins.fromJSON (builtins.readFile $ROOT/flake.lock)).nodes.nixpkgs.locked;
+      pkgs = import (builtins.fetchTarball {
+        url = \"https://github.com/\${n.owner}/\${n.repo}/archive/\${n.rev}.tar.gz\";
+        sha256 = n.narHash;
+      }) { };
+    in import $1 { inherit pkgs; }"
+}
+
+# fetch_pinned <pins.tsv> <name> <dest>: download a file listed in a pins file (name, URL,
+# SHA-256 and license, tab separated) unless it is there, and check its checksum
+fetch_pinned() {
+  local url sum got
+  url=$(awk -F'\t' -v n="$2" '$1 == n {print $2}' "$1")
+  sum=$(awk -F'\t' -v n="$2" '$1 == n {print $3}' "$1")
+  [ -n "$url" ] || die "$2 is not in $1"
+  if [ ! -f "$3" ]; then
+    log "downloading $2"
+    curl -sfL "$url" -o "$3.part" || die "cannot download $url"
+    mv "$3.part" "$3"
+  fi
+  got=$(sha256sum "$3" 2> /dev/null || shasum -a 256 "$3")
+  [ "${got%% *}" = "$sum" ] || die "$2: checksum ${got%% *} does not match the pinned $sum"
 }

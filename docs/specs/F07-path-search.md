@@ -414,6 +414,7 @@ The graph for A1 to A6 has the triples `a→b`, `b→c`, `c→d`, `a→e`, `e→
 4. **Zero-weight edges in `path:allShortest`.** Dijkstra's algorithm records the parents
    of a node only until the node is settled. With edges of weight zero between nodes at
    the same distance, some equally cheap paths can be missed. Positive weights are exact.
+   The Roadmap follow-ups at the end of the Outcome record the fix.
 
 ## 10. Sources
 
@@ -511,8 +512,8 @@ of sweeping whole levels.
 
 **Not built at first.** Edges from a nested pattern, a direction per predicate, a
 `path:edge` binding of the edge as a triple term and the Cypher frontend's use of the
-operator were not built with Phase 1. Zero-weight edges can hide equally cheap paths
-from `path:allShortest`, as §9 says.
+operator were not built with Phase 1. Zero-weight edges hid equally cheap paths from
+`path:allShortest`, as §9 says, until the fix recorded below.
 
 **Later additions (2026-10-03).** The MCP server gained a dedicated tool, `find_paths`,
 which writes the search's block from its arguments and returns the paths with their
@@ -602,6 +603,17 @@ Acceptance examples:
   simple path of its least cost, as the brute-force enumeration in
   `crates/sparkles-core/tests/path_search.rs` computes it. The weighted differential
   test gains a weight of 0 among the random weights.
+
+**Landed (2026-10-13).** `dijkstra` in `pathsearch.rs` now follows the design above. With
+`path:allShortest` it records an edge into a settled node as another parent when the
+cost is equal, and it keeps popping nodes after the last target is settled until the
+next cost in the heap is higher. `Tree::paths` skips a parent that is already on the
+path it is building, so zero-weight cycles end and the paths stay simple. The other modes
+keep their earlier behaviour. The regression test `all_shortest_over_zero_weight_edges`
+in `crates/sparkles-core/tests/path_search.rs` covers A-Z1 and A-Z2 with names that put
+the target before and after the middle node in the dictionary, and with an unbound
+target. The weighted differential test now draws zero weights too and runs 40 graphs
+instead of 6.
 
 **Cypher integration** (with item 20, Tier 3, [F01](F01-cypher.md)). Phase 3, the Cypher frontend's use of this operator for
 `shortestPath` and `allShortestPaths`, waits for [F01](F01-cypher.md). Nothing in the

@@ -30,7 +30,7 @@ main() {
   cd "$(dirname "$0")/.."
 
   full=(
-    fmt:check ui:fmt:check node:fmt:check lint:doc-paths
+    fmt:check ui:fmt:check node:fmt:check lint:doc-paths test:bench-scripts
     lint ui:check fmt:wasm py:lint jvm:lint node:lint
     test ui:test lint:features
     py:test jvm:rust-test jvm:test node:test node:client:check licenses:check

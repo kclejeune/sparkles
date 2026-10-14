@@ -147,8 +147,9 @@ URL and `data`, `gsp-r` also at `get`, `patch` at the dataset URL and `patch`, `
 and `shacl` at their names, and `prefixes-r` and `prefixes-rw` at `prefixes`. An endpoint
 at one of these names converts. Any other name is unsupported, because clients would
 find nothing at its URL. The report names the URL Sparkles serves instead.
-`gsp-direct-r` and `gsp-direct-rw` turn on `--gsp-direct-naming`, which applies to every
-dataset. A custom operation or `fuseki:implementation` is unsupported.
+`gsp-direct-r` and `gsp-direct-rw` turn on `--gsp-direct-naming=NAME=read` or
+`--gsp-direct-naming=NAME=read-write` for the service's dataset. A custom operation or
+`fuseki:implementation` is unsupported.
 
 Sparkles serves every operation on every dataset. A Fuseki service without write
 endpoints is read-only. When every service is read-only, `serve.sh` gets `--read-only`.
@@ -408,6 +409,21 @@ recoverable secret that the operator did not write in plain text. `ja:literalCon
 is unsupported.
 
 ### Roadmap follow-ups (2026-10-12)
+
+**Landed for item 5 (2026-10-13): read-only direct endpoints.** A `gsp-direct-r` endpoint
+was served read-write because the converter turned both direct operations into the one
+server-wide flag, and only grants limited the writes. Direct naming now has a mode per
+dataset. `serve --gsp-direct-naming` alone still means every dataset with writes, and
+`--gsp-direct-naming=NAME` and `--gsp-direct-naming=NAME=read|read-write` (repeatable)
+name datasets. The `direct` handler in `http/fuseki.rs` answers `404` for a dataset with
+no mode and `405` with `Allow: GET, HEAD, OPTIONS` for a write to a dataset in `read`
+mode, before authorization is consulted. The converter writes one value per dataset
+(`read-write` when a service lists both operations) and no longer reports the endpoint
+as approximated. A dataset's description lists `gsp-direct-r` or `gsp-direct-rw` as its
+mode says. The tests are `read_only_direct_naming_refuses_writes` in
+`http/router_tests/fuseki.rs` and `direct_naming_is_per_dataset_and_keeps_its_mode` in
+`fuseki_config/tests.rs`. The modes come from the command line, so the setting and its
+route in C19's settings, and assembler bodies, remain with item 76 below.
 
 **Item 76 (Tier 5, [ROADMAP](../ROADMAP.md)): complete assembler bodies, and Graph Store
 direct naming per dataset.** The item's third part, JVM metrics, belongs to
