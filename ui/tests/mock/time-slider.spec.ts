@@ -201,8 +201,11 @@ test('A6: a commit the server can no longer read keeps the view and hatches the 
   await page.goto('/ui/query?at=commit%3A5');
   // the link reads commit 5, which the mock no longer holds: a toast names what is readable
   await expect(page.getByText('Commit 5 can no longer be read')).toBeVisible();
-  await expect(page.getByText(/Readable commits: 59/)).toBeVisible();
-  await expect(right(page)).toHaveAttribute('aria-valuenow', '59');
+  // the head of the mock's foaf dataset moves with the writes other specs make to it
+  const readable = page.getByText(/Readable commits: \d+\./);
+  await expect(readable).toBeVisible();
+  const head = /Readable commits: (\d+)\./.exec((await readable.textContent()) ?? '')?.[1];
+  await expect(right(page)).toHaveAttribute('aria-valuenow', head ?? '');
   await expect(page.locator('input[list="at-options"]')).toHaveValue('');
   // the track marks the stretch as gone
   await expect(slider(page).getByText('gone')).toBeVisible();
