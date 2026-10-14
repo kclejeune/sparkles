@@ -864,7 +864,7 @@ description = "Interleaved A/B of durable-commit workloads (serial commits, conc
 usage = '''
 arg "<variants>" var=#true help="NAME=REF[:FLAGS]: a revision or sparkles binary, and optional global flags to run it with"
 flag "--people <n>" default="100000" help="dataset size in people (~10.5 triples each)"
-flag "--scenarios <list>" default="serial-literal writers mixed" help="from serial-literal serial-iri serial-delete writers writers16 mixed"
+flag "--scenarios <list>" default="serial-literal writers mixed" help="from serial-literal serial-iri serial-delete writers writers16 mixed serial-message writers-message writers16-message"
 flag "--rounds <n>" default="3" help="runs of every variant and scenario, each in a fresh server process"
 flag "--changes <n>" default="3000" help="requests of the serial scenarios"
 flag "--writer-changes <n>" default="20000" help="requests of the writers scenarios"

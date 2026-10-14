@@ -79,6 +79,9 @@ scenario_args() { # <scenario> -> write-bench arguments
     writers) echo "writers --clients 4 --changes $WRITER_CHANGES" ;;
     writers16) echo "writers --clients 16 --changes $WRITER_CHANGES" ;;
     mixed) echo "mixed --clients 4 --readers 2 --changes $MIXED_CHANGES" ;;
+    serial-message) echo "serial --op literal --message a-commit-message --changes $CHANGES" ;;
+    writers-message) echo "writers --clients 4 --message a-commit-message --changes $WRITER_CHANGES" ;;
+    writers16-message) echo "writers --clients 16 --message a-commit-message --changes $WRITER_CHANGES" ;;
     *) fail "unknown scenario $1" ;;
   esac
 }

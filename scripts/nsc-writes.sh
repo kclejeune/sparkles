@@ -27,6 +27,8 @@
 #   --people N          dataset size in people, about 10.5 triples each (default 100000,
 #                       1.05M triples; 1000000 gives 10.5M)
 #   --scenarios "a b"   from serial-literal serial-iri serial-delete writers mixed writers16
+#                       and serial-message writers-message writers16-message, which give
+#                       every update a commit message
 #                       (default: serial-literal writers mixed)
 #   --rounds N          runs of every variant and scenario (default 3)
 #   --changes N         requests of the serial scenarios (default 3000)

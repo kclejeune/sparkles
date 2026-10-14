@@ -7,6 +7,7 @@
 //!     write-bench --addr 127.0.0.1:3030 --ds bench serial --op literal --changes 5000
 //!     write-bench --addr 127.0.0.1:3030 --ds bench writers --clients 4 --changes 50000
 //!     write-bench --addr 127.0.0.1:3030 --ds bench mixed --clients 4 --readers 2 --changes 5000
+//!     write-bench --addr 127.0.0.1:3030 --ds bench writers --clients 4 --message "a commit"
 //!
 //! Every update is one HTTP request that inserts or deletes one triple, sent on a kept-alive
 //! connection, so a latency is the server's whole answer. The receipts (the
@@ -149,9 +150,16 @@ fn find(h: &[u8], n: &[u8]) -> Option<usize> {
     h.windows(n.len()).position(|w| w == n)
 }
 
+/// The commit message of every update (`--message`), sent as `Sparkles-Commit-Message`.
+static MESSAGE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 fn update_request(ds: &str, addr: &str, update: &str) -> Vec<u8> {
+    let message = MESSAGE
+        .get()
+        .map(|m| format!("Sparkles-Commit-Message: {m}\r\n"))
+        .unwrap_or_default();
     format!(
-        "POST /{ds}/update HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/sparql-update\r\nContent-Length: {}\r\n\r\n{update}",
+        "POST /{ds}/update HTTP/1.1\r\nHost: {addr}\r\n{message}Content-Type: application/sparql-update\r\nContent-Length: {}\r\n\r\n{update}",
         update.len()
     )
     .into_bytes()
@@ -221,6 +229,9 @@ fn parse() -> Args {
             "--warmup" => a.warmup = val().parse().unwrap(),
             "--people" => a.people = val().parse().unwrap(),
             "--run" => a.run = val(),
+            "--message" => {
+                let _ = MESSAGE.set(val());
+            }
             s if !s.starts_with('-') && a.scenario.is_empty() => a.scenario = s.to_string(),
             s => panic!("unknown argument {s}"),
         }
