@@ -485,8 +485,19 @@ target. It permits at most one next-block extension with a bridged gap of at mos
 A separate examined-span cap bounds traversal through cached or empty spans without
 claiming they were hinted. Repeated calls at one position add no window. The bound is
 on requested coverage rather than physical device I/O. Default, disabled and small-window
-configuration tests retain the same scan-answer assertions. Further profile-accounting
-repairs and corrected-source performance gates remain pending.
+configuration tests retain the same scan-answer assertions. Profile lifetime
+synchronization and corrected-source performance gates remain pending.
+
+Vocabulary profiling now records mapped offset pages before loading their values,
+including offset reads made while preparing advice or probing a block's first key.
+Ordinary and fallible bulk decoding record front-coded data before reconstruction and
+count each traversed block once, independently of advice. Isolated tests cover disabled
+hints, disabled automatic look-ahead, advice issued before the profile, partial blocks,
+invalid IDs and early callback or reservation errors. A Linux test evicts only a private
+file's offset pages and independently checks a middle page with `mincore` before lookup.
+The profile then reports that page absent before the read and resident afterward.
+Profile lifetime synchronization remains pending, as do the corrected-source cold,
+warm and no-profile performance gates. These checks establish no speed result.
 
 ### Phase 1 breakdown
 

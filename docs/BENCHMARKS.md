@@ -472,7 +472,7 @@ These measurements predate the cancellation, decoded-cache budget and advised-co
 repairs. The corrected read-ahead path counts existing outstanding bytes and coalesced
 gaps, allows one next-block extension and restores advice after cache eviction. Its
 warm and cold measurements and no-profile overhead gate remain pending on integrated
-source. The correctness tests establish no new speed result.
+source. Vocabulary profiling also observes mapped offsets before loading them and accounts for ordinary and fallible bulk decodes independently of advice. These correctness tests establish no new speed result or counter-cost measurement.
 
 ### Full-text search
 
