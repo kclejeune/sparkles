@@ -812,3 +812,69 @@ fn secrets_key_none_and_unseal() {
     let text = std::fs::read_to_string(&log).unwrap();
     assert!(!text.contains(KEY), "the key is in the log");
 }
+
+/// An offline command source can contain the key itself, so successful rekey guidance
+/// must not echo that source or the bytes it produces.
+#[cfg(all(feature = "backup", unix))]
+#[test]
+fn rekey_guidance_never_echoes_a_command_key_source() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = tempfile::tempdir().unwrap();
+    let data = t.path().join("data");
+    let secrets = data.join("secrets");
+    std::fs::create_dir_all(&secrets).unwrap();
+    std::fs::set_permissions(&secrets, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(secrets.join("a"), "offline-runtime-value").unwrap();
+    let key_hex = "9a".repeat(32);
+    let printf = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|dir| dir.join("printf"))
+        .find(|path| path.is_absolute() && path.is_file())
+        .expect("an absolute printf executable on PATH");
+    let source = format!("command:{}", json!([printf, "%s", key_hex]));
+    let output = Command::new(BIN)
+        .args(["secrets", "rekey", "--data"])
+        .arg(&data)
+        .args(["--new-key", &source])
+        .env_remove("SPARKLES_BACKUP_CONFIG")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stored = std::fs::read(secrets.join("a")).unwrap();
+    let sealer = sparkles_backup::SecretSealer::from_key(zeroize::Zeroizing::new([0x9a; 32]));
+    assert_eq!(
+        &*sealer.open("a", &stored).unwrap(),
+        b"offline-runtime-value"
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    for text in [&stdout, &stderr] {
+        assert!(!text.contains(&key_hex), "command key leaked to CLI output");
+        assert!(
+            !text.contains(&source),
+            "command source leaked to CLI output"
+        );
+    }
+    assert!(stdout.contains("--secrets-key and the same new key source"));
+    assert!(stdout.contains("sealed 1 value(s)"));
+    // The same command source opens the value through the supported offline CLI.
+    let opened = Command::new(BIN)
+        .args(["secrets", "unseal", "--data"])
+        .arg(&data)
+        .args(["--secrets-key", &source])
+        .env_remove("SPARKLES_BACKUP_CONFIG")
+        .output()
+        .unwrap();
+    assert!(
+        opened.status.success(),
+        "{}",
+        String::from_utf8_lossy(&opened.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(secrets.join("a")).unwrap(),
+        "offline-runtime-value"
+    );
+}

@@ -93,7 +93,7 @@ pub fn run(args: SecretsArgs) -> Result<()> {
                 String::new()
             };
             println!(
-                "sealed {} value(s){already} in {} with the new key; start the server with --secrets-key {new_key}",
+                "sealed {} value(s){already} in {} with the new key; start the server with --secrets-key and the same new key source",
                 done.values,
                 data.join(secrets::SECRETS_DIR).display()
             );
