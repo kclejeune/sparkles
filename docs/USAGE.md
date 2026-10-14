@@ -2205,6 +2205,13 @@ available.
 The informational files `origin.json` and `restore.json` are the exception, because a
 store ignores a newer one with a warning.
 
+The command makes the database path absolute before mutation. If it contains `..`,
+it resolves the existing parent through the filesystem and preserves the final database
+name. This keeps a valid `db/../db` path usable during the swap and follows the physical
+meaning of symlink parents. If an interrupted run made that alias unresolvable, use the
+database's stable parent path to recover. Paths without `..` continue to support a
+missing database and new nested directories.
+
 Without `--check`, the command copies each database that has steps to run into a
 sibling directory named `.migrate-<name>` and runs the steps on the copy. It then checks
 the copy as `sparkles check` does and swaps it in with two renames. The copy needs as much

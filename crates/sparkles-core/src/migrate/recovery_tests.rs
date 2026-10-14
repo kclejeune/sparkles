@@ -61,7 +61,7 @@ fn swapped_recovery_preserves_an_unrelated_versions_kept_copy() {
 }
 
 /// Include directory entries as well as bytes, so refusal cannot create a lock file.
-fn tree(dir: &Path) -> std::collections::BTreeMap<PathBuf, Option<Vec<u8>>> {
+pub(super) fn tree(dir: &Path) -> std::collections::BTreeMap<PathBuf, Option<Vec<u8>>> {
     fn visit(
         base: &Path,
         dir: &Path,

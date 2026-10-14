@@ -567,11 +567,32 @@ fn lock_migration(root: &Path) -> Result<std::fs::File> {
     }
 }
 
-/// The path as an absolute one, without resolving symlinks and without the path having
-/// to exist. A relative root would otherwise name a different directory once the
-/// database is moved aside, and recovery has to work on a root that is missing.
+/// An absolute root that stays usable when the final directory is moved aside.
+/// Parent components follow physical filesystem semantics, including symlinks, by
+/// resolving only the existing parent. The final basename is never canonicalized.
+/// Paths without parent components keep supporting new nested or missing roots.
 fn absolute(root: &Path) -> Result<PathBuf> {
-    Ok(std::path::absolute(root)?)
+    let absolute = std::path::absolute(root)?;
+    if !absolute
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        return Ok(absolute);
+    }
+    let stable_path = |detail| {
+        Error::Invalid(format!(
+            "{}: cannot resolve the database parent ({detail}); name the database through its stable existing parent and retry",
+            root.display()
+        ))
+    };
+    let name = absolute
+        .file_name()
+        .ok_or_else(|| stable_path("no final database name".to_string()))?;
+    let parent = absolute
+        .parent()
+        .ok_or_else(|| stable_path("no parent directory".to_string()))?;
+    let parent = std::fs::canonicalize(parent).map_err(|e| stable_path(e.to_string()))?;
+    Ok(parent.join(name))
 }
 
 fn sync_parent(root: &Path) -> Result<()> {
@@ -748,6 +769,8 @@ fn migrate_planned_with(
     Ok((plan, Some(out)))
 }
 
+#[cfg(test)]
+mod path_tests;
 #[cfg(test)]
 mod recovery_tests;
 

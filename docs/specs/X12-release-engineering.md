@@ -697,8 +697,14 @@ including for branch roots. Migration recovery checks the locked file's identity
 allowing the pending state it must finish. A backup restore also refuses to publish over
 a database with a pending migration, even when the target directory is missing, and
 verifies its target lock's identity after checking pending state. Backup captures and clones leave out the migration check mark.
-The command resolves a relative `--loc` to an absolute path, refuses symlinks and special
-files, and does not start while `.pre-migrate-<version>-<name>` exists. Unit tests interrupt the run
+The command resolves a relative `--loc` to an absolute path. When the input has parent
+components, it canonicalizes the existing parent before mutation and appends the final
+basename unchanged. This respects physical symlink-parent semantics and keeps renames
+independent of a root component that the first rename removes. An alias whose parent no
+longer resolves refuses before mutation with guidance to use the stable existing parent.
+Inputs without parent components still support new nested and missing roots. The
+command refuses symlinks and special files within the database, and does not start while
+`.pre-migrate-<version>-<name>` exists. Unit tests interrupt the run
 at each point and check the result, and cover a check during a copy, a live store, the
 lock file's name and a root that reappears next to a checked copy. One step is registered: a legacy delta
 vocabulary to the framed format, which is the lazy upgrade of §4.3 run ahead of time. The
@@ -728,7 +734,8 @@ count, and after a write and a compaction the new log has its header and `datase
 names this release. A second test raises the fixture's index format to 99 and checks
 the refusals of `migrate --check`, `query` and the catalog.
 
-Not built in this phase: the CHANGELOG's **Format** heading (Phase 1 adds the
-CHANGELOG), the fixture job of the release workflow, `sparkles --version --verbose`, and
+A minimal Unreleased **Format** note records checked migration state in `CHANGELOG.md`.
+The broader Phase 1 changelog and release work remain pending. Not built in this phase
+are the fixture job of the release workflow, `sparkles --version --verbose`, and
 the background rebuild of a vector or spatial index whose file version is unknown, which
 already happens for the full-text index (A12).
