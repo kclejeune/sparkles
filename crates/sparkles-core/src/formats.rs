@@ -357,6 +357,60 @@ pub const MIGRATION_STATE: FileKind = FileKind {
     reads: &[1],
 };
 
+/// The family prefix of a sealed server runtime secret, including unknown versions.
+pub const SEALED_SECRET_FAMILY: &str = "sparkles-sealed-secret/";
+/// The exact existing v1 writer prefix, checked against [`RUNTIME_SECRETS`].
+pub const SEALED_SECRET_PREFIX: &str = "sparkles-sealed-secret/1 ";
+
+/// Server runtime-secret files. Version 0 means raw plaintext at the server wrapper,
+/// never an authenticated `/0` envelope.
+pub const RUNTIME_SECRETS: FileKind = FileKind {
+    id: "runtime-secrets",
+    files: "secrets/NAME in the server data directory",
+    marker: "raw plaintext 0, or `sparkles-sealed-secret/1 ` for sealed values",
+    class: Class::Primary,
+    writes: 1,
+    reads: &[0, 1],
+};
+
+/// The existing raw generated key, parsed and permission-checked by the server.
+pub const SECRETS_KEY: FileKind = FileKind {
+    id: "secrets-key",
+    files: "secrets.key in the server data directory",
+    marker: "unversioned opaque key material",
+    class: Class::Primary,
+    writes: 0,
+    reads: &[0],
+};
+
+/// Check the envelope version without authenticating its body. Raw plaintext is 0
+/// for the server wrapper; an encrypted `/0` envelope is never supported.
+pub fn secret_version(stored: &[u8]) -> Result<u32> {
+    let Some(body) = stored.strip_prefix(SEALED_SECRET_FAMILY.as_bytes()) else {
+        return Ok(0);
+    };
+    let malformed = || Error::Corrupt("malformed runtime secret envelope version".into());
+    let end = body.iter().position(|b| *b == b' ').ok_or_else(malformed)?;
+    let field = &body[..end];
+    if field.is_empty() || !field.iter().all(u8::is_ascii_digit) {
+        return Err(malformed());
+    }
+    let version: u32 = std::str::from_utf8(field)
+        .map_err(|_| malformed())?
+        .parse()
+        .map_err(|_| malformed())?;
+    if version != RUNTIME_SECRETS.writes {
+        return Err(Error::Unsupported(format!(
+            "runtime secret envelope version {version} is not supported; this build reads sealed version {}",
+            RUNTIME_SECRETS.writes
+        )));
+    }
+    if !stored.starts_with(SEALED_SECRET_PREFIX.as_bytes()) {
+        return Err(malformed());
+    }
+    Ok(version)
+}
+
 /// Every file kind except the settings files, which [`SETTINGS`] lists.
 pub const KINDS: &[&FileKind] = &[
     &DATASET,
@@ -371,6 +425,8 @@ pub const KINDS: &[&FileKind] = &[
     &LINK,
     &CATALOG,
     &MIGRATION_STATE,
+    &RUNTIME_SECRETS,
+    &SECRETS_KEY,
     &TEXT,
     &VECTOR,
     &GEO,
@@ -697,6 +753,29 @@ pub fn report() -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_secret_reader_windows_are_registered() {
+        let secrets = kind("runtime-secrets").expect("runtime secret files must be registered");
+        assert_eq!(secrets.writes, 1);
+        assert_eq!(secrets.reads, [0, 1]);
+        assert_eq!(secrets.class, Class::Primary);
+        let key = kind("secrets-key").expect("opaque generated keys must be registered");
+        assert_eq!(key.writes, 0);
+        assert_eq!(key.reads, [0]);
+        assert_eq!(key.class, Class::Primary);
+        assert!(settings_file("secrets.key").is_none());
+        assert_eq!(
+            SEALED_SECRET_PREFIX,
+            format!("{SEALED_SECRET_FAMILY}{} ", secrets.writes)
+        );
+        assert_eq!(secret_version(b"legacy plaintext").unwrap(), 0);
+        assert_eq!(secret_version(SEALED_SECRET_PREFIX.as_bytes()).unwrap(), 1);
+        for version in ["0", "2", "x", "4294967296", "", "+1", "01"] {
+            let bytes = format!("{SEALED_SECRET_FAMILY}{version} body");
+            assert!(secret_version(bytes.as_bytes()).is_err());
+        }
+    }
 
     /// The module constants agree with the table.
     #[test]

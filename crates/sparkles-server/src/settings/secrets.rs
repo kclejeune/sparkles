@@ -95,7 +95,7 @@ impl SecretValue {
 
 /// The start of a sealed value, as `sparkles_backup::SEALED_SECRET_PREFIX` writes it. A
 /// build without the `backup` feature still recognizes sealed files.
-const SEALED_MARK: &str = "sparkles-sealed-secret/";
+const SEALED_MARK: &str = sparkles::formats::SEALED_SECRET_FAMILY;
 
 fn is_sealed(bytes: &[u8]) -> bool {
     bytes.starts_with(SEALED_MARK.as_bytes())
@@ -474,6 +474,8 @@ impl Sealing {
     /// The value in `stored` of the secret `name`, opened when it is sealed. The error
     /// never holds the value.
     fn open(&self, name: &str, stored: Vec<u8>) -> Result<Plain, String> {
+        sparkles::formats::secret_version(&stored)
+            .map_err(|e| format!("cannot open secret {name}: {e}"))?;
         if !is_sealed(&stored) {
             #[cfg(feature = "backup")]
             let stored = zeroize::Zeroizing::new(stored);
@@ -518,6 +520,10 @@ impl Sealing {
         for name in stored_names_strict(dir)? {
             let bytes = std::fs::read(dir.join(&name))
                 .map_err(|e| anyhow::anyhow!("cannot read secret {name}: {e}"))?;
+            // Refuse unsupported envelopes before authentication fallback can hide
+            // the version error as an ordinary wrong-key failure.
+            sparkles::formats::secret_version(&bytes)
+                .map_err(|e| anyhow::anyhow!("cannot open secret {name}: {e}"))?;
             let was_sealed = is_sealed(&bytes);
             let kept = (was_sealed && next.is_some()).then(|| bytes.clone());
             let (held, value) = match self.open(&name, bytes) {
@@ -1584,6 +1590,76 @@ mod tests {
             let target = Sealing::start(Some(&source), &data).unwrap();
             assert_eq!(target.read(&dir.join("a"), "a").unwrap(), "value-a");
             assert_eq!(target.read(&dir.join("b"), "b").unwrap(), "value-b");
+        }
+    }
+
+    #[cfg(all(feature = "backup", unix))]
+    #[test]
+    fn unsupported_envelopes_leave_live_files_and_keys_unchanged() {
+        for version in ["0", "2", "x", "4294967296", "", "+1", "01"] {
+            for generated in [false, true] {
+                let (_t, data, source) = offline_fixture();
+                let dir = data.join(SECRETS_DIR);
+                let current = Sealing::start(None, &data).unwrap();
+                if generated {
+                    current.write(&dir, "a", b"legitimate").unwrap();
+                } else {
+                    std::fs::write(dir.join("a"), "legitimate").unwrap();
+                }
+                std::fs::write(dir.join("b"), format!("{SEALED_MARK}{version} body")).unwrap();
+                let before = ["a", "b"].map(|n| std::fs::read(dir.join(n)).unwrap());
+                let key = data.join(SECRETS_KEY_FILE);
+                let old_key = std::fs::read(&key).ok();
+                for operation in ["prepare", "unseal", "rekey"] {
+                    let result = match operation {
+                        "prepare" => current.prepare(&dir).map(|_| ()),
+                        "unseal" => unseal(&data, None).map(|_| ()),
+                        _ => rekey(&data, None, &source).map(|_| ()),
+                    };
+                    let e = result.unwrap_err();
+                    assert!(format!("{e:#}").contains("version"), "{e:#}");
+                    assert_eq!(
+                        ["a", "b"].map(|n| std::fs::read(dir.join(n)).unwrap()),
+                        before
+                    );
+                    assert_eq!(std::fs::read(&key).ok(), old_key);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn plaintext_opt_out_preserves_the_existing_raw_value() {
+        let t = tempfile::tempdir().unwrap();
+        let data = t.path().join("data");
+        let dir = data.join(SECRETS_DIR);
+        private_dir(&dir).unwrap();
+        std::fs::write(dir.join("a"), "plaintext-value").unwrap();
+        let plain = Sealing::start(Some("none"), &data).unwrap();
+        plain.prepare(&dir).unwrap();
+        assert_eq!(plain.read(&dir.join("a"), "a").unwrap(), "plaintext-value");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a")).unwrap(),
+            "plaintext-value"
+        );
+        assert!(!data.join(SECRETS_KEY_FILE).exists());
+    }
+
+    #[cfg(not(feature = "backup"))]
+    #[test]
+    fn sealed_envelopes_are_refused_without_backup_support() {
+        let t = tempfile::tempdir().unwrap();
+        let data = t.path().join("data");
+        let dir = data.join(SECRETS_DIR);
+        private_dir(&dir).unwrap();
+        for version in ["0", "1", "2", "x", "4294967296"] {
+            let bytes = format!("{SEALED_MARK}{version} body");
+            std::fs::write(dir.join("a"), &bytes).unwrap();
+            let current = Sealing::start(None, &data).unwrap();
+            assert!(current.prepare(&dir).is_err());
+            assert!(unseal(&data, None).is_err());
+            assert_eq!(std::fs::read_to_string(dir.join("a")).unwrap(), bytes);
+            assert!(!data.join(SECRETS_KEY_FILE).exists());
         }
     }
 
