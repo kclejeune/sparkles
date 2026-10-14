@@ -308,15 +308,13 @@ impl Drop for Ticket {
 
 /// Bytes reserved from a [`QueryPool`] for one query, returned when the last owner drops.
 ///
-/// The grant keeps the live total of every context that holds it, so that contexts which
-/// share a grant (the WHERE contexts of an update, the contexts of one request) add up.
+/// The grant adds every eager context's admitted peak to live cursor and direct
+/// charges. Contexts sharing one request grant retain independent ownership.
 pub struct PoolGrant {
     pool: Arc<QueryPool>,
     granted: AtomicU64,
-    /// bytes charged by every context that holds this grant
+    /// Sum of eager context contributions, live cursor charges and direct charges.
     used: AtomicU64,
-    /// the grant never trims below this (eager peaks)
-    floor: AtomicU64,
     /// the most the grant has held
     peak: AtomicU64,
     /// serializes growth and trimming of this grant
@@ -338,7 +336,6 @@ impl PoolGrant {
             pool,
             granted: AtomicU64::new(bytes),
             used: AtomicU64::new(0),
-            floor: AtomicU64::new(0),
             peak: AtomicU64::new(bytes),
             resize: Mutex::new(()),
         }
@@ -404,18 +401,6 @@ impl PoolGrant {
         Ok(())
     }
 
-    /// Cover an eager operator's checked output of `bytes` and keep that coverage until
-    /// the grant drops. The grant never trims below the highest peak held this way, so a
-    /// result that outlives the charges that built it keeps its share of the pool. On
-    /// failure the floor is unchanged.
-    pub fn hold_peak(&self, bytes: u64) -> Result<(), Error> {
-        let _lock = self.resize.lock();
-        self.grow_locked(bytes)?;
-        let floor = round_up(bytes).min(self.pool.capacity);
-        self.floor.fetch_max(floor, Ordering::SeqCst);
-        Ok(())
-    }
-
     /// Cover a cursor operator's checked output of `bytes` for now. The coverage goes
     /// back with the next trim, since cursor operators charge what they keep.
     pub fn cover_transient(&self, bytes: u64) -> Result<(), Error> {
@@ -471,12 +456,7 @@ impl PoolGrant {
     fn trim_slow(&self) {
         let _lock = self.resize.lock();
         let cur = self.granted.load(Ordering::SeqCst);
-        let keep = |used: u64| {
-            round_up(used)
-                .max(self.floor.load(Ordering::SeqCst))
-                .max(INITIAL_GRANT.min(cur))
-                .min(cur)
-        };
+        let keep = |used: u64| round_up(used).max(INITIAL_GRANT.min(cur)).min(cur);
         let t1 = keep(self.used.load(Ordering::SeqCst));
         if t1 >= cur {
             return;

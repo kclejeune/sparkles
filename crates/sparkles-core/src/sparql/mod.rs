@@ -90,8 +90,8 @@ pub struct QueryOptions {
     pub base_iri: Option<String>,
     /// Maximum rows in an intermediate table or distinct CONSTRUCT graph output.
     pub max_rows: Option<usize>,
-    /// Budget for the estimated memory of intermediate results and retained CONSTRUCT
-    /// output (`None`: unlimited);
+    /// Budget for the estimated memory of intermediate results and retained decoded
+    /// graph output (`None`: unlimited);
     /// exceeding it fails with [`Error::BudgetExceeded`].
     pub max_memory_bytes: Option<u64>,
     /// The query's reservation in a server-wide memory pool (see [`pool`]). The server
@@ -298,7 +298,7 @@ pub struct QueryResult {
     pub quads: Vec<Quad>,
     pub plan: PlanInfo,
     pub timing: Timing,
-    /// Peak estimated memory of intermediate results and CONSTRUCT output (see
+    /// Peak estimated memory of intermediate results and decoded graph output (see
     /// [`QueryOptions::max_memory_bytes`]).
     pub mem_peak_bytes: u64,
     /// Rows produced by all operators and distinct CONSTRUCT output (see

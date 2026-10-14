@@ -421,8 +421,13 @@ pub struct Ctx {
     /// estimated bytes of the tables currently held by running operators
     mem_live: AtomicU64,
     /// the bytes reserved from the server's query memory pool for this query, which
-    /// follows `mem_live` (`None`: no pool)
+    /// follows live cursor charges or this eager context's admitted peak (`None`: no pool)
     pub grant: Option<Arc<super::pool::PoolGrant>>,
+    /// This eager context's contribution to its grant, retained until context drop.
+    /// Unlike mem_peak, this counts only successfully admitted estimates.
+    eager_reserved: AtomicU64,
+    /// Serializes only increases of this context's admitted contribution.
+    eager_resize: parking_lot::Mutex<()>,
     /// highest estimate seen (held tables plus an output under construction)
     mem_peak: AtomicU64,
     /// Budget for the rows all operators produce together (`u64::MAX`: unlimited). See
@@ -517,6 +522,8 @@ impl Ctx {
             mem_limit: u64::MAX,
             mem_live: AtomicU64::new(0),
             grant: None,
+            eager_reserved: AtomicU64::new(0),
+            eager_resize: Default::default(),
             mem_peak: AtomicU64::new(0),
             max_rows_produced: u64::MAX,
             rows_produced: Arc::new(AtomicU64::new(0)),
@@ -772,6 +779,15 @@ impl Ctx {
             owner: Default::default(),
             regex: Default::default(),
         }));
+        // Preparation may already have admitted an eager peak. Its live state now
+        // belongs to the cursor; transfer that ownership without charging it twice,
+        // and return the excess conservative peak that cursor execution will not pin.
+        let retained = self.eager_reserved.swap(0, Ordering::AcqRel);
+        if let Some(grant) = &self.grant {
+            let live = *self.mem_live.get_mut();
+            debug_assert!(retained >= live);
+            grant.release(retained - live);
+        }
         self.use_cache = false;
         self.opt.sampled_filters = false;
         #[cfg(feature = "geo")]
@@ -833,7 +849,9 @@ impl Ctx {
     #[inline]
     fn release_live(&self, bytes: u64) {
         self.mem_live.fetch_sub(bytes, Ordering::SeqCst);
-        if let Some(g) = &self.grant {
+        if self.is_cursor()
+            && let Some(g) = &self.grant
+        {
             g.release(bytes);
         }
     }
@@ -1012,24 +1030,39 @@ impl Ctx {
             return Err(self.memory_exceeded(need));
         }
         if let Some(g) = &self.grant {
-            // The pool sees at least what the budget sees. An eager context keeps its
-            // highest checked estimate until it drops, since its result outlives the
-            // charges that built it. A cursor context covers it for now, since cursor
-            // operators charge what they keep.
-            let need = g.used().saturating_add(table_bytes(rows, width));
-            if need > g.granted() {
-                if self.is_cursor() {
+            if self.is_cursor() {
+                let need = g.used().saturating_add(table_bytes(rows, width));
+                if need > g.granted() {
                     g.cover_transient(need)?;
-                } else {
-                    g.hold_peak(need)?;
                 }
+            } else {
+                self.retain_eager_estimate(need)?;
             }
         }
         Ok(())
     }
 
-    /// Hold `bytes` of estimated memory until the returned guard drops (see
-    /// [`Charge::add`]).
+    /// Admit only this eager context's increase, independently of other contexts
+    /// using its grant. Already covered estimates do not acquire the growth lock.
+    #[inline]
+    fn retain_eager_estimate(&self, need: u64) -> Result<()> {
+        let Some(grant) = &self.grant else {
+            return Ok(());
+        };
+        if need <= self.eager_reserved.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let _lock = self.eager_resize.lock();
+        let held = self.eager_reserved.load(Ordering::Relaxed);
+        if need > held {
+            grant.charge(need - held)?;
+            self.eager_reserved.store(need, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    /// Hold `bytes` against the local budget until the guard drops. An eager
+    /// context also retains its admitted pool peak until the context drops.
     pub fn charge(&self, bytes: u64) -> Result<Charge<'_>> {
         let c = Charge {
             ctx: self,
@@ -1519,11 +1552,16 @@ impl Charge<'_> {
             })
             .map_err(|live| ctx.memory_exceeded(live.saturating_add(bytes)))?;
         let live = prior + bytes;
-        if let Some(g) = &ctx.grant
-            && let Err(e) = g.charge(bytes)
-        {
-            ctx.mem_live.fetch_sub(bytes, Ordering::SeqCst);
-            return Err(e);
+        if let Some(g) = &ctx.grant {
+            let admitted = if ctx.is_cursor() {
+                g.charge(bytes)
+            } else {
+                ctx.retain_eager_estimate(live)
+            };
+            if let Err(error) = admitted {
+                ctx.mem_live.fetch_sub(bytes, Ordering::SeqCst);
+                return Err(error);
+            }
         }
         self.bytes.set(owned);
         ctx.note_peak(live);
@@ -1532,11 +1570,16 @@ impl Charge<'_> {
 }
 
 impl Drop for Ctx {
-    /// Return what the context still holds in its grant. That covers bytes that
-    /// `retain_cursor_bytes` forgot, and retained charges whose owner is gone.
+    /// Return only this context's ownership. Eager contexts own their admitted peak;
+    /// cursor contexts own remaining live charges, including weak retained state.
     fn drop(&mut self) {
         if let Some(g) = &self.grant {
-            g.release(*self.mem_live.get_mut());
+            let bytes = if self.cursor_memory.is_some() {
+                *self.mem_live.get_mut()
+            } else {
+                *self.eager_reserved.get_mut()
+            };
+            g.release(bytes);
         }
     }
 }
@@ -1732,6 +1775,140 @@ mod charge_tests {
         let mut ctx = Ctx::new(store.snapshot());
         ctx.grant = Some(grant.clone());
         ctx
+    }
+
+    #[test]
+    fn a_fitting_eager_output_remains_owned_until_context_drop() {
+        let store = Store::in_memory(StoreOptions::default());
+        let pool = super::super::pool::QueryPool::new(128 * MIB);
+        let grant = Arc::new(pool.try_grant(100 * MIB).unwrap());
+        let ctx = pooled(&store, &grant);
+        let held = ctx.charge(80 * MIB).unwrap();
+        ctx.check_output((20 * MIB / 8) as usize, 1).unwrap();
+        drop(held);
+        assert_eq!(grant.used(), 100 * MIB);
+        assert!(grant.granted() >= 100 * MIB);
+        drop(ctx);
+        assert_eq!(grant.used(), 0);
+        assert_eq!(grant.granted(), 16 * MIB);
+    }
+
+    #[test]
+    fn fitting_eager_contexts_own_distinct_contributions() {
+        let store = Store::in_memory(StoreOptions::default());
+        let pool = super::super::pool::QueryPool::new(128 * MIB);
+        let grant = Arc::new(pool.try_grant(100 * MIB).unwrap());
+        let one = pooled(&store, &grant);
+        let two = pooled(&store, &grant);
+        one.check_output((40 * MIB / 8) as usize, 1).unwrap();
+        two.check_output((24 * MIB / 8) as usize, 1).unwrap();
+        assert_eq!(grant.used(), 64 * MIB);
+        drop(one);
+        assert_eq!(grant.used(), 24 * MIB);
+        drop(two);
+        assert_eq!(grant.used(), 0);
+    }
+
+    #[test]
+    fn eager_live_and_output_estimates_do_not_count_live_bytes_twice() {
+        let store = Store::in_memory(StoreOptions::default());
+        let pool = super::super::pool::QueryPool::new(64 * MIB);
+        let grant = Arc::new(pool.empty_grant());
+        let ctx = pooled(&store, &grant);
+        let held = ctx.charge(40 * MIB).unwrap();
+        ctx.check_output((20 * MIB / 8) as usize, 1).unwrap();
+        assert_eq!(grant.used(), 60 * MIB);
+        ctx.check_output((10 * MIB / 8) as usize, 1).unwrap();
+        assert_eq!(grant.used(), 60 * MIB);
+        drop(held);
+        assert_eq!(grant.used(), 60 * MIB);
+        drop(ctx);
+        assert_eq!(grant.used(), 0);
+    }
+
+    #[test]
+    fn rejected_eager_estimates_preserve_the_successful_contribution() {
+        let store = Store::in_memory(StoreOptions::default());
+        let pool = super::super::pool::QueryPool::new(32 * MIB);
+        let grant = Arc::new(pool.empty_grant());
+        let mut ctx = pooled(&store, &grant);
+        ctx.mem_limit = 48 * MIB;
+        drop(ctx.charge(24 * MIB).unwrap());
+        assert!(matches!(ctx.charge(40 * MIB), Err(Error::BudgetExceeded(b))
+            if b.kind == BudgetKind::ServerMemory));
+        assert!(matches!(ctx.check_output((56 * MIB / 8) as usize, 1),
+            Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory));
+        assert_eq!(ctx.mem_live.load(Ordering::SeqCst), 0);
+        assert_eq!(grant.used(), 24 * MIB);
+        drop(ctx.charge(0).unwrap());
+        ctx.check_output(0, 0).unwrap();
+        assert_eq!(grant.used(), 24 * MIB);
+        drop(ctx);
+        assert_eq!(grant.used(), 0);
+    }
+
+    #[test]
+    fn concurrent_eager_peaks_reserve_only_the_local_maximum() {
+        let store = Store::in_memory(StoreOptions::default());
+        let pool = super::super::pool::QueryPool::new(64 * MIB);
+        let grant = Arc::new(pool.empty_grant());
+        let ctx = pooled(&store, &grant);
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            for bytes in [24 * MIB, 40 * MIB] {
+                let (ctx, barrier) = (&ctx, &barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    ctx.check_output((bytes / 8) as usize, 1).unwrap();
+                });
+            }
+        });
+        assert_eq!(grant.used(), 40 * MIB);
+        drop(ctx);
+        assert_eq!(grant.used(), 0);
+    }
+
+    #[test]
+    fn eager_and_cursor_ownership_share_a_grant_without_pinning_cursor_peaks() {
+        let store = Store::in_memory(StoreOptions::default());
+        let pool = super::super::pool::QueryPool::new(128 * MIB);
+        let grant = Arc::new(pool.empty_grant());
+        let eager = pooled(&store, &grant);
+        eager.check_output((24 * MIB / 8) as usize, 1).unwrap();
+        let mut cursor = pooled(&store, &grant);
+        cursor.enable_cursor_accounting().unwrap();
+        let held = cursor.charge(48 * MIB).unwrap();
+        assert_eq!(grant.used(), 72 * MIB);
+        drop(held);
+        assert_eq!(grant.used(), 24 * MIB);
+        assert!(grant.granted() <= 32 * MIB);
+        drop(eager);
+        assert_eq!(grant.used(), 0);
+        drop(cursor);
+        drop(grant);
+        assert_eq!(pool.granted(), 0);
+    }
+
+    #[test]
+    fn cursor_transition_reconciles_prepared_local_terms_and_eager_peaks() {
+        let store = Store::in_memory(StoreOptions::default());
+        let pool = super::super::pool::QueryPool::new(128 * MIB);
+        let grant = Arc::new(pool.empty_grant());
+        let mut ctx = pooled(&store, &grant);
+        ctx.check_output((64 * MIB / 8) as usize, 1).unwrap();
+        let term = Term::Literal(oxrdf::Literal::new_simple_literal("x".repeat(MIB as usize)));
+        let id = ctx.intern_term(&term);
+        assert!(ctx.local_len() > 0);
+        ctx.enable_cursor_accounting().unwrap();
+        let live = ctx.mem_live.load(Ordering::SeqCst);
+        assert!(live >= MIB);
+        assert_eq!(grant.used(), live);
+        assert!(grant.granted() <= 16 * MIB);
+        assert_eq!(ctx.term(id), Some(term));
+        drop(ctx);
+        assert_eq!(grant.used(), 0);
+        drop(grant);
+        assert_eq!(pool.granted(), 0);
     }
 
     #[test]

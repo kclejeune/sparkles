@@ -19,7 +19,7 @@
 //! (`?r rdf:subject s ; rdf:predicate p ; rdf:object o`). Options add the labels of the
 //! IRIs the description links to, and bound its depth and its size.
 
-use super::ctx::{Ctx, PlanWarning, RetainedCharge, TermKind};
+use super::ctx::{Charge, Ctx, PlanWarning, RetainedCharge, TermKind};
 use super::plan::GraphFilter;
 use super::table::Table;
 use crate::error::{Error, Result};
@@ -203,11 +203,43 @@ impl DescribeOptions {
     }
 }
 
+/// Traversal estimates borrow an eager context, while cursor state keeps its existing
+/// weak owner. Both paths check the same lexical and container estimates.
+struct DescriptionCharge<'a> {
+    inner: DescriptionChargeKind<'a>,
+    bytes: u64,
+}
+
+enum DescriptionChargeKind<'a> {
+    Eager(Charge<'a>),
+    Cursor(RetainedCharge),
+}
+
+impl<'a> DescriptionCharge<'a> {
+    fn new(ctx: &'a Ctx, bytes: u64) -> Result<Self> {
+        let inner = match ctx.retained_charge(bytes)? {
+            Some(charge) => DescriptionChargeKind::Cursor(charge),
+            None => DescriptionChargeKind::Eager(ctx.charge(bytes)?),
+        };
+        Ok(Self { inner, bytes })
+    }
+
+    fn resize(&mut self, bytes: u64) -> Result<()> {
+        debug_assert!(bytes >= self.bytes, "DESCRIBE estimates only grow");
+        match &mut self.inner {
+            DescriptionChargeKind::Eager(charge) => charge.add(bytes - self.bytes)?,
+            DescriptionChargeKind::Cursor(charge) => charge.resize(bytes)?,
+        }
+        self.bytes = bytes;
+        Ok(())
+    }
+}
+
 /// The triples of a DESCRIBE, and whether [`DescribeOptions::max_triples`] cut them short.
-pub(super) struct Described {
+pub(super) struct Described<'a> {
     pub triples: Vec<Triple>,
     pub truncated: bool,
-    pub _charge: Option<RetainedCharge>,
+    _charge: DescriptionCharge<'a>,
 }
 
 /// A graph a description reads: the query's default graph, or one named graph.
@@ -255,7 +287,7 @@ struct Describer<'a> {
     linked: FxHashSet<(Id, Source)>,
     queue: Vec<Item>,
     truncated: bool,
-    charge: Option<RetainedCharge>,
+    charge: DescriptionCharge<'a>,
     bytes: u64,
 }
 
@@ -263,14 +295,14 @@ struct Describer<'a> {
 /// query or the protocol gave a dataset (or the inference overlay changed the default
 /// graph). Without one, the default graph is the store's default graph, as in Jena,
 /// even when the store's queries see the union of its named graphs.
-pub(super) fn describe(
-    ctx: &Ctx,
+pub(super) fn describe<'a>(
+    ctx: &'a Ctx,
     t: &Table,
-    opts: &DescribeOptions,
+    opts: &'a DescribeOptions,
     explicit: bool,
-) -> Result<Described> {
+) -> Result<Described<'a>> {
     let _resource_charge =
-        ctx.retained_charge(t.mem_bytes().saturating_mul(8).saturating_add(4096))?;
+        DescriptionCharge::new(ctx, t.mem_bytes().saturating_mul(8).saturating_add(4096))?;
     let mut resources: Vec<Id> = Vec::new();
     let mut seen_r = FxHashSet::default();
     for col in &t.cols {
@@ -349,7 +381,7 @@ pub(super) fn describe(
         linked: FxHashSet::default(),
         queue: Vec::new(),
         truncated: false,
-        charge: ctx.retained_charge(4096)?,
+        charge: DescriptionCharge::new(ctx, 4096)?,
         bytes: 4096,
     };
     for r in resources {
@@ -381,30 +413,30 @@ pub(super) fn describe(
     })
 }
 
-struct Quads {
+struct Quads<'a> {
     values: Vec<[Id; 4]>,
-    _charge: Option<RetainedCharge>,
+    _charge: DescriptionCharge<'a>,
 }
-impl std::ops::Deref for Quads {
+impl std::ops::Deref for Quads<'_> {
     type Target = [[Id; 4]];
     fn deref(&self) -> &Self::Target {
         &self.values
     }
 }
-struct QuadIter {
+struct QuadIter<'a> {
     values: std::vec::IntoIter<[Id; 4]>,
-    _charge: Option<RetainedCharge>,
+    _charge: DescriptionCharge<'a>,
 }
-impl Iterator for QuadIter {
+impl Iterator for QuadIter<'_> {
     type Item = [Id; 4];
     fn next(&mut self) -> Option<Self::Item> {
         self.values.next()
     }
 }
-impl IntoIterator for Quads {
+impl<'a> IntoIterator for Quads<'a> {
     type Item = [Id; 4];
-    type IntoIter = QuadIter;
-    fn into_iter(self) -> QuadIter {
+    type IntoIter = QuadIter<'a>;
+    fn into_iter(self) -> Self::IntoIter {
         QuadIter {
             values: self.values.into_iter(),
             _charge: self._charge,
@@ -412,13 +444,10 @@ impl IntoIterator for Quads {
     }
 }
 
-impl Describer<'_> {
+impl<'a> Describer<'a> {
     fn reserve(&mut self, bytes: u64) -> Result<()> {
-        if let Some(charge) = &mut self.charge {
-            self.bytes = self.bytes.saturating_add(bytes);
-            charge.resize(self.bytes)?;
-        }
-        Ok(())
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.charge.resize(self.bytes)
     }
 
     fn push(&mut self, node: Id, src: Option<Source>, dir: Dir, level: u32) -> Result<()> {
@@ -457,21 +486,19 @@ impl Describer<'_> {
 
     /// The quads whose permuted key starts with `prefix`, as `[s, p, o, g]`. The `rows`
     /// budget, the deadline and cancellation stop a scan of a hub's many quads.
-    fn quads(&self, perm: Perm, prefix: &[u64]) -> Result<Quads> {
+    fn quads(&self, perm: Perm, prefix: &[u64]) -> Result<Quads<'a>> {
         let mut keys = Vec::new();
-        let mut charge = self.ctx.retained_charge(1024)?;
+        let mut charge = DescriptionCharge::new(self.ctx, 1024)?;
         self.ctx.snap.scan(perm, prefix, |c| {
             let added = match &c {
                 Chunk::Block(_, s, e) => e - s,
                 Chunk::Row(_) => 1,
             };
-            if let Some(charge) = &mut charge {
-                charge.resize(
-                    (keys.len().saturating_add(added) as u64)
-                        .saturating_mul(128)
-                        .saturating_add(1024),
-                )?;
-            }
+            charge.resize(
+                (keys.len().saturating_add(added) as u64)
+                    .saturating_mul(128)
+                    .saturating_add(1024),
+            )?;
             match c {
                 Chunk::Block(b, s, e) => keys.extend((s..e).map(|i| b.key(i))),
                 Chunk::Row(k) => keys.push(k),
@@ -567,12 +594,10 @@ impl Describer<'_> {
             self.truncated = true;
             return Ok(());
         }
-        if self.charge.is_some() {
-            let bytes = [s, p, o].iter().try_fold(512u64, |bytes, id| {
-                Ok::<_, Error>(bytes.saturating_add(self.ctx.decoded_bytes(*id)?.saturating_mul(4)))
-            })?;
-            self.reserve(bytes)?;
-        }
+        let bytes = [s, p, o].iter().try_fold(512u64, |bytes, id| {
+            Ok::<_, Error>(bytes.saturating_add(self.ctx.decoded_bytes(*id)?.saturating_mul(4)))
+        })?;
+        self.reserve(bytes)?;
         if let Some(q) = self.ctx.snap.quad_to_terms(&[s, p, o, Id::DEFAULT_GRAPH]) {
             self.out.push(Triple::new(q.subject, q.predicate, q.object));
         }
@@ -583,16 +608,10 @@ impl Describer<'_> {
     /// and RDF 1.1's `?r rdf:subject s ; rdf:predicate p ; rdf:object o`.
     fn reifiers_of(&mut self, s: Id, p: Id, o: Id, src: Source) -> Result<Vec<Id>> {
         if !self.reifiers.contains_key(&(s, p, o)) {
-            let _decode_charge = if self.charge.is_some() {
-                let bytes = [s, p, o].iter().try_fold(1024u64, |bytes, id| {
-                    Ok::<_, Error>(
-                        bytes.saturating_add(self.ctx.decoded_bytes(*id)?.saturating_mul(8)),
-                    )
-                })?;
-                self.ctx.retained_charge(bytes)?
-            } else {
-                None
-            };
+            let bytes = [s, p, o].iter().try_fold(1024u64, |bytes, id| {
+                Ok::<_, Error>(bytes.saturating_add(self.ctx.decoded_bytes(*id)?.saturating_mul(8)))
+            })?;
+            let _decode_charge = DescriptionCharge::new(self.ctx, bytes)?;
             let mut found: Vec<(Id, u64)> = Vec::new();
             if let Some(reifies) = self.reifies
                 && let Some(q) = self.ctx.snap.quad_to_terms(&[s, p, o, Id::DEFAULT_GRAPH])
@@ -636,9 +655,7 @@ impl Describer<'_> {
             .iter()
             .filter_map(|p| self.ctx.snap.lookup_iri(p))
             .collect();
-        let _linked_charge = self
-            .ctx
-            .retained_charge(self.linked.len() as u64 * 64 + 256)?;
+        let _linked_charge = DescriptionCharge::new(self.ctx, self.linked.len() as u64 * 64 + 256)?;
         let mut linked: Vec<(Id, Source)> = self.linked.iter().copied().collect();
         linked.sort_unstable_by_key(|(x, s)| {
             (

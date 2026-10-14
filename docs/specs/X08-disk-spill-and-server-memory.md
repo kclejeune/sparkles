@@ -231,22 +231,30 @@ start. The C19 settings file may name a profile as well.
 The pool is a `QueryPool` in `sparkles-core` (`crates/sparkles-core/src/sparql/pool.rs`),
 shared through `Arc`. It has a capacity, a granted total and a FIFO queue of waiters.
 
-Each `Ctx` gets an optional `PoolGrant`. A grant holds a number of bytes reserved from the
-pool, in granules of 4 MiB. `Charge::add` today does one `fetch_update` on `mem_live`
-against `mem_limit` (`ctx.rs`, `impl Charge`). With a pool, the check becomes:
+Each `Ctx` gets an optional `PoolGrant`. A grant reserves pool bytes in granules of
+4 MiB. Its accounted total adds every eager context's admitted high-water estimate,
+live cursor charges and charges made directly against the grant. Contexts sharing one
+grant own separate contributions.
 
-1. Add to `mem_live` as now, against the query's own `mem_limit`.
-2. If the new `mem_live` exceeds the grant, ask the pool for enough granules to cover it,
-   with one compare-and-swap on the pool's granted total. Success raises the grant.
-3. If the pool cannot cover it, undo the addition and fail with kind `server-memory`, or,
-   when the caller is a spillable operator, return `Error::NeedsSpill` so the operator can
-   spill (§6).
+`Charge::add` first checks the local `mem_live` against `mem_limit`. An eager context
+then admits the higher of its previous contribution and its new live estimate.
+`check_output` admits the live estimate plus the output table's estimated bytes. Only
+the increase of that context's contribution is charged to the grant, including when the
+grant already holds enough capacity. A rejected estimate leaves its contribution
+unchanged and rolls back any failed live increment. The pool never waits during growth.
 
-The fast path is unchanged while `mem_live` stays inside the grant, so small queries pay
-one extra comparison. `Charge::drop` and `RetainedCharge` release bytes to `mem_live` only.
-The grant shrinks back to the granule above `mem_live` when the query releases more than
-16 MiB, and to zero when the `Ctx` drops. A `QueryBatch` that the caller retains after the
-cursor closes keeps its share of the grant until it drops, as it keeps its charge today.
+An eager context keeps that contribution until its last owner drops, including a
+`QueryResult` or a separately retained `Arc<Ctx>`. This conservatively retains transient
+build state and graph deduplication along with the final output, so the reservation can
+exceed the final table's bytes. The pool bounds admitted estimates and does not bound RSS.
+
+Cursor contexts charge their live state and release it promptly. Conversion after eager
+preparation transfers only the live contribution to the cursor and releases the excess
+eager estimate. A `QueryBatch` retained after cursor close keeps its charge until it
+drops. Growth and trim share a grant-local lock, while charges fitting the current grant
+use an atomic fast path. A slow charge publishes its usage before new capacity becomes
+available, and a failed growth removes only that charge. The grant trims after enough
+memory is released and keeps its admission floor until its last owner drops.
 
 An update's WHERE contexts share one grant, as they share `rows_produced`. Charges that
 C01 lists outside queries (SHACL-SPARQL, `/$/reason`, ShEx validation) take grants from
@@ -741,10 +749,10 @@ namespace and so one set of counters.
 ### Phase 1b: the query memory pool
 
 `QueryPool` and `PoolGrant` are in `sparkles-core` (`sparql/pool.rs`) as §4.1 describes.
-`Charge::add` checks the grant only after its own `mem_live` update, `Ctx::release_live`
-replaces the direct decrements and trims the grant, and the pool never makes a running
-query wait. The grant keeps the live total of every context that holds it, and growth and
-trimming of one grant run under a lock of its own. The differences from the text:
+`Charge::add` checks the grant only after its own `mem_live` update. Cursor state returns
+through `Ctx::release_live`, and the pool never makes a running query wait. The grant adds eager contexts' retained estimates to live cursor charges,
+and growth and trimming of one grant run under a lock of its own. The differences from
+the text:
 
 * **Admission** is an axum layer inside the rate limiter, as §4.2 says, and passes the
   grant to handlers through a task-local that `query_options` reads. A request is a query
@@ -805,22 +813,23 @@ sequentially consistent ordering.
 That review did not find every defect, and a later review of the merged lane found
 more, which are now fixed.
 
-* **Trim and growth races.** A trim could return granules to the pool between a charge
-  passing the fast path and the grant being checked, which left an accepted charge
-  unbacked. Two threads that grew one grant could also fail each other with
-  `server-memory` although the pool had room for both. The grant now keeps the live total
-  of all contexts that hold it, so contexts that share a grant, such as the WHERE contexts
-  of an update, add up. Growth and trimming run under a lock of the grant. A trim lowers
-  the grant, reads the total again, and returns bytes to the pool only after that second
-  read. A charge that the fast path cannot cover takes its bytes out of the total before
-  it waits for the lock, so a charge that is about to fail does not fail another thread's
-  charge.
-* **Eager outputs and retained results.** The estimate of an eager operator's output was
-  checked against the query's own budget and never reached the pool, so an update's WHERE
-  clause could grow past the pool, and results that outlived the charges that built them
-  held less than their peak. An eager context's grant now holds the highest estimate the
-  context checked until the context drops. A cursor context covers its checks only for
-  the moment, because cursor operators charge what they keep.
+* Grant growth and trimming could leave accepted charges unbacked or fail simultaneous
+  growth although the pool had room. The grant now keeps one accounted total and
+  serializes growth and trimming. A slow charger publishes its contribution before new
+  capacity becomes available, and a failed growth removes only its contribution. Checked
+  additions reject counter overflow. Trimming rereads usage before returning granules.
+* Eager output estimates and retained results could lose coverage after their build
+  guards dropped. Each eager context now owns its highest successfully admitted local
+  estimate, from both `Charge::add` and `check_output`. The grant adds those independent
+  contributions, even when an estimate fits its existing capacity. A contribution lasts
+  until the context's last owner drops. It can exceed the final result's bytes because
+  transient tables and deduplication remain included. This is an estimate policy, not an
+  RSS bound. Cursor contexts retain live charges and still trim after releasing state.
+* Eager CONSTRUCT retains the admitted estimate of decoded triples, named graph quads
+  and deduplication copies. Eager DESCRIBE now checks traversal state and lexical output
+  before allocation through a scoped charge. Cursor DESCRIBE keeps its weak charge owner.
+  Both graph forms retain coverage while their result or context remains alive.
+
 * **Paths that skipped the pool.** `POST /{ds}/update` ran without the admitted grant and
   without the dataset's pool. The Python query defaults dropped the pool. Memory clones
   adopted by a catalog had no pool, and `Transaction::update_with` skipped the dataset's
@@ -829,6 +838,13 @@ more, which are now fixed.
   clone cleared the source's cached results and the per-dataset figures counted both
   datasets under both names. Every memory clone now gets a namespace of its own, which
   also covers the standalone copies of the Node, Python and JVM bindings.
+
+A second independent review and validation found the slow-growth publication race,
+missing charge-based CONSTRUCT retention, uncharged eager DESCRIBE and the missing sum of
+retained contexts on one grant. Regression tests cover oversubscribed concurrent growth,
+fitting output estimates, separate context lifetimes, graph lexical payload, budget
+failure cleanup and conversion from eager preparation to cursor accounting. The existing
+profile and latency measurements remain pending as described below.
 
 ### Gates
 
