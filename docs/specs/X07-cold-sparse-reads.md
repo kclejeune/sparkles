@@ -1,17 +1,20 @@
 # X07: Cold sparse reads
 
-> **Status:** specified
+> **Status:** implemented in part (Phases 1 and 2). Phases 3 and 4 are not built. Phase 3
+> is deferred until a forge run shows that the remaining cold time is block decoding.
 >
-> **Phases:** None shipped. Phase 1 is per-query I/O accounting and a profile of every
-> cold loss in BENCHMARKS.md. Phase 2 adds batched resolution of a query's constants,
-> plan-time prefetch and a read policy chosen per scan instead of per process. Phase 3
+> **Phases:** Phase 1 is per-query I/O accounting and a profile of the cold losses.
+> Phase 2 adds batched resolution of a query's constants, first-scan prefetch, a read
+> window per scan pass instead of per process, and execution-time term prefetch. Phase 3
 > adds a segmented block layout that lets a point lookup read and decode part of a
 > block. Phase 4 is an optional prewarm of the pages a server used before it stopped.
 >
-> **User docs:** none, because nothing is built.
+> **User docs:** [The I/O profile](../API.md#the-io-profile),
+> [Cold reads](../internals/OPTIMIZATIONS.md#cold-reads) and the environment variables in
+> [USAGE.md](../USAGE.md).
 >
-> This is the design as written before implementation. The [Outcome](#outcome) section at
-> the end will record how it lands.
+> This design was written before implementation. The [Outcome](#outcome) section at the
+> end records how it landed.
 
 This design was written from the Sparkles code (`crates/sparkles-core/src/index.rs`,
 `vocab.rs`, `sparql/indexjoin.rs`, `sparql/results.rs`, `sparql/ctx.rs`,
@@ -420,4 +423,170 @@ Phase 1 breakdown attributes the remainder to block reads or decoding.
 
 ## Outcome
 
-Not built. See [ROADMAP](../ROADMAP.md) item 4.
+Phases 1 and 2 are built. Phase 3 and Phase 4 are not.
+
+### What was built
+
+Phase 1 adds per-process I/O counters in `ioacct.rs`, a profile mode that times the
+phases of one query and counts the pages the query brought in, and the request
+parameter `profile=io`, which puts the profile in the native JSON metadata. Three
+process-wide metrics (`sparkles_index_columns_decoded_total`,
+`sparkles_index_readahead_bytes_total` and `sparkles_vocab_groups_read_total`) and an
+`io` object in the metrics JSON expose the counters. The metrics are per process and
+not per dataset, which deviates from §4.3, because datasets can share one block cache.
+The profile counts against a snapshot taken at the start of the query, so it is exact
+only when no other query runs on the process.
+
+Phase 2 has four parts, each behind an `Optimizations` flag that is on by default.
+
+* `prefetch_constants` collects the constants of the algebra (`sparql/constkeys.rs`) and
+  hints their vocabulary groups with `Vocab::prefetch_keys` before the planner resolves
+  any of them.
+* `prefetch_first_scan` requests the blocks of leaf scans of at most 64 blocks at the
+  end of planning. A count over the whole index and a plan-time decode were removed from
+  this step after they cost 7 ms at 1M.
+* The read policy is a `ReadAhead` window owned by each scan pass and each cursor, not a
+  process-wide switch. The first request is about 1 MiB and the window doubles to 4 MiB
+  (`SPARKLES_READ_WINDOW_KB`, where 0 returns to per-block hints). No code calls
+  `madvise` on the mapping after it is opened, so one query's policy cannot change
+  another's. This replaces the single block-count threshold of §5.3, on the advice of a
+  review that found cursors, index joins and key probes also read blocks directly.
+* `prefetch_terms` resolves the terms of a table of 2 to 4,095 rows in one pass, and the
+  native JSON writer prefetches the terms of its answer.
+
+One addition goes beyond the spec. `parallel_decode` decodes the columns that an index
+join or a scan has requested on a pool of its own, when at least 16 columns are
+requested. The pool skips read-through caches. It helps star-lookup and employee-docs
+and is off for smaller requests, where it was slower.
+
+### Phase 1 breakdown
+
+These are server-reported times from a cold `profile=io` request on the Namespace
+instance described below, the median of 3 runs, in ms. The "Phase 1" rows turn off
+every Phase 2 flag and `SPARKLES_READ_WINDOW_KB`, so they show the read path before
+Phase 2. Decode is the CPU time summed over the threads that decode, so with the pool it
+can exceed the execution time.
+
+| Query | Size | Variant | Plan | Exec | Total | Columns | Decoded MB | Decode | Vocabulary lookup |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|
+| `star-lookup` | 10.5M | Phase 1 | 1.5 | 19.1 | 29.6 | 146 | 38.3 | 16.7 | 0.1 |
+| `star-lookup` | 10.5M | Phase 2 | 1.8 | 10.0 | 12.1 | 146 | 38.3 | 30.5 | 0.0 |
+| `employee-docs` | 10.5M | Phase 1 | 1.1 | 6.4 | 8.0 | 96 | 25.2 | 6.0 | 0.0 |
+| `employee-docs` | 10.5M | Phase 2 | 1.7 | 4.8 | 6.9 | 96 | 25.2 | 14.7 | 0.0 |
+| `values-star` | 10.5M | Phase 1 | 1.5 | 0.5 | 2.5 | 12 | 3.1 | 1.0 | 0.0 |
+| `values-star` | 10.5M | Phase 2 | 1.4 | 0.5 | 2.2 | 12 | 3.1 | 1.1 | 0.0 |
+| `path-plus` | 10.5M | Phase 1 | 0.2 | 0.7 | 1.0 | 4 | 1.0 | 0.5 | 0.0 |
+| `path-plus` | 10.5M | Phase 2 | 0.3 | 1.1 | 1.6 | 4 | 1.0 | 0.9 | 0.0 |
+| `star-lookup` | 1.05M | Phase 1 | 1.9 | 3.4 | 6.2 | 57 | 14.0 | 4.2 | 0.0 |
+| `star-lookup` | 1.05M | Phase 2 | 1.7 | 3.7 | 5.6 | 57 | 14.0 | 4.0 | 0.0 |
+| `employee-docs` | 1.05M | Phase 2 | 1.1 | 1.8 | 3.3 | 29 | 7.6 | 2.1 | 0.0 |
+| `path-plus` | 1.05M | Phase 2 | 0.2 | 1.2 | 1.5 | 8 | 2.1 | 1.0 | 0.0 |
+
+The hypotheses of §3 come out as follows.
+
+* Serial constant lookups are not a large cost. The vocabulary lookup timer reads 0.1 ms
+  or less at both sizes on Namespace, and 2 to 4 ms on a slower laptop before batching.
+  Batching still removed the serial reads, which matters on a slower device.
+* Whole-column decoding for a few rows is the dominant cost of the sparse queries. A
+  `star-lookup` at 10.5M decodes 146 columns of 32,768 rows, which is 38 MB from 5.6 MB
+  of compressed data, to return a handful of rows. Decoding is 16.7 of its 19.1 ms of
+  execution in Phase 1.
+* A planner-time decode of about ten columns ran serially before the first scan was
+  hinted. It was removed.
+* The result terms of the native JSON writer looked slow (11 ms at 10.5M on the laptop)
+  because the writer did not prefetch them. That is fixed.
+
+### Gate results
+
+Hosts. Cold numbers come from a Namespace instance (AMD EPYC, 8 vCPU, 16 GB, Linux
+7.1.4) with the page cache dropped before every request, a fresh server for each request
+and the median of 11 requests, unless stated. The data comes from `scripts/gen-data.py` with 100,000, 1,000,000 and 10,000,000 people
+(1.05M, 10.5M and 105M triples). Namespace runs these queries about 1.5 to 2 times faster than the
+forge host of BENCHMARKS.md, so the absolute targets of §9 cannot be judged here.
+
+Median request time through HTTP, in ms, base commit `899fb251` against the final
+build. The figures in parentheses are the minima.
+
+| Query, cold | 1.05M base | 1.05M final | 10.5M base | 10.5M final | 105M base | 105M final |
+|---|---:|---:|---:|---:|---:|---:|
+| `star-lookup` | 7.3 (6.2) | 7.9 (6.6) | 33.1 (25.2) | 25.0 (18.2) | 21.9 (16.5) | 14.4 (11.9) |
+| `employee-docs` | 6.4 (5.3) | 6.2 (4.5) | 23.9 (17.4) | 23.3 (12.5) | 20.2 (17.8) | 13.0 (10.2) |
+| `values-star` | 4.9 (4.0) | 4.3 (3.4) | 17.1 (3.3) | 11.6 (3.4) | 5.0 (4.3) | 4.3 (3.5) |
+| `path-plus` | 3.6 (3.1) | 3.7 (2.7) | 2.7 (2.2) | 2.5 (2.1) | 1381 (1343) | 1383 (1267) |
+
+An earlier, quieter run on the same instance, with the build before the last two
+commits, measured 10.5M `star-lookup` at 24.6 and 14.5 ms and `employee-docs` at 12.8
+and 8.8 ms for base and final. The medians of the table above are noisier because other
+tenants shared the host, so the ratios are the reliable part. At 10.5M `star-lookup`
+falls by about 25% to 40%, and at 105M by 34% to 42%, and `employee-docs` at 105M falls by 36%.
+Nothing improves at 1.05M, where a lookup decodes 57 columns in about 4 ms and the fixed
+cost of a request is a larger share. `path-plus` is unchanged, because its 1 to 2 ms of
+decoding of one block is all that Phase 2 can reach.
+
+* **A1 holds for the Phase 1 read path.** A cold `star-lookup` reports 146 columns
+  decoded by permutation (132 in SPO), the bytes requested per file and the vocabulary
+  groups hinted. Decode, index wait, vocabulary read and lookup add up to 17.4 ms, which
+  is 91% of the 19.1 ms of execution. With the decode pool the phases overlap, so the
+  timers sum to more than the execution time.
+* **A2 holds.** With the counters on and no profile, the warm suite at 1.05M ran 27
+  queries on one pinned CPU, 6 rounds of A, B, B, A, and the geometric mean of the server
+  execution time was 0.985 of base. The largest slowdown was 2.5% on `types-grouped`,
+  which takes 17 µs. A first version of the counters slowed dense vocabulary scans by 10%
+  to 20% through one shared atomic that every scanned block updated. The vocabulary
+  block and lookup counters now count only while a profile is alive, as the
+  [I/O profile](../API.md#the-io-profile) documents.
+* **A3 holds.** The batched hints for a query's constants are issued before the first
+  `find`, and the lookup timer falls from 2.0 to 3.9 ms to 0.1 ms or less.
+* **A4 holds.** The event log of a cold `employee-docs` shows `planned`, then `scans
+  prefetched`, then `executed`.
+* **A5 is not measured.** It needs the 1.01B store, which was not available. At 105M, with
+  hints on, the dense queries are within 3% of base on `contains`, `lang-filter` and
+  `regex-iri`. `export-500k` at 105M was 6% slower at the median over 21 runs
+  (167.6 against 178.1 ms) and 2% slower at the minimum. The same result came with every
+  Phase 2 flag off, so the difference is not from the new read policy. It was not traced
+  to a cause.
+* **A6 holds.** Sixteen concurrent cold point lookups on 10.5M took a median of 5.4 ms
+  next to a running `export-500k` and 6.8 ms alone, against 6.1 and 8.4 ms for base.
+  The lookups are not slower with the export running, partly because the export warms
+  the pages they use. No code changes the mapping advice of a store after it opens.
+
+The 1.05M cold scans that Fluree wins improved at the median by 8% to 16%
+(`contains`, `lang-filter`, `count-all`, `star-join` and `range-topk` ran at 0.84 to
+0.92 of base). They remain a stretch target.
+
+### Targets
+
+The targets of §9 can be confirmed only on forge. Scaling the base of Namespace to
+forge by the ratio of their `star-lookup` and `path-plus` base times, `star-lookup` at
+10.5M lands near 28 ms against a target of 17.3 ms, and `path-plus` near 5 ms against
+2.1 ms. These are estimates and say that both targets are probably unmet. `values-star`
+and `employee-docs` land near their targets and cannot be called either way. Oxigraph
+does not run on the instance, so the same-host comparison was not made.
+
+### Phase 3 decision
+
+Phase 3 was not started. The breakdown attributes `path-plus` and `star-lookup` to
+column decoding, and segments would cut `path-plus` decoding by a large factor. Three
+things are open, and the first two are cheaper than a new block format.
+
+* The request time is larger than the execution time. For `star-lookup` at 10.5M the
+  server reports 12 ms of 25 ms median, and the rest is not split into transfer, client
+  and kernel time. A decode-bound claim needs that split on forge.
+* Decoding takes about 116 µs per 32,768-row column, which is slow for a delta decode,
+  and the decode CPU time doubles on the pool (30.5 against 16.7 ms). Both fit the cost of
+  page faults on the freshly allocated 256 KiB output of each column, which the decode
+  timer includes and concurrent faults make worse. The profile counts major faults only.
+  Adding minor faults to it, and measuring a warm decode of the same columns, would
+  show whether a reused decode buffer fixes most of the gap.
+* `path-plus` spends about 1.5 ms outside execution, so segments alone cannot reach the
+  2.1 ms target.
+
+The recommendation is a forge run of the four queries at 1.05M and 10.5M with
+`profile=io`, with base and final builds, then a decision. Phase 3 starts if decode, not
+including page faults, and the index wait are together larger than the gap to the target.
+
+### Not done
+
+Phase 3 and Phase 4, the 1.01B gates (A5 and the forge targets), a per-query set of
+hinted blocks in the context to avoid a second hint of a block, I/O priority for
+read-ahead, and a `FILTER` constant collector beyond the common comparison nodes.

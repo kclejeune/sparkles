@@ -440,6 +440,34 @@ These cold medians switch the first two features together.
 | 1.01B `category-tree` | 369.7 to 371.1 | 364.5 to 365.2 |
 | 1.01B `top-linked` | 949 to 1,000 | 946 to 964 |
 
+#### Cold reads after X07
+
+The tables above were measured before the cold-read work of [X07](specs/X07-cold-sparse-reads.md),
+which adds one read window per scan pass, batched hints for a query's constants and
+first-scan prefetch. The figures below were measured on a Namespace instance (AMD EPYC,
+8 vCPU, 16 GB, Linux 7.1.4), not on the host of the tables above, which is about 1.5 to
+2 times slower on these queries. Each is the median of 11 fresh-server requests with the
+page cache dropped, through HTTP with TSV output, for the base commit and the build with
+the changes. They show the change from the work and are not comparable with the other
+engines' figures.
+
+| Cold, Namespace, median ms | 1.05M base | 1.05M new | 10.5M base | 10.5M new | 105M base | 105M new |
+|---|---:|---:|---:|---:|---:|---:|
+| `star-lookup` | 7.3 | 7.9 | 33.1 | 25.0 | 21.9 | 14.4 |
+| `employee-docs` | 6.4 | 6.2 | 23.9 | 23.3 | 20.2 | 13.0 |
+| `values-star` | 4.9 | 4.3 | 17.1 | 11.6 | 5.0 | 4.3 |
+| `path-plus` | 3.6 | 3.7 | 2.7 | 2.5 | 1,381 | 1,383 |
+| `contains` | 6.9 | 6.4 | 15.6 | 17.0 | 88.9 | 91.7 |
+| `export-500k` | 147 | 150 | 173 | 184 | 179 | 207 |
+
+Another run of the same instance, with a quieter host, measured 10.5M `star-lookup` at
+24.6 ms for the base and 14.5 ms for the new build. The noise of the table above is larger
+than that, so the ratios are better evidence than the milliseconds. A repeat of
+`export-500k` with 21 runs gave 167.6 and 178.1 ms at 105M, and the same slowdown when
+every new read feature is off. The cold targets of the spec, such as `star-lookup` at
+10.5M within 17.3 ms, are confirmed only by a run on the benchmark host, which has not
+been made.
+
 ### Full-text search
 
 The comparison uses Sparkles' Tantivy-backed `text:query`, Fuseki's Lucene-backed
