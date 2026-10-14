@@ -420,7 +420,7 @@ record (`op = 3`) puts its 24 spare bytes to use. Today they are always zero.
 | 17..25 | `timestamp_ms` i64 LE (Unix epoch, already clamped) |
 | 25 | `kind` code |
 | 26 | record version `2` (`0` = legacy record) |
-| 27 | flags (`1` = the write bypassed write-time validation) |
+| 27 | flags (`1` = the write bypassed write-time validation, `2` = the commit's annotation was written without its own sync because the commit belongs to a group, so replay expects it in `annotations.bin`) |
 | 28 | how many commits just before this one may not have been durable when it was written |
 | 29..33 | CRC-32 (IEEE, `flate2::Crc`) over this transaction's data records followed by bytes 0..29 of this record |
 

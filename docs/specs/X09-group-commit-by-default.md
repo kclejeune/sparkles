@@ -1,18 +1,20 @@
 # X09: Group commit by default
 
-> **Status:** specified
+> **Status:** Phases 1 and 2 built, with exceptions listed in the Outcome. Phase 3 not started.
 >
-> **Phases:** None shipped. Phase 1 is the measurements and fixes that the switch
-> depends on: serial latency, reader tails, metrics and power-loss and sync-failure
-> tests. Phase 2 widens admission to the writes that fall back today (commit messages,
-> preconditions, validation, Graph Store and RDF Patch writes, full-text, spatial and
-> embedding hooks, writes during compaction). Phase 3 makes group commit the default for
-> persistent stores, with `--no-group-commit` to opt out.
+> **Phases:** Phase 1 is the measurements and fixes that the switch depends on: serial
+> latency, reader tails, metrics and power-loss and sync-failure tests. Phase 2 widens
+> admission to the writes that fall back today (commit messages, preconditions,
+> validation, Graph Store and RDF Patch writes, full-text, spatial and embedding hooks,
+> writes during compaction). Phase 3 makes group commit the default for persistent
+> stores, with `--no-group-commit` to opt out. Phases 1 and 2 are built, and Phase 3 waits
+> on the conditions of section 7.2.
 >
-> **User docs:** none, because nothing is built.
+> **User docs:** [FEATURES.md](../FEATURES.md) and [API.md](../API.md#metrics) for the
+> metrics and the `groupCommit` and `commits` fields of `/$/stats`.
 >
-> This is the design as written before implementation. The [Outcome](#outcome) section at
-> the end will record how it lands.
+> Sections 1 to 16 are the design as written before implementation. The
+> [Outcome](#outcome) section at the end records how it landed and where it differs.
 
 This design was written from the Sparkles code (`crates/sparkles-core/src/store/group.rs`,
 `store.rs`, `store/wal.rs`, `commit.rs`, `annotations.rs`, `crates/sparkles-server/src/main.rs`
@@ -66,8 +68,8 @@ safe, and defines the tests and measurements that gate the switch.
   records for their quads.
 - Parallel writers. Transactions still run one at a time under the writer lock. Only the
   synchronization is shared.
-- Changing the WAL format. The commit record's unfenced count (CI Outcome, byte 28)
-  already supports groups.
+- Changing the WAL layout. The commit record's unfenced count (CI Outcome, byte 28)
+  already supports groups. Phase 2 adds one flag bit to byte 27 and no field.
 
 ## 2. The current design
 
@@ -170,8 +172,9 @@ These hold with group commit on, and the tests of §10 check each of them.
    the fence that holds it. A leader leads at most one fence for others before its own
    ticket is set, because the prefix it seals includes its own commit.
 6. **Failure is explicit.** A failed synchronization fails every commit that was not
-   acknowledged, poisons the writer and reports `Error::Poisoned` (HTTP 503), as a
-   failed synchronization of the ordinary path does.
+   acknowledged, poisons the writer and reports `Error::Poisoned` (HTTP 503), including
+   the commit that led the fence. The ordinary path reports the raw I/O error for the
+   commit whose own synchronization failed and `Error::Poisoned` for later writes.
 
 ## 4. Phase 1: measurements and fixes before the switch
 
@@ -262,7 +265,7 @@ falling back until they land.
 
 | Fallback today | Design for admission |
 |---|---|
-| Commit message, change digests | The annotation record is appended without its own sync. The fence synchronizes the annotation file in parallel with the WAL and vocabulary. `annotations.rs` already drops records above the recovered head at open, so a record whose commit was not durable is removed. |
+| Commit message, change digests | The annotation record is appended without its own sync. The fence synchronizes the annotation file in parallel with the WAL and vocabulary. `annotations.rs` already drops records above the recovered head at open, so a record whose commit was not durable is removed. The opposite case needs more: the kernel may write a commit's WAL records back before its annotation, so a commit that was never acknowledged could be recovered without the message or digest it asked for. The commit record of such a commit carries `WAL_FLAG_ANNOTATED`, and replay treats a flagged commit whose annotation is missing as a torn tail, unless a later record shows the commit was durable (see the Outcome). |
 | Precondition (`If-Match`, RDF Patch `H prev`) | The precondition is checked against the speculative head. If it holds, the commit joins the group, and fails with its predecessor. If it fails, the transaction drains the queue and checks again against the durable head before it reports 412, so a refusal is never based on state that a failed sync then lost. |
 | Required or installed guard (C10) | Validation runs under the writer lock against the transaction's base, as today. An update may validate against the speculative head. An accepted write joins the group. A rejection drains the queue first and reports only if the head it was judged against is durable. Otherwise it is re-validated. A validation summary in a receipt is returned with the receipt, after the fence. |
 | `bypass_validation` | The grouped record carries `WAL_FLAG_UNVALIDATED` like the ordinary record: `seal_wal_commit_unfenced` takes the flags that today are passed as 0. |
@@ -483,4 +486,115 @@ logged receipt's commit is present.
 
 ## Outcome
 
-Not built. See [ROADMAP](../ROADMAP.md) item 3.
+Phases 1 and 2 are built behind `--experimental-group-commit`, with the exceptions below.
+Phase 3 is not started, because conditions 1, 2 and 4 of section 7.2 need a quiet `forge`
+run and a host with device-mapper `log-writes`, and condition 3 is not yet met for
+full-text indexes. See [ROADMAP](../ROADMAP.md) item 3.
+
+### Phase 1
+
+- **Metrics.** `Store::commit_metrics` counts synchronizations by path, commits per fence,
+  the wait from enqueue to acknowledgement, failed fences and fallbacks by their first
+  failing condition. `/$/metrics` exports them as `sparkles_commit_sync_seconds`,
+  `sparkles_group_commit_size`, `sparkles_group_commit_wait_seconds`,
+  `sparkles_group_commit_fallbacks_total` and `sparkles_group_commit_failures_total`.
+  `/$/stats` reports `groupCommit` and `commits` per dataset.
+- **Serial latency (A1).** A grouped singleton was 4% to 9% slower than the default writer at
+  1.05M, so the idle fast path of section 4.1 was added
+  (`StoreOptions::group_commit_idle_direct`, on by default, hidden flag
+  `--no-group-commit-idle-direct`). With it, serial literal and IRI inserts at 10.5M on a
+  quiet Namespace instance were within 2.3% of the default writer at p90 and 0.5% at p50
+  (5,000 commits, 8 rounds). A noisier instance showed up to 19% at p90 inside a 3.7× spread
+  in the default writer's own runs. The idle path needs a recheck on `forge`.
+- **Concurrent gain (A2).** With 4 ms added to every synchronization, which reproduces the
+  default writer's 230 transactions/s of `forge`, four writers reach 466 transactions/s
+  (2.0×) and sixteen writers 1,783 (7.8×). The absolute `forge` ranges of section 9 are not
+  measured.
+- **Reader tail (A3).** The 40% regression at 10.5M did not reproduce on Namespace. Reader
+  p99 was between 0.73× and 1.19× of the default writer's across runs, with overlapping
+  ranges. No fix was made, so the candidate fixes of section 4.2 remain untried and the
+  measurement has to be repeated on `forge`.
+- **Failed synchronization (A4).** A router test fails ten requests of one fence with 503
+  and publishes none of them. A test under an `LD_PRELOAD` shim
+  (`crates/sparkles-core/tests/power_loss.rs`, `tests/support/iofault.c`) fails the WAL, the
+  vocabulary or both at chosen calls and checks the reopened store.
+- **Power loss (A5), partly.** The same test records the store's I/O and replays crash images
+  in user space, with each unsynchronized 4 KiB page kept or dropped at random. Every
+  acknowledged commit and its message survives, `sparkles check` passes and the next commit
+  continues the sequence. It ran up to 500 crash points per configuration, on ext4 only. It
+  cannot reproduce file system journal and metadata ordering, so it does not replace the
+  1,000-point `log-writes` runs on ext4 and XFS, which need root and the device-mapper
+  target.
+- **Fairness and batch wait.** Sixteen writers kept every writer's share within 0.063 of the
+  total. Group sizes were large with a slow device, so no collection delay was added.
+- **Wording fix.** Section 3, item 6 said the failing commit reports `Error::Poisoned` as the
+  ordinary path does. The ordinary path returns the raw I/O error for that commit, and the
+  leader of a failed fence now returns `Error::Poisoned`, so every request of the group gets
+  503.
+
+### Phase 2
+
+| Item | Result |
+|---|---|
+| Update, Graph Store, upload, RDF Patch | Admitted as `Update` is, and may start from the speculative head. A router test sends 32 concurrent requests of each kind. |
+| Commit message, change digest | Admitted (A6). The annotation is written without a sync before the WAL records, and the fence syncs `annotations.bin` in parallel with the log. |
+| Precondition | Checked against the speculative head, and a refusal drains first (A7). |
+| Bypass, graph restriction | Admitted. A refused quad of a restricted write never reaches the log. |
+| Guard | Admitted. The SHACL guard keeps the state of each commit in flight and checks against the speculative head (A8). |
+| Compaction | Admitted. The tap records each commit at enqueue, a drain precedes every catch-up round and the switch, and a failed fence aborts the compaction (A9). |
+| Full-text, spatial, embeddings | Not admitted. See below. |
+| ShEx guard | Takes the group path but not the speculative head, so each fence holds one commit. |
+
+Four points differ from the design.
+
+1. **A flag bit in the commit record.** Section 1 ruled out a format change. A commit's
+   WAL records can reach the disk before its unsynchronized annotation, so after a crash a
+   commit that was never acknowledged could be recovered without its message or change digest,
+   leaving a hole in the digest chain. Such a commit carries `WAL_FLAG_ANNOTATED` (bit 1 of
+   byte 27, see [CI](CI-commit-identity.md)), and replay treats a flagged commit whose
+   annotation is missing as a torn tail, unless a later commit record shows it was durable. In
+   that case its fence synced the annotation too, the file lost it afterwards, and the commit
+   stays with a warning. The check is skipped when `annotations.bin` is missing or belongs to
+   another dataset. `sparkles check` applies the same rule. Readers that predate the bit
+   ignore it and lose only this check.
+2. **Errors that rest on speculative state.** The design covered preconditions and guard
+   rejections. An RDF Patch whose late `H prev` names the durable head, or any other error that
+   depends on data, can be raised against a speculative head too. `Store::after_refusal` waits
+   for the commits in flight to be durable, and reports `Error::Poisoned` if their fence
+   failed. SPARQL updates have no such error today, since the engine does not report whether a
+   graph exists.
+3. **A7 as worded cannot happen.** A failed fence poisons the writer, so a write whose tag
+   matched only the durable head is refused as poisoned. If the fence succeeds, the durable
+   head is the speculative head and the refusal stands. The test checks both outcomes, and
+   that nothing is reported before the fence is done. With `no_wait`, such a write fails with
+   `WriterBusy` (503) rather than 412, since it cannot drain.
+4. **Full-text, spatial and embedding datasets stay on the ordinary path.** The design had
+   `publish_group_prefix` call `maintain_text`, `maintain_geo` and `embed_noted`. A review
+   found that the coordinator publishes without the writer lock, while the spatial build,
+   text recovery and text rebuild install a view under that lock, so a grouped commit could
+   publish an older view over a finished build. The fix is to drain the group in each of those
+   installers, which is small, but such a dataset also could not start a transaction from the
+   speculative head, since the snapshot carries no index state. Each fence would then hold one
+   commit and the dataset would gain nothing. The fallback reasons `text`, `geo` and `embed`
+   still count these commits. The ShEx guard is in the same position, because its typing state
+   chains by commit number and has no pending list yet.
+
+### Tests
+
+`group.rs` has 38 tests, including the failed-fence cases of each admission change, the
+annotation recovery rules, an idle commit after grouped ones, a stateful guard that must be
+told of each commit before the next check, and writes during compaction. The SHACL crate has
+a test with a limit across concurrent writes and one with a shapes change in flight. The
+server has router tests for each write kind. Not written: the model-based stress test of
+section 10.1, the `kill -9` runs of section 10.4, a test that fails only the annotation
+file's sync, and a prune followed by a reopen with a flagged commit at the WAL tail.
+
+### Left for Phase 3
+
+1. The gates of section 9 on `forge`, in particular reader p99 and serial parity at 1.05M
+   and 10.5M.
+2. The 1,000-point `log-writes` runs on ext4 and XFS, and the `kill -9` runs.
+3. Full-text, spatial and embedding datasets and the ShEx guard grouping, or measurements
+   that show them rare.
+4. The BENCHMARKS.md refresh under X06, with a `--no-group-commit` row.
+5. The default, the opt-out flag and the removal of `--experimental-group-commit`.
