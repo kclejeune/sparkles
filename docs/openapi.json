@@ -13377,7 +13377,7 @@
                   "type": "string"
                 },
                 "reason": {
-                  "description": "Why the dataset is registered but not served, such as an index format this release does not read.",
+                  "description": "Why the dataset is registered but not served, such as an index format this release does not read. The member lists the refused datasets the caller may read, and all of them for a server administrator, who alone gets the full message, which names paths.",
                   "type": "string"
                 }
               },

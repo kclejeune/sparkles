@@ -162,7 +162,7 @@ pub(super) fn schemas() -> Map<String, J> {
                 },
                 "refusedDatasets": array(obj(&["name", "reason"], json!({
                     "name": { "type": "string" },
-                    "reason": { "type": "string", "description": "Why the dataset is registered but not served, such as an index format this release does not read." },
+                    "reason": { "type": "string", "description": "Why the dataset is registered but not served, such as an index format this release does not read. The member lists the refused datasets the caller may read, and all of them for a server administrator, who alone gets the full message, which names paths." },
                 }))),
             }),
         ),

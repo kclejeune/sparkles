@@ -7103,7 +7103,7 @@ export interface components {
             readOnly: boolean;
             refusedDatasets?: {
                 name: string;
-                /** @description Why the dataset is registered but not served, such as an index format this release does not read. */
+                /** @description Why the dataset is registered but not served, such as an index format this release does not read. The member lists the refused datasets the caller may read, and all of them for a server administrator, who alone gets the full message, which names paths. */
                 reason: string;
             }[];
             /** @description Fuseki's name for `startedAt`. */

@@ -943,6 +943,7 @@ impl Catalog {
             },
         );
         self.inner.detached.lock().remove(name);
+        self.inner.refused.lock().remove(name);
         Ok(())
     }
 }
