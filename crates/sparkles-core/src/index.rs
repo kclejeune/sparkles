@@ -168,6 +168,53 @@ pub(crate) fn read_ahead_fixture(blocks: usize) -> (tempfile::TempDir, PermIndex
     (dir, idx)
 }
 
+#[cfg(test)]
+pub(crate) fn read_ahead_reference(rows: usize) -> Vec<u64> {
+    let mut random = 0x123456789abcdefu64;
+    (0..rows)
+        .map(|_| {
+            random ^= random << 13;
+            random ^= random >> 7;
+            random ^= random << 17;
+            let value = random;
+            random ^= random << 13;
+            random ^= random >> 7;
+            random ^= random << 17;
+            value
+        })
+        .collect()
+}
+
+/// Independent test oracle over raw attempted advice, without production coverage state.
+#[cfg(test)]
+pub(crate) fn advice_covers_span(spans: &[(usize, usize)], (from, to): (usize, usize)) -> bool {
+    if from >= to {
+        return true;
+    }
+    let mut sorted = spans.to_vec();
+    sorted.sort_unstable();
+    let mut through = from;
+    for (start, end) in sorted {
+        if end <= through {
+            continue;
+        }
+        if start > through {
+            return false;
+        }
+        through = end;
+        if through >= to {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn advice_page_size() -> usize {
+    // SAFETY: sysconf has no pointer arguments or other preconditions.
+    usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap()
+}
+
 /// Ask the kernel to start reading `len` bytes of `m` at `off` (see [`io_hints`]).
 #[inline]
 pub(crate) fn will_need(file: IoFile, m: &Mmap, off: usize, len: usize) -> bool {
@@ -241,6 +288,8 @@ pub struct ReadAhead {
     refill_at: usize,
     /// Target outstanding advice bytes, including existing unconsumed coverage.
     window: usize,
+    #[cfg(test)]
+    lookup_inspections: usize,
 }
 
 impl ReadAhead {
@@ -325,7 +374,25 @@ impl ReadAhead {
         // A cached column skipped at look-ahead may have been evicted since. Only
         // actual advice, not the examined endpoint, can suppress miss-time fallback.
         !idx.span(b, columns(b))
-            .is_none_or(|(a, z)| self.covered.iter().any(|&(x, y)| x <= a && y >= z))
+            .is_none_or(|(a, z)| self.covers(a, z))
+    }
+
+    fn covers(&mut self, from: usize, to: usize) -> bool {
+        // Coverage is sorted and merged. A future interval cannot cover a hole
+        // before its start, so do not walk the rest of the future window there.
+        for &(start, end) in &self.covered {
+            #[cfg(test)]
+            {
+                self.lookup_inspections += 1;
+            }
+            if start > from {
+                return false;
+            }
+            if end >= to {
+                return true;
+            }
+        }
+        false
     }
 
     fn hint(&mut self, idx: &PermIndex, data: &Mmap, from: usize, to: usize) {
@@ -1841,27 +1908,119 @@ mod tests {
         assert_eq!(cache.misses(), 0);
     }
 
+    #[test]
+    fn advice_union_requires_complete_spans() {
+        for (spans, expected) in [
+            (vec![], false),
+            (vec![(10, 10)], false),
+            (vec![(10, 11)], false),
+            (vec![(19, 20)], false),
+            (vec![(0, 12), (13, 30)], false),
+            (vec![(10, 20)], true),
+            (vec![(0, 30)], true),
+            (vec![(15, 20), (10, 15)], true),
+            (vec![(16, 20), (10, 16), (10, 16), (12, 18)], true),
+            (vec![(0, 5), (20, 30)], false),
+        ] {
+            assert_eq!(advice_covers_span(&spans, (10, 20)), expected, "{spans:?}");
+        }
+        assert!(advice_covers_span(&[], (10, 10)));
+    }
+
+    #[test]
+    fn read_ahead_sorted_coverage_lookup_edges() {
+        let mut ahead = ReadAhead::default();
+        assert!(!ahead.covers(10, 20));
+        ahead.covered.extend([(10, 20), (30, 40), (50, 60)]);
+        for (from, to, expected) in [
+            (0, 5, false),
+            (20, 30, false),
+            (25, 35, false),
+            (10, 20, true),
+            (12, 18, true),
+            (30, 40, true),
+            (12, 21, false),
+            (30, 41, false),
+            (55, 60, true),
+            (60, 61, false),
+            (65, 70, false),
+        ] {
+            assert_eq!(ahead.covers(from, to), expected, "[{from}, {to})");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_ahead_sorted_coverage_lookup_has_bounded_work() {
+        let (_dir, idx) = read_ahead_fixture(128);
+        let cache = BlockCache::new(64 << 20);
+        for b in (0..idx.blocks.len()).step_by(2) {
+            cache.get_cols(&idx, b, 1).unwrap();
+        }
+        for pair in idx.blocks.windows(2) {
+            let gap = pair[1].offset - pair[0].offset - u64::from(pair[0].col_len[0]);
+            assert!(gap > 64 << 10, "selective spans must remain separate");
+        }
+        let before = cache.misses();
+        let trace = idx.trace_hints();
+        let mut ahead = ReadAhead::default();
+        let mut rows = 0;
+        for b in 0..idx.blocks.len() {
+            let hint = ahead.before(&idx, &cache, b, idx.blocks.len(), &|_| 1);
+            if b == 0 && io_hints() && read_window() != 0 {
+                assert_eq!(ahead.requested, 128);
+                assert_eq!(ahead.covered.len(), 64, "many actual future intervals");
+                assert_eq!(trace.spans().len(), 64);
+            }
+            let block = cache.get_cols_hinted(&idx, b, 1, hint).unwrap();
+            for &value in block.cols[0].iter() {
+                assert_eq!(value, rows);
+                rows += 1;
+            }
+        }
+        assert_eq!(rows, 128 * BLOCK_ROWS as u64);
+        assert_eq!(cache.misses() - before, 64);
+        let inspections = ahead.lookup_inspections;
+        eprintln!("128 real blocks, 64 cached skips, actual containment comparisons={inspections}");
+        assert!(
+            inspections <= 4 * idx.blocks.len(),
+            "coverage lookup exceeds linear pass bound"
+        );
+        if !io_hints() || read_window() == 0 {
+            assert_eq!(inspections, 0);
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn read_ahead_evicted_skipped_column_gets_fallback_advice() {
         let (_dir, idx) = read_ahead_fixture(6);
         let cache = BlockCache::new(64 << 20);
-        cache.get_cols(&idx, 1, 1).unwrap();
+        cache.get_cols(&idx, 1, 2).unwrap();
         let before = cache.misses();
         let trace = idx.trace_hints();
-        let target = idx.span(1, 1).unwrap();
+        let target_start = idx.blocks[1].offset as usize + idx.blocks[1].col_len[0] as usize;
+        let target = (
+            target_start,
+            target_start + idx.blocks[1].col_len[1] as usize,
+        );
+        assert!(target.1 - target.0 > 128 << 10);
+        assert!(target.1 - target.0 > advice_page_size());
+        assert!(idx.blocks[0].col_len[2] > 64 << 10);
+        assert!(idx.blocks[1].col_len[2] > 64 << 10);
+        let expected = read_ahead_reference(6 * BLOCK_ROWS);
         let mut n = 0;
         let mut previously_hinted = false;
-        idx.for_each_key_range_cols(&cache, &[0; 4], &[u64::MAX; 4], 1, |block, start, end| {
+        idx.for_each_key_range_cols(&cache, &[0; 4], &[u64::MAX; 4], 2, |block, start, end| {
             if n == 0 {
                 previously_hinted = trace
                     .spans()
                     .iter()
                     .any(|&(a, z)| a < target.1 && z > target.0);
-                cache.evict_column(&idx, 1, 0);
+                cache.evict_column(&idx, 1, 1);
             }
             for row in start..end {
-                assert_eq!(block.cols[0][row], n);
+                assert_eq!(block.cols[1][row], expected[n as usize]);
                 n += 1;
             }
             Ok(true)
@@ -1877,14 +2036,29 @@ mod tests {
             6,
             "evicted column must miss during consumption"
         );
-        assert_eq!(
-            trace
-                .spans()
+        let spans = trace.spans();
+        eprintln!(
+            "eager target={target:?}, page={}, misses={}, rows={n}, target advice={:?}",
+            advice_page_size(),
+            cache.misses() - before,
+            spans
                 .iter()
-                .any(|&(a, z)| a < target.1 && z > target.0),
+                .filter(|&&(a, z)| a < target.1 && z > target.0)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            spans.iter().any(|&(a, z)| a < target.1 && z > target.0),
             io_hints(),
             "an evicted column needs fallback advice when hints are enabled"
         );
+        assert_eq!(
+            advice_covers_span(&spans, target),
+            io_hints(),
+            "complete evicted column needs advice"
+        );
+        if !io_hints() {
+            assert!(spans.is_empty());
+        }
     }
 
     #[cfg(unix)]

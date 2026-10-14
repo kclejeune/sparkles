@@ -488,6 +488,15 @@ on requested coverage rather than physical device I/O. Default, disabled and sma
 configuration tests retain the same scan-answer assertions. Profile lifetime
 synchronization and corrected-source performance gates remain pending.
 
+Coverage lookup uses the sorted intervals to stop at the first future interval beyond
+the required start. It retains complete-span containment and consumed-prefix pruning.
+A 128-block mixed-cache regression counts actual interval comparisons against a linear
+pass bound. Eviction regressions independently check the complete union of attempted
+advice over a needed compressed column larger than 128 KiB, with payload and miss checks
+in eager, shared cursor, owned cursor and zero-projection count paths. Partial-prefix
+advice fails these assertions even when synchronous reads still decode the right data.
+These are algorithmic and coverage checks, not new latency measurements.
+
 Vocabulary profiling now records mapped offset pages before loading their values,
 including offset reads made while preparing advice or probing a block's first key.
 Ordinary and fallible bulk decoding record front-coded data before reconstruction and
