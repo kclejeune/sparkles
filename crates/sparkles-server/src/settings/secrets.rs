@@ -566,6 +566,10 @@ impl Sealing {
     /// start. Unless the server keeps plaintext values, each plaintext value is sealed in
     /// place, with a generated key when there is no other.
     pub fn prepare(&self, dir: &FsPath) -> anyhow::Result<()> {
+        remove_stale_temps(dir, is_secret_temp);
+        if let Some(data) = dir.parent() {
+            remove_stale_temps(data, is_key_temp);
+        }
         let mut migrated = 0usize;
         for o in self.open_all(dir)? {
             if o.held == Held::Plain && self.sealed() {
@@ -665,7 +669,9 @@ fn offline_values(
 /// back as a plaintext file with mode 0600, for a release that does not seal them. The
 /// key file stays, so a later start of a sealing release seals them again with it.
 pub fn unseal(data: &FsPath, source: Option<&str>) -> anyhow::Result<Offline> {
-    let opened = offline_values(lock_data(data)?, data, source, None)?;
+    let lock = lock_data(data)?;
+    remove_stale_temps(&data.join(SECRETS_DIR), is_secret_temp);
+    let opened = offline_values(lock, data, source, None)?;
     let dir = &opened.dir;
     let mut n = 0;
     for o in &opened.values {
@@ -694,6 +700,7 @@ pub fn rekey(data: &FsPath, source: Option<&str>, new_key: &str) -> anyhow::Resu
     }
     // the lock comes first, so that a running server is refused before any key is read
     let lock = lock_data(data)?;
+    remove_stale_temps(&data.join(SECRETS_DIR), is_secret_temp);
     let new = Sealing::start(Some(new_key), data)?;
     let opened = offline_values(lock, data, source, Some(&new))?;
     let dir = &opened.dir;
@@ -737,6 +744,7 @@ pub fn rekey(data: &FsPath, source: Option<&str>, new_key: &str) -> anyhow::Resu
     {
         std::fs::remove_file(path)
             .map_err(|e| anyhow::anyhow!("cannot remove {}: {e}", path.display()))?;
+        remove_stale_temps(data, is_key_temp);
         sync_dir(data).map_err(|e| anyhow::anyhow!("cannot flush {}: {e}", data.display()))?;
         removed_key = Some(path.clone());
     }
@@ -764,6 +772,56 @@ pub(crate) fn sync_dir(dir: &FsPath) -> std::io::Result<()> {
     #[cfg(not(unix))]
     let _ = dir;
     Ok(())
+}
+
+/// Remove the files in `dir` whose names `matches`, which a write that crashed left
+/// behind. A directory is never removed. Errors are ignored, and only the count is
+/// logged. Only a start or an offline command calls this, under the catalog lock, since
+/// a request handler's write may own a temporary file.
+fn remove_stale_temps(dir: &FsPath, matches: impl Fn(&str) -> bool) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut removed = 0usize;
+    for e in rd.flatten() {
+        let Some(name) = e.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if !matches(&name) {
+            continue;
+        }
+        let Ok(kind) = e.file_type() else {
+            continue;
+        };
+        if !kind.is_dir() && std::fs::remove_file(e.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        tracing::info!(
+            "removed {removed} stale temporary file(s) of an interrupted write in {}",
+            dir.display()
+        );
+    }
+}
+
+fn all_digits(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// `.secrets.key.PID.tmp`, the file that `generate` writes before it links the key.
+fn is_key_temp(name: &str) -> bool {
+    name.strip_prefix(".secrets.key.")
+        .and_then(|n| n.strip_suffix(".tmp"))
+        .is_some_and(all_digits)
+}
+
+/// `.NAME.PID.tmp`, the file that `write_atomic` writes before it renames it to NAME.
+fn is_secret_temp(name: &str) -> bool {
+    name.strip_prefix('.')
+        .and_then(|n| n.strip_suffix(".tmp"))
+        .and_then(|n| n.rsplit_once('.'))
+        .is_some_and(|(n, pid)| all_digits(pid) && crate::models::check_secret_name(n).is_ok())
 }
 
 /// Make `dir` with mode 0700, or set that mode on it.
@@ -1147,5 +1205,27 @@ mod tests {
         private_dir(&dir).unwrap();
         let s = Sealing::start(None, &data).unwrap();
         s.write(&dir, "gw", b"v").unwrap();
+    }
+
+    /// Temporary files that a crashed write left in the data directory or in `secrets/`
+    /// can hold a key or a plaintext value, so a start removes them.
+    #[cfg(all(feature = "backup", unix))]
+    #[test]
+    fn stale_temporary_files_are_removed() {
+        let t = tempfile::tempdir().unwrap();
+        let data = t.path().join("data");
+        let dir = data.join(SECRETS_DIR);
+        private_dir(&dir).unwrap();
+        let key_tmp = data.join(".secrets.key.4242.tmp");
+        std::fs::write(&key_tmp, "ab".repeat(32)).unwrap();
+        let secret_tmp = dir.join(".gw.4242.tmp");
+        std::fs::write(&secret_tmp, "plain").unwrap();
+        std::fs::create_dir(dir.join(".x.1.tmp")).unwrap();
+        std::fs::write(dir.join(".notes.tmp"), "keep").unwrap();
+        Sealing::start(None, &data).unwrap().prepare(&dir).unwrap();
+        assert!(!key_tmp.exists());
+        assert!(!secret_tmp.exists());
+        assert!(dir.join(".x.1.tmp").is_dir());
+        assert!(dir.join(".notes.tmp").exists());
     }
 }
