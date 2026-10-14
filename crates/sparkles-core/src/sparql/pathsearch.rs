@@ -850,6 +850,8 @@ impl Tree {
         cost: Option<&FxHashMap<u64, f64>>,
         check: &dyn Fn() -> Result<()>,
     ) -> Result<Vec<Vec<Edge>>> {
+        // with one parent per node the parents form a tree, and every one reaches the root
+        let cost = cost.filter(|_| all);
         let mut out = Vec::new();
         if cap == 0 || !self.contains(m) {
             return Ok(out);
@@ -2201,6 +2203,7 @@ pub fn run(
                     let tree = eng.bfs(s, true, (!targets.any).then_some(&tset), all, close)?;
                     (tree, None)
                 };
+                let cost = cost.as_ref().filter(|_| all);
                 // every node reached, nearest first, or the targets in id order
                 let mut ends: Vec<u64> = if targets.any {
                     tree.order.iter().map(|e| e.0).collect()
@@ -2230,7 +2233,7 @@ pub fn run(
                         continue;
                     }
                     let n = if all { cap(&eng) } else { 1 };
-                    for p in tree.paths(m, all, n, cost.as_ref(), &|| eng.ctx.check())? {
+                    for p in tree.paths(m, all, n, cost, &|| eng.ctx.check())? {
                         let p = p
                             .into_iter()
                             .map(|e| e.map(|x| if x == VIRT { s } else { x }))
@@ -2310,6 +2313,7 @@ pub fn run(
                     let tree = eng.bfs(t, false, None, all, true)?;
                     (tree, None)
                 };
+                let cost = cost.as_ref().filter(|_| all);
                 if spec.min_len == 0 && !add(&mut found, t, t, Vec::new(), None, false)? {
                     break 'targets;
                 }
@@ -2335,7 +2339,7 @@ pub fn run(
                         continue;
                     }
                     let n = if all { cap(&eng) } else { 1 };
-                    for p in tree.paths(m, all, n, cost.as_ref(), &|| eng.ctx.check())? {
+                    for p in tree.paths(m, all, n, cost, &|| eng.ctx.check())? {
                         let p = p
                             .into_iter()
                             .map(|e| e.map(|x| if x == VIRT { t } else { x }))
@@ -2509,5 +2513,31 @@ mod tree_tests {
         let check = || Err(Error::Timeout);
         let r = t.paths(1, true, 10, Some(&cost), &check);
         assert!(matches!(r, Err(Error::Timeout)), "{:?}", r.map(|p| p.len()));
+    }
+
+    /// A chain `0 -> 1 -> ... -> len` of first parents with every cost zero.
+    fn chain(len: u64) -> Tree {
+        let mut t = Tree::new(0, true);
+        for i in 1..=len {
+            t.first.insert(i, (parent(i - 1), 0));
+        }
+        t.order = (1..=len).map(|i| (i, 0)).collect();
+        t
+    }
+
+    #[test]
+    fn single_path_reconstruction_is_linear() {
+        const L: u64 = 5000;
+        let t = chain(L);
+        let cost: FxHashMap<u64, f64> = (1..=L).map(|i| (i, 0.0)).collect();
+        let calls = Cell::new(0u32);
+        let check = || {
+            calls.set(calls.get() + 1);
+            Ok(())
+        };
+        let r = t.paths(L, false, 1, Some(&cost), &check).unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].len(), L as usize);
+        assert!(calls.get() <= 2, "{} checks", calls.get());
     }
 }
