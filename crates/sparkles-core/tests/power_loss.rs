@@ -70,6 +70,10 @@ fn quad(t: u32, k: u32) -> Quad {
     )
 }
 
+fn message(t: u32, k: u32) -> String {
+    format!("commit {t} {k}")
+}
+
 /// Whether `s` holds the commit that thread `t` made as its `k`th.
 fn holds(s: &Store, t: u32, k: u32) -> bool {
     let snap = s.snapshot();
@@ -146,7 +150,15 @@ fn child_writer() {
         let (s, ack, out) = (s.clone(), ack.clone(), out.clone());
         hs.push(std::thread::spawn(move || {
             for k in 0..cfg.commits {
-                let mut w = s.write_as(CommitKind::Update);
+                // every commit has a message, so the annotation of each acknowledged
+                // commit is checked after the crash
+                let mut w = s.write_with(
+                    CommitKind::Update,
+                    sparkles_core::guard::WriteOptions {
+                        message: Some(message(t, k).into()),
+                        ..Default::default()
+                    },
+                );
                 // a transaction that begins on a poisoned store may already fail here
                 let staged = w
                     .encode_quad(&quad(t, k), &mut Default::default())
@@ -530,6 +542,11 @@ fn check_image(img: &Path, base: u32, acked: &[(u64, u32, u32)], what: &str) {
         assert!(
             holds(&s, *t, *k),
             "{what}: acknowledged commit {seq} ({t},{k}) is missing"
+        );
+        assert_eq!(
+            s.annotation(*seq).and_then(|a| a.message).as_deref(),
+            Some(message(*t, *k).as_str()),
+            "{what}: acknowledged commit {seq} ({t},{k}) lost its message"
         );
     }
     drop(snap);
