@@ -63,24 +63,25 @@ pub fn run(a: MigrateArgs) -> Result<()> {
         }
         (None, None) => bail!("give --data DIR or --loc DB"),
     };
+    // --check only plans, which changes nothing. Otherwise `migrate` plans under its own
+    // locks, after it has recovered an interrupted run, and the report is that plan.
     let mut plans: Vec<(Option<String>, Plan)> = Vec::new();
-    for (name, dir) in &targets {
-        let p = sparkles::migrate::plan(dir)
-            .with_context(|| format!("reading the formats of {}", dir.display()))?;
-        plans.push((name.clone(), p));
-    }
-    let refused = plans.iter().any(|(_, p)| !p.in_window());
     let mut outcomes: Vec<(Option<String>, Outcome)> = Vec::new();
-    if !a.check {
-        for (name, p) in &plans {
-            if !p.in_window() {
-                continue;
+    for (name, dir) in &targets {
+        if a.check {
+            let p = sparkles::migrate::plan(dir)
+                .with_context(|| format!("reading the formats of {}", dir.display()))?;
+            plans.push((name.clone(), p));
+        } else {
+            let (p, o) = sparkles::migrate::migrate_planned(dir, a.keep_old)
+                .with_context(|| format!("upgrading {}", dir.display()))?;
+            if let Some(o) = o {
+                outcomes.push((name.clone(), o));
             }
-            let o = sparkles::migrate::migrate(&p.root, a.keep_old)
-                .with_context(|| format!("upgrading {}", p.root.display()))?;
-            outcomes.push((name.clone(), o));
+            plans.push((name.clone(), p));
         }
     }
+    let refused = plans.iter().any(|(_, p)| !p.in_window());
     let mut out = std::io::stdout().lock();
     if a.format == "json" {
         let json = serde_json::json!({
@@ -93,6 +94,7 @@ pub fn run(a: MigrateArgs) -> Result<()> {
                 "files": p.files,
                 "steps": p.steps,
                 "refused": p.refused,
+                "interrupted": p.interrupted,
                 "upgraded": outcomes.iter().find(|(m, o)| m == n && o.root == p.root).map(|(_, o)| o),
             })).collect::<Vec<_>>(),
         });
@@ -151,6 +153,9 @@ fn write_plan(out: &mut impl Write, p: &Plan) -> std::io::Result<()> {
             "{}: {} version {} ({state})",
             f.file, f.kind, f.version
         )?;
+    }
+    if let Some(i) = &p.interrupted {
+        writeln!(out, "{i}")?;
     }
     if p.in_window() {
         writeln!(out, "inside the window: this release opens it")?;

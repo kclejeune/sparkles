@@ -292,3 +292,46 @@ fn a_newer_index_format_is_refused_by_name() {
     let config = std::fs::read_to_string(data.join("config.json")).unwrap();
     assert!(config.contains("books"), "{config}");
 }
+
+#[test]
+fn migrate_check_reports_an_interrupted_run_and_changes_nothing() {
+    let fixture = &fixtures()[0];
+    let tmp = tempfile::tempdir().unwrap();
+    let h = tmp.path();
+    unpack(fixture, h);
+    let data = h.join("data");
+    let stale = data.join("databases/.migrate-books");
+    std::fs::create_dir(&stale).unwrap();
+    std::fs::write(stale.join("partial"), b"partial").unwrap();
+
+    let out = ok(
+        h,
+        &[
+            "migrate",
+            "--data",
+            data.to_str().unwrap(),
+            "--check",
+            "--format",
+            "json",
+        ],
+    );
+    let v: J = serde_json::from_str(&out).unwrap();
+    let interrupted = v["datasets"][0]["interrupted"].as_str().unwrap_or_default();
+    assert!(interrupted.contains(".migrate-books"), "{out}");
+    assert_eq!(std::fs::read(stale.join("partial")).unwrap(), b"partial");
+
+    // a migrate without --check removes the stale copy, and the report no longer lists it
+    let out = ok(
+        h,
+        &[
+            "migrate",
+            "--data",
+            data.to_str().unwrap(),
+            "--format",
+            "json",
+        ],
+    );
+    let v: J = serde_json::from_str(&out).unwrap();
+    assert!(v["datasets"][0]["interrupted"].is_null(), "{out}");
+    assert!(!stale.exists());
+}
