@@ -513,7 +513,9 @@ impl Sealing {
     fn open_all_with(&self, dir: &FsPath, next: Option<&Sealing>) -> anyhow::Result<Vec<Opened>> {
         let mut out = Vec::new();
         let mut failed = Vec::new();
-        for name in stored(dir).into_keys() {
+        #[cfg(test)]
+        SCAN_PHASE.with(|phase| phase.set(ScanPhase::Open));
+        for name in stored_names_strict(dir)? {
             let bytes = std::fs::read(dir.join(&name))
                 .map_err(|e| anyhow::anyhow!("cannot read secret {name}: {e}"))?;
             let was_sealed = is_sealed(&bytes);
@@ -740,7 +742,12 @@ pub fn rekey(data: &FsPath, source: Option<&str>, new_key: &str) -> anyhow::Resu
     }
     // every file must open with the new key before the old key goes
     let mut unsealed = Vec::new();
-    for name in stored(dir).into_keys() {
+    #[cfg(test)]
+    SCAN_PHASE.with(|phase| phase.set(ScanPhase::Verify));
+    let names = stored_names_strict(dir).map_err(|e| {
+        e.context("cannot verify runtime secrets; no key was removed: run the same sparkles secrets rekey command again")
+    })?;
+    for name in names {
         let ok = std::fs::read(dir.join(&name))
             .ok()
             .is_some_and(|b| is_sealed(&b) && new.open(&name, b).is_ok());
@@ -750,7 +757,7 @@ pub fn rekey(data: &FsPath, source: Option<&str>, new_key: &str) -> anyhow::Resu
     }
     if !unsealed.is_empty() {
         anyhow::bail!(
-            "the stored secrets {} in {} do not open with the new key after the rekey, so the old key stays: run the same sparkles secrets rekey command again",
+            "the stored secrets {} in {} do not open with the new key after the rekey; no key was removed: run the same sparkles secrets rekey command again",
             unsealed.join(", "),
             dir.display()
         );
@@ -780,6 +787,32 @@ thread_local! {
     /// Makes [`sync_dir`] fail on this thread, to test the paths that must report it.
     pub(crate) static FAIL_DIR_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static DIR_SYNC_PROBE: std::cell::RefCell<Option<(PathBuf, bool, usize)>> = const { std::cell::RefCell::new(None) };
+    static SCAN_PHASE: std::cell::Cell<ScanPhase> = const { std::cell::Cell::new(ScanPhase::Open) };
+    static SCAN_FAULT: std::cell::Cell<Option<(ScanPhase, ScanPoint)>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScanPhase {
+    Open,
+    Verify,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScanPoint {
+    Directory,
+    Entry(usize),
+    Metadata,
+}
+
+#[cfg(test)]
+fn scan_check(point: ScanPoint) -> std::io::Result<()> {
+    if SCAN_FAULT.with(|fault| fault.get()) == Some((SCAN_PHASE.with(|phase| phase.get()), point)) {
+        Err(std::io::Error::other("injected secret enumeration failure"))
+    } else {
+        Ok(())
+    }
 }
 
 /// Flush the directory `dir`, so that the names made or removed in it survive a crash.
@@ -909,6 +942,48 @@ pub(crate) fn write_atomic(path: &FsPath, bytes: &[u8], mode: u32) -> std::io::R
     }
     written?;
     sync_dir(dir)
+}
+
+/// All runtime-secret names, or an error. Opening and destructive verification must
+/// never mistake an incomplete scan for an empty directory.
+fn stored_names_strict(dir: &FsPath) -> anyhow::Result<BTreeSet<String>> {
+    use anyhow::Context;
+    #[cfg(test)]
+    scan_check(ScanPoint::Directory).with_context(|| format!("reading {}", dir.display()))?;
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // A dangling directory symlink is an error, rather than an empty store.
+            return match std::fs::symlink_metadata(dir) {
+                Err(m) if m.kind() == std::io::ErrorKind::NotFound => Ok(BTreeSet::new()),
+                _ => Err(e).with_context(|| format!("reading {}", dir.display())),
+            };
+        }
+        Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
+    };
+    let mut names = BTreeSet::new();
+    for (_index, entry) in rd.enumerate() {
+        #[cfg(test)]
+        scan_check(ScanPoint::Entry(_index))
+            .with_context(|| format!("reading an entry of {}", dir.display()))?;
+        let entry = entry.with_context(|| format!("reading an entry of {}", dir.display()))?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if crate::models::check_secret_name(&name).is_err() {
+            continue;
+        }
+        #[cfg(test)]
+        scan_check(ScanPoint::Metadata)
+            .with_context(|| format!("reading metadata of {}", entry.path().display()))?;
+        let md = entry
+            .metadata()
+            .with_context(|| format!("reading metadata of {}", entry.path().display()))?;
+        if md.is_file() {
+            names.insert(name);
+        }
+    }
+    Ok(names)
 }
 
 /// The runtime values in `dir`, by name, with the time each was set. Only the names and
@@ -1380,6 +1455,135 @@ mod tests {
             assert!(rekey(&data, None, &source).is_err());
             assert_eq!(std::fs::read(dir.join("a")).unwrap(), before);
             assert_eq!(std::fs::read(key).unwrap(), old);
+        }
+    }
+
+    #[cfg(all(feature = "backup", unix))]
+    struct ScanFault(Option<(ScanPhase, ScanPoint)>, ScanPhase);
+
+    #[cfg(all(feature = "backup", unix))]
+    impl ScanFault {
+        fn new(phase: ScanPhase, point: ScanPoint) -> Self {
+            Self(
+                SCAN_FAULT.with(|slot| slot.replace(Some((phase, point)))),
+                SCAN_PHASE.with(|slot| slot.get()),
+            )
+        }
+    }
+
+    #[cfg(all(feature = "backup", unix))]
+    impl Drop for ScanFault {
+        fn drop(&mut self) {
+            SCAN_FAULT.with(|slot| slot.set(self.0));
+            SCAN_PHASE.with(|slot| slot.set(self.1));
+        }
+    }
+
+    #[cfg(all(feature = "backup", unix))]
+    #[test]
+    fn rekey_refuses_an_unsearchable_secrets_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid has no preconditions or side effects.
+        if unsafe { libc::geteuid() } == 0 {
+            return; // Deterministic scan-fault tests also cover privileged CI.
+        }
+        struct Restore(PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+        }
+        let (_t, data, source) = offline_fixture();
+        let dir = data.join(SECRETS_DIR);
+        Sealing::start(None, &data)
+            .unwrap()
+            .write(&dir, "a", b"value-a")
+            .unwrap();
+        let key = data.join(SECRETS_KEY_FILE);
+        let old = std::fs::read(&key).unwrap();
+        let before = std::fs::read(dir.join("a")).unwrap();
+        let restore = Restore(dir.clone());
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let result = rekey(&data, None, &source);
+        drop(restore);
+        assert!(
+            result.is_err(),
+            "rekey accepted incomplete enumeration: {result:?}"
+        );
+        assert_eq!(std::fs::read(dir.join("a")).unwrap(), before);
+        assert_eq!(std::fs::read(key).unwrap(), old);
+    }
+
+    #[cfg(all(feature = "backup", unix))]
+    #[test]
+    fn rekey_refuses_initial_scan_errors_before_writing() {
+        for point in [
+            ScanPoint::Directory,
+            ScanPoint::Entry(1),
+            ScanPoint::Metadata,
+        ] {
+            let (_t, data, source) = offline_fixture();
+            let dir = data.join(SECRETS_DIR);
+            let current = Sealing::start(None, &data).unwrap();
+            current.write(&dir, "a", b"value-a").unwrap();
+            current.write(&dir, "b", b"value-b").unwrap();
+            let key = data.join(SECRETS_KEY_FILE);
+            let old = std::fs::read(&key).unwrap();
+            let before: Vec<_> = ["a", "b"]
+                .map(|n| std::fs::read(dir.join(n)).unwrap())
+                .into();
+            let fault = ScanFault::new(ScanPhase::Open, point);
+            let result = rekey(&data, None, &source);
+            drop(fault);
+            let e = result.expect_err("rekey accepted an initial scan error");
+            assert!(
+                format!("{e:#}").contains("injected secret enumeration failure"),
+                "{e:#}"
+            );
+            assert_eq!(
+                ["a", "b"]
+                    .map(|n| std::fs::read(dir.join(n)).unwrap())
+                    .as_slice(),
+                before
+            );
+            assert_eq!(std::fs::read(key).unwrap(), old);
+        }
+    }
+
+    #[cfg(all(feature = "backup", unix))]
+    #[test]
+    fn rekey_refuses_verification_scan_errors_and_retries() {
+        for point in [
+            ScanPoint::Directory,
+            ScanPoint::Entry(1),
+            ScanPoint::Metadata,
+        ] {
+            let (_t, data, source) = offline_fixture();
+            let dir = data.join(SECRETS_DIR);
+            let current = Sealing::start(None, &data).unwrap();
+            current.write(&dir, "a", b"value-a").unwrap();
+            current.write(&dir, "b", b"value-b").unwrap();
+            let key = data.join(SECRETS_KEY_FILE);
+            let old = std::fs::read(&key).unwrap();
+            let before = std::fs::read(dir.join("a")).unwrap();
+            let fault = ScanFault::new(ScanPhase::Verify, point);
+            let result = rekey(&data, None, &source);
+            drop(fault);
+            let e = result.expect_err("rekey accepted an incomplete verification scan");
+            assert!(
+                format!("{e:#}").contains("injected secret enumeration failure"),
+                "{e:#}"
+            );
+            assert_ne!(std::fs::read(dir.join("a")).unwrap(), before);
+            assert_eq!(std::fs::read(&key).unwrap(), old);
+            let done = rekey(&data, None, &source).unwrap();
+            assert_eq!(
+                (done.values, done.already, done.removed_key),
+                (0, 2, Some(key))
+            );
+            let target = Sealing::start(Some(&source), &data).unwrap();
+            assert_eq!(target.read(&dir.join("a"), "a").unwrap(), "value-a");
+            assert_eq!(target.read(&dir.join("b"), "b").unwrap(), "value-b");
         }
     }
 
