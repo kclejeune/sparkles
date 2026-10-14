@@ -863,9 +863,9 @@ way older Fuseki versions did. Fuseki 6 itself refuses such bodies. The syntaxes
   served at the dataset URL and `update`, and `gsp-rw` and `gsp-r` at the dataset URL,
   `data` and `get`. `patch` is served at the dataset URL and `patch`. `upload` and
   `shacl` keep their names, and `prefixes-r` and
-  `prefixes-rw` are served at `prefixes`. `gsp-direct-rw` and `gsp-direct-r` need a
-  server started with `--gsp-direct-naming`. A `gsp-direct-r` endpoint makes its dataset
-  read-only at the graph's own URL.
+  `prefixes-rw` are served at `prefixes`. `gsp-direct-rw` and `gsp-direct-r` need the
+  server's `--gsp-direct-naming` to cover the dataset, which sets its mode. A
+  `gsp-direct-rw` endpoint is refused for a dataset the flag makes read-only.
 * A dataset of type `tdb2:DatasetTDB2` or `tdb:DatasetTDB` becomes a persistent dataset,
   unless its location is `--mem--`. A `ja:MemoryDataset`, `ja:DatasetTxnMem` or
   `ja:RDFDataset` becomes an in-memory dataset.

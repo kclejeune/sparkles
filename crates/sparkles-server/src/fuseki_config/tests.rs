@@ -417,7 +417,7 @@ fn a10_agrees_with_assembler_bodies() {
         let accepts = |union: bool| {
             let server = assembler::Server {
                 union_default_graph: union,
-                gsp_direct_naming: false,
+                gsp_direct_naming: &crate::state::GspDirectNaming::OFF,
             };
             assembler::parse(&body, oxrdfio::RdfFormat::Turtle, &server).ok()
         };

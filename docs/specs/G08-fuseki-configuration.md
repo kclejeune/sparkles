@@ -428,7 +428,10 @@ entry names. The test is `direct_naming_flags_win_over_the_fuseki_config` in `st
 a write to a read-only direct endpoint needs only read access, as `/{ds}/patch` does for a
 refused method, so readers get the `405` and callers without read access keep the usual
 401, 403 or 404. The test is `read_only_direct_naming_answers_readers_with_405` in
-`http/router_tests/auth/mod.rs`.
+`http/router_tests/auth/mod.rs`. An assembler body on `POST /$/datasets` that lists
+`gsp-direct-rw` or `gsp-direct-r` is accepted only when `--gsp-direct-naming` covers that
+dataset, and `gsp-direct-rw` is refused for a dataset the flag makes read-only. The test is
+`direct_endpoints_need_their_dataset_named` in `http/fuseki/assembler.rs`.
 The modes come from the command line, so the setting and its
 route in C19's settings, and assembler bodies, remain with item 76 below.
 

@@ -67,6 +67,13 @@ impl GspDirectNaming {
         Ok(out)
     }
 
+    /// No dataset serves direct naming.
+    #[cfg(test)]
+    pub const OFF: GspDirectNaming = GspDirectNaming {
+        all: None,
+        datasets: BTreeMap::new(),
+    };
+
     /// The values of a Fuseki configuration, then those of the command line, which win
     /// for the datasets both name.
     pub fn layered(config: &[String], cli: &[String]) -> Result<GspDirectNaming, String> {
@@ -89,6 +96,7 @@ impl GspDirectNaming {
     }
 
     /// Whether any dataset serves direct naming.
+    #[cfg(test)]
     pub fn is_on(&self) -> bool {
         self.all.is_some() || !self.datasets.is_empty()
     }
