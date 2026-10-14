@@ -597,7 +597,11 @@ index.
 * **A1 — One cache.** A server with ten datasets of 1.05M triples each, `--cache-mb 256`,
   runs the suite against each in turn. The block cache never holds more than 256 MiB in
   total, `sparkles_block_cache_bytes` summed over datasets equals the cache's weight, and
-  RSS after the run is at most 1.1 times that of a server with one dataset.
+  `RssAnon` after the run is at most `RssAnon` of a server with one dataset, plus the
+  difference between the two caches' bytes, plus nine times the anonymous memory of an
+  idle opened dataset, within 10%. The block cache's bytes never exceed `--cache-mb`.
+  The first version of this gate bounded total RSS by 1.1 times that of a server with one
+  dataset. The Outcome records why it changed.
 * **A2 — Clearing one dataset.** After queries on `a` and `b`, `POST /$/cache/clear/a`
   reports `a`'s entries and bytes. A repeated query on `b` hits the cache, and one on `a`
   misses.
@@ -730,13 +734,17 @@ namespace and so one set of counters.
   `capacityBytes` in each dataset's block and result cache, with the shared capacity.
 * **Catalogs.** `CatalogOptions::memory.caches` is `FromStore` (the default, sized by the
   store options), `Sizes` or `PerDataset`. A `Dataset` opened on its own keeps its caches.
+* **Entries of removed datasets.** The entries of a deleted or reopened dataset stay in the
+  shared caches until they are evicted. This is harmless, because the keys include the
+  store's identity.
 
 ### Phase 1b: the query memory pool
 
 `QueryPool` and `PoolGrant` are in `sparkles-core` (`sparql/pool.rs`) as §4.1 describes.
 `Charge::add` checks the grant only after its own `mem_live` update, `Ctx::release_live`
 replaces the direct decrements and trims the grant, and the pool never makes a running
-query wait. The differences from the text:
+query wait. The grant keeps the live total of every context that holds it, and growth and
+trimming of one grant run under a lock of its own. The differences from the text:
 
 * **Admission** is an axum layer inside the rate limiter, as §4.2 says, and passes the
   grant to handlers through a task-local that `query_options` reads. A request is a query
@@ -755,14 +763,28 @@ query wait. The differences from the text:
 * **Default size.** Half of the memory the process may use (the cgroup v2 limit of the
   server's cgroup and its ancestors, or `MemTotal`) less the configured caches, and at
   least 256 MiB with a warning. The pool is on by default, which is the answer to open
-  question 1. On a host where the memory cannot be read the pool is off until
-  `--total-query-memory-mb` sets it.
+  question 1, and it stays on after the review fixes below. On a host where the memory
+  cannot be read the pool is off until `--total-query-memory-mb` sets it.
+* **Behaviour change on small hosts.** Before the pool, concurrent queries on a small host
+  all ran. Now each request reserves 16 MiB at admission, so on a host whose pool sits at
+  the 256 MiB floor the seventeenth concurrent query or update waits for
+  `--query-admission-wait` and then answers `503` with `Retry-After`. Larger hosts have
+  room for hundreds of concurrent requests. `--total-query-memory-mb 0` turns the pool off
+  and restores the earlier behaviour. This was decided on 2026-10-13 and belongs in the
+  release notes.
 * **`NeedsSpill`**, `spilledBytes` and the spill reservation in `/$/server/memory` belong
   to Phase 2 and are not built. `meta.memory.grantedBytes` is the most the query held.
 * **Not covered.** SHACL-SPARQL, `/$/reason` and ShEx do not take grants, because they run
   through the engine's contexts without a request grant. A SERVICE call from a query to
   its own server is admitted like any request, so it can wait for memory that its caller
-  holds, and it ends with `503` at the admission deadline.
+  holds, and it ends with `503` at the admission deadline. With `SILENT` the failed call
+  yields no rows for that pattern instead of an error. Routes that count as queries but
+  do not run through the request's options, such as GraphQL, SHACL, ShEx, diff,
+  `memory/brief` and the `/$/stats`, `/$/schema` and `/$/validate` reads, hold the
+  admitted grant idle while a query of their own takes a second grant from the dataset's
+  pool. That reserves more than they use but bypasses nothing. Uploads and Graph Store
+  writes hold an admission grant for the whole load, and the memory of the load itself is
+  not charged to the pool.
 * **Errors.** `BudgetKind::ServerMemory` (`server-memory`) answers `503` with
   `Retry-After: 1`, counts as a budget in `sparkles_budget_exceeded_total`, and is
   `budget-server-memory` in the MCP tools. The optional operator caches that fall back on
@@ -773,15 +795,40 @@ query wait. The differences from the text:
   (`total_query_memory_bytes`) and Node (`totalQueryMemoryBytes`) pass the option. The JVM
   bindings do not.
 
-A review by a second model found no deadlock and no leak of granted bytes, and its
-findings changed the code before it shipped. A pool smaller than 16 MiB refused every
-request, so admission now clamps the initial grant to the pool. A trim that raced a
-growing charge could leave the grant below the query's use, so a trim that gives memory
-back is followed by a check of the live bytes, and the counters that decide wake-ups use
-sequentially consistent ordering. A newcomer could overtake a queued request, so the
-check and the reservation of `try_grant` happen under the queue's lock. The bypass rule
-was looser than §4.2, and the history eviction left one state per store over a full
-budget.
+A review by a second model changed the code before it shipped. A pool smaller than 16 MiB
+refused every request, so admission now clamps the initial grant to the pool. A newcomer
+could overtake a queued request, so the check and the reservation of `try_grant` happen
+under the queue's lock. The bypass rule was looser than §4.2, and the history eviction
+left one state per store over a full budget. The counters that decide wake-ups use
+sequentially consistent ordering.
+
+That review did not find every defect, and a later review of the merged lane found
+more, which are now fixed.
+
+* **Trim and growth races.** A trim could return granules to the pool between a charge
+  passing the fast path and the grant being checked, which left an accepted charge
+  unbacked. Two threads that grew one grant could also fail each other with
+  `server-memory` although the pool had room for both. The grant now keeps the live total
+  of all contexts that hold it, so contexts that share a grant, such as the WHERE contexts
+  of an update, add up. Growth and trimming run under a lock of the grant. A trim lowers
+  the grant, reads the total again, and returns bytes to the pool only after that second
+  read. A charge that the fast path cannot cover takes its bytes out of the total before
+  it waits for the lock, so a charge that is about to fail does not fail another thread's
+  charge.
+* **Eager outputs and retained results.** The estimate of an eager operator's output was
+  checked against the query's own budget and never reached the pool, so an update's WHERE
+  clause could grow past the pool, and results that outlived the charges that built them
+  held less than their peak. An eager context's grant now holds the highest estimate the
+  context checked until the context drops. A cursor context covers its checks only for
+  the moment, because cursor operators charge what they keep.
+* **Paths that skipped the pool.** `POST /{ds}/update` ran without the admitted grant and
+  without the dataset's pool. The Python query defaults dropped the pool. Memory clones
+  adopted by a catalog had no pool, and `Transaction::update_with` skipped the dataset's
+  pool, which Node, Python and the JVM bindings reach. All of them now take the pool.
+* **Shared namespaces.** A memory clone kept its source's cache namespace, so clearing the
+  clone cleared the source's cached results and the per-dataset figures counted both
+  datasets under both names. Every memory clone now gets a namespace of its own, which
+  also covers the standalone copies of the Node, Python and JVM bindings.
 
 ### Gates
 
@@ -789,8 +836,22 @@ budget.
   held 251 MiB in 1,063 columns after each dataset ran two queries, and the per-dataset
   bytes added up to that figure. RSS was 770 MiB, against 467 MiB for one dataset and
   1,074 MiB for the build before this change, whose ten caches held about 450 MiB of
-  blocks. The spec's bound of 1.1 times one dataset's RSS does not hold. Each dataset's
-  own pages, vocabulary and statistics are resident, and only the cache is capped.
+  blocks. The bound of 1.1 times one dataset's RSS did not hold, and the mechanism was
+  not short of anything. One dataset at 1.05M triples needs about 40 MiB of blocks, so the
+  one-dataset server never fills its cache, while the ten-dataset server fills it to 251
+  MiB as intended. That accounts for about 210 MiB of the 303 MiB difference. The rest,
+  about 10 MiB per extra dataset, is each dataset's vocabulary, statistics and mapped
+  index pages. Mapped pages that queries touched count in RSS as file-backed pages, which
+  the kernel can reclaim and which Sparkles does not own, and §1 already says that mapped
+  pages are bounded separately.
+
+  Decided on 2026-10-13: the gate is restated in terms of `RssAnon`, as §10 now says. The
+  design of this spec is unchanged, and only the gate that measures it moved. The
+  restated bound is not yet measured. Its measurement reads `VmRSS`, `RssAnon`, `RssFile`
+  and `RssShmem` from `/proc/<pid>/status` and the cache bytes from `/$/server/memory`
+  for ten datasets and for one, at `--cache-mb 256` and at `--cache-mb 32`, and also
+  reads `RssAnon` of a server that opened ten datasets and ran no query, to get the cost
+  of an idle dataset.
 * **A2.** Covered by `shared_caches.rs`. Clearing one namespace leaves the other's entries,
   and only its own queries miss afterwards. The HTTP route reports the namespace's counts.
 * **A3.** `serve --memory-profile small --cache-mb 512` logs `block cache 512 MiB, result
@@ -818,7 +879,21 @@ budget.
 
 ### What remains
 
-* The latency gate for queries under 0.3 ms on a quiet Intel host.
+* The re-measurement of A1 under the restated bound, on a quiet host, as the Gates
+  section describes.
+* The latency gate for queries under 0.3 ms on a quiet Intel host. The run builds the
+  commit before this phase, the fixed build, and the fixed build with
+  `--total-query-memory-mb 0`. It compares the first with itself to get the noise floor,
+  then the first with the fixed build, then the fixed build with the pool off against it
+  with the pool on, at ten rounds of 300 requests with one Rayon thread. A query passes
+  when the upper end of the 95% interval of its median ratio is at most 1.02, or when its
+  interval overlaps the noise floor and its median is at most 1.02. These two runs block
+  marking the Phase 1a and 1b gates as met, and they do not block the merge.
+* **X08-P1-grant-routing.** Admit MCP tool calls and the other requests that never queue,
+  and route the admitted grant into every route that counts as a query.
+* **X08-P1-nested-service.** Recognise a SERVICE call to the same server, without a header
+  that a client could forge, so that it does not wait behind its caller's grant. Today it
+  answers `503` after the admission wait, and `SILENT` turns that into empty results.
 * The 10.5M and DBpedia runs of the profile gate in §3.3, warm and cold. Only the
   1.05M screen ran.
 * A settings-file profile (C19) and the `small` default for the bindings (§8.2).

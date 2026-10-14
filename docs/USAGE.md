@@ -525,9 +525,13 @@ A request that finds the pool full waits up to `--query-admission-wait` seconds 
 receives `503` with `Retry-After`. The pool costs a few atomic operations per request and
 nothing per row while a query stays inside its grant. The default pool is half of the
 available memory less the caches, so a server that ran many large queries at once may now
-see `503` where it used to run them until the host ran out of memory. Set
-`--total-query-memory-mb 0` to turn the pool off. The mechanism is described in
-[API.md](API.md#query-memory-pool).
+see `503` where it used to run them until the host ran out of memory. Every request
+reserves 16 MiB when it starts, so on a small host the pool is the 256 MiB floor, and
+concurrent queries beyond the sixteenth wait and then receive `503` with `Retry-After`.
+Set `--total-query-memory-mb 0` to turn the pool off, which restores the earlier
+behaviour. A SERVICE call from a query to its own server counts as a request of its own,
+so it can wait while its caller holds memory and then answer `503`. The mechanism is
+described in [API.md](API.md#query-memory-pool).
 
 ## Command-line tools
 
