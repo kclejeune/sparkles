@@ -100,9 +100,12 @@ done
 [ ${#ARGS[@]} -ge 2 ] || usage 1
 for t in nsc zstd python3 cargo rustc cc flock; do command -v "$t" > /dev/null || die "$t is not on PATH"; done
 if [ -n "$OUT" ]; then
-  # Do not resolve the final symlink: even a dangling destination must be refused.
-  OUT=$(realpath -ms "$OUT")
-  mkdir -p "$(dirname "$OUT")"
+  # Resolve symlinks and .. in the parent, while preserving the final name so
+  # even a dangling destination symlink must be refused by the exclusive mkdir.
+  OUT_PARENT=$(realpath -m -- "$(dirname -- "$OUT")")
+  OUT_NAME=$(basename -- "$OUT")
+  mkdir -p -- "$OUT_PARENT"
+  OUT=$OUT_PARENT/$OUT_NAME
   mkdir -- "$OUT" || die "results directory already exists or cannot be created: $OUT"
 else
   mkdir -p "$ROOT/target/nsc-writes"
