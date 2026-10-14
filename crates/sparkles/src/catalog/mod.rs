@@ -1141,6 +1141,28 @@ mod tests {
     }
 
     #[test]
+    fn reattaching_a_repaired_dataset_clears_its_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let cat = Catalog::open(dir.path(), Default::default()).unwrap();
+        drop(cat.create("b", &Default::default()).unwrap());
+        drop(cat);
+        let settings = dir.path().join("databases/b/describe.json");
+        std::fs::write(&settings, r#"{"format": 2}"#).unwrap();
+        let cat = Catalog::open(dir.path(), Default::default()).unwrap();
+        assert!(cat.get("b").is_none());
+        assert_eq!(cat.refused().len(), 1);
+        std::fs::remove_file(settings).unwrap();
+        drop(cat.reattach("b").unwrap());
+        assert!(cat.get("b").is_some());
+        assert!(cat.refused().is_empty());
+        cat.save().unwrap();
+        drop(cat);
+        let cat = Catalog::open(dir.path(), Default::default()).unwrap();
+        assert!(cat.get("b").is_some());
+        assert!(cat.refused().is_empty());
+    }
+
+    #[test]
     fn a_dataset_with_a_newer_settings_file_is_refused_alone() {
         for (file, body) in [
             ("describe.json", r#"{"format": 2}"#),
