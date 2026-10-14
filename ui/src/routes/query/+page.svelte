@@ -3374,6 +3374,8 @@
   .format-group {
     position: relative;
     display: flex;
+    /* when the toolbar wraps the group to the start of a row, its right-aligned menu stays clear of the sidebar */
+    margin-left: 16px;
   }
   .format-group .format {
     border-top-right-radius: 0;
