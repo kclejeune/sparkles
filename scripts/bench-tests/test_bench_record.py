@@ -144,6 +144,27 @@ class RecordTests(unittest.TestCase):
         self.assertIsNone(rs[0]["median_ms"])
         self.assertEqual(subprocess.run([sys.executable, RECORD, "validate", out], capture_output=True).returncode, 0)
 
+    def test_pooled_hashes_keep_which_instance_gave_which_answer(self):
+        def pooled(name, t1, t2):
+            d = os.path.join(self.tmp.name, name + "-dir")
+            os.mkdir(d)
+            ans = lambda v: {"rows": 1, "exact": v, "value": v}
+            write(d, "answers.json", {"t-1": {"sparkles": ans(t1)}, "t-2": {"sparkles": ans(t2)}})
+            out = os.path.join(self.tmp.name, name + ".json")
+            p = build(d, out, **{"pool-instances": True})
+            self.assertEqual(p.returncode, 0, p.stderr)
+            return out
+
+        old, same, swapped = pooled("old", "a", "b"), pooled("same", "a", "b"), pooled("swap", "b", "a")
+        hash_of = lambda path: jload(path)["results"][0]["answer"]["hash"]
+        self.assertEqual(hash_of(old), hash_of(same))
+        self.assertNotEqual(hash_of(old), hash_of(swapped))
+        cmp = lambda a, b: subprocess.run([sys.executable, REGRESSIONS, "compare", a, b], capture_output=True, text=True)
+        self.assertEqual(cmp(old, same).returncode, 0)
+        p = cmp(old, swapped)
+        self.assertEqual(p.returncode, 1, p.stdout)
+        self.assertIn("ANSWER CHANGED sparkles t", p.stdout)
+
     def test_a_server_side_timeout_is_a_timeout(self):
         # an HTTP error (curl exit 22) after the request limit is the server's own timeout
         write(self.res, "slow.json", {"results": [hyperfine("jena-fuseki", [5.0, 5.1], [22, 22]),

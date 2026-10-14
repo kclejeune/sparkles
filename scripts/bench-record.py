@@ -312,7 +312,8 @@ def hyperfine_results(d, name, mode, fps, clients=1, query=None):
 
 def pool(results):
     """Results of the instances `<template>-<i>` of one template, as one result per template: the
-    samples of all instances together, the worst status, and one answer for the whole template."""
+    samples of all instances together, the worst status, and one answer for the whole template, whose
+    hash covers each instance's name and hash, so a change in which instance gives which answer shows."""
     order = {"ok": 0, "wrong-answer": 1, "timeout": 2, "oom": 3, "error": 4}
     groups, out = {}, []
     for r in results:
@@ -327,7 +328,10 @@ def pool(results):
         answer = None
         if all(answers):
             agrees = None if any(x["agrees"] is None for x in answers) else all(x["agrees"] for x in answers)
-            h = hashlib.sha256("".join(sorted(str(x["hash"]) for x in answers)).encode()).hexdigest()[:16]
+            pairs = sorted(((int(re.fullmatch(r".+-(\d+)", r["query"]).group(1)), r["query"], r["answer"]) for r in rs),
+                           key=lambda t: (t[0], t[1]))
+            text = "\n".join(f"{name}\t{a['hash']}" for _, name, a in pairs)
+            h = hashlib.sha256(text.encode()).hexdigest()[:16]
             answer = {"rows": sum(x["rows"] for x in answers), "hash": h, "agrees": agrees, "instances": len(rs)}
         out.append({
             "engine": engine, "query": template, "mode": mode, "clients": clients,
