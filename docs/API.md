@@ -2237,6 +2237,13 @@ The default graph and the whole dataset always exist, and a named graph exists w
 holds a triple. A `PUT` with `If-None-Match: *` therefore creates a named graph only if it
 is absent. A missing graph is still a `404` on `GET`, whatever the conditions say.
 
+With group commit, a precondition or permission refusal based on the dataset's state
+waits for earlier writes to become durable. The core `WriteOptions::no_wait` option
+returns `WriterBusy` when that refusal would need to wait. The HTTP error conversion
+maps an escaping `WriterBusy` to `503`. There is no HTTP header for this option.
+Ordinary HTTP writes leave it disabled. The server's internal inline attempt enables
+it, consumes `WriterBusy` and retries through the blocking path.
+
 RFC 9110 asks `If-Match` to use the strong comparison, under which a weak tag never
 matches. Sparkles compares the commit a tag names instead. Its tags identify the data
 exactly, even though they cannot promise identical bytes, and that is what a concurrency

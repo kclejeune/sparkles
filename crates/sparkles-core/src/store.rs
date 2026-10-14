@@ -3821,6 +3821,10 @@ impl Store {
     }
 
     /// Install (or remove) the write guard run before every commit.
+    ///
+    /// Call this before any writer exists, or while holding the writer lock through a
+    /// drained transaction, as validation configuration changes do. This keeps a
+    /// speculative transaction on the guard it began with until its check completes.
     pub fn set_guard(&self, g: Option<Arc<dyn crate::guard::CommitGuard>>) {
         crate::sparql::extensions::assert_family(self.owner_dataset_id());
         *self.guard.write() = g;

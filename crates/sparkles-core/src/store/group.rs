@@ -314,8 +314,9 @@ impl Store {
         }
     }
 
-    /// Publish only a successfully fenced prefix, in commit order. Aux indexes and
-    /// annotation/digest/guard paths are excluded at admission and drain first.
+    /// Publish only a successfully fenced prefix, in commit order. Auxiliary indexes
+    /// remain excluded at admission and drain first. Grouped guard notifications run
+    /// before publication.
     fn publish_group_prefix(&self, p: &Pending) {
         let c = p.info;
         let generation = &p.snapshot.generation;

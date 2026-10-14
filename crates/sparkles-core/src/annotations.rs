@@ -224,8 +224,9 @@ impl Annotations {
     /// Record `a` for commit `seq` without syncing it, and return the file to sync with
     /// the offset the record starts at (none when there is nothing to sync: an empty
     /// annotation, or a store without a file). The caller syncs the file before it
-    /// acknowledges the commit, and cuts the file back to the offset when that fails. The
-    /// offset is taken after the file's creation, so a rollback keeps the header.
+    /// acknowledges the commit. Ordinary append rolls back to the offset on sync failure.
+    /// A failed grouped fence poisons the writer and keeps the records until reopen.
+    /// The offset is taken after the file's creation, so a rollback keeps the header.
     /// The record is written at its own offset, so the descriptor can be shared with the
     /// thread that syncs. The file's creation, which happens with the first record, is
     /// synced here.

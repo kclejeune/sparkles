@@ -564,12 +564,17 @@ Four points differ from the design.
    SPARQL class and pattern protections use this routing too. Another drain after a
    protection check already drained is a no-op. RDF Patch syntax, term, graph, prefix and
    folding errors are reported immediately because they do not depend on the speculative
-   head. Cancellation and deadline errors retain their direct propagation.
+   head. Cancellation and deadline errors retain their direct propagation. A guard
+   rejection increments its rejection counter even when the client receives `Poisoned`
+   because the predecessor's fence failed.
 3. **A7 as worded cannot happen.** A failed fence poisons the writer, so a write whose tag
    matched only the durable head is refused as poisoned. If the fence succeeds, the durable
    head is the speculative head and the refusal stands. The test checks both outcomes, and
-   that nothing is reported before the fence is done. With `no_wait`, such a write fails with
-   `WriterBusy` (503) rather than 412, since it cannot drain.
+   that nothing is reported before the fence is done. With `no_wait`, a data-dependent
+   refusal that needs to drain instead returns `WriterBusy`, rather than the usual
+   precondition or permission refusal, since it cannot wait. This is a core write option,
+   with no HTTP header. The HTTP error conversion maps an escaping `WriterBusy` to 503.
+   The server's internal inline attempt instead retries it through the blocking path.
 4. **Full-text, spatial and embedding datasets stay on the ordinary path.** The design had
    `publish_group_prefix` call `maintain_text`, `maintain_geo` and `embed_noted`. A review
    found that the coordinator publishes without the writer lock, while the spatial build,
@@ -583,18 +588,25 @@ Four points differ from the design.
 
 ### Tests
 
-`group.rs` has 38 tests, including the failed-fence cases of each admission change, the
-annotation recovery rules, an idle commit after grouped ones, a stateful guard that must be
-told of each commit before the next check, and writes during compaction. The SHACL crate has
-a test with a limit across concurrent writes and one with a shapes change in flight.
-A quota-refused write followed by a bypassed commit with the same number discards the
-unpublished SHACL state and makes the next validation full. The server has router tests for
-each write kind. The power-loss test file fails the annotation
-file's sync alone, both inside a fence and for the first message of a database, where the
-file and its header are created by the commit that fails
-(`a_failed_first_annotation_sync_keeps_later_messages`). Not written: the model-based stress
-test of section 10.1, the `kill -9` runs of section 10.4, and a prune followed by a reopen
-with a flagged commit at the WAL tail.
+`group.rs` has 41 tests, including failed-fence cases for preconditions, guard errors,
+class protections and late RDF Patch preconditions. They also cover annotation recovery,
+an idle commit after grouped ones, a stateful guard that must be told of each commit before
+the next check, and writes during compaction.
+
+The SHACL tests cover a limit across concurrent writes and a shapes change in flight.
+`a_bypassed_commit_discards_validation_of_an_unpublished_write` and its grouped counterpart
+check that a quota-refused write followed by a bypassed commit with the same number discards
+the unpublished state and makes the next validation full. A paused-fence test checks that
+a later bypass preserves earlier pending state. The server has three router tests covering
+independent receipts, failed fences and each HTTP write kind.
+
+The six power-loss tests cover acknowledged data and messages, including failure of the
+annotation file's sync inside a fence and during the first message of a database.
+`a_failed_first_annotation_sync_keeps_later_messages` checks that a failed first record
+preserves the new header for a later acknowledged message. The single-writer and concurrent
+annotation-fence cases explicitly disable idle direct commits. The model-based stress test
+of section 10.1, the `kill -9` runs of section 10.4, and a prune followed by reopening a
+flagged commit at the WAL tail remain unwritten.
 
 ### Left for Phase 3
 
