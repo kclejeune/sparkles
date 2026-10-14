@@ -767,7 +767,8 @@ async fn draft_shapes_tool() {
             {"path": "http://ex.org/age", "component": "maxInclusive", "excluded": 1},
             {"path": "http://www.w3.org/2000/01/rdf-schema#label", "component": "datatype", "excluded": 1},
             {"path": "http://www.w3.org/2000/01/rdf-schema#label", "component": "languageIn", "excluded": 1},
-            {"path": "http://ex.org/knows", "component": "minCount", "excluded": 1}])
+            {"path": "http://ex.org/knows", "component": "minCount", "excluded": 1},
+            {"path": "^http://ex.org/knows", "component": "minCount", "excluded": 1}])
     );
     let (text, meta) = c.error("draft_shapes", json!({"support": 2})).await;
     assert!(text.contains("support"), "{text}");
