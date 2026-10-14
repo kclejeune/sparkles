@@ -669,6 +669,109 @@ fn crash_images_keep_every_acknowledged_commit() {
     }
 }
 
+// ------------------------------------------------------- a failed first annotation sync
+
+const RETRY: &str = "SPARKLES_PL_RETRY";
+
+/// The writer process of `a_failed_first_annotation_sync_keeps_later_messages`: two serial
+/// updates that carry a message each. Prints `LINE first ...` and `LINE second ...`.
+#[test]
+fn child_annotation_retry() {
+    let Ok(spec) = std::env::var(RETRY) else {
+        return;
+    };
+    let db = PathBuf::from(std::env::var("SPARKLES_PL_DB").unwrap());
+    let s = Store::open(
+        &db,
+        StoreOptions {
+            experimental_group_commit: spec == "group",
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    // faults count the calls after the store has opened
+    std::fs::write(std::env::var("SPARKLES_IO_ARM").unwrap(), b"armed").unwrap();
+    for (name, k) in [("first", 0), ("second", 1)] {
+        let mut w = s.write_with(
+            CommitKind::Update,
+            sparkles_core::guard::WriteOptions {
+                message: Some(name.into()),
+                ..Default::default()
+            },
+        );
+        let ids = w.encode_quad(&quad(1, k), &mut Default::default()).unwrap();
+        w.insert(ids).unwrap();
+        match w.commit() {
+            Ok(r) => println!("LINE {name} ok {}", r.commit.seq),
+            Err(e) => println!("LINE {name} err {e}"),
+        }
+    }
+    std::process::exit(0);
+}
+
+/// The first annotation of a database creates `annotations.bin` and its header. When the
+/// sync of that first record fails, the record is taken back and the header stays, so the
+/// next message lands after the header and survives a reopen.
+fn annotation_retry(name: &str, mode: &str) {
+    let root = work_root().join(format!("{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let db = root.join("db");
+    // a database that has no annotation file yet
+    drop(Store::open(&db, StoreOptions::default()).unwrap());
+    assert!(!db.join("annotations.bin").exists(), "{name}");
+    let out = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "child_annotation_retry", "--nocapture"])
+        .env(RETRY, mode)
+        .env("SPARKLES_PL_DB", &db)
+        .env("SPARKLES_IO_ROOT", &root)
+        .env("SPARKLES_IO_ARM", root.join("armed"))
+        .env("SPARKLES_IO_FAULT", "fdatasync:annotations.bin:1")
+        .env("LD_PRELOAD", shim())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{name}: writer failed: {}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let lines: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.strip_prefix("LINE ").map(str::to_string))
+        .collect();
+    assert!(
+        lines.iter().any(|l| l.starts_with("first err ")),
+        "{name}: the first message was acknowledged: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l == "second ok 1"),
+        "{name}: the second message did not take sequence 1: {lines:?}"
+    );
+    let s = Store::open(&db, StoreOptions::default()).unwrap();
+    assert_eq!(s.snapshot().commit, 1, "{name}");
+    assert_eq!(
+        s.annotation(1).and_then(|a| a.message).as_deref(),
+        Some("second"),
+        "{name}: the acknowledged message was lost"
+    );
+    drop(s);
+    let report = check(&db, &CheckOptions::default()).unwrap();
+    assert!(
+        report.status != Status::Error,
+        "{name}: sparkles check fails:\n{}",
+        report.to_text()
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_failed_first_annotation_sync_keeps_later_messages() {
+    annotation_retry("ann-retry-ordinary", "ordinary");
+    // the idle direct path of group commit, which is on by default
+    annotation_retry("ann-retry-group", "group");
+}
+
 // ------------------------------------------------------------ failed synchronizations
 
 /// Fail the calls named by `fault` in a run of `cfg`, and check the guarantees of spec X09
@@ -737,6 +840,11 @@ fn failed_sync(name: &str, cfg: Config, fault: &str) {
             holds(&s, *t, *k),
             "{name}: acknowledged commit {seq} is missing"
         );
+        assert_eq!(
+            s.annotation(*seq).and_then(|a| a.message).as_deref(),
+            Some(message(*t, *k).as_str()),
+            "{name}: acknowledged commit {seq} ({t},{k}) lost its message"
+        );
     }
     drop(s);
     let _ = std::fs::remove_dir_all(&run.root);
@@ -778,4 +886,6 @@ fn failed_synchronizations_fail_unacknowledged_commits_and_publish_nothing() {
     failed_sync("o-vocab", ordinary, "fdatasync:delta.vocab:5");
     failed_sync("d-write", direct, "pwrite:wal.log:5");
     failed_sync("d-vocab", direct, "pwrite:delta.vocab:5");
+    // the annotation file alone, in a run of fences
+    failed_sync("g-ann", grouped, "fdatasync:annotations.bin:2");
 }

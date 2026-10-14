@@ -2854,7 +2854,10 @@ impl Store {
     ) -> Result<(crate::annotations::Annotation, Option<Arc<File>>)> {
         let mut a = self.annotations.lock();
         let ann = self.annotation_of(&a, c, message, changes);
-        let file = a.append_unsynced(c.seq, ann.clone(), self.dataset_id)?;
+        // a grouped commit never takes its record back, so only the file is needed
+        let file = a
+            .append_unsynced(c.seq, ann.clone(), self.dataset_id)?
+            .map(|(f, _)| f);
         Ok((ann, file))
     }
 

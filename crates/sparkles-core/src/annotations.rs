@@ -208,30 +208,33 @@ impl Annotations {
     /// persistent store, sync it to disk. Undo it with [`Annotations::undo`] if the
     /// commit does not happen.
     pub fn append(&mut self, seq: u64, a: Annotation, dataset_id: uuid::Uuid) -> Result<()> {
-        let before = self.len;
-        if let Some(f) = self.append_unsynced(seq, a, dataset_id)?
+        if let Some((f, at)) = self.append_unsynced(seq, a, dataset_id)?
             && let Err(e) = f.sync_data()
         {
-            // leave no record behind that may not be on the disk
-            let _ = f.set_len(before);
-            self.len = before;
+            // leave no record behind that may not be on the disk, and keep the header
+            // that this very append may have created
+            let _ = f.set_len(at);
+            self.len = at;
             self.map.remove(&seq);
             return Err(e.into());
         }
         Ok(())
     }
 
-    /// Record `a` for commit `seq` without syncing it, and return the file to sync (none
-    /// when there is nothing to sync: an empty annotation, or a store without a file).
-    /// The caller syncs the file before it acknowledges the commit. The record is written
-    /// at its own offset, so the descriptor can be shared with the thread that syncs.
-    /// The file's creation, which happens with the first record, is synced here.
+    /// Record `a` for commit `seq` without syncing it, and return the file to sync with
+    /// the offset the record starts at (none when there is nothing to sync: an empty
+    /// annotation, or a store without a file). The caller syncs the file before it
+    /// acknowledges the commit, and cuts the file back to the offset when that fails. The
+    /// offset is taken after the file's creation, so a rollback keeps the header.
+    /// The record is written at its own offset, so the descriptor can be shared with the
+    /// thread that syncs. The file's creation, which happens with the first record, is
+    /// synced here.
     pub fn append_unsynced(
         &mut self,
         seq: u64,
         a: Annotation,
         dataset_id: uuid::Uuid,
-    ) -> Result<Option<Arc<File>>> {
+    ) -> Result<Option<(Arc<File>, u64)>> {
         if a.is_empty() {
             return Ok(None);
         }
@@ -255,13 +258,14 @@ impl Annotations {
             }
             let rec = encode_record(seq, &a);
             let f = self.file.as_ref().expect("opened above");
-            if let Err(e) = crate::store::wal::write_all_at(f, &rec, self.len) {
+            let at = self.len;
+            if let Err(e) = crate::store::wal::write_all_at(f, &rec, at) {
                 // leave no partial record behind
-                let _ = f.set_len(self.len);
+                let _ = f.set_len(at);
                 return Err(e.into());
             }
             self.len += rec.len() as u64;
-            synced = Some(f.clone());
+            synced = Some((f.clone(), at));
         }
         self.map.insert(seq, a);
         Ok(synced)
