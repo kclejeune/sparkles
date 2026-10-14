@@ -301,17 +301,63 @@ fn expired_gates_are_pruned_and_fallback_never_uses_an_old_instance() {
         .fail_count
         .store(true, std::sync::atomic::Ordering::Relaxed);
     assert!(Arc::ptr_eq(&initial_main, &refresh(&st, &ds).unwrap()));
+    assert!(
+        Arc::ptr_eq(&initial_main, &refresh(&st, &branch).unwrap()),
+        "a live branch must retain same-main fallback"
+    );
     assert!(st.delete("org").unwrap());
+    assert!(
+        Arc::ptr_eq(&initial_main, &st.ingest.review.get("org").unwrap()),
+        "the failed replacement must exercise an existing old-owner cache"
+    );
     let new = configured_dataset(&st, "org");
     assert!(
         refresh(&st, &new).is_none(),
         "replacement received old-instance fallback"
     );
+    assert!(
+        st.ingest.review.get("org").is_none(),
+        "failed replacement count retained the old owner's cache"
+    );
+    assert!(series(&st).iter().all(|(name, _, _, _)| name != "org"));
+    let metrics = crate::obs::metrics_json(&st);
+    assert!(
+        metrics["memoryReview"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["dataset"] != "org"),
+        "{metrics}"
+    );
     st.ingest
         .review
         .fail_count
         .store(false, std::sync::atomic::Ordering::Relaxed);
-    refresh(&st, &new).unwrap();
+    let recovered = refresh(&st, &new).unwrap();
+    assert_eq!(
+        recovered.fingerprint,
+        fingerprint(&new, &crate::assist::memory_settings(&st, &new))
+    );
+    assert!(
+        recovered
+            .kinds(|_| true)
+            .values()
+            .all(|kind| kind.open == 0)
+    );
+    assert!(
+        series(&st)
+            .iter()
+            .filter(|(name, _, _, _)| name == "org")
+            .all(|(_, _, open, _)| *open == 0)
+    );
+    assert!(
+        refresh(&st, &ds).is_none(),
+        "stale caller must still be refused"
+    );
+    assert!(
+        Arc::ptr_eq(&recovered, &st.ingest.review.get("org").unwrap()),
+        "stale caller purged replacement's successful cache"
+    );
     assert!(st.delete("org").unwrap());
     refresh_all(&st);
     assert!(st.ingest.review.get("org").is_none());

@@ -241,6 +241,14 @@ pub(crate) fn refresh(st: &Arc<AppState>, ds: &Arc<Dataset>) -> Option<Arc<Count
     if !live(st, ds) {
         return None;
     }
+    // A replacement cannot keep another owner's metrics, even if its count fails.
+    // Inspect ownership outside the counts lock; the name gate serializes writers.
+    if reg
+        .get(&ds.name)
+        .is_some_and(|cached| !applicable(&cached, ds))
+    {
+        reg.counts.lock().remove(&ds.name);
+    }
     let memory = crate::assist::memory_settings(st, ds);
     if !configured(&memory) {
         reg.counts.lock().remove(&ds.name);

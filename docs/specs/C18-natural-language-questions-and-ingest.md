@@ -4708,8 +4708,10 @@ waits in each inbox and reports it.
   settings reads, counts and cache publication, so an older refresh cannot overwrite
   a completed newer one. Other datasets count independently. Workers recheck the
   current dataset instance and resolve replacements on each coalesced refresh.
-  Obsolete cache pruning rechecks live names under the same gate. Metrics remain an
-  eventual cached view and do not acquire a count gate or run queries.
+  A replacement discards the old instance's cached counts before counting, including
+  when the new count fails. Obsolete cache pruning rechecks live names under the same
+  gate. Metrics remain an eventual cached view and do not acquire a count gate or run
+  queries.
 - **Metrics.** `sparkles_memory_review_pending{dataset,kind}` and
   `sparkles_memory_review_oldest_seconds{dataset,kind}` report every kind of each
   dataset with memory settings from the kept counts, with no query at scrape time. The
