@@ -184,6 +184,12 @@ fn state_path(st: &AppState) -> Option<PathBuf> {
     (!st.data_dir.as_os_str().is_empty()).then(|| st.data_dir.join(STATE_FILE))
 }
 
+/// The conditions of the state file's bytes. A file that a newer release wrote is
+/// refused, like one that does not parse.
+fn parse_state(bytes: &[u8]) -> sparkles::error::Result<BTreeMap<String, Active>> {
+    sparkles::formats::settings_from_slice::<StateFile>(STATE_FILE, bytes).map(|s| s.active)
+}
+
 impl Inner {
     fn active(&mut self, st: &AppState) -> &mut BTreeMap<String, Active> {
         self.active.get_or_insert_with(|| {
@@ -191,8 +197,8 @@ impl Inner {
                 return BTreeMap::new();
             };
             match std::fs::read(&p) {
-                Ok(b) => match serde_json::from_slice::<StateFile>(&b) {
-                    Ok(s) => s.active,
+                Ok(b) => match parse_state(&b) {
+                    Ok(active) => active,
                     Err(e) => {
                         tracing::warn!(target: "sparkles::notify", "{} is not readable, it starts empty: {e}", p.display());
                         BTreeMap::new()
@@ -210,7 +216,7 @@ impl Inner {
         let f = StateFile {
             active: active.clone(),
         };
-        let mut bytes = serde_json::to_vec_pretty(&f).unwrap_or_default();
+        let mut bytes = sparkles::formats::settings_to_vec(STATE_FILE, &f).unwrap_or_default();
         bytes.push(b'\n');
         if let Err(e) = crate::settings::secrets::write_atomic(&p, &bytes, 0o644) {
             tracing::warn!(target: "sparkles::notify", "cannot write {}: {e}", p.display());

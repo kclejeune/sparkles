@@ -211,21 +211,44 @@ struct RepositoriesFile {
     repositories: Vec<StoredRepo>,
 }
 
+/// Read a JSON file. A file registered in `formats::SETTINGS` is checked for a version
+/// that this build does not read. The member stays in the value, since none of the types
+/// read here deny unknown members (`repositories.json` declares `version` itself).
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> anyhow::Result<Option<T>> {
     match std::fs::read(path) {
-        Ok(b) => Ok(Some(
-            serde_json::from_slice(&b).with_context(|| format!("reading {}", path.display()))?,
-        )),
+        Ok(b) => {
+            let v: serde_json::Value = serde_json::from_slice(&b)
+                .with_context(|| format!("reading {}", path.display()))?;
+            if let Some(name) = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .filter(|n| crate::formats::settings_file(n).is_some())
+            {
+                crate::formats::check_settings(name, &v)
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))
+                    .with_context(|| format!("reading {}", path.display()))?;
+            }
+            Ok(Some(
+                serde_json::from_value(v).with_context(|| format!("reading {}", path.display()))?,
+            ))
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
     }
 }
 
+/// Write a JSON file. A file registered in `formats::SETTINGS` gets its version member.
 fn write_json<T: Serialize>(dir: &Path, file: &str, value: &T) -> anyhow::Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = dir.join(file);
-    write_file_atomic(&path, &serde_json::to_vec_pretty(value)?)
-        .with_context(|| format!("writing {}", path.display()))
+    let bytes = if crate::formats::settings_file(file).is_some() {
+        let mut v = serde_json::to_value(value)?;
+        crate::formats::stamp_settings(file, &mut v);
+        serde_json::to_vec_pretty(&v)?
+    } else {
+        serde_json::to_vec_pretty(value)?
+    };
+    write_file_atomic(&path, &bytes).with_context(|| format!("writing {}", path.display()))
 }
 
 impl Registry {
@@ -704,6 +727,40 @@ mod tests {
         }
         std::fs::write(dir.path().join(REPOSITORIES_FILE), br#"{"version":1,"repositories":[{"name":"api","type":"fs","path":"/srv/plain","futureSetting":true}]}"#).unwrap();
         assert!(Registry::load(dir.path(), None).is_ok());
+    }
+
+    #[test]
+    fn a_newer_repositories_or_policies_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let repos = dir.path().join(REPOSITORIES_FILE);
+        let writes = crate::formats::settings_file(REPOSITORIES_FILE)
+            .unwrap()
+            .writes;
+        std::fs::write(
+            &repos,
+            format!(r#"{{"version":{},"repositories":[]}}"#, writes + 1),
+        )
+        .unwrap();
+        let err = Registry::load(dir.path(), None).err().unwrap();
+        assert!(format!("{err:#}").contains("newer release"), "{err:#}");
+        std::fs::write(
+            &repos,
+            format!(r#"{{"version":{writes},"repositories":[]}}"#),
+        )
+        .unwrap();
+        assert!(Registry::load(dir.path(), None).is_ok());
+        let writes = crate::formats::settings_file("policies.json")
+            .unwrap()
+            .writes;
+        let policies = dir.path().join("policies.json");
+        std::fs::write(
+            &policies,
+            format!(r#"{{"format":{},"policies":[]}}"#, writes + 1),
+        )
+        .unwrap();
+        assert!(read_api_policies(dir.path()).is_err());
+        std::fs::write(&policies, r#"{"policies":[]}"#).unwrap();
+        assert!(read_api_policies(dir.path()).unwrap().is_empty());
     }
 
     #[test]

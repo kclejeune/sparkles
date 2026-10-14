@@ -124,7 +124,14 @@ struct SettingsFile {
 pub(crate) fn read_settings(root: &Path) -> Result<ChangeLogSettings> {
     match std::fs::read(root.join(CHANGE_LOG_FILE)) {
         Ok(b) => {
-            let f: SettingsFile = serde_json::from_slice(&b)
+            let mut v: serde_json::Value = serde_json::from_slice(&b)
+                .map_err(|e| Error::Corrupt(format!("{CHANGE_LOG_FILE}: {e}")))?;
+            crate::formats::check_settings(CHANGE_LOG_FILE, &v)?;
+            // a file without the member is format 1
+            if let Some(o) = v.as_object_mut() {
+                o.entry("format").or_insert(1.into());
+            }
+            let f: SettingsFile = serde_json::from_value(v)
                 .map_err(|e| Error::Corrupt(format!("{CHANGE_LOG_FILE}: {e}")))?;
             Ok(f.settings)
         }
@@ -147,7 +154,7 @@ fn write_settings(root: &Path, s: &ChangeLogSettings) -> Result<()> {
     };
     write_atomic(
         &root.join(CHANGE_LOG_FILE),
-        &serde_json::to_vec_pretty(&f).expect("settings serialize"),
+        &crate::formats::settings_to_vec(CHANGE_LOG_FILE, &f)?,
     )
 }
 
@@ -2081,4 +2088,29 @@ pub(crate) fn quad_key(q: &Quad) -> QuadKey {
         Arc::from(id::iri_key(q.predicate.as_str())),
         Arc::from(id::term_key(&q.object)),
     ]
+}
+
+#[cfg(test)]
+mod settings_format_tests {
+    use super::*;
+
+    #[test]
+    fn a_newer_change_log_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let newer = crate::formats::settings_file(CHANGE_LOG_FILE)
+            .unwrap()
+            .writes
+            + 1;
+        std::fs::write(
+            dir.path().join(CHANGE_LOG_FILE),
+            format!(r#"{{"format": {newer}, "keepCommits": 5}}"#),
+        )
+        .unwrap();
+        assert!(matches!(
+            read_settings(dir.path()),
+            Err(Error::Unsupported(_))
+        ));
+        std::fs::write(dir.path().join(CHANGE_LOG_FILE), r#"{"keepCommits": 5}"#).unwrap();
+        assert_eq!(read_settings(dir.path()).unwrap().keep_commits, Some(5));
+    }
 }

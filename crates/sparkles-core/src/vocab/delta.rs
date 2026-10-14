@@ -325,22 +325,7 @@ impl DeltaFile {
             let from = self.base as usize;
             v.keys[from..from + self.written as usize].to_vec()
         };
-        let mut bytes = Vec::new();
-        let mut start = 0usize;
-        while start < keys.len() {
-            let (mut end, mut size) = (start, 0usize);
-            while end < keys.len() && (end == start || size + 4 + keys[end].len() <= CONVERT_CHUNK)
-            {
-                size += 4 + keys[end].len();
-                end += 1;
-            }
-            bytes.extend_from_slice(&encode_chunk(start as u64, &keys[start..end], start == 0));
-            start = end;
-        }
-        let tmp = self.path.with_file_name("delta.vocab.tmp");
-        crate::store::write_synced(&tmp, &bytes)?;
-        std::fs::rename(&tmp, &self.path)?;
-        crate::store::sync_dir(self.path.parent().unwrap_or(Path::new(".")))?;
+        let bytes = replace_framed(&self.path, &keys)?;
         self.file = OpenOptions::new().read(true).write(true).open(&self.path)?;
         self.end = bytes.len() as u64;
         self.alloc = self.end;
@@ -488,6 +473,57 @@ impl DeltaFile {
             return Err(std::io::Error::other("injected sync failure").into());
         }
         Ok(())
+    }
+}
+
+/// Write `keys` as a framed file in a new file renamed over `path`, synced with its
+/// directory, and return the file's bytes.
+fn replace_framed(path: &Path, keys: &[Arc<[u8]>]) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut start = 0usize;
+    while start < keys.len() {
+        let (mut end, mut size) = (start, 0usize);
+        while end < keys.len() && (end == start || size + 4 + keys[end].len() <= CONVERT_CHUNK) {
+            size += 4 + keys[end].len();
+            end += 1;
+        }
+        bytes.extend_from_slice(&encode_chunk(start as u64, &keys[start..end], start == 0));
+        start = end;
+    }
+    let tmp = path.with_file_name("delta.vocab.tmp");
+    crate::store::write_synced(&tmp, &bytes)?;
+    std::fs::rename(&tmp, path)?;
+    crate::store::sync_dir(path.parent().unwrap_or(Path::new(".")))?;
+    Ok(bytes)
+}
+
+/// Rewrite the legacy delta vocabulary at `path` framed, as the first write to it would
+/// (for `sparkles migrate`, on a closed store). The dataset must already require
+/// [`FRAMED_READER`]. `Ok(false)` when the file is missing, already framed, or holds no
+/// entries.
+pub(crate) fn convert_legacy_file(path: &Path) -> Result<bool> {
+    let buf = read_file(path)?;
+    let parsed = parse_delta(&buf).map_err(|e| corrupt_in(path, e))?;
+    if parsed.format != DeltaFormat::Legacy || parsed.keys.is_empty() {
+        return Ok(false);
+    }
+    let keys: Vec<Arc<[u8]>> = parsed.keys.iter().map(|k| Arc::from(*k)).collect();
+    replace_framed(path, &keys)?;
+    Ok(true)
+}
+
+/// The version of the delta vocabulary at `path`: 1 for a legacy (or missing) file, the
+/// header's version for a framed one.
+pub fn file_version(path: &Path) -> Result<u32> {
+    let buf = read_file(path)?;
+    if buf.len() >= 12 && buf[..MAGIC.len()] == MAGIC {
+        // a header torn before its version holds no entries yet
+        Ok(match u32::from_le_bytes(buf[8..12].try_into().unwrap()) {
+            0 => VERSION,
+            v => v,
+        })
+    } else {
+        Ok(1)
     }
 }
 

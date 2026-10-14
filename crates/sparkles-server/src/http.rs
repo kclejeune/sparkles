@@ -1,6 +1,6 @@
 //! HTTP layer: SPARQL 1.1 Protocol, Graph Store Protocol, Fuseki `/$/` admin API.
 
-use crate::auth::{Level, Principal};
+use crate::auth::{Level, Principal, ServerPerm};
 use crate::obs::{CancelOnDrop, Op, Outcome, RequestReport};
 use crate::state::{AppState, Dataset, DbType, now, uptime_secs};
 use axum::body::Bytes;
@@ -3415,6 +3415,10 @@ pub(crate) fn redact_dataset_info(info: &mut J) {
     }
 }
 
+/// What a caller that is not a server administrator reads as the reason a dataset is
+/// refused, since the full message names the data directory.
+const REFUSED_REASON_REDACTED: &str = "this release does not read the dataset's files; a server administrator can see why in the server log or in GET /$/server";
+
 /// `GET /$/server`; anonymous callers (with auth) do not get the version and limits.
 async fn server_info(State(st): St, Extension(p): Extension<Principal>) -> Json<J> {
     let mut doc = json!({
@@ -3432,6 +3436,30 @@ async fn server_info(State(st): St, Extension(p): Extension<Principal>) -> Json<
     if !p.is_anonymous() {
         doc["version"] = env!("CARGO_PKG_VERSION").into();
         doc["limits"] = st.limits.json(st.default_timeout);
+        // the file versions this build writes and reads, so an operator can see which
+        // databases it opens
+        doc["formats"] = sparkles::formats::report();
+        // A refused dataset is listed like a served one, to the callers that may read
+        // it. The reason names paths, so only a server administrator gets it whole. A
+        // server without auth answers as the local principal, which administers it.
+        let admin = p.has(ServerPerm::ServerAdmin);
+        let refused: Vec<J> = st
+            .catalog
+            .refused()
+            .into_iter()
+            .filter(|(name, _)| admin || p.level_any_branch(name).is_some_and(|l| l >= Level::Read))
+            .map(|(name, reason)| {
+                let reason = if admin {
+                    reason
+                } else {
+                    REFUSED_REASON_REDACTED.to_string()
+                };
+                json!({ "name": name, "reason": reason })
+            })
+            .collect();
+        if !refused.is_empty() {
+            doc["refusedDatasets"] = refused.into();
+        }
     }
     Json(doc)
 }

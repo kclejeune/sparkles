@@ -398,14 +398,11 @@ pub(crate) fn read_file(root: &Path, dataset_id: uuid::Uuid) -> Result<HistoryCo
         }
         Err(e) => return Err(e.into()),
     };
-    let f: HistoryFile =
+    let v: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|e| Error::Corrupt(format!("history.json: {e}")))?;
-    if f.format != 1 {
-        return Err(Error::Corrupt(format!(
-            "history.json has format {}, this build reads 1",
-            f.format
-        )));
-    }
+    crate::formats::check_settings("history.json", &v)?;
+    let f: HistoryFile =
+        serde_json::from_value(v).map_err(|e| Error::Corrupt(format!("history.json: {e}")))?;
     if f.dataset_id != dataset_id {
         return Err(Error::Corrupt(format!(
             "history.json belongs to dataset {}, not {dataset_id}",
@@ -1253,5 +1250,15 @@ mod tests {
         h.leases.remove(&b);
         assert!(h.needed(3, 12, 0, &ts, 0).is_empty());
         assert_eq!(h.lease_holds(3).count(), 1);
+    }
+
+    #[test]
+    fn a_newer_history_file_is_unsupported() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("history.json"), br#"{"format": 2}"#).unwrap();
+        let e = read_file(dir.path(), uuid::Uuid::nil())
+            .err()
+            .expect("refused");
+        assert!(matches!(e, Error::Unsupported(_)), "{e:?}");
     }
 }

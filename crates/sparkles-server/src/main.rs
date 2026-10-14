@@ -44,6 +44,7 @@ mod lsp;
 mod mcp;
 #[cfg(feature = "memory")]
 mod memory_cmd;
+mod migrate_cmd;
 mod model_store;
 // the pipeline that uses most of the model clients (`ask`) needs the `mcp` feature
 #[cfg_attr(not(feature = "mcp"), allow(dead_code, unused_imports))]
@@ -1618,6 +1619,10 @@ enum Cmd {
         #[arg(long)]
         quick: bool,
     },
+    /// Upgrade a stopped server's databases (--data) or one database (--loc) to the
+    /// file versions this release writes; --check lists their versions and the steps
+    /// without changing anything. Exits 1 when a database is outside the window
+    Migrate(migrate_cmd::MigrateArgs),
     /// The quads added and removed between two commits (N, commit:N, time:<RFC 3339>,
     /// snapshot:NAME, head)
     Diff {
@@ -3621,6 +3626,7 @@ fn run() -> Result<()> {
             format,
             quick,
         } => check_cmd::run(loc, data, &format, quick),
+        Cmd::Migrate(a) => migrate_cmd::run(a),
         Cmd::Branch { cmd } => branch_cmd::run_branch(cmd, opts),
         Cmd::Merge(a) => {
             let code = branch_cmd::run_merge(a, opts)?;

@@ -4,7 +4,7 @@ use std::io;
 pub enum Error {
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
-    /// An exclusive database or catalog lock is held by another opener.
+    /// A database or catalog lock is held by another opener, or its directory changed.
     #[error("{}", locked_message(path, *pid))]
     Locked {
         path: std::path::PathBuf,
@@ -328,7 +328,9 @@ fn locked_message(path: &std::path::Path, pid: Option<u32>) -> String {
             "directory {path} is in use by another process (pid {pid}); stop it or talk to it over HTTP"
         ),
         None => {
-            format!("directory {path} is in use by another opener; stop it or talk to it over HTTP")
+            format!(
+                "directory {path} is in use by another opener or its lock changed; retry the open, stop the other opener or talk to it over HTTP"
+            )
         }
     }
 }
@@ -355,7 +357,9 @@ mod tests {
         assert!(!own.contains("Some("), "{own}");
         let unknown = locked(None);
         assert!(
-            unknown.contains("another opener") && !unknown.contains("None"),
+            unknown.contains("another opener")
+                && unknown.contains("retry the open")
+                && !unknown.contains("None"),
             "{unknown}"
         );
     }

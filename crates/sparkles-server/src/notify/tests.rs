@@ -640,3 +640,16 @@ fn routes_and_backoff() {
     assert_eq!(d.wait(2, Some(90.0)), Duration::from_secs(90));
     assert_eq!(d.wait(2, Some(9e9)), Duration::from_secs(1800));
 }
+
+#[test]
+fn a_newer_state_file_is_refused() {
+    let writes = sparkles::formats::settings_file(STATE_FILE).unwrap().writes;
+    let newer = format!(r#"{{"format": {}, "active": {{}}}}"#, writes + 1);
+    assert!(matches!(
+        parse_state(newer.as_bytes()),
+        Err(sparkles::error::Error::Unsupported(_))
+    ));
+    assert!(parse_state(br#"{"active": {}}"#).unwrap().is_empty());
+    let saved = sparkles::formats::settings_to_vec(STATE_FILE, &StateFile::default()).unwrap();
+    assert!(parse_state(&saved).is_ok());
+}

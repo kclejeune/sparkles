@@ -13264,11 +13264,130 @@
             },
             "type": "array"
           },
+          "formats": {
+            "description": "The on-disk file kinds and settings files, with the version this build writes and the versions it reads (`sparkles migrate --check` prints the same registry). Left out for anonymous callers when auth is on.",
+            "properties": {
+              "kinds": {
+                "items": {
+                  "properties": {
+                    "class": {
+                      "enum": [
+                        "primary",
+                        "derived",
+                        "config",
+                        "archive"
+                      ],
+                      "type": "string"
+                    },
+                    "files": {
+                      "type": "string"
+                    },
+                    "id": {
+                      "type": "string"
+                    },
+                    "marker": {
+                      "type": "string"
+                    },
+                    "reads": {
+                      "items": {
+                        "type": "integer"
+                      },
+                      "type": "array"
+                    },
+                    "writes": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "files",
+                    "marker",
+                    "class",
+                    "writes",
+                    "reads"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "settings": {
+                "items": {
+                  "properties": {
+                    "member": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "scope": {
+                      "enum": [
+                        "dataset",
+                        "server"
+                      ],
+                      "type": "string"
+                    },
+                    "writes": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "scope",
+                    "member",
+                    "writes"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "sparkles": {
+                "type": "string"
+              },
+              "unmarkedSettings": {
+                "items": {
+                  "properties": {
+                    "name": {
+                      "type": "string"
+                    },
+                    "reason": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "reason"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            },
+            "type": "object"
+          },
           "limits": {
             "$ref": "#/components/schemas/Limits"
           },
           "readOnly": {
             "type": "boolean"
+          },
+          "refusedDatasets": {
+            "items": {
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "reason": {
+                  "description": "Why the dataset is registered but not served, such as an index format this release does not read. The member lists the refused datasets the caller may read, and all of them for a server administrator, who alone gets the full message, which names paths.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "name",
+                "reason"
+              ],
+              "type": "object"
+            },
+            "type": "array"
           },
           "startDateTime": {
             "description": "Fuseki's name for `startedAt`.",

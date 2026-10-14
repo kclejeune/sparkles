@@ -264,9 +264,7 @@ impl Dataset {
         }
         let reasoning = store.root().and_then(crate::reasoning::read_record);
         let origin = match store.root() {
-            Some(root) => std::fs::read(root.join(ORIGIN_FILE))
-                .ok()
-                .and_then(|b| serde_json::from_slice(&b).ok()),
+            Some(root) => read_origin(&root.join(ORIGIN_FILE)),
             None => opts.origin,
         };
         Dataset {
@@ -1576,10 +1574,32 @@ impl Iterator for QuadIter {
     }
 }
 
+/// The informational `origin.json` of a clone, or `None` when it is absent, does not
+/// parse, or was written by a newer release (which is logged).
+fn read_origin(path: &Path) -> Option<serde_json::Value> {
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    if let Err(e) = crate::formats::check_settings(ORIGIN_FILE, &v) {
+        tracing::warn!("{}: {e}; its content is ignored", path.display());
+        return None;
+    }
+    Some(v)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use oxrdf::{Literal, NamedNodeRef};
+
+    #[test]
+    fn a_newer_origin_file_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(ORIGIN_FILE);
+        let newer = crate::formats::settings_file(ORIGIN_FILE).unwrap().writes + 1;
+        std::fs::write(&path, format!(r#"{{"originFormat": {newer}}}"#)).unwrap();
+        assert!(read_origin(&path).is_none());
+        std::fs::write(&path, r#"{"source": "x"}"#).unwrap();
+        assert!(read_origin(&path).is_some());
+    }
 
     const EX: &str = "http://ex.org/";
     fn n(l: &str) -> NamedNode {

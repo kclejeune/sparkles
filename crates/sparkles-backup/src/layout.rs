@@ -20,7 +20,7 @@ use serde_json::Value as J;
 use uuid::Uuid;
 
 /// Repository format written and read by this build.
-pub const FORMAT: u32 = 1;
+pub const FORMAT: u32 = sparkles_core::formats::BACKUP_LAYOUT.writes;
 /// `kind` of the marker.
 pub const MARKER_KIND: &str = "sparkles-backup-repository";
 /// `kind` of a manifest.

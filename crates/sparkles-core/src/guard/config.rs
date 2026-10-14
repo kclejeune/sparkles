@@ -48,6 +48,8 @@ pub fn config_language(root: &Path) -> Result<Option<GuardLanguage>> {
     };
     let j: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|e| Error::Invalid(format!("{CONFIG_FILE}: {e}")))?;
+    // a version newer than this build writes is refused as unsupported
+    crate::formats::check_settings(CONFIG_FILE, &j)?;
     match j.get("language") {
         None => Ok(Some(GuardLanguage::Shacl)),
         Some(l) => serde_json::from_value(l.clone()).map(Some).map_err(|_| {

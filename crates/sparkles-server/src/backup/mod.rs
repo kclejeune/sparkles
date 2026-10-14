@@ -893,8 +893,14 @@ pub fn restored_from(root: &Path) -> Option<serde_json::Value> {
     let from = match sparkles::commit::read_restored_from(root) {
         Ok(Some(f)) => f,
         _ => {
-            let r: sparkles_backup::RestoreRecord =
-                serde_json::from_slice(&std::fs::read(root.join("restore.json")).ok()?).ok()?;
+            let path = root.join("restore.json");
+            let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
+            // The record is informational, so one that a newer release wrote is ignored.
+            if let Err(e) = sparkles::formats::check_settings("restore.json", &v) {
+                tracing::warn!(target: "sparkles::backup", "{}: {e}; its content is ignored", path.display());
+                return None;
+            }
+            let r: sparkles_backup::RestoreRecord = serde_json::from_value(v).ok()?;
             sparkles::commit::RestoredFrom {
                 repository: r.repository.name,
                 backup: r.backup,

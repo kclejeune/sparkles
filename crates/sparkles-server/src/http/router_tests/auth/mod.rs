@@ -18,6 +18,7 @@ mod idp;
 mod limits;
 mod oidc;
 mod proxy;
+mod refused;
 mod rename;
 mod server_settings;
 mod sessions;
