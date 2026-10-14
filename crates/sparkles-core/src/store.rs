@@ -3885,7 +3885,7 @@ impl Store {
                 return Ok(Some(Arc::new(summary)));
             }
             if let Some(g) = &g {
-                g.bypassed();
+                g.bypassed(head + 1);
             }
             if let Some(o) = &observer
                 && (g.is_some() || self.guard_required())

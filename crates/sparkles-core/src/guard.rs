@@ -22,8 +22,9 @@ pub trait CommitGuard: Send + Sync {
     fn check(&self, c: &Candidate<'_>) -> Result<ValidationSummary>;
     /// Called after a commit the guard saw was published (with its sequence number).
     fn committed(&self, _seq: u64) {}
-    /// Called when a write bypassed the guard.
-    fn bypassed(&self) {}
+    /// Called when a write bypassed the guard. `seq` is the commit number the
+    /// bypassing write will take.
+    fn bypassed(&self, _seq: u64) {}
     /// Whether the guard can check a commit against a state whose commit is not yet
     /// durable, and keep track of the states of the commits in flight until each is
     /// published ([`committed`](Self::committed) is called in commit order, possibly

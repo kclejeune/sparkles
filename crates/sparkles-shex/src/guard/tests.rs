@@ -932,7 +932,7 @@ fn grandfather_mode_blocks_only_new_associations() {
         Err(Error::Rejected(_))
     ));
     // a full validation (the state unknown) compares with the state before the write
-    s.guard().unwrap().bypassed();
+    s.guard().unwrap().bypassed(s.snapshot().commit + 1);
     let v = summary(&upd(&s, "INSERT DATA { ex:fay a ex:Person ; foaf:name \"F\" }").unwrap());
     assert_eq!(
         (v.strategy, v.fallback.as_deref(), v.introduced),
@@ -1018,7 +1018,7 @@ fn writes_are_validated_incrementally() {
     let v = summary(&upd(&s, "INSERT DATA { ex:dave foaf:name \"Dave\" }").unwrap());
     assert_eq!((v.strategy, v.blocking), (Strategy::Incremental, 1));
     // an unknown state: the next write is validated in full
-    g.bypassed();
+    g.bypassed(s.snapshot().commit + 1);
     let v = summary(&upd(&s, "INSERT DATA { ex:erin a ex:Person ; foaf:name \"E\" }").unwrap());
     assert_eq!(
         (v.strategy, v.fallback.as_deref(), v.blocking),

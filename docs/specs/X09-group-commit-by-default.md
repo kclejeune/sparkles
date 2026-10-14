@@ -586,8 +586,10 @@ Four points differ from the design.
 `group.rs` has 38 tests, including the failed-fence cases of each admission change, the
 annotation recovery rules, an idle commit after grouped ones, a stateful guard that must be
 told of each commit before the next check, and writes during compaction. The SHACL crate has
-a test with a limit across concurrent writes and one with a shapes change in flight. The
-server has router tests for each write kind. The power-loss test file fails the annotation
+a test with a limit across concurrent writes and one with a shapes change in flight.
+A quota-refused write followed by a bypassed commit with the same number discards the
+unpublished SHACL state and makes the next validation full. The server has router tests for
+each write kind. The power-loss test file fails the annotation
 file's sync alone, both inside a fence and for the first message of a database, where the
 file and its header are created by the commit that fails
 (`a_failed_first_annotation_sync_keeps_later_messages`). Not written: the model-based stress

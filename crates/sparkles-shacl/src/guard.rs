@@ -1182,7 +1182,8 @@ impl CommitGuard for ShaclGuard {
         true
     }
 
-    fn bypassed(&self) {
+    fn bypassed(&self, seq: u64) {
+        self.pending.lock().retain(|p| p.seq < seq);
         self.count(GuardStatus::Bypassed);
         if let Some(b) = self.baseline.lock().as_mut() {
             b.conforms = None;
@@ -1410,4 +1411,207 @@ pub fn set_config(store: &Store, cfg: Option<ValidationConfig>) -> Result<SetOut
     store.set_guard_required(true);
     drop(txn);
     Ok(SetOutcome::Installed(guard, summary))
+}
+
+#[cfg(test)]
+mod pending_tests {
+    use super::*;
+    use sparkles_core::Error;
+    use sparkles_core::sparql::QueryOptions;
+    use sparkles_core::sparql::update::update;
+    use sparkles_core::store::StoreOptions;
+
+    fn configured(grouped: bool) -> (tempfile::TempDir, Store, Arc<ShaclGuard>) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(
+            dir.path(),
+            StoreOptions {
+                experimental_group_commit: grouped,
+                group_commit_idle_direct: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let cfg = ValidationConfig {
+            format: 1,
+            language: None,
+            mode: GuardMode::Reject,
+            shapes: ShapesSource {
+                inline: Some(
+                    "@prefix sh: <http://www.w3.org/ns/shacl#> . \
+                     <urn:Shape> a sh:NodeShape ; sh:targetNode <urn:hub> ; \
+                     sh:property [ sh:path <urn:link> ; sh:maxCount 1 ] ."
+                        .into(),
+                ),
+                ..Default::default()
+            },
+            data_graph: DataGraphSel::Named("default".into()),
+            include_inferences: false,
+            threshold: Severity::Violation,
+            baseline: Default::default(),
+            timeout_seconds: 60.0,
+            report_limit: 100,
+            updated: None,
+        };
+        let SetOutcome::Installed(guard, _) = set_config(&store, Some(cfg)).unwrap() else {
+            panic!("the empty dataset conforms");
+        };
+        (dir, store, guard)
+    }
+
+    fn bypass_after_unpublished_validation(grouped: bool) {
+        let (_dir, store, guard) = configured(grouped);
+        let before = store.snapshot().commit;
+        let seq = before + 1;
+        store.set_quota(Some(1)).unwrap();
+        let refused = update(
+            &store,
+            "INSERT DATA { <urn:hub> <urn:link> <urn:checked> }",
+            &QueryOptions::default(),
+        );
+        assert!(
+            matches!(refused, Err(Error::BudgetExceeded(_))),
+            "{refused:?}"
+        );
+        assert_eq!(store.snapshot().commit, before);
+        {
+            let pending = guard.pending.lock();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].seq, seq);
+            assert!(pending[0].exact.is_some());
+            assert_eq!(pending[0].baseline.conforms, Some(true));
+        }
+        store.set_quota(Some(0)).unwrap();
+        let bypasses = guard.status().counters.bypassed;
+        let preview = update(
+            &store,
+            "INSERT DATA { <urn:hub> <urn:link> <urn:preview> }",
+            &QueryOptions {
+                write: WriteOptions {
+                    bypass_validation: true,
+                    dry_run: Some(sparkles_core::preview::DryRun::default()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        assert!(matches!(preview, Err(Error::DryRun(_))), "{preview:?}");
+        assert_eq!(store.snapshot().commit, before);
+        assert_eq!(guard.pending.lock().len(), 1);
+        assert_eq!(guard.pending.lock()[0].seq, seq);
+        assert_eq!(guard.status().counters.bypassed, bypasses);
+        let bypassed = update(
+            &store,
+            "INSERT DATA { <urn:hub> <urn:link> <urn:unchecked1>, <urn:unchecked2> }",
+            &QueryOptions {
+                write: WriteOptions {
+                    bypass_validation: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(bypassed.commit.unwrap().commit.seq, seq);
+        assert!(guard.pending.lock().is_empty());
+        assert!(
+            guard.exact.lock().is_none(),
+            "bypassed state has no exact counts"
+        );
+        assert_eq!(guard.baseline.lock().as_ref().unwrap().conforms, None);
+        let before_rejections = guard.status().counters.rejected;
+        let refused = update(
+            &store,
+            "INSERT DATA { <urn:hub> <urn:link> <urn:next> }",
+            &QueryOptions::default(),
+        );
+        let Err(Error::Rejected(rejected)) = refused else {
+            panic!("the bypass introduced a maxCount violation: {refused:?}");
+        };
+        assert_eq!(rejected.summary.strategy, Strategy::Full);
+        assert_eq!(guard.status().counters.rejected, before_rejections + 1);
+    }
+
+    #[test]
+    fn a_bypassed_commit_discards_validation_of_an_unpublished_write() {
+        bypass_after_unpublished_validation(false);
+    }
+
+    #[test]
+    fn a_grouped_bypass_discards_validation_of_an_unpublished_write() {
+        bypass_after_unpublished_validation(true);
+    }
+
+    #[test]
+    fn a_bypass_keeps_an_earlier_commit_pending_its_fence() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::mpsc;
+
+        let (_dir, store, guard) = configured(true);
+        let store = Arc::new(store);
+        let seq = store.snapshot().commit + 1;
+        let (sealed_tx, sealed) = mpsc::channel();
+        let (release_tx, release) = mpsc::channel::<()>();
+        let release = Mutex::new(release);
+        let first = AtomicBool::new(true);
+        store.set_failpoint(
+            "group-sealed",
+            Some(Arc::new(move |_| {
+                if first.swap(false, Ordering::SeqCst) {
+                    sealed_tx.send(()).unwrap();
+                    release
+                        .lock()
+                        .recv_timeout(Duration::from_secs(10))
+                        .unwrap();
+                }
+            })),
+        );
+        let (appended_tx, appended) = mpsc::channel();
+        store.set_failpoint(
+            "group-appended",
+            Some(Arc::new(move |_| appended_tx.send(()).unwrap())),
+        );
+        let checked = {
+            let store = store.clone();
+            std::thread::spawn(move || {
+                update(
+                    &store,
+                    "INSERT DATA { <urn:hub> <urn:link> <urn:checked> }",
+                    &QueryOptions::default(),
+                )
+            })
+        };
+        appended.recv_timeout(Duration::from_secs(10)).unwrap();
+        sealed.recv_timeout(Duration::from_secs(10)).unwrap();
+        let bypassed = {
+            let store = store.clone();
+            std::thread::spawn(move || {
+                update(
+                    &store,
+                    "INSERT DATA { <urn:hub> <urn:link> <urn:unchecked> }",
+                    &QueryOptions {
+                        write: WriteOptions {
+                            bypass_validation: true,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                )
+            })
+        };
+        appended.recv_timeout(Duration::from_secs(10)).unwrap();
+        // The earlier checked write is still legitimate and has not passed its fence.
+        let pending: Vec<_> = guard.pending.lock().iter().map(|p| p.seq).collect();
+        release_tx.send(()).unwrap();
+        let checked = checked.join().unwrap().unwrap();
+        let bypassed = bypassed.join().unwrap().unwrap();
+        store.set_failpoint("group-sealed", None);
+        store.set_failpoint("group-appended", None);
+        assert_eq!(pending, vec![seq]);
+        assert_eq!(checked.commit.unwrap().commit.seq, seq);
+        assert_eq!(bypassed.commit.unwrap().commit.seq, seq + 1);
+        assert!(guard.pending.lock().is_empty());
+        assert!(guard.exact.lock().is_none());
+        assert_eq!(guard.baseline.lock().as_ref().unwrap().conforms, None);
+    }
 }
