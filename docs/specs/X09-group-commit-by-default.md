@@ -594,6 +594,12 @@ Four points differ from the design.
    still count these commits. The ShEx guard is in the same position, because its typing state
    chains by commit number and has no pending list yet.
 
+An independent RDF Patch abort returns the published head and its matching annotation
+without waiting for a pending fence. A successful head check against the speculative
+prefix makes the abort wait and propagate any fence failure. Ignored headers and
+discarded data or prefix rows do not add a drain. Dry runs retain their admission drain
+and distinguish a skipped leading check from an executed late check.
+
 After a bypass, an unknown baseline also invalidates cached graph-backed shapes. The
 next relevant check reloads the authoritative speculative state, then stages refreshed
 shapes with its successful sequence for publication. Dry runs and rejected checks do not
@@ -615,7 +621,7 @@ writes and remains in Phase 3.
 
 ### Tests
 
-`group.rs` has 51 tests, including failed-fence cases for preconditions, guard errors,
+`group.rs` has 74 tests, including failed-fence cases for preconditions, guard errors,
 class protections and late RDF Patch preconditions. They also cover annotation recovery,
 an idle commit after grouped ones, a stateful guard that must be told of each commit before
 the next check, and writes during compaction. Corrupting the first transaction preserves
@@ -632,8 +638,10 @@ a later bypass preserves earlier pending state. Graph-backed bypass tests cover 
 and grouped validation, a refreshed pending schema before publication, quota refusal,
 dry-run and rejection invariance, malformed repairs, severity thresholds and grandfather
 comparison. Actual undecodable graph rows verify that reader failures propagate without
-promoting cache state. The server has three router tests covering
-independent receipts, failed fences and each HTTP write kind.
+promoting cache state. The server has five router tests covering
+independent receipts, failed fences, each HTTP write kind and published identities for
+plain patch aborts. Core and HTTP Patch tests also preserve ordinary dry-run previews
+with matching and mismatching leading head preconditions.
 
 The six power-loss tests cover acknowledged data and messages, including failure of the
 annotation file's sync inside a fence and during the first message of a database.

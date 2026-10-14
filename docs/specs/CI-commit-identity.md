@@ -781,6 +781,15 @@ record `forkedFrom` ([C06](C06-clone-to-sandbox.md)), backups and restores
 ([F05](F05-snapshot-repositories.md)) and write-time validation summaries
 ([C10](C10-write-time-validation.md)) all use them.
 
+An aborted RDF Patch reports one published commit identity, including its matching
+annotation, even while an independent grouped write is waiting for its fence. A plain
+abort does not wait for that write. If the patch successfully checked a head
+precondition against a pending prefix, its abort waits for the fence and propagates a
+failed fence instead of reporting an identity that was never published. Dry runs keep
+their admission drain. A leading `H prev` skipped by an aborted dry run reports
+`prevChecked: false`, while a successful late comparison reports `true`. Ordinary
+previews report their precondition result without changing the store.
+
 **Deviations from the spec.**
 
 - §5.2 swapped the delete case. The implementation counts deleting a quad that was present

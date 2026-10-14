@@ -3750,7 +3750,8 @@ impl Store {
     }
 
     /// Whether a new write transaction may start from the speculative head that group
-    /// commit has written but not yet synced. Only SPARQL updates do. An update's caller
+    /// commit has written but not yet synced. SPARQL updates, Graph Store writes,
+    /// uploads and RDF Patches may do so. An update's caller
     /// sees nothing of the state it reads, and its commit fails with its predecessor's.
     /// An explicit transaction hands that state to its caller through
     /// [`WriteTxn::view`] and queries, and could be dropped without committing, so the

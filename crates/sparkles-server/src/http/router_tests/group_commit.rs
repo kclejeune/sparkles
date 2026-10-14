@@ -378,3 +378,161 @@ async fn every_http_write_kind_groups_and_keeps_its_receipt_and_message() {
         }
     }
 }
+
+async fn http_patch_abort_case(fail: bool) {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("dataset");
+    let opts = StoreOptions {
+        experimental_group_commit: true,
+        group_commit_idle_direct: false,
+        ..Default::default()
+    };
+    let state = Arc::new(
+        AppState::new(&temp.path().join("server"), opts, Duration::from_secs(30)).unwrap(),
+    );
+    let dataset = state.attach("ds", DbType::Persistent, Some(&root)).unwrap();
+    let app = router(state.clone());
+    let (prior, _) = send_h(
+        &app,
+        Request::post("/ds/update")
+            .header(header::CONTENT_TYPE, "application/sparql-update")
+            .header("sparkles-commit-message", "published")
+            .body(Body::from(
+                "INSERT DATA { <urn:published> <urn:p> <urn:o> }",
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(prior.status, StatusCode::OK, "{}", prior.text());
+    let prior = dataset.store.commit(1).unwrap();
+    let (hit_tx, hit) = tokio::sync::mpsc::unbounded_channel();
+    let mut hit = hit;
+    let (go_tx, go) = std::sync::mpsc::channel();
+    let go = std::sync::Mutex::new(go);
+    let first = std::sync::atomic::AtomicBool::new(true);
+    let expired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let deadline = expired.clone();
+    dataset.store.set_failpoint(
+        "group-sealed",
+        Some(Arc::new(move |_| {
+            if first.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                let _ = hit_tx.send(());
+                if go
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))
+                    .is_err()
+                {
+                    deadline.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        })),
+    );
+    let held = tokio::spawn({
+        let app = app.clone();
+        async move {
+            sparql_update(
+                &app,
+                "INSERT DATA { <urn:unpublished> <urn:p> <urn:o> }",
+                None,
+            )
+            .await
+        }
+    });
+    let mut abort = None;
+    let observed = async {
+        let event = tokio::time::timeout(Duration::from_secs(5), hit.recv())
+            .await
+            .map_err(|e| format!("predecessor seal: {e}"))?;
+        if event.is_none() {
+            return Err("seal channel closed".to_string());
+        }
+        let task = tokio::spawn({
+            let app = app.clone();
+            async move {
+                send_h(
+                    &app,
+                    Request::post("/ds/patch")
+                        .header(header::CONTENT_TYPE, "application/rdf-patch")
+                        .header(header::ACCEPT, "application/x-sparkles+json")
+                        .body(Body::from(
+                            "TX .\nA <urn:discarded> <urn:p> <urn:o> .\nTA .\n",
+                        ))
+                        .unwrap(),
+                )
+                .await
+            }
+        });
+        abort = Some(task);
+        let result = tokio::time::timeout(Duration::from_secs(5), abort.as_mut().unwrap()).await;
+        let result = match result {
+            Ok(completed) => {
+                abort = None;
+                completed.map_err(|e| e.to_string())?
+            }
+            Err(e) => return Err(format!("plain abort did not finish: {e}")),
+        };
+        Ok::<_, String>((result, dataset.store.snapshot().commit))
+    }
+    .await;
+    if fail {
+        dataset.store.fail_next_group_sync();
+    }
+    let _ = go_tx.send(());
+    dataset.store.set_failpoint("group-sealed", None);
+    let held = held.await;
+    if let Some(abort) = abort {
+        let _ = abort.await;
+    }
+    assert!(
+        !expired.load(std::sync::atomic::Ordering::SeqCst),
+        "predecessor fence expired"
+    );
+    let ((response, headers), published) = observed.unwrap();
+    let held = held.unwrap().0;
+    assert_eq!(
+        held.status,
+        if fail {
+            StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            StatusCode::OK
+        },
+        "{}",
+        held.text()
+    );
+    assert_eq!(response.status, StatusCode::OK, "{}", response.text());
+    assert_eq!(published, prior.seq);
+    assert_eq!(
+        commit_header(&headers),
+        prior.seq,
+        "HTTP abort header reports only published identity"
+    );
+    let body = response.json();
+    assert_eq!(body["commit"]["seq"], prior.seq);
+    assert_eq!(body["commit"]["message"], "published");
+    assert_eq!(body["committed"], false);
+    assert_eq!(body["aborted"], true);
+    assert_eq!(body["prevChecked"], false);
+    assert_eq!(body["inserted"], 0);
+    assert_eq!(body["deleted"], 0);
+    assert_eq!(dataset.store.snapshot().len(), if fail { 1 } else { 2 });
+    drop(dataset);
+    drop(app);
+    drop(state);
+    let reopened = sparkles::store::Store::open(&root, Default::default()).unwrap();
+    assert_eq!(reopened.commit(prior.seq), Some(prior));
+    assert_eq!(
+        reopened.annotation(prior.seq).unwrap().message.as_deref(),
+        Some("published")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn http_plain_patch_abort_reports_published_success() {
+    http_patch_abort_case(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn http_plain_patch_abort_reports_published_failure() {
+    http_patch_abort_case(true).await;
+}

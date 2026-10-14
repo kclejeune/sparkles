@@ -6199,7 +6199,7 @@ export interface components {
             inserted?: number;
             prefixesRemoved?: number;
             prefixesSet?: number;
-            /** @description The patch's `prev` header named a commit of this dataset, which was the head. */
+            /** @description An own-dataset `prev` was successfully checked against the transaction head. */
             prevChecked?: boolean;
             /** @description The rows read, up to a `TA` that aborted the patch. */
             rows?: number;

@@ -611,6 +611,398 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum AbortCheck {
+        Plain,
+        Discarded,
+        Ignored,
+        Foreign,
+        Leading,
+        Late,
+        Core,
+    }
+
+    #[derive(Debug)]
+    enum AbortEvent {
+        Draining,
+        Done,
+    }
+
+    fn patch_abort_case(check: AbortCheck, fail: bool, no_wait: bool, dry: bool) {
+        use crate::guard::{Precondition, WriteOptions};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        let s = Arc::new(Store::open(&root, options()).unwrap());
+        let prior = kind_insert(
+            &s,
+            CommitKind::Update,
+            message_options("published"),
+            in_graph("published", "urn:g"),
+        )
+        .unwrap();
+        let expected = prior.commit.seq + 1;
+        let (hit_tx, hit) = mpsc::channel();
+        let (go_tx, go) = mpsc::channel();
+        let go = Mutex::new(go);
+        let first = AtomicBool::new(true);
+        let expired = Arc::new(AtomicBool::new(false));
+        let deadline = expired.clone();
+        s.set_failpoint(
+            "group-sealed",
+            Some(Arc::new(move |_| {
+                if first.swap(false, Ordering::SeqCst) {
+                    let _ = hit_tx.send(());
+                    if go.lock().recv_timeout(Duration::from_secs(10)).is_err() {
+                        deadline.store(true, Ordering::SeqCst);
+                    }
+                }
+            })),
+        );
+        let held = thread::spawn({
+            let s = s.clone();
+            move || {
+                kind_insert(
+                    &s,
+                    CommitKind::Update,
+                    message_options("unpublished"),
+                    in_graph("unpublished", "urn:g"),
+                )
+            }
+        });
+        let (tx, events) = mpsc::channel();
+        let notify = tx.clone();
+        s.set_failpoint(
+            "group-draining",
+            Some(Arc::new(move |_| {
+                if thread::current().name() == Some("patch-abort") {
+                    let _ = notify.send(AbortEvent::Draining);
+                }
+            })),
+        );
+        let done = Arc::new(AtomicBool::new(false));
+        let mut abort = None;
+        let observed = (|| -> std::result::Result<_, String> {
+            hit.recv_timeout(Duration::from_secs(5))
+                .map_err(|e| format!("predecessor seal: {e}"))?;
+            let own = format!("urn:uuid:{}#commit:{expected}", s.dataset_id());
+            let text = match check {
+                AbortCheck::Leading => format!("H prev <{own}> .\nTX .\nTA .\n"),
+                AbortCheck::Late => format!("TX .\nH prev <{own}> .\nTA .\n"),
+                AbortCheck::Ignored => "H prev <urn:foreign> .\nTX .\nTA .\n".into(),
+                AbortCheck::Foreign => "H prev <urn:uuid:00000000-0000-0000-0000-000000000000#commit:999> .\nTX .\nTA .\n".into(),
+                AbortCheck::Discarded => "TX .\nA <urn:discarded> <urn:p> <urn:o> .\nPA \"discarded\" <urn:discarded:> .\nTA .\n".into(),
+                _ => "TX .\nTA .\n".into(),
+            };
+            let mut write = WriteOptions {
+                no_wait,
+                dry_run: dry.then(Default::default),
+                ..Default::default()
+            };
+            if matches!(check, AbortCheck::Core) {
+                write.precondition = Some(Precondition::new(move |head| {
+                    if head.commit == expected {
+                        Ok(())
+                    } else {
+                        Err(Error::PreconditionFailed(
+                            "expected speculative head".into(),
+                        ))
+                    }
+                }));
+            }
+            abort = Some(
+                thread::Builder::new()
+                    .name("patch-abort".into())
+                    .spawn({
+                        let s = s.clone();
+                        let done = done.clone();
+                        move || {
+                            let result = s.apply_patch(
+                                text.as_bytes(),
+                                &PatchOptions {
+                                    write,
+                                    ..Default::default()
+                                },
+                            );
+                            done.store(true, Ordering::SeqCst);
+                            let _ = tx.send(AbortEvent::Done);
+                            result
+                        }
+                    })
+                    .map_err(|e| e.to_string())?,
+            );
+            let first = events
+                .recv_timeout(Duration::from_secs(5))
+                .map_err(|e| format!("abort progress: {e}"))?;
+            if matches!(first, AbortEvent::Draining) && no_wait {
+                let next = events
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(|e| format!("no_wait result: {e}"))?;
+                if !matches!(next, AbortEvent::Done) {
+                    return Err(format!("unexpected event {next:?}"));
+                }
+            }
+            Ok((first, done.load(Ordering::SeqCst), s.snapshot().commit))
+        })();
+        if fail {
+            s.fail_next_group_sync();
+        }
+        let _ = go_tx.send(());
+        s.set_failpoint("group-sealed", None);
+        s.set_failpoint("group-draining", None);
+        let held = held.join().unwrap();
+        let result = abort.map(|w| w.join().unwrap());
+        assert!(!expired.load(Ordering::SeqCst), "predecessor fence expired");
+        let (first, completed, published) = observed.unwrap();
+        eprintln!(
+            "abort case {check:?} fail={fail} no_wait={no_wait} dry={dry}: observed {first:?}, published before={published}, published after={}, result={result:?}",
+            s.snapshot().commit
+        );
+        assert_eq!(published, prior.commit.seq);
+        let waits = dry
+            || matches!(
+                check,
+                AbortCheck::Leading | AbortCheck::Late | AbortCheck::Core
+            );
+        if waits {
+            assert!(
+                matches!(first, AbortEvent::Draining),
+                "checked abort must wait: {check:?}, {first:?}"
+            );
+            assert_eq!(completed, no_wait);
+        } else {
+            assert!(
+                matches!(first, AbortEvent::Done),
+                "plain abort must finish before release: {first:?}"
+            );
+            assert!(completed);
+        }
+        if fail {
+            assert!(matches!(held, Err(Error::Poisoned)), "{held:?}");
+        } else {
+            assert_eq!(held.unwrap().commit.seq, expected);
+        }
+        let result = result.unwrap();
+        if waits && no_wait {
+            assert!(matches!(result, Err(Error::WriterBusy)), "{result:?}");
+        } else if waits && fail {
+            assert!(matches!(result, Err(Error::Poisoned)), "{result:?}");
+        } else {
+            let out = result.unwrap();
+            let seq = if waits { expected } else { prior.commit.seq };
+            assert!(out.aborted);
+            assert_eq!(
+                out.rows,
+                match check {
+                    AbortCheck::Plain | AbortCheck::Core => 2,
+                    AbortCheck::Discarded => 4,
+                    _ => 3,
+                }
+            );
+            assert!(!out.receipt.committed);
+            assert_eq!(
+                out.receipt.commit.seq, seq,
+                "abort reports only published identity"
+            );
+            assert_eq!(out.receipt.commit, s.commit(seq).unwrap());
+            assert_eq!(
+                out.receipt.annotation.message.as_deref(),
+                Some(if waits { "unpublished" } else { "published" })
+            );
+            assert_eq!(
+                out.prev_checked,
+                matches!(check, AbortCheck::Late) || (!dry && matches!(check, AbortCheck::Leading))
+            );
+            assert_eq!(
+                (
+                    out.inserted,
+                    out.deleted,
+                    out.prefixes_set,
+                    out.prefixes_removed
+                ),
+                (0, 0, 0, 0)
+            );
+            assert_eq!(s.snapshot().len(), if fail { 1 } else { 2 });
+            assert!(!s.prefixes().contains_key("discarded"));
+            drop(s);
+            let reopened = Store::open(&root, Default::default()).unwrap();
+            assert_eq!(reopened.commit(seq), Some(out.receipt.commit));
+            assert_eq!(
+                reopened.annotation(seq).unwrap().message,
+                out.receipt.annotation.message
+            );
+        }
+    }
+
+    macro_rules! abort_case {
+        ($name:ident, $check:ident, $fail:expr, $no_wait:expr, $dry:expr) => {
+            #[test]
+            fn $name() {
+                patch_abort_case(AbortCheck::$check, $fail, $no_wait, $dry);
+            }
+        };
+    }
+    abort_case!(
+        plain_patch_abort_reports_published_success,
+        Plain,
+        false,
+        false,
+        false
+    );
+    abort_case!(
+        plain_patch_abort_reports_published_failure,
+        Plain,
+        true,
+        false,
+        false
+    );
+    abort_case!(
+        plain_patch_abort_no_wait_reports_published_success,
+        Plain,
+        false,
+        true,
+        false
+    );
+    abort_case!(
+        plain_patch_abort_no_wait_reports_published_failure,
+        Plain,
+        true,
+        true,
+        false
+    );
+    abort_case!(
+        discarded_patch_abort_reports_published_success,
+        Discarded,
+        false,
+        false,
+        false
+    );
+    abort_case!(
+        discarded_patch_abort_reports_published_failure,
+        Discarded,
+        true,
+        false,
+        false
+    );
+    abort_case!(
+        ignored_prev_patch_abort_reports_published,
+        Ignored,
+        true,
+        false,
+        false
+    );
+    abort_case!(
+        foreign_prev_patch_abort_reports_published,
+        Foreign,
+        true,
+        false,
+        false
+    );
+    abort_case!(
+        leading_prev_patch_abort_waits_for_success,
+        Leading,
+        false,
+        false,
+        false
+    );
+    abort_case!(
+        leading_prev_patch_abort_propagates_failure,
+        Leading,
+        true,
+        false,
+        false
+    );
+    abort_case!(
+        leading_prev_patch_abort_no_wait_is_busy,
+        Leading,
+        false,
+        true,
+        false
+    );
+    abort_case!(
+        late_prev_patch_abort_waits_for_success,
+        Late,
+        false,
+        false,
+        false
+    );
+    abort_case!(
+        late_prev_patch_abort_propagates_failure,
+        Late,
+        true,
+        false,
+        false
+    );
+    abort_case!(
+        late_prev_patch_abort_no_wait_is_busy,
+        Late,
+        false,
+        true,
+        false
+    );
+    abort_case!(
+        precondition_patch_abort_waits_for_success,
+        Core,
+        false,
+        false,
+        false
+    );
+    abort_case!(
+        precondition_patch_abort_propagates_failure,
+        Core,
+        true,
+        false,
+        false
+    );
+    abort_case!(
+        precondition_patch_abort_no_wait_is_busy,
+        Core,
+        false,
+        true,
+        false
+    );
+    abort_case!(
+        leading_dry_patch_abort_reports_unchecked_after_admission,
+        Leading,
+        false,
+        false,
+        true
+    );
+    abort_case!(
+        late_dry_patch_abort_reports_checked_after_admission,
+        Late,
+        false,
+        false,
+        true
+    );
+    abort_case!(
+        leading_dry_patch_abort_admission_propagates_failure,
+        Leading,
+        true,
+        false,
+        true
+    );
+    abort_case!(
+        late_dry_patch_abort_admission_propagates_failure,
+        Late,
+        true,
+        false,
+        true
+    );
+    abort_case!(
+        leading_dry_patch_abort_admission_no_wait_is_busy,
+        Leading,
+        false,
+        true,
+        true
+    );
+    abort_case!(
+        late_dry_patch_abort_admission_no_wait_is_busy,
+        Late,
+        false,
+        true,
+        true
+    );
+
     fn fresh_prefix_case(fail: bool) {
         let dir = tempfile::tempdir().unwrap();
         let s = Arc::new(Store::open(dir.path(), options()).unwrap());

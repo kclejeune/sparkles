@@ -10382,7 +10382,7 @@
             "type": "integer"
           },
           "prevChecked": {
-            "description": "The patch's `prev` header named a commit of this dataset, which was the head.",
+            "description": "An own-dataset `prev` was successfully checked against the transaction head.",
             "type": "boolean"
           },
           "rows": {

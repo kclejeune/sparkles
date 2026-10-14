@@ -179,6 +179,43 @@ async fn p4_prev_mismatch_is_412() {
 }
 
 #[tokio::test]
+async fn leading_prev_dry_run_preserves_precondition_preview() {
+    let s = server();
+    let id = s.ds().store.dataset_id();
+    for expected in [0, 99] {
+        let patch = format!(
+            "H prev <urn:uuid:{id}#commit:{expected}> .\nA <urn:preview> <urn:p> 1 .\nTC .\n"
+        );
+        let r = call(
+            &s.app,
+            "POST",
+            "/ds/patch?dryRun=true",
+            &[("content-type", TEXT)],
+            patch,
+        )
+        .await;
+        let (status, precondition, outcome) = if expected == 0 {
+            (StatusCode::OK, "passed", "commit")
+        } else {
+            (
+                StatusCode::PRECONDITION_FAILED,
+                "failed",
+                "precondition-failed",
+            )
+        };
+        assert_eq!(r.status, status, "{}", r.text());
+        let j = r.json();
+        assert_eq!(j["dryRun"], true, "{j}");
+        assert_eq!(j["precondition"]["status"], precondition, "{j}");
+        assert_eq!(j["outcome"], outcome, "{j}");
+        assert_eq!(j["head"], 0, "{j}");
+        assert!(j.get("prevChecked").is_none(), "{j}");
+        assert_eq!(s.head(), 0);
+        assert!(!s.ask("ASK { <urn:preview> ?p ?o }").await);
+    }
+}
+
+#[tokio::test]
 async fn p5_p6_abort_and_prefix_rows() {
     let s = server();
     let r = s.patch("TX . A <urn:q> <urn:p> \"1\" . TA .").await;

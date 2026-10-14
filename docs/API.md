@@ -2425,7 +2425,12 @@ graphs it writes, and gets `403` for a row in another graph and for any `PA` or 
 row.
 
 The default answer is `200` with JSON. `inserted` and `deleted` count the rows that took
-effect, and `rows` counts the rows read.
+effect, and `rows` counts the rows read. `prevChecked` means an own-dataset `prev` was
+successfully checked against the transaction head. An aborted dry run skips its leading
+check and reports `false`, while a successful late comparison reports `true`. After
+normal writer admission, a plain abort reports the published head and its matching
+message without adding a wait for an independent pending write. An abort that
+successfully checked a pending head waits for its fence and propagates a failure.
 
 ```json
 { "committed": true, "inserted": 2, "deleted": 1, "prefixesSet": 0, "prefixesRemoved": 0,
