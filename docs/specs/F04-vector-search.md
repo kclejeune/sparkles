@@ -9,8 +9,9 @@
 > snapshot's changes, the `/similar` page and the dataset page's index cards. Of Phase 3,
 > hybrid ranking with full-text search shipped as `spk:hybridSearch`, and on 2026-10-03
 > the `ORDER BY … LIMIT k` rewrite, the compact datatype `spk:vectorB64` and hybrid calls
-> with bound queries shipped. Background catch-up of the graph and keeping the graph
-> across compactions are not built.
+> with bound queries shipped. On 2026-10-13 background catch-up of the graph, graphs
+> kept across compactions and faster builds shipped as roadmap item 10. Quantization is
+> not built.
 >
 > **User docs:** [API: Vector similarity](../API.md#vector-similarity) · [API: Vector indexes](../API.md#vector-indexes) · [Features](../FEATURES.md#search)
 >
@@ -1183,6 +1184,113 @@ overlay's pending count is 0) within a few seconds of the commit. After a compac
 that changed 1 % of the rows, the plan of the next search reports `method: hnsw`
 without an exact-scan window, and recall@10 at ef = 128 is within 0.005 of a full
 rebuild's.
+
+#### Outcome (item 10, 2026-10-13)
+
+**Delivered.** All three parts landed.
+
+* **Build speed.** Graph distances no longer go through the scoring kernel. They use
+  32 independent lanes, with AVX2 and fused multiply-adds on x86-64 CPUs that have them,
+  detected at run time. Scores still come from the eight-lane kernel of §4.3, so no score
+  changed. The builder keeps each node's links in atomic slots that readers load without
+  a lock, keeps the distance of each link beside it so a full list is shrunk without
+  computing its distances again, and asks for the rows of the neighbours a search is
+  about to score. The largest gain came from the memory traffic: a build reads a few
+  thousand rows spread over the whole segment for each node, and at 1M × 384 it was
+  limited by memory bandwidth. On x86-64 with F16C, the build now reads a copy of the
+  nodes' vectors in binary16, in node order, holding unit vectors under cosine. The copy
+  only decides which links the graph keeps. Searches read the `f32` rows, and every
+  score is computed from them. The copy is made only when it fits in the vector memory
+  budget, and elsewhere the build reads the `f32` rows as before.
+* **Incremental inserts.** A built index has a live layer (`vector/live.rs`). A thread
+  per store wakes after each commit and after each build, and inserts the rows that
+  commits added to an indexed predicate into the graph, after the commit is published.
+  It inserts in batches of up to 512 nodes. Each member of a batch searches the graph as
+  it stands and also considers the other members, and the reverse links of a batch are
+  merged per target and shrunk by the heuristic. The searches and selections run in
+  parallel under a read lock, and only the copy of their results into the layer takes
+  the write lock. A frozen node whose links change gets a replacement list in a side
+  table, which searches read instead of its frozen list. A search accepts a live node
+  only when its own snapshot's delta holds a row of the node's (subject, vector) pair,
+  so a snapshot never sees a row inserted after it or one it deleted, and the rows its
+  delta holds that the layer lacks are still scored exactly. When the layer has caught
+  up with the snapshot's commit, a search does not read the delta's rows at all. The
+  status overlay gains `indexed` and `pending`, the plan counters gain
+  `overlayPending`, and the index card shows both. The layer is not written to the index
+  file. Reopening a store inserts the delta's rows again.
+* **Graphs across compactions.** A compaction carries each index over to the new
+  generation before it switches, in the same phase that builds the spatial index's base.
+  The new segment copies the vectors of the rows the old index holds instead of parsing
+  their literals again. Old nodes map to the new rows through their terms' keys, and
+  their links and levels carry over. A node that lost a neighbour to a deleted row has
+  its links chosen again by the heuristic from the surviving neighbours and the lost
+  neighbours' neighbours. The live layer's nodes become frozen nodes, and the remaining
+  new rows are inserted. The graph is built again when more than 30 % of the nodes
+  changed or when the old graph was built with other settings. The carried index is
+  installed in the new generation before the switch, so searches use the old graph up
+  to the switch and the carried one from the first query after it, with no window of
+  exact scans. A bulk commit's background build carries the old index over in the same
+  way. `lastBuild.carried` says when a build was carried over.
+
+**Deviations.**
+
+* A frozen node's changed links replace its frozen list in the side table rather than
+  being read after it. The list then stays within the layer's cap of links.
+* Searches between a bulk commit and the end of its carried build still scan exactly,
+  as before. Only compactions carry the index over before the switch.
+* The spec asked to keep the previous build alive and read it through a row mapping
+  until the carried graph is installed. Carrying the index over before the switch makes
+  that unnecessary for compactions.
+
+**Format.** The index file's layout is unchanged, at version 1. A carried graph is
+written in the same layout, and the live layer lives in memory only.
+
+**Tests.** `crates/sparkles-core/tests/vector_index.rs` covers rows joining the graph
+after the build, with recall, exact scores, deleted rows and snapshots that must not see
+later rows; a reopened store catching up again; a persistent compaction that carries the
+graph over with no exact window, with recall against a full rebuild and a reopened store
+mapping the carried file; a compaction that changed 40 % of the rows building again; and
+a small bulk commit carrying the graph over. Unit tests cover the graph kernels, the
+binary16 conversions against the hardware's, and a seeded builder extending a graph.
+
+**Performance.** These numbers come from forge (Intel Core i5-13500, 20 threads) with
+`crates/sparkles-core/examples/vector_build.rs`, which builds an in-memory store of the
+clustered vectors that `scripts/bench-vector.sh` generates (1000 centres, noise 0.6,
+cosine, M = 16, efConstruction = 128) and measures recall@10 at ef = 128 on 200
+held-out queries. Each figure is one run.
+
+| Measure | Before | After |
+|---|---:|---:|
+| Build, 100k × 384 | 14.6 s | 6.1 s |
+| Build, 1M × 384 | 139.5 s | 63.5 s |
+| Recall@10 at 1M, full builds | 0.9715 and 0.9625 | 0.963 and 0.975 |
+| Mean search at 1M | 0.80 ms | 0.58 ms |
+| 10,000 inserts into 1M, in the graph after the first commit | at the next compaction | 2.3 s |
+| Search at 100k with 10,000 inserts in the overlay | 2.6 ms, all scored exactly | 0.48 ms |
+| Compaction at 1M with 1 % of the rows changed, until the index is ready | 185 s, with exact scans after the switch | 11.8 s, ready at the switch |
+| Recall@10 at 1M after that compaction | 0.9625, rebuilt | 0.967, carried |
+
+Recall differs by up to 0.013 between two full builds of the same data, because
+parallel insertions meet in a different order each time, so the carried graph's 0.967
+sits within the spread of full builds rather than measurably below them. USearch 2.26.2
+with binary16 vectors, run from Python on the same machine and data, built 1M × 384 in
+50.0 s with recall@10 0.9655 at ef = 128, and 100k × 384 in 3.9 s. The Sparkles build is
+1.27 times USearch's at 1M, inside the target of 1.5, and 1.56 times at 100k.
+
+The published `scripts/bench-vector.sh` run at 100k × 384 on forge built the index in
+6.43 s against 14.02 s, with a peak RSS of 1,044 MB against 1,018 MB and the same 163 MB
+file. Recall@10 was 0.9994 from ef = 32 up, against 0.9989, and 0.9903 at ef = 16,
+against 0.9921. The mean HTTP latency at ef = 128 was 0.54 ms against 0.66 ms, and at
+ef = 256 0.92 ms against 1.14 ms. Below about 0.7 ms the client timings on forge swing
+between passes of the same binary by a factor of two, in both builds, so the ef = 16 and
+ef = 32 figures do not separate the two. A Namespace A/B screen of the SPARQL suite
+found no change outside noise, with a geometric mean of 0.962.
+
+The binary16 copy takes 2 bytes per dimension per node while a build runs, 768 MB at
+1M × 384. A compaction holds the old and new segments at once while it carries an index
+over. The live layer holds each inserted vector and its links in memory until the next
+compaction. The example's peak RSS at 1M rose from 10.2 GB to 12.6 GB, which includes
+all three.
 
 **Quantization, result caching and statistics** (item 34, Tier 4,
 [ROADMAP](../ROADMAP.md)). *Deviations* above records that there is no quantization

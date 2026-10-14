@@ -4753,11 +4753,19 @@ misses.
 With `"hnsw": false` the index keeps only the packed vectors, which are searched
 exactly.
 
-* **Freshness.** The graph covers the generation's base. Every search adds the
-  snapshot's inserted vectors, scored exactly, and leaves out its deleted ones, so new
-  and deleted vectors count at once. Commits do no index work. A compaction or a bulk
-  load starts a new generation, whose index is built in the background. Searches are
-  exact until it is ready.
+* **Freshness.** The graph is built over the generation's base. After each commit, a
+  background thread inserts the vectors the commit added into the graph, so searches
+  find them through it. Until a vector is inserted, searches score it exactly, and they
+  leave out deleted vectors at once, so new and deleted vectors count from their commit
+  on. Commits themselves do no index work. A search sees exactly the vectors of its own
+  snapshot, also when the graph holds vectors inserted after it.
+* **New generations.** A compaction carries each index over to the new generation
+  before it switches. The new index reuses the old one's vectors and links, repairs the
+  links around deleted vectors and inserts the new ones, so searches use a graph right
+  after the switch. When more than 30 % of the vectors changed, or the graph's settings
+  differ, the graph is built again instead. A bulk load starts a new generation whose
+  index is built, or carried over, in the background, and searches are exact until it is
+  ready.
 * **Exact fallback.** A search skips the graph and scans exactly in these cases:
   `exact:true` is set, it reads a past commit, its metric is not the index's, the graph
   is still being built, at most `exactThreshold` rows are in scope, or the active graph
@@ -4774,7 +4782,10 @@ exactly.
   `(2M + 1)·4 + 4` bytes per vector, 136 bytes with the default M, because it does not
   copy the vectors. Both count against `--vector-memory-mb`, mapped or not. A build that
   would pass the budget leaves the index `over-budget`, and searches then scan exactly
-  within the same budget.
+  within the same budget. Vectors inserted into the graph since the base stay in memory
+  with their links until the next compaction. On x86-64 CPUs with F16C, a build reads a
+  binary16 copy of the vectors, 2 bytes per dimension, which it holds while it runs and
+  makes only when it fits in the budget.
 
 | Method | Path | Result |
 |---|---|---|
@@ -4786,10 +4797,12 @@ exactly.
 | POST | `/$/vector/{ds}/{name}/recall?samples=100&k=10&ef=` | Measures recall@k against the exact search, with stored vectors as queries. Returns `{ k, samples, ef, recall, hnswMs, exactMs }`. `recall` is `null` when no vector was sampled, for example while the index has no graph to search. |
 
 A `VectorIndexStatus` is
-`{ name, predicate, dimension, metric, model?, state, progress?, message?, generation, rows, overlay: { inserts, deletes }, skipped: { malformed, wrongDimension, zeroNorm }, memory: { segmentBytes, hnswBytes, residency }, hnsw, exactThreshold, files?, lastBuild?, embedding? }`.
+`{ name, predicate, dimension, metric, model?, state, progress?, message?, generation, rows, overlay: { inserts, deletes, indexed, pending }, skipped: { malformed, wrongDimension, zeroNorm }, memory: { segmentBytes, hnswBytes, residency }, hnsw, exactThreshold, files?, lastBuild?, embedding? }`.
 `state` is `ready`, `building`, `failed` or `over-budget`. `rows` counts the packed base
-rows, and `overlay` the changes that searches add exactly. `residency` is `heap` or
-`mmap`. `hnsw` is `null` or `{ m, efConstruction, efSearch, nodes, layers }`, and
+rows, and `overlay` the changes since the base. Of its inserts, `indexed` are in the
+graph and `pending` are still scored exactly. `lastBuild` is `{ at, ms, rows, carried? }`,
+where `carried` means the graph was carried over from the previous generation.
+`residency` is `heap` or `mmap`. `hnsw` is `null` or `{ m, efConstruction, efSearch, nodes, layers }`, and
 `files` is `{ bytes, opened }`, where `opened` means the build was read from its file.
 The configuration lives in `vector.json` in the database directory.
 
