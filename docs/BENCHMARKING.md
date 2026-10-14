@@ -254,14 +254,15 @@ and comparison methodology. [DEVELOPMENT.md](DEVELOPMENT.md) covers building and
   mixes, and it keeps three distinct instances of each template. The answers to these
   instances are compared across engines before timing, except for the DESCRIBE query, whose
   result the SPARQL specification leaves to the engine. When a query with an ORDER BY on
-  plain variables also has a LIMIT or an OFFSET, the rows that tie with the row at the cut
-  may legitimately differ between engines, so the comparison leaves those rows out and
-  compares only their key values. Each instance is then timed, and the
-  record pools the instances of a template into one result. After that, the driver itself
-  runs the query mix against each engine with 1, 4 and 16 clients (`--clients`) after 50
-  warm-up mixes and 500 measured ones, and the record gets its query mixes per hour. The
-  driver does not look at what a query returns, so a failing or wrongly answering engine
-  would look fast. A run in which the driver exits with an error is recorded as `error`.
+  plain variables also has a LIMIT or an OFFSET, the check sends a second, untimed request
+  one row wider on each side of the cut. The rows that tie with the row past the cut may
+  legitimately differ between engines, so the comparison leaves them out and compares only
+  their key values, and it does so only when that second request shows a tie across the cut.
+  Each instance is then timed, and the record pools the instances of a template into one
+  result. After that, the driver itself runs the query mix against each engine with 1, 4
+  and 16 clients (`--clients`) after 50 warm-up mixes and 500 measured ones, and the record
+  gets its query mixes per hour. The driver does not look at what a query returns, so a
+  failing or wrongly answering engine would look fast. A run in which the driver exits with an error is recorded as `error`.
   Afterwards the average result count of each query is compared across the runs in which the
   driver succeeded without a timeout. Each engine counts once, and runs with different mix
   counts are not compared with each other. A run that differs from the majority is recorded

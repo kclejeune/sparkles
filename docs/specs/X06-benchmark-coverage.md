@@ -626,7 +626,8 @@ also fingerprints ASK, CONSTRUCT and DESCRIBE results. A CONSTRUCT or DESCRIBE a
 set of triples compared by term identity before the value digest normalizes the terms, so
 `1` as an integer and `1.0` as a decimal stay two triples. An `order` digest is recorded only
 for ORDER BY columns whose order SPARQL defines, and rows that tie at a LIMIT or OFFSET
-boundary are compared by their key values only. `bench-lib.sh` picks the Accept type of a
+boundary are compared by their key values only when a second request shows that the tie
+crosses the cut. `bench-lib.sh` picks the Accept type of a
 timed request from the query form. `nixbin` now builds engines from the nixpkgs
 revision in `flake.lock`, so engine versions follow the repository and the manifest records
 them. This can change the Jena, QLever and Oxigraph versions of an existing harness run

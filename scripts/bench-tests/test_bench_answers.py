@@ -160,62 +160,214 @@ class OrderableTests(unittest.TestCase):
         self.assertIn("order", ba.select_record("SELECT ?x { ?s ?p ?x } ORDER BY ?x", res, False))
 
 
+GROUP_AVG = ("SELECT ?o (AVG(?a) AS ?avg) (COUNT(?p) AS ?n) WHERE { ?p ex:worksFor ?o ; foaf:age ?a } "
+             "GROUP BY ?o ORDER BY DESC(?n) ?o LIMIT 10")
+
+
+class Probe:
+    """A fake `run` over the full sorted solution sequence of a query: a list of rows of term dicts.
+    It slices that sequence by the LIMIT and OFFSET of the probe text and records the texts."""
+
+    def __init__(self, vars_, full):
+        self.vars, self.full, self.texts = vars_, full, []
+
+    def __call__(self, text):
+        self.texts.append(text)
+        n, o = ba.slice_of(text)
+        rows = self.full[o:] if n is None else self.full[o:o + n]
+        return result(self.vars, *rows)
+
+
+def pair_rows(*pairs):
+    return [[lit(str(x), "integer"), lit(y)] for x, y in pairs]
+
+
+def pair_probe(*pairs):
+    return Probe(["x", "y"], pair_rows(*pairs))
+
+
 class SliceTests(unittest.TestCase):
     Q = "SELECT ?x ?y { ?x ?p ?y } ORDER BY ?x LIMIT 2"
 
-    def rec(self, query, *pairs):
-        res = result(["x", "y"], *[[lit(str(x), "integer"), lit(y)] for x, y in pairs])
-        return ba.select_record(query, res, False)
+    def rec(self, query, pairs, run=None):
+        res = result(["x", "y"], *pair_rows(*pairs))
+        return ba.select_record(query, res, False, run)
 
     def test_rows_tied_at_the_limit_boundary_are_compared_by_key_only(self):
-        a = self.rec(self.Q, (1, "a"), (2, "b"))
-        b = self.rec(self.Q, (1, "a"), (2, "c"))
+        full = [(1, "a"), (2, "b"), (2, "c")]
+        a = self.rec(self.Q, [(1, "a"), (2, "b")], pair_probe(*full))
+        b = self.rec(self.Q, [(1, "a"), (2, "c")], pair_probe(*full))
         for k in ("exact", "value", "order"):
             self.assertEqual(a[k], b[k], k)
         self.assertEqual(a["boundary_rows"], 1)
         self.assertEqual(a["rows"], 2)
 
+    def test_unique_keys_at_the_limit_leave_nothing_out(self):
+        full = [(1, "a"), (2, "b"), (3, "c")]
+        run = pair_probe(*full)
+        a = self.rec(self.Q, [(1, "a"), (2, "b")], run)
+        b = self.rec(self.Q, [(1, "a"), (2, "z")], pair_probe(*full))
+        self.assertNotEqual(a["value"], b["value"])
+        self.assertNotEqual(a["exact"], b["exact"])
+        self.assertEqual(a["boundary_rows"], 0)
+        self.assertEqual(len(run.texts), 1)
+
+    def test_group_avg_keeps_its_last_row(self):
+        def avg(v):
+            return lit(v, "decimal")
+
+        def row(i, a):
+            return [u(f"urn:org/{i:02d}"), avg(a), lit(str(20 - i), "integer")]
+
+        head = ["o", "avg", "n"]
+        full = [row(i, "30") for i in range(11)]
+        recs = []
+        for last in ("30", "999"):
+            rows = [row(i, "30") for i in range(9)] + [row(9, last)]
+            recs.append(ba.select_record(GROUP_AVG, result(head, *rows), False, Probe(head, full)))
+        self.assertNotEqual(recs[0]["value"], recs[1]["value"])
+        self.assertNotEqual(recs[0]["exact"], recs[1]["exact"])
+        self.assertEqual(recs[0]["boundary_rows"], 0)
+
+    def test_offset_zero_is_no_cut(self):
+        q = "SELECT ?x ?y { ?x ?p ?y } ORDER BY ?x OFFSET 0 LIMIT 5"
+        run = pair_probe((1, "a"))
+        r = self.rec(q, [(1, "a")], run)
+        self.assertEqual(r["boundary_rows"], 0)
+        self.assertEqual(r["exact"], self.rec("SELECT ?x ?y { ?x ?p ?y } ORDER BY ?x", [(1, "a")])["exact"])
+        self.assertEqual(run.texts, [])
+
     def test_a_row_away_from_the_boundary_still_counts(self):
-        self.assertNotEqual(self.rec(self.Q, (1, "z"), (2, "b"))["value"], self.rec(self.Q, (1, "a"), (2, "b"))["value"])
+        full = [(1, "a"), (2, "b"), (2, "c")]
+        a = self.rec(self.Q, [(1, "z"), (2, "b")], pair_probe(*full))
+        b = self.rec(self.Q, [(1, "a"), (2, "b")], pair_probe(*full))
+        self.assertNotEqual(a["value"], b["value"])
 
     def test_a_boundary_key_with_another_number_of_rows_differs(self):
-        a = self.rec("SELECT ?x ?y { ?x ?p ?y } ORDER BY ?x LIMIT 3", (1, "a"), (2, "b"), (2, "c"))
-        b = self.rec("SELECT ?x ?y { ?x ?p ?y } ORDER BY ?x LIMIT 3", (1, "a"), (2, "b"), (3, "c"))
+        q = "SELECT ?x ?y { ?x ?p ?y } ORDER BY ?x LIMIT 3"
+        a = self.rec(q, [(1, "a"), (2, "b"), (2, "c")])
+        b = self.rec(q, [(1, "a"), (2, "b"), (3, "c")])
         self.assertNotEqual(a["order"], b["order"])
 
     def test_fewer_rows_than_the_limit_leave_nothing_out(self):
-        r = self.rec(self.Q, (1, "a"))
+        run = pair_probe((1, "a"))
+        r = self.rec(self.Q, [(1, "a")], run)
         self.assertEqual(r["boundary_rows"], 0)
-        self.assertEqual(r["exact"], self.rec("SELECT ?x ?y { ?x ?p ?y } ORDER BY ?x", (1, "a"))["exact"])
+        self.assertEqual(r["exact"], self.rec("SELECT ?x ?y { ?x ?p ?y } ORDER BY ?x", [(1, "a")])["exact"])
+        self.assertEqual(run.texts, [])
+
+    def test_the_data_ending_at_the_cut_is_no_tie(self):
+        run = pair_probe((1, "a"), (2, "b"))
+        r = self.rec(self.Q, [(1, "a"), (2, "b")], run)
+        self.assertEqual(r["boundary_rows"], 0)
+        self.assertEqual(len(run.texts), 1)
 
     def test_with_an_offset_the_rows_tied_with_the_first_key_are_left_out(self):
         q = "SELECT ?x ?y { ?x ?p ?y } ORDER BY ?x OFFSET 1 LIMIT 5"
-        a = self.rec(q, (1, "a"), (1, "b"), (2, "c"))
-        b = self.rec(q, (1, "x"), (1, "y"), (2, "c"))
+        full = [(1, "p"), (1, "a"), (1, "b"), (2, "c")]
+        a = self.rec(q, [(1, "a"), (1, "b"), (2, "c")], pair_probe(*full))
+        b = self.rec(q, [(1, "x"), (1, "y"), (2, "c")], pair_probe(*full))
         self.assertEqual(a["boundary_rows"], 2)
         self.assertEqual(a["value"], b["value"])
         self.assertEqual(a["order"], b["order"])
 
+    def test_with_an_offset_and_no_tie_nothing_is_left_out(self):
+        q = "SELECT ?x ?y { ?x ?p ?y } ORDER BY ?x OFFSET 1 LIMIT 5"
+        full = [(0, "p"), (1, "a"), (1, "b"), (2, "c")]
+        a = self.rec(q, [(1, "a"), (1, "b"), (2, "c")], pair_probe(*full))
+        b = self.rec(q, [(1, "x"), (1, "b"), (2, "c")], pair_probe(*full))
+        self.assertEqual(a["boundary_rows"], 0)
+        self.assertNotEqual(a["value"], b["value"])
+
+    def test_an_offset_without_a_limit_probes_two_rows(self):
+        q = "SELECT ?x ?y { ?x ?p ?y } ORDER BY ?x OFFSET 1"
+        full = [(1, "p"), (1, "a"), (2, "c")]
+        run = pair_probe(*full)
+        r = self.rec(q, [(1, "a"), (2, "c")], run)
+        self.assertEqual(r["boundary_rows"], 1)
+        self.assertEqual(len(run.texts), 1)
+
+    def test_both_clauses_in_either_order(self):
+        full = [(1, "p"), (1, "a"), (2, "b"), (2, "c")]
+        for tail in ("OFFSET 1 LIMIT 2", "LIMIT 2 OFFSET 1"):
+            q = f"SELECT ?x ?y {{ ?x ?p ?y }} ORDER BY ?x {tail}"
+            r = self.rec(q, [(1, "a"), (2, "b")], pair_probe(*full))
+            self.assertEqual(r["boundary_rows"], 2, tail)
+
+    def test_a_failed_probe_leaves_everything_in(self):
+        def run(_):
+            raise OSError("down")
+
+        r = self.rec(self.Q, [(1, "a"), (2, "b")], run)
+        self.assertEqual(r["boundary_probe"], "failed")
+        self.assertEqual(r["boundary_rows"], 0)
+        self.assertEqual(r["exact"], self.rec("SELECT ?x ?y { ?x ?p ?y } ORDER BY ?x", [(1, "a"), (2, "b")])["exact"])
+
+    def test_a_probe_that_disagrees_with_the_answer_leaves_nothing_out(self):
+        r = self.rec(self.Q, [(1, "a"), (2, "b")], pair_probe((1, "a"), (3, "b"), (3, "c")))
+        self.assertEqual(r["boundary_rows"], 0)
+        self.assertNotIn("boundary_probe", r)
+
     def test_queries_without_a_slice_or_with_unordered_keys_are_unchanged(self):
-        r = self.rec("SELECT ?x ?y { ?x ?p ?y } ORDER BY ?x", (1, "a"), (2, "b"))
+        r = self.rec("SELECT ?x ?y { ?x ?p ?y } ORDER BY ?x", [(1, "a"), (2, "b")])
         self.assertNotIn("boundary_rows", r)
-        r = self.rec("SELECT ?x ?y { ?x ?p ?y } ORDER BY ABS(?x) LIMIT 2", (1, "a"), (2, "b"))
+        run = pair_probe((1, "a"), (2, "b"))
+        r = self.rec("SELECT ?x ?y { ?x ?p ?y } ORDER BY ABS(?x) LIMIT 2", [(1, "a"), (2, "b")], run)
         self.assertNotIn("boundary_rows", r)
+        self.assertEqual(run.texts, [])
+
+    def test_without_a_run_nothing_is_left_out(self):
+        r = self.rec(self.Q, [(1, "a"), (2, "b")])
+        self.assertEqual(r["boundary_rows"], 0)
 
     def test_slice_of(self):
-        self.assertEqual(ba.slice_of("SELECT * { ?s ?p ?o } ORDER BY ?s LIMIT 7"), (7, False))
-        self.assertEqual(ba.slice_of("SELECT * { ?s ?p ?o } ORDER BY ?s OFFSET 3"), (None, True))
-        self.assertEqual(ba.slice_of("SELECT * { ?s ?p ?o } LIMIT 7"), (None, False))
-        self.assertEqual(ba.slice_of("SELECT * { { SELECT ?s { ?s ?p ?o } ORDER BY ?s LIMIT 7 } }"), (None, False))
+        self.assertEqual(ba.slice_of("SELECT * { ?s ?p ?o } ORDER BY ?s LIMIT 7"), (7, 0))
+        self.assertEqual(ba.slice_of("SELECT * { ?s ?p ?o } ORDER BY ?s OFFSET 3"), (None, 3))
+        self.assertEqual(ba.slice_of("SELECT * { ?s ?p ?o } ORDER BY ?s OFFSET 0 LIMIT 3"), (3, 0))
+        self.assertEqual(ba.slice_of("SELECT * { ?s ?p ?o } ORDER BY ?s OFFSET 4"), (None, 4))
+        self.assertEqual(ba.slice_of("SELECT * { ?s ?p ?o } LIMIT 7"), (None, 0))
+        self.assertEqual(ba.slice_of("SELECT * { { SELECT ?s { ?s ?p ?o } ORDER BY ?s LIMIT 7 } }"), (None, 0))
+
+
+class ProbeQueryTests(unittest.TestCase):
+    def test_the_clauses_are_replaced_in_place(self):
+        q = "SELECT ?x { ?s ?p ?x } ORDER BY ?x LIMIT 5 OFFSET 2"
+        p = ba.probe_query(q, 1, 7)
+        self.assertEqual(ba.slice_of(p), (7, 1))
+        self.assertTrue(p.startswith("SELECT ?x { ?s ?p ?x } ORDER BY ?x "))
+        self.assertEqual(p.count("LIMIT"), 1)
+
+    def test_a_trailing_values_block_stays_after_the_new_clauses(self):
+        q = "SELECT ?x { ?s ?p ?x } ORDER BY ?x LIMIT 2 VALUES ?z { 1 }"
+        p = ba.probe_query(q, 0, 3)
+        self.assertEqual(ba.slice_of(p), (3, 0))
+        self.assertLess(p.index("LIMIT 3"), p.index("VALUES"))
+        self.assertTrue(p.rstrip().endswith("VALUES ?z { 1 }"))
+
+    def test_the_word_limit_in_an_iri_or_a_string_is_not_a_clause(self):
+        q = 'SELECT ?x { ?s <urn:limit 9> "limit 8 offset 3" } ORDER BY ?x LIMIT 2'
+        p = ba.probe_query(q, 4, 5)
+        self.assertEqual(ba.slice_of(p), (5, 4))
+        self.assertIn('"limit 8 offset 3"', p)
+        self.assertLess(p.index("ORDER BY"), p.index("LIMIT 5"))
+
+    def test_blanking_keeps_positions(self):
+        q = 'SELECT ?x { ?s <urn:a> "b c" } # note\nORDER BY ?x LIMIT 2'
+        start, tail = ba._order_by_tail(q)
+        self.assertEqual(q[:start].rstrip()[-8:], "ORDER BY")
+        self.assertEqual(len(q) - start, len(tail))
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
+    bodies = []
+
     def log_message(self, *args):
         pass
 
     def do_POST(self):
         n = int(self.headers.get("Content-Length") or 0)
-        self.rfile.read(n)
+        sent = self.rfile.read(n).decode()
+        Handler.bodies.append((self.path, sent))
         if self.path == "/slow":
             # a body that keeps arriving, so no single wait is long
             self.send_response(200)
@@ -229,8 +381,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except OSError:
                 pass
             return
+        if self.path == "/ties":
+            # the main query gets two rows with the same key, the probe (LIMIT 3) gets three
+            count = 3 if "LIMIT+3" in sent else 2
+            vals = ["5"] * count
+        else:
+            vals = ["2", "1"]
         body = json.dumps({"head": {"vars": ["x"]}, "results": {"bindings": [
-            {"x": {"type": "literal", "value": "2"}}, {"x": {"type": "literal", "value": "1"}}]}}).encode()
+            {"x": {"type": "literal", "value": v}} for v in vals]}}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/sparql-results+json")
         self.send_header("Content-Length", str(len(body)))
@@ -274,6 +432,14 @@ class RequestTests(unittest.TestCase):
         self.assertEqual(up["value"], down["value"])
         none, _ = self.answer("/ok", "SELECT ?x { ?s ?p ?x }")
         self.assertNotIn("order", none)
+
+    def test_the_probe_request_is_wired_through_main(self):
+        Handler.bodies.clear()
+        rec, _ = self.answer("/ties", "SELECT ?x ?y { ?s ?p ?x } ORDER BY ?x LIMIT 2")
+        self.assertEqual(rec["boundary_rows"], 2)
+        self.assertEqual(len(Handler.bodies), 2)
+        self.assertIn("LIMIT+3", Handler.bodies[1][1])
+        self.assertNotIn("boundary_probe", rec)
 
 
 if __name__ == "__main__":

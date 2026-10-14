@@ -50,15 +50,22 @@ datatypes or a mix of literal classes gets no digest. A mix of `xsd:dateTime` va
 without a time zone is not detected, although its order is partly undefined. ORDER BY with
 expressions, and ORDER BY inside subqueries, are not checked.
 
-With a LIMIT or an OFFSET, the rows that tie on the keys at the cut may be any of the tied rows.
-For such a query, when the order digest applies, `exact` and `value` leave out the rows whose
-keys equal those of the first row (with an OFFSET) or of the last row (when the result reaches
-the LIMIT), and `boundary_rows` says how many were left out. The `order` digest still covers
-every row, so the key values and the number of rows in each boundary group are checked. A query
-with other keys, such as an expression, can still be rejected when rows tie at the cut.
+With a LIMIT or a nonzero OFFSET, the rows that tie on the keys at the cut may be any of the tied
+rows. For such a query, when the order digest applies, the script sends one more request, which
+is not timed, with the cut widened by one row on each side. It leaves rows out of `exact` and
+`value` only when that request shows that the row past the cut has the same keys as the boundary
+row, which is the first row for an OFFSET and the last row when the result reaches the LIMIT.
+`boundary_rows` says how many rows were left out, and it is 0 when no tie crosses the cut. Keys
+that are unique, such as a final IRI key, never leave a row out. `OFFSET 0` is no cut. A failed
+or inconsistent probe leaves every row in, and a failed one records `boundary_probe` as
+`failed`, so it can cause a false rejection but never hides a wrong answer. The `order` digest
+still covers every row, so the key values and the number of rows in each boundary group are
+checked. A query with other keys, such as an expression, can still be rejected when rows tie at
+the cut.
 
 The whole request, not each wait, is limited to MAX_TIME seconds (default 300). A slower
-answer is recorded as `error`.
+answer is recorded as `error`. The boundary probe has its own MAX_TIME deadline, so the worst
+case for one query is twice MAX_TIME.
 """
 
 import hashlib
@@ -425,12 +432,24 @@ def graph_record(text, count_only, no_check):
     return rec
 
 
-def _after_order_by(query):
-    """The text after the query's last top-level ORDER BY, with strings, comments and IRIs blanked,
-    or None. Only an ORDER BY outside every group counts."""
-    q = re.sub(r"<[^<>\s]*>", "<>", query)
-    q = re.sub(r'"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'', '""', q)
-    q = re.sub(r"#[^\n]*", "", q)
+def _blank(m):
+    """The same-length blanking of one matched IRI, string or comment, so that positions in the
+    blanked text are positions in the query."""
+    t = m.group()
+    if t[0] == "<":
+        return "<" + " " * (len(t) - 2) + ">"
+    if t[0] in "\"'":
+        return t[0] + " " * (len(t) - 2) + t[0]
+    return " " * len(t)
+
+
+def _order_by_tail(query):
+    """(start, tail) of the query's last top-level ORDER BY, where start is the index in `query`
+    after the ORDER BY keywords and tail is the text from there with IRIs, strings and comments
+    blanked to the same length, or None. Only an ORDER BY outside every group counts."""
+    q = re.sub(r"<[^<>\s]*>", _blank, query)
+    q = re.sub(r'"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'', _blank, q)
+    q = re.sub(r"#[^\n]*", _blank, q)
     depth, start = 0, None
     for m in re.finditer(r"[{}]|\border\s+by\b", q, re.I):
         if m.group() == "{":
@@ -439,7 +458,14 @@ def _after_order_by(query):
             depth -= 1
         elif depth == 0:
             start = m.end()
-    return None if start is None else q[start:]
+    return None if start is None else (start, q[start:])
+
+
+def _after_order_by(query):
+    """The text after the query's last top-level ORDER BY with strings, comments and IRIs blanked,
+    or None."""
+    t = _order_by_tail(query)
+    return None if t is None else t[1]
 
 
 def order_keys(query, head_vars):
@@ -457,13 +483,30 @@ def order_keys(query, head_vars):
 
 
 def slice_of(query):
-    """(limit, has_offset) of the query's own top-level ORDER BY ... LIMIT ... OFFSET ..., where
-    limit is an integer or None. A query without a top-level ORDER BY gives (None, False)."""
+    """(limit, offset) of the query's own top-level ORDER BY ... LIMIT ... OFFSET ..., where limit
+    is an integer or None and offset is an integer, 0 when there is none. A query without a
+    top-level ORDER BY gives (None, 0)."""
     tail = _after_order_by(query)
     if tail is None:
-        return None, False
-    m = re.search(r"\blimit\s+(\d+)", tail, re.I)
-    return (int(m.group(1)) if m else None), bool(re.search(r"\boffset\b", tail, re.I))
+        return None, 0
+    lim = re.search(r"\blimit\s+(\d+)", tail, re.I)
+    off = re.search(r"\boffset\s+(\d+)", tail, re.I)
+    return (int(lim.group(1)) if lim else None), (int(off.group(1)) if off else 0)
+
+
+def probe_query(query, offset, count):
+    """The query with its top-level LIMIT and OFFSET clauses replaced by `LIMIT count OFFSET offset`,
+    put where the earlier of the two clauses was so that a trailing VALUES block stays valid. Only
+    called for a query with at least one of the clauses."""
+    start, tail = _order_by_tail(query)
+    spans = [(start + m.start(), start + m.end())
+             for m in re.finditer(r"\b(?:limit|offset)\s+\d+", tail, re.I)]
+    chars = list(query)
+    for a, b in spans:
+        chars[a:b] = " " * (b - a)
+    at = min(a for a, _ in spans)
+    text = "".join(chars)
+    return text[:at] + f" LIMIT {count} OFFSET {offset} " + text[at:]
 
 
 # literal classes whose order SPARQL defines. xsd:date is outside the SPARQL 1.1 operator table, but
@@ -492,8 +535,38 @@ def orderable(seq):
     return True
 
 
-def select_record(query, res, count_only):
-    """The answer record of a SELECT result in SPARQL JSON form."""
+def boundary_edge(query, bindings, keys, seq, run):
+    """(edge, probed) for a query with a LIMIT or an offset. `edge` holds the key tuples of the
+    boundary rows that the probe request `run` shows tied with the row past the cut, and `probed`
+    is "failed" when the probe raised, else None. Nothing is an edge without a shown tie, or when
+    the probe disagrees with the answer."""
+    n, o = slice_of(query)
+    k = len(bindings)
+    low = o > 0 and k > 0
+    high = n is not None and k > 0 and k == n
+    if run is None or not (low or high):
+        return set(), None
+    lo = 1 if low else 0
+    count = 2 if n is None else k + lo + (1 if high else 0)
+    try:
+        res = run(probe_query(query, o - 1 if low else o, count))
+        probe = [tuple(term(b.get(v), True) for v in keys) for b in res["results"]["bindings"]]
+    except Exception:  # noqa: BLE001 - a failed probe masks nothing
+        return set(), "failed"
+    need = min(k, count - lo)
+    if probe[lo:lo + need] != seq[:need]:
+        return set(), None
+    edge = set()
+    if low and probe[0] == seq[0]:
+        edge.add(seq[0])
+    if high and len(probe) > lo + k and probe[lo + k] == seq[-1]:
+        edge.add(seq[-1])
+    return edge, None
+
+
+def select_record(query, res, count_only, run=None):
+    """The answer record of a SELECT result in SPARQL JSON form. `run` takes a query text and
+    returns its parsed SPARQL JSON result or raises, and serves the boundary probe."""
     # variable order in the head is not part of a solution (engines differ)
     vars_ = sorted(res["head"].get("vars", []))
     bindings = res["results"]["bindings"]
@@ -508,14 +581,13 @@ def select_record(query, res, count_only):
         # the sequence of ORDER BY keys, which ties in the keys cannot change
         rec["order"] = hashlib.sha256(repr(seq).encode()).hexdigest()[:16]
         limit, offset = slice_of(query)
-        edge = set()
-        if offset and seq:
-            edge.add(seq[0])
-        if limit is not None and len(bindings) >= limit and seq:
-            edge.add(seq[-1])
         if limit is not None or offset:
-            # rows that tie on the key at the cut may be any of the tied rows, so only their keys count
-            kept = [b for b, k in zip(bindings, seq) if k not in edge]
+            # rows that tie on the key across the cut may be any of the tied rows, so only their
+            # keys count, and a second request shows whether a tie crosses the cut
+            edge, probed = boundary_edge(query, bindings, keys, seq, run)
+            if probed:
+                rec["boundary_probe"] = probed
+            kept = [b for b, kt in zip(bindings, seq) if kt not in edge]
             rec["boundary_rows"] = len(bindings) - len(kept)
     for key, by_value in (("exact", False), ("value", True)):
         rec[key] = canon(tuple(term(b.get(v), by_value) for v in vars_) for b in kept)
@@ -558,14 +630,17 @@ def main():
         query = f.read()
     kind = form(query)
     graph = kind in ("construct", "describe")
-    req = urllib.request.Request(
-        endpoint if endpoint.startswith("http") else "http://" + endpoint,
-        data=urllib.parse.urlencode({"query": query}).encode(),
-        headers={"Accept": "application/n-triples" if graph else "application/sparql-results+json",
-                 "Content-Type": "application/x-www-form-urlencoded"},
-    )
+    url = endpoint if endpoint.startswith("http") else "http://" + endpoint
+
+    def request(text):
+        return urllib.request.Request(
+            url, data=urllib.parse.urlencode({"query": text}).encode(),
+            headers={"Accept": "application/n-triples" if graph else "application/sparql-results+json",
+                     "Content-Type": "application/x-www-form-urlencoded"})
+
+    max_time = float(os.environ.get("MAX_TIME", "300"))
     try:
-        body = fetch(req, float(os.environ.get("MAX_TIME", "300")))
+        body = fetch(request(query), max_time)
         if graph:
             rec = graph_record(body.decode(), count_only, no_check)
         else:
@@ -574,7 +649,8 @@ def main():
                 rec = {"rows": 1}
                 rec["exact"] = rec["value"] = digest([(bool(res["boolean"]),)])
             else:
-                rec = select_record(query, res, count_only)
+                rec = select_record(query, res, count_only,
+                                    lambda text: json.loads(fetch(request(text), max_time)))
     except Exception as e:  # noqa: BLE001 - any failure is recorded, not raised
         rec = {"rows": "error", "error": str(e)[:200]}
     d = {}
