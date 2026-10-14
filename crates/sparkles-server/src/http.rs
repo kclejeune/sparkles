@@ -2062,6 +2062,10 @@ async fn update_endpoint(
         max_rows: Some(st.limits.max_rows),
         max_memory_bytes: st.limits.query_memory_bytes,
         max_rows_produced: st.limits.max_rows_produced,
+        // the grant the request was admitted with. The dataset's pool serves a server
+        // where admission did not run
+        grant: crate::server_memory::current_grant(),
+        pool: ds.dataset.query_options().pool,
         ..Default::default()
     };
     budgets::Overrides::parse(&params)?.apply(&mut opts);

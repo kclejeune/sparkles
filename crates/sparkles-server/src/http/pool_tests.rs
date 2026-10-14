@@ -170,3 +170,53 @@ async fn server_memory_lists_the_caches_per_dataset() {
         .collect();
     assert_eq!(names, ["ds", "other"]);
 }
+
+async fn post_update(app: &Router, body: &str) -> (StatusCode, axum::http::HeaderMap, String) {
+    let res = app
+        .clone()
+        .oneshot(
+            Request::post("/ds/update")
+                .header(header::CONTENT_TYPE, "application/sparql-update")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, headers) = (res.status(), res.headers().clone());
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, headers, String::from_utf8_lossy(&body).into_owned())
+}
+
+#[tokio::test]
+async fn an_update_outgrowing_its_admission_grant_answers_503() {
+    let s = server(64, Duration::from_millis(200));
+    let mut data = String::new();
+    for i in 0..1_000 {
+        data.push_str(&format!("<urn:s{i}> <urn:p> \"{i}\" .\n"));
+    }
+    s.state
+        .get("ds")
+        .unwrap()
+        .store
+        .load(&[Source::from_bytes(
+            data.into_bytes(),
+            oxrdfio::RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+    const U: &str = "DELETE { ?a <urn:none> ?b } WHERE { ?a <urn:p> ?x . ?b <urn:p> ?y }";
+    // other requests hold 40 of the 64 MiB, so the update cannot grow past its 16 MiB
+    let held = pool(&s).try_grant(40 * MB).unwrap();
+    let (status, headers, body) = post_update(&s.app, U).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(headers[header::RETRY_AFTER], "1");
+    let j: J = serde_json::from_str(&body).unwrap();
+    assert_eq!(j["budget"], "server-memory", "{body}");
+    assert_eq!(pool(&s).granted(), 40 * MB);
+    drop(held);
+    let (status, _, body) = post_update(&s.app, U).await;
+    assert!(status.is_success(), "{status} {body}");
+    assert_eq!(pool(&s).granted(), 0);
+}
