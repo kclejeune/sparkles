@@ -268,6 +268,12 @@ mod sealer {
         }
         let written = (|| {
             let mut f = o.open(&tmp)?;
+            // the umask may have reduced the mode that the file was made with
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                f.set_permissions(std::fs::Permissions::from_mode(0o400))?;
+            }
             f.write_all(text.as_bytes())?;
             f.sync_all()?;
             drop(f);
@@ -276,9 +282,13 @@ mod sealer {
         })();
         let _ = std::fs::remove_file(&tmp);
         written?;
-        #[cfg(unix)]
-        if let Ok(d) = std::fs::File::open(dir) {
-            let _ = d.sync_all();
+        // the name must survive a crash before any value is sealed with the key
+        if let Err(e) = super::sync_dir(dir) {
+            let _ = std::fs::remove_file(path);
+            return Err(std::io::Error::other(format!(
+                "cannot make the secrets key {} durable: {e}",
+                path.display()
+            )));
         }
         Ok(Sealer::from_key(key))
     }
@@ -631,6 +641,25 @@ pub fn rekey(data: &FsPath, source: Option<&str>, new_key: &str) -> anyhow::Resu
     })
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Makes [`sync_dir`] fail on this thread, to test the paths that must report it.
+    pub(crate) static FAIL_DIR_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Flush the directory `dir`, so that the names made or removed in it survive a crash.
+pub(crate) fn sync_dir(dir: &FsPath) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FAIL_DIR_SYNC.with(|f| f.get()) {
+        return Err(std::io::Error::other("injected directory sync failure"));
+    }
+    #[cfg(unix)]
+    std::fs::File::open(dir)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
 /// Make `dir` with mode 0700, or set that mode on it.
 fn private_dir(dir: &FsPath) -> std::io::Result<()> {
     #[cfg(unix)]
@@ -649,7 +678,9 @@ fn private_dir(dir: &FsPath) -> std::io::Result<()> {
 }
 
 /// Write `bytes` to `path` atomically: a new file in the same directory with `mode`,
-/// flushed to disk, then renamed over `path`, and the directory flushed.
+/// flushed to disk, then renamed over `path`, and the directory flushed. The error of
+/// the directory flush is returned. The new file is then in place, but it may not
+/// survive a crash.
 pub(crate) fn write_atomic(path: &FsPath, bytes: &[u8], mode: u32) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or(FsPath::new("."));
     let name = path
@@ -678,11 +709,7 @@ pub(crate) fn write_atomic(path: &FsPath, bytes: &[u8], mode: u32) -> std::io::R
         let _ = std::fs::remove_file(&tmp);
     }
     written?;
-    #[cfg(unix)]
-    if let Ok(d) = std::fs::File::open(dir) {
-        let _ = d.sync_all();
-    }
-    Ok(())
+    sync_dir(dir)
 }
 
 /// The runtime values in `dir`, by name, with the time each was set. Only the names and
@@ -925,5 +952,94 @@ mod tests {
         assert_eq!(std::fs::read(dir.join("a")).unwrap(), b"y");
         std::fs::write(dir.join(".hidden"), "z").unwrap();
         assert_eq!(stored(&dir).keys().collect::<Vec<_>>(), ["a"]);
+    }
+
+    /// A key that is generated is durable before any value is sealed with it. When the
+    /// directory sync fails, nothing is written, and no key stays.
+    #[cfg(all(feature = "backup", unix))]
+    #[test]
+    fn generated_key_must_be_durable_before_sealing() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let data = t.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let dir = data.join(SECRETS_DIR);
+        private_dir(&dir).unwrap();
+        let s = Sealing::start(None, &data).unwrap();
+        FAIL_DIR_SYNC.with(|f| f.set(true));
+        let e = s.write(&dir, "gw", b"v");
+        assert!(e.is_err(), "write succeeded without a durable key");
+        assert!(!data.join(SECRETS_KEY_FILE).exists());
+        assert!(!dir.join("gw").exists());
+        assert!(s.key_memory().is_none());
+        let old = dir.join("old");
+        std::fs::write(&old, "plain").unwrap();
+        std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(s.prepare(&dir).is_err());
+        assert_eq!(std::fs::read_to_string(&old).unwrap(), "plain");
+        FAIL_DIR_SYNC.with(|f| f.set(false));
+        s.prepare(&dir).unwrap();
+        assert!(
+            std::fs::read_to_string(&old)
+                .unwrap()
+                .starts_with("sparkles-sealed-secret/1 ")
+        );
+        let mode = std::fs::metadata(data.join(SECRETS_KEY_FILE))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o400);
+    }
+
+    /// The generated key is readable by its owner under any umask. The umask is
+    /// per process, so the test runs [`generated_key_mode_child`] in a child process
+    /// that sets it, and tests that run in parallel keep theirs.
+    #[cfg(all(feature = "backup", target_os = "linux"))]
+    #[test]
+    fn generated_key_mode_ignores_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::process::CommandExt;
+        let t = tempfile::tempdir().unwrap();
+        let data = t.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args([
+            "--exact",
+            "settings::secrets::tests::generated_key_mode_child",
+            "--ignored",
+        ])
+        .env("SPARKLES_TEST_UMASK_DATA", &data);
+        // SAFETY: umask is async-signal-safe and the closure does nothing else.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::umask(0o477);
+                Ok(())
+            });
+        }
+        let out = cmd.output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let key = data.join(SECRETS_KEY_FILE);
+        let mode = std::fs::metadata(&key).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o400);
+        Sealing::start(None, &data).unwrap();
+    }
+
+    /// The child of [`generated_key_mode_ignores_umask`]. It does nothing on its own.
+    #[cfg(all(feature = "backup", target_os = "linux"))]
+    #[test]
+    #[ignore = "runs in a child process of generated_key_mode_ignores_umask"]
+    fn generated_key_mode_child() {
+        let Some(data) = std::env::var_os("SPARKLES_TEST_UMASK_DATA") else {
+            return;
+        };
+        let data = PathBuf::from(data);
+        let dir = data.join(SECRETS_DIR);
+        private_dir(&dir).unwrap();
+        let s = Sealing::start(None, &data).unwrap();
+        s.write(&dir, "gw", b"v").unwrap();
     }
 }
