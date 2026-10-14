@@ -370,24 +370,37 @@ impl PoolGrant {
     /// admission, one query may not hold more than half the pool.
     #[inline]
     pub fn charge(&self, bytes: u64) -> Result<(), Error> {
-        let used = self.used.fetch_add(bytes, Ordering::SeqCst) + bytes;
+        let used = self.add_usage(bytes)?;
         if used > self.granted.load(Ordering::SeqCst) {
             return self.charge_slow(bytes);
         }
         Ok(())
     }
 
-    /// The charge that the fast path could not cover. It takes its bytes back out of
-    /// `used` before it waits for the lock, so that a charge that is about to fail does
-    /// not make another thread's charge fail with it, and adds them again under the
-    /// lock once the grant covers them.
+    /// Add a representable contribution without wrapping another caller's ownership.
+    #[inline]
+    fn add_usage(&self, bytes: u64) -> Result<u64, Error> {
+        self.used
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
+                used.checked_add(bytes)
+            })
+            .map(|prior| prior + bytes)
+            .map_err(|_| self.pool.exhausted(u64::MAX))
+    }
+
+    /// Take a speculative charge out before waiting for the growth lock. Under the
+    /// lock, publish its contribution before publishing more grant capacity, so fast
+    /// chargers cannot consume capacity meant for this charge. A rejected growth
+    /// removes exactly this contribution and leaves concurrent ownership intact.
     #[cold]
     fn charge_slow(&self, bytes: u64) -> Result<(), Error> {
         self.used.fetch_sub(bytes, Ordering::SeqCst);
         let _lock = self.resize.lock();
-        let need = self.used.load(Ordering::SeqCst).saturating_add(bytes);
-        self.grow_locked(need)?;
-        self.used.fetch_add(bytes, Ordering::SeqCst);
+        let need = self.add_usage(bytes)?;
+        if let Err(error) = self.grow_locked(need) {
+            self.used.fetch_sub(bytes, Ordering::SeqCst);
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -472,7 +485,9 @@ impl PoolGrant {
         // `granted` and then reads `used`. Both are sequentially consistent, so either
         // the trimmer sees the charge and keeps its bytes, or the charger sees the lower
         // grant and goes to `grow`, which waits for the lock. The bytes go back to the
-        // pool only after the second read.
+        // pool only after the second read. A slow charger also publishes its own
+        // usage before growing the grant under this lock, so a newly published
+        // granule cannot be accepted twice.
         self.granted.store(t1, Ordering::SeqCst);
         let t2 = keep(self.used.load(Ordering::SeqCst)).max(t1);
         if t2 != t1 {
@@ -677,6 +692,94 @@ mod tests {
         assert!(o.0 > 0);
         assert_eq!(pool.granted(), 0);
         assert_eq!(pool.waiting(), 0);
+    }
+
+    #[test]
+    fn slow_growth_never_accepts_more_than_capacity() {
+        let pool = QueryPool::new(20 * MB);
+        let barrier = std::sync::Barrier::new(3);
+        let slot: Mutex<Option<Arc<PoolGrant>>> = Mutex::new(None);
+        let accepted = AtomicUsize::new(0);
+        let mut unbacked = 0;
+        std::thread::scope(|scope| {
+            for (bit, bytes) in [(1, MB), (2, 4 * MB)] {
+                let (barrier, slot, accepted) = (&barrier, &slot, &accepted);
+                scope.spawn(move || {
+                    for _ in 0..100_000 {
+                        barrier.wait();
+                        let grant = slot.lock().clone().unwrap();
+                        let charged = grant.charge(bytes).is_ok();
+                        if charged {
+                            accepted.fetch_or(bit, Ordering::SeqCst);
+                        }
+                        barrier.wait();
+                        barrier.wait();
+                        if charged {
+                            grant.release(bytes);
+                        }
+                        drop(grant);
+                        barrier.wait();
+                    }
+                });
+            }
+            for _ in 0..100_000 {
+                let grant = Arc::new(pool.try_grant(16 * MB).unwrap());
+                grant.charge(16 * MB).unwrap();
+                *slot.lock() = Some(grant.clone());
+                accepted.store(0, Ordering::SeqCst);
+                barrier.wait();
+                barrier.wait();
+                let bits = accepted.load(Ordering::SeqCst);
+                let bytes = 16 * MB
+                    + if bits & 1 != 0 { MB } else { 0 }
+                    + if bits & 2 != 0 { 4 * MB } else { 0 };
+                if bits == 3 || bytes > pool.capacity() || grant.granted() < bytes {
+                    unbacked += 1;
+                }
+                assert_eq!(grant.used(), bytes);
+                barrier.wait();
+                barrier.wait();
+                grant.release(16 * MB);
+                assert_eq!(grant.used(), 0);
+                slot.lock().take();
+                drop(grant);
+                assert_eq!(pool.granted(), 0);
+            }
+        });
+        assert_eq!(unbacked, 0, "rounds accepting usage beyond the grant");
+    }
+
+    #[test]
+    fn failed_slow_growth_leaves_the_grant_reusable() {
+        let pool = QueryPool::new(20 * MB);
+        let grant = pool.try_grant(16 * MB).unwrap();
+        grant.charge(17 * MB).unwrap();
+        assert!(matches!(grant.charge(4 * MB), Err(Error::BudgetExceeded(b))
+            if b.kind == BudgetKind::ServerMemory));
+        assert_eq!(grant.used(), 17 * MB);
+        assert_eq!(grant.granted(), 20 * MB);
+        grant.release(17 * MB);
+        grant.charge(20 * MB).unwrap();
+        assert_eq!(grant.used(), 20 * MB);
+        grant.release(20 * MB);
+        assert_eq!(grant.used(), 0);
+        drop(grant);
+        assert_eq!(pool.granted(), 0);
+    }
+
+    #[test]
+    fn overflowing_charge_preserves_existing_ownership() {
+        let pool = QueryPool::new(u64::MAX);
+        let grant = pool.empty_grant();
+        grant.charge(u64::MAX - 1).unwrap();
+        let before = (grant.used(), grant.granted(), pool.granted());
+        assert!(matches!(grant.charge(2), Err(Error::BudgetExceeded(b))
+            if b.kind == BudgetKind::ServerMemory));
+        assert_eq!((grant.used(), grant.granted(), pool.granted()), before);
+        grant.release(u64::MAX - 1);
+        assert_eq!(grant.used(), 0);
+        drop(grant);
+        assert_eq!(pool.granted(), 0);
     }
 
     #[test]
