@@ -346,6 +346,8 @@
     assert abs(c["policy"]["deltaRatio"] - 0.1) < 1e-9, c
     assert c["policy"]["idleSeconds"] == 0, c
     machine.succeed("systemctl show -p ExecStart sparkles.service | grep -q -- '--max-clones 1'")
+    # a server that fails at every start backs off instead of restarting every 5 s
+    machine.succeed("systemctl show -p RestartMaxDelayUSec --value sparkles.service | grep -qx 5min")
 
     # An automatic compaction's build threads lower their priority with setpriority,
     # which the unit's ~@resources filter once answered by killing the server (SIGSYS).
