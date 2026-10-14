@@ -123,6 +123,27 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(r["jena"]["status"], "error")
         self.assertEqual(subprocess.run([sys.executable, RECORD, "validate", out], capture_output=True).returncode, 0)
 
+    def test_build_without_queries_finds_answer_only_queries(self):
+        write(self.res, "answers.json", {"q1": {"sparkles": {"rows": 3, "exact": "x", "value": "x"}}})
+        out = os.path.join(self.tmp.name, "r.json")
+        p = build(self.res, out)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        rs = jload(out)["results"]
+        self.assertEqual([(r["engine"], r["query"], r["mode"], r["status"], r["answer"]["rows"]) for r in rs],
+                         [("sparkles", "q1", "answer", "ok", 3)])
+
+    def test_pooled_answer_only_instances_give_one_result_per_template(self):
+        ans = {"rows": 3, "exact": "x", "value": "x"}
+        write(self.res, "answers.json", {"t-1": {"sparkles": ans}, "t-2": {"sparkles": ans}})
+        out = os.path.join(self.tmp.name, "r.json")
+        p = build(self.res, out, **{"pool-instances": True})
+        self.assertEqual(p.returncode, 0, p.stderr)
+        rs = jload(out)["results"]
+        self.assertEqual([(r["query"], r["mode"], r["status"], r["instances"]) for r in rs], [("t", "answer", "ok", 2)])
+        self.assertEqual(rs[0]["answer"]["instances"], 2)
+        self.assertIsNone(rs[0]["median_ms"])
+        self.assertEqual(subprocess.run([sys.executable, RECORD, "validate", out], capture_output=True).returncode, 0)
+
     def test_a_server_side_timeout_is_a_timeout(self):
         # an HTTP error (curl exit 22) after the request limit is the server's own timeout
         write(self.res, "slow.json", {"results": [hyperfine("jena-fuseki", [5.0, 5.1], [22, 22]),

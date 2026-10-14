@@ -23,8 +23,9 @@ pinning, the data hashes and the start time. `finish` adds the end time.
 * `inference.json`: the materialization of the LUBM suite,
 * `extra.json`: optional `{"settings": {…}, "results": [ … ]}` merged into the record.
 
-Which query files count is decided by `--queries` (a list of names); without it every
-`*.json` file in the directory that is not one of the files above is taken as a query.
+Which queries count is decided by `--queries` (a list of names). Without it every `*.json` file
+in the directory that is not one of the files above is taken as a query, and so is every query
+name in `answers.json`, which gives a query that was only answer-checked its answer result.
 
 `validate` checks a record against the shape below and exits with status 1 on the first
 file that does not conform.
@@ -316,7 +317,7 @@ def pool(results):
     groups, out = {}, []
     for r in results:
         m = re.fullmatch(r"(.+)-(\d+)", r["query"])
-        if r["mode"] not in ("warm", "cold") or not m:
+        if r["mode"] not in ("warm", "cold", "answer") or not m:
             out.append(r)
             continue
         groups.setdefault((r["engine"], m.group(1), r["mode"], r["clients"]), []).append(r)
@@ -345,9 +346,9 @@ def cmd_build(a):
     man = json.load(open(a.manifest)) if a.manifest else {}
     answers = load_json(d, "answers.json")
     fps = fingerprints(answers)
-    names = a.queries or sorted(f[:-5] for f in os.listdir(d)
-                                if f.endswith(".json") and f[:-5] not in AUX and not f.startswith("throughput")
-                                and not f.endswith(".new.json"))
+    names = a.queries or sorted({f[:-5] for f in os.listdir(d)
+                                 if f.endswith(".json") and f[:-5] not in AUX and not f.startswith("throughput")
+                                 and not f.endswith(".new.json")} | set(answers or {}))
     results = []
     for n in names:
         results += hyperfine_results(d, n, "warm", fps)
