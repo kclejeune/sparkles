@@ -846,6 +846,13 @@ fitting output estimates, separate context lifetimes, graph lexical payload, bud
 failure cleanup and conversion from eager preparation to cursor accounting. The existing
 profile and latency measurements remain pending as described below.
 
+The retained-estimate path keeps its acquire fast read and moves growth into a separate
+helper that is never inlined. The helper preserves the locked recheck, admission of the
+positive contribution and publication only after admission succeeds. An isolated Intel
+comparison covers only `types-grouped` and does not settle the latency gate. The A1
+anonymous RSS remeasurement, the 10.5M and DBpedia profile runs, and the latency study
+comparing the baseline, fixed build and pool settings remain pending as described below.
+
 ### Gates
 
 * **A1.** With ten datasets of 1.05M triples each and `--cache-mb 256`, the block cache
