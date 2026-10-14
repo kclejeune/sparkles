@@ -163,12 +163,8 @@ pub fn plan(root: &Path) -> Result<Plan> {
         steps: Vec::new(),
         refused: Vec::new(),
     };
-    match crate::commit::read_dataset_versions(root) {
-        Ok(d) => plan.dataset = d,
-        Err(e) => plan.refused.push(e.to_string()),
-    }
-    inspect_store(&mut plan, root, "", by)?;
-    // branch stores keep their generations under branches/<id>/
+    inspect_dir(&mut plan, root, "", by)?;
+    // branch stores, retained ones included, live under branches/<id>/
     let branches = root.join("branches");
     if branches.is_dir() {
         let mut dirs: Vec<_> = std::fs::read_dir(&branches)?
@@ -178,24 +174,27 @@ pub fn plan(root: &Path) -> Result<Plan> {
             .collect();
         dirs.sort();
         for d in dirs {
-            inspect_store(&mut plan, &branches.join(&d), &format!("branches/{d}/"), by)?;
-        }
-    }
-    for s in formats::SETTINGS
-        .iter()
-        .filter(|s| s.scope == formats::Scope::Dataset)
-    {
-        let Ok(b) = std::fs::read(root.join(s.name)) else {
-            continue;
-        };
-        let Ok(v) = serde_json::from_slice::<serde_json::Value>(&b) else {
-            continue;
-        };
-        if let Err(e) = formats::check_settings(s.name, &v) {
-            plan.refused.push(e.to_string());
+            inspect_dir(&mut plan, &branches.join(&d), &format!("branches/{d}/"), by)?;
         }
     }
     Ok(plan)
+}
+
+/// What opening the store in `dir` checks: its `dataset.json`, its registered settings
+/// files other than the informational ones, and the files of its generations. `prefix`
+/// names a branch's directory in the messages and is empty for the root, whose
+/// `dataset.json` versions the plan reports.
+fn inspect_dir(plan: &mut Plan, dir: &Path, prefix: &str, by: Option<&str>) -> Result<()> {
+    match crate::commit::read_dataset_versions(dir) {
+        Ok(d) if prefix.is_empty() => plan.dataset = d,
+        Ok(_) => {}
+        Err(e) => plan.refused.push(format!("{prefix}{e}")),
+    }
+    for e in formats::dataset_dir_refusals(dir) {
+        // the message already names the directory
+        plan.refused.push(e.to_string());
+    }
+    inspect_store(plan, dir, prefix, by)
 }
 
 fn inspect_store(plan: &mut Plan, dir: &Path, prefix: &str, by: Option<&str>) -> Result<()> {
@@ -534,5 +533,72 @@ mod tests {
         assert!(p.refused[0].contains("index version 99"), "{:?}", p.refused);
         let e = migrate(&root, false).unwrap_err().to_string();
         assert!(e.contains("newer release"), "{e}");
+    }
+
+    /// A database with one branch, and the directory of the branch.
+    fn branched_database(root: &Path) -> PathBuf {
+        let s = Store::open(root, StoreOptions::default()).unwrap();
+        s.create_branch("dev", &Default::default()).unwrap();
+        drop(s);
+        let mut dirs: Vec<_> = std::fs::read_dir(root.join("branches"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.is_dir())
+            .collect();
+        assert_eq!(dirs.len(), 1, "{dirs:?}");
+        dirs.pop().unwrap()
+    }
+
+    #[test]
+    fn a_branch_with_a_newer_settings_file_is_outside_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        let branch = branched_database(&root);
+        let id = branch.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(plan(&root).unwrap().in_window());
+        std::fs::write(branch.join("compaction.json"), br#"{"format": 2}"#).unwrap();
+        let p = plan(&root).unwrap();
+        assert!(!p.in_window());
+        assert!(
+            p.refused
+                .iter()
+                .any(|r| r.contains(&format!("branches/{id}")) && r.contains("compaction.json")),
+            "{:?}",
+            p.refused
+        );
+        let e = migrate(&root, false).err().expect("refused");
+        assert!(matches!(e, Error::Unsupported(_)), "{e:?}");
+    }
+
+    #[test]
+    fn a_branch_dataset_json_needing_a_later_reader_is_outside_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        let branch = branched_database(&root);
+        let path = branch.join("dataset.json");
+        if let Ok(b) = std::fs::read(&path) {
+            let mut v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+            v["minimumReader"] = 99.into();
+            std::fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
+        } else {
+            // a branch directory without its own dataset.json takes the root's id
+            let b = std::fs::read(root.join("dataset.json")).unwrap();
+            let mut v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+            v["minimumReader"] = 99.into();
+            std::fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
+        }
+        let p = plan(&root).unwrap();
+        assert!(!p.in_window(), "{:?}", p.refused);
+    }
+
+    #[test]
+    fn a_newer_origin_file_stays_inside_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        drop(Store::open(&root, StoreOptions::default()).unwrap());
+        std::fs::write(root.join("origin.json"), br#"{"originFormat": 9}"#).unwrap();
+        std::fs::write(root.join("restore.json"), br#"{"restoreFormat": 9}"#).unwrap();
+        let p = plan(&root).unwrap();
+        assert!(p.in_window(), "{:?}", p.refused);
     }
 }
