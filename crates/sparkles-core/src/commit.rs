@@ -529,7 +529,7 @@ pub(crate) fn require_reader(root: &Path, reader: u32) -> Result<()> {
     Ok(())
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct DatasetFile {
     format: u32,
     #[serde(default = "legacy_reader", rename = "minimumReader")]
@@ -1422,11 +1422,10 @@ mod tests {
             br#"{"format": 2, "minimumReader": 9, "id": 5}"#,
         )
         .unwrap();
-        let e = read_dataset(dir.path()).err().expect("refused");
+        let e = read_dataset(dir.path()).expect_err("refused");
         assert!(matches!(e, Error::Unsupported(_)), "{e:?}");
-        let e = dataset_id_of(br#"{"format": 2, "minimumReader": 9, "id": 5}"#)
-            .err()
-            .expect("refused");
+        let e =
+            dataset_id_of(br#"{"format": 2, "minimumReader": 9, "id": 5}"#).expect_err("refused");
         assert!(matches!(e, Error::Unsupported(_)), "{e:?}");
     }
 }

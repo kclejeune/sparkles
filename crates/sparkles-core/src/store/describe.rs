@@ -67,7 +67,7 @@ mod tests {
     fn a_newer_describe_file_is_unsupported() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(DESCRIBE_FILE), br#"{"format": 2}"#).unwrap();
-        let e = read_settings(dir.path()).err().expect("refused");
+        let e = read_settings(dir.path()).expect_err("refused");
         assert!(matches!(e, Error::Unsupported(_)), "{e:?}");
     }
 }

@@ -1518,9 +1518,18 @@ impl Store {
         opts: StoreOptions,
         ctx: Option<branching::OpenCtx>,
     ) -> Result<Store> {
+        // A database whose migration stopped part way is refused, before this open
+        // creates the directory a missing root would get, and again under the lock
+        // in case a migration started in between. Branch stores live inside the root.
+        if ctx.is_none() {
+            crate::migrate::check_not_pending(root)?;
+        }
         commit::check_dataset_compatibility(root)?;
         std::fs::create_dir_all(root)?;
         let lock = lock_dir(root)?;
+        if ctx.is_none() {
+            crate::migrate::check_not_pending(root)?;
+        }
         commit::check_dataset_compatibility(root)?;
         // a settings file from a newer release refuses the dataset before any file of it
         // changes, the same verdict as `sparkles migrate --check`

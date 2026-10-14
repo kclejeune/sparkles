@@ -425,7 +425,7 @@ mod tests {
             br#"{"format": 2, "maxBytes": 1}"#,
         )
         .unwrap();
-        let e = read_file(dir.path()).err().expect("refused");
+        let e = read_file(dir.path()).expect_err("refused");
         assert!(matches!(e, Error::Unsupported(_)), "{e:?}");
     }
 }
