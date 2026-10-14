@@ -65,6 +65,9 @@ impl Params {
 pub trait Space: Sync {
     fn len(&self) -> usize;
     fn dist(&self, a: u32, b: u32) -> f32;
+    /// Hint that node `a`'s vector is read soon (a build calls it for the neighbours a
+    /// search is about to score, so their rows load while it scores others).
+    fn prefetch(&self, _a: u32) {}
 }
 
 /// A graph to search: its nodes, entry point and links.
@@ -216,16 +219,24 @@ pub(crate) fn search_layer(
 /// more nodes reachable (recall@10 at ef = 16 went from 0.984 to 0.998 on 50k clustered
 /// vectors of dimension 384 with M = 16).
 pub(crate) fn select(space: &dyn Space, cands: &[Near], m: usize) -> Vec<u32> {
-    let mut out: Vec<u32> = Vec::with_capacity(m);
-    let mut pruned: Vec<u32> = Vec::new();
+    select_near(space, cands, m)
+        .into_iter()
+        .map(|c| c.1)
+        .collect()
+}
+
+/// [`select`], keeping each chosen node's distance.
+pub(crate) fn select_near(space: &dyn Space, cands: &[Near], m: usize) -> Vec<Near> {
+    let mut out: Vec<Near> = Vec::with_capacity(m);
+    let mut pruned: Vec<Near> = Vec::new();
     for c in cands {
         if out.len() >= m {
             break;
         }
-        if out.iter().all(|&r| space.dist(c.1, r) > c.0) {
-            out.push(c.1);
+        if out.iter().all(|r| space.dist(c.1, r.1) > c.0) {
+            out.push(*c);
         } else {
-            pruned.push(c.1);
+            pruned.push(*c);
         }
     }
     let room = m - out.len();
@@ -282,6 +293,10 @@ pub struct Builder<'a> {
     upper_at: Vec<usize>,
     /// per node above level 0: `M + 1` words per layer 1..=level
     upper: Vec<AtomicU32>,
+    /// the distance (`f32` bits) from the node to each link, in the same places as the
+    /// links in `level0` and `upper`, so a full list is shrunk without computing them
+    level0_d: Vec<AtomicU32>,
+    upper_d: Vec<AtomicU32>,
     locks: Vec<Mutex<()>>,
     /// `entry << 8 | top`, `u64::MAX` before the first node
     entry: AtomicU64,
@@ -313,6 +328,8 @@ impl<'a> Builder<'a> {
             level0: (0..n * (m0 + 1)).map(|_| AtomicU32::new(0)).collect(),
             upper_at,
             upper: (0..words).map(|_| AtomicU32::new(0)).collect(),
+            level0_d: (0..n * (m0 + 1)).map(|_| AtomicU32::new(0)).collect(),
+            upper_d: (0..words).map(|_| AtomicU32::new(0)).collect(),
             locks: (0..n).map(|_| Mutex::new(())).collect(),
             levels,
             entry: AtomicU64::new(NO_ENTRY),
@@ -325,14 +342,32 @@ impl<'a> Builder<'a> {
     }
 
     fn slots(&self, l: usize, x: u32) -> &[AtomicU32] {
+        self.slots_of(l, x).0
+    }
+
+    /// Node `x`'s link slots on layer `l` and the slots of their distances.
+    fn slots_of(&self, l: usize, x: u32) -> (&[AtomicU32], &[AtomicU32]) {
         if l == 0 {
             let w = self.p.cap(0) + 1;
-            &self.level0[x as usize * w..(x as usize + 1) * w]
+            let r = x as usize * w..(x as usize + 1) * w;
+            (&self.level0[r.clone()], &self.level0_d[r])
         } else {
             let w = self.p.cap(1) + 1;
             let at = self.upper_at[x as usize] + (l - 1) * w;
-            &self.upper[at..at + w]
+            (&self.upper[at..at + w], &self.upper_d[at..at + w])
         }
+    }
+
+    /// Node `x`'s links on layer `l` with their distances (the caller holds `x`'s lock).
+    fn read_near(&self, l: usize, x: u32, out: &mut Vec<Near>) {
+        let (s, d) = self.slots_of(l, x);
+        let c = (s[0].load(Mem::Acquire) as usize).min(s.len() - 1);
+        out.extend((1..=c).map(|j| {
+            Near(
+                f32::from_bits(d[j].load(Mem::Relaxed)),
+                s[j].load(Mem::Relaxed),
+            )
+        }));
     }
 
     /// Append node `x`'s links on layer `l` to `out`.
@@ -345,13 +380,23 @@ impl<'a> Builder<'a> {
         out.extend(s[1..=c].iter().map(|v| v.load(Mem::Relaxed)));
     }
 
+    /// [`read`](Self::read), and ask the space to load the neighbours' vectors.
+    fn read_ahead(&self, l: usize, x: u32, out: &mut Vec<u32>) {
+        let start = out.len();
+        self.read(l, x, out);
+        for &y in &out[start..] {
+            self.space.prefetch(y);
+        }
+    }
+
     /// Set node `x`'s links on layer `l` (at most the layer's cap; the caller holds
     /// `x`'s lock, or no other thread runs).
-    fn write(&self, l: usize, x: u32, links: &[u32]) {
-        let s = self.slots(l, x);
+    fn write(&self, l: usize, x: u32, links: &[Near]) {
+        let (s, d) = self.slots_of(l, x);
         let c = links.len().min(s.len() - 1);
-        for (slot, &v) in s[1..=c].iter().zip(links) {
-            slot.store(v, Mem::Relaxed);
+        for (j, v) in links[..c].iter().enumerate() {
+            s[j + 1].store(v.1, Mem::Relaxed);
+            d[j + 1].store(v.0.to_bits(), Mem::Relaxed);
         }
         s[0].store(c as u32, Mem::Release);
     }
@@ -359,7 +404,11 @@ impl<'a> Builder<'a> {
     /// Give node `x` the links `links` on layer `l` before insertions start.
     pub fn seed(&self, l: usize, x: u32, links: &[u32]) {
         if l <= self.levels[x as usize] as usize {
-            self.write(l, x, links);
+            let near: Vec<Near> = links
+                .iter()
+                .map(|&y| Near(self.space.dist(x, y), y))
+                .collect();
+            self.write(l, x, &near);
         }
     }
 
@@ -416,22 +465,22 @@ impl<'a> Builder<'a> {
         let accept = |_: u32| true;
         let mut eps = vec![Near(dist(ep), ep)];
         for l in (li + 1..=top).rev() {
-            let links = |x: u32, out: &mut Vec<u32>| self.read(l, x, out);
+            let links = |x: u32, out: &mut Vec<u32>| self.read_ahead(l, x, out);
             eps = with_visited(n, |v| search_layer(&eps, 1, &dist, &links, &accept, v));
         }
         for l in (0..=li.min(top)).rev() {
-            let links = |x: u32, out: &mut Vec<u32>| self.read(l, x, out);
+            let links = |x: u32, out: &mut Vec<u32>| self.read_ahead(l, x, out);
             let mut w = with_visited(n, |v| {
                 search_layer(&eps, self.p.ef_construction, &dist, &links, &accept, v)
             });
             w.retain(|x| x.1 != i);
-            let chosen = select(space, &w, self.p.cap(l));
+            let chosen = select_near(space, &w, self.p.cap(l));
             {
                 let _g = self.locks[i as usize].lock();
                 self.write(l, i, &chosen);
             }
-            for &e in &chosen {
-                self.link(l, e, i);
+            for e in &chosen {
+                self.link(l, e.1, Near(e.0, i));
             }
             if !w.is_empty() {
                 eps = w;
@@ -442,25 +491,20 @@ impl<'a> Builder<'a> {
         }
     }
 
-    /// Add `i` to `e`'s links on layer `l`, shrinking them by the heuristic when full.
-    fn link(&self, l: usize, e: u32, i: u32) {
+    /// Add `i` (with its distance to `e`) to `e`'s links on layer `l`, shrinking them by
+    /// the heuristic when full.
+    fn link(&self, l: usize, e: u32, i: Near) {
         let cap = self.p.cap(l);
         let _g = self.locks[e as usize].lock();
         let mut list = Vec::with_capacity(cap + 1);
-        self.read(l, e, &mut list);
-        if list.contains(&i) {
+        self.read_near(l, e, &mut list);
+        if list.iter().any(|x| x.1 == i.1) {
             return;
         }
-        if list.len() < cap {
-            list.push(i);
-        } else {
-            list.push(i);
-            let mut c: Vec<Near> = list
-                .iter()
-                .map(|&x| Near(self.space.dist(e, x), x))
-                .collect();
-            c.sort_unstable();
-            list = select(self.space, &c, cap);
+        list.push(i);
+        if list.len() > cap {
+            list.sort_unstable();
+            list = select_near(self.space, &list, cap);
         }
         self.write(l, e, &list);
     }

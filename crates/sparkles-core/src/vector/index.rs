@@ -564,6 +564,26 @@ impl hnsw::Space for HalfSpace {
         };
         if d.is_nan() { f32::INFINITY } else { d }
     }
+
+    #[inline]
+    fn prefetch(&self, a: u32) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let row = self.row(a);
+            let p = row.as_ptr().cast::<i8>();
+            let bytes = row.len() * 2;
+            let mut o = 0;
+            while o < bytes {
+                // SAFETY: a prefetch is a hint; the address is inside the row.
+                unsafe {
+                    std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(p.add(o))
+                };
+                o += 64;
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = a;
+    }
 }
 
 /// The rows per graph of a segment.
