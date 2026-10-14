@@ -507,7 +507,10 @@
                 {#if ix.lastBuild}
                   <span title={fmtTime(ix.lastBuild.at)}>{fmtRelative(ix.lastBuild.at, now)}</span>
                   <span class="faint"
-                    >· {fmtInt(ix.lastBuild.rows)} rows in {fmtMs(ix.lastBuild.ms)}</span
+                    >· {fmtInt(ix.lastBuild.rows)} rows in {fmtMs(ix.lastBuild.ms)}{ix.lastBuild
+                      .carried
+                      ? ', graph carried over from the previous generation'
+                      : ''}</span
                   >
                 {:else if ix.files?.opened}
                   <span class="faint">read from its file, not built in this process</span>

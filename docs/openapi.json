@@ -16416,6 +16416,9 @@
               "at": {
                 "type": "string"
               },
+              "carried": {
+                "type": "boolean"
+              },
               "ms": {
                 "type": "number"
               },

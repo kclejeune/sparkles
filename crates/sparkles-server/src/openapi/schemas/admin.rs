@@ -438,7 +438,10 @@ fn indexes(put: &mut dyn FnMut(&str, J)) {
                     "hnsw": or_null(hnsw),
                     "exactThreshold": int(),
                     "files": obj(&["bytes", "opened"], json!({ "bytes": int(), "opened": boolean() })),
-                    "lastBuild": last_build("rows"),
+                    "lastBuild": obj(
+                        &["at", "ms"],
+                        json!({ "at": string(), "ms": num(), "rows": int(), "carried": boolean() }),
+                    ),
                     "embedding": obj(
                         &["state", "model", "endpoint", "backlog", "appliedSeq", "headSeq"],
                         json!({

@@ -58,7 +58,7 @@ pub struct Live {
 }
 
 /// The nodes inserted since the build.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct LiveState {
     /// the frozen graph's node count: live node `i` is node `base + i`
     base: u32,

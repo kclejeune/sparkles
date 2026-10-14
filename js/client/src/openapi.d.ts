@@ -7968,6 +7968,7 @@ export interface components {
             } | null;
             lastBuild?: {
                 at: string;
+                carried?: boolean;
                 ms: number;
                 rows?: number;
             };

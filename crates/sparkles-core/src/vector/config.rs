@@ -380,6 +380,10 @@ pub struct VectorBuild {
     pub at: String,
     pub ms: f64,
     pub rows: u64,
+    /// the graph was carried over from the previous generation's build, with only
+    /// the rows that changed inserted or repaired
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub carried: bool,
 }
 
 #[cfg(test)]

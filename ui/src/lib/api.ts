@@ -2378,7 +2378,8 @@ export type VectorIndexStatus = {
   exactThreshold: number;
   /** The index file of a persistent store; `opened`: read from it, not built. */
   files?: { bytes: number; opened: boolean };
-  lastBuild?: { at: string; ms: number; rows: number };
+  /** `carried`: the graph was carried over from the previous generation. */
+  lastBuild?: { at: string; ms: number; rows: number; carried?: boolean };
   /** The embedding worker, for an index that computes its vectors. */
   embedding?: EmbeddingStatus;
 };

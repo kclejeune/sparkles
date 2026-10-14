@@ -184,16 +184,42 @@ fn main() {
     );
     let (r, ms, m) = recall(&s, &queries, ef);
     println!("recall@10 at ef={ef} with the inserts: {r:.4}, {ms:.3} ms per query ({m})");
+    // deletes as many base rows as half the inserts, spread over the base
+    let gone = inserts / 2;
+    for chunk in (0..gone).collect::<Vec<_>>().chunks(500) {
+        let mut u = String::new();
+        for &j in chunk {
+            let i = j * (n / gone.max(1));
+            u += &format!(
+                "DELETE DATA {{ <urn:x-bench:v{i}> <{EMB}> \"{}\"^^<{}> }} ;\n",
+                vector::canonical_b64(&base[i]),
+                vector::DATATYPE_B64
+            );
+        }
+        sparkles_core::sparql::update::update(&s, u.trim_end_matches(";\n"), &Default::default())
+            .unwrap();
+    }
     let t = Instant::now();
     s.compact().unwrap();
     let compact = t.elapsed().as_secs_f64();
     let st = s.wait_vector_index("emb").unwrap();
     println!(
-        "compaction: {compact:.2} s, index ready {:.2} s after the start ({} rows, state {})",
+        "compaction after {gone} deletes: {compact:.2} s, index ready {:.2} s after the start \
+         ({} rows, state {}, carried {})",
         t.elapsed().as_secs_f64(),
         st.rows,
-        st.state
+        st.state,
+        st.last_build.as_ref().is_some_and(|b| b.carried)
     );
     let (r, ms, m) = recall(&s, &queries, ef);
     println!("recall@10 at ef={ef} after the compaction: {r:.4}, {ms:.3} ms per query ({m})");
+    let t = Instant::now();
+    s.rebuild_vector_index("emb").unwrap();
+    s.wait_vector_index("emb").unwrap();
+    let (r, ms, m) = recall(&s, &queries, ef);
+    println!(
+        "full rebuild of the same generation: {:.2} s, recall@10 at ef={ef}: {r:.4}, {ms:.3} ms \
+         per query ({m})",
+        t.elapsed().as_secs_f64()
+    );
 }

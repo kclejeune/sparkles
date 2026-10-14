@@ -12,8 +12,14 @@
 //!   indexed predicate into the graph's live layer ([`crate::vector::live`]), in batches,
 //!   so searches find them through the graph instead of scoring them exactly. It works
 //!   from the published snapshot, after the commit, so writes never wait for it.
-//! * **Generation switches** (bulk commits, compactions) start a build for the new
-//!   generation of every index; the replaced generation's files are written no more.
+//! * **Generation switches.** A compaction carries each index over to the new
+//!   generation before it switches ([`Store::prebuild_vectors`]): the new segment takes
+//!   the vectors of the rows the old index holds, and the old graph's links map onto the
+//!   new rows, with the rows deleted since repaired around and the new rows inserted.
+//!   Searches keep using the old generation's graph until the switch and the carried one
+//!   right after it. A bulk commit starts a build for the new generation of every index
+//!   after the switch, carrying the old one over in the same way when few rows changed.
+//!   The replaced generation's files are written no more.
 //! * **Files.** A persistent store writes each build to `gen-NNNN/vectors/<name>.spkv`
 //!   and maps it from there, so opening the store again reads the index instead of
 //!   building it. Files that are missing, damaged or made for another configuration or
@@ -26,7 +32,7 @@ use crate::vector::config::{
     VectorIndexConfig, VectorIndexStatus, VectorMemory, VectorOverlay, validate_name,
 };
 use crate::vector::persist::{self, Identity};
-use crate::vector::{BuildCtl, Built, Outcome, build_index};
+use crate::vector::{BuildCtl, Built, Carry, Outcome, build_index};
 use parking_lot::{Condvar, Mutex, RwLock};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -192,12 +198,13 @@ impl Store {
                         at: crate::commit::rfc3339_ms(crate::commit::now_ms()),
                         ms: last,
                         rows: b.segment.rows() as u64,
+                        carried: b.carried,
                     }),
                 );
             }
             None => {
                 gv.remove_built(name);
-                self.spawn_vector_build(entry, snap, true);
+                self.spawn_vector_build(entry, snap, true, None);
             }
         }
         Ok(created)
@@ -242,7 +249,7 @@ impl Store {
             .get(name)
             .cloned()
             .ok_or_else(|| Error::NotFound(format!("no vector index {name}")))?;
-        self.spawn_vector_build(entry, self.snapshot(), false);
+        self.spawn_vector_build(entry, self.snapshot(), false, None);
         Ok(())
     }
 
@@ -539,26 +546,172 @@ impl Store {
             .vectors
             .set_configured(Arc::new(file.indexes));
         for e in entries {
-            self.spawn_vector_build(e, snap.clone(), true);
+            self.spawn_vector_build(e, snap.clone(), true, None);
         }
     }
 
     /// After a generation switch (with the writer lock held): the replaced generation's
-    /// files are written no more, and every index is built for the new one.
+    /// files are written no more, and every index is built for the new one, unless the
+    /// compaction carried it over already ([`Store::prebuild_vectors`]). A build carries
+    /// the previous generation's index over when it can.
     pub(super) fn vectors_switched(&self, prev: &Snapshot) {
         prev.generation.vectors.retire();
         let entries: Vec<Arc<IndexEntry>> = self.vector.indexes.read().values().cloned().collect();
+        let snap = self.snapshot();
+        let gv = &snap.generation.vectors;
+        // a carried index whose configuration was dropped or replaced meanwhile goes
+        for name in gv.built_names() {
+            let keep = entries
+                .iter()
+                .find(|e| e.name == name)
+                .zip(gv.built(&name))
+                .is_some_and(|(e, b)| b.config.build_hash() == e.config.build_hash());
+            if !keep {
+                gv.remove_built(&name);
+                if let Some(dir) = self.vector_dir(&snap) {
+                    gv.with_files(|| persist::remove(&dir, Some(&name)));
+                }
+            }
+        }
         if entries.is_empty() {
             return;
         }
-        let snap = self.snapshot();
-        snap.generation
-            .vectors
-            .set_configured(Arc::new(self.vector_configs()));
-        snap.generation.vectors.set_embedder(&self.embed);
+        gv.set_configured(Arc::new(self.vector_configs()));
+        gv.set_embedder(&self.embed);
+        let prev = Arc::new(prev.clone());
         for e in entries {
-            self.spawn_vector_build(e, snap.clone(), true);
+            if let Some(b) = gv.built(&e.name).filter(|b| !b.hnsw_pending) {
+                // carried over before the switch
+                let epoch = e.epoch.fetch_add(1, Ordering::SeqCst) + 1;
+                e.finish(
+                    epoch,
+                    "ready",
+                    None,
+                    Some(VectorBuild {
+                        at: crate::commit::rfc3339_ms(crate::commit::now_ms()),
+                        ms: b.built_ms,
+                        rows: b.segment.rows() as u64,
+                        carried: b.carried,
+                    }),
+                );
+                self.vector.kick.notify_one();
+                continue;
+            }
+            let carry = prev.generation.vectors.built(&e.name).map(|old| Carry {
+                old,
+                snap: prev.clone(),
+            });
+            self.spawn_vector_build(e, snap.clone(), true, carry);
         }
+    }
+
+    /// During a compaction, before the switch: carry every index of `prev`'s generation
+    /// over to the new generation, whose base `new` reads, and install the results there,
+    /// so searches right after the switch use a graph. `base_seq` is the new generation's
+    /// base commit. An index that cannot be carried (no graph yet, or one built with
+    /// other settings) is built after the switch instead. Runs on the compaction's
+    /// thread, without the writer lock.
+    pub(super) fn prebuild_vectors(
+        &self,
+        new: &Snapshot,
+        prev: &Arc<Snapshot>,
+        base_seq: u64,
+        cancel: &(dyn Fn() -> bool + Sync),
+    ) {
+        let entries: Vec<Arc<IndexEntry>> = self.vector.indexes.read().values().cloned().collect();
+        let gv = &new.generation.vectors;
+        for e in entries {
+            let Some(old) =
+                prev.generation.vectors.built(&e.name).filter(|b| {
+                    b.graph.is_some() && b.config.build_hash() == e.config.build_hash()
+                })
+            else {
+                continue;
+            };
+            let superseded = || cancel() || e.retired.load(Ordering::SeqCst);
+            let (files, write) = self.vector_files(new, &e.config);
+            // `commit.json`, which gives the files' base commit, is written at the switch
+            let files = files.map(|(d, mut id)| {
+                id.base_seq = base_seq;
+                (d, id)
+            });
+            let ctl = BuildCtl {
+                budget: crate::vector::budget(),
+                progress: &|_| {},
+                cancel: &superseded,
+                files,
+                load: false,
+                write,
+                sequential: self.vector.sequential.load(Ordering::SeqCst),
+                carry: Some(Carry {
+                    old,
+                    snap: prev.clone(),
+                }),
+            };
+            let reading = new.without_cache_fill();
+            let t0 = std::time::Instant::now();
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                build_index(&reading, &e.name, &e.config, &ctl, &|_| {})
+            }));
+            match r {
+                Ok(Ok(Outcome::Ready(b))) if !superseded() => {
+                    tracing::info!(
+                        target: "sparkles::store::vector",
+                        "vector index {}: {} rows {} for the new generation in {:?}",
+                        e.name,
+                        b.segment.rows(),
+                        if b.carried { "carried over" } else { "built" },
+                        t0.elapsed()
+                    );
+                    gv.install(b);
+                }
+                Ok(Err(err)) => {
+                    tracing::warn!(target: "sparkles::store::vector", "vector index {}: carrying it over failed: {err}; it is built after the switch", e.name);
+                }
+                Err(_) => {
+                    tracing::error!(target: "sparkles::store::vector", "vector index {}: carrying it over failed; it is built after the switch", e.name);
+                }
+                _ => {}
+            }
+            if cancel() {
+                return;
+            }
+        }
+    }
+
+    /// Where `snap`'s generation keeps the files of an index configured as `cfg`, and
+    /// what they must match, and whether this store writes them.
+    fn vector_files(
+        &self,
+        snap: &Snapshot,
+        cfg: &VectorIndexConfig,
+    ) -> (Option<(std::path::PathBuf, Identity)>, bool) {
+        let files = if persist::SUPPORTED {
+            self.vector_dir(snap).map(|dir| {
+                let gdir = snap
+                    .generation
+                    .linked()
+                    .map(|l| l.base_dir().to_path_buf())
+                    .or_else(|| snap.generation._base.as_ref().and_then(|b| b.dir.clone()))
+                    .or_else(|| snap.generation.dir.clone())
+                    .unwrap_or_default();
+                (
+                    dir,
+                    Identity::of(
+                        &gdir,
+                        snap.generation.meta.quads,
+                        snap.generation.meta.terms,
+                        cfg.build_hash(),
+                    ),
+                )
+            })
+        } else {
+            None
+        };
+        let write = self.opts.vector_files
+            && snap.generation.linked().is_none()
+            && snap.generation._base.is_none();
+        (files, write)
     }
 
     /// The directory of `snap`'s generation's index files (`None`: an in-memory store).
@@ -636,9 +789,16 @@ impl Store {
     }
 
     /// Build index `entry` for `snap`'s generation on a background thread (with `load`,
-    /// from its file when it fits) and install it, unless it was superseded: by a newer
-    /// build, a drop, a generation switch or the store's closing.
-    fn spawn_vector_build(&self, entry: Arc<IndexEntry>, snap: Arc<Snapshot>, load: bool) {
+    /// from its file when it fits, and with `carry`, from the previous generation's build
+    /// when few rows changed) and install it, unless it was superseded: by a newer build,
+    /// a drop, a generation switch or the store's closing.
+    fn spawn_vector_build(
+        &self,
+        entry: Arc<IndexEntry>,
+        snap: Arc<Snapshot>,
+        load: bool,
+        carry: Option<Carry>,
+    ) {
         if entry.config.hnsw.is_some() {
             self.start_vector_catch_up();
         }
@@ -650,31 +810,7 @@ impl Store {
             i.message = None;
         }
         entry.progress.store(0f32.to_bits(), Ordering::Relaxed);
-        let files = if persist::SUPPORTED {
-            self.vector_dir(&snap).map(|dir| {
-                let gdir = snap
-                    .generation
-                    .linked()
-                    .map(|l| l.base_dir().to_path_buf())
-                    .or_else(|| snap.generation._base.as_ref().and_then(|b| b.dir.clone()))
-                    .or_else(|| snap.generation.dir.clone())
-                    .unwrap_or_default();
-                (
-                    dir,
-                    Identity::of(
-                        &gdir,
-                        snap.generation.meta.quads,
-                        snap.generation.meta.terms,
-                        entry.config.build_hash(),
-                    ),
-                )
-            })
-        } else {
-            None
-        };
-        let write = self.opts.vector_files
-            && snap.generation.linked().is_none()
-            && snap.generation._base.is_none();
+        let (files, write) = self.vector_files(&snap, &entry.config);
         let sequential = self.vector.sequential.load(Ordering::SeqCst);
         let current = Arc::downgrade(&self.current);
         let registry = Arc::downgrade(&self.vector);
@@ -699,6 +835,7 @@ impl Store {
                     load,
                     write,
                     sequential,
+                    carry,
                 };
                 let gv = &snap.generation.vectors;
                 let install = |b: Arc<Built>| {
@@ -724,6 +861,7 @@ impl Store {
                 match r {
                     Ok(Ok(Outcome::Ready(b))) => {
                         let rows = b.segment.rows() as u64;
+                        let carried = b.carried;
                         install(b);
                         // the rows committed during the build go into the graph
                         kick.notify_one();
@@ -741,6 +879,7 @@ impl Store {
                                 at: crate::commit::rfc3339_ms(crate::commit::now_ms()),
                                 ms: t0.elapsed().as_secs_f64() * 1000.0,
                                 rows,
+                                carried,
                             }),
                         );
                     }

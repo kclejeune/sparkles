@@ -1226,6 +1226,18 @@ impl Store {
             build += tg.elapsed();
             pre
         };
+        // the vector indexes too: carried over from the old generation's, so searches
+        // after the switch use a graph at once
+        {
+            let tv = Instant::now();
+            let base_only = self.base_snapshot(&gen_, base.seq);
+            let stop = || cancelled();
+            match &pool {
+                Some(p) => p.install(|| self.prebuild_vectors(&base_only, &snap0, base.seq, &stop)),
+                None => self.prebuild_vectors(&base_only, &snap0, base.seq, &stop),
+            }
+            build += tv.elapsed();
+        }
         self.failpoint("compact-indexed");
         if cancelled() {
             return Err(Error::Cancelled);
