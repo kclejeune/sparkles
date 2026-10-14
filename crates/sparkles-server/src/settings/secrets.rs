@@ -673,6 +673,7 @@ fn offline_values(
 /// key file stays, so a later start of a sealing release seals them again with it.
 pub fn unseal(data: &FsPath, source: Option<&str>) -> anyhow::Result<Offline> {
     let lock = lock_data(data)?;
+    remove_stale_temps(data, is_key_temp);
     remove_stale_temps(&data.join(SECRETS_DIR), is_secret_temp);
     let opened = offline_values(lock, data, source, None)?;
     let dir = &opened.dir;
@@ -742,14 +743,14 @@ pub fn rekey(data: &FsPath, source: Option<&str>, new_key: &str) -> anyhow::Resu
     }
     sync_dir(dir).map_err(|e| anyhow::anyhow!("cannot flush {}: {e}", dir.display()))?;
     let mut removed_key = None;
-    if let Mode::Generated(path) = &opened.current.state.mode
-        && path.exists()
-    {
-        std::fs::remove_file(path)
-            .map_err(|e| anyhow::anyhow!("cannot remove {}: {e}", path.display()))?;
+    if let Mode::Generated(path) = &opened.current.state.mode {
+        match std::fs::remove_file(path) {
+            Ok(()) => removed_key = Some(path.clone()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => anyhow::bail!("cannot remove {}: {e}", path.display()),
+        }
         remove_stale_temps(data, is_key_temp);
         sync_dir(data).map_err(|e| anyhow::anyhow!("cannot flush {}: {e}", data.display()))?;
-        removed_key = Some(path.clone());
     }
     Ok(Offline {
         values: written,
@@ -762,6 +763,7 @@ pub fn rekey(data: &FsPath, source: Option<&str>, new_key: &str) -> anyhow::Resu
 thread_local! {
     /// Makes [`sync_dir`] fail on this thread, to test the paths that must report it.
     pub(crate) static FAIL_DIR_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static DIR_SYNC_PROBE: std::cell::RefCell<Option<(PathBuf, bool, usize)>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Flush the directory `dir`, so that the names made or removed in it survive a crash.
@@ -770,6 +772,20 @@ pub(crate) fn sync_dir(dir: &FsPath) -> std::io::Result<()> {
     if FAIL_DIR_SYNC.with(|f| f.get()) {
         return Err(std::io::Error::other("injected directory sync failure"));
     }
+    #[cfg(test)]
+    DIR_SYNC_PROBE.with(|slot| {
+        if let Some((path, fail, calls)) = slot.borrow_mut().as_mut()
+            && path == dir
+        {
+            *calls += 1;
+            if *fail {
+                return Err(std::io::Error::other(
+                    "injected targeted directory sync failure",
+                ));
+            }
+        }
+        Ok(())
+    })?;
     #[cfg(unix)]
     std::fs::File::open(dir)?.sync_all()?;
     #[cfg(not(unix))]
@@ -1084,6 +1100,135 @@ fn internal(name: &str, e: std::io::Error) -> crate::http::ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(feature = "backup", unix))]
+    struct SyncProbe(Option<(PathBuf, bool, usize)>);
+
+    #[cfg(all(feature = "backup", unix))]
+    impl SyncProbe {
+        fn new(path: &FsPath, fail: bool) -> Self {
+            Self(DIR_SYNC_PROBE.with(|slot| slot.replace(Some((path.to_path_buf(), fail, 0)))))
+        }
+
+        fn calls(&self) -> usize {
+            DIR_SYNC_PROBE.with(|slot| slot.borrow().as_ref().unwrap().2)
+        }
+
+        fn allow(&self) {
+            DIR_SYNC_PROBE.with(|slot| slot.borrow_mut().as_mut().unwrap().1 = false);
+        }
+    }
+
+    #[cfg(all(feature = "backup", unix))]
+    impl Drop for SyncProbe {
+        fn drop(&mut self) {
+            DIR_SYNC_PROBE.with(|slot| slot.replace(self.0.take()));
+        }
+    }
+
+    #[cfg(all(feature = "backup", unix))]
+    fn offline_fixture() -> (tempfile::TempDir, PathBuf, String) {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let data = t.path().join("data");
+        private_dir(&data.join(SECRETS_DIR)).unwrap();
+        let key = t.path().join("new.key");
+        std::fs::write(&key, "07".repeat(32)).unwrap();
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let source = format!("file:{}", key.display());
+        (t, data, source)
+    }
+
+    #[cfg(all(feature = "backup", unix))]
+    #[test]
+    fn rekey_retry_repeats_parent_sync_after_key_removal() {
+        let (_t, data, source) = offline_fixture();
+        let dir = data.join(SECRETS_DIR);
+        Sealing::start(None, &data)
+            .unwrap()
+            .write(&dir, "a", b"value-a")
+            .unwrap();
+        let probe = SyncProbe::new(&data, true);
+        let e = rekey(&data, None, &source).unwrap_err().to_string();
+        assert!(e.contains("cannot flush"), "{e}");
+        assert_eq!(probe.calls(), 1);
+        assert!(!data.join(SECRETS_KEY_FILE).exists());
+        let migrated = std::fs::read(dir.join("a")).unwrap();
+        let e = rekey(&data, None, &source).unwrap_err().to_string();
+        assert!(e.contains("cannot flush"), "{e}");
+        assert_eq!(probe.calls(), 2);
+        assert_eq!(std::fs::read(dir.join("a")).unwrap(), migrated);
+        probe.allow();
+        let done = rekey(&data, None, &source).unwrap();
+        assert_eq!((done.values, done.already, done.removed_key), (0, 1, None));
+        assert_eq!(probe.calls(), 3);
+        assert_eq!(std::fs::read(dir.join("a")).unwrap(), migrated);
+        assert_eq!(
+            Sealing::start(Some(&source), &data)
+                .unwrap()
+                .read(&dir.join("a"), "a")
+                .unwrap(),
+            "value-a"
+        );
+        assert!(!data.join(SECRETS_KEY_FILE).exists());
+    }
+
+    #[cfg(all(feature = "backup", unix))]
+    #[test]
+    fn rekey_retry_cleans_stale_keys_after_key_removal() {
+        let (_t, data, source) = offline_fixture();
+        let dir = data.join(SECRETS_DIR);
+        Sealing::start(None, &data)
+            .unwrap()
+            .write(&dir, "a", b"value-a")
+            .unwrap();
+        let key = data.join(SECRETS_KEY_FILE);
+        let old = std::fs::read(&key).unwrap();
+        Sealing::start(Some(&source), &data)
+            .unwrap()
+            .write(&dir, "a", b"value-a")
+            .unwrap();
+        std::fs::remove_file(&key).unwrap();
+        let stale = data.join(".secrets.key.4242.tmp");
+        std::fs::write(&stale, old).unwrap();
+        let keep = data.join(".notes.tmp");
+        std::fs::write(&keep, "keep").unwrap();
+        let keep_dir = data.join(".secrets.key.4243.tmp");
+        std::fs::create_dir(&keep_dir).unwrap();
+        let probe = SyncProbe::new(&data, false);
+        let done = rekey(&data, None, &source).unwrap();
+        assert_eq!((done.values, done.already, done.removed_key), (0, 1, None));
+        assert!(!stale.exists(), "retry left a stale copy of the old key");
+        assert_eq!(probe.calls(), 1);
+        assert_eq!(std::fs::read_to_string(keep).unwrap(), "keep");
+        assert!(keep_dir.is_dir());
+    }
+
+    #[cfg(all(feature = "backup", unix))]
+    #[test]
+    fn unseal_cleans_stale_keys_and_preserves_canonical_key() {
+        let (_t, data, _source) = offline_fixture();
+        let dir = data.join(SECRETS_DIR);
+        Sealing::start(None, &data)
+            .unwrap()
+            .write(&dir, "a", b"value-a")
+            .unwrap();
+        let key = data.join(SECRETS_KEY_FILE);
+        let old = std::fs::read(&key).unwrap();
+        let stale = data.join(".secrets.key.4242.tmp");
+        std::fs::write(&stale, &old).unwrap();
+        let keep = data.join(".notes.tmp");
+        std::fs::write(&keep, "keep").unwrap();
+        let keep_dir = data.join(".secrets.key.4243.tmp");
+        std::fs::create_dir(&keep_dir).unwrap();
+        let done = unseal(&data, None).unwrap();
+        assert_eq!(done.values, 1);
+        assert!(!stale.exists(), "unseal left a stale key temporary");
+        assert_eq!(std::fs::read(key).unwrap(), old);
+        assert_eq!(std::fs::read_to_string(dir.join("a")).unwrap(), "value-a");
+        assert_eq!(std::fs::read_to_string(keep).unwrap(), "keep");
+        assert!(keep_dir.is_dir());
+    }
 
     #[test]
     fn values_are_read_without_being_quoted() {
