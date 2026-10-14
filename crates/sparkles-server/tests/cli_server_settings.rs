@@ -836,6 +836,8 @@ fn rekey_guidance_never_echoes_a_command_key_source() {
         .arg(&data)
         .args(["--new-key", &source])
         .env_remove("SPARKLES_BACKUP_CONFIG")
+        .env_remove("SPARKLES_SECRETS_KEY")
+        .env_remove("CREDENTIALS_DIRECTORY")
         .output()
         .unwrap();
     assert!(
@@ -866,6 +868,8 @@ fn rekey_guidance_never_echoes_a_command_key_source() {
         .arg(&data)
         .args(["--secrets-key", &source])
         .env_remove("SPARKLES_BACKUP_CONFIG")
+        .env_remove("SPARKLES_SECRETS_KEY")
+        .env_remove("CREDENTIALS_DIRECTORY")
         .output()
         .unwrap();
     assert!(
