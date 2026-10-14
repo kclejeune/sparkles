@@ -271,7 +271,7 @@ mod remote {
     fn storage_note(v: &J) -> Option<&'static str> {
         if v["storage"] == "plaintext" {
             return Some(
-                "stored values are kept unencrypted in the data directory (files with mode 0600), since the server runs with --secrets-key none",
+                "stored values are kept unencrypted in the data directory (files with mode 0600): the server runs with --secrets-key none or was built without the backup feature",
             );
         }
         (v["keySource"] == "generated").then_some(

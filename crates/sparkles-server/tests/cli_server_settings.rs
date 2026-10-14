@@ -245,11 +245,19 @@ fn server_settings_restart_reload_and_log() {
     assert_eq!(st, 204);
     test(&s);
     assert_eq!(bearer(), format!("Bearer {KEY}"));
-    // sealed by default, with a key the server generated beside the data
+    // sealed by default, with a key the server generated beside the data, in a build
+    // with the backup feature, and plaintext in a build without it
     let stored = std::fs::read_to_string(data.join("secrets/gw")).unwrap();
-    assert!(stored.starts_with("sparkles-sealed-secret/1 ") && !stored.contains(KEY));
-    let generated = std::fs::read_to_string(data.join("secrets.key")).unwrap();
-    assert_eq!(generated.trim().len(), 64);
+    let generated = if cfg!(feature = "backup") {
+        assert!(stored.starts_with("sparkles-sealed-secret/1 ") && !stored.contains(KEY));
+        let generated = std::fs::read_to_string(data.join("secrets.key")).unwrap();
+        assert_eq!(generated.trim().len(), 64);
+        Some(generated)
+    } else {
+        assert_eq!(stored, KEY);
+        assert!(!data.join("secrets.key").exists());
+        None
+    };
     drop(s);
 
     // a restart keeps the runtime layer and the key
@@ -287,14 +295,16 @@ fn server_settings_restart_reload_and_log() {
     // A12: the log has the audit records and never the key, nor the secrets key
     let text = std::fs::read_to_string(&log).unwrap();
     assert!(!text.contains(KEY), "the key is in the log");
-    assert!(
-        !text.contains(generated.trim()),
-        "the secrets key is in the log"
-    );
-    assert!(
-        text.contains("generated the secrets key"),
-        "no line about the key"
-    );
+    if let Some(generated) = &generated {
+        assert!(
+            !text.contains(generated.trim()),
+            "the secrets key is in the log"
+        );
+        assert!(
+            text.contains("generated the secrets key"),
+            "no line about the key"
+        );
+    }
     assert!(
         !text.contains(DECLARED_KEY),
         "the declared key is in the log"
@@ -513,8 +523,13 @@ fn global_settings_and_secrets_commands() {
     let o = run(&["secrets", "list"], "").ok();
     let gw = line(&o.stdout, "gw");
     assert!(gw.contains("declared"), "{}", o.stdout);
-    // a server without --secrets-key seals with a key it generates, and the list says so
-    assert!(o.stdout.contains("secrets.key"), "{}", o.stdout);
+    // a server without --secrets-key seals with a key it generates, and the list says
+    // so, except in a build without the backup feature, which keeps plaintext
+    if cfg!(feature = "backup") {
+        assert!(o.stdout.contains("secrets.key"), "{}", o.stdout);
+    } else {
+        assert!(o.stdout.contains("kept unencrypted"), "{}", o.stdout);
+    }
     let o = run(&["secrets", "set", "gw"], &format!("{CLI_KEY}\n")).ok();
     assert!(
         o.stdout.contains("stored a runtime value for secret gw"),
@@ -534,8 +549,13 @@ fn global_settings_and_secrets_commands() {
         format!("Bearer {CLI_KEY}")
     );
     let j = run(&["secrets", "list", "--json"], "").ok().json();
-    assert_eq!(j["storage"], "sealed", "{j}");
-    assert_eq!(j["keySource"], "generated", "{j}");
+    if cfg!(feature = "backup") {
+        assert_eq!(j["storage"], "sealed", "{j}");
+        assert_eq!(j["keySource"], "generated", "{j}");
+    } else {
+        assert_eq!(j["storage"], "plaintext", "{j}");
+        assert_eq!(j["keySource"], J::Null, "{j}");
+    }
     let gw = &j["secrets"][0];
     assert_eq!(gw["source"], "runtime", "{j}");
     assert!(gw["setAt"].is_string(), "{j}");
@@ -722,6 +742,7 @@ fn provider_presets_and_insecure_warning() {
 /// `serve --secrets-key none` stores plaintext, a later start without the option seals
 /// those values with a generated key, and `sparkles secrets unseal --data` writes them
 /// back as plaintext once the server has stopped, refusing while it runs.
+#[cfg(feature = "backup")]
 #[test]
 fn secrets_key_none_and_unseal() {
     let dir = tempfile::tempdir().unwrap();
