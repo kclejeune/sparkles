@@ -2198,6 +2198,10 @@ would run. It never changes a database and does not finish or undo an earlier ru
 it reports as `interrupted`. The exit status is 1 when a database is outside the window
 and 0 otherwise. The window covers the root of a database and every branch, and a newer
 settings file of a dataset or of one of its branches puts the database outside it.
+Startup checks dataset metadata and settings in every active and retained branch before
+rewriting root metadata, using the same physical branch directories as migration
+planning. An incompatible branch refuses its dataset while other datasets remain
+available.
 The informational files `origin.json` and `restore.json` are the exception, because a
 store ignores a newer one with a warning.
 

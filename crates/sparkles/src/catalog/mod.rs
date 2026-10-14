@@ -1186,4 +1186,43 @@ mod tests {
             assert!(reg.contains("\"b\""), "{file}: {reg}");
         }
     }
+    #[test]
+    fn a_dataset_with_an_incompatible_branch_is_refused_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let cat = Catalog::open(dir.path(), Default::default()).unwrap();
+        drop(cat.create("a", &Default::default()).unwrap());
+        let bad = cat.create("b", &Default::default()).unwrap();
+        let info = bad
+            .store()
+            .create_branch("dev", &Default::default())
+            .unwrap();
+        drop(bad);
+        drop(cat);
+        let settings = dir
+            .path()
+            .join("databases/b/branches")
+            .join(info.id.to_string())
+            .join("compaction.json");
+        std::fs::write(&settings, br#"{"format":2}"#).unwrap();
+        let cat = Catalog::open(dir.path(), Default::default()).unwrap();
+        assert!(cat.get("a").is_some());
+        assert!(
+            cat.get("b").is_none(),
+            "an incompatible branch must refuse its dataset"
+        );
+        assert_eq!(cat.refused().len(), 1);
+        assert_eq!(cat.refused()[0].0, "b");
+        assert!(cat.refused()[0].1.contains("compaction.json"));
+        cat.save().unwrap();
+        let registration = std::fs::read_to_string(dir.path().join(CONFIG_FILE)).unwrap();
+        assert!(registration.contains("\"b\""));
+        std::fs::remove_file(settings).unwrap();
+        drop(cat.reattach("b").unwrap());
+        assert!(cat.refused().is_empty());
+        cat.save().unwrap();
+        drop(cat);
+        let reopened = Catalog::open(dir.path(), Default::default()).unwrap();
+        assert!(reopened.get("a").is_some());
+        assert!(reopened.get("b").is_some());
+    }
 }

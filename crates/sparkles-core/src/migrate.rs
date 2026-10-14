@@ -208,18 +208,10 @@ fn plan_locked(root: &Path) -> Result<Plan> {
         }
     }
     inspect_dir(&mut plan, root, "", by)?;
-    // branch stores, retained ones included, live under branches/<id>/
-    let branches = root.join("branches");
-    if branches.is_dir() {
-        let mut dirs: Vec<_> = std::fs::read_dir(&branches)?
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect();
-        dirs.sort();
-        for d in dirs {
-            inspect_dir(&mut plan, &branches.join(&d), &format!("branches/{d}/"), by)?;
-        }
+    // Startup uses the same physical enumeration, including retained branches.
+    for branch in formats::branch_directories(root)? {
+        let name = branch.file_name().unwrap().to_string_lossy();
+        inspect_dir(&mut plan, &branch, &format!("branches/{name}/"), by)?;
     }
     Ok(plan)
 }

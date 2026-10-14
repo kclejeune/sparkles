@@ -39,6 +39,8 @@ mod memory_branch_tests;
 mod merge;
 mod partial;
 mod patch_apply;
+#[cfg(test)]
+mod preflight_tests;
 mod preview;
 mod quota;
 mod replay;
@@ -1565,10 +1567,14 @@ impl Store {
         // migration renames, after which only file identity detects the stale lock.
         // Branch roots follow the same identity rule under their parent's exclusion.
         verify_database_lock(root, &lock)?;
-        commit::check_dataset_compatibility(root)?;
-        // a settings file from a newer release refuses the dataset before any file of it
-        // changes, the same verdict as `sparkles migrate --check`
-        crate::formats::check_dataset_dir(root)?;
+        // Refuse incompatible metadata in active and retained branches before any
+        // root writer runs, agreeing with the physical tree migrate --check inspects.
+        if ctx.is_none() {
+            crate::formats::check_dataset_tree(root)?;
+        } else {
+            commit::check_dataset_compatibility(root)?;
+            crate::formats::check_dataset_dir(root)?;
+        }
         let current_file = root.join("CURRENT");
         if !current_file.exists() {
             // a new database: its id, an empty generation holding the root commit, the

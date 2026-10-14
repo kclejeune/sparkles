@@ -492,6 +492,42 @@ pub fn informational(name: &str) -> bool {
     INFORMATIONAL_SETTINGS.contains(&name)
 }
 
+/// Physical branch directories, including retained branches. Startup and migration
+/// use the same enumeration, and directory or entry errors are never silently skipped.
+pub(crate) fn branch_directories(root: &std::path::Path) -> Result<Vec<std::path::PathBuf>> {
+    let entries = match std::fs::read_dir(root.join("branches")) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut branches = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            branches.push(entry.path());
+        }
+    }
+    branches.sort();
+    Ok(branches)
+}
+
+/// Read-only compatibility preflight before a root open changes dataset metadata.
+/// Branch dataset files may be absent, in which case they inherit the root's identity.
+pub(crate) fn check_dataset_tree(root: &std::path::Path) -> Result<()> {
+    crate::commit::check_dataset_compatibility(root)?;
+    check_dataset_dir(root)?;
+    for branch in branch_directories(root)? {
+        crate::commit::check_dataset_compatibility(&branch).map_err(|e| match e {
+            Error::Unsupported(message) => {
+                Error::Unsupported(format!("{}: {message}", branch.display()))
+            }
+            e => e,
+        })?;
+        check_dataset_dir(&branch)?;
+    }
+    Ok(())
+}
+
 /// Every reason this build refuses the dataset directory `dir` because of a settings
 /// file (the registered files of [`Scope::Dataset`] other than the informational ones).
 /// A file that does not exist is skipped. One that is not JSON is skipped too, since its

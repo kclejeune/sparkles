@@ -646,9 +646,11 @@ through another, so `assistant.json`, `memory.json`, `ingest.json`, `asks.json`,
 (`reasoningFormat`, `rdfsFormat`, `originFormat`, `restoreFormat`, `version`) keep it, and
 the registry names it. A newer version is refused, except for the informational
 `origin.json` and `restore.json`, which are then ignored with a warning. A store checks
-every settings file of a dataset, and of each branch, when it opens the dataset, before it
-writes any file, so a refused open leaves `dataset.json` unchanged and agrees with
-`migrate --check`. `dataset.json` keeps the members it does not know when a release
+every settings file and `dataset.json` of a dataset and each physical branch directory,
+including retained branches, before it writes dataset metadata. The process lock may
+record its holder, but a refused open leaves every metadata file unchanged and agrees
+with `migrate --check`. Startup and planning share the read-only branch enumeration,
+which surfaces directory errors and never opens or prunes a branch just to preflight it. `dataset.json` keeps the members it does not know when a release
 rewrites it. Settings files that a release writes through a typed struct drop unknown
 members, so an additive member of such a file must be safe to lose or needs a `format`
 bump.
