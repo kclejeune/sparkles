@@ -51,6 +51,8 @@ pub(super) struct Fixture {
     pub public_url: &'static str,
     /// more TOML (`[oidc]`, `[proxy]`, …)
     pub extra: String,
+    /// the values of `--gsp-direct-naming`
+    pub gsp_direct_naming: Vec<String>,
 }
 
 impl Default for Fixture {
@@ -62,6 +64,7 @@ impl Default for Fixture {
             bob_team: true,
             public_url: "http://localhost:3030",
             extra: String::new(),
+            gsp_direct_naming: Vec::new(),
         }
     }
 }
@@ -192,6 +195,7 @@ fn open_state(
 ) -> (Arc<AppState>, Router) {
     let mut st = AppState::new(dir, StoreOptions::default(), Duration::from_secs(30)).unwrap();
     st.read_only = f.read_only;
+    st.gsp_direct_naming = crate::state::GspDirectNaming::parse(&f.gsp_direct_naming).unwrap();
     // SERVICE and LOAD tests call a listener on 127.0.0.1
     st.outbound.allow_private = true;
     if f.enabled {
@@ -715,6 +719,52 @@ fn reader_fixture() -> Fixture {
 
 const FORM: &str = "application/x-www-form-urlencoded";
 const TRIPLE: &str = "<urn:s> <urn:p> <urn:o> .";
+
+#[tokio::test]
+async fn read_only_direct_naming_answers_readers_with_405() {
+    let s = build(Fixture {
+        gsp_direct_naming: vec![
+            "public=read".into(),
+            "team-a=read".into(),
+            "secret=read".into(),
+        ],
+        ..reader_fixture()
+    });
+    let reader = bearer(&tok('R'));
+    let before = s.state.get("team-a").unwrap().store.snapshot().len();
+    let send = |method: &'static str, uri: &'static str, auth: Option<String>| {
+        let app = s.app.clone();
+        async move {
+            let mut h = vec![("content-type", "text/turtle".to_string())];
+            h.extend(auth.map(|a| ("authorization", a)));
+            let h: Vec<(&str, &str)> = h.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            call(&app, method, uri, &h, TRIPLE).await
+        }
+    };
+    for method in ["PUT", "POST", "DELETE", "PATCH"] {
+        let r = send(method, "/team-a/graphs/one", Some(reader.clone())).await;
+        assert_eq!(
+            r.status,
+            StatusCode::METHOD_NOT_ALLOWED,
+            "{method}: {}",
+            r.text()
+        );
+        assert_eq!(r.header("allow"), "GET, HEAD, OPTIONS", "{method}");
+    }
+    // anonymous callers may read `public`, so they learn the 405 too
+    let r = send("PUT", "/public/graphs/one", None).await;
+    assert_eq!(r.status, StatusCode::METHOD_NOT_ALLOWED, "{}", r.text());
+    assert_eq!(r.header("allow"), "GET, HEAD, OPTIONS");
+    // without read access the usual refusals stay, so a hidden dataset's mode does not leak
+    let r = send("PUT", "/team-a/graphs/one", None).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{}", r.text());
+    let r = send("PUT", "/secret/graphs/one", Some(reader.clone())).await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.text());
+    assert_eq!(
+        s.state.get("team-a").unwrap().store.snapshot().len(),
+        before
+    );
+}
 
 #[tokio::test]
 async fn form_body_without_an_operation_is_not_an_upload() {
