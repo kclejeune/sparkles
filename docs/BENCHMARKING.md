@@ -179,7 +179,12 @@ and comparison methodology. [DEVELOPMENT.md](DEVELOPMENT.md) covers building and
   answer, times each query with hyperfine, and writes the run manifest, the result record
   and `results/summary.md`. The answer check runs with every server up. After it, the
   script stops them all and then starts, times and stops one engine at a time, so each
-  engine's queries and query mixes run with no other server running. `MAX_TIME` is the
+  engine's queries and query mixes run with no other server running. After the start of
+  each engine's server, every selected query runs once untimed, and then hyperfine's
+  warm-ups and timed runs follow. This pass costs one request per query and engine. A query
+  that times out costs `MAX_TIME` once more in it, so at the large scales a suite with
+  several slow queries takes longer by up to `MAX_TIME` for each of them and each engine.
+  `MAX_TIME` is the
   longest a request may take, and each suite sets its own default. The clients give up
   after `MAX_TIME`, and every server's query timeout is `MAX_TIME` plus a margin of 15
   seconds (`TIMEOUT_MARGIN`), so a server stops a query that the client has abandoned. A

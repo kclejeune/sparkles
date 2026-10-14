@@ -51,6 +51,17 @@ suite_time() {
   done
 }
 
+# warm_pass <engine>: every selected query once, untimed, in the format the timed runs ask
+# for, so the server being timed has answered the whole suite (docs/specs/X06 section 5.2)
+warm_pass() {
+  local n
+  log "$1: warm-up pass over the selected queries"
+  for n in "${NAMES[@]}"; do
+    selected "$n" || continue
+    eval "$(q "${URL[$1]}" "$n")" || true
+  done
+}
+
 suite_run() {
   RES=results
   WARMUP=${WARMUP:-2}
@@ -70,11 +81,13 @@ suite_run() {
   stop_all
   if [ -z "${ANSWERS_ONLY:-}" ]; then
     # Each engine runs alone for the timings (docs/specs/X06 section 5.3). The answer check
-    # above may keep every server up, since it measures no time.
+    # above may keep every server up, since it measures no time. A fresh server answers every
+    # selected query once before the timings, so it is as warm as the one that was checked.
     local all=$ENGINES e
     for e in $all; do
       ENGINES=$e
       start "$e"
+      warm_pass "$e"
       suite_time
       if declare -F "${SUITE_EXTRA:-}" > /dev/null; then "$SUITE_EXTRA"; fi
       stop "$e"

@@ -332,5 +332,31 @@ class LibTests(unittest.TestCase):
         self.assertIn('-H "Accept: $(accept_of "$n")"', lib)
 
 
+class SuiteTests(unittest.TestCase):
+    """The order of steps of suite_run in scripts/bench-suite-lib.sh, with every step stubbed."""
+
+    def test_each_timed_server_answers_every_selected_query_first(self):
+        stubs = """
+        resolve_tools() { :; }; suite_manifest() { :; }; load_all() { :; }; start_all() { :; }
+        answer_check() { :; }; stop_all() { :; }; cold() { :; }; python3() { :; }
+        start() { echo "start $1"; URL[$1]=u; }
+        stop() { echo "stop $1"; }
+        suite_time() { echo "time $ENGINES"; }
+        q() { echo "echo warm $1 $2"; }
+        log() { :; }
+        """
+        with tempfile.TemporaryDirectory() as d:
+            env = dict(os.environ, ROOT=os.path.dirname(SCRIPTS), WORK=d, ENGINES="sparkles jena")
+            lib = os.path.join(SCRIPTS, "bench-lib.sh")
+            suite = os.path.join(SCRIPTS, "bench-suite-lib.sh")
+            script = (f'source "{lib}"; source "{suite}"; {stubs}\n'
+                      "NAMES=(a b); ENGINES='sparkles jena'; SUITE=s SCALE=1 SKIP_LOAD=1; suite_run")
+            p = subprocess.run(["bash", "-c", script], cwd=d, env=env, capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(p.stdout.split("\n")[:-1], [
+            "start sparkles", "warm u a", "warm u b", "time sparkles", "stop sparkles",
+            "start jena", "warm u a", "warm u b", "time jena", "stop jena"])
+
+
 if __name__ == "__main__":
     unittest.main()
