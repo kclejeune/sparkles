@@ -281,19 +281,42 @@ pub struct Policies {
     read_only_logged: std::sync::atomic::AtomicBool,
 }
 
+/// Read a JSON file (the default when it does not exist). A file registered in
+/// `formats::SETTINGS` is checked for a version that this build does not read. None of
+/// the types read here deny unknown members, so the member stays in the value.
 fn read_json<T: for<'de> Deserialize<'de> + Default>(path: &FsPath) -> anyhow::Result<T> {
     match std::fs::read(path) {
-        Ok(b) => serde_json::from_slice(&b).with_context(|| format!("reading {}", path.display())),
+        Ok(b) => {
+            let v: serde_json::Value = serde_json::from_slice(&b)
+                .with_context(|| format!("reading {}", path.display()))?;
+            if let Some(name) = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .filter(|n| sparkles::formats::settings_file(n).is_some())
+            {
+                sparkles::formats::check_settings(name, &v)
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))
+                    .with_context(|| format!("reading {}", path.display()))?;
+            }
+            serde_json::from_value(v).with_context(|| format!("reading {}", path.display()))
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(T::default()),
         Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
     }
 }
 
+/// Write a JSON file. A file registered in `formats::SETTINGS` gets its version member.
 fn write_json<T: Serialize>(dir: &FsPath, file: &str, v: &T) -> anyhow::Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = dir.join(file);
-    write_file_atomic(&path, &serde_json::to_vec_pretty(v)?)
-        .with_context(|| format!("writing {}", path.display()))
+    let bytes = if sparkles::formats::settings_file(file).is_some() {
+        let mut v = serde_json::to_value(v)?;
+        sparkles::formats::stamp_settings(file, &mut v);
+        serde_json::to_vec_pretty(&v)?
+    } else {
+        serde_json::to_vec_pretty(v)?
+    };
+    write_file_atomic(&path, &bytes).with_context(|| format!("writing {}", path.display()))
 }
 
 /// The API policies of `<dir>/policies.json` (none when it does not exist).

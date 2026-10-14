@@ -398,14 +398,11 @@ pub(crate) fn read_file(root: &Path, dataset_id: uuid::Uuid) -> Result<HistoryCo
         }
         Err(e) => return Err(e.into()),
     };
-    let f: HistoryFile =
+    let v: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|e| Error::Corrupt(format!("history.json: {e}")))?;
-    if f.format != 1 {
-        return Err(Error::Corrupt(format!(
-            "history.json has format {}, this build reads 1",
-            f.format
-        )));
-    }
+    crate::formats::check_settings("history.json", &v)?;
+    let f: HistoryFile =
+        serde_json::from_value(v).map_err(|e| Error::Corrupt(format!("history.json: {e}")))?;
     if f.dataset_id != dataset_id {
         return Err(Error::Corrupt(format!(
             "history.json belongs to dataset {}, not {dataset_id}",
@@ -544,9 +541,36 @@ pub(crate) struct HistoryState {
     pub branch_gens: Vec<(u32, Hold)>,
     /// commits branches keep readable (their starting commits)
     pub branch_pins: Vec<(u64, Hold)>,
+    /// the byte budget the cached states are charged to, shared with other stores when
+    /// the server shares its caches
+    pub budget: Arc<crate::store::caches::ByteBudget>,
+    /// what this state has charged to `budget`
+    charged: u64,
+}
+
+impl Drop for HistoryState {
+    fn drop(&mut self) {
+        self.budget.settle(self.charged, 0);
+    }
 }
 
 impl HistoryState {
+    /// Charge the cached states to `budget` from now on.
+    pub fn use_budget(&mut self, budget: Arc<crate::store::caches::ByteBudget>) {
+        self.budget.settle(self.charged, 0);
+        self.charged = 0;
+        self.budget = budget;
+        self.settle();
+    }
+
+    /// Bring the charge to the budget in line with the cached states. Call it after the
+    /// cache changes.
+    pub fn settle(&mut self) {
+        let now: u64 = self.cache.iter().map(|e| e.bytes).sum();
+        self.budget.settle(self.charged, now);
+        self.charged = now;
+    }
+
     pub fn new(pins: BTreeMap<String, Pin>, retention: Retention) -> HistoryState {
         HistoryState {
             pins,
@@ -564,6 +588,8 @@ impl HistoryState {
             materialize_nanos: 0,
             branch_gens: Vec::new(),
             branch_pins: Vec::new(),
+            budget: Arc::new(crate::store::caches::ByteBudget::new(u64::MAX)),
+            charged: 0,
         }
     }
 
@@ -1253,5 +1279,15 @@ mod tests {
         h.leases.remove(&b);
         assert!(h.needed(3, 12, 0, &ts, 0).is_empty());
         assert_eq!(h.lease_holds(3).count(), 1);
+    }
+
+    #[test]
+    fn a_newer_history_file_is_unsupported() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("history.json"), br#"{"format": 2}"#).unwrap();
+        let e = read_file(dir.path(), uuid::Uuid::nil())
+            .err()
+            .expect("refused");
+        assert!(matches!(e, Error::Unsupported(_)), "{e:?}");
     }
 }

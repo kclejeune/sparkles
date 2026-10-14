@@ -462,13 +462,17 @@ impl crate::Dataset {
         ctl: &crate::task::Control,
     ) -> crate::Result<MemoryClone> {
         ctl.check()?;
+        // the clone shares the server-wide caches, but its entries get a namespace of
+        // their own, so that clearing or counting one dataset leaves the other alone
+        let mut options = self.store().options().clone();
+        options.shared = options.shared.as_ref().map(|s| s.caches.scope());
         let cloned = clone_into_memory_controlled(
             self.store(),
             self.name().unwrap_or(""),
             target,
             self.reasoning_record(),
             spec,
-            self.store().options().clone(),
+            options,
             ctl.progress.as_fn(),
             Some(ctl.cancel.flag()),
             Some(ctl),

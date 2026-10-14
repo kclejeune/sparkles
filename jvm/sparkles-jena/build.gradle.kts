@@ -32,6 +32,9 @@ tasks.withType<JavaCompile>().configureEach { options.release = 17 }
 val ffiBindings = tasks.register<Sync>("ffiBindings") {
     from(bindingsDir)
     into(layout.buildDirectory.dir("generated/uniffi"))
+    // Nix inputs are read-only; the copied tree must allow nested copies and patching.
+    dirPermissions { unix("755") }
+    filePermissions { unix("644") }
     doLast {
         val helper = listOf(
             "    var status = UniffiRustCallStatus()",

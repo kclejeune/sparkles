@@ -1,19 +1,20 @@
 # X12: Distribution and format compatibility
 
-> **Status:** specified
+> **Status:** partially implemented (Phase 3)
 >
-> **Phases:** None shipped. Phase 1 is one release workflow for every artifact, a single
-> version across the server, crates and bindings, server binaries with checksums and
-> provenance attestations, and published container images. Phase 2 widens the platform
-> matrix to Windows, Intel macOS, musl for the JVM, and PyPy and free-threaded CPython
-> wheels. Phase 3 is the on-disk format policy with older-format fixtures, in-place
-> upgrades and `sparkles migrate`. Phase 4 is the HTTP, CLI and library compatibility
+> **Phases:** Phase 3 shipped: the on-disk format policy with older-format fixtures,
+> in-place upgrades and `sparkles migrate`. Phase 1 is one release workflow for every
+> artifact, a single version across the server, crates and bindings, server binaries
+> with checksums and provenance attestations, and published container images. Phase 2
+> widens the platform matrix to Windows, Intel macOS, musl for the JVM, and PyPy and
+> free-threaded CPython wheels. Phase 4 is the HTTP, CLI and library compatibility
 > policy with its checks.
 >
-> **User docs:** none, because nothing is built.
+> **User docs:** [USAGE: Upgrading databases](../USAGE.md#upgrading-databases) and
+> [DEVELOPMENT: Changing an on-disk format](../DEVELOPMENT.md#changing-an-on-disk-format).
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
-> the end will record how it lands.
+> the end records how it lands.
 
 This design was written from the Sparkles code at `537e048`: the four workflows in
 `.github/workflows`, the `Dockerfile`, `nix/image.nix`, `nix/package.nix`, the Helm chart
@@ -190,7 +191,9 @@ Every binary uses one feature set: the defaults of `sparkles-server`, `embed-loc
 `backup-encryption`. Today the three image paths disagree. The `Dockerfile` adds
 `embed-local` only, `nix/package.nix` adds `embed-local` and, on Linux,
 `backup-encryption`, and a plain `cargo build` adds neither. §8's C19 dependency on
-sealed secrets needs `backup-encryption` in every published build. The `pdf-ocr`
+sealed runtime secrets needs the default `backup` feature in published builds.
+Repository encryption keeps its separate `backup-encryption` feature and platform
+requirements. The `pdf-ocr`
 feature is in the `-ocr` image only, because it needs PDFium and ONNX Runtime at run time.
 
 The release profile keeps line tables (`debug = 1`), which the `Dockerfile` notes make
@@ -249,18 +252,21 @@ locking whose semantics differ from `flock`.
 
 | Kind | Files | Version marker today | Class |
 |---|---|---|---|
-| Dataset | `dataset.json` | `format` 1 and `minimumReader`, read up to `DATASET_READER` 4 (`commit.rs`) | primary |
+| Dataset | `dataset.json` | `format` 1 and `minimumReader`, read up to `DATASET_READER` 5 (`commit.rs`) | primary |
 | Generation index | `gen-*/meta.json` and the index files | `format_version`, must equal `FORMAT_VERSION` 2 (`builder.rs`) | primary |
 | Vocabulary | `vocab.idx` (`SPKVIDX1`), numeric vocabulary (`SPKVNUM2`) | magic | primary |
 | Delta vocabulary | `delta.vocab` | framed header `\x89SDV`, `VERSION` 2, or legacy without a header | primary |
-| Write-ahead log | `wal.log` | none: 33-byte records | primary |
+| Write-ahead log | `wal.log` | A 33-byte header record starts with `\x89SPKWAL\n` and version 1. Headerless logs are version 0. Commit-record flag bits in byte 27 are added compatibly. | primary |
 | Commit catalog | `commits.bin` | magic `SPKCMTS\0`, 64-byte records, flag bits added compatibly | primary |
 | Change log | segments and index | magics `SPKCHGL\0`, `SPKCHGI\0`, `FORMAT` 1 | primary |
 | Annotations | `annotations.bin` | magic `SPKANNO\0`, `FORMAT` 1 | primary |
 | Catalog | `config.json`, `catalog.lock` | none | primary |
+| Runtime secrets | `secrets/NAME` in the server data directory | Raw plaintext is version 0 at the server wrapper. Sealed values use `sparkles-sealed-secret/1 `, and encrypted version 0 is refused. | primary |
+| Generated secrets key | `secrets.key` in the server data directory | The existing opaque key representation is unversioned format 0. | primary |
 | Full-text index | Tantivy directory and `text.json` | `FORMAT` 2 (`text.rs`); another format is rebuilt on open | derived |
 | Vector index | `vector.json`, index files | config `FORMAT_VERSION` 1, file `SPKVEC` `FILE_VERSION` 1 | derived |
 | Spatial index | `geo.json`, index files | config `FORMAT_VERSION` 1, `LITERALS_VERSION` 2, file `SPKGEO` `FILE_VERSION` 1 | derived |
+| Checked migration state | `.migrate-checked` at the root or checked copy | JSON format 1 records the cleanup mode and the exact old sibling directory. Unknown versions and ambiguous bare legacy markers are refused. | config |
 | Settings and state | `describe.json`, `compaction.json`, `queries.json`, `validation.json`, `models.json`, `assistant.json` and others | `FORMAT` fields on some (stored queries 1, GraphQL 1, ShEx guard 2), none on most | config |
 | Backup repository | layout, blobs, manifests, key slots | layout `FORMAT` 1, blob `FORMAT` 1, slot `SLOT_FORMAT` 2, manifest `indexFormat` | archive |
 
@@ -334,7 +340,7 @@ sparkles migrate --loc DIR [--check] [--keep-old]
 * `--check` lists each dataset, its formats, whether it is inside the window, and which
   steps an upgrade would run, and changes nothing.
 * For each dataset it runs the registered steps in order. A step is a function from one
-  version of a file kind to the next, registered in `crates/sparkles-core/src/migrate/`.
+  version of a file kind to the next, registered in `crates/sparkles-core/src/migrate.rs`.
   Steps run on copies in a sibling directory, the result is checked with `sparkles check`,
   and the directory is swapped in with the catalog's existing swap
   (`crates/sparkles/src/catalog/swap.rs`). `--keep-old` keeps the previous directory as
@@ -586,19 +592,166 @@ Phase 3 should land before the first release so that 0.1's databases can be read
 ## 12. Open questions
 
 1. **Registry.** GHCR keeps images next to the repository and its attestations. Docker
-   Hub would be more visible. Default: GHCR only.
-2. **crates.io names.** `sparkles` may be taken on crates.io. Default: check before
-   Phase 1 and fall back to `sparkles-rdf` as the Python and npm names do.
+   Hub would be more visible. Decided (2026-10-13): Docker Hub is the primary registry,
+   and GHCR may carry the same images. The Docker Hub namespace `sparkles` belongs to
+   another account, so the image name is chosen at Phase 1.
+2. **crates.io names.** On 2026-10-13 the crate `sparkles` was taken by an unrelated
+   project (0.1.8, last updated July 2025). Decided: ask its owner for the name before
+   Phase 1, and fall back to `sparkles-rdf` as the Python and npm names do.
 3. **Code signing.** Unsigned macOS binaries downloaded with a browser are quarantined by
    Gatekeeper, and unsigned Windows binaries raise SmartScreen warnings. Both need paid
    certificates. Default: document `xattr -d com.apple.quarantine` and the Windows
-   prompt, and sign once the project has the certificates.
+   prompt, and sign once the project has the certificates. Decided (2026-10-13): keep
+   this default.
 4. **Windows file semantics.** Whether generation switches and catalog swaps need a
    deferred delete of mapped files on Windows. Default: defer deletes to the next start,
    as the JVM loader already does for its DLL copies.
 5. **The 0.x window.** One minor release may be too short if releases are frequent.
-   Default: one, revisited after three releases.
+   Default: one, revisited after three releases. Decided (2026-10-13): keep this default.
 
 ## Outcome
 
-Not built. See [ROADMAP](../ROADMAP.md) items 58–60.
+Phases 1, 2 and 4 are not built. See [ROADMAP](../ROADMAP.md) items 58–60.
+
+### Phase 3 (2026-10-13)
+
+**The registry.** `crates/sparkles-core/src/formats.rs` declares every file kind of §4.1
+with its class, its marker, the version this build writes and the versions it reads,
+and a second table lists every settings and state file with the member that holds its
+version. Thirty-five settings files carry a member. Six cannot, because their top level
+is a map of user keys or an array, or because they are a cache or a transient intent,
+and the registry lists them with the reason. The module documentation describes the
+four kinds of change of §4.3. `GET /$/server` reports the registry in a `formats` member
+for callers that see the version, and `sparkles migrate --check --format json` prints it.
+The backup crate's layout, blob and key-slot constants are now defined from the
+registry, and the module constants of the core files are checked against it by a test.
+
+The registry also records the server's existing runtime-secret envelope and generated
+key. The server wrapper accepts legacy plaintext as version 0 and sealed version 1, but
+an encrypted version-zero envelope is refused. The generated key remains opaque format
+0 and is not a JSON settings file. Envelope versions are checked before authentication
+fallback, and the sealer recognizes the whole family while decoding only v1. This
+registration changes neither the v1 encoding and AAD nor the dataset reader capability.
+
+**Version markers.** A write-ahead log created by this build starts with a header
+record: the magic `\x89SPKWAL\n`, the version (1) and zeros. The spec asked for a 16-byte
+header. The header is instead 33 bytes, the size of every record, so the records after
+it keep their alignment. Every reader that steps through records at multiples of 33
+from the start of the log, and every saved position of byte 0 meaning "before the first
+commit" (the history index, branch link segments, the backward replay), works unchanged
+by skipping the record where the log starts. A log without the header is version 0 and
+reads as before. Existing logs are never rewritten. The header arrives with the next
+generation, at a compaction, a bulk load, a branch or a clone. Because an older release
+would read the header as a damaged record and could truncate the log as a torn tail,
+`dataset.json` gains reader capability 5 (`DATASET_READER`), and a store raises
+`minimumReader` to 5 when it opens a database for writing, after every file it read
+proved readable.
+
+The catalog's `config.json` and the settings files gain a member, absent meaning 1, read
+and written through `formats::settings_from_slice`, `settings_to_vec`,
+`check_settings` and `stamp_settings`. The server's dataset settings kinds go through
+one pair of helpers (`assist::read_file` and `write_file`), and its server-wide kinds
+through another, so `assistant.json`, `memory.json`, `ingest.json`, `asks.json`,
+`query-suggestions.json`, `maintenance.json`, `review.json`, `models.json` and
+`notifications.json` are covered in two places. Files whose types already had a member
+(`reasoningFormat`, `rdfsFormat`, `originFormat`, `restoreFormat`, `version`) keep it, and
+the registry names it. A newer version is refused, except for the informational
+`origin.json` and `restore.json`, which are then ignored with a warning. A store checks
+every settings file and `dataset.json` of a dataset and each physical branch directory,
+including retained branches, before it writes dataset metadata. The process lock may
+record its holder, but a refused open leaves every metadata file unchanged and agrees
+with `migrate --check`. Startup and planning share the read-only branch enumeration,
+which surfaces directory errors and never opens or prunes a branch just to preflight it.
+Recognized unpublished `.create-*` staging and `.deleting` tombstones are excluded from
+that enumeration with the same classification as branch startup recovery. Planning
+leaves them untouched, and startup recovers them only after real branch compatibility
+checks succeed. An empty or partial unpublished dataset.json therefore does not block
+recovery, while an incompatible active or retained branch still refuses before cleanup. `dataset.json` keeps the members it does not know when a release
+rewrites it. Settings files that a release writes through a typed struct drop unknown
+members, so an additive member of such a file must be safe to lose or needs a `format`
+bump.
+
+**`writtenBy`.** `dataset.json` records the release that last opened the database for
+writing, and refusals name it.
+
+**Readable sets.** `formats::READABLE_INDEX_FORMATS` replaces the equality test with
+`FORMAT_VERSION` in `store.rs`, `check.rs` and the backup manifest's validation, which
+now takes the set. A refusal says whether the database is newer than the release, can be
+upgraded with `sparkles migrate`, or must be dumped with the release that wrote it.
+
+**Refusing one dataset.** When `Catalog::open` meets a persistent dataset in a format
+this release does not read (`Error::Unsupported`), it logs the reason, leaves the
+dataset closed and registered, and serves the others. `GET /$/server` lists such datasets
+under `refusedDatasets` to the callers that may read them, with the reason only for server
+administrators. This is the part of §2.5 that roadmap item 64 needs only for
+format refusals. Other open failures still stop the catalog.
+
+**`sparkles migrate`.** `crates/sparkles-core/src/migrate.rs` holds the step registry,
+`plan`, `migrate` and `recover`, and `crates/sparkles-server/src/migrate_cmd.rs` the
+command of §4.4 with `--data`, `--loc`, `--dataset`, `--check`, `--keep-old` and `--format
+json`. The swap is not the catalog's `swap.rs`, which needs a live catalog. The command
+works on a stopped data directory, so it takes the catalog lock and the database's own
+lock, copies the database to `.migrate-<name>`, runs the steps, checks the copy with
+`check::check`, and swaps it in with two renames. A copy that passed the check carries a
+`.migrate-checked` mark in JSON format 1. It records a strict cleanup mode and the exact
+old sibling basename, so a later release recovers and cleans up the originating copy
+without guessing from its own version or deleting an unrelated kept copy. Recovery
+validates the version and safe sibling name before creating lock files or changing
+recovery state, and rereads the marker before publication or cleanup. Unknown
+versions, malformed state, duplicate known fields and bare legacy mode markers refuse
+recovery while preserving every directory and byte. Legacy markers require inspection of the sibling copies and
+manual recovery through a known original location or a restore. A run that stopped
+between the renames is finished by the next run only with understood checked state. The command takes
+a lock file `.migrate.lock-<name>` next to the database for planning, recovery, the copy
+and the swap, and the database's own lock until the renames start. `plan` is read-only
+and reports a pending run as `interrupted`, so `--check` changes nothing. A store refuses
+to open a database whose `.migrate-<name>` exists, before it creates the directory and
+again under its lock, so a stopped run never leaves an empty database. After the pending
+check, startup compares file identities to verify that its acquired lock still belongs
+to the current directory. It refuses an old descriptor that survived a migration swap,
+including for branch roots. Migration recovery checks the locked file's identity while
+allowing the pending state it must finish. A backup restore also refuses to publish over
+a database with a pending migration, even when the target directory is missing, and
+verifies its target lock's identity after checking pending state. Backup captures and clones leave out the migration check mark.
+The command resolves a relative `--loc` to an absolute path. When the input has parent
+components, it canonicalizes the existing parent before mutation and appends the final
+basename unchanged. This respects physical symlink-parent semantics and keeps renames
+independent of a root component that the first rename removes. An alias whose parent no
+longer resolves refuses before mutation with guidance to use the stable existing parent.
+Inputs without parent components still support new nested and missing roots. The
+command refuses symlinks and special files within the database, and does not start while
+`.pre-migrate-<version>-<name>` exists. Unit tests interrupt the run
+at each point and check the result, and cover a check during a copy, a live store, the
+lock file's name and a root that reappears next to a checked copy. One step is registered: a legacy delta
+vocabulary to the framed format, which is the lazy upgrade of §4.3 run ahead of time. The
+log header has no step, because the byte offsets of branch link segments and of backup
+manifests point into existing logs, and rewriting a log would move them. A generation
+index step will be a compaction into the new format when an index format change needs
+one.
+
+**Backups.** A restore accepts any index format in the readable set. The `422
+incompatible-format` message names the release in `server.version` and says what to do.
+
+**Fixtures.** `scripts/format-fixture.sh BIN LABEL` writes a data directory with a
+catalog, a dataset `books` with two generations, a delta, named graphs, blank nodes, an
+RDF 1.2 triple term, a named snapshot that keeps the first generation, a branch with its
+own commit, a stored query, DESCRIBE and compaction settings, the full-text, spatial and
+vector indexes (with literal vectors, so no embedding provider is needed), and a
+plaintext and an encrypted backup repository, with the answers of twelve recorded query
+cases. The first fixture, `testsuite/formats/c7a6811c/` (36 KB), was written by the
+commit before this phase, so it holds headerless logs, settings without members and a
+`dataset.json` without `writtenBy`. `crates/sparkles-core/tests/formats.rs` opens each
+fixture's dataset, checks it, compares the quad counts at the head and at the snapshot,
+writes, compacts and opens it again. `crates/sparkles-server/tests/cli_formats.rs` runs
+the binary over each fixture: `migrate --check` places it inside the window, `check`
+finds no error, every case answers as recorded (past states and the branch included),
+the stored query runs, the catalog lists the dataset, both backups restore to the same
+count, and after a write and a compaction the new log has its header and `dataset.json`
+names this release. A second test raises the fixture's index format to 99 and checks
+the refusals of `migrate --check`, `query` and the catalog.
+
+A minimal Unreleased **Format** note records checked migration state in `CHANGELOG.md`.
+The broader Phase 1 changelog and release work remain pending. Not built in this phase
+are the fixture job of the release workflow, `sparkles --version --verbose`, and
+the background rebuild of a vector or spatial index whose file version is unknown, which
+already happens for the full-text index (A12).

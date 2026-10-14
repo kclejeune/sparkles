@@ -218,8 +218,8 @@ fn a_preallocated_wal_ends_at_its_last_commit() {
         upd(&s, &format!("INSERT DATA {{ <urn:s{i}> <urn:p> {i} }}"));
     }
     let path = wal(&root);
-    // two records per commit: a data record and the commit record
-    assert_eq!(s.wal_bytes(), 50 * 2 * 33);
+    // the header record, then two records per commit: a data record and the commit record
+    assert_eq!(s.wal_bytes(), 33 + 50 * 2 * 33);
     let on_disk = std::fs::metadata(&path).unwrap().len();
     assert!(on_disk >= 64 << 10, "{on_disk} bytes");
     // readers of the live log stop where it ends: past states and diffs
@@ -246,11 +246,11 @@ fn a_preallocated_wal_ends_at_its_last_commit() {
     // a crash leaves the zeros behind; a clean close does not
     let crashed = std::fs::read(&path).unwrap();
     drop(s);
-    assert_eq!(std::fs::metadata(&path).unwrap().len(), 50 * 2 * 33);
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 33 + 50 * 2 * 33);
     std::fs::write(&path, &crashed).unwrap();
     let s = Store::open(&root, StoreOptions::default()).unwrap();
     assert_eq!(s.head_commit().seq, 50);
-    assert_eq!(std::fs::metadata(&path).unwrap().len(), 50 * 2 * 33);
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 33 + 50 * 2 * 33);
     assert_eq!(
         upd(&s, "INSERT DATA { <urn:s50> <urn:p> 50 }").commit.seq,
         51
@@ -283,16 +283,17 @@ fn zeros_inside_the_last_transaction_are_a_torn_tail() {
     }
     let path = wal(&root);
     let full = std::fs::read(&path).unwrap();
-    // three transactions of three data records and a commit record
-    assert_eq!(full.len(), 3 * 4 * 33);
-    for zeroed in [8..9, 8..10, 9..11] {
+    // the header record, then three transactions of three data records and a commit
+    // record
+    assert_eq!(full.len(), 33 + 3 * 4 * 33);
+    for zeroed in [9..10, 9..11, 10..12] {
         let mut v = full.clone();
         v[zeroed.start * 33..zeroed.end * 33].fill(0);
         std::fs::write(&path, &v).unwrap();
         let s = Store::open(&root, StoreOptions::default()).unwrap();
         assert_eq!(s.head_commit().seq, 2, "records {zeroed:?} zeroed");
         assert_eq!(s.snapshot().len(), 6);
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), 2 * 4 * 33);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 33 + 2 * 4 * 33);
         let r = upd(
             &s,
             "INSERT DATA { <urn:a2> <urn:p> 1 . <urn:b2> <urn:p> 2 . <urn:c2> <urn:p> 3 }",
@@ -301,9 +302,9 @@ fn zeros_inside_the_last_transaction_are_a_torn_tail() {
     }
     // the same records again (with a later timestamp)
     let full = std::fs::read(&path).unwrap();
-    assert_eq!(full.len(), 3 * 4 * 33);
+    assert_eq!(full.len(), 33 + 3 * 4 * 33);
     let mut v = full.clone();
-    v[4 * 33..5 * 33].fill(0);
+    v[5 * 33..6 * 33].fill(0);
     std::fs::write(&path, &v).unwrap();
     let e = Store::open(&root, StoreOptions::default()).err().unwrap();
     assert!(e.to_string().contains("wal.log"), "{e}");
@@ -331,7 +332,10 @@ fn without_preallocation_each_commit_appends() {
     drop(s);
     let s = Store::open(&root, opts()).unwrap();
     upd(&s, "INSERT DATA { <urn:s6> <urn:p> 6 }");
-    assert_eq!(std::fs::metadata(wal(&root)).unwrap().len(), 7 * 2 * 33);
+    assert_eq!(
+        std::fs::metadata(wal(&root)).unwrap().len(),
+        33 + 7 * 2 * 33
+    );
     assert_eq!(s.snapshot().len(), 7);
 }
 
@@ -710,9 +714,10 @@ fn a_legacy_delta_vocabulary_is_rewritten_framed_by_the_first_new_term() {
         let s = Store::open(&root, StoreOptions::default()).unwrap();
         assert_eq!(s.head_commit().seq, 2);
         assert!(ask(&s, "ASK { <urn:b> <urn:p> \"two\" }"));
-        // a commit without new terms leaves the file as it is
+        // opening for writing requires the reader of the log header (5), and a commit
+        // without new terms leaves the file as it is
+        assert_eq!(minimum_reader(&root), 5);
         upd(&s, "INSERT DATA { <urn:b> <urn:p> \"one\" }");
-        assert_eq!(minimum_reader(&root), 1);
     }
     // the open dropped the torn entry, and the legacy entries are as they were
     assert_eq!(std::fs::read(&vocab).unwrap(), &legacy[..legacy_len]);
@@ -724,7 +729,8 @@ fn a_legacy_delta_vocabulary_is_rewritten_framed_by_the_first_new_term() {
     {
         let s = Store::open(&root, StoreOptions::default()).unwrap();
         upd(&s, "INSERT DATA { <urn:c> <urn:p> \"three\" }");
-        assert_eq!(minimum_reader(&root), 4);
+        // the framed file needs reader 4, which the log header's reader 5 covers
+        assert_eq!(minimum_reader(&root), 5);
         assert_eq!(s.head_commit().seq, 4);
     }
     let framed = std::fs::read(&vocab).unwrap();
@@ -743,15 +749,15 @@ fn a_legacy_delta_vocabulary_is_rewritten_framed_by_the_first_new_term() {
         assert!(ask(&s, q), "{q}");
     }
     drop(s);
-    // a release that reads up to reader 3 refuses the dataset now, as this one
+    // a release that reads up to reader 4 refuses the dataset now, as this one
     // refuses a dataset that requires a later reader
-    assert_eq!(sparkles_core::commit::DATASET_READER, 4);
+    assert_eq!(sparkles_core::commit::DATASET_READER, 5);
     let mut ds: serde_json::Value =
         serde_json::from_slice(&std::fs::read(root.join("dataset.json")).unwrap()).unwrap();
     ds["minimumReader"] = serde_json::json!(sparkles_core::commit::DATASET_READER + 1);
     std::fs::write(root.join("dataset.json"), ds.to_string()).unwrap();
     let e = Store::open(&root, StoreOptions::default()).err().unwrap();
-    assert!(e.to_string().contains("requires reader 5"), "{e}");
+    assert!(e.to_string().contains("requires reader 6"), "{e}");
 }
 
 #[test]
@@ -815,6 +821,18 @@ fn compaction_keeps_the_head_and_bulk_writes_are_commits() {
 
 #[test]
 fn databases_from_older_versions_get_a_baseline_commit() {
+    let preserved_payload = |s: &Store| {
+        for (pattern, expected) in [("<urn:x> <urn:p> 1", 1), ("<urn:a0> <urn:p> 0", 0)] {
+            let rows = sparkles_core::sparql::query(
+                s.snapshot(),
+                &format!("SELECT * {{ {pattern} }}"),
+                &QueryOptions::default(),
+            )
+            .unwrap()
+            .len();
+            assert_eq!(rows, expected, "legacy payload {pattern}");
+        }
+    };
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("db");
     {
@@ -826,7 +844,15 @@ fn databases_from_older_versions_get_a_baseline_commit() {
     // make it look like an older version's database: legacy WAL commit records, no
     // dataset.json, commit.json or catalog
     let path = wal(&root);
+    let checked = sparkles_core::check::check(&root, &Default::default()).unwrap();
+    assert_eq!(checked.status, sparkles_core::check::Status::Ok);
     let mut w = std::fs::read(&path).unwrap();
+    assert!(w.len() >= 33);
+    assert_eq!(&w[..8], b"\x89SPKWAL\n");
+    assert_eq!(u32::from_le_bytes(w[8..12].try_into().unwrap()), 1);
+    assert!(w[12..33].iter().all(|b| *b == 0));
+    w.drain(..33);
+    assert_ne!(w[0], 0x89, "the legacy fixture is headerless");
     for rec in w.as_chunks_mut::<33>().0 {
         if rec[0] == 3 {
             rec[9..].fill(0);
@@ -837,6 +863,12 @@ fn databases_from_older_versions_get_a_baseline_commit() {
     std::fs::remove_file(root.join(cur.trim()).join("commit.json")).unwrap();
     std::fs::remove_file(root.join("dataset.json")).unwrap();
     std::fs::remove_file(root.join("commits.bin")).unwrap();
+    let checked = sparkles_core::check::check(&root, &Default::default()).unwrap();
+    assert_ne!(
+        checked.status,
+        sparkles_core::check::Status::Error,
+        "{checked:?}"
+    );
     let id;
     {
         let s = Store::open(&root, StoreOptions::default()).unwrap();
@@ -845,10 +877,12 @@ fn databases_from_older_versions_get_a_baseline_commit() {
             (h.seq, h.kind, h.inserted, h.quads),
             (0, CommitKind::Baseline, 3, 3)
         );
+        preserved_payload(&s);
         id = s.dataset_id();
         assert_eq!(upd(&s, "INSERT DATA { <urn:y> <urn:p> 1 }").commit.seq, 1);
     }
     let s = Store::open(&root, StoreOptions::default()).unwrap();
+    preserved_payload(&s);
     assert_eq!(s.dataset_id(), id);
     assert_eq!(seqs(&s), [1, 0]);
     assert_eq!(s.commit(0).unwrap().kind, CommitKind::Baseline);

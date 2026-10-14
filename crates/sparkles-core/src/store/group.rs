@@ -1628,12 +1628,303 @@ mod tests {
         let mut out = Vec::new();
         let mut start = 0;
         for (i, rec) in buf.as_chunks::<WAL_REC>().0.iter().enumerate() {
+            if i == 0 && rec[0] == WAL_HEADER {
+                start = 1;
+                continue;
+            }
             if rec[0] == WAL_COMMIT {
                 out.push(start..i + 1);
                 start = i + 1;
             }
         }
         out
+    }
+
+    #[test]
+    fn damage_to_the_first_transaction_preserves_the_log_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        let store = Store::open(&root, options()).unwrap();
+        insert(&store, "one").unwrap();
+        insert(&store, "two").unwrap();
+        drop(store);
+        let buf = std::fs::read(wal_path(&root)).unwrap();
+        assert_eq!(&buf[..WAL_REC], &wal::header_record());
+        for header in [true, false] {
+            let case = dir.path().join(if header { "header" } else { "legacy" });
+            copy_dir(&root, &case);
+            let mut bad = if header {
+                buf.clone()
+            } else {
+                buf[WAL_REC..].to_vec()
+            };
+            let txns = transactions(&bad);
+            assert_eq!(txns.len(), 2);
+            let first = &txns[0];
+            bad[first.start * WAL_REC + 5] ^= 0x55;
+            if header {
+                assert_eq!(&bad[..WAL_REC], &wal::header_record());
+                assert_eq!(first.start, 1);
+            } else {
+                assert_eq!(first.start, 0);
+            }
+            std::fs::write(wal_path(&case), &bad).unwrap();
+            assert_eq!(wal_check(&case), crate::check::Status::Error);
+            let error = Store::open(&case, Default::default()).err().unwrap();
+            assert!(matches!(error, Error::Corrupt(_)), "{error:?}");
+            assert!(error.to_string().contains("checksum mismatch"), "{error}");
+        }
+    }
+
+    fn metadata_fixture() -> (tempfile::TempDir, PathBuf, Vec<u8>) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        let store = Store::open(&root, options()).unwrap();
+        for name in ["one", "two", "three", "four"] {
+            kind_insert(
+                &store,
+                CommitKind::Update,
+                message_options(name),
+                in_graph(name, "urn:g"),
+            )
+            .unwrap();
+        }
+        drop(store);
+        let buf = std::fs::read(wal_path(&root)).unwrap();
+        (dir, root, buf)
+    }
+
+    fn reseal_transaction(buf: &mut [u8], txn: &std::ops::Range<usize>, unfenced: u8) {
+        let at = (txn.end - 1) * WAL_REC;
+        let data = &buf[txn.start * WAL_REC..at];
+        let mut rec: [u8; WAL_REC] = buf[at..at + WAL_REC].try_into().unwrap();
+        let Some(Ok((seq, ts, kind, flags))) = commit::open_wal_commit(&rec, data) else {
+            panic!("fixture commit must have verified metadata");
+        };
+        commit::seal_wal_commit_unfenced(&mut rec, seq, ts, kind, flags, unfenced, data);
+        buf[at..at + WAL_REC].copy_from_slice(&rec);
+    }
+
+    fn zero_commit_metadata(buf: &mut [u8], txn: &std::ops::Range<usize>) {
+        let at = (txn.end - 1) * WAL_REC;
+        buf[at + 1..at + WAL_REC].fill(0);
+        assert_eq!(buf[at], WAL_COMMIT);
+    }
+
+    fn torn_metadata_case(header: bool, hole: bool, later_proof: bool) {
+        let (dir, root, buf) = metadata_fixture();
+        let mut buf = if header { buf } else { buf[WAL_REC..].to_vec() };
+        let txns = transactions(&buf);
+        // Only the header establishes framing. A preceding v2 record in the headerless
+        // case must not remove the legacy interpretation of later records.
+        let damaged = usize::from(!header);
+        let prefix = damaged as u64;
+        let partial = damaged + usize::from(hole);
+        for (i, txn) in txns.iter().enumerate() {
+            reseal_transaction(&mut buf, txn, i as u8);
+        }
+        if hole {
+            buf[txns[damaged].start * WAL_REC..txns[damaged].end * WAL_REC].fill(0);
+        }
+        zero_commit_metadata(&mut buf, &txns[partial]);
+        let end = if later_proof {
+            reseal_transaction(&mut buf, &txns[partial + 1], 0);
+            txns[partial + 1].end
+        } else {
+            txns[partial].end
+        };
+        buf.truncate(end * WAL_REC);
+        let case = dir.path().join("case");
+        copy_dir(&root, &case);
+        std::fs::write(wal_path(&case), &buf).unwrap();
+        if !header {
+            if hole {
+                assert_eq!(wal_check(&case), crate::check::Status::Error);
+                assert!(matches!(
+                    Store::open(&case, Default::default()),
+                    Err(Error::Corrupt(_))
+                ));
+            } else {
+                // With no framing, CI 5.6 requires this byte-identical record to keep
+                // its legacy interpretation even after a verified modern commit.
+                let store = Store::open(&case, Default::default()).unwrap();
+                let head = partial + 1 + usize::from(later_proof);
+                assert_eq!(store.snapshot().commit, head as u64);
+                assert_eq!(store.snapshot().len(), head as u64);
+                assert_eq!(wal_check(&case), crate::check::Status::Ok);
+            }
+            return;
+        }
+        if later_proof {
+            assert_eq!(wal_check(&case), crate::check::Status::Error);
+            assert!(matches!(
+                Store::open(&case, Default::default()),
+                Err(Error::Corrupt(_))
+            ));
+            return;
+        }
+        assert_eq!(wal_check(&case), crate::check::Status::Warning);
+        let store = Store::open(&case, Default::default()).unwrap();
+        assert_eq!(store.snapshot().commit, prefix);
+        assert_eq!(store.snapshot().len(), prefix);
+        assert!(store.annotation(prefix + 1).is_none());
+        if prefix == 1 {
+            assert_eq!(store.annotation(1).unwrap().message.as_deref(), Some("one"));
+        }
+        let expected_len = txns[damaged].start * WAL_REC;
+        assert_eq!(
+            std::fs::metadata(wal_path(&case)).unwrap().len(),
+            expected_len as u64
+        );
+        assert_eq!(insert(&store, "next").unwrap().commit.seq, prefix + 1);
+        drop(store);
+        let reopened = Store::open(&case, Default::default()).unwrap();
+        assert_eq!(reopened.snapshot().commit, prefix + 1);
+        assert_eq!(reopened.snapshot().len(), prefix + 1);
+    }
+
+    #[test]
+    fn torn_metadata_after_a_header_does_not_prove_an_earlier_hole_durable() {
+        torn_metadata_case(true, true, false);
+    }
+
+    #[test]
+    fn torn_metadata_in_a_headerless_log_preserves_legacy_durability_proof() {
+        torn_metadata_case(false, true, false);
+    }
+
+    #[test]
+    fn torn_metadata_after_a_header_is_not_reconstructed() {
+        torn_metadata_case(true, false, false);
+    }
+
+    #[test]
+    fn torn_metadata_in_a_headerless_log_keeps_legacy_reconstruction() {
+        torn_metadata_case(false, false, false);
+    }
+
+    #[test]
+    fn torn_metadata_with_a_later_verified_proof_stays_corruption() {
+        for header in [false, true] {
+            for hole in [false, true] {
+                torn_metadata_case(header, hole, true);
+            }
+        }
+    }
+
+    #[test]
+    fn torn_metadata_without_any_modern_boundary_stays_conservative() {
+        let (dir, root, buf) = metadata_fixture();
+        let mut buf = buf[WAL_REC..].to_vec();
+        let txns = transactions(&buf);
+        zero_commit_metadata(&mut buf, &txns[0]);
+        buf[txns[1].start * WAL_REC..txns[1].end * WAL_REC].fill(0);
+        zero_commit_metadata(&mut buf, &txns[2]);
+        buf.truncate(txns[2].end * WAL_REC);
+        // These bytes are equally a real legacy commit or a first modern commit
+        // whose metadata was lost. With no boundary, preserve strict legacy refusal.
+        let case = dir.path().join("legacy");
+        copy_dir(&root, &case);
+        std::fs::write(wal_path(&case), &buf).unwrap();
+        assert_eq!(wal_check(&case), crate::check::Status::Error);
+        assert!(matches!(
+            Store::open(&case, Default::default()),
+            Err(Error::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn torn_metadata_scan_preserves_headerless_legacy_proof() {
+        let mut buf = vec![0; WAL_REC];
+        let mut data = [0; WAL_REC];
+        data[0] = WAL_INSERT;
+        let mut rec = [0; WAL_REC];
+        rec[0] = WAL_COMMIT;
+        commit::seal_wal_commit_unfenced(&mut rec, 2, 0, CommitKind::Update, 0, 1, &data);
+        buf.extend_from_slice(&data);
+        buf.extend_from_slice(&rec);
+        let mut partial = [0; WAL_REC];
+        partial[0] = WAL_COMMIT;
+        buf.extend_from_slice(&partial);
+        assert!(!wal_torn_from(&buf, 0, 1, false));
+        assert!(wal_torn_from(&buf, 0, 1, true));
+        let mut proof = [0; WAL_REC];
+        proof[0] = WAL_COMMIT;
+        commit::seal_wal_commit(&mut proof, 4, 0, CommitKind::Update, 0, &[]);
+        buf.extend_from_slice(&proof);
+        assert!(!wal_torn_from(&buf, 0, 1, true));
+        // A version byte alone is not proof when its CRC fails.
+        *buf.last_mut().unwrap() ^= 0x55;
+        assert!(wal_torn_from(&buf, 0, 1, true));
+    }
+
+    fn mixed_headerless_history(resumed: bool) {
+        let (dir, root, buf) = metadata_fixture();
+        let mut buf = buf[WAL_REC..].to_vec();
+        let txns = transactions(&buf);
+        let legacy = (txns[1].end - 1) * WAL_REC;
+        // The pinned pre-identity writer kept opcode and next_bnode and wrote zeros
+        // in the spare metadata bytes. Its real distinct quad data remains intact.
+        buf[legacy + 9..legacy + WAL_REC].fill(0);
+        let head = if resumed { 3 } else { 2 };
+        buf.truncate(txns[head - 1].end * WAL_REC);
+        let case = dir.path().join("mixed");
+        copy_dir(&root, &case);
+        std::fs::write(wal_path(&case), &buf).unwrap();
+        // The older writer did not append catalog metadata for its transaction. Keep
+        // only the header, root and first modern commit so reconstruction is visible.
+        OpenOptions::new()
+            .write(true)
+            .open(case.join("commits.bin"))
+            .unwrap()
+            .set_len((3 * commit::REC) as u64)
+            .unwrap();
+        let store = Store::open(&case, Default::default()).unwrap();
+        assert_eq!(store.snapshot().commit, head as u64);
+        assert_eq!(store.snapshot().len(), head as u64);
+        let legacy = store.catalog.lock().get(2).unwrap();
+        let parent = store.catalog.lock().get(1).unwrap();
+        assert_eq!(legacy.kind, CommitKind::Unknown);
+        assert!(legacy.reconstructed);
+        assert_eq!(legacy.timestamp_ms, parent.timestamp_ms);
+        let verify = |store: &Store| {
+            let snap = store.snapshot();
+            for name in ["one", "two", "three"].into_iter().take(head) {
+                let ids = [
+                    snap.lookup_iri(&format!("urn:{name}")).unwrap(),
+                    snap.lookup_iri("urn:p").unwrap(),
+                    snap.lookup_iri("urn:o").unwrap(),
+                    snap.lookup_iri("urn:g").unwrap(),
+                ];
+                assert!(snap.contains(&ids).unwrap(), "lost {name}");
+            }
+        };
+        verify(&store);
+        assert_eq!(wal_check(&case), crate::check::Status::Ok);
+        drop(store);
+        let store = Store::open(&case, Default::default()).unwrap();
+        verify(&store);
+        assert_eq!(store.snapshot().commit, head as u64);
+        assert_eq!(insert(&store, "next").unwrap().commit.seq, head as u64 + 1);
+        drop(store);
+        let reopened = Store::open(&case, Default::default()).unwrap();
+        verify(&reopened);
+        assert_eq!(reopened.snapshot().commit, head as u64 + 1);
+        let (historical, _) = reopened
+            .snapshot_at(&crate::history::At::Commit(2), &Default::default())
+            .unwrap();
+        assert_eq!(historical.len(), 2);
+        assert_eq!(std::fs::read(wal_path(&case)).unwrap()[0], WAL_INSERT);
+    }
+
+    #[test]
+    fn mixed_headerless_v2_then_legacy_keeps_the_final_payload() {
+        mixed_headerless_history(false);
+    }
+
+    #[test]
+    fn mixed_headerless_v2_legacy_and_resumed_v2_keep_every_commit() {
+        mixed_headerless_history(true);
     }
 
     /// What `sparkles check` says about a WAL, which must agree with open.

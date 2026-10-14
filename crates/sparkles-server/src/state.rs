@@ -20,6 +20,88 @@ pub use sparkles::reasoning::{
     AutoSetting, ReasoningRecord as ReasoningInfo, read_record as read_reasoning_file,
 };
 
+/// What Fuseki's direct Graph Store naming allows on a dataset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DirectMode {
+    /// reads only (`fuseki:gsp-direct-r`): a write is a `405`
+    Read,
+    /// reads and writes (`fuseki:gsp-direct-rw`)
+    ReadWrite,
+}
+
+/// The datasets that serve direct Graph Store naming (`serve --gsp-direct-naming`), and
+/// whether they take writes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GspDirectNaming {
+    /// the mode of the datasets that name none
+    all: Option<DirectMode>,
+    datasets: BTreeMap<String, DirectMode>,
+}
+
+impl GspDirectNaming {
+    /// The values of `--gsp-direct-naming`. An empty value turns direct naming on for
+    /// every dataset, `NAME` for one dataset, and `NAME=read` or `NAME=read-write` sets
+    /// what the dataset allows. Without a mode a dataset is read-write.
+    pub fn parse(values: &[String]) -> Result<GspDirectNaming, String> {
+        let mut out = GspDirectNaming::default();
+        for v in values {
+            if v.is_empty() {
+                out.all = Some(DirectMode::ReadWrite);
+                continue;
+            }
+            let (name, mode) = match v.split_once('=') {
+                None => (v.as_str(), DirectMode::ReadWrite),
+                Some((n, "read")) => (n, DirectMode::Read),
+                Some((n, "read-write")) => (n, DirectMode::ReadWrite),
+                Some((_, m)) => {
+                    return Err(format!(
+                        "--gsp-direct-naming: the mode of a dataset is read or read-write, not '{m}'"
+                    ));
+                }
+            };
+            if name.is_empty() {
+                return Err("--gsp-direct-naming: a dataset name is empty".into());
+            }
+            out.datasets.insert(name.to_string(), mode);
+        }
+        Ok(out)
+    }
+
+    /// No dataset serves direct naming.
+    #[cfg(test)]
+    pub const OFF: GspDirectNaming = GspDirectNaming {
+        all: None,
+        datasets: BTreeMap::new(),
+    };
+
+    /// The values of a Fuseki configuration, then those of the command line, which win
+    /// for the datasets both name.
+    pub fn layered(config: &[String], cli: &[String]) -> Result<GspDirectNaming, String> {
+        let all: Vec<String> = config.iter().chain(cli).cloned().collect();
+        GspDirectNaming::parse(&all)
+    }
+
+    /// Direct naming on every dataset that no entry names, with read and write.
+    #[cfg(test)]
+    pub fn everywhere() -> GspDirectNaming {
+        GspDirectNaming {
+            all: Some(DirectMode::ReadWrite),
+            datasets: BTreeMap::new(),
+        }
+    }
+
+    /// What dataset `name` allows, if it serves direct naming.
+    pub fn mode(&self, name: &str) -> Option<DirectMode> {
+        self.datasets.get(name).copied().or(self.all)
+    }
+
+    /// Whether any dataset serves direct naming.
+    #[cfg(test)]
+    pub fn is_on(&self) -> bool {
+        self.all.is_some() || !self.datasets.is_empty()
+    }
+}
+
 /// A dataset of the server: the library's [`sparkles::Dataset`], which holds the store
 /// and the state its directory configures (the write guard, RDFS on read, the stored
 /// queries, the GraphQL configuration, the reasoning record, the closure cache, the
@@ -244,6 +326,8 @@ pub struct AppState {
     pub started: Instant,
     pub started_at: String,
     pub store_opts: StoreOptions,
+    /// the memory profile and the admission wait of the query memory pool
+    pub admission: crate::server_memory::Admission,
     pub default_timeout: std::time::Duration,
     pub read_only: bool,
     /// honor `validate=false` on writes (skips write-time validation)
@@ -283,7 +367,7 @@ pub struct AppState {
     pub map_style_url: Option<String>,
     /// Fuseki's Graph Store direct naming (`serve --gsp-direct-naming`): `/{ds}/{path}`
     /// names the graph whose IRI is the request URL
-    pub gsp_direct_naming: bool,
+    pub gsp_direct_naming: GspDirectNaming,
     /// automatic re-materialization of stale inferences (`serve --auto-reason`)
     pub auto_reason: Option<crate::reasoning::AutoReason>,
     /// the largest closure a dataset keeps in memory for incremental reasoning, in
@@ -488,15 +572,30 @@ impl Limits {
 }
 
 impl AppState {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(
         data_dir: &Path,
         store_opts: StoreOptions,
         default_timeout: std::time::Duration,
     ) -> Result<AppState> {
+        AppState::with_memory(data_dir, store_opts, default_timeout, None)
+    }
+
+    /// [`new`](Self::new) with a query memory pool of `pool_bytes` for the datasets'
+    /// queries (`None`: no pool).
+    pub fn with_memory(
+        data_dir: &Path,
+        store_opts: StoreOptions,
+        default_timeout: std::time::Duration,
+        pool_bytes: Option<u64>,
+    ) -> Result<AppState> {
         std::fs::create_dir_all(data_dir.join("databases"))?;
+        let mut options: sparkles::CatalogOptions = store_opts.clone().into();
+        options.memory.pool_bytes = pool_bytes;
         let state = AppState {
             data_dir: data_dir.to_path_buf(),
-            catalog: sparkles::Catalog::open(data_dir, store_opts.clone().into())?,
+            catalog: sparkles::Catalog::open(data_dir, options)?,
+            admission: Default::default(),
             routing: Mutex::new(BTreeMap::new()),
             leaving: Mutex::new(BTreeSet::new()),
             tasks: Mutex::new(Vec::new()),
@@ -523,7 +622,7 @@ impl AppState {
             cors_origins: Vec::new(),
             hosts: crate::exposure::Hosts::default(),
             map_style_url: None,
-            gsp_direct_naming: false,
+            gsp_direct_naming: GspDirectNaming::default(),
             allow_unvalidated_writes: false,
             http_compression: Default::default(),
             auto_reason: None,
@@ -556,6 +655,7 @@ impl AppState {
         AppState {
             data_dir: PathBuf::new(),
             catalog: sparkles::Catalog::memory(store_opts.clone().into()),
+            admission: Default::default(),
             routing: Mutex::new(BTreeMap::new()),
             leaving: Mutex::new(BTreeSet::new()),
             tasks: Mutex::new(Vec::new()),
@@ -600,7 +700,7 @@ impl AppState {
             cors_origins: Vec::new(),
             hosts: crate::exposure::Hosts::default(),
             map_style_url: None,
-            gsp_direct_naming: false,
+            gsp_direct_naming: GspDirectNaming::default(),
             allow_unvalidated_writes: false,
             http_compression: Default::default(),
         }
@@ -1432,5 +1532,24 @@ pub(crate) mod tests {
         assert!(gone);
         assert!(st.get(target).is_none());
         assert!(!dir.path().join("databases").join(target).exists());
+    }
+
+    #[test]
+    fn direct_naming_flags_win_over_the_fuseki_config() {
+        use DirectMode::{Read, ReadWrite};
+        let v = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let n = GspDirectNaming::layered(&v(&["ds=read-write"]), &v(&["ds=read"])).unwrap();
+        assert_eq!(n.mode("ds"), Some(Read));
+        let n = GspDirectNaming::layered(&v(&["ds=read"]), &v(&["ds=read-write"])).unwrap();
+        assert_eq!(n.mode("ds"), Some(ReadWrite));
+        // a bare flag covers the datasets no entry names
+        let n = GspDirectNaming::layered(&v(&["ds=read"]), &v(&[""])).unwrap();
+        assert_eq!(n.mode("ds"), Some(Read));
+        assert_eq!(n.mode("other"), Some(ReadWrite));
+        let n = GspDirectNaming::layered(&v(&["a=read"]), &v(&["b"])).unwrap();
+        assert_eq!(
+            (n.mode("a"), n.mode("b"), n.mode("c")),
+            (Some(Read), Some(ReadWrite), None)
+        );
     }
 }

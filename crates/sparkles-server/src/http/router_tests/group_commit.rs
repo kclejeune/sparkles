@@ -2,6 +2,20 @@
 //! retains its receipt and the final durable dataset survives reopening.
 use super::*;
 
+/// Wait for actual enqueue events without occupying a Tokio worker.
+async fn append_events(
+    events: &mut tokio::sync::mpsc::UnboundedReceiver<()>,
+    count: usize,
+) -> Result<(), String> {
+    for n in 0..count {
+        match tokio::time::timeout(Duration::from_secs(10), events.recv()).await {
+            Ok(Some(())) => {}
+            other => return Err(format!("append event {}/{count}: {other:?}", n + 1)),
+        }
+    }
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn opt_in_persistent_updates_keep_independent_durable_receipts() {
     let temp = tempfile::tempdir().unwrap();
@@ -85,6 +99,8 @@ async fn a_failed_fence_fails_every_request_of_its_group_with_503() {
     let (hit_tx, hit) = std::sync::mpsc::channel();
     let (go_tx, go) = std::sync::mpsc::channel::<()>();
     let go = std::sync::Mutex::new(go);
+    let timed_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let pause_timeout = timed_out.clone();
     let calls = std::sync::atomic::AtomicUsize::new(0);
     let armed = dataset.clone();
     dataset.store.set_failpoint(
@@ -92,8 +108,15 @@ async fn a_failed_fence_fails_every_request_of_its_group_with_503() {
         Some(Arc::new(move |_| {
             match calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
                 0 => {
-                    hit_tx.send(()).unwrap();
-                    let _ = go.lock().unwrap().recv_timeout(Duration::from_secs(10));
+                    let _ = hit_tx.send(());
+                    if go
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(10))
+                        .is_err()
+                    {
+                        pause_timeout.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
                 }
                 // the fence that holds the other nine commits fails its synchronization
                 1 => armed.store.fail_next_group_sync(),
@@ -101,9 +124,11 @@ async fn a_failed_fence_fails_every_request_of_its_group_with_503() {
             }
         })),
     );
+    let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut writers = tokio::task::JoinSet::new();
     let spawn = |writers: &mut tokio::task::JoinSet<StatusCode>, n: usize| {
         let app = app.clone();
+        let completed = completed.clone();
         writers.spawn(async move {
             let (r, _) = sparql_update(
                 &app,
@@ -111,24 +136,50 @@ async fn a_failed_fence_fails_every_request_of_its_group_with_503() {
                 None,
             )
             .await;
+            completed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             r.status
         });
     };
     spawn(&mut writers, 0);
-    tokio::task::spawn_blocking(move || hit.recv_timeout(Duration::from_secs(10)))
-        .await
-        .unwrap()
-        .unwrap();
-    for n in 1..10 {
-        spawn(&mut writers, n);
+    let observed = async {
+        tokio::task::spawn_blocking(move || hit.recv_timeout(Duration::from_secs(10)))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| format!("first seal: {e}"))?;
+        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+        dataset.store.set_failpoint(
+            "group-appended",
+            Some(Arc::new(move |_| {
+                let _ = tx.send(());
+            })),
+        );
+        for n in 1..10 {
+            spawn(&mut writers, n);
+        }
+        append_events(&mut events, 9).await?;
+        Ok::<_, String>((
+            dataset.store.snapshot().commit,
+            completed.load(std::sync::atomic::Ordering::SeqCst),
+        ))
     }
-    // let the nine others reach the queue behind the paused fence
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    go_tx.send(()).unwrap();
+    .await;
+    let _ = go_tx.send(());
     let mut statuses = Vec::new();
     while let Some(status) = writers.join_next().await {
-        statuses.push(status.unwrap());
+        statuses.push(status);
     }
+    dataset.store.set_failpoint("group-sealed", None);
+    dataset.store.set_failpoint("group-appended", None);
+    assert!(
+        !timed_out.load(std::sync::atomic::Ordering::SeqCst),
+        "held fence exceeded its deadline"
+    );
+    assert_eq!(
+        observed.unwrap(),
+        (0, 0),
+        "no queued request completed or published"
+    );
+    let statuses: Vec<_> = statuses.into_iter().map(Result::unwrap).collect();
     let ok = statuses.iter().filter(|s| **s == StatusCode::OK).count();
     let unavailable = statuses
         .iter()
@@ -196,13 +247,22 @@ async fn every_http_write_kind_groups_and_keeps_its_receipt_and_message() {
         let (hit_tx, hit) = std::sync::mpsc::channel();
         let (go_tx, go) = std::sync::mpsc::channel::<()>();
         let go = std::sync::Mutex::new(go);
+        let timed_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pause_timeout = timed_out.clone();
         let first = std::sync::atomic::AtomicBool::new(true);
         dataset.store.set_failpoint(
             "group-sealed",
             Some(Arc::new(move |_| {
                 if first.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                    hit_tx.send(()).unwrap();
-                    let _ = go.lock().unwrap().recv_timeout(Duration::from_secs(10));
+                    let _ = hit_tx.send(());
+                    if go
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(10))
+                        .is_err()
+                    {
+                        pause_timeout.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
                 }
             })),
         );
@@ -255,19 +315,38 @@ async fn every_http_write_kind_groups_and_keeps_its_receipt_and_message() {
             });
         };
         spawn(&mut writers, 0);
-        tokio::task::spawn_blocking(move || hit.recv_timeout(Duration::from_secs(10)))
-            .await
-            .unwrap()
-            .unwrap_or_else(|e| panic!("{kind}: {e}"));
-        for n in 1..32 {
-            spawn(&mut writers, n);
+        let observed = async {
+            tokio::task::spawn_blocking(move || hit.recv_timeout(Duration::from_secs(10)))
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| format!("{kind} first seal: {e}"))?;
+            let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+            dataset.store.set_failpoint(
+                "group-appended",
+                Some(Arc::new(move |_| {
+                    let _ = tx.send(());
+                })),
+            );
+            for n in 1..32 {
+                spawn(&mut writers, n);
+            }
+            append_events(&mut events, 31).await?;
+            Ok::<_, String>(dataset.store.snapshot().commit)
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        go_tx.send(()).unwrap();
+        .await;
+        let _ = go_tx.send(());
         let mut receipts = Vec::new();
         while let Some(r) = writers.join_next().await {
-            receipts.push(r.unwrap());
+            receipts.push(r);
         }
+        dataset.store.set_failpoint("group-sealed", None);
+        dataset.store.set_failpoint("group-appended", None);
+        assert!(
+            !timed_out.load(std::sync::atomic::Ordering::SeqCst),
+            "{kind}: held fence exceeded its deadline"
+        );
+        assert_eq!(observed.unwrap(), before, "{kind}: published while held");
+        let receipts: Vec<_> = receipts.into_iter().map(Result::unwrap).collect();
         let mut seqs: Vec<u64> = receipts.iter().map(|r| r.1).collect();
         seqs.sort_unstable();
         assert_eq!(
@@ -283,7 +362,7 @@ async fn every_http_write_kind_groups_and_keeps_its_receipt_and_message() {
             m.fallbacks
         );
         let fences = m.sync[sparkles::store::SyncPath::Group as usize].count() - fences_before;
-        assert!(fences <= 3, "{kind}: {fences} fences for 32 writes");
+        assert_eq!(fences, 2, "{kind}: fences for 32 writes");
         for (n, seq) in receipts {
             let a = dataset.store.annotation(seq).unwrap();
             assert_eq!(a.message.as_deref(), Some(format!("write {n}").as_str()));

@@ -31,8 +31,8 @@ use serde_json::{Value, json};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 /// The most unreviewed facts a count reads.
@@ -87,6 +87,7 @@ pub(crate) struct OpenBranch {
 #[derive(Clone, Debug)]
 pub(crate) struct Counts {
     fingerprint: u64,
+    owner: Weak<Dataset>,
     /// session facts by kind (`session`, `import`)
     pub facts: BTreeMap<&'static str, KindCount>,
     /// open review branches, newest first
@@ -113,6 +114,24 @@ pub struct Registry {
     counts: Mutex<HashMap<String, Arc<Counts>>>,
     /// datasets a refresh thread works on, and whether another refresh was asked for
     busy: Mutex<HashMap<String, bool>>,
+    gates: Mutex<HashMap<String, Weak<Mutex<()>>>>,
+    #[cfg(test)]
+    fail_count: AtomicBool,
+    #[cfg(test)]
+    hook: Mutex<Option<Arc<tests::Hook>>>,
+}
+
+#[cfg(test)]
+pub(crate) mod tests;
+
+#[cfg(test)]
+impl Registry {
+    fn event(&self, point: tests::Point, name: &str) {
+        let hook = self.hook.lock().clone();
+        if let Some(hook) = hook {
+            hook(point, name);
+        }
+    }
 }
 
 fn now_ms() -> i64 {
@@ -160,6 +179,16 @@ fn parse_time(t: &str) -> Option<i64> {
 }
 
 impl Registry {
+    fn gate(&self, name: &str) -> Arc<Mutex<()>> {
+        let mut gates = self.gates.lock();
+        if let Some(gate) = gates.get(name).and_then(Weak::upgrade) {
+            return gate;
+        }
+        let gate = Arc::new(Mutex::new(()));
+        gates.insert(name.to_string(), Arc::downgrade(&gate));
+        gate
+    }
+
     /// The counts of dataset `name`, when it has memory settings and was counted.
     pub(crate) fn get(&self, name: &str) -> Option<Arc<Counts>> {
         self.counts.lock().get(name).cloned()
@@ -175,10 +204,51 @@ impl Registry {
     }
 }
 
-/// Count the open review items of `ds` again unless nothing they depend on changed, and
-/// keep the result. A dataset without memory settings is forgotten.
+// Gates serialize all refresh entry points for one name. The busy map only
+// coalesces touch workers. Release the index/counts/busy locks before a gate wait,
+// settings lookup, catalog lookup or query; unrelated datasets remain independent.
+fn live(st: &AppState, ds: &Arc<Dataset>) -> bool {
+    let owner = match &ds.branch {
+        Some(_) => ds.main(),
+        None => Some(ds.clone()),
+    };
+    owner.is_some_and(|owner| {
+        st.get(&ds.name)
+            .is_some_and(|current| Arc::ptr_eq(&owner, &current))
+    })
+}
+
+fn applicable(c: &Counts, ds: &Arc<Dataset>) -> bool {
+    let owner = ds.main().unwrap_or_else(|| ds.clone());
+    c.owner.ptr_eq(&Arc::downgrade(&owner))
+}
+
+/// Count the open review items again unless their fingerprint is unchanged. A live
+/// dataset without memory settings is forgotten; obsolete instances cannot publish.
 pub(crate) fn refresh(st: &Arc<AppState>, ds: &Arc<Dataset>) -> Option<Arc<Counts>> {
     let reg = &st.ingest.review;
+    let gate = reg.gate(&ds.name);
+    #[cfg(test)]
+    let _held = match gate.try_lock() {
+        Some(held) => held,
+        None => {
+            reg.event(tests::Point::Contended, &ds.name);
+            gate.lock()
+        }
+    };
+    #[cfg(not(test))]
+    let _held = gate.lock();
+    if !live(st, ds) {
+        return None;
+    }
+    // A replacement cannot keep another owner's metrics, even if its count fails.
+    // Inspect ownership outside the counts lock; the name gate serializes writers.
+    if reg
+        .get(&ds.name)
+        .is_some_and(|cached| !applicable(&cached, ds))
+    {
+        reg.counts.lock().remove(&ds.name);
+    }
     let memory = crate::assist::memory_settings(st, ds);
     if !configured(&memory) {
         reg.counts.lock().remove(&ds.name);
@@ -186,19 +256,27 @@ pub(crate) fn refresh(st: &Arc<AppState>, ds: &Arc<Dataset>) -> Option<Arc<Count
     }
     let fp = fingerprint(ds, &memory);
     if let Some(c) = reg.get(&ds.name)
+        && applicable(&c, ds)
         && c.fingerprint == fp
     {
         return Some(c);
     }
     match count(st, ds, &memory, fp) {
         Ok(c) => {
+            #[cfg(test)]
+            reg.event(tests::Point::Counted, &ds.name);
+            if !live(st, ds) {
+                return None;
+            }
             let c = Arc::new(c);
             reg.counts.lock().insert(ds.name.clone(), c.clone());
             Some(c)
         }
         Err(e) => {
             tracing::warn!(dataset = %ds.name, code = %e.code, "counting the review inbox: {}", e.message);
-            reg.get(&ds.name)
+            live(st, ds)
+                .then(|| reg.get(&ds.name).filter(|c| applicable(c, ds)))
+                .flatten()
         }
     }
 }
@@ -212,28 +290,37 @@ pub(crate) fn current(st: &Arc<AppState>, ds: &Arc<Dataset>) -> Option<Arc<Count
 
 /// Refresh every dataset, and forget the datasets that are gone (the maintenance tick).
 pub fn refresh_all(st: &Arc<AppState>) {
+    let reg = &st.ingest.review;
     let datasets = st.datasets();
-    st.ingest
-        .review
-        .counts
-        .lock()
-        .retain(|name, _| datasets.contains_key(name));
+    let obsolete: Vec<_> = reg
+        .all()
+        .into_keys()
+        .filter(|name| !datasets.contains_key(name))
+        .collect();
+    #[cfg(test)]
+    reg.event(tests::Point::PruneCandidates, "");
+    for name in obsolete {
+        forget_absent(st, &name);
+    }
     for ds in datasets.values() {
         refresh(st, ds);
+    }
+    reg.gates.lock().retain(|_, gate| gate.strong_count() > 0);
+}
+
+fn forget_absent(st: &Arc<AppState>, name: &str) {
+    let reg = &st.ingest.review;
+    let gate = reg.gate(name);
+    let _held = gate.lock();
+    if st.get(name).is_none() {
+        reg.counts.lock().remove(name);
     }
 }
 
 /// Refresh dataset `name` on a thread of its own, after a change to its inbox. A refresh
-/// asked for while one runs runs once more after it.
+/// asked for while one runs runs once more after it, resolving the current instance.
 pub(crate) fn touch(st: &Arc<AppState>, name: &str) {
     let name = crate::auth::split_branch(name).0.to_string();
-    let Some(ds) = st.datasets().get(&name).cloned() else {
-        return;
-    };
-    if !configured(&crate::assist::memory_settings(st, &ds)) {
-        st.ingest.review.counts.lock().remove(&name);
-        return;
-    }
     {
         let mut busy = st.ingest.review.busy.lock();
         if let Some(again) = busy.get_mut(&name) {
@@ -243,16 +330,21 @@ pub(crate) fn touch(st: &Arc<AppState>, name: &str) {
         busy.insert(name.clone(), false);
     }
     let st2 = st.clone();
+    let worker_name = name.clone();
     let spawned = std::thread::Builder::new()
         .name("review-count".into())
         .spawn(move || {
             loop {
-                refresh(&st2, &ds);
+                if let Some(ds) = st2.get(&worker_name) {
+                    refresh(&st2, &ds);
+                } else {
+                    forget_absent(&st2, &worker_name);
+                }
                 let mut busy = st2.ingest.review.busy.lock();
-                match busy.get_mut(&ds.name) {
+                match busy.get_mut(&worker_name) {
                     Some(again) if *again => *again = false,
                     _ => {
-                        busy.remove(&ds.name);
+                        busy.remove(&worker_name);
                         break;
                     }
                 }
@@ -270,6 +362,19 @@ fn count(
     memory: &crate::assist::MemorySettings,
     fingerprint: u64,
 ) -> Result<Counts, ToolError> {
+    #[cfg(test)]
+    if st
+        .ingest
+        .review
+        .fail_count
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err(ToolError::new(
+            "injected-count-error",
+            500,
+            "injected count failure",
+        ));
+    }
     let server = McpServer::new(
         st.clone(),
         crate::mcp::rest::config(st, crate::mcp::rest::Mode::Internal),
@@ -388,6 +493,7 @@ fn count(
     }
     Ok(Counts {
         fingerprint,
+        owner: Arc::downgrade(&ds.main().unwrap_or_else(|| ds.clone())),
         facts: by_kind,
         branches,
         truncated,

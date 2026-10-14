@@ -1,7 +1,9 @@
 //! Server-wide model settings and runtime secrets (spec C19 §11) with a server process:
 //! a runtime layer and a runtime key that survive a restart and a SIGHUP that reads a
 //! changed `--model-config`, `sparkles settings check` with `server.locked`, and a log
-//! at TRACE that carries the audit records and never the key (A12).
+//! at TRACE that carries the audit records and never the key (A12). Stored keys are
+//! sealed by default with a key the server generates, which `sparkles secrets unseal`
+//! undoes offline.
 
 use serde_json::{Value as J, json};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -243,6 +245,19 @@ fn server_settings_restart_reload_and_log() {
     assert_eq!(st, 204);
     test(&s);
     assert_eq!(bearer(), format!("Bearer {KEY}"));
+    // sealed by default, with a key the server generated beside the data, in a build
+    // with the backup feature, and plaintext in a build without it
+    let stored = std::fs::read_to_string(data.join("secrets/gw")).unwrap();
+    let generated = if cfg!(feature = "backup") {
+        assert!(stored.starts_with("sparkles-sealed-secret/1 ") && !stored.contains(KEY));
+        let generated = std::fs::read_to_string(data.join("secrets.key")).unwrap();
+        assert_eq!(generated.trim().len(), 64);
+        Some(generated)
+    } else {
+        assert_eq!(stored, KEY);
+        assert!(!data.join("secrets.key").exists());
+        None
+    };
     drop(s);
 
     // a restart keeps the runtime layer and the key
@@ -277,9 +292,19 @@ fn server_settings_restart_reload_and_log() {
     assert_eq!(v["secrets"][0]["source"], "declared", "{v}");
     drop(s);
 
-    // A12: the log has the audit records and never the key
+    // A12: the log has the audit records and never the key, nor the secrets key
     let text = std::fs::read_to_string(&log).unwrap();
     assert!(!text.contains(KEY), "the key is in the log");
+    if let Some(generated) = &generated {
+        assert!(
+            !text.contains(generated.trim()),
+            "the secrets key is in the log"
+        );
+        assert!(
+            text.contains("generated the secrets key"),
+            "no line about the key"
+        );
+    }
     assert!(
         !text.contains(DECLARED_KEY),
         "the declared key is in the log"
@@ -498,8 +523,13 @@ fn global_settings_and_secrets_commands() {
     let o = run(&["secrets", "list"], "").ok();
     let gw = line(&o.stdout, "gw");
     assert!(gw.contains("declared"), "{}", o.stdout);
-    // a server without --secrets-key keeps stored values unencrypted, and the list says so
-    assert!(o.stdout.contains("kept unencrypted"), "{}", o.stdout);
+    // a server without --secrets-key seals with a key it generates, and the list says
+    // so, except in a build without the backup feature, which keeps plaintext
+    if cfg!(feature = "backup") {
+        assert!(o.stdout.contains("secrets.key"), "{}", o.stdout);
+    } else {
+        assert!(o.stdout.contains("kept unencrypted"), "{}", o.stdout);
+    }
     let o = run(&["secrets", "set", "gw"], &format!("{CLI_KEY}\n")).ok();
     assert!(
         o.stdout.contains("stored a runtime value for secret gw"),
@@ -519,7 +549,13 @@ fn global_settings_and_secrets_commands() {
         format!("Bearer {CLI_KEY}")
     );
     let j = run(&["secrets", "list", "--json"], "").ok().json();
-    assert_eq!(j["storage"], "plaintext", "{j}");
+    if cfg!(feature = "backup") {
+        assert_eq!(j["storage"], "sealed", "{j}");
+        assert_eq!(j["keySource"], "generated", "{j}");
+    } else {
+        assert_eq!(j["storage"], "plaintext", "{j}");
+        assert_eq!(j["keySource"], J::Null, "{j}");
+    }
     let gw = &j["secrets"][0];
     assert_eq!(gw["source"], "runtime", "{j}");
     assert!(gw["setAt"].is_string(), "{j}");
@@ -700,5 +736,149 @@ fn provider_presets_and_insecure_warning() {
     assert!(
         text.contains("provider oai: tls.insecureSkipVerify is on"),
         "no warning in the log"
+    );
+}
+
+/// `serve --secrets-key none` stores plaintext, a later start without the option seals
+/// those values with a generated key, and `sparkles secrets unseal --data` writes them
+/// back as plaintext once the server has stopped, refusing while it runs.
+#[cfg(feature = "backup")]
+#[test]
+fn secrets_key_none_and_unseal() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let cfg = dir.path().join("models.json");
+    let log = dir.path().join("server.log");
+    let (mock_port, seen) = mock();
+    std::fs::write(&cfg, models(mock_port, false).to_string()).unwrap();
+    let ports = 48450..48470;
+    let args = [
+        "--model-config",
+        cfg.to_str().unwrap(),
+        "--outbound-allow-private",
+    ];
+    let gw = data.join("secrets/gw");
+    let test = |s: &Server| {
+        let (st, v) = s.call("POST", "/$/models/gw/test", Some(json!({ "model": "m" })));
+        assert_eq!(st, 200, "{v}");
+        assert_eq!(
+            seen.lock().unwrap().last().cloned().unwrap_or_default(),
+            format!("Bearer {KEY}")
+        );
+    };
+
+    // --secrets-key none: plaintext, as releases before sealing kept it
+    let mut none = args.to_vec();
+    none.extend(["--secrets-key", "none"]);
+    let s = Server::start_in(&data, &none, &log, ports.clone());
+    let (st, _) = s.call("PUT", "/$/server/secrets/gw", Some(json!({ "value": KEY })));
+    assert_eq!(st, 204);
+    let (_, v) = s.call("GET", "/$/server/secrets", None);
+    assert_eq!(v["storage"], "plaintext", "{v}");
+    assert_eq!(std::fs::read_to_string(&gw).unwrap(), KEY);
+    assert!(!data.join("secrets.key").exists());
+    drop(s);
+
+    // the default seals them at the start with a generated key
+    let s = Server::start_in(&data, &args, &log, ports.clone());
+    let stored = std::fs::read_to_string(&gw).unwrap();
+    assert!(stored.starts_with("sparkles-sealed-secret/1 "), "{stored}");
+    test(&s);
+    let unseal = || {
+        Command::new(BIN)
+            .args(["secrets", "unseal", "--data"])
+            .arg(&data)
+            .env_remove("SPARKLES_SECRETS_KEY")
+            .output()
+            .unwrap()
+    };
+    // a running server holds the catalog lock
+    let out = unseal();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("stop the server"),
+        "{out:?}"
+    );
+    drop(s);
+    let out = unseal();
+    assert!(out.status.success(), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("wrote 1 sealed value"));
+    assert_eq!(std::fs::read_to_string(&gw).unwrap(), KEY);
+
+    // a server that does not seal reads them again
+    let s = Server::start_in(&data, &none, &log, ports);
+    test(&s);
+    drop(s);
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert!(!text.contains(KEY), "the key is in the log");
+}
+
+/// An offline command source can contain the key itself, so successful rekey guidance
+/// must not echo that source or the bytes it produces.
+#[cfg(all(feature = "backup", unix))]
+#[test]
+fn rekey_guidance_never_echoes_a_command_key_source() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = tempfile::tempdir().unwrap();
+    let data = t.path().join("data");
+    let secrets = data.join("secrets");
+    std::fs::create_dir_all(&secrets).unwrap();
+    std::fs::set_permissions(&secrets, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(secrets.join("a"), "offline-runtime-value").unwrap();
+    let key_hex = "9a".repeat(32);
+    let printf = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|dir| dir.join("printf"))
+        .find(|path| path.is_absolute() && path.is_file())
+        .expect("an absolute printf executable on PATH");
+    let source = format!("command:{}", json!([printf, "%s", key_hex]));
+    let output = Command::new(BIN)
+        .args(["secrets", "rekey", "--data"])
+        .arg(&data)
+        .args(["--new-key", &source])
+        .env_remove("SPARKLES_BACKUP_CONFIG")
+        .env_remove("SPARKLES_SECRETS_KEY")
+        .env_remove("CREDENTIALS_DIRECTORY")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stored = std::fs::read(secrets.join("a")).unwrap();
+    let sealer = sparkles_backup::SecretSealer::from_key(zeroize::Zeroizing::new([0x9a; 32]));
+    assert_eq!(
+        &*sealer.open("a", &stored).unwrap(),
+        b"offline-runtime-value"
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    for text in [&stdout, &stderr] {
+        assert!(!text.contains(&key_hex), "command key leaked to CLI output");
+        assert!(
+            !text.contains(&source),
+            "command source leaked to CLI output"
+        );
+    }
+    assert!(stdout.contains("--secrets-key and the same new key source"));
+    assert!(stdout.contains("sealed 1 value(s)"));
+    // The same command source opens the value through the supported offline CLI.
+    let opened = Command::new(BIN)
+        .args(["secrets", "unseal", "--data"])
+        .arg(&data)
+        .args(["--secrets-key", &source])
+        .env_remove("SPARKLES_BACKUP_CONFIG")
+        .env_remove("SPARKLES_SECRETS_KEY")
+        .env_remove("CREDENTIALS_DIRECTORY")
+        .output()
+        .unwrap();
+    assert!(
+        opened.status.success(),
+        "{}",
+        String::from_utf8_lossy(&opened.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(secrets.join("a")).unwrap(),
+        "offline-runtime-value"
     );
 }

@@ -556,7 +556,10 @@ Four points differ from the design.
    that case its fence synced the annotation too, the file lost it afterwards, and the commit
    stays with a warning. The check is skipped when `annotations.bin` is missing or belongs to
    another dataset. `sparkles check` applies the same rule. Readers that predate the bit
-   ignore it and lose only this check.
+   ignore it and lose only this check. This is an additive change under
+   [X12 section 4.3](X12-release-engineering.md#43-how-a-format-changes), as recorded in
+   `crates/sparkles-core/src/formats.rs`, so neither the WAL version nor the minimum reader
+   changes for this bit.
 2. **Errors that rest on speculative state.** Preconditions, every guard error, triple
    protections at both the per-row and commit checks, and an RDF Patch's late `H prev`
    mismatch can be judged against a speculative head. `Store::after_refusal` waits for the
@@ -586,25 +589,55 @@ Four points differ from the design.
    still count these commits. The ShEx guard is in the same position, because its typing state
    chains by commit number and has no pending list yet.
 
+After a bypass, an unknown baseline also invalidates cached graph-backed shapes. The
+next relevant check reloads the authoritative speculative state, then stages refreshed
+shapes with its successful sequence for publication. Dry runs and rejected checks do not
+publish them. Grandfather comparisons use the actual pre-schema. Repair of an unparseable
+bypassed pre-schema treats post-state blocking results as new, while read failures
+propagate and cannot be interpreted as an empty schema or a parse-only repair.
+
+A validated version 1 WAL header establishes modern framing. Missing commit metadata
+in such a log is damaged transaction state, not a reconstructed legacy commit. Later
+checksum-valid records and their unfenced counts decide whether the suffix is torn or
+the damage is corruption.
+
+Headerless logs preserve the mixed legacy and v2 interpretation of
+[CI section 5.6](CI-commit-identity.md#56-dataset-file-creation-migration), including legacy
+records after v2 records. Torn modern metadata can be byte-identical to a genuine legacy
+record even after earlier v2 commits. Existing rules may retain that legacy interpretation
+or conservatively refuse the image. This inherited ambiguity affects ordinary and grouped
+writes and remains in Phase 3.
+
 ### Tests
 
-`group.rs` has 41 tests, including failed-fence cases for preconditions, guard errors,
+`group.rs` has 51 tests, including failed-fence cases for preconditions, guard errors,
 class protections and late RDF Patch preconditions. They also cover annotation recovery,
 an idle commit after grouped ones, a stateful guard that must be told of each commit before
-the next check, and writes during compaction.
+the next check, and writes during compaction. Corrupting the first transaction preserves
+its separate header, with absolute record positions checked in new and headerless logs.
+Deterministic metadata tests cover earlier holes, direct metadata loss, later durability
+proofs, invalid CRCs and conservative legacy refusal. Mixed headerless histories retain
+their legacy payloads, reconstructed identities and readable history after current writes.
 
 The SHACL tests cover a limit across concurrent writes and a shapes change in flight.
 `a_bypassed_commit_discards_validation_of_an_unpublished_write` and its grouped counterpart
 check that a quota-refused write followed by a bypassed commit with the same number discards
 the unpublished state and makes the next validation full. A paused-fence test checks that
-a later bypass preserves earlier pending state. The server has three router tests covering
+a later bypass preserves earlier pending state. Graph-backed bypass tests cover ordinary
+and grouped validation, a refreshed pending schema before publication, quota refusal,
+dry-run and rejection invariance, malformed repairs, severity thresholds and grandfather
+comparison. Actual undecodable graph rows verify that reader failures propagate without
+promoting cache state. The server has three router tests covering
 independent receipts, failed fences and each HTTP write kind.
 
 The six power-loss tests cover acknowledged data and messages, including failure of the
 annotation file's sync inside a fence and during the first message of a database.
 `a_failed_first_annotation_sync_keeps_later_messages` checks that a failed first record
 preserves the new header for a later acknowledged message. The single-writer and concurrent
-annotation-fence cases explicitly disable idle direct commits. The model-based stress test
+annotation-fence cases explicitly disable idle direct commits. The crash harness selects
+pending pages independently for each write as a conservative overapproximation, which
+need not be a coherent physical page or sector snapshot. It is not physical crash proof.
+The model-based stress test
 of section 10.1, the `kill -9` runs of section 10.4, and a prune followed by reopening a
 flagged commit at the WAL tail remain unwritten.
 
@@ -617,3 +650,5 @@ flagged commit at the WAL tail remain unwritten.
    that show them rare.
 4. The BENCHMARKS.md refresh under X06, with a `--no-group-commit` row.
 5. The default, the opt-out flag and the removal of `--experimental-group-commit`.
+6. Resolve the inherited ambiguity of torn metadata in headerless WALs while preserving
+   mixed-history compatibility and strict legacy corruption checks.

@@ -73,9 +73,9 @@ fn count(s: &Store, q: &str) -> usize {
     .len()
 }
 
-fn install(s: &Store, shapes: ShapesSource) {
+fn install(s: &Store, shapes: ShapesSource) -> Arc<guard::ShaclGuard> {
     match guard::set_config(s, Some(cfg(shapes))).unwrap() {
-        SetOutcome::Installed(..) => {}
+        SetOutcome::Installed(guard, _) => guard,
         _ => panic!("the shapes are not installed"),
     }
 }
@@ -134,7 +134,7 @@ fn a_shapes_change_in_flight_applies_to_the_next_write() {
         Some(oxrdf::NamedNode::new("urn:shapes").unwrap()),
     )])
     .unwrap();
-    install(
+    let guard = install(
         &s,
         ShapesSource {
             graphs: Some(vec!["urn:shapes".into()]),
@@ -150,13 +150,22 @@ fn a_shapes_change_in_flight_applies_to_the_next_write() {
     let (hit_tx, hit) = mpsc::channel();
     let (go_tx, go) = mpsc::channel::<()>();
     let go = std::sync::Mutex::new(go);
+    let timed_out = Arc::new(AtomicBool::new(false));
+    let pause_timeout = timed_out.clone();
     let first = AtomicBool::new(true);
     s.set_failpoint(
         "group-sealed",
         Some(Arc::new(move |_| {
             if first.swap(false, Ordering::SeqCst) {
-                hit_tx.send(()).unwrap();
-                let _ = go.lock().unwrap().recv_timeout(Duration::from_secs(10));
+                let _ = hit_tx.send(());
+                if go
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))
+                    .is_err()
+                {
+                    pause_timeout.store(true, Ordering::SeqCst);
+                }
             }
         })),
     );
@@ -169,30 +178,80 @@ fn a_shapes_change_in_flight_applies_to_the_next_write() {
             )
         })
     };
-    hit.recv_timeout(Duration::from_secs(10)).unwrap();
-    // every person needs an email now, which the data satisfies
-    let tighten = {
-        let s = s.clone();
-        std::thread::spawn(move || {
-            upd(
-                &s,
+    let before = s.snapshot().commit;
+    let mut tighten = None;
+    let mut late = None;
+    let completed = Arc::new(AtomicBool::new(false));
+    let observations = (|| -> Result<_, String> {
+        hit.recv_timeout(Duration::from_secs(10))
+            .map_err(|e| format!("held seal: {e}"))?;
+        let (appended_tx, appended) = mpsc::channel();
+        s.set_failpoint(
+            "group-appended",
+            Some(Arc::new(move |_| {
+                if std::thread::current().name() == Some("tighten") {
+                    let _ = appended_tx.send(());
+                }
+            })),
+        );
+        tighten = Some(std::thread::Builder::new().name("tighten".into()).spawn({
+            let s = s.clone();
+            move || upd(&s,
                 "INSERT DATA { GRAPH <urn:shapes> { ex:PersonShape <http://www.w3.org/ns/shacl#property> \
-                 [ <http://www.w3.org/ns/shacl#path> ex:email ; <http://www.w3.org/ns/shacl#minCount> 1 ] } }",
-            )
-        })
-    };
-    std::thread::sleep(Duration::from_millis(300));
-    // checked against the shapes of the write in flight, and refused once its base is durable
-    let late = {
-        let s = s.clone();
-        std::thread::spawn(move || upd(&s, "INSERT DATA { ex:b a ex:Person ; ex:name \"B\" }"))
-    };
-    std::thread::sleep(Duration::from_millis(300));
-    go_tx.send(()).unwrap();
-    held.join().unwrap().unwrap();
-    tighten.join().unwrap().unwrap();
-    assert!(matches!(late.join().unwrap(), Err(Error::Rejected(_))));
+                 [ <http://www.w3.org/ns/shacl#path> ex:email ; <http://www.w3.org/ns/shacl#minCount> 1 ] } }")
+        }).map_err(|e| e.to_string())?);
+        appended
+            .recv_timeout(Duration::from_secs(10))
+            .map_err(|e| format!("tighten append: {e}"))?;
+        let rejected = guard.status().counters.rejected;
+        let (drain_tx, drain) = mpsc::channel();
+        s.set_failpoint(
+            "group-draining",
+            Some(Arc::new(move |_| {
+                if std::thread::current().name() == Some("late") {
+                    let _ = drain_tx.send(());
+                }
+            })),
+        );
+        late = Some(
+            std::thread::Builder::new()
+                .name("late".into())
+                .spawn({
+                    let s = s.clone();
+                    let completed = completed.clone();
+                    move || {
+                        let result = upd(&s, "INSERT DATA { ex:b a ex:Person ; ex:name \"B\" }");
+                        completed.store(true, Ordering::SeqCst);
+                        result
+                    }
+                })
+                .map_err(|e| e.to_string())?,
+        );
+        drain
+            .recv_timeout(Duration::from_secs(10))
+            .map_err(|e| format!("late drain: {e}"))?;
+        Ok((
+            guard.status().counters.rejected - rejected,
+            s.snapshot().commit,
+            completed.load(Ordering::SeqCst),
+        ))
+    })();
+    // Release and join every writer before inspecting any failed observation.
+    let _ = go_tx.send(());
     s.set_failpoint("group-sealed", None);
+    s.set_failpoint("group-appended", None);
+    s.set_failpoint("group-draining", None);
+    let held = held.join();
+    let tighten = tighten.map(|w| w.join());
+    let late = late.map(|w| w.join());
+    assert!(
+        !timed_out.load(Ordering::SeqCst),
+        "held fence exceeded its deadline"
+    );
+    assert_eq!(observations.unwrap(), (1, before, false));
+    held.unwrap().unwrap();
+    tighten.unwrap().unwrap().unwrap();
+    assert!(matches!(late.unwrap().unwrap(), Err(Error::Rejected(_))));
     assert_eq!(count(&s, "ex:b ?p ?o"), 0);
     upd(
         &s,

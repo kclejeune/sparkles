@@ -1,0 +1,6 @@
+# name	url	sha256	license
+# The LUBM data generator (UBA 1.7) and ontology carry no license text, so they are
+# fetched at run time and never committed (docs/specs/X06 section 6). The queries are
+# in queries.txt, written from the descriptions in the LUBM paper.
+uba1.7.zip	https://swat.cse.lehigh.edu/projects/lubm/uba1.7.zip	3d44f468e36b7f3cd532f0f5693a019d020877846397b1fa657367cbd53f380a	none stated
+univ-bench.owl	https://swat.cse.lehigh.edu/onto/univ-bench.owl	e6eca926fcb7d6c7925ea0c48f7c5d79abc2818f89e7432fd16561aafeb3f67a	none stated

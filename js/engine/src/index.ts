@@ -108,6 +108,12 @@ export interface DatasetOptions {
   readOnly?: boolean;
   unionDefaultGraph?: boolean;
   cacheBytes?: number;
+  /**
+   * Catalog only: the bytes of estimated memory that all of the catalog's queries may
+   * hold together. A query that the pool cannot cover fails with a server-memory budget
+   * error. Without it, only each query's own budget applies.
+   */
+  totalQueryMemoryBytes?: number;
 }
 export interface LoadOptions extends UpdateOptions {
   format?: string;

@@ -171,6 +171,138 @@ and comparison methodology. [DEVELOPMENT.md](DEVELOPMENT.md) covers building and
   WatDiv may be used freely on the condition that publications cite G. Aluç, O. Hartig,
   M. T. Özsu and K. Daudjee, "Diversified Stress Testing of RDF Data Management
   Systems", ISWC 2014.
+* `scripts/bench-sp2b.sh`, `scripts/bench-lubm.sh` and `scripts/bench-bsbm.sh` (`mise run
+  bench:sp2b`, `bench:lubm` and `bench:bsbm`) run the standard benchmarks SP²Bench, LUBM and
+  the Berlin SPARQL Benchmark on the five engines of `scripts/bench.sh`. They share
+  `scripts/bench-suite-lib.sh`. Each one prepares pinned data and a fixed query set. The
+  shared code then loads the data into every engine, starts the servers, checks every
+  answer, times each query with hyperfine, and writes the run manifest, the result record
+  and `results/summary.md`. The answer check runs with every server up. After it, the
+  script stops them all and then starts, times and stops one engine at a time, so each
+  engine's queries and query mixes run with no other server running. After the start of
+  each engine's server, every selected query runs once untimed, and then hyperfine's
+  warm-ups and timed runs follow. This pass costs one request per query and engine. A query
+  that times out costs `MAX_TIME` once more in it, so at the large scales a suite with
+  several slow queries takes longer by up to `MAX_TIME` for each of them and each engine.
+  `MAX_TIME` is the
+  longest a request may take, and each suite sets its own default. The clients give up
+  after `MAX_TIME`, and every server's query timeout is `MAX_TIME` plus a margin of 15
+  seconds (`TIMEOUT_MARGIN`), so a server stops a query that the client has abandoned. A
+  run that fails after taking as long as `MAX_TIME` is recorded as a `timeout`, whichever
+  side stopped it. The options are the
+  ones of `scripts/bench.sh`, which are
+  `ENGINES`, `QUERIES`, `RUNS`, `WARMUP`, `SKIP_LOAD`, `ANSWERS_ONLY`, `PORT_BASE`,
+  `SERVER_MEM_MAX` and `CLIENT_CPU`. `COLD_RUNS=3` adds the cold measurement, a restart
+  with an evicted page cache before each sample. The suites default to the ports from
+  48300.
+
+  ```sh
+  # small runs that check the setup
+  mise run bench:sp2b 50k
+  mise run bench:lubm 1
+  SPARKLES_ALLOW_GPL_BENCHMARK=1 mise run bench:bsbm 2000
+
+  # the runs of the published comparisons, on the reference host (see below)
+  mise run bench:sp2b 10m --cold-runs 3
+  mise run bench:sp2b 100m --cold-runs 3
+  mise run bench:lubm 100 --cold-runs 3
+  SPARKLES_ALLOW_GPL_BENCHMARK=1 mise run bench:bsbm 10m
+  SPARKLES_ALLOW_GPL_BENCHMARK=1 mise run bench:bsbm 10m --usecase bi
+  SPARKLES_ALLOW_GPL_BENCHMARK=1 mise run bench:bsbm 100m
+  ```
+
+  A published run needs a quiet host with nothing else running, because the engines are
+  timed one request at a time. The 10M and 100M runs need `SERVER_MEM_MAX` set to the same
+  limit for every engine and enough free disk for five indexes of the data. Run `fstrim`
+  first and keep builds and other benchmarks off the machine. At 100M triples SP²Bench
+  needs a 14 GB N-Triples file, and its slower queries can run into the 600 second timeout.
+  A timeout is a result and is printed as one.
+
+  *SP²Bench.* The scale is the number of triples. The generator is SP²Bench v1.01, which
+  is under the BSD license. `scripts/bench-sp2b/sp2b.nix` builds it from the release, which
+  it pins by checksum, against the nixpkgs revision in `flake.lock`. The generator seeds its
+  random numbers with a constant, so a size always gives the same document. The 17
+  queries come from the same release. The script converts the generated Turtle to
+  N-Triples once with `sparkles convert`, so all engines load the same file. Requests time
+  out after 600 seconds.
+
+  *LUBM.* The scale is the number of universities, where 100 gives about 13.4M triples. The
+  generator, UBA 1.7, and the univ-bench ontology carry no license text. The script
+  downloads them at run time, checks them against `scripts/bench-lubm/pins.tsv` and never
+  commits them. The 14 queries are in `scripts/bench-lubm/queries.txt`, written out from
+  the descriptions in the LUBM paper. Several queries only return their complete answers
+  with inference. The script therefore materializes the data twice with `sparkles infer`,
+  once with the `rdfs` profile and once with the `owl-rl` profile. The time, the peak RSS
+  and the number of derived triples of each go to `results/inference.json` and the
+  record. Then it dumps the data with the inferred triples of `--profile` (default
+  `owl-rl`), and every engine loads that one file. Jena's rule reasoners are not run. Fluree's
+  documentation describes query-time reasoning with RDFS, OWL 2 QL, OWL 2 RL and Datalog
+  profiles, but the script does not turn it on, so Fluree also answers over the materialized
+  file. QLever and Oxigraph have no reasoner. Only Sparkles has an inference time.
+
+  *BSBM.* The scale is a product count or a size such as `10m`. The sizes `1m`, `10m` and
+  `100m` use the product counts of the datasets that BSBM publishes, which are 2,785,
+  28,480 and 284,826 products (the V2.0 specification for 1m and 100m, and the 2013 V3.1
+  results for 10m). Other sizes get 2,848 products per million. The generator makes about
+  360 triples per product, so 2000 products give about 725,000 triples, and the manifest
+  records the triple count of the data that was generated. The BSBM tools are GPL-3.0, so the script runs them only when
+  `SPARKLES_ALLOW_GPL_BENCHMARK=1` is set. It downloads them into the workdir, checks them
+  against `scripts/bench-bsbm/pins.tsv` and runs the generator and the test driver as
+  separate processes. The generator uses forward chaining and its default seed. The test
+  driver draws its query parameters from the generator's output with a fixed seed. The
+  script runs the driver once against a stub endpoint to record the queries of its own query
+  mixes, and it keeps three distinct instances of each template. The answers to these
+  instances are compared across engines before timing, except for the DESCRIBE query, whose
+  result the SPARQL specification leaves to the engine. When a query with an ORDER BY on
+  plain variables also has a LIMIT or an OFFSET, the check sends a second, untimed request
+  one row wider on each side of the cut. The rows that tie with the row past the cut may
+  legitimately differ between engines, so the comparison leaves them out and compares only
+  their key values, and it does so only when that second request shows a tie across the cut.
+  Each instance is then timed, and the record pools the instances of a template into one
+  result. After that, the driver itself runs the query mix against each engine with 1, 4
+  and 16 clients (`--clients`) after 50 warm-up mixes and 500 measured ones, and the record
+  gets its query mixes per hour. The driver does not look at what a query returns, so a
+  failing or wrongly answering engine would look fast. A run in which the driver exits with an error is recorded as `error`.
+  Afterwards the average result count of each query is compared across the runs in which the
+  driver succeeded without a timeout. Each engine counts once, and runs with different mix
+  counts are not compared with each other. A run that differs from the majority is recorded
+  as `wrong-answer` with the numbers of the queries that differ, and a failed run keeps its
+  `error` or `timeout`.
+  `--usecase bi` runs the Business Intelligence use case instead of Explore. The Explore
+  and Update mix is not run yet.
+
+* `scripts/bench-record.py` writes and checks the common result record that the standard
+  suites produce, and `scripts/bench-regressions.py compare` compares records.
+  `results/record.json` of a suite run holds one entry per engine, query, mode and client
+  count with the samples in milliseconds, the median, the p95, the answer fingerprint and
+  whether it agrees with the majority, a status (`ok`, `timeout`, `error`, `oom` or
+  `wrong-answer`), and for write results the durability class. `results/manifest.json` next
+  to it records the commit of the checkout that holds the scripts, the Sparkles binary's
+  checksum and, when the caller sets `SPARKLES_COMMIT`, the commit it was built from, each
+  engine's version, binary checksum and license (with the store path for an engine from
+  nixpkgs), the host (CPU, memory, disk model, kernel, file system and mount
+  options), the memory limit, the client CPU, the data checksums and the start and end times.
+  `bench-record.py build` also reads the results directory of `scripts/bench.sh`, and
+  `--pool-instances` merges instance names such as WatDiv's `L1-3` into one result per
+  template. `bench-record.py validate FILE` checks a record against the schema in its
+  header.
+
+  ```sh
+  scripts/bench-record.py build --suite synthetic --scale 10.5m --results target/bench/results \
+      --manifest target/bench/results/manifest.json --out docs/benchmarks/2026-11-01-synthetic-forge.json
+  scripts/bench-regressions.py compare docs/benchmarks/2026-11-01-bsbm-explore-forge.json \
+      docs/benchmarks/2026-11-15-bsbm-explore-forge.json
+  ```
+
+  `compare` takes two or more records, oldest first, and pairs results by suite, scale,
+  engine, query, mode and clients. For every pair it prints the ratio of the medians and
+  whether the sample ranges overlap. A Sparkles result is a regression when its median is
+  more than 10% slower and the ranges do not overlap, or when it is more than 5% slower in
+  two comparisons in a row. Throughput results (`qmph` and `qps`) have no samples, so they
+  are compared by ratio with the same two thresholds, and a drop is the bad direction. A
+  changed answer fingerprint and a result that stopped being
+  `ok` are always reported. The exit status is 1 when anything is reported, so a
+  refresh script can stop on it. `mise run test:bench-scripts` runs the tests of both tools.
 * `scripts/nsc-bench.sh A B` (`mise run bench:nsc A B`) compares the query times of two
   Sparkles builds on an ephemeral [Namespace](https://namespace.so) instance, so a
   relative A/B comparison does not have to wait for a quiet local machine. It needs the

@@ -23,6 +23,7 @@
 
 use crate::data::DataGraph;
 use crate::incremental::{Fallback, Model, Tuning};
+use crate::shapes::GraphShapesError;
 use crate::validate::{Sel, ShapeRun, validate_selected};
 use crate::{
     PropertyPath, Shapes, ShapesSyntax, ValidateOptions, ValidationReport, ValidationResult,
@@ -252,6 +253,16 @@ struct Pending {
     loaded: Option<Loaded>,
     baseline: Baseline,
     exact: Option<Exact>,
+}
+
+/// Which pre-state report can be used for grandfather comparison.
+#[derive(Clone, Copy)]
+enum Before<'a> {
+    /// Initial configuration establishes a baseline, including existing violations.
+    Establish,
+    Known(&'a Arc<Snapshot>, &'a Loaded),
+    /// A bypass left unparseable pre-shapes; no result is proven grandfathered.
+    Unproven,
 }
 
 /// A validation and the exact state it leaves.
@@ -527,12 +538,13 @@ impl ShaclGuard {
 
     /// Validate all of `view` with `loaded`. In grandfather mode, `before` (the state
     /// before the write, with the shapes it had) is validated too, and the results
-    /// `view` adds decide; without it nothing counts as added.
+    /// `view` adds decide. Initial installation establishes a baseline; an unparseable
+    /// bypassed pre-schema instead leaves post-state blocking results unproven.
     fn full(
         &self,
         view: &Arc<Snapshot>,
         loaded: &Loaded,
-        before: Option<(&Arc<Snapshot>, &Loaded)>,
+        before: Before<'_>,
         o: &WriteOptions,
         reason: Option<Fallback>,
         commit: u64,
@@ -549,7 +561,7 @@ impl ShaclGuard {
             deadline,
         )?;
         let pre = match before {
-            Some((base, old)) if self.grandfather() => {
+            Before::Known(base, old) if self.grandfather() => {
                 let mut st = self.state(base, &old.shapes, o)?;
                 let runs = Self::run(
                     st.as_mut(),
@@ -581,6 +593,9 @@ impl ShaclGuard {
         let listed: Vec<ValidationResult> = runs.into_iter().flat_map(|r| r.results).collect();
         let introduced = self.grandfather().then(|| match &pre {
             Some(pre) => new_blocking(&listed, pre, self.cfg.threshold),
+            None if matches!(before, Before::Unproven) => {
+                new_blocking(&listed, &[], self.cfg.threshold)
+            }
             None => vec![false; listed.len()],
         });
         let ms = t0.elapsed().as_millis() as u64;
@@ -772,7 +787,7 @@ impl ShaclGuard {
             self.full(
                 &c.view,
                 loaded,
-                Some((&base, loaded)),
+                Before::Known(&base, loaded),
                 c.opts,
                 Some(reason),
                 seq,
@@ -1082,15 +1097,19 @@ impl CommitGuard for ShaclGuard {
         if !data && !shapes_changed {
             return Ok(self.skipped(seq, live, base_baseline, base_exact));
         }
-        let (checked, new_loaded) = if shapes_changed {
-            // changed shapes are read from the new state, and must parse
-            let new = match Shapes::from_store_graphs_with(
+        let unknown = base_baseline.as_ref().is_none_or(|b| b.conforms.is_none());
+        let refresh = unknown && !self.cfg.shapes_graphs().is_empty();
+        let (checked, new_loaded) = if shapes_changed || refresh {
+            // A bypass or unknown base invalidates the cached graph-backed schema too.
+            // Refreshed shapes stay with this sequence until successful publication.
+            let new = match Shapes::from_store_graphs_classified(
                 &c.view,
                 self.cfg.shapes_graphs(),
                 self.file_shapes.as_deref(),
             ) {
                 Ok(s) => Loaded::new(s),
-                Err(e) => {
+                Err(GraphShapesError::Read(e)) => return Err(engine_error(e)),
+                Err(GraphShapesError::Parse(e)) => {
                     let mut s = ValidationSummary::empty(
                         GuardStatus::Rejected,
                         self.cfg.mode,
@@ -1106,15 +1125,47 @@ impl CommitGuard for ShaclGuard {
                 }
             };
             let base = Arc::new(c.base.clone());
+            let pre_loaded = if refresh && shapes_changed && self.grandfather() {
+                Some(
+                    match Shapes::from_store_graphs_classified(
+                        &base,
+                        self.cfg.shapes_graphs(),
+                        self.file_shapes.as_deref(),
+                    ) {
+                        Ok(shapes) => Ok(Loaded::new(shapes)),
+                        // Only a parse failure permits conservative post-state comparison.
+                        Err(GraphShapesError::Parse(_)) => Err(()),
+                        Err(GraphShapesError::Read(e)) => return Err(engine_error(e)),
+                    },
+                )
+            } else {
+                None
+            };
+            let before = match &pre_loaded {
+                Some(Ok(old)) => Before::Known(&base, old),
+                Some(Err(())) => Before::Unproven,
+                None => Before::Known(
+                    &base,
+                    if refresh && !shapes_changed {
+                        &new
+                    } else {
+                        &loaded
+                    },
+                ),
+            };
             let checked = self.full(
                 &c.view,
                 &new,
-                Some((&base, &loaded)),
+                before,
                 c.opts,
                 // a load from sources may have changed anything, the shapes included
-                Some(match c.changes {
-                    Changes::Unknown => Fallback::Bulk,
-                    _ => Fallback::Shapes,
+                Some(if shapes_changed {
+                    match c.changes {
+                        Changes::Unknown => Fallback::Bulk,
+                        _ => Fallback::Shapes,
+                    }
+                } else {
+                    Fallback::Baseline
                 }),
                 seq,
             )?;
@@ -1361,7 +1412,14 @@ pub fn set_config(store: &Store, cfg: Option<ValidationConfig>) -> Result<SetOut
     let (shapes, file_shapes) = load_shapes(&cfg, root.as_deref(), &view)?;
     let loaded = Loaded::new(shapes);
     let probe = ShaclGuard::new(cfg.clone(), loaded.clone(), None);
-    let checked = probe.full(&view, &loaded, None, &WriteOptions::default(), None, head)?;
+    let checked = probe.full(
+        &view,
+        &loaded,
+        Before::Establish,
+        &WriteOptions::default(),
+        None,
+        head,
+    )?;
     let summary = checked.summary;
     if cfg.mode == GuardMode::Reject
         && cfg.baseline == BaselinePolicy::Strict
@@ -1457,6 +1515,573 @@ mod pending_tests {
             panic!("the empty dataset conforms");
         };
         (dir, store, guard)
+    }
+
+    fn graph_configured(
+        grouped: bool,
+        mode: GuardMode,
+        policy: BaselinePolicy,
+    ) -> (tempfile::TempDir, Store, Arc<ShaclGuard>) {
+        let (dir, store, previous) = configured(grouped);
+        update(
+            &store,
+            "INSERT DATA { GRAPH <urn:shapes> { \
+             <urn:Shape> a <http://www.w3.org/ns/shacl#NodeShape> ; \
+             <http://www.w3.org/ns/shacl#targetNode> <urn:hub> ; \
+             <http://www.w3.org/ns/shacl#property> <urn:P> . \
+             <urn:P> <http://www.w3.org/ns/shacl#path> <urn:link> ; \
+             <http://www.w3.org/ns/shacl#maxCount> 2 } }",
+            &QueryOptions::default(),
+        )
+        .unwrap();
+        let mut cfg = previous.cfg.clone();
+        cfg.mode = mode;
+        cfg.baseline = policy;
+        cfg.shapes = ShapesSource {
+            graphs: Some(vec!["urn:shapes".into()]),
+            ..Default::default()
+        };
+        let SetOutcome::Installed(guard, _) = set_config(&store, Some(cfg)).unwrap() else {
+            panic!("the empty data graph conforms to maxCount 2");
+        };
+        (dir, store, guard)
+    }
+
+    fn change_count(
+        store: &Store,
+        value: &str,
+        opts: &QueryOptions,
+    ) -> sparkles_core::Result<sparkles_core::sparql::update::UpdateStats> {
+        update(
+            store,
+            &format!(
+                "DELETE WHERE {{ GRAPH <urn:shapes> {{ <urn:P> \
+            <http://www.w3.org/ns/shacl#maxCount> ?n }} }}; \
+            INSERT DATA {{ GRAPH <urn:shapes> {{ <urn:P> \
+            <http://www.w3.org/ns/shacl#maxCount> {value} }} }}"
+            ),
+            opts,
+        )
+    }
+
+    fn bypass() -> QueryOptions {
+        QueryOptions {
+            write: WriteOptions {
+                bypass_validation: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn grandfather_repair_does_not_introduce_nonblocking_warnings() {
+        for mode in [GuardMode::Reject, GuardMode::Warn] {
+            let (_dir, store, guard) = graph_configured(false, mode, BaselinePolicy::Grandfather);
+            update(
+                &store,
+                "INSERT DATA { <urn:hub> <urn:link> <urn:one>, <urn:two> }",
+                &bypass(),
+            )
+            .unwrap();
+            change_count(&store, "\"bad\"", &bypass()).unwrap();
+            let result = update(
+                &store,
+                "DELETE WHERE { GRAPH <urn:shapes> { <urn:P> <http://www.w3.org/ns/shacl#maxCount> ?n } }; \
+             INSERT DATA { GRAPH <urn:shapes> { <urn:P> <http://www.w3.org/ns/shacl#maxCount> 1 ; \
+             <http://www.w3.org/ns/shacl#severity> <http://www.w3.org/ns/shacl#Warning> } }",
+                &QueryOptions::default(),
+            );
+            let summary = result
+                .expect("a warning is below the Violation threshold")
+                .commit
+                .unwrap()
+                .validation
+                .unwrap();
+            assert_eq!(
+                (summary.status, summary.blocking, summary.introduced),
+                (GuardStatus::Passed, 0, Some(0))
+            );
+            assert_eq!(summary.by_severity.warning, 1);
+            assert_eq!(guard.baseline.lock().as_ref().unwrap().conforms, Some(true));
+        }
+    }
+
+    fn bypassed_shapes_change(grouped: bool) {
+        let (_dir, store, guard) =
+            graph_configured(grouped, GuardMode::Reject, BaselinePolicy::Strict);
+        update(
+            &store,
+            "DELETE DATA { GRAPH <urn:shapes> { <urn:P> \
+             <http://www.w3.org/ns/shacl#maxCount> 2 } }; \
+             INSERT DATA { GRAPH <urn:shapes> { <urn:P> \
+             <http://www.w3.org/ns/shacl#maxCount> 1 } }",
+            &QueryOptions {
+                write: WriteOptions {
+                    bypass_validation: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(guard.baseline.lock().as_ref().unwrap().conforms, None);
+        let before = store.snapshot().commit;
+        let result = update(
+            &store,
+            "INSERT DATA { <urn:hub> <urn:link> <urn:one>, <urn:two> }",
+            &QueryOptions::default(),
+        );
+        let Err(Error::Rejected(rejected)) = result else {
+            panic!("the current maxCount 1 must reject two links: {result:?}");
+        };
+        assert_eq!(rejected.summary.strategy, Strategy::Full);
+        assert_eq!(store.snapshot().commit, before);
+        assert_eq!(
+            sparkles_core::sparql::query(
+                store.snapshot(),
+                "SELECT * { <urn:hub> <urn:link> ?o }",
+                &QueryOptions::default()
+            )
+            .unwrap()
+            .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn a_bypassed_shapes_change_reloads_before_data_validation() {
+        bypassed_shapes_change(false);
+    }
+
+    #[test]
+    fn a_grouped_bypassed_shapes_change_reloads_before_data_validation() {
+        bypassed_shapes_change(true);
+    }
+
+    #[test]
+    fn dry_run_and_rejection_do_not_publish_reloaded_shapes() {
+        let (_dir, store, guard) =
+            graph_configured(false, GuardMode::Reject, BaselinePolicy::Strict);
+        change_count(&store, "1", &bypass()).unwrap();
+        let old = guard.loaded.read().shapes.clone();
+        let unrelated = update(
+            &store,
+            "INSERT DATA { GRAPH <urn:unrelated> { <urn:x> <urn:y> <urn:z> } }",
+            &QueryOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            unrelated.commit.unwrap().validation.unwrap().status,
+            GuardStatus::Skipped
+        );
+        assert_eq!(guard.baseline.lock().as_ref().unwrap().conforms, None);
+        let head = store.snapshot().commit;
+        let baseline = guard.baseline.lock().clone();
+        let before = serde_json::to_value(guard.status()).unwrap();
+        let preview = update(
+            &store,
+            "INSERT DATA { <urn:hub> <urn:link> <urn:one>, <urn:two> }",
+            &QueryOptions {
+                write: WriteOptions {
+                    dry_run: Some(Default::default()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let Err(Error::DryRun(preview)) = preview else {
+            panic!("expected preview");
+        };
+        let summary = preview.validation.unwrap();
+        assert_eq!(
+            (summary.status, summary.strategy),
+            (GuardStatus::Rejected, Strategy::Full)
+        );
+        assert_eq!(serde_json::to_value(guard.status()).unwrap(), before);
+        assert_eq!(store.snapshot().commit, head);
+        assert!(Arc::ptr_eq(&old, &guard.loaded.read().shapes));
+        assert!(guard.pending.lock().is_empty());
+        assert!(guard.exact.lock().is_none());
+        let refused = update(
+            &store,
+            "INSERT DATA { <urn:hub> <urn:link> <urn:one>, <urn:two> }",
+            &QueryOptions::default(),
+        );
+        assert!(matches!(refused, Err(Error::Rejected(_))), "{refused:?}");
+        assert_eq!(
+            serde_json::to_value(guard.baseline.lock().clone()).unwrap(),
+            serde_json::to_value(baseline).unwrap()
+        );
+        assert!(Arc::ptr_eq(&old, &guard.loaded.read().shapes));
+        assert!(guard.pending.lock().is_empty());
+        let accepted = update(
+            &store,
+            "INSERT DATA { <urn:hub> <urn:link> <urn:one> }",
+            &QueryOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            accepted.commit.unwrap().validation.unwrap().strategy,
+            Strategy::Full
+        );
+        assert!(!Arc::ptr_eq(&old, &guard.loaded.read().shapes));
+        assert_eq!(guard.baseline.lock().as_ref().unwrap().conforms, Some(true));
+        assert!(matches!(
+            update(
+                &store,
+                "INSERT DATA { <urn:hub> <urn:link> <urn:two> }",
+                &QueryOptions::default()
+            ),
+            Err(Error::Rejected(_))
+        ));
+    }
+
+    #[test]
+    fn a_refused_bypass_does_not_install_attempted_shapes() {
+        for grouped in [false, true] {
+            let (_dir, store, guard) =
+                graph_configured(grouped, GuardMode::Reject, BaselinePolicy::Strict);
+            let old = guard.loaded.read().shapes.clone();
+            let head = store.snapshot().commit;
+            store.set_quota(Some(1)).unwrap();
+            let refused = update(
+                &store,
+                "DELETE DATA { GRAPH <urn:shapes> { <urn:P> <http://www.w3.org/ns/shacl#maxCount> 2 } }; \
+                 INSERT DATA { GRAPH <urn:shapes> { <urn:P> <http://www.w3.org/ns/shacl#maxCount> 1 ; \
+                 <http://www.w3.org/ns/shacl#name> \"attempted\" } }",
+                &bypass(),
+            );
+            assert!(
+                matches!(refused, Err(Error::BudgetExceeded(_))),
+                "{refused:?}"
+            );
+            assert_eq!(store.snapshot().commit, head);
+            store.set_quota(None).unwrap();
+            let accepted = update(
+                &store,
+                "INSERT DATA { <urn:hub> <urn:link> <urn:one>, <urn:two> }",
+                &QueryOptions::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                accepted.commit.unwrap().validation.unwrap().strategy,
+                Strategy::Full
+            );
+            assert!(!Arc::ptr_eq(&old, &guard.loaded.read().shapes));
+            assert!(matches!(
+                update(
+                    &store,
+                    "INSERT DATA { <urn:hub> <urn:link> <urn:three> }",
+                    &QueryOptions::default()
+                ),
+                Err(Error::Rejected(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn malformed_bypassed_shapes_reject_data_but_allow_conforming_repair() {
+        for mode in [GuardMode::Reject, GuardMode::Warn] {
+            for policy in [BaselinePolicy::Strict, BaselinePolicy::Grandfather] {
+                let (_dir, store, guard) = graph_configured(false, mode, policy);
+                change_count(&store, "\"bad\"", &bypass()).unwrap();
+                let old = guard.loaded.read().shapes.clone();
+                let head = store.snapshot().commit;
+                let result = update(
+                    &store,
+                    "INSERT DATA { <urn:hub> <urn:link> <urn:one> }",
+                    &QueryOptions::default(),
+                );
+                let Err(Error::Rejected(rejected)) = result else {
+                    panic!("malformed schema must reject: {result:?}");
+                };
+                assert!(rejected.summary.shapes_error.is_some());
+                assert_eq!(store.snapshot().commit, head);
+                assert!(Arc::ptr_eq(&old, &guard.loaded.read().shapes));
+                assert!(guard.pending.lock().is_empty());
+                let repaired = change_count(&store, "1", &QueryOptions::default()).unwrap();
+                let summary = repaired.commit.unwrap().validation.unwrap();
+                assert_eq!((summary.status, summary.blocking), (GuardStatus::Passed, 0));
+                assert!(!Arc::ptr_eq(&old, &guard.loaded.read().shapes));
+                update(
+                    &store,
+                    "INSERT DATA { <urn:hub> <urn:link> <urn:one> }",
+                    &QueryOptions::default(),
+                )
+                .unwrap();
+                let malformed_post =
+                    change_count(&store, "\"bad again\"", &QueryOptions::default());
+                assert!(
+                    matches!(malformed_post, Err(Error::Rejected(_))),
+                    "{malformed_post:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn grandfather_malformed_pre_repair_marks_only_blocking_results_new() {
+        for mode in [GuardMode::Reject, GuardMode::Warn] {
+            let (_dir, store, guard) = graph_configured(false, mode, BaselinePolicy::Grandfather);
+            update(
+                &store,
+                "INSERT DATA { <urn:hub> <urn:link> <urn:one>, <urn:two> }",
+                &bypass(),
+            )
+            .unwrap();
+            change_count(&store, "\"bad\"", &bypass()).unwrap();
+            let old = guard.loaded.read().shapes.clone();
+            let head = store.snapshot().commit;
+            let result = change_count(&store, "1", &QueryOptions::default());
+            if mode == GuardMode::Reject {
+                let Err(Error::Rejected(rejected)) = result else {
+                    panic!("unproven violation must reject: {result:?}");
+                };
+                assert_eq!(
+                    (rejected.summary.blocking, rejected.summary.introduced),
+                    (1, Some(1))
+                );
+                assert_eq!(store.snapshot().commit, head);
+                assert!(Arc::ptr_eq(&old, &guard.loaded.read().shapes));
+                assert!(guard.pending.lock().is_empty());
+            } else {
+                let summary = result.unwrap().commit.unwrap().validation.unwrap();
+                assert_eq!(
+                    (summary.status, summary.blocking, summary.introduced),
+                    (GuardStatus::Warned, 1, Some(1))
+                );
+                assert_eq!(store.snapshot().commit, head + 1);
+                assert!(!Arc::ptr_eq(&old, &guard.loaded.read().shapes));
+            }
+        }
+    }
+
+    #[test]
+    fn grandfather_shape_change_compares_authoritative_pre_shapes() {
+        let (_dir, store, _guard) =
+            graph_configured(false, GuardMode::Reject, BaselinePolicy::Grandfather);
+        change_count(&store, "1", &bypass()).unwrap();
+        update(
+            &store,
+            "INSERT DATA { <urn:hub> <urn:link> <urn:one>, <urn:two> }",
+            &bypass(),
+        )
+        .unwrap();
+        let checked = update(&store, "INSERT DATA { GRAPH <urn:shapes> { <urn:P> <http://www.w3.org/ns/shacl#name> \"existing limit\" } }", &QueryOptions::default()).unwrap();
+        let summary = checked.commit.unwrap().validation.unwrap();
+        assert_eq!(
+            (summary.status, summary.blocking, summary.introduced),
+            (GuardStatus::Passed, 1, Some(0))
+        );
+    }
+
+    #[test]
+    fn a_pending_bypassed_shape_change_applies_before_publication() {
+        use std::sync::{atomic::AtomicBool, mpsc};
+        let (_dir, store, guard) =
+            graph_configured(true, GuardMode::Reject, BaselinePolicy::Strict);
+        let store = Arc::new(store);
+        let head = store.snapshot().commit;
+        let (hit_tx, hit) = mpsc::channel();
+        let (go_tx, go) = mpsc::channel();
+        let go = Mutex::new(go);
+        let first = AtomicBool::new(true);
+        let expired = Arc::new(AtomicBool::new(false));
+        let timeout = expired.clone();
+        store.set_failpoint(
+            "group-sealed",
+            Some(Arc::new(move |_| {
+                if first.swap(false, Ordering::SeqCst) {
+                    let _ = hit_tx.send(());
+                    if go.lock().recv_timeout(Duration::from_secs(10)).is_err() {
+                        timeout.store(true, Ordering::SeqCst);
+                    }
+                }
+            })),
+        );
+        let held = std::thread::spawn({
+            let store = store.clone();
+            move || {
+                update(
+                    &store,
+                    "INSERT DATA { <urn:other> <urn:note> <urn:first> }",
+                    &QueryOptions::default(),
+                )
+            }
+        });
+        let mut bypassed = None;
+        let mut accepted = None;
+        let mut late = None;
+        let completed = Arc::new(AtomicBool::new(false));
+        let observed = (|| -> Result<_, String> {
+            hit.recv_timeout(Duration::from_secs(10))
+                .map_err(|e| format!("first seal: {e}"))?;
+            let (tx, appended) = mpsc::channel();
+            store.set_failpoint(
+                "group-appended",
+                Some(Arc::new(move |_| {
+                    if matches!(
+                        std::thread::current().name(),
+                        Some("shapes-bypass" | "shapes-accepted")
+                    ) {
+                        let _ = tx.send(());
+                    }
+                })),
+            );
+            bypassed = Some(
+                std::thread::Builder::new()
+                    .name("shapes-bypass".into())
+                    .spawn({
+                        let store = store.clone();
+                        move || change_count(&store, "1", &bypass())
+                    })
+                    .map_err(|e| e.to_string())?,
+            );
+            appended
+                .recv_timeout(Duration::from_secs(10))
+                .map_err(|e| format!("bypass append: {e}"))?;
+            let lower: Vec<_> = guard.pending.lock().iter().map(|p| p.seq).collect();
+            accepted = Some(
+                std::thread::Builder::new()
+                    .name("shapes-accepted".into())
+                    .spawn({
+                        let store = store.clone();
+                        move || {
+                            update(
+                                &store,
+                                "INSERT DATA { <urn:hub> <urn:link> <urn:one> }",
+                                &QueryOptions::default(),
+                            )
+                        }
+                    })
+                    .map_err(|e| e.to_string())?,
+            );
+            appended
+                .recv_timeout(Duration::from_secs(10))
+                .map_err(|e| format!("refreshed data append: {e}"))?;
+            let refreshed = guard
+                .pending
+                .lock()
+                .iter()
+                .any(|p| p.seq == head + 3 && p.loaded.is_some());
+            let rejected = guard.status().counters.rejected;
+            let (tx, draining) = mpsc::channel();
+            store.set_failpoint(
+                "group-draining",
+                Some(Arc::new(move |_| {
+                    if std::thread::current().name() == Some("shapes-late") {
+                        let _ = tx.send(());
+                    }
+                })),
+            );
+            late = Some(
+                std::thread::Builder::new()
+                    .name("shapes-late".into())
+                    .spawn({
+                        let store = store.clone();
+                        let completed = completed.clone();
+                        move || {
+                            let r = update(
+                                &store,
+                                "INSERT DATA { <urn:hub> <urn:link> <urn:two> }",
+                                &QueryOptions::default(),
+                            );
+                            completed.store(true, Ordering::SeqCst);
+                            r
+                        }
+                    })
+                    .map_err(|e| e.to_string())?,
+            );
+            draining
+                .recv_timeout(Duration::from_secs(10))
+                .map_err(|e| format!("late drain: {e}"))?;
+            Ok((
+                lower,
+                refreshed,
+                guard.status().counters.rejected - rejected,
+                store.snapshot().commit,
+                completed.load(Ordering::SeqCst),
+            ))
+        })();
+        let _ = go_tx.send(());
+        store.set_failpoint("group-sealed", None);
+        store.set_failpoint("group-appended", None);
+        store.set_failpoint("group-draining", None);
+        let held = held.join();
+        let bypassed = bypassed.map(|w| w.join());
+        let accepted = accepted.map(|w| w.join());
+        let late = late.map(|w| w.join());
+        assert!(
+            !expired.load(Ordering::SeqCst),
+            "held fence exceeded deadline"
+        );
+        assert_eq!(observed.unwrap(), (vec![head + 1], true, 1, head, false));
+        held.unwrap().unwrap();
+        bypassed.unwrap().unwrap().unwrap();
+        accepted.unwrap().unwrap().unwrap();
+        assert!(matches!(late.unwrap().unwrap(), Err(Error::Rejected(_))));
+        assert_eq!(store.snapshot().commit, head + 3);
+        assert_eq!(guard.baseline.lock().as_ref().unwrap().conforms, Some(true));
+        assert!(guard.pending.lock().is_empty());
+    }
+
+    fn undecodable_shapes_row(snapshot: &Snapshot) -> Snapshot {
+        use sparkles_core::index::Perm;
+        let mut bad = snapshot.clone();
+        let graph = bad.lookup_iri("urn:shapes").unwrap();
+        let pred = bad.lookup_iri(crate::vocab::rdf::TYPE.as_str()).unwrap();
+        let object = bad
+            .lookup_iri(crate::vocab::sh::NODE_SHAPE.as_str())
+            .unwrap();
+        bad.delta.ins[Perm::Gspo.index()].insert(Perm::Gspo.to_key(&[
+            Id::vocab(1 << 40),
+            pred,
+            object,
+            graph,
+        ]));
+        let err = crate::data::read_graph(&bad, Some("urn:shapes")).unwrap_err();
+        assert!(err.to_string().contains("cannot decode quad"), "{err:#}");
+        bad
+    }
+
+    fn shapes_read_failure(pre: bool) {
+        let (_dir, store, guard) =
+            graph_configured(false, GuardMode::Reject, BaselinePolicy::Grandfather);
+        update(
+            &store,
+            "INSERT DATA { <urn:hub> <urn:link> <urn:one>, <urn:two> }",
+            &bypass(),
+        )
+        .unwrap();
+        let healthy = store.snapshot();
+        let bad = Arc::new(undecodable_shapes_row(&healthy));
+        let state = serde_json::to_value(guard.status()).unwrap();
+        let loaded = guard.loaded.read().shapes.clone();
+        let opts = WriteOptions::default();
+        let checked = guard.check(&Candidate {
+            base: if pre { &bad } else { &healthy },
+            view: if pre { healthy.clone() } else { bad.clone() },
+            kind: CommitKind::Update,
+            changes: Changes::Unknown,
+            opts: &opts,
+        });
+        let err = checked.expect_err("a shapes read failure cannot validate");
+        assert!(err.to_string().contains("cannot decode quad"), "{err}");
+        assert_eq!(serde_json::to_value(guard.status()).unwrap(), state);
+        assert!(Arc::ptr_eq(&loaded, &guard.loaded.read().shapes));
+        assert!(guard.pending.lock().is_empty());
+        assert!(guard.exact.lock().is_none());
+    }
+
+    #[test]
+    fn post_shapes_read_failure_cannot_validate_an_empty_schema() {
+        shapes_read_failure(false);
+    }
+
+    #[test]
+    fn pre_shapes_read_failure_is_not_unproven_parse_repair() {
+        shapes_read_failure(true);
     }
 
     fn bypass_after_unpublished_validation(grouped: bool) {

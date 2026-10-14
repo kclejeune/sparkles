@@ -24,7 +24,8 @@
 # builds add to its defaults. It defaults to `embed-local`, the local embedding runtime,
 # which adds about 5 MB and runs nothing until a local provider is configured, and
 # `--build-arg FEATURES=` leaves it out. `--build-arg NO_DEFAULT_FEATURES=1` starts from
-# no default features at all.
+# no default features at all. The default `backup` feature also seals the model keys that
+# administrators store at runtime, so a build without it keeps them as plaintext files.
 # `docker build --target ocr -t sparkles:ocr .` builds the OCR variant. Its server finds
 # PDFium and ONNX Runtime through PDFIUM_LIB_PATH and ORT_DYLIB_PATH, and OCR is on when
 # `--pdf-ocr-models DIR` names a directory of PP-OCR models, usually a mounted volume.

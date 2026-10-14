@@ -441,6 +441,8 @@ impl Model {
 
     /// The bytes of every tracked file: the base content, then the durable operations,
     /// then the pending ones that `keep` chooses (or part of them, per 4 KiB page).
+    /// Pending page selections are independent per write, a conservative overapproximation
+    /// that need not describe a coherent physical page or sector snapshot.
     fn image(
         &self,
         base: &Path,

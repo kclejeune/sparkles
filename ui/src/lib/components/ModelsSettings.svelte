@@ -50,6 +50,8 @@
   let secrets = $state<SecretInfo[] | null>(null);
   /** How the server keeps stored keys: `sealed` or `plaintext`. */
   let storage = $state<string | null>(null);
+  /** Where the sealing key comes from: `configured` or `generated`. */
+  let keySource = $state<string | null>(null);
   let secretsError = $state<string | null>(null);
   /** The `models` kind as the panel last showed it. */
   let kind = $state<SettingsKind | null>(null);
@@ -90,6 +92,7 @@
     if (s.status === 'fulfilled') {
       secrets = s.value.secrets;
       storage = s.value.storage ?? null;
+      keySource = s.value.keySource ?? null;
       secretsError = null;
     } else secretsError = api.errorMessage(s.reason);
   }
@@ -480,14 +483,22 @@
         Keys are write-only: the server never sends one back. A key stored here is kept in the data
         directory and overrides the server config's key until it is removed.
       </p>
-      {#if storage === 'sealed'}
+      {#if storage === 'sealed' && keySource === 'generated'}
+        <p class="faint" data-testid="secrets-storage">
+          Stored keys are encrypted with a key that the server generated in its data directory (<code
+            >secrets.key</code
+          >). It protects copies of the stored keys made without that file, such as backups, but not
+          against someone who can read the whole data directory. Start the server with
+          <code>--secrets-key</code> to keep the key elsewhere.
+        </p>
+      {:else if storage === 'sealed'}
         <p class="faint" data-testid="secrets-storage">
           Stored keys are encrypted with the server's secrets key.
         </p>
       {:else if storage === 'plaintext'}
         <p class="faint" data-testid="secrets-storage">
-          Stored keys are kept unencrypted, readable by anyone who can read the data directory.
-          Start the server with <code>--secrets-key</code> to encrypt them.
+          Stored keys are kept unencrypted and are readable by anyone who can read the data
+          directory.
         </p>
       {/if}
       {#if secretsError}

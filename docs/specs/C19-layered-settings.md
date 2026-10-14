@@ -1022,6 +1022,100 @@ These points settle what the addendum left open.
   configured key stops the start; `--secrets-key none` stores plaintext; the TRACE log
   check of A12 still finds no value.
 
+**Landed for item 68 (2026-10-13): secrets sealed by default.** The sealer moved from
+`crypto/secret.rs` to `crates/sparkles-backup/src/seal/`, which every build of the crate
+compiles, together with `LockedKey` and the AES-GCM and HKDF primitives. `aws-lc-rs`,
+`zeroize`, `getrandom` and `base64` are no longer optional in `sparkles-backup`, and the
+`encryption` feature now adds only `argon2`. The default server build already had all
+four through rustls and the `auth` feature, and `cargo tree` lists the same crates before
+and after. `SecretSealer::from_key` puts the key in a locked page and falls back to a
+zeroizing heap buffer when the page cannot be made, and `key_memory()` says which.
+Reading a key input moved out of `resolve` into `sparkles::backup::keys::read_key`, which
+the `backup` feature compiles and which works on every platform, while `resolve` stays
+behind `backup-encryption`. `sparkles::catalog::lock_data_dir` takes the catalog lock for
+offline commands.
+
+`Sealing::start` in `settings/secrets.rs` replaces `Sealing::load` and follows the
+design's order: `--secrets-key SOURCE`, `none`, the credential `sparkles-secrets-key`,
+then `<dataDir>/secrets.key`. A missing key file is generated, as 64 hexadecimal digits
+with mode 0400, under the settings write lock of the first `PUT` or in `prepare` when the
+start finds plaintext values. The file is written to a temporary name and hard-linked
+into place, so it appears whole and never replaces an existing key, and the server
+refuses to write it when the data directory belongs to another user. Clones of `Sealing`
+share the key through an `Arc`, so the model configuration and the notification channels
+read values sealed after they were built. `GET /$/server/secrets` adds `keySource` and
+`keyMemory`, both `null` for plaintext values, and `keyMemory` is also `null` before a
+generated key exists. `sparkles secrets list` and the UI's API keys panel say when the key
+was generated beside the data. `sparkles secrets unseal --data DIR` and `rekey --data DIR
+--new-key SOURCE` take `--secrets-key` for the current key, open every value before
+writing any, and refuse while a server holds the catalog lock. `unseal` keeps
+`secrets.key`, so a later start of this release seals the values again with it, and
+`rekey` removes a generated key once the values are sealed under the new one.
+
+Sealing needs the `backup` feature, which is a default feature, because the sealer lives
+in `sparkles-backup` as designed. A server built without `backup` keeps plaintext values
+and refuses `--secrets-key` other than `none` at the start. Server backups do not exist
+yet (item 61), so nothing copies `secrets.key` into a repository today. Dataset backups
+capture only dataset directories, and `SECRETS_KEY_FILE` names the file that item 61's
+manifest must leave out. The previous release's binary is not available to the tests, so
+`unseal` is followed by a start with `--secrets-key none`, whose `prepare` reads plaintext
+values exactly as the previous release does. The tests are `generated_secrets_key`,
+`sealed_runtime_secrets` and `unseal_and_rekey` in `settings/server_tests.rs`,
+`secrets_key_none_and_unseal` and the A12 log check of
+`server_settings_restart_reload_and_log` in `tests/cli_server_settings.rs`, which also
+checks that the generated key never reaches the log, and the heap and locked round trips
+in `sparkles-backup`'s `seal` module.
+
+A review of this work led to follow-up fixes. `rekey` opens each value with the old key
+or, failing that, with the new one, so a run that stopped partway is finished by running
+the same command again. It reads every file back and opens it with the new key, and
+syncs the directory, before it removes the old generated key. A generated key is
+installed and its directory synced before any value is sealed with it, directory syncs
+report their errors, and the key file is set to mode 0400 whatever the umask. Loading
+an existing generated key also syncs its parent before migration or use, so a restart
+finishes an interrupted publication. A failed sync refuses startup and preserves the
+key and stored values for retry. A start, `unseal` and `rekey` remove the
+`.secrets.key.PID.tmp` and `secrets/.NAME.PID.tmp` files that a crashed write can leave.
+The settings CLI test gates its sealing assertions on
+the `backup` feature, and the errors for a build without it and for a data directory
+owned by another user say what to do. The new tests are
+`generated_key_must_be_durable_before_sealing`, `generated_key_mode_ignores_umask` and
+`stale_temporary_files_are_removed` in `settings/secrets.rs`, and
+`rekey_resumes_after_a_failed_write` in `settings/server_tests.rs`.
+
+A second review tightened offline finalization. A rekey retry cleans stale key files
+and syncs the data directory even after an earlier attempt unlinked the generated key.
+A stopped catalog with no runtime-secret directory is a valid empty case. Opening and
+verification require complete secret enumeration, so an unreadable entry or directory
+cannot authorize key removal. The internal migration and verification plaintext owners
+are zeroizing through UTF-8 validation in builds with `backup`. The generated-key
+reader allocates its full 4097-byte input bound before reading into its zeroizing
+buffer, so accepted padded key input does not grow a buffer that already holds key
+bytes. This requests up to 3968 additional bytes for a one-time key read. The encryption
+buffer reserves tag capacity before copying plaintext, so tag appending does not grow
+a buffer that already holds plaintext. Public request reads still return ordinary strings, and
+this does not claim to wipe every heap allocation.
+
+The X12 registry records the existing sealed v1 envelope and the separate raw generated
+key. Unknown, malformed and encrypted version-zero envelopes are refused before
+fallback, preserving live values and keys. The v1 bytes and authenticated name binding
+are unchanged. Regression tests cover final-sync retries, stale-key cleanup, missing
+secret directories, incomplete enumeration, UTF-8 refusal and key classification. A
+legacy v1 fixture and the safe append-tag observer cover compatibility and buffer growth.
+Arbitrary allocator scanning was omitted because it could read uninitialized padding.
+
+Two decisions are recorded. Sealing needs the default `backup` feature, so the docs say
+that every build with it seals, and a build without it keeps plaintext (D1). A start
+that must generate a key in a data directory owned by another user still fails, with an
+error that names the ownership fix, `--secrets-key SOURCE` and `--secrets-key none`, and
+USAGE describes the Docker bind-mount case under its upgrade notes (D2).
+
+* **Follow-up.** Refuse to generate `secrets.key` in a data directory that is group- or
+  world-writable, since another user could then delete the key and stop the server. They
+  cannot put in a key of their own, because the server rejects a key file owned by
+  another user. The check needs a test that sets mode 0o777 on a temporary directory and
+  expects the refusal (D3).
+
 **UI controls that turn on assistant ingestion** (item 77, Tier 5,
 [ROADMAP](../ROADMAP.md)). The other half of item 77, redaction beyond the fixed
 patterns, is in

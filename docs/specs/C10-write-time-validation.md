@@ -1105,6 +1105,20 @@ SHACL validation" task error, the validation status in CLI summaries and
 `INSERT DATA` latency with validation off, warn and reject. The W3C SPARQL suites and the
 SHACL suite (98/98 Core, 20/20 SPARQL) stayed green.
 
+A relevant write with an unknown validation baseline reloads configured graph-backed
+shapes from the actual candidate state, including an unpublished grouped prefix. Refreshed shapes are staged
+with a successful live commit and become the published cache with that commit. Dry runs
+and rejections do not replace the cache. A known baseline without incremental counts
+continues to use its existing schema.
+
+An absent shapes graph contributes nothing. A graph read or decoding failure propagates
+and cannot validate an empty or partial schema. Malformed post-state shapes reject the
+write. In grandfather mode, valid pre-state shapes are reloaded for comparison after a
+bypass. If that authoritative pre-schema cannot parse, a parseable repair treats its
+post-state blocking results as new. Results below the configured severity threshold do
+not block the repair. Read failures never qualify for this fallback. Initial installation
+still establishes its grandfather baseline from the current report.
+
 **Deviations.**
 - `sparkles stats` shows no "last full N ms" for SHACL. The baseline lives only in
   memory, because Phase 1 does not persist it.

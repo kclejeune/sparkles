@@ -24,14 +24,14 @@
 //! first key of each vocabulary block instead of every key, and segment files' presence
 //! instead of their checksums. The WAL and the catalog are checked fully in both modes.
 
-use crate::builder::{FORMAT_VERSION, IndexMeta, Stats};
+use crate::builder::{IndexMeta, Stats};
 use crate::commit::{self, CommitInfo};
 use crate::error::{Error, Result};
 use crate::id::{Id, Tag};
 use crate::index::{
     BLOCK_ROWS, BlockMeta, Key, META_BYTES, Perm, decode_column, read_varint_checked,
 };
-use crate::store::{WAL_COMMIT, WAL_DELETE, WAL_INSERT, WAL_REC};
+use crate::store::{WAL_COMMIT, WAL_DELETE, WAL_HEADER, WAL_INSERT, WAL_REC};
 use crate::vocab::{FC_BLOCK, parse_delta};
 use rayon::prelude::*;
 use serde::Serialize;
@@ -716,14 +716,11 @@ impl Checker<'_> {
             Ok(b) => match serde_json::from_slice::<IndexMeta>(&b) {
                 Err(e) => run.add(Issue::error(format!("does not parse: {e}")).file(&meta_file)),
                 Ok(m) => {
-                    if m.format_version != FORMAT_VERSION {
-                        run.add(
-                            Issue::error(format!(
-                                "index format {} but this build reads {FORMAT_VERSION}: dump and reload the data",
-                                m.format_version
-                            ))
-                            .file(&meta_file),
-                        );
+                    let written_by = dir.parent().and_then(crate::commit::read_written_by);
+                    if let Err(e) =
+                        crate::formats::INDEX.check(name, m.format_version, written_by.as_deref())
+                    {
+                        run.add(Issue::error(e.to_string()).file(&meta_file));
                     }
                     self.meta = Some(m);
                 }
@@ -1249,8 +1246,8 @@ impl Checker<'_> {
         let recs = buf.as_chunks::<WAL_REC>().0;
         // whether damage at record `i` is a torn tail that open truncates, by the rule
         // open uses
-        let torn_at = |i: usize, prev_seq: Option<u64>| {
-            crate::store::wal_torn_from(buf, i, prev_seq.map_or(0, |s| s + 1))
+        let torn_at = |i: usize, prev_seq: Option<u64>, framed_metadata: bool| {
+            crate::store::wal_torn_from(buf, i, prev_seq.map_or(0, |s| s + 1), framed_metadata)
         };
         // the commits that have an annotation, to find a commit of a group that reached
         // the disk without the one it asked for (see `commit::WAL_FLAG_ANNOTATED`)
@@ -1263,7 +1260,10 @@ impl Checker<'_> {
         let mut txn_start = 0usize;
         let mut good = 0usize;
         let mut seen_v2 = false;
+        let mut framed_metadata = false;
         let mut torn = false;
+        // the log's version: 0 without a header record
+        let mut version = 0u32;
         let mut ids_checked = 0u64;
         // the id problems of the current transaction, reported when its commit record
         // shows whether it is torn; and whether one is a delta id beyond delta.vocab
@@ -1277,6 +1277,22 @@ impl Checker<'_> {
                 ))
             });
             match rec[0] {
+                // the header record of a log written by a release with log versions
+                WAL_HEADER if i == 0 => {
+                    match crate::store::wal::header_version(rec, &dir.join("wal.log")) {
+                        Ok(v) => {
+                            version = v;
+                            framed_metadata = v == 1;
+                        }
+                        Err(e) => {
+                            run.add(Issue::error(e.to_string()).file(&file).offset(0));
+                            torn = true;
+                            break;
+                        }
+                    }
+                    txn_start = 1;
+                    good = WAL_REC;
+                }
                 WAL_INSERT | WAL_DELETE => {
                     data_recs += 1;
                     for (pos, id) in q.iter().enumerate() {
@@ -1299,12 +1315,35 @@ impl Checker<'_> {
                     let n = i - txn_start;
                     let n = format!("{n} data record{}", if n == 1 { "" } else { "s" });
                     let meta = commit::open_wal_commit(rec, data);
+                    if meta.is_none() && framed_metadata {
+                        let suffix_torn = torn_at(i, prev_seq, framed_metadata);
+                        let message = if suffix_torn {
+                            format!(
+                                "the transaction ({n} from offset {}) has lost its modern commit metadata, and no later commit shows it was durable: it is treated as torn and truncated on open",
+                                txn_start * WAL_REC
+                            )
+                        } else {
+                            format!(
+                                "missing modern commit metadata in the transaction ({n} from offset {}) ending at byte {}: a later commit proves it durable, so open refuses the database",
+                                txn_start * WAL_REC,
+                                (i + 1) * WAL_REC
+                            )
+                        };
+                        let issue = if suffix_torn {
+                            Issue::warning(message)
+                        } else {
+                            Issue::error(message)
+                        };
+                        run.add(issue.file(&file).offset(at).row(i as u64));
+                        torn = true;
+                        break;
+                    }
                     let issues = std::mem::take(&mut txn_issues);
                     let missing_terms = std::mem::take(&mut txn_missing_terms);
                     // damage that no later commit record shows was durable is a torn tail
                     let torn_here = (matches!(meta, Some(Err(())))
                         || (missing_terms && matches!(meta, Some(Ok(_)))))
-                        && torn_at(i, prev_seq);
+                        && torn_at(i, prev_seq, framed_metadata);
                     if torn_here && missing_terms && matches!(meta, Some(Ok(_))) {
                         run.add(
                             Issue::warning(format!(
@@ -1322,7 +1361,7 @@ impl Checker<'_> {
                         && flags & commit::WAL_FLAG_ANNOTATED != 0
                         && !set.contains(seq)
                     {
-                        if torn_at(i, prev_seq) {
+                        if torn_at(i, prev_seq, framed_metadata) {
                             run.add(
                                 Issue::warning(format!(
                                     "the annotation of commit {seq} is missing from annotations.bin, and no later commit shows it was durable: it did not reach the disk before a crash, so the commit is treated as torn and truncated on open"
@@ -1419,7 +1458,7 @@ impl Checker<'_> {
                     txn_start = i + 1;
                 }
                 op => {
-                    if !torn_at(i, prev_seq) {
+                    if !torn_at(i, prev_seq, framed_metadata) {
                         run.add(
                             Issue::error(format!(
                                 "record {i} has unknown type {op}, and a later commit record shows its transaction was durable: open refuses the database"
@@ -1489,7 +1528,7 @@ impl Checker<'_> {
                 " and {folded} older-version commits that open folds into a baseline"
             ));
         }
-        summary.push_str(&format!("; head {head}"));
+        summary.push_str(&format!("; head {head}; version {version}"));
         if preallocated > 0 {
             summary.push_str(&format!("; {preallocated} bytes preallocated"));
         }

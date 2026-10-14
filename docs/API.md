@@ -190,12 +190,17 @@ validators (`sparkles_shacl`, `sparkles_shex`).
 | `sparkles_rows_produced_total` | counter. The rows every operator of a query or an update produced, the work that `--max-rows-produced` limits. | `dataset` |
 | `sparkles_query_memory_peak_bytes` | histogram (1 MiB … 16 GiB, ×4). The estimated memory peak of each query, the measure that `--query-memory-mb` limits. | `dataset` |
 | `sparkles_budget_exceeded_total` | counter | `dataset`, `budget` |
+| `sparkles_query_pool_capacity_bytes`, `sparkles_query_pool_granted_bytes` | gauge. The [query memory pool](#query-memory-pool) and the part of it granted to running queries. Present while the pool is on. | |
+| `sparkles_query_admission_waiting` | gauge. Requests waiting for a share of the pool. | |
+| `sparkles_query_admission_wait_seconds` | histogram (1 ms … 2 s). How long each admitted request waited for its share. | |
+| `sparkles_query_admission_rejected_total` | counter. Requests answered `503` because the pool stayed full for `--query-admission-wait`. | |
 | `sparkles_dataset_quads`, `sparkles_wal_bytes`, `sparkles_disk_bytes` | gauge | `dataset` |
 | `sparkles_dataset_quota_bytes` | gauge. The storage quota of a persistent dataset, `0` when unlimited. | `dataset` |
 | `sparkles_delta_quads` | gauge | `dataset`, `kind` = `insert` \| `delete` |
-| `sparkles_block_cache_bytes`, `…_capacity_bytes` | gauge | `dataset` |
+| `sparkles_block_cache_bytes` | gauge. The bytes of the shared block cache that the dataset's blocks hold. | `dataset` |
+| `sparkles_block_cache_capacity_bytes`, `sparkles_result_cache_capacity_bytes` | gauge. The size of the shared cache. The caches are sized once for the server, so these carry no label. | |
 | `sparkles_block_cache_hits_total`, `…_misses_total` | counter | `dataset` |
-| `sparkles_result_cache_bytes`, `…_capacity_bytes`, `…_entries` | gauge | `dataset` |
+| `sparkles_result_cache_bytes`, `…_entries` | gauge. What the dataset holds in the shared result cache. | `dataset` |
 | `sparkles_result_cache_hits_total`, `…_misses_total` | counter | `dataset` |
 | `sparkles_validation_total` | counter | `dataset`, `language` = `shacl` \| `shex`, `status` = `passed` \| `warned` \| `rejected` \| `skipped` \| `bypassed` \| `timeout` \| `error` |
 | `sparkles_validation_duration_seconds` | histogram (1 ms … 300 s) | `dataset`, `language`, `strategy` = `full` \| `incremental` |
@@ -234,8 +239,11 @@ its first request, and from then on with all nine outcomes. The `denied` outcome
 refusal by the auth layer. Health checks (`/$/ping`, `/$/ready`), `/$/metrics` and UI
 assets are not counted. The validation series cover every validated write to a dataset
 with write-time validation, whether it comes over HTTP, over MCP or from a reasoning task.
-Deleting a dataset removes its series. Each dataset has its own block cache and result
-cache, each sized to the global `--cache-mb` / `--result-cache-mb`.
+Deleting a dataset removes its series. The block, result, SERVICE and history caches are
+shared by all datasets and sized once by `--cache-mb`, `--result-cache-mb`,
+`--service-cache-mb` and `--history-cache-mb`. The per-dataset cache series count the
+bytes, entries, hits and misses that the dataset caused. Before this sharing, the capacity
+series carried a `dataset` label and each dataset had its own cache of that size.
 
 When rate limits are configured or authentication is on, the counter
 `sparkles_rate_limited_total{dataset,class}` counts refused requests per limit class,
@@ -678,7 +686,7 @@ type DatasetInfo = {
   "ds.state": boolean;     // false while offline
   "ds.services": { "srv.type": string; "srv.description": string; "srv.endpoints": string[] }[];
                            // query, update, gsp-rw, gsp-r, upload, prefixes-rw, SHACL, and
-                           // gsp-direct-rw with --gsp-direct-naming; "" is the dataset URL
+                           // gsp-direct-rw or gsp-direct-r with --gsp-direct-naming; "" is the dataset URL
 };
 
 type FusekiCounters = {
@@ -870,8 +878,9 @@ way older Fuseki versions did. Fuseki 6 itself refuses such bodies. The syntaxes
   served at the dataset URL and `update`, and `gsp-rw` and `gsp-r` at the dataset URL,
   `data` and `get`. `patch` is served at the dataset URL and `patch`. `upload` and
   `shacl` keep their names, and `prefixes-r` and
-  `prefixes-rw` are served at `prefixes`. `gsp-direct-rw` and `gsp-direct-r` need a
-  server started with `--gsp-direct-naming`.
+  `prefixes-rw` are served at `prefixes`. `gsp-direct-rw` and `gsp-direct-r` need the
+  server's `--gsp-direct-naming` to cover the dataset, which sets its mode. A
+  `gsp-direct-rw` endpoint is refused for a dataset the flag makes read-only.
 * A dataset of type `tdb2:DatasetTDB2` or `tdb:DatasetTDB` becomes a persistent dataset,
   unless its location is `--mem--`. A `ja:MemoryDataset`, `ja:DatasetTxnMem` or
   `ja:RDFDataset` becomes an in-memory dataset.
@@ -1483,7 +1492,7 @@ leaves a `DST.clone-tmp-PID` directory, which the next run into `DST` removes.
 | any        | `/{ds}`               | Also the update endpoint (`update=` or `application/sparql-update`), the patch endpoint for a `POST` of `application/rdf-patch` or `application/rdf-patch+thrift`, and the Graph Store endpoint for any other body. A form body (`application/x-www-form-urlencoded`) must hold `query` or `update`. A form with neither is refused and never read as RDF. The refusal is a `400`, or a write's authorization error for a caller without write access. |
 | POST       | `/{ds}/update`        | SPARQL 1.1 Update protocol, with an `update=` form or an `application/sparql-update` body. `using-graph-uri` and `using-named-graph-uri` are the `USING` and `USING NAMED` of every `DELETE`/`INSERT` operation. An operation with `USING`, `USING NAMED` or `WITH` of its own makes them a `400`. An update sent with GET (`/{ds}?update=…`) gets `405`. |
 | GET/PUT/POST/DELETE/HEAD | `/{ds}/data` , `/{ds}/get` | Graph Store Protocol, with `?default` or `?graph=<iri>`. `?graph=default` and `?graph=urn:x-arq:DefaultGraph` name the default graph. `?graph=union` and `?graph=urn:x-arq:UnionGraph` read the union of the named graphs, each triple once. Writing to it is a `400`. A GET with neither parameter returns the whole dataset as N-Quads or TriG. GET is streamed from one snapshot (see [Budgets](#budgets)). |
-| any        | `/{ds}/{path}`        | Fuseki's direct naming, with `sparkles serve --gsp-direct-naming`: the Graph Store Protocol on the graph whose IRI is the request URL without its query, such as `http://host:3030/ds/graphs/one`. The scheme and host are `X-Forwarded-Proto` and `X-Forwarded-Host` when a proxy sends them, else `http` and `Host`. Endpoint names (`sparql`, `data`, `shacl`, …) keep their meaning, so a graph cannot be named by one of them. `?graph=` and `?default` are a `400`. Without the flag the path is a `404`. |
+| any        | `/{ds}/{path}`        | Fuseki's direct naming, with `sparkles serve --gsp-direct-naming`: the Graph Store Protocol on the graph whose IRI is the request URL without its query, such as `http://host:3030/ds/graphs/one`. The scheme and host are `X-Forwarded-Proto` and `X-Forwarded-Host` when a proxy sends them, else `http` and `Host`. Endpoint names (`sparql`, `data`, `shacl`, …) keep their meaning, so a graph cannot be named by one of them. `?graph=` and `?default` are a `400`. Without the flag the path is a `404`. With `--gsp-direct-naming=NAME=read` the dataset is read-only there, and a write answers `405` with `Allow: GET, HEAD, OPTIONS` for any caller who may read the dataset. |
 | POST       | `/{ds}/upload`        | Multipart file upload. The format comes from the file name extension or the content type. Optional `graph` field. CSV and TSV tables are mapped to triples, as [CSV and TSV uploads](#csv-and-tsv-uploads) describes. |
 | POST/PATCH | `/{ds}/patch`         | Applies an RDF Patch in one commit, as Fuseki's `patch` operation. See [Applying RDF Patch](#applying-rdf-patch). |
 | POST       | `/{ds}/shacl`         | SHACL validation, as in Fuseki's `/{ds}/shacl`. See [SHACL validation](#shacl-validation). |
@@ -1581,7 +1590,7 @@ Query parameters beyond the standard protocol:
   `true` if the dataset has any.
 * `nocache=true` bypasses the query result cache, so nothing is read from it or stored in
   it. It is meant for benchmarking, and `explain` accepts it too. `sparkles serve
-  --result-cache-mb N` sets the server-wide cache budget (default 512, `0` disables the
+  --result-cache-mb N` sets the server-wide cache budget (default 256, `0` disables the
   cache). The cache is keyed by snapshot version, so updates invalidate it.
   `POST /$/cache/clear/{ds}` empties it. `nocache=true` also skips the cache of remote
   results that `SERVICE <cache:…>` uses ([SERVICE options](#service-options-loop-bulk-and-cache)).
@@ -2104,7 +2113,7 @@ budget. A caller without `federate`, or a server with SERVICE turned off, is ref
 when the cache holds the answer. Cache entries are kept per caller and per endpoint of
 the request, so callers with different credentials or graph views never read each
 other's entries. Library users choose the scope with `QueryOptions::service_scope`. The
-cache holds `--service-cache-mb` (64) per dataset, skips any entry larger than an eighth
+cache holds `--service-cache-mb` (64) for the whole server, skips any entry larger than an eighth
 of that, and keeps no entry for a response that was cut short. `POST /$/cache/clear/{ds}`
 empties it, the `no_cache` query option skips it, and the dataset's statistics report it
 as `serviceCache`.
@@ -3377,8 +3386,8 @@ longer kept is `410 history-gone`, and the body lists the readable ranges:
   "reconstructable": [ { "from": 40, "to": 57 } ], "metadata": { "seq": 12, … } }
 ```
 
-Materializing a past state is bounded by `--history-cache-mb` (default 1024, `507`
-beyond it) and by the request timeout. Results are cached, and one materialization runs
+Materializing a past state is bounded by `--history-cache-mb` (default 512 for the whole
+server, `507` beyond it) and by the request timeout. Results are cached, and one materialization runs
 at a time. A state starts from the nearest known state of its generation in the
 write-ahead log: the generation's base, a cached past state before or after it, or the
 live state. Later states replay the log forward, and earlier ones undo it backward, so a
@@ -3621,8 +3630,8 @@ as `/{ds}/diff`.
 
 `unrecorded` names the commits whose changes the log does not hold. `before-log` commits
 are older than the log, because it started later or retention dropped them. A `bulk`
-commit loaded more than 1,000,000 quads into a non-empty dataset and is recorded with its
-counts only. A `gap` is a stretch the log could not record. A SPARQL history query skips
+commit loaded, or dropped graphs of, more than 1,000,000 quads in a non-empty dataset and
+is recorded with its counts only. A `gap` is a stretch the log could not record. A SPARQL history query skips
 these commits silently. `sparkles history --loc DB --subject IRI` prints the same changes
 from the command line.
 
@@ -7110,6 +7119,9 @@ fails the request with `507 Insufficient Storage` and a body like this:
   at once, at 8 bytes per value. It is checked before large intermediate results are
   built, so an oversized query fails fast. It is an estimate, not a limit on the
   process's memory.
+* `server-memory` is not one of the request's own budgets. It reports that the server's
+  [query memory pool](#query-memory-pool) is in use. It answers `503 Service Unavailable`
+  with `Retry-After: 1`, because a retry can succeed once other queries finish.
 * `result-bytes` (`--max-result-mb`, default 1024) is the serialized, uncompressed body of
   a SPARQL query response. Graph Store GET, the export path for a graph or the whole
   dataset, has its own budget, `--max-export-mb`, which is unlimited (`0`) by default.
@@ -7145,7 +7157,62 @@ fails the request with `507 Insufficient Storage` and a body like this:
 quads for `hidden-quads`. The
 response of `/{ds}/update` includes `memPeakBytes` and `rowsProduced`.
 `meta.memory.peakBytes` and `meta.rowsProduced` in `application/x-sparkles+json` report a
-query's peak memory estimate and the rows its operators produced.
+query's peak memory estimate and the rows its operators produced. With the query memory
+pool on, `meta.memory.grantedBytes` is the most the query held of the pool.
+
+#### Query memory pool
+
+The design is in [X08 Disk spill and server-wide memory](specs/X08-disk-spill-and-server-memory.md).
+The budgets above bound one query. The pool bounds all queries and updates together, so
+that many large queries cannot add up to more memory than the host has. It counts the same
+estimated bytes as `memory`, not the process's resident memory.
+
+`sparkles serve --total-query-memory-mb N` sets the pool. Without it, the pool is half of
+the memory available to the process, less the configured caches, and at least 256 MiB. The
+available memory is the cgroup v2 limit of the server's cgroup when one is set, and the
+physical memory otherwise. `--memory-profile small` sets 2048 MiB, and `0` turns the pool
+off. On a host where the available memory cannot be read, the pool is off until the flag
+sets it.
+
+Each query and update request is admitted before it parses, after the rate limiter's
+concurrency caps have let it through. Admission takes an initial grant of 16 MiB, or the
+request's whole `--query-memory-mb` budget if that is smaller. If the pool cannot give it,
+the request waits in arrival order. After `--query-admission-wait` seconds (default 2) it
+answers `503` with `Retry-After: 1` and the budget `server-memory`. A waiter behind a
+larger one may be served first when the pool has room for it, at most eight times in a
+row. A running query grows its grant in steps of 4 MiB as its estimate grows, and gives
+steps back as its estimate falls. A query never waits for memory once it runs. When the
+pool cannot cover its next step, the query fails with `server-memory`, and the pool
+therefore cannot deadlock. While requests wait, a query may not hold more than half of the
+pool. A query that exceeds its own `memory` budget still answers `507`.
+
+An eager query keeps its highest estimate in the pool until its result is released, so
+results held by the caller keep their share. A SERVICE call to the same server is admitted
+like any request, so it can answer `503` while its caller holds memory. Uploads and Graph
+Store writes take an admission grant for the whole load, and the memory of the load itself
+is not counted in the pool.
+
+`GET /$/server/memory` needs the `metrics` permission and returns the pool and the shared
+caches.
+
+```json
+{ "profile": "default", "queryMemoryBytes": 8589934592,
+  "pool": { "enabled": true, "capacityBytes": 4294967296, "grantedBytes": 33554432,
+            "waiting": 0, "admitted": 120, "rejected": 0, "admissionWaitSeconds": 2.0 },
+  "caches": { "shared": true,
+              "block": { "capacityBytes": 1073741824, "bytes": 402653184, "entries": 1536 },
+              "result": { "capacityBytes": 268435456, "bytes": 0, "entries": 0 },
+              "service": { "capacityBytes": 67108864, "bytes": 0, "entries": 0 },
+              "history": { "capacityBytes": 536870912, "bytes": 0 } },
+  "datasets": [ { "name": "ds", "blockBytes": 402653184, "blockEntries": 1536,
+                  "resultBytes": 0, "resultEntries": 0,
+                  "serviceBytes": 0, "serviceEntries": 0 } ] }
+```
+
+Requests that are not queries or updates, such as administration, are not admitted. A
+query that such a request or an MCP tool call runs starts with an empty grant and grows it
+like any other. It does not queue, and it fails with `server-memory` when the pool is
+short.
 
 **Budgets per request.** A query can ask for lower budgets than the server's with
 `memory-mb`, `max-rows`, `max-rows-produced` and `max-result-mb`, in the query string or
@@ -9771,20 +9838,31 @@ the declared source unless the settings file locks `secrets.NAME`. A secret's na
 rule applies to `--model-secret` names and to `apiKey.secret`.
 
 A runtime value is kept in `<dataDir>/secrets/NAME` with mode 0600, in a directory with
-mode 0700, and is written to a temporary file and renamed into place. Without a secrets
-key the files hold the values as plaintext. An operator who does not want keys on disk
-locks the secrets in the settings file or starts the server with a secrets key.
+mode 0700, and is written to a temporary file and renamed into place. Every build with
+the default `backup` feature seals each value with a secrets key. A build without that
+feature keeps plaintext files and refuses `--secrets-key` with any source other than
+`none`. An operator who does not want keys on disk at all locks the secrets in the
+settings file.
 
-`serve --secrets-key SOURCE`, or the environment variable `SPARKLES_SECRETS_KEY`, seals
-each runtime value with a key that the server reads once at the start. The source is
-`file:PATH`, `env:VARIABLE`, `credential:NAME` for a file in systemd's
-`$CREDENTIALS_DIRECTORY`, or `command:PROGRAM ARGS`, which runs an absolute program
-without a shell and reads the key from its standard output. `command:` also takes a JSON
-argv array. The key is 32 bytes written as 64 hexadecimal digits or base64, and the same
-rules apply as to a [backup repository key](USAGE.md#encrypted-repositories). A key file
-must not be readable by group or others and must not lie in the data directory. The
-option needs a build with the `backup-encryption` feature on Linux, and a build without
-it refuses the option at the start.
+`serve --secrets-key SOURCE`, or the environment variable `SPARKLES_SECRETS_KEY`, names
+the key, which the server reads once at the start. The source is `file:PATH`,
+`env:VARIABLE`, `credential:NAME` for a file in systemd's `$CREDENTIALS_DIRECTORY`, or
+`command:PROGRAM ARGS`, which runs an absolute program without a shell and reads the key
+from its standard output. `command:` also takes a JSON argv array. The key is 32 bytes
+written as 64 hexadecimal digits or base64, and the same rules apply as to a
+[backup repository key](USAGE.md#encrypted-repositories). A key file must not be
+readable by group or others and must not lie in the data directory.
+
+Without the option, the server uses the systemd credential `sparkles-secrets-key` when
+`$CREDENTIALS_DIRECTORY` holds one, then `<dataDir>/secrets.key`. When neither exists,
+the first value it stores, or the first plaintext value it finds at the start, makes it
+generate 32 random bytes and write them to `<dataDir>/secrets.key` as 64 hexadecimal
+digits with mode 0400. It writes the file only when the data directory belongs to the
+user the server runs as, and it never replaces an existing file. A generated key does
+not protect the values from someone who can read the whole data directory, but it
+protects copies of `secrets/` made without it. There is no whole-server backup yet
+(roadmap item 61), and dataset backups include neither `secrets/` nor `secrets.key`.
+`--secrets-key none` keeps the values as plaintext files.
 
 A sealed file is one line, `sparkles-sealed-secret/1 SALT CIPHERTEXT`, in base64. Each
 value is encrypted with AES-256-GCM under a key that HKDF-SHA256 derives from the secrets
@@ -9792,12 +9870,22 @@ key and a fresh salt, and the secret's name is part of the authenticated data, s
 copied or renamed to another secret's name does not open. At the start the server opens
 every stored value. A plaintext value is sealed in place, and a value that does not open
 stops the start with an error that names the secrets, whether the key is wrong or a file
-was changed or renamed. A server started without a key refuses to start when it finds a
-sealed value. Declared sources of `--model-secret` are read as before and never sealed.
+was changed or renamed. A server that has no key for a sealed value, because it runs
+with `--secrets-key none` or `secrets.key` is missing, refuses to start. Declared
+sources of `--model-secret` are read as before and never sealed. The key stays in a
+locked page that core dumps leave out on Linux, and in a heap buffer that is zeroed on
+release on other platforms or when the page cannot be locked.
+
+`sparkles secrets unseal --data DIR` writes the sealed values of a stopped server back as
+plaintext, for a downgrade to a release that does not seal them, and
+`sparkles secrets rekey --data DIR --new-key SOURCE` seals them again under another key
+and removes a generated `secrets.key` once every value opens with the new key. Running
+an interrupted `rekey` again finishes it. Both run offline and hold the data directory's
+catalog lock, and both take `--secrets-key SOURCE` for the current key.
 
 | Method | Path | Needs | Effect |
 |---|---|---|---|
-| GET | `/$/server/secrets` | `server-admin` | `{storage, secrets}`. `storage` is `sealed` with a secrets key and `plaintext` without one. Each secret has its `name`, `source` (`declared`, `runtime` or `missing`), whether a `declared` source exists, whether it is `locked`, `setAt` for a runtime value, `overridden` when a lock ignores a stored value, and the `providers` and notification `channels` that use it. |
+| GET | `/$/server/secrets` | `server-admin` | `{storage, keySource, keyMemory, secrets}`. `storage` is `sealed`, or `plaintext` with `--secrets-key none`. `keySource` is `configured` for `--secrets-key` or the systemd credential, `generated` for `<dataDir>/secrets.key`, and `null` for plaintext values. `keyMemory` is `locked` or `heap`, and `null` until there is a key. Each secret has its `name`, `source` (`declared`, `runtime` or `missing`), whether a `declared` source exists, whether it is `locked`, `setAt` for a runtime value, `overridden` when a lock ignores a stored value, and the `providers` and notification `channels` that use it. |
 | PUT | `/$/server/secrets/{name}` | `server-admin` | Stores a runtime value from `{"value": "..."}`, `204`. |
 | DELETE | `/$/server/secrets/{name}` | `server-admin` | Removes the runtime value, so the declared source applies again, `204` whether or not there was one. |
 
