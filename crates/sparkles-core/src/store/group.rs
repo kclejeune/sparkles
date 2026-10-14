@@ -2348,6 +2348,174 @@ mod tests {
         }
     }
 
+    /// A guard whose check fails with an error that is not a rejection once the state it
+    /// judges holds a commit, which a speculative base does while the first fence is
+    /// pending.
+    struct Broken;
+
+    impl crate::guard::CommitGuard for Broken {
+        fn check(
+            &self,
+            c: &crate::guard::Candidate<'_>,
+        ) -> Result<crate::guard::ValidationSummary> {
+            use crate::guard::{GuardMode, GuardStatus, Severity, ValidationSummary};
+            if c.base.commit >= 1 {
+                return Err(Error::Invalid("the shapes no longer parse".into()));
+            }
+            Ok(ValidationSummary::empty(
+                GuardStatus::Passed,
+                GuardMode::Reject,
+                Severity::Violation,
+            ))
+        }
+        fn describe(&self) -> String {
+            "broken".into()
+        }
+        fn speculative(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn a_guard_error_other_than_rejection_waits() {
+        for fence_fails in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let s = Arc::new(Store::open(dir.path(), options()).unwrap());
+            s.set_guard(Some(Arc::new(Broken)));
+            let (hit, go) = pause(&s, "group-sealed");
+            let first = {
+                let s = s.clone();
+                thread::spawn(move || insert(&s, "one"))
+            };
+            hit.recv_timeout(Duration::from_secs(5)).unwrap();
+            let (done, received) = mpsc::channel();
+            let next = {
+                let s = s.clone();
+                thread::spawn(move || done.send(insert(&s, "two")).unwrap())
+            };
+            // the guard failed against a state that is not durable yet
+            assert!(received.recv_timeout(Duration::from_millis(100)).is_err());
+            if fence_fails {
+                s.fail_next_group_sync();
+            }
+            go.send(()).unwrap();
+            let answer = received.recv_timeout(Duration::from_secs(5)).unwrap();
+            if fence_fails {
+                assert!(matches!(answer, Err(Error::Poisoned)), "{answer:?}");
+                assert!(first.join().unwrap().is_err());
+            } else {
+                assert!(matches!(answer, Err(Error::Invalid(_))), "{answer:?}");
+                assert_eq!(first.join().unwrap().unwrap().commit.seq, 1);
+            }
+            next.join().unwrap();
+        }
+    }
+
+    /// A view that hides `urn:p` on subjects of `urn:Hidden`, which a write may not touch.
+    fn hidden_class_access() -> Arc<crate::access::GraphAccess> {
+        use crate::access::{Caller, GraphAccess, Graphs, Limits, Protection, Rule, TripleRules};
+        let protection = Protection {
+            name: "hidden".into(),
+            predicates: Some(vec!["urn:p".into()]),
+            classes: Some(vec!["urn:Hidden".into()]),
+            subclasses: true,
+            graphs: None,
+            pattern: None,
+            prefixes: Default::default(),
+            hide_inferences: false,
+        };
+        Arc::new(GraphAccess::with_triples(
+            Graphs::All,
+            Graphs::All,
+            TripleRules {
+                rules: vec![Rule {
+                    protection: Arc::new(protection),
+                    read: Graphs::none(),
+                    write: Graphs::none(),
+                }],
+                caller: Caller::default(),
+                limits: Limits::default(),
+            },
+        ))
+    }
+
+    #[test]
+    fn a_class_protection_refusal_waits_for_the_durable_head() {
+        for fence_fails in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let s = Arc::new(Store::open(dir.path(), options()).unwrap());
+            let (hit, go) = pause(&s, "group-sealed");
+            // commit 1 makes `urn:s` a protected subject, and is not durable yet
+            let first = {
+                let s = s.clone();
+                thread::spawn(move || {
+                    crate::sparql::update::update(
+                        &s,
+                        "INSERT DATA { <urn:s> a <urn:Hidden> }",
+                        &Default::default(),
+                    )
+                })
+            };
+            hit.recv_timeout(Duration::from_secs(5)).unwrap();
+            let (done, received) = mpsc::channel();
+            let next = {
+                let s = s.clone();
+                thread::spawn(move || {
+                    let opts = crate::sparql::QueryOptions {
+                        graphs: Some(hidden_class_access()),
+                        ..Default::default()
+                    };
+                    done.send(crate::sparql::update::update(
+                        &s,
+                        "INSERT DATA { <urn:s> <urn:p> \"x\" }",
+                        &opts,
+                    ))
+                    .unwrap()
+                })
+            };
+            // refused for a subject that only the pending commit makes protected
+            assert!(received.recv_timeout(Duration::from_millis(200)).is_err());
+            if fence_fails {
+                s.fail_next_group_sync();
+            }
+            go.send(()).unwrap();
+            let answer = received.recv_timeout(Duration::from_secs(5)).unwrap();
+            if fence_fails {
+                assert!(matches!(answer, Err(Error::Poisoned)), "{answer:?}");
+                assert!(first.join().unwrap().is_err());
+            } else {
+                assert!(matches!(answer, Err(Error::NotPermitted(_))), "{answer:?}");
+                first.join().unwrap().unwrap();
+            }
+            next.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn a_patch_syntax_error_is_reported_while_a_fence_runs() {
+        use crate::store::PatchOptions;
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(Store::open(dir.path(), options()).unwrap());
+        let (hit, go) = pause(&s, "group-sealed");
+        let first = {
+            let s = s.clone();
+            thread::spawn(move || insert(&s, "one"))
+        };
+        hit.recv_timeout(Duration::from_secs(5)).unwrap();
+        // the error says nothing about the data, so it does not wait for the fence
+        let opts = PatchOptions {
+            write: crate::guard::WriteOptions {
+                no_wait: true,
+                ..Default::default()
+            },
+            binary: false,
+        };
+        let answer = s.apply_patch(&b"BOGUS\n"[..], &opts);
+        assert!(matches!(answer, Err(Error::Patch(_))), "{answer:?}");
+        go.send(()).unwrap();
+        assert_eq!(first.join().unwrap().unwrap().commit.seq, 1);
+    }
+
     /// A guard that keeps one state: it must be told of every commit before the next is
     /// checked.
     struct Settled {

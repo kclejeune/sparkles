@@ -247,7 +247,8 @@ fn run_update(
     let mut txn = store.try_write_with(kind, wopts)?;
     for op in &parsed.operations {
         req.check()?;
-        // an error that rests on the data waits for the state it saw to be durable
+        // An error that rests on data waits for the state it saw to be durable.
+        // Triple protections may already have drained; a second drain is then a no-op.
         run_op(&mut txn, op, &req, &mut stats).map_err(|e| store.after_refusal(e, Some(&after)))?;
     }
     // a request cancelled or timed out before this point publishes nothing

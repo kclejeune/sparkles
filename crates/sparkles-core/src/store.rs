@@ -4961,11 +4961,14 @@ impl WriteTxn<'_> {
         if self.requested.is_none() {
             return Ok(());
         }
-        self.base_check()?;
-        match self.base_check.as_mut() {
-            Some(c) => c.check(q, pred, graph),
-            None => Ok(()),
-        }
+        let checked = (|| {
+            self.base_check()?;
+            match self.base_check.as_mut() {
+                Some(c) => c.check(q, pred, graph),
+                None => Ok(()),
+            }
+        })();
+        checked.map_err(|e| self.store.after_refusal(e, Some(&self.opts)))
     }
 
     fn base_check(&mut self) -> Result<()> {
@@ -5389,7 +5392,8 @@ impl WriteTxn<'_> {
         if (self.is_dirty() || self.force) && self.merge.is_none() {
             self.store.check_protected(self.kind)?;
         }
-        self.check_requested_all()?;
+        self.check_requested_all()
+            .map_err(|e| self.store.after_refusal(e, Some(&self.opts)))?;
         // a write cancelled (its client gone) or past its deadline publishes nothing
         self.opts.check()?;
         if self.bulk.is_empty() {
@@ -5412,7 +5416,7 @@ impl WriteTxn<'_> {
             let validation = match validation {
                 // A refusal is reported only when the state it was judged against is
                 // durable. If its fence fails instead, the write is refused as poisoned.
-                Err(e @ Error::Rejected(_)) if grouped => {
+                Err(e) => {
                     return Err(self.store.after_refusal(e, Some(&self.opts)));
                 }
                 other => other?,

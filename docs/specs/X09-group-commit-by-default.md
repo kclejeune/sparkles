@@ -557,12 +557,14 @@ Four points differ from the design.
    stays with a warning. The check is skipped when `annotations.bin` is missing or belongs to
    another dataset. `sparkles check` applies the same rule. Readers that predate the bit
    ignore it and lose only this check.
-2. **Errors that rest on speculative state.** The design covered preconditions and guard
-   rejections. An RDF Patch whose late `H prev` names the durable head, or any other error that
-   depends on data, can be raised against a speculative head too. `Store::after_refusal` waits
-   for the commits in flight to be durable, and reports `Error::Poisoned` if their fence
-   failed. SPARQL updates have no such error today, since the engine does not report whether a
-   graph exists.
+2. **Errors that rest on speculative state.** Preconditions, every guard error, triple
+   protections at both the per-row and commit checks, and an RDF Patch's late `H prev`
+   mismatch can be judged against a speculative head. `Store::after_refusal` waits for the
+   commits in flight to be durable and reports `Error::Poisoned` if their fence failed.
+   SPARQL class and pattern protections use this routing too. Another drain after a
+   protection check already drained is a no-op. RDF Patch syntax, term, graph, prefix and
+   folding errors are reported immediately because they do not depend on the speculative
+   head. Cancellation and deadline errors retain their direct propagation.
 3. **A7 as worded cannot happen.** A failed fence poisons the writer, so a write whose tag
    matched only the durable head is refused as poisoned. If the fence succeeds, the durable
    head is the speculative head and the refusal stands. The test checks both outcomes, and
