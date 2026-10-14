@@ -203,3 +203,99 @@ fn checked_state_format_is_registered_and_checks_version_before_fields() {
         Err(Error::Unsupported(_))
     ));
 }
+
+#[test]
+fn duplicate_checked_fields_preserve_all_copies() {
+    for at in ["checked", "moved-aside", "swapped"] {
+        for duplicate in [
+            r#""oldDirectory":"ORIGINAL","oldDirectory":"UNRELATED""#,
+            r#""oldDirectory":"UNRELATED","oldDirectory":"ORIGINAL""#,
+            r#""mode":"keep-old","mode":"remove-old""#,
+            r#""mode":"remove-old","mode":"keep-old""#,
+            r#""format":1,"format":99"#,
+            r#""format":99,"format":1"#,
+            r#""format":1,"format":1"#,
+            r#""mode":"keep-old","mode":"keep-old""#,
+            r#""oldDirectory":"ORIGINAL","oldDirectory":"ORIGINAL""#,
+            r#""old\u0044irectory":"ORIGINAL","oldDirectory":"UNRELATED""#,
+            r#""m\u006fde":"keep-old","mode":"remove-old""#,
+            r#""for\u006dat":1,"format":1"#,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("db");
+            super::tests::legacy_database(&root);
+            assert!(
+                migrate_with(&root, false, &mut |stage| {
+                    if stage == at {
+                        Err(Error::Cancelled)
+                    } else {
+                        Ok(())
+                    }
+                })
+                .is_err()
+            );
+            let original = old_dir(&root);
+            std::fs::create_dir_all(&original).unwrap();
+            std::fs::write(original.join("sentinel"), b"original copy").unwrap();
+            let unrelated = root.with_file_name(".pre-migrate-0.0.9-db");
+            std::fs::create_dir(&unrelated).unwrap();
+            std::fs::write(unrelated.join("sentinel"), b"unrelated kept copy").unwrap();
+            let mut fields = vec![duplicate.to_string()];
+            if !duplicate.contains("format") {
+                fields.push(r#""format":1"#.into());
+            }
+            if !duplicate.contains("mode") {
+                fields.push(r#""mode":"remove-old""#.into());
+            }
+            if !duplicate.contains("Directory") {
+                fields.push(r#""oldDirectory":"ORIGINAL""#.into());
+            }
+            let marker = format!("{{{}}}", fields.join(","))
+                .replace("ORIGINAL", original.file_name().unwrap().to_str().unwrap())
+                .replace(
+                    "UNRELATED",
+                    unrelated.file_name().unwrap().to_str().unwrap(),
+                );
+            // This regression exercises ambiguity, not malformed JSON fixtures.
+            serde_json::from_str::<serde_json::Value>(&marker).unwrap();
+            let marked = if at == "swapped" {
+                root.clone()
+            } else {
+                work_dir(&root)
+            };
+            std::fs::write(marked.join(CHECKED_MARK), marker.as_bytes()).unwrap();
+            if at == "swapped" {
+                assert!(!root.join("sparkles.lock").exists());
+            }
+            let before = tree(dir.path());
+            for entry in [recover as fn(&Path) -> Result<()>, |root| {
+                migrate(root, false).map(|_| ())
+            }] {
+                let error = entry(&root).expect_err("ambiguous checked state must refuse recovery");
+                assert!(
+                    matches!(error, Error::Corrupt(_) | Error::Unsupported(_)),
+                    "{error}"
+                );
+                assert_eq!(tree(dir.path()), before, "{at}: {marker}");
+                assert_eq!(
+                    std::fs::read(original.join("sentinel")).unwrap(),
+                    b"original copy"
+                );
+                assert_eq!(
+                    std::fs::read(unrelated.join("sentinel")).unwrap(),
+                    b"unrelated kept copy"
+                );
+                assert!(marked.join(CHECKED_MARK).exists());
+            }
+        }
+    }
+}
+
+#[test]
+fn checked_state_accepts_unknown_additive_members() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join(CHECKED_MARK), br#"{"format":1,"mode":"keep-old","oldDirectory":".pre-migrate-0.0.9-db","note":{"additional":"state"}}"#).unwrap();
+    assert!(read_mark(&root, &root).unwrap().is_some());
+}

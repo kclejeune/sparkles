@@ -2235,7 +2235,7 @@ database, refuses a database with a pending `.migrate-<name>` until `sparkles mi
 has run on it again, so a stopped run never leads to an empty database. The checked
 copy records a versioned marker with the exact old sibling directory and whether to
 keep it. Recovery uses that recorded directory even when another release finishes the
-run, so it preserves unrelated kept copies. Unknown or damaged markers refuse recovery
+run, so it preserves unrelated kept copies. Unknown or damaged markers and duplicate known marker fields refuse recovery
 without changing the copies. Bare legacy `keep-old` or `remove-old` markers also refuse
 automatic recovery because they do not identify the original old directory. Inspect
 the sibling copies and recover through a known original location or restore by hand. After checking

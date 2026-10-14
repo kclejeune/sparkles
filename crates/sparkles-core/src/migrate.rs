@@ -490,7 +490,9 @@ fn read_mark(dir: &Path, root: &Path) -> Result<Option<CheckedMark>> {
             formats::MIGRATION_STATE.writes
         )));
     }
-    let mark: CheckedMark = serde_json::from_value(value).map_err(invalid)?;
+    // The version probe collapses object keys. Decode the original bytes so the
+    // typed reader can reject duplicate known fields, including escaped key names.
+    let mark: CheckedMark = serde_json::from_slice(&bytes).map_err(invalid)?;
     mark.old_path(root)?;
     Ok(Some(mark))
 }

@@ -682,8 +682,8 @@ old sibling basename, so a later release recovers and cleans up the originating 
 without guessing from its own version or deleting an unrelated kept copy. Recovery
 validates the version and safe sibling name before creating lock files or changing
 recovery state, and rereads the marker before publication or cleanup. Unknown
-versions, malformed state and bare legacy mode markers refuse recovery while preserving
-every directory and byte. Legacy markers require inspection of the sibling copies and
+versions, malformed state, duplicate known fields and bare legacy mode markers refuse
+recovery while preserving every directory and byte. Legacy markers require inspection of the sibling copies and
 manual recovery through a known original location or a restore. A run that stopped
 between the renames is finished by the next run only with understood checked state. The command takes
 a lock file `.migrate.lock-<name>` next to the database for planning, recovery, the copy
