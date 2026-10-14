@@ -915,6 +915,8 @@ pub struct BlockCache {
     misses: std::sync::atomic::AtomicU64,
     /// decoded blocks are added (false: a read-through view, see [`BlockCache::read_through`])
     fill: bool,
+    #[cfg(test)]
+    decode_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// The threads that decode blocks ahead of a reader (see [`BlockCache::warm`]). They are
@@ -957,6 +959,8 @@ impl BlockCache {
             hits: Default::default(),
             misses: Default::default(),
             fill: true,
+            #[cfg(test)]
+            decode_hook: None,
         }
     }
 
@@ -969,6 +973,8 @@ impl BlockCache {
             hits: Default::default(),
             misses: Default::default(),
             fill: false,
+            #[cfg(test)]
+            decode_hook: None,
         }
     }
 
@@ -1005,6 +1011,10 @@ impl BlockCache {
                 None => {
                     self.misses
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    #[cfg(test)]
+                    if let Some(hook) = &self.decode_hook {
+                        hook();
+                    }
                     let v = idx.decode_col_hinted(b, c, hint)?;
                     if self.fill {
                         self.cache.insert(key, v.clone());
@@ -1024,33 +1034,35 @@ impl BlockCache {
     /// blocks decodes them one by one otherwise, and on a lookup that touches dozens of
     /// blocks for a few rows each the decoding is most of the time. Only columns the reader
     /// decodes anyway are decoded. Does nothing for a read-through view, which keeps no
-    /// blocks, or for few columns, which are not worth the hand-off.
-    pub fn warm(&self, idx: &PermIndex, blocks: &[usize], mask: ColMask) {
-        use rayon::prelude::*;
-        // Below this the hand-off costs about what the decoding saves: a column of 32,768
-        // rows takes about 0.25 ms, and waking the pool about 1 ms on a small machine.
-        const MIN_COLUMNS: usize = 16;
-        if !self.fill {
-            return;
+    /// blocks, for few columns, or when the distinct missing decoded bytes exceed cache
+    /// capacity. Checks stop optional work cooperatively. Already-started decodes may finish.
+    pub fn warm(
+        &self,
+        idx: &PermIndex,
+        blocks: &[usize],
+        mask: ColMask,
+        check: &(dyn Fn() -> Result<()> + Sync),
+    ) -> Result<()> {
+        check()?;
+        let mut work = self.warm_columns(idx);
+        for &b in blocks {
+            check()?;
+            work.add(b, mask);
         }
-        let work: Vec<(usize, u8)> = blocks
-            .iter()
-            .flat_map(|&b| {
-                (0..4u8)
-                    .filter(move |c| mask & (1 << c) != 0)
-                    .filter(move |&c| self.cache.peek(&(idx.uid, b as u32, c)).is_none())
-                    .map(move |c| (b, c))
-            })
-            .collect();
-        if work.len() < MIN_COLUMNS {
-            return;
+        work.finish(check)
+    }
+
+    /// A bounded candidate set shared with join prefetch, so even enumeration stops
+    /// retaining work once the distinct missing columns exceed the decoded byte budget.
+    pub(crate) fn warm_columns<'a>(&'a self, idx: &'a PermIndex) -> WarmColumns<'a> {
+        WarmColumns {
+            cache: self,
+            idx,
+            work: Vec::new(),
+            seen: Default::default(),
+            bytes: 0,
+            eligible: self.fill,
         }
-        decode_pool().install(|| {
-            work.par_iter().for_each(|&(b, c)| {
-                // a failure shows again when the reader decodes the column
-                let _ = self.get_cols_hinted(idx, b, 1 << c, false);
-            });
-        });
     }
 
     /// Whether the columns in `mask` of block `b` are decoded in the cache, without
@@ -1072,6 +1084,74 @@ impl BlockCache {
     }
     pub fn misses(&self) -> u64 {
         self.misses.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// Optional decoded columns for one permutation and one prefetch request. This is
+/// an admission estimate, not a reservation against other cache users or eviction.
+pub(crate) struct WarmColumns<'a> {
+    cache: &'a BlockCache,
+    idx: &'a PermIndex,
+    work: Vec<(usize, u8)>,
+    seen: rustc_hash::FxHashSet<(usize, u8)>,
+    bytes: u64,
+    eligible: bool,
+}
+
+impl WarmColumns<'_> {
+    pub(crate) fn add(&mut self, b: usize, mask: ColMask) {
+        if !self.eligible {
+            return;
+        }
+        for c in 0..4u8 {
+            let key = (b, c);
+            if mask & (1 << c) == 0
+                || self.seen.contains(&key)
+                || self
+                    .cache
+                    .cache
+                    .peek(&(self.idx.uid, b as u32, c))
+                    .is_some()
+            {
+                continue;
+            }
+            // Match BlockWeighter exactly, including partial tails and empty columns.
+            // Overflow declines the entire optional request before any decode occurs.
+            let next = u64::from(self.idx.blocks[b].rows)
+                .checked_mul(8)
+                .and_then(|weight| self.bytes.checked_add(weight.max(1)));
+            let Some(bytes) = next.filter(|&n| n <= self.cache.cache.capacity()) else {
+                self.eligible = false;
+                self.work = Vec::new();
+                self.seen = Default::default();
+                self.bytes = 0;
+                return;
+            };
+            self.bytes = bytes;
+            self.seen.insert(key);
+            self.work.push(key);
+        }
+    }
+
+    pub(crate) fn finish(self, check: &(dyn Fn() -> Result<()> + Sync)) -> Result<()> {
+        use rayon::prelude::*;
+        check()?;
+        // Below this the hand-off costs about what decoding saves. Keep the existing
+        // threshold; capacity admission never warms a partial prefix of an oversized set.
+        const MIN_COLUMNS: usize = 16;
+        if self.eligible && self.work.len() >= MIN_COLUMNS {
+            decode_pool().install(|| {
+                self.work.par_iter().try_for_each(|&(b, c)| -> Result<()> {
+                    check()?;
+                    // Only check errors propagate: an advisory decode error remains
+                    // for the consuming reader to encounter if it needs this column.
+                    let _ = self.cache.get_cols_hinted(self.idx, b, 1 << c, false);
+                    Ok(())
+                })
+            })?;
+        }
+        // Cancellation during the final already-started decode must not be hidden.
+        check()
     }
 }
 
@@ -1354,9 +1434,9 @@ mod tests {
         let blocks: Vec<usize> = (0..idx.blocks.len()).collect();
         assert!(!cache.has_cols(&idx, 2, mask));
         // too few columns to be worth the hand-off: nothing is decoded
-        cache.warm(&idx, &blocks[..2], mask);
+        cache.warm(&idx, &blocks[..2], mask, &|| Ok(())).unwrap();
         assert!(!cache.has_cols(&idx, 0, mask));
-        cache.warm(&idx, &blocks, mask);
+        cache.warm(&idx, &blocks, mask, &|| Ok(())).unwrap();
         for b in &blocks {
             assert!(cache.has_cols(&idx, *b, mask));
         }
@@ -1368,9 +1448,257 @@ mod tests {
         // a read-through view keeps nothing
         let through = cache.read_through();
         let empty = BlockCache::new(1 << 26);
-        empty.read_through().warm(&idx, &blocks, mask);
+        empty
+            .read_through()
+            .warm(&idx, &blocks, mask, &|| Ok(()))
+            .unwrap();
         assert!(!empty.has_cols(&idx, 0, mask));
         let _ = through;
+    }
+
+    fn warm_fixture(rows: usize) -> (tempfile::TempDir, PermIndex) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = PermWriter::create(dir.path(), Perm::Spo).unwrap();
+        for i in 0..rows as u64 {
+            writer.push([i, i % 7, i % 13, 0]).unwrap();
+        }
+        writer.finish(dir.path(), Perm::Spo).unwrap();
+        let idx = PermIndex::open(dir.path(), Perm::Spo).unwrap();
+        (dir, idx)
+    }
+
+    fn warm_checked(
+        cache: &BlockCache,
+        idx: &PermIndex,
+        blocks: &[usize],
+        mask: ColMask,
+        check: &(dyn Fn() -> Result<()> + Sync),
+    ) -> Result<()> {
+        cache.warm(idx, blocks, mask, check)
+    }
+
+    #[test]
+    fn warm_cancellation_stops_after_the_inflight_pool_wave() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let (_dir, idx) = warm_fixture(8 * BLOCK_ROWS);
+        let mut cache = BlockCache::new(64 << 20);
+        let width = decode_pool().current_num_threads();
+        let entered = Arc::new(AtomicUsize::new(0));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let expired = Arc::new(AtomicBool::new(false));
+        let release = Arc::new((parking_lot::Mutex::new(false), parking_lot::Condvar::new()));
+        let (tx, rx) = mpsc::channel();
+        cache.decode_hook = Some(Arc::new({
+            let entered = entered.clone();
+            let release = release.clone();
+            let expired = expired.clone();
+            move || {
+                if entered.fetch_add(1, Ordering::SeqCst) < width {
+                    let _ = tx.send(());
+                    let mut go = release.0.lock();
+                    while !*go {
+                        if release
+                            .1
+                            .wait_for(&mut go, Duration::from_secs(5))
+                            .timed_out()
+                        {
+                            expired.store(true, Ordering::SeqCst);
+                            break;
+                        }
+                    }
+                }
+            }
+        }));
+        let cache = Arc::new(cache);
+        let worker = std::thread::spawn({
+            let cache = cache.clone();
+            let cancelled = cancelled.clone();
+            move || {
+                warm_checked(&cache, &idx, &(0..8).collect::<Vec<_>>(), ALL_COLS, &|| {
+                    if cancelled.load(Ordering::SeqCst) {
+                        Err(Error::Cancelled)
+                    } else {
+                        Ok(())
+                    }
+                })
+            }
+        });
+        let observed = (0..width).try_for_each(|_| rx.recv_timeout(Duration::from_secs(3)));
+        cancelled.store(true, Ordering::SeqCst);
+        *release.0.lock() = true;
+        release.1.notify_all();
+        let result = worker.join().unwrap();
+        assert!(
+            observed.is_ok(),
+            "first pool wave did not enter: {observed:?}"
+        );
+        assert!(!expired.load(Ordering::SeqCst));
+        eprintln!(
+            "pool width={width}, decoded={}, result={result:?}",
+            cache.misses()
+        );
+        assert!(
+            cache.misses() <= width as u64,
+            "optional decode continued after cancellation"
+        );
+        assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
+    }
+
+    #[test]
+    fn warm_expired_deadline_decodes_nothing() {
+        let (_dir, idx) = warm_fixture(4 * BLOCK_ROWS);
+        let cache = BlockCache::new(64 << 20);
+        let deadline = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let result = warm_checked(&cache, &idx, &[0, 1, 2, 3], ALL_COLS, &|| {
+            if std::time::Instant::now() > deadline {
+                Err(Error::Timeout)
+            } else {
+                Ok(())
+            }
+        });
+        eprintln!("decoded={}, result={result:?}", cache.misses());
+        assert_eq!(cache.misses(), 0);
+        assert!(matches!(result, Err(Error::Timeout)), "{result:?}");
+    }
+
+    #[test]
+    fn warm_oversized_request_skips_optional_decodes() {
+        let (_dir, idx) = warm_fixture(32 * BLOCK_ROWS);
+        let cache = BlockCache::new(8 << 20);
+        warm_checked(
+            &cache,
+            &idx,
+            &(0..32).collect::<Vec<_>>(),
+            ALL_COLS,
+            &|| Ok(()),
+        )
+        .unwrap();
+        let warmed = cache.misses();
+        for b in 0..32 {
+            let block = cache.get(&idx, b).unwrap();
+            for row in 0..BLOCK_ROWS {
+                let i = (b * BLOCK_ROWS + row) as u64;
+                assert_eq!(block.key(row), [i, i % 7, i % 13, 0]);
+            }
+        }
+        eprintln!("optional={warmed}, total decoded={}", cache.misses());
+        assert_eq!(warmed, 0, "oversized optional warmup must be skipped");
+        assert_eq!(cache.misses(), 128);
+    }
+
+    #[test]
+    fn warm_checks_after_the_final_decode_and_preserves_advisory_errors() {
+        let (_dir, mut idx) = warm_fixture(4 * BLOCK_ROWS);
+        let cache = BlockCache::new(64 << 20);
+        let result = cache.warm(&idx, &[0, 1, 2, 3], ALL_COLS, &|| {
+            if cache.misses() == 16 {
+                Err(Error::Cancelled)
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(cache.misses(), 16);
+        assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
+        // Missing mapped data takes the real decoder's Corrupt path. Optional warmup
+        // still defers it to consumption rather than turning unused advice into failure.
+        idx.data = None;
+        let cache = BlockCache::new(64 << 20);
+        cache
+            .warm(&idx, &[0, 1, 2, 3], ALL_COLS, &|| Ok(()))
+            .unwrap();
+        assert_eq!(cache.misses(), 16);
+        assert!(matches!(cache.get(&idx, 0), Err(Error::Corrupt(_))));
+    }
+
+    #[test]
+    fn warm_budget_is_selective_and_deduplicates_missing_columns() {
+        let (_dir, idx) = warm_fixture(8 * BLOCK_ROWS);
+        let mask = (1 << 1) | (1 << 3);
+        let cache = BlockCache::new(64 << 20);
+        cache
+            .warm(&idx, &(0..8).collect::<Vec<_>>(), mask, &|| Ok(()))
+            .unwrap();
+        assert_eq!(cache.misses(), 16);
+        for b in 0..8 {
+            assert!(cache.has_cols(&idx, b, mask));
+            assert!(!cache.has_cols(&idx, b, 1));
+            let got = cache.get_cols(&idx, b, mask).unwrap();
+            for c in [1, 3] {
+                assert_eq!(got.cols[c], idx.decode_col(b, c).unwrap());
+            }
+        }
+        let cache = BlockCache::new(4 * BLOCK_ROWS as u64 * 8 * 4);
+        let duplicates = (0..4).cycle().take(64).collect::<Vec<_>>();
+        cache.warm(&idx, &duplicates, ALL_COLS, &|| Ok(())).unwrap();
+        assert_eq!(
+            cache.misses(),
+            16,
+            "budget and work count distinct missing keys"
+        );
+    }
+
+    #[test]
+    fn warm_budget_counts_partial_tails_and_only_missing_bytes() {
+        let (_dir, idx) = warm_fixture(4 * BLOCK_ROWS + 17);
+        let full = 4 * BLOCK_ROWS as u64 * 8 * 4;
+        let cache = BlockCache::new(full + 17 * 8 * 4);
+        cache
+            .warm(&idx, &[0, 1, 2, 3, 4], ALL_COLS, &|| Ok(()))
+            .unwrap();
+        assert_eq!(
+            cache.misses(),
+            20,
+            "partial tail fits the exact decoded byte budget"
+        );
+        let (_dir, idx) = warm_fixture(12 * BLOCK_ROWS);
+        let mask = 3;
+        let cache = BlockCache::new(16 * BLOCK_ROWS as u64 * 8);
+        for b in 0..4 {
+            cache.get_cols(&idx, b, mask).unwrap();
+        }
+        assert_eq!(cache.misses(), 8);
+        cache
+            .warm(&idx, &(0..12).collect::<Vec<_>>(), mask, &|| Ok(()))
+            .unwrap();
+        assert_eq!(
+            cache.misses(),
+            24,
+            "cached columns consume no new warm budget"
+        );
+    }
+
+    #[test]
+    fn warm_tiny_read_through_and_disqualified_work_stay_bounded() {
+        let (_dir, idx) = warm_fixture(4 * BLOCK_ROWS);
+        for bytes in [0, 1, 64 << 10] {
+            let cache = BlockCache::new(bytes);
+            cache
+                .warm(&idx, &[0, 1, 2, 3], ALL_COLS, &|| Ok(()))
+                .unwrap();
+            assert_eq!(cache.misses(), 0);
+            let block = cache.get(&idx, 0).unwrap();
+            assert_eq!(block.key(10), [10, 3, 10, 0]);
+        }
+        let cache = BlockCache::new(64 << 20).read_through();
+        cache
+            .warm(&idx, &[0, 1, 2, 3], ALL_COLS, &|| Ok(()))
+            .unwrap();
+        assert_eq!(cache.misses(), 0);
+        assert_eq!(cache.get(&idx, 0).unwrap().key(10), [10, 3, 10, 0]);
+        assert_eq!(cache.entries(), 0);
+        let cache = BlockCache::new(1);
+        let mut work = cache.warm_columns(&idx);
+        for b in (0..4).cycle().take(1024) {
+            work.add(b, ALL_COLS);
+        }
+        assert!(!work.eligible);
+        assert!(work.work.is_empty() && work.seen.is_empty());
+        assert_eq!(work.bytes, 0);
+        assert_eq!(work.work.capacity(), 0);
+        work.finish(&|| Ok(())).unwrap();
+        assert_eq!(cache.misses(), 0);
     }
 
     #[test]

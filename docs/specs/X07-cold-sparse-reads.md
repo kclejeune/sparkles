@@ -455,9 +455,27 @@ Phase 2 has four parts, each behind an `Optimizations` flag that is on by defaul
   native JSON writer prefetches the terms of its answer.
 
 One addition goes beyond the spec. `parallel_decode` decodes the columns that an index
-join or a scan has requested on a pool of its own, when at least 16 columns are
-requested. The pool skips read-through caches. It helps star-lookup and employee-docs
+join or a scan has requested on a pool of its own, when at least 16 distinct missing
+columns fit the decoded cache capacity. The pool skips read-through caches. It helps star-lookup and employee-docs
 and is off for smaller requests, where it was slower.
+
+Optional parallel warmup now checks request cancellation and deadlines during candidate
+enumeration and before each column decode, then checks again after the last in-flight
+work finishes. Join prefetch checks while traversing ranges and blocks and propagates
+these failures. An already-started column decode may finish. Optional decoder errors
+remain deferred to the consuming reader.
+
+A warmup runs only when its distinct missing columns fit the decoded cache byte capacity.
+Each column contributes its actual row count times eight bytes, with a minimum weight of
+one, so partial final blocks use their smaller weight. Cached columns add no new budget.
+An oversized request discards its entire candidate set before decoding and retains no
+further candidates, while the normal reader still consumes the requested columns. This
+is an admission estimate rather than a reservation against other cache users or eviction.
+Focused regressions cover cancellation within one pool wave, an expired deadline with no
+decodes, a final cancellation check, oversized requests, selectivity, duplicates, partial
+tails, cached columns and read-through caches. Remaining source-review repairs and the
+warm, cold and no-profile performance gates are pending on corrected integrated source.
+These correctness checks establish no new performance result or Phase 3 clearance.
 
 ### Phase 1 breakdown
 

@@ -804,32 +804,38 @@ const PREFETCH_RANGES: usize = 16_384;
 /// at once, before the reader decodes them one by one (`Optimizations::prefetch_blocks`):
 /// on a cold server their reads then overlap. `cols` are the key columns the reader
 /// decodes besides the ones that bound the ranges.
-fn prefetch(ctx: &Ctx, perm: Perm, ranges: &Ranges, cols: ColMask) {
+fn prefetch(ctx: &Ctx, perm: Perm, ranges: &Ranges, cols: ColMask) -> Result<()> {
+    ctx.check()?;
     if !ctx.opt.prefetch_blocks || ranges.len() > PREFETCH_RANGES || ranges.len() < 2 {
-        return;
+        return Ok(());
     }
     let idx = ctx.snap.perm(perm);
     let mask = cols | ranges.bound_mask() | (1 << perm.col_of(G));
     let mut last = None;
-    let mut visited = Vec::new();
+    let mut warm = ctx
+        .opt
+        .parallel_decode
+        .then(|| ctx.snap.cache.warm_columns(idx));
     for i in 0..ranges.len() {
+        ctx.check()?;
         let (lo, hi) = ranges.get(i);
         let (b0, b1) = idx.key_block_range(&lo, &hi);
         for b in b0..b1 {
+            ctx.check()?;
             // consecutive ranges often share a block
             if last != Some(b) {
                 idx.prefetch(&ctx.snap.cache, b, mask);
                 last = Some(b);
-                if ctx.opt.parallel_decode {
-                    visited.push(b);
+                if let Some(warm) = &mut warm {
+                    warm.add(b, mask);
                 }
             }
         }
     }
-    if ctx.opt.parallel_decode {
-        visited.dedup();
-        ctx.snap.cache.warm(idx, &visited, mask);
+    if let Some(warm) = warm {
+        warm.finish(&|| ctx.check())?;
     }
+    ctx.check()
 }
 
 /// Clusters of consecutive ranges read by one scan each: a range joins the cluster when
@@ -1273,7 +1279,7 @@ fn read_probes(
             // tables in the walk's pattern order, then back in the probes' order
             let mut parts: Vec<Table> = order.iter().map(|&i| out[i].clone()).collect();
             let mask = cols.iter().flatten().fold(0, |m, &c| m | (1 << c));
-            prefetch(ctx, Perm::Spo, &walk, mask);
+            prefetch(ctx, Perm::Spo, &walk, mask)?;
             if gallop {
                 read_ranges_gallop(ctx, Perm::Spo, &walk, &cols, &rule, &mut parts, stats)?;
             } else {
@@ -1300,7 +1306,7 @@ fn read_probes(
         };
         let cols = vec![p.scan.cols.iter().map(|c| c.0).collect::<Vec<_>>()];
         let mask = cols[0].iter().fold(0, |m, &c| m | (1 << c));
-        prefetch(ctx, p.scan.perm, ranges, mask);
+        prefetch(ctx, p.scan.perm, ranges, mask)?;
         let out = std::slice::from_mut(t);
         if gallop {
             read_ranges_gallop(ctx, p.scan.perm, ranges, &cols, &rule, out, stats)?;
@@ -1551,4 +1557,39 @@ fn combine(
         len: li.len(),
         sorted,
     })
+}
+
+#[cfg(test)]
+mod prefetch_tests {
+    use super::*;
+    use crate::store::{Store, StoreOptions};
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn prefetch_propagates_request_checks_even_when_optional_work_is_disabled() {
+        let store = Store::in_memory(StoreOptions::default());
+        let ranges = Ranges::Keys {
+            prefix: &[],
+            keys: &[1, 2],
+        };
+        for enabled in [false, true] {
+            let mut ctx = Ctx::new(store.snapshot());
+            ctx.opt.prefetch_blocks = enabled;
+            ctx.opt.parallel_decode = enabled;
+            ctx.cancel.store(true, Ordering::Relaxed);
+            assert!(matches!(
+                prefetch(&ctx, Perm::Spo, &ranges, ALL_COLS),
+                Err(Error::Cancelled)
+            ));
+            ctx.cancel.store(false, Ordering::Relaxed);
+            ctx.deadline = Some(Instant::now() - Duration::from_secs(1));
+            assert!(matches!(
+                prefetch(&ctx, Perm::Spo, &ranges, ALL_COLS),
+                Err(Error::Timeout)
+            ));
+            ctx.deadline = None;
+            prefetch(&ctx, Perm::Spo, &ranges, ALL_COLS).unwrap();
+        }
+    }
 }
