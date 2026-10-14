@@ -1295,7 +1295,12 @@ than 10%. Fluree's warm advantages on small lookups at 1.05M are within 10%.
     rejects `knows-reach` at 10.5M. Fluree has no result cache.
   * Oxigraph loads with `oxigraph load` and then `oxigraph optimize`, the compaction its
     loader recommends before read-heavy workloads, and serves with
-    `oxigraph serve --timeout-s 600`.
+    `oxigraph serve --timeout-s 600`. The harness reads the N-Triples from standard input.
+    With `--file`, Oxigraph 0.5.11 parses N-Triples in parallel chunks and turns a blank
+    node label used in two chunks into two nodes. The figures above predate this change.
+    The synthetic data and WatDiv contain no blank nodes and the DBpedia load already read
+    standard input, so the figures are not affected, but the load times of a later refresh
+    will be about 3x longer than with `--file`.
 * **Isolation.** Each engine runs alone on the machine, one after another, in a systemd
   scope with a 12 GiB memory limit and no swap, so an engine that runs out of memory is
   killed on its own. The OS page cache is warm except in the cold runs.

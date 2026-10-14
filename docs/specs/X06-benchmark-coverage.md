@@ -592,8 +592,9 @@ Phase 1's tooling is built. The measurements it exists for have not been run on 
 publication host, so BENCHMARKS.md has no figures from it.
 
 **Record and manifest.** `scripts/bench-record.py` has four subcommands. `manifest` writes
-the run manifest of §6 with the Sparkles commit and binary checksum, every engine's version,
-binary checksum and license, the host, the memory limit, the client CPU, the data checksums
+the run manifest of §6 with the commit of the scripts' checkout, the Sparkles binary's
+checksum and its own commit when the caller knows it (`SPARKLES_COMMIT`), every engine's
+version, binary checksum and license, the Nix store path of an engine taken from nixpkgs, the host, the memory limit, the client CPU, the data checksums
 and the license check. `finish` adds the end time. `build` turns the results directory of
 `scripts/bench.sh` or of a suite into the record of §7, and `validate` checks a record
 against the shape described in the script's header. The record also carries the load
@@ -616,11 +617,18 @@ They cover A4 on fixture records and the marking of a wrong answer from A2.
 **Suites.** `scripts/bench-suite-lib.sh` is the common run of the three suites. It loads one
 N-Triples file into the selected engines, serves them, checks every answer, times each query
 with hyperfine, optionally measures cold restarts, and writes the manifest, the record and
-`summary.md`. To share this code with the existing harness, the load, the server start-up,
+`summary.md`. The timed server of each engine first answers every selected query once, so
+it is as warm as the one that was checked, and then each engine's queries and query mixes
+run with no other server up. To share this code with the existing harness, the load, the server start-up,
 the answer check and the cold mode moved from `scripts/bench.sh` into `scripts/bench-lib.sh`.
 `bench.sh` was checked afterwards in its default and cold modes. `bench-answers.py` now
-also fingerprints ASK, CONSTRUCT and DESCRIBE results, and `bench-lib.sh` picks the Accept
-type of a timed request from the query form. `nixbin` now builds engines from the nixpkgs
+also fingerprints ASK, CONSTRUCT and DESCRIBE results. A CONSTRUCT or DESCRIBE answer is a
+set of triples compared by term identity before the value digest normalizes the terms, so
+`1` as an integer and `1.0` as a decimal stay two triples. An `order` digest is recorded only
+for ORDER BY columns whose order SPARQL defines, and rows that tie at a LIMIT or OFFSET
+boundary are compared by their key values only when a second request shows that the tie
+crosses the cut. `bench-lib.sh` picks the Accept type of a
+timed request from the query form. `nixbin` now builds engines from the nixpkgs
 revision in `flake.lock`, so engine versions follow the repository and the manifest records
 them. This can change the Jena, QLever and Oxigraph versions of an existing harness run
 compared with the older registry lookup.
@@ -640,14 +648,22 @@ compared with the older registry lookup.
   at LUBM(1), and a direct query
   over the generated data confirms that only one person has a degree from University0. The
   answers have not been compared with published reference counts, because the scripts use the
-  majority of the engines as the reference. Jena's reasoners are not run.
+  majority of the engines as the reference. Jena's reasoners are not run. Fluree's public
+  documentation describes query-time reasoning, which the script does not enable, so Fluree
+  answers over the same materialized file as the other engines. Timing it with its own
+  reasoning on is not done.
 * *BSBM* (`scripts/bench-bsbm.sh`). The GPL-3.0 tools run as separate processes and are
   fetched only with `SPARKLES_ALLOW_GPL_BENCHMARK=1`. Generation is deterministic. The
   test driver's own query mixes are recorded through a stub endpoint
   (`scripts/bench-bsbm/instantiate.py`) to get the query instances for the answer check and
   the per-template timings, and the driver itself measures query mixes per hour with 1, 4
   and 16 clients. The Explore and BI use cases both instantiate. The Explore and Update mix
-  is not built.
+  is not built. The scale labels follow BSBM's published dataset sizes, which are 2,785
+  products for 1m, 28,480 for 10m and 284,826 for 100m, and the manifest records the triple
+  count that was generated. At 1m the generator gives 1,000,312 triples, against 1,000,313
+  in the V2.0 specification. The query mix check compares only runs in which the driver
+  succeeded, gives each engine one vote, and does not compare runs with different mix
+  counts.
 
 **Smoke runs.** SP²Bench at 50k, LUBM(1) and BSBM with 2000 products ran end to end with
 Sparkles alone on a development machine. SP²Bench at 50k also ran with all five engines,
@@ -655,14 +671,26 @@ with a 20 second request timeout, on a machine that was compiling at the same ti
 times mean nothing. The run showed what the harness is for. Oxigraph and QLever returned
 other answers than the majority for several queries (q4, q5a, q5b, q6 and q8) and were
 marked and left out of the ranking, and Jena, Fluree and Oxigraph timed out on some
-queries and were recorded as `timeout`. The causes of the disagreements have not been
-looked into. Sparkles was slow on q5a and q12a at this size, which a run on the reference
-host should confirm before it is listed under "Where Sparkles loses".
+queries and were recorded as `timeout`.
+
+The Oxigraph disagreements came from the harness. `oxigraph load --file` parses N-Triples
+in parallel chunks and splits a blank node label that occurs in two chunks into two nodes,
+so it held 4,727 blank nodes for SP²Bench at 50k triples instead of 4,198, and 109,384
+instead of 86,870 at 1M. The harness now loads Oxigraph from standard input with
+`--format nt`, which keeps the labels whole and takes about 3x as long to load at 1M
+(6.6 s against 2.3 s). With that load Sparkles, Oxigraph and QLever agree on q4, q5a, q5b
+and q6. QLever still differs on q6 (1,959 rows against 1,769) and q8 (0 rows against 264),
+which looks like the engine's own behavior. The synthetic data and WatDiv contain no blank
+nodes, and the DBpedia load already read standard input, so no published Oxigraph result
+needs a rerun. Sparkles was slow on q5a and q12a at this size, which a run on the
+reference host should confirm before it is listed under "Where Sparkles loses".
 
 **Left for Phase 1.**
 
 * The standard refresh of every existing suite at one head (A5), and the regeneration of the
-  BENCHMARKS.md tables from records without a numeric change (A3). `bench-record.py` reads
+  BENCHMARKS.md tables from records without a numeric change (A3). The per-engine loop of
+  `suite_run` is not in `bench.sh` yet, and adding it is part of this refresh. The published
+  runs invoke `bench.sh` once per engine, so each engine ran alone. `bench-record.py` reads
   the results of `bench.sh` and of a small `bench-watdiv.sh` run, and both produce valid
   records. It does not read the DBpedia or full-text results yet, and `bench-summary.py`
   still reads the raw files.
