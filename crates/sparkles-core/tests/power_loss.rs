@@ -102,6 +102,7 @@ fn base_commit(s: &Store, n: u32) {
 struct Config {
     group: bool,
     direct: bool,
+    idle_direct: bool,
     threads: u32,
     commits: u32,
 }
@@ -111,6 +112,7 @@ impl Config {
         StoreOptions {
             experimental_group_commit: self.group,
             wal_direct_writes: self.direct,
+            group_commit_idle_direct: self.idle_direct,
             ..Default::default()
         }
     }
@@ -126,9 +128,15 @@ fn child_writer() {
         return;
     };
     let f: Vec<&str> = spec.split(',').collect();
+    assert_eq!(
+        f.len(),
+        5,
+        "group, WAL direct, threads, commits, idle direct"
+    );
     let cfg = Config {
         group: f[0] == "1",
         direct: f[1] == "1",
+        idle_direct: f[4] == "1",
         threads: f[2].parse().unwrap(),
         commits: f[3].parse().unwrap(),
     };
@@ -246,11 +254,12 @@ fn run_writer(name: &str, cfg: Config, base: u32, record: bool, fault: &str) -> 
         .env(
             CHILD,
             format!(
-                "{},{},{},{}",
+                "{},{},{},{},{}",
                 u8::from(cfg.group),
                 u8::from(cfg.direct),
                 cfg.threads,
-                cfg.commits
+                cfg.commits,
+                u8::from(cfg.idle_direct)
             ),
         )
         .env("SPARKLES_PL_DB", &db)
@@ -633,6 +642,7 @@ fn crash_images_keep_every_acknowledged_commit() {
             Config {
                 group: true,
                 direct: true,
+                idle_direct: true,
                 threads: 4,
                 commits: 25,
             },
@@ -642,6 +652,7 @@ fn crash_images_keep_every_acknowledged_commit() {
             Config {
                 group: true,
                 direct: false,
+                idle_direct: true,
                 threads: 4,
                 commits: 25,
             },
@@ -651,6 +662,7 @@ fn crash_images_keep_every_acknowledged_commit() {
             Config {
                 group: false,
                 direct: true,
+                idle_direct: true,
                 threads: 2,
                 commits: 25,
             },
@@ -660,6 +672,7 @@ fn crash_images_keep_every_acknowledged_commit() {
             Config {
                 group: false,
                 direct: false,
+                idle_direct: true,
                 threads: 2,
                 commits: 25,
             },
@@ -685,6 +698,7 @@ fn child_annotation_retry() {
         &db,
         StoreOptions {
             experimental_group_commit: spec == "group",
+            group_commit_idle_direct: true,
             ..Default::default()
         },
     )
@@ -855,18 +869,21 @@ fn failed_synchronizations_fail_unacknowledged_commits_and_publish_nothing() {
     let grouped = Config {
         group: true,
         direct: false,
+        idle_direct: true,
         threads: 4,
         commits: 12,
     };
     let ordinary = Config {
         group: false,
         direct: false,
+        idle_direct: true,
         threads: 1,
         commits: 12,
     };
     let direct = Config {
         group: false,
         direct: true,
+        idle_direct: true,
         threads: 1,
         commits: 12,
     };
@@ -887,5 +904,27 @@ fn failed_synchronizations_fail_unacknowledged_commits_and_publish_nothing() {
     failed_sync("d-write", direct, "pwrite:wal.log:5");
     failed_sync("d-vocab", direct, "pwrite:delta.vocab:5");
     // the annotation file alone, in a run of fences
-    failed_sync("g-ann", grouped, "fdatasync:annotations.bin:2");
+    failed_sync(
+        "g-ann",
+        Config {
+            idle_direct: false,
+            ..grouped
+        },
+        "fdatasync:annotations.bin:2",
+    );
+}
+
+#[test]
+fn a_single_writer_annotation_fence_fault_is_poisoning() {
+    failed_sync(
+        "g-ann-single",
+        Config {
+            group: true,
+            direct: false,
+            idle_direct: false,
+            threads: 1,
+            commits: 12,
+        },
+        "fdatasync:annotations.bin:2",
+    );
 }
