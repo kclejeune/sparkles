@@ -424,7 +424,11 @@ mode says. The tests are `read_only_direct_naming_refuses_writes` in
 `http/router_tests/fuseki.rs` and `direct_naming_is_per_dataset_and_keeps_its_mode` in
 `fuseki_config/tests.rs`. Under `--fuseki-config`, a command-line value for a dataset wins
 over the converted one in both directions, and a bare flag covers only the datasets that no
-entry names. The test is `direct_naming_flags_win_over_the_fuseki_config` in `state.rs`.
+entry names. The test is `direct_naming_flags_win_over_the_fuseki_config` in `state.rs`. With auth on,
+a write to a read-only direct endpoint needs only read access, as `/{ds}/patch` does for a
+refused method, so readers get the `405` and callers without read access keep the usual
+401, 403 or 404. The test is `read_only_direct_naming_answers_readers_with_405` in
+`http/router_tests/auth/mod.rs`.
 The modes come from the command line, so the setting and its
 route in C19's settings, and assembler bodies, remain with item 76 below.
 
