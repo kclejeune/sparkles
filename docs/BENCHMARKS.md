@@ -463,16 +463,26 @@ engines' figures.
 Another run of the same instance, with a quieter host, measured 10.5M `star-lookup` at
 24.6 ms for the base and 14.5 ms for the new build. The noise of the table above is larger
 than that, so the ratios are better evidence than the milliseconds. A repeat of
-`export-500k` with 21 runs gave 167.6 and 178.1 ms at 105M, and the same slowdown when
-every new read feature is off. The cold targets of the spec, such as `star-lookup` at
-10.5M within 17.3 ms, are confirmed only by a run on the benchmark host, which has not
-been made.
+`export-500k` on that Namespace instance with 21 runs gave 167.6 and 178.1 ms at 105M.
+The repeat with `prefetch_constants`, `prefetch_first_scan`, `prefetch_terms` and
+`parallel_decode` disabled showed the same slowdown while `ReadAhead` and the vocabulary
+window changes remained active. The ablation was incomplete, and the cause remains
+unresolved.
+
+Roadmap item 4 and [X07 §9](specs/X07-cold-sparse-reads.md#9-targets), including A5,
+retain the follow-up on quiet forge. After correctness review and integration, compare
+the corrected default with the approved baseline. Repeat that comparison with the
+candidate's four flags disabled and `SPARKLES_READ_WINDOW_KB=0`. Window zero retains the
+original 1 MiB vocabulary window. The cold targets, such as `star-lookup` at 10.5M within
+17.3 ms, still require that host's measurements.
 
 These measurements predate the cancellation, decoded-cache budget and advised-coverage
 repairs. The corrected read-ahead path counts existing outstanding bytes and coalesced
 gaps, allows one next-block extension and restores advice after cache eviction. Its
 warm and cold measurements and no-profile overhead gate remain pending on integrated
-source. Vocabulary profiling also observes mapped offsets before loading them and accounts for ordinary and fallible bulk decodes independently of advice. These correctness tests establish no new speed result or counter-cost measurement.
+source. Vocabulary profiling also observes mapped offsets before loading them and
+accounts for ordinary and fallible bulk decodes independently of advice. These
+correctness tests establish no new speed result or counter-cost measurement.
 
 ### Full-text search
 

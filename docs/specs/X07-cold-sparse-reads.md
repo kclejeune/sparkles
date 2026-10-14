@@ -437,7 +437,9 @@ not per dataset, which deviates from §4.3, because datasets can share one block
 The profile counts against a snapshot taken at the start of the query, so it is exact
 only when no other query runs on the process.
 
-Phase 2 has four parts, each behind an `Optimizations` flag that is on by default.
+Phase 2 adds the following read optimizations. Four `Optimizations` flags control
+constant prefetch, first-scan prefetch, term prefetch and parallel decode. They are on
+by default. The `ReadAhead` and vocabulary windows use `SPARKLES_READ_WINDOW_KB`.
 
 * `prefetch_constants` collects the constants of the algebra (`sparql/constkeys.rs`) and
   hints their vocabulary groups with `Vocab::prefetch_keys` before the planner resolves
@@ -554,16 +556,16 @@ The hypotheses of §3 come out as follows.
 * The result terms of the native JSON writer looked slow (11 ms at 10.5M on the laptop)
   because the writer did not prefetch them. That is fixed.
 
-### Gate results
+### Historical gate results
 
-Hosts. Cold numbers come from a Namespace instance (AMD EPYC, 8 vCPU, 16 GB, Linux
+The historical cold numbers come from a Namespace instance (AMD EPYC, 8 vCPU, 16 GB, Linux
 7.1.4) with the page cache dropped before every request, a fresh server for each request
 and the median of 11 requests, unless stated. The data comes from `scripts/gen-data.py` with 100,000, 1,000,000 and 10,000,000 people
 (1.05M, 10.5M and 105M triples). Namespace runs these queries about 1.5 to 2 times faster than the
 forge host of BENCHMARKS.md, so the absolute targets of §9 cannot be judged here.
 
-Median request time through HTTP, in ms, base commit `899fb251` against the final
-build. The figures in parentheses are the minima.
+Median request time through HTTP, in ms, base commit `899fb251` against the historical
+final build. The figures in parentheses are the minima.
 
 | Query, cold | 1.05M base | 1.05M final | 10.5M base | 10.5M final | 105M base | 105M final |
 |---|---:|---:|---:|---:|---:|---:|
@@ -600,9 +602,10 @@ decoding of one block is all that Phase 2 can reach.
 * **A5 is not measured.** It needs the 1.01B store, which was not available. At 105M, with
   hints on, the dense queries are within 3% of base on `contains`, `lang-filter` and
   `regex-iri`. `export-500k` at 105M was 6% slower at the median over 21 runs
-  (167.6 against 178.1 ms) and 2% slower at the minimum. The same result came with every
-  Phase 2 flag off, so the difference is not from the new read policy. It was not traced
-  to a cause.
+  (167.6 against 178.1 ms) and 2% slower at the minimum. The repeat with
+  `prefetch_constants`, `prefetch_first_scan`, `prefetch_terms` and `parallel_decode`
+  disabled showed the same slowdown while `ReadAhead` and the vocabulary window changes
+  remained active. That ablation was incomplete, and the cause remains unresolved.
 * **A6 holds.** Sixteen concurrent cold point lookups on 10.5M took a median of 5.4 ms
   next to a running `export-500k` and 6.8 ms alone, against 6.1 and 8.4 ms for base.
   The lookups are not slower with the export running, partly because the export warms
@@ -621,6 +624,24 @@ forge by the ratio of their `star-lookup` and `path-plus` base times, `star-look
 and `employee-docs` land near their targets and cannot be called either way. Oxigraph
 does not run on the instance, so the same-host comparison was not made.
 
+### Remaining measurements
+
+Roadmap item 4, §9 and A5 retain the slowdown investigation. After correctness review
+and integration, compare the corrected default build with the approved baseline.
+Repeat that comparison with the candidate's four flags disabled and
+`SPARKLES_READ_WINDOW_KB=0`.
+Window zero restores per-block index advice and the original 1 MiB vocabulary window.
+The comparisons need source, binary, input and driver hashes, exact flags, valid answers,
+balanced samples, cold preparation and raw distributions. Historical comparisons against
+`899fb251` remain separate from these corrected-source measurements.
+
+The quiet forge runs remain pending for the same-host cold targets at 1.05M and 10.5M,
+the warm per-query gates, the 1.01B dense-policy gate A5, concurrent policies A6 and the
+1, 4 and 16 MiB window sweep. The 5% phase performance threshold and the 2% A2 counter-cost
+threshold remain separate from the 10% batch push threshold. The historical observations
+above do not clear these gates on corrected integrated source or establish that the
+slowdown is fixed.
+
 ### Phase 3 decision
 
 Phase 3 was not started. The breakdown attributes `path-plus` and `star-lookup` to
@@ -633,9 +654,9 @@ things are open, and the first two are cheaper than a new block format.
 * Decoding takes about 116 µs per 32,768-row column, which is slow for a delta decode,
   and the decode CPU time doubles on the pool (30.5 against 16.7 ms). Both fit the cost of
   page faults on the freshly allocated 256 KiB output of each column, which the decode
-  timer includes and concurrent faults make worse. The profile counts major faults only.
-  Adding minor faults to it, and measuring a warm decode of the same columns, would
-  show whether a reused decode buffer fixes most of the gap.
+  timer includes and concurrent faults make worse. The profile already reports major
+  and minor faults. A warm decode of the same columns remains needed to distinguish
+  fault cost from decoder CPU time before choosing buffer reuse or segmentation.
 * `path-plus` spends about 1.5 ms outside execution, so segments alone cannot reach the
   2.1 ms target.
 
