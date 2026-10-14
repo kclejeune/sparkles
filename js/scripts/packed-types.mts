@@ -75,7 +75,7 @@ async function catalogHelpers(cat: Catalog, policy: BackupPolicy) {
   const bytes: bigint | undefined = run.datasets[0]?.addedBytes;
   const logical: bigint | undefined = report.keep[0]?.logicalBytes;
   const files: { name: string; path: string }[] = await cat.backupFiles();
-  const claim = cat.reserve('new', 'clone', 'typed');
+  const claim = await cat.reserve('new', 'clone', 'typed');
   claim.close();
   await cat.repositories.withFixed([{ name: 'archive', type: 'fs', path: './backups' }]);
   void bytes;
