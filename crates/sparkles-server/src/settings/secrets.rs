@@ -967,11 +967,13 @@ fn stored_names_strict(dir: &FsPath) -> anyhow::Result<BTreeSet<String>> {
         }
         Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
     };
+    #[cfg(test)]
+    let rd = rd.enumerate().map(|(index, entry)| {
+        scan_check(ScanPoint::Entry(index))?;
+        entry
+    });
     let mut names = BTreeSet::new();
-    for (_index, entry) in rd.enumerate() {
-        #[cfg(test)]
-        scan_check(ScanPoint::Entry(_index))
-            .with_context(|| format!("reading an entry of {}", dir.display()))?;
+    for entry in rd {
         let entry = entry.with_context(|| format!("reading an entry of {}", dir.display()))?;
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
