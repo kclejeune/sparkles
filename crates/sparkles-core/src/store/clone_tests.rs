@@ -88,6 +88,7 @@ fn inode(p: &Path) -> u64 {
 fn shared_files_match_a_rebuild() {
     let dir = tempfile::tempdir().unwrap();
     let src = source(&dir.path().join("src"));
+    std::fs::write(dir.path().join("src/.migrate-checked"), b"remove-old").unwrap();
     let want = dump(&src);
     let mut seen = Vec::new();
     for mode in [CloneMode::Rebuild, CloneMode::Auto, CloneMode::Link] {
@@ -97,6 +98,7 @@ fn shared_files_match_a_rebuild() {
             ..Default::default()
         };
         let rep = src.clone_to(&out, &o).unwrap();
+        assert!(!out.join(".migrate-checked").exists());
         assert_eq!((rep.quads, rep.source_quads), (7, 7));
         assert_eq!(rep.graphs, 5, "{mode:?}");
         assert!(rep.bytes > 0);

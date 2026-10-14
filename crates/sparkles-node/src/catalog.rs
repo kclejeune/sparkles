@@ -155,7 +155,9 @@ impl NativeCatalog {
                     let mut o = sparkles::store::StoreOptions::default();
                     o.union_default_graph = v["unionDefaultGraph"].as_bool().unwrap_or(false);
                     o.cache_bytes = v["cacheBytes"].as_u64().unwrap_or(o.cache_bytes);
-                    o.into()
+                    let mut o: sparkles::CatalogOptions = o.into();
+                    o.memory.pool_bytes = v["totalQueryMemoryBytes"].as_u64();
+                    o
                 }),
                 options: v,
             }))),
@@ -183,8 +185,10 @@ impl NativeCatalog {
             let mut opts = sparkles::store::StoreOptions::default();
             opts.union_default_graph = v["unionDefaultGraph"].as_bool().unwrap_or(false);
             opts.cache_bytes = v["cacheBytes"].as_u64().unwrap_or(opts.cache_bytes);
+            let mut catalog_opts: sparkles::CatalogOptions = opts.into();
+            catalog_opts.memory.pool_bytes = v["totalQueryMemoryBytes"].as_u64();
             let s = Arc::new(CatalogState {
-                catalog: sparkles::Catalog::open(&path, opts.into())?,
+                catalog: sparkles::Catalog::open(&path, catalog_opts)?,
                 options: v,
             });
             map.insert(path, Arc::downgrade(&s));

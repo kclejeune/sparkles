@@ -42,12 +42,14 @@
 //!
 //! **Bulk commits** have no write-ahead log records. Their changes are recorded when
 //! they are small: the dataset was empty and the new state holds at most
-//! `change_log_bulk_max_quads` quads, or the commit adds and removes at most that many.
-//! A larger one is recorded as a summary with the commit's counts. The build collects
-//! the quads that can have changed (those from its sources, those of the graphs it drops
-//! and those of the transaction), and the log keeps the ones that differ between the
-//! states, so a small commit into a large dataset reads neither state in full. History
-//! queries report the commits they could not see.
+//! `change_log_bulk_max_quads` quads, both states together hold at most that many, or the
+//! quads the commit can have changed number at most that many. Those are the quads it
+//! loads, the quads of the graphs it drops and its transaction's own changes, counted with
+//! duplicates, so a commit that rewrites many quads it keeps can be a summary even when it
+//! changes few. A larger one is recorded as a summary with the commit's counts. The build
+//! collects those quads, and the log keeps the ones that differ between the states, so a
+//! small commit into a large dataset reads neither state in full. History queries report
+//! the commits they could not see.
 //!
 //! **Retention.** Whole segments are dropped from the oldest, by commit count, age or
 //! total size. The open segment always stays.
@@ -122,7 +124,14 @@ struct SettingsFile {
 pub(crate) fn read_settings(root: &Path) -> Result<ChangeLogSettings> {
     match std::fs::read(root.join(CHANGE_LOG_FILE)) {
         Ok(b) => {
-            let f: SettingsFile = serde_json::from_slice(&b)
+            let mut v: serde_json::Value = serde_json::from_slice(&b)
+                .map_err(|e| Error::Corrupt(format!("{CHANGE_LOG_FILE}: {e}")))?;
+            crate::formats::check_settings(CHANGE_LOG_FILE, &v)?;
+            // a file without the member is format 1
+            if let Some(o) = v.as_object_mut() {
+                o.entry("format").or_insert(1.into());
+            }
+            let f: SettingsFile = serde_json::from_value(v)
                 .map_err(|e| Error::Corrupt(format!("{CHANGE_LOG_FILE}: {e}")))?;
             Ok(f.settings)
         }
@@ -145,7 +154,7 @@ fn write_settings(root: &Path, s: &ChangeLogSettings) -> Result<()> {
     };
     write_atomic(
         &root.join(CHANGE_LOG_FILE),
-        &serde_json::to_vec_pretty(&f).expect("settings serialize"),
+        &crate::formats::settings_to_vec(CHANGE_LOG_FILE, &f)?,
     )
 }
 
@@ -2042,16 +2051,21 @@ fn candidate_changes(
     }
     quads.sort_unstable();
     quads.dedup();
-    let holds = |s: &Snapshot, q: &QuadKey| -> bool {
+    // a term missing from a state's dictionary means the quad is absent there; a read
+    // error means nothing is known, and the commit becomes a summary
+    let holds = |s: &Snapshot, q: &QuadKey| -> Option<bool> {
         let ids: Option<Vec<Id>> = [1, 2, 3, 0]
             .iter()
             .map(|&i| super::diff::key_id(s, &q[i]))
             .collect();
-        ids.is_some_and(|i| s.contains(&[i[0], i[1], i[2], i[3]]).unwrap_or(false))
+        match ids {
+            None => Some(false),
+            Some(i) => s.contains(&[i[0], i[1], i[2], i[3]]).ok(),
+        }
     };
     let mut out = Vec::new();
     for q in quads {
-        match (holds(before, &q), holds(after, &q)) {
+        match (holds(before, &q)?, holds(after, &q)?) {
             (false, true) => out.push((q, true)),
             (true, false) => out.push((q, false)),
             _ => {}
@@ -2074,4 +2088,29 @@ pub(crate) fn quad_key(q: &Quad) -> QuadKey {
         Arc::from(id::iri_key(q.predicate.as_str())),
         Arc::from(id::term_key(&q.object)),
     ]
+}
+
+#[cfg(test)]
+mod settings_format_tests {
+    use super::*;
+
+    #[test]
+    fn a_newer_change_log_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let newer = crate::formats::settings_file(CHANGE_LOG_FILE)
+            .unwrap()
+            .writes
+            + 1;
+        std::fs::write(
+            dir.path().join(CHANGE_LOG_FILE),
+            format!(r#"{{"format": {newer}, "keepCommits": 5}}"#),
+        )
+        .unwrap();
+        assert!(matches!(
+            read_settings(dir.path()),
+            Err(Error::Unsupported(_))
+        ));
+        std::fs::write(dir.path().join(CHANGE_LOG_FILE), r#"{"keepCommits": 5}"#).unwrap();
+        assert_eq!(read_settings(dir.path()).unwrap().keep_commits, Some(5));
+    }
 }

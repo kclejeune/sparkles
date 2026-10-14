@@ -51,7 +51,7 @@ pub fn parse(bytes: &[u8]) -> Result<Manifest> {
 /// The content checks that need the downloaded files (`CURRENT` names `generation`;
 /// `gen-NNNN/commit.json` has the dataset id and `baseSeq <= commit.seq`) are the
 /// restore's.
-pub fn validate(m: &Manifest, piece_bytes: u64, index_format: u32) -> Result<()> {
+pub fn validate(m: &Manifest, piece_bytes: u64, index_formats: &[u32]) -> Result<()> {
     let bad = |field: &str, msg: String| Err(BackupError::invalid_backup(field, msg));
     if m.kind != MANIFEST_KIND {
         return bad("kind", format!("{:?} is not {MANIFEST_KIND}", m.kind));
@@ -59,12 +59,27 @@ pub fn validate(m: &Manifest, piece_bytes: u64, index_format: u32) -> Result<()>
     if m.format != 1 {
         return bad("format", format!("{} is not 1", m.format));
     }
-    if m.index_format != index_format {
+    // a backup restores as written when its index format is inside the window, and the
+    // restored dataset then opens under the same rules as a database
+    if !index_formats.contains(&m.index_format) {
+        let reads = index_formats
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let remedy = if index_formats.iter().all(|&f| m.index_format > f) {
+            "restore it with that release or a later one".to_string()
+        } else {
+            format!(
+                "restore it with Sparkles {}, dump the dataset there and load the dump here",
+                m.server.version
+            )
+        };
         return Err(BackupError::new(
             Code::IncompatibleFormat,
             format!(
-                "backup uses index format {}; this build reads {index_format}",
-                m.index_format
+                "backup uses index format {}, written by Sparkles {}; this build reads {reads}: {remedy}",
+                m.index_format, m.server.version
             ),
         ));
     }
@@ -359,7 +374,7 @@ mod tests {
     }
 
     fn field_of(m: &Manifest) -> (Code, String) {
-        let e = validate(m, PIECE, 2).unwrap_err();
+        let e = validate(m, PIECE, &[2]).unwrap_err();
         let body = e.body();
         (e.code(), body["field"].as_str().unwrap_or("").to_string())
     }
@@ -375,7 +390,7 @@ mod tests {
 
     #[test]
     fn a_good_manifest_validates() {
-        validate(&good(), PIECE, 2).unwrap();
+        validate(&good(), PIECE, &[2]).unwrap();
         assert_eq!(logical_size(&good()), 8 + 64 + 207);
         // captured after a compaction: the head commit is in the previous generation
         let mut m = good();
@@ -383,7 +398,7 @@ mod tests {
         for f in &mut m.files {
             f.path = f.path.replace("gen-0001/", "gen-0002/");
         }
-        validate(&m, PIECE, 2).unwrap();
+        validate(&m, PIECE, &[2]).unwrap();
     }
 
     #[test]
@@ -460,7 +475,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            validate(&m, u64::MAX, 2).unwrap_err().code(),
+            validate(&m, u64::MAX, &[2]).unwrap_err().code(),
             Code::InvalidBackup
         );
     }
@@ -504,20 +519,21 @@ mod tests {
         m.commit.seq = 0;
         m.commit.reference = "commit:0".into();
         m.commit.parent = None;
-        validate(&m, PIECE, 2).unwrap();
+        validate(&m, PIECE, &[2]).unwrap();
     }
 
     #[test]
     fn a_newer_index_format_is_incompatible() {
         let mut m = good();
         m.index_format = sparkles_core::builder::FORMAT_VERSION + 1;
-        let e = validate(&m, PIECE, sparkles_core::builder::FORMAT_VERSION).unwrap_err();
+        let e = validate(&m, PIECE, sparkles_core::formats::READABLE_INDEX_FORMATS).unwrap_err();
         assert_eq!(e.code(), Code::IncompatibleFormat);
         assert_eq!(e.http_status(), 422);
         let v = sparkles_core::builder::FORMAT_VERSION;
         assert!(
             e.message()
-                .contains(&format!("index format {}; this build reads {v}", v + 1)),
+                .contains(&format!("index format {}, written by Sparkles", v + 1))
+                && e.message().contains(&format!("this build reads {v}")),
             "{e}"
         );
     }
@@ -532,7 +548,7 @@ mod tests {
         }
         for next in [1, 65_536] {
             m.dataset.next_ordinal = Some(next);
-            validate(&m, PIECE, 2).unwrap();
+            validate(&m, PIECE, &[2]).unwrap();
         }
         m.dataset.next_ordinal = None;
         m.dataset.branch = Some(sparkles_core::store::BackupBranch {
@@ -541,7 +557,7 @@ mod tests {
             name: "work".into(),
             next_ordinal: 2,
         });
-        validate(&m, PIECE, 2).unwrap();
+        validate(&m, PIECE, &[2]).unwrap();
         for next in [0, 1, 65_537] {
             m.dataset.branch.as_mut().unwrap().next_ordinal = next;
             assert_eq!(field_of(&m).1, "dataset.branch");

@@ -4,6 +4,7 @@
 //! never enter the catalog namespace. A catalog is cheap to clone and shares its
 //! stores, reservations and lock with every clone.
 
+use crate::store::caches::{CacheSizes, SharedCaches};
 use crate::store::{Store, StoreOptions};
 use crate::{Dataset, DatasetOptions, Error, Result};
 use parking_lot::{Mutex, RwLock};
@@ -23,15 +24,64 @@ pub use restore::RESTORE_PREFIX;
 #[cfg(feature = "backup")]
 mod swap;
 
+/// How a catalog sizes the caches of its datasets (spec X08 §3).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CatalogCaches {
+    /// One set of caches for all datasets, sized by the `cache_bytes`,
+    /// `result_cache_bytes`, `service_cache_bytes` and `history_cache_bytes` of the
+    /// dataset options the catalog is created with.
+    #[default]
+    FromStore,
+    /// One set of caches for all datasets, of these sizes.
+    Sizes(CacheSizes),
+    /// Each dataset sizes its own caches by its store options, so memory grows with the
+    /// number of datasets.
+    PerDataset,
+}
+
+/// The memory a catalog's datasets share.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MemoryOptions {
+    pub caches: CatalogCaches,
+    /// The bytes the estimated memory of all the catalog's queries and updates may
+    /// reach together (the query memory pool, spec X08 §4). `None` has no pool, so only
+    /// each query's own budget applies. A query that the pool cannot cover fails with
+    /// [`BudgetKind::ServerMemory`](crate::BudgetKind).
+    pub pool_bytes: Option<u64>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct CatalogOptions {
     pub dataset: DatasetOptions,
+    pub memory: MemoryOptions,
 }
 impl From<StoreOptions> for CatalogOptions {
     fn from(store: StoreOptions) -> Self {
         Self {
             dataset: store.into(),
+            memory: MemoryOptions::default(),
         }
+    }
+}
+
+impl CatalogOptions {
+    /// The caches the catalog's datasets share, if any.
+    fn shared_caches(&self) -> Option<SharedCaches> {
+        let store = &self.dataset.store;
+        if store.shared.is_some() {
+            return None;
+        }
+        let sizes = match self.memory.caches {
+            CatalogCaches::PerDataset => return None,
+            CatalogCaches::Sizes(s) => s,
+            CatalogCaches::FromStore => CacheSizes {
+                blocks: store.cache_bytes,
+                results: store.result_cache_bytes,
+                service: store.service_cache_bytes,
+                history: store.history_cache_bytes,
+            },
+        };
+        Some(SharedCaches::new(sizes))
     }
 }
 
@@ -90,6 +140,10 @@ struct Entry {
     kind: DatasetKind,
     attached: bool,
 }
+/// The catalog's registry of datasets in the data directory. Its `format` member
+/// ([`sparkles_core::formats::CATALOG`]) is added on write and checked on read.
+pub const CONFIG_FILE: &str = "config.json";
+
 #[derive(Serialize, Deserialize, Default)]
 struct Registry {
     datasets: Vec<RegistryEntry>,
@@ -112,11 +166,19 @@ struct Detached {
 pub(crate) struct Inner {
     dir: Option<PathBuf>,
     options: RwLock<CatalogOptions>,
+    /// the caches every dataset opened by this catalog reads through
+    caches: Option<SharedCaches>,
+    /// the pool its datasets' queries take grants from
+    pool: Option<Arc<crate::sparql::pool::QueryPool>>,
     entries: RwLock<BTreeMap<String, Entry>>,
     reservations: Mutex<BTreeMap<String, (ReservationKind, String)>>,
     /// Persistent datasets taken out of `entries` for an in-place restore, or left
     /// closed by a rename whose rollback could not reopen them.
     detached: Mutex<BTreeMap<String, Detached>>,
+    /// Datasets left closed at open because their files are in a format this release
+    /// does not read, with the refusal. They are also in `detached`, so they stay
+    /// registered.
+    refused: Mutex<BTreeMap<String, String>>,
     manage: Mutex<()>,
     #[cfg(feature = "backup")]
     pub(crate) repositories: Mutex<Option<crate::backup::Repositories>>,
@@ -174,10 +236,16 @@ impl Catalog {
         let catalog = Self {
             inner: Arc::new(Inner {
                 dir: Some(dir.clone()),
+                caches: options.shared_caches(),
+                pool: options
+                    .memory
+                    .pool_bytes
+                    .map(crate::sparql::pool::QueryPool::new),
                 options: RwLock::new(options),
                 entries: RwLock::new(BTreeMap::new()),
                 reservations: Mutex::new(BTreeMap::new()),
                 detached: Mutex::new(BTreeMap::new()),
+                refused: Mutex::new(BTreeMap::new()),
                 manage: Mutex::new(()),
                 #[cfg(feature = "backup")]
                 repositories: Mutex::new(None),
@@ -193,7 +261,29 @@ impl Catalog {
                     e.name
                 )));
             }
-            let ds = catalog.open_dataset(&e.name, e.kind, None)?;
+            let ds = match catalog.open_dataset(&e.name, e.kind, None) {
+                Ok(ds) => ds,
+                // A dataset in a format this release does not read is refused alone: it
+                // stays registered and closed, and the catalog serves the others.
+                Err(Error::Unsupported(msg)) if e.kind == DatasetKind::Persistent => {
+                    let msg = format!(
+                        "dataset \"{}\" is not served: {msg} (`sparkles migrate --data {} --dataset {} --check` lists its formats)",
+                        e.name,
+                        dir.display(),
+                        e.name
+                    );
+                    tracing::error!(target: "sparkles::catalog", "{msg}");
+                    catalog.inner.detached.lock().insert(
+                        e.name.clone(),
+                        Detached {
+                            reasoning: e.reasoning,
+                        },
+                    );
+                    catalog.inner.refused.lock().insert(e.name, msg);
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
             if ds.reasoning_record().is_none() {
                 *ds.state().reasoning.write() = e.reasoning;
             }
@@ -213,16 +303,30 @@ impl Catalog {
         Self {
             inner: Arc::new(Inner {
                 dir: None,
+                caches: options.shared_caches(),
+                pool: options
+                    .memory
+                    .pool_bytes
+                    .map(crate::sparql::pool::QueryPool::new),
                 options: RwLock::new(options),
                 entries: RwLock::new(BTreeMap::new()),
                 reservations: Mutex::new(BTreeMap::new()),
                 detached: Mutex::new(BTreeMap::new()),
+                refused: Mutex::new(BTreeMap::new()),
                 manage: Mutex::new(()),
                 #[cfg(feature = "backup")]
                 repositories: Mutex::new(None),
                 _lock: None,
             }),
         }
+    }
+    /// The caches that the catalog's datasets share, unless it sizes them per dataset.
+    pub fn caches(&self) -> Option<&SharedCaches> {
+        self.inner.caches.as_ref()
+    }
+    /// The pool that bounds the memory of the catalog's queries, if it has one.
+    pub fn pool(&self) -> Option<&Arc<crate::sparql::pool::QueryPool>> {
+        self.inner.pool.as_ref()
     }
     /// Replace the options that datasets created or attached from now on open with.
     /// Datasets that are already open keep their options.
@@ -337,11 +441,20 @@ impl Catalog {
             .map(|d| d.join("databases").join(name))
             .ok_or_else(|| Error::invalid("a persistent dataset needs a catalog directory"))
     }
-    fn open_dataset(&self, name: &str, kind: DatasetKind, loc: Option<&Path>) -> Result<Dataset> {
-        let opts = DatasetOptions {
+    /// The catalog's default dataset options for the dataset `name`, under the catalog's
+    /// query memory pool. A dataset that opens its own store also takes a cache scope.
+    fn dataset_options(&self, name: &str) -> DatasetOptions {
+        DatasetOptions {
             name: Some(name.into()),
+            pool: self.inner.pool.clone(),
             ..self.inner.options.read().dataset.clone()
-        };
+        }
+    }
+    fn open_dataset(&self, name: &str, kind: DatasetKind, loc: Option<&Path>) -> Result<Dataset> {
+        let mut opts = self.dataset_options(name);
+        if let Some(c) = &self.inner.caches {
+            opts.store.shared = Some(c.scope());
+        }
         match kind {
             DatasetKind::Memory => Ok(Dataset::from_store_with(
                 Store::in_memory(opts.store.clone()),
@@ -694,9 +807,8 @@ impl Catalog {
         self.check_reservation(&reservation)?;
         let name = reservation.name();
         let opts = DatasetOptions {
-            name: Some(name.into()),
             origin: Some(origin),
-            ..self.inner.options.read().dataset.clone()
+            ..self.dataset_options(name)
         };
         let ds = Dataset::from_store_with(store, opts);
         *ds.state().reasoning.write() = reasoning;
@@ -807,6 +919,16 @@ impl Catalog {
         files.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(files)
     }
+    /// The registered datasets this catalog left closed when it opened, because their
+    /// files are in a format this release does not read, with the reason (name, message).
+    pub fn refused(&self) -> Vec<(String, String)> {
+        self.inner
+            .refused
+            .lock()
+            .iter()
+            .map(|(n, m)| (n.clone(), m.clone()))
+            .collect()
+    }
     /// Write `config.json` again, with each dataset's current reasoning record. The
     /// catalog saves after its own changes. Programs that change a dataset's reasoning
     /// record outside the catalog call this to persist it.
@@ -841,8 +963,8 @@ impl Catalog {
         datasets.sort_by(|a, b| a.name.cmp(&b.name));
         let reg = Registry { datasets };
         write_file_atomic(
-            &dir.join("config.json"),
-            &serde_json::to_vec_pretty(&reg).map_err(|e| Error::invalid(e.to_string()))?,
+            &dir.join(CONFIG_FILE),
+            &sparkles_core::formats::settings_to_vec(CONFIG_FILE, &reg)?,
         )
     }
     /// Take a managed persistent dataset out of the lookup map for an in-place
@@ -901,6 +1023,7 @@ impl Catalog {
             },
         );
         self.inner.detached.lock().remove(name);
+        self.inner.refused.lock().remove(name);
         Ok(())
     }
 }
@@ -930,18 +1053,16 @@ fn check_name(name: &str) -> Result<()> {
     }
 }
 fn read_registry(dir: &Path) -> Result<Registry> {
-    match std::fs::read(dir.join("config.json")) {
-        Ok(b) => {
-            serde_json::from_slice(&b).map_err(|e| Error::Corrupt(format!("config.json: {e}")))
-        }
+    match std::fs::read(dir.join(CONFIG_FILE)) {
+        // `format` is absent in catalogs written before it existed, which reads as 1
+        Ok(b) => sparkles_core::formats::settings_from_slice(CONFIG_FILE, &b),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Registry::default()),
         Err(e) => Err(e.into()),
     }
 }
-/// Take the catalog lock of the data directory `dir`, as [`Catalog::open`] does, for an
-/// offline command that changes files beside the catalog. The lock is held until the
-/// returned file is dropped. A running server holds it, so this fails with
-/// [`Error::Locked`] while one runs.
+/// Take the catalog lock of a data directory without opening its datasets, for offline
+/// commands on a stopped server. The lock is held until the returned file is dropped.
+/// A running server holds it, so this fails with [`Error::Locked`] while one runs.
 pub fn lock_data_dir(dir: &Path) -> Result<File> {
     lock_dir(dir)
 }
@@ -1097,5 +1218,91 @@ mod tests {
             .map(|d| d.name)
             .collect();
         assert_eq!(names, ["b"]);
+    }
+
+    #[test]
+    fn reattaching_a_repaired_dataset_clears_its_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let cat = Catalog::open(dir.path(), Default::default()).unwrap();
+        drop(cat.create("b", &Default::default()).unwrap());
+        drop(cat);
+        let settings = dir.path().join("databases/b/describe.json");
+        std::fs::write(&settings, r#"{"format": 2}"#).unwrap();
+        let cat = Catalog::open(dir.path(), Default::default()).unwrap();
+        assert!(cat.get("b").is_none());
+        assert_eq!(cat.refused().len(), 1);
+        std::fs::remove_file(settings).unwrap();
+        drop(cat.reattach("b").unwrap());
+        assert!(cat.get("b").is_some());
+        assert!(cat.refused().is_empty());
+        cat.save().unwrap();
+        drop(cat);
+        let cat = Catalog::open(dir.path(), Default::default()).unwrap();
+        assert!(cat.get("b").is_some());
+        assert!(cat.refused().is_empty());
+    }
+
+    #[test]
+    fn a_dataset_with_a_newer_settings_file_is_refused_alone() {
+        for (file, body) in [
+            ("describe.json", r#"{"format": 2}"#),
+            ("rdfs.json", r#"{"rdfsFormat": 2, "graph": "default"}"#),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let cat = Catalog::open(dir.path(), Default::default()).unwrap();
+            drop(cat.create("a", &Default::default()).unwrap());
+            drop(cat.create("b", &Default::default()).unwrap());
+            drop(cat);
+            std::fs::write(dir.path().join("databases/b").join(file), body).unwrap();
+            let cat = Catalog::open(dir.path(), Default::default()).unwrap();
+            assert!(cat.get("a").is_some(), "{file}");
+            assert!(cat.get("b").is_none(), "{file}: b is served");
+            let refused = cat.refused();
+            assert_eq!(refused.len(), 1, "{file}: {refused:?}");
+            assert_eq!(refused[0].0, "b");
+            assert!(refused[0].1.contains(file), "{file}: {refused:?}");
+            cat.save().unwrap();
+            let reg = std::fs::read_to_string(dir.path().join(CONFIG_FILE)).unwrap();
+            assert!(reg.contains("\"b\""), "{file}: {reg}");
+        }
+    }
+    #[test]
+    fn a_dataset_with_an_incompatible_branch_is_refused_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let cat = Catalog::open(dir.path(), Default::default()).unwrap();
+        drop(cat.create("a", &Default::default()).unwrap());
+        let bad = cat.create("b", &Default::default()).unwrap();
+        let info = bad
+            .store()
+            .create_branch("dev", &Default::default())
+            .unwrap();
+        drop(bad);
+        drop(cat);
+        let settings = dir
+            .path()
+            .join("databases/b/branches")
+            .join(info.id.to_string())
+            .join("compaction.json");
+        std::fs::write(&settings, br#"{"format":2}"#).unwrap();
+        let cat = Catalog::open(dir.path(), Default::default()).unwrap();
+        assert!(cat.get("a").is_some());
+        assert!(
+            cat.get("b").is_none(),
+            "an incompatible branch must refuse its dataset"
+        );
+        assert_eq!(cat.refused().len(), 1);
+        assert_eq!(cat.refused()[0].0, "b");
+        assert!(cat.refused()[0].1.contains("compaction.json"));
+        cat.save().unwrap();
+        let registration = std::fs::read_to_string(dir.path().join(CONFIG_FILE)).unwrap();
+        assert!(registration.contains("\"b\""));
+        std::fs::remove_file(settings).unwrap();
+        drop(cat.reattach("b").unwrap());
+        assert!(cat.refused().is_empty());
+        cat.save().unwrap();
+        drop(cat);
+        let reopened = Catalog::open(dir.path(), Default::default()).unwrap();
+        assert!(reopened.get("a").is_some());
+        assert!(reopened.get("b").is_some());
     }
 }

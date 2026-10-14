@@ -11,7 +11,8 @@
 #   DATA_SPECS     bench-record.py --data arguments (name=path|license|params), as an array
 #   LICENSE_NOTES  optional array of notes for the manifest's license check
 #   COUNT_ONLY, NO_CHECK   optional query names compared by row count or not compared
-#   SUITE_EXTRA    optional function run after the timings, with the servers still up
+#   SUITE_EXTRA    optional function run after the timings of each engine, with its server up
+#   SUITE_AFTER    optional function run once every engine has been timed
 #   POOL=1         the queries are <template>-<i> instances, recorded per template
 # and the environment knobs of scripts/bench.sh: WARMUP, RUNS, ENGINES, QUERIES, SKIP_LOAD,
 # ANSWERS_ONLY, PORT_BASE, SERVER_MEM_MAX, CLIENT_CPU, MAX_TIME, plus COLD_RUNS (restarts
@@ -34,7 +35,7 @@ suite_manifest() {
 
 suite_time() {
   local n
-  # clears QLever's result cache before every run (a no-op without QLever)
+  # clears QLever's result cache before every run (a no-op without QLever); ENGINES is one engine here
   local clear=true
   has qlever && clear="curl -sf -o /dev/null 'localhost:${PORT[qlever]}/?cmd=clear-cache&access-token=bench'"
   for n in "${NAMES[@]}"; do
@@ -47,6 +48,17 @@ suite_time() {
     "${CLIENT[@]}" hyperfine --warmup "$WARMUP" --runs "$RUNS" --style basic --ignore-failure --prepare "$clear" \
       "${ARGS[@]}" --export-json "$RES/$n.new.json"
     merge "$RES/$n.new.json" "$RES/$n.json"
+  done
+}
+
+# warm_pass <engine>: every selected query once, untimed, in the format the timed runs ask
+# for, so the server being timed has answered the whole suite (docs/specs/X06 section 5.2)
+warm_pass() {
+  local n
+  log "$1: warm-up pass over the selected queries"
+  for n in "${NAMES[@]}"; do
+    selected "$n" || continue
+    eval "$(q "${URL[$1]}" "$n")" || true
   done
 }
 
@@ -66,11 +78,23 @@ suite_run() {
   [ -n "${SKIP_LOAD:-}" ] || load_all
   start_all
   answer_check
-  if [ -z "${ANSWERS_ONLY:-}" ]; then
-    suite_time
-    if declare -F "${SUITE_EXTRA:-}" > /dev/null; then "$SUITE_EXTRA"; fi
-  fi
   stop_all
+  if [ -z "${ANSWERS_ONLY:-}" ]; then
+    # Each engine runs alone for the timings (docs/specs/X06 section 5.3). The answer check
+    # above may keep every server up, since it measures no time. A fresh server answers every
+    # selected query once before the timings, so it is as warm as the one that was checked.
+    local all=$ENGINES e
+    for e in $all; do
+      ENGINES=$e
+      start "$e"
+      warm_pass "$e"
+      suite_time
+      if declare -F "${SUITE_EXTRA:-}" > /dev/null; then "$SUITE_EXTRA"; fi
+      stop "$e"
+    done
+    ENGINES=$all
+    if declare -F "${SUITE_AFTER:-}" > /dev/null; then "$SUITE_AFTER"; fi
+  fi
   if [ -z "${ANSWERS_ONLY:-}" ] && [ "$COLD_RUNS" -gt 0 ]; then
     local e
     for e in $ENGINES; do cold "$e"; done
@@ -80,7 +104,7 @@ suite_run() {
   for n in "${NAMES[@]}"; do selected "$n" && names+=("$n"); done
   [ -n "${POOL:-}" ] && pool=(--pool-instances)
   python3 "$ROOT/scripts/bench-record.py" build --suite "$SUITE" --scale "$SCALE" --results "$RES" \
-    --manifest "$RES/manifest.json" --out "$RES/record.json" --warmup "$WARMUP" --runs "$RUNS" \
+    --manifest "$RES/manifest.json" --out "$RES/record.json" --warmup "$WARMUP" --runs "$RUNS" --max-time "$MAX_TIME" \
     --queries "${names[@]}" "${pool[@]}"
   python3 "$ROOT/scripts/bench-summary.py" "$RES" "${names[@]}" > /dev/null || log "bench-summary.py failed"
   log "record: $WORK/$RES/record.json, table: $WORK/$RES/summary.md"

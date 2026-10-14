@@ -2220,6 +2220,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/$/server/memory": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Server memory
+         * @description The query memory pool (capacity, bytes granted, requests waiting) and the block, result, SERVICE and history caches, with the bytes each dataset holds in the shared ones.
+         */
+        get: operations["serverMemory"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/server/secrets": {
         parameters: {
             query?: never;
@@ -4109,10 +4129,10 @@ export interface components {
             /** @description The brief as plain text. Its first line says that the lines are recalled data. */
             text: string;
         };
-        /** @description A `507` for a request over one of its budgets. */
+        /** @description A `507` for a request over one of its budgets. The `server-memory` budget is a `503` with `Retry-After`, because the server's query memory pool is in use and a retry can succeed. */
         BudgetError: components["schemas"]["Error"] & {
             /** @enum {string} */
-            budget: "memory" | "result-bytes" | "outbound-bytes" | "validation-work" | "rows" | "rows-produced" | "dataset-bytes";
+            budget: "memory" | "result-bytes" | "outbound-bytes" | "validation-work" | "rows" | "rows-produced" | "dataset-bytes" | "server-memory";
             /** @description Bytes, or rows for `rows` and `rows-produced`. */
             limit?: number;
             requested?: number;
@@ -7079,8 +7099,37 @@ export interface components {
                 enabled: boolean;
             };
             datasets: components["schemas"]["DatasetInfo"][];
+            /** @description The on-disk file kinds and settings files, with the version this build writes and the versions it reads (`sparkles migrate --check` prints the same registry). Left out for anonymous callers when auth is on. */
+            formats?: {
+                kinds?: {
+                    /** @enum {string} */
+                    class: "primary" | "derived" | "config" | "archive";
+                    files: string;
+                    id: string;
+                    marker: string;
+                    reads: number[];
+                    writes: number;
+                }[];
+                settings?: {
+                    member: string;
+                    name: string;
+                    /** @enum {string} */
+                    scope: "dataset" | "server";
+                    writes: number;
+                }[];
+                sparkles?: string;
+                unmarkedSettings?: {
+                    name: string;
+                    reason: string;
+                }[];
+            };
             limits?: components["schemas"]["Limits"];
             readOnly: boolean;
+            refusedDatasets?: {
+                name: string;
+                /** @description Why the dataset is registered but not served, such as an index format this release does not read. The member lists the refused datasets the caller may read, and all of them for a server administrator, who alone gets the full message, which names paths. */
+                reason: string;
+            }[];
             /** @description Fuseki's name for `startedAt`. */
             startDateTime?: string;
             /** Format: date-time */
@@ -7090,6 +7139,55 @@ export interface components {
             uptimeSeconds: number;
             /** @description Left out for anonymous callers when auth is on. */
             version?: string;
+        };
+        /** @description The query memory pool and the caches the datasets share, with each dataset's bytes in them. */
+        ServerMemory: {
+            caches: {
+                block?: {
+                    bytes: number;
+                    capacityBytes: number;
+                    entries: number;
+                };
+                history?: {
+                    bytes: number;
+                    capacityBytes: number;
+                };
+                result?: {
+                    bytes: number;
+                    capacityBytes: number;
+                    entries: number;
+                };
+                service?: {
+                    bytes: number;
+                    capacityBytes: number;
+                    entries: number;
+                };
+                shared?: boolean;
+            };
+            datasets: {
+                blockBytes: number;
+                blockEntries: number;
+                name: string;
+                resultBytes: number;
+                resultEntries: number;
+                serviceBytes: number;
+                serviceEntries: number;
+            }[];
+            pool: {
+                admissionWaitSeconds?: number;
+                admitted?: number;
+                capacityBytes?: number;
+                enabled: boolean;
+                grantedBytes?: number;
+                /** @description Requests answered `503` after the admission wait. */
+                rejected?: number;
+                /** @description Requests waiting for admission. */
+                waiting?: number;
+            };
+            /** @enum {string} */
+            profile: "default" | "small";
+            /** @description The budget of one query (`--query-memory-mb`), `null` when unlimited. */
+            queryMemoryBytes: number | null;
         };
         /** @description A server-wide settings kind with its layers and sources. */
         ServerSettingsKind: {
@@ -13557,6 +13655,29 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ServerInfo"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    serverMemory: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The memory state. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ServerMemory"];
                 };
             };
             401: components["responses"]["Unauthorized"];

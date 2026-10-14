@@ -902,9 +902,7 @@ impl Store {
                 }
             } else {
                 let mut v = serde_json::to_value(&s).expect("settings serialize");
-                v.as_object_mut()
-                    .expect("an object")
-                    .insert("format".into(), 1.into());
+                crate::formats::stamp_settings(COMPACTION_FILE, &mut v);
                 let mut bytes = serde_json::to_vec_pretty(&v).expect("json serializes");
                 bytes.push(b'\n');
                 write_atomic(&path, &bytes)?;
@@ -1239,7 +1237,8 @@ impl Store {
             } else {
                 None
             },
-            wal_len: 0,
+            // a new log holds its header record
+            wal_len: if persistent { wal::HEADER_BYTES } else { 0 },
             index: wal::WalIndex::new(base.seq, false),
             ids: Default::default(),
             last: base.seq,
@@ -1747,6 +1746,7 @@ pub(crate) fn read_settings(root: &Path) -> Result<CompactionSettings> {
         Ok(b) => {
             let v: serde_json::Value = serde_json::from_slice(&b)
                 .map_err(|e| Error::Corrupt(format!("{COMPACTION_FILE}: {e}")))?;
+            crate::formats::check_settings(COMPACTION_FILE, &v)?;
             CompactionSettings::from_json(&v)
                 .map_err(|e| Error::Corrupt(format!("{COMPACTION_FILE}: {e}")))
         }
@@ -1835,5 +1835,25 @@ mod tests {
         assert_eq!(t.delta_ratio, Some(0.5));
         assert!(CompactionSettings::from_json(&serde_json::json!({"ratio": 1})).is_err());
         assert!(CompactionSettings::from_json(&serde_json::json!([1])).is_err());
+    }
+
+    #[test]
+    fn a_newer_compaction_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let newer = crate::formats::settings_file(COMPACTION_FILE)
+            .unwrap()
+            .writes
+            + 1;
+        std::fs::write(
+            dir.path().join(COMPACTION_FILE),
+            format!(r#"{{"format": {newer}, "deltaRatio": 0.5}}"#),
+        )
+        .unwrap();
+        assert!(matches!(
+            read_settings(dir.path()),
+            Err(Error::Unsupported(_))
+        ));
+        std::fs::write(dir.path().join(COMPACTION_FILE), r#"{"deltaRatio": 0.5}"#).unwrap();
+        assert_eq!(read_settings(dir.path()).unwrap().delta_ratio, Some(0.5));
     }
 }

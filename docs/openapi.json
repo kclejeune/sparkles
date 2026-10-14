@@ -3341,7 +3341,8 @@
                   "validation-work",
                   "rows",
                   "rows-produced",
-                  "dataset-bytes"
+                  "dataset-bytes",
+                  "server-memory"
                 ],
                 "type": "string"
               },
@@ -3359,7 +3360,7 @@
             "type": "object"
           }
         ],
-        "description": "A `507` for a request over one of its budgets.",
+        "description": "A `507` for a request over one of its budgets. The `server-memory` budget is a `503` with `Retry-After`, because the server's query memory pool is in use and a retry can succeed.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#budgets"
         }
@@ -13296,11 +13297,130 @@
             },
             "type": "array"
           },
+          "formats": {
+            "description": "The on-disk file kinds and settings files, with the version this build writes and the versions it reads (`sparkles migrate --check` prints the same registry). Left out for anonymous callers when auth is on.",
+            "properties": {
+              "kinds": {
+                "items": {
+                  "properties": {
+                    "class": {
+                      "enum": [
+                        "primary",
+                        "derived",
+                        "config",
+                        "archive"
+                      ],
+                      "type": "string"
+                    },
+                    "files": {
+                      "type": "string"
+                    },
+                    "id": {
+                      "type": "string"
+                    },
+                    "marker": {
+                      "type": "string"
+                    },
+                    "reads": {
+                      "items": {
+                        "type": "integer"
+                      },
+                      "type": "array"
+                    },
+                    "writes": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "files",
+                    "marker",
+                    "class",
+                    "writes",
+                    "reads"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "settings": {
+                "items": {
+                  "properties": {
+                    "member": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "scope": {
+                      "enum": [
+                        "dataset",
+                        "server"
+                      ],
+                      "type": "string"
+                    },
+                    "writes": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "scope",
+                    "member",
+                    "writes"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "sparkles": {
+                "type": "string"
+              },
+              "unmarkedSettings": {
+                "items": {
+                  "properties": {
+                    "name": {
+                      "type": "string"
+                    },
+                    "reason": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "reason"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            },
+            "type": "object"
+          },
           "limits": {
             "$ref": "#/components/schemas/Limits"
           },
           "readOnly": {
             "type": "boolean"
+          },
+          "refusedDatasets": {
+            "items": {
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "reason": {
+                  "description": "Why the dataset is registered but not served, such as an index format this release does not read. The member lists the refused datasets the caller may read, and all of them for a server administrator, who alone gets the full message, which names paths.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "name",
+                "reason"
+              ],
+              "type": "object"
+            },
+            "type": "array"
           },
           "startDateTime": {
             "description": "Fuseki's name for `startedAt`.",
@@ -13328,6 +13448,185 @@
           "readOnly",
           "datasets",
           "auth"
+        ],
+        "type": "object"
+      },
+      "ServerMemory": {
+        "description": "The query memory pool and the caches the datasets share, with each dataset's bytes in them.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#budgets"
+        },
+        "properties": {
+          "caches": {
+            "properties": {
+              "block": {
+                "properties": {
+                  "bytes": {
+                    "type": "integer"
+                  },
+                  "capacityBytes": {
+                    "type": "integer"
+                  },
+                  "entries": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "capacityBytes",
+                  "bytes",
+                  "entries"
+                ],
+                "type": "object"
+              },
+              "history": {
+                "properties": {
+                  "bytes": {
+                    "type": "integer"
+                  },
+                  "capacityBytes": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "capacityBytes",
+                  "bytes"
+                ],
+                "type": "object"
+              },
+              "result": {
+                "properties": {
+                  "bytes": {
+                    "type": "integer"
+                  },
+                  "capacityBytes": {
+                    "type": "integer"
+                  },
+                  "entries": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "capacityBytes",
+                  "bytes",
+                  "entries"
+                ],
+                "type": "object"
+              },
+              "service": {
+                "properties": {
+                  "bytes": {
+                    "type": "integer"
+                  },
+                  "capacityBytes": {
+                    "type": "integer"
+                  },
+                  "entries": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "capacityBytes",
+                  "bytes",
+                  "entries"
+                ],
+                "type": "object"
+              },
+              "shared": {
+                "type": "boolean"
+              }
+            },
+            "type": "object"
+          },
+          "datasets": {
+            "items": {
+              "properties": {
+                "blockBytes": {
+                  "type": "integer"
+                },
+                "blockEntries": {
+                  "type": "integer"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "resultBytes": {
+                  "type": "integer"
+                },
+                "resultEntries": {
+                  "type": "integer"
+                },
+                "serviceBytes": {
+                  "type": "integer"
+                },
+                "serviceEntries": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "name",
+                "blockBytes",
+                "blockEntries",
+                "resultBytes",
+                "resultEntries",
+                "serviceBytes",
+                "serviceEntries"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "pool": {
+            "properties": {
+              "admissionWaitSeconds": {
+                "type": "number"
+              },
+              "admitted": {
+                "type": "integer"
+              },
+              "capacityBytes": {
+                "type": "integer"
+              },
+              "enabled": {
+                "type": "boolean"
+              },
+              "grantedBytes": {
+                "type": "integer"
+              },
+              "rejected": {
+                "description": "Requests answered `503` after the admission wait.",
+                "type": "integer"
+              },
+              "waiting": {
+                "description": "Requests waiting for admission.",
+                "type": "integer"
+              }
+            },
+            "required": [
+              "enabled"
+            ],
+            "type": "object"
+          },
+          "profile": {
+            "enum": [
+              "default",
+              "small"
+            ],
+            "type": "string"
+          },
+          "queryMemoryBytes": {
+            "description": "The budget of one query (`--query-memory-mb`), `null` when unlimited.",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "profile",
+          "queryMemoryBytes",
+          "pool",
+          "caches",
+          "datasets"
         ],
         "type": "object"
       },
@@ -27789,6 +28088,41 @@
           "Server"
         ],
         "x-sparkles-permission": "any caller"
+      }
+    },
+    "/$/server/memory": {
+      "get": {
+        "description": "The query memory pool (capacity, bytes granted, requests waiting) and the block, result, SERVICE and history caches, with the bytes each dataset holds in the shared ones.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#budgets"
+        },
+        "operationId": "serverMemory",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServerMemory"
+                }
+              }
+            },
+            "description": "The memory state."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Server memory",
+        "tags": [
+          "Server"
+        ],
+        "x-sparkles-permission": "metrics"
       }
     },
     "/$/server/secrets": {

@@ -71,7 +71,7 @@ for n in names:
         bad = {c for c, v in an.items() if v["rows"] == "error"}
         ok = {c: v for c, v in an.items() if c not in bad}
         # value-level disagreement with the majority: shown, footnoted, not ranked
-        by_value = {c: v.get("value", v["rows"]) for c, v in ok.items()}
+        by_value = {c: f"{v.get('value', v['rows'])}/{v.get('order', '')}" for c, v in ok.items()}
         ref = majority(by_value)
         wrong = {c for c, v in by_value.items() if ref is not None and v != ref}
         # no majority (two engines that differ, or a tie): none is ranked

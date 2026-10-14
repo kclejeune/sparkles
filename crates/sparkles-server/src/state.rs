@@ -67,6 +67,20 @@ impl GspDirectNaming {
         Ok(out)
     }
 
+    /// No dataset serves direct naming.
+    #[cfg(test)]
+    pub const OFF: GspDirectNaming = GspDirectNaming {
+        all: None,
+        datasets: BTreeMap::new(),
+    };
+
+    /// The values of a Fuseki configuration, then those of the command line, which win
+    /// for the datasets both name.
+    pub fn layered(config: &[String], cli: &[String]) -> Result<GspDirectNaming, String> {
+        let all: Vec<String> = config.iter().chain(cli).cloned().collect();
+        GspDirectNaming::parse(&all)
+    }
+
     /// Direct naming on every dataset that no entry names, with read and write.
     #[cfg(test)]
     pub fn everywhere() -> GspDirectNaming {
@@ -82,6 +96,7 @@ impl GspDirectNaming {
     }
 
     /// Whether any dataset serves direct naming.
+    #[cfg(test)]
     pub fn is_on(&self) -> bool {
         self.all.is_some() || !self.datasets.is_empty()
     }
@@ -311,6 +326,8 @@ pub struct AppState {
     pub started: Instant,
     pub started_at: String,
     pub store_opts: StoreOptions,
+    /// the memory profile and the admission wait of the query memory pool
+    pub admission: crate::server_memory::Admission,
     pub default_timeout: std::time::Duration,
     pub read_only: bool,
     /// honor `validate=false` on writes (skips write-time validation)
@@ -555,15 +572,30 @@ impl Limits {
 }
 
 impl AppState {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(
         data_dir: &Path,
         store_opts: StoreOptions,
         default_timeout: std::time::Duration,
     ) -> Result<AppState> {
+        AppState::with_memory(data_dir, store_opts, default_timeout, None)
+    }
+
+    /// [`new`](Self::new) with a query memory pool of `pool_bytes` for the datasets'
+    /// queries (`None`: no pool).
+    pub fn with_memory(
+        data_dir: &Path,
+        store_opts: StoreOptions,
+        default_timeout: std::time::Duration,
+        pool_bytes: Option<u64>,
+    ) -> Result<AppState> {
         std::fs::create_dir_all(data_dir.join("databases"))?;
+        let mut options: sparkles::CatalogOptions = store_opts.clone().into();
+        options.memory.pool_bytes = pool_bytes;
         let state = AppState {
             data_dir: data_dir.to_path_buf(),
-            catalog: sparkles::Catalog::open(data_dir, store_opts.clone().into())?,
+            catalog: sparkles::Catalog::open(data_dir, options)?,
+            admission: Default::default(),
             routing: Mutex::new(BTreeMap::new()),
             leaving: Mutex::new(BTreeSet::new()),
             tasks: Mutex::new(Vec::new()),
@@ -623,6 +655,7 @@ impl AppState {
         AppState {
             data_dir: PathBuf::new(),
             catalog: sparkles::Catalog::memory(store_opts.clone().into()),
+            admission: Default::default(),
             routing: Mutex::new(BTreeMap::new()),
             leaving: Mutex::new(BTreeSet::new()),
             tasks: Mutex::new(Vec::new()),
@@ -1499,5 +1532,24 @@ pub(crate) mod tests {
         assert!(gone);
         assert!(st.get(target).is_none());
         assert!(!dir.path().join("databases").join(target).exists());
+    }
+
+    #[test]
+    fn direct_naming_flags_win_over_the_fuseki_config() {
+        use DirectMode::{Read, ReadWrite};
+        let v = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let n = GspDirectNaming::layered(&v(&["ds=read-write"]), &v(&["ds=read"])).unwrap();
+        assert_eq!(n.mode("ds"), Some(Read));
+        let n = GspDirectNaming::layered(&v(&["ds=read"]), &v(&["ds=read-write"])).unwrap();
+        assert_eq!(n.mode("ds"), Some(ReadWrite));
+        // a bare flag covers the datasets no entry names
+        let n = GspDirectNaming::layered(&v(&["ds=read"]), &v(&[""])).unwrap();
+        assert_eq!(n.mode("ds"), Some(Read));
+        assert_eq!(n.mode("other"), Some(ReadWrite));
+        let n = GspDirectNaming::layered(&v(&["a=read"]), &v(&["b"])).unwrap();
+        assert_eq!(
+            (n.mode("a"), n.mode("b"), n.mode("c")),
+            (Some(Read), Some(ReadWrite), None)
+        );
     }
 }

@@ -1813,17 +1813,21 @@ also collects the quads of the graphs it drops and passes the quads of the trans
 along, and `log_bulk_commit` keeps the candidates that differ between the two states with
 one lookup in each. It still uses the plain comparison first when both states are small,
 and a commit with more candidates than the limit is a summary. The option keeps its name
-and default, and its documentation now says it counts changed quads. The test
+and default, and its documentation says it counts the candidates, which are the loaded quads, the
+dropped graphs' quads and the transaction's changes, with duplicates. A replace that
+rewrites a graph of 60 quads with one changed is a summary under a limit of 100. Counting
+only the net change is possible later work. The test
 `small_bulk_commits_into_large_datasets_are_recorded` in
 `crates/sparkles-core/tests/history_log.rs` covers A-B1 to A-B3 on persistent and
 in-memory stores, with blank nodes, inline numbers, language tags and triple terms in the
 loaded data.
 
-Two parts of the design did not land. The build does not write `changes.bin`, so a crash
+Three parts of the design did not land. The build does not write `changes.bin`, so a crash
 between the `CURRENT` switch and the change log's flush still leaves the commit
 unrecorded (A-B4). The collected keys are capped by the quad limit but are not charged to
 the build's memory budget. At the default cap this can be a few hundred megabytes of keys, held only while the build runs.
 The extra memory buys a commit latency that does not depend on the size of the dataset.
+The limit counts candidates, not the net change.
 
 **History extensions** (item 52, Tier 5, [ROADMAP](../ROADMAP.md)). *Not built* above
 lists pin rebasing, periods per quad and point-in-time reads rebuilt from the change log;

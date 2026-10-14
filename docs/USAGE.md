@@ -41,6 +41,7 @@ without a migration path, so keep backups of anything you cannot regenerate.
 * [Finding paths](#finding-paths)
 * [Embeddings computed on write](#embeddings-computed-on-write)
 * [Checking a database](#checking-a-database)
+* [Upgrading databases](#upgrading-databases)
 * [MCP server (LLM agents)](#mcp-server-llm-agents)
   * [Handing a query to the web UI](#handing-a-query-to-the-web-ui)
   * [Agent memory grants](#agent-memory-grants)
@@ -406,7 +407,9 @@ happens to materialized inferences, and the limits.
 | `--timeout S` | `60` | Default query timeout in seconds. `timeout=` sets it per request. |
 | `--update-timeout S` | `0` | Default SPARQL update timeout in seconds; `0` means none. `timeout=` sets it per request. An update that times out changes nothing. |
 | `--max-timeout S` | `1800` | Largest `timeout=` a query or update may ask for; `0` means unlimited. Never below `--timeout` or `--update-timeout`. |
-| `--query-memory-mb N` | `8192` | Budget for the estimated memory of a query's intermediate results; `0` means unlimited. |
+| `--query-memory-mb N` | `8192` (`small`: `1024`) | Budget for the estimated memory of a query's intermediate results; `0` means unlimited. |
+| `--total-query-memory-mb N` | half the available memory, less the caches (`small`: `2048`) | The query memory pool, the estimated memory of all queries and updates together. A request waits for a share of it before it runs. `0` turns the pool off. See [Memory and caches](#memory-and-caches). |
+| `--query-admission-wait S` | `2` | Seconds a request waits for its share of the pool before it answers `503` with `Retry-After: 1`. |
 | `--max-result-mb N` | `1024` | Budget for the body of a SPARQL query response; `0` means unlimited. |
 | `--max-export-mb N` | `0` | Budget for the body of a Graph Store GET, which exports a graph or the whole dataset; `0` means unlimited. |
 | `--max-rows N` | `200000000` | Rows in any intermediate result. |
@@ -442,7 +445,7 @@ happens to materialized inferences, and the limits.
 | `--no-metrics` | | `/$/metrics` answers `404`, and no request metrics are kept. |
 | `--metrics-max-datasets N` | `100` | Datasets that get their own metric labels. The rest share `$other`. |
 | `--metrics-fuseki-names` | off | Also expose Fuseki's metric names (`fuseki_requests`, `fuseki_requests_good`, `fuseki_requests_bad`) on `/$/metrics`, for dashboards built for Fuseki. See [API.md](API.md#fuseki-metric-names). |
-| `--gsp-direct-naming[=NAME[=read\|read-write]]` | off | Fuseki's direct Graph Store naming: a request to `/{ds}/{path}` that names no endpoint reads or writes the graph whose IRI is the request URL. Alone, the flag covers every dataset. `=NAME` covers one dataset, and `=NAME=read` makes it read-only, so a write answers `405`. The flag can repeat. See [Fuseki and Jena clients](#fuseki-and-jena-clients). |
+| `--gsp-direct-naming[=NAME[=read\|read-write]]` | off | Fuseki's direct Graph Store naming: a request to `/{ds}/{path}` that names no endpoint reads or writes the graph whose IRI is the request URL. Alone, the flag covers every dataset. `=NAME` covers one dataset, and `=NAME=read` makes it read-only, so a write answers `405`. The flag can repeat. With `--fuseki-config`, a value given here for a dataset wins over the configuration's. A bare flag does not change a dataset that the configuration names. The mode follows the name, so a renamed dataset loses it. See [Fuseki and Jena clients](#fuseki-and-jena-clients). |
 | `--metrics-addr HOST:PORT` | | Also serve `/$/metrics` on this address, with the same authentication. Without `--auth-config`, an address that is not loopback needs `--allow-open-network`. |
 | `--otel` | off | Export traces and metrics over OTLP. `OTEL_EXPORTER_OTLP_ENDPOINT` also turns this on, and the standard `OTEL_*` variables apply (see [API.md](API.md), OpenTelemetry). |
 | `--otel-logs` | off | Export log events over OTLP as well. |
@@ -462,7 +465,11 @@ happens to materialized inferences, and the limits.
 | `--outbound-request-timeout S` | 4 × `--outbound-timeout` (`240`) | Time that all the SERVICE calls and LOADs of one query or update may take, summed. |
 | `--service-bulk-size N` | `10` | Inputs per request of `SERVICE <loop:bulk:…>` (see [Correlated and cached SERVICE](#correlated-bulk-and-cached-service)). |
 | `--service-bulk-max N` | `100` | The most inputs per request of any bulk SERVICE. `bulk+n` is capped to it. |
-| `--service-cache-mb N` | `64` | The cache of remote results that `SERVICE <cache:…>` uses, per dataset. `0` turns it off. A global flag. |
+| `--service-cache-mb N` | `64` (`small`: `16`) | The cache of remote results that `SERVICE <cache:…>` uses, for the whole server. `0` turns it off. A global flag. |
+| `--cache-mb N` | `1024` (`small`: `256`) | The block cache, for the whole server. Each dataset used to have a cache of this size. A global flag. |
+| `--result-cache-mb N` | `256` (`small`: `64`) | The query result cache, for the whole server. `0` turns it off. A global flag. |
+| `--history-cache-mb N` | `512` (`small`: `128`) | Materialized past states for point-in-time reads, for the whole server. A global flag. |
+| `--memory-profile NAME` | `default` | `default` or `small`. A profile sets the defaults of the cache, query budget and pool flags above, and a flag given on the command line overrides it. A global flag. |
 | `--shex-max-imports N` | `64` | Most schemas that the imports of one ShEx schema may bring in, directly or through other imports. `shex validate` and `validation` take it too. |
 | `--shex-max-import-mb N` | `16` | Most schema text that the imports of one ShEx schema may read, from files and the network together. `shex validate` and `validation` take it too. |
 | `--shex-import-timeout S` | `10` | Time that one http(s) import may take. The import is also held to `--outbound-timeout` and the request's budget. |
@@ -474,8 +481,7 @@ happens to materialized inferences, and the limits.
 | `--reason-cache-triples N` | `10000000` | The largest closure of a materialization that a dataset keeps in memory, so that the next re-run or automatic run updates it incrementally. A closure takes about 135 bytes per triple. With `0`, a run reads the closure back from a persistent dataset, and an in-memory dataset runs in full. |
 
 `sparkles serve --help` lists the other options. They include `--read-only`,
-`--union-default-graph`, the cache sizes (`--cache-mb`, `--result-cache-mb`,
-`--history-cache-mb`), `--auto-reason`, `--auth-config`, `--unix-socket`,
+`--union-default-graph`, `--auto-reason`, `--auth-config`, `--unix-socket`,
 `--map-style-url`, the GraphQL limits ([GraphQL](#graphql)), the `--mcp-*` options
 ([MCP over HTTP](#over-http)), response compression (`--http-compression`) and the
 schema limits.
@@ -493,6 +499,40 @@ the same text took under 10 ms, and updates of up to 64 KiB that only use `INSER
 and `DELETE DATA`, on a dataset without write-time validation, when no other write holds
 the dataset. Such a request runs to its end even if its client disconnects, though its
 timeout still applies. Everything else runs on the pool and stops on a disconnect.
+
+### Memory and caches
+
+The server keeps four caches for all its datasets together. The block cache holds decoded
+index blocks (`--cache-mb`), the result cache holds results of query subtrees
+(`--result-cache-mb`), the SERVICE cache holds remote results (`--service-cache-mb`), and
+the history cache holds materialized past states (`--history-cache-mb`). Their memory
+therefore does not grow with the number of datasets. A dataset that is queried keeps its
+blocks, and one that is idle loses them to the others. `/$/server/memory` shows how much of
+each cache every dataset holds, and `POST /$/cache/clear/{ds}` empties the result and
+SERVICE entries of one dataset only.
+
+`--memory-profile small` is for hosts with little memory. It shrinks the caches to 256 MiB
+of blocks, 64 MiB of results, 16 MiB of SERVICE results and 128 MiB of history, lowers the
+budget of one query to 1 GiB, and sets the pool to 2 GiB. The default profile keeps the
+block cache at 1 GiB. The 10.5M-triple benchmark touched about 378 MiB of blocks and ran
+at the same speed with 256 MiB as with 1 GiB, but data at the scale of DBpedia touches
+more, and a smaller cache costs speed when the working set no longer fits. Use `small`
+when memory matters more than the last bit of speed, and read the resolved values in the
+log line that `serve` writes at start.
+
+The query memory pool bounds what all running queries may hold together, so that sixteen
+queries that each stay within `--query-memory-mb` cannot add up to more than the host has.
+A request that finds the pool full waits up to `--query-admission-wait` seconds and then
+receives `503` with `Retry-After`. The pool costs a few atomic operations per request and
+nothing per row while a query stays inside its grant. The default pool is half of the
+available memory less the caches, so a server that ran many large queries at once may now
+see `503` where it used to run them until the host ran out of memory. Every request
+reserves 16 MiB when it starts, so on a small host the pool is the 256 MiB floor, and
+concurrent queries beyond the sixteenth wait and then receive `503` with `Retry-After`.
+Set `--total-query-memory-mb 0` to turn the pool off, which restores the earlier
+behaviour. A SERVICE call from a query to its own server counts as a request of its own,
+so it can wait while its caller holds memory and then answer `503`. The mechanism is
+described in [API.md](API.md#query-memory-pool).
 
 ## Command-line tools
 
@@ -740,6 +780,8 @@ The other commands are:
 * `config import` and `config check`, for Fuseki configurations
   ([above](#migrating-from-fuseki));
 * `snapshot`, for named snapshots and history retention;
+* `migrate`, for upgrading a stopped server's databases to the file versions of this
+  release ([below](#upgrading-databases));
 * `quota`, for the storage quota of a dataset, locally or on a `--server`;
 * `compaction`, for a dataset's automatic compaction settings, locally or on a `--server`
   ([below](#automatic-compaction));
@@ -1916,8 +1958,8 @@ every film gets the same label. With `loop:` and no `bulk`, it gets one request 
 With `bulk+50`, 1,000 films take 20 requests, and with `cache:` a second run takes none.
 The requests follow the outbound policy and its budgets like any SERVICE call.
 
-The cache belongs to the dataset, holds `--service-cache-mb` (64), and keeps each caller's
-entries apart. `cache+clear:` refreshes the entries a query reads, and
+The cache is shared by the datasets, holds `--service-cache-mb` (64) in all, and keeps each
+caller's entries apart. `cache+clear:` refreshes the entries a query reads, and
 `POST /$/cache/clear/{ds}` drops them all. `SERVICE <loop:> { … }` and
 `SERVICE <urn:x-arq:self> { … }` read the dataset itself without a request. The options
 and the request shapes are in [API.md](API.md#service-options-loop-bulk-and-cache).
@@ -2138,12 +2180,12 @@ clean, 1 when any check found an error, and 2 when there are warnings only.
 | Check | What it verifies |
 |---|---|
 | `layout` | `CURRENT` names an existing generation. `dataset.json`, the generation's `commit.json` (with the same dataset id) and `prefixes.json` parse. Leftovers of interrupted work are warnings: `*.tmp`, `text.new`/`text.old`, an old or unfinished `gen-NNNN`, or a set-aside catalog. |
-| `generation` | `meta.json` (index format) and `stats.json` parse and agree on the quad count. |
+| `generation` | `meta.json` and `stats.json` parse and agree on the quad count, and this release reads the index format. |
 | `vocabulary` | The front-coded vocabulary decodes, its keys strictly increase, and its size matches `meta.json`. Every vocabulary id in the permutations is below that size. Every entry of the sparse index `vocab.idx` names the offset and first key of its block. An index that does not read as one for this vocabulary is a warning, because the server ignores it. |
 | `delta-vocabulary` | The update vocabulary is well formed and holds no duplicate. The summary names its format, `framed` or `legacy`, and the zero bytes preallocated after its last chunk. A torn tail is a warning. |
 | `perm.spo` … `perm.gspo` | Block metadata is contiguous, sorted and fits the file, and the row count matches `meta.json`. Every block decodes to its row count, and its first and last keys match the metadata. Keys strictly increase within and across blocks, and every id is valid for its position. |
 | `permutations` | The 7 permutations hold the same number of rows and, compared by an order-independent hash, the same quads. |
-| `wal` | Records are well formed, and every commit record's checksum matches. A damaged final transaction is a warning, because open truncates it. So is a final transaction that names update-vocabulary terms the file lacks, which a crash during its commit can leave, and one with zero records before its commit record. Zero bytes after the last commit are preallocated space, reported in the summary. Commit numbers continue from the generation's base commit, and ids resolve. |
+| `wal` | Records are well formed, and every commit record's checksum matches. A damaged final transaction is a warning, because open truncates it. So is a final transaction that names update-vocabulary terms the file lacks, which a crash during its commit can leave, and one with zero records before its commit record. Zero bytes after the last commit are preallocated space, reported in the summary. Commit numbers continue from the generation's base commit, and ids resolve. The summary names the log's version: 1 for a log that starts with a header record, 0 for one written before the header existed. A header with a version this release does not read is an error. |
 | `catalog` | `commits.bin` has valid record checksums, continuous records and the right dataset id, and agrees with the WAL. A lagging catalog, or damage that open can rebuild from the WAL, is a warning. Lost history before the generation is an error. |
 | `text` | `text.json` parses. The index opens read-only, and every committed segment file exists and matches its checksum. The index's commit is compared with the WAL. An index that is behind is a warning, because open catches it up or rebuilds it. |
 | `geo` | `geo.json` parses and is a valid configuration. The current generation's index files (`geo/rtree.spkg`, `geo/column.spkg`) have a valid header and footer, belong to this generation and configuration, and match their index checksums. In full mode, the data checksums are checked too. A damaged file is a warning, because open rebuilds it. |
@@ -2160,6 +2202,109 @@ checksums. On the 10.5M-quad benchmark database, a full check takes about 0.3 s 
 quick one 20 ms (16 cores, warm page cache). The same check is a library call:
 `sparkles::check::check(root, &CheckOptions::default())` returns a serializable
 `CheckReport`.
+
+## Upgrading databases
+
+Every file Sparkles keeps records the version of its format, and a release reads the
+versions of the release before it. The registry of file kinds and versions is
+`crates/sparkles-core/src/formats.rs`. `GET /$/server` lists it in its `formats` member,
+and `sparkles migrate --check` prints it with each database's versions. Before 1.0, release
+0.N opens the databases and backups that 0.N and 0.(N-1) wrote. From 1.0, a release opens
+those of its own major version and of the last minor release before it.
+
+Most changes need no step. A release reads the older version, and it writes the new one
+the next time it writes the file or, for a generation's index, at the next compaction.
+A full-text, spatial or vector index in a version the release does not read is rebuilt
+in the background. When a format changes in a way the new release cannot read, the
+release ships an upgrade step and refuses the old files with a message that names
+`sparkles migrate`. A database outside the window is refused with the release that wrote
+it, which `writtenBy` in `dataset.json` records. Dump it with `sparkles dump` from that
+release and load the dump with `sparkles load`.
+
+```sh
+sparkles migrate --data /srv/sparkles --check            # every database of a stopped server
+sparkles migrate --data /srv/sparkles --dataset books    # upgrade one dataset
+sparkles migrate --loc db --keep-old                     # one database, keeping the old files
+sparkles migrate --loc db --check --format json
+```
+
+`sparkles migrate` works offline. With `--data` it takes the catalog lock, so it fails
+while a server holds the data directory, and it upgrades the persistent datasets that
+`config.json` registers, or those that `--dataset` names. `--check` lists each
+database's `dataset.json` versions, the version of every generation's index, log and
+update vocabulary, whether the release opens the database, and the steps an upgrade
+would run. It never changes a database and does not finish or undo an earlier run, which
+it reports as `interrupted`. The exit status is 1 when a database is outside the window
+and 0 otherwise. The window covers the root of a database and every branch, and a newer
+settings file of a dataset or of one of its branches puts the database outside it.
+Startup checks dataset metadata and settings in every active and retained branch before
+rewriting root metadata, using the same physical branch directories as migration
+planning. Unpublished `.create-*` directories and `.deleting` tombstones are excluded
+from these checks and left unchanged by migration planning. Startup's existing branch
+recovery removes them after compatibility preflight succeeds. An incompatible real
+branch refuses its dataset before cleanup while other datasets remain available.
+The informational files `origin.json` and `restore.json` are the exception, because a
+store ignores a newer one with a warning.
+
+The command makes the database path absolute before mutation. If it contains `..`,
+it resolves the existing parent through the filesystem and preserves the final database
+name. This keeps a valid `db/../db` path usable during the swap and follows the physical
+meaning of symlink parents. If an interrupted run made that alias unresolvable, use the
+database's stable parent path to recover. Paths without `..` continue to support a
+missing database and new nested directories.
+
+Without `--check`, the command copies each database that has steps to run into a
+sibling directory named `.migrate-<name>` and runs the steps on the copy. It then checks
+the copy as `sparkles check` does and swaps it in with two renames. The copy needs as much
+free space as the database. The dataset id, the commit numbers, the commit catalog, the
+branches and the snapshots stay as they were. `--keep-old` keeps the database as it was
+in `.pre-migrate-<version>-<name>`, and without it that directory is removed. The
+command refuses to start while that directory exists, so it never deletes an earlier
+kept copy. It also refuses a database that holds a symlink or another entry that is not a
+regular file or directory, because the copy would leave it out. Replace the entry with the
+files it points to and run again.
+
+The command takes the lock file `.migrate.lock-<name>` next to the database, which a
+second `sparkles migrate` and a `--check` of the same database respect, and the
+database's own lock, which a server or any other process that has the database open
+holds. It therefore fails with a locked error while a server runs on the database, and it
+leaves the lock file in place after it finishes. A copy that fails the check is removed,
+and the database is left as it was. If the command stops before the swap, the next run
+removes the copy and the database is unchanged. If it stops between the two renames, the
+next run renames the checked copy into place. A server, or any other open of the
+database, refuses a database with a pending `.migrate-<name>` until `sparkles migrate`
+has run on it again, so a stopped run never leads to an empty database. The checked
+copy records a versioned marker with the exact old sibling directory and whether to
+keep it. Recovery uses that recorded directory even when another release finishes the
+run, so it preserves unrelated kept copies. Unknown or damaged markers and duplicate known marker fields refuse recovery
+without changing the copies. Bare legacy `keep-old` or `remove-old` markers also refuse
+automatic recovery because they do not identify the original old directory. Inspect
+the sibling copies and recover through a known original location or restore by hand. After checking
+for a pending migration, startup verifies that its locked file still belongs to the
+current database directory. If migration replaced that directory while startup was
+acquiring its lock, the open refuses with a locked error and can be retried. An offline
+backup restore makes the same check before publication and refuses a stale lock with
+`dataset-busy`, leaving both directories intact. A copy that
+carries no mark of a passed check is never renamed into place. The command reports it and
+leaves both directories alone. A backup restore also refuses to replace the database while
+a migration is pending, including when the database directory is missing between the two
+renames.
+
+The only step today rewrites a legacy update vocabulary (`delta.vocab`) in the framed
+format, which the first write to it would also do. A server opens such a database
+without the step.
+
+A server that finds a dataset in a version it does not read leaves that dataset closed,
+logs why, and serves the others. That covers an index or a log in a newer version, a
+`dataset.json` that needs a later reader, and a settings file such as `describe.json`,
+`rdfs.json` or `assistant.json` with a newer `format`, which a store checks at open before
+it writes any file. The dataset stays registered, and `GET /$/server` lists it under
+`refusedDatasets`. A caller sees the refused datasets it may read, and a server
+administrator sees all of them and alone gets the full reason, which names paths. The
+other callers get a fixed sentence. A refused dataset cannot be deleted or renamed through
+the API while it is closed. Stop the server and run `sparkles migrate`, or edit
+`config.json`. After `sparkles migrate`, or after the database is replaced, the next start
+opens it.
 
 ## MCP server (LLM agents)
 
@@ -4012,6 +4157,18 @@ cannot start with `.` and cannot be `ui` or `$`. Renaming a persistent dataset f
 while handles to it are open. Otherwise the rename closes the store, moves its
 directory and updates the registry.
 
+A catalog builds one block cache, result cache, SERVICE cache and history cache for all
+the datasets it opens, sized by the cache options of the `StoreOptions` it was created
+with, so its memory does not grow with the number of datasets. `CatalogOptions::memory`
+can size them separately (`CatalogCaches::Sizes`) or give each dataset its own
+(`CatalogCaches::PerDataset`). `MemoryOptions::pool_bytes` adds a query memory pool, the
+estimated bytes that all the catalog's queries and updates may hold together. A query
+that the pool cannot cover fails with `BudgetKind::ServerMemory`, and nothing queues.
+There is no pool by default. A dataset opened on its own keeps its own caches. Python
+takes `total_query_memory_bytes` in `Catalog(...)` and `Catalog.memory(...)`, and
+Node takes `totalQueryMemoryBytes` in the catalog options. The JVM bindings do not expose
+the pool.
+
 With the feature `backup`, `catalog.repositories()` manages `backup/repositories.json`.
 Its `list`, `get`, `add`, `update`, `remove` and `open` calls share the configuration
 and the opened repositories. `with_fixed` adds read-only entries defined by the
@@ -5091,13 +5248,15 @@ Sparkles is experimental, and its on-disk format may change between commits with
 migration path, so take a backup before you upgrade.
 
 A release refuses a database whose `dataset.json` asks for a later reader
-(`minimumReader`), so an older release never misreads files it does not know. A
-database moves to a later reader only when it first uses the feature that needs it. The
-framed update vocabulary needs reader 4. A database that an earlier release wrote opens
-unchanged, and the first commit that adds a term to it raises `minimumReader` to 4 and
-rewrites its `delta.vocab` in the framed format. From then on, releases that read only
-up to reader 3 refuse it. To go back to such a release, dump the database with
-`sparkles dump` and load the dump with the older release.
+(`minimumReader`), so an older release never misreads files it does not know. The framed
+update vocabulary needs reader 4, and a write-ahead log with a header record needs
+reader 5. A database that an earlier release wrote opens unchanged. When a release
+opens it for writing, it records itself in `writtenBy` and raises `minimumReader` to 5,
+because the generations it writes from then on start their logs with a header. From
+then on, releases that read only up to reader 4 refuse it. To go back to such a
+release, dump the database with `sparkles dump` and load the dump with the older
+release. [Upgrading databases](#upgrading-databases) describes the version window and
+`sparkles migrate`.
 
 ### Backing up the container's data
 

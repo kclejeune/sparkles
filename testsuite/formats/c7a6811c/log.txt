@@ -1,0 +1,8 @@
+dataset c7958510-e63e-4c1b-9944-401d98d1d425  head 5  (* readable with --at)
+    seq  timestamp                 kind          +inserted   -deleted        quads  generation  message
+     5*  2026-10-13T23:05:36.393Z  update                1          1           25  gen-0003
+     4*  2026-10-13T23:05:36.370Z  update                3          0           25  gen-0003    after the compaction
+     3*  2026-10-13T23:05:36.295Z  update                2          0           22  gen-0002
+     2   2026-10-13T23:05:36.267Z  update                2          0           20  gen-0002    first commit
+     1   2026-10-13T23:05:36.237Z  load                 18          0           18  gen-0002
+     0   2026-10-13T23:05:36.193Z  create                0          0            0  gen-0001

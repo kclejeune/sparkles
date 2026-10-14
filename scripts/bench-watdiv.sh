@@ -229,7 +229,7 @@ if [ -z "${SKIP_LOAD:-}" ]; then
     LOAD+=(--prepare 'rm -f qlever-index/bench.*' --command-name qlever "cd qlever-index && $QINDEX -i bench -F nt -f ../data.nt -p true -s settings.json")
   fi
   if has fluree; then LOAD+=(--prepare 'rm -rf fluree' --command-name fluree "mkdir -p fluree && cd fluree && $FLUREE init -q && $FLUREE --memory-budget-mb 8192 create bench --from ../data.nt --chunk-size-mb 16"); fi
-  if has oxigraph; then LOAD+=(--prepare 'rm -rf oxigraph.db' --command-name oxigraph "$OXIGRAPH load --location oxigraph.db --file data.nt && $OXIGRAPH optimize --location oxigraph.db"); fi
+  if has oxigraph; then LOAD+=(--prepare 'rm -rf oxigraph.db' --command-name oxigraph "$OXIGRAPH load --location oxigraph.db --format nt < data.nt && $OXIGRAPH optimize --location oxigraph.db"); fi
   hyperfine --runs 1 --style basic "${LOAD[@]}" --export-json results/load.new.json
   merge results/load.new.json results/load.json
 fi

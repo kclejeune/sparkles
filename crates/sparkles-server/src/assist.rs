@@ -360,9 +360,16 @@ impl Imports {
 pub(crate) fn read_file(st: &AppState, ds: &Dataset, file: &'static str) -> Result<Option<Value>> {
     match ds.store.root() {
         Some(root) => match std::fs::read(root.join(file)) {
-            Ok(b) => Ok(Some(
-                serde_json::from_slice(&b).with_context(|| format!("{file} of {}", ds.name))?,
-            )),
+            Ok(b) => {
+                let v: Value =
+                    serde_json::from_slice(&b).with_context(|| format!("{file} of {}", ds.name))?;
+                // a version member newer than this release writes is refused
+                if sparkles::formats::settings_file(file).is_some() {
+                    sparkles::formats::check_settings(file, &v)
+                        .with_context(|| format!("{file} of {}", ds.name))?;
+                }
+                Ok(Some(v))
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e).with_context(|| format!("reading {file} of {}", ds.name)),
         },
@@ -373,7 +380,11 @@ pub(crate) fn read_file(st: &AppState, ds: &Dataset, file: &'static str) -> Resu
 pub(crate) fn write_file(st: &AppState, ds: &Dataset, file: &'static str, v: &Value) -> Result<()> {
     match ds.store.root() {
         Some(root) => {
-            let bytes = serde_json::to_vec_pretty(v)?;
+            let mut v = v.clone();
+            if sparkles::formats::settings_file(file).is_some() {
+                sparkles::formats::stamp_settings(file, &mut v);
+            }
+            let bytes = serde_json::to_vec_pretty(&v)?;
             sparkles::guard::config::write_atomic(&root.join(file), &bytes)
                 .with_context(|| format!("writing {file} of {}", ds.name))
         }

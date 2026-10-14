@@ -212,7 +212,7 @@ impl Store {
             &gdir.join("commit.json"),
             &commit::gen_commit_bytes(id, "clone", &root),
         )?;
-        File::create(gdir.join("wal.log"))?.sync_all()?;
+        super::wal::create(&gdir.join("wal.log"))?;
         sync_dir(&gdir)?;
         write_atomic(
             &dir.join("dataset.json"),
