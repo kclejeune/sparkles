@@ -416,6 +416,38 @@ fn entries() -> Vec<(&'static str, Entry)> {
         op!("draftShapes", "schema.draft_shapes", |ds| {
             ds.schema().draft_shapes(&Default::default());
         }),
+        // ------------------------------------------------ graph algorithms
+        op!("runAlgorithm", "algorithms.run", |ds| {
+            ds.algorithms().run(&any(), &Default::default());
+        }),
+        op!(
+            "listAlgorithmProjections",
+            "algorithms.projections.list",
+            |ds| {
+                ds.algorithms().projections().list();
+            }
+        ),
+        op!(
+            "getAlgorithmProjection",
+            "algorithms.projections.get",
+            |ds| {
+                ds.algorithms().projections().get("p");
+            }
+        ),
+        op!(
+            "putAlgorithmProjection",
+            "algorithms.projections.put",
+            |ds| {
+                ds.algorithms().projections().put("p", any(), None, None);
+            }
+        ),
+        op!(
+            "deleteAlgorithmProjection",
+            "algorithms.projections.delete",
+            |ds| {
+                ds.algorithms().projections().delete("p", None);
+            }
+        ),
         // ------------------------------------------------ stored queries and GraphQL
         op!("listStoredQueries", "queries.list", |ds| {
             ds.queries().list();
@@ -818,6 +850,9 @@ fn every_operation_maps_to_a_library_call_or_a_reason() {
 
 /// Library calls with no HTTP operation. Keep their binding decisions explicit too.
 const EXTRA_KEYS: &[&str] = &[
+    "algorithms.query_text",
+    "algorithms.run_write",
+    "algorithms.stats",
     "catalog.open",
     "catalog.memory",
     "catalog.inspect",
@@ -877,6 +912,14 @@ fn check_library_only_calls(ds: &Dataset, cat: &sparkles::Catalog) {
     ds.branch("dev");
     ds.clone_to_with("clone", &Default::default(), &Default::default());
     ds.clone_to_memory_with("clone", &Default::default(), &Default::default());
+    ds.algorithms().query_text(&any(), false);
+    ds.algorithms().stats(&any(), &Default::default());
+    ds.algorithms().run_write(
+        &any(),
+        &Default::default(),
+        None,
+        &sparkles::task::Control::none(),
+    );
     ds.history().wait_for_commit(0, std::time::Duration::ZERO);
     ds.history().prune();
     ds.history().tick();

@@ -136,7 +136,7 @@ fn pairs(items: &[String], what: &str) -> Result<BTreeMap<String, String>> {
 
 fn request(a: &RunArgs) -> Result<AlgoRequest> {
     if let Some(f) = &a.request {
-        let mut j: Value = serde_json::from_slice(
+        let j: Value = serde_json::from_slice(
             &std::fs::read(f).with_context(|| format!("reading {}", f.display()))?,
         )
         .with_context(|| format!("{}: not JSON", f.display()))?;

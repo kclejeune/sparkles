@@ -553,6 +553,8 @@ sparkles quota   --loc db --max-mb 10240      # storage quota; --default removes
 sparkles quota   --server URL --dataset db --max-mb 0   # on a server, as server-admin; 0 is unlimited
 sparkles compaction --loc db --set deltaRatio=0.02     # automatic compaction settings; --default removes them
 sparkles describe-settings --loc db --set mode=scbd   # how DESCRIBE describes a resource; --default removes it
+sparkles algo run --loc db pageRank --predicate http://ex.org/knows   # graph algorithms, see below
+sparkles algo projections put --loc db people --predicate http://ex.org/knows   # a named projection
 sparkles ping    127.0.0.1:3030               # GET /$/ready over HTTP, then HTTPS; exit 0 on 200 (health checks)
 ```
 
