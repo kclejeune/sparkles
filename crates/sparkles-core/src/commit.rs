@@ -555,6 +555,10 @@ struct DatasetFile {
         skip_serializing_if = "Option::is_none"
     )]
     restored_from: Option<RestoredFrom>,
+    /// members a later release added; kept on rewrite so that an additive change survives
+    /// a write by this release (X12 §4.3)
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Where a cloned dataset came from: the source's dataset id and the commit (`seq`) of
@@ -700,6 +704,7 @@ pub(crate) fn clone_dataset_file_bytes(
         origin: "clone".to_string(),
         forked_from: Some(from),
         restored_from: None,
+        extra: Default::default(),
     })
     .unwrap()
 }
@@ -733,6 +738,7 @@ pub(crate) fn dataset_file_bytes(id: uuid::Uuid, origin: &str, created_ms: i64) 
         origin: origin.to_string(),
         forked_from: None,
         restored_from: None,
+        extra: Default::default(),
     })
     .unwrap()
 }
@@ -1427,5 +1433,40 @@ mod tests {
         let e =
             dataset_id_of(br#"{"format": 2, "minimumReader": 9, "id": 5}"#).expect_err("refused");
         assert!(matches!(e, Error::Unsupported(_)), "{e:?}");
+    }
+
+    #[test]
+    fn unknown_dataset_members_survive_a_write_open() {
+        use crate::store::{Store, StoreOptions};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        drop(Store::open(&root, StoreOptions::default()).unwrap());
+        let path = root.join("dataset.json");
+        let edit = |f: &dyn Fn(&mut serde_json::Value)| {
+            let mut v: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            f(&mut v);
+            std::fs::write(&path, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
+        };
+        let read = || -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap()
+        };
+        edit(&|v| {
+            v["futureMember"] = serde_json::json!({"a": 1});
+            v["writtenBy"] = "9.9.9".into();
+        });
+        drop(Store::open(&root, StoreOptions::default()).unwrap());
+        let v = read();
+        assert_eq!(v["writtenBy"], crate::formats::SPARKLES_VERSION);
+        assert_eq!(v["futureMember"], serde_json::json!({"a": 1}));
+        // a member that a later release added never shadows a known one
+        assert_eq!(v["format"], 1);
+        assert_eq!(v["minimumReader"], 5);
+        // raising the reader keeps it too
+        edit(&|v| v["minimumReader"] = 1.into());
+        require_reader(&root, 5).unwrap();
+        let v = read();
+        assert_eq!(v["minimumReader"], 5);
+        assert_eq!(v["futureMember"], serde_json::json!({"a": 1}));
     }
 }
