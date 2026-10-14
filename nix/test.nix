@@ -347,6 +347,34 @@
     assert c["policy"]["idleSeconds"] == 0, c
     machine.succeed("systemctl show -p ExecStart sparkles.service | grep -q -- '--max-clones 1'")
 
+    # An automatic compaction's build threads lower their priority with setpriority,
+    # which the unit's ~@resources filter once answered by killing the server (SIGSYS).
+    # Crossing minQuads makes one due.
+    machine.succeed(
+        "{ echo 'INSERT DATA {'; for i in $(seq 6000); do echo \"<urn:s$i> <urn:q> $i .\"; done; echo '}'; } > /tmp/bulk.ru"
+    )
+    machine.succeed(
+        f"curl -sf {base}/demo/update -H 'Content-Type: application/sparql-update' --data-binary @/tmp/bulk.ru"
+    )
+    for _ in range(240):
+        c = json.loads(machine.succeed(f"curl -sf {base}/\\$/compaction/demo"))
+        if c["automaticRuns"] >= 1 and c["state"] != "running":
+            break
+        time.sleep(0.5)
+    else:
+        raise Exception(f"no automatic compaction ran: {c}")
+    assert c["failures"] == 0, c
+    restarts = machine.succeed("systemctl show -p NRestarts --value sparkles.service").strip()
+    assert restarts == "0", f"sparkles restarted {restarts} times during compaction"
+    out = machine.succeed(
+        f"curl -sf {base}/demo/sparql -H 'Accept: text/csv' --data-urlencode "
+        + "'query=SELECT (SUM(?v) AS ?s) WHERE { ?x <urn:p> ?v }'"
+    )
+    assert last_value(out) == "49", out
+    machine.succeed(
+        f"curl -sf {base}/demo/update --data-urlencode 'update=DELETE WHERE {{ ?s <urn:q> ?o }}'"
+    )
+
     # the admin API and the embedded UI are reachable through the proxy
     machine.succeed(f"curl -sf {base}/\\$/datasets | grep -q scratch")
     machine.succeed(f"curl -sf {base}/ui/ | grep -qi '<html'")
