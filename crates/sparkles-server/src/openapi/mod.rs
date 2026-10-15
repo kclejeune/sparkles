@@ -654,7 +654,7 @@ fn parameters() -> Map<String, J> {
         q(
             "profile",
             json!({ "type": "string", "enum": ["io"] }),
-            "`io` adds an `io` object to the metadata of the `application/x-sparkles+json` result, with what the query read from the index and vocabulary files and the time spent doing so. The counters are process-wide, so concurrent queries add to them. Overlapping profiles share at most 65,536 first-admitted pages; pagesTruncated reports cap omissions, not completeness. Page counts describe the retained sample, and broughtIn is its diagnostic nonnegative resident-count delta rather than physical I/O.",
+            "`io` adds an `io` object to the metadata of the `application/x-sparkles+json` result, with what the query read from the index and vocabulary files and the time spent doing so. The counters are process-wide, so concurrent queries add to them. Overlapping profiles share at most 65,536 first-admitted pages; pagesTruncated reports cap omissions, not completeness. Page counts describe the retained sample, and broughtIn is its diagnostic nonnegative resident-count delta rather than physical I/O. Numeric mapped loads are observed independently of advice, including hints-off and previously hinted reads.",
         ),
     );
     put(

@@ -6887,6 +6887,12 @@ evicted. Platforms without mapped page observations report a false truncation fl
 no page entries. The bounded shared inventory and event log add memory while profiles
 are active, outside any one query's grant. Their allocation size depends on the allocator.
 Profiling adds observation work, whose corrected-source cost remains to be measured.
+Numeric profiles record mapped value loads in both single and bulk lookup paths. Kinds
+and rank entries are observed before access only when read from the mapping, rather
+than a resident copy. These observations work with hints disabled or already issued.
+`numericPagesRequested` keeps counting numeric advice pages and does not count actual
+loads. Observation adds no advice and does not reset the mapping's once-only hint bits.
+
 The same counters are in `/$/metrics` as `sparkles_index_columns_decoded_total`,
 `sparkles_index_readahead_bytes_total` and `sparkles_vocab_groups_read_total`.
 

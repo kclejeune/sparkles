@@ -537,6 +537,17 @@ cover 65,537 small observations, exact saturation, duplicate-only touches, multi
 mappings and files, clipped and partial ranges, shared overlapping quotas and fresh
 epoch reset. The original lifecycle ordering tests remain in place.
 
+Numeric profiling now observes mapped kind, rank and value ranges before loading them.
+Single and bulk value reads share the same accessor. Resident head copies do not add
+mapped observations, and actual-read observation neither issues advice nor changes the
+numeric advice counter or hint bits. Isolated exact-page guards cover hints off, normal
+hints, hints issued before profiling, resident and mapped heads, empty and duplicate
+inputs, unknown and non-numeric kinds, segment gaps and partial tails. A private cold
+numeric value page is independently nonresident before access and resident afterward.
+A FILTER/BIND guard retains the original noncanonical literal identity while the context
+uses its numeric value. File bytes, layout and error behavior remain unchanged. These
+checks establish no numeric performance or counter-cost result.
+
 ### Phase 1 breakdown
 
 These are server-reported times from a cold `profile=io` request on the Namespace

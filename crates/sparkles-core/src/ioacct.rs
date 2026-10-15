@@ -1132,6 +1132,14 @@ mod tests {
         assert_eq!(sampled_pages(&second), 65536);
         assert_eq!(second.report().pages_truncated, Some(true));
         assert!(!sampled_page_indices(IoFile::Spo, a.as_ptr()).contains(&65535));
+        let third = Profile::start();
+        assert_eq!(sampled_pages(&third), 65536);
+        assert_eq!(
+            third.report().pages_truncated,
+            Some(true),
+            "overlapping starts preserve omission"
+        );
+        drop(third);
         drop(first);
         touch(IoFile::VocabData, b.as_ptr(), page, 1);
         assert_eq!(sampled_pages(&second), 65536);
