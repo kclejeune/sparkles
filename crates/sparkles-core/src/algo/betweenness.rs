@@ -5,11 +5,13 @@
 //! exactly reproducible. With several threads, floating-point sums may differ in the last
 //! digits between thread counts. A sampled run picks `samples` sources with a seeded
 //! shuffle and scales the scores by `n / samples` (Brandes and Pich, 2007). A graph that
-//! is read both ways counts each pair twice, so its scores are halved.
+//! is read both ways counts each pair twice, so its scores are halved. Weighted calls
+//! require finite, strictly positive stored weights and refuse competitive distance
+//! additions that cannot retain a strict increase in f64 arithmetic.
 
 use super::Rng;
 use super::traverse::OrdF64;
-use super::{Control, Graph, Par, bad};
+use super::{CHECK_EVERY, Control, Graph, Par, bad};
 use crate::error::Result;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -24,10 +26,18 @@ pub struct Params {
 pub fn run(g: &Graph, p: &Params, par: &Par, ctl: &Control) -> Result<Vec<f64>> {
     let n = g.n();
     let weighted = g.out.w.is_some();
-    if let Some(w) = &g.out.w
-        && w.iter().any(|&x| x < 0.0 || x.is_nan())
-    {
-        return Err(bad("betweenness", "a negative edge weight"));
+    if let Some(w) = &g.out.w {
+        for (i, &x) in w.iter().enumerate() {
+            if !x.is_finite() || x <= 0.0 {
+                return Err(bad(
+                    "betweenness",
+                    "edge weights must be finite and strictly positive",
+                ));
+            }
+            if (i + 1).is_multiple_of(CHECK_EVERY) {
+                ctl.check()?;
+            }
+        }
     }
     let mut sources: Vec<u32> = (0..n as u32).collect();
     if p.samples > 0 && p.samples < n {
@@ -52,7 +62,7 @@ pub fn run(g: &Graph, p: &Params, par: &Par, ctl: &Control) -> Result<Vec<f64>> 
                 ctl.check()?;
             }
             if weighted {
-                w.dijkstra(g, s);
+                w.dijkstra(g, s)?;
             } else {
                 w.bfs(g, s);
             }
@@ -134,7 +144,7 @@ impl Work {
         }
     }
 
-    fn dijkstra(&mut self, g: &Graph, s: u32) {
+    fn dijkstra(&mut self, g: &Graph, s: u32) -> Result<()> {
         self.reset();
         self.dist[s as usize] = 0.0;
         self.sigma[s as usize] = 1.0;
@@ -153,6 +163,17 @@ impl Work {
             for (i, &v) in row.iter().enumerate() {
                 let nd = d + ws[i] as f64;
                 let dv = self.dist[v as usize];
+                if !nd.is_finite() {
+                    return Err(bad("betweenness", "shortest-path distance is not finite"));
+                }
+                // Brandes needs a strictly increasing shortest-path dependency order.
+                // An absorbed edge matters only if it can improve or tie the target.
+                if nd <= dv && nd <= d {
+                    return Err(bad(
+                        "betweenness",
+                        "shortest-path distance cannot increase at floating-point precision",
+                    ));
+                }
                 if nd < dv {
                     self.dist[v as usize] = nd;
                     self.sigma[v as usize] = self.sigma[u as usize];
@@ -162,6 +183,7 @@ impl Work {
                 }
             }
         }
+        Ok(())
     }
 
     /// Add the dependencies of source `s` to `acc`, walking the settled nodes backwards.

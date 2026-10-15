@@ -297,7 +297,7 @@ definition.
 | Service | Default direction | Outputs | Parameters and notes |
 |---|---|---|---|
 | `algo:pageRank` | forward | `score` | `dampingFactor` 0.85, `maxIterations` 20, `tolerance` 1e-7. Pull-based power iteration in parallel over nodes. The rank of dangling nodes is spread evenly, as Graphalytics defines. With `algo:source`, personalized PageRank teleports to the sources only. Weighted with `algo:weight`. |
-| `algo:betweenness` | forward | `score` | Brandes' algorithm, parallel over sources, with Dijkstra's algorithm when weighted. `algo:samples k` estimates from `k` sources chosen with `algo:seed`, after Brandes and Pich, and scales the scores. |
+| `algo:betweenness` | forward | `score` | Brandes' algorithm runs in parallel over sources and requires finite, strictly positive weights when weighted. A competitive distance addition that cannot retain a strict increase at `f64` precision is refused. `algo:samples k` estimates from `k` sources chosen with `algo:seed`, after Brandes and Pich, and scales the scores. |
 | `algo:wcc` | undirected | `component` | Union-find with path compression, parallel over edges. Components are numbered by their smallest node, so numbers are stable for a commit. |
 | `algo:scc` | forward | `component` | Iterative Tarjan's algorithm, without recursion. |
 | `algo:labelPropagation` | undirected | `community` | `maxIterations` 10. Synchronous updates. A tie goes to the smallest label, which is the CDLP rule of Graphalytics and makes the result deterministic. Weighted with `algo:weight`. |
@@ -558,6 +558,20 @@ gates are still pending.
   predicate. Each resulting edge uses one additional `f32`, including its reverse
   entry when built. Build reservations and cache accounting include those weights,
   and a sum that is not finite in the stored `f32` representation is refused.
+* **Weighted betweenness.** Native and SERVICE calls refuse any stored `f32` weight
+  that is nonfinite or not strictly positive, including signed zero and SERVICE
+  conversion overflow or underflow to zero. Validation scans borrowed weights before
+  allocating source or Brandes working arrays, acquiring incoming edges or returning
+  scores. Long valid scans retain cooperative cancellation and deadline checks.
+  Unweighted betweenness, zero-weight SSSP and nonnegative PageRank retain their
+  existing behavior. Nonnegative betweenness remains the follow-up below.
+  Weighted searches also refuse a competitive candidate distance that does not
+  increase the source distance at `f64` precision, or a nonfinite computed distance.
+  This dynamic check can follow workspace allocation and other source searches.
+  It returns `Invalid` for the whole invocation before score rows, success statistics
+  or write-back commits are published. Noncompetitive absorbed edges remain accepted.
+  Sampling checks only its selected source searches. Accepted distance and path-count
+  arithmetic remains approximate, as the numerical follow-up below describes.
 * **Named projections.** `algo/catalog.rs` keeps `<db>/algo.json` as
   `{"format": 1, "projections": {name: {revision, updated, author?, definition}}}`,
   written the way `queries.json` is, with a revision for `If-Match`. A file that cannot
@@ -674,4 +688,30 @@ graph or the ten-million-triple benchmark graph that §9 names.
   editor.
 * The JVM binding. `SERVICE algo:…` works through it, but there is no typed handle.
 * The routing of write-back through the writer of C23.
+
+### Nonnegative weighted betweenness semantics
+
+Weighted betweenness currently requires finite, strictly positive stored weights. A
+future extension must define how zero-weight dependencies, parallel edges and cycles
+contribute to shortest paths before supporting the nonnegative domain. It needs an
+independently reviewed algorithm and small-graph reference tests. A heap tie-breaker
+or zero-component contraction alone does not establish correct vertex scores.
+[Roadmap item 79](../ROADMAP.md) tracks this work.
+
+### Positive-weight numerical robustness
+
+Weighted betweenness uses `f64` distances and path counts over stored `f32` weights.
+It refuses a competitive candidate when addition cannot preserve a strict increase
+from its source distance, and refuses nonfinite computed distances. This avoids
+publishing dependencies whose numerical order violates the weighted Brandes search.
+The check applies only to the searches performed by the invocation. A sampled run
+does not certify unsampled sources, and noncompetitive absorbed edges stay accepted.
+
+Accepted arithmetic remains approximate. For example, a diamond with edges
+`0→1=1`, `0→2=2`, `1→3=2^100` and `2→3=2^100` has rounded equal-length paths
+and returns scores `[0, 0.5, 0.5, 0]`. Exact real sums instead give `[0, 1, 0, 0]`.
+The current guard does not establish exact path equality or prevent path-count
+overflow. Supporting refused mixed-scale inputs and defining stronger numerical
+guarantees needs a separately reviewed distance and path-count design.
+[Roadmap item 80](../ROADMAP.md) tracks this work separately from zero-weight semantics.
 

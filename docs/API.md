@@ -5207,6 +5207,23 @@ is refused.
 
 ### Projections
 
+Weighted betweenness requires every stored `f32` edge weight to be finite and strictly
+positive. Zero, signed zero, negative and nonfinite weights fail before its workspace or
+incoming edges are built, and the call returns no score rows. This also refuses a
+finite SERVICE weight that overflows to infinity or underflows to zero when converted
+to `f32`. Unweighted betweenness uses unit edges. Zero-weight SSSP and nonnegative
+PageRank weights remain supported. Nonnegative weighted betweenness is tracked as
+[roadmap item 79](ROADMAP.md).
+
+During weighted search, a competitive distance addition that cannot increase its
+source distance at `f64` precision also refuses the whole invocation with `Invalid`.
+A nonfinite computed distance is refused too. This check can run after workspace or
+incoming edges have been allocated. A refused invocation publishes no score rows,
+success statistics or write-back commits. Noncompetitive absorbed edges remain
+accepted. Accepted distances and path counts still use approximate `f64` arithmetic,
+so rounded path ties need not match exact real sums. Sampling checks only the sources
+it searches. [Roadmap item 80](ROADMAP.md) tracks positive-weight numerical robustness.
+
 A projection is the graph the algorithm runs on, built from the active graph when the
 call starts. It holds what the caller may read.
 

@@ -744,3 +744,65 @@ fn algorithms_stats_on_empty_dataset() {
 fn algorithms_stats_with_absent_predicate() {
     algorithms_empty_stats(true);
 }
+
+#[test]
+fn algorithms_numerical_refusal_has_no_rows_stats_or_writeback() {
+    use sparkles::algo::catalog::{PredicateDef, ProjectionDef};
+    use sparkles::sparql::{
+        QueryOptions,
+        algorun::{AlgoRequest, ProjectionRef, WriteMode, WriteSpec},
+    };
+    let (_dir, ds) = persistent();
+    ds.load_str(
+        "<http://ex/a> <http://ex/edge> <http://ex/c> {| <http://ex/w> 1e0 |} .
+         <http://ex/a> <http://ex/edge> <http://ex/b> {| <http://ex/w> 1e0 |} .
+         <http://ex/c> <http://ex/edge> <http://ex/b> {| <http://ex/w> 1.401298464324817e-45 |} .
+         <http://ex/b> <http://ex/edge> <http://ex/d> {| <http://ex/w> 1e0 |} .",
+        RdfFormat::Turtle,
+    )
+    .unwrap();
+    let before = ds.head_commit().seq;
+    let mut req = AlgoRequest {
+        algorithm: "betweenness".into(),
+        projection: Some(ProjectionRef::Inline(ProjectionDef {
+            predicates: Some(vec![PredicateDef::new("http://ex/edge", None)]),
+            weight: Some("http://ex/w".into()),
+            direction: Some("forward".into()),
+            ..Default::default()
+        })),
+        params: [("samples".into(), 8.into())].into_iter().collect(),
+        write: None,
+    };
+    let rows = ds.algorithms().run(&req, &QueryOptions::default());
+    assert!(
+        matches!(&rows,Err(sparkles::Error::Invalid(m)) if m.contains("shortest-path distance cannot increase at floating-point precision")),
+        "{:?}",
+        rows.err()
+    );
+    let stats = ds.algorithms().stats(&req, &QueryOptions::default());
+    assert!(
+        matches!(&stats,Err(sparkles::Error::Invalid(m)) if m.contains("shortest-path distance cannot increase at floating-point precision")),
+        "{stats:?}"
+    );
+    req.write = Some(WriteSpec {
+        graph: "urn:precision:out".into(),
+        mode: WriteMode::Replace,
+        predicates: [("score".into(), "http://ex/score".into())].into(),
+        batch_size: Some(1),
+        atomic: false,
+    });
+    let result = ds
+        .algorithms()
+        .run_write(&req, &QueryOptions::default(), None, &Control::none());
+    assert!(
+        matches!(&result,Err(sparkles::Error::Invalid(m)) if m.contains("shortest-path distance cannot increase at floating-point precision")),
+        "{result:?}"
+    );
+    assert_eq!(ds.head_commit().seq, before);
+    assert!(
+        ds.query("SELECT ?s WHERE { GRAPH <urn:precision:out> { ?s ?p ?o } }")
+            .unwrap()
+            .rows()
+            .is_empty()
+    );
+}
