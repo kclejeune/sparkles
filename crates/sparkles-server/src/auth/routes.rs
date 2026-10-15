@@ -306,8 +306,10 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         // a pure computation over the request's literals
         "/$/geo/convert" => Caller,
         "/$/metrics" => Server(ServerPerm::Metrics),
-        // a run reads (a run that writes is checked by the handler); projections are
-        // definitions that an admin sets
+        // Exact POST run admission selects Query/Read or Update/Write from its body
+        // before the restore guard. Other methods retain their previous policy.
+        "/$/algo/{ds}/run" if *method == Method::POST => Caller,
+        // Projections are definitions that an admin sets.
         "/$/algo/{ds}/run" | "/$/algo/{ds}/projections" => Dataset(Read),
         "/$/algo/{ds}/projections/{name}" if get => Dataset(Read),
         "/$/algo/{ds}/projections/{name}" => Dataset(Admin),

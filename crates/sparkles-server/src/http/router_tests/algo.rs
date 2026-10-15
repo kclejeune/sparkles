@@ -165,3 +165,5 @@ async fn a_run_that_writes_is_a_task() {
     .await;
     assert_eq!(r.json()["results"]["bindings"].as_array().unwrap().len(), 5);
 }
+
+mod admission;
