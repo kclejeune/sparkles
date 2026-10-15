@@ -1776,3 +1776,99 @@ fn r18_blank_endpoints_preserve_canonical_reifier_keys() {
         BTreeSet::from(["0".into(), "3".into(), "5".into()])
     );
 }
+
+// R12 weight failures must be typed before output rows can contain invalid ranks.
+fn r12_invalid(s: &Store, body: &str) -> bool {
+    matches!(
+        query(
+            s.snapshot(),
+            &format!("{PREFIXES} SELECT ?n ?r WHERE {{ {body} }}"),
+            &QueryOptions::default()
+        ),
+        Err(sparkles_core::Error::Invalid(_))
+    )
+}
+
+#[test]
+fn r12_pagerank_negative_native_equivalents() {
+    let s = store_of("ex:a ex:p ex:b {|ex:w -10|}, ex:c {|ex:w 11|}.");
+    let reifier = "SERVICE algo:pageRank { [] algo:predicate ex:p;algo:weight ex:w;algo:node ?n;algo:score ?r }";
+    let nested = "SERVICE algo:pageRank { [] algo:start ?s;algo:end ?e;algo:edgeWeight ?w;algo:node ?n;algo:score ?r . VALUES (?s ?e ?w) {(ex:a ex:b -10) (ex:a ex:c 11)} }";
+    let actual = [r12_invalid(&s, reifier), r12_invalid(&s, nested)];
+    assert_eq!(
+        actual, [true; 2],
+        "reifier and nested must reject signed probability weights"
+    );
+}
+
+#[test]
+fn r12_projection_conversions_remain_finite() {
+    let mut missed = Vec::new();
+    for lexical in ["NaN", "INF", "-INF", "1e40"] {
+        let literal = format!("\"{lexical}\"^^<http://www.w3.org/2001/XMLSchema#double>");
+        let s = store_of(&format!("ex:a ex:p ex:b {{|ex:w {literal}|}}."));
+        let reifier = "SERVICE algo:pageRank { [] algo:predicate ex:p;algo:weight ex:w;algo:node ?n;algo:score ?r }";
+        let nested = format!(
+            "SERVICE algo:pageRank {{ [] algo:start ?s;algo:end ?e;algo:edgeWeight ?w;algo:node ?n;algo:score ?r . VALUES (?s ?e ?w) {{(ex:a ex:b {literal})}} }}"
+        );
+        let default = format!(
+            "SERVICE algo:pageRank {{ [] algo:start ?s;algo:end ?e;algo:edgeWeight ?w;algo:defaultWeight {literal};algo:node ?n;algo:score ?r . VALUES (?s ?e ?w) {{(ex:a ex:b UNDEF)}} }}"
+        );
+        for (path, body) in [
+            ("reifier", reifier.to_string()),
+            ("nested", nested),
+            ("default", default),
+        ] {
+            let invalid = r12_invalid(&s, &body);
+            eprintln!("{path}/{lexical}: typed_invalid={invalid}");
+            if !invalid {
+                missed.push(format!("{path}/{lexical}"));
+            }
+        }
+    }
+    assert!(missed.is_empty(), "unchecked conversions: {missed:?}");
+}
+
+#[test]
+fn r12_default_applicability_and_aggregate_overflow() {
+    let s = store_of("ex:a ex:p ex:b {|ex:w 2|}.");
+    let q = "SELECT ?n ?r WHERE { SERVICE algo:pageRank { [] algo:predicate ex:p;algo:weight ex:w;algo:defaultWeight 1e40;algo:node ?n;algo:score ?r } }";
+    assert_eq!(
+        rows(&s, q).len(),
+        2,
+        "unused large default is not converted"
+    );
+    let s = store_of("ex:a ex:p ex:b.");
+    assert!(
+        r12_invalid(
+            &s,
+            "SERVICE algo:pageRank { [] algo:predicate ex:p;algo:weight ex:w;algo:defaultWeight 1e40;algo:node ?n;algo:score ?r }"
+        ),
+        "selected reifier default must fit f32"
+    );
+    let s = store_of("ex:a ex:p ex:b {|ex:w 3e38|}; ex:q ex:b {|ex:w 3e38|}.");
+    assert!(r12_invalid(
+        &s,
+        "SERVICE algo:pageRank { [] algo:predicate ex:p,ex:q;algo:weight ex:w;algo:aggregate algo:aggregateSum;algo:node ?n;algo:score ?r }"
+    ));
+}
+
+#[test]
+fn r12_conversion_precedes_minimum_and_preserves_applicability() {
+    let s = store_of("ex:a ex:p ex:b {|ex:w 2, 1e40|}.");
+    assert!(
+        r12_invalid(
+            &s,
+            "SERVICE algo:wcc { [] algo:predicate ex:p;algo:weight ex:w;algo:node ?n }"
+        ),
+        "every applicable candidate must fit before taking the minimum"
+    );
+    let s = store_of("ex:a ex:p ex:b {|ex:w -10|}, ex:c {|ex:w 11|}.");
+    assert_eq!(rows(&s, "SELECT ?n WHERE { SERVICE algo:wcc { [] algo:predicate ex:p;algo:weight ex:w;algo:node ?n } }").len(), 3, "projection does not impose PageRank's sign domain on other algorithms");
+    let q = "SELECT ?n WHERE { SERVICE algo:wcc { [] algo:start ?s;algo:end ?e;algo:edgeWeight ?w;algo:defaultWeight 1e40;algo:node ?n . VALUES (?s ?e ?w) { (ex:a ex:b 2) (ex:a ex:b 1e40) (ex:a \"literal\" 1e40) } } }";
+    assert_eq!(
+        rows(&s, q).len(),
+        2,
+        "unused default, duplicate and non-resource rows are not converted"
+    );
+}

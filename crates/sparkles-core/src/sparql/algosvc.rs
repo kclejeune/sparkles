@@ -1788,15 +1788,23 @@ fn projection_rows(
         Ok(true)
     })
 }
+/// Convert only a selected projection weight, before it enters the stored CSR.
+fn stored_weight(value: f64) -> Result<f32> {
+    let value = value as f32;
+    if !value.is_finite() {
+        return Err(bad("an edge weight is not finite as f32"));
+    }
+    Ok(value)
+}
+
 /// Resolve only visible weights of an applicable asserted edge. All accepted graph
 /// statements may participate in the union, even across its physical graphs.
 fn weight(ctx: &Ctx, proj: &ProjectionSpec, s: u64, p: u64, o: u64, ctl: &Control) -> Result<f32> {
-    let default = proj.default_weight as f32;
     let (Some(Some(wprop)), Some(reifies)) = (proj.weight, proj.reifies) else {
-        return Ok(default);
+        return stored_weight(proj.default_weight);
     };
     let Some(triple) = triple_id(ctx, s, p, o, ctl)? else {
-        return Ok(default);
+        return stored_weight(proj.default_weight);
     };
     let mut best: Option<f32> = None;
     let mut work = Work::new(ctl)?;
@@ -1810,16 +1818,20 @@ fn weight(ctx: &Ctx, proj: &ProjectionSpec, s: u64, p: u64, o: u64, ctl: &Contro
             if !proj.graph.accepts(k[3]) {
                 return Ok(());
             }
-            let value = projection_number(ctx, Id(k[2]), ctl)?
-                .filter(|v| v.is_finite())
-                .ok_or_else(|| bad("an applicable edge weight is not a number"))?
-                as f32;
+            let value = stored_weight(
+                projection_number(ctx, Id(k[2]), ctl)?
+                    .filter(|v| v.is_finite())
+                    .ok_or_else(|| bad("an applicable edge weight is not a number"))?,
+            )?;
             best = Some(best.map_or(value, |b| b.min(value)));
             Ok(())
         })
     })?;
     ctl.check()?;
-    Ok(best.unwrap_or(default))
+    match best {
+        Some(value) => Ok(value),
+        None => stored_weight(proj.default_weight),
+    }
 }
 
 /// The projection of a call: a cached build of the same data and edges, or a new one.
@@ -1906,7 +1918,6 @@ fn build_graph(
                     .all(|(_, d)| d.is_none_or(|d| d == Dir::Undirected))
             }),
     };
-    let default = proj.default_weight as f32;
     if let Some(t) = edges {
         let (s, e, w) = proj.pattern.expect("a nested pattern");
         let (Some(cs), Some(ce)) = (t.col_of(s), t.col_of(e)) else {
@@ -1926,11 +1937,14 @@ fn build_graph(
                 continue;
             }
             let value = match cw {
-                Some(c) if !t.cols[c][i].is_undef() => projection_number(ctx, t.cols[c][i], ctl)?
-                    .filter(|v| v.is_finite())
-                    .ok_or_else(|| bad("an edge weight of the nested pattern is not a number"))?
-                    as f32,
-                _ => default,
+                Some(c) if !t.cols[c][i].is_undef() => stored_weight(
+                    projection_number(ctx, t.cols[c][i], ctl)?
+                        .filter(|v| v.is_finite())
+                        .ok_or_else(|| {
+                            bad("an edge weight of the nested pattern is not a number")
+                        })?,
+                )?,
+                _ => stored_weight(proj.default_weight)?,
             };
             col.push(a.0, b.0, value, call_dir)?;
         }
