@@ -299,6 +299,13 @@ that work by priority and links each item to its design spec.
   data, and protections hide triples, not the IRIs that visible triples mention. Backups
   cover individual datasets. There is no whole-server backup, and encryption keys for
   backup repositories cannot be managed through the API, Vault or a cloud KMS. [Roadmap](ROADMAP.md) items 61, 65, 71, 75, 76.
+* **Ask evaluation.** The initial hosted demo pilot stopped on `upstream_framing`
+  after one of 68 planned executions and scored no cases. Its closed wallet retains
+  $1.002560 in unresolved liability, and actual billed spend is unknown. Compatible
+  upstream framing, bounded nonsecret diagnostics and a separate closed-wallet recovery
+  design remain, alongside public-corpus and independent-role evaluation. The existing
+  wallet and grant claim must be preserved, and recovery or another run is not
+  authorized. [Roadmap](ROADMAP.md) item 6.
 * **Assistant configuration.** Dataset assistant settings, including `enabled`,
   `ingest` and `send: "documents"`, can be declared for every dataset or by name in the
   settings file of `serve --settings`, which can also lock them, and changed through
