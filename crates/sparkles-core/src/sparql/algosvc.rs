@@ -20,20 +20,22 @@
 //! The projection is read from the permutations of the query's snapshot, so it holds
 //! what the caller may read: the graphs of the view and the masked triples.
 
-use super::ctx::{Ctx, TermKind};
+use super::ctx::Ctx;
 use super::plan::{ActiveGraph, GraphFilter, Kind, Node, PT, PathEnd, Planner};
 use super::table::{Table, VarId};
 use super::value::Value;
-use crate::algo::{self, Aggregate, Control, Graph, Par, RawEdges};
+use crate::algo::graph::OwnedRawEdges;
+use crate::algo::memory::{self, Buffer, Reservation, Work};
+use crate::algo::{self, Aggregate, Control, Graph, Par};
 use crate::error::{Error, Result};
 use crate::id::{Id, Tag};
 use crate::index::{Perm, pad};
 use crate::store::Chunk;
 use oxrdf::Term;
-use rustc_hash::FxHashMap;
 use spargebra::algebra::GraphPattern;
 use spargebra::term::{NamedNodePattern, TermPattern};
 use std::collections::BTreeMap;
+use std::hash::{Hash, Hasher};
 use std::time::Instant;
 
 /// The namespace of the algorithms and their parameters (`PREFIX algo:
@@ -1545,98 +1547,279 @@ fn rows(
 
 // ------------------------------------------------------------- projections ------
 
-/// Raw edges being collected from the store, with the memory they hold accounted.
+/// Every collection buffer owns its admitted capacity until builder transfer.
 struct Collect<'a> {
     ctl: &'a Control,
-    src: Vec<u64>,
-    dst: Vec<u64>,
-    w: Option<Vec<f32>>,
-    charged: usize,
+    src: Buffer<u64>,
+    dst: Buffer<u64>,
+    w: Option<Buffer<f32>>,
     symmetric: bool,
 }
-
 impl Collect<'_> {
-    #[inline]
     fn push(&mut self, s: u64, o: u64, w: f32, d: Dir) -> Result<()> {
         let (a, b) = if d == Dir::Backward { (o, s) } else { (s, o) };
-        self.add(a, b, w);
-        if d == Dir::Undirected && a != b {
-            self.add(b, a, w);
+        let mirror = d == Dir::Undirected && a != b;
+        let need = self
+            .src
+            .len()
+            .checked_add(if mirror { 2 } else { 1 })
+            .ok_or_else(|| bad("edge count overflows"))?;
+        // Admit every array before changing any length, including a mirrored edge.
+        self.src.reserve("projection-source", need, self.ctl)?;
+        self.dst.reserve("projection-destination", need, self.ctl)?;
+        if let Some(ws) = &mut self.w {
+            ws.reserve("projection-raw-weights", need, self.ctl)?;
         }
-        if self.src.len() >= self.charged {
-            // charge ahead in doubling steps, so a small projection holds little
-            let step = self.charged.max(4096);
-            self.ctl.check()?;
-            self.ctl
-                .charge(step as u64 * if self.w.is_some() { 20 } else { 16 })?;
-            self.charged += step;
+        self.add(a, b, w)?;
+        if mirror {
+            self.add(b, a, w)?;
         }
         Ok(())
     }
-
-    #[inline]
-    fn add(&mut self, a: u64, b: u64, w: f32) {
-        self.src.push(a);
-        self.dst.push(b);
+    fn add(&mut self, a: u64, b: u64, w: f32) -> Result<()> {
+        self.src.push(a)?;
+        self.dst.push(b)?;
         if let Some(ws) = &mut self.w {
-            ws.push(w);
+            ws.push(w)?;
         }
+        Ok(())
     }
 }
 
-/// The weights of the edges, from the weight property of the reifiers of their triples.
-fn weights(
-    ctx: &Ctx,
-    spec: &ProjectionSpec,
-    wprop: u64,
-) -> Result<FxHashMap<(u64, u64, u64), f32>> {
-    let mut map: FxHashMap<(u64, u64, u64), f32> = FxHashMap::default();
-    let Some(reifies) = spec.reifies else {
-        return Ok(map);
-    };
-    let snap = &ctx.snap;
-    for k in snap.scan_keys(Perm::Pso, &[wprop])? {
-        if !spec.graph.accepts(k[3]) {
-            continue;
-        }
-        let w = ctx
-            .value(Id(k[2]))
-            .as_ref()
-            .and_then(super::value::approx_f64);
-        let w = match w {
-            Some(w) if w.is_finite() => w as f32,
-            _ => {
-                let t = ctx
-                    .term(Id(k[2]))
-                    .map_or_else(|| "?".to_string(), |t| t.to_string());
-                return Err(bad(format!("the weight {t} is not a number")));
-            }
-        };
-        ctx.check()?;
-        for r in snap.scan_keys(Perm::Pso, &[reifies, k[1]])? {
-            if !spec.graph.accepts(r[3]) {
-                continue;
-            }
-            let Some(Term::Triple(t)) = ctx.term(Id(r[2])) else {
-                continue;
-            };
-            let s = match &t.subject {
-                oxrdf::NamedOrBlankNode::NamedNode(n) => Term::NamedNode(n.clone()),
-                oxrdf::NamedOrBlankNode::BlankNode(b) => Term::BlankNode(b.clone()),
-            };
-            let ids = (
-                snap.lookup_term(&s),
-                snap.lookup_term(&Term::NamedNode(t.predicate.clone())),
-                snap.lookup_term(&t.object),
-            );
-            if let (Some(s), Some(p), Some(o)) = ids {
-                map.entry((s.0, p.0, o.0))
-                    .and_modify(|x| *x = x.min(w))
-                    .or_insert(w);
-            }
-        }
+// hashbrown 0.16.1, pair size16/alignment8. Group16 bounds supported SIMD/scalar
+// requested layouts, including control bytes/alignment; allocator overhead is excluded.
+fn distinct_bytes(capacity: usize) -> Result<u64> {
+    if capacity == 0 {
+        return Ok(0);
     }
-    Ok(map)
+    let buckets = if capacity < 15 {
+        if capacity < 4 {
+            4
+        } else if capacity < 8 {
+            8
+        } else {
+            16
+        }
+    } else {
+        capacity
+            .checked_mul(8)
+            .map(|n| n / 7)
+            .and_then(usize::checked_next_power_of_two)
+            .ok_or_else(|| bad("distinct capacity overflows"))?
+    };
+    let bytes = buckets
+        .checked_mul(16)
+        .and_then(|n| n.checked_add(buckets))
+        .and_then(|n| n.checked_add(16))
+        .filter(|&n| n <= isize::MAX as usize - 15)
+        .ok_or_else(|| bad("distinct layout overflows"))?;
+    u64::try_from(bytes).map_err(|_| bad("distinct layout overflows"))
+}
+struct Distinct {
+    table: hashbrown::HashTable<(u64, u64)>,
+    _charge: Reservation,
+}
+fn pair_hash(pair: &(u64, u64)) -> u64 {
+    let mut h = rustc_hash::FxHasher::default();
+    pair.hash(&mut h);
+    h.finish()
+}
+impl Distinct {
+    fn new(ctl: &Control) -> Result<Self> {
+        Ok(Self {
+            table: hashbrown::HashTable::new(),
+            _charge: Reservation::new(ctl, 0)?,
+        })
+    }
+    fn insert(&mut self, pair: (u64, u64), ctl: &Control) -> Result<bool> {
+        if !self._charge.belongs_to(ctl) {
+            return Err(bad("distinct table belongs to another call"));
+        }
+        let hash = pair_hash(&pair);
+        if self.table.find(hash, |p| *p == pair).is_some() {
+            return Ok(false);
+        }
+        if self.table.len() == self.table.capacity() {
+            let need = self
+                .table
+                .len()
+                .checked_add(1)
+                .ok_or_else(|| bad("distinct count overflows"))?;
+            let capacity = self
+                .table
+                .capacity()
+                .checked_mul(2)
+                .map(|n| n.max(need))
+                .ok_or_else(|| bad("distinct growth overflows"))?;
+            let bound = distinct_bytes(capacity)?;
+            let charge = Reservation::new(ctl, bound)?;
+            let mut table = hashbrown::HashTable::new();
+            table
+                .try_reserve(capacity, pair_hash)
+                .map_err(|e| bad(format!("distinct allocation failed: {e:?}")))?;
+            if table.allocation_size() as u64 > bound || table.capacity() < need {
+                return Err(bad("unsupported distinct allocation layout"));
+            }
+            #[cfg(any(test, feature = "failpoints"))]
+            algo::observe_projection(algo::ProjectionEvent::Materialized(
+                "distinct-allocated",
+                table.capacity(),
+            ));
+            #[cfg(any(test, feature = "failpoints"))]
+            algo::observe_projection(algo::ProjectionEvent::Allocation(
+                "projection-distinct",
+                table.num_buckets(),
+                table.allocation_size() as u64,
+                ctl.observed_used(),
+            ));
+            let mut work = Work::new(ctl)?;
+            for item in self.table.drain() {
+                work.tick("projection-distinct-move")?;
+                table.insert_unique(pair_hash(&item), item, pair_hash);
+            }
+            ctl.check()?;
+            *self = Self {
+                table,
+                _charge: charge,
+            };
+        }
+        self.table.insert_unique(hash, pair, pair_hash);
+        Ok(true)
+    }
+}
+
+/// Uncached scalar numeric conversion under the algorithm's budget.
+fn projection_number(ctx: &Ctx, id: Id, ctl: &Control) -> Result<Option<f64>> {
+    let value = match id.tag() {
+        Tag::Int => Some(Value::Integer(id.as_i64().into())),
+        Tag::Double => Some(Value::Double(id.as_f64().into())),
+        Tag::Decimal => Some(Value::Decimal(crate::id::unpack_decimal(id.payload()))),
+        _ => None,
+    };
+    if let Some(value) = value {
+        return Ok(super::value::approx_f64(&value));
+    }
+    Ok(ctx
+        .with_algo_key(id, ctl, |key| Ok(super::value::numeric_key(key)))?
+        .flatten())
+}
+fn resource(ctx: &Ctx, id: Id, ctl: &Control) -> Result<bool> {
+    match id.tag() {
+        Tag::BNode => Ok(true),
+        Tag::Vocab => Ok(ctx.snap.generation.vocab.is_iri(id.payload())),
+        Tag::Delta | Tag::Local => Ok(ctx
+            .with_algo_key(id, ctl, |key| Ok(key.first() == Some(&b'<')))?
+            .unwrap_or(false)),
+        _ => Ok(false),
+    }
+}
+fn owned_key(ctx: &Ctx, id: Id, ctl: &Control) -> Result<Buffer<u8>> {
+    ctx.with_algo_key(id, ctl, |key| {
+        let mut out = Buffer::new("projection-term-key", key.len(), ctl)?;
+        out.extend(key)?;
+        Ok(out)
+    })?
+    .ok_or_else(|| bad("projection term key is unavailable"))
+}
+fn triple_id(ctx: &Ctx, s: u64, p: u64, o: u64, ctl: &Control) -> Result<Option<Id>> {
+    let a = owned_key(ctx, Id(s), ctl)?;
+    let b = owned_key(ctx, Id(p), ctl)?;
+    let c = owned_key(ctx, Id(o), ctl)?;
+    fn width(mut n: usize) -> usize {
+        let mut len = 1;
+        while n >= 128 {
+            n >>= 7;
+            len += 1;
+        }
+        len
+    }
+    let capacity = [&a, &b, &c]
+        .iter()
+        .try_fold(1usize, |n, key| {
+            n.checked_add(width(key.len()))
+                .and_then(|n| n.checked_add(key.len()))
+        })
+        .ok_or_else(|| bad("triple key capacity overflows"))?;
+    let mut key = Buffer::new("projection-triple-key", capacity, ctl)?;
+    key.push(b'(')?;
+    for part in [&a, &b, &c] {
+        let mut n = u64::try_from(part.len()).map_err(|_| bad("triple key length overflows"))?;
+        while n >= 128 {
+            key.push((n as u8) | 0x80)?;
+            n >>= 7;
+        }
+        key.push(n as u8)?;
+        key.extend(part)?;
+    }
+    // The lookup reconstruction scratch is admitted independently of the encoded key.
+    let mut scratch = Reservation::new(ctl, 0)?;
+    if let Ok(id) = ctx.snap.generation.vocab.find_with_checked(&key, |need| {
+        let bound = memory::bytes::<u8>(need)?
+            .checked_mul(2)
+            .ok_or_else(|| bad("lookup scratch overflows"))?;
+        scratch.grow_to(bound)
+    })? {
+        return Ok(Some(Id::vocab(id)));
+    }
+    Ok(ctx
+        .snap
+        .generation
+        .dvocab
+        .find(&key)
+        .filter(|&id| id < ctx.snap.dvocab_len)
+        .map(Id::delta))
+}
+/// Iterate all requested columns without retaining a result vector or hiding errors.
+fn projection_rows(
+    ctx: &Ctx,
+    perm: Perm,
+    prefix: &[u64],
+    mut each: impl FnMut([u64; 4]) -> Result<()>,
+) -> Result<()> {
+    ctx.snap.scan(perm, prefix, |chunk| {
+        match chunk {
+            Chunk::Block(b, s, e) => {
+                for i in s..e {
+                    each([b.cols[0][i], b.cols[1][i], b.cols[2][i], b.cols[3][i]])?;
+                }
+            }
+            Chunk::Row(k) => each(k)?,
+        }
+        Ok(true)
+    })
+}
+/// Resolve only visible weights of an applicable asserted edge. All accepted graph
+/// statements may participate in the union, even across its physical graphs.
+fn weight(ctx: &Ctx, proj: &ProjectionSpec, s: u64, p: u64, o: u64, ctl: &Control) -> Result<f32> {
+    let default = proj.default_weight as f32;
+    let (Some(Some(wprop)), Some(reifies)) = (proj.weight, proj.reifies) else {
+        return Ok(default);
+    };
+    let Some(triple) = triple_id(ctx, s, p, o, ctl)? else {
+        return Ok(default);
+    };
+    let mut best: Option<f32> = None;
+    let mut work = Work::new(ctl)?;
+    projection_rows(ctx, Perm::Pos, &[reifies, triple.0], |r| {
+        work.tick("projection-reifiers")?;
+        if !proj.graph.accepts(r[3]) {
+            return Ok(());
+        }
+        projection_rows(ctx, Perm::Pso, &[wprop, r[2]], |k| {
+            work.tick("projection-weights")?;
+            if !proj.graph.accepts(k[3]) {
+                return Ok(());
+            }
+            let value = projection_number(ctx, Id(k[2]), ctl)?
+                .filter(|v| v.is_finite())
+                .ok_or_else(|| bad("an applicable edge weight is not a number"))?
+                as f32;
+            best = Some(best.map_or(value, |b| b.min(value)));
+            Ok(())
+        })
+    })?;
+    ctl.check()?;
+    Ok(best.unwrap_or(default))
 }
 
 /// The projection of a call: a cached build of the same data and edges, or a new one.
@@ -1679,211 +1862,461 @@ fn build_graph(
     ctl: &Control,
 ) -> Result<Graph> {
     let proj = &spec.proj;
-    let snap = &ctx.snap;
     let call_dir = spec.direction();
     let has_weights = proj.weight.is_some() || proj.pattern.is_some_and(|p| p.2.is_some());
-    // fail before reading anything when the projection cannot fit
-    let m_est = match (&proj.predicates, edges) {
-        (_, Some(t)) => t.len() as u64,
-        (Some(ps), None) => ps
-            .iter()
-            .map(|(p, _)| snap.estimate(Perm::Pso, &[*p]))
-            .sum(),
-        (None, None) => snap.len(),
+    let mut work = Work::new(ctl)?;
+    let class_limited = !proj.node_class_names.is_empty();
+    let mut nodes = Buffer::new("projection-class", 0, ctl)?;
+    if class_limited {
+        let ty = proj
+            .rdf_type
+            .ok_or_else(|| bad("the dataset has no rdf:type triples for algo:nodeClass"))?;
+        for &class in &proj.node_classes {
+            projection_rows(ctx, Perm::Pos, &[ty, class], |k| {
+                work.tick("projection-class")?;
+                if proj.graph.accepts(k[3]) {
+                    let need = nodes
+                        .len()
+                        .checked_add(1)
+                        .ok_or_else(|| bad("class count overflows"))?;
+                    nodes.reserve("projection-class", need, ctl)?;
+                    nodes.push(k[2])?;
+                }
+                Ok(())
+            })?;
+        }
+        ctl.check()?;
+        par.sort(&mut nodes);
+        ctl.check()?;
+        nodes.dedup(ctl)?;
+    }
+    let allowed = |s: u64, o: u64| {
+        !class_limited || (nodes.binary_search(&s).is_ok() && nodes.binary_search(&o).is_ok())
     };
-    let both = matches!(call_dir, Dir::Undirected)
-        || proj
-            .predicates
-            .as_ref()
-            .is_some_and(|ps| ps.iter().any(|(_, d)| *d == Some(Dir::Undirected)));
-    let m_est = m_est * if both { 2 } else { 1 };
-    let stored_weights = has_weights || matches!(proj.aggregate, Aggregate::Sum | Aggregate::Count);
-    ctl.require(Graph::estimate(0, m_est, stored_weights))?;
     let mut col = Collect {
         ctl,
-        src: Vec::new(),
-        dst: Vec::new(),
-        w: has_weights.then(Vec::new),
-        charged: 0,
+        src: Buffer::new("projection-source", 0, ctl)?,
+        dst: Buffer::new("projection-destination", 0, ctl)?,
+        w: has_weights
+            .then(|| Buffer::new("projection-raw-weights", 0, ctl))
+            .transpose()?,
         symmetric: call_dir == Dir::Undirected
             && proj.predicates.as_ref().is_none_or(|ps| {
                 ps.iter()
                     .all(|(_, d)| d.is_none_or(|d| d == Dir::Undirected))
             }),
     };
-    let default_w = proj.default_weight as f32;
+    let default = proj.default_weight as f32;
     if let Some(t) = edges {
         let (s, e, w) = proj.pattern.expect("a nested pattern");
-        let (cs, ce) = (t.col_of(s), t.col_of(e));
-        let cw = w.and_then(|w| t.col_of(w));
-        let (Some(cs), Some(ce)) = (cs, ce) else {
+        let (Some(cs), Some(ce)) = (t.col_of(s), t.col_of(e)) else {
             return Err(bad(
                 "the nested pattern does not bind algo:start and algo:end",
             ));
         };
-        let mut seen: rustc_hash::FxHashSet<(u64, u64)> = rustc_hash::FxHashSet::default();
+        let cw = w.and_then(|v| t.col_of(v));
+        let mut seen = Distinct::new(ctl)?;
         for i in 0..t.len() {
-            if i % 65536 == 0 {
-                ctl.check()?;
-            }
+            work.tick("projection-pattern")?;
             let (a, b) = (t.cols[cs][i], t.cols[ce][i]);
-            if a.is_undef() || b.is_undef() {
+            if !resource(ctx, a, ctl)? || !resource(ctx, b, ctl)? || !allowed(a.0, b.0) {
                 continue;
             }
-            let is_node = |x: Id| matches!(ctx.kind(x), TermKind::Iri | TermKind::BNode);
-            if !is_node(a) || !is_node(b) {
+            if !seen.insert((a.0, b.0), ctl)? {
                 continue;
             }
-            // distinct pairs become the projection
-            if !seen.insert((a.0, b.0)) {
-                continue;
-            }
-            let w = match cw {
-                Some(c) => {
-                    let id = t.cols[c][i];
-                    match ctx.value(id).as_ref().and_then(super::value::approx_f64) {
-                        Some(x) if x.is_finite() => x as f32,
-                        _ if id.is_undef() => default_w,
-                        _ => {
-                            return Err(bad(
-                                "an edge weight of the nested pattern is not a number",
-                            ));
-                        }
-                    }
-                }
-                None => default_w,
+            let value = match cw {
+                Some(c) if !t.cols[c][i].is_undef() => projection_number(ctx, t.cols[c][i], ctl)?
+                    .filter(|v| v.is_finite())
+                    .ok_or_else(|| bad("an edge weight of the nested pattern is not a number"))?
+                    as f32,
+                _ => default,
             };
-            col.push(a.0, b.0, w, call_dir)?;
+            col.push(a.0, b.0, value, call_dir)?;
         }
     } else {
-        let wmap = match proj.weight {
-            Some(Some(wp)) => Some(weights(ctx, proj, wp)?),
-            _ => None,
-        };
-        let mask: crate::index::ColMask = 0b1111;
-        let node_kind = |o: u64| -> bool {
-            match Id(o).tag() {
-                Tag::BNode => true,
-                Tag::Vocab | Tag::Delta | Tag::Local => {
-                    matches!(ctx.kind(Id(o)), TermKind::Iri | TermKind::BNode)
-                }
-                _ => false,
-            }
-        };
-        // scan the rows of the Pso range [lo, hi] of predicates
-        let mut scan = |lo: u64, hi: u64, dir_of: &dyn Fn(u64) -> Dir| -> Result<()> {
-            let mut last: Option<(u64, u64, u64)> = None;
-            let mut last_o: (u64, bool) = (u64::MAX, false);
-            let mut err = None;
-            snap.scan_between_cols(Perm::Pso, pad(&[lo], 0), pad(&[hi], u64::MAX), mask, |c| {
-                let mut each = |p: u64, s: u64, o: u64, g: u64| -> bool {
-                    if !proj.graph.accepts(g) {
-                        return true;
-                    }
-                    if last == Some((p, s, o)) {
-                        return true;
-                    }
-                    last = Some((p, s, o));
-                    if last_o.0 != o {
-                        last_o = (o, node_kind(o));
-                    }
-                    if !last_o.1 {
-                        return true;
-                    }
-                    let w = match &wmap {
-                        Some(m) => m.get(&(s, p, o)).copied().unwrap_or(default_w),
-                        None if has_weights => default_w,
-                        None => 0.0,
-                    };
-                    match col.push(s, o, w, dir_of(p)) {
-                        Ok(()) => true,
-                        Err(e) => {
-                            err = Some(e);
-                            false
+        let mut scan_work = Work::new(ctl)?;
+        let mut scan = |lo: u64, hi: u64, dir: Dir| -> Result<()> {
+            let mut last = None;
+            ctx.snap.scan_between_cols(
+                Perm::Pso,
+                pad(&[lo], 0),
+                pad(&[hi], u64::MAX),
+                0b1111,
+                |chunk| {
+                    let mut each = |k: [u64; 4]| -> Result<()> {
+                        scan_work.tick("projection-edge")?;
+                        let [p, s, o, g] = k;
+                        if !proj.graph.accepts(g) || last == Some((p, s, o)) {
+                            return Ok(());
                         }
-                    }
-                };
-                match c {
-                    Chunk::Block(b, s, e) => {
-                        for i in s..e {
-                            if !each(b.cols[0][i], b.cols[1][i], b.cols[2][i], b.cols[3][i]) {
-                                return Ok(false);
+                        last = Some((p, s, o));
+                        if !resource(ctx, Id(s), ctl)?
+                            || !resource(ctx, Id(o), ctl)?
+                            || !allowed(s, o)
+                        {
+                            return Ok(());
+                        }
+                        let value = if has_weights {
+                            weight(ctx, proj, s, p, o, ctl)?
+                        } else {
+                            0.0
+                        };
+                        col.push(s, o, value, dir)
+                    };
+                    match chunk {
+                        Chunk::Block(b, s, e) => {
+                            for i in s..e {
+                                each([b.cols[0][i], b.cols[1][i], b.cols[2][i], b.cols[3][i]])?;
                             }
                         }
+                        Chunk::Row(k) => each(k)?,
                     }
-                    Chunk::Row(k) => {
-                        if !each(k[0], k[1], k[2], k[3]) {
-                            return Ok(false);
-                        }
-                    }
-                }
-                Ok(true)
-            })?;
-            match err {
-                Some(e) => Err(e),
-                None => Ok(()),
-            }
+                    Ok(true)
+                },
+            )
         };
-        match &proj.predicates {
-            Some(ps) => {
-                let dirs: FxHashMap<u64, Dir> = ps
-                    .iter()
-                    .map(|(p, d)| (*p, d.unwrap_or(call_dir)))
-                    .collect();
-                let mut ids: Vec<u64> = ps.iter().map(|(p, _)| *p).collect();
-                ids.sort_unstable();
-                ids.dedup();
-                for p in ids {
-                    scan(p, p, &|p| dirs[&p])?;
-                }
+        if let Some(ps) = &proj.predicates {
+            let mut dirs = Buffer::new("projection-predicates", ps.len(), ctl)?;
+            for (i, &(p, d)) in ps.iter().enumerate() {
+                work.tick("projection-predicates")?;
+                dirs.push((p, i, d.unwrap_or(call_dir)))?;
             }
-            None => {
-                // every predicate but rdf:type, in at most two ranges
-                match proj.rdf_type {
-                    Some(t) => {
-                        if t > 0 {
-                            scan(0, t - 1, &|_| call_dir)?;
-                        }
-                        if t < u64::MAX {
-                            scan(t + 1, u64::MAX, &|_| call_dir)?;
-                        }
-                    }
-                    None => scan(0, u64::MAX, &|_| call_dir)?,
+            ctl.check()?;
+            dirs.sort_unstable_by_key(|d| (d.0, d.1));
+            ctl.check()?;
+            let mut i = 0;
+            while i < dirs.len() {
+                work.tick("projection-predicates")?;
+                let mut j = i + 1;
+                while j < dirs.len() && dirs[j].0 == dirs[i].0 {
+                    work.tick("projection-predicates")?;
+                    j += 1;
                 }
+                let (p, _, d) = dirs[j - 1];
+                scan(p, p, d)?;
+                i = j;
+            }
+        } else {
+            match proj.rdf_type {
+                Some(t) => {
+                    if t > 0 {
+                        scan(0, t - 1, call_dir)?;
+                    }
+                    if t < u64::MAX {
+                        scan(t + 1, u64::MAX, call_dir)?;
+                    }
+                }
+                None => scan(0, u64::MAX, call_dir)?,
             }
         }
     }
-    // the nodes: the members of the classes, or every end of an edge
-    let mut nodes: Vec<u64> = if !proj.node_class_names.is_empty() {
-        let Some(ty) = proj.rdf_type else {
-            return Err(bad(
-                "the dataset has no rdf:type triples for algo:nodeClass",
-            ));
-        };
-        let mut v = Vec::new();
-        for &c in &proj.node_classes {
-            for k in snap.scan_keys(Perm::Pos, &[ty, c])? {
-                if proj.graph.accepts(k[3]) {
-                    v.push(k[2]);
-                }
+    if !class_limited {
+        let capacity = col
+            .src
+            .len()
+            .checked_mul(2)
+            .ok_or_else(|| bad("endpoint count overflows"))?;
+        nodes = Buffer::new("projection-nodes", capacity, ctl)?;
+        for ends in [&*col.src, &*col.dst] {
+            for &id in ends {
+                work.tick("projection-nodes")?;
+                nodes.push(id)?;
             }
         }
-        v
-    } else {
-        ctl.charge(col.src.len() as u64 * 16)?;
-        let mut v = Vec::with_capacity(col.src.len() * 2);
-        v.extend_from_slice(&col.src);
-        v.extend_from_slice(&col.dst);
-        v
+        ctl.check()?;
+        par.sort(&mut nodes);
+        ctl.check()?;
+        nodes.dedup(ctl)?;
+    }
+    Graph::build_owned(
+        OwnedRawEdges {
+            nodes,
+            src: col.src,
+            dst: col.dst,
+            w: col.w,
+            symmetric: col.symmetric,
+        },
+        proj.aggregate,
+        par,
+        ctl,
+    )
+}
+
+#[cfg(test)]
+mod projection_capacity_tests {
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
     };
-    par.sort(&mut nodes);
-    nodes.dedup();
-    let raw = RawEdges {
-        nodes,
-        src: col.src,
-        dst: col.dst,
-        w: col.w,
-        symmetric: col.symmetric,
-    };
-    Graph::build(raw, proj.aggregate, par, ctl)
+    #[test]
+    fn hash_bound_covers_real_layout_and_replacement_overlap() {
+        let ctl = Control::new(Default::default(), None, 1 << 20);
+        let mut seen = Distinct::new(&ctl).unwrap();
+        let observed = ctl.clone();
+        let old = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let old_hook = old.clone();
+        algo::set_projection_observer(Some(Arc::new(move |event| {
+            if let algo::ProjectionEvent::Materialized("distinct-allocated", _) = event {
+                assert!(observed.observed_used() > old_hook.load(Ordering::Relaxed));
+            }
+        })));
+        for i in 0..512 {
+            old.store(ctl.observed_used(), Ordering::Relaxed);
+            assert!(seen.insert((i, i + 1), &ctl).unwrap());
+            assert!(seen.table.allocation_size() as u64 <= ctl.observed_used());
+            assert!(!seen.insert((i, i + 1), &ctl).unwrap());
+        }
+        algo::set_projection_observer(None);
+        drop(seen);
+        assert_eq!(ctl.remaining(), 1 << 20);
+        assert!(distinct_bytes(usize::MAX).is_err());
+    }
+    #[test]
+    fn hash_first_and_rehash_refuse_before_allocation_and_restore() {
+        for (budget, n) in [(83, 0), (235, 3)] {
+            let ctl = Control::new(Default::default(), None, budget);
+            let mut seen = Distinct::new(&ctl).unwrap();
+            for i in 0..n {
+                assert!(seen.insert((i, i), &ctl).unwrap());
+            }
+            let allocations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let a = allocations.clone();
+            algo::set_projection_observer(Some(Arc::new(move |event| {
+                if let algo::ProjectionEvent::Materialized("distinct-allocated", _) = event {
+                    a.fetch_add(1, Ordering::Relaxed);
+                }
+            })));
+            assert!(matches!(
+                seen.insert((n, n), &ctl),
+                Err(Error::BudgetExceeded(_))
+            ));
+            algo::set_projection_observer(None);
+            assert_eq!(allocations.load(Ordering::Relaxed), 0);
+            assert_eq!(seen.table.len(), n as usize);
+            drop(seen);
+            assert_eq!(ctl.remaining(), budget);
+        }
+    }
+    #[test]
+    fn hash_migration_cancel_and_unwind_release_new_table() {
+        for unwind in [false, true] {
+            let cancel = Arc::new(AtomicBool::new(false));
+            let ctl = Control::new(cancel.clone(), None, 1024);
+            let mut seen = Distinct::new(&ctl).unwrap();
+            for i in 0..3 {
+                seen.insert((i, i), &ctl).unwrap();
+            }
+            let prior = ctl.remaining();
+            let scope = memory::probe::install(
+                move |point| {
+                    if let memory::probe::Point::Work("projection-distinct-move") = point {
+                        if unwind {
+                            panic!("distinct migration unwind");
+                        } else {
+                            cancel.store(true, Ordering::Relaxed);
+                        }
+                    }
+                },
+                None,
+            );
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                seen.insert((3, 3), &ctl)
+            }));
+            drop(scope);
+            if unwind {
+                assert!(result.is_err());
+            } else {
+                assert!(matches!(result.unwrap(), Err(Error::Cancelled)));
+            }
+            assert_eq!(ctl.remaining(), prior);
+            drop(seen);
+            assert_eq!(ctl.remaining(), 1024);
+        }
+    }
+    #[test]
+    fn collector_mirror_arrays_and_failure_lifetimes() {
+        for name in [
+            "projection-source",
+            "projection-destination",
+            "projection-raw-weights",
+        ] {
+            let ctl = Control::new(Default::default(), None, 1024);
+            let mut c = Collect {
+                ctl: &ctl,
+                src: Buffer::new("empty", 0, &ctl).unwrap(),
+                dst: Buffer::new("empty", 0, &ctl).unwrap(),
+                w: Some(Buffer::new("empty", 0, &ctl).unwrap()),
+                symmetric: true,
+            };
+            let scope = memory::probe::install(|_| {}, Some(name));
+            assert!(c.push(1, 2, 3., Dir::Undirected).is_err());
+            drop(scope);
+            assert!(c.src.is_empty() && c.dst.is_empty() && c.w.as_ref().unwrap().is_empty());
+            drop(c);
+            assert_eq!(ctl.remaining(), 1024);
+        }
+        let ctl = Control::unlimited();
+        let mut c = Collect {
+            ctl: &ctl,
+            src: Buffer::new("empty", 0, &ctl).unwrap(),
+            dst: Buffer::new("empty", 0, &ctl).unwrap(),
+            w: None,
+            symmetric: true,
+        };
+        c.push(1, 1, 0., Dir::Undirected).unwrap();
+        c.push(1, 2, 0., Dir::Undirected).unwrap();
+        assert_eq!(&*c.src, &[1, 1, 2]);
+        assert_eq!(&*c.dst, &[1, 2, 1]);
+        drop(c);
+        assert_eq!(ctl.remaining(), u64::MAX);
+    }
+    fn weighted() -> (crate::store::Store, Ctx, AlgoSpec) {
+        use crate::io::{RdfFormat, Source};
+        let store = crate::store::Store::in_memory(Default::default());
+        store
+            .load(&[Source::from_bytes(
+                b"@prefix ex:<http://ex/>. ex:a a ex:N;ex:p ex:b {|ex:w 2|}. ex:b a ex:N.".to_vec(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let ctx = Ctx::new(store.snapshot());
+        let id = |iri: &str| ctx.snap.lookup_iri(iri).unwrap().0;
+        let proj = ProjectionSpec {
+            predicates: Some(vec![(id("http://ex/p"), None)]),
+            direction: None,
+            node_classes: vec![id("http://ex/N")],
+            node_class_names: vec!["http://ex/N".into()],
+            weight: Some(Some(id("http://ex/w"))),
+            default_weight: 1.,
+            aggregate: Aggregate::None,
+            pattern: None,
+            graph: GraphFilter::All,
+            rdf_type: Some(id(RDF_TYPE)),
+            reifies: Some(id(RDF_REIFIES)),
+        };
+        (
+            store,
+            ctx,
+            AlgoSpec {
+                algo: Algo::Sssp,
+                proj,
+                nums: BTreeMap::new(),
+                metric: None,
+                graphalytics: false,
+                iteration_weights: None,
+                sources: vec![],
+                outs: Outs::default(),
+                graph_var: None,
+            },
+        )
+    }
+    #[test]
+    fn callback_cancellation_preserves_type_and_drops_all_owners() {
+        for phase in [
+            "projection-class",
+            "projection-edge",
+            "projection-reifiers",
+            "projection-weights",
+        ] {
+            let (_store, ctx, spec) = weighted();
+            let cancel = Arc::new(AtomicBool::new(false));
+            let ctl = Control::new(cancel.clone(), None, 1 << 20);
+            let scope = memory::probe::install(
+                move |point| {
+                    if let memory::probe::Point::Work(p) = point
+                        && p == phase
+                    {
+                        cancel.store(true, Ordering::Relaxed);
+                    }
+                },
+                None,
+            );
+            assert!(
+                matches!(
+                    build_graph(&ctx, &spec, None, &Par::single(), &ctl),
+                    Err(Error::Cancelled)
+                ),
+                "{phase}"
+            );
+            drop(scope);
+            assert_eq!(ctl.remaining(), 1 << 20, "{phase}");
+        }
+        let (_store, ctx, spec) = weighted();
+        let ctl = Control::new(Default::default(), Some(Instant::now()), 1 << 20);
+        assert!(matches!(
+            build_graph(&ctx, &spec, None, &Par::single(), &ctl),
+            Err(Error::Timeout)
+        ));
+        assert_eq!(ctl.remaining(), 1 << 20);
+        let mut visited = 0;
+        let result = projection_rows(&ctx, Perm::Pso, &[], |_| {
+            visited += 1;
+            Err(Error::Timeout)
+        });
+        assert!(matches!(result, Err(Error::Timeout)));
+        assert_eq!(visited, 1);
+    }
+    #[test]
+    fn rejected_rows_still_bound_cancellation_work() {
+        use crate::io::{RdfFormat, Source};
+        let store = crate::store::Store::in_memory(Default::default());
+        let mut ttl = String::from("@prefix ex:<http://ex/>.");
+        for i in 0..=algo::CHECK_EVERY {
+            ttl.push_str(&format!("ex:a ex:p ex:n{i}.\n"));
+        }
+        store
+            .load(&[Source::from_bytes(
+                ttl.into_bytes(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let (_other, _ctx, mut spec) = weighted();
+        let ctx = Ctx::new(store.snapshot());
+        spec.proj.predicates = Some(vec![(ctx.snap.lookup_iri("http://ex/p").unwrap().0, None)]);
+        spec.proj.node_classes.clear();
+        spec.proj.node_class_names.clear();
+        spec.proj.weight = None;
+        spec.proj.graph = GraphFilter::One(0);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let ctl = Control::new(cancel.clone(), None, 64);
+        let observed = std::rc::Rc::new(std::cell::Cell::new(0));
+        let count = observed.clone();
+        let scope = memory::probe::install(
+            move |point| {
+                if let memory::probe::Point::Work("projection-edge") = point {
+                    count.set(count.get() + 1);
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            },
+            None,
+        );
+        assert!(matches!(
+            build_graph(&ctx, &spec, None, &Par::single(), &ctl),
+            Err(Error::Cancelled)
+        ));
+        drop(scope);
+        assert_eq!(observed.get(), algo::CHECK_EVERY);
+        assert_eq!(ctl.remaining(), 64);
+    }
+    #[test]
+    fn graph_handoff_and_cache_hit_charge_base_once() {
+        let (_store, ctx, spec) = weighted();
+        let cold = Control::new(Default::default(), None, 1 << 20);
+        let (graph, hit) = projection(&ctx, &spec, None, &Par::single(), &cold).unwrap();
+        assert!(!hit);
+        assert_eq!((1 << 20) - cold.remaining(), graph.base_bytes().unwrap());
+        let warm = Control::new(Default::default(), None, 1 << 20);
+        let (_, hit) = projection(&ctx, &spec, None, &Par::single(), &warm).unwrap();
+        assert!(hit);
+        assert_eq!((1 << 20) - warm.remaining(), graph.base_bytes().unwrap());
+        let prior = warm.remaining();
+        let incoming = graph.inn(&warm).unwrap();
+        assert!(warm.remaining() < prior);
+        drop(incoming);
+        assert_eq!(warm.remaining(), prior);
+    }
 }

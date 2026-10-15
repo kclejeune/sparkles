@@ -270,8 +270,10 @@ graphs are one edge.
 
 With `algo:nodeClass`, the class members come from `POS [rdf:type, class]` and edges
 with an end outside them are dropped. With weights, each edge's reifiers are looked up
-by `rdf:reifies` with its triple term, as F07's weighted search does, and the first
-numeric value of the weight property is used. A non-numeric weight fails the call, and a
+by `rdf:reifies` with its triple term, as F07's weighted search does, and the minimum
+visible numeric value of the weight property is used. Only visible resource edges whose
+ends pass the class filter are applicable. An applicable non-numeric weight fails the
+call, while unrelated weights do not affect it. A
 negative weight fails the algorithms that need non-negative weights.
 
 A nested pattern in the block, as in F07's Phase 2, gives edges from any query: its
@@ -544,6 +546,22 @@ stays current. It is left out of this spec.
   C12, C12b, F04, F07 and P06.
 
 ## Outcome
+
+Projection collection now streams snapshot rows and resolves only applicable visible
+edge weights through indexed reifier lookups. Class members, predicate directions and
+nested-pattern distinct pairs hold admitted capacity owners. Key reconstruction,
+raw edges, padded sort keys, aggregation and outgoing CSR storage remain charged while
+they overlap. Native consumed inputs enter the same builder by actual capacity, and
+SERVICE transfers its existing owners under one Control. Node deduplication retains
+its allocation and charge, and a successful build retains exactly its base capacities.
+The incoming-CSR reservation remains independent.
+
+The allocation bounds use the pinned Rust Global Vec and hashbrown 0.16.1 requested
+layouts. They exclude allocator metadata, size classes, process RSS and Rayon scheduler
+storage. Edge-driven weight reads replace the earlier global pass with per-edge index
+and vocabulary lookups. This changes locality and lookup cost without establishing a
+speed improvement. Other algorithm workspace gaps and acceptance measurements remain
+separate.
 
 Node2vec now checks bounded work inside its own loops and admits every owned buffer's
 fixed capacity before allocation. Controlled cancellation and low-memory tests cover

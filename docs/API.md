@@ -5226,6 +5226,13 @@ A block can also hold a nested pattern whose solutions are the edges, with
 distinct pair of ends is one edge. Under `GRAPH ?g` the call runs once for each named
 graph and `?g` is bound to it.
 
+Weights are read only for visible resource edges whose ends pass `algo:nodeClass`.
+Each applicable reifier and weight statement must also be visible in the selected graph
+or graph union. The minimum of its visible numeric weights is used. An applicable
+non-numeric weight fails the call, while unrelated weights do not affect it. A nested
+pattern keeps the first solution's weight for each ordered pair, with the default for
+an unbound weight.
+
 ### Results
 
 * **Doubles.** A score is an `xsd:double` whose lowest four mantissa bits are zero, a
@@ -5253,7 +5260,14 @@ compute an unpersonalized ranking. Omitting the source still runs ordinary PageR
   with an update and indexed (see [Vector similarity](#vector-similarity)).
 * **Budgets.** A call counts against the query's timeout and memory budget. A projection
   or a result that does not fit fails the query with a message that names the parameter
-  to change. `algo:maxMemory` sets a lower budget for one call. Node2vec charges
+  to change. `algo:maxMemory` sets a lower budget for one call. Projection buffers,
+  distinct pairs, key reconstruction and graph construction admit their requested
+  capacities before allocation, including old and replacement storage while both are
+  live. Deduplicated node arrays retain their full capacity charge. Native callers'
+  consumed edge arrays are admitted by actual capacity on entry, since those arrays
+  already exist. Returned graph storage remains charged once. These bounds cover the
+  pinned Rust Global Vec and hashbrown layouts, not allocator metadata, size classes or
+  process RSS. Node2vec charges
   fixed embedding and scratch capacities before allocation and checks cancellation
   throughout its own initialization, walks and training. Its memory peak includes
   those capacities while live, with returned embeddings still charged to the call.

@@ -62,20 +62,6 @@ impl Csr {
         self.row(u).binary_search(&v).is_ok()
     }
 
-    /// The edges `(src, dst)` sorted by `src` then `dst`, with their weights, as rows.
-    fn from_sorted(n: usize, keys: &[(u64, u32)], weighted: bool) -> Csr {
-        let mut off = vec![0u64; n + 1];
-        for &(k, _) in keys {
-            off[(k >> 32) as usize + 1] += 1;
-        }
-        for i in 0..n {
-            off[i + 1] += off[i];
-        }
-        let adj: Vec<u32> = keys.iter().map(|&(k, _)| k as u32).collect();
-        let w = weighted.then(|| keys.iter().map(|&(_, w)| f32::from_bits(w)).collect());
-        Csr { off, adj, w }
-    }
-
     fn retained_bytes(&self) -> Result<u64> {
         memory::sum(&[
             memory::bytes::<u64>(self.off.capacity())?,
@@ -226,6 +212,35 @@ pub struct Graph {
     inn_init: parking_lot::Mutex<()>,
 }
 
+/// Raw collection owners retain all capacities under one call, without readmission.
+pub(crate) struct OwnedRawEdges {
+    pub(crate) nodes: Buffer<u64>,
+    pub(crate) src: Buffer<u64>,
+    pub(crate) dst: Buffer<u64>,
+    pub(crate) w: Option<Buffer<f32>>,
+    pub(crate) symmetric: bool,
+}
+impl OwnedRawEdges {
+    fn validate(&self, ctl: &Control) -> Result<()> {
+        if !self.nodes.belongs_to(ctl)
+            || !self.src.belongs_to(ctl)
+            || !self.dst.belongs_to(ctl)
+            || self.w.as_ref().is_some_and(|w| !w.belongs_to(ctl))
+        {
+            return Err(super::bad(
+                "projection",
+                "buffers belong to different calls",
+            ));
+        }
+        if self.src.len() != self.dst.len()
+            || self.w.as_ref().is_some_and(|w| w.len() != self.src.len())
+        {
+            return Err(super::bad("projection", "edge array lengths differ"));
+        }
+        Ok(())
+    }
+}
+
 impl Graph {
     /// The number of nodes.
     #[inline]
@@ -321,55 +336,73 @@ impl Graph {
         self.ids.len() as u64 * 8 + self.out.bytes() + self.inn.get().map_or(0, |i| i.bytes())
     }
 
-    /// Estimated bytes of a projection of `n` nodes and `m` edges (§3.2), also counting
-    /// the temporary arrays of the build.
+    /// Advisory size estimate for compatibility. Construction admits each actual
+    /// capacity separately, including its overlapping temporary storage.
     pub fn estimate(n: u64, m: u64, weighted: bool) -> u64 {
-        n * 16 + m * if weighted { 28 } else { 20 }
+        n.saturating_mul(16)
+            .saturating_add(m.saturating_mul(if weighted { 28 } else { 20 }))
     }
 
     /// Number the nodes and build the rows from `raw`.
     pub fn build(raw: RawEdges, agg: Aggregate, par: &Par, ctl: &Control) -> Result<Graph> {
+        // Caller-owned inputs already exist; admit their actual capacities on entry.
+        let raw = OwnedRawEdges {
+            nodes: Buffer::adopt(raw.nodes, ctl)?,
+            src: Buffer::adopt(raw.src, ctl)?,
+            dst: Buffer::adopt(raw.dst, ctl)?,
+            w: raw.w.map(|w| Buffer::adopt(w, ctl)).transpose()?,
+            symmetric: raw.symmetric,
+        };
+        Self::build_owned(raw, agg, par, ctl)
+    }
+
+    pub(crate) fn build_owned(
+        raw: OwnedRawEdges,
+        agg: Aggregate,
+        par: &Par,
+        ctl: &Control,
+    ) -> Result<Graph> {
+        raw.validate(ctl)?;
         let n = raw.nodes.len();
         if n >= u32::MAX as usize {
             return Err(super::bad("projection", "more than 4 billion nodes"));
         }
         let m = raw.src.len();
         let weighted = raw.w.is_some() || matches!(agg, Aggregate::Sum | Aggregate::Count);
-        ctl.charge(Graph::estimate(n as u64, m as u64, weighted))?;
-        let nodes = &raw.nodes;
-        let index = |id: u64| nodes.binary_search(&id).map_or(u32::MAX, |i| i as u32);
-        // (source index << 32 | destination index, weight bits)
-        let mut keys: Vec<(u64, u32)> = vec![(u64::MAX, 0); m];
-        let (src, dst, w) = (&raw.src, &raw.dst, &raw.w);
+        let mut keys = Buffer::filled("projection-keys", m, (u64::MAX, 0u32), ctl)?;
+        let index = |id: u64| raw.nodes.binary_search(&id).map_or(u32::MAX, |i| i as u32);
         par.chunks_mut(&mut keys, 1 << 16, |lo, chunk| {
             ctl.check()?;
             for (i, k) in chunk.iter_mut().enumerate() {
-                let (a, b) = (index(src[lo + i]), index(dst[lo + i]));
+                let (a, b) = (index(raw.src[lo + i]), index(raw.dst[lo + i]));
                 if a != u32::MAX && b != u32::MAX {
                     *k = (
                         (a as u64) << 32 | b as u64,
-                        w.as_ref().map_or(0, |w| w[lo + i].to_bits()),
+                        raw.w.as_ref().map_or(0, |w| w[lo + i].to_bits()),
                     );
                 }
             }
             Ok(())
         })?;
+        let unweighted_input = raw.w.is_none();
         drop(raw.src);
         drop(raw.dst);
+        drop(raw.w);
+        ctl.check()?;
         par.sort(&mut keys);
-        // the edges with an end outside the nodes sorted last
+        ctl.check()?;
         let kept = keys.partition_point(|k| k.0 != u64::MAX);
         keys.truncate(kept);
-        let unweighted_input = raw.w.is_none();
         if agg != Aggregate::None {
-            let mut out: Vec<(u64, u32)> = Vec::with_capacity(keys.len());
+            let mut out = Buffer::new("projection-aggregate", keys.len(), ctl)?;
             let mut count = 0u32;
             let mut sum = 0f64;
             let mut last = u64::MAX;
-            let fin = |out: &mut Vec<(u64, u32)>, k: u64, count: u32, sum: f64| -> Result<()> {
-                let v = match agg {
-                    Aggregate::Count => count as f32,
-                    _ => sum as f32,
+            let fin = |out: &mut Buffer<(u64, u32)>, k: u64, count: u32, sum: f64| -> Result<()> {
+                let v = if agg == Aggregate::Count {
+                    count as f32
+                } else {
+                    sum as f32
                 };
                 if agg == Aggregate::Sum && !v.is_finite() {
                     return Err(super::bad(
@@ -377,10 +410,11 @@ impl Graph {
                         "summed edge weight is not finite as f32",
                     ));
                 }
-                out.push((k, v.to_bits()));
-                Ok(())
+                out.push((k, v.to_bits()))
             };
-            for &(k, wb) in &keys {
+            let mut work = Work::new(ctl)?;
+            for &(k, wb) in &*keys {
+                work.tick("projection-aggregate")?;
                 let x = if unweighted_input {
                     1.0
                 } else {
@@ -392,15 +426,19 @@ impl Graph {
                     }
                     last = k;
                     count = 0;
-                    sum = match agg {
-                        Aggregate::Max => f64::NEG_INFINITY,
-                        _ => 0.0,
+                    sum = if agg == Aggregate::Max {
+                        f64::NEG_INFINITY
+                    } else {
+                        0.0
                     };
                 }
-                count += 1;
-                match agg {
-                    Aggregate::Max => sum = sum.max(x),
-                    _ => sum += x,
+                count = count
+                    .checked_add(1)
+                    .ok_or_else(|| super::bad("projection", "aggregate count overflows"))?;
+                if agg == Aggregate::Max {
+                    sum = sum.max(x);
+                } else {
+                    sum += x;
                 }
             }
             if last != u64::MAX {
@@ -408,10 +446,42 @@ impl Graph {
             }
             keys = out;
         }
-        let csr = Csr::from_sorted(n, &keys, weighted);
+        let offsets = n
+            .checked_add(1)
+            .ok_or_else(|| super::bad("projection", "offset count overflows"))?;
+        let mut off = Buffer::filled("projection-offsets", offsets, 0u64, ctl)?;
+        let mut adj = Buffer::new("projection-adjacency", keys.len(), ctl)?;
+        let mut weights = weighted
+            .then(|| Buffer::new("projection-weights", keys.len(), ctl))
+            .transpose()?;
+        let mut work = Work::new(ctl)?;
+        for &(k, wb) in &*keys {
+            work.tick("projection-csr")?;
+            let row = (k >> 32) as usize + 1;
+            off[row] = off[row]
+                .checked_add(1)
+                .ok_or_else(|| super::bad("projection", "row count overflows"))?;
+            adj.push(k as u32)?;
+            if let Some(w) = &mut weights {
+                w.push(f32::from_bits(wb))?;
+            }
+        }
+        for i in 0..n {
+            work.tick("projection-prefix")?;
+            off[i + 1] = off[i + 1]
+                .checked_add(off[i])
+                .ok_or_else(|| super::bad("projection", "offset sum overflows"))?;
+        }
+        drop(keys);
+        ctl.check()?;
+        // No fallible work follows the final detach. All retained capacities stay charged.
         Ok(Graph {
-            ids: raw.nodes,
-            out: csr,
+            ids: raw.nodes.into_output(),
+            out: Csr {
+                off: off.into_output(),
+                adj: adj.into_output(),
+                w: weights.map(Buffer::into_output),
+            },
             symmetric: raw.symmetric,
             inn: OnceLock::new(),
             inn_init: parking_lot::Mutex::new(()),
@@ -618,8 +688,10 @@ mod tests {
     }
 
     #[test]
-    fn unit_sum_reserves_weighted_build_bytes() {
-        let bytes = Graph::estimate(3, 3, true);
+    fn unit_sum_reserves_actual_overlapping_capacities() {
+        // Raw nodes+edges and padded key tuples overlap (24+24+24+48).
+        // The later aggregation and CSR stages have no higher live capacity.
+        let bytes = 120;
         let too_small = Control::new(Default::default(), None, bytes - 1);
         assert!(Graph::build(unit_parallel(), Aggregate::Sum, &Par::single(), &too_small).is_err());
         let exact = Control::new(Default::default(), None, bytes);
@@ -763,3 +835,177 @@ mod tests {
 #[cfg(test)]
 #[path = "incoming_tests.rs"]
 mod incoming_tests;
+
+#[cfg(test)]
+mod r6_before {
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    fn duplicate_capacity() -> RawEdges {
+        let mut nodes = Vec::with_capacity(16384);
+        nodes.extend([0, 1]);
+        RawEdges {
+            nodes,
+            src: vec![0],
+            dst: vec![1],
+            w: None,
+            symmetric: false,
+        }
+    }
+    #[test]
+    fn r6_native_raw_keys_overlap_is_admitted_before_allocation() {
+        let raw = duplicate_capacity();
+        let raw_bytes =
+            (raw.nodes.capacity() * 8 + raw.src.capacity() * 8 + raw.dst.capacity() * 8) as u64;
+        super::super::set_projection_observer(Some(Arc::new(move |event| {
+            if let super::super::ProjectionEvent::Allocation("projection-keys", _, request, used) =
+                event
+            {
+                assert!(
+                    used >= raw_bytes + request,
+                    "raw {raw_bytes} + requested keys {request}, charged {used}"
+                );
+            }
+        })));
+        let _ = Graph::build(raw, Aggregate::None, &Par::single(), &Control::unlimited()).unwrap();
+        super::super::set_projection_observer(None);
+    }
+    #[test]
+    fn r6_native_retains_actual_node_capacity() {
+        let ctl = Control::unlimited();
+        let g = Graph::build(duplicate_capacity(), Aggregate::None, &Par::single(), &ctl).unwrap();
+        assert_eq!(ctl.observed_used(), g.base_bytes().unwrap());
+    }
+    #[test]
+    fn r6_empty_budget_refuses_before_offset_allocation() {
+        let allocated = Arc::new(AtomicBool::new(false));
+        let a = allocated.clone();
+        super::super::set_projection_observer(Some(Arc::new(move |event| {
+            if let super::super::ProjectionEvent::Allocation("projection-offsets", ..) = event {
+                a.store(true, Ordering::Relaxed);
+            }
+        })));
+        let result = Graph::build(
+            RawEdges::default(),
+            Aggregate::None,
+            &Par::single(),
+            &Control::new(Default::default(), None, 0),
+        );
+        super::super::set_projection_observer(None);
+        assert!(
+            matches!(result, Err(crate::Error::BudgetExceeded(_))),
+            "unexpected success or failure"
+        );
+        assert!(
+            !allocated.load(Ordering::Relaxed),
+            "offset allocated before admission"
+        );
+    }
+    #[test]
+    fn r6_cancelled_builder_restores_its_prior_ledger() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let f = flag.clone();
+        super::super::set_projection_observer(Some(Arc::new(move |event| {
+            if let super::super::ProjectionEvent::Allocation("projection-keys", ..) = event {
+                f.store(true, Ordering::Relaxed);
+            }
+        })));
+        let ctl = Control::new(flag, None, u64::MAX);
+        let result = Graph::build(duplicate_capacity(), Aggregate::None, &Par::single(), &ctl);
+        super::super::set_projection_observer(None);
+        assert!(matches!(result, Err(crate::Error::Cancelled)));
+        assert_eq!(
+            ctl.remaining(),
+            u64::MAX,
+            "failed build leaked capacity charge"
+        );
+    }
+}
+
+#[cfg(test)]
+mod owned_build_tests {
+    use super::*;
+    fn raw() -> RawEdges {
+        RawEdges {
+            nodes: vec![0, 1, 2],
+            src: vec![0, 0, 1],
+            dst: vec![1, 1, 2],
+            w: Some(vec![1., 2., 3.]),
+            symmetric: false,
+        }
+    }
+    #[test]
+    fn every_builder_allocation_failure_releases_inputs_and_scratch() {
+        for name in [
+            "projection-keys",
+            "projection-aggregate",
+            "projection-offsets",
+            "projection-adjacency",
+            "projection-weights",
+        ] {
+            let ctl = Control::new(Default::default(), None, 4096);
+            let scope = memory::probe::install(|_| {}, Some(name));
+            assert!(
+                Graph::build(raw(), Aggregate::Sum, &Par::single(), &ctl).is_err(),
+                "{name}"
+            );
+            drop(scope);
+            assert_eq!(ctl.remaining(), 4096, "{name}");
+        }
+    }
+    #[test]
+    fn successful_ledger_is_base_capacity_and_empty_offset_is_real() {
+        for agg in [
+            Aggregate::None,
+            Aggregate::Max,
+            Aggregate::Count,
+            Aggregate::Sum,
+        ] {
+            let ctl = Control::new(Default::default(), None, 4096);
+            let graph = Graph::build(raw(), agg, &Par::single(), &ctl).unwrap();
+            assert_eq!(4096 - ctl.remaining(), graph.base_bytes().unwrap());
+            let before = ctl.remaining();
+            let incoming = graph.inn(&ctl).unwrap();
+            assert!(ctl.remaining() < before);
+            drop(incoming);
+            assert_eq!(ctl.remaining(), before);
+        }
+        let ctl = Control::new(Default::default(), None, 8);
+        let graph = Graph::build(
+            RawEdges {
+                nodes: vec![],
+                src: vec![],
+                dst: vec![],
+                w: None,
+                symmetric: false,
+            },
+            Aggregate::None,
+            &Par::single(),
+            &ctl,
+        )
+        .unwrap();
+        assert_eq!(graph.out.off, &[0]);
+        assert_eq!(ctl.remaining(), 0);
+        assert_eq!(graph.base_bytes().unwrap(), 8);
+    }
+    #[test]
+    fn foreign_and_misaligned_owners_refuse_without_retained_charge() {
+        let ctl = Control::new(Default::default(), None, 1024);
+        let other = Control::unlimited();
+        let owned = OwnedRawEdges {
+            nodes: Buffer::adopt(vec![0, 1], &other).unwrap(),
+            src: Buffer::adopt(vec![0], &ctl).unwrap(),
+            dst: Buffer::adopt(vec![1], &ctl).unwrap(),
+            w: None,
+            symmetric: false,
+        };
+        assert!(Graph::build_owned(owned, Aggregate::None, &Par::single(), &ctl).is_err());
+        assert_eq!(ctl.remaining(), 1024);
+        let mut r = raw();
+        r.dst.clear();
+        assert!(Graph::build(r, Aggregate::None, &Par::single(), &ctl).is_err());
+        assert_eq!(ctl.remaining(), 1024);
+    }
+}

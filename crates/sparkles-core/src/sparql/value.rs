@@ -67,6 +67,34 @@ pub(crate) fn numeric_datatype(dt: &str) -> bool {
         || INTEGER_DERIVED.contains(&dt)
 }
 
+/// Numeric subset of from_key without allocating Other/lexical Arc values.
+/// The pinned four parsers and approx_f64 use fixed scalar/stack storage.
+pub(crate) fn numeric_key(key: &[u8]) -> Option<f64> {
+    if key.first() != Some(&b'"') {
+        return None;
+    }
+    let sep = key.iter().rposition(|&b| b == crate::id::KEY_SEP)?;
+    let lex = std::str::from_utf8(key.get(1..sep)?).ok()?;
+    let suffix = key.get(sep + 1..)?;
+    if suffix.first().is_none_or(|&b| b == b'@') {
+        return None;
+    }
+    let dt = std::str::from_utf8(suffix.get(1..)?).ok()?;
+    if !numeric_datatype(dt) {
+        return None;
+    }
+    let value = if dt == xsd::DECIMAL.as_str() {
+        Value::Decimal(lex.parse().ok()?)
+    } else if dt == xsd::FLOAT.as_str() {
+        Value::Float(lex.parse().ok()?)
+    } else if dt == xsd::DOUBLE.as_str() {
+        Value::Double(lex.parse().ok()?)
+    } else {
+        Value::Integer(lex.parse().ok()?)
+    };
+    approx_f64(&value)
+}
+
 impl Value {
     pub fn from_term(t: &Term) -> Value {
         match t {
@@ -752,5 +780,53 @@ mod tests {
         v.sort_by(|a, b| order_cmp(Some(a), Some(b)));
         assert!(matches!(v[0], Value::BNode(_)));
         assert!(matches!(v[1], Value::Iri(_)));
+    }
+}
+
+#[cfg(test)]
+mod projection_numeric_tests {
+    use super::*;
+    #[test]
+    fn borrowed_numeric_subset_matches_existing_key_decode_bits() {
+        let datatypes = [
+            xsd::INTEGER.as_str(),
+            xsd::DECIMAL.as_str(),
+            xsd::FLOAT.as_str(),
+            xsd::DOUBLE.as_str(),
+            xsd::STRING.as_str(),
+        ];
+        for dt in datatypes.into_iter().chain(INTEGER_DERIVED.iter().copied()) {
+            for lex in [
+                "0",
+                "-0",
+                "01",
+                "-3",
+                "1.50",
+                "+1",
+                "1e20",
+                "INF",
+                "-INF",
+                "NaN",
+                "heavy",
+                "99999999999999999999999999999",
+            ] {
+                let key = crate::id::term_key(&Term::Literal(Literal::new_typed_literal(
+                    lex,
+                    NamedNode::new_unchecked(dt),
+                )));
+                assert_eq!(
+                    numeric_key(&key).map(f64::to_bits),
+                    approx_f64(&Value::from_key(&key)).map(f64::to_bits),
+                    "{lex} {dt}"
+                );
+            }
+        }
+        for key in [
+            b"\"\xff\x1f^http://www.w3.org/2001/XMLSchema#double".as_slice(),
+            b"\"1\x1f@en",
+            b"<iri",
+        ] {
+            assert_eq!(numeric_key(key), None);
+        }
     }
 }

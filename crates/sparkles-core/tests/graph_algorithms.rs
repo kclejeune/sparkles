@@ -1570,3 +1570,209 @@ fn r7_cached_incoming_requires_each_call_budget() {
         "expected initialized incoming refusal"
     );
 }
+
+#[test]
+fn r18_irrelevant_malformed_weight_is_not_applicable() {
+    let s = store_of("ex:a ex:p ex:b {| ex:w 2 |} . ex:person ex:w \"heavy\" .");
+    let r = rows(
+        &s,
+        "SELECT ?n ?d WHERE { SERVICE algo:sssp { [] algo:predicate ex:p ; algo:weight ex:w ; algo:source ex:a ; algo:node ?n ; algo:distance ?d } }",
+    );
+    assert_eq!(by_node(&r, "d")["b"], "2");
+}
+#[cfg(feature = "failpoints")]
+#[test]
+fn r6_weights_do_not_materialize_irrelevant_ranges() {
+    let mut ttl = String::from("ex:a ex:p ex:b {| ex:w 2 |} . ");
+    for i in 0..1000 {
+        ttl.push_str(&format!("ex:r{i} ex:w {i} . "));
+    }
+    let s = store_of(&ttl);
+    sparkles_core::algo::set_projection_observer(Some(Arc::new(|event| {
+        if let sparkles_core::algo::ProjectionEvent::Materialized("weight-scan-keys", capacity) =
+            event
+        {
+            assert_eq!(
+                capacity, 0,
+                "global weight scan materialized {capacity} rows"
+            );
+        }
+    })));
+    let r = rows(
+        &s,
+        "SELECT ?n ?d WHERE { SERVICE algo:sssp { [] algo:predicate ex:p ; algo:weight ex:w ; algo:source ex:a ; algo:node ?n ; algo:distance ?d } }",
+    );
+    sparkles_core::algo::set_projection_observer(None);
+    assert_eq!(by_node(&r, "d")["b"], "2");
+}
+#[cfg(feature = "failpoints")]
+#[test]
+fn r6_class_growth_is_precharged() {
+    let s = store_of("ex:a a ex:N . ex:b a ex:N .");
+    sparkles_core::algo::set_projection_observer(Some(Arc::new(|event| {
+        if let sparkles_core::algo::ProjectionEvent::Allocation(
+            "projection-class",
+            _,
+            bytes,
+            used,
+        ) = event
+        {
+            assert!(
+                used >= bytes,
+                "class allocation {bytes} preceded admission {used}"
+            );
+        }
+    })));
+    let r = rows(
+        &s,
+        "SELECT ?n ?c WHERE { SERVICE algo:wcc { [] algo:predicate ex:missing ; algo:nodeClass ex:N ; algo:node ?n ; algo:component ?c } }",
+    );
+    sparkles_core::algo::set_projection_observer(None);
+    assert_eq!(r.len(), 2);
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn r6_distinct_refuses_before_first_allocation() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let s = store_of("ex:a ex:p ex:b .");
+    let allocated = Arc::new(AtomicBool::new(false));
+    let seen = allocated.clone();
+    sparkles_core::algo::set_projection_observer(Some(Arc::new(move |event| {
+        if let sparkles_core::algo::ProjectionEvent::Materialized("distinct-allocated", n) = event
+            && n > 0
+        {
+            seen.store(true, Ordering::Relaxed);
+        }
+    })));
+    let result = query(
+        s.snapshot(),
+        &format!(
+            "{PREFIXES} SELECT ?n ?c WHERE {{ SERVICE algo:wcc {{ [] algo:start ?s ; algo:end ?e ; algo:maxMemory 64 ; algo:node ?n ; algo:component ?c . ?s ex:p ?e }} }}"
+        ),
+        &QueryOptions::default(),
+    );
+    sparkles_core::algo::set_projection_observer(None);
+    assert!(
+        matches!(result, Err(sparkles_core::Error::BudgetExceeded(_))),
+        "expected a typed budget refusal"
+    );
+    assert!(
+        !allocated.load(Ordering::Relaxed),
+        "distinct table allocated before admission"
+    );
+}
+
+#[test]
+fn r18_applicable_minimum_classes_and_irrelevant_edges() {
+    let s = store_of(
+        "ex:a a ex:N; ex:p ex:b {| ex:w 5, 2 |}. ex:b a ex:N. ex:h a ex:N. ex:x ex:p ex:y {| ex:w \"heavy\" |}. ex:a ex:p \"literal\" {| ex:w \"heavy\" |}. ex:x ex:q ex:y {|ex:w \"heavy\"|}.",
+    );
+    let q = "SELECT ?n ?d WHERE { SERVICE algo:sssp { [] algo:predicate ex:p; algo:nodeClass ex:N; algo:weight ex:w; algo:source ex:a; algo:node ?n; algo:distance ?d } }";
+    let d = by_node(&rows(&s, q), "d");
+    assert_eq!(d["b"], "2");
+    assert!(!d.contains_key("x"));
+    let wcc = rows(
+        &s,
+        "SELECT ?n ?c WHERE { SERVICE algo:wcc { [] algo:predicate ex:p; algo:nodeClass ex:N; algo:weight ex:w; algo:node ?n; algo:component ?c } }",
+    );
+    assert_eq!(groups(&by_node(&wcc, "c")), set(&[&["a", "b"], &["h"]]));
+    update(
+        &s,
+        &format!("{PREFIXES} INSERT DATA {{ ex:a ex:p ex:b {{|ex:w \"bad\"|}} }}"),
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    assert!(error(&s, q).contains("not a number"));
+}
+
+#[test]
+fn r18_graph_union_weights_and_delta_triple_key_visibility() {
+    let s = Store::in_memory(StoreOptions::default());
+    s.load(&[Source::from_bytes(b"@prefix ex:<http://ex/>. @prefix rdf:<http://www.w3.org/1999/02/22-rdf-syntax-ns#>. ex:edges { ex:a ex:p ex:b. } ex:types {ex:a a ex:N. ex:b a ex:N.} ex:reifiers {_:r rdf:reifies <<(ex:a ex:p ex:b)>>.} ex:weights {_:r ex:w 5, 2.}".to_vec(),RdfFormat::TriG,None)]).unwrap();
+    let body = "SERVICE algo:sssp { [] algo:predicate ex:p; algo:weight ex:w; algo:defaultWeight 7; algo:source ex:a; algo:node ?n; algo:distance ?d }";
+    for (dataset, expected) in [
+        (
+            "FROM ex:edges FROM ex:types FROM ex:reifiers FROM ex:weights",
+            "2",
+        ),
+        ("FROM ex:edges FROM ex:reifiers", "7"),
+        ("FROM ex:edges FROM ex:weights", "7"),
+    ] {
+        let q = format!("SELECT ?n ?d {dataset} WHERE {{ {body} }}");
+        assert_eq!(by_node(&rows(&s, &q), "d")["b"], expected);
+    }
+    let q = format!(
+        "SELECT ?n ?d FROM NAMED ex:edges FROM NAMED ex:weights WHERE {{ GRAPH ex:edges {{ {body} }} }}"
+    );
+    assert_eq!(by_node(&rows(&s, &q), "d")["b"], "7");
+    let s = store_of("ex:a ex:p ex:b.");
+    update(
+        &s,
+        &format!("{PREFIXES} INSERT DATA {{ ex:r rdf:reifies <<(ex:a ex:p ex:b)>>;ex:w 3 }}"),
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        by_node(&rows(&s, &format!("SELECT ?n ?d WHERE {{ {body} }}")), "d")["b"],
+        "3"
+    );
+}
+
+#[test]
+fn r18_hidden_reifier_weights_and_absent_assertions_are_irrelevant() {
+    let s = store_of(
+        "ex:a ex:p ex:b {|ex:w 2|}. ex:r a ex:Hidden; <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> <<(ex:a ex:p ex:b)>>;ex:w \"heavy\". ex:absent <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> <<(ex:x ex:p ex:y)>>;ex:w \"heavy\".",
+    );
+    let protection = Protection {
+        name: "hidden-weights".into(),
+        predicates: Some(vec!["http://ex/w".into()]),
+        classes: Some(vec!["http://ex/Hidden".into()]),
+        subclasses: false,
+        graphs: None,
+        pattern: None,
+        prefixes: Default::default(),
+        hide_inferences: false,
+    };
+    let opts = QueryOptions {
+        graphs: Some(Arc::new(GraphAccess::with_triples(
+            Graphs::All,
+            Graphs::All,
+            TripleRules {
+                rules: vec![Rule {
+                    protection: Arc::new(protection),
+                    read: Graphs::none(),
+                    write: Graphs::none(),
+                }],
+                caller: Caller::default(),
+                limits: Limits::default(),
+            },
+        ))),
+        ..Default::default()
+    };
+    let q = "SELECT ?n ?d WHERE { SERVICE algo:sssp { [] algo:predicate ex:p;algo:weight ex:w;algo:source ex:a;algo:node ?n;algo:distance ?d } }";
+    assert!(error(&s, q).contains("not a number"));
+    assert_eq!(by_node(&rows_with(&s, q, &opts), "d")["b"], "2");
+}
+
+#[test]
+fn r18_pattern_first_pair_weight_and_filtered_endpoints() {
+    let s = store_of("ex:a a ex:N. ex:b a ex:N.");
+    let q = "SELECT ?n ?d WHERE { SERVICE algo:sssp { [] algo:start ?s;algo:end ?e;algo:edgeWeight ?w;algo:source ex:a;algo:node ?n;algo:distance ?d . VALUES (?s ?e ?w) { (ex:a ex:b 2) (ex:a ex:b \"heavy\") (ex:x ex:y \"heavy\") (ex:a \"literal\" \"heavy\") } FILTER(?s != ex:x) } }";
+    assert_eq!(by_node(&rows(&s, q), "d")["b"], "2");
+    let s = store_of("ex:a ex:p ex:b.");
+    let q = "SELECT ?n ?d WHERE { SERVICE algo:sssp { [] algo:start ?s;algo:end ?e;algo:edgeWeight ?w;algo:defaultWeight 7;algo:source ex:a;algo:node ?n;algo:distance ?d . VALUES (?s ?e ?w) { (ex:a ex:b UNDEF) } FILTER(?s != ex:x) } }";
+    assert_eq!(by_node(&rows(&s, q), "d")["b"], "7");
+}
+
+#[test]
+fn r18_blank_endpoints_preserve_canonical_reifier_keys() {
+    let s = store_of("_:a ex:p _:b {|ex:w 2|}. _:b ex:p ex:c {|ex:w 3|}.");
+    let q = "SELECT ?n ?d WHERE { SERVICE algo:sssp { [] algo:predicate ex:p;algo:direction algo:backward;algo:weight ex:w;algo:source ex:c;algo:node ?n;algo:distance ?d } }";
+    let result = rows(&s, q);
+    let distances: BTreeSet<_> = result.iter().map(|r| r["d"].clone()).collect();
+    assert_eq!(
+        distances,
+        BTreeSet::from(["0".into(), "3".into(), "5".into()])
+    );
+}

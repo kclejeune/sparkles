@@ -1298,6 +1298,49 @@ impl Ctx {
         )
     }
 
+    /// Algorithm-owned key reconstruction never populates the eager value cache.
+    pub(super) fn with_algo_key<T>(
+        &self,
+        id: Id,
+        ctl: &crate::algo::Control,
+        mut f: impl FnMut(&[u8]) -> Result<T>,
+    ) -> Result<Option<T>> {
+        use crate::algo::memory::{Reservation, bytes};
+        ctl.check()?;
+        match id.tag() {
+            Tag::Vocab => {
+                let mut scratch = Reservation::new(ctl, 0)?;
+                self.snap
+                    .generation
+                    .vocab
+                    .get_with_fallible(
+                        id.payload(),
+                        |need| {
+                            let bound = bytes::<u8>(need)?
+                                .checked_mul(2)
+                                .ok_or_else(|| Error::invalid("algorithm key scratch overflows"))?;
+                            scratch.grow_to(bound)
+                        },
+                        &mut f,
+                    )?
+                    .transpose()
+            }
+            Tag::Delta => self.snap.generation.dvocab.with(|v| {
+                if id.payload() >= self.snap.dvocab_len {
+                    return Ok(None);
+                }
+                v.get(id.payload()).map(&mut f).transpose()
+            }),
+            Tag::Local => self.with_local_key(id.payload(), &mut f).transpose(),
+            Tag::BNode => {
+                let mut key = [b'_'; 9];
+                key[1..].copy_from_slice(&id.payload().to_be_bytes());
+                f(&key).map(Some)
+            }
+            _ => Ok(None),
+        }
+    }
+
     pub(super) fn with_local_key<T>(&self, id: u64, f: impl FnOnce(&[u8]) -> T) -> Option<T> {
         self.local.read().get(id).map(f)
     }

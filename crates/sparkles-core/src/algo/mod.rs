@@ -22,7 +22,7 @@ pub mod fastrp;
 pub mod graph;
 pub mod kcore;
 pub mod labelprop;
-mod memory;
+pub(crate) mod memory;
 pub mod node2vec;
 pub mod pagerank;
 pub mod pool;
@@ -91,7 +91,41 @@ fn observe_check(
     }
 }
 
+/// Bounded actual projection allocation/scan observations for regression tests only.
+#[cfg(any(test, feature = "failpoints"))]
+#[derive(Clone, Copy, Debug)]
+pub enum ProjectionEvent {
+    Allocation(&'static str, usize, u64, u64),
+    Materialized(&'static str, usize),
+}
+#[cfg(any(test, feature = "failpoints"))]
+type ProjectionObserver = Arc<dyn Fn(ProjectionEvent) + Send + Sync>;
+#[cfg(any(test, feature = "failpoints"))]
+thread_local! {
+    static PROJECTION_OBSERVER: std::cell::RefCell<Option<ProjectionObserver>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(any(test, feature = "failpoints"))]
+pub fn set_projection_observer(observer: Option<ProjectionObserver>) {
+    PROJECTION_OBSERVER.with(|s| *s.borrow_mut() = observer);
+}
+#[cfg(any(test, feature = "failpoints"))]
+pub(crate) fn observe_projection(event: ProjectionEvent) {
+    let f = PROJECTION_OBSERVER.with(|s| s.borrow().clone());
+    if let Some(f) = f {
+        f(event);
+    }
+}
+
 impl Control {
+    pub(crate) fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    #[cfg(any(test, feature = "failpoints"))]
+    pub(crate) fn observed_used(&self) -> u64 {
+        self.inner.used.load(Ordering::Relaxed)
+    }
+
     /// A call that stops when `cancel` is set or the deadline passes, and holds at most
     /// `mem_limit` bytes of estimated memory (`u64::MAX`: no limit).
     pub fn new(cancel: Arc<AtomicBool>, deadline: Option<Instant>, mem_limit: u64) -> Control {

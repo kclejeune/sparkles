@@ -82,6 +82,7 @@ fn r7_exact_incoming_capacity_and_cache_independent_call_charge() {
 #[test]
 fn r7_scratch_refuses_before_allocation_and_symmetric_reuses_out() {
     let g = weighted();
+    let sym = ugraph(3, &[(0, 1)]);
     let ctl = Control::new(Default::default(), None, 56);
     let _hook = probe::install(
         |p| {
@@ -94,7 +95,6 @@ fn r7_scratch_refuses_before_allocation_and_symmetric_reuses_out() {
     assert!(matches!(g.inn(&ctl), Err(Error::BudgetExceeded(_))));
     assert_eq!(ctl.remaining(), 56);
     assert!(g.inn.get().is_none());
-    let sym = ugraph(3, &[(0, 1)]);
     let zero = Control::new(Default::default(), None, 0);
     assert!(std::ptr::eq(&*sym.inn(&zero).unwrap(), &sym.out));
     assert_eq!(zero.peak(), 0);
