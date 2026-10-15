@@ -61,10 +61,25 @@ pub fn run(g: &Graph, p: &Params, par: &Par, ctl: &Control) -> Result<Output> {
     let mut outw = Buffer::new("pagerank-out-weights", n, ctl)?;
     for u in 0..n as u32 {
         work.tick("pagerank-out-weights")?;
-        outw.push(match out.wrow(u) {
-            Some(w) => w.iter().map(|&x| x as f64).sum(),
+        let total: f64 = match out.wrow(u) {
+            Some(w) => {
+                for &weight in w {
+                    work.tick("pagerank-weight-validation")?;
+                    if !weight.is_finite() || weight < 0.0 {
+                        return Err(bad(
+                            "pageRank",
+                            "edge weights must be finite and non-negative",
+                        ));
+                    }
+                }
+                w.iter().map(|&x| x as f64).sum()
+            }
             None => out.deg(u) as f64,
-        })?;
+        };
+        if !total.is_finite() {
+            return Err(bad("pageRank", "outgoing weight total is not finite"));
+        }
+        outw.push(total)?;
     }
     let mut tele = Buffer::filled("pagerank-teleport", n, 0f64, ctl)?;
     if p.sources.is_empty() {
@@ -117,6 +132,9 @@ pub fn run(g: &Graph, p: &Params, par: &Par, ctl: &Control) -> Result<Output> {
             Ok(())
         })?;
         let dangling: f64 = partials.iter().copied().sum();
+        if !dangling.is_finite() {
+            return Err(bad("pageRank", "dangling rank total is not finite"));
+        }
         // what each node sends along one unit of edge weight
         par.chunks_mut(&mut contrib, BLOCK, |lo, c| {
             for (i, x) in c.iter_mut().enumerate() {
@@ -126,6 +144,9 @@ pub fn run(g: &Graph, p: &Params, par: &Par, ctl: &Control) -> Result<Output> {
                 } else {
                     0.0
                 };
+                if !x.is_finite() {
+                    return Err(bad("pageRank", "rank contribution is not finite"));
+                }
             }
             Ok(())
         })?;
@@ -150,6 +171,9 @@ pub fn run(g: &Graph, p: &Params, par: &Par, ctl: &Control) -> Result<Output> {
                     }
                     let t = tele_ref[v];
                     *x = (1.0 - d) * t + d * (s + dangling * t);
+                    if !x.is_finite() {
+                        return Err(bad("pageRank", "rank is not finite"));
+                    }
                 }
                 Ok(())
             })?;
@@ -162,6 +186,9 @@ pub fn run(g: &Graph, p: &Params, par: &Par, ctl: &Control) -> Result<Output> {
             Ok(())
         })?;
         delta = partials.iter().copied().sum();
+        if !delta.is_finite() {
+            return Err(bad("pageRank", "rank change is not finite"));
+        }
         std::mem::swap(&mut score, &mut next);
         iterations = it + 1;
         if !p.fixed && delta < p.tolerance {
@@ -186,6 +213,148 @@ pub fn run(g: &Graph, p: &Params, par: &Par, ctl: &Control) -> Result<Output> {
 mod tests {
     use super::super::testutil::*;
     use super::*;
+
+    fn r12_graph(weights: [f32; 2]) -> Graph {
+        Graph::build(
+            super::super::RawEdges {
+                nodes: vec![0, 1, 2, 3],
+                src: vec![0, 0],
+                dst: vec![1, 2],
+                w: Some(weights.to_vec()),
+                ..Default::default()
+            },
+            super::super::Aggregate::None,
+            &Par::single(),
+            &Control::unlimited(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn r12_native_invalid_weights_are_typed_and_release_workspace() {
+        let mut accepted = Vec::new();
+        for weights in [
+            [-10.0, 11.0],
+            [f32::NAN, 1.0],
+            [f32::INFINITY, 1.0],
+            [f32::NEG_INFINITY, 1.0],
+        ] {
+            let g = r12_graph(weights);
+            let ctl = Control::new(Default::default(), None, 1024 * 1024);
+            let result = run(&g, &Params::default(), &Par::single(), &ctl);
+            let invalid = matches!(result, Err(crate::Error::Invalid(_)));
+            eprintln!("weights={weights:?} typed_invalid={invalid}");
+            drop(result);
+            if invalid {
+                assert_eq!(ctl.remaining(), 1024 * 1024);
+            }
+            if !invalid {
+                accepted.push(weights);
+            }
+        }
+        assert!(
+            accepted.is_empty(),
+            "invalid weights accepted: {accepted:?}"
+        );
+    }
+
+    #[test]
+    fn r12_zero_weights_and_isolated_nodes_remain_probabilities() {
+        for weights in [[0.0, 0.0], [0.0, 3.0], [2.0, 3.0]] {
+            let g = r12_graph(weights);
+            let p = Params {
+                max_iterations: 100,
+                ..Params::default()
+            };
+            let output = run(&g, &p, &Par::single(), &Control::unlimited()).unwrap();
+            assert!(output.score.iter().all(|v| v.is_finite() && *v >= 0.0));
+            assert!((output.score.iter().sum::<f64>() - 1.0).abs() < 1e-12);
+            assert!(output.score[3] > 0.0, "isolated node retains teleport mass");
+            if weights == [0.0, 0.0] {
+                assert_eq!(output.score, vec![0.25; 4]);
+            }
+        }
+    }
+
+    #[test]
+    fn r12_positive_reference_bits_threads_one_two_four() {
+        let g = r12_graph([2.0, 3.0]);
+        let p = Params {
+            max_iterations: 20,
+            fixed: true,
+            ..Params::default()
+        };
+        // Independent four-node recurrence, recorded before the domain repair.
+        let mut expected = [0.25f64; 4];
+        for _ in 0..20 {
+            let dangling = expected[1] + expected[2] + expected[3];
+            let contribution = expected[0] / 5.0;
+            expected = [
+                (1.0 - 0.85) * 0.25 + 0.85 * (dangling * 0.25),
+                (1.0 - 0.85) * 0.25 + 0.85 * (contribution * 2.0 + dangling * 0.25),
+                (1.0 - 0.85) * 0.25 + 0.85 * (contribution * 3.0 + dangling * 0.25),
+                (1.0 - 0.85) * 0.25 + 0.85 * (dangling * 0.25),
+            ];
+        }
+        for par in [Par::single(), Par::with_threads(2), Par::with_threads(4)] {
+            let output = run(&g, &p, &par, &Control::unlimited()).unwrap();
+            assert_eq!(
+                output.score.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                expected.map(f64::to_bits)
+            );
+        }
+    }
+
+    #[test]
+    fn r12_weight_validation_cancellation_and_deadline_release() {
+        use crate::algo::memory::probe::{self, Point};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        };
+        let edges = 2 * super::super::CHECK_EVERY;
+        let limit = 8 * 1024 * 1024;
+        let g = Graph::build(
+            super::super::RawEdges {
+                nodes: vec![0, 1],
+                src: vec![0; edges],
+                dst: vec![1; edges],
+                w: Some(vec![1.0; edges]),
+                ..Default::default()
+            },
+            super::super::Aggregate::None,
+            &Par::single(),
+            &Control::unlimited(),
+        )
+        .unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let visits = Arc::new(AtomicUsize::new(0));
+        let ctl = Control::new(cancel.clone(), None, limit);
+        let v = visits.clone();
+        let _scope = probe::install(
+            move |point| {
+                if matches!(point, Point::Work("pagerank-weight-validation")) {
+                    v.fetch_add(1, Ordering::Relaxed);
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            },
+            None,
+        );
+        assert!(matches!(
+            run(&g, &Params::default(), &Par::single(), &ctl),
+            Err(crate::Error::Cancelled)
+        ));
+        let visits = visits.load(Ordering::Relaxed);
+        eprintln!("validation visits before cancellation: {visits}");
+        assert!((1..=super::super::CHECK_EVERY).contains(&visits));
+        assert_eq!(ctl.remaining(), limit);
+        let expired = Control::new(Default::default(), Some(std::time::Instant::now()), limit);
+        assert!(matches!(
+            run(&g, &Params::default(), &Par::single(), &expired),
+            Err(crate::Error::Timeout)
+        ));
+        assert_eq!(expired.remaining(), limit);
+    }
 
     fn a1() -> Graph {
         // a b c d e f g = 0..7, h = 7

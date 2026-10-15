@@ -5240,7 +5240,14 @@ Each applicable reifier and weight statement must also be visible in the selecte
 or graph union. The minimum of its visible numeric weights is used. An applicable
 non-numeric weight fails the call, while unrelated weights do not affect it. A nested
 pattern keeps the first solution's weight for each ordered pair, with the default for
-an unbound weight.
+an unbound weight. Every applicable numeric weight must remain finite when converted
+from f64 to the projection's f32 storage, including each candidate before minimum
+selection and the result of sum aggregation. A default is converted only when it
+supplies an accepted edge.
+
+PageRank requires finite non-negative stored weights, including native library inputs.
+Zero weights are valid. A node whose outgoing weights sum to zero distributes its rank
+as a dangling node. Other algorithms retain their own weight domains.
 
 ### Results
 

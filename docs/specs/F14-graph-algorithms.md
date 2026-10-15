@@ -562,6 +562,16 @@ Heap selection and scheduling change access costs without establishing a speed r
 The bounds describe requested Vec capacities, excluding allocator and Rayon bookkeeping.
 Broader algorithm and acceptance work remains pending.
 
+PageRank now rejects negative and nonfinite stored weights before iteration, including
+native graph inputs, and refuses nonfinite totals or rank arithmetic. Zero weights
+remain valid, and a zero outgoing sum follows the dangling-node rule. Applicable
+reifier candidates and the first accepted nested-pattern weight must remain finite in
+f32 storage. Checks precede minimum selection and aggregation. Defaults are converted
+only when they supply an accepted edge. Sum aggregation retains its existing stored-overflow check. Targeted regressions cover
+these refusals, cancellation and reservation release, and preserve the positive
+reference bits at one, two and four threads. Other algorithm weight domains and the
+remaining review and acceptance gates are unchanged.
+
 Projection collection now streams snapshot rows and resolves only applicable visible
 edge weights through indexed reifier lookups. Class members, predicate directions and
 nested-pattern distinct pairs hold admitted capacity owners. Key reconstruction,
