@@ -4772,8 +4772,20 @@ bytes across informational and final responses. Truncated or ambiguous framing
 keeps the full reservation unresolved and stops dispatch. Valid chunked and
 close-delimited responses are also refused because this transport supports only
 Content-Length framing. A nonstreaming request does not guarantee that framing
-from a provider. What is missing is a run with real models and the published
-numbers. The follow-up:
+from a provider. A complete real-model matrix and published numbers remain missing.
+
+The initial Anthropic demo pilot on 2026-10-15 passed all 13 local gold checks and
+stopped on the first Haiku request with `upstream_framing`. It attempted and executed
+one of 68 planned Ask executions, scored no cases and left 67 unattempted. The closed
+wallet recorded zero settled spend and retained 1002560000 USD nanodollars, or
+$1.002560, as its full unresolved liability. Actual billed spend is unknown. The
+retained status does not identify which framing check failed, and this pilot supplies
+no accuracy results.
+
+Compatible upstream framing, bounded nonsecret diagnostics that distinguish framing
+refusals and a separate closed-wallet recovery design remain part of item 6. The
+existing wallet and grant claim must be preserved. Recovery, reset, another grant and
+another run are not authorized. The remaining evaluation work follows.
 
 - Run the matrix of §11.4 with real providers on the demo set, QALD-9-plus (DBpedia
   questions, gold answers recomputed on the loaded release as §11.1 says) and the
