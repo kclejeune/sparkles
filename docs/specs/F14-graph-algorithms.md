@@ -550,6 +550,28 @@ stays current. It is left out of this spec.
 
 ## Outcome
 
+Algorithm SERVICE allocations now enter the same query ledger as ordinary query work.
+The ledger admits each projection, workspace and result-buffer increment through the
+query's current memory owner before allocation. Eager results retain their admitted
+high-water contribution, and cursor results retain live ownership through fallback,
+sorting, batching and early close. Cached projections and result tables retain plain
+data. Each warm caller admits its own copied or shared storage without keeping the
+initializer's query grant alive.
+
+A call's `algo:maxMemory` covers all selected graphs together, including retained
+outputs and old and replacement append buffers while both are live. Accumulation
+within one call reuses column capacity and grows it geometrically. The complete
+incoming part stays admitted during each replacement, and retained spare capacity
+continues to count after the old backing is dropped. This avoids repeated prefix
+copies at the cost of unused admitted capacity. Native scratch ends with its graph
+frame. The final SERVICE output keeps its query reservation when
+the completed call closes its native budget. `peakBytes` keeps its existing boundary
+before the final input join, whose inherited kernel and estimates remain unchanged.
+Summary and embedding serialization use admitted growing buffers. Local term insertion
+retains the existing key-byte estimate rather than claiming an allocator or RSS bound.
+These ownership repairs do not establish a performance result or complete the remaining
+acceptance gates.
+
 Node similarity now reuses at most one logical workspace per admitted thread. Fixed
 counters, touched IDs and a bounded topK heap remain charged while live, and duplicate
 outgoing rows use a temporary owned CSR with the existing controlled transpose.

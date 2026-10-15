@@ -5296,7 +5296,14 @@ compute an unpersonalized ranking. Omitting the source still runs ordinary PageR
   with an update and indexed (see [Vector similarity](#vector-similarity)).
 * **Budgets.** A call counts against the query's timeout and memory budget. A projection
   or a result that does not fit fails the query with a message that names the parameter
-  to change. `algo:maxMemory` sets a lower budget for one call. Projection buffers,
+  to change. `algo:maxMemory` sets a lower budget for one call across all selected
+  graphs. Native buffers and retained outputs share the query's memory owner and
+  server pool admission before allocation. Accumulation within a call reuses admitted
+  columns and grows their capacity geometrically. Spare capacity remains charged with
+  the result, so fewer prefix copies can require more admitted memory. Old and
+  replacement append buffers count while both are live. Completed output keeps its
+  query reservation through parent operators and cursor batches. The call's `peakBytes` stops before the final input
+  join, which keeps its existing query estimates. Projection buffers,
   distinct pairs, key reconstruction and graph construction admit their requested
   capacities before allocation, including old and replacement storage while both are
   live. Deduplicated node arrays retain their full capacity charge. Native callers'

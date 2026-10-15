@@ -22,7 +22,7 @@
 
 use super::ctx::Ctx;
 use super::plan::{ActiveGraph, GraphFilter, Kind, Node, PT, PathEnd, Planner};
-use super::table::{Table, VarId};
+use super::table::{Materialized, Table, VarId};
 use super::value::Value;
 use crate::algo::graph::OwnedRawEdges;
 use crate::algo::memory::{self, Buffer, Reservation, Work};
@@ -934,64 +934,62 @@ pub(super) fn run(
     input: Option<Table>,
     edges: Option<Table>,
     vars: &[VarId],
-) -> Result<(Table, serde_json::Map<String, serde_json::Value>)> {
+) -> Result<(Materialized, serde_json::Map<String, serde_json::Value>)> {
     let started = Instant::now();
     let limit = spec.num("maxMemory").map_or(u64::MAX, |m| m as u64);
-    let ctl = Control::with_cancellation(
-        ctx.cancel.clone(),
-        ctx.cancellation.clone(),
-        ctx.deadline,
-        limit.min(ctx.memory_remaining()),
-    );
+    let ctl = Control::for_query(ctx, limit)?;
     let par = Par::acquire(spec.int("concurrency", 0) as usize, &ctl)?;
-    let mut counters = serde_json::Map::new();
-    let result_vars: Vec<VarId> = vars
-        .iter()
-        .copied()
-        .filter(|v| spec.outs.vars().contains(v) || Some(*v) == spec.graph_var)
-        .collect();
-    // one projection, or one for each named graph under GRAPH ?g
-    let graphs: Vec<(GraphFilter, Option<Id>)> = match spec.graph_var {
-        None => vec![(spec.proj.graph.clone(), None)],
-        Some(_) => ctx
-            .snap
-            .graph_ids()?
-            .into_iter()
-            .filter(|g| spec.proj.graph.accepts(g.0))
-            .map(|g| (GraphFilter::One(g.0), Some(g)))
-            .collect(),
-    };
-    let mut t = Table::empty(result_vars.clone());
+    let mut result_vars = Buffer::new("algorithm-result-vars", vars.len(), &ctl)?;
+    let mut work = Work::new(&ctl)?;
+    for &v in vars {
+        work.tick("algorithm-result-vars")?;
+        if spec.outs.vars().contains(&v) || Some(v) == spec.graph_var {
+            result_vars.push(v)?;
+        }
+    }
+    let mut t = Some(Builder::new(&result_vars, &ctl)?.finish(0, ctx)?);
     let mut built = std::time::Duration::ZERO;
     let (mut nodes, mut edge_count, mut cache_hits) = (0usize, 0usize, 0usize);
-    for (filter, gid) in graphs {
+    let mut each = |filter: &GraphFilter, gid: Option<Id>| -> Result<()> {
+        let frame = ctl.query_frame()?;
         let at = Instant::now();
-        let mut one = spec.clone();
-        one.proj.graph = filter;
-        let (g, hit) = projection(ctx, &one, edges.as_ref(), &par, &ctl)?;
+        let (g, hit) = projection_in_graph(ctx, spec, edges.as_ref(), &par, &frame, filter)?;
         built += at.elapsed();
         cache_hits += hit as usize;
         nodes += g.n();
         edge_count += g.m();
-        // the sources: node indexes of the constants and of the group's bound values
-        let mut sources: Vec<u32> = Vec::new();
-        let mut want_sources = false;
+        let bound = spec
+            .sources
+            .iter()
+            .try_fold(0usize, |n, s| {
+                n.checked_add(match s {
+                    PathEnd::Const(_) => 1,
+                    PathEnd::Var(v) => input
+                        .as_ref()
+                        .and_then(|t| t.col_of(*v).map(|_| t.len()))
+                        .unwrap_or(0),
+                })
+            })
+            .ok_or_else(|| bad("source count overflows"))?;
+        let mut sources = Buffer::new("algorithm-sources", bound, &frame)?;
+        let mut work = Work::new(&frame)?;
         for s in &spec.sources {
-            want_sources = true;
-            let mut add = |id: Id| {
+            let mut add = |id: Id| -> Result<()> {
+                work.tick("algorithm-sources")?;
                 if let Ok(i) = g.ids.binary_search(&id.0) {
-                    sources.push(i as u32);
+                    sources.push(i as u32)?;
                 }
+                Ok(())
             };
             match s {
-                PathEnd::Const(id) => add(*id),
+                PathEnd::Const(id) => add(*id)?,
                 PathEnd::Var(v) => {
                     if let Some(t) = input.as_ref()
                         && let Some(c) = t.col_of(*v)
                     {
                         for &id in &t.cols[c] {
                             if !id.is_undef() {
-                                add(id);
+                                add(id)?;
                             }
                         }
                     }
@@ -999,24 +997,81 @@ pub(super) fn run(
             }
         }
         sources.sort_unstable();
-        sources.dedup();
-        let mut part = if want_sources
+        sources.dedup(&frame)?;
+        let mut part = if !spec.sources.is_empty()
             && sources.is_empty()
             && matches!(spec.algo, Algo::Bfs | Algo::Sssp)
             && !spec.stats_only()
         {
-            // no source is a node of the projection: nothing is reached
-            Table::empty(result_vars.clone())
+            Builder::new(&result_vars, &frame)?.finish(0, ctx)?
         } else {
-            rows(ctx, spec, &g, &sources, &par, &ctl, &result_vars)?
+            rows(ctx, spec, &g, &sources, &par, &frame, &result_vars)?
         };
         if let (Some(gid), Some(gv)) = (gid, spec.graph_var)
-            && let Some(c) = part.col_of(gv)
+            && let Some(c) = part.table.col_of(gv)
         {
-            part.cols[c] = vec![gid; part.len];
+            let replacement =
+                Buffer::filled("algorithm-graph-column", part.table.len, gid, &frame)?;
+            let bytes = memory::bytes::<Id>(replacement.capacity())?;
+            let replacement = replacement.into_output();
+            let mut lease = frame.output_lease(bytes)?;
+            let Some(held) = &mut part.lease else {
+                drop(replacement);
+                return Err(bad("missing algorithm part admission"));
+            };
+            if let Err(error) = held.merge(&mut lease) {
+                drop(replacement);
+                return Err(error);
+            }
+            part.table.cols[c] = replacement;
+            if let Some(held) = &mut part.lease {
+                held.resize(ctx.mem_limit, table_capacity(&part.table)?)?;
+            }
         }
-        t.append(part);
+        t = Some(append(
+            ctx,
+            t.take().expect("previous graph output"),
+            part,
+            &ctl,
+        )?);
+        // Graph/Csr cache ownership is plain data; this call's base admission ends
+        // only after every local Arc dies. Output leases own their separate columns.
+        drop(g);
+        Ok(())
+    };
+    match spec.graph_var {
+        None => each(&spec.proj.graph, None)?,
+        Some(_) => ctx.snap.for_each_graph_id_checked(
+            || ctl.check(),
+            |g| {
+                if spec.proj.graph.accepts(g.0) {
+                    each(&GraphFilter::One(g.0), Some(g))?;
+                }
+                Ok(())
+            },
+        )?,
     }
+    let mut t = t.expect("graph output");
+    // No SERVICE phase survives this boundary. Native frames and scratch die first;
+    // the final backing keeps exactly the same query charge through retirement.
+    drop(result_vars);
+    drop(par);
+    let peak = ctl.peak();
+    drop(ctl);
+    if let Some(lease) = &mut t.lease {
+        #[cfg(any(test, feature = "failpoints"))]
+        algo::observe_projection(algo::ProjectionEvent::Materialized(
+            "algorithm-retirement-before",
+            lease.bytes as usize,
+        ));
+        lease.retire_service()?;
+        #[cfg(any(test, feature = "failpoints"))]
+        algo::observe_projection(algo::ProjectionEvent::Materialized(
+            "algorithm-retirement-after",
+            lease.bytes as usize,
+        ));
+    }
+    let mut counters = serde_json::Map::new();
     counters.insert("nodes".into(), nodes.into());
     counters.insert("cachedProjections".into(), cache_hits.into());
     counters.insert("edges".into(), edge_count.into());
@@ -1025,15 +1080,96 @@ pub(super) fn run(
         "runMs".into(),
         ((started.elapsed() - built).as_secs_f64() * 1000.0).into(),
     );
-    counters.insert("peakBytes".into(), ctl.peak().into());
-    let _ = ctx.charge(ctl.peak())?;
-    // the call's rows joined with the rest of its group
+    counters.insert("peakBytes".into(), peak.into());
     let out = match input {
-        Some(inp) => super::exec::join_tables(ctx, &inp, &t, &[], false)?,
+        Some(inp) => super::exec::join_algorithm_tables(ctx, &inp, &t.table)?,
         None => t,
     };
-    ctx.produced(out.len())?;
+    ctx.produced(out.table.len())?;
     Ok((out, counters))
+}
+fn append(
+    ctx: &Ctx,
+    mut left: Materialized,
+    right: Materialized,
+    ctl: &Control,
+) -> Result<Materialized> {
+    ctl.check()?;
+    let n = left
+        .table
+        .len
+        .checked_add(right.table.len)
+        .ok_or_else(|| bad("result rows overflow"))?;
+    ctx.check_output_rows(n)?;
+    if left.table.width() == 0 {
+        // Zero-width rows still have the inherited logical Id-sized estimate.
+        // Admit it before publishing the larger length, including on refusal.
+        let bytes = memory::sum(&[
+            table_capacity(&left.table)?,
+            memory::bytes::<Id>(right.table.len)?,
+        ])?;
+        left.lease
+            .as_mut()
+            .ok_or_else(|| bad("missing algorithm output admission"))?
+            .resize(ctx.mem_limit, bytes)?;
+    } else {
+        let mut work = Work::new(ctl)?;
+        for c in 0..left.table.width() {
+            ctl.check()?;
+            if n <= left.table.cols[c].capacity() {
+                for &value in &right.table.cols[c] {
+                    work.tick("algorithm-append-copy")?;
+                    // n was checked against the admitted capacity above. No push
+                    // here can trigger implicit growth.
+                    left.table.cols[c].push(value);
+                }
+            } else {
+                let capacity = left.table.cols[c]
+                    .capacity()
+                    .checked_mul(2)
+                    .map(|v| v.max(4).max(n))
+                    .ok_or_else(|| bad("result column growth overflows"))?;
+                let mut replacement = Buffer::new("algorithm-append-column", capacity, ctl)?;
+                for &value in &left.table.cols[c] {
+                    work.tick("algorithm-append-relocate")?;
+                    replacement.push(value)?;
+                }
+                for &value in &right.table.cols[c] {
+                    work.tick("algorithm-append-copy")?;
+                    replacement.push(value)?;
+                }
+                ctl.check()?;
+                let bytes = memory::bytes::<Id>(replacement.capacity())?;
+                let replacement = replacement.into_output();
+                let mut lease = ctl.output_lease(bytes)?;
+                let Some(held) = &mut left.lease else {
+                    drop(replacement);
+                    return Err(bad("missing algorithm output admission"));
+                };
+                if let Err(error) = held.merge(&mut lease) {
+                    drop(replacement);
+                    return Err(error);
+                }
+                #[cfg(test)]
+                memory::probe::at(memory::probe::Point::Work("algorithm-append-transferred"));
+                let old = std::mem::replace(&mut left.table.cols[c], replacement);
+                drop(old); // Backing dies before its capacity leaves the lease.
+                #[cfg(test)]
+                memory::probe::at(memory::probe::Point::Work("algorithm-append-old-dropped"));
+                let bytes = table_capacity(&left.table)?;
+                left.lease
+                    .as_mut()
+                    .expect("admitted accumulator")
+                    .resize(ctx.mem_limit, bytes)?;
+                #[cfg(test)]
+                memory::probe::at(memory::probe::Point::Work("algorithm-append-resized"));
+            }
+        }
+    }
+    ctl.check()?;
+    left.table.len = n;
+    left.table.sorted.clear();
+    Ok(left)
 }
 
 /// The id of an `xsd:double`. A value whose low four mantissa bits are not zero loses
@@ -1043,67 +1179,214 @@ fn dbl(x: f64) -> Id {
     Id::from_f64(f64::from_bits(x.to_bits() & !0xF)).unwrap_or(Id::UNDEF)
 }
 
-fn int(ctx: &Ctx, x: i64) -> Id {
-    Id::from_i64(x).unwrap_or_else(|| ctx.intern_value(&Value::Integer(x.into())))
+fn int(ctx: &Ctx, x: i64, ctl: &Control) -> Result<Id> {
+    if let Some(id) = Id::from_i64(x) {
+        return Ok(id);
+    }
+    let mut text = Text::new(ctl)?;
+    use std::fmt::Write;
+    let result = write!(&mut text, "{x}");
+    text.formatted(result)?;
+    literal(
+        ctx,
+        &text.bytes,
+        "http://www.w3.org/2001/XMLSchema#integer",
+        ctl,
+    )
 }
 
-/// One output column being filled.
-struct Col {
-    var: VarId,
-    pos: usize,
+/// The same incremental serde/Debug encoding, with old/new capacity admitted before
+/// every growth. Preserve the original typed cancellation/resource error across Write.
+struct Text<'a> {
+    bytes: Buffer<u8>,
+    ctl: &'a Control,
+    error: Option<Error>,
 }
-
-/// Table columns by the variable they bind.
-struct Builder {
-    vars: Vec<VarId>,
-    cols: Vec<Vec<Id>>,
-}
-
-impl Builder {
-    fn new(vars: &[VarId]) -> Builder {
-        Builder {
-            vars: vars.to_vec(),
-            cols: vars.iter().map(|_| Vec::new()).collect(),
+impl<'a> Text<'a> {
+    fn new(ctl: &'a Control) -> Result<Self> {
+        Ok(Self {
+            bytes: Buffer::new("algorithm-text", 0, ctl)?,
+            ctl,
+            error: None,
+        })
+    }
+    fn append(&mut self, text: &[u8]) -> Result<()> {
+        let n = self
+            .bytes
+            .len()
+            .checked_add(text.len())
+            .ok_or_else(|| bad("text capacity overflows"))?;
+        self.bytes.reserve("algorithm-text", n, self.ctl)?;
+        self.bytes.extend(text)
+    }
+    fn formatted(&mut self, result: std::fmt::Result) -> Result<()> {
+        if let Some(error) = self.error.take() {
+            return Err(error);
         }
+        result.map_err(|_| bad("text formatting failed"))
     }
-
-    fn col(&self, v: Option<VarId>) -> Option<Col> {
-        let v = v?;
-        self.vars
-            .iter()
-            .position(|x| *x == v)
-            .map(|pos| Col { var: v, pos })
-    }
-
-    fn set(&mut self, c: &Option<Col>, f: impl FnMut(usize) -> Id, n: usize) {
-        if let Some(c) = c {
-            let mut f = f;
-            self.cols[c.pos] = (0..n).map(&mut f).collect();
-            let _ = c.var;
-        }
-    }
-
-    fn finish(self, len: usize, ctx: &Ctx) -> Result<Table> {
-        ctx.check_output(len, self.vars.len())?;
-        Ok(Table {
-            vars: self.vars,
-            cols: self.cols,
-            len,
-            sorted: Vec::new(),
+}
+impl std::fmt::Write for Text<'_> {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.append(s.as_bytes()).map_err(|e| {
+            self.error = Some(e);
+            std::fmt::Error
         })
     }
 }
+impl std::io::Write for Text<'_> {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        match self.append(b) {
+            Ok(()) => Ok(b.len()),
+            Err(e) => {
+                self.error = Some(e);
+                Err(std::io::Error::other("algorithm text refused"))
+            }
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+fn literal(ctx: &Ctx, text: &[u8], datatype: &str, ctl: &Control) -> Result<Id> {
+    let n = text
+        .len()
+        .checked_add(datatype.len())
+        .and_then(|n| n.checked_add(3))
+        .ok_or_else(|| bad("literal capacity overflows"))?;
+    let mut key = Buffer::new("algorithm-literal-key", n, ctl)?;
+    key.push(b'"')?;
+    key.extend(text)?;
+    key.push(crate::id::KEY_SEP)?;
+    key.push(b'^')?;
+    key.extend(datatype.as_bytes())?;
+    ctx.intern_algorithm_key(&key, ctl)
+}
+fn embedding(ctx: &Ctx, values: &[f32], ctl: &Control) -> Result<Id> {
+    use std::fmt::Write;
+    let mut text = Text::new(ctl)?;
+    text.append(b"[")?;
+    let mut work = Work::new(ctl)?;
+    for (i, value) in values.iter().enumerate() {
+        work.tick("algorithm-embedding")?;
+        if i != 0 {
+            text.append(b",")?;
+        }
+        let result = write!(&mut text, "{value:?}");
+        text.formatted(result)?;
+    }
+    text.append(b"]")?;
+    #[cfg(any(test, feature = "failpoints"))]
+    algo::observe_projection(algo::ProjectionEvent::Materialized(
+        "algorithm-embedding-text",
+        text.bytes.capacity(),
+    ));
+    literal(ctx, &text.bytes, crate::vector::DATATYPE, ctl)
+}
 
-/// The summary literal of a run.
-fn summary(ctx: &Ctx, g: &Graph, stats: algo::Stats) -> Id {
-    let mut m = stats;
-    m.insert("nodes".into(), g.n().into());
-    m.insert("edges".into(), g.m().into());
-    let text = serde_json::Value::Object(m).to_string();
-    ctx.intern_term(&Term::Literal(oxrdf::Literal::new_typed_literal(
-        text,
-        oxrdf::NamedNode::new_unchecked(RDF_JSON),
-    )))
+/// Table columns own exact capacities until their backing moves to the private carrier.
+struct Col {
+    pos: usize,
+}
+struct Builder<'a> {
+    vars: Buffer<VarId>,
+    cols: Buffer<Buffer<Id>>,
+    ctl: &'a Control,
+}
+impl<'a> Builder<'a> {
+    fn new(vars: &[VarId], ctl: &'a Control) -> Result<Self> {
+        let mut owned = Buffer::new("algorithm-table-vars", vars.len(), ctl)?;
+        owned.extend(vars)?;
+        let mut cols = Buffer::new("algorithm-builder", vars.len(), ctl)?;
+        for _ in vars {
+            cols.push(Buffer::new("algorithm-empty-column", 0, ctl)?)?;
+        }
+        Ok(Self {
+            vars: owned,
+            cols,
+            ctl,
+        })
+    }
+    fn col(&self, v: Option<VarId>) -> Option<Col> {
+        self.vars
+            .iter()
+            .position(|x| Some(*x) == v)
+            .map(|pos| Col { pos })
+    }
+    fn set(
+        &mut self,
+        c: &Option<Col>,
+        mut f: impl FnMut(usize) -> Result<Id>,
+        n: usize,
+    ) -> Result<()> {
+        if let Some(c) = c {
+            let mut next = Buffer::new("algorithm-column", n, self.ctl)?;
+            let mut work = Work::new(self.ctl)?;
+            for i in 0..n {
+                work.tick("algorithm-column")?;
+                next.push(f(i)?)?;
+            }
+            self.cols[c.pos] = next;
+        }
+        Ok(())
+    }
+    fn finish(mut self, len: usize, ctx: &Ctx) -> Result<Materialized> {
+        ctx.check_output_rows(len)?;
+        let mut cols = Buffer::new("algorithm-table-cols", self.cols.len(), self.ctl)?;
+        for col in self.cols.drain() {
+            cols.push(col.into_output())?;
+        }
+        let table = Table {
+            vars: self.vars.into_output(),
+            cols: cols.into_output(),
+            len,
+            sorted: Vec::new(),
+        };
+        let extra = 128u64
+            .checked_add(if table.width() == 0 {
+                memory::bytes::<Id>(len)?
+            } else {
+                0
+            })
+            .ok_or_else(|| bad("table capacity overflows"))?;
+        // Metadata/zero-width estimate is owned as well as every real Vec capacity.
+        self.ctl.charge(extra)?;
+        let bytes = table_capacity(&table)?;
+        let lease = self.ctl.output_lease(bytes)?;
+        Ok(Materialized { table, lease })
+    }
+}
+pub(super) fn table_capacity(t: &Table) -> Result<u64> {
+    let data = t.cols.iter().try_fold(0u64, |n, c| {
+        memory::sum(&[n, memory::bytes::<Id>(c.capacity())?])
+    })?;
+    memory::sum(&[
+        data.max(if t.width() == 0 {
+            memory::bytes::<Id>(t.len)?
+        } else {
+            0
+        }),
+        memory::bytes::<VarId>(t.vars.capacity())?,
+        memory::bytes::<Vec<Id>>(t.cols.capacity())?,
+        memory::bytes::<VarId>(t.sorted.capacity())?,
+        128,
+    ])
+}
+fn summary(ctx: &Ctx, g: &Graph, mut stats: algo::Stats, ctl: &Control) -> Result<Id> {
+    stats.insert("nodes".into(), g.n().into());
+    stats.insert("edges".into(), g.m().into());
+    let mut text = Text::new(ctl)?;
+    let result = serde_json::to_writer(&mut text, &stats);
+    if let Some(error) = text.error.take() {
+        return Err(error);
+    }
+    result.map_err(|e| bad(format_args!("summary encoding failed: {e}")))?;
+    #[cfg(any(test, feature = "failpoints"))]
+    algo::observe_projection(algo::ProjectionEvent::Materialized(
+        "algorithm-summary-text",
+        text.bytes.capacity(),
+    ));
+    literal(ctx, &text.bytes, RDF_JSON, ctl)
 }
 
 /// Stats have one row independently of the algorithm's node, pair or level rows.
@@ -1113,31 +1396,65 @@ fn summary_row(
     g: &Graph,
     stats: algo::Stats,
     vars: &[VarId],
-) -> Result<Table> {
+    ctl: &Control,
+) -> Result<Materialized> {
     ctx.check()?;
-    ctx.check_output(1, vars.len())?;
-    let mut b = Builder::new(vars);
+    ctx.check_output_rows(1)?;
+    let mut b = Builder::new(vars, ctl)?;
     let col = b.col(spec.outs.summary);
-    let sm = summary(ctx, g, stats);
-    b.set(&col, |_| sm, 1);
+    let sm = summary(ctx, g, stats, ctl)?;
+    b.set(&col, |_| Ok(sm), 1)?;
     b.finish(1, ctx)
 }
 
 /// The indexes of the nodes to report, best first by `key` when a limit asks for the top
 /// rows, else in node order.
-fn pick(n: usize, limit: Option<usize>, key: Option<&[f64]>, descending: bool) -> Vec<u32> {
-    let mut idx: Vec<u32> = (0..n as u32).collect();
+fn copied<T: Copy>(name: &'static str, source: &[T], ctl: &Control) -> Result<Buffer<T>> {
+    let mut out = Buffer::new(name, source.len(), ctl)?;
+    out.extend(source)?;
+    Ok(out)
+}
+fn ranking<T>(source: &[T], mut f: impl FnMut(&T) -> f64, ctl: &Control) -> Result<Buffer<f64>> {
+    let mut out = Buffer::new("algorithm-rank", source.len(), ctl)?;
+    let mut work = Work::new(ctl)?;
+    for x in source {
+        work.tick("algorithm-rank")?;
+        out.push(f(x))?;
+    }
+    Ok(out)
+}
+fn selected(n: usize, mut keep: impl FnMut(usize) -> bool, ctl: &Control) -> Result<Buffer<u32>> {
+    let mut out = Buffer::new("algorithm-pick", n, ctl)?;
+    let mut work = Work::new(ctl)?;
+    for i in 0..n {
+        work.tick("algorithm-pick")?;
+        if keep(i) {
+            out.push(u32::try_from(i).map_err(|_| bad("node index overflows"))?)?;
+        }
+    }
+    Ok(out)
+}
+fn pick(
+    n: usize,
+    limit: Option<usize>,
+    key: Option<&[f64]>,
+    descending: bool,
+    ctl: &Control,
+) -> Result<Buffer<u32>> {
+    let mut idx = selected(n, |_| true, ctl)?;
     if let (Some(l), Some(k)) = (limit, key) {
-        idx.sort_by(|&a, &b| {
+        ctl.check()?;
+        idx.sort_unstable_by(|&a, &b| {
             let o = k[a as usize].total_cmp(&k[b as usize]);
             let o = if descending { o.reverse() } else { o };
             o.then(a.cmp(&b))
         });
+        ctl.check()?;
         idx.truncate(l);
     } else if let Some(l) = limit {
         idx.truncate(l);
     }
-    idx
+    Ok(idx)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1149,12 +1466,12 @@ fn rows(
     par: &Par,
     ctl: &Control,
     vars: &[VarId],
-) -> Result<Table> {
+) -> Result<Materialized> {
     let o = &spec.outs;
     // a call that asks for the summary alone reports one row (GDS's stats mode)
     let stats_only = spec.stats_only();
     let limit = spec.num("limit").map(|l| l as usize);
-    let mut b = Builder::new(vars);
+    let mut b = Builder::new(vars, ctl)?;
     let c_node = b.col(o.node);
     let c_summary = b.col(o.summary);
     let n = g.n();
@@ -1163,16 +1480,16 @@ fn rows(
     macro_rules! per_node {
         ($key:expr, $desc:expr, $stats:expr, $cols:expr) => {{
             if stats_only {
-                return summary_row(ctx, spec, g, $stats, vars);
+                return summary_row(ctx, spec, g, $stats, vars, ctl);
             }
-            let key: Option<Vec<f64>> = $key;
-            let idx = pick(n, limit, key.as_deref(), $desc);
-            ctx.check_output(idx.len(), vars.len())?;
-            b.set(&c_node, |i| node_id(idx[i] as usize), idx.len());
-            let sm = summary(ctx, g, $stats);
-            b.set(&c_summary, |_| sm, idx.len());
+            let key: Option<&[f64]> = $key;
+            let idx = pick(n, limit, key, $desc, ctl)?;
+            ctx.check_output_rows(idx.len())?;
+            b.set(&c_node, |i| Ok(node_id(idx[i] as usize)), idx.len())?;
+            let sm = summary(ctx, g, $stats, ctl)?;
+            b.set(&c_summary, |_| Ok(sm), idx.len())?;
             #[allow(clippy::redundant_closure_call)]
-            ($cols)(&mut b, &idx);
+            ($cols)(&mut b, &idx)?;
             return b.finish(idx.len(), ctx);
         }};
     }
@@ -1182,7 +1499,7 @@ fn rows(
                 damping: spec.float("dampingFactor", 0.85),
                 max_iterations: spec.int("maxIterations", 20) as u32,
                 tolerance: spec.float("tolerance", 1e-7),
-                sources: sources.to_vec(),
+                sources: copied("algorithm-pagerank-sources", sources, ctl)?.into_output(),
                 fixed: spec.graphalytics,
             };
             if !spec.sources.is_empty() && sources.is_empty() {
@@ -1191,21 +1508,19 @@ fn rows(
                     let mut stats = algo::Stats::new();
                     stats.insert("iterations".into(), 0.into());
                     stats.insert("converged".into(), true.into());
-                    return summary_row(ctx, spec, g, stats, vars);
+                    return summary_row(ctx, spec, g, stats, vars, ctl);
                 }
                 return b.finish(0, ctx);
             }
             let r = algo::pagerank::run(g, &p, par, ctl)?;
             let c = b.col(o.score);
             let score = r.score;
-            per_node!(
-                Some(score.clone()),
-                true,
-                r.stats,
-                |b: &mut Builder, idx: &Vec<u32>| {
-                    b.set(&c, |i| dbl(score[idx[i] as usize]), idx.len());
-                }
-            )
+            per_node!(Some(&score), true, r.stats, |b: &mut Builder<'_>,
+                                                    idx: &[u32]|
+             -> Result<()> {
+                b.set(&c, |i| Ok(dbl(score[idx[i] as usize])), idx.len())?;
+                Ok(())
+            })
         }
         Algo::Betweenness => {
             let max = crate::algo::pool::max_exact_betweenness();
@@ -1223,14 +1538,12 @@ fn rows(
             let c = b.col(o.score);
             let mut stats = algo::Stats::new();
             stats.insert("samples".into(), samples.into());
-            per_node!(
-                Some(score.clone()),
-                true,
-                stats,
-                |b: &mut Builder, idx: &Vec<u32>| {
-                    b.set(&c, |i| dbl(score[idx[i] as usize]), idx.len());
-                }
-            )
+            per_node!(Some(&score), true, stats, |b: &mut Builder<'_>,
+                                                  idx: &[u32]|
+             -> Result<()> {
+                b.set(&c, |i| Ok(dbl(score[idx[i] as usize])), idx.len())?;
+                Ok(())
+            })
         }
         Algo::Wcc | Algo::Scc => {
             let r = if spec.algo == Algo::Wcc {
@@ -1241,8 +1554,15 @@ fn rows(
             let c = b.col(o.component);
             let mut stats = algo::Stats::new();
             stats.insert("components".into(), r.count.into());
-            per_node!(None, false, stats, |b: &mut Builder, idx: &Vec<u32>| {
-                b.set(&c, |i| int(ctx, r.comp[idx[i] as usize] as i64), idx.len());
+            per_node!(None, false, stats, |b: &mut Builder<'_>,
+                                           idx: &[u32]|
+             -> Result<()> {
+                b.set(
+                    &c,
+                    |i| int(ctx, r.comp[idx[i] as usize] as i64, ctl),
+                    idx.len(),
+                )?;
+                Ok(())
             })
         }
         Algo::LabelPropagation => {
@@ -1252,8 +1572,15 @@ fn rows(
             let mut stats = algo::Stats::new();
             stats.insert("iterations".into(), r.iterations.into());
             stats.insert("converged".into(), r.converged.into());
-            per_node!(None, false, stats, |b: &mut Builder, idx: &Vec<u32>| {
-                b.set(&c, |i| int(ctx, r.label[idx[i] as usize] as i64), idx.len());
+            per_node!(None, false, stats, |b: &mut Builder<'_>,
+                                           idx: &[u32]|
+             -> Result<()> {
+                b.set(
+                    &c,
+                    |i| int(ctx, r.label[idx[i] as usize] as i64, ctl),
+                    idx.len(),
+                )?;
+                Ok(())
             })
         }
         Algo::Louvain | Algo::Leiden => {
@@ -1273,7 +1600,17 @@ fn rows(
                 "modularity".into(),
                 serde_json::json!(r.modularity.last().copied()),
             );
-            stats.insert("modularities".into(), serde_json::json!(r.modularity));
+            let mut modularities =
+                Buffer::new("algorithm-modularity-values", r.modularity.len(), ctl)?;
+            let mut work = Work::new(ctl)?;
+            for value in &r.modularity {
+                work.tick("algorithm-modularity-values")?;
+                modularities.push(serde_json::json!(value))?;
+            }
+            stats.insert(
+                "modularities".into(),
+                serde_json::Value::Array(modularities.into_output()),
+            );
             stats.insert(
                 "communities".into(),
                 r.levels
@@ -1282,34 +1619,44 @@ fn rows(
                     .into(),
             );
             if stats_only {
-                return summary_row(ctx, spec, g, stats, vars);
+                return summary_row(ctx, spec, g, stats, vars, ctl);
             }
-            let sm = summary(ctx, g, stats);
+            let sm = summary(ctx, g, stats, ctl)?;
             let (c_comm, c_level) = (b.col(o.community), b.col(o.level));
             // one row per node and level when the level is asked for, else the last level
-            let levels: Vec<usize> = if o.level.is_some() {
-                (0..r.levels.len()).collect()
+            let level_count = if o.level.is_some() {
+                r.levels.len()
             } else {
-                r.levels.len().checked_sub(1).into_iter().collect()
+                usize::from(!r.levels.is_empty())
             };
-            let mut pairs: Vec<(u32, usize)> = Vec::new();
-            for &l in &levels {
+            let count = level_count
+                .checked_mul(n)
+                .ok_or_else(|| bad("level rows overflow"))?;
+            let mut pairs = Buffer::new("algorithm-level-pairs", count, ctl)?;
+            let mut work = Work::new(ctl)?;
+            let first = if o.level.is_some() {
+                0
+            } else {
+                r.levels.len().saturating_sub(1)
+            };
+            for l in first..r.levels.len() {
                 for i in 0..n as u32 {
-                    pairs.push((i, l));
+                    work.tick("algorithm-level-pairs")?;
+                    pairs.push((i, l))?;
                 }
             }
             if let Some(l) = limit {
                 pairs.truncate(l);
             }
-            ctx.check_output(pairs.len(), vars.len())?;
-            b.set(&c_node, |i| node_id(pairs[i].0 as usize), pairs.len());
+            ctx.check_output_rows(pairs.len())?;
+            b.set(&c_node, |i| Ok(node_id(pairs[i].0 as usize)), pairs.len())?;
             b.set(
                 &c_comm,
-                |i| int(ctx, r.levels[pairs[i].1][pairs[i].0 as usize] as i64),
+                |i| int(ctx, r.levels[pairs[i].1][pairs[i].0 as usize] as i64, ctl),
                 pairs.len(),
-            );
-            b.set(&c_level, |i| int(ctx, pairs[i].1 as i64), pairs.len());
-            b.set(&c_summary, |_| sm, pairs.len());
+            )?;
+            b.set(&c_level, |i| int(ctx, pairs[i].1 as i64, ctl), pairs.len())?;
+            b.set(&c_summary, |_| Ok(sm), pairs.len())?;
             b.finish(pairs.len(), ctx)
         }
         Algo::NodeSimilarity => {
@@ -1324,39 +1671,40 @@ fn rows(
             if stats_only {
                 let mut stats = algo::Stats::new();
                 stats.insert("pairs".into(), r.len().into());
-                return summary_row(ctx, spec, g, stats, vars);
+                return summary_row(ctx, spec, g, stats, vars, ctl);
             }
             if let Some(l) = limit {
-                r.sort_by(|a, b| b.2.total_cmp(&a.2).then(a.0.cmp(&b.0)).then(a.1.cmp(&b.1)));
+                r.sort_unstable_by(|a, b| {
+                    b.2.total_cmp(&a.2).then(a.0.cmp(&b.0)).then(a.1.cmp(&b.1))
+                });
                 r.truncate(l);
             }
-            ctx.check_output(r.len(), vars.len())?;
+            ctx.check_output_rows(r.len())?;
             let (c_other, c_sim) = (b.col(o.other_node), b.col(o.similarity));
-            b.set(&c_node, |i| node_id(r[i].0 as usize), r.len());
-            b.set(&c_other, |i| node_id(r[i].1 as usize), r.len());
-            b.set(&c_sim, |i| dbl(r[i].2), r.len());
+            b.set(&c_node, |i| Ok(node_id(r[i].0 as usize)), r.len())?;
+            b.set(&c_other, |i| Ok(node_id(r[i].1 as usize)), r.len())?;
+            b.set(&c_sim, |i| Ok(dbl(r[i].2)), r.len())?;
             let mut stats = algo::Stats::new();
             stats.insert("pairs".into(), r.len().into());
-            let sm = summary(ctx, g, stats);
-            b.set(&c_summary, |_| sm, r.len());
+            let sm = summary(ctx, g, stats, ctl)?;
+            b.set(&c_summary, |_| Ok(sm), r.len())?;
             b.finish(r.len(), ctx)
         }
         Algo::TriangleCount => {
             let t = algo::triangles::count(g, par, ctl)?;
+            let rank = ranking(&t, |&x| x as f64, ctl)?;
             let c = b.col(o.triangles);
             let mut stats = algo::Stats::new();
             stats.insert(
                 "triangles".into(),
                 (t.iter().map(|&x| x as u64).sum::<u64>() / 3).into(),
             );
-            per_node!(
-                Some(t.iter().map(|&x| x as f64).collect()),
-                true,
-                stats,
-                |b: &mut Builder, idx: &Vec<u32>| {
-                    b.set(&c, |i| int(ctx, t[idx[i] as usize] as i64), idx.len());
-                }
-            )
+            per_node!(Some(&rank), true, stats, |b: &mut Builder<'_>,
+                                                 idx: &[u32]|
+             -> Result<()> {
+                b.set(&c, |i| int(ctx, t[idx[i] as usize] as i64, ctl), idx.len())?;
+                Ok(())
+            })
         }
         Algo::Clustering => {
             let (coef, tri) = if spec.graphalytics {
@@ -1378,34 +1726,39 @@ fn rows(
                 coef.iter().sum::<f64>() / n as f64
             };
             stats.insert("averageCoefficient".into(), serde_json::json!(mean));
-            per_node!(
-                Some(coef.clone()),
-                true,
-                stats,
-                |b: &mut Builder, idx: &Vec<u32>| {
-                    b.set(&c_coef, |i| dbl(coef[idx[i] as usize]), idx.len());
-                    if let Some(t) = &tri {
-                        b.set(&c_tri, |i| int(ctx, t[idx[i] as usize] as i64), idx.len());
-                    }
+            per_node!(Some(&coef), true, stats, |b: &mut Builder<'_>,
+                                                 idx: &[u32]|
+             -> Result<()> {
+                b.set(&c_coef, |i| Ok(dbl(coef[idx[i] as usize])), idx.len())?;
+                if let Some(t) = &tri {
+                    b.set(
+                        &c_tri,
+                        |i| int(ctx, t[idx[i] as usize] as i64, ctl),
+                        idx.len(),
+                    )?;
                 }
-            )
+                Ok(())
+            })
         }
         Algo::KCore => {
             let core = algo::kcore::run(g, ctl)?;
+            let rank = ranking(&core, |&x| x as f64, ctl)?;
             let c = b.col(o.core);
             let mut stats = algo::Stats::new();
             stats.insert(
                 "degeneracy".into(),
                 core.iter().copied().max().unwrap_or(0).into(),
             );
-            per_node!(
-                Some(core.iter().map(|&x| x as f64).collect()),
-                true,
-                stats,
-                |b: &mut Builder, idx: &Vec<u32>| {
-                    b.set(&c, |i| int(ctx, core[idx[i] as usize] as i64), idx.len());
-                }
-            )
+            per_node!(Some(&rank), true, stats, |b: &mut Builder<'_>,
+                                                 idx: &[u32]|
+             -> Result<()> {
+                b.set(
+                    &c,
+                    |i| int(ctx, core[idx[i] as usize] as i64, ctl),
+                    idx.len(),
+                )?;
+                Ok(())
+            })
         }
         Algo::Bfs => {
             let depth = algo::traverse::bfs(g, sources, par, ctl)?;
@@ -1419,38 +1772,41 @@ fn rows(
                         .count()
                         .into(),
                 );
-                return summary_row(ctx, spec, g, stats, vars);
+                return summary_row(ctx, spec, g, stats, vars, ctl);
             }
             let c = b.col(o.depth);
             let inf = ctx.intern_term(&Term::Literal(oxrdf::Literal::new_simple_literal("inf")));
             // unreached nodes are left out, or bound to "inf" under Graphalytics
-            let keep: Vec<u32> = (0..n as u32)
-                .filter(|&i| spec.graphalytics || depth[i as usize] != algo::traverse::UNREACHED)
-                .collect();
-            let key: Vec<f64> = depth.iter().map(|&d| d as f64).collect();
-            let mut idx = keep;
+            let mut idx = selected(
+                n,
+                |i| spec.graphalytics || depth[i] != algo::traverse::UNREACHED,
+                ctl,
+            )?;
+            let key = ranking(&depth, |&d| d as f64, ctl)?;
             if let Some(l) = limit {
-                idx.sort_by(|&a, &b2| {
+                idx.sort_unstable_by(|&a, &b2| {
                     key[a as usize]
                         .total_cmp(&key[b2 as usize])
                         .then(a.cmp(&b2))
                 });
                 idx.truncate(l);
             }
-            ctx.check_output(idx.len(), vars.len())?;
-            b.set(&c_node, |i| node_id(idx[i] as usize), idx.len());
+            ctx.check_output_rows(idx.len())?;
+            b.set(&c_node, |i| Ok(node_id(idx[i] as usize)), idx.len())?;
             b.set(
                 &c,
                 |i| {
-                    let d = depth[idx[i] as usize];
-                    if d == algo::traverse::UNREACHED {
-                        inf
-                    } else {
-                        int(ctx, d as i64)
-                    }
+                    Ok({
+                        let d = depth[idx[i] as usize];
+                        if d == algo::traverse::UNREACHED {
+                            inf
+                        } else {
+                            int(ctx, d as i64, ctl)?
+                        }
+                    })
                 },
                 idx.len(),
-            );
+            )?;
             let mut stats = algo::Stats::new();
             stats.insert(
                 "reached".into(),
@@ -1460,8 +1816,8 @@ fn rows(
                     .count()
                     .into(),
             );
-            let sm = summary(ctx, g, stats);
-            b.set(&c_summary, |_| sm, idx.len());
+            let sm = summary(ctx, g, stats, ctl)?;
+            b.set(&c_summary, |_| Ok(sm), idx.len())?;
             b.finish(idx.len(), ctx)
         }
         Algo::Sssp => {
@@ -1472,30 +1828,28 @@ fn rows(
                     "reached".into(),
                     dist.iter().filter(|d| d.is_finite()).count().into(),
                 );
-                return summary_row(ctx, spec, g, stats, vars);
+                return summary_row(ctx, spec, g, stats, vars, ctl);
             }
             let c = b.col(o.distance);
-            let mut idx: Vec<u32> = (0..n as u32)
-                .filter(|&i| spec.graphalytics || dist[i as usize].is_finite())
-                .collect();
+            let mut idx = selected(n, |i| spec.graphalytics || dist[i].is_finite(), ctl)?;
             if let Some(l) = limit {
-                idx.sort_by(|&a, &b2| {
+                idx.sort_unstable_by(|&a, &b2| {
                     dist[a as usize]
                         .total_cmp(&dist[b2 as usize])
                         .then(a.cmp(&b2))
                 });
                 idx.truncate(l);
             }
-            ctx.check_output(idx.len(), vars.len())?;
-            b.set(&c_node, |i| node_id(idx[i] as usize), idx.len());
-            b.set(&c, |i| dbl(dist[idx[i] as usize]), idx.len());
+            ctx.check_output_rows(idx.len())?;
+            b.set(&c_node, |i| Ok(node_id(idx[i] as usize)), idx.len())?;
+            b.set(&c, |i| Ok(dbl(dist[idx[i] as usize])), idx.len())?;
             let mut stats = algo::Stats::new();
             stats.insert(
                 "reached".into(),
                 dist.iter().filter(|d| d.is_finite()).count().into(),
             );
-            let sm = summary(ctx, g, stats);
-            b.set(&c_summary, |_| sm, idx.len());
+            let sm = summary(ctx, g, stats, ctl)?;
+            b.set(&c_summary, |_| Ok(sm), idx.len())?;
             b.finish(idx.len(), ctx)
         }
         Algo::FastRp | Algo::Node2Vec => {
@@ -1503,10 +1857,14 @@ fn rows(
             let emb = if spec.algo == Algo::FastRp {
                 let p = algo::fastrp::Params {
                     dimension: dim,
-                    iteration_weights: spec
-                        .iteration_weights
-                        .clone()
-                        .unwrap_or_else(|| vec![0.0, 1.0, 1.0]),
+                    iteration_weights: copied(
+                        "algorithm-iteration-weights",
+                        spec.iteration_weights
+                            .as_deref()
+                            .unwrap_or(&[0.0, 1.0, 1.0]),
+                        ctl,
+                    )?
+                    .into_output(),
                     normalization_strength: spec.float("normalizationStrength", 0.0),
                     seed: spec.int("seed", 0),
                 };
@@ -1529,17 +1887,20 @@ fn rows(
             let c = b.col(o.embedding);
             let mut stats = algo::Stats::new();
             stats.insert("dimension".into(), dim.into());
-            per_node!(None, false, stats, |b: &mut Builder, idx: &Vec<u32>| {
+            per_node!(None, false, stats, |b: &mut Builder<'_>,
+                                           idx: &[u32]|
+             -> Result<()> {
                 b.set(
                     &c,
                     |i| {
-                        let u = idx[i] as usize;
-                        ctx.intern_term(&Term::Literal(crate::vector::literal(
-                            &emb[u * dim..(u + 1) * dim],
-                        )))
+                        Ok({
+                            let u = idx[i] as usize;
+                            embedding(ctx, &emb[u * dim..(u + 1) * dim], ctl)?
+                        })
                     },
                     idx.len(),
-                );
+                )?;
+                Ok(())
             })
         }
     }
@@ -1799,7 +2160,15 @@ fn stored_weight(value: f64) -> Result<f32> {
 
 /// Resolve only visible weights of an applicable asserted edge. All accepted graph
 /// statements may participate in the union, even across its physical graphs.
-fn weight(ctx: &Ctx, proj: &ProjectionSpec, s: u64, p: u64, o: u64, ctl: &Control) -> Result<f32> {
+fn weight_in_graph(
+    ctx: &Ctx,
+    proj: &ProjectionSpec,
+    s: u64,
+    p: u64,
+    o: u64,
+    ctl: &Control,
+    filter: &GraphFilter,
+) -> Result<f32> {
     let (Some(Some(wprop)), Some(reifies)) = (proj.weight, proj.reifies) else {
         return stored_weight(proj.default_weight);
     };
@@ -1810,12 +2179,12 @@ fn weight(ctx: &Ctx, proj: &ProjectionSpec, s: u64, p: u64, o: u64, ctl: &Contro
     let mut work = Work::new(ctl)?;
     projection_rows(ctx, Perm::Pos, &[reifies, triple.0], |r| {
         work.tick("projection-reifiers")?;
-        if !proj.graph.accepts(r[3]) {
+        if !filter.accepts(r[3]) {
             return Ok(());
         }
         projection_rows(ctx, Perm::Pso, &[wprop, r[2]], |k| {
             work.tick("projection-weights")?;
-            if !proj.graph.accepts(k[3]) {
+            if !filter.accepts(k[3]) {
                 return Ok(());
             }
             let value = stored_weight(
@@ -1836,6 +2205,7 @@ fn weight(ctx: &Ctx, proj: &ProjectionSpec, s: u64, p: u64, o: u64, ctl: &Contro
 
 /// The projection of a call: a cached build of the same data and edges, or a new one.
 /// Uncommitted views and projections from a nested pattern are not cached.
+#[cfg(test)]
 fn projection(
     ctx: &Ctx,
     spec: &AlgoSpec,
@@ -1843,35 +2213,96 @@ fn projection(
     par: &Par,
     ctl: &Control,
 ) -> Result<(std::sync::Arc<Graph>, bool)> {
-    let key = (ctx.snap.cacheable && spec.proj.pattern.is_none() && ctx.use_cache).then(|| {
-        format!(
-            "{}{:?}|{}",
-            super::cache::view_key(ctx),
-            spec.proj,
-            spec.direction().name()
-        )
-    });
+    projection_in_graph(ctx, spec, edges, par, ctl, &spec.proj.graph)
+}
+struct ProjectionInGraph<'a>(&'a ProjectionSpec, &'a GraphFilter);
+impl std::fmt::Debug for ProjectionInGraph<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let p = self.0;
+        f.debug_struct("ProjectionSpec")
+            .field("predicates", &p.predicates)
+            .field("direction", &p.direction)
+            .field("node_classes", &p.node_classes)
+            .field("node_class_names", &p.node_class_names)
+            .field("weight", &p.weight)
+            .field("default_weight", &p.default_weight)
+            .field("aggregate", &p.aggregate)
+            .field("pattern", &p.pattern)
+            .field("graph", self.1)
+            .field("rdf_type", &p.rdf_type)
+            .field("reifies", &p.reifies)
+            .finish()
+    }
+}
+fn projection_key<'a>(
+    ctx: &Ctx,
+    spec: &AlgoSpec,
+    filter: &GraphFilter,
+    ctl: &'a Control,
+) -> Result<Text<'a>> {
+    let mut key = Text::new(ctl)?;
+    let result = super::cache::write_view_key(ctx, &mut key);
+    key.formatted(result)?;
+    use std::fmt::Write;
+    let result = write!(
+        &mut key,
+        "{:?}|{}",
+        ProjectionInGraph(&spec.proj, filter),
+        spec.direction().name()
+    );
+    key.formatted(result)?;
+    Ok(key)
+}
+fn projection_in_graph(
+    ctx: &Ctx,
+    spec: &AlgoSpec,
+    edges: Option<&Table>,
+    par: &Par,
+    ctl: &Control,
+    filter: &GraphFilter,
+) -> Result<(std::sync::Arc<Graph>, bool)> {
+    let key = if ctx.snap.cacheable && spec.proj.pattern.is_none() && ctx.use_cache {
+        Some(projection_key(ctx, spec, filter, ctl)?)
+    } else {
+        None
+    };
     if let Some(k) = &key
-        && let Some(g) = algo::cache::get(k)
+        && let Some(g) = algo::cache::get(std::str::from_utf8(&k.bytes).expect("formatted UTF8"))
     {
-        // the call holds the build while it runs, as if it had made it
         ctl.charge(g.base_bytes()?)?;
         return Ok((g, true));
     }
-    let g = std::sync::Arc::new(build_graph(ctx, spec, edges, par, ctl)?);
-    if let Some(k) = key {
-        algo::cache::put(k, g.clone());
+    let g = std::sync::Arc::new(build_graph_in_graph(ctx, spec, edges, par, ctl, filter)?);
+    if let Some(key) = key {
+        let bytes = key.bytes.capacity() as u64;
+        algo::cache::put(
+            String::from_utf8(key.bytes.into_output()).expect("formatted UTF8"),
+            g.clone(),
+        );
+        // Ownership moved to the independently budgeted plain cache key.
+        ctl.release(bytes);
     }
     Ok((g, false))
 }
 
 /// Build the projection of a call from the store, or from the rows of a nested pattern.
+#[cfg(test)]
 fn build_graph(
     ctx: &Ctx,
     spec: &AlgoSpec,
     edges: Option<&Table>,
     par: &Par,
     ctl: &Control,
+) -> Result<Graph> {
+    build_graph_in_graph(ctx, spec, edges, par, ctl, &spec.proj.graph)
+}
+fn build_graph_in_graph(
+    ctx: &Ctx,
+    spec: &AlgoSpec,
+    edges: Option<&Table>,
+    par: &Par,
+    ctl: &Control,
+    filter: &GraphFilter,
 ) -> Result<Graph> {
     let proj = &spec.proj;
     let call_dir = spec.direction();
@@ -1886,7 +2317,7 @@ fn build_graph(
         for &class in &proj.node_classes {
             projection_rows(ctx, Perm::Pos, &[ty, class], |k| {
                 work.tick("projection-class")?;
-                if proj.graph.accepts(k[3]) {
+                if filter.accepts(k[3]) {
                     let need = nodes
                         .len()
                         .checked_add(1)
@@ -1961,7 +2392,7 @@ fn build_graph(
                     let mut each = |k: [u64; 4]| -> Result<()> {
                         scan_work.tick("projection-edge")?;
                         let [p, s, o, g] = k;
-                        if !proj.graph.accepts(g) || last == Some((p, s, o)) {
+                        if !filter.accepts(g) || last == Some((p, s, o)) {
                             return Ok(());
                         }
                         last = Some((p, s, o));
@@ -1972,7 +2403,7 @@ fn build_graph(
                             return Ok(());
                         }
                         let value = if has_weights {
-                            weight(ctx, proj, s, p, o, ctl)?
+                            weight_in_graph(ctx, proj, s, p, o, ctl, filter)?
                         } else {
                             0.0
                         };
@@ -2064,6 +2495,1338 @@ mod projection_capacity_tests {
         Arc,
         atomic::{AtomicBool, Ordering},
     };
+
+    const GRAPH_SERVICE: &str = "PREFIX ex:<http://ex/> PREFIX algo:<urn:x-sparkles:algo#> SELECT ?g ?n ?c WHERE { SERVICE algo:wcc { [] algo:predicate ex:p;algo:concurrency 1;algo:node ?n;algo:component ?c } }";
+    fn graph_fixture(graphs: usize) -> crate::store::Store {
+        use crate::io::{RdfFormat, Source};
+        let store = crate::store::Store::in_memory(crate::store::StoreOptions {
+            result_cache_bytes: 0,
+            ..Default::default()
+        });
+        let mut data = String::from("@prefix ex:<http://ex/>.");
+        for g in 0..graphs {
+            data.push_str(&format!("ex:g{g:04} {{ex:a ex:p ex:b.}}"));
+        }
+        store
+            .load(&[Source::from_bytes(data.into_bytes(), RdfFormat::TriG, None)])
+            .unwrap();
+        store
+    }
+    fn adapter(ctx: &Ctx) -> Node {
+        let parsed = super::super::parse_query(GRAPH_SERVICE, None, &[]).unwrap();
+        let spargebra::Query::Select { pattern, .. } = &parsed else {
+            panic!("SELECT");
+        };
+        let mut planner = super::super::plan::Planner::new(ctx);
+        planner.source = Some(&parsed);
+        planner
+            .plan(
+                pattern,
+                &super::super::plan::ActiveGraph::Var(ctx.var("g")),
+                Vec::new(),
+            )
+            .unwrap()
+    }
+    fn algo_nodes<'a>(node: &'a Node, leaves: &mut Vec<&'a Node>) {
+        if matches!(node.kind, Kind::AlgoCall(_)) {
+            leaves.push(node);
+        }
+        for child in &node.children {
+            algo_nodes(child, leaves);
+        }
+    }
+    fn algo_infos<'a>(
+        info: &'a super::super::PlanInfo,
+        leaves: &mut Vec<&'a super::super::PlanInfo>,
+    ) {
+        if info.operator == "AlgoCall" {
+            leaves.push(info);
+        }
+        for child in &info.children {
+            algo_infos(child, leaves);
+        }
+    }
+    fn graph_payload(snapshot: &crate::store::Snapshot, graph_ids: &[Id]) -> Vec<Vec<Id>> {
+        let mut nodes = [
+            snapshot.lookup_iri("http://ex/a").unwrap(),
+            snapshot.lookup_iri("http://ex/b").unwrap(),
+        ];
+        nodes.sort_unstable();
+        let mut expected = vec![Vec::new(), Vec::new(), Vec::new()];
+        for &g in graph_ids {
+            for n in nodes {
+                expected[0].push(g);
+                expected[1].push(n);
+                expected[2].push(Id::from_i64(0).unwrap());
+            }
+        }
+        expected
+    }
+    fn warmed_graph_accumulation_counts() -> Vec<(usize, usize, usize, usize)> {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let mut observed = Vec::new();
+        for graphs in [64, 128, 256] {
+            let store = graph_fixture(graphs);
+            let snapshot = store.snapshot();
+            {
+                let warm = Ctx::new(snapshot.clone());
+                let node = adapter(&warm);
+                drop(super::super::exec::execute_owned(&warm, &node).unwrap());
+            }
+            let ctx = Ctx::new(snapshot.clone());
+            let node = adapter(&ctx);
+            let mut leaves = Vec::new();
+            algo_nodes(&node, &mut leaves);
+            assert_eq!(leaves.len(), 1);
+            let Kind::AlgoCall(spec) = &leaves[0].kind else {
+                unreachable!()
+            };
+            assert_eq!(spec.graph_var, Some(ctx.var("g")));
+            assert_eq!(spec.proj.graph, GraphFilter::Named);
+            assert!(leaves[0].children.is_empty());
+            let visits = Rc::new(Cell::new(0usize));
+            let cells = Rc::new(Cell::new(0usize));
+            let v = visits.clone();
+            let a = cells.clone();
+            let hook = memory::probe::install(
+                move |event| match event {
+                    memory::probe::Point::Work(
+                        "algorithm-column"
+                        | "algorithm-append-copy"
+                        | "algorithm-append-relocate"
+                        | "buffer-fill",
+                    ) => v.set(v.get() + 1),
+                    memory::probe::Point::Allocation(
+                        "algorithm-column" | "algorithm-graph-column" | "algorithm-append-column",
+                        capacity,
+                    ) => a.set(a.get() + capacity),
+                    _ => {}
+                },
+                None,
+            );
+            let (out, info) = super::super::exec::execute_owned(&ctx, &node).unwrap();
+            drop(hook);
+            assert!(!info.cached);
+            assert!(ctx.use_cache);
+            let mut infos = Vec::new();
+            algo_infos(&info, &mut infos);
+            assert_eq!(infos.len(), 1);
+            assert_eq!(
+                infos[0].counters.as_ref().unwrap()["cachedProjections"].as_u64(),
+                Some(graphs as u64)
+            );
+            let graph_ids = snapshot.graph_ids().unwrap();
+            assert_eq!(graph_ids.len(), graphs);
+            assert_eq!(out.table.cols, graph_payload(&snapshot, &graph_ids));
+            assert_eq!(out.table.vars, [ctx.var("g"), ctx.var("n"), ctx.var("c")]);
+            assert_eq!(out.table.len, 2 * graphs);
+            let capacity = table_capacity(&out.table).unwrap();
+            assert_eq!(out.lease.as_ref().unwrap().bytes, capacity);
+            assert!(out.lease.as_ref().unwrap().service.is_none());
+            let bound = 8 * out.table.width() * out.table.len;
+            eprintln!(
+                "GRAPH_ACCUMULATION {}",
+                serde_json::json!({"context":"public-planner-ActiveGraph-Var", "graphs":graphs, "rows":out.table.len, "width":out.table.width(), "copy_visits":visits.get(), "allocated_column_cells":cells.get(), "linear_bound":bound, "cached_projections":graphs, "retained_capacity_bytes":capacity,"column_capacities":out.table.cols.iter().map(Vec::capacity).collect::<Vec<_>>(), "columns":out.table.cols.iter().map(|c|c.iter().map(|id|id.0).collect::<Vec<_>>()).collect::<Vec<_>>()})
+            );
+            observed.push((graphs, visits.get(), cells.get(), bound));
+        }
+        observed
+    }
+    #[test]
+    fn warmed_graph_accumulation_copy_work_stays_linear() {
+        let observed = warmed_graph_accumulation_counts();
+        assert!(
+            observed.iter().all(|(_, visits, _, bound)| visits <= bound),
+            "actual column copy visits exceed linear bound: {observed:?}"
+        );
+    }
+    #[test]
+    fn warmed_graph_accumulation_allocation_volume_stays_linear() {
+        let observed = warmed_graph_accumulation_counts();
+        assert!(
+            observed.iter().all(|(_, _, cells, bound)| cells <= bound),
+            "actual requested column cells exceed linear bound: {observed:?}"
+        );
+    }
+    #[test]
+    fn ordinary_graph_query_keeps_named_leaf_cache_and_payload_semantics() {
+        let store = graph_fixture(64);
+        let snapshot = store.snapshot();
+        let query = GRAPH_SERVICE.replace("WHERE { SERVICE", "WHERE { GRAPH ?g { SERVICE");
+        let query = format!("{query} }}");
+        drop(super::super::query(snapshot.clone(), &query, &Default::default()).unwrap());
+        let result = super::super::query(snapshot.clone(), &query, &Default::default()).unwrap();
+        assert!(!result.plan.cached);
+        assert!(result.ctx.use_cache);
+        let mut leaves = Vec::new();
+        algo_infos(&result.plan, &mut leaves);
+        assert_eq!(leaves.len(), 64);
+        for info in leaves {
+            assert_eq!(
+                info.counters.as_ref().unwrap()["cachedProjections"].as_u64(),
+                Some(1)
+            );
+        }
+        let parsed = super::super::parse_query(&query, None, &[]).unwrap();
+        let prepared =
+            super::super::prepare_query(snapshot.clone(), &parsed, &Default::default(), None, None)
+                .unwrap();
+        let mut nodes = Vec::new();
+        algo_nodes(&prepared.node, &mut nodes);
+        assert_eq!(nodes.len(), 64);
+        for node in nodes {
+            let Kind::AlgoCall(spec) = &node.kind else {
+                unreachable!()
+            };
+            assert_eq!(spec.graph_var, None);
+            assert!(matches!(spec.proj.graph, GraphFilter::One(_)));
+        }
+        assert_eq!(
+            result.table.cols,
+            graph_payload(&snapshot, &snapshot.graph_ids().unwrap())
+        );
+    }
+    #[test]
+    fn adapter_graph_subset_substitution_and_empty_visibility_are_preserved() {
+        let store = graph_fixture(3);
+        let snapshot = store.snapshot();
+        let ids = snapshot.graph_ids().unwrap();
+        for case in 0..3 {
+            let mut ctx = Ctx::new(snapshot.clone());
+            if case != 1 {
+                ctx.dataset.named = Some(if case == 0 { vec![ids[1]] } else { vec![] });
+            }
+            let parsed = super::super::parse_query(GRAPH_SERVICE, None, &[]).unwrap();
+            let spargebra::Query::Select { pattern, .. } = &parsed else {
+                unreachable!()
+            };
+            let mut planner = super::super::plan::Planner::new(&ctx);
+            planner.source = Some(&parsed);
+            if case == 1 {
+                planner.subst.insert(ctx.var("g"), ids[2]);
+            }
+            let node = planner
+                .plan(
+                    pattern,
+                    &super::super::plan::ActiveGraph::Var(ctx.var("g")),
+                    Vec::new(),
+                )
+                .unwrap();
+            let mut leaves = Vec::new();
+            algo_nodes(&node, &mut leaves);
+            if case == 2 {
+                assert!(leaves.is_empty());
+            } else {
+                assert_eq!(leaves.len(), 1);
+                let Kind::AlgoCall(spec) = &leaves[0].kind else {
+                    unreachable!()
+                };
+                if case == 0 {
+                    assert_eq!(spec.graph_var, Some(ctx.var("g")));
+                    assert_eq!(spec.proj.graph, GraphFilter::Set(vec![ids[1].0]));
+                } else {
+                    assert_eq!(spec.graph_var, None);
+                    assert_eq!(spec.proj.graph, GraphFilter::One(ids[2].0));
+                }
+            }
+            let (out, _) = super::super::exec::execute_owned(&ctx, &node).unwrap();
+            if case == 2 {
+                assert_eq!(out.table.len, 0);
+            } else {
+                let mut expected = graph_payload(&snapshot, &[ids[if case == 0 { 1 } else { 2 }]]);
+                // Substitution selects the active graph; an unbound SELECT output
+                // still has no input binding table supplying g.
+                if case == 1 {
+                    expected[0].fill(Id::UNDEF);
+                }
+                for (column, &var) in out.table.cols.iter().zip(&out.table.vars) {
+                    let pos = [ctx.var("g"), ctx.var("n"), ctx.var("c")]
+                        .iter()
+                        .position(|&v| v == var)
+                        .unwrap();
+                    assert_eq!(column, &expected[pos]);
+                }
+                assert_eq!(out.table.len, 2);
+            }
+        }
+    }
+    #[test]
+    fn adapter_all_graphs_share_peak_and_exact_service_limit() {
+        let store = graph_fixture(8);
+        let snapshot = store.snapshot();
+        let peak = {
+            let ctx = Ctx::new(snapshot.clone());
+            let (out, info) = super::super::exec::execute_owned(&ctx, &adapter(&ctx)).unwrap();
+            let mut leaves = Vec::new();
+            algo_infos(&info, &mut leaves);
+            let peak = leaves[0].counters.as_ref().unwrap()["peakBytes"]
+                .as_u64()
+                .unwrap();
+            assert_eq!(
+                out.table.cols,
+                graph_payload(&snapshot, &snapshot.graph_ids().unwrap())
+            );
+            peak
+        };
+        // Warm the exact cached projection path before measuring its own peak.
+        let warm_peak = {
+            let ctx = Ctx::new(snapshot.clone());
+            let (_out, info) = super::super::exec::execute_owned(&ctx, &adapter(&ctx)).unwrap();
+            let mut leaves = Vec::new();
+            algo_infos(&info, &mut leaves);
+            leaves[0].counters.as_ref().unwrap()["peakBytes"]
+                .as_u64()
+                .unwrap()
+        };
+        assert!(peak >= warm_peak);
+        for short in [false, true] {
+            let query = GRAPH_SERVICE.replace(
+                "algo:concurrency 1;",
+                &format!(
+                    "algo:concurrency 1;algo:maxMemory {};",
+                    warm_peak - u64::from(short)
+                ),
+            );
+            let parsed = super::super::parse_query(&query, None, &[]).unwrap();
+            let spargebra::Query::Select { pattern, .. } = &parsed else {
+                unreachable!()
+            };
+            let mut ctx = Ctx::new(snapshot.clone());
+            let pool = super::super::pool::QueryPool::new(64 << 20);
+            let grant = Arc::new(pool.empty_grant());
+            ctx.grant = Some(grant.clone());
+            let mut planner = Planner::new(&ctx);
+            planner.source = Some(&parsed);
+            let node = planner
+                .plan(pattern, &ActiveGraph::Var(ctx.var("g")), Vec::new())
+                .unwrap();
+            let planned_live = ctx.memory().live.load(Ordering::Acquire);
+            let planned_local = ctx.local_len();
+            let result = super::super::exec::execute_owned(&ctx, &node);
+            if short {
+                assert!(
+                    matches!(result,Err(Error::BudgetExceeded(e)) if e.kind==crate::error::BudgetKind::Memory)
+                );
+            } else {
+                let (out, info) = result.unwrap();
+                let mut leaves = Vec::new();
+                algo_infos(&info, &mut leaves);
+                assert_eq!(
+                    leaves[0].counters.as_ref().unwrap()["peakBytes"].as_u64(),
+                    Some(warm_peak)
+                );
+                assert_eq!(
+                    out.table.cols,
+                    graph_payload(&snapshot, &snapshot.graph_ids().unwrap())
+                );
+                assert_eq!(
+                    out.lease.as_ref().unwrap().bytes,
+                    table_capacity(&out.table).unwrap()
+                );
+            }
+            // The inherited per-node path interns its JSON summary even if the
+            // summary column was not requested. This is context-owned key storage,
+            // independent of native graph/output capacity.
+            let retained = (planned_local..ctx.local_len())
+                .map(|id| ctx.with_local_key(id, |key| key.len() as u64 + 96).unwrap())
+                .sum::<u64>();
+            assert!(retained > 0);
+            assert_eq!(
+                ctx.memory().live.load(Ordering::Acquire),
+                planned_live + retained
+            );
+            let second = super::super::exec::execute_owned(&ctx, &node);
+            assert_eq!(second.is_err(), short);
+            drop(second);
+            assert_eq!(
+                ctx.memory().live.load(Ordering::Acquire),
+                planned_live + retained
+            );
+            drop(planner);
+            drop(node);
+            let weak = Arc::downgrade(ctx.memory());
+            drop(ctx);
+            assert!(weak.upgrade().is_none());
+            assert_eq!(grant.used(), 0);
+        }
+    }
+    // These bounded fixture Vecs exist before admission/observation. The helper
+    // adopts their real capacities, rather than claiming to observe their allocation.
+    fn append_table(width: usize, len: usize, capacity: usize, start: u64) -> Table {
+        let mut cols = Vec::with_capacity(width);
+        for c in 0..width {
+            let mut values = Vec::with_capacity(capacity);
+            for r in 0..len {
+                values.push(Id(start + r as u64 + (c as u64) * 100));
+            }
+            cols.push(values);
+        }
+        Table {
+            vars: (0..width as VarId).collect(),
+            cols,
+            len,
+            sorted: Vec::new(),
+        }
+    }
+    fn admit_append(table: Table, ctl: &Control) -> Materialized {
+        let bytes = table_capacity(&table).unwrap();
+        ctl.charge(bytes).unwrap();
+        Materialized {
+            table,
+            lease: ctl.output_lease(bytes).unwrap(),
+        }
+    }
+    #[test]
+    fn append_reuses_spare_capacity_and_grows_once_for_large_parts() {
+        use std::{cell::RefCell, rc::Rc};
+        let store = graph_fixture(1);
+        let ctx = Ctx::new(store.snapshot());
+        let ctl = Control::for_query(&ctx, u64::MAX).unwrap();
+        let mut out = admit_append(append_table(2, 0, 0, 0), &ctl);
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let captured = events.clone();
+        let scope = memory::probe::install(move |p| captured.borrow_mut().push(p), None);
+        let mut expected = vec![Vec::new(), Vec::new()];
+        for (len, cap) in [(3, 4), (1, 4), (1, 8), (0, 8), (19, 24)] {
+            // Construction and adoption are independent of append's observed allocs.
+            let part = admit_append(
+                append_table(2, len, len, 1000 + expected[0].len() as u64),
+                &ctl,
+            );
+            for (e, c) in expected.iter_mut().zip(&part.table.cols) {
+                e.extend(c);
+            }
+            let before = events.borrow().len();
+            let ptrs = out.table.cols.iter().map(Vec::as_ptr).collect::<Vec<_>>();
+            out = append(&ctx, out, part, &ctl).unwrap();
+            assert_eq!(out.table.cols, expected);
+            assert_eq!(out.table.len, expected[0].len());
+            assert_eq!(
+                out.lease.as_ref().unwrap().bytes,
+                table_capacity(&out.table).unwrap()
+            );
+            assert!(out.table.cols.iter().all(|c| c.capacity() == cap));
+            let new_events = &events.borrow()[before..];
+            let allocations = new_events
+                .iter()
+                .filter(|p| {
+                    matches!(
+                        p,
+                        memory::probe::Point::Allocation("algorithm-append-column", _)
+                    )
+                })
+                .count();
+            if len == 1 && cap == 4 || len == 0 {
+                assert_eq!(allocations, 0);
+                assert_eq!(
+                    out.table.cols.iter().map(Vec::as_ptr).collect::<Vec<_>>(),
+                    ptrs
+                );
+            } else {
+                assert_eq!(allocations, 2);
+            }
+            if len == 0 {
+                assert!(!new_events.iter().any(|p| matches!(
+                    p,
+                    memory::probe::Point::Work(
+                        "algorithm-append-copy" | "algorithm-append-relocate"
+                    )
+                )));
+            }
+        }
+        drop(scope);
+        drop(out);
+        assert_eq!(ctx.memory().live.load(Ordering::Acquire), 0);
+    }
+    #[test]
+    fn grown_outputs_of_two_services_keep_each_original_query_owner() {
+        use crate::sparql::pool::QueryPool;
+        for shared in [false, true] {
+            let store = graph_fixture(8);
+            let snapshot = store.snapshot();
+            // Independent warm caller ends before the two measured owners begin.
+            {
+                let ctx = Ctx::new(snapshot.clone());
+                drop(super::super::exec::execute_owned(&ctx, &adapter(&ctx)).unwrap());
+            }
+            let pool = QueryPool::new(64 << 20);
+            let a = Arc::new(pool.empty_grant());
+            let b = if shared {
+                a.clone()
+            } else {
+                Arc::new(pool.empty_grant())
+            };
+            let mut ctx = Ctx::new(snapshot.clone());
+            ctx.grant = Some(a.clone());
+            let (first, info) = super::super::exec::execute_owned(&ctx, &adapter(&ctx)).unwrap();
+            let mut leaves = Vec::new();
+            algo_infos(&info, &mut leaves);
+            assert_eq!(
+                leaves[0].counters.as_ref().unwrap()["cachedProjections"].as_u64(),
+                Some(8)
+            );
+            assert!(first.lease.as_ref().unwrap().service.is_none());
+            let live = ctx.memory().live.load(Ordering::Acquire);
+            let held_a = a.used();
+            ctx.grant = Some(b.clone());
+            let (second, info) = super::super::exec::execute_owned(&ctx, &adapter(&ctx)).unwrap();
+            let mut leaves = Vec::new();
+            algo_infos(&info, &mut leaves);
+            assert_eq!(
+                leaves[0].counters.as_ref().unwrap()["cachedProjections"].as_u64(),
+                Some(8)
+            );
+            assert_eq!(
+                first.table.cols,
+                graph_payload(&snapshot, &snapshot.graph_ids().unwrap())
+            );
+            assert_eq!(second.table.cols, first.table.cols);
+            let bytes = table_capacity(&second.table).unwrap();
+            assert_eq!(second.lease.as_ref().unwrap().bytes, bytes);
+            assert_eq!(ctx.memory().live.load(Ordering::Acquire), live + bytes);
+            if !shared {
+                assert_eq!(a.used(), held_a);
+            }
+            drop(second);
+            assert_eq!(ctx.memory().live.load(Ordering::Acquire), live);
+            if !shared {
+                assert_eq!(a.used(), held_a);
+            }
+            let weak = Arc::downgrade(ctx.memory());
+            drop(ctx);
+            assert!(weak.upgrade().is_some());
+            assert!(a.used() > 0);
+            drop(first);
+            assert!(weak.upgrade().is_none());
+            assert_eq!(a.used(), 0);
+            assert_eq!(b.used(), 0);
+        }
+    }
+    #[test]
+    fn append_growth_admits_full_overlap_and_transfers_without_a_gap() {
+        use crate::sparql::pool::QueryPool;
+        use std::{cell::RefCell, rc::Rc};
+        for boundary in ["service", "query", "pool"] {
+            for short in [false, true] {
+                let store = graph_fixture(1);
+                let mut ctx = Ctx::new(store.snapshot());
+                let mut other = Ctx::new(store.snapshot());
+                let left_table = append_table(1, 3, 4, 10);
+                let right_table = append_table(1, 3, 3, 20);
+                let left_bytes = table_capacity(&left_table).unwrap();
+                let right_bytes = table_capacity(&right_table).unwrap();
+                let replacement = memory::bytes::<Id>(8).unwrap();
+                let service_peak = left_bytes + right_bytes + replacement;
+                let query_peak = service_peak + 135;
+                let pool_peak = query_peak + 77;
+                ctx.mem_limit = if boundary == "query" {
+                    query_peak - u64::from(short)
+                } else {
+                    u64::MAX
+                };
+                let pool = QueryPool::new(if boundary == "pool" {
+                    pool_peak - u64::from(short)
+                } else {
+                    64 << 20
+                });
+                let grant = Arc::new(pool.empty_grant());
+                ctx.grant = Some(grant.clone());
+                other.grant = Some(grant.clone());
+                let other_held = other.charge(77).unwrap();
+                let held = ctx.charge(135).unwrap();
+                let ctl = Control::for_query(
+                    &ctx,
+                    if boundary == "service" {
+                        service_peak - u64::from(short)
+                    } else {
+                        u64::MAX
+                    },
+                )
+                .unwrap();
+                let left = admit_append(left_table, &ctl);
+                let right = admit_append(right_table, &ctl);
+                let records = Rc::new(RefCell::new(Vec::new()));
+                let captured = records.clone();
+                let ledger = ctx.memory().clone();
+                let native = ctl.clone();
+                let observed = grant.clone();
+                let hook = memory::probe::install(
+                    move |p| {
+                        if matches!(
+                            p,
+                            memory::probe::Point::Allocation("algorithm-append-column", _)
+                                | memory::probe::Point::Work(
+                                    "algorithm-append-transferred"
+                                        | "algorithm-append-old-dropped"
+                                        | "algorithm-append-resized"
+                                )
+                        ) {
+                            captured.borrow_mut().push((
+                                p,
+                                native.observed_used(),
+                                ledger.live.load(Ordering::Acquire),
+                                observed.used(),
+                            ));
+                        }
+                    },
+                    None,
+                );
+                let result = append(&ctx, left, right, &ctl);
+                drop(hook);
+                if short {
+                    assert!(
+                        records.borrow().is_empty(),
+                        "{boundary} must refuse before allocation"
+                    );
+                    let Err(Error::BudgetExceeded(error)) = result else {
+                        panic!("expected {boundary} capacity refusal")
+                    };
+                    assert_eq!(
+                        error.kind,
+                        if boundary == "pool" {
+                            crate::error::BudgetKind::ServerMemory
+                        } else {
+                            crate::error::BudgetKind::Memory
+                        }
+                    );
+                    assert_eq!(ctx.memory().live.load(Ordering::Acquire), 135);
+                } else {
+                    let out = result.unwrap();
+                    let records = records.borrow();
+                    assert_eq!(records.len(), 4);
+                    for (_, native, live, pool) in &records[..3] {
+                        assert_eq!((*native, *live), (service_peak, query_peak));
+                        assert!(*pool >= pool_peak);
+                    }
+                    assert_eq!(
+                        (records[3].1, records[3].2),
+                        (
+                            service_peak - memory::bytes::<Id>(4).unwrap(),
+                            query_peak - memory::bytes::<Id>(4).unwrap()
+                        )
+                    );
+                    assert_eq!(
+                        out.table.cols[0],
+                        [Id(10), Id(11), Id(12), Id(20), Id(21), Id(22)]
+                    );
+                    let retained = table_capacity(&out.table).unwrap();
+                    assert_eq!(out.lease.as_ref().unwrap().bytes, retained);
+                    assert_eq!(ctx.memory().live.load(Ordering::Acquire), 135 + retained);
+                    assert_eq!(ctl.observed_used(), retained);
+                    drop(out);
+                }
+                assert_eq!(other.memory().live.load(Ordering::Acquire), 77);
+                drop(ctl);
+                drop(held);
+                drop(ctx);
+                assert!(grant.used() >= 77);
+                drop(other_held);
+                drop(other);
+                assert_eq!(grant.used(), 0);
+            }
+        }
+    }
+    #[test]
+    fn append_zero_width_precharges_rows_and_checks_arithmetic_without_allocating() {
+        let store = graph_fixture(1);
+        for short in [false, true] {
+            let ctx = Ctx::new(store.snapshot());
+            let left = append_table(0, 2, 0, 0);
+            let right = append_table(0, 3, 0, 0);
+            let peak = table_capacity(&left).unwrap() + table_capacity(&right).unwrap() + 24;
+            let ctl = Control::for_query(&ctx, peak - u64::from(short)).unwrap();
+            let left = admit_append(left, &ctl);
+            let right = admit_append(right, &ctl);
+            let hook = memory::probe::install(
+                |p| assert!(!matches!(p, memory::probe::Point::Allocation(..))),
+                None,
+            );
+            let out = append(&ctx, left, right, &ctl);
+            drop(hook);
+            if short {
+                assert!(matches!(out, Err(Error::BudgetExceeded(_))));
+            } else {
+                let out = out.unwrap();
+                assert_eq!(out.table.len, 5);
+                assert_eq!(
+                    out.lease.as_ref().unwrap().bytes,
+                    table_capacity(&out.table).unwrap()
+                );
+                drop(out);
+            }
+            assert_eq!(ctx.memory().live.load(Ordering::Acquire), 0);
+        }
+        let ctx = Ctx::new(store.snapshot());
+        let ctl = Control::for_query(&ctx, u64::MAX).unwrap();
+        // Deliberately impossible logical lengths, with no large backing allocation.
+        let fake = |len| {
+            Materialized::plain(Table {
+                vars: Vec::new(),
+                cols: Vec::new(),
+                len,
+                sorted: Vec::new(),
+            })
+        };
+        let hook = memory::probe::install(
+            |p| assert!(!matches!(p, memory::probe::Point::Allocation(..))),
+            None,
+        );
+        assert!(matches!(
+            append(&ctx, fake(usize::MAX), fake(1), &ctl),
+            Err(Error::Invalid(_))
+        ));
+        assert!(matches!(
+            memory::bytes::<Id>(usize::MAX),
+            Err(Error::Invalid(_))
+        ));
+        drop(hook);
+    }
+    #[test]
+    fn append_growth_failure_unwind_and_owner_mismatch_drop_backing_before_charge() {
+        for mode in ["allocation", "unwind", "owner"] {
+            let store = graph_fixture(1);
+            let ctx = Ctx::new(store.snapshot());
+            let ctl = Control::for_query(&ctx, u64::MAX).unwrap();
+            let left = admit_append(append_table(1, 3, 4, 10), &ctl);
+            let right = admit_append(append_table(1, 3, 3, 20), &ctl);
+            let foreign = Control::for_query(&ctx, u64::MAX).unwrap();
+            let hook = memory::probe::install(
+                move |p| {
+                    if mode == "unwind"
+                        && matches!(p, memory::probe::Point::Work("algorithm-append-relocate"))
+                    {
+                        panic!("caught actual relocation unwind");
+                    }
+                },
+                if mode == "allocation" {
+                    Some("algorithm-append-column")
+                } else {
+                    None
+                },
+            );
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                append(
+                    &ctx,
+                    left,
+                    right,
+                    if mode == "owner" { &foreign } else { &ctl },
+                )
+            }));
+            drop(hook);
+            if mode == "unwind" {
+                assert!(result.is_err());
+            } else {
+                assert!(matches!(result.unwrap(), Err(Error::Invalid(_))));
+            }
+            drop(foreign);
+            drop(ctl);
+            assert_eq!(ctx.memory().live.load(Ordering::Acquire), 0);
+        }
+    }
+    #[test]
+    fn append_polls_cancellation_and_deadline_at_real_copy_boundaries() {
+        for timeout in [false, true] {
+            let store = graph_fixture(1);
+            let mut ctx = Ctx::new(store.snapshot());
+            let left_table = append_table(1, 1, 1, 10);
+            let right_table = append_table(
+                1,
+                crate::algo::CHECK_EVERY + 2,
+                crate::algo::CHECK_EVERY + 2,
+                20,
+            );
+            if timeout {
+                ctx.deadline = Some(Instant::now() + std::time::Duration::from_secs(1));
+            }
+            let ctl = Control::for_query(&ctx, u64::MAX).unwrap();
+            let left = admit_append(left_table, &ctl);
+            let right = admit_append(right_table, &ctl);
+            let cancel = ctx.cancel.clone();
+            let deadline = ctx.deadline;
+            let seen = std::rc::Rc::new(std::cell::Cell::new(0));
+            let visits = seen.clone();
+            let scope = memory::probe::install(
+                move |p| {
+                    if matches!(p, memory::probe::Point::Work("algorithm-append-copy")) {
+                        visits.set(visits.get() + 1);
+                        if let Some(deadline) = deadline {
+                            while Instant::now() < deadline {
+                                std::hint::spin_loop();
+                            }
+                        } else {
+                            cancel.store(true, Ordering::Release);
+                        }
+                    }
+                },
+                None,
+            );
+            let result = append(&ctx, left, right, &ctl);
+            drop(scope);
+            assert!(seen.get() > 0, "must reach a real incoming-copy boundary");
+            assert!(
+                seen.get() <= crate::algo::CHECK_EVERY,
+                "must stop at a bounded check, not only after copying the whole incoming part"
+            );
+            if timeout {
+                assert!(matches!(result, Err(Error::Timeout)));
+            } else {
+                assert!(matches!(result, Err(Error::Cancelled)));
+            }
+            drop(ctl);
+            assert_eq!(ctx.memory().live.load(Ordering::Acquire), 0);
+        }
+    }
+    #[test]
+    fn effective_graph_key_is_exactly_the_original_owned_debug_encoding() {
+        let (_store, mut ctx, mut spec) = weighted();
+        ctx.dataset.default = Some(vec![Id(13), Id(21)]);
+        ctx.dataset.named = Some(vec![Id(42), Id(78)]);
+        ctx.dataset.union_default = true;
+        spec.proj.predicates = Some(vec![(11, Some(Dir::Backward)), (15, None)]);
+        spec.proj.direction = Some(Dir::Undirected);
+        spec.proj.node_classes = vec![7, 8];
+        spec.proj.node_class_names = vec!["quoted \" name".into(), "unicode λ".into()];
+        spec.proj.weight = Some(None);
+        spec.proj.default_weight = 2.5;
+        spec.proj.aggregate = Aggregate::Sum;
+        spec.proj.pattern = Some((3, 8, Some(9)));
+        spec.proj.rdf_type = Some(18);
+        spec.proj.reifies = Some(19);
+        let ctl = Control::unlimited();
+        for graph in [
+            GraphFilter::All,
+            GraphFilter::Default,
+            GraphFilter::Named,
+            GraphFilter::One(0),
+            GraphFilter::One(47),
+            GraphFilter::Set(vec![]),
+            GraphFilter::Set(vec![4, 7, 12]),
+        ] {
+            let mut owned = spec.proj.clone();
+            owned.graph = graph.clone();
+            let expected = format!(
+                "{}{:?}|{}",
+                super::super::cache::view_key(&ctx),
+                owned,
+                spec.direction().name()
+            );
+            let key = projection_key(&ctx, &spec, &graph, &ctl).unwrap();
+            assert_eq!(&*key.bytes, expected.as_bytes());
+        }
+    }
+    #[test]
+    fn checked_serializers_preserve_lexical_bytes_and_refuse_growth_with_original_error() {
+        let (_store, ctx, _spec) = weighted();
+        for values in [
+            &[][..],
+            &[
+                0.0,
+                -0.0,
+                1.25,
+                f32::MAX,
+                f32::MIN_POSITIVE,
+                f32::INFINITY,
+                f32::NAN,
+            ][..],
+        ] {
+            let ctl = Control::for_query(&ctx, u64::MAX).unwrap();
+            let id = embedding(&ctx, values, &ctl).unwrap();
+            assert_eq!(
+                ctx.term(id).unwrap(),
+                Term::Literal(crate::vector::literal(values))
+            );
+        }
+        let ctl = Control::for_query(&ctx, 3).unwrap();
+        assert!(
+            matches!(embedding(&ctx,&[1.25],&ctl),Err(Error::BudgetExceeded(b)) if b.kind==crate::error::BudgetKind::Memory)
+        );
+        let ctl = Control::for_query(&ctx, u64::MAX).unwrap();
+        let mut text = Text::new(&ctl).unwrap();
+        ctx.cancel.store(true, Ordering::Relaxed);
+        use std::fmt::Write;
+        let result = write!(&mut text, "must refuse before growth");
+        assert!(matches!(text.formatted(result), Err(Error::Cancelled)));
+    }
+    #[test]
+    fn actual_service_buffers_and_output_lease_share_one_query_owner() {
+        use crate::sparql::pool::QueryPool;
+        for case in 0..5 {
+            let (store, _old, mut spec) = weighted();
+            if case == 3 {
+                super::super::update::update(&store,"INSERT DATA { GRAPH <urn:g1> { <http://ex/a> <http://ex/p> <http://ex/b> } GRAPH <urn:g2> { <http://ex/b> <http://ex/p> <http://ex/a> } }",&Default::default()).unwrap();
+            }
+            let mut ctx = Ctx::new(store.snapshot());
+            let pool = QueryPool::new(64 << 20);
+            let grant = Arc::new(pool.empty_grant());
+            ctx.grant = Some(grant.clone());
+            spec.algo = match case {
+                1 => Algo::FastRp,
+                2 => Algo::Bfs,
+                _ => Algo::Wcc,
+            };
+            spec.proj.weight = None;
+            spec.proj.node_classes.clear();
+            spec.proj.node_class_names.clear();
+            spec.outs = Outs {
+                node: Some(0),
+                summary: Some(2),
+                ..Default::default()
+            };
+            match case {
+                1 => {
+                    spec.outs.embedding = Some(1);
+                    spec.nums.insert("dimension".into(), 8.0);
+                }
+                2 => {
+                    spec.outs.depth = Some(1);
+                    spec.sources = vec![PathEnd::Const(Id::UNDEF)];
+                }
+                _ => spec.outs.component = Some(1),
+            }
+            if case == 0 {
+                spec.nums.insert("limit".into(), 1.0);
+            }
+            if case == 3 {
+                spec.graph_var = Some(3);
+            }
+            let input = (case == 4).then(|| Table {
+                vars: vec![4],
+                cols: vec![vec![Id(77), Id(88)]],
+                len: 2,
+                sorted: vec![],
+            });
+            let held = ctx
+                .charge(input.as_ref().map_or(0, Table::mem_bytes))
+                .unwrap();
+            let ledger = ctx.memory().clone();
+            let observed_grant = grant.clone();
+            let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen = events.clone();
+            let retirement = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let retired = retirement.clone();
+            algo::set_projection_observer(Some(Arc::new(move |event| {
+                if let algo::ProjectionEvent::Allocation(name, capacity, bytes, used) = event {
+                    let live = ledger.live.load(Ordering::Acquire);
+                    assert!(
+                        live >= used && observed_grant.used() >= live,
+                        "{name} before query admission: native={used}, query={live}"
+                    );
+                    seen.lock().unwrap().push((name, capacity, bytes));
+                } else if let algo::ProjectionEvent::Materialized(name, bytes) = event
+                    && matches!(
+                        name,
+                        "algorithm-retirement-before" | "algorithm-retirement-after"
+                    )
+                {
+                    retired.lock().unwrap().push((
+                        name,
+                        bytes,
+                        ledger.live.load(Ordering::Acquire),
+                        observed_grant.used(),
+                    ));
+                }
+            })));
+            let (out, _) = run(
+                &ctx,
+                &spec,
+                input,
+                None,
+                if case == 3 { &[0, 1, 2, 3] } else { &[0, 1, 2] },
+            )
+            .unwrap();
+            algo::set_projection_observer(None);
+            let retired = retirement.lock().unwrap();
+            assert_eq!(retired.len(), 2);
+            assert_eq!(retired[0].0, "algorithm-retirement-before");
+            assert_eq!(retired[1].0, "algorithm-retirement-after");
+            assert_eq!(
+                (retired[0].1, retired[0].2, retired[0].3),
+                (retired[1].1, retired[1].2, retired[1].3),
+                "retirement must not release/re-admit backing"
+            );
+            assert_eq!(
+                out.lease.as_ref().unwrap().bytes,
+                table_capacity(&out.table).unwrap()
+            );
+            assert!(grant.used() >= out.lease.as_ref().unwrap().bytes);
+            if case == 0 {
+                assert_eq!(out.table.len, 1);
+                assert!(
+                    events
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|(n, c, _)| *n == "algorithm-pick" && *c == 2)
+                );
+            }
+            if case == 2 {
+                assert_eq!(out.table.len, 0);
+                assert!(out.lease.as_ref().unwrap().bytes > 0);
+            }
+            if case == 3 {
+                assert_eq!(out.table.len, 4);
+                assert!(
+                    events
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|(name, _, _)| *name == "algorithm-append-column"),
+                    "actual growth boundary"
+                );
+                assert_eq!(
+                    out.lease.as_ref().unwrap().bytes,
+                    table_capacity(&out.table).unwrap()
+                );
+            }
+            if case == 4 {
+                assert_eq!((out.table.len, out.table.width()), (4, 4));
+            }
+            drop(out);
+            drop(held);
+            drop(ctx);
+            assert_eq!(grant.used(), 0);
+        }
+    }
+    #[test]
+    fn cached_projection_and_incoming_owners_never_retain_initializing_query() {
+        use crate::sparql::pool::QueryPool;
+        let (_store, mut ctx, mut spec) = weighted();
+        spec.proj.direction = Some(Dir::Forward);
+        let snapshot = ctx.snap.clone();
+        let pool = QueryPool::new(64 << 20);
+        let grant = Arc::new(pool.empty_grant());
+        ctx.grant = Some(grant.clone());
+        let ctl = Control::for_query(&ctx, u64::MAX).unwrap();
+        let (g, hit) = projection(&ctx, &spec, None, &Par::single(), &ctl).unwrap();
+        assert!(!hit);
+        // Genuine refused initialization does not publish partial incoming storage.
+        let short = Control::for_query(&ctx, 0).unwrap();
+        assert!(matches!(g.inn(&short), Err(Error::BudgetExceeded(_))));
+        drop(short);
+        let prior = ctx.memory().live.load(Ordering::Acquire);
+        let scope = memory::probe::install(|_| {}, Some("incoming-edges"));
+        assert!(matches!(g.inn(&ctl), Err(Error::Invalid(_))));
+        drop(scope);
+        assert_eq!(ctx.memory().live.load(Ordering::Acquire), prior);
+        let incoming = g.inn(&ctl).unwrap();
+        assert_eq!(incoming.n(), g.n());
+        drop(incoming);
+        let weak = Arc::downgrade(ctx.memory());
+        drop(ctl);
+        drop(ctx);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(grant.used(), 0);
+        for _ in 0..2 {
+            let mut next = Ctx::new(snapshot.clone());
+            let next_grant = Arc::new(pool.empty_grant());
+            next.grant = Some(next_grant.clone());
+            let ctl = Control::for_query(&next, u64::MAX).unwrap();
+            let (warm, hit) = projection(&next, &spec, None, &Par::single(), &ctl).unwrap();
+            assert!(hit);
+            assert!(Arc::ptr_eq(&warm, &g));
+            let base = next.memory().live.load(Ordering::Acquire);
+            let incoming = warm.inn(&ctl).unwrap();
+            assert!(next.memory().live.load(Ordering::Acquire) > base);
+            assert!(next_grant.used() >= next.memory().live.load(Ordering::Acquire));
+            drop(incoming);
+            assert_eq!(next.memory().live.load(Ordering::Acquire), base);
+            let weak = Arc::downgrade(next.memory());
+            drop(warm);
+            drop(ctl);
+            drop(next);
+            assert!(weak.upgrade().is_none());
+            assert_eq!(next_grant.used(), 0);
+        }
+    }
+    #[test]
+    fn service_allocation_failure_and_unwind_release_only_their_query_contribution() {
+        use crate::sparql::pool::QueryPool;
+        for unwind in [false, true] {
+            let (_store, mut ctx, mut spec) = weighted();
+            spec.algo = Algo::Wcc;
+            spec.outs = Outs {
+                node: Some(0),
+                component: Some(1),
+                ..Default::default()
+            };
+            let pool = QueryPool::new(64 << 20);
+            let grant = Arc::new(pool.empty_grant());
+            ctx.grant = Some(grant.clone());
+            let mut other = Ctx::new(ctx.snap.clone());
+            other.grant = Some(grant.clone());
+            let other_held = other.charge(135).unwrap();
+            let scope = memory::probe::install(
+                move |point| {
+                    if unwind
+                        && let memory::probe::Point::Allocation("algorithm-column", n) = point
+                        && n > 0
+                    {
+                        panic!("service capacity unwind");
+                    }
+                },
+                (!unwind).then_some("algorithm-column"),
+            );
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run(&ctx, &spec, None, None, &[0, 1])
+            }));
+            drop(scope);
+            if unwind {
+                assert!(result.is_err());
+            } else {
+                assert!(matches!(result.unwrap(), Err(Error::Invalid(_))));
+            }
+            assert_eq!(ctx.memory().live.load(Ordering::Acquire), 0);
+            drop(ctx);
+            assert_eq!(grant.used(), 135);
+            assert_eq!(other.memory().live.load(Ordering::Acquire), 135);
+            drop(other_held);
+            drop(other);
+            assert_eq!(grant.used(), 0);
+        }
+    }
+    #[test]
+    fn owned_execution_forwards_backing_and_warm_cache_without_losing_the_query_lease() {
+        use crate::sparql::pool::QueryPool;
+        let (store, _ctx, _spec) = weighted();
+        let service = "SERVICE <urn:x-sparkles:algo#wcc> { [] <urn:x-sparkles:algo#predicate> <http://ex/p>; <urn:x-sparkles:algo#node> ?n; <urn:x-sparkles:algo#component> ?c }";
+        let queries = [
+            format!("SELECT ?n WHERE {{ {service} }}"),
+            format!("SELECT ?n ?missing WHERE {{ {service} FILTER(?c>=0) }}"),
+            format!("SELECT ?n (?c+1 AS ?next) WHERE {{ {service} }}"),
+            format!("SELECT DISTINCT ?c WHERE {{ {service} }}"),
+            format!("SELECT ?n ?c WHERE {{ {service} }} ORDER BY DESC(?n)"),
+            format!("SELECT ?n ?c WHERE {{ {service} FILTER(?c>=0) }} LIMIT 1"),
+            format!("SELECT ?n ?c WHERE {{ {{ {service} }} UNION {{ {service} }} }} LIMIT 3"),
+        ];
+        let pool = QueryPool::new(64 << 20);
+        let grant = Arc::new(pool.empty_grant());
+        for q in queries {
+            let parsed = super::super::parse_query(&q, None, &[]).unwrap();
+            let prepared = super::super::prepare_query(
+                store.snapshot(),
+                &parsed,
+                &super::super::QueryOptions {
+                    grant: Some(grant.clone()),
+                    ..Default::default()
+                },
+                None,
+                None,
+            )
+            .unwrap();
+            let (out, _) =
+                super::super::exec::execute_owned(&prepared.ctx, &prepared.node).unwrap();
+            assert!(
+                out.lease.as_ref().is_some_and(|l| l.service.is_none()),
+                "{q}"
+            );
+            assert_eq!(
+                out.lease.as_ref().unwrap().bytes,
+                table_capacity(&out.table).unwrap(),
+                "{q}"
+            );
+            assert!(
+                prepared.ctx.memory().live.load(Ordering::Acquire)
+                    >= table_capacity(&out.table).unwrap()
+            );
+            assert!(grant.used() >= prepared.ctx.memory().live.load(Ordering::Acquire));
+            let weak = Arc::downgrade(prepared.ctx.memory());
+            drop(out);
+            drop(prepared);
+            assert!(weak.upgrade().is_none());
+            assert_eq!(grant.used(), 0);
+        }
+        // Actual result-cache hit through the private ownership-aware eager entry.
+        let s = crate::store::Store::in_memory(crate::store::StoreOptions {
+            result_cache_min_ms: 0.0,
+            ..Default::default()
+        });
+        s.load(&[crate::io::Source::from_bytes(
+            b"<urn:a> <http://ex/p> <urn:b>.".to_vec(),
+            crate::io::RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+        let q = format!("SELECT ?n ?c WHERE {{ {service} }}");
+        let parsed = super::super::parse_query(&q, None, &[]).unwrap();
+        let options = super::super::QueryOptions {
+            grant: Some(grant.clone()),
+            ..Default::default()
+        };
+        let first = super::super::query(s.snapshot(), &q, &options).unwrap();
+        let expected = first.table.clone();
+        drop(first);
+        assert_eq!(grant.used(), 0);
+        let prepared =
+            super::super::prepare_query(s.snapshot(), &parsed, &options, None, None).unwrap();
+        let (out, info) = super::super::exec::execute_owned(&prepared.ctx, &prepared.node).unwrap();
+        assert!(info.cached);
+        assert_eq!(out.table.cols, expected.cols);
+        assert_eq!(
+            out.lease.as_ref().unwrap().bytes,
+            table_capacity(&out.table).unwrap()
+        );
+        let weak = Arc::downgrade(prepared.ctx.memory());
+        drop(prepared);
+        assert!(weak.upgrade().is_some());
+        assert!(grant.used() > 0);
+        drop(out);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(grant.used(), 0);
+    }
+    #[test]
+    fn final_input_join_is_query_owned_after_the_service_peak_is_closed() {
+        use crate::sparql::pool::QueryPool;
+        let (_store, mut ctx, mut spec) = weighted();
+        spec.algo = Algo::Wcc;
+        spec.outs = Outs {
+            node: Some(0),
+            component: Some(1),
+            ..Default::default()
+        };
+        spec.nums.insert("maxMemory".into(), 2048.0);
+        let pool = QueryPool::new(64 << 20);
+        let grant = Arc::new(pool.empty_grant());
+        ctx.grant = Some(grant.clone());
+        let input = Table {
+            vars: vec![4],
+            cols: vec![vec![Id(77); 1000]],
+            len: 1000,
+            sorted: Vec::new(),
+        };
+        let held = ctx.charge(input.mem_bytes()).unwrap();
+        let (out, counters) = run(&ctx, &spec, Some(input), None, &[0, 1]).unwrap();
+        assert_eq!(out.table.len, 2000);
+        assert!(table_capacity(&out.table).unwrap() > 2048);
+        assert!(counters["peakBytes"].as_u64().unwrap() <= 2048);
+        assert!(out.lease.as_ref().unwrap().service.is_none());
+        drop(out);
+        drop(held);
+        drop(ctx);
+        assert_eq!(grant.used(), 0);
+    }
+    #[test]
+    fn repeated_graphs_share_one_service_limit_and_reclaim_dead_native_frames() {
+        use crate::io::{RdfFormat, Source};
+        let store = crate::store::Store::in_memory(Default::default());
+        let mut data = String::from("@prefix ex:<http://ex/>.");
+        for g in 0..8 {
+            data.push_str(&format!("ex:g{g} {{ex:a ex:p ex:b.}}"));
+        }
+        store
+            .load(&[Source::from_bytes(data.into_bytes(), RdfFormat::TriG, None)])
+            .unwrap();
+        let (_other, _old, mut spec) = weighted();
+        let ctx = Ctx::new(store.snapshot());
+        spec.proj.predicates = Some(vec![(ctx.snap.lookup_iri("http://ex/p").unwrap().0, None)]);
+        spec.proj.weight = None;
+        spec.proj.node_classes.clear();
+        spec.proj.node_class_names.clear();
+        spec.algo = Algo::Wcc;
+        spec.outs = Outs {
+            node: Some(0),
+            component: Some(1),
+            ..Default::default()
+        };
+        spec.graph_var = Some(3);
+        let mut one = spec.clone();
+        one.proj.graph = GraphFilter::One(ctx.snap.lookup_iri("http://ex/g0").unwrap().0);
+        let mut ctx_one = Ctx::new(ctx.snap.clone());
+        ctx_one.use_cache = false;
+        let (out, one_stats) = run(&ctx_one, &one, None, None, &[0, 1, 3]).unwrap();
+        assert_eq!(out.table.len, 2);
+        drop(out);
+        let mut ctx_all = Ctx::new(ctx.snap.clone());
+        ctx_all.use_cache = false;
+        let (out, all_stats) = run(&ctx_all, &spec, None, None, &[0, 1, 3]).unwrap();
+        assert_eq!(out.table.len, 16);
+        drop(out);
+        let first = one_stats["peakBytes"].as_u64().unwrap();
+        let all = all_stats["peakBytes"].as_u64().unwrap();
+        assert!(
+            all > first,
+            "aggregate GRAPH/output overlap must exceed one isolated graph: {first}/{all}"
+        );
+        let mut limited = spec.clone();
+        limited.nums.insert("maxMemory".into(), first as f64);
+        assert!(
+            matches!(run(&ctx_all,&limited,None,None,&[0,1,3]),Err(Error::BudgetExceeded(b)) if b.kind==crate::error::BudgetKind::Memory && b.limit==first)
+        );
+        // No reached source means empty rows. Native graph capacity is still real,
+        // but each dead frame must end before the next equal graph starts.
+        let mut empty = spec.clone();
+        empty.algo = Algo::Bfs;
+        empty.outs = Outs {
+            node: Some(0),
+            depth: Some(1),
+            ..Default::default()
+        };
+        empty.sources = vec![PathEnd::Const(Id::UNDEF)];
+        let (out, stats) = run(&ctx_all, &empty, None, None, &[0, 1, 3]).unwrap();
+        assert_eq!(out.table.len, 0);
+        drop(out);
+        let mut ids = vec![
+            ctx.snap.lookup_iri("http://ex/g0").unwrap().0,
+            ctx.snap.lookup_iri("http://ex/g1").unwrap().0,
+        ];
+        ids.sort_unstable();
+        let mut two = empty.clone();
+        two.proj.graph = GraphFilter::Set(ids);
+        let (out, two_stats) = run(&ctx_all, &two, None, None, &[0, 1, 3]).unwrap();
+        assert_eq!(out.table.len, 0);
+        drop(out);
+        assert_eq!(
+            stats["peakBytes"], two_stats["peakBytes"],
+            "dead native reservations must not accumulate over eight graphs"
+        );
+    }
+    fn serialization_admission(embedding_case: bool) {
+        let (_store, ctx, spec) = weighted();
+        let graph_ctl = Control::unlimited();
+        let g = build_graph(&ctx, &spec, None, &Par::single(), &graph_ctl).unwrap();
+        let ledger = ctx.memory().clone();
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let witness = observed.clone();
+        algo::set_projection_observer(Some(Arc::new(move |event| {
+            if let algo::ProjectionEvent::Materialized(name, bytes) = event
+                && name
+                    == if embedding_case {
+                        "algorithm-embedding-text"
+                    } else {
+                        "algorithm-summary-text"
+                    }
+            {
+                witness
+                    .lock()
+                    .unwrap()
+                    .push((bytes, ledger.live.load(Ordering::Acquire)));
+            }
+        })));
+        let ctl = Control::for_query(&ctx, u64::MAX).unwrap();
+        if embedding_case {
+            embedding(&ctx, &[1.25; 2048], &ctl).unwrap();
+        } else {
+            let mut stats = algo::Stats::new();
+            stats.insert("test".into(), "x".repeat(16384).into());
+            summary(&ctx, &g, stats, &ctl).unwrap();
+        }
+        algo::set_projection_observer(None);
+        let got = observed.lock().unwrap();
+        assert_eq!(got.len(), 1);
+        assert!(got[0].0 > 1024);
+        assert!(
+            got[0].1 >= got[0].0 as u64,
+            "actual serialized backing is unadmitted: {got:?}"
+        );
+    }
+    #[test]
+    fn summary_serialization_is_admitted_before_materialization() {
+        serialization_admission(false);
+    }
+    #[test]
+    fn embedding_serialization_is_admitted_before_materialization() {
+        serialization_admission(true);
+    }
     #[test]
     fn hash_bound_covers_real_layout_and_replacement_overlap() {
         let ctl = Control::new(Default::default(), None, 1 << 20);

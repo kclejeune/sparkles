@@ -52,6 +52,33 @@ struct Inner {
     limit: u64,
     used: AtomicU64,
     peak: AtomicU64,
+    query: Option<Arc<ServiceMemory>>,
+}
+
+pub(crate) struct ServiceMemory {
+    pub(crate) ledger: Arc<crate::sparql::query_memory::QueryMemoryLedger>,
+    pub(crate) owner: Arc<crate::sparql::query_memory::MemoryOwner>,
+    pub(crate) query_limit: u64,
+    pub(crate) limit: u64,
+    pub(crate) used: AtomicU64,
+    pub(crate) peak: AtomicU64,
+    pub(crate) frames: std::sync::atomic::AtomicUsize,
+    pub(crate) closed: AtomicBool,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        if let Some(query) = &self.query {
+            // Plain Vec outputs and immutable projection data do not retain Control.
+            // The call's residual ownership ends only after its other owners drop.
+            query.ledger.release_service(
+                query,
+                self.used.load(Ordering::Relaxed),
+                Some(&self.used),
+            );
+            query.ledger.end_service_frame(query);
+        }
+    }
 }
 
 /// A test-only observation of a native control check at its actual call site.
@@ -123,7 +150,10 @@ impl Control {
 
     #[cfg(any(test, feature = "failpoints"))]
     pub(crate) fn observed_used(&self) -> u64 {
-        self.inner.used.load(Ordering::Relaxed)
+        self.inner.query.as_ref().map_or_else(
+            || self.inner.used.load(Ordering::Relaxed),
+            |q| q.used.load(Ordering::Relaxed),
+        )
     }
 
     /// A call that stops when `cancel` is set or the deadline passes, and holds at most
@@ -146,8 +176,66 @@ impl Control {
                 limit: mem_limit,
                 used: AtomicU64::new(0),
                 peak: AtomicU64::new(0),
+                query: None,
             }),
         }
+    }
+
+    pub(crate) fn for_query(ctx: &crate::sparql::Ctx, limit: u64) -> Result<Self> {
+        let ledger = ctx.memory().clone();
+        let owner = ledger.owner(ctx.grant.as_ref())?;
+        let mut control = Self::with_cancellation(
+            ctx.cancel.clone(),
+            ctx.cancellation.clone(),
+            ctx.deadline,
+            limit,
+        );
+        ledger.start_call();
+        Arc::get_mut(&mut control.inner).expect("new call").query = Some(Arc::new(ServiceMemory {
+            ledger,
+            owner,
+            query_limit: ctx.mem_limit,
+            limit,
+            used: AtomicU64::new(0),
+            peak: AtomicU64::new(0),
+            frames: std::sync::atomic::AtomicUsize::new(1),
+            closed: AtomicBool::new(false),
+        }));
+        Ok(control)
+    }
+
+    /// A lexical graph/workspace frame. SERVICE limits include all prior output
+    /// leases, while this frame releases only its residual native storage on drop.
+    pub(crate) fn query_frame(&self) -> Result<Self> {
+        self.check()?;
+        let query = self
+            .inner
+            .query
+            .as_ref()
+            .ok_or_else(|| Error::invalid("query frame needs a SERVICE owner"))?;
+        query.ledger.start_service_frame(query)?;
+        Ok(Self {
+            inner: Arc::new(Inner {
+                cancel: self.inner.cancel.clone(),
+                cancellation: self.inner.cancellation.clone(),
+                deadline: self.inner.deadline,
+                limit: query.limit,
+                used: AtomicU64::new(0),
+                peak: AtomicU64::new(0),
+                query: Some(query.clone()),
+            }),
+        })
+    }
+
+    pub(crate) fn output_lease(
+        &self,
+        bytes: u64,
+    ) -> Result<Option<crate::sparql::query_memory::QueryMemoryLease>> {
+        self.inner
+            .query
+            .as_ref()
+            .map(|query| query.ledger.transfer_native(query, bytes, &self.inner.used))
+            .transpose()
     }
 
     /// A call without a deadline, cancel flag or memory limit.
@@ -190,6 +278,9 @@ impl Control {
     /// pass the limit. Call it before the allocation it accounts for.
     pub fn charge(&self, bytes: u64) -> Result<()> {
         let i = &self.inner;
+        if let Some(query) = &i.query {
+            return query.ledger.reserve_service(query, bytes, Some(&i.used));
+        }
         let prior = i
             .used
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |u| {
@@ -209,6 +300,9 @@ impl Control {
     /// Fail when `bytes` more would pass the limit, without holding them.
     pub fn require(&self, bytes: u64) -> Result<()> {
         let i = &self.inner;
+        if let Some(query) = &i.query {
+            return query.ledger.require_service(query, bytes);
+        }
         let used = i.used.load(Ordering::Relaxed);
         if used.saturating_add(bytes) > i.limit {
             return Err(Error::BudgetExceeded(Budget {
@@ -222,6 +316,12 @@ impl Control {
 
     /// Give back `bytes` of the memory charged.
     pub fn release(&self, bytes: u64) {
+        if let Some(query) = &self.inner.query {
+            query
+                .ledger
+                .release_service(query, bytes, Some(&self.inner.used));
+            return;
+        }
         let _ = self
             .inner
             .used
@@ -232,14 +332,22 @@ impl Control {
 
     /// The most estimated memory the call held at once.
     pub fn peak(&self) -> u64 {
-        self.inner.peak.load(Ordering::Relaxed)
+        self.inner.query.as_ref().map_or_else(
+            || self.inner.peak.load(Ordering::Relaxed),
+            |q| q.peak.load(Ordering::Relaxed),
+        )
     }
 
     /// The memory the call may still charge.
     pub fn remaining(&self) -> u64 {
-        self.inner
-            .limit
-            .saturating_sub(self.inner.used.load(Ordering::Relaxed))
+        self.inner.query.as_ref().map_or_else(
+            || {
+                self.inner
+                    .limit
+                    .saturating_sub(self.inner.used.load(Ordering::Relaxed))
+            },
+            |q| q.limit.saturating_sub(q.used.load(Ordering::Relaxed)),
+        )
     }
 }
 

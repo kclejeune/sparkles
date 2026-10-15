@@ -207,3 +207,14 @@ impl Table {
         self.sorted.clear();
     }
 }
+
+/// Private algorithm ownership. Backing is destroyed before its admission lease.
+pub(super) struct Materialized {
+    pub(super) table: Table,
+    pub(super) lease: Option<super::query_memory::QueryMemoryLease>,
+}
+impl Materialized {
+    pub(super) fn plain(table: Table) -> Self {
+        Self { table, lease: None }
+    }
+}
