@@ -247,6 +247,7 @@ async fn native_io_and_grant_metadata_survive_eager_streaming_and_early_stop() {
         assert_eq!(j["meta"]["sentRows"], rows, "{j}");
         assert_eq!(j["meta"]["memory"]["grantedBytes"], 16 * MB, "{j}");
         assert!(j["meta"]["io"].is_object(), "{j}");
+        assert!(j["meta"]["io"]["pagesTruncated"].is_boolean(), "{j}");
         assert!(j["meta"]["io"]["minorFaults"].is_number(), "{j}");
         assert_eq!(pool(&s).granted(), 0);
     }

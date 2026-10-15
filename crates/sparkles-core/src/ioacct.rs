@@ -11,8 +11,8 @@
 //!
 //! A [`Profile`] adds what is too costly to leave on. While one is alive, the readers time
 //! their vocabulary lookups, block decodes and the wait for the pages of a block, record
-//! the pages they ask for or touch so that `mincore(2)` can say how many of them the query
-//! brought into memory, and log the first requests in order. The major page faults come
+//! a bounded sample of pages they ask for or touch and its `mincore(2)` residency,
+//! and log the first requests in order. The major page faults come
 //! from `getrusage(2)`, for the whole process.
 
 use crate::index::Perm;
@@ -134,6 +134,12 @@ pub(crate) fn touch(file: IoFile, base: *const u8, off: usize, len: usize) {
     if profiling() {
         profile::record(file, base, off, len, None);
     }
+}
+
+/// Retained mapping-page identities for independent test oracles. No mapped bytes are read.
+#[cfg(all(test, unix))]
+pub(crate) fn sampled_page_indices(file: IoFile, base: *const u8) -> Vec<usize> {
+    profile::sampled_page_indices(file, base as usize)
 }
 
 /// Vocabulary lookups, counted by a profile only for the same reason as the blocks.
@@ -335,6 +341,7 @@ impl IoSnapshot {
             major_faults: None,
             minor_faults: None,
             pages: None,
+            pages_truncated: None,
             events: None,
         }
         .with_times(
@@ -387,13 +394,13 @@ pub struct PhaseTimes {
 #[derive(Clone, Debug, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PageIo {
-    /// distinct pages the query asked for or read
+    /// distinct pages retained in the best-effort sample
     pub touched: u64,
     /// of those, in memory when first recorded
     pub resident_before: u64,
     /// of those, in memory at the end
     pub resident_after: u64,
-    /// pages `mincore(2)` reports in memory at the end that were not at first
+    /// max(resident_after - resident_before, 0) for the retained sample, not physical I/O
     pub brought_in: u64,
 }
 
@@ -425,6 +432,10 @@ pub struct IoReport {
     pub minor_faults: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pages: Option<BTreeMap<&'static str, PageIo>>,
+    /// The shared epoch omitted pages due to its inventory or per-range cap. False
+    /// does not guarantee complete coverage. Page counts describe the retained sample.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pages_truncated: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub events: Option<Vec<IoEvent>>,
 }
@@ -469,7 +480,8 @@ impl Profile {
         let (maj, min) = profile::faults();
         r.major_faults = Some(maj.saturating_sub(self.faults.0));
         r.minor_faults = Some(min.saturating_sub(self.faults.1));
-        let pages = profile::pages();
+        let (pages, truncated) = profile::pages();
+        r.pages_truncated = Some(truncated);
         if !pages.is_empty() {
             r.pages = Some(pages);
         }
@@ -527,13 +539,14 @@ mod profile {
     use super::*;
 
     const MAX_EVENTS: usize = 512;
-    /// ranges longer than this many pages are recorded up to it
+    /// Total distinct pages per shared epoch, also the maximum examined per range
     const MAX_PAGES: usize = 1 << 16;
 
     struct State {
         began: Instant,
         /// (file, mapping address, page) of every page recorded
         seen: BTreeSet<(IoFile, usize, usize)>,
+        pages_truncated: bool,
         /// of the pages recorded, how many were in memory when recorded
         before: BTreeMap<IoFile, u64>,
         events: Vec<(Instant, &'static str, &'static str, u64, u64)>,
@@ -580,6 +593,7 @@ mod profile {
         *guard = Some(State {
             began: Instant::now(),
             seen: BTreeSet::new(),
+            pages_truncated: false,
             before: BTreeMap::new(),
             events: Vec::new(),
         });
@@ -640,9 +654,10 @@ mod profile {
         let ps = page_size();
         let addr = base as usize;
         let (p0, p1) = (off / ps, (off + len).div_ceil(ps));
-        let p1 = p1.min(p0 + MAX_PAGES);
+        let end = p1.min(p0 + MAX_PAGES);
         let mut guard = state();
         let Some(s) = guard.as_mut() else { return };
+        s.pages_truncated |= end < p1;
         if let Some(what) = what
             && s.events.len() < MAX_EVENTS
         {
@@ -653,8 +668,17 @@ mod profile {
         // this query brought in does not count as in memory before the query
         let mut run: Option<(usize, usize)> = None;
         let mut before = 0u64;
-        for p in p0..p1 {
-            if s.seen.insert((file, addr, p)) {
+        for p in p0..end {
+            let key = (file, addr, p);
+            // Deduplicate before admission, including when the inventory is full.
+            if s.seen.contains(&key) {
+                continue;
+            }
+            if s.seen.len() == MAX_PAGES {
+                s.pages_truncated = true;
+                continue;
+            }
+            if s.seen.insert(key) {
                 run = match run {
                     Some((a, b)) if b == p => Some((a, p + 1)),
                     Some((a, b)) => {
@@ -675,10 +699,10 @@ mod profile {
     pub(super) fn record(_: IoFile, _: *const u8, _: usize, _: usize, _: Option<&'static str>) {}
 
     #[cfg(unix)]
-    pub(super) fn pages() -> BTreeMap<&'static str, PageIo> {
+    pub(super) fn pages() -> (BTreeMap<&'static str, PageIo>, bool) {
         let guard = state();
         let Some(s) = guard.as_ref() else {
-            return BTreeMap::new();
+            return (BTreeMap::new(), false);
         };
         let mut out: BTreeMap<IoFile, (u64, u64)> = BTreeMap::new();
         let mut it = s.seen.iter().peekable();
@@ -695,7 +719,8 @@ mod profile {
             e.0 += (last - first) as u64;
             e.1 += resident(addr, first, last);
         }
-        out.into_iter()
+        let pages = out
+            .into_iter()
             .map(|(f, (touched, after))| {
                 let before = s.before.get(&f).copied().unwrap_or(0).min(touched);
                 (
@@ -708,12 +733,23 @@ mod profile {
                     },
                 )
             })
-            .collect()
+            .collect();
+        (pages, s.pages_truncated)
     }
 
     #[cfg(not(unix))]
-    pub(super) fn pages() -> BTreeMap<&'static str, PageIo> {
-        BTreeMap::new()
+    pub(super) fn pages() -> (BTreeMap<&'static str, PageIo>, bool) {
+        (BTreeMap::new(), false)
+    }
+
+    #[cfg(all(test, unix))]
+    pub(super) fn sampled_page_indices(file: IoFile, base: usize) -> Vec<usize> {
+        state().as_ref().map_or_else(Vec::new, |s| {
+            s.seen
+                .iter()
+                .filter_map(|&(f, a, p)| ((f, a) == (file, base)).then_some(p))
+                .collect()
+        })
     }
 
     fn columns_now() -> u64 {
@@ -998,6 +1034,163 @@ mod tests {
         let empty = fresh.report();
         drop(fresh);
         assert!(empty.events.is_none() && empty.pages.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_epoch_bounds_many_small_page_touches() {
+        if isolated_profile_test("profile_epoch_bounds_many_small_page_touches") {
+            return;
+        }
+        // Sparse immutable mappings reserve address space, not 256 MiB of resident data.
+        // SAFETY: sysconf has no pointer arguments or other preconditions.
+        let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
+        assert!(page > 0);
+        let mut files = Vec::new();
+        let mut maps = Vec::new();
+        for pages in [32768, 32769] {
+            let f = tempfile::tempfile().unwrap();
+            f.set_len((pages * page) as u64).unwrap();
+            // SAFETY: the owned file is never changed or truncated while mapped.
+            maps.push(unsafe { memmap2::MmapOptions::new().map(&f).unwrap() });
+            files.push(f);
+        }
+        let profile = Profile::start();
+        for (map, file) in maps.iter().zip([IoFile::Spo, IoFile::VocabData]) {
+            for off in (0..map.len()).step_by(page) {
+                touch(file, map.as_ptr(), off, 1);
+            }
+        }
+        let report = profile.report();
+        let touched: u64 = report
+            .pages
+            .as_ref()
+            .unwrap()
+            .values()
+            .map(|p| p.touched)
+            .sum();
+        eprintln!("actual aggregate touched pages after 65537 one-byte observations: {touched}");
+        assert!(
+            touched <= 65536,
+            "entire shared profile epoch must be bounded: {touched}"
+        );
+        drop(profile);
+        drop(maps);
+        drop(files);
+    }
+
+    #[cfg(unix)]
+    fn sparse_mapping(pages: usize, tail: usize) -> (File, memmap2::Mmap, usize) {
+        // SAFETY: sysconf has no pointer arguments or other preconditions.
+        let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
+        let file = tempfile::tempfile().unwrap();
+        file.set_len((pages * page + tail) as u64).unwrap();
+        // SAFETY: the private file remains immutable and is held for the mapping lifetime.
+        let map = unsafe { memmap2::MmapOptions::new().map(&file).unwrap() };
+        (file, map, page)
+    }
+
+    #[cfg(unix)]
+    fn sampled_pages(p: &Profile) -> u64 {
+        p.report()
+            .pages
+            .as_ref()
+            .map_or(0, |pages| pages.values().map(|p| p.touched).sum())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_epoch_cap_deduplicates_overlaps_and_resets() {
+        if isolated_profile_test("profile_epoch_cap_deduplicates_overlaps_and_resets") {
+            return;
+        }
+        let (_a, a, page) = sparse_mapping(65536, 0);
+        let (_b, b, _) = sparse_mapping(2, 0);
+        let first = Profile::start();
+        for off in (0..a.len() - page).step_by(page) {
+            touch(IoFile::Spo, a.as_ptr(), off, 1);
+        }
+        touch(IoFile::VocabData, b.as_ptr(), 0, 1);
+        assert_eq!(sampled_pages(&first), 65536);
+        assert_eq!(first.report().pages_truncated, Some(false));
+        assert_eq!(
+            sampled_page_indices(IoFile::Spo, a.as_ptr()),
+            (0..65535).collect::<Vec<_>>()
+        );
+        assert_eq!(sampled_page_indices(IoFile::VocabData, b.as_ptr()), [0]);
+        let second = Profile::start();
+        for off in (0..a.len() - page).step_by(page) {
+            touch(IoFile::Spo, a.as_ptr(), off, 1);
+        }
+        touch(IoFile::VocabData, b.as_ptr(), 0, 1);
+        assert_eq!(
+            second.report().pages_truncated,
+            Some(false),
+            "duplicates at cap omit nothing"
+        );
+        touch(IoFile::Spo, a.as_ptr(), a.len() - page, 1);
+        assert_eq!(sampled_pages(&second), 65536);
+        assert_eq!(second.report().pages_truncated, Some(true));
+        assert!(!sampled_page_indices(IoFile::Spo, a.as_ptr()).contains(&65535));
+        drop(first);
+        touch(IoFile::VocabData, b.as_ptr(), page, 1);
+        assert_eq!(sampled_pages(&second), 65536);
+        assert_eq!(second.report().pages_truncated, Some(true));
+        for _ in 0..600 {
+            mark("bounded event");
+        }
+        assert_eq!(second.report().events.as_ref().unwrap().len(), 512);
+        drop(second);
+        let fresh = Profile::start();
+        assert_eq!(sampled_pages(&fresh), 0);
+        assert_eq!(fresh.report().pages_truncated, Some(false));
+        assert!(fresh.report().events.is_none());
+        touch(IoFile::VocabData, b.as_ptr(), page, 1);
+        assert_eq!(sampled_pages(&fresh), 1);
+        assert_eq!(fresh.report().pages_truncated, Some(false));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_epoch_marks_clipped_ranges_and_partial_pages() {
+        if isolated_profile_test("profile_epoch_marks_clipped_ranges_and_partial_pages") {
+            return;
+        }
+        let (_f, map, page) = sparse_mapping(65537, 17);
+        let profile = Profile::start();
+        touch(IoFile::VocabData, map.as_ptr(), 0, map.len());
+        assert_eq!(sampled_pages(&profile), 65536);
+        assert_eq!(profile.report().pages_truncated, Some(true));
+        drop(profile);
+        let profile = Profile::start();
+        touch(IoFile::VocabData, map.as_ptr(), 65537 * page, 17);
+        touch(IoFile::VocabData, map.as_ptr(), 65537 * page + 16, 1);
+        assert_eq!(sampled_pages(&profile), 1);
+        assert_eq!(profile.report().pages_truncated, Some(false));
+    }
+
+    #[test]
+    fn profile_truncation_serialization_distinguishes_process_snapshots() {
+        if isolated_profile_test("profile_truncation_serialization_distinguishes_process_snapshots")
+        {
+            return;
+        }
+        let snapshot = IoSnapshot::now().report();
+        assert_eq!(snapshot.pages_truncated, None);
+        assert!(
+            serde_json::to_value(snapshot)
+                .unwrap()
+                .get("pagesTruncated")
+                .is_none()
+        );
+        let profile = Profile::start();
+        assert_eq!(profile.report().pages_truncated, Some(false));
+        assert_eq!(
+            serde_json::to_value(profile.report()).unwrap()["pagesTruncated"],
+            false
+        );
+        #[cfg(not(unix))]
+        assert!(profile.report().pages.is_none());
     }
 
     #[test]

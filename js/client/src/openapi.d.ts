@@ -7477,8 +7477,11 @@ export interface components {
             meta: {
                 commit?: number;
                 datasetId?: string;
-                /** @description Reads of the index and vocabulary files; present when the request has `profile=io`. */
+                /** @description Reads of the index and vocabulary files; present when the request has `profile=io`. Page fields describe the first-admitted best-effort sample shared by overlapping profiles. Touched and resident counts are additive lower bounds; broughtIn is the nonnegative sample resident-count delta, not a lower bound on the full-set delta or physical I/O. */
                 io?: {
+                    /** @description True when the shared profiling epoch omitted pages because of its 65,536-entry inventory or range cap. False records no cap omission and does not promise complete coverage. Process counter snapshots omit this field. */
+                    pagesTruncated?: boolean;
+                } & {
                     [key: string]: unknown;
                 };
                 memory?: Record<string, never>;
@@ -8498,7 +8501,7 @@ export interface components {
         nocache: boolean;
         /** @description The backup policy. */
         policy: string;
-        /** @description `io` adds an `io` object to the metadata of the `application/x-sparkles+json` result, with what the query read from the index and vocabulary files and the time spent doing so. The counters are process-wide, so concurrent queries add to them. */
+        /** @description `io` adds an `io` object to the metadata of the `application/x-sparkles+json` result, with what the query read from the index and vocabulary files and the time spent doing so. The counters are process-wide, so concurrent queries add to them. Overlapping profiles share at most 65,536 first-admitted pages; pagesTruncated reports cap omissions, not completeness. Page counts describe the retained sample, and broughtIn is its diagnostic nonnegative resident-count delta rather than physical I/O. */
         profile: "io";
         /** @description Include materialized inferences. The default is true when the dataset has any. */
         reasoning: boolean;
@@ -15174,7 +15177,7 @@ export interface operations {
                 send?: components["parameters"]["send"];
                 /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto conservatively selects streaming for large immutable SELECT scans and eligible uncached OPTIONAL counts, and eager execution otherwise. The default remains eager. Explicit streaming SELECT does not support Thrift results, and auto runs those requests eagerly. Deadlines include blocked response writes; late failures abort the body. */
                 execution?: components["parameters"]["execution"];
-                /** @description `io` adds an `io` object to the metadata of the `application/x-sparkles+json` result, with what the query read from the index and vocabulary files and the time spent doing so. The counters are process-wide, so concurrent queries add to them. */
+                /** @description `io` adds an `io` object to the metadata of the `application/x-sparkles+json` result, with what the query read from the index and vocabulary files and the time spent doing so. The counters are process-wide, so concurrent queries add to them. Overlapping profiles share at most 65,536 first-admitted pages; pagesTruncated reports cap omissions, not completeness. Page counts describe the retained sample, and broughtIn is its diagnostic nonnegative resident-count delta rather than physical I/O. */
                 profile?: components["parameters"]["profile"];
                 /** @description Bypass the query result cache. */
                 nocache?: components["parameters"]["nocache"];
@@ -15331,7 +15334,7 @@ export interface operations {
                 send?: components["parameters"]["send"];
                 /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto conservatively selects streaming for large immutable SELECT scans and eligible uncached OPTIONAL counts, and eager execution otherwise. The default remains eager. Explicit streaming SELECT does not support Thrift results, and auto runs those requests eagerly. Deadlines include blocked response writes; late failures abort the body. */
                 execution?: components["parameters"]["execution"];
-                /** @description `io` adds an `io` object to the metadata of the `application/x-sparkles+json` result, with what the query read from the index and vocabulary files and the time spent doing so. The counters are process-wide, so concurrent queries add to them. */
+                /** @description `io` adds an `io` object to the metadata of the `application/x-sparkles+json` result, with what the query read from the index and vocabulary files and the time spent doing so. The counters are process-wide, so concurrent queries add to them. Overlapping profiles share at most 65,536 first-admitted pages; pagesTruncated reports cap omissions, not completeness. Page counts describe the retained sample, and broughtIn is its diagnostic nonnegative resident-count delta rather than physical I/O. */
                 profile?: components["parameters"]["profile"];
                 /** @description Bypass the query result cache. */
                 nocache?: components["parameters"]["nocache"];
@@ -17056,7 +17059,7 @@ export interface operations {
                 send?: components["parameters"]["send"];
                 /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto conservatively selects streaming for large immutable SELECT scans and eligible uncached OPTIONAL counts, and eager execution otherwise. The default remains eager. Explicit streaming SELECT does not support Thrift results, and auto runs those requests eagerly. Deadlines include blocked response writes; late failures abort the body. */
                 execution?: components["parameters"]["execution"];
-                /** @description `io` adds an `io` object to the metadata of the `application/x-sparkles+json` result, with what the query read from the index and vocabulary files and the time spent doing so. The counters are process-wide, so concurrent queries add to them. */
+                /** @description `io` adds an `io` object to the metadata of the `application/x-sparkles+json` result, with what the query read from the index and vocabulary files and the time spent doing so. The counters are process-wide, so concurrent queries add to them. Overlapping profiles share at most 65,536 first-admitted pages; pagesTruncated reports cap omissions, not completeness. Page counts describe the retained sample, and broughtIn is its diagnostic nonnegative resident-count delta rather than physical I/O. */
                 profile?: components["parameters"]["profile"];
                 /** @description Bypass the query result cache. */
                 nocache?: components["parameters"]["nocache"];
@@ -17125,7 +17128,7 @@ export interface operations {
                 send?: components["parameters"]["send"];
                 /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto conservatively selects streaming for large immutable SELECT scans and eligible uncached OPTIONAL counts, and eager execution otherwise. The default remains eager. Explicit streaming SELECT does not support Thrift results, and auto runs those requests eagerly. Deadlines include blocked response writes; late failures abort the body. */
                 execution?: components["parameters"]["execution"];
-                /** @description `io` adds an `io` object to the metadata of the `application/x-sparkles+json` result, with what the query read from the index and vocabulary files and the time spent doing so. The counters are process-wide, so concurrent queries add to them. */
+                /** @description `io` adds an `io` object to the metadata of the `application/x-sparkles+json` result, with what the query read from the index and vocabulary files and the time spent doing so. The counters are process-wide, so concurrent queries add to them. Overlapping profiles share at most 65,536 first-admitted pages; pagesTruncated reports cap omissions, not completeness. Page counts describe the retained sample, and broughtIn is its diagnostic nonnegative resident-count delta rather than physical I/O. */
                 profile?: components["parameters"]["profile"];
                 /** @description Bypass the query result cache. */
                 nocache?: components["parameters"]["nocache"];
@@ -17423,7 +17426,7 @@ export interface operations {
                 send?: components["parameters"]["send"];
                 /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto conservatively selects streaming for large immutable SELECT scans and eligible uncached OPTIONAL counts, and eager execution otherwise. The default remains eager. Explicit streaming SELECT does not support Thrift results, and auto runs those requests eagerly. Deadlines include blocked response writes; late failures abort the body. */
                 execution?: components["parameters"]["execution"];
-                /** @description `io` adds an `io` object to the metadata of the `application/x-sparkles+json` result, with what the query read from the index and vocabulary files and the time spent doing so. The counters are process-wide, so concurrent queries add to them. */
+                /** @description `io` adds an `io` object to the metadata of the `application/x-sparkles+json` result, with what the query read from the index and vocabulary files and the time spent doing so. The counters are process-wide, so concurrent queries add to them. Overlapping profiles share at most 65,536 first-admitted pages; pagesTruncated reports cap omissions, not completeness. Page counts describe the retained sample, and broughtIn is its diagnostic nonnegative resident-count delta rather than physical I/O. */
                 profile?: components["parameters"]["profile"];
                 /** @description Bypass the query result cache. */
                 nocache?: components["parameters"]["nocache"];
@@ -17492,7 +17495,7 @@ export interface operations {
                 send?: components["parameters"]["send"];
                 /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto conservatively selects streaming for large immutable SELECT scans and eligible uncached OPTIONAL counts, and eager execution otherwise. The default remains eager. Explicit streaming SELECT does not support Thrift results, and auto runs those requests eagerly. Deadlines include blocked response writes; late failures abort the body. */
                 execution?: components["parameters"]["execution"];
-                /** @description `io` adds an `io` object to the metadata of the `application/x-sparkles+json` result, with what the query read from the index and vocabulary files and the time spent doing so. The counters are process-wide, so concurrent queries add to them. */
+                /** @description `io` adds an `io` object to the metadata of the `application/x-sparkles+json` result, with what the query read from the index and vocabulary files and the time spent doing so. The counters are process-wide, so concurrent queries add to them. Overlapping profiles share at most 65,536 first-admitted pages; pagesTruncated reports cap omissions, not completeness. Page counts describe the retained sample, and broughtIn is its diagnostic nonnegative resident-count delta rather than physical I/O. */
                 profile?: components["parameters"]["profile"];
                 /** @description Bypass the query result cache. */
                 nocache?: components["parameters"]["nocache"];

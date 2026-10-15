@@ -428,14 +428,15 @@ Phases 1 and 2 are built. Phase 3 and Phase 4 are not.
 ### What was built
 
 Phase 1 adds per-process I/O counters in `ioacct.rs`, a profile mode that times the
-phases of one query and counts the pages the query brought in, and the request
+phases of one query and records a page-residency sample, and the request
 parameter `profile=io`, which puts the profile in the native JSON metadata. Three
 process-wide metrics (`sparkles_index_columns_decoded_total`,
 `sparkles_index_readahead_bytes_total` and `sparkles_vocab_groups_read_total`) and an
 `io` object in the metrics JSON expose the counters. The metrics are per process and
 not per dataset, which deviates from §4.3, because datasets can share one block cache.
-The profile counts against a snapshot taken at the start of the query, so it is exact
-only when no other query runs on the process.
+Counter deltas use a snapshot taken at the start of the query and can be attributed to
+one query only when no other query runs on the process. Page observations remain a
+best-effort sample.
 
 Phase 2 adds the following read optimizations. Four `Optimizations` flags control
 constant prefetch, first-scan prefetch, term prefetch and parallel decode. They are on
@@ -518,6 +519,23 @@ start and last drop transitions and verify initialization ordering, preservation
 new epoch's observations and preservation while another profile remains alive. The
 read path still checks an atomic flag without acquiring this lock when profiling is
 disabled. These correctness checks do not establish the counter-cost performance gate.
+
+The shared profiling epoch now retains at most 65,536 distinct file, mapping and page
+entries, keeping the first pages observed. Duplicate observations do not consume another entry.
+`pagesTruncated` records an actual omission from this inventory or the per-range cap
+and remains set across overlapping profiles until the epoch resets. A false flag does
+not promise complete coverage. Process snapshots omit it. The page snapshot and flag
+are read under the same state lock, and report scratch storage is bounded by the sample.
+The inventory and existing 512-event log add bounded shared allocation outside any one
+query's grant. No exact RSS or counter-cost result is claimed.
+
+All page fields describe the retained sample. The additive touched and before/after
+resident counts are lower bounds on the corresponding full observed-set counts.
+`broughtIn` remains the nonnegative difference of sample resident counts. Eviction means
+it is not a lower bound on the full-set delta or a physical-I/O measure. Isolated guards
+cover 65,537 small observations, exact saturation, duplicate-only touches, multiple
+mappings and files, clipped and partial ranges, shared overlapping quotas and fresh
+epoch reset. The original lifecycle ordering tests remain in place.
 
 ### Phase 1 breakdown
 

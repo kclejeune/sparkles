@@ -6860,6 +6860,7 @@ type IoProfile = {
   majorFaults?: number; minorFaults?: number;
   pages?: Record<string, { touched: number; residentBefore: number;
                            residentAfter: number; broughtIn: number }>;
+  pagesTruncated?: boolean;
   events?: { atUs: number; file: string; what: string; bytes: number }[];
 };
 ```
@@ -6872,8 +6873,21 @@ in key lookups, which resolve the constants of the query. `vocabRead` is the tim
 terms by id. `indexDecode` is the time decompressing index columns, and `indexWait` is the
 time to read their pages into memory before decoding. The times are summed over threads.
 `pages` comes from `mincore(2)` on the pages the query asked for or read, and `events`
-lists the first requests in order. Profiling slows the query a little. The same counters
-are in `/$/metrics` as `sparkles_index_columns_decoded_total`,
+lists the first 512 requests in order. Overlapping profiles share one epoch inventory
+of at most 65,536 distinct file, mapping and page entries. It retains the first admitted
+pages and bounds report scratch storage by that sample. `pagesTruncated` is true when
+an inventory or range cap omitted pages. It is false when no cap omission was recorded,
+which does not guarantee complete coverage. Process counter snapshots omit the flag.
+
+All `pages` fields describe the retained best-effort sample. `touched`, `residentBefore`
+and `residentAfter` are additive lower bounds on those counts for the full observed set.
+`broughtIn` is `max(residentAfter - residentBefore, 0)` for the sample. It is neither a
+lower bound on the full-set delta nor a physical-I/O count, especially when pages are
+evicted. Platforms without mapped page observations report a false truncation flag and
+no page entries. The bounded shared inventory and event log add memory while profiles
+are active, outside any one query's grant. Their allocation size depends on the allocator.
+Profiling adds observation work, whose corrected-source cost remains to be measured.
+The same counters are in `/$/metrics` as `sparkles_index_columns_decoded_total`,
 `sparkles_index_readahead_bytes_total` and `sparkles_vocab_groups_read_total`.
 
 ## Explain
