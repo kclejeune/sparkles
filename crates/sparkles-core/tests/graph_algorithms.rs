@@ -368,6 +368,133 @@ fn directions_and_weights() {
     assert_eq!(by_node(&r, "d")["a"], "6");
 }
 
+fn weighted_rank_reference(direction: &str, weights: [f32; 2]) -> Vec<f64> {
+    use sparkles_core::algo::{Aggregate, Control, Graph, Par, RawEdges, pagerank};
+    let (mut src, mut dst, mut w) = (vec![0, 0], vec![1, 2], weights.to_vec());
+    if direction == "backward" {
+        std::mem::swap(&mut src, &mut dst);
+    } else if direction == "undirected" {
+        src.extend([1, 2]);
+        dst.extend([0, 0]);
+        w.extend(weights);
+    }
+    let ctl = Control::unlimited();
+    let g = Graph::build(
+        RawEdges {
+            nodes: vec![0, 1, 2],
+            src,
+            dst,
+            w: Some(w),
+            symmetric: direction == "undirected",
+        },
+        Aggregate::None,
+        &Par::single(),
+        &ctl,
+    )
+    .unwrap();
+    pagerank::run(
+        &g,
+        &pagerank::Params {
+            max_iterations: 100,
+            ..Default::default()
+        },
+        &Par::single(),
+        &ctl,
+    )
+    .unwrap()
+    .score
+}
+
+fn assert_weighted_ranks(s: &Store, q: &str, direction: &str, weights: [f32; 2]) {
+    let actual = by_node(&rows(s, q), "r");
+    let reference = weighted_rank_reference(direction, weights);
+    assert_eq!(actual.len(), 3);
+    for (i, n) in ["a", "b", "c"].into_iter().enumerate() {
+        let score: f64 = actual[n].parse().unwrap();
+        assert!(
+            (score - reference[i]).abs() < 1e-12,
+            "{q}: {n}: {score} != {}",
+            reference[i]
+        );
+    }
+}
+
+#[test]
+fn unit_sum_pagerank_matches_explicit_weighted_reference() {
+    let s = store_of("ex:a ex:p ex:b ; ex:q ex:b ; ex:p ex:c .");
+    for direction in ["forward", "backward", "undirected"] {
+        let q = format!(
+            "SELECT ?n ?r WHERE {{ SERVICE algo:pageRank {{ [] algo:predicate ex:p, ex:q ; \
+             algo:aggregate algo:sum ; algo:direction algo:{direction} ; algo:maxIterations 100 ; \
+             algo:node ?n ; algo:score ?r }} }}"
+        );
+        assert_weighted_ranks(&s, &q, direction, [2.0, 1.0]);
+    }
+}
+
+#[test]
+fn aggregation_modes_preserve_graph_union_and_explicit_weights() {
+    let s = Store::in_memory(StoreOptions::default());
+    s.load(&[Source::from_bytes(
+        b"@prefix ex: <http://ex/> .\nex:g1 { ex:a ex:p ex:b, ex:c . }\n\
+          ex:g2 { ex:a ex:p ex:b, ex:c ; ex:q ex:b . }"
+            .to_vec(),
+        RdfFormat::TriG,
+        None,
+    )])
+    .unwrap();
+    for aggregate in ["none", "sum", "max", "count"] {
+        for (dataset, graph, weights) in [
+            (
+                "FROM ex:g1 FROM ex:g2",
+                "",
+                if aggregate == "max" {
+                    [1.0, 1.0]
+                } else {
+                    [2.0, 1.0]
+                },
+            ),
+            ("", "ex:g1", [1.0, 1.0]),
+            (
+                "",
+                "ex:g2",
+                if aggregate == "max" {
+                    [1.0, 1.0]
+                } else {
+                    [2.0, 1.0]
+                },
+            ),
+        ] {
+            let body = format!(
+                "SERVICE algo:pageRank {{ [] algo:predicate ex:p, ex:q ; \
+                algo:aggregate algo:{aggregate} ; algo:maxIterations 100 ; algo:node ?n ; algo:score ?r }}"
+            );
+            let body = if graph.is_empty() {
+                body
+            } else {
+                format!("GRAPH {graph} {{ {body} }}")
+            };
+            let q = format!("SELECT ?n ?r {dataset} WHERE {{ {body} }}");
+            assert_weighted_ranks(&s, &q, "forward", weights);
+        }
+    }
+    let weighted =
+        store_of("ex:a ex:p ex:b {| ex:w 1 |} ; ex:q ex:b {| ex:w 3 |} ; ex:p ex:c {| ex:w 2 |} .");
+    for (aggregate, weights) in [
+        ("none", [4.0, 2.0]),
+        ("sum", [4.0, 2.0]),
+        ("max", [3.0, 2.0]),
+        ("count", [2.0, 1.0]),
+    ] {
+        let q = format!(
+            "SELECT ?n ?r WHERE {{ SERVICE algo:pageRank {{ [] algo:predicate ex:p, ex:q ; \
+             algo:weight ex:w ; algo:aggregate algo:{aggregate} ; algo:maxIterations 100 ; \
+             algo:node ?n ; algo:score ?r }} }}"
+        );
+        assert_weighted_ranks(&weighted, &q, "forward", weights);
+    }
+}
+
 #[test]
 fn write_back_with_sparql_update() {
     let s = store_of(A);

@@ -1632,7 +1632,8 @@ fn build_graph(
             .as_ref()
             .is_some_and(|ps| ps.iter().any(|(_, d)| *d == Some(Dir::Undirected)));
     let m_est = m_est * if both { 2 } else { 1 };
-    ctl.require(Graph::estimate(0, m_est, has_weights))?;
+    let stored_weights = has_weights || matches!(proj.aggregate, Aggregate::Sum | Aggregate::Count);
+    ctl.require(Graph::estimate(0, m_est, stored_weights))?;
     let mut col = Collect {
         ctl,
         src: Vec::new(),

@@ -114,6 +114,7 @@ pub fn clear() {
 #[cfg(test)]
 mod tests {
     use super::super::testutil::*;
+    use super::super::{Aggregate, Control, Par, RawEdges};
     use super::*;
 
     #[test]
@@ -128,6 +129,40 @@ mod tests {
         put("c".into(), g);
         assert!(get("a").is_some());
         assert!(get("b").is_none(), "b was the least recently used");
+
+        // The sole cache test also checks the retained Sum weights and the capacity
+        // reserved for their later transpose, without another global-cache test.
+        clear();
+        let g = Arc::new(
+            Graph::build(
+                RawEdges {
+                    nodes: vec![0, 1, 2],
+                    src: vec![0, 0, 0],
+                    dst: vec![1, 1, 2],
+                    ..Default::default()
+                },
+                Aggregate::Sum,
+                &Par::single(),
+                &Control::unlimited(),
+            )
+            .unwrap(),
+        );
+        // Three ids take 24 bytes; each CSR has four offsets and two weighted edges.
+        assert_eq!(g.out.bytes(), 48);
+        assert_eq!(g.bytes(), 72);
+        set_limit(119);
+        put("sum".into(), g.clone());
+        assert!(get("sum").is_none());
+        assert_eq!(stats(), (0, 0));
+        set_limit(120);
+        put("sum".into(), g);
+        let hit = get("sum").unwrap();
+        assert_eq!(hit.out.row(0), &[1, 2]);
+        assert_eq!(hit.out.wrow(0), Some([2.0, 1.0].as_slice()));
+        assert_eq!(hit.inn().wrow(1), Some([2.0].as_slice()));
+        assert_eq!(hit.inn().wrow(2), Some([1.0].as_slice()));
+        assert_eq!(hit.bytes(), 120);
+        assert_eq!(stats(), (120, 1));
         set_limit(256 << 20);
         clear();
     }

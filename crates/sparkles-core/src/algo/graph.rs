@@ -183,7 +183,7 @@ impl Graph {
             return Err(super::bad("projection", "more than 4 billion nodes"));
         }
         let m = raw.src.len();
-        let weighted = raw.w.is_some() || matches!(agg, Aggregate::Count);
+        let weighted = raw.w.is_some() || matches!(agg, Aggregate::Sum | Aggregate::Count);
         ctl.charge(Graph::estimate(n as u64, m as u64, weighted))?;
         let nodes = &raw.nodes;
         let index = |id: u64| nodes.binary_search(&id).map_or(u32::MAX, |i| i as u32);
@@ -215,12 +215,19 @@ impl Graph {
             let mut count = 0u32;
             let mut sum = 0f64;
             let mut last = u64::MAX;
-            let fin = |out: &mut Vec<(u64, u32)>, k: u64, count: u32, sum: f64| {
+            let fin = |out: &mut Vec<(u64, u32)>, k: u64, count: u32, sum: f64| -> Result<()> {
                 let v = match agg {
                     Aggregate::Count => count as f32,
                     _ => sum as f32,
                 };
+                if agg == Aggregate::Sum && !v.is_finite() {
+                    return Err(super::bad(
+                        "projection",
+                        "summed edge weight is not finite as f32",
+                    ));
+                }
                 out.push((k, v.to_bits()));
+                Ok(())
             };
             for &(k, wb) in &keys {
                 let x = if unweighted_input {
@@ -230,7 +237,7 @@ impl Graph {
                 };
                 if k != last {
                     if last != u64::MAX {
-                        fin(&mut out, last, count, sum);
+                        fin(&mut out, last, count, sum)?;
                     }
                     last = k;
                     count = 0;
@@ -246,7 +253,7 @@ impl Graph {
                 }
             }
             if last != u64::MAX {
-                fin(&mut out, last, count, sum);
+                fin(&mut out, last, count, sum)?;
             }
             keys = out;
         }
@@ -420,6 +427,92 @@ mod tests {
         assert_eq!(mk(Aggregate::Sum).out.w.unwrap(), vec![7.0]);
         assert_eq!(mk(Aggregate::Max).out.w.unwrap(), vec![4.0]);
         assert_eq!(mk(Aggregate::Count).out.w.unwrap(), vec![3.0]);
+    }
+
+    fn unit_parallel() -> RawEdges {
+        RawEdges {
+            nodes: vec![0, 1, 2],
+            src: vec![0, 0, 0],
+            dst: vec![1, 1, 2],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn unit_sum_retains_weights_and_accounts_for_rows() {
+        let g = Graph::build(
+            unit_parallel(),
+            Aggregate::Sum,
+            &Par::single(),
+            &Control::unlimited(),
+        )
+        .unwrap();
+        assert_eq!(g.out.row(0), &[1, 2]);
+        assert_eq!(g.out.wrow(0), Some([2.0, 1.0].as_slice()));
+        // Three ids, four offsets, two neighbours and two retained f32 weights.
+        assert_eq!(g.out.bytes(), 48);
+        assert_eq!(g.bytes(), 72);
+        assert_eq!(g.inn().wrow(1), Some([2.0].as_slice()));
+        assert_eq!(g.inn().wrow(2), Some([1.0].as_slice()));
+        assert_eq!(g.bytes(), 120);
+    }
+
+    #[test]
+    fn unit_sum_reserves_weighted_build_bytes() {
+        let bytes = Graph::estimate(3, 3, true);
+        let too_small = Control::new(Default::default(), None, bytes - 1);
+        assert!(Graph::build(unit_parallel(), Aggregate::Sum, &Par::single(), &too_small).is_err());
+        let exact = Control::new(Default::default(), None, bytes);
+        Graph::build(unit_parallel(), Aggregate::Sum, &Par::single(), &exact).unwrap();
+        assert_eq!(exact.peak(), bytes);
+    }
+
+    #[test]
+    fn unit_aggregation_modes_and_empty_inputs() {
+        for (agg, m, w) in [
+            (Aggregate::None, 3, None),
+            (Aggregate::Max, 2, None),
+            (Aggregate::Count, 2, Some(vec![2.0, 1.0])),
+        ] {
+            let g =
+                Graph::build(unit_parallel(), agg, &Par::single(), &Control::unlimited()).unwrap();
+            assert_eq!(g.m(), m);
+            assert_eq!(g.out.w, w);
+        }
+        for agg in [
+            Aggregate::None,
+            Aggregate::Sum,
+            Aggregate::Max,
+            Aggregate::Count,
+        ] {
+            let g = Graph::build(
+                RawEdges::default(),
+                agg,
+                &Par::single(),
+                &Control::unlimited(),
+            )
+            .unwrap();
+            assert_eq!(g.out.off, vec![0]);
+            assert!(g.out.adj.is_empty());
+            assert_eq!(
+                g.weighted(),
+                matches!(agg, Aggregate::Sum | Aggregate::Count)
+            );
+        }
+    }
+
+    #[test]
+    fn sum_refuses_overflow_in_stored_weights() {
+        let raw = RawEdges {
+            nodes: vec![0, 1],
+            src: vec![0, 0],
+            dst: vec![1, 1],
+            w: Some(vec![f32::MAX, f32::MAX]),
+            ..Default::default()
+        };
+        let e =
+            Graph::build(raw, Aggregate::Sum, &Par::single(), &Control::unlimited()).unwrap_err();
+        assert!(matches!(e, crate::Error::Invalid(_)), "{e}");
     }
 
     #[test]

@@ -515,7 +515,7 @@ stays current. It is left out of this spec.
 **Delivered** on 2026-10-13, as Phases 1 and 2 and the embeddings of Phase 3, with the
 gaps listed under "Not built".
 
-The counter confinement repair has targeted write-back regression coverage. The
+The counter confinement and unit-weight sum repairs have targeted regression coverage. The
 remaining findings from the resumed review and the lane's integration and acceptance
 gates are still pending.
 
@@ -542,6 +542,10 @@ gates are still pending.
   evicts the least recently used. A write to the dataset changes the key, so the next
   call rebuilds. Patching a projection with a commit stays the work of F13, as
   question 4 of §11 decided.
+  Sum aggregation retains multiplicity weights even without an explicit weight
+  predicate. Each resulting edge uses one additional `f32`, including its reverse
+  entry when built. Build reservations and cache accounting include those weights,
+  and a sum that is not finite in the stored `f32` representation is refused.
 * **Named projections.** `algo/catalog.rs` keeps `<db>/algo.json` as
   `{"format": 1, "projections": {name: {revision, updated, author?, definition}}}`,
   written the way `queries.json` is, with a revision for `If-Match`. A file that cannot

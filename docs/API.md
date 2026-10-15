@@ -5211,7 +5211,7 @@ call starts. It holds what the caller may read.
 | `algo:nodeClass` | an IRI, repeatable | any node | Keeps the nodes with that `rdf:type`. A node of the class without edges is a node of the projection. |
 | `algo:weight` | an IRI | none | The property of an edge's RDF 1.2 reifier that holds its weight. |
 | `algo:defaultWeight` | a non-negative number | 1 | The weight of an edge without one. |
-| `algo:aggregate` | `none`, `sum`, `max` or `count` | `none` | How several edges between the same nodes combine. `none` keeps them apart and `count` makes one edge whose weight is their number. |
+| `algo:aggregate` | `none`, `sum`, `max` or `count` | `none` | How several edges between the same nodes combine. `none` keeps them apart, `sum` adds their weights, `max` takes the largest and `count` uses their number. In an unweighted projection, each edge contributes one, so `sum` retains the multiplicity as a weight. |
 | `algo:projection` | a string | none | The name of a [stored projection](#named-projections). It cannot be combined with the parameters above. |
 
 A block can also hold a nested pattern whose solutions are the edges, with
