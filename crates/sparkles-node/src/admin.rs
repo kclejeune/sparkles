@@ -2,6 +2,10 @@
 use super::*;
 use serde::Serialize;
 use sparkles::history::{At, SnapshotOptions};
+#[cfg(feature = "failpoints")]
+mod algo_stats_probe;
+#[cfg(test)]
+mod algo_stats_tests;
 fn value<T: Serialize>(v: T) -> sparkles::Result<Value> {
     serde_json::to_value(v).map_err(|e| EngineError::invalid(e.to_string()))
 }
@@ -559,10 +563,21 @@ fn run_admin(
             a["summary"].as_bool().unwrap_or(false),
         )?),
         "algo.stats" => {
-            let text = ds.algorithms().stats(
+            #[cfg(feature = "failpoints")]
+            let probe = algo_stats_probe::Probe::install(ctl)?;
+            let result = ds.algorithms().stats(
                 &sparkles::sparql::algorun::AlgoRequest::from_json(a["request"].clone())?,
-                &sparkles::sparql::QueryOptions::default(),
-            )?;
+                &sparkles::sparql::QueryOptions {
+                    cancel: Some(ctl.cancel.flag()),
+                    deadline: ctl.deadline,
+                    ..Default::default()
+                },
+            );
+            #[cfg(feature = "failpoints")]
+            if let Some(probe) = probe {
+                probe.finish(&result)?;
+            }
+            let text = result?;
             serde_json::from_str::<Value>(&text).map_err(|e| EngineError::invalid(e.to_string()))?
         }
         "algo.runWrite" => value(ds.algorithms().run_write(

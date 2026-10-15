@@ -32,6 +32,7 @@ uuid = { version = "1", features = ["v4"] }
 napi-build = "2"
 
 [features]
+failpoints = ["sparkles/failpoints"]
 default = ["reasoning", "shacl", "shex", "text", "geo", "backup", "graphql", "mimalloc"]
 reasoning = ["sparkles/reasoning", "dep:sparkles-reasoner"]
 shacl = ["sparkles/shacl", "dep:sparkles-shacl"]

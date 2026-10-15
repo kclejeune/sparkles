@@ -24,9 +24,53 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { spawn } from 'node:child_process';
 import { QueryEngine } from '@comunica/query-sparql-rdfjs';
 import { Dataset, Catalog, Repository, factory, ConflictError } from '../dist/index.js';
 const temp = () => mkdtemp(join(tmpdir(), 'sparkles-node-admin-'));
+for (const mode of ['compute-cancel', 'compute-timeout', 'slot-cancel', 'slot-timeout']) {
+  test(
+    `algorithm stats controls reach native ${mode}`,
+    {
+      skip: process.env.SPARKLES_TEST_ALGO_STATS_ENABLE !== '1',
+      timeout: 15000,
+    },
+    async () => {
+      const dir = await temp();
+      const child = spawn(
+        process.execPath,
+        [new URL('./fixtures/algo-stats-child.mjs', import.meta.url).pathname, mode, dir],
+        {
+          env: { ...process.env, SPARKLES_TEST_ALGO_STATS_DIR: dir },
+          stdio: ['ignore', 'pipe', 'pipe'],
+        },
+      );
+      let output = '';
+      child.stdout.on('data', (chunk) => {
+        output += chunk;
+      });
+      child.stderr.on('data', (chunk) => {
+        output += chunk;
+      });
+      const timer = setTimeout(() => child.kill('SIGKILL'), 12000);
+      try {
+        const code = await new Promise((resolve, reject) => {
+          child.once('error', reject);
+          child.once('close', resolve);
+        });
+        assert.equal(code, 0, output);
+        console.log(output.trim());
+      } finally {
+        clearTimeout(timer);
+        if (child.exitCode === null && child.signalCode === null) {
+          child.kill('SIGKILL');
+          await new Promise((resolve) => child.once('close', resolve));
+        }
+        await rm(dir, { recursive: true, force: true });
+      }
+    },
+  );
+}
 test('catalog identities, alias transaction ownership and dataset recreation', async (t) => {
   const cat = t.resource(Catalog.memory());
   const ds = t.resource(await cat.create('one', { kind: 'mem' }));
