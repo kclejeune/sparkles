@@ -32,7 +32,7 @@ pub const BRANCH_FILE: &str = "branch.json";
 pub const MERGES_FILE: &str = "merges.bin";
 
 /// Configuration files a new branch copies from its upstream.
-const COPIED_FILES: [&str; 14] = [
+const COPIED_FILES: [&str; 15] = [
     "reasoning.json",
     "rdfs.json",
     "rdfs-schema.nt",
@@ -41,6 +41,7 @@ const COPIED_FILES: [&str; 14] = [
     crate::guard::config::SHEX_SCHEMA_SHEXC_FILE,
     crate::guard::config::SHEX_SCHEMA_SHEXJ_FILE,
     "text.json",
+    crate::algo::catalog::FILE,
     crate::geo::CONFIG_FILE,
     crate::vector::config::CONFIG_FILE,
     compaction::COMPACTION_FILE,

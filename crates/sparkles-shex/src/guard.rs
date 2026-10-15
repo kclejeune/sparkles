@@ -548,8 +548,10 @@ impl ShexGuard {
             data_graph: graphs.data_graph,
             extra_graphs: graphs.extra_graphs,
             exclude_graphs: graphs.exclude_graphs,
-            timeout: Some(deadline.saturating_duration_since(Instant::now())),
+            timeout: None,
+            deadline: o.deadline.into_iter().chain([deadline]).min(),
             cancel: o.cancel.clone(),
+            cancellation: o.cancellation.clone(),
             only_nonconformant: true,
             // a guard never runs SERVICE
             selector_query: Some(sparkles_core::sparql::QueryOptions {

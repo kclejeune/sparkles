@@ -344,11 +344,12 @@ pub fn key(n: &Node, ctx: &Ctx) -> Option<CacheKey> {
     Some(CacheKey { key, anon })
 }
 
-fn raw_key(n: &Node, ctx: &Ctx) -> Option<String> {
-    let mut s = String::with_capacity(256);
+/// What the data a query reads is a function of: the generation instance and the commit
+/// (a compaction makes a new instance; a past state shares its generation's instance),
+/// the graphs of the request, and the mask of a view that hides triples.
+pub(super) fn view_key(ctx: &Ctx) -> String {
+    let mut s = String::with_capacity(64);
     let ds = &ctx.dataset;
-    // the data is a function of the generation instance and the commit (a compaction
-    // makes a new instance; a past state shares its generation's instance)
     let _ = write!(
         s,
         "g{}|c{}|{:?}|{:?}|{}|{}|",
@@ -364,6 +365,12 @@ fn raw_key(n: &Node, ctx: &Ctx) -> Option<String> {
     if let Some(m) = &ctx.snap.mask {
         let _ = write!(s, "m{}|", m.key);
     }
+    s
+}
+
+fn raw_key(n: &Node, ctx: &Ctx) -> Option<String> {
+    let mut s = view_key(ctx);
+    s.reserve(256);
     write_node(n, ctx, &mut s).then_some(s)
 }
 
@@ -468,6 +475,11 @@ fn write_node(n: &Node, ctx: &Ctx, s: &mut String) -> bool {
         }
         // the change log grows and retention trims it: not cached
         Kind::HistoryChanges(_) => false,
+        Kind::AlgoCall(spec) => {
+            // every parameter is in the spec, ids and variables included
+            let _ = write!(s, "{spec:?}");
+            true
+        }
         Kind::PathSearch(spec) => {
             // every parameter is in the spec, ids and variables included
             let _ = write!(s, "{spec:?}");

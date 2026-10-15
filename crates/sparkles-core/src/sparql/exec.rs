@@ -392,7 +392,8 @@ pub fn execute(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
     ctx.check()
         .inspect_err(|_| fail(ctx, n, Instant::now(), Vec::new()))?;
     let results = &ctx.snap.results;
-    let cacheable = ctx.use_cache
+    let cacheable = ctx.snap.cacheable
+        && ctx.use_cache
         && results.enabled()
         && !matches!(
             n.kind,
@@ -937,6 +938,21 @@ fn run_node(
                 None => None,
             };
             let (t, c) = super::pathsearch::run(ctx, spec, input, edges, &n.vars)?;
+            counters = Some(c);
+            t
+        }
+        Kind::AlgoCall(spec) => {
+            // the input when a source is a variable, then the nested pattern of edges
+            let reads_input = n.children.len() > spec.proj.pattern.is_some() as usize;
+            let input = match reads_input {
+                false => None,
+                true => Some(child(0, infos)?),
+            };
+            let edges = match spec.proj.pattern {
+                Some(_) => Some(child(n.children.len() - 1, infos)?),
+                None => None,
+            };
+            let (t, c) = super::algosvc::run(ctx, spec, input, edges, &n.vars)?;
             counters = Some(c);
             t
         }

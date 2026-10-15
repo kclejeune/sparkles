@@ -621,3 +621,126 @@ fn sparkles_graphql_request(q: &str) -> sparkles::handles::graphql::Request {
         variables: Default::default(),
     }
 }
+
+#[test]
+fn algorithms_and_named_projections() {
+    use sparkles::algo::catalog::{PredicateDef, ProjectionDef};
+    use sparkles::sparql::QueryOptions;
+    use sparkles::sparql::algorun::{AlgoRequest, ProjectionRef};
+    const ALGO: &str = "urn:x-sparkles:algo#";
+    let (dir, ds) = persistent();
+    ds.update(
+        "INSERT DATA { <http://ex.org/b> <http://ex.org/p> <http://ex.org/a> . \
+         <http://ex.org/a> <http://ex.org/p> <http://ex.org/b> }",
+    )
+    .unwrap();
+    let def = ProjectionDef {
+        predicates: Some(vec![PredicateDef::new("http://ex.org/p", None)]),
+        ..Default::default()
+    };
+    let (st, created) = ds
+        .algorithms()
+        .projections()
+        .put("p", def.clone(), None, None)
+        .unwrap();
+    assert!(created && st.revision == 1);
+    // the definition survives a reopen
+    drop(ds);
+    let ds = Dataset::open(dir.path().join("db")).unwrap();
+    assert_eq!(
+        ds.algorithms().projections().get("p").unwrap().definition,
+        def
+    );
+    // a SPARQL query and an update find it
+    let wcc = format!(
+        "SERVICE <{ALGO}wcc> {{ [] <{ALGO}projection> \"p\" ; <{ALGO}node> ?n ; <{ALGO}component> ?c }}"
+    );
+    let r = ds
+        .query(&format!("SELECT ?n ?c WHERE {{ {wcc} }}"))
+        .unwrap();
+    assert_eq!(r.rows().len(), 2);
+    ds.update(&format!(
+        "INSERT {{ <urn:out> <urn:n> ?n }} WHERE {{ {wcc} }}"
+    ))
+    .unwrap();
+    // a request
+    let req = AlgoRequest {
+        algorithm: "pageRank".into(),
+        projection: Some(ProjectionRef::Named("p".into())),
+        params: Default::default(),
+        write: None,
+    };
+    let r = ds.algorithms().run(&req, &QueryOptions::default()).unwrap();
+    assert_eq!(r.rows().len(), 2);
+    let stats = ds
+        .algorithms()
+        .stats(&req, &QueryOptions::default())
+        .unwrap();
+    assert!(stats.contains("\"nodes\":2"), "{stats}");
+    assert!(ds.algorithms().projections().delete("p", None).unwrap());
+    assert!(ds.algorithms().projections().list().is_empty());
+}
+
+#[test]
+fn algorithms_graphalytics_clustering_request() {
+    use sparkles::sparql::{QueryOptions, algorun::AlgoRequest};
+    let (_dir, ds) = persistent();
+    ds.update("INSERT DATA { <urn:a> <urn:p> <urn:b>, <urn:c> . <urn:b> <urn:p> <urn:c> }")
+        .unwrap();
+    let req = AlgoRequest::from_json(serde_json::json!({"algorithm":"clustering","projection":{"predicates":["urn:p"]},"params":{"graphalytics":true}})).unwrap();
+    let result = ds.algorithms().run(&req, &QueryOptions::default()).unwrap();
+    assert_eq!(result.vars, ["node", "coefficient"]);
+    assert_eq!(result.rows().len(), 3);
+    for row in result.rows() {
+        assert!(
+            matches!(&row[1], Some(oxrdf::Term::Literal(l)) if l.value().parse::<f64>().unwrap() == 0.5)
+        );
+    }
+    let stats = ds
+        .algorithms()
+        .stats(&req, &QueryOptions::default())
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&stats).unwrap()["nodes"],
+        3
+    );
+}
+
+fn algorithms_empty_stats(populated: bool) {
+    use sparkles::sparql::{QueryOptions, algorun::AlgoRequest};
+    let ds = Dataset::memory();
+    if populated {
+        ds.update("INSERT DATA { <urn:a> <urn:p> <urn:b> }")
+            .unwrap();
+    }
+    let req = AlgoRequest::from_json(
+        serde_json::json!({"algorithm":"pageRank","projection":{"predicates":["urn:absent"]}}),
+    )
+    .unwrap();
+    let text = ds
+        .algorithms()
+        .stats(&req, &QueryOptions::default())
+        .unwrap();
+    let j: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(j["nodes"], 0);
+    assert_eq!(j["edges"], 0);
+    assert_eq!(j["iterations"], 0);
+    assert_eq!(j["converged"], true);
+    assert!(
+        ds.algorithms()
+            .run(&req, &QueryOptions::default())
+            .unwrap()
+            .rows()
+            .is_empty()
+    );
+}
+
+#[test]
+fn algorithms_stats_on_empty_dataset() {
+    algorithms_empty_stats(false);
+}
+
+#[test]
+fn algorithms_stats_with_absent_predicate() {
+    algorithms_empty_stats(true);
+}

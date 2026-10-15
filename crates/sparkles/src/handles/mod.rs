@@ -22,6 +22,7 @@
 //! # Ok::<_, sparkles::Error>(())
 //! ```
 
+pub mod algorithms;
 #[cfg(feature = "backup")]
 pub mod backups;
 #[cfg(feature = "graphql")]
@@ -34,6 +35,7 @@ pub mod schema;
 pub mod settings;
 pub mod validation;
 
+pub use algorithms::{Algorithms, Projections};
 #[cfg(feature = "backup")]
 pub use backups::Backups;
 #[cfg(feature = "graphql")]

@@ -262,6 +262,10 @@ fn security_follows_the_need() {
         op("/{ds}", "post")["x-sparkles-permission"],
         "read or write, by operation"
     );
+    assert_eq!(
+        op("/$/algo/{ds}/run", "post")["x-sparkles-permission"],
+        "read or write, by operation"
+    );
 }
 
 /// GitHub's anchor of a Markdown heading.

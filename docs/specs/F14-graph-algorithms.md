@@ -1,20 +1,17 @@
 # F14: Graph algorithms
 
-> **Status:** specified
+> **Status:** implemented in part (Phases 1 and 2, and the embeddings of Phase 3)
 >
-> **Phases:** None shipped. Phase 1 is the projection of a graph from predicates, the
-> `SERVICE algo:` calls for PageRank and personalized PageRank, connected and strongly
-> connected components, label propagation, triangle counts and clustering, k-core, BFS
-> and single-source shortest paths, results streamed as rows, and the LDBC Graphalytics
-> harness. Phase 2 adds betweenness, Louvain and Leiden with hierarchy levels, node
-> similarity, projections from nested patterns, named projections, write-back as tasks,
-> the CLI, HTTP, MCP and binding surfaces. Phase 3 adds FastRP and node2vec embeddings
-> written into F04 vector indexes, and openCypher procedures through F01.
+> **Phases:** Phases 1 and 2 shipped, apart from the LDBC Graphalytics harness, the web
+> UI and the JVM binding. Of Phase 3, `algo:fastRP` and `algo:node2vec` shipped, and
+> their vectors reach F04 indexes through SPARQL Update or a write-back run. The
+> openCypher procedures wait for the Cypher frontend of [F01](F01-cypher.md), which is
+> not built.
 >
-> **User docs:** none, because nothing is built.
+> **User docs:** [API: Graph algorithms](../API.md#graph-algorithms) · [Usage: Graph algorithms](../USAGE.md#graph-algorithms) · [Features](../FEATURES.md#search)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
-> the end will record how it lands.
+> the end records how it landed.
 
 This design was written from the public documentation of the Neo4j Graph Data Science
 library (its algorithm pages, graph projections and execution modes), the public
@@ -131,6 +128,13 @@ query's budget) and `algo:limit` (rows).
 `algo:embedding`. A call can also bind `algo:summary` to one JSON literal of statistics
 (iterations run, convergence, node and edge counts, modularity), which with no other
 output variables gives GDS's `stats` mode.
+
+Stats mode emits one row per selected concrete graph, including empty projections and
+empty node, pair or community results. Normal SPARQL joins retain their multiplicity,
+and selecting no named graphs under `GRAPH ?g` produces no stats row. An explicitly
+requested PageRank personalization with no matching node does no ranking work. Its
+summary keeps the projection counts and reports zero iterations and convergence,
+rather than running unpersonalized PageRank.
 
 ### 2.2 Rows and inputs
 
@@ -266,8 +270,10 @@ graphs are one edge.
 
 With `algo:nodeClass`, the class members come from `POS [rdf:type, class]` and edges
 with an end outside them are dropped. With weights, each edge's reifiers are looked up
-by `rdf:reifies` with its triple term, as F07's weighted search does, and the first
-numeric value of the weight property is used. A non-numeric weight fails the call, and a
+by `rdf:reifies` with its triple term, as F07's weighted search does, and the minimum
+visible numeric value of the weight property is used. Only visible resource edges whose
+ends pass the class filter are applicable. An applicable non-numeric weight fails the
+call, while unrelated weights do not affect it. A
 negative weight fails the algorithms that need non-negative weights.
 
 A nested pattern in the block, as in F07's Phase 2, gives edges from any query: its
@@ -301,7 +307,7 @@ definition.
 | `algo:leiden` | undirected | `community`, `level`, `summary` | As Louvain, with Leiden's refinement phase, so every community is connected. `randomness` 0.01 and `seed` for the refinement. `algo:level` binds one row per node and level, from the finest. |
 | `algo:nodeSimilarity` | forward | `node`, `otherNode`, `similarity` | `metric` `jaccard` or `overlap`, `topK` 10 per node, `similarityCutoff` 1e-42, `degreeCutoff` 1. Candidate pairs share a neighbour; pairs are generated per shared neighbour, bounded by `algo:maxPairs`. |
 | `algo:triangleCount` | undirected | `triangles` | Forward algorithm over nodes ordered by degree. |
-| `algo:clustering` | undirected | `coefficient`, `triangles` | Local clustering coefficient. With `graphalytics`, Graphalytics' LCC, which counts directed edges among neighbours. |
+| `algo:clustering` | undirected, or forward with `graphalytics` | `coefficient`, and `triangles` outside Graphalytics mode | Local clustering coefficient. Graphalytics' LCC counts directed edges among neighbours and returns only the coefficient. Explicit projection and predicate directions take precedence. |
 | `algo:kCore` | undirected | `core` | Batagelj and Zaversnik's bucket algorithm, linear in edges. |
 | `algo:bfs` | forward | `depth` | From `algo:source`. Levels expanded in parallel. Unreached nodes are left out, or bound with depth `"inf"` under `graphalytics`. |
 | `algo:sssp` | forward | `distance` | From one `algo:source`, Dijkstra's algorithm with weights, BFS without. |
@@ -321,14 +327,40 @@ returns its result and sets `converged: false` in the summary. It is not an erro
 
 ## 5. Budgets and parallelism
 
-Algorithms run on a pool of `--algo-threads` threads shared by the server, by default
-half the cores, so that a long algorithm leaves the query threads free. A call takes
-`algo:concurrency` threads from it, at most `--algo-max-threads-per-call` (4 by default),
-and waits when the pool is busy, counting the wait against its timeout. The rayon pool
-that the reasoner uses is not shared.
+Algorithm calls share a process-wide budget of `--algo-threads` threads, by default
+half the cores. A call reserves `algo:concurrency` slots, at most
+`--algo-max-threads-per-call` (4 by default), and waits when those slots are busy.
+The wait counts against its timeout and checks cancellation. Admission checks both
+controls before accepting free slots, including after each wake. A one-thread call
+runs on its caller without a Rayon pool and keeps one slot until the call ends.
+A multithreaded call owns a Rayon pool under its reservation, separate from the
+reasoner's pool. If pool construction fails, it runs sequentially while retaining
+that reservation. Returning an error or unwinding releases the reservation.
+
+Native callers can explicitly use `Par::single` or `Par::with_threads` outside this
+admission policy. Production `SERVICE algo:` calls use `Par::acquire`.
 
 Each call checks the query's timeout and cancel flag between iterations and every 64K
-nodes inside one. Memory is charged as §3.2 says. Rows count against the query's row
+nodes inside one. Node2vec also checks at entry, before returning and at most every
+64K operations across its own initialization, shuffle, walk, neighbor and training
+loops. Binary searches count as one operation and take at most the machine word's bit
+width in comparisons. These are work bounds, not a wall-clock preemption guarantee.
+Node2vec reserves its embedding arrays and temporary buffers before allocation, using
+checked capacity arithmetic and fallible allocation. Sampling scratch reserves the
+maximum outgoing degree, and walk scratch reserves `walkLength`, even if one walk uses
+less. Temporary reservations end after
+their buffers are dropped, and the returned embedding remains charged to the call.
+This accounts for Vec capacities on the pinned Rust Global allocator, excluding
+allocator bookkeeping. Incoming graph storage is reserved separately for each directed-graph caller, even
+when another call has already built it. Only its initializer reserves construction
+cursor offsets. Waiting and construction check cancellation and deadlines, and a failed
+initialization publishes no partial rows. Symmetric graphs reuse outgoing rows.
+PageRank reserves five f64 arrays, a temporary personalized-source copy and one reusable
+fixed-block reduction buffer before allocation. Temporary owners release reservations
+after dropping their buffers. Returned scores remain charged to the call. Allocator and
+Rayon bookkeeping, small summary metadata and other algorithms' auxiliary workspaces
+are outside these vector bounds.
+Memory is charged as §3.2 says. Rows count against the query's row
 budget. Betweenness without sampling on more than `--algo-exact-betweenness-max`
 nodes (100,000) is refused with a message that suggests `algo:samples`. Node similarity
 stops with an error when its candidate pairs pass `algo:maxPairs` (10 million).
@@ -515,4 +547,219 @@ stays current. It is left out of this spec.
 
 ## Outcome
 
-Not built. See [ROADMAP](../ROADMAP.md) item 8.
+Node similarity now reuses at most one logical workspace per admitted thread. Fixed
+counters, touched IDs and a bounded topK heap remain charged while live, and duplicate
+outgoing rows use a temporary owned CSR with the existing controlled transpose.
+Candidate limits count distinct ordered nonself pairs before degree, score and topK
+filters. Worker outputs retain their spare capacities through checked growth, and the
+final ordered merge admits both old outputs and its exact replacement before copying.
+Cancellation and deadlines are polled inside duplicate scans, neighbour intersections,
+selection and output migration. Temporary owners release on failure or unwind, while
+returned pair storage remains charged to the call.
+
+More admitted workspaces reserve more scratch, including in sequential pool fallback.
+Heap selection and scheduling change access costs without establishing a speed result.
+The bounds describe requested Vec capacities, excluding allocator and Rayon bookkeeping.
+Broader algorithm and acceptance work remains pending.
+
+Projection collection now streams snapshot rows and resolves only applicable visible
+edge weights through indexed reifier lookups. Class members, predicate directions and
+nested-pattern distinct pairs hold admitted capacity owners. Key reconstruction,
+raw edges, padded sort keys, aggregation and outgoing CSR storage remain charged while
+they overlap. Native consumed inputs enter the same builder by actual capacity, and
+SERVICE transfers its existing owners under one Control. Node deduplication retains
+its allocation and charge, and a successful build retains exactly its base capacities.
+The incoming-CSR reservation remains independent.
+
+The allocation bounds use the pinned Rust Global Vec and hashbrown 0.16.1 requested
+layouts. They exclude allocator metadata, size classes, process RSS and Rayon scheduler
+storage. Edge-driven weight reads replace the earlier global pass with per-edge index
+and vocabulary lookups. This changes locality and lookup cost without establishing a
+speed improvement. Other algorithm workspace gaps and acceptance measurements remain
+separate.
+
+Node2vec now checks bounded work inside its own loops and admits every owned buffer's
+fixed capacity before allocation. Controlled cancellation and low-memory tests cover
+inner walks and training, and retained seeded fixtures preserve the earlier f32 bits.
+Overflow and allocation failures release temporary reservations. This repair does not
+establish a performance result. Incoming-CSR and PageRank vector-workspace accounting
+have separate targeted repairs. Other auxiliary-workspace gaps remain.
+
+**Delivered** on 2026-10-13, as Phases 1 and 2 and the embeddings of Phase 3, with the
+gaps listed under "Not built".
+
+The counter confinement, unit-weight sum, Graphalytics clustering, empty-result
+statistics, transaction projection-cache and operation-control repairs have targeted
+regression coverage. The
+remaining findings from the resumed review and the lane's integration and acceptance
+gates are still pending.
+
+* **Library.** `crates/sparkles-core/src/algo/` holds the algorithms on compressed
+  sparse rows. `graph.rs` builds the projection, and the modules `pagerank`,
+  `components` (weakly connected components by an atomic union-find and strongly
+  connected components by an iterative Tarjan), `labelprop`, `kcore`, `triangles`,
+  `traverse` (breadth-first search and single-source shortest paths), `betweenness`
+  (Brandes, sampled when asked), `community` (Louvain, and Leiden with refinement and a
+  connectivity split at each level), `similarity`, `fastrp` and `node2vec` hold one
+  algorithm each. `pool.rs` holds the control handle (cancel, deadline, memory budget)
+  and the thread pools. Every algorithm takes a seed where it needs one, so a run is
+  repeatable, and tests check that PageRank and FastRP give the same result at any thread
+  count. Production admission includes one-thread calls, which keep one process slot
+  while running on the caller without creating a Rayon pool. Cancellation and deadline
+  checks apply before free-slot acceptance and after waking. A reservation guard exists
+  before pool construction, so unwinding releases slots and sequential construction
+  fallback retains its slots until the call ends. Pool regression fixtures isolate
+  configuration in subprocesses and prove waiting, control errors and release using
+  boundary handshakes.
+* **SPARQL.** `sparql/algosvc.rs` plans `SERVICE algo:<name>` as an `AlgoCall` leaf, as
+  `path:search` is planned, so the outbound policy and `--no-service` never apply to it.
+  A variable `algo:source` makes the leaf read the rest of its join group, and `GRAPH
+  ?g` runs the call once for each named graph. The projection is read from the
+  permutations of the query's snapshot, so the caller's graph view and masked triples
+  decide which edges exist. EXPLAIN shows the counters `nodes`, `edges`, `projectionMs`,
+  `runMs`, `peakBytes` and `cachedProjections`.
+* **Projection cache.** `algo/cache.rs` keeps built projections under a byte budget
+  (`--algo-cache-mb`), keyed by the query's view and the projection's definition, and
+  evicts the least recently used. A committed write changes the key, so the next
+  call rebuilds. Transaction views explicitly disable lookup and insertion, including
+  through masked and derived snapshots, so pending changes neither reuse committed
+  projections nor enter their cache. Committed views retain projection reuse when
+  the query result cache is disabled. Patching a projection with a commit stays the work of F13, as
+  question 4 of §11 decided.
+  Sum aggregation retains multiplicity weights even without an explicit weight
+  predicate. Each resulting edge uses one additional `f32`, including its reverse
+  entry when built. Build reservations and cache accounting include those weights,
+  and a sum that is not finite in the stored `f32` representation is refused.
+  Cache admission reserves immutable base storage and one future incoming CSR, whether
+  incoming rows exist already or not. Each caller charges base storage separately from
+  its incoming handle, avoiding a changing resident-byte snapshot during initialization.
+  Native callers migrate from `g.inn()` to `let incoming = g.inn(ctl)?` and borrow
+  `&*incoming` until all workers using it join. The handle owns the caller's reservation;
+  the Graph owns the retained rows. Native prebuilt base graphs remain caller-owned.
+  Similarity uses the same controlled transpose construction for deduplicated rows.
+* **Named projections.** `algo/catalog.rs` keeps `<db>/algo.json` as
+  `{"format": 1, "projections": {name: {revision, updated, author?, definition}}}`,
+  written the way `queries.json` is, with a revision for `If-Match`. A file that cannot
+  be read leaves the catalog empty and read-only, so it is never overwritten. The file
+  is part of backups, clones and branch copies. `algo:projection "name"` is resolved
+  when the query is planned, also inside SPARQL Update, so a query at an older commit
+  uses today's definitions.
+* **Runs and write-back.** `sparql/algorun.rs` turns a JSON request into the query it
+  stands for and runs the batched write-back. The first commit of a run clears the graph
+  in replace mode and writes the run record. Every commit holds whole nodes, updates the
+  record's `spk:batchesWritten` and `spk:triplesWritten`, and carries the message
+  `algo run <uuid> batch i/n`. Counter replacement is confined to the requested
+  destination graph. Values for the same run in other graphs are preserved, so
+  replacing the counters needs write grants only for the destination graph.
+  The last commit adds `prov:endedAtTime` and
+  `spk:status`. Task and query cancellation sources share checks in computation, result
+  preparation and writer admission. A relative timeout starts at operation entry and is
+  intersected with the absolute and task deadlines once, without phase renewal.
+  Built-in SHACL and ShEx guards carry those controls through validation and SPARQL
+  evaluation. History SERVICE lookups carry composed cancellation and the same absolute
+  deadline into the native change-log scan checks. Native history queries accept that
+  composition alongside their existing single flag. These checks do not preempt
+  history indexing, reads or flushing. Custom guards remain responsible for checking
+  the full `WriteOptions`.
+  A partial cancelled or failed run attempts one optional status commit with no writer
+  wait and a separate 100 ms cooperative cleanup budget. The budget cannot interrupt a
+  durability call, and recording failure never replaces the original error. A control
+  error observed after the final batch preserves its durable complete record. A cancel
+  can still race the final check. In merge mode the old values of the written predicates are deleted inside the
+  batch's own commit. Louvain and Leiden communities are written as resources
+  `urn:x-sparkles:algo:{run}:{level}:{id}` with a level and a `skos:broader` link.
+  The writer of C23 does not exist yet, so the loop is built on the store's
+  `try_write_with`, and a later C23 writer can take its place.
+* **Surfaces.** `sparkles::Dataset::algorithms()` holds `run`, `stats`, `run_write` and
+  the projections. `POST /$/algo/{ds}/run` runs a request, as rows or as a cancellable
+  task of kind `algo-run`. Body-aware admission parses once under the existing
+  admin-body and decompressed-size caps, then checks Read through Query for rows or
+  summaries and Write through Update for write-back before dataset lookup or restore
+  disclosure. Query rate and concurrency limits cover computation and the body,
+  including blocking and streaming work after disconnect. Query and Update HTTP
+  permits also cover admitted error bodies, including when only the raw body remains
+  with a client. Update HTTP admission
+  covers the `202` body; background work uses the existing task queue and algorithm
+  thread admission without retaining the HTTP permit. The queue defaults to four
+  running tasks and prechecks 1,000 waiting tasks. Per-dataset active-task checks are
+  not a new atomic reservation. `/$/algo/{ds}/projections[/{name}]` manages projections
+  with `ETag` and `If-Match`. `sparkles algo run` and `sparkles algo projections` work
+  on a database directory. The MCP tool `graph_algorithm` is read-only and returns at
+  most 100 rows with the run's summary. The Python and Node.js bindings have the same
+  `algorithms` handle. The server flags are `--algo-threads`,
+  `--algo-max-threads-per-call`, `--algo-cache-mb` and `--algo-exact-betweenness-max`.
+  The OpenAPI description, `docs/openapi.json` and the generated TypeScript types
+  describe the routes.
+* **Tests.** The acceptance examples A1 to A14 run as tests: `tests/graph_algorithms.rs`
+  for the queries and the budgets, `tests/graph_algorithm_runs.rs` for write-back, and
+  the unit tests of each module, which compare PageRank with dense iteration,
+  betweenness with counting shortest paths, components with repeated search, triangles
+  with a triple loop, k-core with repeated peeling and similarity with set operations.
+  A9 holds with seed 1 (modularity at least 0.41, every community connected, the same
+  result twice), and on random planted-community graphs Leiden's modularity is within
+  0.01 of Louvain's with every community connected. Further tests cancel a running
+  node2vec call by flag and by deadline, run eight calls at once, and check the EXPLAIN
+  counters. The HTTP, MCP, Python and Node.js surfaces have a test each.
+
+**Measurements.** One run on a 20-core Intel host with nothing else running, on a
+synthetic graph of 2,000,000 nodes and 10,000,000 undirected edges (20,000,000 stored
+edges) with a skewed degree distribution
+(`tests/graph_algorithms_scale.rs`, `ALGO_NODES=2000000 ALGO_EDGES=10000000`).
+
+| | 1 thread | 2 | 4 | 8 |
+|---|---|---|---|---|
+| PageRank, 20 iterations | 1343 ms | 792 ms | 431 ms | 326 ms |
+| Weakly connected components | 342 ms | 174 ms | 87 ms | 68 ms |
+| Label propagation | 1478 ms | 884 ms | 399 ms | 258 ms |
+| Triangle count | 1353 ms | 952 ms | 585 ms | 469 ms |
+
+K-core takes 650 ms on one thread. Louvain takes 88 s and Leiden 113 s, both on one
+thread, and reach modularity 0.2345 and 0.2372 on this graph, which has no planted
+structure. Building the projection from edge arrays on 8 threads takes 0.80 s, 25
+million stored edges per second, and the projection takes 107 MiB, 5.6 bytes per stored
+edge. The build rate does not include the scan of the permutations that feeds it, so a
+query's `projectionMs` is higher. These numbers are not from the LDBC SNB SF10 `knows`
+graph or the ten-million-triple benchmark graph that §9 names.
+
+**Deviations.**
+* A1 says `{h}` appears as a third component "with `algo:nodeClass ex:N`". `nodeClass`
+  keeps the nodes of the class, so the result is the single component `{h}`, not three.
+  The test expects that, and the nodes of a class include those without edges.
+* `algo:limit` keeps the best rows by the algorithm's main measure before the call's
+  rows are joined with the rest of the group. Ties go to the lower term id, and BFS and
+  SSSP return the nearest nodes first.
+* `algo:nodeSimilarity` returns each pair in both orders, with the `topK` best partners
+  of each node. A caller who wants one row per pair uses `SELECT DISTINCT` with an
+  ordered filter. A later `algo:distinctPairs` parameter could do it in the leaf.
+* A double result has its four lowest mantissa bits cleared, so that every score is an
+  inline id. A caller who compares two scores for equality across runs gets the same
+  values, and one who compares with a value computed elsewhere should allow a relative
+  difference of 2^-48.
+* The default `algo:predicate` leaves `rdf:type` out, as question 1 of §11 decided, and
+  the API reference says so.
+* The summary is an `rdf:JSON` literal in the `algo:summary` variable.
+* `GRAPH ?g` runs the call once for each named graph, as path search does.
+* Embeddings reach a vector index through `INSERT { ?n ex:emb ?e } WHERE { SERVICE
+  algo:fastRP … }` or through a write-back run. The call has no direct write into an
+  index, because F04 indexes follow the commits either way.
+
+**Risks that stay open.**
+* A replace run commits its first batch before the others, so a reader sees part of the
+  new results until the run ends. `atomic` avoids it at the price of one large commit.
+* Merge mode with hierarchical output leaves the community resources of an earlier run
+  in the graph, because they are not the written predicate of any node.
+* Nothing reports a run as `interrupted` after a restart. Its record stays at the last
+  batch it wrote, without an end time.
+* The default `batchSize` of 100,000 is below the store's bulk threshold of 250,000
+  quads, so a run's commits stay ordinary commits. A larger batch takes the bulk path.
+
+**Not built.**
+* The LDBC Graphalytics harness and its validation runs. X06 specifies the harness and
+  has not built it, and no Graphalytics datasets are in the repository. The
+  `algo:graphalytics` switches on PageRank, BFS, SSSP, clustering and the others do what
+  the benchmark's definitions say, and the tests cover them on small graphs only.
+* The openCypher procedures, which wait for F01.
+* The web UI: colouring a graph view by community, and `algo:` completions in the
+  editor.
+* The JVM binding. `SERVICE algo:…` works through it, but there is no typed handle.
+* The routing of write-back through the writer of C23.

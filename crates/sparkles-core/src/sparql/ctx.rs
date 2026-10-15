@@ -403,6 +403,7 @@ pub struct Ctx {
     literal_bnodes: parking_lot::Mutex<FxHashMap<String, Id>>,
     pub deadline: Option<Instant>,
     pub cancel: Arc<AtomicBool>,
+    pub cancellation: Option<crate::task::Cancellation>,
     pub dataset: DatasetSpec,
     /// the request's graph view when it does not read every graph: `dataset` is already
     /// limited to it (see [`DatasetSpec::restrict`]), and plans are redacted
@@ -450,6 +451,8 @@ pub struct Ctx {
     /// the caller's scope in the cache of remote SERVICE results (see
     /// [`QueryOptions::service_scope`](super::QueryOptions::service_scope))
     pub service_scope: Arc<str>,
+    /// the dataset's named projections (see [`crate::algo::catalog`])
+    pub algo_projections: Option<Arc<crate::algo::catalog::Catalog>>,
     /// RDFS on read (see [`super::rdfs`])
     pub rdfs: Option<Arc<super::rdfs::RdfsSchema>>,
     pub opt: Optimizations,
@@ -513,6 +516,7 @@ impl Ctx {
             literal_bnodes: Default::default(),
             deadline: None,
             cancel: Arc::new(AtomicBool::new(false)),
+            cancellation: None,
             dataset: DatasetSpec::default(),
             graphs: None,
             now: std::sync::OnceLock::new(),
@@ -533,6 +537,7 @@ impl Ctx {
             outbound_budget: crate::outbound::RequestBudget::new(&Default::default()),
             use_cache: true,
             service_scope: Arc::from(""),
+            algo_projections: None,
             rdfs: None,
             opt: Optimizations::default(),
             geo: Default::default(),
@@ -757,8 +762,11 @@ impl Ctx {
         if self.cancel.load(Ordering::Relaxed) {
             return Err(Error::Cancelled);
         }
+        if let Some(cancellation) = &self.cancellation {
+            cancellation.check()?;
+        }
         if let Some(d) = self.deadline
-            && Instant::now() > d
+            && Instant::now() >= d
         {
             return Err(Error::Timeout);
         }
@@ -1359,6 +1367,49 @@ impl Ctx {
             },
             f,
         )
+    }
+
+    /// Algorithm-owned key reconstruction never populates the eager value cache.
+    pub(super) fn with_algo_key<T>(
+        &self,
+        id: Id,
+        ctl: &crate::algo::Control,
+        mut f: impl FnMut(&[u8]) -> Result<T>,
+    ) -> Result<Option<T>> {
+        use crate::algo::memory::{Reservation, bytes};
+        ctl.check()?;
+        match id.tag() {
+            Tag::Vocab => {
+                let mut scratch = Reservation::new(ctl, 0)?;
+                self.snap
+                    .generation
+                    .vocab
+                    .get_with_fallible(
+                        id.payload(),
+                        |need| {
+                            let bound = bytes::<u8>(need)?
+                                .checked_mul(2)
+                                .ok_or_else(|| Error::invalid("algorithm key scratch overflows"))?;
+                            scratch.grow_to(bound)
+                        },
+                        &mut f,
+                    )?
+                    .transpose()
+            }
+            Tag::Delta => self.snap.generation.dvocab.with(|v| {
+                if id.payload() >= self.snap.dvocab_len {
+                    return Ok(None);
+                }
+                v.get(id.payload()).map(&mut f).transpose()
+            }),
+            Tag::Local => self.with_local_key(id.payload(), &mut f).transpose(),
+            Tag::BNode => {
+                let mut key = [b'_'; 9];
+                key[1..].copy_from_slice(&id.payload().to_be_bytes());
+                f(&key).map(Some)
+            }
+            _ => Ok(None),
+        }
     }
 
     pub(super) fn with_local_key<T>(&self, id: u64, f: impl FnOnce(&[u8]) -> T) -> Option<T> {

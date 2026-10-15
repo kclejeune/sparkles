@@ -348,6 +348,7 @@ impl WriteTxn<'_> {
             .quota
             .set_vocab_preallocated(generation.dvocab.preallocated());
         let snapshot = Arc::new(Snapshot {
+            cacheable: true,
             dataset_id: self.base.dataset_id,
             generation: generation.clone(),
             delta: std::mem::take(&mut self.delta),

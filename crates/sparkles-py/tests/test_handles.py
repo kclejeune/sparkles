@@ -154,6 +154,50 @@ def test_stored_query_parameters_and_versions() -> None:
             ds.queries.run("by-person")
 
 
+def test_graph_algorithms_and_named_projections() -> None:
+    with Dataset() as ds:
+        ds.load(
+            "@prefix ex: <http://ex.org/> . ex:a ex:p ex:b . ex:b ex:p ex:c . ex:c ex:p ex:a . ex:d ex:p ex:e .",
+            "turtle",
+        )
+        algo = ds.algorithms
+        saved = algo.projections.put("p", {"predicates": ["http://ex.org/p"], "direction": "undirected"})
+        assert saved["created"] and saved["stored"]["revision"] == 1
+        assert algo.projections.get("p")["definition"]["predicates"][0]["iri"] == "http://ex.org/p"
+        assert [p["name"] for p in algo.projections.list()] == ["p"]
+        rows = list(algo.run({"algorithm": "wcc", "projection": "p"}))
+        assert len(rows) == 5
+        assert len({row["component"].value for row in rows}) == 2
+        stats = algo.stats({"algorithm": "pageRank", "projection": "p"})
+        assert stats["nodes"] == 5
+        with pytest.raises(InvalidInputError):
+            algo.run({"algorithm": "nope"})
+        with pytest.raises(ConflictError):
+            algo.projections.put("p", {"direction": "forward"}, if_revision=7)
+        report = algo.run_write(
+            {
+                "algorithm": "pageRank",
+                "projection": "p",
+                "write": {"graph": "http://ex.org/out", "predicates": {"score": "http://ex.org/rank"}, "batchSize": 2},
+            }
+        )
+        assert report["status"] == "complete" and report["triples"] == 5 and report["commits"] == 3
+        count = list(ds.query("SELECT (COUNT(*) AS ?n) WHERE { GRAPH <http://ex.org/out> { ?s <http://ex.org/rank> ?r } }"))
+        assert count[0]["n"].value == "5"
+        assert algo.projections.delete("p")
+        assert algo.projections.list() == []
+
+
+def test_graphalytics_clustering_request() -> None:
+    with Dataset() as ds:
+        ds.load("@prefix ex: <http://ex.org/> . ex:a ex:p ex:b, ex:c . ex:b ex:p ex:c .", "turtle")
+        req = {"algorithm": "clustering", "projection": {"predicates": ["http://ex.org/p"]}, "params": {"graphalytics": True}}
+        rows = list(ds.algorithms.run(req))
+        assert len(rows) == 3
+        assert all(set(row.keys()) == {"node", "coefficient"} and float(row["coefficient"].value) == 0.5 for row in rows)
+        assert ds.algorithms.stats(req)["nodes"] == 3
+
+
 @pytest.mark.skipif("graphql" not in sparkles.FEATURES, reason="built without GraphQL")
 def test_graphql_draft_install_execute() -> None:
     with Dataset() as ds:

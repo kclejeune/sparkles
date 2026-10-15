@@ -9,6 +9,7 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod admin;
+mod algorithms;
 mod backups;
 mod branches;
 mod catalog;
@@ -69,6 +70,7 @@ fn _sparkles(m: &Bound<'_, PyModule>) -> PyResult<()> {
     reasoning::register(m)?;
     querybuilder::register(m)?;
     queries::register(m)?;
+    algorithms::register(m)?;
     rdflib_nodes::register(m)?;
     m.add_class::<dataset::PyDataset>()?;
     m.add_class::<txn::PyTransaction>()?;

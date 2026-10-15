@@ -449,6 +449,8 @@ impl ShaclGuard {
             return Ok(None);
         };
         vo.cancel = o.cancel.clone();
+        vo.cancellation = o.cancellation.clone();
+        vo.deadline = o.deadline;
         let (data, ids) = DataGraph::new(
             snap.clone(),
             vo.data_graph.as_deref(),
@@ -475,7 +477,8 @@ impl ShaclGuard {
         match st {
             None => Ok((0..shapes.len()).map(|_| ShapeRun::default()).collect()),
             Some(st) => {
-                st.opts.timeout = Some(deadline.saturating_duration_since(Instant::now()));
+                st.opts.timeout = None;
+                st.opts.deadline = st.opts.deadline.into_iter().chain([deadline]).min();
                 validate_selected(&mut st.data, &st.ids, shapes, &st.opts, sel, ids_of)
                     .map_err(engine_error)
             }
@@ -1357,4 +1360,63 @@ pub fn set_config(store: &Store, cfg: Option<ValidationConfig>) -> Result<SetOut
     store.set_guard_required(true);
     drop(txn);
     Ok(SetOutcome::Installed(guard, summary))
+}
+
+#[cfg(test)]
+mod control_tests {
+    use super::*;
+    use sparkles_core::io::RdfFormat;
+    use sparkles_core::store::StoreOptions;
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn operation_controls_survive_guard_adapter_and_runtime() {
+        let text = "@prefix sh: <http://www.w3.org/ns/shacl#> . <urn:S> a sh:NodeShape ; sh:targetNode <urn:focus> ; sh:nodeKind sh:IRI .";
+        let shapes = Shapes::parse(text, RdfFormat::Turtle, None).unwrap();
+        let cfg =
+            serde_json::from_value(serde_json::json!({"mode":"warn", "shapes":{"inline":text}}))
+                .unwrap();
+        let guard = ShaclGuard::new(cfg, Loaded::new(shapes.clone()), None);
+        let store = Store::in_memory(StoreOptions::default());
+        let snap = store.snapshot();
+        let flag = Arc::new(AtomicBool::new(false));
+        let primary = Arc::new(AtomicBool::new(false));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let opts = WriteOptions {
+            deadline: Some(deadline),
+            cancel: Some(primary.clone()),
+            cancellation: Some(sparkles_core::task::Cancellation::from_flags(
+                [flag.clone()],
+            )),
+            ..Default::default()
+        };
+        for source in 0..3 {
+            flag.store(false, Ordering::Relaxed);
+            primary.store(false, Ordering::Relaxed);
+            let mut opts = opts.clone();
+            if source == 2 {
+                opts.deadline = Some(Instant::now());
+            }
+            let mut state = guard.state(&snap, &shapes, &opts).unwrap().unwrap();
+            assert_eq!(state.opts.deadline, opts.deadline);
+            assert!(state.opts.cancellation.as_ref().unwrap().check().is_ok());
+            if source == 0 {
+                flag.store(true, Ordering::Relaxed);
+            }
+            if source == 1 {
+                primary.store(true, Ordering::Relaxed);
+            }
+            let result = ShaclGuard::run(Some(&mut state), &shapes, &[Sel::All], None, deadline);
+            assert_eq!(
+                state.opts.deadline, opts.deadline,
+                "no renewed guard deadline"
+            );
+            assert!(state.opts.timeout.is_none());
+            assert!(if source == 2 {
+                matches!(result, Err(sparkles_core::Error::Timeout))
+            } else {
+                matches!(result, Err(sparkles_core::Error::Cancelled))
+            });
+        }
+    }
 }

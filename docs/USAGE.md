@@ -39,6 +39,7 @@ without a migration path, so keep backups of anything you cannot regenerate.
 * [Outbound requests (SERVICE and LOAD)](#outbound-requests-service-and-load)
   * [Correlated, bulk and cached SERVICE](#correlated-bulk-and-cached-service)
 * [Finding paths](#finding-paths)
+* [Graph algorithms](#graph-algorithms)
 * [Embeddings computed on write](#embeddings-computed-on-write)
 * [Checking a database](#checking-a-database)
 * [Upgrading databases](#upgrading-databases)
@@ -432,6 +433,10 @@ happens to materialized inferences, and the limits.
 | `--format-max-mb N` | `16` | Largest `POST /$/format` body; `0` means unlimited. |
 | `--format-timeout S` | `10` | Seconds a `POST /$/format` request may take, including the wait for a free slot (one per core). A slower request gets `408`. |
 | `--vector-memory-mb N` | `4096` | Memory for packed vectors and HNSW graphs (`spk:vectorSearch` and vector indexes), per index generation. A build past it leaves the index `over-budget`, and a search past it gets `507`. A global flag. |
+| `--algo-threads N` | half the cores | Threads that graph algorithms (`SERVICE algo:…`) may use together, shared by all calls. A call that asks for more than are free waits, and the wait counts against its timeout. A global flag. |
+| `--algo-max-threads-per-call N` | `4` | Threads one graph-algorithm call may take, whatever `algo:concurrency` asks for. A global flag. |
+| `--algo-cache-mb N` | `256` | Memory for built projections of graph algorithms, shared by all datasets. Calls on the same data and projection reuse one build, and the least recently used build leaves first. `0` disables the cache. A global flag. |
+| `--algo-exact-betweenness-max N` | `100000` | Most nodes `algo:betweenness` runs on without `algo:samples`. A larger projection is refused with a message that names the parameter. A global flag. |
 | `--text NAME[=FILE]` | | Enable full-text search for a dataset. `FILE` is a `text.json`-shaped configuration file. |
 | `--validate NAME[=FILE]` | | Set a dataset's write-time validation from `FILE`, a `PUT /$/validation/{ds}` body, or with `NAME` alone validate the dataset with the configuration it has. Shapes and schemas without inline text are read from the path in `source`, relative to `FILE`. The data is validated in full before the server listens, and the result is logged. A `reject` configuration the data does not pass stops the start ([API](API.md#write-time-validation)). |
 | `--rdfs NAME=FILE` | | Answer a dataset's queries over the RDFS closure of its graphs with respect to the schema in `FILE`, as Fuseki's `--rdfs` does. The setting is kept like one made with `PUT /$/rdfs/{ds}` ([API](API.md#rdfs-on-read)). |
@@ -588,6 +593,8 @@ sparkles quota   --loc db --max-mb 10240      # storage quota; --default removes
 sparkles quota   --server URL --dataset db --max-mb 0   # on a server, as server-admin; 0 is unlimited
 sparkles compaction --loc db --set deltaRatio=0.02     # automatic compaction settings; --default removes them
 sparkles describe-settings --loc db --set mode=scbd   # how DESCRIBE describes a resource; --default removes it
+sparkles algo run --loc db pageRank --predicate http://ex.org/knows   # graph algorithms, see below
+sparkles algo projections put --loc db people --predicate http://ex.org/knows   # a named projection
 sparkles ping    127.0.0.1:3030               # GET /$/ready over HTTP, then HTTPS; exit 0 on 200 (health checks)
 ```
 
@@ -2034,6 +2041,89 @@ benchmark data, the shortest path between two people 17 edges apart takes about 
 where `ASK { … foaf:knows+ … }` for the same pair takes about 125 ms, because the search
 runs from both ends at once ([BENCHMARKS.md](BENCHMARKS.md#path-search)).
 
+## Graph algorithms
+
+PageRank, betweenness, components, communities, node similarity, triangle counts,
+k-cores, breadth-first and shortest-path distances, and two kinds of node embeddings run
+inside the server on a projection of the graph. A query reaches them through
+`SERVICE algo:<name>`, and `sparkles algo` and `POST /$/algo/{ds}/run` run them without
+writing a query. The parameters and outputs of each algorithm are in
+[API.md](API.md#graph-algorithms), and the design is in
+[F14](specs/F14-graph-algorithms.md).
+
+The ten most central people of a social graph:
+
+```sh
+sparkles query --loc ./db '
+PREFIX algo: <urn:x-sparkles:algo#>
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+SELECT ?person ?rank WHERE {
+  SERVICE algo:pageRank { [] algo:predicate foaf:knows ; algo:node ?person ; algo:score ?rank }
+} ORDER BY DESC(?rank) LIMIT 10'
+```
+
+The same run from the command line, and a community detection that is written back to a
+graph in commits of 50,000 triples:
+
+```sh
+sparkles algo run --loc ./db pageRank --predicate http://xmlns.com/foaf/0.1/knows --param maxIterations=30
+sparkles algo run --loc ./db leiden --predicate http://xmlns.com/foaf/0.1/knows --direction undirected \
+  --param seed=7 --write-graph http://example.org/analytics \
+  --write community=http://example.org/community --write level=http://example.org/level --batch-size 50000
+```
+
+`--summary` prints the statistics of the run instead of its rows, and `--request FILE`
+takes the whole request as JSON, as the HTTP route does. A write-back run records itself
+in the output graph with the commit it computed at, so a reader knows which state the
+numbers describe. It commits in batches so that a large result does not hold the writer
+lock for long. Query and task cancellation both reach computation, result preparation and
+writer admission. A supplied timeout and task deadline share the earlier absolute bound
+from operation entry through completion, including built-in SHACL and ShEx validation.
+History SERVICE calls retain the same controls at the native change-log scan checks.
+Rust history queries accept composed cancellation flags as well as a single flag and
+an absolute deadline. Checks are cooperative and do not preempt history indexing, reads
+or flushing. Committed batches remain after cancellation.
+A partial run attempts to record its final status without waiting for another writer,
+with one separate 100 ms cooperative cleanup budget. The record can remain unfinished
+when that attempt fails. This budget does not interrupt a durability call. Cancellation
+observed after the last batch can return an error while the durable record remains
+complete, and cancellation can race the final check.
+
+Define a projection once under a name when several queries use it:
+
+```sh
+sparkles algo projections put --loc ./db people --predicate http://xmlns.com/foaf/0.1/knows --direction undirected
+sparkles algo projections list --loc ./db
+```
+
+A query then writes `algo:projection "people"` instead of the predicates. The server
+keeps built projections in memory (`--algo-cache-mb`), so a second call on unchanged
+data skips the build. `--algo-threads` and `--algo-max-threads-per-call` bound the CPU
+that algorithms take, and a call that is over its memory budget fails with a message that
+names the parameter that would make it fit.
+
+The Rust library, Python and Node.js reach the same runs and projections through the
+dataset's `algorithms` handle. A request is the JSON of the HTTP route as a dict or an
+object:
+
+```python
+ds.algorithms.projections.put("people", {"predicates": ["http://xmlns.com/foaf/0.1/knows"]})
+rows = list(ds.algorithms.run({"algorithm": "pageRank", "projection": "people"}))
+ds.algorithms.run_write({"algorithm": "leiden", "projection": "people",
+                         "write": {"graph": "http://example.org/analytics",
+                                   "predicates": {"community": "http://example.org/community"}}})
+```
+
+In Node.js the calls are `ds.algorithms.run(request)` and `ds.algorithms.runWrite(request)`
+with the same `projections` methods. The JVM binding reaches algorithms only
+through `SERVICE algo:…` queries.
+
+For a clustering request with `params: {"graphalytics": true}`, the Rust, Python and
+Node.js handles return `node` and `coefficient`. The default direction is forward,
+and an explicit projection or predicate direction takes precedence. Summary requests
+remain available. A write mapping for `triangles` is refused before computation,
+while ordinary clustering continues to expose triangle counts.
+
 ## Embeddings computed on write
 
 A vector index can compute its vectors from the dataset's text through an embeddings
@@ -2341,6 +2431,9 @@ The tools are read-only unless the operator turns on the write tool:
 * `find_paths` finds the shortest path, all shortest paths, the k shortest or all paths
   up to a length between two nodes, or from one node, as
   [`SERVICE path:search`](#finding-paths) does, and returns each path's edges.
+* `graph_algorithm` runs PageRank, communities, similarity, components or embeddings on
+  a projection of the graph, as [`SERVICE algo:…`](#graph-algorithms) does, and returns
+  the best rows with the statistics of the run. It never writes.
 * `list_changes` lists the recorded changes of a range of commits, each quad added or
   removed with its commit, time, author and message, filtered by subject, predicate,
   object and graph. It answers when a fact changed and who changed it.
