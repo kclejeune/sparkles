@@ -129,6 +129,13 @@ query's budget) and `algo:limit` (rows).
 (iterations run, convergence, node and edge counts, modularity), which with no other
 output variables gives GDS's `stats` mode.
 
+Stats mode emits one row per selected concrete graph, including empty projections and
+empty node, pair or community results. Normal SPARQL joins retain their multiplicity,
+and selecting no named graphs under `GRAPH ?g` produces no stats row. An explicitly
+requested PageRank personalization with no matching node does no ranking work. Its
+summary keeps the projection counts and reports zero iterations and convergence,
+rather than running unpersonalized PageRank.
+
 ### 2.2 Rows and inputs
 
 A call returns one row per node, or per node pair for similarity, or per node and level
@@ -515,8 +522,8 @@ stays current. It is left out of this spec.
 **Delivered** on 2026-10-13, as Phases 1 and 2 and the embeddings of Phase 3, with the
 gaps listed under "Not built".
 
-The counter confinement, unit-weight sum and Graphalytics clustering repairs have
-targeted regression coverage. The
+The counter confinement, unit-weight sum, Graphalytics clustering and empty-result
+statistics repairs have targeted regression coverage. The
 remaining findings from the resumed review and the lane's integration and acceptance
 gates are still pending.
 

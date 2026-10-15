@@ -390,6 +390,10 @@ impl AlgoSpec {
             }
         })
     }
+
+    fn stats_only(&self) -> bool {
+        self.outs.summary.is_some() && self.outs.vars().len() == 1
+    }
 }
 
 // ----------------------------------------------------------------- planning ------
@@ -993,13 +997,16 @@ pub(super) fn run(
         }
         sources.sort_unstable();
         sources.dedup();
-        let mut part =
-            if want_sources && sources.is_empty() && matches!(spec.algo, Algo::Bfs | Algo::Sssp) {
-                // no source is a node of the projection: nothing is reached
-                Table::empty(result_vars.clone())
-            } else {
-                rows(ctx, spec, &g, &sources, &par, &ctl, &result_vars)?
-            };
+        let mut part = if want_sources
+            && sources.is_empty()
+            && matches!(spec.algo, Algo::Bfs | Algo::Sssp)
+            && !spec.stats_only()
+        {
+            // no source is a node of the projection: nothing is reached
+            Table::empty(result_vars.clone())
+        } else {
+            rows(ctx, spec, &g, &sources, &par, &ctl, &result_vars)?
+        };
         if let (Some(gid), Some(gv)) = (gid, spec.graph_var)
             && let Some(c) = part.col_of(gv)
         {
@@ -1096,6 +1103,23 @@ fn summary(ctx: &Ctx, g: &Graph, stats: algo::Stats) -> Id {
     )))
 }
 
+/// Stats have one row independently of the algorithm's node, pair or level rows.
+fn summary_row(
+    ctx: &Ctx,
+    spec: &AlgoSpec,
+    g: &Graph,
+    stats: algo::Stats,
+    vars: &[VarId],
+) -> Result<Table> {
+    ctx.check()?;
+    ctx.check_output(1, vars.len())?;
+    let mut b = Builder::new(vars);
+    let col = b.col(spec.outs.summary);
+    let sm = summary(ctx, g, stats);
+    b.set(&col, |_| sm, 1);
+    b.finish(1, ctx)
+}
+
 /// The indexes of the nodes to report, best first by `key` when a limit asks for the top
 /// rows, else in node order.
 fn pick(n: usize, limit: Option<usize>, key: Option<&[f64]>, descending: bool) -> Vec<u32> {
@@ -1125,12 +1149,8 @@ fn rows(
 ) -> Result<Table> {
     let o = &spec.outs;
     // a call that asks for the summary alone reports one row (GDS's stats mode)
-    let stats_only = o.summary.is_some() && o.vars().len() == 1;
-    let limit = if stats_only {
-        Some(1)
-    } else {
-        spec.num("limit").map(|l| l as usize)
-    };
+    let stats_only = spec.stats_only();
+    let limit = spec.num("limit").map(|l| l as usize);
     let mut b = Builder::new(vars);
     let c_node = b.col(o.node);
     let c_summary = b.col(o.summary);
@@ -1139,6 +1159,9 @@ fn rows(
     // columns of the per-node algorithms: the reported nodes and their values
     macro_rules! per_node {
         ($key:expr, $desc:expr, $stats:expr, $cols:expr) => {{
+            if stats_only {
+                return summary_row(ctx, spec, g, $stats, vars);
+            }
             let key: Option<Vec<f64>> = $key;
             let idx = pick(n, limit, key.as_deref(), $desc);
             ctx.check_output(idx.len(), vars.len())?;
@@ -1160,6 +1183,13 @@ fn rows(
                 fixed: spec.graphalytics,
             };
             if !spec.sources.is_empty() && sources.is_empty() {
+                if stats_only {
+                    // An explicitly empty personalization is no work, not a uniform run.
+                    let mut stats = algo::Stats::new();
+                    stats.insert("iterations".into(), 0.into());
+                    stats.insert("converged".into(), true.into());
+                    return summary_row(ctx, spec, g, stats, vars);
+                }
                 return b.finish(0, ctx);
             }
             let r = algo::pagerank::run(g, &p, par, ctl)?;
@@ -1248,6 +1278,9 @@ fn rows(
                     .map_or(0, |l| l.iter().max().map_or(0, |m| *m as usize + 1))
                     .into(),
             );
+            if stats_only {
+                return summary_row(ctx, spec, g, stats, vars);
+            }
             let sm = summary(ctx, g, stats);
             let (c_comm, c_level) = (b.col(o.community), b.col(o.level));
             // one row per node and level when the level is asked for, else the last level
@@ -1285,6 +1318,11 @@ fn rows(
                 max_pairs: spec.int("maxPairs", 10_000_000),
             };
             let mut r = algo::similarity::run(g, &p, par, ctl)?;
+            if stats_only {
+                let mut stats = algo::Stats::new();
+                stats.insert("pairs".into(), r.len().into());
+                return summary_row(ctx, spec, g, stats, vars);
+            }
             if let Some(l) = limit {
                 r.sort_by(|a, b| b.2.total_cmp(&a.2).then(a.0.cmp(&b.0)).then(a.1.cmp(&b.1)));
                 r.truncate(l);
@@ -1368,6 +1406,18 @@ fn rows(
         }
         Algo::Bfs => {
             let depth = algo::traverse::bfs(g, sources, par, ctl)?;
+            if stats_only {
+                let mut stats = algo::Stats::new();
+                stats.insert(
+                    "reached".into(),
+                    depth
+                        .iter()
+                        .filter(|&&d| d != algo::traverse::UNREACHED)
+                        .count()
+                        .into(),
+                );
+                return summary_row(ctx, spec, g, stats, vars);
+            }
             let c = b.col(o.depth);
             let inf = ctx.intern_term(&Term::Literal(oxrdf::Literal::new_simple_literal("inf")));
             // unreached nodes are left out, or bound to "inf" under Graphalytics
@@ -1413,6 +1463,14 @@ fn rows(
         }
         Algo::Sssp => {
             let dist = algo::traverse::sssp(g, sources, par, ctl)?;
+            if stats_only {
+                let mut stats = algo::Stats::new();
+                stats.insert(
+                    "reached".into(),
+                    dist.iter().filter(|d| d.is_finite()).count().into(),
+                );
+                return summary_row(ctx, spec, g, stats, vars);
+            }
             let c = b.col(o.distance);
             let mut idx: Vec<u32> = (0..n as u32)
                 .filter(|&i| spec.graphalytics || dist[i as usize].is_finite())

@@ -5239,7 +5239,16 @@ graph and `?g` is bound to it.
   fixed order, for example with `FILTER(STR(?a) < STR(?b))`, keeps one of each pair.
 * **Summary.** `algo:summary ?s` binds an `rdf:JSON` literal with the statistics of the
   run, such as `nodes`, `edges` and the iterations or modularity of the algorithm. A
-  block that asks only for `algo:summary` returns one row and skips the per-node work.
+  block that asks only for `algo:summary` emits one statistics row per selected concrete
+  graph, even when its projection or algorithm result is empty. It computes the
+  algorithm's statistics and omits result-row formatting. Normal SPARQL joins still
+  apply, and `GRAPH ?g` emits no row when it selects no named graphs. With other outputs,
+  the summary remains attached to each actual result row.
+
+An explicitly requested PageRank source that matches no projection node gives no
+ranking results. Its summary reports the projection's node and edge counts with
+`iterations: 0` and `converged: true` to describe a run that did no work. It does not
+compute an unpersonalized ranking. Omitting the source still runs ordinary PageRank.
 * **Embeddings.** `algo:embedding` is an `spk:vector` literal, so it can be written
   with an update and indexed (see [Vector similarity](#vector-similarity)).
 * **Budgets.** A call counts against the query's timeout and memory budget. A projection

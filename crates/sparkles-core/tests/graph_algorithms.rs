@@ -88,6 +88,194 @@ fn groups(m: &BTreeMap<String, String>) -> BTreeSet<Vec<String>> {
     g.into_values().collect()
 }
 
+fn stats_json(s: &Store, body: &str) -> serde_json::Value {
+    let result = rows(s, &format!("SELECT ?s WHERE {{ {body} }}"));
+    assert_eq!(result.len(), 1, "{body}: {result:?}");
+    serde_json::from_str(&result[0]["s"]).unwrap()
+}
+
+fn empty_pagerank_stats(populated: bool) {
+    let s = store_of(if populated { "ex:a ex:p ex:b ." } else { "" });
+    let body = "SERVICE algo:pageRank { [] algo:predicate ex:absent ; algo:summary ?s }";
+    let j = stats_json(&s, body);
+    assert_eq!(j["nodes"], 0);
+    assert_eq!(j["edges"], 0);
+    assert_eq!(j["iterations"], 0);
+    assert_eq!(j["converged"], true);
+    for outputs in [
+        "algo:node ?n ; algo:score ?r",
+        "algo:node ?n ; algo:summary ?s",
+    ] {
+        assert!(rows(&s, &format!("SELECT * WHERE {{ SERVICE algo:pageRank {{ [] algo:predicate ex:absent ; {outputs} }} }}")).is_empty());
+    }
+}
+
+#[test]
+fn stats_pagerank_on_empty_dataset() {
+    empty_pagerank_stats(false);
+}
+
+#[test]
+fn stats_pagerank_with_absent_predicate() {
+    empty_pagerank_stats(true);
+}
+
+#[test]
+fn stats_empty_communities_and_similarity() {
+    let s = store_of("");
+    for algorithm in ["louvain", "leiden", "nodeSimilarity"] {
+        let j = stats_json(
+            &s,
+            &format!("SERVICE algo:{algorithm} {{ [] algo:predicate ex:p ; algo:summary ?s }}"),
+        );
+        assert_eq!(j["nodes"], 0);
+        assert_eq!(j["edges"], 0);
+        let outputs = if algorithm == "nodeSimilarity" {
+            assert_eq!(j["pairs"], 0);
+            "algo:node ?n ; algo:otherNode ?o ; algo:similarity ?v"
+        } else {
+            assert_eq!(j["levels"], 0);
+            assert_eq!(j["communities"], 0);
+            assert_eq!(j["modularities"], serde_json::json!([]));
+            assert!(j["modularity"].is_null());
+            "algo:node ?n ; algo:community ?c ; algo:level ?l"
+        };
+        assert!(rows(&s, &format!("SELECT * WHERE {{ SERVICE algo:{algorithm} {{ [] algo:predicate ex:p ; {outputs} ; algo:summary ?s }} }}")).is_empty());
+    }
+}
+
+#[test]
+fn stats_similarity_with_no_qualifying_pairs() {
+    let s = store_of("ex:a ex:p ex:b . ex:c ex:p ex:d .");
+    let j = stats_json(
+        &s,
+        "SERVICE algo:nodeSimilarity { [] algo:predicate ex:p ; algo:direction algo:forward ; algo:summary ?s }",
+    );
+    assert_eq!(j["nodes"], 4);
+    assert_eq!(j["edges"], 2);
+    assert_eq!(j["pairs"], 0);
+    assert!(rows(&s, "SELECT * WHERE { SERVICE algo:nodeSimilarity { [] algo:predicate ex:p ; algo:direction algo:forward ; algo:node ?n ; algo:otherNode ?o ; algo:summary ?s } }").is_empty());
+}
+
+#[test]
+fn stats_similarity_counts_all_qualifying_pairs() {
+    let s = store_of("ex:a ex:p ex:b . ex:c ex:p ex:b .");
+    let j = stats_json(
+        &s,
+        "SERVICE algo:nodeSimilarity { [] algo:predicate ex:p ; algo:direction algo:forward ; algo:summary ?s }",
+    );
+    assert_eq!(j["nodes"], 3);
+    assert_eq!(j["edges"], 2);
+    assert_eq!(j["pairs"], 2);
+}
+
+#[test]
+fn stats_follow_concrete_graph_selection() {
+    let s = Store::in_memory(StoreOptions::default());
+    s.load(&[Source::from_bytes(
+        b"@prefix ex: <http://ex/> . ex:g1 { ex:a ex:q ex:b } ex:g2 { ex:c ex:q ex:d }".to_vec(),
+        RdfFormat::TriG,
+        None,
+    )])
+    .unwrap();
+    let j = stats_json(
+        &s,
+        "GRAPH ex:g1 { SERVICE algo:pageRank { [] algo:predicate ex:absent ; algo:summary ?s } }",
+    );
+    assert_eq!(j["nodes"], 0);
+    assert_eq!(j["edges"], 0);
+    let q = "SELECT ?g ?s WHERE { GRAPH ?g { SERVICE algo:pageRank { [] algo:predicate ex:absent ; algo:summary ?s } } }";
+    let result = rows(&s, q);
+    assert_eq!(result.len(), 2);
+    assert_eq!(
+        result
+            .iter()
+            .map(|r| r["g"].as_str())
+            .collect::<BTreeSet<_>>(),
+        ["g1", "g2"].into()
+    );
+    for row in result {
+        let j: serde_json::Value = serde_json::from_str(&row["s"]).unwrap();
+        assert_eq!(j["nodes"], 0);
+        assert_eq!(j["edges"], 0);
+    }
+    assert!(rows(&store_of(""), q).is_empty());
+    assert!(rows(&s, "SELECT ?s WHERE { GRAPH ex:neverSelected { SERVICE algo:pageRank { [] algo:summary ?s } } }").is_empty());
+}
+
+#[test]
+fn stats_unmatched_sources_do_not_invent_results() {
+    let s = store_of("ex:a ex:p ex:b . ex:b ex:p ex:c .");
+    for algorithm in ["pageRank", "bfs", "sssp"] {
+        let body = format!(
+            "VALUES ?src {{ ex:missing }} SERVICE algo:{algorithm} {{ [] algo:predicate ex:p ; algo:source ?src ; algo:summary ?s }}"
+        );
+        let j = stats_json(&s, &body);
+        assert_eq!(j["nodes"], 3);
+        assert_eq!(j["edges"], 2);
+        if algorithm == "pageRank" {
+            assert_eq!(j["iterations"], 0);
+            assert_eq!(j["converged"], true);
+        } else {
+            assert_eq!(j["reached"], 0);
+        }
+        assert!(rows(&s, &format!("SELECT * WHERE {{ VALUES ?src {{ ex:missing }} SERVICE algo:{algorithm} {{ [] algo:predicate ex:p ; algo:source ?src ; algo:node ?n ; algo:summary ?s }} }}")).is_empty());
+    }
+    for source in ["", "algo:source ex:a ;"] {
+        let j = stats_json(
+            &s,
+            &format!(
+                "SERVICE algo:pageRank {{ [] algo:predicate ex:p ; {source} algo:summary ?s }}"
+            ),
+        );
+        assert!(j["iterations"].as_u64().unwrap() > 0);
+    }
+    let result = rows(
+        &s,
+        "SELECT ?n ?s WHERE { SERVICE algo:pageRank { [] algo:predicate ex:p ; algo:node ?n ; algo:summary ?s } }",
+    );
+    assert_eq!(result.len(), 3);
+    for row in result {
+        let j: serde_json::Value = serde_json::from_str(&row["s"]).unwrap();
+        assert_eq!(j["nodes"], 3);
+        assert_eq!(j["edges"], 2);
+    }
+    // One algorithm stats row still joins to the original upstream rows.
+    assert!(rows(&s, "SELECT ?s WHERE { VALUES ?src { } SERVICE algo:bfs { [] algo:predicate ex:p ; algo:source ?src ; algo:summary ?s } }").is_empty());
+    assert_eq!(rows(&s, "SELECT ?s WHERE { VALUES ?src { ex:a ex:a } SERVICE algo:bfs { [] algo:predicate ex:p ; algo:source ?src ; algo:summary ?s } }").len(), 2);
+}
+
+#[test]
+fn stats_rows_obey_budgets_and_cancellation() {
+    let s = store_of("");
+    let q = format!(
+        "{PREFIXES} SELECT ?s WHERE {{ SERVICE algo:pageRank {{ [] algo:predicate ex:absent ; algo:summary ?s }} }}"
+    );
+    for opts in [
+        QueryOptions {
+            max_rows: Some(0),
+            ..Default::default()
+        },
+        QueryOptions {
+            max_rows_produced: Some(0),
+            ..Default::default()
+        },
+    ] {
+        assert!(matches!(
+            query(s.snapshot(), &q, &opts),
+            Err(sparkles_core::Error::BudgetExceeded(_))
+        ));
+    }
+    let opts = QueryOptions {
+        cancel: Some(Arc::new(std::sync::atomic::AtomicBool::new(true))),
+        ..Default::default()
+    };
+    assert!(matches!(
+        query(s.snapshot(), &q, &opts),
+        Err(sparkles_core::Error::Cancelled)
+    ));
+}
+
 fn set(items: &[&[&str]]) -> BTreeSet<Vec<String>> {
     items
         .iter()

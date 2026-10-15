@@ -705,3 +705,42 @@ fn algorithms_graphalytics_clustering_request() {
         3
     );
 }
+
+fn algorithms_empty_stats(populated: bool) {
+    use sparkles::sparql::{QueryOptions, algorun::AlgoRequest};
+    let ds = Dataset::memory();
+    if populated {
+        ds.update("INSERT DATA { <urn:a> <urn:p> <urn:b> }")
+            .unwrap();
+    }
+    let req = AlgoRequest::from_json(
+        serde_json::json!({"algorithm":"pageRank","projection":{"predicates":["urn:absent"]}}),
+    )
+    .unwrap();
+    let text = ds
+        .algorithms()
+        .stats(&req, &QueryOptions::default())
+        .unwrap();
+    let j: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(j["nodes"], 0);
+    assert_eq!(j["edges"], 0);
+    assert_eq!(j["iterations"], 0);
+    assert_eq!(j["converged"], true);
+    assert!(
+        ds.algorithms()
+            .run(&req, &QueryOptions::default())
+            .unwrap()
+            .rows()
+            .is_empty()
+    );
+}
+
+#[test]
+fn algorithms_stats_on_empty_dataset() {
+    algorithms_empty_stats(false);
+}
+
+#[test]
+fn algorithms_stats_with_absent_predicate() {
+    algorithms_empty_stats(true);
+}
