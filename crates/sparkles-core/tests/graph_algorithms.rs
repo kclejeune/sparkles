@@ -1522,23 +1522,51 @@ fn r7_cached_incoming_requires_each_call_budget() {
     let _ = projection_cache_read(s.snapshot(), warm, &opts);
     assert_eq!(projection_cache_read(s.snapshot(), warm, &opts).1, 1);
     let q = format!(
-        "{PREFIXES}SELECT ?n ?r WHERE {{ SERVICE algo:pageRank {{ [] algo:predicate ex:p ; algo:direction algo:forward ; algo:maxMemory 208 ; algo:node ?n ; algo:score ?r }} }}"
+        "{PREFIXES}SELECT ?n ?r WHERE {{ SERVICE algo:pageRank {{ [] algo:predicate ex:p ; algo:direction algo:forward ; algo:maxMemory 248 ; algo:node ?n ; algo:score ?r }} }}"
     );
-    // Four ids and five offsets plus two edges = 80 base bytes, plus 128
-    // bytes charged by the old PageRank workspace. Incoming storage is extra.
-    let result = query(s.snapshot(), &q, &opts);
-    assert!(
-        matches!(result, Err(sparkles_core::Error::BudgetExceeded(_))),
-        "expected cached incoming refusal"
-    );
-    let enough = q.replace("algo:maxMemory 208 ; ", "");
-    let good = query(s.snapshot(), &enough, &opts).unwrap();
-    assert_eq!(good.rows().len(), 4);
-    let leaf = find(&good.plan, "AlgoCall").unwrap();
+    // Base80 plus five PageRank arrays160 and one partial8 fits248. Incoming48
+    // makes the real peak296. Cold cursor scratch32 ends before PageRank arrays,
+    // so the peak is max(80+48+32,80+48+168), not their cumulative sum328.
+    // This checks combined per-call accounting, not a no-transpose-allocation rule.
+    let cold = query(s.snapshot(), &q, &opts);
+    let adequate = query(
+        s.snapshot(),
+        &q.replace("algo:maxMemory 248", "algo:maxMemory 296"),
+        &opts,
+    )
+    .unwrap();
+    assert_eq!(adequate.rows().len(), 4);
+    let leaf = find(&adequate.plan, "AlgoCall").unwrap();
     assert_eq!(leaf.counters.as_ref().unwrap()["cachedProjections"], 1);
-    // Initialization by the successful caller cannot exempt the next caller.
-    assert!(matches!(
-        query(s.snapshot(), &q, &opts),
-        Err(sparkles_core::Error::BudgetExceeded(_))
-    ));
+    println!(
+        "R7_ADEQUATE_296 peak_bytes={}",
+        leaf.counters.as_ref().unwrap()["peakBytes"]
+    );
+    // The successful caller has initialized incoming rows for the next low-budget call.
+    let initialized = query(s.snapshot(), &q, &opts);
+    // Observe both negatives before asserting so the incoming-only counterfactual
+    // records both incorrect successes rather than stopping at the first assertion.
+    println!(
+        "R7_COLD_248 success={} budget_exceeded={}",
+        cold.is_ok(),
+        matches!(&cold, Err(sparkles_core::Error::BudgetExceeded(_)))
+    );
+    println!(
+        "R7_INITIALIZED_248 success={} budget_exceeded={}",
+        initialized.is_ok(),
+        matches!(&initialized, Err(sparkles_core::Error::BudgetExceeded(_)))
+    );
+    let unlimited = query(s.snapshot(), &q.replace("algo:maxMemory 248 ; ", ""), &opts).unwrap();
+    assert_eq!(unlimited.rows().len(), 4);
+    let leaf = find(&unlimited.plan, "AlgoCall").unwrap();
+    assert_eq!(leaf.counters.as_ref().unwrap()["cachedProjections"], 1);
+    assert_eq!(adequate.rows(), unlimited.rows());
+    assert!(
+        matches!(cold, Err(sparkles_core::Error::BudgetExceeded(_))),
+        "expected cold incoming refusal"
+    );
+    assert!(
+        matches!(initialized, Err(sparkles_core::Error::BudgetExceeded(_))),
+        "expected initialized incoming refusal"
+    );
 }
