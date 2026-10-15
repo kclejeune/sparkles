@@ -5244,6 +5244,9 @@ an unbound weight.
 * **Node pairs.** `algo:nodeSimilarity` returns each pair in both orders, with the
   `algo:topK` best partners for each node. `SELECT DISTINCT` over the two nodes in a
   fixed order, for example with `FILTER(STR(?a) < STR(?b))`, keeps one of each pair.
+  `algo:maxPairs` counts distinct ordered nonself candidates sharing an outgoing
+  neighbour before the partner degree, similarity cutoff and topK filters. It is
+  independent of the memory budget and the number of returned rows.
 * **Summary.** `algo:summary ?s` binds an `rdf:JSON` literal with the statistics of the
   run, such as `nodes`, `edges` and the iterations or modularity of the algorithm. A
   block that asks only for `algo:summary` emits one statistics row per selected concrete
@@ -5267,7 +5270,12 @@ compute an unpersonalized ranking. Omitting the source still runs ordinary PageR
   consumed edge arrays are admitted by actual capacity on entry, since those arrays
   already exist. Returned graph storage remains charged once. These bounds cover the
   pinned Rust Global Vec and hashbrown layouts, not allocator metadata, size classes or
-  process RSS. Node2vec charges
+  process RSS. Node similarity reserves reusable counters, touched IDs and a bounded
+  topK heap for each logical workspace, at most the admitted thread count. Its memory
+  peak includes retained worker-output capacity and old/new growth and final-merge
+  overlap. More admitted threads can therefore need more scratch even in sequential
+  pool fallback. Returned pairs stay charged, and temporary storage releases after
+  it is dropped. Node2vec charges
   fixed embedding and scratch capacities before allocation and checks cancellation
   throughout its own initialization, walks and training. Its memory peak includes
   those capacities while live, with returned embeddings still charged to the call.

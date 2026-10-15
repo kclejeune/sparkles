@@ -156,6 +156,12 @@ impl<T> Buffer<T> {
         }
         Ok(())
     }
+    pub(crate) fn clear(&mut self) {
+        self.values.clear();
+    }
+    pub(crate) fn drain(&mut self) -> std::vec::Drain<'_, T> {
+        self.values.drain(..)
+    }
     pub(crate) fn push(&mut self, value: T) -> Result<()> {
         if self.values.len() == self.values.capacity() {
             return Err(bad("memory", "fixed buffer capacity exceeded"));

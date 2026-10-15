@@ -1776,3 +1776,34 @@ fn r18_blank_endpoints_preserve_canonical_reifier_keys() {
         BTreeSet::from(["0".into(), "3".into(), "5".into()])
     );
 }
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn r8_service_workspace_refuses_after_projection_and_incoming_admission() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let s = store_of("ex:a ex:p ex:b. ex:b ex:p ex:c. ex:c ex:p ex:a.");
+    let incoming = Arc::new(AtomicBool::new(false));
+    let seen = incoming.clone();
+    sparkles_core::algo::set_projection_observer(Some(Arc::new(move |event| {
+        if let sparkles_core::algo::ProjectionEvent::Allocation("incoming-offsets", _, _, _) = event
+        {
+            seen.store(true, Ordering::Relaxed);
+        }
+    })));
+    let q = "SELECT ?n ?o ?v WHERE { SERVICE algo:nodeSimilarity { [] algo:predicate ex:p;algo:direction algo:forward;algo:concurrency 1;algo:maxMemory 256;algo:node ?n;algo:otherNode ?o;algo:similarity ?v } }";
+    let result = query(
+        s.snapshot(),
+        &format!("{PREFIXES}{q}"),
+        &QueryOptions::default(),
+    );
+    sparkles_core::algo::set_projection_observer(None);
+    assert!(
+        incoming.load(Ordering::Relaxed),
+        "projection/incoming did not reach the workspace boundary"
+    );
+    assert!(matches!(
+        result,
+        Err(sparkles_core::Error::BudgetExceeded(_))
+    ));
+    assert!(rows(&s, &q.replace("algo:maxMemory 256", "algo:maxMemory 8192")).is_empty());
+}

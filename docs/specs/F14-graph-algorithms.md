@@ -547,6 +547,21 @@ stays current. It is left out of this spec.
 
 ## Outcome
 
+Node similarity now reuses at most one logical workspace per admitted thread. Fixed
+counters, touched IDs and a bounded topK heap remain charged while live, and duplicate
+outgoing rows use a temporary owned CSR with the existing controlled transpose.
+Candidate limits count distinct ordered nonself pairs before degree, score and topK
+filters. Worker outputs retain their spare capacities through checked growth, and the
+final ordered merge admits both old outputs and its exact replacement before copying.
+Cancellation and deadlines are polled inside duplicate scans, neighbour intersections,
+selection and output migration. Temporary owners release on failure or unwind, while
+returned pair storage remains charged to the call.
+
+More admitted workspaces reserve more scratch, including in sequential pool fallback.
+Heap selection and scheduling change access costs without establishing a speed result.
+The bounds describe requested Vec capacities, excluding allocator and Rayon bookkeeping.
+Broader algorithm and acceptance work remains pending.
+
 Projection collection now streams snapshot rows and resolves only applicable visible
 edge weights through indexed reifier lookups. Class members, predicate directions and
 nested-pattern distinct pairs hold admitted capacity owners. Key reconstruction,
