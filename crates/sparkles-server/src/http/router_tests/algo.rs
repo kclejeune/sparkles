@@ -34,6 +34,23 @@ fn json_req(method: &str, path: &str, body: &str) -> Request<Body> {
 }
 
 #[tokio::test]
+async fn graphalytics_clustering_request_rows_and_summary() {
+    let s = algo_server();
+    let body = r#"{"algorithm":"clustering","projection":{"predicates":["http://ex/p"]},"params":{"graphalytics":true}}"#;
+    let r = send(&s.app, json_req("POST", "/$/algo/g/run", body)).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(
+        j["head"]["vars"],
+        serde_json::json!(["node", "coefficient"])
+    );
+    assert_eq!(j["results"]["bindings"].as_array().unwrap().len(), 5);
+    let r = send(&s.app, json_req("POST", "/$/algo/g/run?summary=true", body)).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["results"]["bindings"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn projections_are_managed_and_used() {
     let s = algo_server();
     let r = send(

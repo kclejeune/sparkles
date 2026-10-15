@@ -188,6 +188,16 @@ def test_graph_algorithms_and_named_projections() -> None:
         assert algo.projections.list() == []
 
 
+def test_graphalytics_clustering_request() -> None:
+    with Dataset() as ds:
+        ds.load("@prefix ex: <http://ex.org/> . ex:a ex:p ex:b, ex:c . ex:b ex:p ex:c .", "turtle")
+        req = {"algorithm": "clustering", "projection": {"predicates": ["http://ex.org/p"]}, "params": {"graphalytics": True}}
+        rows = list(ds.algorithms.run(req))
+        assert len(rows) == 3
+        assert all(set(row.keys()) == {"node", "coefficient"} and float(row["coefficient"].value) == 0.5 for row in rows)
+        assert ds.algorithms.stats(req)["nodes"] == 3
+
+
 @pytest.mark.skipif("graphql" not in sparkles.FEATURES, reason="built without GraphQL")
 def test_graphql_draft_install_execute() -> None:
     with Dataset() as ds:

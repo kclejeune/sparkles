@@ -172,12 +172,36 @@ fn projection_triples(def: &ProjectionDef, prefixes: &[(String, String)]) -> Res
 }
 
 /// The outputs a request selects, in the order of its query's variables.
-fn outputs(algo: &str) -> Result<Vec<&'static str>> {
-    let a = super::algosvc::Algo::from_name(algo)
-        .ok_or_else(|| invalid(format!("unknown algorithm '{algo}'")))?;
+fn outputs(req: &AlgoRequest) -> Result<Vec<&'static str>> {
+    let a = super::algosvc::Algo::from_name(&req.algorithm)
+        .ok_or_else(|| invalid(format!("unknown algorithm '{}'", req.algorithm)))?;
+    let graphalytics = match req.params.get("graphalytics") {
+        Some(Value::Bool(b)) => *b,
+        None => false,
+        _ => return Err(invalid("unknown or malformed parameter 'graphalytics'")),
+    };
+    let clustering = matches!(a, super::algosvc::Algo::Clustering) && graphalytics;
     let mut v = vec!["node"];
-    v.extend(a.outputs());
+    v.extend(
+        a.outputs()
+            .iter()
+            .copied()
+            .filter(|o| !clustering || *o != "triangles"),
+    );
     Ok(v)
+}
+
+fn check_write_outputs(req: &AlgoRequest, w: &WriteSpec) -> Result<()> {
+    let supported = outputs(req)?;
+    for out in w.predicates.keys() {
+        if !supported.contains(&out.as_str()) || out == "node" {
+            return Err(invalid(format!(
+                "'{out}' is not an output of {} that can be written",
+                req.algorithm
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The query a request stands for: the rows of the algorithm, with the variables named
@@ -252,7 +276,7 @@ fn build(
             _ => return Err(invalid(format!("unknown or malformed parameter '{k}'"))),
         }
     }
-    let outs = outputs(&req.algorithm)?;
+    let outs = outputs(req)?;
     let mut selected: Vec<&'static str> = if rows { outs } else { Vec::new() };
     if summary {
         selected.push("summary");
@@ -315,13 +339,8 @@ fn groups(
 ) -> Result<(Vec<Group>, Vec<NamedNode>)> {
     let col = |name: &str| vars.iter().position(|v| v == name);
     let mut preds: BTreeMap<&str, NamedNode> = BTreeMap::new();
+    check_write_outputs(req, w)?;
     for (out, p) in &w.predicates {
-        if !outputs(&req.algorithm)?.contains(&out.as_str()) || out == "node" {
-            return Err(invalid(format!(
-                "'{out}' is not an output of {} that can be written",
-                req.algorithm
-            )));
-        }
         preds.insert(
             out.as_str(),
             NamedNode::new(expand_iri(p, prefixes)?).map_err(|e| invalid(e.to_string()))?,
@@ -438,6 +457,7 @@ pub fn run_write(
     let graph =
         NamedNode::new(expand_iri(&w.graph, prefixes)?).map_err(|e| invalid(e.to_string()))?;
     let (q, _) = query_text(req, prefixes, false)?;
+    check_write_outputs(req, w)?;
     let snap = store.snapshot();
     let source_commit = snap.commit;
     let started = now();

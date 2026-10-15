@@ -2065,6 +2065,12 @@ In Node.js the calls are `ds.algorithms.run(request)` and `ds.algorithms.runWrit
 with the same `projections` methods. The JVM binding reaches algorithms only
 through `SERVICE algo:…` queries.
 
+For a clustering request with `params: {"graphalytics": true}`, the Rust, Python and
+Node.js handles return `node` and `coefficient`. The default direction is forward,
+and an explicit projection or predicate direction takes precedence. Summary requests
+remain available. A write mapping for `triangles` is refused before computation,
+while ordinary clustering continues to expose triangle counts.
+
 ## Embeddings computed on write
 
 A vector index can compute its vectors from the dataset's text through an embeddings

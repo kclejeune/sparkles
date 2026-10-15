@@ -382,7 +382,13 @@ impl AlgoSpec {
     }
 
     fn direction(&self) -> Dir {
-        self.proj.direction.unwrap_or(self.algo.default_direction())
+        self.proj.direction.unwrap_or_else(|| {
+            if matches!(self.algo, Algo::Clustering) && self.graphalytics {
+                Dir::Forward
+            } else {
+                self.algo.default_direction()
+            }
+        })
     }
 }
 

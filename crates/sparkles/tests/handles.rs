@@ -680,3 +680,28 @@ fn algorithms_and_named_projections() {
     assert!(ds.algorithms().projections().delete("p", None).unwrap());
     assert!(ds.algorithms().projections().list().is_empty());
 }
+
+#[test]
+fn algorithms_graphalytics_clustering_request() {
+    use sparkles::sparql::{QueryOptions, algorun::AlgoRequest};
+    let (_dir, ds) = persistent();
+    ds.update("INSERT DATA { <urn:a> <urn:p> <urn:b>, <urn:c> . <urn:b> <urn:p> <urn:c> }")
+        .unwrap();
+    let req = AlgoRequest::from_json(serde_json::json!({"algorithm":"clustering","projection":{"predicates":["urn:p"]},"params":{"graphalytics":true}})).unwrap();
+    let result = ds.algorithms().run(&req, &QueryOptions::default()).unwrap();
+    assert_eq!(result.vars, ["node", "coefficient"]);
+    assert_eq!(result.rows().len(), 3);
+    for row in result.rows() {
+        assert!(
+            matches!(&row[1], Some(oxrdf::Term::Literal(l)) if l.value().parse::<f64>().unwrap() == 0.5)
+        );
+    }
+    let stats = ds
+        .algorithms()
+        .stats(&req, &QueryOptions::default())
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&stats).unwrap()["nodes"],
+        3
+    );
+}

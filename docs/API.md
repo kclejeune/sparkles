@@ -5187,7 +5187,7 @@ take, fails with `400`.
 | `algo:leiden` | `algo:community`, `algo:level` | the Louvain parameters, `randomness` (0.01), `seed` |
 | `algo:nodeSimilarity` | `algo:otherNode`, `algo:similarity` | `metric` (`jaccard` or `overlap`), `topK` (10), `similarityCutoff`, `degreeCutoff`, `maxPairs` |
 | `algo:triangleCount` | `algo:triangles` | none |
-| `algo:clustering` | `algo:coefficient`, `algo:triangles` | `graphalytics` |
+| `algo:clustering` | `algo:coefficient`, and `algo:triangles` outside Graphalytics mode | `graphalytics` |
 | `algo:kCore` | `algo:core` | none |
 | `algo:bfs` | `algo:depth` | `source`, `graphalytics` |
 | `algo:sssp` | `algo:distance` | `source`, `graphalytics` |
@@ -5198,6 +5198,12 @@ Every algorithm also has `algo:node` and `algo:summary` as outputs, and takes
 `algo:concurrency`, `algo:maxMemory` and `algo:limit` as parameters. `algo:source` is a
 constant or a variable that another pattern of the group binds. The call then runs once
 for all its values and joins its rows with the group's.
+
+With `algo:graphalytics true`, clustering defaults to forward edges and returns the
+coefficient without triangle counts. An explicit direction on the projection or an
+individual predicate still applies. Ordinary clustering defaults to undirected edges
+and exposes both outputs. Explicitly requesting `algo:triangles` in Graphalytics mode
+is refused.
 
 ### Projections
 

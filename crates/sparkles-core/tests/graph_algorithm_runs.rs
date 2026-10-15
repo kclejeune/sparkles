@@ -284,6 +284,138 @@ fn the_query_a_request_stands_for() {
     assert!(query_text(&request("nope", BTreeMap::new(), None), &prefixes(), false).is_err());
 }
 
+fn graphalytics_request() -> AlgoRequest {
+    AlgoRequest {
+        algorithm: "clustering".into(),
+        projection: Some(inline(&["ex:p"])),
+        params: [("graphalytics".into(), true.into())].into_iter().collect(),
+        write: None,
+    }
+}
+
+#[test]
+fn graphalytics_request_selects_only_available_rows_and_summary() {
+    let s = store();
+    let req = graphalytics_request();
+    let (q, vars) = query_text(&req, &prefixes(), false).unwrap();
+    let result = query(s.snapshot(), &q, &QueryOptions::default()).unwrap();
+    assert_eq!(vars, ["node", "coefficient"]);
+    assert_eq!(result.rows().len(), 7);
+    let (q, vars) = query_text(&req, &prefixes(), true).unwrap();
+    assert_eq!(vars, ["summary"]);
+    let result = query(s.snapshot(), &q, &QueryOptions::default()).unwrap();
+    assert_eq!(result.rows().len(), 1);
+    let mut ordinary = req.clone();
+    ordinary.params.insert("graphalytics".into(), false.into());
+    assert_eq!(
+        query_text(&ordinary, &prefixes(), false).unwrap().1,
+        ["node", "coefficient", "triangles"]
+    );
+    ordinary.params.insert("graphalytics".into(), "true".into());
+    assert!(
+        query_text(&ordinary, &prefixes(), false)
+            .unwrap_err()
+            .to_string()
+            .contains("malformed parameter 'graphalytics'")
+    );
+}
+
+#[test]
+fn graphalytics_write_selects_coefficient_and_refuses_triangles_before_compute() {
+    let s = store();
+    let mut req = graphalytics_request();
+    req.write = request(
+        "clustering",
+        [("triangles".into(), "ex:triangles".into())].into(),
+        None,
+    )
+    .write;
+    let before = s.snapshot().commit;
+    let computing = Arc::new(AtomicUsize::new(0));
+    let observed = computing.clone();
+    let ctl = Control {
+        progress: Progress::new(move |_, m| {
+            if m == "computing" {
+                observed.fetch_add(1, Ordering::Relaxed);
+            }
+        }),
+        ..Control::none()
+    };
+    let error = run_write(&s, &req, &prefixes(), &QueryOptions::default(), None, &ctl).unwrap_err();
+    assert_eq!(computing.load(Ordering::Relaxed), 0, "{error}");
+    assert!(error.to_string().contains("not an output"), "{error}");
+    assert_eq!(s.snapshot().commit, before);
+    req.write.as_mut().unwrap().predicates =
+        [("coefficient".into(), "ex:coefficient".into())].into();
+    let report = run_write(
+        &s,
+        &req,
+        &prefixes(),
+        &QueryOptions::default(),
+        None,
+        &Control::none(),
+    )
+    .unwrap();
+    assert_eq!(report.triples, 7);
+    assert_eq!(report.commits, 1);
+    req.params.insert("graphalytics".into(), false.into());
+    req.write.as_mut().unwrap().predicates = [("triangles".into(), "ex:triangles".into())].into();
+    assert_eq!(
+        run_write(
+            &s,
+            &req,
+            &prefixes(),
+            &QueryOptions::default(),
+            None,
+            &Control::none()
+        )
+        .unwrap()
+        .triples,
+        7
+    );
+}
+
+#[test]
+fn graphalytics_write_preserves_invalid_input_precedence() {
+    let s = store();
+    let mut req = graphalytics_request();
+    req.params.insert("graphalytics".into(), "true".into());
+    req.write = request(
+        "clustering",
+        [("triangles".into(), "ex:triangles".into())].into(),
+        None,
+    )
+    .write;
+    let before = s.snapshot().commit;
+    let error = run_write(
+        &s,
+        &req,
+        &prefixes(),
+        &QueryOptions::default(),
+        None,
+        &Control::none(),
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("malformed parameter 'graphalytics'"),
+        "{error}"
+    );
+    req.write.as_mut().unwrap().graph = "invalid graph".into();
+    let error = run_write(
+        &s,
+        &req,
+        &prefixes(),
+        &QueryOptions::default(),
+        None,
+        &Control::none(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("not an absolute IRI"), "{error}");
+    assert_eq!(s.snapshot().commit, before);
+}
+
 #[test]
 fn a11_batches_records_and_replace() {
     let s = store();

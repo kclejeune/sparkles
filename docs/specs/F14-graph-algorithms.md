@@ -298,7 +298,7 @@ definition.
 | `algo:leiden` | undirected | `community`, `level`, `summary` | As Louvain, with Leiden's refinement phase, so every community is connected. `randomness` 0.01 and `seed` for the refinement. `algo:level` binds one row per node and level, from the finest. |
 | `algo:nodeSimilarity` | forward | `node`, `otherNode`, `similarity` | `metric` `jaccard` or `overlap`, `topK` 10 per node, `similarityCutoff` 1e-42, `degreeCutoff` 1. Candidate pairs share a neighbour; pairs are generated per shared neighbour, bounded by `algo:maxPairs`. |
 | `algo:triangleCount` | undirected | `triangles` | Forward algorithm over nodes ordered by degree. |
-| `algo:clustering` | undirected | `coefficient`, `triangles` | Local clustering coefficient. With `graphalytics`, Graphalytics' LCC, which counts directed edges among neighbours. |
+| `algo:clustering` | undirected, or forward with `graphalytics` | `coefficient`, and `triangles` outside Graphalytics mode | Local clustering coefficient. Graphalytics' LCC counts directed edges among neighbours and returns only the coefficient. Explicit projection and predicate directions take precedence. |
 | `algo:kCore` | undirected | `core` | Batagelj and Zaversnik's bucket algorithm, linear in edges. |
 | `algo:bfs` | forward | `depth` | From `algo:source`. Levels expanded in parallel. Unreached nodes are left out, or bound with depth `"inf"` under `graphalytics`. |
 | `algo:sssp` | forward | `distance` | From one `algo:source`, Dijkstra's algorithm with weights, BFS without. |
@@ -515,7 +515,8 @@ stays current. It is left out of this spec.
 **Delivered** on 2026-10-13, as Phases 1 and 2 and the embeddings of Phase 3, with the
 gaps listed under "Not built".
 
-The counter confinement and unit-weight sum repairs have targeted regression coverage. The
+The counter confinement, unit-weight sum and Graphalytics clustering repairs have
+targeted regression coverage. The
 remaining findings from the resumed review and the lane's integration and acceptance
 gates are still pending.
 

@@ -368,6 +368,116 @@ fn directions_and_weights() {
     assert_eq!(by_node(&r, "d")["a"], "6");
 }
 
+#[test]
+fn graphalytics_clustering_defaults_forward_and_preserves_overrides() {
+    use sparkles_core::algo::catalog::{Catalog, PredicateDef, ProjectionDef};
+    let s = store_of("ex:a ex:p ex:b, ex:c . ex:b ex:p ex:c .");
+    let cat = Arc::new(Catalog::memory());
+    for (name, direction) in [
+        ("implicit", None),
+        ("directed", Some("forward")),
+        ("symmetric", Some("undirected")),
+    ] {
+        cat.put(
+            name,
+            ProjectionDef {
+                predicates: Some(vec![PredicateDef::new("http://ex/p", None)]),
+                direction: direction.map(str::to_string),
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .unwrap();
+    }
+    let opts = QueryOptions {
+        algo_projections: Some(cat),
+        ..Default::default()
+    };
+    let cases = [
+        ("algo:predicate ex:p ; algo:graphalytics true", 0.5),
+        ("algo:predicate ex:p ; algo:graphalytics false", 1.0),
+        (
+            "algo:predicate ex:p ; algo:graphalytics true ; algo:direction algo:forward",
+            0.5,
+        ),
+        (
+            "algo:predicate ex:p ; algo:graphalytics true ; algo:direction algo:backward",
+            0.5,
+        ),
+        (
+            "algo:predicate ex:p ; algo:graphalytics true ; algo:direction algo:undirected",
+            1.0,
+        ),
+        (
+            "algo:predicate (ex:p algo:undirected) ; algo:graphalytics true",
+            1.0,
+        ),
+        (
+            "algo:predicate (ex:p algo:backward) ; algo:graphalytics true",
+            0.5,
+        ),
+        (
+            "algo:predicate (ex:p algo:forward) ; algo:direction algo:undirected ; algo:graphalytics true",
+            0.5,
+        ),
+        ("algo:projection \"implicit\" ; algo:graphalytics true", 0.5),
+        ("algo:projection \"directed\" ; algo:graphalytics true", 0.5),
+        (
+            "algo:projection \"symmetric\" ; algo:graphalytics true",
+            1.0,
+        ),
+    ];
+    // Alternate the conditional defaults and overrides twice on the same store/cache.
+    for _ in 0..2 {
+        for (body, expected) in cases {
+            let q = format!(
+                "SELECT ?n ?c WHERE {{ SERVICE algo:clustering {{ [] {body} ; algo:node ?n ; algo:coefficient ?c }} }}"
+            );
+            let result = rows_with(&s, &q, &opts);
+            assert_eq!(result.len(), 3, "{q}");
+            for row in result {
+                assert_eq!(row["c"].parse::<f64>().unwrap(), expected, "{q}: {row:?}");
+            }
+        }
+    }
+    let e = error(
+        &s,
+        "SELECT ?t WHERE { SERVICE algo:clustering { [] algo:predicate ex:p ; algo:graphalytics true ; algo:triangles ?t } }",
+    );
+    assert!(e.contains("triangles is not available"), "{e}");
+}
+
+#[test]
+fn graphalytics_clustering_reuses_distinct_default_projections() {
+    let s = Store::in_memory(StoreOptions {
+        result_cache_bytes: 0,
+        ..Default::default()
+    });
+    s.load(&[Source::from_bytes(
+        b"@prefix ex: <http://ex/> . ex:a ex:p ex:b, ex:c . ex:b ex:p ex:c .".to_vec(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    for round in 0..2 {
+        for (mode, expected) in [(true, 0.5), (false, 1.0)] {
+            let q = format!(
+                "{PREFIXES} SELECT ?n ?c WHERE {{ SERVICE algo:clustering {{ [] algo:predicate ex:p ; algo:graphalytics {mode} ; algo:node ?n ; algo:coefficient ?c }} }}"
+            );
+            let result = query(s.snapshot(), &q, &QueryOptions::default()).unwrap();
+            assert_eq!(result.rows().len(), 3);
+            for row in result.rows() {
+                assert_eq!(short(&row[1]).parse::<f64>().unwrap(), expected);
+            }
+            if round == 1 {
+                let leaf = find(&result.plan, "AlgoCall").expect("algorithm executed");
+                assert_eq!(leaf.counters.as_ref().unwrap()["cachedProjections"], 1);
+            }
+        }
+    }
+}
+
 fn weighted_rank_reference(direction: &str, weights: [f32; 2]) -> Vec<f64> {
     use sparkles_core::algo::{Aggregate, Control, Graph, Par, RawEdges, pagerank};
     let (mut src, mut dst, mut w) = (vec![0, 0], vec![1, 2], weights.to_vec());
