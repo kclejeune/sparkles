@@ -5255,8 +5255,9 @@ compute an unpersonalized ranking. Omitting the source still runs ordinary PageR
   or a result that does not fit fails the query with a message that names the parameter
   to change. `algo:maxMemory` sets a lower budget for one call.
 * **Threads and cache.** `--algo-threads` and `--algo-max-threads-per-call` limit the
-  threads of all calls and of each call, and `--algo-cache-mb` sizes the cache of built
-  projections. Committed views can reuse a built projection independently of the query
+  threads of all calls and of each call. A one-thread call runs on the caller and
+  holds one slot in that shared budget. Calls waiting for slots check cancellation and
+  their deadline before admission. `--algo-cache-mb` sizes the cache of built projections. Committed views can reuse a built projection independently of the query
   result cache. A committed write changes the key. Queries over pending transaction
   changes neither read nor populate the projection cache, including through masked
   or derived views.
