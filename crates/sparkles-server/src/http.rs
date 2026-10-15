@@ -305,6 +305,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             state.clone(),
             restoring_guard,
         ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            algo::admit_run,
+        ))
         .layer(axum::middleware::from_fn(error_request_id))
         // for extractors without a ceiling of their own (see `limited_body!`)
         .layer(DefaultBodyLimit::max(
@@ -468,6 +472,13 @@ async fn error_request_id(req: axum::extract::Request, next: axum::middleware::N
         .and_then(|v| v.to_str().ok())
         .is_some_and(|a| a.contains("text/turtle"));
     let mut resp = next.run(req).await;
+    finalize_error_response(&mut resp, id, turtle);
+    resp
+}
+
+/// Finalize error bodies before a body-owned admission permit is installed. Once
+/// consumed, the markers make later outer formatting calls leave that body intact.
+fn finalize_error_response(resp: &mut Response, id: Option<String>, turtle: bool) {
     if let Some(validation::RejectionTurtle(t)) = resp.extensions_mut().remove()
         && turtle
     {
@@ -479,10 +490,9 @@ async fn error_request_id(req: axum::extract::Request, next: axum::middleware::N
         resp.headers_mut()
             .insert(header::CONTENT_LENGTH, t.len().into());
         *resp.body_mut() = axum::body::Body::from(t);
-        return resp;
+        return;
     }
-    add_request_id(&mut resp, id);
-    resp
+    add_request_id(resp, id);
 }
 
 /// Answer `503` with `Retry-After: 5` to any request whose `{ds}` is being replaced in
@@ -511,6 +521,8 @@ async fn restoring_guard(
     {
         return next.run(req).await;
     }
+    #[cfg(test)]
+    algo::probe::event(req.extensions(), "restore");
     let checked = st
         .catalog
         .get_for_request(&ds)
@@ -696,8 +708,16 @@ pub(crate) async fn blocking<T: Send + 'static>(
 ) -> ApiResult<T> {
     let span = tracing::Span::current();
     let held = crate::ratelimit::hold();
+    #[cfg(test)]
+    let probe = algo::probe::current();
     tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _completion = probe.blocking.clone().map(algo::probe::Completion);
         let _held = held;
+        #[cfg(test)]
+        if let Some(gate) = probe.blocking {
+            gate.wait();
+        }
         span.in_scope(f)
     })
     .await
@@ -1212,6 +1232,10 @@ pub(crate) async fn run_query(
     // a client that disconnects drops this future: the flag stops the query at its
     // next check
     let (cancel, _cancel_on_drop) = cancel_on_drop();
+    #[cfg(test)]
+    {
+        *algo::probe::current().cancel.lock() = Some(cancel.clone());
+    }
     opts.cancel = Some(cancel);
     let limit = asked.result_limit(st.limits.max_result_bytes);
     let sfmt = solutions_format(&params, &headers);

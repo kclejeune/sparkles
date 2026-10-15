@@ -672,7 +672,17 @@ gates are still pending.
   `try_write_with`, and a later C23 writer can take its place.
 * **Surfaces.** `sparkles::Dataset::algorithms()` holds `run`, `stats`, `run_write` and
   the projections. `POST /$/algo/{ds}/run` runs a request, as rows or as a cancellable
-  task of kind `algo-run`, and `/$/algo/{ds}/projections[/{name}]` manages projections
+  task of kind `algo-run`. Body-aware admission parses once under the existing
+  admin-body and decompressed-size caps, then checks Read through Query for rows or
+  summaries and Write through Update for write-back before dataset lookup or restore
+  disclosure. Query rate and concurrency limits cover computation and the body,
+  including blocking and streaming work after disconnect. Query and Update HTTP
+  permits also cover admitted error bodies, including when only the raw body remains
+  with a client. Update HTTP admission
+  covers the `202` body; background work uses the existing task queue and algorithm
+  thread admission without retaining the HTTP permit. The queue defaults to four
+  running tasks and prechecks 1,000 waiting tasks. Per-dataset active-task checks are
+  not a new atomic reservation. `/$/algo/{ds}/projections[/{name}]` manages projections
   with `ETag` and `If-Match`. `sparkles algo run` and `sparkles algo projections` work
   on a database directory. The MCP tool `graph_algorithm` is read-only and returns at
   most 100 rows with the run's summary. The Python and Node.js bindings have the same

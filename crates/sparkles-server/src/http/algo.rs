@@ -9,22 +9,134 @@
 //! cancellable task (`202`, then `GET /$/tasks/{id}` and `DELETE /$/tasks/{id}`), with
 //! the run record in the output graph.
 //!
-//! Authorization: a run needs `read` on `{ds}` and, with a `write` part, `write` through
-//! the update endpoint. Reading the projections needs `read` and changing them `admin`.
+//! Authorization: read-only runs need `read` through the query endpoint; write-back
+//! runs need `write` through the update endpoint. Body-aware admission precedes the
+//! restore guard and uses the corresponding Query or Update HTTP limits. Reading the
+//! projections needs `read` and changing them `admin`.
 
 use super::{AdminBody, ApiResult, Params, St, blocking, dataset, err};
 use crate::auth::{Endpoint, Level, Principal};
 use axum::Extension;
 use axum::Json;
+use axum::extract::{FromRequestParts, MatchedPath, Request};
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value as J, json};
 use sparkles::algo::catalog::{ProjectionDef, Stored};
 use sparkles::sparql::algorun::AlgoRequest;
+use std::sync::Arc;
+
+#[cfg(test)]
+pub(super) mod probe;
 
 /// The kind of the task of a run that writes its results.
 pub const TASK: &str = "algo-run";
+
+/// Private admission result. The original request parts carry this to the handler;
+/// the JSON body is parsed once, inside both request decompression limits.
+#[derive(Clone)]
+pub(super) struct PreparedAlgoRun {
+    dataset: String,
+    request: Arc<AlgoRequest>,
+    #[cfg(test)]
+    probe: probe::Probe,
+}
+
+/// Body-aware authorization and class admission must wrap the restoring guard:
+/// otherwise an endpoint-denied caller could learn its task ID before authorization.
+pub(super) async fn admit_run(State(st): St, req: Request, next: Next) -> Response {
+    if req.method() != axum::http::Method::POST
+        || req
+            .extensions()
+            .get::<MatchedPath>()
+            .map(MatchedPath::as_str)
+            != Some("/$/algo/{ds}/run")
+    {
+        return next.run(req).await;
+    }
+    let (mut parts, body) = req.into_parts();
+    let Path(name) = match Path::<String>::from_request_parts(&mut parts, &st).await {
+        Ok(path) => path,
+        Err(error) => return error.into_response(),
+    };
+    let Some(p) = parts.extensions.get::<Principal>() else {
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "missing algorithm caller",
+        )
+        .into_response();
+    };
+    let body =
+        match super::read_body(body, st.limits.max_admin_body_bytes, "--max-admin-body-mb").await {
+            Ok(body) => body,
+            Err(error) => return error.into_response(),
+        };
+    #[cfg(test)]
+    probe::event(&parts.extensions, "parse");
+    let request = match serde_json::from_slice::<J>(&body)
+        .map_err(|e| bad(format!("invalid JSON: {e}")))
+        .and_then(|j| AlgoRequest::from_json(j).map_err(Into::into))
+    {
+        Ok(request) => Arc::new(request),
+        Err(error) => return error.into_response(),
+    };
+    let (level, endpoint, class) = if request.write.is_some() {
+        (
+            Level::Write,
+            Endpoint::Update,
+            crate::ratelimit::Class::Update,
+        )
+    } else {
+        (Level::Read, Endpoint::Query, crate::ratelimit::Class::Query)
+    };
+    #[cfg(test)]
+    probe::event(&parts.extensions, "grant");
+    if let Some(denied) =
+        crate::auth::dataset_denial(&st, p, &parts.headers, &name, level, endpoint)
+    {
+        return denied;
+    }
+    if request.write.is_some() && st.read_only {
+        return err(StatusCode::FORBIDDEN, "server is read-only").into_response();
+    }
+    let id = parts
+        .headers
+        .get(&crate::obs::X_REQUEST_ID)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let turtle = parts
+        .headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|a| a.contains("text/turtle"));
+    let prepared = PreparedAlgoRun {
+        dataset: name.clone(),
+        request,
+        #[cfg(test)]
+        probe: parts
+            .extensions
+            .get::<probe::Probe>()
+            .cloned()
+            .unwrap_or_default(),
+    };
+    parts.extensions.insert(prepared);
+    let req = Request::from_parts(parts, axum::body::Body::empty());
+    match &st.rate_limit {
+        Some(rl) => {
+            crate::ratelimit::limit_as(rl, class, Some(name), req, |req| async move {
+                let mut resp = next.run(req).await;
+                // Outer JSON/Turtle formatting must not replace PermitBody after
+                // admission, including when only the raw Body remains with a client.
+                super::finalize_error_response(&mut resp, id, turtle);
+                resp
+            })
+            .await
+        }
+        None => next.run(req).await,
+    }
+}
 
 fn bad(m: impl Into<String>) -> super::ApiError {
     err(StatusCode::BAD_REQUEST, m)
@@ -49,31 +161,41 @@ pub(super) async fn run(
     Extension(p): Extension<Principal>,
     uri: Uri,
     headers: HeaderMap,
-    AdminBody(body): AdminBody,
+    prepared: Option<Extension<PreparedAlgoRun>>,
 ) -> ApiResult {
+    let Some(Extension(prepared)) = prepared.filter(|p| p.0.dataset == name) else {
+        return Err(err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "missing or mismatched algorithm admission",
+        ));
+    };
+    let req = prepared.request;
+    #[cfg(test)]
+    prepared.probe.events.lock().push("lookup");
     let ds = dataset(&st, &name)?;
-    let j: J = serde_json::from_slice(&body).map_err(|e| bad(format!("invalid JSON: {e}")))?;
-    let req = AlgoRequest::from_json(j)?;
     let params = Params::from_query(&uri);
     if req.write.is_none() {
         let summary = params
             .get("summary")
             .is_some_and(|v| matches!(v, "" | "true" | "1"));
+        #[cfg(test)]
+        prepared.probe.events.lock().push("projection");
         let query = ds.dataset.algorithms().query_text(&req, summary)?;
-        return super::run_query(st, ds, p, uri, headers, params, query, Vec::new()).await;
+        let run = super::run_query(st, ds, p, uri, headers, params, query, Vec::new());
+        #[cfg(test)]
+        return probe::CURRENT.scope(prepared.probe, run).await;
+        #[cfg(not(test))]
+        return run.await;
     }
     if st.read_only {
         return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
-    }
-    if let Some(denied) =
-        crate::auth::dataset_denial(&st, &p, &headers, &name, Level::Write, Endpoint::Update)
-    {
-        return Ok(denied);
     }
     super::task_start_check(&st, Some(TASK), &ds.name)?;
     let mut opts = super::query_options(&st, &ds, &params);
     crate::auth::restrict(&mut opts, &p, &ds.name, Endpoint::Update);
     let author = super::author(&p);
+    #[cfg(test)]
+    prepared.probe.events.lock().push("task-id");
     let id = st.next_task_id();
     let key = ds.name.clone();
     let d = ds.clone();

@@ -1024,7 +1024,7 @@ fn algorithms(p: &mut Paths) {
             "Graph algorithms",
             "Run a graph algorithm",
         )
-        .doc("Without `write` the run is the SPARQL query its request stands for, answered as `/{ds}/sparql` answers (`Accept`, `timeout`, `execution` and the budget overrides apply), one row per node, node pair or node and level. `summary=true` returns only the statistics of the run. With `write` the run is a task that computes at the head commit and writes the rows in batched commits, with a run record in the graph. It needs `write` on the dataset and can be cancelled with `DELETE /$/tasks/{id}`.")
+        .doc("Without `write` the run is the SPARQL query its request stands for, answered as `/{ds}/sparql` answers (`Accept`, `timeout`, `execution` and the budget overrides apply), one row per node, node pair or node and level. `summary=true` returns only the statistics of the run. With `write` the run is a task that computes at the head commit and writes the rows in batched commits, with a run record in the graph. Read-only runs need read through the query endpoint and use Query rate/concurrency limits. Write-back runs need write through the update endpoint and use Update HTTP admission through the 202 response body. Background work uses the existing task queue and algorithm-thread admission, not an HTTP permit. A task can be cancelled with `DELETE /$/tasks/{id}`.")
         .see("graph-algorithms")
         .params(&["format", "timeout", "nocache", "execution"])
         .query("summary", json!({ "type": "boolean" }), "Return only the summary of the run.")
@@ -1036,7 +1036,7 @@ fn algorithms(p: &mut Paths) {
             json!({}),
         )
         .resp("202", "A run with `write`, started as a task.", Some(json!({ "application/json": { "schema": sref("Task") } })))
-        .errors(&[400, 409, 507]),
+        .errors(&[400, 409, 413, 429, 503, 507]),
     );
     p.add(
         op(

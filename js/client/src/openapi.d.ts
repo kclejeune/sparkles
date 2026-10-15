@@ -54,7 +54,7 @@ export interface paths {
         put?: never;
         /**
          * Run a graph algorithm
-         * @description Without `write` the run is the SPARQL query its request stands for, answered as `/{ds}/sparql` answers (`Accept`, `timeout`, `execution` and the budget overrides apply), one row per node, node pair or node and level. `summary=true` returns only the statistics of the run. With `write` the run is a task that computes at the head commit and writes the rows in batched commits, with a run record in the graph. It needs `write` on the dataset and can be cancelled with `DELETE /$/tasks/{id}`.
+         * @description Without `write` the run is the SPARQL query its request stands for, answered as `/{ds}/sparql` answers (`Accept`, `timeout`, `execution` and the budget overrides apply), one row per node, node pair or node and level. `summary=true` returns only the statistics of the run. With `write` the run is a task that computes at the head commit and writes the rows in batched commits, with a run record in the graph. Read-only runs need read through the query endpoint and use Query rate/concurrency limits. Write-back runs need write through the update endpoint and use Update HTTP admission through the 202 response body. Background work uses the existing task queue and algorithm-thread admission, not an HTTP permit. A task can be cancelled with `DELETE /$/tasks/{id}`.
          */
         post: operations["runAlgorithm"];
         delete?: never;
@@ -8753,6 +8753,9 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
+            413: components["responses"]["PayloadTooLarge"];
+            429: components["responses"]["TooManyRequests"];
+            503: components["responses"]["Unavailable"];
             507: components["responses"]["InsufficientStorage"];
             default: components["responses"]["Error"];
         };

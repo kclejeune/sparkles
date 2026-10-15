@@ -433,9 +433,9 @@ each request class per client:
 | Class | Requests |
 |-------|----------|
 | `auth` | Every path under `/$/auth/`, matched or not: login, token minting, device flow and the OIDC callback. |
-| `query` | `/{ds}/sparql`, `/{ds}/query`, `/{ds}/queries/{name}`, `/{ds}/explain`, `/{ds}/shacl`, `/{ds}/shex`, `/{ds}/diff`, `/{ds}/graphql` and `/{ds}/graphql/schema`, Graph Store `GET`/`HEAD` and reads of `/{ds}/patch`, `/{ds}` with `query=` or a GET, `/$/schema/*`, `/$/stats/*`, `/$/validate/*`, `/$/reason/{ds}/diagnostics`, `/$/graphql/{ds}/draft`, `/$/format`, `/$/lint`, and MCP tool calls and resource reads at `/$/mcp` |
-| `update` | `/{ds}/update`, `/{ds}/upload`, `POST` and `PATCH /{ds}/patch`, Graph Store `PUT`/`POST`/`DELETE`, `/{ds}` with `update=` or any other write, and the MCP tools that write (`sparql_update`, `assert_facts`, `create_branch`, `merge_branch` and `delete_branch`). A form POST to `/{ds}` counts as an update. |
-| `admin` | `/$/…` requests other than `GET`, `HEAD` and `OPTIONS` that are not in the `query` class. These cover dataset management, compaction, backups, reasoning, caches and full-text. |
+| `query` | `/{ds}/sparql`, `/{ds}/query`, `/{ds}/queries/{name}`, `/{ds}/explain`, `/{ds}/shacl`, `/{ds}/shex`, `/{ds}/diff`, `/{ds}/graphql` and `/{ds}/graphql/schema`, Graph Store `GET`/`HEAD` and reads of `/{ds}/patch`, `/{ds}` with `query=` or a GET, `/$/schema/*`, `/$/stats/*`, `/$/validate/*`, `/$/reason/{ds}/diagnostics`, `/$/graphql/{ds}/draft`, `/$/format`, `/$/lint`, read-only runs and summaries on `POST /$/algo/{ds}/run`, and MCP tool calls and resource reads at `/$/mcp` |
+| `update` | `/{ds}/update`, `/{ds}/upload`, `POST` and `PATCH /{ds}/patch`, Graph Store `PUT`/`POST`/`DELETE`, `/{ds}` with `update=` or any other write, and the MCP tools that write (`sparql_update`, `assert_facts`, `create_branch`, `merge_branch` and `delete_branch`). Write-back requests on `POST /$/algo/{ds}/run` also use this class. A form POST to `/{ds}` counts as an update. |
+| `admin` | `/$/…` requests other than `GET`, `HEAD` and `OPTIONS` that are not in the `query` or `update` class. These cover dataset management, compaction, backups, reasoning, caches and full-text. |
 | `preauth` | Every request, before authentication. Counts failed credential checks per client address and per IPv6 /48. Has no per-dataset form. |
 
 `/$/ping`, `/$/ready*`, `/$/metrics`, the UI and the other `/$/` reads are never limited.
@@ -5302,6 +5302,13 @@ compute an unpersonalized ranking. Omitting the source still runs ordinary PageR
 ### Runs over HTTP
 
 `POST /$/algo/{ds}/run` takes a JSON request and runs it as the query it stands for.
+Read-only requests, including `summary=true`, require `read` through the `query`
+endpoint. Requests with `write` require `write` through the `update` endpoint. The
+server parses the bounded body once and checks that grant before looking up the
+dataset or disclosing a restore task. Input projections and output writes retain the
+selected endpoint's graph and triple restrictions. Both forms use the admin-body
+ceiling, including after request decompression. Projection-management permissions
+are unchanged.
 
 ```json
 {
@@ -5318,7 +5325,19 @@ Without a `write` member the answer is the result of the query, in the format th
 projection or a definition, and its `predicates` may be bare IRIs. Prefixed names in
 `params` and `write` use the standard prefixes and the dataset's.
 
+Read-only requests use the Query rate and concurrency policy. The permit covers
+computation and the response body. Blocking and streaming producers keep their
+share until their work ends even if the client disconnects.
+Admitted error bodies retain the same concurrency permit as successful bodies,
+including after the response headers have been discarded.
+
 A request with a `write` member writes its results back as a task.
+Write requests use Update HTTP admission through the `202` response body. The
+background task does not retain that HTTP permit. It uses the existing task queue
+with four running tasks by default, configurable with `--max-tasks`, a precheck
+that refuses when 1,000 tasks are queued, per-dataset algorithm-task checks and
+algorithm-thread admission. These checks do not form a new atomic task reservation.
+Other task kinds and task polling or cancellation permissions are unchanged.
 
 ```json
 {
@@ -5343,7 +5362,8 @@ A request with a `write` member writes its results back as a task.
 
 The answer is `202` with a task of kind `algo-run`. The task computes at the head commit
 and then writes batches in commits with the message `algo run <uuid> batch i/n`. It needs
-`write` on the dataset, and only one such task runs for a dataset at a time. A run that is
+`write` through the update endpoint, and an active-task precheck refuses another
+algorithm task for the same dataset. It does not reserve that name atomically. A run that is
 cancelled with `DELETE /$/tasks/{id}` keeps the batches it committed. When the task
 ends, its `detail` holds the IRI of the run, the commit it computed at, and the rows,
 triples and commits written. Task and query cancellation sources are both checked during
@@ -7578,6 +7598,9 @@ without the permission is a `403` before any connection or file is opened, even 
 | `/ui/*`, `/$/ping`, `/$/ready`, `/$/openapi.json`, `/$/openapi.yaml` | GET | Nothing. Without `metrics`, `/$/ready` lists only readable datasets. |
 | `/$/whoami`, `/$/auth/config`, `/$/auth/login`, `/$/auth/oidc/*` (including the back-channel logout), `/$/auth/device`, `/$/auth/token` | | Nothing. Invalid credentials are still `401`. |
 | `/$/server`, `/$/datasets` (GET), `/$/tasks`, `/$/tasks/{id}`, `/$/stats`, `/$/backups-list`, `/$/validate/*`, `/$/auth/logout`, `/$/format` (POST), `/$/lint` (POST), `/$/geo/convert` (POST) | | Any caller. `/$/format` and `/$/lint` admit nobody under `--format-endpoint off`, and only signed-in callers under `authenticated`. Listings show readable datasets only, and server-wide tasks only to `server-admin`. `/$/stats` covers the datasets the caller may read, and `/$/backups-list` the files of the datasets it administers. Cancelling a task (DELETE) needs `admin` on its dataset. |
+| `/$/algo/{ds}/run` | POST | Read-only runs need `read` through `query`. Runs with `write` need `write` through `update`. The body selects the policy before dataset access. |
+| `/$/algo/{ds}/projections[/{name}]` | GET | `read` through `info`. |
+| `/$/algo/{ds}/projections/{name}` | PUT, DELETE | Dataset `admin`. |
 | `/$/metrics` | GET | `metrics` |
 | `/$/datasets` | POST | `server-admin` |
 | `/$/datasets/{ds}`, `/$/stats/{ds}`, `/$/schema/{ds}…`, `/$/queries/{ds}…` (GET), `/$/prefixes/{ds}`, `/$/commits/{ds}…`, `/$/ready/{ds}`, `/$/reason/{ds}` (GET), `/$/reason/{ds}/diagnostics`, `/$/text/{ds}` (GET), `/$/geo/{ds}` (GET), `/$/vector/{ds}`, `/$/vector/{ds}/{name}` (GET), `/$/snapshots/{ds}…` (GET), `/$/history/{ds}` (GET), `/$/validation/{ds}` (GET), `/$/rdfs/{ds}` (GET), `/$/describe/{ds}` (GET), `/$/quota/{ds}` (GET), `/$/compaction/{ds}` (GET), `/$/graphql/{ds}…` (GET), `/{ds}/prefixes` (GET) | GET | `read`. `POST /$/vector/{ds}/{name}/recall` needs `read` too. |
@@ -7661,8 +7684,8 @@ server_models = true
 
 | Endpoint | Requests |
 |---|---|
-| `query` | SPARQL queries on `/{ds}/sparql`, `/{ds}/query` and `/{ds}`, stored-query runs on `/{ds}/queries/{name}`, `/{ds}/explain`, `/{ds}/text`, `/{ds}/geo`, and the MCP tools that query |
-| `update` | SPARQL Update on `/{ds}/update` and `/{ds}`, and the MCP tool `sparql_update` |
+| `query` | SPARQL queries on `/{ds}/sparql`, `/{ds}/query` and `/{ds}`, stored-query runs on `/{ds}/queries/{name}`, `/{ds}/explain`, `/{ds}/text`, `/{ds}/geo`, read-only algorithm runs and summaries on `POST /$/algo/{ds}/run`, and the MCP tools that query |
+| `update` | SPARQL Update on `/{ds}/update` and `/{ds}`, algorithm write-back on `POST /$/algo/{ds}/run`, and the MCP tool `sparql_update` |
 | `gsp-r` | Graph Store reads (`GET` and `HEAD` on `/{ds}/data`, `/{ds}/get` and `/{ds}`) |
 | `gsp-rw` | Graph Store reads and writes |
 | `upload` | `/{ds}/upload` |
