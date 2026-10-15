@@ -4761,7 +4761,16 @@ not change it.
 **Item 6: Ask measured on QALD and LC-QuAD, with numbers per model.** §11.1 already
 plans QALD-9-plus over DBpedia and Text2SPARQL'25, and `scripts/eval-ask` already runs
 the matrix of §11.4 on the demo set of `testsuite/ask/demo.json`, with `--self-test`
-against a mock provider. What is missing is a run with real models and the published
+against a mock provider. Its offline scorer refuses SERVICE before a query child
+starts, including after CR, LF and CRLF comment endings. An excluded first draft
+remains unknown and does not enter the conditional failed-first denominator. The
+initial spending gate requires complete, unique Content-Length response framing
+before settlement. It enforces a cumulative 64 KiB bound on raw status and header
+bytes across informational and final responses. Truncated or ambiguous framing
+keeps the full reservation unresolved and stops dispatch. Valid chunked and
+close-delimited responses are also refused because this transport supports only
+Content-Length framing. A nonstreaming request does not guarantee that framing
+from a provider. What is missing is a run with real models and the published
 numbers. The follow-up:
 
 - Run the matrix of §11.4 with real providers on the demo set, QALD-9-plus (DBpedia

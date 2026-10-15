@@ -497,6 +497,50 @@ class FirstDraft(unittest.TestCase):
         self.assertEqual(row["firstDraftUnknown"]["numerator"], 1)
         self.assertEqual(row["repairConditional"]["denominator"], 0)
 
+    def test_comment_endings_service_pre_spawn(self):
+        from evaluator import OfflinePolicy
+
+        args = self.fixture()
+        qs, out = eval_ask.validate_args(args)
+        runner = eval_ask.Runner(args, qs, out)
+        executions = []
+
+        def execute(argv, label, *unused):
+            executions.append({"argv": argv, "label": label})
+            return {"head": {}, "boolean": True}, {}
+
+        runner.execute = execute
+        for ending in ("\r", "\n", "\r\n"):
+            for keyword in ("SERVICE", "sErViCe", "SERVICE SILENT"):
+                text = (
+                    "ASK { # actual comment"
+                    + ending
+                    + keyword
+                    + " <urn:endpoint> {?s ?p ?o}}"
+                )
+                q = {"id": ending + keyword, "kind": "answerable", "gold": text}
+                refused = False
+                try:
+                    runner.gold(q)
+                except OfflinePolicy:
+                    refused = True
+                first = runner.first_draft(
+                    q, {"attempts": [{"query": text, "check": {"issues": []}}]}
+                )
+                # Assert receipts first so the old CR-only scanner fails genuinely.
+                self.assertEqual(executions, [])
+                self.assertTrue(refused)
+                self.assertEqual(first["status"], "unknown")
+                self.assertEqual(first["reason"], "offline_policy_exclusion")
+                row = eval_ask.summarize_pair(
+                    "p/m",
+                    [q],
+                    [{"outcome": "empty"}],
+                    [(True, (1, 1, 1), {"kind": "ask", "firstDraft": first})],
+                )[0]
+                self.assertEqual(row["repairConditional"]["denominator"], 0)
+                self.assertEqual(row["firstDraftUnknown"]["numerator"], 1)
+
     def test_offline_service_and_names(self):
         from evaluator import OfflinePolicy, offline_query
 

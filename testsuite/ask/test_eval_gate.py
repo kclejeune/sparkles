@@ -9,6 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "eval_support"))
 from anthropic_gate import (
@@ -19,6 +20,7 @@ from anthropic_gate import (
     Gate,
     GateError,
     Wallet,
+    dispatch_once,
     effective_config,
     redact,
     serve_gate,
@@ -26,6 +28,12 @@ from anthropic_gate import (
     validate_usage,
 )
 from evaluator import capture_child
+from test_eval_transport import (
+    header_prefix,
+    length_wire,
+    raw_upstream,
+    record_observation,
+)
 
 
 def request(model=MODELS[0]):
@@ -49,6 +57,59 @@ def response(model=MODELS[0], **usage):
             **usage,
         ),
     }
+
+
+def invalid_request_cases():
+    for key, value in [
+        ("temperature", 0),
+        ("top_p", 1),
+        ("thinking", {"type": "enabled"}),
+        ("tools", []),
+        ("cache_control", {}),
+        ("service_tier", "auto"),
+        ("inference_geo", "us"),
+        ("stream", True),
+        ("max_tokens", 1025),
+        ("model", "unknown"),
+    ]:
+        r = request()
+        r[key] = value
+        code = (
+            "request_model_limit"
+            if key in ("model", "max_tokens")
+            else "request_control_conflict"
+            if key in ("service_tier", "inference_geo", "stream")
+            else "request_fields"
+        )
+        yield key, json.dumps(r).encode(), code, code, None
+    valid = json.dumps(request()).encode()
+    # The permissively decoded objects otherwise pass validation. Each fixture
+    # isolates its own raw JSON/cap restriction instead of failing a later field.
+    yield (
+        "duplicate-key",
+        valid[:-1] + b',"system":"duplicate"}',
+        "invalid JSON",
+        "gate_internal",
+        "duplicate JSON field",
+    )
+    r = request()
+    r["output_config"] = {
+        "format": {"type": "json_schema", "schema": {"const": float("nan")}}
+    }
+    yield (
+        "nonfinite-json",
+        json.dumps(r).encode(),
+        "invalid JSON",
+        "gate_internal",
+        "nonfinite JSON number",
+    )
+    yield (
+        "oversize",
+        valid + b" " * (128 * 1024 + 1 - len(valid)),
+        "request_cap",
+        "request_cap",
+        None,
+    )
 
 
 class Budget(unittest.TestCase):
@@ -75,6 +136,13 @@ class Budget(unittest.TestCase):
             db.close()
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0][1], BOUNDS[json.loads(payload)["model"]])
+            record_observation(
+                {
+                    "case": self.id(),
+                    "priorCommittedReservation": rows,
+                    "model": json.loads(payload)["model"],
+                }
+            )
             observed.append(json.loads(payload))
             return (
                 dispatch
@@ -88,6 +156,80 @@ class Budget(unittest.TestCase):
         g = Gate(self.w, "FAKE_SENTINEL_NOT_A_KEY", counted)
         g.set_case("case-one")
         return g, observed
+
+    def test_complete_framing_before_settlement(self):
+        body = json.dumps(response()).encode()
+        for label, wire, malformed in [
+            ("exact-length", length_wire(body), False),
+            ("short-length-valid-json", length_wire(body, len(body) + 7), True),
+            (
+                "duplicate-length",
+                length_wire(
+                    body, extra=b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+                ),
+                True,
+            ),
+            (
+                "conflicting-framing",
+                length_wire(body, extra=b"Transfer-Encoding: chunked\r\n"),
+                True,
+            ),
+            (
+                "valid-chunked-unsupported",
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                + f"{len(body):x}\r\n".encode()
+                + body
+                + b"\r\n0\r\n\r\n",
+                True,
+            ),
+            ("close-delimited-unsupported", b"HTTP/1.1 200 OK\r\n\r\n" + body, True),
+            (
+                "header-cap",
+                header_prefix(
+                    65537,
+                    headers=b"Content-Length: " + str(len(body)).encode() + b"\r\n",
+                )
+                + body,
+                True,
+            ),
+            ("body-cap", length_wire(body, 1024 * 1024 + 1), True),
+        ]:
+            d = self.root / label
+            d.mkdir()
+            self.w = Wallet(d / "wallet", d / "grant", {"run": "synthetic-" + label})
+            self.addCleanup(self.w.close)
+            with raw_upstream(wire) as seen:
+                g, witnesses = self.gate(dispatch_once)
+                error = None
+                try:
+                    g.process(json.dumps(request()).encode())
+                except GateError as exception:
+                    error = exception.code
+                first = self.w.snapshot_report()
+                record_observation(
+                    {
+                        "case": label,
+                        "error": error,
+                        "wallet": first,
+                        "priorReservationPayloads": witnesses,
+                    }
+                )
+                if malformed:
+                    self.assertEqual(
+                        first["unresolvedUpperNanodollars"], BOUNDS[MODELS[0]]
+                    )
+                    self.assertIn(
+                        error, ("upstream_framing", "upstream_headers", "upstream_cap")
+                    )
+                    self.assertEqual(first["knownSettledNanodollars"], 0)
+                    self.assertTrue(g.stopped)
+                    with self.assertRaisesRegex(GateError, "dispatch_stopped"):
+                        g.process(json.dumps(request()).encode())
+                else:
+                    self.assertIsNone(error)
+                    self.assertEqual(first["unresolvedUpperNanodollars"], 0)
+                    self.assertEqual(first["knownSettledNanodollars"], 2000)
+                self.assertEqual(len(seen), 1)
 
     def test_each_model_and_durable_prior_reservation(self):
         g, obs = self.gate()
@@ -185,33 +327,80 @@ class Budget(unittest.TestCase):
             with self.assertRaises(GateError):
                 validate_usage(MODELS[0], r)
 
+    def assert_invalid_request_case(self, fixture):
+        label, raw, direct_code, gate_code, cause = fixture
+        with self.assertRaisesRegex(ValueError, "^" + direct_code + "$") as direct:
+            validate_request(raw)
+        if cause:
+            self.assertEqual(str(direct.exception.__cause__), cause)
+        d = self.root / (label + "-" + str(len(list(self.root.iterdir()))))
+        d.mkdir()
+        wallet = Wallet(d / "wallet", d / "grant", {"run": "synthetic-" + label})
+        calls = []
+        gate = Gate(
+            wallet,
+            "FAKE",
+            lambda *args: calls.append(True) or json.dumps(response()).encode(),
+        )
+        gate.set_case("invalid-fixture")
+        try:
+            self.assertFalse(gate.stopped)
+            with self.assertRaisesRegex(GateError, "^" + gate_code + "$"):
+                gate.process(raw)
+            self.assertEqual(calls, [])
+            state = wallet.snapshot_report()
+            self.assertEqual(state["acceptedRequests"], 0)
+            record_observation(
+                {
+                    "case": label,
+                    "directReason": direct_code,
+                    "cause": cause,
+                    "gateReason": gate_code,
+                    "dispatches": calls,
+                    "wallet": state,
+                }
+            )
+        finally:
+            wallet.close()
+
     def test_invalid_request_zero_dispatch(self):
+        for fixture in invalid_request_cases():
+            with self.subTest(case=fixture[0]):
+                self.assert_invalid_request_case(fixture)
+
+    def test_invalid_request_checks_detect_each_validation_bypass(self):
+        for fixture in invalid_request_cases():
+            label, target, *_ = fixture
+
+            def bypass(raw, target=target):
+                # An in-memory double simulates accepting just this invalid
+                # fixture. Unrelated validation remains the production function.
+                return validate_request(
+                    json.dumps(request()).encode() if raw == target else raw
+                )
+
+            with (
+                self.subTest(case=label),
+                mock.patch("anthropic_gate.validate_request", side_effect=bypass),
+            ):
+                with self.assertRaisesRegex(AssertionError, "GateError not raised"):
+                    self.assert_invalid_request_case(fixture)
+                record_observation(
+                    {"validationBypass": label, "correctedFixtureDetectedBypass": True}
+                )
+
+    def test_invalid_request_latches_separately(self):
         g, obs = self.gate()
-        for key, value in [
-            ("temperature", 0),
-            ("top_p", 1),
-            ("thinking", {"type": "enabled"}),
-            ("tools", []),
-            ("cache_control", {}),
-            ("service_tier", "auto"),
-            ("inference_geo", "us"),
-            ("stream", True),
-            ("max_tokens", 1025),
-            ("model", "unknown"),
-        ]:
-            r = request()
-            r[key] = value
-            with self.subTest(key=key), self.assertRaises(ValueError):
-                g.process(json.dumps(r).encode())
-        for raw in [
-            b'{"model":"x","model":"y"}',
-            b'{"x":NaN}',
-            b"x" * (128 * 1024 + 1),
-        ]:
-            with self.assertRaises(ValueError):
-                g.process(raw)
+        invalid = dict(request(), temperature=0)
+        with self.assertRaisesRegex(GateError, "^request_fields$"):
+            g.process(json.dumps(invalid).encode())
+        with self.assertRaisesRegex(GateError, "^dispatch_stopped$"):
+            g.process(json.dumps(request()).encode())
         self.assertEqual(obs, [])
         self.assertEqual(self.w.snapshot_report()["acceptedRequests"], 0)
+        self.assertEqual(
+            self.w.db.execute("SELECT count(*) FROM attempts").fetchone()[0], 0
+        )
 
     def test_unresolved_no_retry_refund_or_restart(self):
         def failed(*args):

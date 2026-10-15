@@ -12,6 +12,7 @@ import json
 import os
 import pathlib
 import queue
+import re
 import secrets
 import socket
 import sqlite3
@@ -436,6 +437,83 @@ class Wallet:
             self.lock_fd = None
 
 
+def read_upstream_response(stream):
+    """Accept only complete Content-Length framing with one raw header budget.
+
+    Every interim/final status line, header line and terminating CRLF consumes
+    the same 64 KiB budget. Read at most the remainder plus one overflow byte,
+    before parsing or accumulating headers. Chunked and close-delimited replies
+    are unsupported and cannot release a reservation.
+    """
+    remaining = ERROR_CAP
+
+    def line():
+        nonlocal remaining
+        # Keep the standard-library per-line bound as well as the aggregate cap.
+        raw = stream.readline(min(http.client._MAXLINE + 1, remaining + 1))
+        remaining -= len(raw)
+        if remaining < 0 or len(raw) > http.client._MAXLINE:
+            raise GateError("upstream_headers")
+        if not raw.endswith(b"\r\n"):
+            raise GateError("upstream_framing")
+        return raw
+
+    while True:
+        status_line = line()
+        status_match = re.fullmatch(
+            rb"HTTP/1\.[01] ([0-9]{3}) [^\r\n]*\r\n", status_line
+        )
+        if not status_match:
+            raise GateError("upstream_framing")
+        status = int(status_match[1])
+        if not 100 <= status <= 599 or status == 101:
+            raise GateError("upstream_framing")
+        headers = {}
+        count = 0
+        while True:
+            raw = line()
+            count += 1
+            if count > http.client._MAXHEADERS:
+                raise GateError("upstream_headers")
+            if raw == b"\r\n":
+                break
+            name, separator, value = raw[:-2].partition(b":")
+            if (
+                not separator
+                or not re.fullmatch(rb"[!#$%&'*+.^_`|~0-9A-Za-z-]+", name)
+                or any(c < 32 and c != 9 or c == 127 for c in value)
+            ):
+                raise GateError("upstream_framing")
+            headers.setdefault(name.lower(), []).append(value.strip(b" \t"))
+        # An informational response cannot define the final body's framing. No
+        # interim block resets the cumulative budget or authorizes settlement.
+        if status < 200:
+            if b"content-length" in headers or b"transfer-encoding" in headers:
+                raise GateError("upstream_framing")
+            continue
+        break
+
+    if not 200 <= status < 300:
+        raise GateError("upstream_status")
+    lengths = headers.get(b"content-length", [])
+    if b"transfer-encoding" in headers or len(lengths) != 1:
+        raise GateError("upstream_framing")
+    length = lengths[0]
+    if not re.fullmatch(rb"[0-9]+", length):
+        raise GateError("upstream_framing")
+    # Avoid converting unbounded decimal strings, including long leading zeros.
+    significant = length.lstrip(b"0") or b"0"
+    if len(significant) > len(str(RESPONSE_CAP)) or int(significant) > RESPONSE_CAP:
+        raise GateError("upstream_cap")
+    length = int(significant)
+    if headers.get(b"content-encoding", [b"identity"]) != [b"identity"]:
+        raise GateError("upstream_encoding")
+    body = stream.read(length)
+    if len(body) != length:
+        raise GateError("upstream_framing")
+    return body
+
+
 def dispatch_once(payload, key, timeout):
     """Exactly one standard-library TLS request; no redirects/proxies/retries."""
     deadline = time.monotonic() + timeout
@@ -515,15 +593,8 @@ def dispatch_once(payload, key, timeout):
                 "x-api-key": key,
             },
         )
-        response = conn.getresponse()
-        if not 200 <= response.status < 300:
-            raise GateError("upstream_status")
-        if response.getheader("content-encoding", "identity") != "identity":
-            raise GateError("upstream_encoding")
-        body = response.read(RESPONSE_CAP + 1)
-        if len(body) > RESPONSE_CAP:
-            raise GateError("upstream_cap")
-        return body
+        with conn.sock.makefile("rb") as stream:
+            return read_upstream_response(stream)
     finally:
         timer.cancel()
         timer.join(timeout=1)

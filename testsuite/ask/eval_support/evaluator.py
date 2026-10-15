@@ -103,8 +103,12 @@ def offline_query(text):
     while i < len(text):
         c = text[i]
         if c == "#":
-            j = text.find("\n", i)
-            i = len(text) if j == -1 else j + 1
+            while i < len(text) and text[i] not in "\r\n":
+                i += 1
+            if text.startswith("\r\n", i):
+                i += 2
+            elif i < len(text):
+                i += 1
             continue
         if c in ('"', "'"):
             marker = c * 3 if text.startswith(c * 3, i) else c
