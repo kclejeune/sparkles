@@ -472,6 +472,13 @@ async fn error_request_id(req: axum::extract::Request, next: axum::middleware::N
         .and_then(|v| v.to_str().ok())
         .is_some_and(|a| a.contains("text/turtle"));
     let mut resp = next.run(req).await;
+    finalize_error_response(&mut resp, id, turtle);
+    resp
+}
+
+/// Finalize error bodies before a body-owned admission permit is installed. Once
+/// consumed, the markers make later outer formatting calls leave that body intact.
+fn finalize_error_response(resp: &mut Response, id: Option<String>, turtle: bool) {
     if let Some(validation::RejectionTurtle(t)) = resp.extensions_mut().remove()
         && turtle
     {
@@ -483,10 +490,9 @@ async fn error_request_id(req: axum::extract::Request, next: axum::middleware::N
         resp.headers_mut()
             .insert(header::CONTENT_LENGTH, t.len().into());
         *resp.body_mut() = axum::body::Body::from(t);
-        return resp;
+        return;
     }
-    add_request_id(&mut resp, id);
-    resp
+    add_request_id(resp, id);
 }
 
 /// Answer `503` with `Retry-After: 5` to any request whose `{ds}` is being replaced in

@@ -5306,6 +5306,8 @@ projection or a definition, and its `predicates` may be bare IRIs. Prefixed name
 Read-only requests use the Query rate and concurrency policy. The permit covers
 computation and the response body. Blocking and streaming producers keep their
 share until their work ends even if the client disconnects.
+Admitted error bodies retain the same concurrency permit as successful bodies,
+including after the response headers have been discarded.
 
 A request with a `write` member writes its results back as a task.
 Write requests use Update HTTP admission through the `202` response body. The

@@ -643,7 +643,9 @@ gates are still pending.
   admin-body and decompressed-size caps, then checks Read through Query for rows or
   summaries and Write through Update for write-back before dataset lookup or restore
   disclosure. Query rate and concurrency limits cover computation and the body,
-  including blocking and streaming work after disconnect. Update HTTP admission
+  including blocking and streaming work after disconnect. Query and Update HTTP
+  permits also cover admitted error bodies, including when only the raw body remains
+  with a client. Update HTTP admission
   covers the `202` body; background work uses the existing task queue and algorithm
   thread admission without retaining the HTTP permit. The queue defaults to four
   running tasks and prechecks 1,000 waiting tasks. Per-dataset active-task checks are

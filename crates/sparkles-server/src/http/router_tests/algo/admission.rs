@@ -1,7 +1,7 @@
 //! Body-selected algorithm authorization and class admission through the real router.
 use super::*;
 use crate::ratelimit::{Config, RateLimiter};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 
 const READ: &str = r#"{"algorithm":"wcc","projection":{"predicates":["http://ex/p"]}}"#;
 const WRITE: &str = r#"{"algorithm":"pageRank","projection":{"predicates":["http://ex/p"]},"write":{"graph":"http://ex/out","predicates":{"score":"http://ex/rank"}}}"#;
@@ -198,6 +198,250 @@ async fn body_aware_query_body_retains_concurrency() {
     assert_eq!(
         raw(&s, "/$/algo/g/run", READ, None).await.status(),
         StatusCode::OK
+    );
+}
+
+// Finding-validation regressions originally failing on a0101f50.
+async fn finding_json_error_keeps_raw_body(authenticated: bool, token: Option<char>) {
+    let s = fixture(&["query=concurrency=1"], authenticated, false);
+    let first = raw(&s, "/$/algo/g/run?execution=bad", READ, token).await;
+    assert_eq!(first.status(), StatusCode::BAD_REQUEST);
+    let id = first.headers()["x-request-id"].to_str().unwrap().to_owned();
+    assert_eq!(first.headers()["x-content-type-options"], "nosniff");
+    let (parts, body) = first.into_parts();
+    drop(parts);
+    // Hold the raw unread Body after dropping all Response Parts/extensions.
+    let busy = raw(&s, "/$/algo/g/run?execution=eager", READ, token).await;
+    let held_status = busy.status();
+    drop(busy);
+    let bytes = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+    let error: J = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(error["requestId"], id);
+    assert!(error["error"].as_str().unwrap().contains("execution"));
+    let after_eof = raw(&s, "/$/algo/g/run?execution=eager", READ, token).await;
+    let released_status = after_eof.status();
+    drop(after_eof);
+    assert_eq!(released_status, StatusCode::OK);
+    assert_eq!(
+        held_status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admitted JSON400 must retain Query concurrency through raw unread body"
+    );
+}
+
+#[tokio::test]
+async fn finding_json_error_body_holds_query_no_auth() {
+    finding_json_error_keeps_raw_body(false, None).await;
+}
+
+#[cfg(feature = "auth")]
+#[tokio::test]
+async fn finding_json_error_body_holds_query_with_auth() {
+    finding_json_error_keeps_raw_body(true, Some('H')).await;
+}
+
+#[tokio::test]
+async fn finding_success_raw_body_control() {
+    let s = fixture(&["query=concurrency=1"], false, false);
+    let first = raw(&s, "/$/algo/g/run?execution=eager", READ, None).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let (parts, body) = first.into_parts();
+    drop(parts);
+    let busy = raw(&s, "/$/algo/g/run?execution=eager", READ, None).await;
+    let held_status = busy.status();
+    drop(busy);
+    drop(body);
+    let released = raw(&s, "/$/algo/g/run?execution=eager", READ, None).await;
+    let released_status = released.status();
+    drop(released);
+    assert_eq!(held_status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(released_status, StatusCode::OK);
+}
+
+async fn finding_update_error_keeps_raw_body(authenticated: bool, token: Option<char>) {
+    let s = fixture(&["update=concurrency=1"], authenticated, false);
+    let _reservation = s
+        .state
+        .catalog
+        .reserve(
+            "g",
+            sparkles::catalog::ReservationKind::Restore,
+            "owned-restore",
+        )
+        .unwrap();
+    let first = raw(&s, "/$/algo/g/run", WRITE, token).await;
+    assert_eq!(first.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let (parts, body) = first.into_parts();
+    let id = parts.headers["x-request-id"].to_str().unwrap().to_owned();
+    assert_eq!(parts.headers[header::RETRY_AFTER], "5");
+    drop(parts);
+    let busy = raw(&s, "/$/algo/g/run", WRITE, token).await;
+    let busy_json: J = serde_json::from_slice(
+        &axum::body::to_bytes(busy.into_body(), 1 << 20)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let first_json: J =
+        serde_json::from_slice(&axum::body::to_bytes(body, 1 << 20).await.unwrap()).unwrap();
+    assert_eq!(first_json["code"], "dataset-restoring");
+    assert_eq!(first_json["requestId"], id);
+    let after = raw(&s, "/$/algo/g/run", WRITE, token).await;
+    let after_json: J = serde_json::from_slice(
+        &axum::body::to_bytes(after.into_body(), 1 << 20)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(after_json["code"], "dataset-restoring");
+    assert!(s.state.tasks.lock().is_empty());
+    assert_eq!(
+        busy_json["reason"], "concurrency",
+        "admitted Update503 must hold slot, not disclose another restore response: {busy_json}"
+    );
+}
+
+#[tokio::test]
+async fn finding_json_error_body_holds_update_no_auth() {
+    finding_update_error_keeps_raw_body(false, None).await;
+}
+
+#[cfg(feature = "auth")]
+#[tokio::test]
+async fn finding_json_error_body_holds_update_with_auth() {
+    finding_update_error_keeps_raw_body(true, Some('I')).await;
+}
+
+const FINDING_TURTLE: &str = "<urn:report> <urn:result> <urn:rejected> .\n";
+
+/// Controlled downstream error only. This is not an algorithm/SHACL execution.
+/// It exercises actual admission, ErrorJson/RejectionTurtle and outer formatters.
+fn finding_error_adapter(s: &Fixture, inner_formatter: bool) -> Router {
+    let app = Router::new()
+        .route(
+            "/$/algo/{ds}/run",
+            axum::routing::post(|| async {
+                crate::http::err_body(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    serde_json::json!({"error":"controlled downstream rejection",
+                        "_validationHeader":"rejected", "_turtle":FINDING_TURTLE}),
+                )
+                .into_response()
+            }),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            s.state.clone(),
+            crate::http::algo::admit_run,
+        ));
+    let app = if inner_formatter {
+        app.layer(axum::middleware::from_fn(crate::http::error_request_id))
+    } else {
+        app
+    };
+    app.layer(axum::middleware::from_fn_with_state(
+        s.state.clone(),
+        crate::auth::middleware,
+    ))
+    .layer(axum::middleware::from_fn_with_state(
+        s.state.clone(),
+        crate::obs::observe,
+    ))
+}
+
+async fn finding_adapter_keeps_body(authenticated: bool, token: Option<char>, turtle: bool) {
+    let s = fixture(&["query=concurrency=1"], authenticated, false);
+    // No inner formatter isolates the real outer auth add_request_id path.
+    let app = finding_error_adapter(&s, turtle);
+    let mut req = request("/$/algo/g/run", READ, token);
+    if turtle {
+        req.headers_mut()
+            .insert(header::ACCEPT, "text/turtle".parse().unwrap());
+    }
+    let first = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(first.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let (parts, body) = first.into_parts();
+    let id = parts.headers["x-request-id"].to_str().unwrap().to_owned();
+    if turtle {
+        assert_eq!(parts.headers[header::CONTENT_TYPE], "text/turtle");
+        assert_eq!(
+            parts.headers[header::CONTENT_LENGTH],
+            FINDING_TURTLE.len().to_string()
+        );
+        assert_eq!(parts.headers["sparkles-validation"], "rejected");
+    }
+    drop(parts);
+    let busy = app
+        .clone()
+        .oneshot(request("/$/algo/g/run", READ, token))
+        .await
+        .unwrap();
+    let held_status = busy.status();
+    drop(busy);
+    let bytes = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+    if turtle {
+        assert_eq!(&bytes[..], FINDING_TURTLE.as_bytes());
+    } else {
+        assert_eq!(
+            serde_json::from_slice::<J>(&bytes).unwrap()["requestId"],
+            id
+        );
+    }
+    let released = app
+        .oneshot(request("/$/algo/g/run", READ, token))
+        .await
+        .unwrap();
+    let released_status = released.status();
+    drop(released);
+    assert_eq!(released_status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        held_status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "labelled controlled formatter adapter must preserve raw body permit; turtle={turtle}"
+    );
+}
+
+#[tokio::test]
+async fn finding_turtle_formatter_body_holds_no_auth() {
+    finding_adapter_keeps_body(false, None, true).await;
+}
+
+#[cfg(feature = "auth")]
+#[tokio::test]
+async fn finding_turtle_formatter_body_holds_with_auth() {
+    finding_adapter_keeps_body(true, Some('H'), true).await;
+}
+
+#[cfg(feature = "auth")]
+#[tokio::test]
+async fn finding_outer_auth_json_formatter_body_holds() {
+    finding_adapter_keeps_body(true, Some('H'), false).await;
+}
+
+#[tokio::test]
+async fn finding_busy_error_does_not_spend_rate_token() {
+    let s = fixture(&["query=1/min,burst=2,concurrency=1"], false, false);
+    let first = raw(&s, "/$/algo/g/run?execution=bad", READ, None).await;
+    assert_eq!(first.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        first.headers()["ratelimit-policy"]
+            .to_str()
+            .unwrap()
+            .contains("query")
+    );
+    let body = first.into_body();
+    let busy = raw(&s, "/$/algo/g/run?execution=eager", READ, None).await;
+    let held_status = busy.status();
+    drop(busy);
+    drop(body);
+    let released = raw(&s, "/$/algo/g/run?execution=eager", READ, None).await;
+    let released_status = released.status();
+    drop(released);
+    eprintln!("finding token witness: held={held_status} released={released_status}");
+    assert_eq!(held_status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        released_status,
+        StatusCode::OK,
+        "busy attempt cannot spend second token"
     );
 }
 

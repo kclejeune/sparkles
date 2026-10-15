@@ -101,6 +101,16 @@ pub(super) async fn admit_run(State(st): St, req: Request, next: Next) -> Respon
     if request.write.is_some() && st.read_only {
         return err(StatusCode::FORBIDDEN, "server is read-only").into_response();
     }
+    let id = parts
+        .headers
+        .get(&crate::obs::X_REQUEST_ID)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let turtle = parts
+        .headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|a| a.contains("text/turtle"));
     let prepared = PreparedAlgoRun {
         dataset: name.clone(),
         request,
@@ -115,7 +125,14 @@ pub(super) async fn admit_run(State(st): St, req: Request, next: Next) -> Respon
     let req = Request::from_parts(parts, axum::body::Body::empty());
     match &st.rate_limit {
         Some(rl) => {
-            crate::ratelimit::limit_as(rl, class, Some(name), req, |req| next.run(req)).await
+            crate::ratelimit::limit_as(rl, class, Some(name), req, |req| async move {
+                let mut resp = next.run(req).await;
+                // Outer JSON/Turtle formatting must not replace PermitBody after
+                // admission, including when only the raw Body remains with a client.
+                super::finalize_error_response(&mut resp, id, turtle);
+                resp
+            })
+            .await
         }
         None => next.run(req).await,
     }
