@@ -2051,6 +2051,21 @@ writing a query. The parameters and outputs of each algorithm are in
 [API.md](API.md#graph-algorithms), and the design is in
 [F14](specs/F14-graph-algorithms.md).
 
+Weighted betweenness accepts only finite, strictly positive weights in the stored
+`f32` representation. A zero, negative or nonfinite weight refuses the whole call,
+including a SERVICE value that rounds to zero or infinity during conversion. A
+refused call returns no score rows. Unweighted betweenness still uses unit edges, SSSP
+still accepts zero weights, and PageRank retains its nonnegative weight domain.
+[Roadmap item 79](ROADMAP.md) tracks nonnegative weighted betweenness semantics.
+
+Some finite positive graphs are also refused during computation. If a competitive
+edge cannot increase the distance at `f64` precision, or a computed distance is
+nonfinite, the invocation fails with `Invalid` and publishes no score rows, success
+statistics or write-back commits. A tiny edge that cannot improve or tie its target
+does not trigger this refusal. Accepted distances and path counts remain approximate,
+and sampling checks only the selected source searches.
+[Roadmap item 80](ROADMAP.md) tracks positive-weight numerical robustness.
+
 The ten most central people of a social graph:
 
 ```sh

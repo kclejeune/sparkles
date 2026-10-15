@@ -216,6 +216,17 @@ other RDF stores have and Sparkles does not.
 Each gap ends with the [roadmap](ROADMAP.md) items that address it. The roadmap orders
 that work by priority and links each item to its design spec.
 
+* **Weighted betweenness.** Betweenness requires finite, strictly positive stored edge
+  weights. Zero-weight shortest-path counting needs defined cycle semantics and a
+  validated algorithm. SSSP still accepts zero weights, and PageRank retains its
+  nonnegative weight domain. [Roadmap](ROADMAP.md) item 79.
+
+* **Positive-weight numerical limits.** Weighted betweenness refuses a competitive
+  distance addition that cannot retain a strict increase at `f64` precision, and
+  refuses nonfinite computed distances. Accepted distances and path counts remain
+  approximate, including rounded path ties. Sampling checks only the selected
+  source searches. [Roadmap](ROADMAP.md) item 80.
+
 * **Scale and execution.** The largest measured dataset is English DBpedia, 1.24 billion
   triples on one machine. Nothing larger, such as Wikidata, has been tried. Queries run
   eagerly by default, and each operator then materializes its result within budgets.

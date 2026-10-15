@@ -143,6 +143,8 @@ These items are smaller or narrower. Each has a design sketch in the linked spec
 | 75 | Access control: validation endpoints for callers whose grants cover part of a dataset, the change feed for data-dependent protections, and hiding IRIs that visible triples mention | [C12](specs/C12-graph-access-control.md#roadmap-follow-ups-2026-10-12), [C12b](specs/C12b-triple-access-control.md#roadmap-follow-ups-2026-10-12) | M–L |
 | 76 | Jena compatibility: complete assembler bodies, direct Graph Store naming per dataset, and JVM metrics | [G08](specs/G08-fuseki-configuration.md#roadmap-follow-ups-2026-10-12), [P04](specs/P04-jvm-bindings.md#roadmap-follow-ups-2026-10-12) | S–M |
 | 77 | Assistant ingestion: the Ingest panel stores uploads without extracting facts when server ingestion is off, without saying so; and server-side document ingestion has no redaction (memory import redacts with built-in and custom patterns) | [C18](specs/C18-natural-language-questions-and-ingest.md#roadmap-follow-ups-2026-10-12), [C19](specs/C19-layered-settings.md#roadmap-follow-ups-2026-10-12) | S–M |
+| 79 | Nonnegative weighted betweenness semantics. Define zero-weight path counting and validate an algorithm before extending the current finite, strictly positive domain. | [F14](specs/F14-graph-algorithms.md#nonnegative-weighted-betweenness-semantics) | M–L |
+| 80 | Positive-weight numerical robustness. Extend the refused mixed-scale domain and define distance and path-count approximation guarantees for weighted betweenness. | [F14](specs/F14-graph-algorithms.md#positive-weight-numerical-robustness) | M–L |
 
 ## Tier 6: release work
 

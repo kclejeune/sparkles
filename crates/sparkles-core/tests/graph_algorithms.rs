@@ -12,6 +12,823 @@ use std::sync::Arc;
 const PREFIXES: &str = "PREFIX ex: <http://ex/> PREFIX algo: <urn:x-sparkles:algo#> PREFIX spk: <urn:x-sparkles:> \
                         PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> ";
 
+mod betweenness_weight_domain {
+    use super::*;
+    use sparkles_core::Error;
+    use sparkles_core::algo::{
+        Aggregate, Control, Graph, Par, RawEdges, betweenness, pagerank, traverse,
+    };
+    use std::sync::atomic::AtomicBool;
+
+    const DOMAIN: &str = "edge weights must be finite and strictly positive";
+    const ZERO_DAG: &[(u32, u32, f32)] = &[(0, 2, 1.0), (0, 1, 1.0), (2, 1, 0.0), (1, 3, 1.0)];
+
+    fn graph(n: u32, edges: &[(u32, u32, f32)], symmetric: bool) -> Graph {
+        Graph::build(
+            RawEdges {
+                nodes: (0..n as u64).collect(),
+                src: edges.iter().map(|e| e.0 as u64).collect(),
+                dst: edges.iter().map(|e| e.1 as u64).collect(),
+                w: Some(edges.iter().map(|e| e.2).collect()),
+                symmetric,
+            },
+            Aggregate::None,
+            &Par::single(),
+            &Control::unlimited(),
+        )
+        .unwrap()
+    }
+
+    fn refused(n: u32, edges: &[(u32, u32, f32)], symmetric: bool) {
+        let g = graph(n, edges, symmetric);
+        let bytes = g.bytes();
+        for samples in [0, 1] {
+            let ctl = Control::unlimited();
+            let result = betweenness::run(
+                &g,
+                &betweenness::Params { samples, seed: 7 },
+                &Par::single(),
+                &ctl,
+            );
+            assert!(
+                matches!(&result, Err(Error::Invalid(message)) if message.contains(DOMAIN)),
+                "expected finite-positive refusal, no score vector; got {result:?}"
+            );
+            assert_eq!(ctl.peak(), 0, "refuse before Brandes workspace charge");
+            assert_eq!(g.bytes(), bytes, "refuse before incoming transpose");
+        }
+        let ctl = Control::new(Arc::new(AtomicBool::new(false)), None, 0);
+        assert!(
+            matches!(
+                betweenness::run(&g, &Default::default(), &Par::single(), &ctl),
+                Err(Error::Invalid(_))
+            ),
+            "weight refusal precedes workspace-budget refusal"
+        );
+    }
+
+    #[test]
+    fn four_node_zero_dag_refused() {
+        refused(4, ZERO_DAG, false);
+    }
+
+    #[test]
+    fn node_id_permutation_refused() {
+        let permutation = [3, 2, 1, 0];
+        let edges: Vec<_> = ZERO_DAG
+            .iter()
+            .map(|&(a, b, w)| (permutation[a as usize], permutation[b as usize], w))
+            .collect();
+        refused(4, &edges, false);
+    }
+
+    #[test]
+    fn parallel_zero_edges_refused() {
+        refused(
+            4,
+            &[
+                (0, 2, 1.0),
+                (0, 1, 1.0),
+                (2, 1, 0.0),
+                (2, 1, 0.0),
+                (1, 3, 1.0),
+            ],
+            false,
+        );
+    }
+
+    #[test]
+    fn equal_distance_groups_refused() {
+        refused(
+            6,
+            &[
+                (0, 1, 1.0),
+                (0, 2, 1.0),
+                (2, 1, 0.0),
+                (1, 3, 1.0),
+                (1, 4, 1.0),
+                (4, 3, 0.0),
+                (3, 5, 1.0),
+            ],
+            false,
+        );
+    }
+
+    #[test]
+    fn zero_self_loop_refused() {
+        refused(2, &[(0, 0, 0.0), (0, 1, 1.0)], false);
+    }
+
+    #[test]
+    fn reachable_zero_scc_refused() {
+        refused(
+            4,
+            &[(0, 1, 1.0), (1, 2, 0.0), (2, 1, 0.0), (2, 3, 1.0)],
+            false,
+        );
+    }
+
+    #[test]
+    fn undirected_zero_edge_refused() {
+        refused(
+            3,
+            &[(0, 1, 0.0), (1, 0, 0.0), (1, 2, 1.0), (2, 1, 1.0)],
+            true,
+        );
+    }
+
+    #[test]
+    fn disconnected_zero_scc_refused() {
+        refused(4, &[(0, 1, 1.0), (2, 3, 0.0), (3, 2, 0.0)], false);
+    }
+
+    #[test]
+    fn negative_zero_refused() {
+        refused(2, &[(0, 1, -0.0)], false);
+    }
+
+    #[test]
+    fn positive_infinity_refused() {
+        refused(2, &[(0, 1, f32::INFINITY)], false);
+    }
+
+    #[test]
+    fn existing_negative_nan_and_negative_infinity_refusals_remain() {
+        for weight in [-1.0, f32::NAN, f32::NEG_INFINITY] {
+            let g = graph(2, &[(0, 1, weight)], false);
+            let ctl = Control::unlimited();
+            assert!(matches!(
+                betweenness::run(&g, &Default::default(), &Par::single(), &ctl),
+                Err(Error::Invalid(_))
+            ));
+            assert_eq!(ctl.peak(), 0);
+        }
+    }
+
+    /// Enumerate edge-distinct simple paths, independently of Dijkstra/Brandes.
+    fn reference(n: usize, edges: &[(u32, u32, f32)], symmetric: bool) -> Vec<f64> {
+        fn visit(
+            u: usize,
+            target: usize,
+            edges: &[(u32, u32, f32)],
+            path: &mut Vec<usize>,
+            cost: f64,
+            found: &mut Vec<(f64, Vec<usize>)>,
+        ) {
+            if u == target {
+                found.push((cost, path.clone()));
+                return;
+            }
+            for &(a, b, w) in edges {
+                let v = b as usize;
+                if a as usize == u && !path.contains(&v) {
+                    path.push(v);
+                    visit(v, target, edges, path, cost + w as f64, found);
+                    path.pop();
+                }
+            }
+        }
+        let mut scores = vec![0.0; n];
+        for s in 0..n {
+            for t in 0..n {
+                if s == t {
+                    continue;
+                }
+                let mut paths = Vec::new();
+                visit(s, t, edges, &mut vec![s], 0.0, &mut paths);
+                let best = paths.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
+                let shortest: Vec<_> = paths.iter().filter(|p| p.0 == best).collect();
+                for (_, path) in &shortest {
+                    for &v in &path[1..path.len() - 1] {
+                        scores[v] += 1.0 / shortest.len() as f64;
+                    }
+                }
+            }
+        }
+        if symmetric {
+            for s in &mut scores {
+                *s *= 0.5;
+            }
+        }
+        scores
+    }
+
+    fn close(got: &[f64], expected: &[f64]) {
+        assert_eq!(got.len(), expected.len());
+        for (got, expected) in got.iter().zip(expected) {
+            assert!((got - expected).abs() < 1e-10, "{got} vs {expected}");
+        }
+    }
+
+    #[test]
+    fn positive_scores_match_independent_path_enumeration() {
+        let edges = [
+            (0, 1, 1.0),
+            (0, 1, 1.0),
+            (0, 2, 1.0),
+            (1, 3, 1.0),
+            (2, 3, 1.0),
+            (3, 4, 2.0),
+            (1, 4, 3.0),
+        ];
+        let expected = reference(5, &edges, false);
+        for par in [Par::single(), Par::with_threads(2)] {
+            let g = graph(5, &edges, false);
+            close(
+                &betweenness::run(&g, &Default::default(), &par, &Control::unlimited()).unwrap(),
+                &expected,
+            );
+        }
+    }
+
+    #[test]
+    fn finite_positive_f32_extremes_remain_valid() {
+        for weight in [f32::from_bits(1), f32::MIN_POSITIVE, f32::MAX] {
+            let g = graph(3, &[(0, 1, weight), (1, 2, weight)], false);
+            close(
+                &betweenness::run(
+                    &g,
+                    &Default::default(),
+                    &Par::single(),
+                    &Control::unlimited(),
+                )
+                .unwrap(),
+                &[0.0, 1.0, 0.0],
+            );
+        }
+    }
+
+    fn service_store(edges: &[(u32, u32, f32)]) -> Store {
+        let ttl: String = edges
+            .iter()
+            .enumerate()
+            .map(|(i, &(a, b, w))| format!("ex:n{a} ex:p{i} ex:n{b} {{| ex:w {w:e} |}} .\n"))
+            .collect();
+        store_of(&ttl)
+    }
+
+    fn service_query(predicates: usize, direction: &str) -> String {
+        let predicates = (0..predicates)
+            .map(|i| format!("ex:p{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "SELECT ?n ?r WHERE {{ SERVICE algo:betweenness {{ [] algo:predicate {predicates} ; algo:weight ex:w ; algo:direction algo:{direction} ; algo:samples 8 ; algo:node ?n ; algo:score ?r }} }}"
+        )
+    }
+
+    fn service_zero_refused(direction: &str) {
+        let s = service_store(ZERO_DAG);
+        let q = service_query(ZERO_DAG.len(), direction);
+        let result = query(
+            s.snapshot(),
+            &format!("{PREFIXES}{q}"),
+            &QueryOptions {
+                no_cache: true,
+                ..Default::default()
+            },
+        );
+        assert!(
+            matches!(&result,Err(Error::Invalid(message)) if message.contains(DOMAIN)),
+            "SERVICE must refuse without score rows; error={:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn service_zero_dag_refused() {
+        service_zero_refused("forward");
+    }
+
+    #[test]
+    fn service_undirected_zero_refused() {
+        service_zero_refused("undirected");
+    }
+
+    #[test]
+    fn service_positive_scores_match_native_and_reference() {
+        let edges = [
+            (0, 1, 1.0),
+            (0, 1, 1.0),
+            (0, 2, 1.0),
+            (1, 3, 1.0),
+            (2, 3, 1.0),
+            (3, 4, 2.0),
+            (1, 4, 3.0),
+        ];
+        let expected = reference(5, &edges, false);
+        let s = service_store(&edges);
+        let r = rows(&s, &service_query(edges.len(), "forward"));
+        let got = by_node(&r, "r");
+        let got: Vec<f64> = (0..5)
+            .map(|n| got[&format!("n{n}")].parse().unwrap())
+            .collect();
+        close(&got, &expected);
+        close(
+            &got,
+            &betweenness::run(
+                &graph(5, &edges, false),
+                &Default::default(),
+                &Par::single(),
+                &Control::unlimited(),
+            )
+            .unwrap(),
+        );
+    }
+
+    fn service_storage_refused(value: &str, form: usize) {
+        let s = store_of(&format!("ex:a ex:p ex:b {{| ex:w {value} |}} ."));
+        let cases = [
+            "[] algo:predicate ex:p ; algo:weight ex:w ; algo:node ?n ; algo:score ?r".to_string(),
+            format!(
+                "[] algo:predicate ex:p ; algo:weight ex:absent ; algo:defaultWeight {value} ; algo:node ?n ; algo:score ?r"
+            ),
+            format!(
+                "[] algo:start ?a ; algo:end ?b ; algo:edgeWeight ?w ; algo:node ?n ; algo:score ?r . {{ VALUES (?a ?b ?w) {{ (ex:a ex:b {value}) }} }}"
+            ),
+        ];
+        let body = &cases[form];
+        let q =
+            format!("{PREFIXES} SELECT ?n ?r WHERE {{ SERVICE algo:betweenness {{ {body} }} }}");
+        let result = query(
+            s.snapshot(),
+            &q,
+            &QueryOptions {
+                no_cache: true,
+                ..Default::default()
+            },
+        );
+        let expected = match value {
+            "1e100" => matches!(&result, Err(Error::Invalid(message))
+                if message == "algo: an edge weight is not finite as f32"),
+            "1e-100" => matches!(&result, Err(Error::Invalid(message))
+                if message.contains(DOMAIN)),
+            _ => panic!("unexpected storage-refusal fixture: {value}"),
+        };
+        assert!(expected, "{value}, {body}: {:?}", result.err());
+    }
+
+    #[test]
+    fn service_reifier_overflow_refused() {
+        service_storage_refused("1e100", 0);
+    }
+    #[test]
+    fn service_default_overflow_refused() {
+        service_storage_refused("1e100", 1);
+    }
+    #[test]
+    fn service_nested_overflow_refused() {
+        service_storage_refused("1e100", 2);
+    }
+    #[test]
+    fn service_reifier_underflow_refused() {
+        service_storage_refused("1e-100", 0);
+    }
+    #[test]
+    fn service_default_underflow_refused() {
+        service_storage_refused("1e-100", 1);
+    }
+    #[test]
+    fn service_nested_underflow_refused() {
+        service_storage_refused("1e-100", 2);
+    }
+
+    #[test]
+    fn zero_weight_sssp_and_nonnegative_pagerank_remain_valid() {
+        let g = graph(3, &[(0, 1, 0.0), (1, 2, 1.0)], false);
+        close(
+            &traverse::sssp(&g, &[0], &Par::single(), &Control::unlimited()).unwrap(),
+            &[0.0, 0.0, 1.0],
+        );
+        let r = pagerank::run(
+            &g,
+            &Default::default(),
+            &Par::single(),
+            &Control::unlimited(),
+        )
+        .unwrap();
+        assert!(r.score.iter().all(|x| x.is_finite() && *x >= 0.0));
+        assert!((r.score.iter().sum::<f64>() - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn large_valid_weight_scan_checks_controls_before_workspace() {
+        let edges = vec![(0, 1, 1.0); 1 << 16];
+        let g = graph(2, &edges, false);
+        let bytes = g.bytes();
+        for cancel in [true, false] {
+            let ctl = Control::new(
+                Arc::new(AtomicBool::new(cancel)),
+                (!cancel).then(std::time::Instant::now),
+                u64::MAX,
+            );
+            let result = betweenness::run(&g, &Default::default(), &Par::single(), &ctl);
+            if cancel {
+                assert!(matches!(result, Err(Error::Cancelled)));
+            } else {
+                assert!(matches!(result, Err(Error::Timeout)));
+            }
+            assert_eq!(ctl.peak(), 0);
+            assert_eq!(g.bytes(), bytes);
+        }
+    }
+
+    mod numerical_guard {
+        use super::*;
+        use sparkles_core::algo::catalog::{PredicateDef, ProjectionDef};
+        use sparkles_core::sparql::algorun::{
+            AlgoRequest, ProjectionRef, WriteMode, WriteSpec, query_text, run_write,
+        };
+        use std::sync::atomic::Ordering;
+
+        const NUMERICAL: &str =
+            "shortest-path distance cannot increase at floating-point precision";
+
+        fn tiny_edges() -> Vec<(u32, u32, f32)> {
+            vec![
+                (0, 2, 1.0),
+                (0, 1, 1.0),
+                (2, 1, f32::from_bits(1)),
+                (1, 3, 1.0),
+            ]
+        }
+
+        fn numerical(result: Result<Vec<f64>, Error>) {
+            assert!(
+                matches!(&result, Err(Error::Invalid(m)) if m.contains(NUMERICAL)),
+                "affected computation must refuse without scores: {result:?}"
+            );
+        }
+
+        #[test]
+        fn tiny_positive_original_and_all_node_permutations_refuse() {
+            let edges = tiny_edges();
+            let mut tested = 0;
+            for a in 0..4 {
+                for b in 0..4 {
+                    for c in 0..4 {
+                        for d in 0..4 {
+                            let p = [a, b, c, d];
+                            if p.into_iter().collect::<BTreeSet<_>>().len() != 4 {
+                                continue;
+                            }
+                            let permuted: Vec<_> = edges
+                                .iter()
+                                .map(|&(a, b, w)| (p[a as usize], p[b as usize], w))
+                                .collect();
+                            for par in [Par::single(), Par::with_threads(2)] {
+                                let g = graph(4, &permuted, false);
+                                let flag = Arc::new(AtomicBool::new(false));
+                                let ctl = Control::new(flag.clone(), None, u64::MAX);
+                                numerical(betweenness::run(&g, &Default::default(), &par, &ctl));
+                                assert!(
+                                    !flag.load(Ordering::Relaxed),
+                                    "numerical refusal must not cancel the caller"
+                                );
+                            }
+                            tested += 1;
+                        }
+                    }
+                }
+            }
+            assert_eq!(tested, 24);
+        }
+
+        #[test]
+        fn improving_absorbed_candidate_refuses() {
+            numerical(betweenness::run(
+                &graph(3, &[(0, 1, 1.0), (1, 2, f32::from_bits(1))], false),
+                &Default::default(),
+                &Par::single(),
+                &Control::unlimited(),
+            ));
+        }
+
+        #[test]
+        fn collapsed_positive_self_loop_and_cycle_refuse() {
+            let tiny = f32::from_bits(1);
+            for edges in [
+                vec![(0, 1, 1.0), (1, 1, tiny)],
+                vec![(0, 1, 1.0), (0, 2, 1.0), (1, 2, tiny), (2, 1, tiny)],
+            ] {
+                numerical(betweenness::run(
+                    &graph(3, &edges, false),
+                    &Default::default(),
+                    &Par::single(),
+                    &Control::unlimited(),
+                ));
+            }
+        }
+
+        #[test]
+        fn noncompetitive_absorbed_edge_and_mixed_components_remain_valid() {
+            let tiny = f32::from_bits(1);
+            for edges in [
+                vec![(0, 1, 1.0), (0, 2, tiny), (1, 2, tiny)],
+                vec![(0, 1, 1.0), (2, 3, tiny)],
+            ] {
+                close(
+                    &betweenness::run(
+                        &graph(4, &edges, false),
+                        &Default::default(),
+                        &Par::single(),
+                        &Control::unlimited(),
+                    )
+                    .unwrap(),
+                    &[0.0; 4],
+                );
+            }
+        }
+
+        #[test]
+        fn uniform_tiny_parallel_edges_keep_reference_multiplicity() {
+            let t = f32::from_bits(1);
+            let edges = [(0, 1, t), (0, 1, t), (0, 2, t), (1, 3, t), (2, 3, t)];
+            let expected = reference(4, &edges, false);
+            close(
+                &betweenness::run(
+                    &graph(4, &edges, false),
+                    &Default::default(),
+                    &Par::single(),
+                    &Control::unlimited(),
+                )
+                .unwrap(),
+                &expected,
+            );
+        }
+
+        #[test]
+        fn ordinary_large_edge_tie_is_an_approximation_not_an_exact_oracle() {
+            let large = 2f32.powi(100);
+            let edges = [(0, 1, 1.0), (0, 2, 2.0), (1, 3, large), (2, 3, large)];
+            // Exact dyadic path costs give [0,1,0,0]. The supported f64 computation
+            // rounds both long paths to the same cost, and intentionally remains approximate.
+            close(
+                &betweenness::run(
+                    &graph(4, &edges, false),
+                    &Default::default(),
+                    &Par::single(),
+                    &Control::unlimited(),
+                )
+                .unwrap(),
+                &[0.0, 0.5, 0.5, 0.0],
+            );
+        }
+
+        #[test]
+        fn sampling_only_checks_selected_searches_and_all_sources_remain_exact() {
+            let g = graph(4, &tiny_edges(), false);
+            // The existing seeded shuffle selects source0 with seed9 and sink3 with seed1.
+            numerical(betweenness::run(
+                &g,
+                &betweenness::Params {
+                    samples: 1,
+                    seed: 9,
+                },
+                &Par::single(),
+                &Control::unlimited(),
+            ));
+            close(
+                &betweenness::run(
+                    &g,
+                    &betweenness::Params {
+                        samples: 1,
+                        seed: 1,
+                    },
+                    &Par::single(),
+                    &Control::unlimited(),
+                )
+                .unwrap(),
+                &[0.0; 4],
+            );
+            numerical(betweenness::run(
+                &g,
+                &betweenness::Params {
+                    samples: 4,
+                    seed: 1,
+                },
+                &Par::single(),
+                &Control::unlimited(),
+            ));
+            let path = graph(4, &[(0, 1, 1.0), (1, 2, 1.0), (2, 3, 1.0)], false);
+            close(
+                &betweenness::run(
+                    &path,
+                    &betweenness::Params {
+                        samples: 1,
+                        seed: 9,
+                    },
+                    &Par::single(),
+                    &Control::unlimited(),
+                )
+                .unwrap(),
+                &[0.0, 8.0, 4.0, 0.0],
+            );
+        }
+
+        #[test]
+        fn existing_control_errors_precede_dynamic_numerical_work() {
+            let g = graph(4, &tiny_edges(), false);
+            let flag = Arc::new(AtomicBool::new(true));
+            assert!(matches!(
+                betweenness::run(
+                    &g,
+                    &Default::default(),
+                    &Par::single(),
+                    &Control::new(flag.clone(), None, u64::MAX)
+                ),
+                Err(Error::Cancelled)
+            ));
+            let clear = Arc::new(AtomicBool::new(false));
+            assert!(matches!(
+                betweenness::run(
+                    &g,
+                    &Default::default(),
+                    &Par::single(),
+                    &Control::new(clear.clone(), Some(std::time::Instant::now()), u64::MAX)
+                ),
+                Err(Error::Timeout)
+            ));
+            assert!(matches!(
+                betweenness::run(
+                    &g,
+                    &Default::default(),
+                    &Par::single(),
+                    &Control::new(clear.clone(), None, 0)
+                ),
+                Err(Error::BudgetExceeded(_))
+            ));
+            assert!(flag.load(Ordering::Relaxed));
+            assert!(!clear.load(Ordering::Relaxed));
+        }
+
+        #[test]
+        fn empty_and_unweighted_calls_remain_valid() {
+            assert!(
+                betweenness::run(
+                    &graph(0, &[], false),
+                    &Default::default(),
+                    &Par::single(),
+                    &Control::unlimited()
+                )
+                .unwrap()
+                .is_empty()
+            );
+            let g = Graph::build(
+                RawEdges {
+                    nodes: (0..4).collect(),
+                    src: vec![0, 1, 2],
+                    dst: vec![1, 2, 3],
+                    w: None,
+                    symmetric: false,
+                },
+                Aggregate::None,
+                &Par::single(),
+                &Control::unlimited(),
+            )
+            .unwrap();
+            close(
+                &betweenness::run(
+                    &g,
+                    &Default::default(),
+                    &Par::single(),
+                    &Control::unlimited(),
+                )
+                .unwrap(),
+                &[0.0, 2.0, 2.0, 0.0],
+            );
+        }
+
+        fn request() -> AlgoRequest {
+            AlgoRequest {
+                algorithm: "betweenness".into(),
+                projection: Some(ProjectionRef::Inline(ProjectionDef {
+                    predicates: Some(
+                        (0..4)
+                            .map(|i| PredicateDef::new(format!("http://ex/p{i}"), None))
+                            .collect(),
+                    ),
+                    direction: Some("forward".into()),
+                    weight: Some("http://ex/w".into()),
+                    ..Default::default()
+                })),
+                params: [("samples".into(), 8.into())].into_iter().collect(),
+                write: None,
+            }
+        }
+
+        #[test]
+        fn service_reifier_nested_default_and_stats_refuse() {
+            let s = service_store(&tiny_edges());
+            for stats in [false, true] {
+                let (q, _) = query_text(&request(), &[], stats).unwrap();
+                for _ in 0..2 {
+                    let result = query(s.snapshot(), &q, &Default::default());
+                    assert!(
+                        matches!(&result,Err(Error::Invalid(m)) if m.contains(NUMERICAL)),
+                        "no rows/stats success: {:?}",
+                        result.err()
+                    );
+                }
+            }
+            for body in [
+                "[] algo:start ?a ; algo:end ?b ; algo:edgeWeight ?w ; algo:samples 8 ; algo:node ?n ; algo:score ?r . { VALUES (?a ?b ?w) { (ex:a ex:c 1e0) (ex:a ex:b 1e0) (ex:c ex:b 1.401298464324817e-45) (ex:b ex:d 1e0) } }",
+                "[] algo:predicate ex:p ; algo:weight ex:w ; algo:defaultWeight 1.401298464324817e-45 ; algo:samples 8 ; algo:node ?n ; algo:score ?r",
+            ] {
+                let data = store_of(
+                    "ex:a ex:p ex:c {| ex:w 1e0 |} . ex:a ex:p ex:b {| ex:w 1e0 |} . ex:c ex:p ex:b . ex:b ex:p ex:d {| ex:w 1e0 |} .",
+                );
+                let q = format!(
+                    "{PREFIXES} SELECT ?n ?r WHERE {{ SERVICE algo:betweenness {{ {body} }} }}"
+                );
+                let result = query(data.snapshot(), &q, &Default::default());
+                assert!(
+                    matches!(&result,Err(Error::Invalid(m)) if m.contains(NUMERICAL)),
+                    "{:?}",
+                    result.err()
+                );
+            }
+        }
+
+        #[test]
+        fn cached_projection_refusals_do_not_poison_later_queries() {
+            let s = Store::in_memory(StoreOptions {
+                result_cache_bytes: 0,
+                ..Default::default()
+            });
+            let data: String = tiny_edges().iter().enumerate().map(|(i,&(a,b,w))|format!("<http://ex/n{a}> <http://ex/p{i}> <http://ex/n{b}> {{| <http://ex/w> {w:e} |}} .\n")).collect();
+            s.load(&[Source::from_bytes(
+                data.into_bytes(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+            let predicates = "ex:p0,ex:p1,ex:p2,ex:p3";
+            let good = format!(
+                "SELECT ?n ?d WHERE {{ SERVICE algo:sssp {{ [] algo:predicate {predicates} ; algo:weight ex:w ; algo:source ex:n0 ; algo:node ?n ; algo:distance ?d }} }}"
+            );
+            for _ in 0..2 {
+                assert_eq!(rows(&s, &good).len(), 4);
+            }
+            let (q, _) = query_text(&request(), &[], false).unwrap();
+            for _ in 0..2 {
+                let result = query(s.snapshot(), &q, &Default::default());
+                assert!(
+                    matches!(&result,Err(Error::Invalid(m)) if m.contains(NUMERICAL)),
+                    "{:?}",
+                    result.err()
+                );
+            }
+            let result = query(
+                s.snapshot(),
+                &format!("{PREFIXES}{good}"),
+                &Default::default(),
+            )
+            .unwrap();
+            let leaf = find(&result.plan, "AlgoCall").unwrap();
+            assert_eq!(
+                leaf.counters.as_ref().unwrap()["cachedProjections"].as_u64(),
+                Some(1)
+            );
+            assert_eq!(result.rows().len(), 4);
+        }
+
+        #[test]
+        fn writeback_refusal_publishes_no_commit_or_run_record() {
+            let s = service_store(&tiny_edges());
+            let before = s.head_commit().seq;
+            let mut req = request();
+            req.write = Some(WriteSpec {
+                graph: "urn:numerical:out".into(),
+                mode: WriteMode::Replace,
+                predicates: [("score".into(), "http://ex/score".into())].into(),
+                batch_size: Some(1),
+                atomic: false,
+            });
+            let result = run_write(
+                &s,
+                &req,
+                &[],
+                &Default::default(),
+                None,
+                &sparkles_core::task::Control::none(),
+            );
+            assert!(
+                matches!(&result,Err(Error::Invalid(m)) if m.contains(NUMERICAL)),
+                "{result:?}"
+            );
+            assert_eq!(s.head_commit().seq, before);
+            assert!(
+                rows(
+                    &s,
+                    "SELECT ?s WHERE { GRAPH <urn:numerical:out> { ?s ?p ?o } }"
+                )
+                .is_empty()
+            );
+        }
+    }
+}
+
 fn store_of(ttl: &str) -> Store {
     let s = Store::in_memory(StoreOptions::default());
     s.load(&[Source::from_bytes(
