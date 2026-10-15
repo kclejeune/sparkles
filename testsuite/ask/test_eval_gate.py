@@ -1,0 +1,658 @@
+"""Actual SQLite transactions and counted fake dispatch, never a real provider."""
+
+import http.client
+import json
+import pathlib
+import sqlite3
+import sys
+import tempfile
+import threading
+import time
+import unittest
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "eval_support"))
+from anthropic_gate import (
+    AUTHORITY_HASHES,
+    BOUNDS,
+    CAP,
+    MODELS,
+    Gate,
+    GateError,
+    Wallet,
+    effective_config,
+    redact,
+    serve_gate,
+    validate_request,
+    validate_usage,
+)
+from evaluator import capture_child
+
+
+def request(model=MODELS[0]):
+    return {
+        "model": model,
+        "max_tokens": 1024,
+        "system": "a system",
+        "messages": [{"role": "user", "content": "a question"}],
+    }
+
+
+def response(model=MODELS[0], **usage):
+    return {
+        "model": model,
+        "content": [{"type": "text", "text": "{}"}],
+        "usage": dict(
+            input_tokens=10,
+            output_tokens=2,
+            service_tier="standard",
+            inference_geo="global",
+            **usage,
+        ),
+    }
+
+
+class Budget(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="ask-wallet-")
+        self.addCleanup(self.tmp.cleanup)
+        self.root = pathlib.Path(self.tmp.name)
+        self.w = Wallet(
+            self.root / "wallet",
+            self.root / "grant",
+            {"run": "synthetic", "authority": AUTHORITY_HASHES},
+        )
+        self.addCleanup(self.w.close)
+
+    def gate(self, dispatch=None):
+        observed = []
+
+        def counted(payload, key, timeout):
+            # Independent connection sees only committed rows at actual send time.
+            db = sqlite3.connect(self.w.path / "wallet.sqlite3")
+            rows = db.execute(
+                "SELECT state,bound FROM attempts WHERE state='RESERVED_UNRESOLVED'"
+            ).fetchall()
+            db.close()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0][1], BOUNDS[json.loads(payload)["model"]])
+            observed.append(json.loads(payload))
+            return (
+                dispatch
+                or (
+                    lambda p, k, t: json.dumps(
+                        response(json.loads(p)["model"])
+                    ).encode()
+                )
+            )(payload, key, timeout)
+
+        g = Gate(self.w, "FAKE_SENTINEL_NOT_A_KEY", counted)
+        g.set_case("case-one")
+        return g, observed
+
+    def test_each_model_and_durable_prior_reservation(self):
+        g, obs = self.gate()
+        for model in MODELS:
+            body, info = g.process(json.dumps(request(model)).encode())
+            self.assertEqual(json.loads(body)["model"], model)
+            self.assertEqual(obs[-1]["service_tier"], "standard_only")
+            self.assertEqual(obs[-1]["inference_geo"], "global")
+            self.assertIs(obs[-1]["stream"], False)
+            self.assertNotEqual(info["preControlSha256"], info["wireSha256"])
+        s = self.w.snapshot_report()
+        self.assertEqual(s["acceptedRequests"], 3)
+        self.assertEqual(s["unresolvedUpperNanodollars"], 0)
+        self.assertLessEqual(s["highWaterNanodollars"], CAP)
+
+    def seed_spend(self, amount):
+        # Real admitted/settled attempts, no direct UPDATE to fabricate a wallet.
+        while amount:
+            ident = self.w.reserve_attempt(MODELS[2], "synthetic prior", "0" * 64)
+            actual = min(BOUNDS[MODELS[2]], amount)
+            self.w.settle_once(
+                ident, actual, {"fixture": "explicit wallet transition test"}
+            )
+            amount -= actual
+
+    def test_exact_fit_and_one_nanodollar_short(self):
+        for offset in (0, 1):
+            # Independent synthetic grants exercise the two admission boundaries;
+            # no paid grant is reinitialized or reused.
+            d = self.root / ("boundary-" + str(offset))
+            d.mkdir()
+            self.w = Wallet(
+                d / "wallet", d / "grant", {"run": "synthetic-boundary-" + str(offset)}
+            )
+            self.addCleanup(self.w.close)
+            self.seed_spend(CAP - BOUNDS[MODELS[0]] + offset)
+            g, obs = self.gate()
+            if offset:
+                with self.assertRaisesRegex(GateError, "budget_exhausted"):
+                    g.process(json.dumps(request()).encode())
+            else:
+                g.process(json.dumps(request()).encode())
+            self.assertEqual(len(obs), 1 - offset)
+            self.assertLessEqual(
+                self.w.snapshot_report()["upperLiabilityNanodollars"], CAP
+            )
+
+    def test_usage_tiers_cache_and_thinking_once(self):
+        for n, rate in [(100000, 100), (100001, 500)]:
+            r = response()
+            r["usage"]["input_tokens"] = n
+            self.assertEqual(
+                validate_usage(MODELS[0], r)[0],
+                n * rate + 2 * (500 if n == 100000 else 2500),
+            )
+        r = response(
+            cache_creation_input_tokens=30,
+            cache_read_input_tokens=40,
+            cache_creation={
+                "ephemeral_5m_input_tokens": 10,
+                "ephemeral_1h_input_tokens": 20,
+            },
+            output_tokens_details={"thinking_tokens": 1},
+        )
+        self.assertEqual(
+            validate_usage(MODELS[0], r)[0],
+            10 * 100 + 10 * 125 + 20 * 200 + 40 * 10 + 2 * 500,
+        )
+        for change in [
+            ("input_tokens", True),
+            ("input_tokens", -1),
+            ("input_tokens", 1.5),
+            ("input_tokens", 10**20),
+            ("input_tokens", None),
+            ("service_tier", "priority"),
+            ("inference_geo", "us"),
+            ("unknown_billable", 1),
+            ("cache_creation_input_tokens", 5),
+        ]:
+            bad = response()
+            bad["usage"][change[0]] = change[1]
+            with self.subTest(change=change), self.assertRaises(GateError):
+                validate_usage(MODELS[0], bad)
+        for r in [
+            dict(response(), model=MODELS[1]),
+            dict(response(), usage={}),
+            response(cache_creation_input_tokens=1),
+            response(
+                cache_creation={
+                    "ephemeral_5m_input_tokens": 1,
+                    "ephemeral_1h_input_tokens": 1,
+                }
+            ),
+        ]:
+            with self.assertRaises(GateError):
+                validate_usage(MODELS[0], r)
+
+    def test_invalid_request_zero_dispatch(self):
+        g, obs = self.gate()
+        for key, value in [
+            ("temperature", 0),
+            ("top_p", 1),
+            ("thinking", {"type": "enabled"}),
+            ("tools", []),
+            ("cache_control", {}),
+            ("service_tier", "auto"),
+            ("inference_geo", "us"),
+            ("stream", True),
+            ("max_tokens", 1025),
+            ("model", "unknown"),
+        ]:
+            r = request()
+            r[key] = value
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                g.process(json.dumps(r).encode())
+        for raw in [
+            b'{"model":"x","model":"y"}',
+            b'{"x":NaN}',
+            b"x" * (128 * 1024 + 1),
+        ]:
+            with self.assertRaises(ValueError):
+                g.process(raw)
+        self.assertEqual(obs, [])
+        self.assertEqual(self.w.snapshot_report()["acceptedRequests"], 0)
+
+    def test_unresolved_no_retry_refund_or_restart(self):
+        def failed(*args):
+            raise GateError("upstream_status")
+
+        g, obs = self.gate(failed)
+        for _ in range(3):
+            with self.assertRaises(GateError):
+                g.process(json.dumps(request()).encode())
+        self.assertEqual(len(obs), 1)
+        s = self.w.snapshot_report()
+        self.assertEqual(s["unresolvedUpperNanodollars"], BOUNDS[MODELS[0]])
+        self.w.close()
+        for wallet, claim in [("wallet", "grant"), ("replacement", "grant")]:
+            with self.assertRaises(FileExistsError):
+                Wallet(self.root / wallet, self.root / claim, {"run": "synthetic"})
+        db = sqlite3.connect(self.root / "wallet/wallet.sqlite3")
+        self.assertEqual(
+            db.execute("SELECT bound,state FROM attempts").fetchone(),
+            (BOUNDS[MODELS[0]], "RESERVED_UNRESOLVED"),
+        )
+        db.close()
+
+    def test_storage_faults_keep_reservation(self):
+        for phase in ("after_reserve", "after_response", "before_settlement"):
+            d = self.root / phase
+            d.mkdir()
+            w = Wallet(d / "wallet", d / "grant", {"run": phase})
+            calls = []
+
+            def fault(p, phase=phase):
+                if p == phase:
+                    raise OSError("synthetic storage failure")
+
+            w.fault = fault
+            g = Gate(
+                w,
+                "FAKE",
+                lambda *args, calls=calls: (
+                    calls.append(True) or json.dumps(response()).encode()
+                ),
+            )
+            g.set_case("case")
+            with self.assertRaises(GateError):
+                g.process(json.dumps(request()).encode())
+            self.assertEqual(len(calls), int(phase != "after_reserve"))
+            self.assertEqual(
+                w.snapshot_report()["unresolvedUpperNanodollars"], BOUNDS[MODELS[0]]
+            )
+            w.close()
+        # Failed reserve commit is independently observed as no dispatch/no row.
+        self.w.fault = lambda p: (
+            (_ for _ in ()).throw(OSError("commit refused"))
+            if p == "before_commit"
+            else None
+        )
+        g, obs = self.gate()
+        with self.assertRaises(GateError):
+            g.process(json.dumps(request()).encode())
+        self.assertEqual(obs, [])
+        self.assertEqual(
+            self.w.db.execute("SELECT count(*) FROM attempts").fetchone()[0], 0
+        )
+
+    def test_duplicate_settlement_concurrent_callers(self):
+        ident = self.w.reserve_attempt(MODELS[0], "case", "0" * 64)
+        self.w.settle_once(ident, 1, {})
+        with self.assertRaises(GateError):
+            self.w.settle_once(ident, 0, {})
+        g, obs = self.gate()
+        errors = []
+
+        def call():
+            try:
+                g.process(json.dumps(request()).encode())
+            except Exception as e:  # noqa: BLE001 -- collect worker failures before asserting
+                errors.append(type(e).__name__)
+
+        threads = [threading.Thread(target=call) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(2)
+            self.assertFalse(t.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(len(obs), 4)
+
+    def test_redaction_short_unicode_control_and_exception(self):
+        for key in ["x", "FAKE_SECRET", "\u96ea\n\t"]:
+            obj = {"message": key, key: [key]}
+            safe, changed = redact(obj, key)
+            self.assertTrue(changed)
+            self.assertNotIn(key, json.dumps(safe, ensure_ascii=False))
+
+        def echoes(payload, key, timeout):
+            r = response()
+            r["content"][0]["text"] = key
+            return json.dumps(r).encode()
+
+        g, _obs = self.gate(echoes)
+        body, info = g.process(json.dumps(request()).encode())
+        self.assertNotIn(b"FAKE_SENTINEL_NOT_A_KEY", body)
+        self.assertTrue(info["redacted"])
+        g.dispatch = lambda *args: (_ for _ in ()).throw(
+            OSError("FAKE_SENTINEL_NOT_A_KEY")
+        )
+        with self.assertRaises(GateError) as cm:
+            g.process(json.dumps(request()).encode())
+        self.assertNotIn("FAKE_SENTINEL_NOT_A_KEY", str(cm.exception))
+
+    def test_http_auth_path_framing_and_effective_configuration(self):
+        g, obs = self.gate()
+        s = serve_gate(g)
+        g.server_port = s.server_port
+        t = threading.Thread(target=s.serve_forever)
+        t.start()
+        self.addCleanup(s.server_close)
+        self.addCleanup(t.join, 2)
+        self.addCleanup(s.shutdown)
+        for route, token in [("/wrong", g.token), (g.route, "not-token")]:
+            c = http.client.HTTPConnection("127.0.0.1", s.server_port, timeout=2)
+            c.request(
+                "POST",
+                route,
+                json.dumps(request()),
+                {"content-type": "application/json", "x-api-key": token},
+            )
+            r = c.getresponse()
+            self.assertEqual(r.status, 400)
+            r.read()
+            c.close()
+        self.assertEqual(obs, [])
+        c = http.client.HTTPConnection("127.0.0.1", s.server_port, timeout=2)
+        c.request(
+            "POST",
+            g.route,
+            json.dumps(request()),
+            {"content-type": "application/json", "x-api-key": g.token},
+        )
+        r = c.getresponse()
+        self.assertEqual(r.status, 200)
+        r.read()
+        c.close()
+        self.assertEqual(len(obs), 1)
+        cfg = effective_config(g)
+        p = cfg["models"]["providers"]["evaluation"]
+        self.assertEqual(p["structuredOutput"], "json-schema")
+        self.assertEqual(p["maxOutputTokens"], 1024)
+        self.assertNotIn("FAKE_SENTINEL_NOT_A_KEY", json.dumps(cfg))
+        self.assertNotIn("temperature", p)
+
+    def test_real_process_crash_after_durable_reserve(self):
+        d = self.root / "crash"
+        d.mkdir()
+        source = self.root / "crash.py"
+        source.write_text(
+            "import sys,os\nsys.path.insert(0,"
+            + repr(str(pathlib.Path(__file__).parent / "eval_support"))
+            + ")\nfrom anthropic_gate import Wallet,MODELS\nw=Wallet("
+            + repr(str(d / "wallet"))
+            + ","
+            + repr(str(d / "grant"))
+            + ',{"run":"crash"})\nw.reserve_attempt(MODELS[0],"case","0"*64)\nos._exit(19)\n'
+        )
+        python = str(pathlib.Path(sys.base_prefix) / "bin/python3")
+        r = capture_child(
+            [python, "-I", "-S", "-B", str(source)],
+            self.root / "crash-output",
+            time.monotonic() + 5,
+        )
+        self.assertEqual(r["returncode"], 19)
+        self.assertTrue(r["cleanup"])
+        db = sqlite3.connect(d / "wallet/wallet.sqlite3")
+        self.assertEqual(db.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+        self.assertEqual(
+            db.execute("SELECT state,bound FROM attempts").fetchone(),
+            ("RESERVED_UNRESOLVED", BOUNDS[MODELS[0]]),
+        )
+        db.close()
+        with self.assertRaises(FileExistsError):
+            Wallet(d / "otherwallet", d / "grant", {"run": "crash"})
+
+
+class Boundaries(unittest.TestCase):
+    def test_reservations_decimal_authority(self):
+        from decimal import Decimal
+
+        for m, rate, output in zip(MODELS, ("1", "4", "8"), ("2.5", "10", "20")):
+            self.assertEqual(
+                int(
+                    (Decimal(1000000) * Decimal(rate) + Decimal(1024) * Decimal(output))
+                    * Decimal(1000)
+                ),
+                BOUNDS[m],
+            )
+
+    def test_context_output_and_unknown_billing(self):
+        for field, value in [
+            ("output_tokens", 1025),
+            ("input_tokens", 999999),
+            ("cache_creation", {"ephemeral_5m_input_tokens": 0}),
+            ("output_tokens_details", {"thinking_tokens": 3}),
+            ("server_tool_use", {"web_search_requests": 1}),
+        ]:
+            r = response()
+            r["usage"][field] = value
+            with self.assertRaises(GateError):
+                validate_usage(MODELS[0], r)
+        for key, value in [
+            ("stream", 0),
+            (
+                "output_config",
+                {"format": {"type": "json_schema", "schema": {}, "extra": 1}},
+            ),
+            (
+                "messages",
+                [
+                    {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "x", "cache_control": {}}],
+                    }
+                ],
+            ),
+        ]:
+            r = request()
+            r[key] = value
+            with self.assertRaises(GateError):
+                validate_request(json.dumps(r).encode())
+
+    def test_response_caps_malformed_model_and_usage_keep_full_bound(self):
+        for i, value in enumerate(
+            [
+                b"x" * (1024 * 1024 + 1),
+                b"{",
+                json.dumps(response(MODELS[1])).encode(),
+                b'{"model":"claude-haiku-5-5","usage":{"input_tokens":true}}',
+            ]
+        ):
+            with tempfile.TemporaryDirectory(prefix="ask-bad-response-") as d:
+                d = pathlib.Path(d)
+                w = Wallet(d / "w", d / "grant", {"run": str(i)})
+                g = Gate(w, "FAKE", lambda *args, value=value: value)
+                g.set_case("case")
+                try:
+                    with self.assertRaises(GateError):
+                        g.process(json.dumps(request()).encode())
+                    self.assertEqual(
+                        w.snapshot_report()["unresolvedUpperNanodollars"],
+                        BOUNDS[MODELS[0]],
+                    )
+                    with self.assertRaises(GateError):
+                        g.process(json.dumps(request()).encode())
+                    self.assertEqual(w.snapshot_report()["acceptedRequests"], 1)
+                finally:
+                    w.close()
+
+    def test_real_storage_crash_phases(self):
+        python = str(pathlib.Path(sys.base_prefix) / "bin/python3")
+        for phase in (
+            "before_commit",
+            "after_reserve",
+            "after_response",
+            "before_settlement",
+        ):
+            with tempfile.TemporaryDirectory(prefix="ask-storage-phase-") as d:
+                d = pathlib.Path(d)
+                source = d / "crash.py"
+                source.write_text(
+                    "import sys,os,json\nsys.path.insert(0,"
+                    + repr(str(pathlib.Path(__file__).parent / "eval_support"))
+                    + ")\nfrom anthropic_gate import Wallet,Gate,MODELS\nw=Wallet("
+                    + repr(str(d / "wallet"))
+                    + ","
+                    + repr(str(d / "grant"))
+                    + ',{"run":"crash"})\ndef fault(p):\n if p=='
+                    + repr(phase)
+                    + ":os._exit(23)\nw.fault=fault\ndef send(*args):\n open("
+                    + repr(str(d / "sent"))
+                    + ',"x").write("one")\n return json.dumps({"model":MODELS[0],"usage":{"input_tokens":1,"output_tokens":1,"service_tier":"standard","inference_geo":"global"}}).encode()\ng=Gate(w,"FAKE",send);g.set_case("case")\ng.process(json.dumps({"model":MODELS[0],"max_tokens":1024,"system":"x","messages":[{"role":"user","content":"x"}]}).encode())\n'
+                )
+                r = capture_child(
+                    [python, "-I", "-S", "-B", str(source)],
+                    d / "capture",
+                    time.monotonic() + 5,
+                )
+                self.assertEqual(r["returncode"], 23)
+                db = sqlite3.connect(d / "wallet/wallet.sqlite3")
+                self.assertEqual(
+                    db.execute("PRAGMA integrity_check").fetchone()[0], "ok"
+                )
+                rows = db.execute("SELECT state,bound FROM attempts").fetchall()
+                db.close()
+                if phase == "before_commit":
+                    self.assertEqual(rows, [])
+                else:
+                    self.assertEqual(rows, [("RESERVED_UNRESOLVED", BOUNDS[MODELS[0]])])
+                self.assertEqual(
+                    (d / "sent").exists(),
+                    phase in ("after_response", "before_settlement"),
+                )
+                with self.assertRaises(FileExistsError):
+                    Wallet(d / "another", d / "grant", {"run": "crash"})
+
+    def test_owner_process_exclusive_claim(self):
+        python = str(pathlib.Path(sys.base_prefix) / "bin/python3")
+        with tempfile.TemporaryDirectory(prefix="ask-owner-") as d:
+            d = pathlib.Path(d)
+            w = Wallet(d / "w", d / "grant", {"run": "owned"})
+            try:
+                source = d / "other.py"
+                source.write_text(
+                    "import sys\nsys.path.insert(0,"
+                    + repr(str(pathlib.Path(__file__).parent / "eval_support"))
+                    + ")\nfrom anthropic_gate import Wallet\ntry:Wallet("
+                    + repr(str(d / "replacement"))
+                    + ","
+                    + repr(str(d / "grant"))
+                    + ',{"run":"other"})\nexcept FileExistsError:raise SystemExit(0)\nraise SystemExit(41)\n'
+                )
+                r = capture_child(
+                    [python, "-I", "-S", "-B", str(source)],
+                    d / "capture",
+                    time.monotonic() + 5,
+                )
+                self.assertEqual(r["returncode"], 0)
+                self.assertFalse((d / "replacement").exists())
+            finally:
+                w.close()
+
+
+class SQLiteFailures(unittest.TestCase):
+    def test_actual_journal_insert_and_commit_refusal(self):
+        for phase in ("journal", "reserve_commit", "settle_commit"):
+            with tempfile.TemporaryDirectory(prefix="ask-sqlite-refusal-") as d:
+                d = pathlib.Path(d)
+                w = Wallet(d / "wallet", d / "claim", {"run": phase})
+                calls = []
+
+                def deny_commit(action, arg1, arg2, db, trigger):
+                    if action == sqlite3.SQLITE_TRANSACTION and arg1 == "COMMIT":
+                        return sqlite3.SQLITE_DENY
+                    return sqlite3.SQLITE_OK
+
+                if phase == "journal":
+                    w.db.execute(
+                        "CREATE TRIGGER refuse_journal BEFORE INSERT ON journal BEGIN SELECT RAISE(ABORT,'synthetic journal refusal'); END"
+                    )
+                if phase == "reserve_commit":
+                    w.db.set_authorizer(deny_commit)
+
+                def send(*args, calls=calls, phase=phase, w=w):
+                    calls.append(True)
+                    if phase == "settle_commit":
+                        w.db.set_authorizer(deny_commit)
+                    return json.dumps(response()).encode()
+
+                g = Gate(w, "FAKE", send)
+                g.set_case("case")
+                try:
+                    with self.assertRaises(GateError):
+                        g.process(json.dumps(request()).encode())
+                    w.db.set_authorizer(None)
+                    self.assertTrue(g.stopped)
+                    self.assertEqual(len(calls), int(phase == "settle_commit"))
+                    state = w.snapshot_report()
+                    self.assertEqual(
+                        state["acceptedRequests"], int(phase == "settle_commit")
+                    )
+                    self.assertEqual(
+                        state["unresolvedUpperNanodollars"],
+                        BOUNDS[MODELS[0]] if phase == "settle_commit" else 0,
+                    )
+                    self.assertEqual(state["knownSettledNanodollars"], 0)
+                finally:
+                    w.close()
+
+
+class SettlementDurability(unittest.TestCase):
+    def test_committed_settlement_directory_failure_keeps_full_bound(self):
+        with tempfile.TemporaryDirectory(prefix="ask-settle-sync-") as d:
+            d = pathlib.Path(d)
+            w = Wallet(d / "wallet", d / "grant", {"run": "synthetic-sync"})
+            settling = False
+
+            def fault(phase):
+                nonlocal settling
+                if phase == "after_response":
+                    settling = True
+                if settling and phase == "after_commit_before_directory_sync":
+                    raise OSError("synthetic post-commit directory EIO")
+
+            w.fault = fault
+            calls = []
+            g = Gate(
+                w,
+                "FAKE",
+                lambda *args: calls.append(True) or json.dumps(response()).encode(),
+            )
+            g.set_case("case")
+            try:
+                with self.assertRaises(GateError):
+                    g.process(json.dumps(request()).encode())
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(
+                    w.db.execute("SELECT state,actual FROM attempts").fetchone(),
+                    ("SETTLED", 2000),
+                )
+                report = w.snapshot_report()
+                self.assertEqual(report["knownSettledNanodollars"], 0)
+                self.assertEqual(
+                    report["unresolvedUpperNanodollars"], BOUNDS[MODELS[0]]
+                )
+                self.assertEqual(report["settlementDurabilityUncertainIds"], [1])
+                with self.assertRaises(GateError):
+                    w.reserve_attempt(MODELS[0], "case", "0" * 64)
+                with self.assertRaises(GateError):
+                    g.process(json.dumps(request()).encode())
+                self.assertEqual(len(calls), 1)
+                w.fault = lambda phase: None
+                self.assertEqual(
+                    w.snapshot_report()["upperLiabilityNanodollars"], BOUNDS[MODELS[0]]
+                )
+            finally:
+                w.close()
+
+    def test_rejected_duplicate_does_not_taint_confirmed_settlement(self):
+        with tempfile.TemporaryDirectory(prefix="ask-settle-once-") as d:
+            d = pathlib.Path(d)
+            w = Wallet(d / "wallet", d / "grant", {"run": "synthetic-once"})
+            try:
+                ident = w.reserve_attempt(MODELS[0], "case", "0" * 64)
+                w.settle_once(ident, 2000, {})
+                with self.assertRaises(GateError):
+                    w.settle_once(ident, 0, {})
+                report = w.snapshot_report()
+                self.assertEqual(report["knownSettledNanodollars"], 2000)
+                self.assertEqual(report["unresolvedUpperNanodollars"], 0)
+                self.assertEqual(report["settlementDurabilityUncertainIds"], [])
+            finally:
+                w.close()
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,561 @@
+"""Credential-free regression tests for the initial evaluator."""
+
+import importlib.machinery
+import importlib.util
+import json
+import pathlib
+import sys
+import tempfile
+import time
+import unittest
+
+HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE / "eval_support"))
+from evaluator import (
+    Invalid,
+    Unsupported,
+    answer_set,
+    capture_child,
+    digest,
+    norm_term,
+    parse_child,
+    prf,
+    score_sets,
+    strict_json,
+)
+
+loader = importlib.machinery.SourceFileLoader(
+    "evaluation_under_test", str(HERE.parents[1] / "scripts/eval-ask")
+)
+spec = importlib.util.spec_from_loader(loader.name, loader)
+eval_ask = importlib.util.module_from_spec(spec)
+loader.exec_module(eval_ask)
+PYTHON = str(pathlib.Path(sys.base_prefix) / "bin/python3")
+
+
+def literal(value, **kw):
+    return dict(type="literal", value=value, **kw)
+
+
+def result(rows, names=("x", "y")):
+    return {"head": {"vars": list(names)}, "results": {"bindings": rows}}
+
+
+class Scoring(unittest.TestCase):
+    def test_global_columns(self):
+        a = answer_set(
+            result(
+                [
+                    {"x": literal("A"), "y": literal("B")},
+                    {"x": literal("B"), "y": literal("C")},
+                ]
+            )
+        )
+        b = answer_set(
+            result(
+                [
+                    {"x": literal("B"), "y": literal("A")},
+                    {"x": literal("B"), "y": literal("C")},
+                ]
+            )
+        )
+        c = answer_set(
+            result(
+                [
+                    {"x": literal("B"), "y": literal("A")},
+                    {"x": literal("C"), "y": literal("B")},
+                ]
+            )
+        )
+        self.assertNotEqual(a, b)
+        self.assertEqual(a, c)
+        self.assertEqual(prf(a, c), (1, 1, 1))
+        self.assertLess(prf(a, b)[2], 1)
+
+    def test_tuple_precision(self):
+        a = answer_set(
+            result(
+                [
+                    {"x": literal("A"), "y": literal("B")},
+                    {"x": literal("B"), "y": literal("C")},
+                ]
+            )
+        )
+        b = answer_set(
+            result(
+                [
+                    {"x": literal("A"), "y": literal("C")},
+                    {"x": literal("B"), "y": literal("B")},
+                ]
+            )
+        )
+        self.assertEqual(prf(a, b), (0, 0, 0))
+
+    def test_terms(self):
+        self.assertNotEqual(
+            norm_term(
+                literal(
+                    "1.0000001", datatype="http://www.w3.org/2001/XMLSchema#decimal"
+                )
+            ),
+            norm_term(
+                literal(
+                    "1.0000002", datatype="http://www.w3.org/2001/XMLSchema#decimal"
+                )
+            ),
+        )
+        self.assertNotEqual(
+            norm_term(literal("word", **{"xml:lang": "en"})),
+            norm_term(literal("word", **{"xml:lang": "fr"})),
+        )
+        self.assertEqual(
+            norm_term(literal("word", **{"xml:lang": "EN-us"})),
+            norm_term(literal("word", **{"xml:lang": "en-US"})),
+        )
+        self.assertEqual(
+            norm_term(literal("word")),
+            norm_term(
+                literal("word", datatype="http://www.w3.org/2001/XMLSchema#string")
+            ),
+        )
+        self.assertNotEqual(
+            norm_term(literal("1")), norm_term({"type": "uri", "value": "1"})
+        )
+        with self.assertRaises(Unsupported):
+            answer_set(result([{"x": {"type": "bnode", "value": "a"}}]))
+
+    def test_schema_and_unbound(self):
+        self.assertNotEqual(
+            answer_set(result([{"x": literal("A")}])),
+            answer_set(result([{"x": literal("A"), "y": literal("A")}])),
+        )
+        self.assertNotEqual(
+            answer_set(result([{"x": literal("A"), "y": literal("A")}])),
+            answer_set(result([{"x": literal("A")}], ("x",))),
+        )
+        bad = [
+            {},
+            {"error": "oops"},
+            {"head": {}, "boolean": 0},
+            {"head": {}, "boolean": False, "results": {"bindings": []}},
+            result([{"z": literal("x")}]),
+            result([], ("x", "x")),
+        ]
+        for value in bad:
+            with self.subTest(value=value), self.assertRaises(Invalid):
+                answer_set(value)
+        self.assertEqual(prf(answer_set(result([])), answer_set(result([]))), (1, 1, 1))
+        self.assertEqual(prf(False, answer_set(result([]))), (0, 0, 0))
+        self.assertEqual(
+            prf(answer_set(result([])), answer_set(result([{"x": literal("a")}]))),
+            (0, 0, 0),
+        )
+        with self.assertRaises(Unsupported):
+            answer_set(result([], tuple(str(i) for i in range(9))))
+        with self.assertRaises(Invalid):
+            strict_json('{"x":1,"x":2}')
+        with self.assertRaises(Invalid):
+            strict_json('{"x":NaN}')
+
+    def test_duplicates_and_bounded_search(self):
+        a = answer_set(result([{"x": literal("a")}, {"x": literal("a")}]))
+        self.assertEqual(a.duplicates, 1)
+        b = answer_set(result([{"x": literal("a")}]))
+        self.assertEqual(a, b)
+        called = []
+        score_sets(a, b, lambda: called.append(True))
+        self.assertTrue(called)
+
+        def expired():
+            raise Invalid("expired")
+
+        with self.assertRaises(Invalid):
+            score_sets(a, b, expired)
+
+    def test_metrics_pipeline_denominators(self):
+        qs = [
+            {"kind": "answerable", "complexity": 1},
+            {"kind": "answerable", "complexity": 9},
+            {"kind": "clarify"},
+            {"kind": "unanswerable"},
+        ]
+        answers = [
+            {"result": {"attempt": 2}, "usage": {"estimatedCost": 3}},
+            {"outcome": "unanswerable"},
+            {"outcome": "clarify"},
+            {"outcome": "empty"},
+        ]
+        scores = [
+            (True, (1, 1, 1), {"kind": "ask", "firstDraft": {"status": "incorrect"}}),
+            (
+                False,
+                (0, 0, 0),
+                {"kind": "missing_query", "firstDraft": {"status": "incorrect"}},
+            ),
+            (True, (1, 1, 1), {"kind": "clarify"}),
+            (False, (0, 0, 0), {"kind": "unanswerable"}),
+        ]
+        rows = eval_ask.summarize_pair("p/m", qs, answers, scores)
+        self.assertEqual(len(rows), 1)
+        r = rows[0]
+        self.assertEqual(r["executionAccuracy"]["denominator"], 2)
+        self.assertEqual(
+            r["repairRate"], {"numerator": 1, "denominator": 2, "value": 0.5}
+        )
+        self.assertEqual(r["repairConditional"]["denominator"], 2)
+        self.assertIsNone(r["cliEstimatedCostUSD"])
+        self.assertEqual(r["refusalAccuracy"]["value"], 0)
+        for a in answers:
+            a["usage"] = {"estimatedCost": 3}
+        self.assertEqual(
+            eval_ask.summarize_pair("p/m", qs, answers, scores)[0][
+                "cliEstimatedCostUSD"
+            ],
+            12,
+        )
+        for answer in answers:
+            answer["cliEstimatedCostKnown"] = False
+            answer["usage"]["estimatedCost"] = 0
+        self.assertIsNone(
+            eval_ask.summarize_pair("p/m", qs, answers, scores)[0][
+                "cliEstimatedCostUSD"
+            ]
+        )
+
+
+class Processes(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="ask-controls-")
+        self.addCleanup(self.tmp.cleanup)
+        self.root = pathlib.Path(self.tmp.name)
+
+    def child(self, source, name="child"):
+        p = self.root / name
+        p.write_text("#!" + PYTHON + "\n" + source)
+        p.chmod(0o700)
+        return str(p)
+
+    def run_child(self, source, timeout=2, **kwargs):
+        f = self.child(source)
+        d = self.root / ("capture-" + str(len(list(self.root.iterdir()))))
+        r = capture_child([f], d, time.monotonic() + timeout, **kwargs)
+        return r, d
+
+    def test_nonzero_noise_multiple_and_malformed(self):
+        for source in [
+            'print("{}")\nraise SystemExit(17)',
+            'print("noise\\n{}")',
+            'print("{}\\n{}")',
+            'print("broken")',
+        ]:
+            r, d = self.run_child(source)
+            with self.assertRaises(Invalid):
+                parse_child(r, d)
+        self.assertEqual(r["returncode"], 0)
+
+    def test_caps_exact_and_plus_one(self):
+        for channel in ("stdout", "stderr"):
+            cap = 4 * 1024 * 1024 if channel == "stdout" else 1024 * 1024
+            for size in (cap, cap + 1):
+                r, d = self.run_child(
+                    f'import os\nos.write({1 if channel == "stdout" else 2},b"x"*{size})',
+                )
+                self.assertEqual((d / channel).stat().st_size, cap)
+                self.assertEqual(r["byteCap"], None if size == cap else channel)
+                self.assertTrue(r["cleanup"])
+
+    def test_deadline_and_descendant(self):
+        r, d = self.run_child(
+            "import os,time\nif os.fork()==0: time.sleep(30)\ntime.sleep(30)",
+            timeout=0.1,
+        )
+        self.assertTrue(r["timeout"])
+        self.assertTrue(r["cleanup"])
+        self.assertLess(r["elapsedSeconds"], 3)
+        with self.assertRaises(Invalid):
+            parse_child(r, d)
+
+    def fixture(self):
+        binary = self.child(
+            'import json\nprint(json.dumps({"head":{"vars":[]},"results":{"bindings":[]}}))'
+        )
+        data = self.root / "data.ttl"
+        data.write_text("")
+        q = self.root / "set.json"
+        q.write_text(
+            json.dumps(
+                {
+                    "data": "data.ttl",
+                    "questions": [{"id": "one", "kind": "clarify", "question": "q"}],
+                }
+            )
+        )
+        cfg = self.root / "models.json"
+        cfg.write_text(
+            json.dumps({"models": {"providers": {"p": {"models": {"m": {}}}}}})
+        )
+        return eval_ask.parse_args(
+            [
+                "--sparkles",
+                binary,
+                "--sparkles-sha256",
+                digest(binary),
+                "--model-config",
+                str(cfg),
+                "--pair",
+                "p/m",
+                "--set",
+                str(q),
+                "--out",
+                str(self.root / "report"),
+            ]
+        )
+
+    def test_setup_refusals_no_invocations(self):
+        for field, value in [
+            ("deadline", float("nan")),
+            ("deadline", float("inf")),
+            ("deadline", -1),
+            ("jobs", 2),
+            ("pair", ["p/m", "p/m"]),
+            ("pair", ["p/absent"]),
+            ("only", "absent"),
+            ("sparkles", "/absent"),
+        ]:
+            args = self.fixture()
+            setattr(args, field, value)
+            with self.subTest(field=field, value=value), self.assertRaises(Invalid):
+                eval_ask.validate_args(args)
+        args = self.fixture()
+        pathlib.Path(args.out).mkdir()
+        (pathlib.Path(args.out) / "KEEP").write_text("original")
+        with self.assertRaises(FileExistsError):
+            eval_ask.validate_args(args)
+        self.assertEqual((pathlib.Path(args.out) / "KEEP").read_text(), "original")
+
+    def test_duplicate_ids_and_old_slug_collision(self):
+        args = self.fixture()
+        data = json.loads(pathlib.Path(args.set).read_text())
+        data["questions"] *= 2
+        pathlib.Path(args.set).write_text(json.dumps(data))
+        with self.assertRaises(Invalid):
+            eval_ask.validate_args(args)
+        data["questions"] = data["questions"][:1]
+        pathlib.Path(args.set).write_text(json.dumps(data))
+        binary = pathlib.Path(args.sparkles)
+        binary.write_text(
+            "#!" + PYTHON + '\nimport json\nprint(json.dumps({"outcome":"clarify"}))\n'
+        )
+        args.sparkles_sha256 = digest(binary)
+        pathlib.Path(args.model_config).write_text(
+            json.dumps(
+                {"models": {"providers": {"p": {"models": {"a:b": {}, "a_b": {}}}}}}
+            )
+        )
+        args.pair = ["p/a:b", "p/a_b"]
+        out, report = eval_ask.run_matrix(args)
+        self.assertTrue(report["complete"])
+        self.assertEqual(report["executed"], 3)
+        ids = [c["case"] for c in report["cases"]]
+        self.assertEqual(len(set(ids)), 3)
+        self.assertTrue(all((out / (i + ".json")).is_file() for i in ids))
+
+    def test_forwarded_limits_and_exit17(self):
+        args = self.fixture()
+        qs, out = eval_ask.validate_args(args)
+        binary = pathlib.Path(args.sparkles)
+        binary.write_text(
+            "#!"
+            + PYTHON
+            + '\nimport json,sys\nprint(json.dumps({"outcome":"clarify"}))\nraise SystemExit(17)\n'
+        )
+        runner = eval_ask.Runner(args, qs, out)
+        with self.assertRaises(Invalid):
+            runner.ask("p/m", qs["questions"][0])
+        status = json.loads(next(out.glob("*/status.json")).read_text())
+        self.assertEqual(status["returncode"], 17)
+        for flag, value in [
+            ("--deadline", "30"),
+            ("--timeout", "5"),
+            ("--max-tokens", "32768"),
+            ("--max-rows", "1000"),
+        ]:
+            self.assertEqual(status["argv"][status["argv"].index(flag) + 1], value)
+        self.assertLessEqual(status["elapsedSeconds"], 2)
+
+    def test_invalid_gold_prevents_ask(self):
+        args = self.fixture()
+        s = json.loads(pathlib.Path(args.set).read_text())
+        s["questions"][0].update(kind="answerable", gold="SELECT")
+        pathlib.Path(args.set).write_text(json.dumps(s))
+        # The real fake executable emits malformed query results, not a score stub.
+        b = pathlib.Path(args.sparkles)
+        b.write_text("#!" + PYTHON + '\nprint("{}")\n')
+        args.sparkles_sha256 = digest(b)
+        _, report = eval_ask.run_matrix(args)
+        self.assertFalse(report["complete"])
+        self.assertEqual(report["executed"], 0)
+        status = json.loads(
+            next(pathlib.Path(args.out).glob("*/status.json")).read_text()
+        )
+        self.assertEqual(status["argv"][1], "query")
+
+
+class ExtraInvariants(unittest.TestCase):
+    def test_empty_arity_is_not_a_match_and_nonfinite_exponents(self):
+        self.assertEqual(
+            prf(answer_set(result([], ("x",))), answer_set(result([], ("x", "y")))),
+            (0, 0, 0),
+        )
+        with self.assertRaises(Invalid):
+            strict_json('{"number":1e9999}')
+        with self.assertRaises(Invalid):
+            norm_term(literal("x", datatype=""))
+
+    def test_exhausted_phase_never_spawns(self):
+        with (
+            tempfile.TemporaryDirectory(prefix="ask-expired-") as d,
+            self.assertRaises(Invalid),
+        ):
+            capture_child(
+                ["/not-an-executable"],
+                pathlib.Path(d) / "child",
+                time.monotonic() - 1,
+            )
+
+
+class FirstDraft(unittest.TestCase):
+    setUp = Processes.setUp
+    child = Processes.child
+    fixture = Processes.fixture
+
+    def test_empty_correct_repaired_is_not_failed_first(self):
+        args = self.fixture()
+        qs, out = eval_ask.validate_args(args)
+        q = dict(qs["questions"][0], kind="answerable", gold="EMPTY")
+        runner = eval_ask.Runner(args, qs, out)
+        runner.gold_cache[q["id"]] = answer_set(result([], ("x",)))
+        # Actual bounded fake-CLI reads under the same data identity. This is a
+        # scoring fixture, not a claim that a real provider produced these drafts.
+        b = pathlib.Path(args.sparkles)
+        b.write_text(
+            "#!"
+            + PYTHON
+            + '\nimport json,sys\nprint(json.dumps({"head":{"vars":["x"]},"results":{"bindings":[] if sys.argv[-1]=="EMPTY" else [{"x":{"type":"literal","value":"wrong"}}]}}))\n'
+        )
+
+        def answer(first, check=None):
+            return {
+                "outcome": "empty",
+                "result": {"query": "EMPTY", "attempt": 2},
+                "attempts": [
+                    {"query": first, "check": check or {"ok": True, "issues": []}}
+                ],
+            }
+
+        cases = [
+            ("EMPTY", None, "correct"),
+            ("WRONG", None, "incorrect"),
+            (
+                "WRONG",
+                {
+                    "ok": False,
+                    "issues": [{"severity": "error", "code": "fixture-invalid"}],
+                },
+                "incorrect",
+            ),
+        ]
+        for text, check, status in cases:
+            a = answer(text, check)
+            score = runner.score(q, a)
+            self.assertTrue(score[0])
+            self.assertEqual(score[2]["firstDraft"]["status"], status)
+            row = eval_ask.summarize_pair("p/m", [q], [a], [score])[0]
+            self.assertEqual(row["repairRate"]["numerator"], int(status == "incorrect"))
+            self.assertEqual(row["repairInvoked"]["numerator"], 1)
+        a = answer("WRONG", {"ok": True, "issues": [{"severity": "warning"}]})
+        self.assertEqual(
+            runner.score(q, a)[2]["firstDraft"]["reason"], "complete_strict_comparison"
+        )
+        # A real malformed child result is unknown, never silently failed-first.
+        b.write_text("#!" + PYTHON + '\nprint("{}")\n')
+        probe = runner.first_draft(q, answer("WRONG"))
+        self.assertEqual(probe["status"], "unknown")
+        self.assertEqual(probe["reason"], "probe_incomplete")
+        score = (
+            True,
+            (1, 1, 1),
+            {
+                "kind": "select",
+                "firstDraft": probe,
+                "intersection": 0,
+                "goldRows": 0,
+                "gotRows": 0,
+            },
+        )
+        row = eval_ask.summarize_pair("p/m", [q], [answer("WRONG")], [score])[0]
+        self.assertEqual(row["firstDraftUnknown"]["numerator"], 1)
+        self.assertEqual(row["repairConditional"]["denominator"], 0)
+
+    def test_offline_service_and_names(self):
+        from evaluator import OfflinePolicy, offline_query
+
+        for text in [
+            "SELECT ?x WHERE {SERVICE <https://example.invalid/q> {?x ?p ?o}}",
+            "SELECT ?x WHERE {sErViCe ?endpoint {?x ?p ?o}}",
+        ]:
+            with self.assertRaises(OfflinePolicy):
+                offline_query(text)
+        for text in [
+            "PREFIX ex:<urn:example:> SELECT ?service WHERE {?service a ex:Service}",
+            'SELECT ?x WHERE {?x ?p "SERVICE"} # SERVICE ignored',
+            "SELECT ?x WHERE {?x ?p <urn:SERVICE>}",
+            "SELECT ?x WHERE {FILTER(?x<1) ?x ?p ?o}",
+        ]:
+            self.assertEqual(offline_query(text), text)
+        for text in [
+            r"SELECT ?x WHERE {SER\u0056ICE <http://127.0.0.1:1/> {?x ?p ?o}}",
+            r'SELECT ?x WHERE {?x ?p "\u0053ERVICE"}',
+            r"# \u000a SERVICE <http://127.0.0.1:1/> {}",
+            "SELECT ?x WHERE {SERVICE SILENT <http://127.0.0.1:1/> {?x ?p ?o}}",
+        ]:
+            with self.assertRaises(OfflinePolicy):
+                offline_query(text)
+        for text in [
+            "PREFIX :<urn:example:> SELECT ?service WHERE {?service a :SERVICE}",
+            'SELECT ?x WHERE {?x ?p """a SERVICE long string"""}',
+            "SELECT ?x WHERE {?x ?p 'a SERVICE string'}",
+            "# SERVICE\n SELECT ?x WHERE {?x ?p <urn:service>}",
+        ]:
+            self.assertEqual(offline_query(text), text)
+        args = self.fixture()
+        qs, out = eval_ask.validate_args(args)
+        runner = eval_ask.Runner(args, qs, out)
+        with self.assertRaises(OfflinePolicy):
+            runner.query("SELECT ?x WHERE {SERVICE <http://127.0.0.1:1/> {?x ?p ?o}}")
+        self.assertEqual(list(out.iterdir()), [])
+
+
+class RecordShapes(unittest.TestCase):
+    def test_invalid_optional_record_fields_are_not_scored(self):
+        from evaluator import validate_ask_record
+
+        for field, value in [
+            ("usage", []),
+            ("result", "bad"),
+            ("attempts", [False]),
+            ("usage", {"steps": [None]}),
+            ("usage", {"inputTokens": True}),
+            ("usage", {"estimatedCost": -1}),
+            ("result", {"query": None}),
+            ("attempts", [{"check": {"issues": [True]}}]),
+        ]:
+            with self.subTest(field=field, value=value), self.assertRaises(Invalid):
+                validate_ask_record({"outcome": "clarify", field: value})
+        self.assertEqual(
+            validate_ask_record({"outcome": "clarify"}), {"outcome": "clarify"}
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
