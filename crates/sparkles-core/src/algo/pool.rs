@@ -58,6 +58,25 @@ pub fn max_per_call() -> usize {
     PER_CALL.load(Ordering::Relaxed).max(1)
 }
 
+fn build_pool(threads: usize) -> Option<rayon::ThreadPool> {
+    #[cfg(test)]
+    match tests::build_mode() {
+        tests::BuildMode::Normal => {}
+        tests::BuildMode::Error => {
+            return rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .spawn_handler(|_| Err(std::io::Error::other("injected pool spawn failure")))
+                .build()
+                .ok();
+        }
+        tests::BuildMode::Unwind => panic!("injected pool construction unwind"),
+    }
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .ok()
+}
+
 /// The threads of one call. The threads go back to the process when it drops.
 pub struct Par {
     threads: usize,
@@ -66,7 +85,7 @@ pub struct Par {
 }
 
 impl Par {
-    /// One thread, which runs every loop in the caller.
+    /// One thread outside process admission, which runs every loop in the caller.
     pub fn single() -> Par {
         Par {
             threads: 1,
@@ -89,8 +108,10 @@ impl Par {
     }
 
     /// Take `requested` threads (0: the call limit), capped by the call limit and the
-    /// process capacity, waiting while they are in use.
+    /// process capacity, waiting while they are in use. A one-thread call runs in the
+    /// caller without a Rayon pool, but holds one slot until it drops.
     pub fn acquire(requested: usize, ctl: &Control) -> Result<Par> {
+        ctl.check()?;
         let cap = capacity();
         let want = match requested {
             0 => max_per_call(),
@@ -98,27 +119,30 @@ impl Par {
         }
         .min(cap)
         .max(1);
-        if want == 1 {
-            return Ok(Par::single());
-        }
         let mut in_use = SLOTS.in_use.lock();
         loop {
-            if *in_use + want <= cap {
+            ctl.check()?;
+            if *in_use <= cap - want {
                 *in_use += want;
                 break;
             }
-            ctl.check()?;
+            #[cfg(test)]
+            tests::waiting();
             SLOTS.freed.wait_for(&mut in_use, Duration::from_millis(20));
+            #[cfg(test)]
+            tests::woken(*in_use);
         }
-        drop(in_use);
-        Ok(Par {
+        // Establish the release guard before pool construction, including unwinding.
+        let mut par = Par {
             threads: want,
-            pool: rayon::ThreadPoolBuilder::new()
-                .num_threads(want)
-                .build()
-                .ok(),
+            pool: None,
             held: want,
-        })
+        };
+        drop(in_use);
+        if want > 1 {
+            par.pool = build_pool(want);
+        }
+        Ok(par)
     }
 
     /// The threads of this call.
@@ -188,6 +212,7 @@ impl Drop for Par {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("pool_admission_tests.rs");
 
     #[test]
     fn blocks_keep_order() {

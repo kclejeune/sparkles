@@ -325,11 +325,18 @@ returns its result and sets `converged: false` in the summary. It is not an erro
 
 ## 5. Budgets and parallelism
 
-Algorithms run on a pool of `--algo-threads` threads shared by the server, by default
-half the cores, so that a long algorithm leaves the query threads free. A call takes
-`algo:concurrency` threads from it, at most `--algo-max-threads-per-call` (4 by default),
-and waits when the pool is busy, counting the wait against its timeout. The rayon pool
-that the reasoner uses is not shared.
+Algorithm calls share a process-wide budget of `--algo-threads` threads, by default
+half the cores. A call reserves `algo:concurrency` slots, at most
+`--algo-max-threads-per-call` (4 by default), and waits when those slots are busy.
+The wait counts against its timeout and checks cancellation. Admission checks both
+controls before accepting free slots, including after each wake. A one-thread call
+runs on its caller without a Rayon pool and keeps one slot until the call ends.
+A multithreaded call owns a Rayon pool under its reservation, separate from the
+reasoner's pool. If pool construction fails, it runs sequentially while retaining
+that reservation. Returning an error or unwinding releases the reservation.
+
+Native callers can explicitly use `Par::single` or `Par::with_threads` outside this
+admission policy. Production `SERVICE algo:` calls use `Par::acquire`.
 
 Each call checks the query's timeout and cancel flag between iterations and every 64K
 nodes inside one. Node2vec also checks at entry, before returning and at most every
@@ -555,7 +562,13 @@ gates are still pending.
   algorithm each. `pool.rs` holds the control handle (cancel, deadline, memory budget)
   and the thread pools. Every algorithm takes a seed where it needs one, so a run is
   repeatable, and tests check that PageRank and FastRP give the same result at any thread
-  count.
+  count. Production admission includes one-thread calls, which keep one process slot
+  while running on the caller without creating a Rayon pool. Cancellation and deadline
+  checks apply before free-slot acceptance and after waking. A reservation guard exists
+  before pool construction, so unwinding releases slots and sequential construction
+  fallback retains its slots until the call ends. Pool regression fixtures isolate
+  configuration in subprocesses and prove waiting, control errors and release using
+  boundary handshakes.
 * **SPARQL.** `sparql/algosvc.rs` plans `SERVICE algo:<name>` as an `AlgoCall` leaf, as
   `path:search` is planned, so the outbound policy and `--no-service` never apply to it.
   A variable `algo:source` makes the leaf read the rest of its join group, and `GRAPH
