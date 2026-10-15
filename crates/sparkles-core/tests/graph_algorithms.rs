@@ -1829,6 +1829,20 @@ fn r12_projection_conversions_remain_finite() {
     assert!(missed.is_empty(), "unchecked conversions: {missed:?}");
 }
 
+fn r12_invalid_diagnostic(s: &Store, q: &str, expected: &str) {
+    let e = match query(
+        s.snapshot(),
+        &format!("{PREFIXES}{q}"),
+        &QueryOptions::default(),
+    ) {
+        Ok(_) => panic!("expected Invalid containing {expected}"),
+        Err(e) => e,
+    };
+    eprintln!("R12 diagnostic: {e}");
+    assert!(matches!(e, sparkles_core::Error::Invalid(_)), "{e}");
+    assert!(e.to_string().contains(expected), "{e}");
+}
+
 #[test]
 fn r12_default_applicability_and_aggregate_overflow() {
     let s = store_of("ex:a ex:p ex:b {|ex:w 2|}.");
@@ -1839,18 +1853,45 @@ fn r12_default_applicability_and_aggregate_overflow() {
         "unused large default is not converted"
     );
     let s = store_of("ex:a ex:p ex:b.");
-    assert!(
-        r12_invalid(
-            &s,
-            "SERVICE algo:pageRank { [] algo:predicate ex:p;algo:weight ex:w;algo:defaultWeight 1e40;algo:node ?n;algo:score ?r }"
-        ),
-        "selected reifier default must fit f32"
-    );
+    r12_invalid_diagnostic(&s, q, "an edge weight is not finite as f32");
     let s = store_of("ex:a ex:p ex:b {|ex:w 3e38|}; ex:q ex:b {|ex:w 3e38|}.");
-    assert!(r12_invalid(
+    r12_invalid_diagnostic(
         &s,
-        "SERVICE algo:pageRank { [] algo:predicate ex:p,ex:q;algo:weight ex:w;algo:aggregate algo:aggregateSum;algo:node ?n;algo:score ?r }"
-    ));
+        "SELECT ?n ?r WHERE { SERVICE algo:pageRank { [] algo:predicate ex:p,ex:q;algo:weight ex:w;algo:aggregate algo:sum;algo:node ?n;algo:score ?r } }",
+        "summed edge weight is not finite as f32",
+    );
+}
+
+#[test]
+fn r12_normal_and_f32_boundary_sum_controls() {
+    let q = |aggregate: &str| {
+        format!(
+            "SELECT ?n ?d WHERE {{ SERVICE algo:sssp {{ [] algo:predicate ex:p,ex:q;algo:weight ex:w;algo:aggregate algo:{aggregate};algo:source ex:a;algo:node ?n;algo:distance ?d }} }}"
+        )
+    };
+    let s = store_of("ex:a ex:p ex:b {|ex:w 2|}; ex:q ex:b {|ex:w 3|}.");
+    let summed = by_node(&rows(&s, &q("sum")), "d");
+    let separate = by_node(&rows(&s, &q("none")), "d");
+    assert_eq!(summed["b"].parse::<f64>().unwrap(), 5.0);
+    assert_eq!(separate["b"].parse::<f64>().unwrap(), 2.0);
+    let s = store_of(
+        "ex:a ex:p ex:b {|ex:w 1.7014117331926443e38|}; ex:q ex:b {|ex:w 1.7014117331926443e38|}.",
+    );
+    let boundary = by_node(&rows(&s, &q("sum")), "d");
+    let actual = boundary["b"].parse::<f64>().unwrap();
+    eprintln!("finite sum boundary: {actual:e}, f32::MAX={:e}", f32::MAX);
+    assert!(actual.is_finite());
+    assert_eq!(actual as f32, f32::MAX);
+    let ranks = rows(
+        &s,
+        "SELECT ?n ?r WHERE { SERVICE algo:pageRank { [] algo:predicate ex:p,ex:q;algo:weight ex:w;algo:aggregate algo:sum;algo:node ?n;algo:score ?r } }",
+    );
+    assert_eq!(ranks.len(), 2);
+    assert!(
+        ranks
+            .iter()
+            .all(|r| r["r"].parse::<f64>().unwrap().is_finite())
+    );
 }
 
 #[test]
