@@ -1,18 +1,22 @@
 # X06: Benchmark coverage and refresh
 
-> **Status:** specified
+> **Status:** partly shipped
 >
-> **Phases:** None shipped. Phase 1 is the common result record, the refresh protocol,
-> regression tracking and the cheap standard suites (BSBM, SP²Bench, LUBM) at the current
-> head. Phase 2 adds comparative spatial and vector runs, OWL2Bench and long write runs
+> **Phases:** Phase 1 has shipped its tooling and not its measurements. The result record,
+> the run manifest, `scripts/bench-record.py`, the `compare` subcommand and the BSBM
+> (Explore and BI), SP²Bench and LUBM drivers are in the repository and run at smoke scale.
+> The standard refresh of the existing suites at one head, the published comparisons of the
+> new suites and the regeneration of the BENCHMARKS.md tables from records are not done.
+> Phase 2 adds comparative spatial and vector runs, OWL2Bench and long write runs
 > with compaction. Phase 3 adds LDBC SNB Interactive and BI and the Wikidata query-log
 > replay above 1.24 billion triples. Phase 4 adds LDBC Graphalytics once the graph
 > algorithms of F14 exist, and the wider hardware matrix.
 >
-> **User docs:** none, because nothing is built.
+> **User docs:** [BENCHMARKING.md](../BENCHMARKING.md) documents the harnesses and the commands
+> of the full runs, and [BENCHMARKS.md](../BENCHMARKS.md) the methodology.
 >
-> This is the design as written before implementation. The [Outcome](#outcome) section at
-> the end will record how it lands.
+> The sections before the Outcome are the design as written before implementation. The
+> [Outcome](#outcome) section at the end records how it landed.
 
 This design was written from the published descriptions of the Berlin SPARQL Benchmark,
 SP²Bench, LUBM, OWL2Bench, the LDBC Social Network Benchmark and LDBC Graphalytics, the
@@ -584,4 +588,121 @@ one ranking.
 
 ## Outcome
 
-Not built. See [ROADMAP](../ROADMAP.md) item 1.
+Phase 1's tooling is built. The measurements it exists for have not been run on a
+publication host, so BENCHMARKS.md has no figures from it.
+
+**Record and manifest.** `scripts/bench-record.py` has four subcommands. `manifest` writes
+the run manifest of §6 with the commit of the scripts' checkout, the Sparkles binary's
+checksum and its own commit when the caller knows it (`SPARKLES_COMMIT`), every engine's
+version, binary checksum and license, the Nix store path of an engine taken from nixpkgs, the host, the memory limit, the client CPU, the data checksums
+and the license check. `finish` adds the end time. `build` turns the results directory of
+`scripts/bench.sh` or of a suite into the record of §7, and `validate` checks a record
+against the shape described in the script's header. The record also carries the load
+numbers and the memory readings, and the LUBM record carries the materialization costs
+under `inference`. `build --pool-instances` merges query instances named `<template>-<i>`
+into one result per template, with the samples pooled. The agreement of an answer is judged
+against the majority of the engines that answered, as in `bench-summary.py`, and a result
+that disagrees is recorded as `wrong-answer`. The durability class of §5.1 is filled in for
+update results only, and no suite has a long write run yet.
+
+**Comparison.** `scripts/bench-regressions.py compare` takes two or more records, pairs
+results by suite, scale, engine, query, mode and clients, and applies the rules of §9 to the
+compared engine. It reports a regression when the median is more than 10% slower and the
+sample ranges are disjoint, or more than 5% slower in two consecutive comparisons of a
+chain. It also reports a changed answer hash and a result that stopped being `ok`, and it
+exits with status 1 when it reports anything. The old store-copy mode is unchanged. Unit
+tests for both tools run in `mise run test:bench-scripts`, which is part of `mise run ci`.
+They cover A4 on fixture records and the marking of a wrong answer from A2.
+
+**Suites.** `scripts/bench-suite-lib.sh` is the common run of the three suites. It loads one
+N-Triples file into the selected engines, serves them, checks every answer, times each query
+with hyperfine, optionally measures cold restarts, and writes the manifest, the record and
+`summary.md`. The timed server of each engine first answers every selected query once, so
+it is as warm as the one that was checked, and then each engine's queries and query mixes
+run with no other server up. To share this code with the existing harness, the load, the server start-up,
+the answer check and the cold mode moved from `scripts/bench.sh` into `scripts/bench-lib.sh`.
+`bench.sh` was checked afterwards in its default and cold modes. `bench-answers.py` now
+also fingerprints ASK, CONSTRUCT and DESCRIBE results. A CONSTRUCT or DESCRIBE answer is a
+set of triples compared by term identity before the value digest normalizes the terms, so
+`1` as an integer and `1.0` as a decimal stay two triples. An `order` digest is recorded only
+for ORDER BY columns whose order SPARQL defines, and rows that tie at a LIMIT or OFFSET
+boundary are compared by their key values only when a second request shows that the tie
+crosses the cut. `bench-lib.sh` picks the Accept type of a
+timed request from the query form. `nixbin` now builds engines from the nixpkgs
+revision in `flake.lock`, so engine versions follow the repository and the manifest records
+them. This can change the Jena, QLever and Oxigraph versions of an existing harness run
+compared with the older registry lookup.
+
+* *SP²Bench* (`scripts/bench-sp2b.sh`). The generator is built from the checksum-pinned v1.01
+  release by `scripts/bench-sp2b/sp2b.nix` as a 64-bit binary. Two runs of the same size gave
+  the same file. The 17 queries come from the same release. All five engines loaded the 50k
+  document and agreed on the first queries, and the Sparkles-only smoke run completed.
+* *LUBM* (`scripts/bench-lubm.sh`). The generator and ontology are downloaded at run time
+  against `scripts/bench-lubm/pins.tsv` because they carry no license text. The queries are
+  written out from the paper in `scripts/bench-lubm/queries.txt`. Two generations of
+  LUBM(1) in different directories gave the same N-Triples file. That needed two
+  normalizations after conversion. The two header triples that name each generated file by
+  its local path are dropped, and the ontology's blank nodes are relabeled in order of
+  appearance. The data has 103,380 triples with the ontology, and `sparkles infer` derives
+  43,557 triples with the `rdfs` profile and 84,748 with `owl-rl`. Query 13 returns one row
+  at LUBM(1), and a direct query
+  over the generated data confirms that only one person has a degree from University0. The
+  answers have not been compared with published reference counts, because the scripts use the
+  majority of the engines as the reference. Jena's reasoners are not run. Fluree's public
+  documentation describes query-time reasoning, which the script does not enable, so Fluree
+  answers over the same materialized file as the other engines. Timing it with its own
+  reasoning on is not done.
+* *BSBM* (`scripts/bench-bsbm.sh`). The GPL-3.0 tools run as separate processes and are
+  fetched only with `SPARKLES_ALLOW_GPL_BENCHMARK=1`. Generation is deterministic. The
+  test driver's own query mixes are recorded through a stub endpoint
+  (`scripts/bench-bsbm/instantiate.py`) to get the query instances for the answer check and
+  the per-template timings, and the driver itself measures query mixes per hour with 1, 4
+  and 16 clients. The Explore and BI use cases both instantiate. The Explore and Update mix
+  is not built. The scale labels follow BSBM's published dataset sizes, which are 2,785
+  products for 1m, 28,480 for 10m and 284,826 for 100m, and the manifest records the triple
+  count that was generated. At 1m the generator gives 1,000,312 triples, against 1,000,313
+  in the V2.0 specification. The query mix check compares only runs in which the driver
+  succeeded, gives each engine one vote, and does not compare runs with different mix
+  counts.
+
+**Smoke runs.** SP²Bench at 50k, LUBM(1) and BSBM with 2000 products ran end to end with
+Sparkles alone on a development machine. SP²Bench at 50k also ran with all five engines,
+with a 20 second request timeout, on a machine that was compiling at the same time, so its
+times mean nothing. The run showed what the harness is for. Oxigraph and QLever returned
+other answers than the majority for several queries (q4, q5a, q5b, q6 and q8) and were
+marked and left out of the ranking, and Jena, Fluree and Oxigraph timed out on some
+queries and were recorded as `timeout`.
+
+The Oxigraph disagreements came from the harness. `oxigraph load --file` parses N-Triples
+in parallel chunks and splits a blank node label that occurs in two chunks into two nodes,
+so it held 4,727 blank nodes for SP²Bench at 50k triples instead of 4,198, and 109,384
+instead of 86,870 at 1M. The harness now loads Oxigraph from standard input with
+`--format nt`, which keeps the labels whole and takes about 3x as long to load at 1M
+(6.6 s against 2.3 s). With that load Sparkles, Oxigraph and QLever agree on q4, q5a, q5b
+and q6. QLever still differs on q6 (1,959 rows against 1,769) and q8 (0 rows against 264),
+which looks like the engine's own behavior. The synthetic data and WatDiv contain no blank
+nodes, and the DBpedia load already read standard input, so no published Oxigraph result
+needs a rerun. Sparkles was slow on q5a and q12a at this size, which a run on the
+reference host should confirm before it is listed under "Where Sparkles loses".
+
+**Left for Phase 1.**
+
+* The standard refresh of every existing suite at one head (A5), and the regeneration of the
+  BENCHMARKS.md tables from records without a numeric change (A3). The per-engine loop of
+  `suite_run` is not in `bench.sh` yet, and adding it is part of this refresh. The published
+  runs invoke `bench.sh` once per engine, so each engine ran alone. `bench-record.py` reads
+  the results of `bench.sh` and of a small `bench-watdiv.sh` run, and both produce valid
+  records. It does not read the DBpedia or full-text results yet, and `bench-summary.py`
+  still reads the raw files.
+* The published comparisons of BSBM, SP²Bench and LUBM(100) on the reference host, with a
+  noise-floor control for each (§14). Their commands are in BENCHMARKING.md.
+* BSBM at 100M triples has not been tried, and the generator's heap defaults may need
+  raising. SP²Bench at 100M triples will meet the 600 second timeout in its slower queries.
+* Open question 1 is settled for LUBM and BSBM only in practice. The BSBM tools and the LUBM
+  generator are fetched at run time, the SP²Bench release is BSD and also fetched, and only
+  the LUBM queries, which come from a published paper, are committed.
+* A CI smoke job in `ANSWERS_ONLY` mode (§14) is not wired in. BSBM would stay out of it
+  because of its license.
+* Phases 2 to 4 are untouched.
+
+See [ROADMAP](../ROADMAP.md) item 1.

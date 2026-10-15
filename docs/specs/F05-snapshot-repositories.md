@@ -1916,7 +1916,9 @@ repository copy and content-defined chunking** (item 61, Tier 6,
   repositories and policies, and the auth store (users and token hashes, not session
   secrets). Runtime model secrets are left out unless the server seals them
   ([C19](C19-layered-settings.md#roadmap-follow-ups-2026-10-12)); sealed values are
-  included and restore only with the same key. `POST /$/server/backups {repository,
+  included and restore only with the same key. A server backup leaves out
+  `secrets.key` and any `.secrets.key.*.tmp`, and copies `secrets/` as sealed files.
+  C19's item 68 Outcome records why. `POST /$/server/backups {repository,
   datasets?}` makes a server backup plus one backup per listed dataset under one run
   id. `sparkles backup restore-server RUN --data DIR` restores into an empty data
   directory, offline, and recreates every dataset of the run; it refuses a non-empty

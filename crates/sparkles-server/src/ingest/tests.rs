@@ -1321,3 +1321,61 @@ async fn retention_task() {
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
 }
+
+/// A pre-merge count must never overwrite a completed post-merge refresh.
+#[tokio::test]
+async fn review_refresh_publication_is_ordered() {
+    use crate::mcp::memory::pending::{
+        self,
+        tests::{Paused, idle, old_refresh},
+    };
+    let (st, app) = app(None);
+    memory(&app, json!({})).await;
+    let fact = json!({ "s": "<http://example.org/ana>", "p": format!("<{MEMBER_OF}>"),
+        "o": "<http://example.org/payments>" });
+    session(&app, "s1", json!({ "facts": [fact] })).await;
+    session(&app, "s2", json!({ "facts": [fact] })).await;
+    let v = maintain(&app, "/$/memory/org/consolidate", json!({})).await;
+    assert_eq!(v["result"]["outcome"], "proposed", "{v}");
+    let branch = v["result"]["branch"].as_str().unwrap();
+    idle(&st);
+    let ds = st.get("org").unwrap();
+    // Invalidate a possible cached fingerprint without changing inbox contents.
+    ds.store
+        .load(&[Source::from_bytes(
+            b"<urn:x> <urn:p> <urn:o> .".to_vec(),
+            RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+    let paused = Paused::new(&st, "old-refresh");
+    let old = old_refresh(&st, &ds);
+    paused.entered();
+    // Use the actual merge without scheduling another route touch that could mask
+    // the stale overwrite. Replacement coalescing is tested independently.
+    ds.store.merge(branch, "main", &Default::default()).unwrap();
+    let fresh = paused.fresh(&st, &ds);
+    old.join().unwrap();
+    let refreshed = fresh.join().unwrap().unwrap();
+    assert!(
+        refreshed
+            .kinds(|_| true)
+            .values()
+            .all(|kind| kind.open == 0)
+    );
+    let metrics = crate::obs::metrics_json(&st);
+    for kind in ["session", "consolidation"] {
+        assert!(
+            metrics["memoryReview"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["dataset"] == "org" && r["kind"] == kind && r["pending"] == 0),
+            "{metrics}"
+        );
+    }
+    let current = pending::current(&st, &ds).unwrap();
+    assert!(current.kinds(|_| true).values().all(|k| k.open == 0));
+    let (_, maintenance) = send(&app, req("GET", "/$/memory/org/maintenance", Value::Null)).await;
+    assert_eq!(maintenance["review"]["open"], 0, "{maintenance}");
+}

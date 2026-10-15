@@ -763,6 +763,7 @@ fn entries() -> Vec<(&'static str, Entry)> {
         server_only!("getServer", Process),
         server_only!("getServerPost", Process),
         server_only!("metrics", Process),
+        server_only!("serverMemory", Process),
         server_only!("ready", Process),
         server_only!("readyDataset", Process),
         server_only!("openapiJson", Process),

@@ -1506,3 +1506,25 @@ async fn automatic_small_queries_preserve_eager_results() {
         assert_eq!(auto.body, eager.body);
     }
 }
+
+#[tokio::test]
+async fn cache_capacities_are_server_wide_and_unlabelled() {
+    let s = server();
+    s.state.attach("other", DbType::Mem, None).unwrap();
+    let m = metrics(&s.app).await;
+    let sizes = sparkles::store::caches::CacheSizes::default();
+    assert_eq!(
+        sample(&m, "sparkles_block_cache_capacity_bytes"),
+        Some(sizes.blocks as f64)
+    );
+    assert_eq!(
+        sample(&m, "sparkles_result_cache_capacity_bytes"),
+        Some(sizes.results as f64)
+    );
+    // the bytes and counters stay per dataset
+    for ds in ["ds", "other"] {
+        let series = format!("sparkles_block_cache_bytes{{dataset=\"{ds}\"}}");
+        assert!(sample(&m, &series).is_some(), "{series}");
+    }
+    assert!(!m.contains("sparkles_block_cache_capacity_bytes{"));
+}

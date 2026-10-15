@@ -477,7 +477,7 @@ class SparklesStore(Store):
         # The common call, a pattern on IRIs in a plain Graph read before, as `contains`
         # and `Graph.value` make it, takes the kept nodes without the general helpers.
         # Their calls took more time than the lookup itself.
-        g = None
+        g: DefaultGraph | NamedNode | BlankNode | None = None
         if type(context) is Graph and type(s) is URIRef and type(p) is URIRef:
             g = self._graph_names.get(context.identifier)
         if g is not None:

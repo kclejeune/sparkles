@@ -495,6 +495,12 @@ fn server(p: &mut Paths) {
             ),
     );
     p.add(
+        op(GET, "/$/server/memory", "serverMemory", "Server", "Server memory")
+            .doc("The query memory pool (capacity, bytes granted, requests waiting) and the block, result, SERVICE and history caches, with the bytes each dataset holds in the shared ones.")
+            .see("budgets")
+            .json("200", "The memory state.", "ServerMemory"),
+    );
+    p.add(
         op(GET, "/$/ready", "ready", "Server", "Readiness check")
             .doc("`200` when the server is ready and `503` otherwise, both with `ReadyInfo`. Without `metrics`, only readable datasets are listed.")
             .see("server")
@@ -2652,13 +2658,13 @@ fn assist(p: &mut Paths) {
     );
     p.add(
         op(GET, "/$/server/secrets", "listSecrets", "Server", "List model secrets")
-            .doc("Each secret that `--model-secret`, a stored value, a provider or a lock names, with its source, whether it is locked, when a runtime value was stored and the providers that use it, and whether stored values are sealed. Values are never returned. Needs server `admin`.")
+            .doc("Each secret that `--model-secret`, a stored value, a provider or a lock names, with its source, whether it is locked, when a runtime value was stored and the providers that use it, and whether stored values are sealed and with which key. Values are never returned. Needs server `admin`.")
             .see("model-secrets")
             .json("200", "The secrets.", "SecretList"),
     );
     p.add(
         op(PUT, "/$/server/secrets/{name}", "putSecret", "Server", "Store a model secret")
-            .doc("Stores a runtime value for the secret in the data directory with mode 0600, sealed with the key of `serve --secrets-key` when the server has one. It overrides the `--model-secret` source, and requests that start after it use it. A secret that `server.locked` locks is a `409` with `locked-by-config`. Needs server `admin`.")
+            .doc("Stores a runtime value for the secret in the data directory with mode 0600. Builds with the default `backup` feature seal values unless the server runs with `--secrets-key none`. Builds without it keep plaintext. When sealing is enabled, the first value stored without a configured key generates `<dataDir>/secrets.key`. It overrides the `--model-secret` source, and requests that start after it use it. A secret that `server.locked` locks is a `409` with `locked-by-config`. Needs server `admin`.")
             .see("model-secrets")
             .json_body(true, "SecretValue")
             .no_content("Stored.")

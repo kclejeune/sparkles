@@ -85,6 +85,11 @@ pub struct DatasetOptions {
     pub closure_cache_triples: usize,
     /// the origin of an in-memory clone, which has no `origin.json`
     pub origin: Option<serde_json::Value>,
+    /// the pool whose grants bound the memory of this dataset's queries and updates
+    /// together with those of the other datasets that share it (spec X08 §4.4). A
+    /// [`Catalog`](crate::Catalog) sets it from its memory options. Without a pool,
+    /// only each query's own budget applies.
+    pub pool: Option<Arc<crate::sparql::pool::QueryPool>>,
 }
 
 impl Default for DatasetOptions {
@@ -94,6 +99,7 @@ impl Default for DatasetOptions {
             name: None,
             closure_cache_triples: crate::reasoning::DEFAULT_CLOSURE_CACHE_TRIPLES,
             origin: None,
+            pool: None,
         }
     }
 }
@@ -117,6 +123,7 @@ pub struct DatasetState {
     pub(crate) branches: Mutex<BTreeMap<String, Dataset>>,
     pub(crate) branch_handles: Mutex<Vec<std::sync::Weak<DatasetState>>>,
     pub(crate) closure_cache_triples: usize,
+    pub(crate) pool: Option<Arc<crate::sparql::pool::QueryPool>>,
     pub store: StoreHandle,
     pub name: Option<String>,
     /// the stored queries (`queries.json`)
@@ -264,9 +271,7 @@ impl Dataset {
         }
         let reasoning = store.root().and_then(crate::reasoning::read_record);
         let origin = match store.root() {
-            Some(root) => std::fs::read(root.join(ORIGIN_FILE))
-                .ok()
-                .and_then(|b| serde_json::from_slice(&b).ok()),
+            Some(root) => read_origin(&root.join(ORIGIN_FILE)),
             None => opts.origin,
         };
         Dataset {
@@ -275,6 +280,7 @@ impl Dataset {
                 branches: Mutex::new(BTreeMap::new()),
                 branch_handles: Mutex::new(Vec::new()),
                 closure_cache_triples: opts.closure_cache_triples,
+                pool: opts.pool,
                 name: opts.name,
                 queries,
                 #[cfg(feature = "graphql")]
@@ -565,8 +571,21 @@ impl Dataset {
                 Vec::new()
             },
             describe: state.store.describe_settings(),
+            pool: state.pool.clone(),
             defaults_applied: true,
             ..Default::default()
+        }
+    }
+
+    /// `opts` under the dataset's memory pool, unless they name a pool or a grant.
+    fn with_pool<'o>(&self, opts: &'o QueryOptions) -> Cow<'o, QueryOptions> {
+        match &self.inner.pool {
+            Some(p) if opts.pool.is_none() && opts.grant.is_none() => {
+                let mut o = opts.clone();
+                o.pool = Some(p.clone());
+                Cow::Owned(o)
+            }
+            _ => Cow::Borrowed(opts),
         }
     }
 
@@ -590,6 +609,9 @@ impl Dataset {
         }
         if o.describe == crate::sparql::describe::DescribeOptions::default() {
             o.describe = defaults.describe;
+        }
+        if o.pool.is_none() && o.grant.is_none() {
+            o.pool = defaults.pool;
         }
         o.defaults_applied = true;
         Cow::Owned(o)
@@ -640,11 +662,11 @@ impl Dataset {
 
     /// Run a SPARQL Update request (all operations in one transaction).
     pub fn update(&self, update: &str) -> Result<UpdateStats> {
-        crate::sparql::update::update(&self.inner.store, update, &QueryOptions::default())
+        self.update_with(update, &QueryOptions::default())
     }
 
     pub fn update_with(&self, update: &str, opts: &QueryOptions) -> Result<UpdateStats> {
-        crate::sparql::update::update(&self.inner.store, update, opts)
+        crate::sparql::update::update(&self.inner.store, update, &self.with_pool(opts))
     }
 
     /// Apply an RDF Patch, in the text form or (`binary`) the RDF Thrift form, as one
@@ -1243,7 +1265,7 @@ impl Transaction<'_> {
     /// transaction's changes, and they commit or roll back with it. A `text:query` call
     /// fails once the transaction has changed data, as in [`Transaction::query_with`].
     pub fn update_with(&mut self, update: &str, opts: &QueryOptions) -> Result<UpdateStats> {
-        crate::sparql::update::update_in(&mut self.txn, update, opts)
+        crate::sparql::update::update_in(&mut self.txn, update, &self.ds.with_pool(opts))
     }
 }
 
@@ -1576,10 +1598,32 @@ impl Iterator for QuadIter {
     }
 }
 
+/// The informational `origin.json` of a clone, or `None` when it is absent, does not
+/// parse, or was written by a newer release (which is logged).
+fn read_origin(path: &Path) -> Option<serde_json::Value> {
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    if let Err(e) = crate::formats::check_settings(ORIGIN_FILE, &v) {
+        tracing::warn!("{}: {e}; its content is ignored", path.display());
+        return None;
+    }
+    Some(v)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use oxrdf::{Literal, NamedNodeRef};
+
+    #[test]
+    fn a_newer_origin_file_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(ORIGIN_FILE);
+        let newer = crate::formats::settings_file(ORIGIN_FILE).unwrap().writes + 1;
+        std::fs::write(&path, format!(r#"{{"originFormat": {newer}}}"#)).unwrap();
+        assert!(read_origin(&path).is_none());
+        std::fs::write(&path, r#"{"source": "x"}"#).unwrap();
+        assert!(read_origin(&path).is_some());
+    }
 
     const EX: &str = "http://ex.org/";
     fn n(l: &str) -> NamedNode {

@@ -153,6 +153,9 @@ pub struct CursorStats {
     pub emitted_rows: u64,
     pub rows_produced: u64,
     pub mem_peak_bytes: u64,
+    /// the most the query held of the server's memory pool (`None` without a pool)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub granted_bytes: Option<u64>,
     pub timing: Timing,
     pub error: Option<String>,
 }
@@ -819,6 +822,7 @@ impl QueryExecution {
                 emitted_rows: r.result().len() as u64,
                 rows_produced: r.result().rows_produced,
                 mem_peak_bytes: r.result().mem_peak_bytes,
+                granted_bytes: r.result().ctx.grant.as_ref().map(|g| g.peak()),
                 timing: r.result().timing.clone(),
                 error: None,
             },
@@ -938,6 +942,7 @@ impl QueryCursor {
             emitted_rows: self.emitted,
             rows_produced: self.ctx.rows_produced(),
             mem_peak_bytes: self.ctx.mem_peak(),
+            granted_bytes: self.ctx.grant.as_ref().map(|g| g.peak()),
             timing,
             error: self.failure.clone(),
         }

@@ -32,6 +32,7 @@ mod keyprobe;
 pub mod lateral;
 pub mod pathsearch;
 pub mod plan;
+pub mod pool;
 mod propertyext;
 pub mod rdfs;
 mod registeredagg;
@@ -91,10 +92,18 @@ pub struct QueryOptions {
     pub base_iri: Option<String>,
     /// Maximum rows in an intermediate table or distinct CONSTRUCT graph output.
     pub max_rows: Option<usize>,
-    /// Budget for the estimated memory of intermediate results and retained CONSTRUCT
-    /// output (`None`: unlimited);
+    /// Budget for the estimated memory of intermediate results and retained decoded
+    /// graph output (`None`: unlimited);
     /// exceeding it fails with [`Error::BudgetExceeded`].
     pub max_memory_bytes: Option<u64>,
+    /// The query's reservation in a server-wide memory pool (see [`pool`]). The server
+    /// admits the request and passes the grant it got, and the query grows and shrinks
+    /// it with its charges. An update's WHERE clauses share it, one at a time.
+    pub grant: Option<Arc<pool::PoolGrant>>,
+    /// A pool to take a grant from when `grant` is unset. The query then starts with an
+    /// empty grant and fails with [`BudgetKind::ServerMemory`](crate::BudgetKind) when
+    /// the pool cannot cover its charges. Nothing queues.
+    pub pool: Option<Arc<pool::QueryPool>>,
     /// Budget for the rows all operators of a query produce together, including
     /// distinct CONSTRUCT output (`None`: unlimited); exceeding it fails with
     /// [`Error::BudgetExceeded`]. An update's WHERE clauses share one count.
@@ -162,6 +171,18 @@ pub struct QueryOptions {
     /// dataset fills each of those fields that the caller left unset. The engine itself
     /// does not read it.
     pub defaults_applied: bool,
+}
+
+impl QueryOptions {
+    /// The grant a query under these options holds: the one given, else an empty one from
+    /// the pool.
+    pub(crate) fn query_grant(&self) -> Option<Arc<pool::PoolGrant>> {
+        match (&self.grant, &self.pool) {
+            (Some(g), _) => Some(g.clone()),
+            (None, Some(p)) => Some(Arc::new(p.empty_grant())),
+            (None, None) => None,
+        }
+    }
 }
 
 /// `snap` with the request's union default graph setting, if it overrides the store's.
@@ -279,7 +300,7 @@ pub struct QueryResult {
     pub quads: Vec<Quad>,
     pub plan: PlanInfo,
     pub timing: Timing,
-    /// Peak estimated memory of intermediate results and CONSTRUCT output (see
+    /// Peak estimated memory of intermediate results and decoded graph output (see
     /// [`QueryOptions::max_memory_bytes`]).
     pub mem_peak_bytes: u64,
     /// Rows produced by all operators and distinct CONSTRUCT output (see
@@ -413,6 +434,7 @@ fn make_ctx(
     if let Some(m) = opts.max_memory_bytes {
         ctx.mem_limit = m;
     }
+    ctx.grant = opts.query_grant();
     if let Some(m) = opts.max_rows_produced {
         ctx.max_rows_produced = m;
     }

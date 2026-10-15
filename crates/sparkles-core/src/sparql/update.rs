@@ -87,6 +87,7 @@ pub fn update_in(txn: &mut WriteTxn<'_>, u: &str, opts: &QueryOptions) -> Result
             base: parsed.base_iri.clone(),
             budget: RequestBudget::new(&opts.outbound),
             produced: Default::default(),
+            grant: opts.query_grant(),
         };
         for op in &parsed.operations {
             req.check()?;
@@ -224,6 +225,7 @@ fn run_update(
             .clone()
             .unwrap_or_else(|| RequestBudget::new(&opts.outbound)),
         produced: Default::default(),
+        grant: opts.query_grant(),
     };
     // the request's cancellation and deadline also end the wait for the writer lock
     // and the write guard
@@ -274,6 +276,8 @@ struct Request<'a> {
     budget: Arc<RequestBudget>,
     /// rows produced by the WHERE evaluations of every operation
     produced: Arc<std::sync::atomic::AtomicU64>,
+    /// the pool reservation the operations share, one at a time
+    grant: Option<Arc<super::pool::PoolGrant>>,
 }
 
 impl Request<'_> {
@@ -310,6 +314,7 @@ impl Request<'_> {
         if let Some(m) = self.opts.max_memory_bytes {
             ctx.mem_limit = m;
         }
+        ctx.grant = self.grant.clone();
         if let Some(m) = self.opts.max_rows_produced {
             ctx.max_rows_produced = m;
         }

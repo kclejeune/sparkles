@@ -16,6 +16,7 @@ mod branch_ops_tests;
 #[cfg(test)]
 mod branch_tests;
 mod branching;
+pub mod caches;
 mod changelog;
 mod changes;
 mod clone;
@@ -31,12 +32,16 @@ mod group;
 mod history_query;
 pub mod keyset;
 mod link;
+#[cfg(test)]
+mod lock_tests;
 mod mem_history;
 #[cfg(test)]
 mod memory_branch_tests;
 mod merge;
 mod partial;
 mod patch_apply;
+#[cfg(test)]
+mod preflight_tests;
 mod preview;
 mod quota;
 mod replay;
@@ -47,6 +52,7 @@ pub(crate) mod text_recovery;
 #[cfg(all(test, feature = "geo"))]
 mod test_support;
 mod vector;
+pub(crate) use diff::QuadKey;
 pub(crate) use embed::embed_query_text;
 pub use embed::embed_texts;
 pub(crate) mod wal;
@@ -197,14 +203,13 @@ impl Generation {
     fn open_with(dir: &Path, name: &str, dvocab: DeltaVocab) -> Result<Generation> {
         let meta: IndexMeta = serde_json::from_slice(&std::fs::read(dir.join("meta.json"))?)
             .map_err(|e| Error::Corrupt(format!("meta.json: {e}")))?;
-        if meta.format_version != crate::builder::FORMAT_VERSION {
-            return Err(Error::Corrupt(format!(
-                "{} has index format {} but this build uses {}; dump and reload the data",
-                dir.display(),
-                meta.format_version,
-                crate::builder::FORMAT_VERSION
-            )));
-        }
+        // the database's directory holds the generation (a branch's holds its own)
+        let written_by = || dir.parent().and_then(commit::read_written_by);
+        crate::formats::INDEX.check(
+            &dir.display().to_string(),
+            meta.format_version,
+            written_by().as_deref(),
+        )?;
         let stats: Stats = serde_json::from_slice(&std::fs::read(dir.join("stats.json"))?)
             .map_err(|e| Error::Corrupt(format!("stats.json: {e}")))?;
         Ok(Generation {
@@ -1020,6 +1025,9 @@ pub struct StoreOptions {
     pub memory_commit_ring: usize,
     /// Memory for materialized past states (point-in-time reads).
     pub history_cache_bytes: u64,
+    /// Caches shared with other datasets. When set, the block, result, SERVICE and
+    /// history caches come from the scope and the size options above do not apply.
+    pub shared: Option<caches::CacheScope>,
     /// Non-current generations named snapshots may keep (the retention window shares it).
     pub history_max_generations: usize,
     /// Named snapshots per dataset.
@@ -1089,8 +1097,10 @@ pub struct StoreOptions {
     /// The size at which a change log segment is sealed and a new one started.
     pub change_log_segment_bytes: u64,
     /// A bulk commit's changes are recorded when the dataset was empty and the new state
-    /// holds at most this many quads, or when both states together hold at most this
-    /// many; a larger one is recorded with its counts only.
+    /// holds at most this many quads, when both states together hold at most this many, or
+    /// when the quads the commit can have changed number at most this many: the quads it
+    /// loads, the quads of the graphs it drops and its transaction's own changes, counted
+    /// with duplicates. A larger one is recorded with its counts only.
     pub change_log_bulk_max_quads: u64,
     /// Branches per dataset, `main` included ([`Store::create_branch`] refuses more).
     pub max_branches: usize,
@@ -1122,14 +1132,15 @@ impl Default for StoreOptions {
     fn default() -> Self {
         StoreOptions {
             cache_bytes: 1 << 30,
-            result_cache_bytes: 512 << 20,
+            result_cache_bytes: 256 << 20,
             result_cache_min_ms: 1.0,
             service_cache_bytes: 64 << 20,
             union_default_graph: false,
             build: BuildOptions::default(),
             bulk_threshold: 250_000,
             memory_commit_ring: 65_536,
-            history_cache_bytes: 1 << 30,
+            history_cache_bytes: 512 << 20,
+            shared: None,
             history_max_generations: 8,
             max_snapshots: 256,
             unvalidated_writes: false,
@@ -1313,6 +1324,39 @@ pub struct Store {
 
 pub(crate) const WAL_INSERT: u8 = 1;
 
+/// Take the exclusive process lock of a database directory, for offline work on a
+/// closed database (`sparkles migrate`). Checks the locked file's identity but allows
+/// pending migration state, which the caller may be recovering.
+pub(crate) fn lock_database(root: &Path) -> Result<File> {
+    let lock = lock_dir(root)?;
+    verify_database_lock(root, &lock)?;
+    Ok(lock)
+}
+
+/// Verify that an acquired database lock still names `root/sparkles.lock`.
+///
+/// An offline directory swap can move a lock file between opening and locking it.
+/// Callers must check pending migration state before this final identity comparison,
+/// unless they own migration exclusion and are recovering that state themselves.
+/// The handles used for comparison are dropped before returning, including on Windows.
+/// A missing or replaced lock file returns [`Error::Locked`]; retry with a fresh lock.
+pub fn verify_database_lock(root: &Path, lock: &File) -> Result<()> {
+    let stale = || Error::Locked {
+        path: root.to_path_buf(),
+        pid: None,
+    };
+    let current = match same_file::Handle::from_path(root.join("sparkles.lock")) {
+        Ok(current) => current,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(stale()),
+        Err(e) => return Err(e.into()),
+    };
+    let locked = same_file::Handle::from_file(lock.try_clone()?)?;
+    if locked != current {
+        return Err(stale());
+    }
+    Ok(())
+}
+
 /// Take the exclusive process lock of a database directory.
 fn lock_dir(root: &Path) -> Result<File> {
     let path = root.join("sparkles.lock");
@@ -1322,6 +1366,8 @@ fn lock_dir(root: &Path) -> Result<File> {
         .read(true)
         .write(true)
         .open(&path)?;
+    #[cfg(test)]
+    lock_tests::after_open();
     match f.try_lock() {
         Ok(()) => {
             f.set_len(0)?;
@@ -1341,6 +1387,9 @@ fn lock_dir(root: &Path) -> Result<File> {
 }
 pub(crate) const WAL_DELETE: u8 = 2;
 pub(crate) const WAL_COMMIT: u8 = 3;
+/// The type byte of the header record that starts a log written by this release (see
+/// [`wal::header_record`]). It is never a data or commit record type.
+pub(crate) const WAL_HEADER: u8 = 0x89;
 pub(crate) const WAL_REC: usize = 1 + 32;
 
 impl Store {
@@ -1383,12 +1432,8 @@ impl Store {
         dataset_id: uuid::Uuid,
         forked_from: Option<ForkedFrom>,
     ) -> Store {
-        let cache = Arc::new(BlockCache::new(opts.cache_bytes));
-        let results = Arc::new(crate::sparql::cache::ResultCache::with_service(
-            opts.result_cache_bytes,
-            opts.result_cache_min_ms,
-            opts.service_cache_bytes,
-        ));
+        let cache = Store::block_cache_for(&opts);
+        let results = Store::result_cache_for(&opts);
         let dvocab_len = gen_.dvocab.len();
         let mut limits = Store::log_limits(&opts);
         if limits.default_max_bytes == 0 || limits.default_max_bytes > 64 << 20 {
@@ -1510,10 +1555,30 @@ impl Store {
         opts: StoreOptions,
         ctx: Option<branching::OpenCtx>,
     ) -> Result<Store> {
+        // A database whose migration stopped part way is refused, before this open
+        // creates the directory a missing root would get, and again under the lock
+        // in case a migration started in between. Branch stores live inside the root.
+        if ctx.is_none() {
+            crate::migrate::check_not_pending(root)?;
+        }
         commit::check_dataset_compatibility(root)?;
         std::fs::create_dir_all(root)?;
         let lock = lock_dir(root)?;
-        commit::check_dataset_compatibility(root)?;
+        if ctx.is_none() {
+            crate::migrate::check_not_pending(root)?;
+        }
+        // Pending state must be checked first: an old descriptor can survive both
+        // migration renames, after which only file identity detects the stale lock.
+        // Branch roots follow the same identity rule under their parent's exclusion.
+        verify_database_lock(root, &lock)?;
+        // Refuse incompatible metadata in active and retained branches before any
+        // root writer runs, agreeing with the physical tree migrate --check inspects.
+        if ctx.is_none() {
+            crate::formats::check_dataset_tree(root)?;
+        } else {
+            commit::check_dataset_compatibility(root)?;
+            crate::formats::check_dataset_dir(root)?;
+        }
         let current_file = root.join("CURRENT");
         if !current_file.exists() {
             // a new database: its id, an empty generation holding the root commit, the
@@ -1557,7 +1622,7 @@ impl Store {
         let gen_no = commit::generation_number(&name);
         let cache = match &ctx {
             Some(c) => c.cache.clone(),
-            None => Arc::new(BlockCache::new(opts.cache_bytes)),
+            None => Store::block_cache_for(&opts),
         };
         let gen_dir = root.join(&name);
         let mut gen_ = match link::read_link(&gen_dir)? {
@@ -1577,11 +1642,7 @@ impl Store {
                 gen_.share_blocks_with(g);
             }
         }
-        let results = Arc::new(crate::sparql::cache::ResultCache::with_service(
-            opts.result_cache_bytes,
-            opts.result_cache_min_ms,
-            opts.service_cache_bytes,
-        ));
+        let results = Store::result_cache_for(&opts);
         let mut next_bnode = gen_.meta.next_bnode;
         // a branch numbers its blank nodes in its own range
         let bnode_floor = ctx
@@ -1711,7 +1772,17 @@ impl Store {
             .last()
             .map(|c| catalog.get(c.seq).filter(|r| r.seq == c.seq).unwrap_or(*c))
             .unwrap_or(base);
+        // The settings files were checked by the preflight after the lock, and every file
+        // this open read is in a version this build reads. The release now writes the
+        // database: record it in dataset.json, and require the reader of the
+        // files it creates (a log with a header record) before it creates any.
+        commit::note_writer(root)?;
+        let wal_existed = wal_path.exists();
         let wal = wal::open_for_append(&wal_path)?;
+        if !wal_existed {
+            // a new log starts with its header record
+            wal_len = wal::HEADER_BYTES;
+        }
         // What this open read is where the writes to come start, so it must be durable
         // first. A process that stopped without syncing can leave bytes that are only
         // in the page cache, and a direct write after them would be durable while
@@ -1812,7 +1883,14 @@ impl Store {
             geo: Default::default(),
             vector: Default::default(),
             embed: Default::default(),
-            history: Some(Arc::new(Mutex::new(history))),
+            history: Some(Arc::new(Mutex::new({
+                let mut history = history;
+                history.use_budget(match &opts.shared {
+                    Some(s) => s.caches.history().clone(),
+                    None => Arc::new(caches::ByteBudget::new(opts.history_cache_bytes)),
+                });
+                history
+            }))),
             mem_history: None,
             changelog,
             guard: parking_lot::RwLock::new(None),
@@ -2159,7 +2237,7 @@ impl Store {
         h.misses += 1;
         let entry = h.gens[&owner].clone();
         let generation = self.history_generation(&mut h, owner, current, &live, &entry)?;
-        let budget = self.opts.history_cache_bytes;
+        let budget = h.budget.capacity();
         let t0 = std::time::Instant::now();
         let mut check = |d: &Delta| -> Result<()> {
             if o.cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
@@ -2219,13 +2297,20 @@ impl Store {
             .filter(|p| p.warm)
             .filter_map(|p| h.owner(p.seq, current, r.head).map(|o| (o, p.seq)))
             .collect();
-        let mut total: u64 = h.cache.iter().map(|e| e.bytes).sum();
-        while total > budget && h.cache.len() > 1 {
+        h.settle();
+        while h.budget.over() && h.cache.len() > 1 {
             let i = (0..h.cache.len())
                 .rev()
                 .find(|&i| !warm.contains(&(h.cache[i].generation, h.cache[i].seq)))
                 .unwrap_or(h.cache.len() - 1);
-            total -= h.cache.remove(i).bytes;
+            h.cache.remove(i);
+            h.settle();
+        }
+        // The caches of other stores can leave the shared budget over its capacity even
+        // when this store holds only the state just built. It is then not cached.
+        if h.budget.over() && h.cache.len() == 1 && h.cache[0].seq == seq {
+            h.cache.clear();
+            h.settle();
         }
         Ok((snap, r))
     }
@@ -2907,7 +2992,7 @@ impl Store {
             let first_wal_seq = snap
                 .generation
                 .linked()
-                .and_then(|link| link.file.segments.iter().find(|s| s.wal_end > 0))
+                .and_then(|link| link.file.segments.iter().find(|s| s.end_seq > s.base_seq))
                 .and_then(|segment| segment.base_seq.checked_add(1))
                 .or_else(|| wal.first().map(|(seq, _)| *seq));
             let load_wal = || {
@@ -3058,7 +3143,7 @@ impl Store {
         if let Some(root) = &self.root {
             write_atomic(
                 &root.join("text.json"),
-                &serde_json::to_vec_pretty(&cfg).unwrap(),
+                &crate::formats::settings_to_vec("text.json", &cfg)?,
             )?;
         }
         let snap = self.snapshot();
@@ -3232,6 +3317,26 @@ impl Store {
     pub fn options(&self) -> &StoreOptions {
         &self.opts
     }
+    /// The block cache a store opened with `opts` reads through: its dataset's share of
+    /// the shared one, or one of its own.
+    fn block_cache_for(opts: &StoreOptions) -> Arc<BlockCache> {
+        match &opts.shared {
+            Some(s) => s.block_cache(),
+            None => Arc::new(BlockCache::new(opts.cache_bytes)),
+        }
+    }
+
+    fn result_cache_for(opts: &StoreOptions) -> Arc<crate::sparql::cache::ResultCache> {
+        match &opts.shared {
+            Some(s) => s.result_cache(opts.result_cache_min_ms),
+            None => Arc::new(crate::sparql::cache::ResultCache::with_service(
+                opts.result_cache_bytes,
+                opts.result_cache_min_ms,
+                opts.service_cache_bytes,
+            )),
+        }
+    }
+
     pub fn cache(&self) -> &Arc<BlockCache> {
         &self.cache
     }
@@ -4134,21 +4239,48 @@ impl Store {
         bopts.first_bnode = w.next_bnode;
         let wopts = check.as_ref().map(|(_, o)| (*o).clone());
         let interrupt = self.build_interrupt(wopts.clone(), &dir);
+        // What a bulk commit into a dataset that is not empty changes: the quads of its
+        // sources and of the graphs it drops are collected as the build reads them, up to
+        // the change log's limit, so the log need not compare the two states.
+        let change_cap = if bulk.is_some() && dry.is_none() && !prior.is_empty() {
+            self.bulk_change_cap()
+        } else {
+            None
+        };
+        let mut sourced: Option<Vec<QuadKey>> = None;
+        let mut dropped: Vec<[Id; 4]> = Vec::new();
+        let mut dropped_over = false;
         let built = (|| {
             let mut builder = Builder::new(&dir, bopts)?;
             if let Some(i) = interrupt.clone() {
                 builder = builder.with_interrupt(i);
             }
+            if let Some(cap) = change_cap {
+                builder = builder.with_change_tap(cap);
+            }
             write_snapshot(
                 &builder,
                 snap,
                 None,
-                |q| Ok(!drop_graphs.contains(&q[3])),
+                |q| {
+                    if !drop_graphs.contains(&q[3]) {
+                        return Ok(true);
+                    }
+                    if let Some(cap) = change_cap {
+                        if (dropped.len() as u64) < cap {
+                            dropped.push(*q);
+                        } else {
+                            dropped_over = true;
+                        }
+                    }
+                    Ok(false)
+                },
                 extra_quads,
             )?;
             for s in extra {
                 builder.add_source(s)?;
             }
+            sourced = builder.take_tapped();
             builder.add_prefixes(self.prefixes());
             let meta = builder.finish()?;
             // a write stopped while it was built publishes nothing
@@ -4297,8 +4429,9 @@ impl Store {
             w.wal_alloc = wal.metadata()?.len();
             w.wal = Some(BufWriter::new(wal));
             w.wal_direct = Default::default();
-            w.wal_len = 0;
-            self.wal_end.store(0, Ordering::Relaxed);
+            // the new log holds its header record
+            w.wal_len = wal::HEADER_BYTES;
+            self.wal_end.store(wal::HEADER_BYTES, Ordering::Relaxed);
             self.quota.set_preallocated(0);
             *gen_.wal_index.lock() = Some(wal::WalIndex::new(head.seq, false));
         } else if bulk.is_some() {
@@ -4346,7 +4479,25 @@ impl Store {
             self.rebuild_text_locked(&mut new_snap, &prior);
             // the bulk commit's changes, while the state before it is at hand
             let author = check.as_ref().and_then(|(_, o)| o.author.clone());
-            self.log_bulk_commit(&head, message.clone(), author, &prior, &new_snap);
+            let txn_log: &[(u8, [Id; 4])] = match check.as_ref().map(|c| c.0) {
+                Some(crate::guard::Changes::Rebuilt { log, .. }) => log,
+                _ => &[],
+            };
+            let candidates = change_cap.map(|_| changelog::BulkCandidates {
+                sources: sourced,
+                dropped: (!dropped_over).then_some(dropped),
+                view: snap,
+                log: txn_log,
+                bulk: extra_quads,
+            });
+            self.log_bulk_commit(
+                &head,
+                message.clone(),
+                author,
+                &prior,
+                &new_snap,
+                candidates,
+            );
         }
         // a new generation needs its own spatial base (bulk commits and compactions)
         self.rebuild_geo_locked(&mut new_snap, snap);
@@ -5747,6 +5898,7 @@ fn collect_generations(
     for (no, dir) in doomed {
         h.open.retain(|(n, _)| *n != no);
         h.cache.retain(|c| c.generation != no);
+        h.settle();
         match crate::history::retire_generation(root, &dir) {
             Ok(d) => {
                 h.gens.remove(&no);
@@ -6033,6 +6185,7 @@ pub(crate) fn wal_end(dir: &Path, base: &CommitInfo, fold_legacy: bool) -> u64 {
     for (i, rec) in recs.iter().enumerate() {
         match rec[0] {
             WAL_INSERT | WAL_DELETE => {}
+            WAL_HEADER if i == 0 => txn_start = 1,
             WAL_COMMIT => {
                 match commit::open_wal_commit(rec, &buf[txn_start * WAL_REC..i * WAL_REC]) {
                     Some(Ok((seq, _, _, _))) => {
@@ -6193,6 +6346,13 @@ pub(crate) fn replay_wal(
         });
         match rec[0] {
             WAL_INSERT | WAL_DELETE => pending.push((rec[0], q)),
+            // the header record that starts a log written by this release: the replay
+            // accepts it as the log's first complete part
+            WAL_HEADER if i == 0 => {
+                wal::header_version(rec, from.path)?;
+                txn_start = 1;
+                out.good = WAL_REC;
+            }
             WAL_COMMIT => {
                 let meta = commit::open_wal_commit(rec, &buf[txn_start * WAL_REC..i * WAL_REC]);
                 if matches!(meta, Some(Err(()))) {

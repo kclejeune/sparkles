@@ -907,9 +907,10 @@ in
         such as a sops-nix or agenix secret. systemd passes it to the service with
         `LoadCredential`, so it need not be readable by the service user, and the
         module passes `--secrets-key credential:secrets-key`. Values stored without
-        encryption are sealed at the next start. Without a key the values are kept in
-        files with mode 0600. The package must be built with the `backup-encryption`
-        feature, as the flake's packages are on Linux.
+        encryption are sealed at the next start. Without this option the server seals
+        the values with a key that it generates in the data directory
+        (`secrets.key`), which does not protect them from someone who can read that
+        directory.
       '';
     };
 
@@ -1249,6 +1250,10 @@ in
           ++ lib.optional (modelsDirOutside && cfg.models.download == "off") modelsDir;
         Restart = "on-failure";
         RestartSec = 5;
+        # A server that fails at every start (a refused data format, a denied syscall)
+        # backs off to one attempt every 5 minutes instead of retrying every 5 s.
+        RestartSteps = 6;
+        RestartMaxDelaySec = "5min";
         # the grace period for requests in flight, then up to 5 s for cancelled ones to
         # stop and the final flush (commits are durable either way)
         TimeoutStopSec = cfg.shutdownGrace + 15;
@@ -1287,7 +1292,12 @@ in
           "@system-service"
           "~@privileged"
           "~@resources"
+          # Background compaction and local-embedding threads lower their own CPU
+          # priority. Raising it still needs CAP_SYS_NICE, which the service lacks.
+          "setpriority"
         ];
+        # A filtered call fails with EPERM instead of killing the server.
+        SystemCallErrorNumber = "EPERM";
         UMask = "0027";
       };
     };
