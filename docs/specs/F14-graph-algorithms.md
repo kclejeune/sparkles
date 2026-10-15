@@ -649,9 +649,13 @@ gates are still pending.
   Similarity uses the same controlled transpose construction for deduplicated rows.
 * **Named projections.** `algo/catalog.rs` keeps `<db>/algo.json` as
   `{"format": 1, "projections": {name: {revision, updated, author?, definition}}}`,
-  written the way `queries.json` is, with a revision for `If-Match`. A file that cannot
-  be read leaves the catalog empty and read-only, so it is never overwritten. The file
-  is part of backups, clones and branch copies. `algo:projection "name"` is resolved
+  written the way `queries.json` is, with a revision for `If-Match`. Format 1 is in the
+  shared settings registry. A missing marker reads as 1 without a rewrite. A future
+  version gives `Unsupported` at dataset admission before metadata writers, including
+  for active and retained branches, and migration planning makes the same read-only
+  check. Malformed JSON or current definitions leave the catalog empty and read-only,
+  so it is never overwritten. Backups, clones and branch copies preserve the file.
+  `algo:projection "name"` is resolved
   when the query is planned, also inside SPARQL Update, so a query at an older commit
   uses today's definitions.
 * **Runs and write-back.** `sparql/algorun.rs` turns a JSON request into the query it

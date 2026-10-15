@@ -202,14 +202,18 @@ impl Catalog {
         let doc = match root {
             Some(r) => match std::fs::read(r.join(FILE)) {
                 Ok(b) => {
-                    let d: FileDoc =
+                    let mut value: serde_json::Value =
                         serde_json::from_slice(&b).map_err(|e| invalid(format!("{FILE}: {e}")))?;
-                    if d.format != FORMAT {
-                        return Err(invalid(format!(
-                            "{FILE}: unknown format {} (this version reads {FORMAT})",
-                            d.format
-                        )));
+                    let format = crate::formats::check_settings(FILE, &value)?;
+                    // The registry treats an absent marker as format 1. Normalize
+                    // only the in-memory value, leaving a read-only open unchanged.
+                    if value.get("format").is_none()
+                        && let Some(object) = value.as_object_mut()
+                    {
+                        object.insert("format".into(), format.into());
                     }
+                    let d: FileDoc = serde_json::from_value(value)
+                        .map_err(|e| invalid(format!("{FILE}: {e}")))?;
                     for (n, p) in &d.projections {
                         if !valid_name(n) {
                             return Err(invalid(format!("{FILE}: invalid projection name '{n}'")));
@@ -296,7 +300,7 @@ impl Catalog {
                 _ => Ok(()),
             };
         }
-        let bytes = serde_json::to_vec_pretty(doc).map_err(|e| Error::Io(e.into()))?;
+        let bytes = crate::formats::settings_to_vec(FILE, doc)?;
         crate::store::write_atomic(&path, &bytes)?;
         Ok(())
     }
@@ -414,5 +418,137 @@ mod tests {
             c.put("x", def(), None, None).is_err(),
             "a broken file is not overwritten"
         );
+    }
+}
+
+#[cfg(test)]
+mod algo_catalog_format_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn algo_catalog_future_format_precedes_shape_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wrong = Vec::new();
+        for doc in [
+            json!({"format":2,"projections":{}}),
+            json!({"format":2,"unknownFutureShape":[1,2]}),
+        ] {
+            std::fs::write(dir.path().join(FILE), serde_json::to_vec(&doc).unwrap()).unwrap();
+            let result = Catalog::open(Some(dir.path()));
+            if !matches!(&result, Err(Error::Unsupported(_))) {
+                wrong.push(format!("{doc}: {result:?}"));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "future formats lost typed Unsupported: {wrong:?}"
+        );
+    }
+    #[test]
+    fn algo_catalog_invalid_versions_use_registry_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wrong = Vec::new();
+        for marker in [json!(0), json!("next"), json!(4294967296u64)] {
+            let doc = json!({"format":marker,"projections":{}});
+            std::fs::write(dir.path().join(FILE), serde_json::to_vec(&doc).unwrap()).unwrap();
+            let result = Catalog::open(Some(dir.path()));
+            if !matches!(&result, Err(Error::Corrupt(_))) {
+                wrong.push(format!("{doc}: {result:?}"));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "invalid version markers bypassed registry: {wrong:?}"
+        );
+    }
+    #[test]
+    fn algo_catalog_versionless_read_does_not_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(Some(dir.path())).unwrap();
+        let (stored, _) = catalog
+            .put(
+                "people",
+                ProjectionDef::default(),
+                Some("fixture".into()),
+                None,
+            )
+            .unwrap();
+        drop(catalog);
+        let mut doc: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join(FILE)).unwrap()).unwrap();
+        doc.as_object_mut().unwrap().remove("format");
+        let bytes = serde_json::to_vec(&doc).unwrap();
+        std::fs::write(dir.path().join(FILE), &bytes).unwrap();
+        let catalog = Catalog::open(Some(dir.path())).unwrap();
+        assert_eq!(catalog.get_stored("people"), Some(stored));
+        assert_eq!(std::fs::read(dir.path().join(FILE)).unwrap(), bytes);
+        catalog
+            .put("people", ProjectionDef::default(), None, Some(1))
+            .unwrap();
+        let doc: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join(FILE)).unwrap()).unwrap();
+        assert_eq!(doc["format"], FORMAT);
+    }
+    #[test]
+    fn algo_catalog_null_version_stays_broken_without_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let value = json!({"format":null,"projections":{}});
+        let bytes = serde_json::to_vec(&value).unwrap();
+        let path = dir.path().join(FILE);
+        std::fs::write(&path, &bytes).unwrap();
+        // Compatibility probing is not typed schema acceptance. The existing
+        // catalog reader rejects an explicit null rather than defaulting it.
+        assert_eq!(
+            crate::formats::check_settings(FILE, &value).unwrap(),
+            FORMAT
+        );
+        crate::formats::check_dataset_dir(dir.path()).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert!(matches!(
+            Catalog::open(Some(dir.path())),
+            Err(Error::Invalid(_))
+        ));
+        let catalog = Catalog::open_or_broken(Some(dir.path()));
+        assert!(catalog.broken().is_some());
+        assert!(catalog.list().is_empty());
+        assert!(matches!(
+            catalog.put("valid", ProjectionDef::default(), None, None),
+            Err(Error::Conflict(_))
+        ));
+        assert!(matches!(
+            catalog.delete("valid", None),
+            Err(Error::Conflict(_))
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+    #[test]
+    fn algo_catalog_missing_current_and_damaged_controls() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(Catalog::open(Some(dir.path())).unwrap().list().is_empty());
+        assert!(!dir.path().join(FILE).exists());
+        let c = Catalog::open(Some(dir.path())).unwrap();
+        let (stored, _) = c
+            .put("people", ProjectionDef::default(), None, None)
+            .unwrap();
+        drop(c);
+        let bytes = std::fs::read(dir.path().join(FILE)).unwrap();
+        assert_eq!(
+            Catalog::open(Some(dir.path()))
+                .unwrap()
+                .get_stored("people"),
+            Some(stored)
+        );
+        assert_eq!(std::fs::read(dir.path().join(FILE)).unwrap(), bytes);
+        for bytes in [b"{".as_slice(),br#"{"format":1,"extra":true}"#,
+            br#"{"format":1,"projections":{"bad name":{"revision":1,"updated":"fixture","definition":{}}}}"#,
+            br#"{"format":1,"projections":{"bad":{"revision":1,"updated":"fixture","definition":{"direction":"sideways"}}}}"#] {
+            std::fs::write(dir.path().join(FILE),bytes).unwrap();
+            let c=Catalog::open_or_broken(Some(dir.path()));assert!(c.broken().is_some());
+            assert!(matches!(c.put("valid",ProjectionDef::default(),None,None),Err(Error::Conflict(_))));
+            assert!(matches!(c.delete("valid",None),Err(Error::Conflict(_))));
+            assert_eq!(std::fs::read(dir.path().join(FILE)).unwrap(),bytes);
+        }
     }
 }
