@@ -28,10 +28,14 @@ sparkles-reasoner = { path = "../sparkles-reasoner", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
 uuid = { version = "1", features = ["v4"] }
 
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31.3", default-features = false, optional = true }
+
 [build-dependencies]
 napi-build = "2"
 
 [features]
+failpoints = ["sparkles/failpoints", "dep:nix"]
 default = ["reasoning", "shacl", "shex", "text", "geo", "backup", "graphql", "mimalloc"]
 reasoning = ["sparkles/reasoning", "dep:sparkles-reasoner"]
 shacl = ["sparkles/shacl", "dep:sparkles-shacl"]

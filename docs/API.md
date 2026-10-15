@@ -5451,8 +5451,12 @@ They read the definition as it is when the query is planned, so a query at an ol
 uses today's definitions.
 
 The definitions are kept in `algo.json` of a persistent dataset, which backups and
-clones include. A file that cannot be read leaves the list empty, reports why in
-`warning`, and refuses changes, so that it is never overwritten.
+clones include. Its registered format is 1, and a missing format marker also reads as
+1 without rewriting the file. A newer version returns `Unsupported` before dataset
+metadata changes, including when it belongs to an active or retained branch.
+`sparkles migrate --check` applies the same version check without changing files.
+Malformed JSON or malformed current definitions leave the list empty, report why in
+`warning`, and refuse catalog changes, so that the damaged file is never overwritten.
 
 ## GeoSPARQL
 

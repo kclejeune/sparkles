@@ -267,7 +267,7 @@ locking whose semantics differ from `flock`.
 | Vector index | `vector.json`, index files | config `FORMAT_VERSION` 1, file `SPKVEC` `FILE_VERSION` 1 | derived |
 | Spatial index | `geo.json`, index files | config `FORMAT_VERSION` 1, `LITERALS_VERSION` 2, file `SPKGEO` `FILE_VERSION` 1 | derived |
 | Checked migration state | `.migrate-checked` at the root or checked copy | JSON format 1 records the cleanup mode and the exact old sibling directory. Unknown versions and ambiguous bare legacy markers are refused. | config |
-| Settings and state | `describe.json`, `compaction.json`, `queries.json`, `validation.json`, `models.json`, `assistant.json` and others | `FORMAT` fields on some (stored queries 1, GraphQL 1, ShEx guard 2), none on most | config |
+| Settings and state | `describe.json`, `compaction.json`, `queries.json`, `algo.json`, `validation.json`, `models.json`, `assistant.json` and others | The registry names each version member. Named projections use `format` 1, and an absent marker reads as 1. | config |
 | Backup repository | layout, blobs, manifests, key slots | layout `FORMAT` 1, blob `FORMAT` 1, slot `SLOT_FORMAT` 2, manifest `indexFormat` | archive |
 
 Primary files hold data that cannot be recomputed. Derived files are indexes that can be
@@ -618,13 +618,20 @@ Phases 1, 2 and 4 are not built. See [ROADMAP](../ROADMAP.md) items 58–60.
 **The registry.** `crates/sparkles-core/src/formats.rs` declares every file kind of §4.1
 with its class, its marker, the version this build writes and the versions it reads,
 and a second table lists every settings and state file with the member that holds its
-version. Thirty-five settings files carry a member. Six cannot, because their top level
+version. Thirty-six settings files carry a member. Six cannot, because their top level
 is a map of user keys or an array, or because they are a cache or a transient intent,
 and the registry lists them with the reason. The module documentation describes the
 four kinds of change of §4.3. `GET /$/server` reports the registry in a `formats` member
 for callers that see the version, and `sparkles migrate --check --format json` prints it.
 The backup crate's layout, blob and key-slot constants are now defined from the
 registry, and the module constants of the core files are checked against it by a test.
+
+The named-projection catalog `algo.json` uses the existing format 1 in that registry.
+Its reader checks the version before the typed document shape, so an unknown future
+shape still gives `Unsupported`. A versionless current document reads as 1 without a
+rewrite. Dataset admission checks the catalog in the root and physical branches before
+metadata writers, and migration planning remains read-only. This registration changes
+neither the catalog format nor the backup, clone or migration formats.
 
 The registry also records the server's existing runtime-secret envelope and generated
 key. The server wrapper accepts legacy plaintext as version 0 and sealed version 1, but

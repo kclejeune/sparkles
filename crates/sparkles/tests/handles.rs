@@ -806,3 +806,100 @@ fn algorithms_numerical_refusal_has_no_rows_stats_or_writeback() {
             .is_empty()
     );
 }
+
+#[test]
+fn algorithms_catalog_future_versions_refuse_dataset_open() {
+    for content in [
+        br#"{"format":2,"projections":{}}"#.as_slice(),
+        br#"{"format":2,"futureShape":[1,2]}"#,
+    ] {
+        let (dir, ds) = persistent();
+        ds.update("INSERT DATA { <urn:s> <urn:p> <urn:o> }")
+            .unwrap();
+        drop(ds);
+        std::fs::write(dir.path().join("db/algo.json"), content).unwrap();
+        let result = Dataset::open(dir.path().join("db"));
+        assert!(
+            matches!(result, Err(sparkles::Error::Unsupported(_))),
+            "future catalog was hidden by the facade fallback"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("db/algo.json")).unwrap(),
+            content
+        );
+    }
+}
+
+#[test]
+fn algorithms_catalog_malformed_current_stays_broken_without_overwrite() {
+    for content in [b"{".as_slice(), br#"{"format":null,"projections":{}}"#, br#"{"format":1,"projections":{"bad":{"revision":1,"updated":"fixture","definition":{"direction":"sideways"}}}}"#] {
+        let (dir,ds)=persistent();drop(ds);
+        let path=dir.path().join("db/algo.json");std::fs::write(&path,content).unwrap();
+        let ds=Dataset::open(dir.path().join("db")).unwrap();
+        assert!(ds.algorithms().projections().list().is_empty());
+        assert!(matches!(ds.algorithms().projections().put("valid",sparkles::algo::catalog::ProjectionDef::default(),None,None),Err(sparkles::Error::Conflict(_))));
+        ds.update("INSERT DATA { <urn:s> <urn:p> <urn:o> }").unwrap();
+        assert_eq!(std::fs::read(path).unwrap(),content);
+    }
+}
+
+#[cfg(feature = "backup")]
+#[test]
+fn algorithms_catalog_backup_restore_and_clone_preserve_revision_and_definition() {
+    use sparkles::algo::catalog::ProjectionDef;
+    use sparkles::backup::{CreateOptions, OpenEnv, RepoConfig, RestoreOptions};
+    let (dir, ds) = persistent();
+    ds.update("INSERT DATA { <urn:s> <urn:p> <urn:o> }")
+        .unwrap();
+    let definition = ProjectionDef::from_json(
+        serde_json::json!({"predicates":["urn:p"],"direction":"undirected","aggregate":"sum"}),
+    )
+    .unwrap();
+    ds.algorithms()
+        .projections()
+        .put("named", definition.clone(), None, None)
+        .unwrap();
+    let (expected, created) = ds
+        .algorithms()
+        .projections()
+        .put("named", definition, Some("roundtrip".into()), Some(1))
+        .unwrap();
+    assert!(!created);
+    assert_eq!(expected.revision, 2);
+    let raw = std::fs::read(dir.path().join("db/algo.json")).unwrap();
+    let copy = dir.path().join("cloned");
+    ds.clone_to_with(&copy, &Default::default(), &sparkles::task::Control::none())
+        .unwrap();
+    let cloned = Dataset::open(&copy).unwrap();
+    assert_eq!(
+        cloned.algorithms().projections().get("named"),
+        Some(expected.clone())
+    );
+    assert_eq!(std::fs::read(copy.join("algo.json")).unwrap(), raw);
+    let cfg = RepoConfig::from_url(
+        "local",
+        &format!("file://{}", dir.path().join("repository").display()),
+    )
+    .unwrap();
+    let repo = sparkles::backup::open(&cfg, &OpenEnv::default()).unwrap();
+    ds.backups(&repo)
+        .create_with(
+            &CreateOptions {
+                name: "named-projection".into(),
+                dataset_name: "catalog-fixture".into(),
+                ..Default::default()
+            },
+            &sparkles::task::Control::none(),
+        )
+        .unwrap();
+    let restored = dir.path().join("restored");
+    sparkles::backup::blocking(&repo)
+        .restore_to_dir("named-projection", &restored, &RestoreOptions::default())
+        .unwrap();
+    let restored_ds = Dataset::open(&restored).unwrap();
+    assert_eq!(
+        restored_ds.algorithms().projections().get("named"),
+        Some(expected)
+    );
+    assert_eq!(std::fs::read(restored.join("algo.json")).unwrap(), raw);
+}

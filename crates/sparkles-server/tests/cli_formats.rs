@@ -335,3 +335,87 @@ fn migrate_check_reports_an_interrupted_run_and_changes_nothing() {
     assert!(v["datasets"][0]["interrupted"].is_null(), "{out}");
     assert!(!stale.exists());
 }
+
+#[test]
+fn algo_catalog_cli_inventory_and_future_plan() {
+    use std::collections::BTreeMap;
+    fn files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        let mut out = BTreeMap::new();
+        for e in std::fs::read_dir(root).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                out.extend(files(&p));
+            } else {
+                out.insert(p.clone(), std::fs::read(p).unwrap());
+            }
+        }
+        out
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("db");
+    let ds = sparkles::Dataset::open(&db).unwrap();
+    ds.algorithms()
+        .projections()
+        .put(
+            "named",
+            sparkles::algo::catalog::ProjectionDef::default(),
+            None,
+            None,
+        )
+        .unwrap();
+    drop(ds);
+    let args = [
+        "migrate",
+        "--loc",
+        db.to_str().unwrap(),
+        "--check",
+        "--format",
+        "json",
+    ];
+    let before = files(&db);
+    let current = sparkles(tmp.path(), &args);
+    assert!(
+        current.status.success(),
+        "{}",
+        String::from_utf8_lossy(&current.stderr)
+    );
+    let report: J = serde_json::from_slice(&current.stdout).unwrap();
+    let registered: Vec<_> = report["formats"]["settings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|v| v["name"] == "algo.json")
+        .collect();
+    assert_eq!(registered.len(), 1);
+    assert_eq!(registered[0]["writes"], 1);
+    assert_eq!(registered[0]["scope"], "dataset");
+    assert_eq!(report["datasets"][0]["inWindow"], true);
+    assert_eq!(files(&db), before);
+    std::fs::write(db.join("algo.json"), br#"{"format":2,"futureShape":[1,2]}"#).unwrap();
+    let before = files(&db);
+    let future = sparkles(tmp.path(), &args);
+    assert_eq!(future.status.code(), Some(1));
+    let future_report: J = serde_json::from_slice(&future.stdout).unwrap();
+    assert_eq!(future_report["datasets"][0]["inWindow"], false);
+    assert!(
+        future_report["datasets"][0]["refused"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_str().unwrap().contains("algo.json"))
+    );
+    assert_eq!(
+        files(&db),
+        before,
+        "CLI planning must leave even sparkles.lock unchanged"
+    );
+    if let Some(dir) = std::env::var_os("SPARKLES_F3_CLI_EVIDENCE_DIR") {
+        let dir = PathBuf::from(dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, output) in [("current", current), ("future", future)] {
+            let path = dir.join(format!("{name}.json"));
+            assert!(!path.exists());
+            std::fs::write(path,serde_json::to_vec_pretty(&serde_json::json!({"argv":args,"exit":output.status.code(),"stdout":String::from_utf8(output.stdout).unwrap(),"stderr":String::from_utf8(output.stderr).unwrap()})).unwrap()).unwrap();
+        }
+    }
+}
