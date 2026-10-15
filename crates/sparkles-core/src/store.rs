@@ -5072,6 +5072,23 @@ impl Drop for WriteTxn<'_> {
     }
 }
 
+/// Retain an ordinary synchronization sample until the consumed transaction has
+/// released its writer, including when publication unwinds after synchronization.
+struct OrdinarySyncObservation<'a> {
+    store: &'a Store,
+    sample: Option<(SyncPath, std::time::Duration)>,
+}
+
+impl Drop for OrdinarySyncObservation<'_> {
+    fn drop(&mut self) {
+        if let Some((path, took)) = self.sample.take() {
+            self.store.commit_stats.synced(path, took);
+            #[cfg(test)]
+            ordinary_sync_probe::published(self.store, path);
+        }
+    }
+}
+
 impl WriteTxn<'_> {
     /// [`Error::NotPermitted`] unless the write's graph view lets it change graph `g`.
     /// Called before a quad is looked up, so the answer never depends on the data.
@@ -5521,7 +5538,12 @@ impl WriteTxn<'_> {
             deleted = tracing::field::Empty,
         );
         let _entered = span.enter();
-        let r = self.commit_inner();
+        let mut observation = OrdinarySyncObservation {
+            store: self.store,
+            sample: None,
+        };
+        let r = self.commit_inner(&mut observation.sample);
+        drop(observation);
         if let Ok(r) = &r
             && r.committed
         {
@@ -5533,7 +5555,10 @@ impl WriteTxn<'_> {
         r
     }
 
-    fn commit_inner(mut self) -> Result<Receipt> {
+    fn commit_inner(
+        mut self,
+        sync: &mut Option<(SyncPath, std::time::Duration)>,
+    ) -> Result<Receipt> {
         self._callback_owner.check()?;
         if self.guard.poisoned || self.store.group.as_ref().is_some_and(|g| g.failed()) {
             return Err(Error::Poisoned);
@@ -5558,7 +5583,7 @@ impl WriteTxn<'_> {
             }
             if self.net_ins == 0 && self.net_del == 0 && !self.force {
                 // no net change: no commit, nothing to validate
-                return self.publish_log(None);
+                return self.publish_log(None, sync);
             }
             let head = self.guard.head.seq;
             let validation = self.store.run_guard(
@@ -5580,7 +5605,7 @@ impl WriteTxn<'_> {
             if grouped {
                 return self.publish_grouped(validation);
             }
-            return self.publish_log(validation);
+            return self.publish_log(validation, sync);
         }
         // Build the new generation from this transaction's view (base + uncommitted delta)
         // plus the bulk quads; switching CURRENT is the atomic commit point, so the
@@ -5651,6 +5676,7 @@ impl WriteTxn<'_> {
     fn publish_log(
         &mut self,
         validation: Option<Arc<crate::guard::ValidationSummary>>,
+        sync: &mut Option<(SyncPath, std::time::Duration)>,
     ) -> Result<Receipt> {
         let gen_ = &self.base.generation;
         let head = self.guard.head;
@@ -5739,10 +5765,38 @@ impl WriteTxn<'_> {
                     && let Some(direct) = w.wal_direct.handle(path.as_deref(), wal.get_ref())
                 {
                     let t = std::time::Instant::now();
-                    if commit_direct(direct, w.wal_len, &data, &gen_.dvocab, &mut w.vocab_sync)? {
-                        self.store
-                            .commit_stats
-                            .synced(SyncPath::Direct, t.elapsed());
+                    let direct_written = {
+                        #[cfg(not(test))]
+                        {
+                            commit_direct(
+                                direct,
+                                w.wal_len,
+                                &data,
+                                &gen_.dvocab,
+                                &mut w.vocab_sync,
+                            )?
+                        }
+                        #[cfg(test)]
+                        {
+                            // Branch-selection control, not a physical EINVAL fault:
+                            // refuse before this helper performs any mutation.
+                            if ordinary_sync_probe::skip_direct(self.store) {
+                                false
+                            } else {
+                                commit_direct(
+                                    direct,
+                                    w.wal_len,
+                                    &data,
+                                    &gen_.dvocab,
+                                    &mut w.vocab_sync,
+                                )?
+                            }
+                        }
+                    };
+                    if direct_written {
+                        *sync = Some((SyncPath::Direct, t.elapsed()));
+                        #[cfg(test)]
+                        ordinary_sync_probe::captured(self.store);
                         return Ok(());
                     }
                     // the file system refused direct I/O: write this commit and the
@@ -5758,9 +5812,9 @@ impl WriteTxn<'_> {
                 wal::write_commit(wal.get_ref(), w.wal_len, &mut w.wal_alloc, &data, prealloc)?;
                 let t = std::time::Instant::now();
                 let synced = sync_commit_reused(wal.get_ref(), &gen_.dvocab, &mut w.vocab_sync);
-                self.store
-                    .commit_stats
-                    .synced(SyncPath::Buffered, t.elapsed());
+                *sync = Some((SyncPath::Buffered, t.elapsed()));
+                #[cfg(test)]
+                ordinary_sync_probe::captured(self.store);
                 synced
             });
             if let Err(e) = written {
@@ -7524,5 +7578,451 @@ ex:a ex:p 1, 2, 3 . ex:b ex:p 2 . ex:c ex:q "hello"@en .
         })
         .unwrap();
         assert_eq!(n, 3);
+    }
+}
+
+// Private diagnostic probes are scoped to one Store and one calling thread. No timed
+// release build contains the observer, fault selection, or post-capture panic point.
+#[cfg(test)]
+mod ordinary_sync_probe {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    #[derive(Default)]
+    pub(super) struct Probe {
+        target: Cell<usize>,
+        pub publications: Cell<usize>,
+        pub last: Cell<Option<(SyncPath, bool)>>,
+        pub skip_direct: Cell<bool>,
+        pub skipped: Cell<bool>,
+        pub panic_after_capture: Cell<bool>,
+    }
+
+    thread_local! {
+        static ACTIVE: RefCell<Option<Rc<Probe>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) struct Scope(Option<Rc<Probe>>);
+
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            ACTIVE.with(|active| *active.borrow_mut() = self.0.take());
+        }
+    }
+
+    pub(super) fn install(store: &Store, probe: &Rc<Probe>) -> Scope {
+        probe.target.set(std::ptr::from_ref(store) as usize);
+        Scope(ACTIVE.with(|active| active.replace(Some(probe.clone()))))
+    }
+
+    fn with_probe<T: Default>(store: &Store, f: impl FnOnce(&Probe) -> T) -> T {
+        ACTIVE.with(|active| {
+            let Ok(active) = active.try_borrow() else {
+                return T::default();
+            };
+            active
+                .as_ref()
+                .filter(|p| p.target.get() == std::ptr::from_ref(store) as usize)
+                .map_or_else(T::default, |p| f(p))
+        })
+    }
+
+    pub(super) fn published(store: &Store, path: SyncPath) {
+        with_probe(store, |p| {
+            let writer = store.writer.try_lock();
+            let free = writer.is_some();
+            drop(writer);
+            p.last.set(Some((path, free)));
+            p.publications.set(p.publications.get() + 1);
+        });
+    }
+
+    pub(super) fn captured(store: &Store) {
+        // The observer itself never panics. Inject only inside publish_log, after
+        // the original sample publication (R) or sample capture (S).
+        if with_probe(store, |p| p.panic_after_capture.replace(false)) {
+            panic!("private diagnostic panic after ordinary sync sample");
+        }
+    }
+
+    pub(super) fn skip_direct(store: &Store) -> bool {
+        with_probe(store, |p| {
+            let skip = p.skip_direct.replace(false);
+            p.skipped.set(skip);
+            skip
+        })
+    }
+}
+
+#[cfg(test)]
+mod ordinary_sync_tests {
+    use super::*;
+    use std::rc::Rc;
+
+    fn insert(store: &Store, name: &str) -> Result<Receipt> {
+        let mut txn = store.write_with(CommitKind::Update, Default::default());
+        let quad = Quad::new(
+            NamedNode::new(format!("urn:{name}")).unwrap(),
+            NamedNode::new("urn:p").unwrap(),
+            NamedNode::new("urn:o").unwrap(),
+            GraphName::DefaultGraph,
+        );
+        let q = txn.encode_quad(&quad, &mut Default::default())?;
+        txn.insert(q)?;
+        txn.commit()
+    }
+
+    fn counts(store: &Store) -> [u64; 3] {
+        store.commit_metrics().sync.map(|h| h.count())
+    }
+
+    fn expected_free() -> bool {
+        // Reference runs explicitly request "held". The retained S test defaults
+        // to its required writer-free publication invariant.
+        std::env::var("SPARKLES_SYNC_PUBLICATION_EXPECT").as_deref() != Ok("held")
+    }
+
+    fn assert_observed(probe: &ordinary_sync_probe::Probe, path: SyncPath) {
+        assert_eq!(probe.publications.get(), 1);
+        assert_eq!(probe.last.get(), Some((path, expected_free())));
+    }
+
+    #[test]
+    fn ordinary_sync_success_and_unwind_preserve_samples_and_observe_writer() {
+        for direct in [false, true] {
+            for panic in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let store = Store::open(
+                    dir.path(),
+                    StoreOptions {
+                        wal_direct_writes: direct,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                // A real buffered commit establishes the allocation needed by direct I/O.
+                insert(&store, "warm").unwrap();
+                let before = counts(&store);
+                let head = store.snapshot().commit;
+                let probe = Rc::new(ordinary_sync_probe::Probe::default());
+                probe.panic_after_capture.set(panic);
+                let scope = ordinary_sync_probe::install(&store, &probe);
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    insert(&store, "observed")
+                }));
+                drop(scope);
+                assert_eq!(result.is_err(), panic);
+                if let Ok(result) = result {
+                    assert!(result.unwrap().committed);
+                }
+                let path = if direct {
+                    SyncPath::Direct
+                } else {
+                    SyncPath::Buffered
+                };
+                let mut expected = before;
+                expected[path as usize] += 1;
+                assert_eq!(counts(&store), expected, "direct={direct}, panic={panic}");
+                assert_observed(&probe, path);
+                assert!(store.writer.try_lock().is_some());
+                if !panic {
+                    assert_eq!(store.snapshot().commit, head + 1);
+                }
+                drop(store);
+                let reopened = Store::open(dir.path(), Default::default()).unwrap();
+                // The injected panic has no acknowledged receipt. Orderly Store
+                // close trims its unpublished WAL suffix using the unchanged head.
+                assert_eq!(reopened.snapshot().commit, head + u64::from(!panic));
+                assert_eq!(reopened.snapshot().len(), if panic { 1 } else { 2 });
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_sync_error_and_fallback_sample_rules_are_unchanged() {
+        for direct in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::open(
+                dir.path(),
+                StoreOptions {
+                    wal_direct_writes: direct,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            insert(&store, "warm").unwrap();
+            let before = counts(&store);
+            let head = store.snapshot().commit;
+            let probe = Rc::new(ordinary_sync_probe::Probe::default());
+            let scope = ordinary_sync_probe::install(&store, &probe);
+            store.snapshot().generation.dvocab.fail_next_sync();
+            assert!(insert(&store, "failing").is_err());
+            drop(scope);
+            assert_eq!(store.snapshot().commit, head);
+            let mut expected = before;
+            if direct {
+                // commit_direct returns Err before the original sample site.
+                assert_eq!(probe.publications.get(), 0);
+            } else {
+                expected[SyncPath::Buffered as usize] += 1;
+                assert_observed(&probe, SyncPath::Buffered);
+            }
+            assert_eq!(counts(&store), expected);
+            assert!(matches!(insert(&store, "poisoned"), Err(Error::Poisoned)));
+            assert_eq!(counts(&store), expected);
+        }
+        // A labeled caller-path adapter selects false before mutation. The buffered
+        // fallback still performs a real write and synchronization exactly once.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), Default::default()).unwrap();
+        insert(&store, "warm").unwrap();
+        let before = counts(&store);
+        let probe = Rc::new(ordinary_sync_probe::Probe::default());
+        probe.skip_direct.set(true);
+        let scope = ordinary_sync_probe::install(&store, &probe);
+        insert(&store, "fallback").unwrap();
+        drop(scope);
+        assert!(probe.skipped.get());
+        assert!(matches!(store.writer.lock().wal_direct, wal::Direct::Off));
+        let mut expected = before;
+        expected[SyncPath::Buffered as usize] += 1;
+        assert_eq!(counts(&store), expected);
+        assert_observed(&probe, SyncPath::Buffered);
+        drop(store);
+        assert_eq!(
+            Store::open(dir.path(), Default::default())
+                .unwrap()
+                .snapshot()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn ordinary_sync_excludes_noop_dry_bulk_memory_and_group_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), Default::default()).unwrap();
+        insert(&store, "warm").unwrap();
+        let before = counts(&store);
+        let probe = Rc::new(ordinary_sync_probe::Probe::default());
+        let scope = ordinary_sync_probe::install(&store, &probe);
+        assert!(!store.write().commit().unwrap().committed);
+        let mut txn = store.write_with(
+            CommitKind::Update,
+            crate::guard::WriteOptions {
+                dry_run: Some(Default::default()),
+                ..Default::default()
+            },
+        );
+        let q = txn
+            .encode_quad(
+                &Quad::new(
+                    NamedNode::new("urn:preview").unwrap(),
+                    NamedNode::new("urn:p").unwrap(),
+                    NamedNode::new("urn:o").unwrap(),
+                    GraphName::DefaultGraph,
+                ),
+                &mut Default::default(),
+            )
+            .unwrap();
+        txn.insert(q).unwrap();
+        assert!(matches!(txn.commit(), Err(Error::DryRun(_))));
+        // Actual commit_inner error before the synchronization sites.
+        store.writer.lock().poisoned = true;
+        assert!(matches!(store.write().commit(), Err(Error::Poisoned)));
+        drop(scope);
+        assert_eq!(counts(&store), before);
+        assert_eq!(probe.publications.get(), 0);
+
+        for (memory, bulk, group) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let opts = StoreOptions {
+                experimental_group_commit: group,
+                bulk_threshold: if bulk { 0 } else { 250_000 },
+                group_commit_idle_direct: false,
+                ..Default::default()
+            };
+            let store = if memory {
+                Store::in_memory(opts)
+            } else {
+                Store::open(dir.path(), opts).unwrap()
+            };
+            let probe = Rc::new(ordinary_sync_probe::Probe::default());
+            let scope = ordinary_sync_probe::install(&store, &probe);
+            if bulk {
+                let mut txn = store.write();
+                let q = txn
+                    .encode_quad(
+                        &Quad::new(
+                            NamedNode::new("urn:bulk").unwrap(),
+                            NamedNode::new("urn:p").unwrap(),
+                            NamedNode::new("urn:o").unwrap(),
+                            GraphName::DefaultGraph,
+                        ),
+                        &mut Default::default(),
+                    )
+                    .unwrap();
+                txn.insert_bulk(vec![q]).unwrap();
+                txn.commit().unwrap();
+            } else {
+                insert(&store, "other").unwrap();
+            }
+            drop(scope);
+            assert_eq!(counts(&store), [0, 0, u64::from(group)]);
+            assert_eq!(probe.publications.get(), 0);
+            assert_eq!(store.snapshot().len(), 1);
+            if !memory {
+                drop(store);
+                assert_eq!(
+                    Store::open(dir.path(), Default::default())
+                        .unwrap()
+                        .snapshot()
+                        .len(),
+                    1
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ordinary_sync_owned_file_faults_preserve_sample_and_failure_rules() {
+        use std::process::Command;
+        const CHILD: &str = "SPARKLES_SYNC_FAULT_CHILD";
+        if let Ok(case) = std::env::var(CHILD) {
+            let root = PathBuf::from(std::env::var("SPARKLES_IO_ROOT").unwrap());
+            let db = root.join("db");
+            let direct = case == "direct-write";
+            let store = Store::open(
+                &db,
+                StoreOptions {
+                    wal_direct_writes: direct,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            insert(&store, "warm").unwrap();
+            let before = counts(&store);
+            let head = store.snapshot().commit;
+            let probe = Rc::new(ordinary_sync_probe::Probe::default());
+            let scope = ordinary_sync_probe::install(&store, &probe);
+            let arm = PathBuf::from(std::env::var("SPARKLES_IO_ARM").unwrap());
+            std::fs::write(&arm, b"armed").unwrap();
+            let result = insert(&store, "failed");
+            std::fs::remove_file(&arm).unwrap();
+            drop(scope);
+            let error = result.unwrap_err();
+            eprintln!("owned-file fault {case}: {error:?}");
+            assert!(
+                error.to_string().contains("Input/output error"),
+                "{error:?}"
+            );
+            let mut expected = before;
+            if case.starts_with("buffered-sync") {
+                expected[SyncPath::Buffered as usize] += 1;
+                assert_observed(&probe, SyncPath::Buffered);
+            } else {
+                assert_eq!(probe.publications.get(), 0);
+            }
+            if direct {
+                assert!(
+                    matches!(store.writer.lock().wal_direct, wal::Direct::Open(_)),
+                    "direct error case must reach the real direct handle"
+                );
+            }
+            assert_eq!(counts(&store), expected);
+            eprintln!(
+                "sample counts {before:?} -> {expected:?}; publication {:?}; no acknowledgement; published head {head}",
+                probe.last.get()
+            );
+            assert_eq!(store.snapshot().commit, head);
+            assert!(matches!(insert(&store, "poisoned"), Err(Error::Poisoned)));
+            assert_eq!(counts(&store), expected);
+            drop(store);
+            let reopened = Store::open(&db, Default::default()).unwrap();
+            let present = case.starts_with("buffered-sync");
+            assert_eq!(reopened.snapshot().commit, head + u64::from(present));
+            assert_eq!(reopened.snapshot().len(), if present { 2 } else { 1 });
+            return;
+        }
+        // Each child owns its files, fault shim and process environment. The real
+        // syscall fault occurs only after the warmed store has been opened.
+        let root = tempfile::tempdir().unwrap();
+        let shim = root.path().join("libiofault.so");
+        assert!(
+            Command::new("cc")
+                .args(["-shared", "-fPIC", "-O1", "-o"])
+                .arg(&shim)
+                .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/iofault.c"))
+                .arg("-ldl")
+                .status()
+                .unwrap()
+                .success()
+        );
+        for (case, fault) in [
+            ("buffered-sync-wal", "fdatasync:wal.log:1"),
+            ("buffered-sync-vocab", "fdatasync:delta.vocab:1"),
+            ("buffered-write", "pwrite:wal.log:1"),
+            ("direct-write", "pwrite:wal.log:1"),
+        ] {
+            let owned = root.path().join(case);
+            std::fs::create_dir(&owned).unwrap();
+            let out = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "store::ordinary_sync_tests::ordinary_sync_owned_file_faults_preserve_sample_and_failure_rules", "--nocapture"])
+                .env(CHILD, case)
+                .env("LD_PRELOAD", &shim)
+                .env("SPARKLES_IO_ROOT", &owned)
+                .env("SPARKLES_IO_ARM", owned.join("armed"))
+                .env("SPARKLES_IO_LOG", owned.join("io.log"))
+                .env("SPARKLES_IO_FAULT", fault)
+                .output().unwrap();
+            eprintln!(
+                "{case}: {}\n{}\n{}",
+                out.status,
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            if let Some(destination) = std::env::var_os("SPARKLES_SYNC_FAULT_EVIDENCE") {
+                let destination = PathBuf::from(destination);
+                std::fs::create_dir_all(&destination).unwrap();
+                std::fs::copy(
+                    owned.join("io.log"),
+                    destination.join(format!("{case}.io.log")),
+                )
+                .unwrap();
+            }
+            assert!(out.status.success(), "owned-file fault {case}");
+        }
+    }
+
+    #[test]
+    fn ordinary_sync_group_enabled_idle_fallback_remains_ordinary() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(
+            dir.path(),
+            StoreOptions {
+                experimental_group_commit: true,
+                group_commit_idle_direct: true,
+                wal_direct_writes: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let probe = Rc::new(ordinary_sync_probe::Probe::default());
+        let scope = ordinary_sync_probe::install(&store, &probe);
+        let receipt = insert(&store, "idle").unwrap();
+        drop(scope);
+        assert_eq!(counts(&store), [0, 1, 0]);
+        assert_observed(&probe, SyncPath::Buffered);
+        assert!(receipt.committed);
+        drop(store);
+        let reopened = Store::open(dir.path(), Default::default()).unwrap();
+        assert_eq!(reopened.snapshot().commit, receipt.commit.seq);
+        assert_eq!(reopened.snapshot().len(), 1);
     }
 }
