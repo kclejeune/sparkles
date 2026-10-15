@@ -433,6 +433,10 @@ pub struct Snapshot {
     pub cache: Arc<BlockCache>,
     /// query result cache shared by all snapshots of the store
     pub results: Arc<crate::sparql::cache::ResultCache>,
+    /// Whether committed-view identity safely keys result and projection caches.
+    /// Uncommitted and synthetic views must not read or populate those caches.
+    /// This does not control the block cache.
+    pub cacheable: bool,
     /// delta-vocabulary size visible to this snapshot
     pub dvocab_len: u64,
     /// the commit (`seq`) this snapshot reflects
@@ -1399,6 +1403,7 @@ impl Store {
             root: None,
             group: None,
             current: Arc::new(ArcSwap::from_pointee(Snapshot {
+                cacheable: true,
                 dataset_id,
                 generation: gen_,
                 delta: Delta::default(),
@@ -1760,6 +1765,7 @@ impl Store {
                 .experimental_group_commit
                 .then(|| Box::new(group::Coordinator::default())),
             current: Arc::new(ArcSwap::from_pointee(Snapshot {
+                cacheable: true,
                 dataset_id: branching
                     .ident
                     .as_ref()
@@ -2185,6 +2191,7 @@ impl Store {
         let bytes = delta_bytes(&delta);
         let dvocab_len = generation.dvocab.len();
         let snap = Arc::new(Snapshot {
+            cacheable: true,
             dataset_id: self.owner_dataset_id(),
             generation,
             delta,
@@ -4190,6 +4197,7 @@ impl Store {
         let head_seq = w.head.seq;
         let candidate = || {
             Arc::new(Snapshot {
+                cacheable: false,
                 dataset_id: self.owner_dataset_id(),
                 generation: gen_.clone(),
                 delta: Delta::default(),
@@ -4321,6 +4329,7 @@ impl Store {
         let old_name = snap.generation.name.clone();
         let dvocab_len = gen_.dvocab.len();
         let mut new_snap = Snapshot {
+            cacheable: true,
             dataset_id: self.owner_dataset_id(),
             generation: gen_,
             delta: Delta::default(),
@@ -4897,10 +4906,12 @@ impl WriteTxn<'_> {
     }
 
     /// Snapshot view including this transaction's uncommitted changes. It keeps the
-    /// committed version number but not its result cache: the data differs from that
-    /// version, so cached results must neither be read nor written through this view.
+    /// committed version number, but marks the view non-cacheable and disables its
+    /// result cache. Its data differs from that committed identity, so result and
+    /// projection caches must neither be read nor populated through this view.
     pub fn view(&self) -> Snapshot {
         Snapshot {
+            cacheable: false,
             dataset_id: self.base.dataset_id,
             generation: self.base.generation.clone(),
             delta: self.delta.clone(),
@@ -5499,6 +5510,7 @@ impl WriteTxn<'_> {
         }
         let version = self.base.version + 1;
         let mut snap = Snapshot {
+            cacheable: true,
             dataset_id: self.base.dataset_id,
             generation: gen_.clone(),
             delta: std::mem::take(&mut self.delta),
@@ -6161,6 +6173,7 @@ pub(crate) fn replay_wal(
     // commit's net counts), from its first change in the transaction
     let mut start: rustc_hash::FxHashMap<Key, bool> = Default::default();
     let probe = Snapshot {
+        cacheable: false,
         dataset_id: uuid::Uuid::nil(),
         generation: from.generation.clone(),
         delta: Delta::default(),

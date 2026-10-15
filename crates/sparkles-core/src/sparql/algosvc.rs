@@ -1639,7 +1639,7 @@ fn weights(
 }
 
 /// The projection of a call: a cached build of the same data and edges, or a new one.
-/// Projections from a nested pattern depend on the query and are not cached.
+/// Uncommitted views and projections from a nested pattern are not cached.
 fn projection(
     ctx: &Ctx,
     spec: &AlgoSpec,
@@ -1647,7 +1647,7 @@ fn projection(
     par: &Par,
     ctl: &Control,
 ) -> Result<(std::sync::Arc<Graph>, bool)> {
-    let key = (spec.proj.pattern.is_none() && ctx.use_cache).then(|| {
+    let key = (ctx.snap.cacheable && spec.proj.pattern.is_none() && ctx.use_cache).then(|| {
         format!(
             "{}{:?}|{}",
             super::cache::view_key(ctx),

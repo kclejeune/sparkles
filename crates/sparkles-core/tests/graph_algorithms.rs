@@ -94,6 +94,332 @@ fn stats_json(s: &Store, body: &str) -> serde_json::Value {
     serde_json::from_str(&result[0]["s"]).unwrap()
 }
 
+const PROJECTION_WCC: &str = "SELECT ?n ?c WHERE { SERVICE algo:wcc { [] algo:predicate ex:p ; algo:node ?n ; algo:component ?c } }";
+
+fn projection_cache_store() -> Store {
+    let s = Store::in_memory(StoreOptions {
+        result_cache_bytes: 0,
+        ..Default::default()
+    });
+    s.load(&[Source::from_bytes(
+        b"@prefix ex: <http://ex/> . ex:a ex:p ex:b . ex:c ex:p ex:d .".to_vec(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    s
+}
+
+fn projection_cache_read(
+    snap: Arc<sparkles_core::store::Snapshot>,
+    q: &str,
+    opts: &QueryOptions,
+) -> (usize, u64) {
+    let result = query(snap, &format!("{PREFIXES}{q}"), opts).unwrap();
+    let rows = result.rows();
+    assert_eq!(rows.len(), 4);
+    let components: BTreeSet<_> = rows.iter().map(|r| short(&r[1])).collect();
+    let leaf = find(&result.plan, "AlgoCall").expect("algorithm executed");
+    (
+        components.len(),
+        leaf.counters.as_ref().unwrap()["cachedProjections"]
+            .as_u64()
+            .unwrap(),
+    )
+}
+
+fn projection_cache_txn(s: &Store) -> sparkles_core::store::WriteTxn<'_> {
+    s.try_write_with(
+        sparkles_core::commit::CommitKind::Update,
+        sparkles_core::guard::WriteOptions {
+            deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(10)),
+            ..Default::default()
+        },
+    )
+    .unwrap()
+}
+
+fn projection_cache_bridge(
+    t: &mut sparkles_core::store::WriteTxn<'_>,
+) -> [sparkles_core::id::Id; 4] {
+    let mut iri = |name| {
+        t.intern(&oxrdf::Term::NamedNode(oxrdf::NamedNode::new_unchecked(
+            format!("http://ex/{name}"),
+        )))
+        .unwrap()
+    };
+    [
+        iri("b"),
+        iri("p"),
+        iri("c"),
+        sparkles_core::id::Id::DEFAULT_GRAPH,
+    ]
+}
+
+#[test]
+fn projection_cache_warm_committed_does_not_hide_pending_update() {
+    let s = projection_cache_store();
+    let opts = QueryOptions::default();
+    assert_eq!(
+        projection_cache_read(s.snapshot(), PROJECTION_WCC, &opts).0,
+        2
+    );
+    assert_eq!(
+        projection_cache_read(s.snapshot(), PROJECTION_WCC, &opts),
+        (2, 1)
+    );
+    update(&s, &format!("{PREFIXES} INSERT DATA {{ ex:b ex:p ex:c }} ; INSERT {{ GRAPH ex:out {{ ?n ex:component ?c }} }} WHERE {{ SERVICE algo:wcc {{ [] algo:predicate ex:p ; algo:node ?n ; algo:component ?c }} }}"), &opts).unwrap();
+    let result = rows(
+        &s,
+        "SELECT ?n ?c WHERE { GRAPH ex:out { ?n ex:component ?c } }",
+    );
+    assert_eq!(result.len(), 4);
+    assert_eq!(
+        result
+            .iter()
+            .map(|r| &r["c"])
+            .collect::<BTreeSet<_>>()
+            .len(),
+        1,
+        "pending bridge must be visible inside the multi-operation update: {result:?}"
+    );
+}
+
+#[test]
+fn projection_cache_pending_rollback_does_not_poison_committed() {
+    let s = projection_cache_store();
+    let mut t = projection_cache_txn(&s);
+    let bridge = projection_cache_bridge(&mut t);
+    t.insert(bridge).unwrap();
+    assert_eq!(
+        projection_cache_read(Arc::new(t.view()), PROJECTION_WCC, &QueryOptions::default()),
+        (1, 0)
+    );
+    drop(t);
+    assert_eq!(
+        projection_cache_read(s.snapshot(), PROJECTION_WCC, &QueryOptions::default()).0,
+        2,
+        "rolled-back bridge must not enter the committed projection cache"
+    );
+}
+
+#[test]
+fn projection_cache_successive_transaction_views_are_fresh() {
+    let s = projection_cache_store();
+    let mut t = projection_cache_txn(&s);
+    let bridge = projection_cache_bridge(&mut t);
+    t.insert(bridge).unwrap();
+    assert_eq!(
+        projection_cache_read(Arc::new(t.view()), PROJECTION_WCC, &QueryOptions::default()),
+        (1, 0)
+    );
+    t.delete(bridge).unwrap();
+    assert_eq!(
+        projection_cache_read(Arc::new(t.view()), PROJECTION_WCC, &QueryOptions::default()),
+        (2, 0)
+    );
+    drop(t);
+}
+
+#[test]
+fn projection_cache_masked_readthrough_pending_view_stays_uncached() {
+    let s = projection_cache_store();
+    let derived = |snap: &sparkles_core::store::Snapshot| {
+        Arc::new(sparkles_core::access::triples::apply(
+            &snap.without_cache_fill(),
+            Vec::new(),
+            "r1-empty-mask".into(),
+        ))
+    };
+    assert_eq!(
+        projection_cache_read(
+            derived(&s.snapshot()),
+            PROJECTION_WCC,
+            &QueryOptions::default()
+        )
+        .0,
+        2
+    );
+    assert_eq!(
+        projection_cache_read(
+            derived(&s.snapshot()),
+            PROJECTION_WCC,
+            &QueryOptions::default()
+        ),
+        (2, 1)
+    );
+    let mut t = projection_cache_txn(&s);
+    let bridge = projection_cache_bridge(&mut t);
+    t.insert(bridge).unwrap();
+    assert_eq!(
+        projection_cache_read(derived(&t.view()), PROJECTION_WCC, &QueryOptions::default()),
+        (1, 0)
+    );
+    drop(t);
+}
+
+#[test]
+fn projection_cache_no_cache_and_disabled_result_cache_are_independent() {
+    let s = projection_cache_store();
+    let opts = QueryOptions {
+        no_cache: true,
+        ..Default::default()
+    };
+    for _ in 0..2 {
+        assert_eq!(
+            projection_cache_read(s.snapshot(), PROJECTION_WCC, &opts),
+            (2, 0)
+        );
+    }
+    assert_eq!(
+        projection_cache_read(s.snapshot(), PROJECTION_WCC, &QueryOptions::default()).0,
+        2
+    );
+    assert_eq!(
+        projection_cache_read(s.snapshot(), PROJECTION_WCC, &QueryOptions::default()),
+        (2, 1)
+    );
+    assert_eq!(
+        projection_cache_read(
+            Arc::new(s.snapshot().without_cache_fill()),
+            PROJECTION_WCC,
+            &QueryOptions::default()
+        ),
+        (2, 1)
+    );
+}
+
+#[test]
+fn projection_cache_graph_scopes_remain_separate() {
+    let s = Store::in_memory(StoreOptions {
+        result_cache_bytes: 0,
+        ..Default::default()
+    });
+    s.load(&[Source::from_bytes(b"@prefix ex: <http://ex/> . ex:g1 { ex:a ex:p ex:b . ex:c ex:p ex:d } ex:g2 { ex:a ex:p ex:b . ex:b ex:p ex:c . ex:c ex:p ex:d }".to_vec(), RdfFormat::TriG, None)]).unwrap();
+    for round in 0..2 {
+        for (graph, count) in [("g1", 2), ("g2", 1)] {
+            let q = format!(
+                "SELECT ?n ?c WHERE {{ GRAPH ex:{graph} {{ SERVICE algo:wcc {{ [] algo:predicate ex:p ; algo:node ?n ; algo:component ?c }} }} }}"
+            );
+            let (actual, hit) = projection_cache_read(s.snapshot(), &q, &QueryOptions::default());
+            assert_eq!(actual, count);
+            if round == 1 {
+                assert_eq!(hit, 1);
+            }
+        }
+    }
+}
+
+#[test]
+fn projection_cache_triple_masks_remain_separate() {
+    let s = projection_cache_store();
+    update(
+        &s,
+        &format!("{PREFIXES} INSERT DATA {{ ex:b ex:p ex:c ; a ex:Hidden }}"),
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    let protection = Protection {
+        name: "r1-hidden-bridge".into(),
+        predicates: None,
+        classes: Some(vec!["http://ex/Hidden".into()]),
+        subclasses: false,
+        graphs: None,
+        pattern: None,
+        prefixes: Default::default(),
+        hide_inferences: false,
+    };
+    let masked = QueryOptions {
+        graphs: Some(Arc::new(GraphAccess::with_triples(
+            Graphs::All,
+            Graphs::All,
+            TripleRules {
+                rules: vec![Rule {
+                    protection: Arc::new(protection),
+                    read: Graphs::none(),
+                    write: Graphs::none(),
+                }],
+                caller: Caller::default(),
+                limits: Limits::default(),
+            },
+        ))),
+        ..Default::default()
+    };
+    for round in 0..2 {
+        let (count, hit) =
+            projection_cache_read(s.snapshot(), PROJECTION_WCC, &QueryOptions::default());
+        assert_eq!(count, 1);
+        if round == 1 {
+            assert_eq!(hit, 1);
+        }
+        let result = query(
+            s.snapshot(),
+            &format!("{PREFIXES}{PROJECTION_WCC}"),
+            &masked,
+        )
+        .unwrap();
+        let rows = result.rows();
+        assert_eq!(rows.len(), 4);
+        assert_eq!(
+            rows.iter()
+                .map(|r| short(&r[1]))
+                .collect::<BTreeSet<_>>()
+                .len(),
+            2
+        );
+        // Access-controlled plans intentionally redact runtime counters. Semantic
+        // results still distinguish this mask from the warmed unrestricted view.
+        assert!(find(&result.plan, "AlgoCall").unwrap().counters.is_none());
+    }
+}
+
+#[test]
+fn noncacheable_view_with_enabled_result_backend_neither_reads_nor_populates() {
+    let s = Store::in_memory(StoreOptions {
+        result_cache_bytes: 1 << 20,
+        result_cache_min_ms: 0.0,
+        ..Default::default()
+    });
+    s.load(&[Source::from_bytes(
+        b"@prefix ex: <http://ex/> . ex:a ex:p ex:b . ex:c ex:p ex:d .".to_vec(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    let q = format!("{PREFIXES}{PROJECTION_WCC}");
+    let opts = QueryOptions::default();
+    let components = |r: &sparkles_core::sparql::QueryResult| {
+        let rows = r.rows();
+        assert_eq!(rows.len(), 4);
+        rows.iter()
+            .map(|row| short(&row[1]))
+            .collect::<BTreeSet<_>>()
+            .len()
+    };
+    assert_eq!(components(&query(s.snapshot(), &q, &opts).unwrap()), 2);
+    let committed = query(s.snapshot(), &q, &opts).unwrap();
+    assert!(committed.plan.cached);
+    assert_eq!(components(&committed), 2);
+    let mut t = projection_cache_txn(&s);
+    let bridge = projection_cache_bridge(&mut t);
+    t.insert(bridge).unwrap();
+    let mut pending = t.view().without_cache_fill();
+    assert!(!pending.cacheable);
+    // Exercise the explicit contract even when a derived view retains a usable
+    // backend. Ordinary transaction views also keep their disabled backend.
+    pending.results = s.snapshot().results.clone();
+    assert!(pending.results.enabled());
+    for _ in 0..2 {
+        let result = query(Arc::new(pending.clone()), &q, &opts).unwrap();
+        assert!(!result.plan.cached);
+        assert_eq!(components(&result), 1);
+    }
+    drop(t);
+    let committed = query(s.snapshot(), &q, &opts).unwrap();
+    assert!(committed.plan.cached);
+    assert_eq!(components(&committed), 2);
+}
+
 fn empty_pagerank_stats(populated: bool) {
     let s = store_of(if populated { "ex:a ex:p ex:b ." } else { "" });
     let body = "SERVICE algo:pageRank { [] algo:predicate ex:absent ; algo:summary ?s }";

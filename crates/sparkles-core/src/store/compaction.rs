@@ -1377,6 +1377,7 @@ impl Store {
         }
         let dvocab_len = gen_.dvocab.len();
         let mut new_snap = Snapshot {
+            cacheable: true,
             dataset_id: self.owner_dataset_id(),
             generation: gen_,
             delta: std::mem::take(&mut cu.delta),
@@ -1618,6 +1619,7 @@ impl Store {
     /// compaction's new generation holds before the commits carried over).
     pub(super) fn base_snapshot(&self, gen_: &Arc<Generation>, seq: u64) -> Snapshot {
         Snapshot {
+            cacheable: true,
             dataset_id: self.owner_dataset_id(),
             generation: gen_.clone(),
             delta: gen_.base_delta(),

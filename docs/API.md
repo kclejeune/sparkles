@@ -5256,8 +5256,10 @@ compute an unpersonalized ranking. Omitting the source still runs ordinary PageR
   to change. `algo:maxMemory` sets a lower budget for one call.
 * **Threads and cache.** `--algo-threads` and `--algo-max-threads-per-call` limit the
   threads of all calls and of each call, and `--algo-cache-mb` sizes the cache of built
-  projections. A projection of unchanged data is built once, and a write to the dataset
-  makes the next call build a new one.
+  projections. Committed views can reuse a built projection independently of the query
+  result cache. A committed write changes the key. Queries over pending transaction
+  changes neither read nor populate the projection cache, including through masked
+  or derived views.
 * **Plans.** EXPLAIN shows an `AlgoCall` operator with the algorithm and its projection.
   The executed plan adds the nodes, the edges, the milliseconds spent building and running,
   the peak bytes, and the projections taken from the cache.

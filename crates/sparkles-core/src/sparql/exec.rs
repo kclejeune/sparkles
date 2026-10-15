@@ -392,7 +392,8 @@ pub fn execute(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
     ctx.check()
         .inspect_err(|_| fail(ctx, n, Instant::now(), Vec::new()))?;
     let results = &ctx.snap.results;
-    let cacheable = ctx.use_cache
+    let cacheable = ctx.snap.cacheable
+        && ctx.use_cache
         && results.enabled()
         && !matches!(
             n.kind,

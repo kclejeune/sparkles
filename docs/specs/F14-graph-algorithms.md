@@ -522,8 +522,8 @@ stays current. It is left out of this spec.
 **Delivered** on 2026-10-13, as Phases 1 and 2 and the embeddings of Phase 3, with the
 gaps listed under "Not built".
 
-The counter confinement, unit-weight sum, Graphalytics clustering and empty-result
-statistics repairs have targeted regression coverage. The
+The counter confinement, unit-weight sum, Graphalytics clustering, empty-result
+statistics and transaction projection-cache repairs have targeted regression coverage. The
 remaining findings from the resumed review and the lane's integration and acceptance
 gates are still pending.
 
@@ -547,8 +547,11 @@ gates are still pending.
   `runMs`, `peakBytes` and `cachedProjections`.
 * **Projection cache.** `algo/cache.rs` keeps built projections under a byte budget
   (`--algo-cache-mb`), keyed by the query's view and the projection's definition, and
-  evicts the least recently used. A write to the dataset changes the key, so the next
-  call rebuilds. Patching a projection with a commit stays the work of F13, as
+  evicts the least recently used. A committed write changes the key, so the next
+  call rebuilds. Transaction views explicitly disable lookup and insertion, including
+  through masked and derived snapshots, so pending changes neither reuse committed
+  projections nor enter their cache. Committed views retain projection reuse when
+  the query result cache is disabled. Patching a projection with a commit stays the work of F13, as
   question 4 of §11 decided.
   Sum aggregation retains multiplicity weights even without an explicit weight
   predicate. Each resulting edge uses one additional `f32`, including its reverse
