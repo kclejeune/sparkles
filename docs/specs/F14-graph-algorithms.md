@@ -556,8 +556,12 @@ data. Each warm caller admits its own copied or shared storage without keeping t
 initializer's query grant alive.
 
 A call's `algo:maxMemory` covers all selected graphs together, including retained
-outputs and old and replacement append buffers while both are live. Native scratch
-ends with its graph frame. The final SERVICE output keeps its query reservation when
+outputs and old and replacement append buffers while both are live. Accumulation
+within one call reuses column capacity and grows it geometrically. The complete
+incoming part stays admitted during each replacement, and retained spare capacity
+continues to count after the old backing is dropped. This avoids repeated prefix
+copies at the cost of unused admitted capacity. Native scratch ends with its graph
+frame. The final SERVICE output keeps its query reservation when
 the completed call closes its native budget. `peakBytes` keeps its existing boundary
 before the final input join, whose inherited kernel and estimates remain unchanged.
 Summary and embedding serialization use admitted growing buffers. Local term insertion

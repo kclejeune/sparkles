@@ -1090,32 +1090,86 @@ pub(super) fn run(
 }
 fn append(
     ctx: &Ctx,
-    left: Materialized,
+    mut left: Materialized,
     right: Materialized,
     ctl: &Control,
 ) -> Result<Materialized> {
+    ctl.check()?;
     let n = left
         .table
         .len
         .checked_add(right.table.len)
         .ok_or_else(|| bad("result rows overflow"))?;
     ctx.check_output_rows(n)?;
-    let mut b = Builder::new(&left.table.vars, ctl)?;
-    for c in 0..left.table.width() {
-        let var = Some(Col { pos: c });
-        b.set(
-            &var,
-            |i| {
-                Ok(if i < left.table.len {
-                    left.table.cols[c][i]
-                } else {
-                    right.table.cols[c][i - left.table.len]
-                })
-            },
-            n,
-        )?;
+    if left.table.width() == 0 {
+        // Zero-width rows still have the inherited logical Id-sized estimate.
+        // Admit it before publishing the larger length, including on refusal.
+        let bytes = memory::sum(&[
+            table_capacity(&left.table)?,
+            memory::bytes::<Id>(right.table.len)?,
+        ])?;
+        left.lease
+            .as_mut()
+            .ok_or_else(|| bad("missing algorithm output admission"))?
+            .resize(ctx.mem_limit, bytes)?;
+    } else {
+        let mut work = Work::new(ctl)?;
+        for c in 0..left.table.width() {
+            ctl.check()?;
+            if n <= left.table.cols[c].capacity() {
+                for &value in &right.table.cols[c] {
+                    work.tick("algorithm-append-copy")?;
+                    // n was checked against the admitted capacity above. No push
+                    // here can trigger implicit growth.
+                    left.table.cols[c].push(value);
+                }
+            } else {
+                let capacity = left.table.cols[c]
+                    .capacity()
+                    .checked_mul(2)
+                    .map(|v| v.max(4).max(n))
+                    .ok_or_else(|| bad("result column growth overflows"))?;
+                let mut replacement = Buffer::new("algorithm-append-column", capacity, ctl)?;
+                for &value in &left.table.cols[c] {
+                    work.tick("algorithm-append-relocate")?;
+                    replacement.push(value)?;
+                }
+                for &value in &right.table.cols[c] {
+                    work.tick("algorithm-append-copy")?;
+                    replacement.push(value)?;
+                }
+                ctl.check()?;
+                let bytes = memory::bytes::<Id>(replacement.capacity())?;
+                let replacement = replacement.into_output();
+                let mut lease = ctl.output_lease(bytes)?;
+                let Some(held) = &mut left.lease else {
+                    drop(replacement);
+                    return Err(bad("missing algorithm output admission"));
+                };
+                if let Err(error) = held.merge(&mut lease) {
+                    drop(replacement);
+                    return Err(error);
+                }
+                #[cfg(test)]
+                memory::probe::at(memory::probe::Point::Work("algorithm-append-transferred"));
+                let old = std::mem::replace(&mut left.table.cols[c], replacement);
+                drop(old); // Backing dies before its capacity leaves the lease.
+                #[cfg(test)]
+                memory::probe::at(memory::probe::Point::Work("algorithm-append-old-dropped"));
+                let bytes = table_capacity(&left.table)?;
+                left.lease
+                    .as_mut()
+                    .expect("admitted accumulator")
+                    .resize(ctx.mem_limit, bytes)?;
+                #[cfg(test)]
+                memory::probe::at(memory::probe::Point::Work("algorithm-append-resized"));
+            }
+        }
     }
-    b.finish(n, ctx)
+    ctl.check()?;
+    left.table.len = n;
+    left.table.sorted.clear();
+    Ok(left)
 }
 
 /// The id of an `xsd:double`. A value whose low four mantissa bits are not zero loses
@@ -2441,6 +2495,788 @@ mod projection_capacity_tests {
         Arc,
         atomic::{AtomicBool, Ordering},
     };
+
+    const GRAPH_SERVICE: &str = "PREFIX ex:<http://ex/> PREFIX algo:<urn:x-sparkles:algo#> SELECT ?g ?n ?c WHERE { SERVICE algo:wcc { [] algo:predicate ex:p;algo:concurrency 1;algo:node ?n;algo:component ?c } }";
+    fn graph_fixture(graphs: usize) -> crate::store::Store {
+        use crate::io::{RdfFormat, Source};
+        let store = crate::store::Store::in_memory(crate::store::StoreOptions {
+            result_cache_bytes: 0,
+            ..Default::default()
+        });
+        let mut data = String::from("@prefix ex:<http://ex/>.");
+        for g in 0..graphs {
+            data.push_str(&format!("ex:g{g:04} {{ex:a ex:p ex:b.}}"));
+        }
+        store
+            .load(&[Source::from_bytes(data.into_bytes(), RdfFormat::TriG, None)])
+            .unwrap();
+        store
+    }
+    fn adapter(ctx: &Ctx) -> Node {
+        let parsed = super::super::parse_query(GRAPH_SERVICE, None, &[]).unwrap();
+        let spargebra::Query::Select { pattern, .. } = &parsed else {
+            panic!("SELECT");
+        };
+        let mut planner = super::super::plan::Planner::new(ctx);
+        planner.source = Some(&parsed);
+        planner
+            .plan(
+                pattern,
+                &super::super::plan::ActiveGraph::Var(ctx.var("g")),
+                Vec::new(),
+            )
+            .unwrap()
+    }
+    fn algo_nodes<'a>(node: &'a Node, leaves: &mut Vec<&'a Node>) {
+        if matches!(node.kind, Kind::AlgoCall(_)) {
+            leaves.push(node);
+        }
+        for child in &node.children {
+            algo_nodes(child, leaves);
+        }
+    }
+    fn algo_infos<'a>(
+        info: &'a super::super::PlanInfo,
+        leaves: &mut Vec<&'a super::super::PlanInfo>,
+    ) {
+        if info.operator == "AlgoCall" {
+            leaves.push(info);
+        }
+        for child in &info.children {
+            algo_infos(child, leaves);
+        }
+    }
+    fn graph_payload(snapshot: &crate::store::Snapshot, graph_ids: &[Id]) -> Vec<Vec<Id>> {
+        let mut nodes = [
+            snapshot.lookup_iri("http://ex/a").unwrap(),
+            snapshot.lookup_iri("http://ex/b").unwrap(),
+        ];
+        nodes.sort_unstable();
+        let mut expected = vec![Vec::new(), Vec::new(), Vec::new()];
+        for &g in graph_ids {
+            for n in nodes {
+                expected[0].push(g);
+                expected[1].push(n);
+                expected[2].push(Id::from_i64(0).unwrap());
+            }
+        }
+        expected
+    }
+    fn warmed_graph_accumulation_counts() -> Vec<(usize, usize, usize, usize)> {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let mut observed = Vec::new();
+        for graphs in [64, 128, 256] {
+            let store = graph_fixture(graphs);
+            let snapshot = store.snapshot();
+            {
+                let warm = Ctx::new(snapshot.clone());
+                let node = adapter(&warm);
+                drop(super::super::exec::execute_owned(&warm, &node).unwrap());
+            }
+            let ctx = Ctx::new(snapshot.clone());
+            let node = adapter(&ctx);
+            let mut leaves = Vec::new();
+            algo_nodes(&node, &mut leaves);
+            assert_eq!(leaves.len(), 1);
+            let Kind::AlgoCall(spec) = &leaves[0].kind else {
+                unreachable!()
+            };
+            assert_eq!(spec.graph_var, Some(ctx.var("g")));
+            assert_eq!(spec.proj.graph, GraphFilter::Named);
+            assert!(leaves[0].children.is_empty());
+            let visits = Rc::new(Cell::new(0usize));
+            let cells = Rc::new(Cell::new(0usize));
+            let v = visits.clone();
+            let a = cells.clone();
+            let hook = memory::probe::install(
+                move |event| match event {
+                    memory::probe::Point::Work(
+                        "algorithm-column"
+                        | "algorithm-append-copy"
+                        | "algorithm-append-relocate"
+                        | "buffer-fill",
+                    ) => v.set(v.get() + 1),
+                    memory::probe::Point::Allocation(
+                        "algorithm-column" | "algorithm-graph-column" | "algorithm-append-column",
+                        capacity,
+                    ) => a.set(a.get() + capacity),
+                    _ => {}
+                },
+                None,
+            );
+            let (out, info) = super::super::exec::execute_owned(&ctx, &node).unwrap();
+            drop(hook);
+            assert!(!info.cached);
+            assert!(ctx.use_cache);
+            let mut infos = Vec::new();
+            algo_infos(&info, &mut infos);
+            assert_eq!(infos.len(), 1);
+            assert_eq!(
+                infos[0].counters.as_ref().unwrap()["cachedProjections"].as_u64(),
+                Some(graphs as u64)
+            );
+            let graph_ids = snapshot.graph_ids().unwrap();
+            assert_eq!(graph_ids.len(), graphs);
+            assert_eq!(out.table.cols, graph_payload(&snapshot, &graph_ids));
+            assert_eq!(out.table.vars, [ctx.var("g"), ctx.var("n"), ctx.var("c")]);
+            assert_eq!(out.table.len, 2 * graphs);
+            let capacity = table_capacity(&out.table).unwrap();
+            assert_eq!(out.lease.as_ref().unwrap().bytes, capacity);
+            assert!(out.lease.as_ref().unwrap().service.is_none());
+            let bound = 8 * out.table.width() * out.table.len;
+            eprintln!(
+                "GRAPH_ACCUMULATION {}",
+                serde_json::json!({"context":"public-planner-ActiveGraph-Var", "graphs":graphs, "rows":out.table.len, "width":out.table.width(), "copy_visits":visits.get(), "allocated_column_cells":cells.get(), "linear_bound":bound, "cached_projections":graphs, "retained_capacity_bytes":capacity,"column_capacities":out.table.cols.iter().map(Vec::capacity).collect::<Vec<_>>(), "columns":out.table.cols.iter().map(|c|c.iter().map(|id|id.0).collect::<Vec<_>>()).collect::<Vec<_>>()})
+            );
+            observed.push((graphs, visits.get(), cells.get(), bound));
+        }
+        observed
+    }
+    #[test]
+    fn warmed_graph_accumulation_copy_work_stays_linear() {
+        let observed = warmed_graph_accumulation_counts();
+        assert!(
+            observed.iter().all(|(_, visits, _, bound)| visits <= bound),
+            "actual column copy visits exceed linear bound: {observed:?}"
+        );
+    }
+    #[test]
+    fn warmed_graph_accumulation_allocation_volume_stays_linear() {
+        let observed = warmed_graph_accumulation_counts();
+        assert!(
+            observed.iter().all(|(_, _, cells, bound)| cells <= bound),
+            "actual requested column cells exceed linear bound: {observed:?}"
+        );
+    }
+    #[test]
+    fn ordinary_graph_query_keeps_named_leaf_cache_and_payload_semantics() {
+        let store = graph_fixture(64);
+        let snapshot = store.snapshot();
+        let query = GRAPH_SERVICE.replace("WHERE { SERVICE", "WHERE { GRAPH ?g { SERVICE");
+        let query = format!("{query} }}");
+        drop(super::super::query(snapshot.clone(), &query, &Default::default()).unwrap());
+        let result = super::super::query(snapshot.clone(), &query, &Default::default()).unwrap();
+        assert!(!result.plan.cached);
+        assert!(result.ctx.use_cache);
+        let mut leaves = Vec::new();
+        algo_infos(&result.plan, &mut leaves);
+        assert_eq!(leaves.len(), 64);
+        for info in leaves {
+            assert_eq!(
+                info.counters.as_ref().unwrap()["cachedProjections"].as_u64(),
+                Some(1)
+            );
+        }
+        let parsed = super::super::parse_query(&query, None, &[]).unwrap();
+        let prepared =
+            super::super::prepare_query(snapshot.clone(), &parsed, &Default::default(), None, None)
+                .unwrap();
+        let mut nodes = Vec::new();
+        algo_nodes(&prepared.node, &mut nodes);
+        assert_eq!(nodes.len(), 64);
+        for node in nodes {
+            let Kind::AlgoCall(spec) = &node.kind else {
+                unreachable!()
+            };
+            assert_eq!(spec.graph_var, None);
+            assert!(matches!(spec.proj.graph, GraphFilter::One(_)));
+        }
+        assert_eq!(
+            result.table.cols,
+            graph_payload(&snapshot, &snapshot.graph_ids().unwrap())
+        );
+    }
+    #[test]
+    fn adapter_graph_subset_substitution_and_empty_visibility_are_preserved() {
+        let store = graph_fixture(3);
+        let snapshot = store.snapshot();
+        let ids = snapshot.graph_ids().unwrap();
+        for case in 0..3 {
+            let mut ctx = Ctx::new(snapshot.clone());
+            if case != 1 {
+                ctx.dataset.named = Some(if case == 0 { vec![ids[1]] } else { vec![] });
+            }
+            let parsed = super::super::parse_query(GRAPH_SERVICE, None, &[]).unwrap();
+            let spargebra::Query::Select { pattern, .. } = &parsed else {
+                unreachable!()
+            };
+            let mut planner = super::super::plan::Planner::new(&ctx);
+            planner.source = Some(&parsed);
+            if case == 1 {
+                planner.subst.insert(ctx.var("g"), ids[2]);
+            }
+            let node = planner
+                .plan(
+                    pattern,
+                    &super::super::plan::ActiveGraph::Var(ctx.var("g")),
+                    Vec::new(),
+                )
+                .unwrap();
+            let mut leaves = Vec::new();
+            algo_nodes(&node, &mut leaves);
+            if case == 2 {
+                assert!(leaves.is_empty());
+            } else {
+                assert_eq!(leaves.len(), 1);
+                let Kind::AlgoCall(spec) = &leaves[0].kind else {
+                    unreachable!()
+                };
+                if case == 0 {
+                    assert_eq!(spec.graph_var, Some(ctx.var("g")));
+                    assert_eq!(spec.proj.graph, GraphFilter::Set(vec![ids[1].0]));
+                } else {
+                    assert_eq!(spec.graph_var, None);
+                    assert_eq!(spec.proj.graph, GraphFilter::One(ids[2].0));
+                }
+            }
+            let (out, _) = super::super::exec::execute_owned(&ctx, &node).unwrap();
+            if case == 2 {
+                assert_eq!(out.table.len, 0);
+            } else {
+                let mut expected = graph_payload(&snapshot, &[ids[if case == 0 { 1 } else { 2 }]]);
+                // Substitution selects the active graph; an unbound SELECT output
+                // still has no input binding table supplying g.
+                if case == 1 {
+                    expected[0].fill(Id::UNDEF);
+                }
+                for (column, &var) in out.table.cols.iter().zip(&out.table.vars) {
+                    let pos = [ctx.var("g"), ctx.var("n"), ctx.var("c")]
+                        .iter()
+                        .position(|&v| v == var)
+                        .unwrap();
+                    assert_eq!(column, &expected[pos]);
+                }
+                assert_eq!(out.table.len, 2);
+            }
+        }
+    }
+    #[test]
+    fn adapter_all_graphs_share_peak_and_exact_service_limit() {
+        let store = graph_fixture(8);
+        let snapshot = store.snapshot();
+        let peak = {
+            let ctx = Ctx::new(snapshot.clone());
+            let (out, info) = super::super::exec::execute_owned(&ctx, &adapter(&ctx)).unwrap();
+            let mut leaves = Vec::new();
+            algo_infos(&info, &mut leaves);
+            let peak = leaves[0].counters.as_ref().unwrap()["peakBytes"]
+                .as_u64()
+                .unwrap();
+            assert_eq!(
+                out.table.cols,
+                graph_payload(&snapshot, &snapshot.graph_ids().unwrap())
+            );
+            peak
+        };
+        // Warm the exact cached projection path before measuring its own peak.
+        let warm_peak = {
+            let ctx = Ctx::new(snapshot.clone());
+            let (_out, info) = super::super::exec::execute_owned(&ctx, &adapter(&ctx)).unwrap();
+            let mut leaves = Vec::new();
+            algo_infos(&info, &mut leaves);
+            leaves[0].counters.as_ref().unwrap()["peakBytes"]
+                .as_u64()
+                .unwrap()
+        };
+        assert!(peak >= warm_peak);
+        for short in [false, true] {
+            let query = GRAPH_SERVICE.replace(
+                "algo:concurrency 1;",
+                &format!(
+                    "algo:concurrency 1;algo:maxMemory {};",
+                    warm_peak - u64::from(short)
+                ),
+            );
+            let parsed = super::super::parse_query(&query, None, &[]).unwrap();
+            let spargebra::Query::Select { pattern, .. } = &parsed else {
+                unreachable!()
+            };
+            let mut ctx = Ctx::new(snapshot.clone());
+            let pool = super::super::pool::QueryPool::new(64 << 20);
+            let grant = Arc::new(pool.empty_grant());
+            ctx.grant = Some(grant.clone());
+            let mut planner = Planner::new(&ctx);
+            planner.source = Some(&parsed);
+            let node = planner
+                .plan(pattern, &ActiveGraph::Var(ctx.var("g")), Vec::new())
+                .unwrap();
+            let planned_live = ctx.memory().live.load(Ordering::Acquire);
+            let planned_local = ctx.local_len();
+            let result = super::super::exec::execute_owned(&ctx, &node);
+            if short {
+                assert!(
+                    matches!(result,Err(Error::BudgetExceeded(e)) if e.kind==crate::error::BudgetKind::Memory)
+                );
+            } else {
+                let (out, info) = result.unwrap();
+                let mut leaves = Vec::new();
+                algo_infos(&info, &mut leaves);
+                assert_eq!(
+                    leaves[0].counters.as_ref().unwrap()["peakBytes"].as_u64(),
+                    Some(warm_peak)
+                );
+                assert_eq!(
+                    out.table.cols,
+                    graph_payload(&snapshot, &snapshot.graph_ids().unwrap())
+                );
+                assert_eq!(
+                    out.lease.as_ref().unwrap().bytes,
+                    table_capacity(&out.table).unwrap()
+                );
+            }
+            // The inherited per-node path interns its JSON summary even if the
+            // summary column was not requested. This is context-owned key storage,
+            // independent of native graph/output capacity.
+            let retained = (planned_local..ctx.local_len())
+                .map(|id| ctx.with_local_key(id, |key| key.len() as u64 + 96).unwrap())
+                .sum::<u64>();
+            assert!(retained > 0);
+            assert_eq!(
+                ctx.memory().live.load(Ordering::Acquire),
+                planned_live + retained
+            );
+            let second = super::super::exec::execute_owned(&ctx, &node);
+            assert_eq!(second.is_err(), short);
+            drop(second);
+            assert_eq!(
+                ctx.memory().live.load(Ordering::Acquire),
+                planned_live + retained
+            );
+            drop(planner);
+            drop(node);
+            let weak = Arc::downgrade(ctx.memory());
+            drop(ctx);
+            assert!(weak.upgrade().is_none());
+            assert_eq!(grant.used(), 0);
+        }
+    }
+    // These bounded fixture Vecs exist before admission/observation. The helper
+    // adopts their real capacities, rather than claiming to observe their allocation.
+    fn append_table(width: usize, len: usize, capacity: usize, start: u64) -> Table {
+        let mut cols = Vec::with_capacity(width);
+        for c in 0..width {
+            let mut values = Vec::with_capacity(capacity);
+            for r in 0..len {
+                values.push(Id(start + r as u64 + (c as u64) * 100));
+            }
+            cols.push(values);
+        }
+        Table {
+            vars: (0..width as VarId).collect(),
+            cols,
+            len,
+            sorted: Vec::new(),
+        }
+    }
+    fn admit_append(table: Table, ctl: &Control) -> Materialized {
+        let bytes = table_capacity(&table).unwrap();
+        ctl.charge(bytes).unwrap();
+        Materialized {
+            table,
+            lease: ctl.output_lease(bytes).unwrap(),
+        }
+    }
+    #[test]
+    fn append_reuses_spare_capacity_and_grows_once_for_large_parts() {
+        use std::{cell::RefCell, rc::Rc};
+        let store = graph_fixture(1);
+        let ctx = Ctx::new(store.snapshot());
+        let ctl = Control::for_query(&ctx, u64::MAX).unwrap();
+        let mut out = admit_append(append_table(2, 0, 0, 0), &ctl);
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let captured = events.clone();
+        let scope = memory::probe::install(move |p| captured.borrow_mut().push(p), None);
+        let mut expected = vec![Vec::new(), Vec::new()];
+        for (len, cap) in [(3, 4), (1, 4), (1, 8), (0, 8), (19, 24)] {
+            // Construction and adoption are independent of append's observed allocs.
+            let part = admit_append(
+                append_table(2, len, len, 1000 + expected[0].len() as u64),
+                &ctl,
+            );
+            for (e, c) in expected.iter_mut().zip(&part.table.cols) {
+                e.extend(c);
+            }
+            let before = events.borrow().len();
+            let ptrs = out.table.cols.iter().map(Vec::as_ptr).collect::<Vec<_>>();
+            out = append(&ctx, out, part, &ctl).unwrap();
+            assert_eq!(out.table.cols, expected);
+            assert_eq!(out.table.len, expected[0].len());
+            assert_eq!(
+                out.lease.as_ref().unwrap().bytes,
+                table_capacity(&out.table).unwrap()
+            );
+            assert!(out.table.cols.iter().all(|c| c.capacity() == cap));
+            let new_events = &events.borrow()[before..];
+            let allocations = new_events
+                .iter()
+                .filter(|p| {
+                    matches!(
+                        p,
+                        memory::probe::Point::Allocation("algorithm-append-column", _)
+                    )
+                })
+                .count();
+            if len == 1 && cap == 4 || len == 0 {
+                assert_eq!(allocations, 0);
+                assert_eq!(
+                    out.table.cols.iter().map(Vec::as_ptr).collect::<Vec<_>>(),
+                    ptrs
+                );
+            } else {
+                assert_eq!(allocations, 2);
+            }
+            if len == 0 {
+                assert!(!new_events.iter().any(|p| matches!(
+                    p,
+                    memory::probe::Point::Work(
+                        "algorithm-append-copy" | "algorithm-append-relocate"
+                    )
+                )));
+            }
+        }
+        drop(scope);
+        drop(out);
+        assert_eq!(ctx.memory().live.load(Ordering::Acquire), 0);
+    }
+    #[test]
+    fn grown_outputs_of_two_services_keep_each_original_query_owner() {
+        use crate::sparql::pool::QueryPool;
+        for shared in [false, true] {
+            let store = graph_fixture(8);
+            let snapshot = store.snapshot();
+            // Independent warm caller ends before the two measured owners begin.
+            {
+                let ctx = Ctx::new(snapshot.clone());
+                drop(super::super::exec::execute_owned(&ctx, &adapter(&ctx)).unwrap());
+            }
+            let pool = QueryPool::new(64 << 20);
+            let a = Arc::new(pool.empty_grant());
+            let b = if shared {
+                a.clone()
+            } else {
+                Arc::new(pool.empty_grant())
+            };
+            let mut ctx = Ctx::new(snapshot.clone());
+            ctx.grant = Some(a.clone());
+            let (first, info) = super::super::exec::execute_owned(&ctx, &adapter(&ctx)).unwrap();
+            let mut leaves = Vec::new();
+            algo_infos(&info, &mut leaves);
+            assert_eq!(
+                leaves[0].counters.as_ref().unwrap()["cachedProjections"].as_u64(),
+                Some(8)
+            );
+            assert!(first.lease.as_ref().unwrap().service.is_none());
+            let live = ctx.memory().live.load(Ordering::Acquire);
+            let held_a = a.used();
+            ctx.grant = Some(b.clone());
+            let (second, info) = super::super::exec::execute_owned(&ctx, &adapter(&ctx)).unwrap();
+            let mut leaves = Vec::new();
+            algo_infos(&info, &mut leaves);
+            assert_eq!(
+                leaves[0].counters.as_ref().unwrap()["cachedProjections"].as_u64(),
+                Some(8)
+            );
+            assert_eq!(
+                first.table.cols,
+                graph_payload(&snapshot, &snapshot.graph_ids().unwrap())
+            );
+            assert_eq!(second.table.cols, first.table.cols);
+            let bytes = table_capacity(&second.table).unwrap();
+            assert_eq!(second.lease.as_ref().unwrap().bytes, bytes);
+            assert_eq!(ctx.memory().live.load(Ordering::Acquire), live + bytes);
+            if !shared {
+                assert_eq!(a.used(), held_a);
+            }
+            drop(second);
+            assert_eq!(ctx.memory().live.load(Ordering::Acquire), live);
+            if !shared {
+                assert_eq!(a.used(), held_a);
+            }
+            let weak = Arc::downgrade(ctx.memory());
+            drop(ctx);
+            assert!(weak.upgrade().is_some());
+            assert!(a.used() > 0);
+            drop(first);
+            assert!(weak.upgrade().is_none());
+            assert_eq!(a.used(), 0);
+            assert_eq!(b.used(), 0);
+        }
+    }
+    #[test]
+    fn append_growth_admits_full_overlap_and_transfers_without_a_gap() {
+        use crate::sparql::pool::QueryPool;
+        use std::{cell::RefCell, rc::Rc};
+        for boundary in ["service", "query", "pool"] {
+            for short in [false, true] {
+                let store = graph_fixture(1);
+                let mut ctx = Ctx::new(store.snapshot());
+                let mut other = Ctx::new(store.snapshot());
+                let left_table = append_table(1, 3, 4, 10);
+                let right_table = append_table(1, 3, 3, 20);
+                let left_bytes = table_capacity(&left_table).unwrap();
+                let right_bytes = table_capacity(&right_table).unwrap();
+                let replacement = memory::bytes::<Id>(8).unwrap();
+                let service_peak = left_bytes + right_bytes + replacement;
+                let query_peak = service_peak + 135;
+                let pool_peak = query_peak + 77;
+                ctx.mem_limit = if boundary == "query" {
+                    query_peak - u64::from(short)
+                } else {
+                    u64::MAX
+                };
+                let pool = QueryPool::new(if boundary == "pool" {
+                    pool_peak - u64::from(short)
+                } else {
+                    64 << 20
+                });
+                let grant = Arc::new(pool.empty_grant());
+                ctx.grant = Some(grant.clone());
+                other.grant = Some(grant.clone());
+                let other_held = other.charge(77).unwrap();
+                let held = ctx.charge(135).unwrap();
+                let ctl = Control::for_query(
+                    &ctx,
+                    if boundary == "service" {
+                        service_peak - u64::from(short)
+                    } else {
+                        u64::MAX
+                    },
+                )
+                .unwrap();
+                let left = admit_append(left_table, &ctl);
+                let right = admit_append(right_table, &ctl);
+                let records = Rc::new(RefCell::new(Vec::new()));
+                let captured = records.clone();
+                let ledger = ctx.memory().clone();
+                let native = ctl.clone();
+                let observed = grant.clone();
+                let hook = memory::probe::install(
+                    move |p| {
+                        if matches!(
+                            p,
+                            memory::probe::Point::Allocation("algorithm-append-column", _)
+                                | memory::probe::Point::Work(
+                                    "algorithm-append-transferred"
+                                        | "algorithm-append-old-dropped"
+                                        | "algorithm-append-resized"
+                                )
+                        ) {
+                            captured.borrow_mut().push((
+                                p,
+                                native.observed_used(),
+                                ledger.live.load(Ordering::Acquire),
+                                observed.used(),
+                            ));
+                        }
+                    },
+                    None,
+                );
+                let result = append(&ctx, left, right, &ctl);
+                drop(hook);
+                if short {
+                    assert!(
+                        records.borrow().is_empty(),
+                        "{boundary} must refuse before allocation"
+                    );
+                    let Err(Error::BudgetExceeded(error)) = result else {
+                        panic!("expected {boundary} capacity refusal")
+                    };
+                    assert_eq!(
+                        error.kind,
+                        if boundary == "pool" {
+                            crate::error::BudgetKind::ServerMemory
+                        } else {
+                            crate::error::BudgetKind::Memory
+                        }
+                    );
+                    assert_eq!(ctx.memory().live.load(Ordering::Acquire), 135);
+                } else {
+                    let out = result.unwrap();
+                    let records = records.borrow();
+                    assert_eq!(records.len(), 4);
+                    for (_, native, live, pool) in &records[..3] {
+                        assert_eq!((*native, *live), (service_peak, query_peak));
+                        assert!(*pool >= pool_peak);
+                    }
+                    assert_eq!(
+                        (records[3].1, records[3].2),
+                        (
+                            service_peak - memory::bytes::<Id>(4).unwrap(),
+                            query_peak - memory::bytes::<Id>(4).unwrap()
+                        )
+                    );
+                    assert_eq!(
+                        out.table.cols[0],
+                        [Id(10), Id(11), Id(12), Id(20), Id(21), Id(22)]
+                    );
+                    let retained = table_capacity(&out.table).unwrap();
+                    assert_eq!(out.lease.as_ref().unwrap().bytes, retained);
+                    assert_eq!(ctx.memory().live.load(Ordering::Acquire), 135 + retained);
+                    assert_eq!(ctl.observed_used(), retained);
+                    drop(out);
+                }
+                assert_eq!(other.memory().live.load(Ordering::Acquire), 77);
+                drop(ctl);
+                drop(held);
+                drop(ctx);
+                assert!(grant.used() >= 77);
+                drop(other_held);
+                drop(other);
+                assert_eq!(grant.used(), 0);
+            }
+        }
+    }
+    #[test]
+    fn append_zero_width_precharges_rows_and_checks_arithmetic_without_allocating() {
+        let store = graph_fixture(1);
+        for short in [false, true] {
+            let ctx = Ctx::new(store.snapshot());
+            let left = append_table(0, 2, 0, 0);
+            let right = append_table(0, 3, 0, 0);
+            let peak = table_capacity(&left).unwrap() + table_capacity(&right).unwrap() + 24;
+            let ctl = Control::for_query(&ctx, peak - u64::from(short)).unwrap();
+            let left = admit_append(left, &ctl);
+            let right = admit_append(right, &ctl);
+            let hook = memory::probe::install(
+                |p| assert!(!matches!(p, memory::probe::Point::Allocation(..))),
+                None,
+            );
+            let out = append(&ctx, left, right, &ctl);
+            drop(hook);
+            if short {
+                assert!(matches!(out, Err(Error::BudgetExceeded(_))));
+            } else {
+                let out = out.unwrap();
+                assert_eq!(out.table.len, 5);
+                assert_eq!(
+                    out.lease.as_ref().unwrap().bytes,
+                    table_capacity(&out.table).unwrap()
+                );
+                drop(out);
+            }
+            assert_eq!(ctx.memory().live.load(Ordering::Acquire), 0);
+        }
+        let ctx = Ctx::new(store.snapshot());
+        let ctl = Control::for_query(&ctx, u64::MAX).unwrap();
+        // Deliberately impossible logical lengths, with no large backing allocation.
+        let fake = |len| {
+            Materialized::plain(Table {
+                vars: Vec::new(),
+                cols: Vec::new(),
+                len,
+                sorted: Vec::new(),
+            })
+        };
+        let hook = memory::probe::install(
+            |p| assert!(!matches!(p, memory::probe::Point::Allocation(..))),
+            None,
+        );
+        assert!(matches!(
+            append(&ctx, fake(usize::MAX), fake(1), &ctl),
+            Err(Error::Invalid(_))
+        ));
+        assert!(matches!(
+            memory::bytes::<Id>(usize::MAX),
+            Err(Error::Invalid(_))
+        ));
+        drop(hook);
+    }
+    #[test]
+    fn append_growth_failure_unwind_and_owner_mismatch_drop_backing_before_charge() {
+        for mode in ["allocation", "unwind", "owner"] {
+            let store = graph_fixture(1);
+            let ctx = Ctx::new(store.snapshot());
+            let ctl = Control::for_query(&ctx, u64::MAX).unwrap();
+            let left = admit_append(append_table(1, 3, 4, 10), &ctl);
+            let right = admit_append(append_table(1, 3, 3, 20), &ctl);
+            let foreign = Control::for_query(&ctx, u64::MAX).unwrap();
+            let hook = memory::probe::install(
+                move |p| {
+                    if mode == "unwind"
+                        && matches!(p, memory::probe::Point::Work("algorithm-append-relocate"))
+                    {
+                        panic!("caught actual relocation unwind");
+                    }
+                },
+                if mode == "allocation" {
+                    Some("algorithm-append-column")
+                } else {
+                    None
+                },
+            );
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                append(
+                    &ctx,
+                    left,
+                    right,
+                    if mode == "owner" { &foreign } else { &ctl },
+                )
+            }));
+            drop(hook);
+            if mode == "unwind" {
+                assert!(result.is_err());
+            } else {
+                assert!(matches!(result.unwrap(), Err(Error::Invalid(_))));
+            }
+            drop(foreign);
+            drop(ctl);
+            assert_eq!(ctx.memory().live.load(Ordering::Acquire), 0);
+        }
+    }
+    #[test]
+    fn append_polls_cancellation_and_deadline_at_real_copy_boundaries() {
+        for timeout in [false, true] {
+            let store = graph_fixture(1);
+            let mut ctx = Ctx::new(store.snapshot());
+            let left_table = append_table(1, 1, 1, 10);
+            let right_table = append_table(
+                1,
+                crate::algo::CHECK_EVERY + 2,
+                crate::algo::CHECK_EVERY + 2,
+                20,
+            );
+            if timeout {
+                ctx.deadline = Some(Instant::now() + std::time::Duration::from_secs(1));
+            }
+            let ctl = Control::for_query(&ctx, u64::MAX).unwrap();
+            let left = admit_append(left_table, &ctl);
+            let right = admit_append(right_table, &ctl);
+            let cancel = ctx.cancel.clone();
+            let deadline = ctx.deadline;
+            let seen = std::rc::Rc::new(std::cell::Cell::new(0));
+            let visits = seen.clone();
+            let scope = memory::probe::install(
+                move |p| {
+                    if matches!(p, memory::probe::Point::Work("algorithm-append-copy")) {
+                        visits.set(visits.get() + 1);
+                        if let Some(deadline) = deadline {
+                            while Instant::now() < deadline {
+                                std::hint::spin_loop();
+                            }
+                        } else {
+                            cancel.store(true, Ordering::Release);
+                        }
+                    }
+                },
+                None,
+            );
+            let result = append(&ctx, left, right, &ctl);
+            drop(scope);
+            assert!(seen.get() > 0, "must reach a real incoming-copy boundary");
+            assert!(
+                seen.get() <= crate::algo::CHECK_EVERY,
+                "must stop at a bounded check, not only after copying the whole incoming part"
+            );
+            if timeout {
+                assert!(matches!(result, Err(Error::Timeout)));
+            } else {
+                assert!(matches!(result, Err(Error::Cancelled)));
+            }
+            drop(ctl);
+            assert_eq!(ctx.memory().live.load(Ordering::Acquire), 0);
+        }
+    }
     #[test]
     fn effective_graph_key_is_exactly_the_original_owned_debug_encoding() {
         let (_store, mut ctx, mut spec) = weighted();
@@ -2635,9 +3471,12 @@ mod projection_capacity_tests {
                         .lock()
                         .unwrap()
                         .iter()
-                        .filter(|(n, _, _)| *n == "algorithm-table-cols")
-                        .count()
-                        >= 5
+                        .any(|(name, _, _)| *name == "algorithm-append-column"),
+                    "actual growth boundary"
+                );
+                assert_eq!(
+                    out.lease.as_ref().unwrap().bytes,
+                    table_capacity(&out.table).unwrap()
                 );
             }
             if case == 4 {

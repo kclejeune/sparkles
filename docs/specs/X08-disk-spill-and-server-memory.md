@@ -715,6 +715,10 @@ contributions remain attached to their original grants when those fields change.
 Projection and result caches keep plain data rather than query owners. A warm caller
 admits its own storage before use or copying. Closing an algorithm call transfers its
 finished output to query-only ownership without releasing and reacquiring its grant.
+Algorithm accumulation reuses admitted columns and grows them geometrically, keeping
+the incoming part and complete replacement charged while the old backing is live.
+Spare capacity stays charged with the output, trading unused capacity for fewer
+allocations and prefix copies.
 These capacity and ownership checks retain the existing estimates for other executor
 kernels and decoded terms. They exclude allocator metadata, size classes and process
 RSS, and do not establish a performance result.
