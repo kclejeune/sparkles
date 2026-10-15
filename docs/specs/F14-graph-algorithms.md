@@ -345,6 +345,9 @@ nodes inside one. Node2vec also checks at entry, before returning and at most ev
 64K operations across its own initialization, shuffle, walk, neighbor and training
 loops. Binary searches count as one operation and take at most the machine word's bit
 width in comparisons. These are work bounds, not a wall-clock preemption guarantee.
+PageRank checks before each node in its four iteration passes and around the passes
+and their reductions. This does not bound edge work inside one incoming row or the
+ordered outgoing-weight sum, and does not strengthen the setup polling contract.
 Node2vec reserves its embedding arrays and temporary buffers before allocation, using
 checked capacity arithmetic and fallible allocation. Sampling scratch reserves the
 maximum outgoing degree, and walk scratch reserves `walkLength`, even if one walk uses
@@ -561,6 +564,15 @@ More admitted workspaces reserve more scratch, including in sequential pool fall
 Heap selection and scheduling change access costs without establishing a speed result.
 The bounds describe requested Vec capacities, excluding allocator and Rayon bookkeeping.
 Broader algorithm and acceptance work remains pending.
+
+PageRank iteration cancellation now polls at every node in its dangling-rank,
+contribution, incoming-rank and delta passes, with checks around their reductions.
+Targeted cancellation and real-deadline tests at one, two and four threads return
+typed errors without partial output and restore the workspace budget. The complete
+weighted personalized reference retains the earlier score bits at all three thread
+counts. The fixed blocks, neighbor order and floating-point expressions are unchanged.
+Polling overhead is unmeasured. This repair does not establish an edge-operation or
+wall-clock bound, strengthen setup polling or complete the remaining acceptance gates.
 
 PageRank now rejects negative and nonfinite stored weights before iteration, including
 native graph inputs, and refuses nonfinite totals or rank arithmetic. Zero weights
