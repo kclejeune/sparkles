@@ -5253,7 +5253,12 @@ compute an unpersonalized ranking. Omitting the source still runs ordinary PageR
   with an update and indexed (see [Vector similarity](#vector-similarity)).
 * **Budgets.** A call counts against the query's timeout and memory budget. A projection
   or a result that does not fit fails the query with a message that names the parameter
-  to change. `algo:maxMemory` sets a lower budget for one call.
+  to change. `algo:maxMemory` sets a lower budget for one call. Node2vec charges
+  fixed embedding and scratch capacities before allocation and checks cancellation
+  throughout its own initialization, walks and training. Its memory peak includes
+  those capacities while live, with returned embeddings still charged to the call.
+  Allocator bookkeeping and the separate incoming-graph accounting are not included
+  in this buffer bound.
 * **Threads and cache.** `--algo-threads` and `--algo-max-threads-per-call` limit the
   threads of all calls and of each call, and `--algo-cache-mb` sizes the cache of built
   projections. Committed views can reuse a built projection independently of the query

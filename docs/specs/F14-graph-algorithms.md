@@ -332,7 +332,18 @@ and waits when the pool is busy, counting the wait against its timeout. The rayo
 that the reasoner uses is not shared.
 
 Each call checks the query's timeout and cancel flag between iterations and every 64K
-nodes inside one. Memory is charged as §3.2 says. Rows count against the query's row
+nodes inside one. Node2vec also checks at entry, before returning and at most every
+64K operations across its own initialization, shuffle, walk, neighbor and training
+loops. Binary searches count as one operation and take at most the machine word's bit
+width in comparisons. These are work bounds, not a wall-clock preemption guarantee.
+Node2vec reserves its embedding arrays and temporary buffers before allocation, using
+checked capacity arithmetic and fallible allocation. Sampling scratch reserves the
+maximum outgoing degree, and walk scratch reserves `walkLength`, even if one walk uses
+less. Temporary reservations end after
+their buffers are dropped, and the returned embedding remains charged to the call.
+This accounts for Vec capacities on the pinned Rust Global allocator, excluding
+allocator bookkeeping. Incoming graph storage remains a separate accounting concern.
+Memory is charged as §3.2 says. Rows count against the query's row
 budget. Betweenness without sampling on more than `--algo-exact-betweenness-max`
 nodes (100,000) is refused with a message that suggests `algo:samples`. Node similarity
 stops with an error when its candidate pairs pass `algo:maxPairs` (10 million).
@@ -518,6 +529,12 @@ stays current. It is left out of this spec.
   C12, C12b, F04, F07 and P06.
 
 ## Outcome
+
+Node2vec now checks bounded work inside its own loops and admits every owned buffer's
+fixed capacity before allocation. Controlled cancellation and low-memory tests cover
+inner walks and training, and retained seeded fixtures preserve the earlier f32 bits.
+Overflow and allocation failures release temporary reservations. This repair does not
+complete incoming-CSR accounting or establish a performance result.
 
 **Delivered** on 2026-10-13, as Phases 1 and 2 and the embeddings of Phase 3, with the
 gaps listed under "Not built".

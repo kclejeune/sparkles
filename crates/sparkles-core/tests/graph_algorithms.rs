@@ -1409,6 +1409,39 @@ fn big(n: usize, m: usize) -> Store {
 }
 
 #[test]
+fn node2vec_service_budgets_walk_scratch_and_preserves_seeded_results() {
+    let s = store_of("ex:a ex:p ex:b . ex:b ex:p ex:a .");
+    let text = |length| {
+        format!(
+            "{PREFIXES}SELECT ?n ?e WHERE {{ SERVICE algo:node2vec {{ [] algo:predicate ex:p ; \
+         algo:dimension 2 ; algo:walkLength {length} ; algo:walksPerNode 1 ; \
+         algo:windowSize 1 ; algo:negativeSamples 0 ; algo:seed 17 ; \
+         algo:maxMemory 100000 ; algo:node ?n ; algo:embedding ?e }} }}"
+        )
+    };
+    let options = QueryOptions::default();
+    let short = query(s.snapshot(), &text(8), &options).unwrap();
+    assert_eq!(short.rows().len(), 2);
+    let again = query(s.snapshot(), &text(8), &options).unwrap();
+    assert_eq!(short.rows(), again.rows());
+    // The same projection and embedding dimensions fit. The long walk's 200,000
+    // bytes of capacity alone exceed the budget before the walk is allocated.
+    let error = match query(s.snapshot(), &text(50_000), &options) {
+        Ok(_) => panic!("unaccounted node2vec walk scratch"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(error, sparkles_core::Error::BudgetExceeded(_)),
+        "{error}"
+    );
+    // Failure releases the call's native temporaries and does not poison a retry.
+    assert_eq!(
+        query(s.snapshot(), &text(8), &options).unwrap().rows(),
+        short.rows()
+    );
+}
+
+#[test]
 fn a_running_algorithm_stops_on_cancel_and_on_timeout() {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
