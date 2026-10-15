@@ -5285,6 +5285,10 @@ compute an unpersonalized ranking. Omitting the source still runs ordinary PageR
   temporary reservations end after the buffers are dropped, while returned scores stay
   charged to the call. These Vec-capacity bounds exclude allocator and Rayon bookkeeping,
   small summary metadata and other algorithm workspaces outside those bounds.
+  PageRank checks cancellation and deadlines before each node in its four iteration
+  passes and around the passes and their reductions. These checks do not bound edge
+  work inside one incoming row or the ordered outgoing-weight sum, strengthen setup
+  polling or guarantee wall-clock preemption.
 * **Threads and cache.** `--algo-threads` and `--algo-max-threads-per-call` limit the
   threads of all calls and of each call. A one-thread call runs on the caller and
   holds one slot in that shared budget. Calls waiting for slots check cancellation and

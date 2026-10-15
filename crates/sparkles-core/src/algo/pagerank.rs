@@ -122,23 +122,48 @@ pub fn run(g: &Graph, p: &Params, par: &Par, ctl: &Control) -> Result<Output> {
     let mut converged = false;
     for it in 0..p.max_iterations {
         ctl.check()?;
+        #[cfg(test)]
+        c1_probe::at(c1_probe::Event::Iteration, ctl);
         // the rank of the nodes with no out-edges, which is spread over the teleport set
+        ctl.check()?;
         par.chunks_mut(&mut partials, 1, |lo, c| {
             let start = lo * BLOCK;
+            let mut failure = None;
             c[0] = (start..(start + BLOCK).min(n))
-                .filter(|&u| outw[u] <= 0.0)
+                // Stop fallibly without changing the ordered floating-point sum.
+                .take_while(|_| match ctl.check() {
+                    Ok(()) => true,
+                    Err(error) => {
+                        failure = Some(error);
+                        false
+                    }
+                })
+                .filter(|&u| {
+                    #[cfg(test)]
+                    c1_probe::at(c1_probe::Event::Node(0), ctl);
+                    outw[u] <= 0.0
+                })
                 .map(|u| score[u])
                 .sum::<f64>();
+            if let Some(error) = failure {
+                return Err(error);
+            }
             Ok(())
         })?;
+        ctl.check()?;
         let dangling: f64 = partials.iter().copied().sum();
+        ctl.check()?;
         if !dangling.is_finite() {
             return Err(bad("pageRank", "dangling rank total is not finite"));
         }
         // what each node sends along one unit of edge weight
+        ctl.check()?;
         par.chunks_mut(&mut contrib, BLOCK, |lo, c| {
             for (i, x) in c.iter_mut().enumerate() {
+                ctl.check()?;
                 let u = lo + i;
+                #[cfg(test)]
+                c1_probe::at(c1_probe::Event::Node(1), ctl);
                 *x = if outw[u] > 0.0 {
                     score[u] / outw[u]
                 } else {
@@ -150,11 +175,16 @@ pub fn run(g: &Graph, p: &Params, par: &Par, ctl: &Control) -> Result<Output> {
             }
             Ok(())
         })?;
+        ctl.check()?;
         {
             let (contrib_ref, tele_ref) = (&contrib, &tele);
+            ctl.check()?;
             par.chunks_mut(&mut next, BLOCK, |lo, c| {
                 for (i, x) in c.iter_mut().enumerate() {
+                    ctl.check()?;
                     let v = lo + i;
+                    #[cfg(test)]
+                    c1_probe::at(c1_probe::Event::Node(2), ctl);
                     let (r, w) = (inn.row(v as u32), inn.wrow(v as u32));
                     let mut s = 0.0;
                     match (weighted, w) {
@@ -177,15 +207,34 @@ pub fn run(g: &Graph, p: &Params, par: &Par, ctl: &Control) -> Result<Output> {
                 }
                 Ok(())
             })?;
+            ctl.check()?;
         }
+        ctl.check()?;
         par.chunks_mut(&mut partials, 1, |lo, c| {
             let start = lo * BLOCK;
+            let mut failure = None;
             c[0] = (start..(start + BLOCK).min(n))
-                .map(|v| (next[v] - score[v]).abs())
+                .take_while(|_| match ctl.check() {
+                    Ok(()) => true,
+                    Err(error) => {
+                        failure = Some(error);
+                        false
+                    }
+                })
+                .map(|v| {
+                    #[cfg(test)]
+                    c1_probe::at(c1_probe::Event::Node(3), ctl);
+                    (next[v] - score[v]).abs()
+                })
                 .sum::<f64>();
+            if let Some(error) = failure {
+                return Err(error);
+            }
             Ok(())
         })?;
+        ctl.check()?;
         delta = partials.iter().copied().sum();
+        ctl.check()?;
         if !delta.is_finite() {
             return Err(bad("pageRank", "rank change is not finite"));
         }
@@ -608,3 +657,8 @@ mod tests {
         assert_eq!(ctl.remaining(), 10000);
     }
 }
+
+#[cfg(test)]
+mod c1_probe;
+#[cfg(test)]
+mod polling_tests;
