@@ -7660,7 +7660,7 @@ mod ordinary_sync_tests {
     use super::*;
     use std::rc::Rc;
 
-    fn insert(store: &Store, name: &str) -> Result<Receipt> {
+    fn transaction<'a>(store: &'a Store, name: &str) -> Result<WriteTxn<'a>> {
         let mut txn = store.write_with(CommitKind::Update, Default::default());
         let quad = Quad::new(
             NamedNode::new(format!("urn:{name}")).unwrap(),
@@ -7670,7 +7670,94 @@ mod ordinary_sync_tests {
         );
         let q = txn.encode_quad(&quad, &mut Default::default())?;
         txn.insert(q)?;
+        Ok(txn)
+    }
+
+    fn insert(store: &Store, name: &str) -> Result<Receipt> {
+        transaction(store, name)?.commit()
+    }
+
+    fn insert_known_fit(store: &Store, name: &str) -> Result<Receipt> {
+        let txn = transaction(store, name)?;
+        assert!(
+            wal::DirectLog::fits(
+                txn.guard.wal_len,
+                txn.wal_bytes() as usize,
+                txn.guard.wal_alloc,
+            ),
+            "the selected ordinary write must fit its allocated direct window"
+        );
         txn.commit()
+    }
+
+    fn unavailable_handle(store: &Store) {
+        let dir = store.snapshot().generation.dir.clone().unwrap();
+        let missing = dir.join("private-missing-direct-candidate");
+        assert!(!missing.exists());
+        let wal_path = dir.join("wal.log");
+        let before = std::fs::read(&wal_path).unwrap();
+        let mut state = wal::Direct::Untried;
+        let mut writer = store.writer.lock();
+        let descriptor = writer.wal.as_ref().unwrap().get_ref();
+        assert!(state.handle(Some(&missing), descriptor).is_none());
+        assert!(matches!(state, wal::Direct::Off));
+        writer.wal_direct = state;
+        drop(writer);
+        assert_eq!(std::fs::read(&wal_path).unwrap(), before);
+        eprintln!(
+            "controlled real Direct::handle None; cached Off; WAL bytes untouched; requested direct remains true"
+        );
+    }
+
+    // A requested option or an acquired handle is not capability evidence. This
+    // separate successful write calibrates the real path before observing an attempt.
+    fn calibrate(store: &Store, unavailable: bool) -> bool {
+        insert(store, "warm").unwrap();
+        if unavailable {
+            unavailable_handle(store);
+        }
+        let before = counts(store);
+        assert!(insert_known_fit(store, "calibration").unwrap().committed);
+        let after = counts(store);
+        let mut expected = before;
+        expected[SyncPath::Direct as usize] += 1;
+        let direct = after == expected;
+        if !direct {
+            expected = before;
+            expected[SyncPath::Buffered as usize] += 1;
+            assert_eq!(after, expected);
+        }
+        assert_eq!(
+            selected_path(store, direct),
+            if direct {
+                SyncPath::Direct
+            } else {
+                SyncPath::Buffered
+            }
+        );
+        eprintln!(
+            "calibration requested_direct={} controlled_unavailable={unavailable}: successful actual {}; counts {before:?} -> {after:?}",
+            store.opts.wal_direct_writes,
+            if direct { "Direct" } else { "Buffered" }
+        );
+        direct
+    }
+
+    fn selected_path(store: &Store, calibrated_direct: bool) -> SyncPath {
+        match &store.writer.lock().wal_direct {
+            wal::Direct::Open(_) => {
+                assert!(
+                    calibrated_direct,
+                    "Direct requires a successful prior Direct calibration"
+                );
+                SyncPath::Direct
+            }
+            // A later EINVAL can legitimately disable even a calibrated handle.
+            wal::Direct::Off => SyncPath::Buffered,
+            wal::Direct::Untried => {
+                panic!("known-fit calibration must resolve direct availability")
+            }
+        }
     }
 
     fn counts(store: &Store) -> [u64; 3] {
@@ -7690,7 +7777,7 @@ mod ordinary_sync_tests {
 
     #[test]
     fn ordinary_sync_success_and_unwind_preserve_samples_and_observe_writer() {
-        for direct in [false, true] {
+        for (direct, unavailable) in [(false, false), (true, false), (true, true)] {
             for panic in [false, true] {
                 let dir = tempfile::tempdir().unwrap();
                 let store = Store::open(
@@ -7701,47 +7788,50 @@ mod ordinary_sync_tests {
                     },
                 )
                 .unwrap();
-                // A real buffered commit establishes the allocation needed by direct I/O.
-                insert(&store, "warm").unwrap();
+                let calibrated = calibrate(&store, unavailable);
                 let before = counts(&store);
                 let head = store.snapshot().commit;
+                let len = store.snapshot().len();
                 let probe = Rc::new(ordinary_sync_probe::Probe::default());
                 probe.panic_after_capture.set(panic);
                 let scope = ordinary_sync_probe::install(&store, &probe);
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    insert(&store, "observed")
+                    insert_known_fit(&store, "observed")
                 }));
                 drop(scope);
                 assert_eq!(result.is_err(), panic);
                 if let Ok(result) = result {
                     assert!(result.unwrap().committed);
                 }
-                let path = if direct {
-                    SyncPath::Direct
-                } else {
-                    SyncPath::Buffered
-                };
+                let path = selected_path(&store, calibrated);
                 let mut expected = before;
                 expected[path as usize] += 1;
-                assert_eq!(counts(&store), expected, "direct={direct}, panic={panic}");
+                assert_eq!(
+                    counts(&store),
+                    expected,
+                    "direct={direct}, unavailable={unavailable}, panic={panic}"
+                );
                 assert_observed(&probe, path);
+                eprintln!(
+                    "observed success/unwind requested_direct={direct} controlled_unavailable={unavailable} calibrated_direct={calibrated} panic={panic}: actual {path:?}, counts {before:?} -> {expected:?}"
+                );
                 assert!(store.writer.try_lock().is_some());
                 if !panic {
                     assert_eq!(store.snapshot().commit, head + 1);
                 }
                 drop(store);
                 let reopened = Store::open(dir.path(), Default::default()).unwrap();
-                // The injected panic has no acknowledged receipt. Orderly Store
-                // close trims its unpublished WAL suffix using the unchanged head.
+                // An injected panic has no acknowledged receipt. Orderly close
+                // trims that unpublished suffix using the unchanged head.
                 assert_eq!(reopened.snapshot().commit, head + u64::from(!panic));
-                assert_eq!(reopened.snapshot().len(), if panic { 1 } else { 2 });
+                assert_eq!(reopened.snapshot().len(), len + u64::from(!panic));
             }
         }
     }
 
     #[test]
     fn ordinary_sync_error_and_fallback_sample_rules_are_unchanged() {
-        for direct in [false, true] {
+        for (direct, unavailable) in [(false, false), (true, false), (true, true)] {
             let dir = tempfile::tempdir().unwrap();
             let store = Store::open(
                 dir.path(),
@@ -7751,52 +7841,69 @@ mod ordinary_sync_tests {
                 },
             )
             .unwrap();
-            insert(&store, "warm").unwrap();
+            let calibrated = calibrate(&store, unavailable);
             let before = counts(&store);
             let head = store.snapshot().commit;
+            let len = store.snapshot().len();
             let probe = Rc::new(ordinary_sync_probe::Probe::default());
             let scope = ordinary_sync_probe::install(&store, &probe);
             store.snapshot().generation.dvocab.fail_next_sync();
-            assert!(insert(&store, "failing").is_err());
+            let error = insert_known_fit(&store, "failing").unwrap_err();
             drop(scope);
+            assert!(
+                error.to_string().contains("injected sync failure"),
+                "{error:?}"
+            );
             assert_eq!(store.snapshot().commit, head);
+            let path = selected_path(&store, calibrated);
             let mut expected = before;
-            if direct {
-                // commit_direct returns Err before the original sample site.
+            if path == SyncPath::Direct {
+                // A real commit_direct error precedes its sample site.
                 assert_eq!(probe.publications.get(), 0);
             } else {
                 expected[SyncPath::Buffered as usize] += 1;
                 assert_observed(&probe, SyncPath::Buffered);
             }
+            eprintln!(
+                "injected vocabulary error requested_direct={direct} controlled_unavailable={unavailable} calibrated_direct={calibrated}: actual {path:?}, counts {before:?} -> {expected:?}"
+            );
             assert_eq!(counts(&store), expected);
             assert!(matches!(insert(&store, "poisoned"), Err(Error::Poisoned)));
             assert_eq!(counts(&store), expected);
+            drop(store);
+            let reopened = Store::open(dir.path(), Default::default()).unwrap();
+            assert_eq!(reopened.snapshot().commit, head + 1);
+            assert_eq!(reopened.snapshot().len(), len + 1);
         }
-        // A labeled caller-path adapter selects false before mutation. The buffered
-        // fallback still performs a real write and synchronization exactly once.
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path(), Default::default()).unwrap();
-        insert(&store, "warm").unwrap();
-        let before = counts(&store);
-        let probe = Rc::new(ordinary_sync_probe::Probe::default());
-        probe.skip_direct.set(true);
-        let scope = ordinary_sync_probe::install(&store, &probe);
-        insert(&store, "fallback").unwrap();
-        drop(scope);
-        assert!(probe.skipped.get());
-        assert!(matches!(store.writer.lock().wal_direct, wal::Direct::Off));
-        let mut expected = before;
-        expected[SyncPath::Buffered as usize] += 1;
-        assert_eq!(counts(&store), expected);
-        assert_observed(&probe, SyncPath::Buffered);
-        drop(store);
-        assert_eq!(
-            Store::open(dir.path(), Default::default())
-                .unwrap()
-                .snapshot()
-                .len(),
-            2
-        );
+        for unavailable in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::open(dir.path(), Default::default()).unwrap();
+            let calibrated = calibrate(&store, unavailable);
+            let before = counts(&store);
+            let head = store.snapshot().commit;
+            let len = store.snapshot().len();
+            let probe = Rc::new(ordinary_sync_probe::Probe::default());
+            probe.skip_direct.set(true);
+            let scope = ordinary_sync_probe::install(&store, &probe);
+            insert_known_fit(&store, "fallback").unwrap();
+            drop(scope);
+            // This labeled control selects false before any helper mutation. If
+            // acquisition was unavailable it is not called; Buffered still runs.
+            assert_eq!(probe.skipped.get(), calibrated);
+            assert!(matches!(store.writer.lock().wal_direct, wal::Direct::Off));
+            let mut expected = before;
+            expected[SyncPath::Buffered as usize] += 1;
+            assert_eq!(counts(&store), expected);
+            assert_observed(&probe, SyncPath::Buffered);
+            eprintln!(
+                "direct-false caller adapter calibrated_direct={calibrated} controlled_unavailable={unavailable}: exercised={}; actual Buffered",
+                probe.skipped.get()
+            );
+            drop(store);
+            let reopened = Store::open(dir.path(), Default::default()).unwrap();
+            assert_eq!(reopened.snapshot().commit, head + 1);
+            assert_eq!(reopened.snapshot().len(), len + 1);
+        }
     }
 
     #[test]
@@ -7897,7 +8004,7 @@ mod ordinary_sync_tests {
         if let Ok(case) = std::env::var(CHILD) {
             let root = PathBuf::from(std::env::var("SPARKLES_IO_ROOT").unwrap());
             let db = root.join("db");
-            let direct = case == "direct-write";
+            let direct = case.starts_with("direct-write");
             let store = Store::open(
                 &db,
                 StoreOptions {
@@ -7906,14 +8013,15 @@ mod ordinary_sync_tests {
                 },
             )
             .unwrap();
-            insert(&store, "warm").unwrap();
+            let calibrated = calibrate(&store, case == "direct-write-unavailable");
             let before = counts(&store);
             let head = store.snapshot().commit;
+            let len = store.snapshot().len();
             let probe = Rc::new(ordinary_sync_probe::Probe::default());
             let scope = ordinary_sync_probe::install(&store, &probe);
             let arm = PathBuf::from(std::env::var("SPARKLES_IO_ARM").unwrap());
             std::fs::write(&arm, b"armed").unwrap();
-            let result = insert(&store, "failed");
+            let result = insert_known_fit(&store, "failed");
             std::fs::remove_file(&arm).unwrap();
             drop(scope);
             let error = result.unwrap_err();
@@ -7929,10 +8037,17 @@ mod ordinary_sync_tests {
             } else {
                 assert_eq!(probe.publications.get(), 0);
             }
-            if direct {
-                assert!(
-                    matches!(store.writer.lock().wal_direct, wal::Direct::Open(_)),
-                    "direct error case must reach the real direct handle"
+            let actual = selected_path(&store, calibrated);
+            if direct && actual == SyncPath::Direct {
+                assert!(calibrated);
+                assert!(matches!(
+                    store.writer.lock().wal_direct,
+                    wal::Direct::Open(_)
+                ));
+                eprintln!("{case}: actual Direct EIO after successful real Direct calibration");
+            } else if direct {
+                eprintln!(
+                    "{case}: direct unavailable or subsequently refused; actual Buffered pre-sync write EIO, not Direct coverage"
                 );
             }
             assert_eq!(counts(&store), expected);
@@ -7947,7 +8062,7 @@ mod ordinary_sync_tests {
             let reopened = Store::open(&db, Default::default()).unwrap();
             let present = case.starts_with("buffered-sync");
             assert_eq!(reopened.snapshot().commit, head + u64::from(present));
-            assert_eq!(reopened.snapshot().len(), if present { 2 } else { 1 });
+            assert_eq!(reopened.snapshot().len(), len + u64::from(present));
             return;
         }
         // Each child owns its files, fault shim and process environment. The real
@@ -7969,6 +8084,7 @@ mod ordinary_sync_tests {
             ("buffered-sync-vocab", "fdatasync:delta.vocab:1"),
             ("buffered-write", "pwrite:wal.log:1"),
             ("direct-write", "pwrite:wal.log:1"),
+            ("direct-write-unavailable", "pwrite:wal.log:1"),
         ] {
             let owned = root.path().join(case);
             std::fs::create_dir(&owned).unwrap();
