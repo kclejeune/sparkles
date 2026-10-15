@@ -515,6 +515,10 @@ stays current. It is left out of this spec.
 **Delivered** on 2026-10-13, as Phases 1 and 2 and the embeddings of Phase 3, with the
 gaps listed under "Not built".
 
+The counter confinement repair has targeted write-back regression coverage. The
+remaining findings from the resumed review and the lane's integration and acceptance
+gates are still pending.
+
 * **Library.** `crates/sparkles-core/src/algo/` holds the algorithms on compressed
   sparse rows. `graph.rs` builds the projection, and the modules `pagerank`,
   `components` (weakly connected components by an atomic union-find and strongly
@@ -549,7 +553,10 @@ gaps listed under "Not built".
   stands for and runs the batched write-back. The first commit of a run clears the graph
   in replace mode and writes the run record. Every commit holds whole nodes, updates the
   record's `spk:batchesWritten` and `spk:triplesWritten`, and carries the message
-  `algo run <uuid> batch i/n`. The last commit adds `prov:endedAtTime` and
+  `algo run <uuid> batch i/n`. Counter replacement is confined to the requested
+  destination graph. Values for the same run in other graphs are preserved, so
+  replacing the counters needs write grants only for the destination graph.
+  The last commit adds `prov:endedAtTime` and
   `spk:status`. A cancelled or failed run records its status with one more commit when
   it can. In merge mode the old values of the written predicates are deleted inside the
   batch's own commit. Louvain and Leiden communities are written as resources

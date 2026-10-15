@@ -599,7 +599,10 @@ pub fn run_write(
                     Ok(true)
                 })?;
                 for k in keys {
-                    txn.delete(Perm::Spo.to_quad(&k))?;
+                    let q = Perm::Spo.to_quad(&k);
+                    if q[3] == g {
+                        txn.delete(q)?;
+                    }
                 }
                 put(&mut txn, rec, &spk(name), &int(v))?;
             }

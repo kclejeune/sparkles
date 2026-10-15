@@ -8,8 +8,9 @@ use sparkles_core::sparql::{QueryOptions, query};
 use sparkles_core::store::{Store, StoreOptions};
 use sparkles_core::task::{Control, Progress};
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Duration, Instant};
 
 const DATA: &str = "@prefix ex: <http://ex/> .
 ex:a ex:p ex:b . ex:b ex:p ex:c . ex:c ex:p ex:a . ex:c ex:p ex:d .
@@ -71,6 +72,202 @@ fn select(s: &Store, q: &str) -> Vec<Vec<String>> {
                 .collect()
         })
         .collect()
+}
+
+fn destination_only() -> QueryOptions {
+    use sparkles_core::access::{GraphAccess, GraphRule, Graphs};
+    QueryOptions {
+        graphs: Some(Arc::new(GraphAccess {
+            read: Graphs::All,
+            write: Graphs::Only(GraphRule::new(["urn:graph:out"], &[])),
+            triples: None,
+        })),
+        ..Default::default()
+    }
+}
+
+fn batch_record(s: &Store) -> Vec<Vec<String>> {
+    select(
+        s,
+        "SELECT ?run ?b ?t (COUNT(?n) AS ?nodes) WHERE { GRAPH <urn:graph:out> { \
+         ?run a spk:AlgorithmRun ; spk:batchesWritten ?b ; spk:triplesWritten ?t . \
+         ?n ex:rank ?rank } } GROUP BY ?run ?b ?t",
+    )
+}
+
+fn counters_stay_in_the_destination(mode: WriteMode, restricted: bool) {
+    let s = Arc::new(store());
+    let before = s.snapshot().commit;
+    let (start_tx, start_rx) = mpsc::sync_channel(1);
+    let (done_tx, done_rx) = mpsc::sync_channel(1);
+    let writer_store = s.clone();
+    let writer = std::thread::spawn(move || -> Result<String, String> {
+        start_rx
+            .recv_timeout(Duration::from_secs(10))
+            .map_err(|e| format!("batch boundary not reached: {e}"))?;
+        // One snapshot witnesses both counters and their data after batch 1 commits.
+        let first = batch_record(&writer_store);
+        if first.len() != 1 || first[0][1..] != ["1", "2", "2"] {
+            return Err(format!("batch 1 was not atomically published: {first:?}"));
+        }
+        let run = first[0][0].clone();
+        let result = sparkles_core::sparql::update::update(
+            &writer_store,
+            &format!(
+                "INSERT DATA {{ GRAPH <urn:graph:other> {{ <{run}> \
+                 <urn:x-sparkles:batchesWritten> 777 ; \
+                 <urn:x-sparkles:triplesWritten> 888 }} }}"
+            ),
+            &QueryOptions {
+                write: sparkles_core::guard::WriteOptions {
+                    deadline: Some(Instant::now() + Duration::from_secs(10)),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string());
+        // Sending only follows the competing writer's actual committed update.
+        let _ = done_tx.send(result.clone());
+        result?;
+        Ok(run)
+    });
+    let callback_error = Arc::new(Mutex::new(None));
+    let callback_error2 = callback_error.clone();
+    let done_rx = Mutex::new(done_rx);
+    let ctl = Control::none();
+    let cancel = ctl.cancel.clone();
+    let ctl = Control {
+        deadline: Some(Instant::now() + Duration::from_secs(20)),
+        progress: Progress::new(move |_, message| {
+            if !message.starts_with("writing batch 2 ") {
+                return;
+            }
+            let result = start_tx.send(()).map_err(|e| e.to_string()).and_then(|()| {
+                done_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))
+                    .map_err(|e| e.to_string())?
+            });
+            if let Err(error) = result {
+                *callback_error2.lock().unwrap() = Some(error);
+                cancel.cancel();
+            }
+        }),
+        ..ctl
+    };
+    let mut req = request(
+        "pageRank",
+        [("score".into(), "ex:rank".into())].into(),
+        Some(2),
+    );
+    req.write.as_mut().unwrap().mode = mode;
+    let opts = if restricted {
+        destination_only()
+    } else {
+        QueryOptions::default()
+    };
+    let outcome = run_write(&s, &req, &prefixes(), &opts, None, &ctl);
+    drop(ctl);
+    // All handshake guards are released and the competing writer joined before assertions.
+    let inserted = writer.join();
+    assert_eq!(*callback_error.lock().unwrap(), None);
+    let run = inserted.expect("competing writer panicked").unwrap();
+    let rep = outcome.expect("destination-only write must not delete another graph");
+    assert_eq!(rep.run, run);
+    let unrelated = select(
+        &s,
+        &format!(
+            "SELECT ?b ?t WHERE {{ GRAPH <urn:graph:other> {{ <{run}> \
+             spk:batchesWritten ?b ; spk:triplesWritten ?t }} }}"
+        ),
+    );
+    assert_eq!(unrelated, vec![vec!["777", "888"]]);
+    assert_eq!(rep.triples, 7);
+    assert_eq!(rep.commits, 4);
+    assert_eq!(rep.source_commit, before);
+    assert_eq!(s.snapshot().commit, before + rep.commits + 1);
+    let final_record = batch_record(&s);
+    assert_eq!(
+        final_record,
+        vec![vec![run, "4".into(), "7".into(), "7".into()]]
+    );
+}
+
+#[test]
+fn replace_counter_updates_preserve_another_graph() {
+    counters_stay_in_the_destination(WriteMode::Replace, false);
+}
+
+#[test]
+fn merge_counter_updates_preserve_another_graph() {
+    counters_stay_in_the_destination(WriteMode::Merge, false);
+}
+
+#[test]
+fn replace_counter_updates_need_only_destination_write_grants() {
+    counters_stay_in_the_destination(WriteMode::Replace, true);
+}
+
+#[test]
+fn merge_counter_updates_need_only_destination_write_grants() {
+    counters_stay_in_the_destination(WriteMode::Merge, true);
+}
+
+fn atomic_counters_stay_in_the_destination(mode: WriteMode) {
+    let s = store();
+    sparkles_core::sparql::update::update(
+        &s,
+        "INSERT DATA { GRAPH <urn:graph:other> { <urn:uuid:other-run> \
+         <urn:x-sparkles:batchesWritten> 777 ; <urn:x-sparkles:triplesWritten> 888 } }",
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    let before = s.snapshot().commit;
+    let mut req = request(
+        "pageRank",
+        [("score".into(), "ex:rank".into())].into(),
+        Some(2),
+    );
+    let write = req.write.as_mut().unwrap();
+    write.mode = mode;
+    write.atomic = true;
+    let rep = run_write(
+        &s,
+        &req,
+        &prefixes(),
+        &destination_only(),
+        None,
+        &Control::none(),
+    )
+    .unwrap();
+    assert_eq!(rep.commits, 1);
+    assert_eq!(rep.triples, 7);
+    assert_eq!(s.snapshot().commit, before + 1);
+    assert_eq!(
+        batch_record(&s),
+        vec![vec![rep.run, "1".into(), "7".into(), "7".into()]]
+    );
+    assert_eq!(
+        select(
+            &s,
+            "SELECT ?b ?t WHERE { GRAPH <urn:graph:other> { <urn:uuid:other-run> \
+             spk:batchesWritten ?b ; spk:triplesWritten ?t } }",
+        ),
+        vec![vec!["777", "888"]]
+    );
+}
+
+#[test]
+fn atomic_replace_counters_need_only_destination_grants() {
+    atomic_counters_stay_in_the_destination(WriteMode::Replace);
+}
+
+#[test]
+fn atomic_merge_counters_need_only_destination_grants() {
+    atomic_counters_stay_in_the_destination(WriteMode::Merge);
 }
 
 #[test]
