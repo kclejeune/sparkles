@@ -169,9 +169,14 @@ pub struct Stored {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct FileDoc {
+    #[serde(default = "default_format")]
     format: u32,
     #[serde(default)]
     projections: BTreeMap<String, Stored>,
+}
+
+fn default_format() -> u32 {
+    FORMAT
 }
 
 /// The named projections of one dataset.
@@ -202,18 +207,13 @@ impl Catalog {
         let doc = match root {
             Some(r) => match std::fs::read(r.join(FILE)) {
                 Ok(b) => {
-                    let mut value: serde_json::Value =
+                    let value: serde_json::Value =
                         serde_json::from_slice(&b).map_err(|e| invalid(format!("{FILE}: {e}")))?;
-                    let format = crate::formats::check_settings(FILE, &value)?;
-                    // The registry treats an absent marker as format 1. Normalize
-                    // only the in-memory value, leaving a read-only open unchanged.
-                    if value.get("format").is_none()
-                        && let Some(object) = value.as_object_mut()
-                    {
-                        object.insert("format".into(), format.into());
-                    }
-                    let d: FileDoc = serde_json::from_value(value)
-                        .map_err(|e| invalid(format!("{FILE}: {e}")))?;
+                    crate::formats::check_settings(FILE, &value)?;
+                    // Probe compatibility first, then validate untouched bytes so
+                    // duplicate known fields are not discarded by Value parsing.
+                    let d: FileDoc =
+                        serde_json::from_slice(&b).map_err(|e| invalid(format!("{FILE}: {e}")))?;
                     for (n, p) in &d.projections {
                         if !valid_name(n) {
                             return Err(invalid(format!("{FILE}: invalid projection name '{n}'")));
@@ -549,6 +549,200 @@ mod algo_catalog_format_tests {
             assert!(matches!(c.put("valid",ProjectionDef::default(),None,None),Err(Error::Conflict(_))));
             assert!(matches!(c.delete("valid",None),Err(Error::Conflict(_))));
             assert_eq!(std::fs::read(dir.path().join(FILE)).unwrap(),bytes);
+        }
+    }
+}
+
+#[cfg(test)]
+mod duplicate_field_tests {
+    use super::*;
+
+    // These are raw JSON field sequences. Going through Value would discard the
+    // duplicate before Catalog sees it, which is the defect under test.
+    fn documents() -> Vec<(String, String)> {
+        const KEPT: &str = r#"{"keep":{"revision":1,"updated":"fixture","definition":{}}}"#;
+        let mut fields = vec![
+            (
+                "FileDoc.projections.same".into(),
+                format!(r#""projections":{KEPT},"projections":{KEPT}"#),
+            ),
+            (
+                "FileDoc.projections.keep-then-empty".into(),
+                format!(r#""projections":{KEPT},"projections":{{}}"#),
+            ),
+        ];
+        for (name, first, second, extra) in [
+            (
+                "revision",
+                "1",
+                "2",
+                r#""updated":"fixture","definition":{}"#,
+            ),
+            (
+                "updated",
+                r#""first""#,
+                r#""second""#,
+                r#""revision":1,"definition":{}"#,
+            ),
+            (
+                "author",
+                r#""first""#,
+                r#""second""#,
+                r#""revision":1,"updated":"fixture","definition":{}"#,
+            ),
+            (
+                "definition",
+                "{}",
+                r#"{"direction":"forward"}"#,
+                r#""revision":1,"updated":"fixture""#,
+            ),
+        ] {
+            let mut pairs = vec![("same", first, first), ("different", first, second)];
+            if name == "author" {
+                pairs.extend([("null-first", "null", first), ("null-last", first, "null")]);
+            }
+            for (case, a, b) in pairs {
+                fields.push((
+                    format!("Stored.{name}.{case}"),
+                    format!(r#""projections":{{"keep":{{{extra},"{name}":{a},"{name}":{b}}}}}"#),
+                ));
+            }
+        }
+        for (name, first, second, optional, extra) in [
+            (
+                "predicates",
+                r#"[{"iri":"urn:p"}]"#,
+                r#"[{"iri":"urn:q"}]"#,
+                true,
+                "",
+            ),
+            ("direction", r#""forward""#, r#""backward""#, true, ""),
+            ("nodeClasses", r#"["urn:C"]"#, r#"["urn:D"]"#, false, ""),
+            ("weight", r#""urn:w""#, r#""urn:x""#, true, ""),
+            ("defaultWeight", "1", "2", true, r#", "weight":"urn:w""#),
+            ("aggregate", r#""sum""#, r#""max""#, true, ""),
+        ] {
+            let mut pairs = vec![("same", first, first), ("different", first, second)];
+            if optional {
+                pairs.extend([("null-first", "null", first), ("null-last", first, "null")]);
+            }
+            for (case, a, b) in pairs {
+                fields.push((format!("ProjectionDef.{name}.{case}"), format!(r#""projections":{{"keep":{{"revision":1,"updated":"fixture","definition":{{"{name}":{a},"{name}":{b}{extra}}}}}}}"#)));
+            }
+        }
+        for (name, first, second, extra) in [
+            ("iri", r#""urn:p""#, r#""urn:q""#, ""),
+            (
+                "direction",
+                r#""forward""#,
+                r#""backward""#,
+                r#", "iri":"urn:p""#,
+            ),
+        ] {
+            let mut pairs = vec![("same", first, first), ("different", first, second)];
+            if name == "direction" {
+                pairs.extend([("null-first", "null", first), ("null-last", first, "null")]);
+            }
+            for (case, a, b) in pairs {
+                fields.push((format!("PredicateDef.{name}.{case}"), format!(r#""projections":{{"keep":{{"revision":1,"updated":"fixture","definition":{{"predicates":[{{"{name}":{a},"{name}":{b}{extra}}}]}}}}}}"#)));
+            }
+        }
+        let mut docs = Vec::new();
+        for (name, body) in fields {
+            for (marker, prefix) in [("current", r#""format":1,"#), ("absent", "")] {
+                docs.push((format!("{name}.{marker}"), format!("{{{prefix}{body}}}")));
+            }
+        }
+        docs.extend([
+            (
+                "FileDoc.format.same".into(),
+                r#"{"format":1,"format":1,"projections":{}}"#.into(),
+            ),
+            (
+                "FileDoc.format.invalid-then-current".into(),
+                r#"{"format":0,"format":1,"projections":{}}"#.into(),
+            ),
+        ]);
+        docs
+    }
+
+    #[test]
+    fn duplicate_known_fields_are_invalid() {
+        let mut accepted = Vec::new();
+        for (name, raw) in documents() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join(FILE), raw.as_bytes()).unwrap();
+            let result = Catalog::open(Some(dir.path()));
+            if !matches!(result, Err(Error::Invalid(_))) {
+                eprintln!("duplicate accepted instead of Invalid: {name}: {result:?}; raw={raw}");
+                accepted.push(name);
+            }
+        }
+        assert!(
+            accepted.is_empty(),
+            "raw duplicate fields were accepted: {accepted:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_known_fields_stay_read_only() {
+        let mut writable = Vec::new();
+        for (name, raw) in documents() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(FILE);
+            std::fs::write(&path, raw.as_bytes()).unwrap();
+            let permissions = std::fs::metadata(&path).unwrap().permissions();
+            let entries = || {
+                let mut names: Vec<_> = std::fs::read_dir(dir.path())
+                    .unwrap()
+                    .map(|e| e.unwrap().file_name())
+                    .collect();
+                names.sort();
+                names
+            };
+            let before = entries();
+            let unchanged = || {
+                std::fs::read(&path).is_ok_and(|bytes| bytes == raw.as_bytes())
+                    && std::fs::metadata(&path).is_ok_and(|m| m.permissions() == permissions)
+                    && entries() == before
+            };
+            let c = Catalog::open_or_broken(Some(dir.path()));
+            let broken =
+                c.broken().is_some_and(|e| !e.is_empty()) && c.list().is_empty() && unchanged();
+            let put = matches!(
+                c.put("new", ProjectionDef::default(), None, None),
+                Err(Error::Conflict(_))
+            ) && unchanged();
+            let delete = matches!(c.delete("keep", None), Err(Error::Conflict(_))) && unchanged();
+            let missing =
+                matches!(c.delete("missing", None), Err(Error::Conflict(_))) && unchanged();
+            if !(broken && put && delete && missing) {
+                eprintln!(
+                    "duplicate fallback not read-only: {name}: broken={broken}, put={put}, delete={delete}, missing={missing}"
+                );
+                writable.push(name);
+            }
+        }
+        assert!(
+            writable.is_empty(),
+            "damaged catalog writable: {writable:?}"
+        );
+    }
+
+    #[test]
+    fn future_duplicate_body_keeps_compatibility_precedence() {
+        for raw in [
+            r#"{"format":2,"projections":{},"projections":{"future":null},"unknownFutureShape":true}"#,
+            r#"{"format":1,"format":2,"projections":{},"projections":{}}"#,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(FILE);
+            std::fs::write(&path, raw).unwrap();
+            assert!(matches!(
+                Catalog::open(Some(dir.path())),
+                Err(Error::Unsupported(_))
+            ));
+            assert_eq!(std::fs::read(&path).unwrap(), raw.as_bytes());
         }
     }
 }

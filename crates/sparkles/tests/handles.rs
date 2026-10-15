@@ -841,3 +841,43 @@ fn algorithms_catalog_backup_restore_and_clone_preserve_revision_and_definition(
     );
     assert_eq!(std::fs::read(restored.join("algo.json")).unwrap(), raw);
 }
+
+#[test]
+fn algorithms_catalog_duplicate_fields_stay_readable_and_read_only() {
+    use sparkles::algo::catalog::ProjectionDef;
+    for content in [
+        br#"{"format":1,"projections":{"keep":{"revision":1,"updated":"fixture","definition":{}}},"projections":{}}"#.as_slice(),
+        br#"{"projections":{"keep":{"revision":1,"updated":"fixture","definition":{"direction":"forward","direction":"backward"}}}}"#,
+    ] {
+        let (dir, ds) = persistent();
+        drop(ds);
+        let root = dir.path().join("db");
+        let path = root.join("algo.json");
+        std::fs::write(&path, content).unwrap();
+        let permissions = std::fs::metadata(&path).unwrap().permissions();
+        let entries = || {
+            let mut names: Vec<_> = std::fs::read_dir(&root).unwrap().map(|e| e.unwrap().file_name()).collect();
+            names.sort();
+            names
+        };
+        let before = entries();
+        let unchanged = || {
+            assert_eq!(std::fs::read(&path).unwrap(), content);
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions(), permissions);
+            assert_eq!(entries(), before);
+        };
+        let ds = Dataset::open(&root).unwrap();
+        unchanged();
+        let catalog = ds.algorithms().projections();
+        assert!(catalog.list().is_empty());
+        assert!(matches!(catalog.put("new", ProjectionDef::default(), None, None), Err(sparkles::Error::Conflict(_))), "duplicate catalog must refuse a real facade put");
+        unchanged();
+        for name in ["keep", "missing"] {
+            assert!(matches!(catalog.delete(name, None), Err(sparkles::Error::Conflict(_))));
+            unchanged();
+        }
+        assert!(ds.ask("ASK { <http://ex.org/a> <http://ex.org/p> 1 }").unwrap());
+        ds.update("INSERT DATA { <urn:readable> <urn:p> <urn:o> }").unwrap();
+        unchanged();
+    }
+}

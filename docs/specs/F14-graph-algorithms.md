@@ -653,8 +653,8 @@ gates are still pending.
   shared settings registry. A missing marker reads as 1 without a rewrite. A future
   version gives `Unsupported` at dataset admission before metadata writers, including
   for active and retained branches, and migration planning makes the same read-only
-  check. Malformed JSON or current definitions leave the catalog empty and read-only,
-  so it is never overwritten. Backups, clones and branch copies preserve the file.
+  check. Malformed JSON, duplicate known struct fields or invalid current definitions
+  leave the catalog empty and read-only, so it is never overwritten. Backups, clones and branch copies preserve the file.
   `algo:projection "name"` is resolved
   when the query is planned, also inside SPARQL Update, so a query at an older commit
   uses today's definitions.
