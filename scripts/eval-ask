@@ -1,68 +1,46 @@
 #!/usr/bin/env python3
-"""The model matrix of C18 §11.4 on a question set: `sparkles ask` for every pair, then
-a cascade of the pairs in the order given.
+"""Run the initial Ask demo as whole pipelines with strict RDF-term scoring.
 
-    scripts/eval-ask --model-config models.json [--model-secret NAME=env:VAR ...]
-                     --pair PROVIDER/MODEL [--pair ...] [--set testsuite/ask/demo.json]
-                     [--out DIR] [--sparkles BIN] [--jobs N] [--only ID,...]
-    scripts/eval-ask --self-test [--sparkles BIN]
-
-Each pair answers every question with `--pair draft=P --pair repair=P --pair
-summarize=P`, so one run measures the pair in the draft, repair and summarize roles. The
-final query of each answer runs again through `sparkles query`, and its answer set is
-compared with the gold query's. Answer sets compare as sets of rows, each row the set
-of its values, with literals by lexical value and numbers by value, so the order of
-the projected variables and their names do not matter.
-
-The report has a row per pair and role, with accuracy overall and by the complexity
-bucket of §5.5 (`simple` under 4, `medium` under 8, `complex` from 8), the share of
-answers that matched the schema without a retry, the median and 95th-percentile latency
-per call, tokens and estimated cost per question and per correct answer, and a cascade
-row. With two or more pairs, the cascade row comes from a real run of the escalation of
-§5.5. Every question is asked once more with the pairs, in the order given, as the
-draft, repair and summarize lists of a copy of the model configuration. The pipeline
-then moves a step to the next pair on the signals it verifies, and the row gives the
-share of answers each pair wrote, the escalations by signal, the accuracy and the cost.
-
-Reports are written outside the repository, to --out or a new directory under the
-system's temporary directory: `report.md`, `report.json` and the raw answers in
-`answers/`.
-
-`--self-test` starts a mock provider that speaks the OpenAI protocol with two models,
-`oracle`, which answers each question with its gold query, and `weak`, which answers
-every question with the same wrong query, runs the matrix on the demo set, and checks
-the report. It needs no key and makes no network call outside the loopback interface.
-
-The public sets of §11.1, QALD-9-plus and Text2SPARQL'25, need their own data loaded
-into a database and their questions converted into this set's format; this script runs
-any set in that format.
+This script makes no claim of independent role accuracy or public QALD compatibility.
+Paid Anthropic runs must use eval-ask-anthropic and its single durable wallet.
 """
 
 import argparse
-import concurrent.futures
+import hashlib
 import json
 import math
 import os
 import pathlib
 import statistics
-import subprocess
 import sys
 import tempfile
-import threading
 import time
-from decimal import Decimal, InvalidOperation
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-DEFAULT_SET = ROOT / "testsuite" / "ask" / "demo.json"
-NUMERIC = {
-    "http://www.w3.org/2001/XMLSchema#" + t
-    for t in (
-        "integer decimal double float long int short byte nonNegativeInteger "
-        "positiveInteger negativeInteger nonPositiveInteger unsignedLong unsignedInt "
-        "unsignedShort unsignedByte"
-    ).split()
-}
+sys.path.insert(0, str(ROOT / "testsuite/ask/eval_support"))
+from evaluator import (
+    Invalid,
+    OfflinePolicy,
+    answer_set,
+    bounded_file,
+    capture_child,
+    digest,
+    finite_positive,
+    leaf_environment,
+    offline_query,
+    parse_child,
+    score_sets,
+    strict_json,
+    validate_ask_record,
+)
+from evaluator import (
+    norm_term as norm_term,  # noqa: PLC0414 -- retained scoring import for recomputation
+)
+from evaluator import (
+    prf as prf,  # noqa: PLC0414 -- retained scoring import for recomputation
+)
+
+DEFAULT_SET = ROOT / "testsuite/ask/demo.json"
 
 
 def bucket(score):
@@ -71,470 +49,624 @@ def bucket(score):
     return "simple" if score < 4 else "medium" if score < 8 else "complex"
 
 
-def percentile(xs, p):
-    if not xs:
-        return None
-    xs = sorted(xs)
-    k = max(0, min(len(xs) - 1, math.ceil(p / 100 * len(xs)) - 1))
-    return xs[k]
+def load_questions(args):
+    qset = strict_json(bounded_file(args.set, 4 * 1024 * 1024))
+    if (
+        not isinstance(qset, dict)
+        or not isinstance(qset.get("questions"), list)
+        or not isinstance(qset.get("data"), str)
+    ):
+        raise Invalid("invalid question set")
+    ids = []
+    for q in qset["questions"]:
+        if (
+            not isinstance(q, dict)
+            or not isinstance(q.get("id"), str)
+            or not q["id"]
+            or len(q["id"]) > 200
+            or q.get("kind") not in ("answerable", "clarify", "unanswerable")
+            or not isinstance(q.get("question"), str)
+        ):
+            raise Invalid("invalid question")
+        if q["kind"] == "answerable" and not isinstance(q.get("gold"), str):
+            raise Invalid("answerable question needs gold")
+        ids.append(q["id"])
+    if len(ids) != len(set(ids)) or not ids:
+        raise Invalid("empty or duplicate question IDs")
+    if args.only is not None:
+        selected = args.only.split(",")
+        if len(selected) != len(set(selected)) or not set(selected) <= set(ids):
+            raise Invalid("unknown or duplicate --only ID")
+        qset = dict(
+            qset, questions=[q for q in qset["questions"] if q["id"] in selected]
+        )
+    if not qset["questions"]:
+        raise Invalid("empty question selection")
+    data = (pathlib.Path(args.set).resolve().parent / qset["data"]).resolve()
+    if not data.is_file():
+        raise Invalid("data file required")
+    return qset
 
 
-def norm_term(b):
-    if b is None or b.get("type") == "bnode":
-        return None
-    v = b.get("value", "")
-    if b.get("type") == "literal" and b.get("datatype") in NUMERIC:
-        try:
-            d = Decimal(v)
-            return "n:" + format(d.normalize() if d == d.to_integral() else round(d, 6).normalize(), "f")
-        except InvalidOperation:
-            return "l:" + v
-    return ("i:" if b.get("type") == "uri" else "l:") + v
-
-
-def answer_set(results):
-    """The answer of a SPARQL JSON result: a boolean, or a set of rows of value sets."""
-    if "boolean" in results:
-        return results["boolean"]
-    rows = set()
-    for b in results.get("results", {}).get("bindings", []):
-        vals = frozenset(x for x in (norm_term(t) for t in b.values()) if x is not None)
-        rows.add(vals)
-    return rows
-
-
-def prf(gold, got):
-    if isinstance(gold, bool) or isinstance(got, bool):
-        ok = gold == got
-        return (1.0 if ok else 0.0,) * 3
-    g = set().union(*gold) if gold else set()
-    a = set().union(*got) if got else set()
-    if not g and not a:
-        return 1.0, 1.0, 1.0
-    p = len(g & a) / len(a) if a else 0.0
-    r = len(g & a) / len(g) if g else 0.0
-    f = 2 * p * r / (p + r) if p + r else 0.0
-    return p, r, f
+def validate_args(args):
+    for value in (args.deadline, args.phase_deadline, args.timeout):
+        finite_positive(value)
+    if (
+        args.deadline > 30
+        or args.phase_deadline > 900
+        or args.timeout > 5
+        or args.jobs != 1
+    ):
+        raise Invalid(
+            "initial limits: jobs 1, Ask deadline <=30, query <=5, phase <=900"
+        )
+    binary = pathlib.Path(args.sparkles)
+    if (
+        not binary.is_absolute()
+        or not binary.is_file()
+        or not os.access(binary, os.X_OK)
+    ):
+        raise Invalid("exact existing absolute --sparkles required; no fallback")
+    actual = digest(binary)
+    if not args.sparkles_sha256 or args.sparkles_sha256 != actual:
+        raise Invalid("exact --sparkles-sha256 required")
+    if (
+        not args.pair
+        or len(set(args.pair)) != len(args.pair)
+        or any(p.count("/") != 1 or not all(p.split("/")) for p in args.pair)
+    ):
+        raise Invalid("unique nonempty provider/model pairs required")
+    cfg = strict_json(bounded_file(args.model_config, 1024 * 1024))
+    if (
+        not isinstance(cfg, dict)
+        or not isinstance(cfg.get("models"), dict)
+        or not isinstance(cfg["models"].get("providers"), dict)
+    ):
+        raise Invalid("model provider map required")
+    providers = cfg.get("models", {}).get("providers", {})
+    if any(
+        not isinstance(pcfg, dict)
+        or not isinstance(pcfg.get("models"), dict)
+        or any(not isinstance(mcfg, dict) for mcfg in pcfg["models"].values())
+        for pcfg in providers.values()
+    ):
+        raise Invalid("model option maps required")
+    for pair in args.pair:
+        p, m = pair.split("/")
+        if p not in providers or m not in providers[p].get("models", {}):
+            raise Invalid("pair not configured")
+    # General fake/self-test providers are permitted here. The paid wrapper renders
+    # and checks the exact single-provider config and credential-free leaf boundary.
+    if len(args.model_secret) > 1 or any(
+        s != "evalgate=env:SPARKLES_EVAL_GATE_TOKEN" for s in args.model_secret
+    ):
+        raise Invalid("only evaluation gate secret reference is allowed")
+    qset = load_questions(args)
+    out = (
+        pathlib.Path(args.out)
+        if args.out
+        else pathlib.Path(tempfile.gettempdir())
+        / ("sparkles-eval-" + os.urandom(16).hex())
+    )
+    if (
+        not out.is_absolute()
+        or out.resolve() != out
+        or ROOT == out
+        or ROOT in out.parents
+    ):
+        raise Invalid("new absolute output outside repository required")
+    out.mkdir(mode=0o700)  # Exclusive, including existing empty directories/symlinks.
+    return qset, out
 
 
 class Runner:
-    def __init__(self, args, qset):
-        self.args = args
-        self.qset = qset
+    def __init__(self, args, qset, out_dir=None, gate=None, deadline=None):
+        self.args, self.qset, self.gate = args, qset, gate
+        self.out = pathlib.Path(out_dir or args.out)
+        self.deadline = deadline or time.monotonic() + args.phase_deadline
         self.data = (pathlib.Path(args.set).parent / qset["data"]).resolve()
-        self.header = "".join(f"PREFIX {k}: <{v}>\n" for k, v in qset.get("prefixes", {}).items())
-        self.gold_cache = {}
-        self.lock = threading.Lock()
-
-    def query(self, text):
-        r = subprocess.run(
-            [self.args.sparkles, "query", "--data", str(self.data), "--results", "json", self.header + text],
-            capture_output=True,
-            text=True,
-            timeout=120,
+        self.header = "".join(
+            f"PREFIX {k}: <{v}>\n" for k, v in qset.get("prefixes", {}).items()
         )
-        if r.returncode:
-            return None
-        try:
-            return answer_set(json.loads(r.stdout))
-        except json.JSONDecodeError:
-            return None
+        self.gold_cache, self.serial, self.last_record = {}, 0, None
+        self.env = leaf_environment(
+            {"SPARKLES_EVAL_GATE_TOKEN": gate.token} if gate else None
+        )
+        cfg = strict_json(bounded_file(args.model_config, 1024 * 1024))
+        self.cli_priced_pairs = set()
+        for provider, pcfg in cfg.get("models", {}).get("providers", {}).items():
+            for model, mcfg in pcfg.get("models", {}).items():
+                price = mcfg.get("pricing", pcfg.get("pricing"))
+                if isinstance(price, dict) and all(
+                    type(price.get(k)) in (int, float)
+                    and math.isfinite(price[k])
+                    and price[k] >= 0
+                    for k in ("inputPerMTok", "outputPerMTok")
+                ):
+                    self.cli_priced_pairs.add(provider + "/" + model)
+
+    def check(self):
+        if time.monotonic() >= self.deadline:
+            raise Invalid("phase deadline expired")
+        if self.gate and (
+            self.gate.stopped or self.gate.wallet.snapshot_report()["stopped"]
+        ):
+            raise Invalid("gate stopped")
+
+    def execute(self, argv, label, child_limit=None):
+        self.check()
+        self.serial += 1
+        directory = self.out / f"{self.serial:05d}-{label}"
+        record = capture_child(
+            argv,
+            directory,
+            min(self.deadline, time.monotonic() + (child_limit or self.args.deadline)),
+            self.env,
+        )
+        self.last_record = record
+        result = parse_child(record, directory)
+        if not isinstance(result, dict):
+            raise Invalid("final result object required")
+        return result, record
+
+    def query(self, text, label="query"):
+        offline_query(self.header + text)
+        result, record = self.execute(
+            [
+                self.args.sparkles,
+                "query",
+                "--data",
+                str(self.data),
+                "--results",
+                "json",
+                "--timeout",
+                str(self.args.timeout),
+                "--outbound-block-private",
+                "--outbound-allow",
+                "no-remote-eval.invalid",
+                self.header + text,
+            ],
+            label,
+            self.args.timeout,
+        )
+        return answer_set(result), record
 
     def gold(self, q):
-        with self.lock:
-            if q["id"] in self.gold_cache:
-                return self.gold_cache[q["id"]]
-        g = self.query(q["gold"])
-        with self.lock:
-            self.gold_cache[q["id"]] = g
-        return g
+        if q["id"] not in self.gold_cache:
+            self.gold_cache[q["id"]] = self.query(q["gold"], "gold")[0]
+        return self.gold_cache[q["id"]]
 
     def ask(self, pair, q, config=None):
-        """One answer: by `pair` in every role, or by the role lists of `config`."""
-        cmd = [self.args.sparkles, "ask", "--data", str(self.data), "--text"]
-        cmd += [self.qset.get("dataset", "data"), q["question"], "--json"]
+        cmd = [
+            self.args.sparkles,
+            "ask",
+            "--data",
+            str(self.data),
+            "--text",
+            self.qset.get("dataset", "data"),
+            q["question"],
+            "--json",
+            "--deadline",
+            str(self.args.deadline),
+            "--timeout",
+            str(self.args.timeout),
+            "--max-tokens",
+            "32768",
+            "--max-rows",
+            "1000",
+            "--model-config",
+            str(config or self.args.model_config),
+        ]
         if pair is not None:
             for role in ("draft", "repair", "summarize"):
-                cmd += ["--pair", f"{role}={pair}"]
-        cmd += ["--model-config", config or self.args.model_config]
-        for s in self.args.model_secret:
-            cmd += ["--model-secret", s]
-        started = time.monotonic()
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=self.args.deadline + 60)
-        wall = time.monotonic() - started
-        try:
-            out = json.loads(r.stdout.strip().splitlines()[-1])
-        except (json.JSONDecodeError, IndexError):
-            out = {"outcome": "error", "error": {"code": "cli", "message": r.stderr.strip()[-500:]}}
-        out["wallSeconds"] = wall
+                cmd += ["--pair", role + "=" + pair]
+        for secret in self.args.model_secret:
+            cmd += ["--model-secret", secret]
+        if self.args.allow_loopback:
+            cmd += ["--outbound-allow", "127.0.0.1/32"]
+        out, record = self.execute(cmd, "ask")
+        validate_ask_record(out)
+        semantic_failed = (
+            out.get("outcome") == "failed"
+            and not out.get("error")
+            and any(
+                i.get("severity") == "error"
+                for i in ((out.get("result") or {}).get("issues") or [])
+            )
+        )
+        if (
+            out.get("outcome")
+            not in ("answered", "empty", "clarify", "unanswerable", "not-run")
+            and not semantic_failed
+        ):
+            raise Invalid("nonsemantic or error Ask outcome")
+        out["wallSeconds"] = record["elapsedSeconds"]
+        out["execution"] = record
+        # The SDK reports zero when pricing is unconfigured, and cannot represent
+        # the gate's full context-tier/cache attempt accounting. Never call that a
+        # known free answer. Preserve the raw SDK value in stdout as a diagnostic.
+        out["cliEstimatedCostKnown"] = self.gate is None and all(
+            p in self.cli_priced_pairs for p in ([pair] if pair else self.args.pair)
+        )
         return out
 
+    def first_draft(self, q, out):
+        attempts = out.get("attempts")
+        if (
+            not isinstance(attempts, list)
+            or not attempts
+            or not isinstance(attempts[0], dict)
+        ):
+            return {"status": "unknown", "reason": "no_retained_first_attempt"}
+        first = attempts[0]
+        issues = (first.get("check") or {}).get("issues", [])
+        if any(i.get("severity") == "error" for i in issues):
+            return {"status": "incorrect", "reason": "check_invalid"}
+        query = first.get("query")
+        if not isinstance(query, str) or not query:
+            return {"status": "unknown", "reason": "no_runnable_first_query"}
+        query_sha = hashlib.sha256((self.header + query).encode()).hexdigest()
+        try:
+            first_result, record = self.query(query, "first-query")
+            correct, _, _ = score_sets(self.gold(q), first_result, self.check)
+            return {
+                "status": "correct" if correct else "incorrect",
+                "reason": "complete_strict_comparison",
+                "querySha256": query_sha,
+                "execution": record,
+            }
+        except OfflinePolicy:
+            return {
+                "status": "unknown",
+                "reason": "offline_policy_exclusion",
+                "querySha256": query_sha,
+            }
+        except (Invalid, OSError):
+            return {
+                "status": "unknown",
+                "reason": "probe_incomplete",
+                "querySha256": query_sha,
+                "execution": self.last_record,
+            }
+
     def score(self, q, out):
-        """Whether the answer is correct, and its precision, recall and F1."""
-        kind = q["kind"]
-        outcome = out.get("outcome")
-        if kind == "clarify":
-            ok = outcome == "clarify"
-            return ok, (1.0 if ok else 0.0,) * 3
-        if kind == "unanswerable":
-            ok = outcome in ("unanswerable", "empty")
-            return ok, (1.0 if ok else 0.0,) * 3
-        query = (out.get("result") or {}).get("query")
-        if outcome not in ("answered", "empty") or not query:
-            return False, (0.0, 0.0, 0.0)
+        kind, outcome = q["kind"], out.get("outcome")
+        if kind in ("clarify", "unanswerable"):
+            ok = outcome == kind
+            return ok, (float(ok),) * 3, {"kind": kind}
+        first = self.first_draft(q, out)
         gold = self.gold(q)
-        got = self.query(query)
-        if gold is None or got is None:
-            return False, (0.0, 0.0, 0.0)
-        return gold == got, prf(gold, got)
+
+        def failure(status):
+            detail = (
+                {"kind": "ask", "match": False}
+                if type(gold) is bool
+                else {
+                    "kind": "select",
+                    "intersection": 0,
+                    "goldRows": len(gold.rows),
+                    "gotRows": 0,
+                }
+            )
+            detail.update(status=status, firstDraft=first)
+            return False, (0.0, 0.0, 0.0), detail
+
+        query = (out.get("result") or {}).get("query")
+        if outcome not in ("answered", "empty"):
+            return failure("pipeline_" + str(outcome))
+        if not isinstance(query, str) or not query:
+            return failure("missing_query")
+        try:
+            got, _ = self.query(query)
+        except Invalid:
+            return failure("candidate_query_failure")
+        ok, scores, detail = score_sets(gold, got, self.check)
+        detail["firstDraft"] = first
+        return ok, scores, detail
 
 
-def steps(out, role):
-    return [s for s in out.get("usage", {}).get("steps", []) if s.get("role") == role]
+def ratio(n, d):
+    return {"numerator": n, "denominator": d, "value": n / d if d else None}
 
 
 def summarize_pair(pair, qs, answers, scores):
-    rows = []
     n = len(qs)
-    cost = sum(a.get("usage", {}).get("estimatedCost", 0) or 0 for a in answers)
-    tin = sum(a.get("usage", {}).get("inputTokens", 0) for a in answers)
-    tout = sum(a.get("usage", {}).get("outputTokens", 0) for a in answers)
-    correct = sum(1 for s in scores if s[0])
-
-    def calls(role):
-        ss = [s for a in answers for s in steps(a, role)]
-        lat = [s["latencyMs"] for s in ss]
-        valid = [s for s in ss if s.get("outcome") == "ok" and s.get("requests") == 1]
-        return {
-            "calls": len(ss),
-            "validOutput": round(len(valid) / len(ss), 3) if ss else None,
-            "latencyP50Ms": statistics.median(lat) if lat else None,
-            "latencyP95Ms": percentile(lat, 95),
-        }
-
-    def by_bucket(pred):
-        out = {}
-        for b in ("simple", "medium", "complex"):
-            idx = [i for i, q in enumerate(qs) if q["kind"] == "answerable" and bucket(q.get("complexity")) == b]
-            if idx:
-                out[b] = round(sum(1 for i in idx if pred(i)) / len(idx), 3)
-        return out
-
     answerable = [i for i, q in enumerate(qs) if q["kind"] == "answerable"]
-    first_ok = lambda i: scores[i][0] and answers[i].get("result", {}).get("attempt") == 1
-    final_ok = lambda i: scores[i][0]
+    correct = sum(scores[i][0] for i in answerable)
+    invoked = [
+        i
+        for i in answerable
+        if (answers[i].get("result") or {}).get("attempt", 1) > 1
+        or any(a.get("role") == "repair" for a in answers[i].get("attempts", []))
+        or any(
+            s.get("role") == "repair"
+            for s in (answers[i].get("usage") or {}).get("steps", [])
+        )
+    ]
+    failed_first = [
+        i
+        for i in answerable
+        if scores[i][2].get("firstDraft", {}).get("status") == "incorrect"
+    ]
+    unknown_first = [
+        i
+        for i in answerable
+        if scores[i][2].get("firstDraft", {}).get("status", "unknown") == "unknown"
+    ]
+    repaired = [i for i in invoked if scores[i][0] and i in failed_first]
+    costs = [(a.get("usage") or {}).get("estimatedCost") for a in answers]
+    cost = (
+        sum(costs)
+        if all(type(v) in (int, float) and math.isfinite(v) and v >= 0 for v in costs)
+        and all(a.get("cliEstimatedCostKnown", True) for a in answers)
+        else None
+    )
     clar = [i for i, a in enumerate(answers) if a.get("outcome") == "clarify"]
-    unans = [i for i, q in enumerate(qs) if q["kind"] == "unanswerable"]
-    finals = [a for a in answers if (a.get("result") or {}).get("query")]
-    valid_query = [a for a in finals if not any(i.get("severity") == "error" for i in (a["result"].get("issues") or []))]
-    common = {
-        "pair": pair,
-        "questions": n,
-        "inputTokensPerQuestion": round(tin / n, 1) if n else None,
-        "outputTokensPerQuestion": round(tout / n, 1) if n else None,
-        "costPerQuestion": round(cost / n, 6) if n else None,
-        "costPerCorrect": round(cost / correct, 6) if correct else None,
-    }
-    rows.append({
-        **common,
-        "role": "draft",
-        "accuracy": round(sum(1 for i in answerable if first_ok(i)) / len(answerable), 3) if answerable else None,
-        "byComplexity": by_bucket(first_ok),
-        "f1": round(statistics.mean(scores[i][1][2] for i in answerable), 3) if answerable else None,
-        "validQueryRate": round(len(valid_query) / len(finals), 3) if finals else None,
-        "clarificationPrecision": round(sum(1 for i in clar if qs[i]["kind"] == "clarify") / len(clar), 3) if clar else None,
-        "refusalAccuracy": round(sum(1 for i in unans if scores[i][0]) / len(unans), 3) if unans else None,
-        **calls("draft"),
-    })
-    failed_first = [i for i in answerable if answers[i].get("result", {}).get("attempt", 1) > 1 or not first_ok(i)]
-    rows.append({
-        **common,
-        "role": "repair",
-        "accuracy": round(sum(1 for i in failed_first if final_ok(i)) / len(failed_first), 3) if failed_first else None,
-        "byComplexity": by_bucket(final_ok),
-        "finalAccuracy": round(sum(1 for i in answerable if final_ok(i)) / len(answerable), 3) if answerable else None,
-        **calls("repair"),
-    })
-    sums = [a["summary"] for a in answers if a.get("summary")]
-    rows.append({
-        **common,
-        "role": "summarize",
-        "accuracy": round(sum(1 for s in sums if s.get("citations") and not s.get("uncited")) / len(sums), 3) if sums else None,
-        "byComplexity": {},
-        **calls("summarize"),
-    })
-    return rows
+    refusal = [i for i, q in enumerate(qs) if q["kind"] == "unanswerable"]
+    selects = [scores[i][2] for i in answerable if scores[i][2]["kind"] == "select"]
+    common = sum(s["intersection"] for s in selects)
+    pden, rden = sum(s["gotRows"] for s in selects), sum(s["goldRows"] for s in selects)
+    return [
+        {
+            "pair": pair,
+            "role": "demo-pipeline",
+            "questions": n,
+            "executionAccuracy": ratio(correct, len(answerable)),
+            "endToEndSuccess": ratio(sum(s[0] for s in scores), n),
+            "repairRate": ratio(len(repaired), len(answerable)),
+            "repairConditional": ratio(len(repaired), len(failed_first)),
+            "repairInvoked": ratio(len(invoked), len(answerable)),
+            "firstDraftUnknown": ratio(len(unknown_first), len(answerable)),
+            "firstDraftIncorrect": ratio(len(failed_first), len(answerable)),
+            "clarificationPrecision": ratio(
+                sum(qs[i]["kind"] == "clarify" for i in clar), len(clar)
+            ),
+            "refusalAccuracy": ratio(sum(scores[i][0] for i in refusal), len(refusal)),
+            "macroPrecision": statistics.mean(scores[i][1][0] for i in answerable)
+            if answerable
+            else None,
+            "macroRecall": statistics.mean(scores[i][1][1] for i in answerable)
+            if answerable
+            else None,
+            "macroF1": statistics.mean(scores[i][1][2] for i in answerable)
+            if answerable
+            else None,
+            "microPrecision": ratio(common, pden),
+            "microRecall": ratio(common, rden),
+            "askExact": ratio(
+                sum(scores[i][0] for i in answerable if scores[i][2]["kind"] == "ask"),
+                sum(scores[i][2]["kind"] == "ask" for i in answerable),
+            ),
+            "byComplexity": {
+                b: ratio(
+                    sum(
+                        scores[i][0]
+                        for i in answerable
+                        if bucket(qs[i].get("complexity")) == b
+                    ),
+                    sum(bucket(qs[i].get("complexity")) == b for i in answerable),
+                )
+                for b in ("simple", "medium", "complex")
+            },
+            "repairByComplexity": {
+                b: ratio(
+                    sum(bucket(qs[i].get("complexity")) == b for i in repaired),
+                    sum(bucket(qs[i].get("complexity")) == b for i in answerable),
+                )
+                for b in ("simple", "medium", "complex")
+            },
+            "cliEstimatedCostUSD": cost,
+            "citationChecks": "unjudged",
+            "cliInputTokens": sum(
+                (a.get("usage") or {}).get("inputTokens", 0) for a in answers
+            ),
+            "cliOutputTokens": sum(
+                (a.get("usage") or {}).get("outputTokens", 0) for a in answers
+            ),
+        }
+    ]
 
 
 def cascade_config(args, pairs, out_dir):
-    """A copy of the model configuration whose role lists are `pairs` in order."""
-    cfg = json.loads(pathlib.Path(args.model_config).read_text())
-    lst = [{"provider": p.split("/", 1)[0], "model": p.split("/", 1)[1]} for p in pairs]
-    roles = cfg.setdefault("models", {}).setdefault("roles", {})
-    for role in ("draft", "repair", "summarize"):
-        roles[role] = lst
+    cfg = strict_json(bounded_file(args.model_config, 1024 * 1024))
+    roles = {
+        r: [dict(zip(("provider", "model"), p.split("/"))) for p in pairs]
+        for r in ("draft", "repair", "summarize")
+    }
+    cfg["models"]["roles"] = roles
     path = out_dir / "cascade-models.json"
-    path.write_text(json.dumps(cfg, indent=1))
+    with path.open("x") as f:
+        json.dump(cfg, f)
     return str(path)
 
 
-def cascade(pairs, qs, answers, scores):
-    """The cascade row from real escalation runs: who wrote each answer, and why it moved."""
-    answered_by = {p: 0 for p in pairs}
-    answered_by["none"] = 0
-    signals = {}
-    moved = 0
-    for a in answers:
-        u = a.get("usage", {})
-        ab = u.get("answeredBy") or {}
-        who = f"{ab.get('provider')}/{ab.get('model')}" if ab else "none"
-        answered_by[who if who in answered_by else "none"] += 1
-        esc = u.get("escalations") or []
-        moved += bool(esc)
-        for e in esc:
-            key = f"{e.get('role')} {e.get('signal')}"
-            signals[key] = signals.get(key, 0) + 1
-    if not answered_by["none"]:
-        del answered_by["none"]
-    n = len(qs)
-    cost = sum(a.get("usage", {}).get("estimatedCost", 0) or 0 for a in answers)
-    correct = sum(1 for s in scores if s[0])
-    answerable = [i for i, q in enumerate(qs) if q["kind"] == "answerable"]
-    return {
-        "pair": " > ".join(pairs),
-        "role": "cascade",
-        "questions": n,
-        "accuracy": round(correct / n, 3) if n else None,
-        "answeredBy": {p: round(c / n, 3) for p, c in answered_by.items()},
-        "escalated": round(moved / n, 3) if n else None,
-        "escalations": signals,
-        "costPerQuestion": round(cost / n, 6) if n else None,
-        "costPerCorrect": round(cost / correct, 6) if correct else None,
-        "answerable": len(answerable),
-    }
-
-
-def fmt(v):
-    if v is None:
-        return "–"
-    if isinstance(v, float):
-        return f"{v:.4g}"
-    if isinstance(v, dict):
-        return ", ".join(f"{k} {fmt(x)}" for k, x in v.items()) or "–"
-    return str(v)
-
-
-def markdown(report):
-    lines = [
-        f"# eval-ask on {report['set']}",
-        "",
-        f"{report['questions']} questions, run on {report['started']}.",
-        "",
-        "| Pair | Role | Accuracy | By complexity | Valid output | p50 ms | p95 ms | Tokens in/out per question | Cost per question | Cost per correct |",
-        "|---|---|---|---|---|---|---|---|---|---|",
+def finish_run(report, out_dir, runner, error=None):
+    report["complete"] = error is None and report["executed"] == report["planned"]
+    report["error"] = error
+    report["unattempted"] = report["planned"] - report["attempted"]
+    report["goldUnattemptedIds"] = [
+        i
+        for i in report["goldPlannedIds"]
+        if i not in {r["id"] for r in report["goldPreflight"]}
     ]
-    for r in report["rows"]:
-        lines.append(
-            f"| {r['pair']} | {r['role']} | {fmt(r.get('accuracy'))} | {fmt(r.get('byComplexity'))} | "
-            f"{fmt(r.get('validOutput'))} | {fmt(r.get('latencyP50Ms'))} | {fmt(r.get('latencyP95Ms'))} | "
-            f"{fmt(r.get('inputTokensPerQuestion'))}/{fmt(r.get('outputTokensPerQuestion'))} | "
-            f"{fmt(r.get('costPerQuestion'))} | {fmt(r.get('costPerCorrect'))} |"
+    report["phaseElapsedSeconds"] = time.monotonic() - report.pop("_started")
+    if runner.gate:
+        runner.gate.set_case(None)
+        report["gate"] = runner.gate.wallet.snapshot_report()
+        report["gate"]["upstreamDispatchInvocations"] = runner.gate.attempts
+        report["gate"]["validInboundRequests"] = runner.gate.received
+        report["gate"]["blockedRequests"] = runner.gate.received - runner.gate.attempts
+        if report["gate"]["stopped"] or report["gate"]["unresolvedUpperNanodollars"]:
+            report["complete"] = False
+    with (out_dir / "report.json").open("x") as f:
+        json.dump(report, f, indent=2)
+        f.write("\n")
+    with (out_dir / "report.md").open("x") as f:
+        f.write(
+            "# Initial Ask demo pipelines\n\nStrict RDF-term accuracy uses rdf-term-set-global-columns-v1.\n\n"
         )
-    c = report.get("cascade")
-    if c:
-        lines.append(
-            f"| {c['pair']} | cascade | {fmt(c['accuracy'])} | answered by: {fmt(c['answeredBy'])} | – | – | – | – | "
-            f"{fmt(c['costPerQuestion'])} | {fmt(c['costPerCorrect'])} |"
+        f.write(
+            "The run is "
+            + ("complete" if report["complete"] else "incomplete")
+            + ". Role accuracy and public corpus alignment remain unmeasured.\n"
         )
-    if c:
-        lines += [
-            "",
-            f"The cascade escalated {fmt(c['escalated'])} of the questions. Escalations by role and signal: "
-            f"{fmt(c['escalations'])}.",
-        ]
-    lines += ["", "Draft rows also report:", ""]
-    for r in report["rows"]:
-        if r["role"] == "draft":
-            lines.append(
-                f"- {r['pair']}: F1 {fmt(r.get('f1'))}, valid-query rate {fmt(r.get('validQueryRate'))}, "
-                f"clarification precision {fmt(r.get('clarificationPrecision'))}, refusal accuracy {fmt(r.get('refusalAccuracy'))}."
-            )
-    return "\n".join(lines) + "\n"
-
-
-def run_matrix(args):
-    qset = json.loads(pathlib.Path(args.set).read_text())
-    qs = qset["questions"]
-    if args.only:
-        keep = set(args.only.split(","))
-        qs = [q for q in qs if q["id"] in keep]
-    out_dir = pathlib.Path(args.out or tempfile.mkdtemp(prefix="sparkles-eval-ask-")).resolve()
-    if out_dir == ROOT or ROOT in out_dir.parents:
-        sys.exit(f"eval-ask: --out {out_dir} is inside the repository; write reports elsewhere")
-    (out_dir / "answers").mkdir(parents=True, exist_ok=True)
-    runner = Runner(args, qset)
-    runs = {}
-    for pair in args.pair:
-        with concurrent.futures.ThreadPoolExecutor(args.jobs) as ex:
-            answers = list(ex.map(lambda q: runner.ask(pair, q), qs))
-        scores = [runner.score(q, a) for q, a in zip(qs, answers)]
-        runs[pair] = {"answers": answers, "scores": scores}
-        safe = pair.replace("/", "_").replace(":", "_")
-        (out_dir / "answers" / f"{safe}.json").write_text(
-            json.dumps([{"id": q["id"], "correct": s[0], "answer": a} for q, a, s in zip(qs, answers, scores)], indent=1)
-        )
-        print(f"eval-ask: {pair}: {sum(s[0] for s in scores)}/{len(qs)} correct", file=sys.stderr)
-    rows = [r for p in args.pair for r in summarize_pair(p, qs, runs[p]["answers"], runs[p]["scores"])]
-    casc = None
-    if len(args.pair) > 1:
-        cfg = cascade_config(args, args.pair, out_dir)
-        with concurrent.futures.ThreadPoolExecutor(args.jobs) as ex:
-            answers = list(ex.map(lambda q: runner.ask(None, q, cfg), qs))
-        scores = [runner.score(q, a) for q, a in zip(qs, answers)]
-        (out_dir / "answers" / "cascade.json").write_text(
-            json.dumps([{"id": q["id"], "correct": s[0], "answer": a} for q, a, s in zip(qs, answers, scores)], indent=1)
-        )
-        casc = cascade(args.pair, qs, answers, scores)
-        print(f"eval-ask: cascade: {sum(s[0] for s in scores)}/{len(qs)} correct", file=sys.stderr)
-    report = {
-        "set": str(args.set),
-        "questions": len(qs),
-        "started": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "pairs": args.pair,
-        "rows": rows,
-        "cascade": casc,
-    }
-    (out_dir / "report.json").write_text(json.dumps(report, indent=1))
-    (out_dir / "report.md").write_text(markdown(report))
-    print(f"eval-ask: report in {out_dir}", file=sys.stderr)
     return out_dir, report
 
 
-class MockProvider(BaseHTTPRequestHandler):
-    """An OpenAI-protocol provider with the models `oracle` and `weak`."""
-
-    gold = {}
-    kinds = {}
-
-    def log_message(self, *a):
-        pass
-
-    def do_POST(self):
-        body = json.loads(self.rfile.read(int(self.headers.get("content-length", 0))) or b"{}")
-        msgs = body.get("messages", [])
-        system = msgs[0]["content"] if msgs else ""
-        user = msgs[-1]["content"] if msgs else ""
-        if "rows of a query result" in system:
-            content = {"text": "The result answers the question [1].", "citations": [1]}
-        else:
-            q = user.split("\n", 1)[0].removeprefix("Question: ").strip()
-            content = {
-                "query": "",
-                "explanation": "",
-                "assumptions": [],
-                "clarify": {"question": "", "choices": []},
-                "graph": {"subject": "", "predicate": "", "object": ""},
-            }
-            kind = self.kinds.get(q, "answerable")
-            if body.get("model") == "weak":
-                # every other question gets a class the data lacks, which fails the check
-                bad = sum(map(ord, q)) % 2 == 0
-                content["query"] = "SELECT ?s WHERE { ?s a ex:Teem }" if bad else "SELECT ?s WHERE { ?s a ex:Team } LIMIT 1"
-                content["explanation"] = "One team."
-            elif kind == "clarify":
-                content["query"] = "SELECT ?s WHERE { ?s a ex:Team }"
-                content["clarify"] = {"question": "Which reading?", "choices": ["the first", "the second"]}
-            elif kind == "unanswerable":
-                content["explanation"] = "The data cannot answer this."
-            else:
-                content["query"] = self.gold.get(q, "")
-                content["explanation"] = "The gold query."
-        out = json.dumps({
-            "choices": [{"message": {"role": "assistant", "content": json.dumps(content)}, "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": len(user) // 4, "completion_tokens": 40},
-        }).encode()
-        self.send_response(200)
-        self.send_header("content-type", "application/json")
-        self.send_header("content-length", str(len(out)))
-        self.end_headers()
-        self.wfile.write(out)
-
-
-def self_test(args):
-    qset = json.loads(pathlib.Path(args.set).read_text())
-    MockProvider.gold = {q["question"]: q.get("gold", "") for q in qset["questions"]}
-    MockProvider.kinds = {q["question"]: q["kind"] for q in qset["questions"]}
-    srv = ThreadingHTTPServer(("127.0.0.1", 0), MockProvider)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    tmp = pathlib.Path(tempfile.mkdtemp(prefix="sparkles-eval-ask-self-test-"))
-    cfg = {
-        "models": {
-            "providers": {
-                "mock": {
-                    "kind": "openai",
-                    "endpoint": f"http://127.0.0.1:{srv.server_address[1]}",
-                    "models": {
-                        "oracle": {"pricing": {"inputPerMTok": 1.0, "outputPerMTok": 5.0}},
-                        "weak": {"pricing": {"inputPerMTok": 0.1, "outputPerMTok": 0.5}},
-                    },
-                }
-            },
-            "roles": {"draft": [{"provider": "mock", "model": "weak"}]},
-        }
+def run_matrix(args, gate=None, prepared=None):
+    started = time.monotonic()
+    qset, out_dir = prepared or validate_args(args)
+    qs = qset["questions"]
+    runner = Runner(args, qset, out_dir, gate, started + args.phase_deadline)
+    report = {
+        "schema": 2,
+        "mode": "demo-pipeline",
+        "scoringPolicy": "rdf-term-set-global-columns-v1",
+        "set": str(args.set),
+        "setSha256": digest(args.set),
+        "dataSha256": digest(runner.data),
+        "binary": args.sparkles,
+        "binarySha256": digest(args.sparkles),
+        "modelConfigSha256": digest(args.model_config),
+        "evaluatorSha256": digest(__file__),
+        "supportSha256": digest(ROOT / "testsuite/ask/eval_support/evaluator.py"),
+        "questions": len(qs),
+        "selectedQuestionIds": [q["id"] for q in qs],
+        "pairs": args.pair,
+        "planned": len(qs) * (len(args.pair) + int(len(args.pair) > 1)),
+        "executed": 0,
+        "attempted": 0,
+        "attemptedCases": [],
+        "scored": 0,
+        "rows": [],
+        "cases": [],
+        "goldPreflight": [],
+        "goldPlannedIds": [q["id"] for q in qs if q["kind"] == "answerable"],
+        "_started": started,
     }
-    (tmp / "models.json").write_text(json.dumps(cfg))
-    args.model_config = str(tmp / "models.json")
-    args.pair = ["mock/weak", "mock/oracle"]
-    args.out = str(tmp / "report")
-    out_dir, report = run_matrix(args)
-    srv.shutdown()
-    rows = {(r["pair"], r["role"]): r for r in report["rows"]}
-    for p in args.pair:
-        for role in ("draft", "repair", "summarize"):
-            assert (p, role) in rows, (p, role)
-    oracle = rows[("mock/oracle", "draft")]
-    assert oracle["accuracy"] == 1.0, oracle
-    assert oracle["refusalAccuracy"] == 1.0 and oracle["clarificationPrecision"] == 1.0, oracle
-    assert set(oracle["byComplexity"]) >= {"simple", "medium", "complex"}, oracle
-    assert oracle["validOutput"] == 1.0 and oracle["latencyP95Ms"] is not None, oracle
-    assert oracle["costPerQuestion"] > 0 and oracle["costPerCorrect"] > 0, oracle
-    assert rows[("mock/weak", "draft")]["accuracy"] < 0.2, rows[("mock/weak", "draft")]
-    c = report["cascade"]
-    assert abs(sum(c["answeredBy"].values()) - 1) < 0.01, c
-    assert c["answeredBy"].get("mock/weak", 0) > 0 and c["answeredBy"].get("mock/oracle", 0) > 0, c
-    assert c["escalated"] > 0 and any(k.endswith("check-failed") for k in c["escalations"]), c
-    assert c["accuracy"] > rows[("mock/weak", "draft")]["accuracy"], c
-    assert rows[("mock/weak", "repair")]["calls"] > 0, rows[("mock/weak", "repair")]
-    assert (out_dir / "report.md").read_text().count("| mock/") >= 6
-    print(f"eval-ask: self-test passed ({out_dir})", file=sys.stderr)
+    try:
+        for q in qs:
+            if q["kind"] == "answerable":
+                try:
+                    gold = runner.gold(q)  # All gold is validated before the first Ask.
+                except (Invalid, OSError) as error:
+                    report["goldPreflight"].append(
+                        {
+                            "id": q["id"],
+                            "status": "failed",
+                            "reason": type(error).__name__,
+                            "execution": runner.last_record,
+                        }
+                    )
+                    raise
+                report["goldPreflight"].append(
+                    {
+                        "id": q["id"],
+                        "status": "complete",
+                        "querySha256": hashlib.sha256(
+                            (runner.header + q["gold"]).encode()
+                        ).hexdigest(),
+                        "empty": not gold.rows if hasattr(gold, "rows") else False,
+                    }
+                )
+        matrix = [(p, None) for p in args.pair]
+        if len(args.pair) > 1:
+            matrix.append(
+                (" > ".join(args.pair), cascade_config(args, args.pair, out_dir))
+            )
+        for pair, cfg in matrix:
+            answers, scores = [], []
+            for q in qs:
+                runner.check()
+                case_id = hashlib.sha256(
+                    json.dumps(
+                        [pair, q["id"]], separators=(",", ":"), ensure_ascii=False
+                    ).encode()
+                ).hexdigest()
+                if gate:
+                    gate.set_case(case_id)
+                report["attempted"] += 1
+                report["attemptedCases"].append(
+                    {"case": case_id, "pair": pair, "id": q["id"]}
+                )
+                runner.last_record = None
+                try:
+                    answer = runner.ask(None if cfg else pair, q, cfg)
+                except (Invalid, OSError):
+                    report["failedCase"] = {
+                        "case": case_id,
+                        "id": q["id"],
+                        "execution": runner.last_record,
+                    }
+                    raise
+                finally:
+                    if runner.last_record and "pid" in runner.last_record:
+                        report["executed"] += 1
+                if gate:
+                    gate.set_case(
+                        None
+                    )  # Waits for actual in-flight reservation/settlement.
+                    runner.check()
+                score = runner.score(q, answer)
+                report["scored"] += 1
+                answers.append(answer)
+                scores.append(score)
+                report["cases"].append(
+                    {
+                        "case": case_id,
+                        "pair": pair,
+                        "id": q["id"],
+                        "correct": score[0],
+                        "prf": score[1],
+                        "detail": score[2],
+                    }
+                )
+                with (out_dir / (case_id + ".json")).open("x") as f:
+                    json.dump(
+                        {"id": q["id"], "answer": answer, "score": score}, f, indent=2
+                    )
+            report["rows"] += summarize_pair(pair, qs, answers, scores)
+        runner.check()
+        return finish_run(report, out_dir, runner)
+    except (Invalid, OSError) as error:
+        # No raw subprocess/provider exception or environment is published here.
+        return finish_run(report, out_dir, runner, type(error).__name__)
+
+
+def parse_args(argv=None):
+    ap = argparse.ArgumentParser(
+        description=(__doc__ or "Initial Ask evaluator").split("\n")[0]
+    )
+    ap.add_argument("--model-config")
+    ap.add_argument("--model-secret", action="append", default=[])
+    ap.add_argument("--pair", action="append", default=[])
+    ap.add_argument("--set", default=str(DEFAULT_SET))
+    ap.add_argument("--out")
+    ap.add_argument("--sparkles", required=True)
+    ap.add_argument("--sparkles-sha256")
+    ap.add_argument("--jobs", type=int, default=1)
+    ap.add_argument("--deadline", type=float, default=30)
+    ap.add_argument("--timeout", type=float, default=5)
+    ap.add_argument("--phase-deadline", type=float, default=900)
+    ap.add_argument("--only")
+    ap.add_argument("--allow-loopback", action="store_true")
+    ap.add_argument("--self-test", action="store_true")
+    return ap.parse_args(argv)
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--model-config")
-    ap.add_argument("--model-secret", action="append", default=[])
-    ap.add_argument("--pair", action="append", default=[], help="PROVIDER/MODEL, in cascade order")
-    ap.add_argument("--set", default=str(DEFAULT_SET))
-    ap.add_argument("--out")
-    ap.add_argument("--sparkles", default=str(ROOT / "target" / "release" / "sparkles"))
-    ap.add_argument("--jobs", type=int, default=4)
-    ap.add_argument("--deadline", type=float, default=120)
-    ap.add_argument("--only", help="comma-separated question ids")
-    ap.add_argument("--self-test", action="store_true")
-    args = ap.parse_args()
-    if not os.path.exists(args.sparkles):
-        alt = ROOT / "target" / "debug" / "sparkles"
-        if alt.exists():
-            args.sparkles = str(alt)
-        else:
-            sys.exit(f"eval-ask: no sparkles binary at {args.sparkles}; build it or pass --sparkles")
+    args = parse_args()
     if args.self_test:
-        self_test(args)
-        return
-    if not args.model_config or not args.pair:
-        sys.exit("eval-ask: --model-config and at least one --pair are required")
-    run_matrix(args)
+        from cli_checks import self_test
+
+        return self_test(args)
+    _, report = run_matrix(args)
+    return 0 if report["complete"] else 2
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        sys.exit(main())
+    except (Invalid, OSError):
+        print("eval-ask: refused invalid setup", file=sys.stderr)
+        sys.exit(2)

@@ -3898,9 +3898,20 @@ built.
   organisation graph, which `testsuite/ask/org.ttl` keeps as Turtle. There are 59
   answerable questions with gold queries in seven categories, four that need a
   clarification and five that the data cannot answer. A test runs every gold query
-  and checks its stored complexity. `scripts/eval-ask` runs the matrix of §11.4 and
-  writes its report outside the repository, and `--self-test` runs it against a mock
-  provider (A43).
+  and checks its stored complexity. The initial `scripts/eval-ask` report now uses
+  one whole-pipeline row per pair and a separate real cascade. Schema 2 reports
+  strict RDF-term row-set precision and recall under one global column mapping,
+  separate answerable, clarification and refusal denominators, and bounded child
+  execution statuses. A bounded first-draft query probe distinguishes an actually
+  failed first draft from repair invocation. Incomplete probes stay unknown and
+  outside the conditional repair denominator. Gold preflight must succeed before any model call. Reports
+  require a new output directory and an exact pinned binary. The private
+  `scripts/eval-ask-anthropic` owner requires separate runtime admission and keeps
+  one durable aggregate USD25 wallet across models and retries. Uncertain billing
+  retains its full reservation and stops further dispatch. Credential-free tests
+  exercise the retained CLI against a loopback fake provider. They establish
+  execution and accounting controls, not real accuracy or provider behavior.
+  Independent role experiments and public corpus alignment remain roadmap item 6.
 - **Access.** `sparkles auth grant --template agent` prints the grants of §8.6 (A30).
   The rule of §8.8 that the `agent_memory` prompt adds is the constant
   `mcp::context::UNREVIEWED_RULE`, which `ask_graph` already includes.
@@ -4750,7 +4761,18 @@ not change it.
 **Item 6: Ask measured on QALD and LC-QuAD, with numbers per model.** §11.1 already
 plans QALD-9-plus over DBpedia and Text2SPARQL'25, and `scripts/eval-ask` already runs
 the matrix of §11.4 on the demo set of `testsuite/ask/demo.json`, with `--self-test`
-against a mock provider. What is missing is a run with real models and the published
+against a mock provider. Its offline scorer refuses SERVICE before a query child
+starts, including after CR, LF and CRLF comment endings. An excluded first draft
+remains unknown and does not enter the conditional failed-first denominator. The
+initial spending gate requires a status permitting response content and complete,
+unique Content-Length response framing before settlement. It refuses 204 and 205
+before reading a body because neither can supply the required usage response. It
+enforces a cumulative 64 KiB bound on raw status and header
+bytes across informational and final responses. Truncated or ambiguous framing
+keeps the full reservation unresolved and stops dispatch. Valid chunked and
+close-delimited responses are also refused because this transport supports only
+Content-Length framing. A nonstreaming request does not guarantee that framing
+from a provider. What is missing is a run with real models and the published
 numbers. The follow-up:
 
 - Run the matrix of §11.4 with real providers on the demo set, QALD-9-plus (DBpedia
