@@ -318,6 +318,10 @@ that work by priority and links each item to its design spec.
   office formats, images or audio. Scanned PDF pages need a build with `pdf-ocr` and
   OCR models from the operator. A CSV mapping draft names its own IRIs for the values
   of IRI columns and does not link them to existing entities. [Roadmap](ROADMAP.md) items 15, 77.
+* **Memory representation.** Sources, cited assertions, sessions and imported memory
+  already have a representation. There is no shared profile connecting these to personal
+  notes, decisions and tasks with explicit evidence, dependency and validity semantics.
+  [Roadmap](ROADMAP.md) item 81.
 * **History.** A past state can be read only while a
   retained generation holds it, even when the change log has its changes. A bulk
   commit into a non-empty dataset is recorded in the change log with its counts only when
