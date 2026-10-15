@@ -91,10 +91,22 @@ impl<T> Buffer<T> {
     pub(crate) fn new(name: &'static str, capacity: usize, ctl: &Control) -> Result<Self> {
         let charge = Reservation::new(ctl, bytes::<T>(capacity)?)?;
         let values = allocate(name, capacity, ctl)?;
+        #[cfg(test)]
+        probe::at(probe::Point::Physical(
+            name,
+            bytes::<T>(values.capacity())?,
+            true,
+        ));
         Ok(Self { values, charge })
     }
     pub(crate) fn adopt(values: Vec<T>, ctl: &Control) -> Result<Self> {
         let charge = Reservation::new(ctl, bytes::<T>(values.capacity())?)?;
+        #[cfg(test)]
+        probe::at(probe::Point::Physical(
+            "adopt",
+            bytes::<T>(values.capacity())?,
+            true,
+        ));
         Ok(Self { values, charge })
     }
     pub(crate) fn capacity(&self) -> usize {
@@ -192,6 +204,16 @@ impl<T> Buffer<T> {
         values
     }
 }
+#[cfg(test)]
+impl<T> Drop for Buffer<T> {
+    fn drop(&mut self) {
+        probe::at(probe::Point::Physical(
+            "buffer-drop",
+            bytes::<T>(self.values.capacity()).unwrap(),
+            false,
+        ));
+    }
+}
 impl<T> Deref for Buffer<T> {
     type Target = [T];
     fn deref(&self) -> &[T] {
@@ -236,6 +258,7 @@ pub(crate) mod probe {
     #[derive(Clone, Copy, Debug)]
     pub(crate) enum Point {
         Allocation(&'static str, usize),
+        Physical(&'static str, u64, bool),
         Work(&'static str),
         Waiting,
         Initializing,

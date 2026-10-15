@@ -430,8 +430,12 @@ pub fn run(g: &Graph, p: &Params, par: &Par, ctl: &Control) -> Result<Vec<(u32, 
             Err(Failed::Original(error)) => {
                 slot.error = Some(error);
                 stop.store(true, Ordering::Release);
+                #[cfg(test)]
+                probe::at(probe::Event::StopPublished, ctl);
             }
         }
+        #[cfg(test)]
+        probe::at(probe::Event::WorkerDone(slot.lo as usize), ctl);
         Ok(())
     })?;
     for slot in &mut *slots {
@@ -625,6 +629,9 @@ mod probe {
             bytes: u64,
         },
         Work(&'static str),
+        StopPublished,
+        WorkerDone(usize),
+        Physical(&'static str, u64, bool),
     }
     type Callback = Arc<dyn Fn(Event, &Control) + Send + Sync>;
     static HOOK: Mutex<Option<(Control, Callback)>> = Mutex::new(None);
@@ -690,6 +697,9 @@ mod probe {
                     );
                 }
                 super::super::memory::probe::Point::Work(phase) => at(Event::Work(phase), &ctl),
+                super::super::memory::probe::Point::Physical(name, bytes, add) => {
+                    at(Event::Physical(name, bytes, add), &ctl)
+                }
                 _ => {}
             },
             None,
@@ -1353,5 +1363,480 @@ mod owned_tests {
                 }
             },
         );
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::super::testutil::*;
+    use super::*;
+    use std::sync::{Arc, Condvar, Mutex, atomic::AtomicUsize};
+    use std::time::{Duration, Instant};
+    fn isolated(name: &str, f: impl FnOnce()) {
+        super::r8_before::isolated(&format!("regression_tests::{name}"), f);
+    }
+    fn dense() -> Graph {
+        let edges: Vec<_> = (0..450)
+            .flat_map(|u| (450..900).map(move |v| (u, v)))
+            .collect();
+        digraph(900, &edges)
+    }
+    fn bounded(deadline: bool) {
+        let g = dense();
+        let flag = Arc::new(AtomicBool::new(false));
+        let expires = Instant::now() + Duration::from_secs(2);
+        let ctl = Control::new(flag.clone(), deadline.then_some(expires), 1 << 24);
+        let seen = Arc::new(AtomicBool::new(false));
+        let operations = Arc::new(AtomicUsize::new(0));
+        let worker = Arc::new(AtomicBool::new(false));
+        let main = std::thread::current().id();
+        let owner = Arc::new(Mutex::new(None));
+        let peer_done = Arc::new((Mutex::new(false), Condvar::new()));
+        let (seen2, operations2, worker2) = (seen.clone(), operations.clone(), worker.clone());
+        let hook = probe::install(&ctl, move |event, _| {
+            if let probe::Event::WorkerDone(450) = event {
+                *peer_done.0.lock().unwrap() = true;
+                peer_done.1.notify_all();
+            }
+            if let probe::Event::Work(phase) = event {
+                if phase == "similarity-intersections" && !seen2.swap(true, Ordering::SeqCst) {
+                    let (done, wait) = peer_done
+                        .1
+                        .wait_timeout_while(
+                            peer_done.0.lock().unwrap(),
+                            Duration::from_secs(5),
+                            |done| !*done,
+                        )
+                        .unwrap();
+                    assert!(
+                        !wait.timed_out() && *done,
+                        "empty peer must finish before injection"
+                    );
+                    drop(done);
+                    *owner.lock().unwrap() = Some(std::thread::current().id());
+                    if std::thread::current().id() != main
+                        && rayon::current_thread_index().is_some()
+                    {
+                        worker2.store(true, Ordering::SeqCst);
+                    }
+                    if deadline {
+                        if let Some(wait) = expires.checked_duration_since(Instant::now()) {
+                            std::thread::sleep(wait);
+                        }
+                    } else {
+                        flag.store(true, Ordering::SeqCst);
+                    }
+                }
+                if seen2.load(Ordering::SeqCst)
+                    && *owner.lock().unwrap() == Some(std::thread::current().id())
+                {
+                    operations2.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        });
+        // One worker runs a >CHECK_EVERY first source; Rayon is still the actual executor.
+        let result = run(&g, &Params::default(), &Par::with_threads(2), &ctl);
+        drop(hook);
+        assert!(seen.load(Ordering::SeqCst));
+        assert!(
+            worker.load(Ordering::SeqCst),
+            "observer did not reach actual Rayon"
+        );
+        if deadline {
+            assert!(matches!(result, Err(Error::Timeout)), "{result:?}");
+        } else {
+            assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
+        }
+        assert_eq!(ctl.remaining(), 1 << 24);
+        let actual = operations.load(Ordering::SeqCst);
+        println!(
+            "VALIDATION bounded deadline={deadline} operations_after_injection={actual} bound={}",
+            super::super::CHECK_EVERY
+        );
+        assert!(
+            actual <= super::super::CHECK_EVERY,
+            "unbounded work: {actual}"
+        );
+    }
+    #[test]
+    fn cancellation_has_bounded_actual_work() {
+        isolated("cancellation_has_bounded_actual_work", || bounded(false));
+    }
+    #[test]
+    fn timeout_has_bounded_actual_work() {
+        isolated("timeout_has_bounded_actual_work", || bounded(true));
+    }
+
+    #[test]
+    fn peer_error_stops_started_worker_without_caller_cancel() {
+        isolated(
+            "peer_error_stops_started_worker_without_caller_cancel",
+            || {
+                // Both contiguous source ranges have a long first source.
+                let edges: Vec<_> = (0..900)
+                    .flat_map(|u| (900..1350).map(move |v| (u, v)))
+                    .collect();
+                let g = digraph(1350, &edges);
+                let flag = Arc::new(AtomicBool::new(false));
+                let ctl = Control::new(flag.clone(), None, 1 << 25);
+                #[derive(Default)]
+                struct State {
+                    roles: std::collections::HashMap<std::thread::ThreadId, usize>,
+                    peer_started: bool,
+                    stopped: bool,
+                    peer_ops: usize,
+                    threads: std::collections::HashSet<std::thread::ThreadId>,
+                    rayon_workers: usize,
+                }
+                let state = Arc::new((Mutex::new(State::default()), Condvar::new()));
+                let observed = state.clone();
+                let hook = probe::install(&ctl, move |event, _| {
+                    let (lock, cv) = &*observed;
+                    match event {
+                        probe::Event::Worker { slot } => {
+                            let id = std::thread::current().id();
+                            let mut s = lock.lock().unwrap();
+                            s.roles.insert(id, slot);
+                            s.threads.insert(id);
+                            s.rayon_workers += usize::from(rayon::current_thread_index().is_some());
+                            if slot == 0 {
+                                let (s2, wait) = cv
+                                    .wait_timeout_while(s, Duration::from_secs(5), |s| {
+                                        !s.peer_started
+                                    })
+                                    .unwrap();
+                                assert!(!wait.timed_out() && s2.peer_started, "peer never started");
+                            }
+                        }
+                        probe::Event::Work(phase) => {
+                            let id = std::thread::current().id();
+                            let mut s = lock.lock().unwrap();
+                            if s.roles.get(&id) == Some(&675) {
+                                if phase == "similarity-intersections" && !s.peer_started {
+                                    s.peer_started = true;
+                                    cv.notify_all();
+                                    let (s2, wait) = cv
+                                        .wait_timeout_while(s, Duration::from_secs(5), |s| {
+                                            !s.stopped
+                                        })
+                                        .unwrap();
+                                    assert!(
+                                        !wait.timed_out() && s2.stopped,
+                                        "original error never published"
+                                    );
+                                    s = s2;
+                                }
+                                if s.stopped {
+                                    s.peer_ops += 1;
+                                }
+                            }
+                        }
+                        probe::Event::StopPublished => {
+                            let mut s = lock.lock().unwrap();
+                            s.stopped = true;
+                            cv.notify_all();
+                        }
+                        _ => {}
+                    }
+                });
+                let result = run(
+                    &g,
+                    &Params {
+                        max_pairs: 0,
+                        ..Default::default()
+                    },
+                    &Par::with_threads(2),
+                    &ctl,
+                );
+                drop(hook);
+                assert!(result.unwrap_err().to_string().contains("candidate pairs"));
+                assert!(!flag.load(Ordering::SeqCst));
+                assert_eq!(ctl.remaining(), 1 << 25);
+                let s = state.0.lock().unwrap();
+                assert!(s.peer_started && s.stopped && s.threads.len() == 2);
+                assert_eq!(
+                    s.rayon_workers, 2,
+                    "both callbacks must reach actual Rayon jobs"
+                );
+                println!(
+                    "VALIDATION private_stop peer_operations={} bound={} actual_threads={:?} caller_cancel={}",
+                    s.peer_ops,
+                    super::super::CHECK_EVERY,
+                    s.threads,
+                    flag.load(Ordering::SeqCst)
+                );
+                assert!(
+                    s.peer_ops <= super::super::CHECK_EVERY,
+                    "peer polling missing: {}",
+                    s.peer_ops
+                );
+            },
+        );
+    }
+
+    struct Physical {
+        live: AtomicU64,
+        violated: AtomicBool,
+        calls: AtomicUsize,
+        peak: AtomicU64,
+    }
+    fn physical(ctl: &Control, target: &'static str) -> (Arc<Physical>, probe::Scope) {
+        let state = Arc::new(Physical {
+            live: AtomicU64::new(0),
+            violated: AtomicBool::new(false),
+            calls: AtomicUsize::new(0),
+            peak: AtomicU64::new(0),
+        });
+        let observed = state.clone();
+        let hook = probe::install(ctl, move |event, ctl| match event {
+            probe::Event::Physical(name, bytes, add) => {
+                // These symmetric fixtures have only Buffer allocations; no graph/transposition charge.
+                if add {
+                    observed
+                        .live
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_add(bytes))
+                        .expect("physical capacity overflow");
+                } else {
+                    observed
+                        .live
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(bytes))
+                        .expect("physical capacity owner underflow");
+                }
+                let _ = name;
+            }
+            probe::Event::Admission {
+                name,
+                capacity,
+                bytes,
+            } => {
+                let required = observed
+                    .live
+                    .load(Ordering::SeqCst)
+                    .checked_add(bytes)
+                    .expect("physical capacity plus proposal overflow");
+                observed.peak.fetch_max(required, Ordering::SeqCst);
+                if ctl.observed_used() < required {
+                    println!(
+                        "VALIDATION precharge violation {name} capacity={capacity} physical_plus_new={required} charged={}",
+                        ctl.observed_used()
+                    );
+                    observed.violated.store(true, Ordering::SeqCst);
+                }
+                if name == target {
+                    observed.calls.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            _ => {}
+        });
+        (state, hook)
+    }
+    #[test]
+    fn growth_precharges_complete_overlap_and_short_refuses_before_callback() {
+        isolated(
+            "growth_precharges_complete_overlap_and_short_refuses_before_callback",
+            || {
+                let mut violation = false;
+                for short in [false, true] {
+                    // Independent physical capacity: 256 u32 + 4 Pair + replacement 8 Pair.
+                    let required =
+                        256 * std::mem::size_of::<u32>() + 12 * std::mem::size_of::<Pair>();
+                    let budget = required as u64 - u64::from(short);
+                    let ctl = Control::new(Default::default(), None, budget);
+                    let (state, hook) = physical(&ctl, "similarity-worker-output");
+                    let relay = probe::relay(&ctl);
+                    let scratch = Buffer::<u32>::new("similarity-touched", 256, &ctl).unwrap();
+                    let mut output = Buffer::new("similarity-worker-output", 4, &ctl).unwrap();
+                    for i in 0..4 {
+                        output.push((i, i, 1.)).unwrap();
+                    }
+                    state.calls.store(0, Ordering::SeqCst);
+                    let stop = AtomicBool::new(false);
+                    let mut poll = Poll::new(&ctl, &stop).unwrap_or_else(|_| panic!("poll setup"));
+                    let result = grow_output(&mut output, 5, 16, &ctl, &mut poll);
+                    if short {
+                        assert!(matches!(
+                            result,
+                            Err(Failed::Original(Error::BudgetExceeded(_)))
+                        ));
+                        assert_eq!(
+                            state.calls.load(Ordering::SeqCst),
+                            0,
+                            "allocation reached before refusal"
+                        );
+                        assert_eq!(output.capacity(), 4);
+                        assert_eq!(&*output, &[(0, 0, 1.), (1, 1, 1.), (2, 2, 1.), (3, 3, 1.)]);
+                    } else {
+                        assert!(result.is_ok());
+                        assert_eq!(state.calls.load(Ordering::SeqCst), 1);
+                        assert_eq!(output.capacity(), 8);
+                        assert_eq!(&*output, &[(0, 0, 1.), (1, 1, 1.), (2, 2, 1.), (3, 3, 1.)]);
+                    }
+                    drop(output);
+                    drop(scratch);
+                    assert_eq!(ctl.remaining(), budget);
+                    assert_eq!(state.live.load(Ordering::SeqCst), 0);
+                    drop(relay);
+                    drop(hook);
+                    println!(
+                        "VALIDATION growth short={short} independent_required={required} callbacks={} physical_violation={}",
+                        state.calls.load(Ordering::SeqCst),
+                        state.violated.load(Ordering::SeqCst)
+                    );
+                    violation |= state.violated.load(Ordering::SeqCst);
+                }
+                assert!(
+                    !violation,
+                    "physical live-capacity oracle found missing precharge"
+                );
+            },
+        );
+    }
+    #[test]
+    fn concatenation_precharges_all_live_capacities_and_short_refuses_before_callback() {
+        isolated(
+            "concatenation_precharges_all_live_capacities_and_short_refuses_before_callback",
+            || {
+                let mut violation = false;
+                for short in [false, true] {
+                    let g = ugraph(65, &(0..64).map(|u| (u, 64)).collect::<Vec<_>>());
+                    // 64 sources retain 63 rows each. Growth retains capacity4096, final len4032.
+                    // Scratch has already dropped at final allocation; descriptor remains live.
+                    let required = std::mem::size_of::<Workspace>()
+                        + (4096 + 64 * 63) * std::mem::size_of::<Pair>();
+                    let budget = required as u64 - u64::from(short);
+                    let ctl = Control::new(Default::default(), None, budget);
+                    let (state, hook) = physical(&ctl, "similarity-result");
+                    let result = run(
+                        &g,
+                        &Params {
+                            top_k: 64,
+                            ..Default::default()
+                        },
+                        &Par::single(),
+                        &ctl,
+                    );
+                    drop(hook);
+                    if short {
+                        assert!(matches!(result, Err(Error::BudgetExceeded(_))));
+                        assert_eq!(
+                            state.calls.load(Ordering::SeqCst),
+                            0,
+                            "final allocation reached before refusal"
+                        );
+                        assert_eq!(ctl.remaining(), budget);
+                        assert_eq!(state.live.load(Ordering::SeqCst), 0);
+                    } else {
+                        let output = result.unwrap();
+                        assert_eq!(output.len(), 64 * 63);
+                        let expected: Vec<Pair> = (0..64)
+                            .flat_map(|u| (0..64).filter(move |&v| v != u).map(move |v| (u, v, 1.)))
+                            .collect();
+                        assert_eq!(
+                            output, expected,
+                            "complete ordered source/partner/score oracle"
+                        );
+                        assert_eq!(output.capacity(), 4032);
+                        assert_eq!(
+                            budget - ctl.remaining(),
+                            (output.capacity() * std::mem::size_of::<Pair>()) as u64
+                        );
+                        assert_eq!(state.calls.load(Ordering::SeqCst), 1);
+                        assert_eq!(state.peak.load(Ordering::SeqCst), required as u64);
+                        assert_eq!(
+                            state.live.load(Ordering::SeqCst),
+                            (output.capacity() * std::mem::size_of::<Pair>()) as u64
+                        );
+                    }
+                    println!(
+                        "VALIDATION concat short={short} independent_required={required} callbacks={} physical_violation={}",
+                        state.calls.load(Ordering::SeqCst),
+                        state.violated.load(Ordering::SeqCst)
+                    );
+                    violation |= state.violated.load(Ordering::SeqCst);
+                }
+                assert!(
+                    !violation,
+                    "physical live-capacity oracle found missing precharge"
+                );
+            },
+        );
+    }
+    #[test]
+    fn physical_capacity_events_reach_actual_rayon_workers() {
+        isolated(
+            "physical_capacity_events_reach_actual_rayon_workers",
+            || {
+                let g = ugraph(65, &(0..64).map(|u| (u, 64)).collect::<Vec<_>>());
+                let ctl = Control::new(Default::default(), None, 1 << 20);
+                let caller = std::thread::current().id();
+                let threads = Arc::new(Mutex::new(std::collections::HashSet::new()));
+                let seen = threads.clone();
+                let started =
+                    Arc::new((Mutex::new(std::collections::HashSet::new()), Condvar::new()));
+                let hook = probe::install(&ctl, move |event, _| {
+                    if let probe::Event::Worker { .. } = event {
+                        let mut ids = started.0.lock().unwrap();
+                        ids.insert(std::thread::current().id());
+                        started.1.notify_all();
+                        let (ids, timeout) = started
+                            .1
+                            .wait_timeout_while(ids, Duration::from_secs(5), |ids| ids.len() != 2)
+                            .unwrap();
+                        assert!(
+                            !timeout.timed_out() && ids.len() == 2,
+                            "both actual jobs must start before allocation"
+                        );
+                    }
+                    if let probe::Event::Physical("similarity-worker-output", bytes, true) = event {
+                        assert!(bytes > 0);
+                        assert_ne!(std::thread::current().id(), caller);
+                        assert!(rayon::current_thread_index().is_some());
+                        seen.lock().unwrap().insert(std::thread::current().id());
+                    }
+                });
+                let output = run(
+                    &g,
+                    &Params {
+                        top_k: 64,
+                        ..Default::default()
+                    },
+                    &Par::with_threads(2),
+                    &ctl,
+                )
+                .unwrap();
+                drop(hook);
+                let expected: Vec<Pair> = (0..64)
+                    .flat_map(|u| (0..64).filter(move |&v| v != u).map(move |v| (u, v, 1.)))
+                    .collect();
+                assert_eq!(output, expected);
+                assert_eq!(
+                    threads.lock().unwrap().len(),
+                    2,
+                    "each actual Rayon job must relay physical events"
+                );
+                assert_eq!(
+                    (1 << 20) - ctl.remaining(),
+                    (output.capacity() * std::mem::size_of::<Pair>()) as u64
+                );
+                println!(
+                    "R8 physical relay reached two actual Rayon workers; serial tests alone assert complete coherent capacity snapshots"
+                );
+            },
+        );
+    }
+    #[test]
+    fn empty_output_has_zero_physical_capacity() {
+        isolated("empty_output_has_zero_physical_capacity", || {
+            let g = ugraph(3, &[]);
+            let ctl = Control::new(Default::default(), None, 1 << 20);
+            let (state, hook) = physical(&ctl, "similarity-result");
+            let output = run(&g, &Params::default(), &Par::single(), &ctl).unwrap();
+            drop(hook);
+            assert!(output.is_empty());
+            assert_eq!(output.capacity(), 0);
+            assert_eq!(ctl.remaining(), 1 << 20);
+            assert_eq!(state.live.load(Ordering::SeqCst), 0);
+            assert!(!state.violated.load(Ordering::SeqCst));
+        });
     }
 }
