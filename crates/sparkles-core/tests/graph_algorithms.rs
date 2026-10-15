@@ -1516,30 +1516,59 @@ fn concurrent_calls_agree_and_share_the_thread_budget() {
 
 #[test]
 fn r7_cached_incoming_requires_each_call_budget() {
-    let s = projection_cache_store();
+    // Keep the incoming reservation decisive after SERVICE now admits its own
+    // Builder/key/serialization scratch. Four tiny nodes let that scratch dominate.
+    let s = Store::in_memory(StoreOptions {
+        result_cache_bytes: 0,
+        ..Default::default()
+    });
+    let mut ttl = String::from("@prefix ex:<http://ex/>.");
+    for i in 0..2048 {
+        ttl.push_str(&format!("ex:n{} ex:p ex:n{}.\n", 2 * i, 2 * i + 1));
+    }
+    s.load(&[Source::from_bytes(
+        ttl.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
     let warm = "SELECT ?n ?c WHERE { SERVICE algo:wcc { [] algo:predicate ex:p ; algo:direction algo:forward ; algo:node ?n ; algo:component ?c } }";
     let opts = QueryOptions::default();
-    let _ = projection_cache_read(s.snapshot(), warm, &opts);
-    assert_eq!(projection_cache_read(s.snapshot(), warm, &opts).1, 1);
-    let q = format!(
-        "{PREFIXES}SELECT ?n ?r WHERE {{ SERVICE algo:pageRank {{ [] algo:predicate ex:p ; algo:direction algo:forward ; algo:maxMemory 248 ; algo:node ?n ; algo:score ?r }} }}"
+    let first = query(s.snapshot(), &format!("{PREFIXES}{warm}"), &opts).unwrap();
+    assert_eq!(first.rows().len(), 4096);
+    drop(first);
+    let warmed = query(s.snapshot(), &format!("{PREFIXES}{warm}"), &opts).unwrap();
+    assert_eq!(warmed.rows().len(), 4096);
+    assert_eq!(
+        find(&warmed.plan, "AlgoCall")
+            .unwrap()
+            .counters
+            .as_ref()
+            .unwrap()["cachedProjections"],
+        1
     );
-    // Base80 plus five PageRank arrays160 and one partial8 fits248. Incoming48
-    // makes the real peak296. Cold cursor scratch32 ends before PageRank arrays,
-    // so the peak is max(80+48+32,80+48+168), not their cumulative sum328.
-    // This checks combined per-call accounting, not a no-transpose-allocation rule.
+    drop(warmed);
+    let q = format!(
+        "{PREFIXES}SELECT ?n ?r WHERE {{ SERVICE algo:pageRank {{ [] algo:predicate ex:p ; algo:direction algo:forward ; algo:maxMemory 240000 ; algo:node ?n ; algo:score ?r }} }}"
+    );
+    // 4,096 nodes/2,048 edges retain 73,736 base bytes. Five PageRank arrays
+    // and its partial sum need 163,848. The 40,968-byte incoming reservation
+    // raises this actual native boundary beyond 240,000, while query-owned
+    // SERVICE setup and the later result conversion fit without it. Cold incoming
+    // construction scratch ends before the rank arrays. The success limit also
+    // covers all newly admitted SERVICE capacities rather than reusing old 296.
     let cold = query(s.snapshot(), &q, &opts);
     let adequate = query(
         s.snapshot(),
-        &q.replace("algo:maxMemory 248", "algo:maxMemory 296"),
+        &q.replace("algo:maxMemory 240000", "algo:maxMemory 1048576"),
         &opts,
     )
     .unwrap();
-    assert_eq!(adequate.rows().len(), 4);
+    assert_eq!(adequate.rows().len(), 4096);
     let leaf = find(&adequate.plan, "AlgoCall").unwrap();
     assert_eq!(leaf.counters.as_ref().unwrap()["cachedProjections"], 1);
     println!(
-        "R7_ADEQUATE_296 peak_bytes={}",
+        "R7_ADEQUATE_1048576 peak_bytes={}",
         leaf.counters.as_ref().unwrap()["peakBytes"]
     );
     // The successful caller has initialized incoming rows for the next low-budget call.
@@ -1547,17 +1576,22 @@ fn r7_cached_incoming_requires_each_call_budget() {
     // Observe both negatives before asserting so the incoming-only counterfactual
     // records both incorrect successes rather than stopping at the first assertion.
     println!(
-        "R7_COLD_248 success={} budget_exceeded={}",
+        "R7_COLD_240000 success={} budget_exceeded={}",
         cold.is_ok(),
         matches!(&cold, Err(sparkles_core::Error::BudgetExceeded(_)))
     );
     println!(
-        "R7_INITIALIZED_248 success={} budget_exceeded={}",
+        "R7_INITIALIZED_240000 success={} budget_exceeded={}",
         initialized.is_ok(),
         matches!(&initialized, Err(sparkles_core::Error::BudgetExceeded(_)))
     );
-    let unlimited = query(s.snapshot(), &q.replace("algo:maxMemory 248 ; ", ""), &opts).unwrap();
-    assert_eq!(unlimited.rows().len(), 4);
+    let unlimited = query(
+        s.snapshot(),
+        &q.replace("algo:maxMemory 240000 ; ", ""),
+        &opts,
+    )
+    .unwrap();
+    assert_eq!(unlimited.rows().len(), 4096);
     let leaf = find(&unlimited.plan, "AlgoCall").unwrap();
     assert_eq!(leaf.counters.as_ref().unwrap()["cachedProjections"], 1);
     assert_eq!(adequate.rows(), unlimited.rows());
@@ -1781,7 +1815,24 @@ fn r18_blank_endpoints_preserve_canonical_reifier_keys() {
 #[test]
 fn r8_service_workspace_refuses_after_projection_and_incoming_admission() {
     use std::sync::atomic::{AtomicBool, Ordering};
-    let s = store_of("ex:a ex:p ex:b. ex:b ex:p ex:c. ex:c ex:p ex:a.");
+    let s = Store::in_memory(StoreOptions {
+        result_cache_bytes: 0,
+        ..Default::default()
+    });
+    let mut ttl = String::from("@prefix ex:<http://ex/>.");
+    for i in 0..100 {
+        ttl.push_str(&format!("ex:n{i} ex:p ex:n{}.\n", (i + 1) % 100));
+    }
+    s.load(&[Source::from_bytes(
+        ttl.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    // Warm only the forward base. Its incoming rows are still built by the actual
+    // similarity request; a larger fixture separates setup from workspace capacity.
+    let warm = "SELECT ?n ?c WHERE { SERVICE algo:wcc { [] algo:predicate ex:p;algo:direction algo:forward;algo:node ?n;algo:component ?c } }";
+    assert_eq!(rows(&s, warm).len(), 100);
     let incoming = Arc::new(AtomicBool::new(false));
     let seen = incoming.clone();
     sparkles_core::algo::set_projection_observer(Some(Arc::new(move |event| {
@@ -1790,7 +1841,7 @@ fn r8_service_workspace_refuses_after_projection_and_incoming_admission() {
             seen.store(true, Ordering::Relaxed);
         }
     })));
-    let q = "SELECT ?n ?o ?v WHERE { SERVICE algo:nodeSimilarity { [] algo:predicate ex:p;algo:direction algo:forward;algo:concurrency 1;algo:maxMemory 256;algo:node ?n;algo:otherNode ?o;algo:similarity ?v } }";
+    let q = "SELECT ?n ?o ?v WHERE { SERVICE algo:nodeSimilarity { [] algo:predicate ex:p;algo:direction algo:forward;algo:concurrency 1;algo:maxMemory 5300;algo:node ?n;algo:otherNode ?o;algo:similarity ?v } }";
     let result = query(
         s.snapshot(),
         &format!("{PREFIXES}{q}"),
@@ -1805,7 +1856,13 @@ fn r8_service_workspace_refuses_after_projection_and_incoming_admission() {
         result,
         Err(sparkles_core::Error::BudgetExceeded(_))
     ));
-    assert!(rows(&s, &q.replace("algo:maxMemory 256", "algo:maxMemory 8192")).is_empty());
+    assert!(
+        rows(
+            &s,
+            &q.replace("algo:maxMemory 5300", "algo:maxMemory 32768")
+        )
+        .is_empty()
+    );
 }
 
 // R12 weight failures must be typed before output rows can contain invalid ranks.

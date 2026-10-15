@@ -22,7 +22,7 @@
 
 use super::ctx::Ctx;
 use super::plan::{ActiveGraph, GraphFilter, Kind, Node, PT, PathEnd, Planner};
-use super::table::{Table, VarId};
+use super::table::{Materialized, Table, VarId};
 use super::value::Value;
 use crate::algo::graph::OwnedRawEdges;
 use crate::algo::memory::{self, Buffer, Reservation, Work};
@@ -934,64 +934,62 @@ pub(super) fn run(
     input: Option<Table>,
     edges: Option<Table>,
     vars: &[VarId],
-) -> Result<(Table, serde_json::Map<String, serde_json::Value>)> {
+) -> Result<(Materialized, serde_json::Map<String, serde_json::Value>)> {
     let started = Instant::now();
     let limit = spec.num("maxMemory").map_or(u64::MAX, |m| m as u64);
-    let ctl = Control::with_cancellation(
-        ctx.cancel.clone(),
-        ctx.cancellation.clone(),
-        ctx.deadline,
-        limit.min(ctx.memory_remaining()),
-    );
+    let ctl = Control::for_query(ctx, limit)?;
     let par = Par::acquire(spec.int("concurrency", 0) as usize, &ctl)?;
-    let mut counters = serde_json::Map::new();
-    let result_vars: Vec<VarId> = vars
-        .iter()
-        .copied()
-        .filter(|v| spec.outs.vars().contains(v) || Some(*v) == spec.graph_var)
-        .collect();
-    // one projection, or one for each named graph under GRAPH ?g
-    let graphs: Vec<(GraphFilter, Option<Id>)> = match spec.graph_var {
-        None => vec![(spec.proj.graph.clone(), None)],
-        Some(_) => ctx
-            .snap
-            .graph_ids()?
-            .into_iter()
-            .filter(|g| spec.proj.graph.accepts(g.0))
-            .map(|g| (GraphFilter::One(g.0), Some(g)))
-            .collect(),
-    };
-    let mut t = Table::empty(result_vars.clone());
+    let mut result_vars = Buffer::new("algorithm-result-vars", vars.len(), &ctl)?;
+    let mut work = Work::new(&ctl)?;
+    for &v in vars {
+        work.tick("algorithm-result-vars")?;
+        if spec.outs.vars().contains(&v) || Some(v) == spec.graph_var {
+            result_vars.push(v)?;
+        }
+    }
+    let mut t = Some(Builder::new(&result_vars, &ctl)?.finish(0, ctx)?);
     let mut built = std::time::Duration::ZERO;
     let (mut nodes, mut edge_count, mut cache_hits) = (0usize, 0usize, 0usize);
-    for (filter, gid) in graphs {
+    let mut each = |filter: &GraphFilter, gid: Option<Id>| -> Result<()> {
+        let frame = ctl.query_frame()?;
         let at = Instant::now();
-        let mut one = spec.clone();
-        one.proj.graph = filter;
-        let (g, hit) = projection(ctx, &one, edges.as_ref(), &par, &ctl)?;
+        let (g, hit) = projection_in_graph(ctx, spec, edges.as_ref(), &par, &frame, filter)?;
         built += at.elapsed();
         cache_hits += hit as usize;
         nodes += g.n();
         edge_count += g.m();
-        // the sources: node indexes of the constants and of the group's bound values
-        let mut sources: Vec<u32> = Vec::new();
-        let mut want_sources = false;
+        let bound = spec
+            .sources
+            .iter()
+            .try_fold(0usize, |n, s| {
+                n.checked_add(match s {
+                    PathEnd::Const(_) => 1,
+                    PathEnd::Var(v) => input
+                        .as_ref()
+                        .and_then(|t| t.col_of(*v).map(|_| t.len()))
+                        .unwrap_or(0),
+                })
+            })
+            .ok_or_else(|| bad("source count overflows"))?;
+        let mut sources = Buffer::new("algorithm-sources", bound, &frame)?;
+        let mut work = Work::new(&frame)?;
         for s in &spec.sources {
-            want_sources = true;
-            let mut add = |id: Id| {
+            let mut add = |id: Id| -> Result<()> {
+                work.tick("algorithm-sources")?;
                 if let Ok(i) = g.ids.binary_search(&id.0) {
-                    sources.push(i as u32);
+                    sources.push(i as u32)?;
                 }
+                Ok(())
             };
             match s {
-                PathEnd::Const(id) => add(*id),
+                PathEnd::Const(id) => add(*id)?,
                 PathEnd::Var(v) => {
                     if let Some(t) = input.as_ref()
                         && let Some(c) = t.col_of(*v)
                     {
                         for &id in &t.cols[c] {
                             if !id.is_undef() {
-                                add(id);
+                                add(id)?;
                             }
                         }
                     }
@@ -999,24 +997,81 @@ pub(super) fn run(
             }
         }
         sources.sort_unstable();
-        sources.dedup();
-        let mut part = if want_sources
+        sources.dedup(&frame)?;
+        let mut part = if !spec.sources.is_empty()
             && sources.is_empty()
             && matches!(spec.algo, Algo::Bfs | Algo::Sssp)
             && !spec.stats_only()
         {
-            // no source is a node of the projection: nothing is reached
-            Table::empty(result_vars.clone())
+            Builder::new(&result_vars, &frame)?.finish(0, ctx)?
         } else {
-            rows(ctx, spec, &g, &sources, &par, &ctl, &result_vars)?
+            rows(ctx, spec, &g, &sources, &par, &frame, &result_vars)?
         };
         if let (Some(gid), Some(gv)) = (gid, spec.graph_var)
-            && let Some(c) = part.col_of(gv)
+            && let Some(c) = part.table.col_of(gv)
         {
-            part.cols[c] = vec![gid; part.len];
+            let replacement =
+                Buffer::filled("algorithm-graph-column", part.table.len, gid, &frame)?;
+            let bytes = memory::bytes::<Id>(replacement.capacity())?;
+            let replacement = replacement.into_output();
+            let mut lease = frame.output_lease(bytes)?;
+            let Some(held) = &mut part.lease else {
+                drop(replacement);
+                return Err(bad("missing algorithm part admission"));
+            };
+            if let Err(error) = held.merge(&mut lease) {
+                drop(replacement);
+                return Err(error);
+            }
+            part.table.cols[c] = replacement;
+            if let Some(held) = &mut part.lease {
+                held.resize(ctx.mem_limit, table_capacity(&part.table)?)?;
+            }
         }
-        t.append(part);
+        t = Some(append(
+            ctx,
+            t.take().expect("previous graph output"),
+            part,
+            &ctl,
+        )?);
+        // Graph/Csr cache ownership is plain data; this call's base admission ends
+        // only after every local Arc dies. Output leases own their separate columns.
+        drop(g);
+        Ok(())
+    };
+    match spec.graph_var {
+        None => each(&spec.proj.graph, None)?,
+        Some(_) => ctx.snap.for_each_graph_id_checked(
+            || ctl.check(),
+            |g| {
+                if spec.proj.graph.accepts(g.0) {
+                    each(&GraphFilter::One(g.0), Some(g))?;
+                }
+                Ok(())
+            },
+        )?,
     }
+    let mut t = t.expect("graph output");
+    // No SERVICE phase survives this boundary. Native frames and scratch die first;
+    // the final backing keeps exactly the same query charge through retirement.
+    drop(result_vars);
+    drop(par);
+    let peak = ctl.peak();
+    drop(ctl);
+    if let Some(lease) = &mut t.lease {
+        #[cfg(any(test, feature = "failpoints"))]
+        algo::observe_projection(algo::ProjectionEvent::Materialized(
+            "algorithm-retirement-before",
+            lease.bytes as usize,
+        ));
+        lease.retire_service()?;
+        #[cfg(any(test, feature = "failpoints"))]
+        algo::observe_projection(algo::ProjectionEvent::Materialized(
+            "algorithm-retirement-after",
+            lease.bytes as usize,
+        ));
+    }
+    let mut counters = serde_json::Map::new();
     counters.insert("nodes".into(), nodes.into());
     counters.insert("cachedProjections".into(), cache_hits.into());
     counters.insert("edges".into(), edge_count.into());
@@ -1025,15 +1080,42 @@ pub(super) fn run(
         "runMs".into(),
         ((started.elapsed() - built).as_secs_f64() * 1000.0).into(),
     );
-    counters.insert("peakBytes".into(), ctl.peak().into());
-    let _ = ctx.charge(ctl.peak())?;
-    // the call's rows joined with the rest of its group
+    counters.insert("peakBytes".into(), peak.into());
     let out = match input {
-        Some(inp) => super::exec::join_tables(ctx, &inp, &t, &[], false)?,
+        Some(inp) => super::exec::join_algorithm_tables(ctx, &inp, &t.table)?,
         None => t,
     };
-    ctx.produced(out.len())?;
+    ctx.produced(out.table.len())?;
     Ok((out, counters))
+}
+fn append(
+    ctx: &Ctx,
+    left: Materialized,
+    right: Materialized,
+    ctl: &Control,
+) -> Result<Materialized> {
+    let n = left
+        .table
+        .len
+        .checked_add(right.table.len)
+        .ok_or_else(|| bad("result rows overflow"))?;
+    ctx.check_output_rows(n)?;
+    let mut b = Builder::new(&left.table.vars, ctl)?;
+    for c in 0..left.table.width() {
+        let var = Some(Col { pos: c });
+        b.set(
+            &var,
+            |i| {
+                Ok(if i < left.table.len {
+                    left.table.cols[c][i]
+                } else {
+                    right.table.cols[c][i - left.table.len]
+                })
+            },
+            n,
+        )?;
+    }
+    b.finish(n, ctx)
 }
 
 /// The id of an `xsd:double`. A value whose low four mantissa bits are not zero loses
@@ -1043,67 +1125,214 @@ fn dbl(x: f64) -> Id {
     Id::from_f64(f64::from_bits(x.to_bits() & !0xF)).unwrap_or(Id::UNDEF)
 }
 
-fn int(ctx: &Ctx, x: i64) -> Id {
-    Id::from_i64(x).unwrap_or_else(|| ctx.intern_value(&Value::Integer(x.into())))
+fn int(ctx: &Ctx, x: i64, ctl: &Control) -> Result<Id> {
+    if let Some(id) = Id::from_i64(x) {
+        return Ok(id);
+    }
+    let mut text = Text::new(ctl)?;
+    use std::fmt::Write;
+    let result = write!(&mut text, "{x}");
+    text.formatted(result)?;
+    literal(
+        ctx,
+        &text.bytes,
+        "http://www.w3.org/2001/XMLSchema#integer",
+        ctl,
+    )
 }
 
-/// One output column being filled.
-struct Col {
-    var: VarId,
-    pos: usize,
+/// The same incremental serde/Debug encoding, with old/new capacity admitted before
+/// every growth. Preserve the original typed cancellation/resource error across Write.
+struct Text<'a> {
+    bytes: Buffer<u8>,
+    ctl: &'a Control,
+    error: Option<Error>,
 }
-
-/// Table columns by the variable they bind.
-struct Builder {
-    vars: Vec<VarId>,
-    cols: Vec<Vec<Id>>,
-}
-
-impl Builder {
-    fn new(vars: &[VarId]) -> Builder {
-        Builder {
-            vars: vars.to_vec(),
-            cols: vars.iter().map(|_| Vec::new()).collect(),
+impl<'a> Text<'a> {
+    fn new(ctl: &'a Control) -> Result<Self> {
+        Ok(Self {
+            bytes: Buffer::new("algorithm-text", 0, ctl)?,
+            ctl,
+            error: None,
+        })
+    }
+    fn append(&mut self, text: &[u8]) -> Result<()> {
+        let n = self
+            .bytes
+            .len()
+            .checked_add(text.len())
+            .ok_or_else(|| bad("text capacity overflows"))?;
+        self.bytes.reserve("algorithm-text", n, self.ctl)?;
+        self.bytes.extend(text)
+    }
+    fn formatted(&mut self, result: std::fmt::Result) -> Result<()> {
+        if let Some(error) = self.error.take() {
+            return Err(error);
         }
+        result.map_err(|_| bad("text formatting failed"))
     }
-
-    fn col(&self, v: Option<VarId>) -> Option<Col> {
-        let v = v?;
-        self.vars
-            .iter()
-            .position(|x| *x == v)
-            .map(|pos| Col { var: v, pos })
-    }
-
-    fn set(&mut self, c: &Option<Col>, f: impl FnMut(usize) -> Id, n: usize) {
-        if let Some(c) = c {
-            let mut f = f;
-            self.cols[c.pos] = (0..n).map(&mut f).collect();
-            let _ = c.var;
-        }
-    }
-
-    fn finish(self, len: usize, ctx: &Ctx) -> Result<Table> {
-        ctx.check_output(len, self.vars.len())?;
-        Ok(Table {
-            vars: self.vars,
-            cols: self.cols,
-            len,
-            sorted: Vec::new(),
+}
+impl std::fmt::Write for Text<'_> {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.append(s.as_bytes()).map_err(|e| {
+            self.error = Some(e);
+            std::fmt::Error
         })
     }
 }
+impl std::io::Write for Text<'_> {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        match self.append(b) {
+            Ok(()) => Ok(b.len()),
+            Err(e) => {
+                self.error = Some(e);
+                Err(std::io::Error::other("algorithm text refused"))
+            }
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+fn literal(ctx: &Ctx, text: &[u8], datatype: &str, ctl: &Control) -> Result<Id> {
+    let n = text
+        .len()
+        .checked_add(datatype.len())
+        .and_then(|n| n.checked_add(3))
+        .ok_or_else(|| bad("literal capacity overflows"))?;
+    let mut key = Buffer::new("algorithm-literal-key", n, ctl)?;
+    key.push(b'"')?;
+    key.extend(text)?;
+    key.push(crate::id::KEY_SEP)?;
+    key.push(b'^')?;
+    key.extend(datatype.as_bytes())?;
+    ctx.intern_algorithm_key(&key, ctl)
+}
+fn embedding(ctx: &Ctx, values: &[f32], ctl: &Control) -> Result<Id> {
+    use std::fmt::Write;
+    let mut text = Text::new(ctl)?;
+    text.append(b"[")?;
+    let mut work = Work::new(ctl)?;
+    for (i, value) in values.iter().enumerate() {
+        work.tick("algorithm-embedding")?;
+        if i != 0 {
+            text.append(b",")?;
+        }
+        let result = write!(&mut text, "{value:?}");
+        text.formatted(result)?;
+    }
+    text.append(b"]")?;
+    #[cfg(any(test, feature = "failpoints"))]
+    algo::observe_projection(algo::ProjectionEvent::Materialized(
+        "algorithm-embedding-text",
+        text.bytes.capacity(),
+    ));
+    literal(ctx, &text.bytes, crate::vector::DATATYPE, ctl)
+}
 
-/// The summary literal of a run.
-fn summary(ctx: &Ctx, g: &Graph, stats: algo::Stats) -> Id {
-    let mut m = stats;
-    m.insert("nodes".into(), g.n().into());
-    m.insert("edges".into(), g.m().into());
-    let text = serde_json::Value::Object(m).to_string();
-    ctx.intern_term(&Term::Literal(oxrdf::Literal::new_typed_literal(
-        text,
-        oxrdf::NamedNode::new_unchecked(RDF_JSON),
-    )))
+/// Table columns own exact capacities until their backing moves to the private carrier.
+struct Col {
+    pos: usize,
+}
+struct Builder<'a> {
+    vars: Buffer<VarId>,
+    cols: Buffer<Buffer<Id>>,
+    ctl: &'a Control,
+}
+impl<'a> Builder<'a> {
+    fn new(vars: &[VarId], ctl: &'a Control) -> Result<Self> {
+        let mut owned = Buffer::new("algorithm-table-vars", vars.len(), ctl)?;
+        owned.extend(vars)?;
+        let mut cols = Buffer::new("algorithm-builder", vars.len(), ctl)?;
+        for _ in vars {
+            cols.push(Buffer::new("algorithm-empty-column", 0, ctl)?)?;
+        }
+        Ok(Self {
+            vars: owned,
+            cols,
+            ctl,
+        })
+    }
+    fn col(&self, v: Option<VarId>) -> Option<Col> {
+        self.vars
+            .iter()
+            .position(|x| Some(*x) == v)
+            .map(|pos| Col { pos })
+    }
+    fn set(
+        &mut self,
+        c: &Option<Col>,
+        mut f: impl FnMut(usize) -> Result<Id>,
+        n: usize,
+    ) -> Result<()> {
+        if let Some(c) = c {
+            let mut next = Buffer::new("algorithm-column", n, self.ctl)?;
+            let mut work = Work::new(self.ctl)?;
+            for i in 0..n {
+                work.tick("algorithm-column")?;
+                next.push(f(i)?)?;
+            }
+            self.cols[c.pos] = next;
+        }
+        Ok(())
+    }
+    fn finish(mut self, len: usize, ctx: &Ctx) -> Result<Materialized> {
+        ctx.check_output_rows(len)?;
+        let mut cols = Buffer::new("algorithm-table-cols", self.cols.len(), self.ctl)?;
+        for col in self.cols.drain() {
+            cols.push(col.into_output())?;
+        }
+        let table = Table {
+            vars: self.vars.into_output(),
+            cols: cols.into_output(),
+            len,
+            sorted: Vec::new(),
+        };
+        let extra = 128u64
+            .checked_add(if table.width() == 0 {
+                memory::bytes::<Id>(len)?
+            } else {
+                0
+            })
+            .ok_or_else(|| bad("table capacity overflows"))?;
+        // Metadata/zero-width estimate is owned as well as every real Vec capacity.
+        self.ctl.charge(extra)?;
+        let bytes = table_capacity(&table)?;
+        let lease = self.ctl.output_lease(bytes)?;
+        Ok(Materialized { table, lease })
+    }
+}
+pub(super) fn table_capacity(t: &Table) -> Result<u64> {
+    let data = t.cols.iter().try_fold(0u64, |n, c| {
+        memory::sum(&[n, memory::bytes::<Id>(c.capacity())?])
+    })?;
+    memory::sum(&[
+        data.max(if t.width() == 0 {
+            memory::bytes::<Id>(t.len)?
+        } else {
+            0
+        }),
+        memory::bytes::<VarId>(t.vars.capacity())?,
+        memory::bytes::<Vec<Id>>(t.cols.capacity())?,
+        memory::bytes::<VarId>(t.sorted.capacity())?,
+        128,
+    ])
+}
+fn summary(ctx: &Ctx, g: &Graph, mut stats: algo::Stats, ctl: &Control) -> Result<Id> {
+    stats.insert("nodes".into(), g.n().into());
+    stats.insert("edges".into(), g.m().into());
+    let mut text = Text::new(ctl)?;
+    let result = serde_json::to_writer(&mut text, &stats);
+    if let Some(error) = text.error.take() {
+        return Err(error);
+    }
+    result.map_err(|e| bad(format_args!("summary encoding failed: {e}")))?;
+    #[cfg(any(test, feature = "failpoints"))]
+    algo::observe_projection(algo::ProjectionEvent::Materialized(
+        "algorithm-summary-text",
+        text.bytes.capacity(),
+    ));
+    literal(ctx, &text.bytes, RDF_JSON, ctl)
 }
 
 /// Stats have one row independently of the algorithm's node, pair or level rows.
@@ -1113,31 +1342,65 @@ fn summary_row(
     g: &Graph,
     stats: algo::Stats,
     vars: &[VarId],
-) -> Result<Table> {
+    ctl: &Control,
+) -> Result<Materialized> {
     ctx.check()?;
-    ctx.check_output(1, vars.len())?;
-    let mut b = Builder::new(vars);
+    ctx.check_output_rows(1)?;
+    let mut b = Builder::new(vars, ctl)?;
     let col = b.col(spec.outs.summary);
-    let sm = summary(ctx, g, stats);
-    b.set(&col, |_| sm, 1);
+    let sm = summary(ctx, g, stats, ctl)?;
+    b.set(&col, |_| Ok(sm), 1)?;
     b.finish(1, ctx)
 }
 
 /// The indexes of the nodes to report, best first by `key` when a limit asks for the top
 /// rows, else in node order.
-fn pick(n: usize, limit: Option<usize>, key: Option<&[f64]>, descending: bool) -> Vec<u32> {
-    let mut idx: Vec<u32> = (0..n as u32).collect();
+fn copied<T: Copy>(name: &'static str, source: &[T], ctl: &Control) -> Result<Buffer<T>> {
+    let mut out = Buffer::new(name, source.len(), ctl)?;
+    out.extend(source)?;
+    Ok(out)
+}
+fn ranking<T>(source: &[T], mut f: impl FnMut(&T) -> f64, ctl: &Control) -> Result<Buffer<f64>> {
+    let mut out = Buffer::new("algorithm-rank", source.len(), ctl)?;
+    let mut work = Work::new(ctl)?;
+    for x in source {
+        work.tick("algorithm-rank")?;
+        out.push(f(x))?;
+    }
+    Ok(out)
+}
+fn selected(n: usize, mut keep: impl FnMut(usize) -> bool, ctl: &Control) -> Result<Buffer<u32>> {
+    let mut out = Buffer::new("algorithm-pick", n, ctl)?;
+    let mut work = Work::new(ctl)?;
+    for i in 0..n {
+        work.tick("algorithm-pick")?;
+        if keep(i) {
+            out.push(u32::try_from(i).map_err(|_| bad("node index overflows"))?)?;
+        }
+    }
+    Ok(out)
+}
+fn pick(
+    n: usize,
+    limit: Option<usize>,
+    key: Option<&[f64]>,
+    descending: bool,
+    ctl: &Control,
+) -> Result<Buffer<u32>> {
+    let mut idx = selected(n, |_| true, ctl)?;
     if let (Some(l), Some(k)) = (limit, key) {
-        idx.sort_by(|&a, &b| {
+        ctl.check()?;
+        idx.sort_unstable_by(|&a, &b| {
             let o = k[a as usize].total_cmp(&k[b as usize]);
             let o = if descending { o.reverse() } else { o };
             o.then(a.cmp(&b))
         });
+        ctl.check()?;
         idx.truncate(l);
     } else if let Some(l) = limit {
         idx.truncate(l);
     }
-    idx
+    Ok(idx)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1149,12 +1412,12 @@ fn rows(
     par: &Par,
     ctl: &Control,
     vars: &[VarId],
-) -> Result<Table> {
+) -> Result<Materialized> {
     let o = &spec.outs;
     // a call that asks for the summary alone reports one row (GDS's stats mode)
     let stats_only = spec.stats_only();
     let limit = spec.num("limit").map(|l| l as usize);
-    let mut b = Builder::new(vars);
+    let mut b = Builder::new(vars, ctl)?;
     let c_node = b.col(o.node);
     let c_summary = b.col(o.summary);
     let n = g.n();
@@ -1163,16 +1426,16 @@ fn rows(
     macro_rules! per_node {
         ($key:expr, $desc:expr, $stats:expr, $cols:expr) => {{
             if stats_only {
-                return summary_row(ctx, spec, g, $stats, vars);
+                return summary_row(ctx, spec, g, $stats, vars, ctl);
             }
-            let key: Option<Vec<f64>> = $key;
-            let idx = pick(n, limit, key.as_deref(), $desc);
-            ctx.check_output(idx.len(), vars.len())?;
-            b.set(&c_node, |i| node_id(idx[i] as usize), idx.len());
-            let sm = summary(ctx, g, $stats);
-            b.set(&c_summary, |_| sm, idx.len());
+            let key: Option<&[f64]> = $key;
+            let idx = pick(n, limit, key, $desc, ctl)?;
+            ctx.check_output_rows(idx.len())?;
+            b.set(&c_node, |i| Ok(node_id(idx[i] as usize)), idx.len())?;
+            let sm = summary(ctx, g, $stats, ctl)?;
+            b.set(&c_summary, |_| Ok(sm), idx.len())?;
             #[allow(clippy::redundant_closure_call)]
-            ($cols)(&mut b, &idx);
+            ($cols)(&mut b, &idx)?;
             return b.finish(idx.len(), ctx);
         }};
     }
@@ -1182,7 +1445,7 @@ fn rows(
                 damping: spec.float("dampingFactor", 0.85),
                 max_iterations: spec.int("maxIterations", 20) as u32,
                 tolerance: spec.float("tolerance", 1e-7),
-                sources: sources.to_vec(),
+                sources: copied("algorithm-pagerank-sources", sources, ctl)?.into_output(),
                 fixed: spec.graphalytics,
             };
             if !spec.sources.is_empty() && sources.is_empty() {
@@ -1191,21 +1454,19 @@ fn rows(
                     let mut stats = algo::Stats::new();
                     stats.insert("iterations".into(), 0.into());
                     stats.insert("converged".into(), true.into());
-                    return summary_row(ctx, spec, g, stats, vars);
+                    return summary_row(ctx, spec, g, stats, vars, ctl);
                 }
                 return b.finish(0, ctx);
             }
             let r = algo::pagerank::run(g, &p, par, ctl)?;
             let c = b.col(o.score);
             let score = r.score;
-            per_node!(
-                Some(score.clone()),
-                true,
-                r.stats,
-                |b: &mut Builder, idx: &Vec<u32>| {
-                    b.set(&c, |i| dbl(score[idx[i] as usize]), idx.len());
-                }
-            )
+            per_node!(Some(&score), true, r.stats, |b: &mut Builder<'_>,
+                                                    idx: &[u32]|
+             -> Result<()> {
+                b.set(&c, |i| Ok(dbl(score[idx[i] as usize])), idx.len())?;
+                Ok(())
+            })
         }
         Algo::Betweenness => {
             let max = crate::algo::pool::max_exact_betweenness();
@@ -1223,14 +1484,12 @@ fn rows(
             let c = b.col(o.score);
             let mut stats = algo::Stats::new();
             stats.insert("samples".into(), samples.into());
-            per_node!(
-                Some(score.clone()),
-                true,
-                stats,
-                |b: &mut Builder, idx: &Vec<u32>| {
-                    b.set(&c, |i| dbl(score[idx[i] as usize]), idx.len());
-                }
-            )
+            per_node!(Some(&score), true, stats, |b: &mut Builder<'_>,
+                                                  idx: &[u32]|
+             -> Result<()> {
+                b.set(&c, |i| Ok(dbl(score[idx[i] as usize])), idx.len())?;
+                Ok(())
+            })
         }
         Algo::Wcc | Algo::Scc => {
             let r = if spec.algo == Algo::Wcc {
@@ -1241,8 +1500,15 @@ fn rows(
             let c = b.col(o.component);
             let mut stats = algo::Stats::new();
             stats.insert("components".into(), r.count.into());
-            per_node!(None, false, stats, |b: &mut Builder, idx: &Vec<u32>| {
-                b.set(&c, |i| int(ctx, r.comp[idx[i] as usize] as i64), idx.len());
+            per_node!(None, false, stats, |b: &mut Builder<'_>,
+                                           idx: &[u32]|
+             -> Result<()> {
+                b.set(
+                    &c,
+                    |i| int(ctx, r.comp[idx[i] as usize] as i64, ctl),
+                    idx.len(),
+                )?;
+                Ok(())
             })
         }
         Algo::LabelPropagation => {
@@ -1252,8 +1518,15 @@ fn rows(
             let mut stats = algo::Stats::new();
             stats.insert("iterations".into(), r.iterations.into());
             stats.insert("converged".into(), r.converged.into());
-            per_node!(None, false, stats, |b: &mut Builder, idx: &Vec<u32>| {
-                b.set(&c, |i| int(ctx, r.label[idx[i] as usize] as i64), idx.len());
+            per_node!(None, false, stats, |b: &mut Builder<'_>,
+                                           idx: &[u32]|
+             -> Result<()> {
+                b.set(
+                    &c,
+                    |i| int(ctx, r.label[idx[i] as usize] as i64, ctl),
+                    idx.len(),
+                )?;
+                Ok(())
             })
         }
         Algo::Louvain | Algo::Leiden => {
@@ -1273,7 +1546,17 @@ fn rows(
                 "modularity".into(),
                 serde_json::json!(r.modularity.last().copied()),
             );
-            stats.insert("modularities".into(), serde_json::json!(r.modularity));
+            let mut modularities =
+                Buffer::new("algorithm-modularity-values", r.modularity.len(), ctl)?;
+            let mut work = Work::new(ctl)?;
+            for value in &r.modularity {
+                work.tick("algorithm-modularity-values")?;
+                modularities.push(serde_json::json!(value))?;
+            }
+            stats.insert(
+                "modularities".into(),
+                serde_json::Value::Array(modularities.into_output()),
+            );
             stats.insert(
                 "communities".into(),
                 r.levels
@@ -1282,34 +1565,44 @@ fn rows(
                     .into(),
             );
             if stats_only {
-                return summary_row(ctx, spec, g, stats, vars);
+                return summary_row(ctx, spec, g, stats, vars, ctl);
             }
-            let sm = summary(ctx, g, stats);
+            let sm = summary(ctx, g, stats, ctl)?;
             let (c_comm, c_level) = (b.col(o.community), b.col(o.level));
             // one row per node and level when the level is asked for, else the last level
-            let levels: Vec<usize> = if o.level.is_some() {
-                (0..r.levels.len()).collect()
+            let level_count = if o.level.is_some() {
+                r.levels.len()
             } else {
-                r.levels.len().checked_sub(1).into_iter().collect()
+                usize::from(!r.levels.is_empty())
             };
-            let mut pairs: Vec<(u32, usize)> = Vec::new();
-            for &l in &levels {
+            let count = level_count
+                .checked_mul(n)
+                .ok_or_else(|| bad("level rows overflow"))?;
+            let mut pairs = Buffer::new("algorithm-level-pairs", count, ctl)?;
+            let mut work = Work::new(ctl)?;
+            let first = if o.level.is_some() {
+                0
+            } else {
+                r.levels.len().saturating_sub(1)
+            };
+            for l in first..r.levels.len() {
                 for i in 0..n as u32 {
-                    pairs.push((i, l));
+                    work.tick("algorithm-level-pairs")?;
+                    pairs.push((i, l))?;
                 }
             }
             if let Some(l) = limit {
                 pairs.truncate(l);
             }
-            ctx.check_output(pairs.len(), vars.len())?;
-            b.set(&c_node, |i| node_id(pairs[i].0 as usize), pairs.len());
+            ctx.check_output_rows(pairs.len())?;
+            b.set(&c_node, |i| Ok(node_id(pairs[i].0 as usize)), pairs.len())?;
             b.set(
                 &c_comm,
-                |i| int(ctx, r.levels[pairs[i].1][pairs[i].0 as usize] as i64),
+                |i| int(ctx, r.levels[pairs[i].1][pairs[i].0 as usize] as i64, ctl),
                 pairs.len(),
-            );
-            b.set(&c_level, |i| int(ctx, pairs[i].1 as i64), pairs.len());
-            b.set(&c_summary, |_| sm, pairs.len());
+            )?;
+            b.set(&c_level, |i| int(ctx, pairs[i].1 as i64, ctl), pairs.len())?;
+            b.set(&c_summary, |_| Ok(sm), pairs.len())?;
             b.finish(pairs.len(), ctx)
         }
         Algo::NodeSimilarity => {
@@ -1324,39 +1617,40 @@ fn rows(
             if stats_only {
                 let mut stats = algo::Stats::new();
                 stats.insert("pairs".into(), r.len().into());
-                return summary_row(ctx, spec, g, stats, vars);
+                return summary_row(ctx, spec, g, stats, vars, ctl);
             }
             if let Some(l) = limit {
-                r.sort_by(|a, b| b.2.total_cmp(&a.2).then(a.0.cmp(&b.0)).then(a.1.cmp(&b.1)));
+                r.sort_unstable_by(|a, b| {
+                    b.2.total_cmp(&a.2).then(a.0.cmp(&b.0)).then(a.1.cmp(&b.1))
+                });
                 r.truncate(l);
             }
-            ctx.check_output(r.len(), vars.len())?;
+            ctx.check_output_rows(r.len())?;
             let (c_other, c_sim) = (b.col(o.other_node), b.col(o.similarity));
-            b.set(&c_node, |i| node_id(r[i].0 as usize), r.len());
-            b.set(&c_other, |i| node_id(r[i].1 as usize), r.len());
-            b.set(&c_sim, |i| dbl(r[i].2), r.len());
+            b.set(&c_node, |i| Ok(node_id(r[i].0 as usize)), r.len())?;
+            b.set(&c_other, |i| Ok(node_id(r[i].1 as usize)), r.len())?;
+            b.set(&c_sim, |i| Ok(dbl(r[i].2)), r.len())?;
             let mut stats = algo::Stats::new();
             stats.insert("pairs".into(), r.len().into());
-            let sm = summary(ctx, g, stats);
-            b.set(&c_summary, |_| sm, r.len());
+            let sm = summary(ctx, g, stats, ctl)?;
+            b.set(&c_summary, |_| Ok(sm), r.len())?;
             b.finish(r.len(), ctx)
         }
         Algo::TriangleCount => {
             let t = algo::triangles::count(g, par, ctl)?;
+            let rank = ranking(&t, |&x| x as f64, ctl)?;
             let c = b.col(o.triangles);
             let mut stats = algo::Stats::new();
             stats.insert(
                 "triangles".into(),
                 (t.iter().map(|&x| x as u64).sum::<u64>() / 3).into(),
             );
-            per_node!(
-                Some(t.iter().map(|&x| x as f64).collect()),
-                true,
-                stats,
-                |b: &mut Builder, idx: &Vec<u32>| {
-                    b.set(&c, |i| int(ctx, t[idx[i] as usize] as i64), idx.len());
-                }
-            )
+            per_node!(Some(&rank), true, stats, |b: &mut Builder<'_>,
+                                                 idx: &[u32]|
+             -> Result<()> {
+                b.set(&c, |i| int(ctx, t[idx[i] as usize] as i64, ctl), idx.len())?;
+                Ok(())
+            })
         }
         Algo::Clustering => {
             let (coef, tri) = if spec.graphalytics {
@@ -1378,34 +1672,39 @@ fn rows(
                 coef.iter().sum::<f64>() / n as f64
             };
             stats.insert("averageCoefficient".into(), serde_json::json!(mean));
-            per_node!(
-                Some(coef.clone()),
-                true,
-                stats,
-                |b: &mut Builder, idx: &Vec<u32>| {
-                    b.set(&c_coef, |i| dbl(coef[idx[i] as usize]), idx.len());
-                    if let Some(t) = &tri {
-                        b.set(&c_tri, |i| int(ctx, t[idx[i] as usize] as i64), idx.len());
-                    }
+            per_node!(Some(&coef), true, stats, |b: &mut Builder<'_>,
+                                                 idx: &[u32]|
+             -> Result<()> {
+                b.set(&c_coef, |i| Ok(dbl(coef[idx[i] as usize])), idx.len())?;
+                if let Some(t) = &tri {
+                    b.set(
+                        &c_tri,
+                        |i| int(ctx, t[idx[i] as usize] as i64, ctl),
+                        idx.len(),
+                    )?;
                 }
-            )
+                Ok(())
+            })
         }
         Algo::KCore => {
             let core = algo::kcore::run(g, ctl)?;
+            let rank = ranking(&core, |&x| x as f64, ctl)?;
             let c = b.col(o.core);
             let mut stats = algo::Stats::new();
             stats.insert(
                 "degeneracy".into(),
                 core.iter().copied().max().unwrap_or(0).into(),
             );
-            per_node!(
-                Some(core.iter().map(|&x| x as f64).collect()),
-                true,
-                stats,
-                |b: &mut Builder, idx: &Vec<u32>| {
-                    b.set(&c, |i| int(ctx, core[idx[i] as usize] as i64), idx.len());
-                }
-            )
+            per_node!(Some(&rank), true, stats, |b: &mut Builder<'_>,
+                                                 idx: &[u32]|
+             -> Result<()> {
+                b.set(
+                    &c,
+                    |i| int(ctx, core[idx[i] as usize] as i64, ctl),
+                    idx.len(),
+                )?;
+                Ok(())
+            })
         }
         Algo::Bfs => {
             let depth = algo::traverse::bfs(g, sources, par, ctl)?;
@@ -1419,38 +1718,41 @@ fn rows(
                         .count()
                         .into(),
                 );
-                return summary_row(ctx, spec, g, stats, vars);
+                return summary_row(ctx, spec, g, stats, vars, ctl);
             }
             let c = b.col(o.depth);
             let inf = ctx.intern_term(&Term::Literal(oxrdf::Literal::new_simple_literal("inf")));
             // unreached nodes are left out, or bound to "inf" under Graphalytics
-            let keep: Vec<u32> = (0..n as u32)
-                .filter(|&i| spec.graphalytics || depth[i as usize] != algo::traverse::UNREACHED)
-                .collect();
-            let key: Vec<f64> = depth.iter().map(|&d| d as f64).collect();
-            let mut idx = keep;
+            let mut idx = selected(
+                n,
+                |i| spec.graphalytics || depth[i] != algo::traverse::UNREACHED,
+                ctl,
+            )?;
+            let key = ranking(&depth, |&d| d as f64, ctl)?;
             if let Some(l) = limit {
-                idx.sort_by(|&a, &b2| {
+                idx.sort_unstable_by(|&a, &b2| {
                     key[a as usize]
                         .total_cmp(&key[b2 as usize])
                         .then(a.cmp(&b2))
                 });
                 idx.truncate(l);
             }
-            ctx.check_output(idx.len(), vars.len())?;
-            b.set(&c_node, |i| node_id(idx[i] as usize), idx.len());
+            ctx.check_output_rows(idx.len())?;
+            b.set(&c_node, |i| Ok(node_id(idx[i] as usize)), idx.len())?;
             b.set(
                 &c,
                 |i| {
-                    let d = depth[idx[i] as usize];
-                    if d == algo::traverse::UNREACHED {
-                        inf
-                    } else {
-                        int(ctx, d as i64)
-                    }
+                    Ok({
+                        let d = depth[idx[i] as usize];
+                        if d == algo::traverse::UNREACHED {
+                            inf
+                        } else {
+                            int(ctx, d as i64, ctl)?
+                        }
+                    })
                 },
                 idx.len(),
-            );
+            )?;
             let mut stats = algo::Stats::new();
             stats.insert(
                 "reached".into(),
@@ -1460,8 +1762,8 @@ fn rows(
                     .count()
                     .into(),
             );
-            let sm = summary(ctx, g, stats);
-            b.set(&c_summary, |_| sm, idx.len());
+            let sm = summary(ctx, g, stats, ctl)?;
+            b.set(&c_summary, |_| Ok(sm), idx.len())?;
             b.finish(idx.len(), ctx)
         }
         Algo::Sssp => {
@@ -1472,30 +1774,28 @@ fn rows(
                     "reached".into(),
                     dist.iter().filter(|d| d.is_finite()).count().into(),
                 );
-                return summary_row(ctx, spec, g, stats, vars);
+                return summary_row(ctx, spec, g, stats, vars, ctl);
             }
             let c = b.col(o.distance);
-            let mut idx: Vec<u32> = (0..n as u32)
-                .filter(|&i| spec.graphalytics || dist[i as usize].is_finite())
-                .collect();
+            let mut idx = selected(n, |i| spec.graphalytics || dist[i].is_finite(), ctl)?;
             if let Some(l) = limit {
-                idx.sort_by(|&a, &b2| {
+                idx.sort_unstable_by(|&a, &b2| {
                     dist[a as usize]
                         .total_cmp(&dist[b2 as usize])
                         .then(a.cmp(&b2))
                 });
                 idx.truncate(l);
             }
-            ctx.check_output(idx.len(), vars.len())?;
-            b.set(&c_node, |i| node_id(idx[i] as usize), idx.len());
-            b.set(&c, |i| dbl(dist[idx[i] as usize]), idx.len());
+            ctx.check_output_rows(idx.len())?;
+            b.set(&c_node, |i| Ok(node_id(idx[i] as usize)), idx.len())?;
+            b.set(&c, |i| Ok(dbl(dist[idx[i] as usize])), idx.len())?;
             let mut stats = algo::Stats::new();
             stats.insert(
                 "reached".into(),
                 dist.iter().filter(|d| d.is_finite()).count().into(),
             );
-            let sm = summary(ctx, g, stats);
-            b.set(&c_summary, |_| sm, idx.len());
+            let sm = summary(ctx, g, stats, ctl)?;
+            b.set(&c_summary, |_| Ok(sm), idx.len())?;
             b.finish(idx.len(), ctx)
         }
         Algo::FastRp | Algo::Node2Vec => {
@@ -1503,10 +1803,14 @@ fn rows(
             let emb = if spec.algo == Algo::FastRp {
                 let p = algo::fastrp::Params {
                     dimension: dim,
-                    iteration_weights: spec
-                        .iteration_weights
-                        .clone()
-                        .unwrap_or_else(|| vec![0.0, 1.0, 1.0]),
+                    iteration_weights: copied(
+                        "algorithm-iteration-weights",
+                        spec.iteration_weights
+                            .as_deref()
+                            .unwrap_or(&[0.0, 1.0, 1.0]),
+                        ctl,
+                    )?
+                    .into_output(),
                     normalization_strength: spec.float("normalizationStrength", 0.0),
                     seed: spec.int("seed", 0),
                 };
@@ -1529,17 +1833,20 @@ fn rows(
             let c = b.col(o.embedding);
             let mut stats = algo::Stats::new();
             stats.insert("dimension".into(), dim.into());
-            per_node!(None, false, stats, |b: &mut Builder, idx: &Vec<u32>| {
+            per_node!(None, false, stats, |b: &mut Builder<'_>,
+                                           idx: &[u32]|
+             -> Result<()> {
                 b.set(
                     &c,
                     |i| {
-                        let u = idx[i] as usize;
-                        ctx.intern_term(&Term::Literal(crate::vector::literal(
-                            &emb[u * dim..(u + 1) * dim],
-                        )))
+                        Ok({
+                            let u = idx[i] as usize;
+                            embedding(ctx, &emb[u * dim..(u + 1) * dim], ctl)?
+                        })
                     },
                     idx.len(),
-                );
+                )?;
+                Ok(())
             })
         }
     }
@@ -1799,7 +2106,15 @@ fn stored_weight(value: f64) -> Result<f32> {
 
 /// Resolve only visible weights of an applicable asserted edge. All accepted graph
 /// statements may participate in the union, even across its physical graphs.
-fn weight(ctx: &Ctx, proj: &ProjectionSpec, s: u64, p: u64, o: u64, ctl: &Control) -> Result<f32> {
+fn weight_in_graph(
+    ctx: &Ctx,
+    proj: &ProjectionSpec,
+    s: u64,
+    p: u64,
+    o: u64,
+    ctl: &Control,
+    filter: &GraphFilter,
+) -> Result<f32> {
     let (Some(Some(wprop)), Some(reifies)) = (proj.weight, proj.reifies) else {
         return stored_weight(proj.default_weight);
     };
@@ -1810,12 +2125,12 @@ fn weight(ctx: &Ctx, proj: &ProjectionSpec, s: u64, p: u64, o: u64, ctl: &Contro
     let mut work = Work::new(ctl)?;
     projection_rows(ctx, Perm::Pos, &[reifies, triple.0], |r| {
         work.tick("projection-reifiers")?;
-        if !proj.graph.accepts(r[3]) {
+        if !filter.accepts(r[3]) {
             return Ok(());
         }
         projection_rows(ctx, Perm::Pso, &[wprop, r[2]], |k| {
             work.tick("projection-weights")?;
-            if !proj.graph.accepts(k[3]) {
+            if !filter.accepts(k[3]) {
                 return Ok(());
             }
             let value = stored_weight(
@@ -1836,6 +2151,7 @@ fn weight(ctx: &Ctx, proj: &ProjectionSpec, s: u64, p: u64, o: u64, ctl: &Contro
 
 /// The projection of a call: a cached build of the same data and edges, or a new one.
 /// Uncommitted views and projections from a nested pattern are not cached.
+#[cfg(test)]
 fn projection(
     ctx: &Ctx,
     spec: &AlgoSpec,
@@ -1843,35 +2159,96 @@ fn projection(
     par: &Par,
     ctl: &Control,
 ) -> Result<(std::sync::Arc<Graph>, bool)> {
-    let key = (ctx.snap.cacheable && spec.proj.pattern.is_none() && ctx.use_cache).then(|| {
-        format!(
-            "{}{:?}|{}",
-            super::cache::view_key(ctx),
-            spec.proj,
-            spec.direction().name()
-        )
-    });
+    projection_in_graph(ctx, spec, edges, par, ctl, &spec.proj.graph)
+}
+struct ProjectionInGraph<'a>(&'a ProjectionSpec, &'a GraphFilter);
+impl std::fmt::Debug for ProjectionInGraph<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let p = self.0;
+        f.debug_struct("ProjectionSpec")
+            .field("predicates", &p.predicates)
+            .field("direction", &p.direction)
+            .field("node_classes", &p.node_classes)
+            .field("node_class_names", &p.node_class_names)
+            .field("weight", &p.weight)
+            .field("default_weight", &p.default_weight)
+            .field("aggregate", &p.aggregate)
+            .field("pattern", &p.pattern)
+            .field("graph", self.1)
+            .field("rdf_type", &p.rdf_type)
+            .field("reifies", &p.reifies)
+            .finish()
+    }
+}
+fn projection_key<'a>(
+    ctx: &Ctx,
+    spec: &AlgoSpec,
+    filter: &GraphFilter,
+    ctl: &'a Control,
+) -> Result<Text<'a>> {
+    let mut key = Text::new(ctl)?;
+    let result = super::cache::write_view_key(ctx, &mut key);
+    key.formatted(result)?;
+    use std::fmt::Write;
+    let result = write!(
+        &mut key,
+        "{:?}|{}",
+        ProjectionInGraph(&spec.proj, filter),
+        spec.direction().name()
+    );
+    key.formatted(result)?;
+    Ok(key)
+}
+fn projection_in_graph(
+    ctx: &Ctx,
+    spec: &AlgoSpec,
+    edges: Option<&Table>,
+    par: &Par,
+    ctl: &Control,
+    filter: &GraphFilter,
+) -> Result<(std::sync::Arc<Graph>, bool)> {
+    let key = if ctx.snap.cacheable && spec.proj.pattern.is_none() && ctx.use_cache {
+        Some(projection_key(ctx, spec, filter, ctl)?)
+    } else {
+        None
+    };
     if let Some(k) = &key
-        && let Some(g) = algo::cache::get(k)
+        && let Some(g) = algo::cache::get(std::str::from_utf8(&k.bytes).expect("formatted UTF8"))
     {
-        // the call holds the build while it runs, as if it had made it
         ctl.charge(g.base_bytes()?)?;
         return Ok((g, true));
     }
-    let g = std::sync::Arc::new(build_graph(ctx, spec, edges, par, ctl)?);
-    if let Some(k) = key {
-        algo::cache::put(k, g.clone());
+    let g = std::sync::Arc::new(build_graph_in_graph(ctx, spec, edges, par, ctl, filter)?);
+    if let Some(key) = key {
+        let bytes = key.bytes.capacity() as u64;
+        algo::cache::put(
+            String::from_utf8(key.bytes.into_output()).expect("formatted UTF8"),
+            g.clone(),
+        );
+        // Ownership moved to the independently budgeted plain cache key.
+        ctl.release(bytes);
     }
     Ok((g, false))
 }
 
 /// Build the projection of a call from the store, or from the rows of a nested pattern.
+#[cfg(test)]
 fn build_graph(
     ctx: &Ctx,
     spec: &AlgoSpec,
     edges: Option<&Table>,
     par: &Par,
     ctl: &Control,
+) -> Result<Graph> {
+    build_graph_in_graph(ctx, spec, edges, par, ctl, &spec.proj.graph)
+}
+fn build_graph_in_graph(
+    ctx: &Ctx,
+    spec: &AlgoSpec,
+    edges: Option<&Table>,
+    par: &Par,
+    ctl: &Control,
+    filter: &GraphFilter,
 ) -> Result<Graph> {
     let proj = &spec.proj;
     let call_dir = spec.direction();
@@ -1886,7 +2263,7 @@ fn build_graph(
         for &class in &proj.node_classes {
             projection_rows(ctx, Perm::Pos, &[ty, class], |k| {
                 work.tick("projection-class")?;
-                if proj.graph.accepts(k[3]) {
+                if filter.accepts(k[3]) {
                     let need = nodes
                         .len()
                         .checked_add(1)
@@ -1961,7 +2338,7 @@ fn build_graph(
                     let mut each = |k: [u64; 4]| -> Result<()> {
                         scan_work.tick("projection-edge")?;
                         let [p, s, o, g] = k;
-                        if !proj.graph.accepts(g) || last == Some((p, s, o)) {
+                        if !filter.accepts(g) || last == Some((p, s, o)) {
                             return Ok(());
                         }
                         last = Some((p, s, o));
@@ -1972,7 +2349,7 @@ fn build_graph(
                             return Ok(());
                         }
                         let value = if has_weights {
-                            weight(ctx, proj, s, p, o, ctl)?
+                            weight_in_graph(ctx, proj, s, p, o, ctl, filter)?
                         } else {
                             0.0
                         };
@@ -2064,6 +2441,553 @@ mod projection_capacity_tests {
         Arc,
         atomic::{AtomicBool, Ordering},
     };
+    #[test]
+    fn effective_graph_key_is_exactly_the_original_owned_debug_encoding() {
+        let (_store, mut ctx, mut spec) = weighted();
+        ctx.dataset.default = Some(vec![Id(13), Id(21)]);
+        ctx.dataset.named = Some(vec![Id(42), Id(78)]);
+        ctx.dataset.union_default = true;
+        spec.proj.predicates = Some(vec![(11, Some(Dir::Backward)), (15, None)]);
+        spec.proj.direction = Some(Dir::Undirected);
+        spec.proj.node_classes = vec![7, 8];
+        spec.proj.node_class_names = vec!["quoted \" name".into(), "unicode λ".into()];
+        spec.proj.weight = Some(None);
+        spec.proj.default_weight = 2.5;
+        spec.proj.aggregate = Aggregate::Sum;
+        spec.proj.pattern = Some((3, 8, Some(9)));
+        spec.proj.rdf_type = Some(18);
+        spec.proj.reifies = Some(19);
+        let ctl = Control::unlimited();
+        for graph in [
+            GraphFilter::All,
+            GraphFilter::Default,
+            GraphFilter::Named,
+            GraphFilter::One(0),
+            GraphFilter::One(47),
+            GraphFilter::Set(vec![]),
+            GraphFilter::Set(vec![4, 7, 12]),
+        ] {
+            let mut owned = spec.proj.clone();
+            owned.graph = graph.clone();
+            let expected = format!(
+                "{}{:?}|{}",
+                super::super::cache::view_key(&ctx),
+                owned,
+                spec.direction().name()
+            );
+            let key = projection_key(&ctx, &spec, &graph, &ctl).unwrap();
+            assert_eq!(&*key.bytes, expected.as_bytes());
+        }
+    }
+    #[test]
+    fn checked_serializers_preserve_lexical_bytes_and_refuse_growth_with_original_error() {
+        let (_store, ctx, _spec) = weighted();
+        for values in [
+            &[][..],
+            &[
+                0.0,
+                -0.0,
+                1.25,
+                f32::MAX,
+                f32::MIN_POSITIVE,
+                f32::INFINITY,
+                f32::NAN,
+            ][..],
+        ] {
+            let ctl = Control::for_query(&ctx, u64::MAX).unwrap();
+            let id = embedding(&ctx, values, &ctl).unwrap();
+            assert_eq!(
+                ctx.term(id).unwrap(),
+                Term::Literal(crate::vector::literal(values))
+            );
+        }
+        let ctl = Control::for_query(&ctx, 3).unwrap();
+        assert!(
+            matches!(embedding(&ctx,&[1.25],&ctl),Err(Error::BudgetExceeded(b)) if b.kind==crate::error::BudgetKind::Memory)
+        );
+        let ctl = Control::for_query(&ctx, u64::MAX).unwrap();
+        let mut text = Text::new(&ctl).unwrap();
+        ctx.cancel.store(true, Ordering::Relaxed);
+        use std::fmt::Write;
+        let result = write!(&mut text, "must refuse before growth");
+        assert!(matches!(text.formatted(result), Err(Error::Cancelled)));
+    }
+    #[test]
+    fn actual_service_buffers_and_output_lease_share_one_query_owner() {
+        use crate::sparql::pool::QueryPool;
+        for case in 0..5 {
+            let (store, _old, mut spec) = weighted();
+            if case == 3 {
+                super::super::update::update(&store,"INSERT DATA { GRAPH <urn:g1> { <http://ex/a> <http://ex/p> <http://ex/b> } GRAPH <urn:g2> { <http://ex/b> <http://ex/p> <http://ex/a> } }",&Default::default()).unwrap();
+            }
+            let mut ctx = Ctx::new(store.snapshot());
+            let pool = QueryPool::new(64 << 20);
+            let grant = Arc::new(pool.empty_grant());
+            ctx.grant = Some(grant.clone());
+            spec.algo = match case {
+                1 => Algo::FastRp,
+                2 => Algo::Bfs,
+                _ => Algo::Wcc,
+            };
+            spec.proj.weight = None;
+            spec.proj.node_classes.clear();
+            spec.proj.node_class_names.clear();
+            spec.outs = Outs {
+                node: Some(0),
+                summary: Some(2),
+                ..Default::default()
+            };
+            match case {
+                1 => {
+                    spec.outs.embedding = Some(1);
+                    spec.nums.insert("dimension".into(), 8.0);
+                }
+                2 => {
+                    spec.outs.depth = Some(1);
+                    spec.sources = vec![PathEnd::Const(Id::UNDEF)];
+                }
+                _ => spec.outs.component = Some(1),
+            }
+            if case == 0 {
+                spec.nums.insert("limit".into(), 1.0);
+            }
+            if case == 3 {
+                spec.graph_var = Some(3);
+            }
+            let input = (case == 4).then(|| Table {
+                vars: vec![4],
+                cols: vec![vec![Id(77), Id(88)]],
+                len: 2,
+                sorted: vec![],
+            });
+            let held = ctx
+                .charge(input.as_ref().map_or(0, Table::mem_bytes))
+                .unwrap();
+            let ledger = ctx.memory().clone();
+            let observed_grant = grant.clone();
+            let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen = events.clone();
+            let retirement = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let retired = retirement.clone();
+            algo::set_projection_observer(Some(Arc::new(move |event| {
+                if let algo::ProjectionEvent::Allocation(name, capacity, bytes, used) = event {
+                    let live = ledger.live.load(Ordering::Acquire);
+                    assert!(
+                        live >= used && observed_grant.used() >= live,
+                        "{name} before query admission: native={used}, query={live}"
+                    );
+                    seen.lock().unwrap().push((name, capacity, bytes));
+                } else if let algo::ProjectionEvent::Materialized(name, bytes) = event
+                    && matches!(
+                        name,
+                        "algorithm-retirement-before" | "algorithm-retirement-after"
+                    )
+                {
+                    retired.lock().unwrap().push((
+                        name,
+                        bytes,
+                        ledger.live.load(Ordering::Acquire),
+                        observed_grant.used(),
+                    ));
+                }
+            })));
+            let (out, _) = run(
+                &ctx,
+                &spec,
+                input,
+                None,
+                if case == 3 { &[0, 1, 2, 3] } else { &[0, 1, 2] },
+            )
+            .unwrap();
+            algo::set_projection_observer(None);
+            let retired = retirement.lock().unwrap();
+            assert_eq!(retired.len(), 2);
+            assert_eq!(retired[0].0, "algorithm-retirement-before");
+            assert_eq!(retired[1].0, "algorithm-retirement-after");
+            assert_eq!(
+                (retired[0].1, retired[0].2, retired[0].3),
+                (retired[1].1, retired[1].2, retired[1].3),
+                "retirement must not release/re-admit backing"
+            );
+            assert_eq!(
+                out.lease.as_ref().unwrap().bytes,
+                table_capacity(&out.table).unwrap()
+            );
+            assert!(grant.used() >= out.lease.as_ref().unwrap().bytes);
+            if case == 0 {
+                assert_eq!(out.table.len, 1);
+                assert!(
+                    events
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|(n, c, _)| *n == "algorithm-pick" && *c == 2)
+                );
+            }
+            if case == 2 {
+                assert_eq!(out.table.len, 0);
+                assert!(out.lease.as_ref().unwrap().bytes > 0);
+            }
+            if case == 3 {
+                assert_eq!(out.table.len, 4);
+                assert!(
+                    events
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|(n, _, _)| *n == "algorithm-table-cols")
+                        .count()
+                        >= 5
+                );
+            }
+            if case == 4 {
+                assert_eq!((out.table.len, out.table.width()), (4, 4));
+            }
+            drop(out);
+            drop(held);
+            drop(ctx);
+            assert_eq!(grant.used(), 0);
+        }
+    }
+    #[test]
+    fn cached_projection_and_incoming_owners_never_retain_initializing_query() {
+        use crate::sparql::pool::QueryPool;
+        let (_store, mut ctx, mut spec) = weighted();
+        spec.proj.direction = Some(Dir::Forward);
+        let snapshot = ctx.snap.clone();
+        let pool = QueryPool::new(64 << 20);
+        let grant = Arc::new(pool.empty_grant());
+        ctx.grant = Some(grant.clone());
+        let ctl = Control::for_query(&ctx, u64::MAX).unwrap();
+        let (g, hit) = projection(&ctx, &spec, None, &Par::single(), &ctl).unwrap();
+        assert!(!hit);
+        // Genuine refused initialization does not publish partial incoming storage.
+        let short = Control::for_query(&ctx, 0).unwrap();
+        assert!(matches!(g.inn(&short), Err(Error::BudgetExceeded(_))));
+        drop(short);
+        let prior = ctx.memory().live.load(Ordering::Acquire);
+        let scope = memory::probe::install(|_| {}, Some("incoming-edges"));
+        assert!(matches!(g.inn(&ctl), Err(Error::Invalid(_))));
+        drop(scope);
+        assert_eq!(ctx.memory().live.load(Ordering::Acquire), prior);
+        let incoming = g.inn(&ctl).unwrap();
+        assert_eq!(incoming.n(), g.n());
+        drop(incoming);
+        let weak = Arc::downgrade(ctx.memory());
+        drop(ctl);
+        drop(ctx);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(grant.used(), 0);
+        for _ in 0..2 {
+            let mut next = Ctx::new(snapshot.clone());
+            let next_grant = Arc::new(pool.empty_grant());
+            next.grant = Some(next_grant.clone());
+            let ctl = Control::for_query(&next, u64::MAX).unwrap();
+            let (warm, hit) = projection(&next, &spec, None, &Par::single(), &ctl).unwrap();
+            assert!(hit);
+            assert!(Arc::ptr_eq(&warm, &g));
+            let base = next.memory().live.load(Ordering::Acquire);
+            let incoming = warm.inn(&ctl).unwrap();
+            assert!(next.memory().live.load(Ordering::Acquire) > base);
+            assert!(next_grant.used() >= next.memory().live.load(Ordering::Acquire));
+            drop(incoming);
+            assert_eq!(next.memory().live.load(Ordering::Acquire), base);
+            let weak = Arc::downgrade(next.memory());
+            drop(warm);
+            drop(ctl);
+            drop(next);
+            assert!(weak.upgrade().is_none());
+            assert_eq!(next_grant.used(), 0);
+        }
+    }
+    #[test]
+    fn service_allocation_failure_and_unwind_release_only_their_query_contribution() {
+        use crate::sparql::pool::QueryPool;
+        for unwind in [false, true] {
+            let (_store, mut ctx, mut spec) = weighted();
+            spec.algo = Algo::Wcc;
+            spec.outs = Outs {
+                node: Some(0),
+                component: Some(1),
+                ..Default::default()
+            };
+            let pool = QueryPool::new(64 << 20);
+            let grant = Arc::new(pool.empty_grant());
+            ctx.grant = Some(grant.clone());
+            let mut other = Ctx::new(ctx.snap.clone());
+            other.grant = Some(grant.clone());
+            let other_held = other.charge(135).unwrap();
+            let scope = memory::probe::install(
+                move |point| {
+                    if unwind
+                        && let memory::probe::Point::Allocation("algorithm-column", n) = point
+                        && n > 0
+                    {
+                        panic!("service capacity unwind");
+                    }
+                },
+                (!unwind).then_some("algorithm-column"),
+            );
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run(&ctx, &spec, None, None, &[0, 1])
+            }));
+            drop(scope);
+            if unwind {
+                assert!(result.is_err());
+            } else {
+                assert!(matches!(result.unwrap(), Err(Error::Invalid(_))));
+            }
+            assert_eq!(ctx.memory().live.load(Ordering::Acquire), 0);
+            drop(ctx);
+            assert_eq!(grant.used(), 135);
+            assert_eq!(other.memory().live.load(Ordering::Acquire), 135);
+            drop(other_held);
+            drop(other);
+            assert_eq!(grant.used(), 0);
+        }
+    }
+    #[test]
+    fn owned_execution_forwards_backing_and_warm_cache_without_losing_the_query_lease() {
+        use crate::sparql::pool::QueryPool;
+        let (store, _ctx, _spec) = weighted();
+        let service = "SERVICE <urn:x-sparkles:algo#wcc> { [] <urn:x-sparkles:algo#predicate> <http://ex/p>; <urn:x-sparkles:algo#node> ?n; <urn:x-sparkles:algo#component> ?c }";
+        let queries = [
+            format!("SELECT ?n WHERE {{ {service} }}"),
+            format!("SELECT ?n ?missing WHERE {{ {service} FILTER(?c>=0) }}"),
+            format!("SELECT ?n (?c+1 AS ?next) WHERE {{ {service} }}"),
+            format!("SELECT DISTINCT ?c WHERE {{ {service} }}"),
+            format!("SELECT ?n ?c WHERE {{ {service} }} ORDER BY DESC(?n)"),
+            format!("SELECT ?n ?c WHERE {{ {service} FILTER(?c>=0) }} LIMIT 1"),
+            format!("SELECT ?n ?c WHERE {{ {{ {service} }} UNION {{ {service} }} }} LIMIT 3"),
+        ];
+        let pool = QueryPool::new(64 << 20);
+        let grant = Arc::new(pool.empty_grant());
+        for q in queries {
+            let parsed = super::super::parse_query(&q, None, &[]).unwrap();
+            let prepared = super::super::prepare_query(
+                store.snapshot(),
+                &parsed,
+                &super::super::QueryOptions {
+                    grant: Some(grant.clone()),
+                    ..Default::default()
+                },
+                None,
+                None,
+            )
+            .unwrap();
+            let (out, _) =
+                super::super::exec::execute_owned(&prepared.ctx, &prepared.node).unwrap();
+            assert!(
+                out.lease.as_ref().is_some_and(|l| l.service.is_none()),
+                "{q}"
+            );
+            assert_eq!(
+                out.lease.as_ref().unwrap().bytes,
+                table_capacity(&out.table).unwrap(),
+                "{q}"
+            );
+            assert!(
+                prepared.ctx.memory().live.load(Ordering::Acquire)
+                    >= table_capacity(&out.table).unwrap()
+            );
+            assert!(grant.used() >= prepared.ctx.memory().live.load(Ordering::Acquire));
+            let weak = Arc::downgrade(prepared.ctx.memory());
+            drop(out);
+            drop(prepared);
+            assert!(weak.upgrade().is_none());
+            assert_eq!(grant.used(), 0);
+        }
+        // Actual result-cache hit through the private ownership-aware eager entry.
+        let s = crate::store::Store::in_memory(crate::store::StoreOptions {
+            result_cache_min_ms: 0.0,
+            ..Default::default()
+        });
+        s.load(&[crate::io::Source::from_bytes(
+            b"<urn:a> <http://ex/p> <urn:b>.".to_vec(),
+            crate::io::RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+        let q = format!("SELECT ?n ?c WHERE {{ {service} }}");
+        let parsed = super::super::parse_query(&q, None, &[]).unwrap();
+        let options = super::super::QueryOptions {
+            grant: Some(grant.clone()),
+            ..Default::default()
+        };
+        let first = super::super::query(s.snapshot(), &q, &options).unwrap();
+        let expected = first.table.clone();
+        drop(first);
+        assert_eq!(grant.used(), 0);
+        let prepared =
+            super::super::prepare_query(s.snapshot(), &parsed, &options, None, None).unwrap();
+        let (out, info) = super::super::exec::execute_owned(&prepared.ctx, &prepared.node).unwrap();
+        assert!(info.cached);
+        assert_eq!(out.table.cols, expected.cols);
+        assert_eq!(
+            out.lease.as_ref().unwrap().bytes,
+            table_capacity(&out.table).unwrap()
+        );
+        let weak = Arc::downgrade(prepared.ctx.memory());
+        drop(prepared);
+        assert!(weak.upgrade().is_some());
+        assert!(grant.used() > 0);
+        drop(out);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(grant.used(), 0);
+    }
+    #[test]
+    fn final_input_join_is_query_owned_after_the_service_peak_is_closed() {
+        use crate::sparql::pool::QueryPool;
+        let (_store, mut ctx, mut spec) = weighted();
+        spec.algo = Algo::Wcc;
+        spec.outs = Outs {
+            node: Some(0),
+            component: Some(1),
+            ..Default::default()
+        };
+        spec.nums.insert("maxMemory".into(), 2048.0);
+        let pool = QueryPool::new(64 << 20);
+        let grant = Arc::new(pool.empty_grant());
+        ctx.grant = Some(grant.clone());
+        let input = Table {
+            vars: vec![4],
+            cols: vec![vec![Id(77); 1000]],
+            len: 1000,
+            sorted: Vec::new(),
+        };
+        let held = ctx.charge(input.mem_bytes()).unwrap();
+        let (out, counters) = run(&ctx, &spec, Some(input), None, &[0, 1]).unwrap();
+        assert_eq!(out.table.len, 2000);
+        assert!(table_capacity(&out.table).unwrap() > 2048);
+        assert!(counters["peakBytes"].as_u64().unwrap() <= 2048);
+        assert!(out.lease.as_ref().unwrap().service.is_none());
+        drop(out);
+        drop(held);
+        drop(ctx);
+        assert_eq!(grant.used(), 0);
+    }
+    #[test]
+    fn repeated_graphs_share_one_service_limit_and_reclaim_dead_native_frames() {
+        use crate::io::{RdfFormat, Source};
+        let store = crate::store::Store::in_memory(Default::default());
+        let mut data = String::from("@prefix ex:<http://ex/>.");
+        for g in 0..8 {
+            data.push_str(&format!("ex:g{g} {{ex:a ex:p ex:b.}}"));
+        }
+        store
+            .load(&[Source::from_bytes(data.into_bytes(), RdfFormat::TriG, None)])
+            .unwrap();
+        let (_other, _old, mut spec) = weighted();
+        let ctx = Ctx::new(store.snapshot());
+        spec.proj.predicates = Some(vec![(ctx.snap.lookup_iri("http://ex/p").unwrap().0, None)]);
+        spec.proj.weight = None;
+        spec.proj.node_classes.clear();
+        spec.proj.node_class_names.clear();
+        spec.algo = Algo::Wcc;
+        spec.outs = Outs {
+            node: Some(0),
+            component: Some(1),
+            ..Default::default()
+        };
+        spec.graph_var = Some(3);
+        let mut one = spec.clone();
+        one.proj.graph = GraphFilter::One(ctx.snap.lookup_iri("http://ex/g0").unwrap().0);
+        let mut ctx_one = Ctx::new(ctx.snap.clone());
+        ctx_one.use_cache = false;
+        let (out, one_stats) = run(&ctx_one, &one, None, None, &[0, 1, 3]).unwrap();
+        assert_eq!(out.table.len, 2);
+        drop(out);
+        let mut ctx_all = Ctx::new(ctx.snap.clone());
+        ctx_all.use_cache = false;
+        let (out, all_stats) = run(&ctx_all, &spec, None, None, &[0, 1, 3]).unwrap();
+        assert_eq!(out.table.len, 16);
+        drop(out);
+        let first = one_stats["peakBytes"].as_u64().unwrap();
+        let all = all_stats["peakBytes"].as_u64().unwrap();
+        assert!(
+            all > first,
+            "aggregate GRAPH/output overlap must exceed one isolated graph: {first}/{all}"
+        );
+        let mut limited = spec.clone();
+        limited.nums.insert("maxMemory".into(), first as f64);
+        assert!(
+            matches!(run(&ctx_all,&limited,None,None,&[0,1,3]),Err(Error::BudgetExceeded(b)) if b.kind==crate::error::BudgetKind::Memory && b.limit==first)
+        );
+        // No reached source means empty rows. Native graph capacity is still real,
+        // but each dead frame must end before the next equal graph starts.
+        let mut empty = spec.clone();
+        empty.algo = Algo::Bfs;
+        empty.outs = Outs {
+            node: Some(0),
+            depth: Some(1),
+            ..Default::default()
+        };
+        empty.sources = vec![PathEnd::Const(Id::UNDEF)];
+        let (out, stats) = run(&ctx_all, &empty, None, None, &[0, 1, 3]).unwrap();
+        assert_eq!(out.table.len, 0);
+        drop(out);
+        let mut ids = vec![
+            ctx.snap.lookup_iri("http://ex/g0").unwrap().0,
+            ctx.snap.lookup_iri("http://ex/g1").unwrap().0,
+        ];
+        ids.sort_unstable();
+        let mut two = empty.clone();
+        two.proj.graph = GraphFilter::Set(ids);
+        let (out, two_stats) = run(&ctx_all, &two, None, None, &[0, 1, 3]).unwrap();
+        assert_eq!(out.table.len, 0);
+        drop(out);
+        assert_eq!(
+            stats["peakBytes"], two_stats["peakBytes"],
+            "dead native reservations must not accumulate over eight graphs"
+        );
+    }
+    fn serialization_admission(embedding_case: bool) {
+        let (_store, ctx, spec) = weighted();
+        let graph_ctl = Control::unlimited();
+        let g = build_graph(&ctx, &spec, None, &Par::single(), &graph_ctl).unwrap();
+        let ledger = ctx.memory().clone();
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let witness = observed.clone();
+        algo::set_projection_observer(Some(Arc::new(move |event| {
+            if let algo::ProjectionEvent::Materialized(name, bytes) = event
+                && name
+                    == if embedding_case {
+                        "algorithm-embedding-text"
+                    } else {
+                        "algorithm-summary-text"
+                    }
+            {
+                witness
+                    .lock()
+                    .unwrap()
+                    .push((bytes, ledger.live.load(Ordering::Acquire)));
+            }
+        })));
+        let ctl = Control::for_query(&ctx, u64::MAX).unwrap();
+        if embedding_case {
+            embedding(&ctx, &[1.25; 2048], &ctl).unwrap();
+        } else {
+            let mut stats = algo::Stats::new();
+            stats.insert("test".into(), "x".repeat(16384).into());
+            summary(&ctx, &g, stats, &ctl).unwrap();
+        }
+        algo::set_projection_observer(None);
+        let got = observed.lock().unwrap();
+        assert_eq!(got.len(), 1);
+        assert!(got[0].0 > 1024);
+        assert!(
+            got[0].1 >= got[0].0 as u64,
+            "actual serialized backing is unadmitted: {got:?}"
+        );
+    }
+    #[test]
+    fn summary_serialization_is_admitted_before_materialization() {
+        serialization_admission(false);
+    }
+    #[test]
+    fn embedding_serialization_is_admitted_before_materialization() {
+        serialization_admission(true);
+    }
     #[test]
     fn hash_bound_covers_real_layout_and_replacement_overlap() {
         let ctl = Control::new(Default::default(), None, 1 << 20);

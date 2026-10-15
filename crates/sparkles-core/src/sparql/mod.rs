@@ -35,6 +35,7 @@ pub mod pathsearch;
 pub mod plan;
 pub mod pool;
 mod propertyext;
+pub(crate) mod query_memory;
 pub mod rdfs;
 mod registeredagg;
 pub mod results;

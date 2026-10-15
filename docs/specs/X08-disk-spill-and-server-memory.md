@@ -704,6 +704,21 @@ index.
 
 ## Outcome
 
+Algorithm SERVICE calls now share the query ledger and pool admission with ordinary
+query work. Native allocation and output leases use one admission transaction, and a
+refused increment changes neither live ownership nor the successful native peak.
+Eager owners retain their admitted high-water contribution. Cursor owners retain live
+storage through fallback transfer, sorting, returned batches and early close. Each
+public context operation still reads its current memory limit and grant. Existing
+contributions remain attached to their original grants when those fields change.
+
+Projection and result caches keep plain data rather than query owners. A warm caller
+admits its own storage before use or copying. Closing an algorithm call transfers its
+finished output to query-only ownership without releasing and reacquiring its grant.
+These capacity and ownership checks retain the existing estimates for other executor
+kernels and decoded terms. They exclude allocator metadata, size classes and process
+RSS, and do not establish a performance result.
+
 Phase 1 is built (roadmap item 2). Phases 2 and 3 are not (items 7 and 40).
 
 ### Phase 1a: shared caches
@@ -749,8 +764,9 @@ namespace and so one set of counters.
 ### Phase 1b: the query memory pool
 
 `QueryPool` and `PoolGrant` are in `sparkles-core` (`sparql/pool.rs`) as §4.1 describes.
-`Charge::add` checks the grant only after its own `mem_live` update. Cursor state returns
-through `Ctx::release_live`, and the pool never makes a running query wait. The grant adds eager contexts' retained estimates to live cursor charges,
+`Charge::add` admits local and pool growth under the query ledger's lock before
+publishing live ownership. Cursor state returns through the same ledger, and the pool
+never makes a running query wait. The grant adds eager contexts' retained estimates to live cursor charges,
 and growth and trimming of one grant run under a lock of its own. The differences from
 the text:
 
@@ -846,10 +862,11 @@ fitting output estimates, separate context lifetimes, graph lexical payload, bud
 failure cleanup and conversion from eager preparation to cursor accounting. The existing
 profile and latency measurements remain pending as described below.
 
-The retained-estimate path keeps its acquire fast read and moves growth into a separate
-helper that is never inlined. The helper preserves the locked recheck, admission of the
-positive contribution and publication only after admission succeeds. An isolated Intel
-comparison covers only `types-grouped` and does not settle the latency gate. The A1
+The query ledger now serializes admission and successful ownership publication for
+ordinary charges and adapted algorithm buffers. Pool releases and wakeups run after
+that lock is released. This changes the retained-estimate path from the earlier fast
+read and separate growth helper. The earlier isolated Intel comparison covered only
+`types-grouped` and does not measure this repair or settle the latency gate. The A1
 anonymous RSS remeasurement, the 10.5M and DBpedia profile runs, and the latency study
 comparing the baseline, fixed build and pool settings remain pending as described below.
 

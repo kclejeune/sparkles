@@ -887,10 +887,15 @@ impl Snapshot {
     }
 
     /// Distinct values of the first key column (e.g. graph names from GSPO), by skipping.
-    pub fn distinct_first(&self, perm: Perm) -> Result<Vec<u64>> {
-        let mut out = Vec::new();
+    fn distinct_first_checked(
+        &self,
+        perm: Perm,
+        mut check: impl FnMut() -> Result<()>,
+        mut each: impl FnMut(u64) -> Result<()>,
+    ) -> Result<()> {
         let mut cur: Option<u64> = None;
         loop {
+            check()?;
             let from = match cur {
                 None => 0,
                 Some(u64::MAX) => break,
@@ -921,6 +926,7 @@ impl Snapshot {
             // a count would walk every inserted and deleted key of the delta under `v`
             let mut any = false;
             self.scan(perm, &[v], |c| {
+                check()?;
                 any = match c {
                     Chunk::Block(_, start, end) => start < end,
                     Chunk::Row(_) => true,
@@ -928,11 +934,41 @@ impl Snapshot {
                 Ok(!any)
             })?;
             if any {
-                out.push(v);
+                each(v)?;
             }
             cur = Some(v);
         }
+        Ok(())
+    }
+
+    /// Distinct values of the first key column (e.g. graph names from GSPO), by skipping.
+    pub fn distinct_first(&self, perm: Perm) -> Result<Vec<u64>> {
+        let mut out = Vec::new();
+        self.distinct_first_checked(
+            perm,
+            || Ok(()),
+            |value| {
+                out.push(value);
+                Ok(())
+            },
+        )?;
         Ok(out)
+    }
+
+    /// Visit visible named graph IDs in the same order as graph_ids, without a list.
+    /// The query adapter supplies its control check; callback errors propagate directly.
+    pub(crate) fn for_each_graph_id_checked(
+        &self,
+        check: impl FnMut() -> Result<()>,
+        mut each: impl FnMut(Id) -> Result<()>,
+    ) -> Result<()> {
+        self.distinct_first_checked(Perm::Gspo, check, |value| {
+            let graph = Id(value);
+            if graph != Id::DEFAULT_GRAPH {
+                each(graph)?;
+            }
+            Ok(())
+        })
     }
 
     /// All named graph ids (excludes the default graph).
@@ -7265,6 +7301,42 @@ ex:a ex:p 1, 2, 3 . ex:b ex:p 2 . ex:c ex:q "hello"@en .
     }
 
     #[test]
+    fn checked_graph_ids_stream_order_and_preserve_callback_errors() {
+        let store = Store::in_memory(StoreOptions::default());
+        store.load(&[Source::from_bytes(
+            b"<urn:s> <urn:p> <urn:o> . <urn:g1> { <urn:s> <urn:p> <urn:o> . } <urn:g2> { <urn:s> <urn:p> <urn:o> . }".to_vec(),
+            RdfFormat::TriG, None,
+        )]).unwrap();
+        let snap = store.snapshot();
+        let mut found = Vec::new();
+        snap.for_each_graph_id_checked(
+            || Ok(()),
+            |id| {
+                found.push(id);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(found, snap.graph_ids().unwrap());
+        assert_eq!(found.len(), 2);
+        let mut callbacks = 0;
+        let stopped = snap.for_each_graph_id_checked(
+            || Ok(()),
+            |_| {
+                callbacks += 1;
+                Err(Error::Cancelled)
+            },
+        );
+        assert!(matches!(stopped, Err(Error::Cancelled)));
+        assert_eq!(callbacks, 1);
+        let denied = snap.for_each_graph_id_checked(
+            || Err(Error::Timeout),
+            |_| panic!("control failure must precede a graph callback"),
+        );
+        assert!(matches!(denied, Err(Error::Timeout)));
+    }
+
+    #[test]
     fn mem_store_and_graphs() {
         let store = Store::in_memory(StoreOptions::default());
         let trig = r#"@prefix ex: <http://ex.org/> .
@@ -7282,6 +7354,16 @@ ex:a ex:p 1, 2, 3 . ex:b ex:p 2 . ex:c ex:q "hello"@en .
         assert_eq!(s.len(), 4);
         let graphs = s.graph_ids().unwrap();
         assert_eq!(graphs.len(), 2);
+        let mut streamed = Vec::new();
+        s.for_each_graph_id_checked(
+            || Ok(()),
+            |g| {
+                streamed.push(g);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(streamed, graphs);
         // small incremental load goes through the delta
         store
             .load(&[Source::from_bytes(
@@ -7294,6 +7376,16 @@ ex:a ex:p 1, 2, 3 . ex:b ex:p 2 . ex:c ex:q "hello"@en .
         assert_eq!(s.len(), 5);
         assert_eq!(s.delta.inserts(), 1);
         assert_eq!(s.graph_ids().unwrap().len(), 3);
+        let mut streamed = Vec::new();
+        s.for_each_graph_id_checked(
+            || Ok(()),
+            |g| {
+                streamed.push(g);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(streamed, s.graph_ids().unwrap());
         // deleting every quad of a graph through the delta drops it, and deleting some
         // of a graph's quads keeps it
         let gquad = |o: &str, g: &str| {
