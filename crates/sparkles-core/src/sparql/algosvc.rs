@@ -935,8 +935,9 @@ pub(super) fn run(
 ) -> Result<(Table, serde_json::Map<String, serde_json::Value>)> {
     let started = Instant::now();
     let limit = spec.num("maxMemory").map_or(u64::MAX, |m| m as u64);
-    let ctl = Control::new(
+    let ctl = Control::with_cancellation(
         ctx.cancel.clone(),
+        ctx.cancellation.clone(),
         ctx.deadline,
         limit.min(ctx.memory_remaining()),
     );

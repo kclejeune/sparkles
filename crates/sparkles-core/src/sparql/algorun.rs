@@ -336,11 +336,13 @@ fn groups(
     rows: &[Vec<Option<Term>>],
     run: &str,
     prefixes: &[(String, String)],
+    control: &WriteOptions,
 ) -> Result<(Vec<Group>, Vec<NamedNode>)> {
     let col = |name: &str| vars.iter().position(|v| v == name);
     let mut preds: BTreeMap<&str, NamedNode> = BTreeMap::new();
     check_write_outputs(req, w)?;
     for (out, p) in &w.predicates {
+        control.check()?;
         preds.insert(
             out.as_str(),
             NamedNode::new(expand_iri(p, prefixes)?).map_err(|e| invalid(e.to_string()))?,
@@ -358,6 +360,7 @@ fn groups(
     // the community of each node at each level, to link a community to its parent
     let mut last: std::collections::HashMap<(Term, i64), i64> = Default::default();
     for row in rows {
+        control.check()?;
         let Some(n) = &row[node] else { continue };
         let subject = subject_of(n)?;
         let at = *index.entry(n.clone()).or_insert_with(|| {
@@ -365,6 +368,7 @@ fn groups(
             out.len() - 1
         });
         for (name, pred) in &preds {
+            control.check()?;
             if *name == "level" {
                 continue;
             }
@@ -394,6 +398,7 @@ fn groups(
     if hierarchical {
         // a community's parent is the community of the next level that holds its nodes
         for ((n, level), id) in &last {
+            control.check()?;
             if let Some(parent) = last.get(&(n.clone(), level + 1)) {
                 resources.insert((*level, *id), Some((level + 1, *parent)));
             }
@@ -403,6 +408,7 @@ fn groups(
             Term::NamedNode(NamedNode::new_unchecked(format!("{SPK}algo:{run}:{l}:{i}")))
         };
         for ((level, id), parent) in &resources {
+            control.check()?;
             let mut po: Vec<(NamedNode, Term)> = Vec::new();
             if let Some(lp) = &level_pred {
                 po.push((lp.clone(), int(*level as u64)));
@@ -450,6 +456,21 @@ pub fn run_write(
     author: Option<Arc<str>>,
     ctl: &Control,
 ) -> Result<RunReport> {
+    let entered = std::time::Instant::now();
+    let deadline = super::earlier_deadline(opts.effective_deadline(entered)?, ctl.deadline);
+    let flags = crate::task::Cancellation::from_flags(
+        opts.cancel.iter().cloned().chain([ctl.cancel.flag()]),
+    );
+    let cancellation = opts
+        .cancellation
+        .as_ref()
+        .map_or_else(|| flags.clone(), |c| c.combine(&flags));
+    let operation = WriteOptions {
+        deadline,
+        cancellation: Some(cancellation.clone()),
+        ..Default::default()
+    };
+
     let w = req
         .write
         .as_ref()
@@ -461,18 +482,33 @@ pub fn run_write(
     let snap = store.snapshot();
     let source_commit = snap.commit;
     let started = now();
+    operation.check()?;
     ctl.progress.report(0.0, "computing");
+    operation.check()?;
     let mut o = opts.clone();
-    if o.cancel.is_none() {
-        o.cancel = Some(ctl.cancel.flag());
-    }
+    o.timeout = None;
+    o.deadline = deadline;
+    o.cancellation = Some(cancellation.clone());
     let result = query(snap, &q, &o)?;
-    ctl.check()?;
-    let rows = result.rows();
+    operation.check()?;
+    let mut rows = Vec::with_capacity(result.len());
+    for i in 0..result.table.len() {
+        operation.check()?;
+        let mut row = Vec::with_capacity(result.table.cols.len());
+        for col in &result.table.cols {
+            operation.check()?;
+            row.push(result.term(col[i]));
+        }
+        rows.push(row);
+    }
     let run = uuid::Uuid::new_v4().to_string();
     let run_iri = NamedNode::new_unchecked(format!("urn:uuid:{run}"));
-    let (groups, node_preds) = groups(req, w, &result.vars, &rows, &run, prefixes)?;
-    let total_triples: u64 = groups.iter().map(|g| g.1.len() as u64).sum();
+    let (groups, node_preds) = groups(req, w, &result.vars, &rows, &run, prefixes, &operation)?;
+    let mut total_triples = 0;
+    for group in &groups {
+        operation.check()?;
+        total_triples += group.1.len() as u64;
+    }
     // batches of whole groups
     let size = w.batch_size.unwrap_or(DEFAULT_BATCH).max(1);
     let mut batches: Vec<std::ops::Range<usize>> = Vec::new();
@@ -481,6 +517,7 @@ pub fn run_write(
     } else {
         let (mut start, mut n) = (0usize, 0usize);
         for (i, g) in groups.iter().enumerate() {
+            operation.check()?;
             n += g.1.len();
             if n >= size {
                 batches.push(start..i + 1);
@@ -521,14 +558,16 @@ pub fn run_write(
     let n_batches = batches.len();
     let outcome = (|| -> Result<()> {
         for (bi, range) in batches.iter().enumerate() {
-            ctl.check()?;
+            operation.check()?;
+            operation.check()?;
             ctl.progress.report(
                 0.1 + 0.9 * bi as f32 / n_batches.max(1) as f32,
                 &format!("writing batch {} of {n_batches}", bi + 1),
             );
             let wo = WriteOptions {
                 cancel: Some(ctl.cancel.flag()),
-                deadline: ctl.deadline,
+                cancellation: Some(cancellation.clone()),
+                deadline,
                 author: author.clone(),
                 message: Some(Arc::from(format!(
                     "algo run {run} batch {}/{n_batches}",
@@ -555,6 +594,7 @@ pub fn run_write(
                     let view = txn.view();
                     let mut keys = Vec::new();
                     view.scan(Perm::Gspo, &[g.0], |c| {
+                        operation.check()?;
                         match c {
                             Chunk::Block(b, s, e) => keys.extend((s..e).map(|i| b.key(i))),
                             Chunk::Row(k) => keys.push(k),
@@ -562,16 +602,19 @@ pub fn run_write(
                         Ok(true)
                     })?;
                     for k in keys {
+                        operation.check()?;
                         txn.delete(Perm::Gspo.to_quad(&k))?;
                     }
                 }
                 let mut t = Vec::new();
                 record(&mut t);
                 for (p, o) in &t {
+                    operation.check()?;
                     put(&mut txn, rec, p, o)?;
                 }
             }
             for (s, po) in &groups[range.clone()] {
+                operation.check()?;
                 let sid = txn.intern(&match s {
                     NamedOrBlankNode::NamedNode(n) => Term::NamedNode(n.clone()),
                     NamedOrBlankNode::BlankNode(b) => Term::BlankNode(b.clone()),
@@ -579,10 +622,12 @@ pub fn run_write(
                 if w.mode == WriteMode::Merge {
                     // read in this transaction: the values another writer added are replaced too
                     for p in &node_preds {
+                        operation.check()?;
                         let pid = txn.intern(&Term::NamedNode(p.clone()))?;
                         let view = txn.view();
                         let mut keys = Vec::new();
                         view.scan(Perm::Spo, &[sid.0, pid.0], |c| {
+                            operation.check()?;
                             match c {
                                 Chunk::Block(b, s, e) => keys.extend((s..e).map(|i| b.key(i))),
                                 Chunk::Row(k) => keys.push(k),
@@ -590,6 +635,7 @@ pub fn run_write(
                             Ok(true)
                         })?;
                         for k in keys {
+                            operation.check()?;
                             let q = Perm::Spo.to_quad(&k);
                             if q[3] == g {
                                 txn.delete(q)?;
@@ -598,6 +644,7 @@ pub fn run_write(
                     }
                 }
                 for (p, o) in po {
+                    operation.check()?;
                     put(&mut txn, sid, p, o)?;
                     written += 1;
                 }
@@ -608,10 +655,12 @@ pub fn run_write(
                 ("triplesWritten", written),
             ];
             for (name, v) in counters {
+                operation.check()?;
                 let p = txn.intern(&Term::NamedNode(spk(name)))?;
                 let view = txn.view();
                 let mut keys = Vec::new();
                 view.scan(Perm::Spo, &[rec.0, p.0], |c| {
+                    operation.check()?;
                     match c {
                         Chunk::Block(b, s, e) => keys.extend((s..e).map(|i| b.key(i))),
                         Chunk::Row(k) => keys.push(k),
@@ -619,6 +668,7 @@ pub fn run_write(
                     Ok(true)
                 })?;
                 for k in keys {
+                    operation.check()?;
                     let q = Perm::Spo.to_quad(&k);
                     if q[3] == g {
                         txn.delete(q)?;
@@ -635,9 +685,14 @@ pub fn run_write(
                 )?;
                 put(&mut txn, rec, &spk("status"), &lit("complete"))?;
             }
+            operation.check()?;
             txn.commit()?;
             commits += 1;
+            operation.check()?;
         }
+        operation.check()?;
+        ctl.progress.report(1.0, "done");
+        operation.check()?;
         Ok(())
     })();
     if let Err(e) = outcome {
@@ -647,32 +702,40 @@ pub fn run_write(
         } else {
             "failed"
         };
-        if commits > 0
-            && let Ok(mut txn) = store.try_write_with(
-                CommitKind::Transaction,
-                WriteOptions {
-                    author: author.clone(),
-                    graphs: opts.graphs.clone(),
-                    message: Some(Arc::from(format!("algo run {run} {status}"))),
-                    ..Default::default()
-                },
-            )
-        {
-            let g = txn.intern(&Term::NamedNode(graph.clone()))?;
-            let rec = txn.intern(&Term::NamedNode(run_iri.clone()))?;
-            for (p, o) in [
-                (format!("{PROV}endedAtTime"), now()),
-                (format!("{SPK}status"), lit(status)),
-            ] {
-                let p = txn.intern(&Term::NamedNode(NamedNode::new_unchecked(p)))?;
-                let o = txn.intern(&o)?;
-                txn.insert([rec, p, o, g])?;
-            }
-            let _ = txn.commit();
+        if commits > 0 && commits < n_batches as u64 {
+            // One cooperative cleanup budget; never wait for a competing writer.
+            // No failure in this optional record may replace the operation's error.
+            let _ = (|| -> Result<()> {
+                let deadline = std::time::Instant::now()
+                    .checked_add(std::time::Duration::from_millis(100))
+                    .ok_or_else(|| invalid("cleanup deadline is too large"))?;
+                let mut txn = store.try_write_with(
+                    CommitKind::Transaction,
+                    WriteOptions {
+                        no_wait: true,
+                        deadline: Some(deadline),
+                        author: author.clone(),
+                        graphs: opts.graphs.clone(),
+                        message: Some(Arc::from(format!("algo run {run} {status}"))),
+                        ..Default::default()
+                    },
+                )?;
+                let g = txn.intern(&Term::NamedNode(graph.clone()))?;
+                let rec = txn.intern(&Term::NamedNode(run_iri.clone()))?;
+                for (p, o) in [
+                    (format!("{PROV}endedAtTime"), now()),
+                    (format!("{SPK}status"), lit(status)),
+                ] {
+                    let p = txn.intern(&Term::NamedNode(NamedNode::new_unchecked(p)))?;
+                    let o = txn.intern(&o)?;
+                    txn.insert([rec, p, o, g])?;
+                }
+                txn.commit()?;
+                Ok(())
+            })();
         }
         return Err(e);
     }
-    ctl.progress.report(1.0, "done");
     Ok(RunReport {
         run: run_iri.as_str().to_string(),
         algorithm: req.algorithm.clone(),

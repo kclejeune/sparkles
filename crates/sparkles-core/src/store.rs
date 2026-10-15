@@ -3505,10 +3505,12 @@ impl Store {
         let w = {
             // counted while it waits, so a long holder of the lock can give way
             let _waiting = Waiting::new(&self.writers_waiting);
+            #[cfg(any(test, feature = "failpoints"))]
+            self.failpoint("writer-acquiring");
             if o.no_wait {
                 o.check()?;
                 self.writer.try_lock().ok_or(Error::WriterBusy)?
-            } else if o.cancel.is_none() && o.deadline.is_none() {
+            } else if o.cancel.is_none() && o.cancellation.is_none() && o.deadline.is_none() {
                 self.writer.lock()
             } else {
                 loop {
@@ -3614,7 +3616,8 @@ impl Store {
         o: Option<crate::guard::WriteOptions>,
         dir: &Path,
     ) -> Option<crate::builder::InterruptFn> {
-        let o = o.filter(|o| o.cancel.is_some() || o.deadline.is_some());
+        let o =
+            o.filter(|o| o.cancel.is_some() || o.cancellation.is_some() || o.deadline.is_some());
         let reserve = self.root.as_ref().and(self.opts.min_free_disk_bytes);
         if o.is_none() && reserve.is_none() {
             return None;

@@ -83,7 +83,7 @@ pub fn update_in(txn: &mut WriteTxn<'_>, u: &str, opts: &QueryOptions) -> Result
         let t1 = Instant::now();
         let req = Request {
             opts,
-            deadline: opts.timeout.map(|t| t0 + t),
+            deadline: opts.effective_deadline(t0)?,
             base: parsed.base_iri.clone(),
             budget: RequestBudget::new(&opts.outbound),
             produced: Default::default(),
@@ -217,7 +217,7 @@ fn run_update(
     let t1 = Instant::now();
     let req = Request {
         opts,
-        deadline: opts.timeout.map(|t| t0 + t),
+        deadline: opts.effective_deadline(t0)?,
         base: parsed.base_iri.clone(),
         budget: opts
             .outbound_budget
@@ -240,8 +240,19 @@ fn run_update(
     if wopts.cancel.is_none() {
         wopts.cancel = opts.cancel.clone();
     }
-    if wopts.deadline.is_none() {
-        wopts.deadline = req.deadline;
+    wopts.deadline = super::earlier_deadline(wopts.deadline, req.deadline);
+    if opts.cancel.is_some() || opts.cancellation.is_some() {
+        let query_flags = crate::task::Cancellation::from_flags(opts.cancel.iter().cloned());
+        let query_flags = opts
+            .cancellation
+            .as_ref()
+            .map_or_else(|| query_flags.clone(), |c| c.combine(&query_flags));
+        wopts.cancellation = Some(
+            wopts
+                .cancellation
+                .as_ref()
+                .map_or_else(|| query_flags.clone(), |c| c.combine(&query_flags)),
+        );
     }
     let mut txn = store.try_write_with(kind, wopts)?;
     for op in &parsed.operations {
@@ -286,7 +297,10 @@ impl Request<'_> {
         {
             return Err(Error::Cancelled);
         }
-        if self.deadline.is_some_and(|d| Instant::now() > d) {
+        if let Some(cancellation) = &self.opts.cancellation {
+            cancellation.check()?;
+        }
+        if self.deadline.is_some_and(|d| Instant::now() >= d) {
             return Err(Error::Timeout);
         }
         Ok(())
@@ -302,6 +316,7 @@ impl Request<'_> {
         #[cfg(feature = "geo")]
         ctx.geo.set_op_vertices(op_vertices);
         ctx.deadline = self.deadline;
+        ctx.cancellation = self.opts.cancellation.clone();
         if let Some(c) = &self.opts.cancel {
             ctx.cancel = c.clone();
         }

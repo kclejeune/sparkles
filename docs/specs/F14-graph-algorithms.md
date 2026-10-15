@@ -523,7 +523,8 @@ stays current. It is left out of this spec.
 gaps listed under "Not built".
 
 The counter confinement, unit-weight sum, Graphalytics clustering, empty-result
-statistics and transaction projection-cache repairs have targeted regression coverage. The
+statistics, transaction projection-cache and operation-control repairs have targeted
+regression coverage. The
 remaining findings from the resumed review and the lane's integration and acceptance
 gates are still pending.
 
@@ -572,8 +573,16 @@ gates are still pending.
   destination graph. Values for the same run in other graphs are preserved, so
   replacing the counters needs write grants only for the destination graph.
   The last commit adds `prov:endedAtTime` and
-  `spk:status`. A cancelled or failed run records its status with one more commit when
-  it can. In merge mode the old values of the written predicates are deleted inside the
+  `spk:status`. Task and query cancellation sources share checks in computation, result
+  preparation and writer admission. A relative timeout starts at operation entry and is
+  intersected with the absolute and task deadlines once, without phase renewal.
+  Built-in SHACL and ShEx guards carry those controls through validation and SPARQL
+  evaluation. Custom guards remain responsible for checking the full `WriteOptions`.
+  A partial cancelled or failed run attempts one optional status commit with no writer
+  wait and a separate 100 ms cooperative cleanup budget. The budget cannot interrupt a
+  durability call, and recording failure never replaces the original error. A control
+  error observed after the final batch preserves its durable complete record. A cancel
+  can still race the final check. In merge mode the old values of the written predicates are deleted inside the
   batch's own commit. Louvain and Leiden communities are written as resources
   `urn:x-sparkles:algo:{run}:{level}:{id}` with a level and a `skos:broader` link.
   The writer of C23 does not exist yet, so the loop is built on the store's

@@ -82,6 +82,10 @@ pub struct QueryOptions {
     /// Immutable application scalar and aggregate callbacks resolved for this query only.
     pub extensions: Option<Arc<extensions::ExtensionRegistry>>,
     pub timeout: Option<Duration>,
+    /// An absolute deadline, intersected with the relative timeout without renewal.
+    pub deadline: Option<Instant>,
+    /// Additional cancellation sources, intersected with `cancel` at work checks.
+    pub cancellation: Option<crate::task::Cancellation>,
     /// options for write guards (updates)
     pub write: crate::guard::WriteOptions,
     /// protocol `default-graph-uri` (overrides FROM)
@@ -165,6 +169,25 @@ pub struct QueryOptions {
     /// dataset fills each of those fields that the caller left unset. The engine itself
     /// does not read it.
     pub defaults_applied: bool,
+}
+
+impl QueryOptions {
+    /// The earlier absolute or relative bound, anchored once by the caller.
+    pub(crate) fn effective_deadline(&self, started: Instant) -> Result<Option<Instant>> {
+        let relative = self
+            .timeout
+            .map(|timeout| {
+                started
+                    .checked_add(timeout)
+                    .ok_or_else(|| Error::invalid("query timeout is too large"))
+            })
+            .transpose()?;
+        Ok(earlier_deadline(self.deadline, relative))
+    }
+}
+
+pub(crate) fn earlier_deadline(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
+    a.into_iter().chain(b).min()
 }
 
 /// `snap` with the request's union default graph setting, if it overrides the store's.
@@ -406,7 +429,11 @@ fn make_ctx(
     // the store's limit on one geometry operation
     #[cfg(feature = "geo")]
     ctx.geo.set_op_vertices(op_vertices);
-    ctx.deadline = opts.timeout.map(|t| Instant::now() + t);
+    ctx.deadline = match opts.timeout {
+        Some(_) => opts.effective_deadline(Instant::now())?,
+        None => opts.deadline,
+    };
+    ctx.cancellation = opts.cancellation.clone();
     if let Some(c) = &opts.cancel {
         ctx.cancel = c.clone();
     }
@@ -657,14 +684,7 @@ fn prepare_query(
     let mut ctx = make_ctx(snap, opts, dataset, base)?;
     if let Some(started) = cursor_started.filter(|_| automatic.is_none()) {
         ctx.enable_cursor_accounting()?;
-        ctx.deadline = opts
-            .timeout
-            .map(|timeout| {
-                started
-                    .checked_add(timeout)
-                    .ok_or_else(|| Error::invalid("cursor timeout is too large"))
-            })
-            .transpose()?;
+        ctx.deadline = opts.effective_deadline(started)?;
     }
     ctx.configure_extensions(pattern);
     let mut ctx = Arc::new(ctx);
@@ -704,14 +724,7 @@ fn prepare_query(
         let mutable = Arc::get_mut(&mut ctx)
             .ok_or_else(|| Error::invalid("automatic cursor context is shared"))?;
         mutable.enable_cursor_accounting()?;
-        mutable.deadline = opts
-            .timeout
-            .map(|timeout| {
-                started
-                    .checked_add(timeout)
-                    .ok_or_else(|| Error::invalid("cursor timeout is too large"))
-            })
-            .transpose()?;
+        mutable.deadline = opts.effective_deadline(started)?;
         ctx.attach_cursor_owner();
     }
     ctx.check()?;

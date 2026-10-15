@@ -46,19 +46,67 @@ pub struct Control {
 
 struct Inner {
     cancel: Arc<AtomicBool>,
+    cancellation: Option<crate::task::Cancellation>,
     deadline: Option<Instant>,
     limit: u64,
     used: AtomicU64,
     peak: AtomicU64,
 }
 
+/// A test-only observation of a native control check at its actual call site.
+#[cfg(feature = "failpoints")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckOutcome {
+    Before,
+    Passed,
+    Cancelled,
+    Timeout,
+}
+
+#[cfg(feature = "failpoints")]
+pub type CheckObserver =
+    Arc<dyn Fn(&'static str, u32, CheckOutcome, Option<Instant>) + Send + Sync>;
+
+#[cfg(feature = "failpoints")]
+thread_local! {
+    static CHECK_OBSERVER: std::cell::RefCell<Option<CheckObserver>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Install a native check observer on this thread only, for bounded control tests.
+#[cfg(feature = "failpoints")]
+pub fn set_check_observer(observer: Option<CheckObserver>) {
+    CHECK_OBSERVER.with(|slot| *slot.borrow_mut() = observer);
+}
+
+#[cfg(feature = "failpoints")]
+fn observe_check(
+    at: &'static std::panic::Location<'static>,
+    outcome: CheckOutcome,
+    deadline: Option<Instant>,
+) {
+    let observer = CHECK_OBSERVER.with(|slot| slot.borrow().clone());
+    if let Some(observer) = observer {
+        observer(at.file(), at.line(), outcome, deadline);
+    }
+}
+
 impl Control {
     /// A call that stops when `cancel` is set or the deadline passes, and holds at most
     /// `mem_limit` bytes of estimated memory (`u64::MAX`: no limit).
     pub fn new(cancel: Arc<AtomicBool>, deadline: Option<Instant>, mem_limit: u64) -> Control {
+        Self::with_cancellation(cancel, None, deadline, mem_limit)
+    }
+
+    pub(crate) fn with_cancellation(
+        cancel: Arc<AtomicBool>,
+        cancellation: Option<crate::task::Cancellation>,
+        deadline: Option<Instant>,
+        mem_limit: u64,
+    ) -> Control {
         Control {
             inner: Arc::new(Inner {
                 cancel,
+                cancellation,
                 deadline,
                 limit: mem_limit,
                 used: AtomicU64::new(0),
@@ -74,15 +122,32 @@ impl Control {
 
     /// Fail when the call is cancelled or past its deadline.
     #[inline]
+    #[cfg_attr(feature = "failpoints", track_caller)]
     pub fn check(&self) -> Result<()> {
-        if self.inner.cancel.load(Ordering::Relaxed) {
+        #[cfg(feature = "failpoints")]
+        let at = std::panic::Location::caller();
+        #[cfg(feature = "failpoints")]
+        observe_check(at, CheckOutcome::Before, self.inner.deadline);
+        if self.inner.cancel.load(Ordering::Relaxed)
+            || self
+                .inner
+                .cancellation
+                .as_ref()
+                .is_some_and(|c| c.check().is_err())
+        {
+            #[cfg(feature = "failpoints")]
+            observe_check(at, CheckOutcome::Cancelled, self.inner.deadline);
             return Err(Error::Cancelled);
         }
         if let Some(d) = self.inner.deadline
-            && Instant::now() > d
+            && Instant::now() >= d
         {
+            #[cfg(feature = "failpoints")]
+            observe_check(at, CheckOutcome::Timeout, self.inner.deadline);
             return Err(Error::Timeout);
         }
+        #[cfg(feature = "failpoints")]
+        observe_check(at, CheckOutcome::Passed, self.inner.deadline);
         Ok(())
     }
 

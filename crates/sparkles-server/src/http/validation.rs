@@ -47,6 +47,7 @@ pub(super) fn write_options(
         bypass_validation: bypass,
         deadline: deadline.map(|d| std::time::Instant::now() + d),
         cancel: None,
+        cancellation: None,
         report_limit,
         message: super::conditional::commit_message(headers)?,
         // the handler names the caller (see `super::author`)

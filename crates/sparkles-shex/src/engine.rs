@@ -53,7 +53,11 @@ pub(crate) fn validate_typed(
         &opts.exclude_graphs,
     )?;
     // the timeout covers the expansion (SPARQL selectors) and the typing together
-    let deadline = opts.timeout.map(|t| started + t);
+    let deadline = opts
+        .deadline
+        .into_iter()
+        .chain(opts.timeout.map(|t| started + t))
+        .min();
     let (entries, mut warnings) = shapemap::expand(map, &data, schema, opts, deadline)?;
     let rest;
     let opts = match opts.timeout {

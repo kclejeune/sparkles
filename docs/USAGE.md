@@ -2034,7 +2034,15 @@ sparkles algo run --loc ./db leiden --predicate http://xmlns.com/foaf/0.1/knows 
 takes the whole request as JSON, as the HTTP route does. A write-back run records itself
 in the output graph with the commit it computed at, so a reader knows which state the
 numbers describe. It commits in batches so that a large result does not hold the writer
-lock for long, and it can be cancelled between batches.
+lock for long. Query and task cancellation both reach computation, result preparation and
+writer admission. A supplied timeout and task deadline share the earlier absolute bound
+from operation entry through completion, including built-in SHACL and ShEx validation.
+Checks are cooperative. Committed batches remain after cancellation.
+A partial run attempts to record its final status without waiting for another writer,
+with one separate 100 ms cooperative cleanup budget. The record can remain unfinished
+when that attempt fails. This budget does not interrupt a durability call. Cancellation
+observed after the last batch can return an error while the durable record remains
+complete, and cancellation can race the final check.
 
 Define a projection once under a name when several queries use it:
 

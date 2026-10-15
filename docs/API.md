@@ -5311,13 +5311,24 @@ and then writes batches in commits with the message `algo run <uuid> batch i/n`.
 `write` on the dataset, and only one such task runs for a dataset at a time. A run that is
 cancelled with `DELETE /$/tasks/{id}` keeps the batches it committed. When the task
 ends, its `detail` holds the IRI of the run, the commit it computed at, and the rows,
-triples and commits written.
+triples and commits written. Task and query cancellation sources are both checked during
+computation, result preparation and batch writes, including writer admission. A supplied
+timeout starts at operation entry and shares one absolute bound with the task deadline.
+The earlier bound applies through completion and is never renewed for a later phase.
+Built-in SHACL and ShEx guards retain both cancellation sources and that absolute bound,
+including their SPARQL evaluation. Custom Rust guards must check the full `WriteOptions`
+cooperatively. These controls do not preempt a durability call or other unchecked work.
 
 The run record is a resource in the output graph with `spk:algorithm`, `spk:parameters`,
 `spk:projection`, `spk:sourceCommit`, `prov:startedAtTime`, `spk:triplesPlanned` and
 `spk:batchesPlanned`. Each batch updates `spk:batchesWritten` and `spk:triplesWritten` in
 its own commit, and the last one adds `prov:endedAtTime` and `spk:status`, which is
-`complete`. A run that is cancelled or fails records `cancelled` or `failed` when it can.
+`complete`. A partial run that is cancelled or fails attempts one optional commit of
+`cancelled` or `failed`. It skips a busy writer and uses a separate, nonrenewing 100 ms
+cleanup budget. That budget applies at cooperative checks and cannot preempt a durability
+call. Failure to record status preserves the original error and committed batches. If the
+last batch has already committed, a late control error preserves its complete record
+rather than adding a contradictory status. Cancellation can still race the final check.
 `louvain` and `leiden` write each community as the resource
 `urn:x-sparkles:algo:{run}:{level}:{id}`, with the level and a `skos:broader` link to its
 parent at the next level.

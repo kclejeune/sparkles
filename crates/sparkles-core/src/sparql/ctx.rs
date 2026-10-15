@@ -403,6 +403,7 @@ pub struct Ctx {
     literal_bnodes: parking_lot::Mutex<FxHashMap<String, Id>>,
     pub deadline: Option<Instant>,
     pub cancel: Arc<AtomicBool>,
+    pub cancellation: Option<crate::task::Cancellation>,
     pub dataset: DatasetSpec,
     /// the request's graph view when it does not read every graph: `dataset` is already
     /// limited to it (see [`DatasetSpec::restrict`]), and plans are redacted
@@ -507,6 +508,7 @@ impl Ctx {
             literal_bnodes: Default::default(),
             deadline: None,
             cancel: Arc::new(AtomicBool::new(false)),
+            cancellation: None,
             dataset: DatasetSpec::default(),
             graphs: None,
             now: std::sync::OnceLock::new(),
@@ -749,8 +751,11 @@ impl Ctx {
         if self.cancel.load(Ordering::Relaxed) {
             return Err(Error::Cancelled);
         }
+        if let Some(cancellation) = &self.cancellation {
+            cancellation.check()?;
+        }
         if let Some(d) = self.deadline
-            && Instant::now() > d
+            && Instant::now() >= d
         {
             return Err(Error::Timeout);
         }
