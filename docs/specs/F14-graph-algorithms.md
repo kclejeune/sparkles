@@ -577,7 +577,11 @@ gates are still pending.
   preparation and writer admission. A relative timeout starts at operation entry and is
   intersected with the absolute and task deadlines once, without phase renewal.
   Built-in SHACL and ShEx guards carry those controls through validation and SPARQL
-  evaluation. Custom guards remain responsible for checking the full `WriteOptions`.
+  evaluation. History SERVICE lookups carry composed cancellation and the same absolute
+  deadline into the native change-log scan checks. Native history queries accept that
+  composition alongside their existing single flag. These checks do not preempt
+  history indexing, reads or flushing. Custom guards remain responsible for checking
+  the full `WriteOptions`.
   A partial cancelled or failed run attempts one optional status commit with no writer
   wait and a separate 100 ms cooperative cleanup budget. The budget cannot interrupt a
   durability call, and recording failure never replaces the original error. A control

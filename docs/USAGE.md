@@ -2037,7 +2037,10 @@ numbers describe. It commits in batches so that a large result does not hold the
 lock for long. Query and task cancellation both reach computation, result preparation and
 writer admission. A supplied timeout and task deadline share the earlier absolute bound
 from operation entry through completion, including built-in SHACL and ShEx validation.
-Checks are cooperative. Committed batches remain after cancellation.
+History SERVICE calls retain the same controls at the native change-log scan checks.
+Rust history queries accept composed cancellation flags as well as a single flag and
+an absolute deadline. Checks are cooperative and do not preempt history indexing, reads
+or flushing. Committed batches remain after cancellation.
 A partial run attempts to record its final status without waiting for another writer,
 with one separate 100 ms cooperative cleanup budget. The record can remain unfinished
 when that attempt fails. This budget does not interrupt a durability call. Cancellation

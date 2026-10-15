@@ -5316,7 +5316,11 @@ computation, result preparation and batch writes, including writer admission. A 
 timeout starts at operation entry and shares one absolute bound with the task deadline.
 The earlier bound applies through completion and is never renewed for a later phase.
 Built-in SHACL and ShEx guards retain both cancellation sources and that absolute bound,
-including their SPARQL evaluation. Custom Rust guards must check the full `WriteOptions`
+including their SPARQL evaluation. History SERVICE calls forward the same controls to
+the native change-log scan. Native Rust history queries also accept an immutable
+composition of cancellation flags alongside their existing flag and absolute deadline.
+Checks occur during the scan and do not preempt indexing, reads or flushing.
+Custom Rust guards must check the full `WriteOptions`
 cooperatively. These controls do not preempt a durability call or other unchecked work.
 
 The run record is a resource in the output graph with `spk:algorithm`, `spk:parameters`,

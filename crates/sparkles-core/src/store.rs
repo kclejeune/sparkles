@@ -74,6 +74,8 @@ pub use compaction::{
 pub use describe::DESCRIBE_FILE;
 pub use diff::{Diff, DiffMethod, DiffOp, DiffOptions, StateMark, key_id};
 pub use history_query::{HistoryBound, HistoryChange, HistoryQuery, HistoryResult};
+#[cfg(feature = "failpoints")]
+pub use history_query::{HistoryCheckObserver, HistoryCheckOutcome, set_history_check_observer};
 pub use link::{Linked, read_link_file};
 pub use merge::{INFERRED_GRAPH, conflict_error};
 pub use partial::PartialMode;
