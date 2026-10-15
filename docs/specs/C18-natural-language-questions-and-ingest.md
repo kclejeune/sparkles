@@ -4764,8 +4764,10 @@ the matrix of §11.4 on the demo set of `testsuite/ask/demo.json`, with `--self-
 against a mock provider. Its offline scorer refuses SERVICE before a query child
 starts, including after CR, LF and CRLF comment endings. An excluded first draft
 remains unknown and does not enter the conditional failed-first denominator. The
-initial spending gate requires complete, unique Content-Length response framing
-before settlement. It enforces a cumulative 64 KiB bound on raw status and header
+initial spending gate requires a status permitting response content and complete,
+unique Content-Length response framing before settlement. It refuses 204 and 205
+before reading a body because neither can supply the required usage response. It
+enforces a cumulative 64 KiB bound on raw status and header
 bytes across informational and final responses. Truncated or ambiguous framing
 keeps the full reservation unresolved and stops dispatch. Valid chunked and
 close-delimited responses are also refused because this transport supports only

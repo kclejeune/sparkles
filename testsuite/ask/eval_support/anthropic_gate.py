@@ -495,6 +495,11 @@ def read_upstream_response(stream):
 
     if not 200 <= status < 300:
         raise GateError("upstream_status")
+    # 204 ends at the headers and forbids Content-Length. 205 separately
+    # prohibits content, including when CL zero is valid framing. Neither can
+    # provide the usage object required to settle this reservation.
+    if status in (204, 205):
+        raise GateError("upstream_framing")
     lengths = headers.get(b"content-length", [])
     if b"transfer-encoding" in headers or len(lengths) != 1:
         raise GateError("upstream_framing")

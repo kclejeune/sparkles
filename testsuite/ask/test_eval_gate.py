@@ -1,5 +1,6 @@
 """Actual SQLite transactions and counted fake dispatch, never a real provider."""
 
+import hashlib
 import http.client
 import json
 import pathlib
@@ -33,6 +34,8 @@ from test_eval_transport import (
     length_wire,
     raw_upstream,
     record_observation,
+    status_usage_body,
+    status_wire,
 )
 
 
@@ -156,6 +159,127 @@ class Budget(unittest.TestCase):
         g = Gate(self.w, "FAKE_SENTINEL_NOT_A_KEY", counted)
         g.set_case("case-one")
         return g, observed
+
+    def test_bodyless_status_complete_framing_before_settlement(self):
+        for status in (200, 204, 205):
+            variants = [("valid-usage-tail", status_usage_body())]
+            if status != 200:
+                variants += [("empty", b""), ("malformed", b"{")]
+            for label, body in variants:
+                with self.subTest(status=status, variant=label):
+                    directory = self.root / f"status-{status}-{label}"
+                    directory.mkdir()
+                    wallet = Wallet(
+                        directory / "wallet",
+                        directory / "grant",
+                        {"run": f"synthetic-status-{status}-{label}"},
+                    )
+                    witnesses = []
+
+                    def counted_dispatch(
+                        payload, key, timeout, wallet=wallet, witnesses=witnesses
+                    ):
+                        independent = sqlite3.connect(wallet.path / "wallet.sqlite3")
+                        try:
+                            rows = independent.execute(
+                                "SELECT id,case_id,model,payload_sha,bound,state FROM attempts WHERE state='RESERVED_UNRESOLVED'"
+                            ).fetchall()
+                        finally:
+                            independent.close()
+                        witnesses.append(
+                            {
+                                "priorCommittedReservation": rows,
+                                "payloadHex": payload.hex(),
+                                "independentConnectionClosed": True,
+                            }
+                        )
+                        self.assertEqual(len(rows), 1)
+                        self.assertEqual(
+                            rows[0][2:],
+                            (
+                                MODELS[0],
+                                hashlib.sha256(payload).hexdigest(),
+                                BOUNDS[MODELS[0]],
+                                "RESERVED_UNRESOLVED",
+                            ),
+                        )
+                        return dispatch_once(payload, key, min(timeout, 2))
+
+                    gate = Gate(wallet, "FAKE", counted_dispatch)
+                    gate.set_case("bodyless-status")
+                    wire = status_wire(status, body)
+                    try:
+                        with raw_upstream(wire) as seen:
+                            errors = []
+                            snapshots = []
+                            for _ in range(2):
+                                error = None
+                                try:
+                                    gate.process(json.dumps(request()).encode())
+                                except GateError as failure:
+                                    error = failure.code
+                                errors.append(error)
+                                snapshots.append(wallet.snapshot_report())
+                            # Both requests and their evidence precede desired
+                            # assertions, including on the unfixed source.
+                            observation = {
+                                "walletStatus": status,
+                                "variant": label,
+                                "wireHex": wire.hex(),
+                                "errors": errors,
+                                "first": snapshots[0],
+                                "final": snapshots[1],
+                                "upstreamSends": len(seen),
+                                "priorWitnesses": witnesses,
+                                "gateStopped": gate.stopped,
+                            }
+                            record_observation(observation)
+                            first, final = snapshots
+                            if status == 200:
+                                self.assertEqual(errors, [None, None])
+                                self.assertEqual(len(seen), 2)
+                                self.assertEqual(first["acceptedRequests"], 1)
+                                self.assertEqual(final["acceptedRequests"], 2)
+                                self.assertEqual(first["knownSettledNanodollars"], 2000)
+                                self.assertEqual(final["knownSettledNanodollars"], 4000)
+                                self.assertEqual(final["unresolvedUpperNanodollars"], 0)
+                                self.assertFalse(gate.stopped)
+                                self.assertFalse(final["dispatchClosed"])
+                            else:
+                                self.assertEqual(
+                                    first["unresolvedUpperNanodollars"],
+                                    BOUNDS[MODELS[0]],
+                                )
+                                self.assertEqual(
+                                    errors, ["upstream_framing", "dispatch_stopped"]
+                                )
+                                self.assertEqual(len(seen), 1)
+                                self.assertTrue(gate.stopped)
+                                for snapshot in snapshots:
+                                    self.assertEqual(snapshot["acceptedRequests"], 1)
+                                    self.assertEqual(
+                                        snapshot["knownSettledNanodollars"], 0
+                                    )
+                                    self.assertEqual(
+                                        snapshot["unresolvedUpperNanodollars"],
+                                        BOUNDS[MODELS[0]],
+                                    )
+                                    self.assertTrue(snapshot["dispatchClosed"])
+                                    self.assertEqual(len(snapshot["attempts"]), 1)
+                                    self.assertEqual(
+                                        snapshot["attempts"][0]["state"],
+                                        "RESERVED_UNRESOLVED",
+                                    )
+                    finally:
+                        wallet.close()
+                        record_observation(
+                            {
+                                "statusWalletClosed": status,
+                                "variant": label,
+                                "databaseClosed": wallet.db is None,
+                                "lockClosed": wallet.lock_fd is None,
+                            }
+                        )
 
     def test_complete_framing_before_settlement(self):
         body = json.dumps(response()).encode()

@@ -14,6 +14,7 @@ from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "eval_support"))
 from anthropic_gate import (
+    MODELS,
     RESPONSE_CAP,
     GateError,
     dispatch_once,
@@ -112,6 +113,27 @@ def length_wire(body=b"{}", declared=None, extra=b""):
     )
 
 
+def status_wire(status, body=b"", headers=None):
+    if headers is None:
+        headers = b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+    return f"HTTP/1.1 {status} Fixture\r\n".encode() + headers + b"\r\n" + body
+
+
+def status_usage_body():
+    return json.dumps(
+        {
+            "model": MODELS[0],
+            "content": [{"type": "text", "text": "{}"}],
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 2,
+                "service_tier": "standard",
+                "inference_geo": "global",
+            },
+        }
+    ).encode()
+
+
 def header_prefix(
     total, status=b"HTTP/1.1 200 OK\r\n", headers=b"Content-Length: 2\r\n"
 ):
@@ -132,6 +154,82 @@ def header_prefix(
 
 
 class Transport(unittest.TestCase):
+    def test_bodyless_status_refused_before_body_read(self):
+        import io
+
+        class CountedStream(io.BytesIO):
+            def __init__(self, wire):
+                super().__init__(wire)
+                self.body_reads = []
+
+            def read(self, length):
+                self.body_reads.append(length)
+                return super().read(length)
+
+        body = status_usage_body()
+        for status in (200, 204, 205):
+            with self.subTest(status=status):
+                stream = CountedStream(status_wire(status, body))
+                error, returned = None, None
+                try:
+                    returned = read_upstream_response(stream)
+                except GateError as failure:
+                    error = failure.code
+                record_observation(
+                    {
+                        "readerStatus": status,
+                        "error": error,
+                        "bodyReads": stream.body_reads,
+                        "returnedHex": returned.hex() if returned is not None else None,
+                    }
+                )
+                self.assertEqual(
+                    stream.body_reads, [len(body)] if status == 200 else []
+                )
+                self.assertEqual(error, None if status == 200 else "upstream_framing")
+                self.assertEqual(returned, body if status == 200 else None)
+
+    def test_bodyless_status_transport_refusal(self):
+        body = status_usage_body()
+        length = b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+        for status in (200, 204, 205):
+            variants = [("valid-usage-tail", body, length)]
+            if status != 200:
+                variants += [
+                    ("no-length", body, b""),
+                    ("zero-length", b"", b"Content-Length: 0\r\n"),
+                    ("zero-with-tail", body, b"Content-Length: 0\r\n"),
+                    ("malformed-length", body, b"Content-Length: -1\r\n"),
+                    ("duplicate-length", body, length * 2),
+                    ("cl-and-te", body, length + b"Transfer-Encoding: chunked\r\n"),
+                ]
+            for label, tail, headers in variants:
+                with (
+                    self.subTest(status=status, variant=label),
+                    raw_upstream(status_wire(status, tail, headers)) as seen,
+                ):
+                    error, returned = None, None
+                    try:
+                        returned = dispatch_once(b"{}", "FAKE", 2)
+                    except GateError as failure:
+                        error = failure.code
+                    record_observation(
+                        {
+                            "transportStatus": status,
+                            "variant": label,
+                            "error": error,
+                            "returnedHex": returned.hex()
+                            if returned is not None
+                            else None,
+                            "upstreamSends": len(seen),
+                        }
+                    )
+                    self.assertEqual(len(seen), 1)
+                    self.assertEqual(
+                        error, None if status == 200 else "upstream_framing"
+                    )
+                    self.assertEqual(returned, body if status == 200 else None)
+
     def test_complete_declared_length_required(self):
         with (
             raw_upstream(length_wire(b"{}", declared=9)),

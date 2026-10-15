@@ -94,8 +94,12 @@ are capped at 128 KiB before parsing. Upstream responses are capped at 1 MiB.
 The cumulative raw status and header bytes across all informational and final
 responses are bounded at 64 KiB, including line terminators. The gate enforces
 that budget while reading, before accumulating an oversized header section.
-Error diagnostics are separately bounded at 64 KiB. Settlement requires one
-valid Content-Length within the body cap and exactly that many body bytes.
+Error diagnostics are separately bounded at 64 KiB. Settlement requires a status
+that permits response content, one valid Content-Length within the body cap and
+exactly that many body bytes. The gate refuses 204 and 205 before reading a body
+because neither can provide its required usage response. A 204 ends at its
+headers and prohibits Content-Length. A 205 prohibits content even when its
+Content-Length is zero.
 Duplicate lengths, conflicting framing and premature EOF keep the full
 reservation unresolved and stop further dispatch. This transport supports only
 Content-Length framing. It refuses even valid chunked responses and refuses
