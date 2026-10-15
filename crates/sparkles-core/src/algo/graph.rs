@@ -1,5 +1,6 @@
 //! The projection: compressed sparse rows over dense node indexes (spec F14 §3).
 
+use super::memory::{self, Buffer, Reservation, Work};
 use super::{Control, Par};
 use crate::error::Result;
 use std::sync::OnceLock;
@@ -75,32 +76,116 @@ impl Csr {
         Csr { off, adj, w }
     }
 
-    /// The rows of the reversed edges. Rows stay sorted because edges are read in source
-    /// order.
-    fn transpose(&self) -> Csr {
+    fn retained_bytes(&self) -> Result<u64> {
+        memory::sum(&[
+            memory::bytes::<u64>(self.off.capacity())?,
+            memory::bytes::<u32>(self.adj.capacity())?,
+            self.w
+                .as_ref()
+                .map_or(Ok(0), |w| memory::bytes::<f32>(w.capacity()))?,
+        ])
+    }
+
+    fn transpose_bytes(&self) -> Result<u64> {
+        let offsets = self
+            .n()
+            .checked_add(1)
+            .ok_or_else(|| super::bad("projection", "offset count overflows"))?;
+        memory::sum(&[
+            memory::bytes::<u64>(offsets)?,
+            memory::bytes::<u32>(self.adj.len())?,
+            if self.w.is_some() {
+                memory::bytes::<f32>(self.adj.len())?
+            } else {
+                0
+            },
+        ])
+    }
+
+    /// A separately owned transpose, charged until its vectors have been dropped.
+    pub(crate) fn transpose(&self, ctl: &Control) -> Result<OwnedCsr> {
+        self.transpose_reserved(ctl, Reservation::new(ctl, self.transpose_bytes()?)?)
+    }
+
+    fn transpose_reserved(&self, ctl: &Control, reservation: Reservation) -> Result<OwnedCsr> {
         let n = self.n();
-        let mut off = vec![0u64; n + 1];
+        let mut work = Work::new(ctl)?;
+        // The owner exists before allocation so every error drops its vectors first.
+        let mut owner = OwnedCsr {
+            csr: Csr::default(),
+            reservation,
+        };
+        let mut at = Buffer::<u64>::new("incoming-cursors", n, ctl)?;
+        owner.csr.off = memory::allocate("incoming-offsets", n + 1, ctl)?;
+        for _ in 0..=n {
+            work.tick("incoming-zero-offsets")?;
+            owner.csr.off.push(0);
+        }
         for &v in &self.adj {
-            off[v as usize + 1] += 1;
+            work.tick("incoming-count")?;
+            owner.csr.off[v as usize + 1] += 1;
         }
         for i in 0..n {
-            off[i + 1] += off[i];
+            work.tick("incoming-prefix")?;
+            owner.csr.off[i + 1] += owner.csr.off[i];
         }
-        let mut at: Vec<u64> = off[..n].to_vec();
-        let mut adj = vec![0u32; self.adj.len()];
-        let mut w = self.w.as_ref().map(|w| vec![0f32; w.len()]);
+        for &v in &owner.csr.off[..n] {
+            work.tick("incoming-cursors")?;
+            at.push(v)?;
+        }
+        owner.csr.adj = memory::allocate("incoming-edges", self.adj.len(), ctl)?;
+        for _ in 0..self.adj.len() {
+            work.tick("incoming-zero-edges")?;
+            owner.csr.adj.push(0);
+        }
+        if self.w.is_some() {
+            owner.csr.w = Some(memory::allocate("incoming-weights", self.adj.len(), ctl)?);
+            for _ in 0..self.adj.len() {
+                work.tick("incoming-zero-weights")?;
+                owner.csr.w.as_mut().unwrap().push(0.0);
+            }
+        }
         for u in 0..n as u32 {
+            work.tick("incoming-source")?;
             for i in self.range(u) {
+                work.tick("incoming-scatter")?;
                 let v = self.adj[i] as usize;
                 let p = at[v] as usize;
                 at[v] += 1;
-                adj[p] = u;
-                if let (Some(dst), Some(src)) = (w.as_mut(), self.w.as_ref()) {
+                owner.csr.adj[p] = u;
+                if let (Some(dst), Some(src)) = (owner.csr.w.as_mut(), self.w.as_ref()) {
                     dst[p] = src[i];
                 }
             }
         }
-        Csr { off, adj, w }
+        ctl.check()?;
+        Ok(owner)
+    }
+}
+
+// Both owners drop data before the corresponding per-call reservation.
+pub(crate) struct OwnedCsr {
+    csr: Csr,
+    reservation: Reservation,
+}
+impl std::ops::Deref for OwnedCsr {
+    type Target = Csr;
+    fn deref(&self) -> &Csr {
+        &self.csr
+    }
+}
+
+/// Incoming rows borrowed for one algorithm invocation. Keep this handle until all
+/// workers using its rows have joined. Directed cached rows count against every caller;
+/// symmetric rows reuse outgoing storage without an additional reservation.
+pub struct Incoming<'a> {
+    csr: &'a Csr,
+    _reservation: Option<Reservation>,
+}
+impl std::ops::Deref for Incoming<'_> {
+    type Target = Csr;
+    fn deref(&self) -> &Csr {
+        self.csr
     }
 }
 
@@ -138,6 +223,7 @@ pub struct Graph {
     /// every edge is present in both directions
     pub symmetric: bool,
     inn: OnceLock<Csr>,
+    inn_init: parking_lot::Mutex<()>,
 }
 
 impl Graph {
@@ -157,12 +243,77 @@ impl Graph {
         self.out.w.is_some()
     }
 
-    /// The rows of the in-edges.
-    pub fn inn(&self) -> &Csr {
+    /// Prepare incoming rows under this caller's cancellation, deadline and memory
+    /// budget. Native callers migrate from `g.inn()` to `let incoming = g.inn(ctl)?;`
+    /// and borrow `&*incoming` while workers run. Failed initialization can be retried.
+    pub fn inn(&self, ctl: &Control) -> Result<Incoming<'_>> {
+        ctl.check()?;
         if self.symmetric {
-            return &self.out;
+            return Ok(Incoming {
+                csr: &self.out,
+                _reservation: None,
+            });
         }
-        self.inn.get_or_init(|| self.out.transpose())
+        let reservation = Reservation::new(ctl, self.out.transpose_bytes()?)?;
+        if let Some(csr) = self.inn.get() {
+            return Ok(Incoming {
+                csr,
+                _reservation: Some(reservation),
+            });
+        }
+        let guard = loop {
+            ctl.check()?;
+            if let Some(guard) = self
+                .inn_init
+                .try_lock_for(std::time::Duration::from_millis(10))
+            {
+                break guard;
+            }
+            #[cfg(test)]
+            memory::probe::at(memory::probe::Point::Waiting);
+        };
+        ctl.check()?;
+        if self.inn.get().is_none() {
+            #[cfg(test)]
+            memory::probe::at(memory::probe::Point::Initializing);
+            let owner = self.out.transpose_reserved(ctl, reservation)?;
+            #[cfg(test)]
+            memory::probe::at(memory::probe::Point::Publishing);
+            ctl.check()?;
+            // The initializer mutex excludes competing publishers. A complete CSR is
+            // retained by Graph; only the current call's charge lives in the handle.
+            let OwnedCsr { csr, reservation } = owner;
+            let _ = self.inn.set(csr);
+            drop(guard);
+            return Ok(Incoming {
+                csr: self.inn.get().unwrap(),
+                _reservation: Some(reservation),
+            });
+        }
+        drop(guard);
+        Ok(Incoming {
+            csr: self.inn.get().unwrap(),
+            _reservation: Some(reservation),
+        })
+    }
+
+    /// Immutable base projection storage, independent of lazy incoming initialization.
+    pub(crate) fn base_bytes(&self) -> Result<u64> {
+        memory::sum(&[
+            memory::bytes::<u64>(self.ids.capacity())?,
+            self.out.retained_bytes()?,
+        ])
+    }
+
+    pub(crate) fn cache_bytes(&self) -> Result<u64> {
+        memory::sum(&[
+            self.base_bytes()?,
+            if self.symmetric {
+                0
+            } else {
+                self.out.transpose_bytes()?
+            },
+        ])
     }
 
     /// Bytes the graph takes now.
@@ -263,6 +414,7 @@ impl Graph {
             out: csr,
             symmetric: raw.symmetric,
             inn: OnceLock::new(),
+            inn_init: parking_lot::Mutex::new(()),
         })
     }
 
@@ -271,7 +423,8 @@ impl Graph {
     pub fn simple(&self, ctl: &Control) -> Result<Csr> {
         ctl.charge(self.out.bytes() * 2)?;
         let n = self.n();
-        let inn = self.inn();
+        let incoming = self.inn(ctl)?;
+        let inn = &*incoming;
         let mut off = vec![0u64; n + 1];
         let mut adj: Vec<u32> =
             Vec::with_capacity(self.out.nnz() * if self.symmetric { 1 } else { 2 });
@@ -321,7 +474,8 @@ impl Graph {
     pub fn weighted_sym(&self, ctl: &Control) -> Result<Csr> {
         ctl.charge(self.out.bytes() * 3)?;
         let n = self.n();
-        let inn = self.inn();
+        let incoming = self.inn(ctl)?;
+        let inn = &*incoming;
         let mut off = vec![0u64; n + 1];
         let cap = self.out.nnz() * if self.symmetric { 1 } else { 2 };
         let mut adj: Vec<u32> = Vec::with_capacity(cap);
@@ -393,7 +547,7 @@ mod tests {
         let g = digraph(4, &[(2, 1), (0, 3), (0, 1), (2, 0)]);
         assert_eq!(g.out.row(0), &[1, 3]);
         assert_eq!(g.out.row(2), &[0, 1]);
-        assert_eq!(g.inn().row(1), &[0, 2]);
+        assert_eq!(g.inn(&Control::unlimited()).unwrap().row(1), &[0, 2]);
         assert_eq!(g.m(), 4);
     }
 
@@ -452,8 +606,14 @@ mod tests {
         // Three ids, four offsets, two neighbours and two retained f32 weights.
         assert_eq!(g.out.bytes(), 48);
         assert_eq!(g.bytes(), 72);
-        assert_eq!(g.inn().wrow(1), Some([2.0].as_slice()));
-        assert_eq!(g.inn().wrow(2), Some([1.0].as_slice()));
+        assert_eq!(
+            g.inn(&Control::unlimited()).unwrap().wrow(1),
+            Some([2.0].as_slice())
+        );
+        assert_eq!(
+            g.inn(&Control::unlimited()).unwrap().wrow(2),
+            Some([1.0].as_slice())
+        );
         assert_eq!(g.bytes(), 120);
     }
 
@@ -536,4 +696,70 @@ mod tests {
         let ctl = Control::new(Default::default(), None, 100);
         assert!(Graph::build(raw, Aggregate::None, &Par::single(), &ctl).is_err());
     }
+    #[test]
+    fn r7_cold_incoming_respects_native_budget() {
+        let g = digraph(4, &[(0, 1), (1, 2), (2, 3)]);
+        let ctl = Control::new(Default::default(), None, 32);
+        let result = crate::algo::labelprop::run(&g, 1, &Par::single(), &ctl);
+        assert!(
+            matches!(result, Err(crate::Error::BudgetExceeded(_))),
+            "unexpected success or wrong error"
+        );
+        assert!(
+            g.inn.get().is_none(),
+            "must refuse before transpose allocation"
+        );
+    }
+
+    #[test]
+    fn r7_warm_incoming_respects_native_budget() {
+        let g = digraph(4, &[(0, 1), (1, 2), (2, 3)]);
+        let _ = g.inn(&Control::unlimited()).unwrap();
+        let ctl = Control::new(Default::default(), None, 32);
+        let result = crate::algo::labelprop::run(&g, 1, &Par::single(), &ctl);
+        assert!(
+            matches!(result, Err(crate::Error::BudgetExceeded(_))),
+            "unexpected success or wrong error"
+        );
+    }
+
+    #[test]
+    fn r7_cancelled_native_does_not_initialize() {
+        let g = digraph(4, &[(0, 1)]);
+        let ctl = Control::new(
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            None,
+            u64::MAX,
+        );
+        assert!(matches!(
+            crate::algo::labelprop::run(&g, 1, &Par::single(), &ctl),
+            Err(crate::Error::Cancelled)
+        ));
+        assert!(
+            g.inn.get().is_none(),
+            "cancelled call built incoming before checking"
+        );
+    }
+
+    #[test]
+    fn r7_expired_native_does_not_initialize() {
+        let g = digraph(4, &[(0, 1)]);
+        let ctl = Control::new(
+            Default::default(),
+            Some(std::time::Instant::now()),
+            u64::MAX,
+        );
+        assert!(matches!(
+            crate::algo::labelprop::run(&g, 1, &Par::single(), &ctl),
+            Err(crate::Error::Timeout)
+        ));
+        assert!(
+            g.inn.get().is_none(),
+            "expired call built incoming before checking"
+        );
+    }
 }
+
+#[cfg(test)]
+#[path = "incoming_tests.rs"]
+mod incoming_tests;

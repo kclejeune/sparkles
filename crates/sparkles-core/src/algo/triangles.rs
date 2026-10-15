@@ -105,7 +105,8 @@ pub fn clustering(g: &Graph, par: &Par, ctl: &Control) -> Result<Clustering> {
 pub fn clustering_graphalytics(g: &Graph, par: &Par, ctl: &Control) -> Result<Vec<f64>> {
     let n = g.n();
     ctl.charge(n as u64 * 8)?;
-    let inn = g.inn();
+    let incoming = g.inn(ctl)?;
+    let inn = &*incoming;
     let mut out = vec![0f64; n];
     par.chunks_mut(&mut out, BLOCK / 4, |lo, chunk| {
         ctl.check()?;

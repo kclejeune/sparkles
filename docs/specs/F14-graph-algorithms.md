@@ -349,7 +349,15 @@ maximum outgoing degree, and walk scratch reserves `walkLength`, even if one wal
 less. Temporary reservations end after
 their buffers are dropped, and the returned embedding remains charged to the call.
 This accounts for Vec capacities on the pinned Rust Global allocator, excluding
-allocator bookkeeping. Incoming graph storage remains a separate accounting concern.
+allocator bookkeeping. Incoming graph storage is reserved separately for each directed-graph caller, even
+when another call has already built it. Only its initializer reserves construction
+cursor offsets. Waiting and construction check cancellation and deadlines, and a failed
+initialization publishes no partial rows. Symmetric graphs reuse outgoing rows.
+PageRank reserves five f64 arrays, a temporary personalized-source copy and one reusable
+fixed-block reduction buffer before allocation. Temporary owners release reservations
+after dropping their buffers. Returned scores remain charged to the call. Allocator and
+Rayon bookkeeping, small summary metadata and other algorithms' auxiliary workspaces
+are outside these vector bounds.
 Memory is charged as §3.2 says. Rows count against the query's row
 budget. Betweenness without sampling on more than `--algo-exact-betweenness-max`
 nodes (100,000) is refused with a message that suggests `algo:samples`. Node similarity
@@ -541,7 +549,8 @@ Node2vec now checks bounded work inside its own loops and admits every owned buf
 fixed capacity before allocation. Controlled cancellation and low-memory tests cover
 inner walks and training, and retained seeded fixtures preserve the earlier f32 bits.
 Overflow and allocation failures release temporary reservations. This repair does not
-complete incoming-CSR accounting or establish a performance result.
+establish a performance result. Incoming-CSR and PageRank vector-workspace accounting
+have separate targeted repairs. Other auxiliary-workspace gaps remain.
 
 **Delivered** on 2026-10-13, as Phases 1 and 2 and the embeddings of Phase 3, with the
 gaps listed under "Not built".
@@ -588,6 +597,13 @@ gates are still pending.
   predicate. Each resulting edge uses one additional `f32`, including its reverse
   entry when built. Build reservations and cache accounting include those weights,
   and a sum that is not finite in the stored `f32` representation is refused.
+  Cache admission reserves immutable base storage and one future incoming CSR, whether
+  incoming rows exist already or not. Each caller charges base storage separately from
+  its incoming handle, avoiding a changing resident-byte snapshot during initialization.
+  Native callers migrate from `g.inn()` to `let incoming = g.inn(ctl)?` and borrow
+  `&*incoming` until all workers using it join. The handle owns the caller's reservation;
+  the Graph owns the retained rows. Native prebuilt base graphs remain caller-owned.
+  Similarity uses the same controlled transpose construction for deduplicated rows.
 * **Named projections.** `algo/catalog.rs` keeps `<db>/algo.json` as
   `{"format": 1, "projections": {name: {revision, updated, author?, definition}}}`,
   written the way `queries.json` is, with a revision for `If-Match`. A file that cannot

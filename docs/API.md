@@ -5257,15 +5257,22 @@ compute an unpersonalized ranking. Omitting the source still runs ordinary PageR
   fixed embedding and scratch capacities before allocation and checks cancellation
   throughout its own initialization, walks and training. Its memory peak includes
   those capacities while live, with returned embeddings still charged to the call.
-  Allocator bookkeeping and the separate incoming-graph accounting are not included
-  in this buffer bound.
+  Incoming rows have a separate reservation for every directed-graph caller, including
+  cache hits. Only the caller constructing those rows reserves temporary cursor offsets.
+  Symmetric graphs reuse outgoing rows. PageRank also reserves its five vector arrays,
+  personalized-source copy and one reusable reduction buffer before allocation. Its
+  temporary reservations end after the buffers are dropped, while returned scores stay
+  charged to the call. These Vec-capacity bounds exclude allocator and Rayon bookkeeping,
+  small summary metadata and other algorithm workspaces outside those bounds.
 * **Threads and cache.** `--algo-threads` and `--algo-max-threads-per-call` limit the
   threads of all calls and of each call. A one-thread call runs on the caller and
   holds one slot in that shared budget. Calls waiting for slots check cancellation and
   their deadline before admission. `--algo-cache-mb` sizes the cache of built projections. Committed views can reuse a built projection independently of the query
   result cache. A committed write changes the key. Queries over pending transaction
   changes neither read nor populate the projection cache, including through masked
-  or derived views.
+  or derived views. The cache reserves fixed base and possible incoming storage once.
+  Each call separately charges the base projection and the incoming rows it uses.
+  Initialization waits check cancellation and deadlines, and failed builds can be retried.
 * **Plans.** EXPLAIN shows an `AlgoCall` operator with the algorithm and its projection.
   The executed plan adds the nodes, the edges, the milliseconds spent building and running,
   the peak bytes, and the projections taken from the cache.

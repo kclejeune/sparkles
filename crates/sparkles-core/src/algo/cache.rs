@@ -71,13 +71,10 @@ pub fn get(key: &str) -> Option<Arc<Graph>> {
 /// Keep `graph` under `key`, evicting the least recently used projections to make room.
 pub fn put(key: String, graph: Arc<Graph>) {
     let limit = LIMIT.load(Ordering::Relaxed);
-    // the in-edges that an algorithm may build later are about as large as the out-edges
-    let bytes = graph.bytes()
-        + if graph.symmetric {
-            0
-        } else {
-            graph.out.bytes()
-        };
+    // Fixed future retention, whether or not incoming rows are already initialized.
+    let Ok(bytes) = graph.cache_bytes() else {
+        return;
+    };
     if bytes > limit {
         return;
     }
@@ -159,10 +156,23 @@ mod tests {
         let hit = get("sum").unwrap();
         assert_eq!(hit.out.row(0), &[1, 2]);
         assert_eq!(hit.out.wrow(0), Some([2.0, 1.0].as_slice()));
-        assert_eq!(hit.inn().wrow(1), Some([2.0].as_slice()));
-        assert_eq!(hit.inn().wrow(2), Some([1.0].as_slice()));
+        assert_eq!(
+            hit.inn(&Control::unlimited()).unwrap().wrow(1),
+            Some([2.0].as_slice())
+        );
+        assert_eq!(
+            hit.inn(&Control::unlimited()).unwrap().wrow(2),
+            Some([1.0].as_slice())
+        );
         assert_eq!(hit.bytes(), 120);
         assert_eq!(stats(), (120, 1));
+        let before = hit.cache_bytes().unwrap();
+        clear();
+        put("already-transposed".into(), hit.clone());
+        assert!(get("already-transposed").is_some());
+        assert_eq!(stats(), (before, 1));
+        assert_eq!(before, 120);
+
         set_limit(256 << 20);
         clear();
     }

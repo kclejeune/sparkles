@@ -67,33 +67,17 @@ pub fn run(g: &Graph, p: &Params, par: &Par, ctl: &Control) -> Result<Vec<(u32, 
     let n = g.n();
     let owned = distinct(&g.out, ctl)?;
     let out: &Csr = owned.as_ref().unwrap_or(&g.out);
-    // who has each node as a neighbour
-    let inn_owned;
-    let inn: &Csr = if owned.is_some() || g.symmetric {
-        // a symmetric graph is its own transpose; a deduplicated copy needs its own
-        if g.symmetric && owned.is_none() {
-            &g.out
-        } else {
-            let mut off = vec![0u64; n + 1];
-            for &v in &out.adj {
-                off[v as usize + 1] += 1;
-            }
-            for i in 0..n {
-                off[i + 1] += off[i];
-            }
-            let mut at: Vec<u64> = off[..n].to_vec();
-            let mut adj = vec![0u32; out.adj.len()];
-            for u in 0..n as u32 {
-                for &v in out.row(u) {
-                    adj[at[v as usize] as usize] = u;
-                    at[v as usize] += 1;
-                }
-            }
-            inn_owned = Csr { off, adj, w: None };
-            &inn_owned
-        }
+    // Keep the one call-owned incoming reservation through all worker joins.
+    let local;
+    let shared;
+    let inn: &Csr = if g.symmetric {
+        out
+    } else if owned.is_some() {
+        local = out.transpose(ctl)?;
+        &local
     } else {
-        g.inn()
+        shared = g.inn(ctl)?;
+        &shared
     };
     ctl.charge(n as u64 * 12)?;
     let pairs = AtomicU64::new(0);
@@ -253,5 +237,32 @@ mod tests {
                 }
             }
         }
+    }
+    #[test]
+    fn r7_deduplicated_transpose_reserves_retention_and_scratch() {
+        let g = digraph(4, &[(0, 2), (0, 2), (1, 2)]);
+        let ctl = Control::new(Default::default(), None, 100);
+        assert!(matches!(
+            run(&g, &Params::default(), &Par::single(), &ctl),
+            Err(crate::Error::BudgetExceeded(_))
+        ));
+        // The existing distinct outgoing charge remains outside this R7 owner.
+        assert_eq!(ctl.remaining(), 48);
+        let got = run(
+            &g,
+            &Params::default(),
+            &Par::single(),
+            &Control::unlimited(),
+        )
+        .unwrap();
+        assert!(got.iter().any(|&(u, v, s)| u == 0 && v == 1 && s == 1.0));
+        let sym = ugraph(3, &[(0, 1), (0, 1), (1, 2)]);
+        let _ = run(
+            &sym,
+            &Params::default(),
+            &Par::single(),
+            &Control::unlimited(),
+        )
+        .unwrap();
     }
 }

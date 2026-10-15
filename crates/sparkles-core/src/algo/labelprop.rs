@@ -20,7 +20,8 @@ pub fn run(g: &Graph, max_iterations: u32, par: &Par, ctl: &Control) -> Result<O
     ctl.charge(n as u64 * 8)?;
     let mut label: Vec<u32> = (0..n as u32).collect();
     let mut next = label.clone();
-    let inn = g.inn();
+    let incoming = g.inn(ctl)?;
+    let inn = &*incoming;
     let mut iterations = 0;
     let mut converged = false;
     for it in 0..max_iterations {

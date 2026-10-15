@@ -40,6 +40,8 @@ pub fn run(g: &Graph, p: &Params, par: &Par, ctl: &Control) -> Result<Vec<f64>> 
         sources.truncate(p.samples);
         sources.sort_unstable();
     }
+    let incoming = g.inn(ctl)?;
+    let inn = &*incoming;
     let threads = par.threads();
     // per thread: the score array and the working arrays of one source
     ctl.charge(threads as u64 * n as u64 * (8 + 8 + 8 + 4 + 8))?;
@@ -56,7 +58,7 @@ pub fn run(g: &Graph, p: &Params, par: &Par, ctl: &Control) -> Result<Vec<f64>> 
             } else {
                 w.bfs(g, s);
             }
-            w.accumulate(g, s, &mut acc);
+            w.accumulate(inn, s, &mut acc);
         }
         Ok(acc)
     })?;
@@ -165,12 +167,11 @@ impl Work {
     }
 
     /// Add the dependencies of source `s` to `acc`, walking the settled nodes backwards.
-    fn accumulate(&mut self, g: &Graph, s: u32, acc: &mut [f64]) {
+    fn accumulate(&mut self, inn: &super::Csr, s: u32, acc: &mut [f64]) {
         for i in (0..self.order.len()).rev() {
             let w = self.order[i];
             // the predecessors of w: nodes u with an edge u -> w on a shortest path. Walk
             // the in-edges.
-            let inn = g.inn();
             let (row, ws) = (inn.row(w), inn.wrow(w));
             let dw = self.dist[w as usize];
             let coeff = (1.0 + self.delta[w as usize]) / self.sigma[w as usize];

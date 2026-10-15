@@ -6,6 +6,7 @@
 //! node's in-neighbours run in index order and the sums over nodes add fixed-size blocks
 //! in order, so the result does not depend on the number of threads.
 
+use super::memory::{Buffer, Work};
 use super::{BLOCK, Control, Graph, Par, Stats, bad};
 use crate::error::Result;
 
@@ -52,33 +53,54 @@ pub fn run(g: &Graph, p: &Params, par: &Par, ctl: &Control) -> Result<Output> {
             stats,
         });
     }
-    ctl.charge(n as u64 * 8 * 4)?;
+    let incoming = g.inn(ctl)?;
+    let inn = &*incoming;
     let out = &g.out;
-    let inn = g.inn();
     let weighted = out.w.is_some();
-    // the total weight leaving each node
-    let outw: Vec<f64> = (0..n as u32)
-        .map(|u| match out.wrow(u) {
+    let mut work = Work::new(ctl)?;
+    let mut outw = Buffer::new("pagerank-out-weights", n, ctl)?;
+    for u in 0..n as u32 {
+        work.tick("pagerank-out-weights")?;
+        outw.push(match out.wrow(u) {
             Some(w) => w.iter().map(|&x| x as f64).sum(),
             None => out.deg(u) as f64,
-        })
-        .collect();
-    // the teleport distribution
-    let mut tele = vec![0f64; n];
+        })?;
+    }
+    let mut tele = Buffer::filled("pagerank-teleport", n, 0f64, ctl)?;
     if p.sources.is_empty() {
         tele.fill(1.0 / n as f64);
     } else {
-        let mut srcs = p.sources.clone();
+        let mut srcs = Buffer::new("pagerank-sources", p.sources.len(), ctl)?;
+        for &s in &p.sources {
+            work.tick("pagerank-source-copy")?;
+            srcs.push(s)?;
+        }
         srcs.sort_unstable();
-        srcs.dedup();
-        let share = 1.0 / srcs.len() as f64;
-        for &s in &srcs {
+        // Deduplicate in place without changing the capacity charged for the clone.
+        let mut kept = 0;
+        for i in 0..srcs.len() {
+            work.tick("pagerank-source-dedup")?;
+            if kept == 0 || srcs[i] != srcs[kept - 1] {
+                srcs[kept] = srcs[i];
+                kept += 1;
+            }
+        }
+        let share = 1.0 / kept as f64;
+        for &s in &srcs[..kept] {
+            work.tick("pagerank-personalize")?;
             tele[s as usize] = share;
         }
     }
-    let mut score = tele.clone();
-    let mut contrib = vec![0f64; n];
-    let mut next = vec![0f64; n];
+    let mut score = Buffer::new("pagerank-score", n, ctl)?;
+    for &v in &*tele {
+        work.tick("pagerank-score-copy")?;
+        score.push(v)?;
+    }
+    let mut contrib = Buffer::filled("pagerank-contribution", n, 0f64, ctl)?;
+    let mut next = Buffer::filled("pagerank-next", n, 0f64, ctl)?;
+    // Both reductions use the same fixed block boundaries and order as Par::blocks,
+    // without an uncharged Result<Vec> collection or overlapping reduction buffers.
+    let mut partials = Buffer::filled("pagerank-partials", n.div_ceil(BLOCK), 0f64, ctl)?;
     let d = p.damping;
     let mut iterations = 0u32;
     let mut delta = f64::INFINITY;
@@ -86,15 +108,15 @@ pub fn run(g: &Graph, p: &Params, par: &Par, ctl: &Control) -> Result<Output> {
     for it in 0..p.max_iterations {
         ctl.check()?;
         // the rank of the nodes with no out-edges, which is spread over the teleport set
-        let dangling: f64 = par
-            .blocks(n, BLOCK, |lo, hi| {
-                Ok((lo..hi)
-                    .filter(|&u| outw[u] <= 0.0)
-                    .map(|u| score[u])
-                    .sum::<f64>())
-            })?
-            .into_iter()
-            .sum();
+        par.chunks_mut(&mut partials, 1, |lo, c| {
+            let start = lo * BLOCK;
+            c[0] = (start..(start + BLOCK).min(n))
+                .filter(|&u| outw[u] <= 0.0)
+                .map(|u| score[u])
+                .sum::<f64>();
+            Ok(())
+        })?;
+        let dangling: f64 = partials.iter().copied().sum();
         // what each node sends along one unit of edge weight
         par.chunks_mut(&mut contrib, BLOCK, |lo, c| {
             for (i, x) in c.iter_mut().enumerate() {
@@ -132,10 +154,14 @@ pub fn run(g: &Graph, p: &Params, par: &Par, ctl: &Control) -> Result<Output> {
                 Ok(())
             })?;
         }
-        let diffs = par.blocks(n, BLOCK, |lo, hi| {
-            Ok((lo..hi).map(|v| (next[v] - score[v]).abs()).sum::<f64>())
+        par.chunks_mut(&mut partials, 1, |lo, c| {
+            let start = lo * BLOCK;
+            c[0] = (start..(start + BLOCK).min(n))
+                .map(|v| (next[v] - score[v]).abs())
+                .sum::<f64>();
+            Ok(())
         })?;
-        delta = diffs.into_iter().sum();
+        delta = partials.iter().copied().sum();
         std::mem::swap(&mut score, &mut next);
         iterations = it + 1;
         if !p.fixed && delta < p.tolerance {
@@ -149,7 +175,11 @@ pub fn run(g: &Graph, p: &Params, par: &Par, ctl: &Control) -> Result<Output> {
     stats.insert("iterations".into(), iterations.into());
     stats.insert("converged".into(), converged.into());
     stats.insert("delta".into(), serde_json::json!(delta));
-    Ok(Output { score, stats })
+    ctl.check()?;
+    Ok(Output {
+        score: score.into_output(),
+        stats,
+    })
 }
 
 #[cfg(test)]
@@ -252,5 +282,160 @@ mod tests {
         for v in 0..n {
             assert!((r[v] - s[v]).abs() < 1e-9);
         }
+    }
+    #[test]
+    fn r7_workspace_fifth_array_is_charged() {
+        let g = ugraph(4, &[(0, 1), (1, 2), (2, 3)]);
+        let ctl = Control::new(Default::default(), None, 4 * 4 * 8);
+        let result = run(&g, &Params::default(), &Par::single(), &ctl);
+        assert!(
+            matches!(result, Err(crate::Error::BudgetExceeded(_))),
+            "expected fifth-array refusal"
+        );
+    }
+
+    #[test]
+    fn r7_workspace_personalized_clone_is_charged() {
+        let g = ugraph(2, &[(0, 1)]);
+        let ctl = Control::new(Default::default(), None, 88);
+        let p = Params {
+            sources: vec![0; 1000],
+            ..Params::default()
+        };
+        let result = run(&g, &p, &Par::single(), &ctl);
+        assert!(
+            matches!(result, Err(crate::Error::BudgetExceeded(_))),
+            "expected source-clone refusal"
+        );
+    }
+
+    #[test]
+    fn r7_reduction_workspace_is_charged() {
+        let n = 4100;
+        let g = ugraph(n, &[(0, 1)]);
+        let ctl = Control::new(Default::default(), None, n as u64 * 5 * 8 + 15);
+        let result = run(
+            &g,
+            &Params {
+                max_iterations: 1,
+                ..Params::default()
+            },
+            &Par::single(),
+            &ctl,
+        );
+        assert!(
+            matches!(result, Err(crate::Error::BudgetExceeded(_))),
+            "expected reduction-buffer refusal"
+        );
+    }
+
+    #[test]
+    fn r7_reduction_fixed_bits() {
+        use sha2::{Digest, Sha256};
+        let n = 4100;
+        let edges: Vec<_> = (0..n)
+            .flat_map(|u| [(u, (u + 1) % n), (u, (u * 7 + 3) % n)])
+            .collect();
+        let g = digraph(n, &edges);
+        let p = Params {
+            max_iterations: 3,
+            fixed: true,
+            sources: vec![0, 0, 1299, 4099],
+            ..Params::default()
+        };
+        for par in [Par::single(), Par::with_threads(4)] {
+            let output = run(&g, &p, &par, &Control::unlimited()).unwrap();
+            let mut digest = Sha256::new();
+            for v in &output.score {
+                digest.update(v.to_bits().to_le_bytes());
+            }
+            assert_eq!(
+                digest
+                    .finalize()
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>(),
+                "d1dbaed2c3118f816315c0be3f20c21902955362fa903ccfda39dcbf6bbe7dd5"
+            );
+        }
+    }
+    #[test]
+    fn r7_workspace_exact_peak_and_output_lifetime() {
+        let g = ugraph(4, &[(0, 1), (1, 2)]);
+        // Five four-element f64 arrays and one fixed-block partial.
+        let expected = 5 * 4 * 8 + 8;
+        let ctl = Control::new(Default::default(), None, expected);
+        let output = run(&g, &Params::default(), &Par::single(), &ctl).unwrap();
+        assert_eq!(ctl.peak(), expected);
+        assert_eq!(ctl.remaining(), expected - 4 * 8);
+        drop(output);
+        assert_eq!(ctl.remaining(), expected - 4 * 8);
+        let short = Control::new(Default::default(), None, expected - 1);
+        assert!(matches!(
+            run(&g, &Params::default(), &Par::single(), &short),
+            Err(crate::Error::BudgetExceeded(_))
+        ));
+        assert_eq!(short.remaining(), expected - 1);
+        let p = Params {
+            sources: vec![0; 1000],
+            ..Params::default()
+        };
+        // During source copying, only outw and tele accompany the full clone.
+        let peak = 2 * 4 * 8 + 1000 * 4;
+        let ctl = Control::new(Default::default(), None, peak);
+        run(&g, &p, &Par::single(), &ctl).unwrap();
+        assert_eq!(ctl.peak(), peak);
+        let short = Control::new(Default::default(), None, peak - 1);
+        assert!(matches!(
+            run(&g, &p, &Par::single(), &short),
+            Err(crate::Error::BudgetExceeded(_))
+        ));
+        assert_eq!(short.remaining(), peak - 1);
+    }
+
+    #[test]
+    fn r7_workspace_allocation_failure_and_unwind_rollback() {
+        use crate::algo::memory::probe::{self, Point};
+        let g = ugraph(4, &[(0, 1)]);
+        let p = Params {
+            sources: vec![0, 0],
+            ..Params::default()
+        };
+        for name in [
+            "pagerank-out-weights",
+            "pagerank-teleport",
+            "pagerank-sources",
+            "pagerank-score",
+            "pagerank-contribution",
+            "pagerank-next",
+            "pagerank-partials",
+        ] {
+            let ctl = Control::new(Default::default(), None, 10000);
+            let _scope = probe::install(|_| {}, Some(name));
+            assert!(matches!(
+                run(&g, &p, &Par::single(), &ctl),
+                Err(crate::Error::Invalid(_))
+            ));
+            assert_eq!(ctl.remaining(), 10000, "{name}");
+        }
+        let ctl = Control::new(Default::default(), None, 10000);
+        let _scope = probe::install(
+            |point| {
+                if let Point::Allocation("pagerank-next", _) = point {
+                    panic!("test PageRank unwind");
+                }
+            },
+            None,
+        );
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(
+                &g,
+                &p,
+                &Par::single(),
+                &ctl
+            )))
+            .is_err()
+        );
+        assert_eq!(ctl.remaining(), 10000);
     }
 }

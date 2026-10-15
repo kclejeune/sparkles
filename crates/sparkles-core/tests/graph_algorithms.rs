@@ -1513,3 +1513,32 @@ fn concurrent_calls_agree_and_share_the_thread_budget() {
         assert_eq!(r, &results[0]);
     }
 }
+
+#[test]
+fn r7_cached_incoming_requires_each_call_budget() {
+    let s = projection_cache_store();
+    let warm = "SELECT ?n ?c WHERE { SERVICE algo:wcc { [] algo:predicate ex:p ; algo:direction algo:forward ; algo:node ?n ; algo:component ?c } }";
+    let opts = QueryOptions::default();
+    let _ = projection_cache_read(s.snapshot(), warm, &opts);
+    assert_eq!(projection_cache_read(s.snapshot(), warm, &opts).1, 1);
+    let q = format!(
+        "{PREFIXES}SELECT ?n ?r WHERE {{ SERVICE algo:pageRank {{ [] algo:predicate ex:p ; algo:direction algo:forward ; algo:maxMemory 208 ; algo:node ?n ; algo:score ?r }} }}"
+    );
+    // Four ids and five offsets plus two edges = 80 base bytes, plus 128
+    // bytes charged by the old PageRank workspace. Incoming storage is extra.
+    let result = query(s.snapshot(), &q, &opts);
+    assert!(
+        matches!(result, Err(sparkles_core::Error::BudgetExceeded(_))),
+        "expected cached incoming refusal"
+    );
+    let enough = q.replace("algo:maxMemory 208 ; ", "");
+    let good = query(s.snapshot(), &enough, &opts).unwrap();
+    assert_eq!(good.rows().len(), 4);
+    let leaf = find(&good.plan, "AlgoCall").unwrap();
+    assert_eq!(leaf.counters.as_ref().unwrap()["cachedProjections"], 1);
+    // Initialization by the successful caller cannot exempt the next caller.
+    assert!(matches!(
+        query(s.snapshot(), &q, &opts),
+        Err(sparkles_core::Error::BudgetExceeded(_))
+    ));
+}

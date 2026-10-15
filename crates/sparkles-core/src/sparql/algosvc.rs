@@ -1660,7 +1660,7 @@ fn projection(
         && let Some(g) = algo::cache::get(k)
     {
         // the call holds the build while it runs, as if it had made it
-        ctl.charge(g.bytes())?;
+        ctl.charge(g.base_bytes()?)?;
         return Ok((g, true));
     }
     let g = std::sync::Arc::new(build_graph(ctx, spec, edges, par, ctl)?);

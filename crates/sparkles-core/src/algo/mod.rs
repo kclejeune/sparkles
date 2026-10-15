@@ -22,6 +22,7 @@ pub mod fastrp;
 pub mod graph;
 pub mod kcore;
 pub mod labelprop;
+mod memory;
 pub mod node2vec;
 pub mod pagerank;
 pub mod pool;

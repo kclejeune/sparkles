@@ -323,7 +323,8 @@ pub fn run(g: &Graph, p: &Params, ctl: &Control) -> Result<Vec<f32>> {
     let mut syn1 = Buffer::new("syn1", nd, ctl)?.filled(0f32, &mut work, "initialize-output")?;
     // Incoming CSR ownership is the separate graph/transpose accounting contract.
     // Acquire it once; do not duplicate that reservation among these own buffers.
-    let inn = g.inn();
+    let incoming = g.inn(ctl)?;
+    let inn = &*incoming;
     let mut cum = Buffer::new("noise", n, ctl)?;
     let mut acc = 0.0;
     for u in 0..n as u32 {
