@@ -6,9 +6,10 @@
 //! parser recurses once per bracket). The planner, the evaluator and the code that clones
 //! or drops the algebra recurse once per level of the algebra. [`check_query`] and
 //! [`check_update`] measure the parsed algebra itself, never recursing deeper than
-//! [`MAX_ALGEBRA_DEPTH`], so that bound holds whatever the text count misses; and
-//! [`with_stack`] gives the planner and the evaluator a stack that fits the depth they
-//! measured, whatever thread they run on.
+//! [`MAX_ALGEBRA_DEPTH`], so that bound holds whatever the text count misses. They also
+//! refuse a plan deeper than [`MAX_PLAN_DEPTH`], which a large basic graph pattern
+//! reaches without nesting at all, and [`with_stack`] gives the planner and the
+//! evaluator a stack that fits the depth they measured, whatever thread they run on.
 
 use crate::error::{Error, Result};
 use oxrdf::Term;
@@ -23,6 +24,13 @@ use spargebra::{GraphUpdateOperation, Query, Update};
 /// filter an `Exists` and its group), so this is twice spargebra's bound on the text,
 /// with room for the levels a query form adds.
 pub const MAX_ALGEBRA_DEPTH: usize = 2 * spargebra::nesting::MAX_DEPTH + 64;
+
+/// The deepest plan the engine builds. The planner joins the triple patterns of a basic
+/// graph pattern one after the other, so a basic graph pattern counts one level per
+/// triple pattern, and a text far below the body limit could otherwise ask for more
+/// stack than [`STACK_MAX`]. The plan, its description and its JSON form are all
+/// recursive, and at this depth they fit the stack of any thread the server runs.
+pub const MAX_PLAN_DEPTH: usize = 4000;
 
 /// The stack allowance per measured plan level. Lowering blank-node property lists adds
 /// plan nodes, and debug owned-executor frames need 256 KiB per measured level. Release
@@ -40,24 +48,37 @@ const STACK_BASE: usize = 256 << 10;
 /// The largest stack [`with_stack`] asks for.
 const STACK_MAX: usize = 1 << 30;
 
-/// Refuse a query whose algebra nests deeper than [`MAX_ALGEBRA_DEPTH`]; else the depth
-/// of its plan, for [`with_stack`].
+// a plan within the bound always gets all the stack it is measured to need
+const _: () = assert!(STACK_BASE + MAX_PLAN_DEPTH * STACK_PER_LEVEL <= STACK_MAX);
+
+/// Refuse a query whose algebra nests deeper than [`MAX_ALGEBRA_DEPTH`] or whose plan
+/// nests deeper than [`MAX_PLAN_DEPTH`]; else the depth of its plan, for [`with_stack`].
 pub fn check_query(q: &Query) -> Result<usize> {
     limit(Walk::new(MAX_ALGEBRA_DEPTH, false).query(q))?;
-    Ok(Walk::new(usize::MAX, true).query(q))
+    plan_limit(Walk::new(MAX_PLAN_DEPTH, true).query(q))
 }
 
-/// Refuse an update whose algebra nests deeper than [`MAX_ALGEBRA_DEPTH`]; else the depth
-/// of its plans, for [`with_stack`].
+/// Refuse an update whose algebra nests deeper than [`MAX_ALGEBRA_DEPTH`] or whose plans
+/// nest deeper than [`MAX_PLAN_DEPTH`]; else the depth of its plans, for [`with_stack`].
 pub fn check_update(u: &Update) -> Result<usize> {
     limit(Walk::new(MAX_ALGEBRA_DEPTH, false).update(u))?;
-    Ok(Walk::new(usize::MAX, true).update(u))
+    plan_limit(Walk::new(MAX_PLAN_DEPTH, true).update(u))
 }
 
 fn limit(depth: usize) -> Result<usize> {
     if depth > MAX_ALGEBRA_DEPTH {
         return Err(Error::invalid(format!(
             "query algebra nested deeper than {MAX_ALGEBRA_DEPTH} levels"
+        )));
+    }
+    Ok(depth)
+}
+
+fn plan_limit(depth: usize) -> Result<usize> {
+    if depth > MAX_PLAN_DEPTH {
+        return Err(Error::invalid(format!(
+            "query plan nested deeper than {MAX_PLAN_DEPTH} levels; a basic graph pattern \
+             counts one level per triple pattern"
         )));
     }
     Ok(depth)
@@ -86,9 +107,11 @@ pub fn update_depth(u: &Update, limit: usize) -> usize {
 }
 
 /// A walk that never goes deeper than `limit + 1` levels. Each method takes the depth `d`
-/// of the node it is given and returns the depth of its deepest descendant. With `bgp`, a
-/// basic graph pattern counts one level per triple pattern, as the plan that joins them
-/// nests (the depth the planner and the executor recurse to).
+/// of the node it is given and returns the depth of its deepest descendant. With `bgp`, it
+/// measures the plan the planner builds and the executor recurses through: a basic graph
+/// pattern counts one level per triple pattern and two for one with a blank node, and
+/// the plan of a join's right operand stacks on the plan of its left one, since the
+/// planner flattens joins into one join tree.
 struct Walk {
     limit: usize,
     bgp: bool,
@@ -168,7 +191,16 @@ impl Walk {
                     .max()
                     .unwrap_or(d);
                 if self.bgp {
-                    terms.saturating_add(patterns.len())
+                    // a join, and a sort before it when a blank node joins on, per
+                    // triple pattern
+                    let levels: usize = patterns
+                        .iter()
+                        .map(|t| {
+                            let blank = |t: &TermPattern| matches!(t, TermPattern::BlankNode(_));
+                            1 + usize::from(blank(&t.subject) || blank(&t.object))
+                        })
+                        .sum();
+                    terms.saturating_add(levels)
                 } else {
                     terms
                 }
@@ -181,6 +213,14 @@ impl Walk {
                 .term(subject, n)
                 .max(self.path(path, n))
                 .max(self.term(object, n)),
+            // the planner flattens joins into one join tree, so the plan of the right
+            // operand can stack on top of the plan of the left one
+            GraphPattern::Join { left, right } | GraphPattern::Lateral { left, right }
+                if self.bgp =>
+            {
+                let l = self.pattern(left, n);
+                self.pattern(right, l.max(n))
+            }
             GraphPattern::Join { left, right }
             | GraphPattern::Lateral { left, right }
             | GraphPattern::Union { left, right }

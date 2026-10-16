@@ -123,22 +123,29 @@ impl CursorPlan {
                 self.0.write(&self.1, s)
             }
         }
-        let mut m = s.serialize_map(None)?;
-        m.serialize_entry("id", id)?;
-        m.serialize_entry("operator", &Operator(&self.operator, id))?;
-        m.serialize_entry("materializes", &self.materializes)?;
-        m.serialize_entry("fullInputBeforeOutput", &self.full_input_before_output)?;
-        m.serialize_entry("growingState", &self.growing_state)?;
-        m.serialize_entry("complete", &self.complete)?;
-        m.serialize_entry("reason", &self.reason)?;
-        let children: Vec<Child<'_>> = self
-            .children
-            .iter()
-            .enumerate()
-            .map(|(i, c)| Child(c, format!("{id}.{i}")))
-            .collect();
-        m.serialize_entry("children", &children)?;
-        m.end()
+        // a plan nests up to `MAX_PLAN_DEPTH` levels, as in `PlanWithId`
+        stacker::maybe_grow(
+            super::exec::PLAN_RED_ZONE,
+            super::exec::PLAN_STACK_SEGMENT,
+            || {
+                let mut m = s.serialize_map(None)?;
+                m.serialize_entry("id", id)?;
+                m.serialize_entry("operator", &Operator(&self.operator, id))?;
+                m.serialize_entry("materializes", &self.materializes)?;
+                m.serialize_entry("fullInputBeforeOutput", &self.full_input_before_output)?;
+                m.serialize_entry("growingState", &self.growing_state)?;
+                m.serialize_entry("complete", &self.complete)?;
+                m.serialize_entry("reason", &self.reason)?;
+                let children: Vec<Child<'_>> = self
+                    .children
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| Child(c, format!("{id}.{i}")))
+                    .collect();
+                m.serialize_entry("children", &children)?;
+                m.end()
+            },
+        )
     }
 
     pub fn has_materialization(&self) -> bool {

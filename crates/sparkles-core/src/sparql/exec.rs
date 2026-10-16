@@ -167,12 +167,22 @@ impl Serialize for PlanWithId<'_> {
                 )
             }
         }
-        let mut m = s.serialize_map(None)?;
-        self.info.serialize_members(&self.id, &mut m)?;
-        m.serialize_entry("children", &Children(&self.info.children, &self.id))?;
-        m.end()
+        // a plan nests up to `MAX_PLAN_DEPTH` levels, more than the stack of a small
+        // thread holds in a debug build, so each level makes sure of its own stack
+        stacker::maybe_grow(PLAN_RED_ZONE, PLAN_STACK_SEGMENT, || {
+            let mut m = s.serialize_map(None)?;
+            self.info.serialize_members(&self.id, &mut m)?;
+            m.serialize_entry("children", &Children(&self.info.children, &self.id))?;
+            m.end()
+        })
     }
 }
+
+/// The stack a level of a recursion over a [`PlanInfo`] wants left before it runs.
+pub(super) const PLAN_RED_ZONE: usize = 64 << 10;
+
+/// The stack segment a recursion over a [`PlanInfo`] grows by when less is left.
+pub(super) const PLAN_STACK_SEGMENT: usize = 2 << 20;
 
 impl PlanInfo {
     /// This node written as the node `id` of its plan.
@@ -271,6 +281,19 @@ impl PlanInfo {
         }
         mark(&mut self, why);
         self
+    }
+
+    /// How many levels the plan nests, counted without recursion: 1 for a leaf. A
+    /// caller that walks the plan recursively runs on
+    /// [`with_stack`](super::depth::with_stack) of this depth.
+    pub fn depth(&self) -> usize {
+        let mut deepest = 0;
+        let mut todo = vec![(self, 1)];
+        while let Some((n, d)) = todo.pop() {
+            deepest = deepest.max(d);
+            todo.extend(n.children.iter().map(|c| (c, d + 1)));
+        }
+        deepest
     }
 
     /// The node `id` (`0`, `0.1`, …) of this plan, when it has one.

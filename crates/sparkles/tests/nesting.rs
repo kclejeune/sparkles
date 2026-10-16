@@ -5,7 +5,7 @@
 use spargebra::nesting::{MAX_DEPTH, MAX_NESTING, measure};
 use sparkles::Dataset;
 use sparkles::io::RdfFormat;
-use sparkles::sparql::depth::query_depth;
+use sparkles::sparql::depth::{MAX_PLAN_DEPTH, check_query, check_update, query_depth, with_stack};
 
 /// Run `f` on a thread with a 2 MiB stack.
 fn on_small_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
@@ -502,4 +502,190 @@ fn the_w3c_queries_nest_far_below_the_limits() {
         checked += 1;
     }
     assert!(checked > 500, "{checked} files");
+}
+
+/// A basic graph pattern of `n` triple patterns over the two triples of [`dataset`],
+/// each of which matches.
+fn bgp(n: usize) -> String {
+    let mut q = String::from("SELECT * { ");
+    for i in 0..n {
+        let o = if i % 2 == 0 { "s" } else { "o" };
+        q.push_str(&format!("<urn:s> <urn:p> <urn:{o}> . "));
+    }
+    q.push('}');
+    q
+}
+
+/// A `DELETE WHERE` of `n` triple patterns that match nothing.
+fn delete_where(n: usize) -> String {
+    let mut u = String::from("DELETE WHERE { ");
+    for i in 0..n {
+        u.push_str(&format!("<urn:x> <urn:p> <urn:o{i}> . "));
+    }
+    u.push('}');
+    u
+}
+
+/// The most triple patterns a [`bgp`] may hold: the projection and the group around
+/// it are plan levels too.
+fn largest_bgp() -> usize {
+    let n = MAX_PLAN_DEPTH - 3;
+    let parsed = spargebra::SparqlParser::new().parse_query(&bgp(n)).unwrap();
+    assert_eq!(check_query(&parsed).unwrap(), MAX_PLAN_DEPTH);
+    n
+}
+
+/// The most triple patterns a [`delete_where`] may hold.
+fn largest_delete_where() -> usize {
+    let n = MAX_PLAN_DEPTH - 2;
+    let parsed = spargebra::SparqlParser::new()
+        .parse_update(&delete_where(n))
+        .unwrap();
+    assert_eq!(check_update(&parsed).unwrap(), MAX_PLAN_DEPTH);
+    n
+}
+
+#[test]
+fn a_basic_graph_pattern_at_the_plan_limit_runs_and_explains() {
+    on_small_stack(|| {
+        let ds = dataset();
+        let n = largest_bgp();
+        assert_eq!(ds.query(&bgp(n)).unwrap().len(), 1);
+        let opts = sparkles::sparql::QueryOptions::default();
+        let (_, plan) = sparkles::sparql::explain(ds.snapshot(), &bgp(n), &opts).unwrap();
+        // writing the plan grows the stack as it needs
+        let text = serde_json::to_string(&plan).unwrap();
+        assert!(text.len() > 100 * n, "{}", text.len());
+        assert_eq!(plan.depth(), n + 1);
+        // a JSON value of the plan nests twice as deep, and it is dropped by recursion
+        with_stack(plan.depth(), || {
+            let value = serde_json::to_value(&plan).unwrap();
+            assert_eq!(serde_json::to_string(&value).unwrap().len(), text.len());
+        });
+        drop(plan);
+        ds.update(&delete_where(largest_delete_where())).unwrap();
+    });
+}
+
+#[test]
+fn a_basic_graph_pattern_past_the_plan_limit_is_refused() {
+    on_small_stack(|| {
+        let ds = dataset();
+        let opts = sparkles::sparql::QueryOptions::default();
+        let sizes = [
+            (largest_bgp(), largest_delete_where()),
+            (MAX_PLAN_DEPTH, MAX_PLAN_DEPTH),
+            (100_000, 100_000),
+        ];
+        for (q, u) in sizes {
+            let t = std::time::Instant::now();
+            plan_refused(ds.query(&bgp(q + 1)));
+            plan_refused(sparkles::sparql::explain(ds.snapshot(), &bgp(q + 1), &opts));
+            plan_refused(ds.update(&delete_where(u + 1)));
+            // refused before planning, which takes seconds at this size
+            assert!(t.elapsed().as_secs() < 5, "{q}: {:?}", t.elapsed());
+        }
+    });
+}
+
+#[test]
+fn the_measured_plan_depth_bounds_the_plan() {
+    // the planner flattens joins and sorts before a blank node joins on, so a group of
+    // basic graph patterns and a blank node count as deep as the plan they make
+    let ds = dataset();
+    let opts = sparkles::sparql::QueryOptions::default();
+    let ground = |n: usize| "<urn:s> <urn:p> ?x . ".repeat(n);
+    let chain = |n: usize, v: &str| {
+        (0..n)
+            .map(|i| format!("?{v}{i} <urn:p> ?{v}{} . ", i + 1))
+            .collect::<String>()
+    };
+    let blank = |n: usize| "?s <urn:p> [ <urn:p> ?o ] . ".repeat(n);
+    let queries = [
+        format!("SELECT * {{ {} }}", chain(100, "a")),
+        format!("SELECT * {{ {} }}", blank(50)),
+        format!(
+            "SELECT * {{ {} }}",
+            "?s <urn:p> [ <urn:p> [ <urn:p> ?o ] ] . ".repeat(30)
+        ),
+        format!("SELECT * {{ {} BIND(1 AS ?z) {} }}", ground(50), ground(50)),
+        format!(
+            "SELECT * {{ {} {{ SELECT * {{ {} }} }} }}",
+            ground(50),
+            ground(50)
+        ),
+        format!(
+            "SELECT * {{ {} GRAPH ?g {{ {} }} }}",
+            ground(50),
+            ground(50)
+        ),
+        format!(
+            "SELECT * {{ {} OPTIONAL {{ ?x <urn:p> ?y }} {} }}",
+            ground(50),
+            ground(50)
+        ),
+        format!(
+            "SELECT * {{ {} FILTER(?x != 1) {} }}",
+            ground(50),
+            ground(50)
+        ),
+        format!(
+            "SELECT * {{ {} OPTIONAL {{ {} }} }}",
+            chain(50, "a"),
+            chain(50, "b")
+        ),
+        format!(
+            "SELECT * {{ {{ {} }} UNION {{ {} }} }}",
+            ground(50),
+            ground(50)
+        ),
+        format!(
+            "SELECT * {{ {} MINUS {{ {} }} }}",
+            chain(50, "a"),
+            chain(50, "b")
+        ),
+        format!(
+            "SELECT * {{ {} FILTER EXISTS {{ {} }} {} }}",
+            chain(50, "a"),
+            chain(50, "b"),
+            chain(50, "c")
+        ),
+        format!("SELECT * {{ ?s <urn:p>{{3,5}} ?o . {} }}", ground(50)),
+        format!("ASK {{ {} }}", chain(100, "a")),
+        format!(
+            "CONSTRUCT {{ ?a0 <urn:p> ?a1 }} WHERE {{ {} }}",
+            chain(100, "a")
+        ),
+    ];
+    for q in &queries {
+        let parsed = spargebra::SparqlParser::new().parse_query(q).unwrap();
+        let measured = check_query(&parsed).unwrap();
+        let (_, plan) = sparkles::sparql::explain(ds.snapshot(), q, &opts).unwrap();
+        assert!(
+            plan.depth() <= measured,
+            "{} > {measured}: {q}",
+            plan.depth()
+        );
+    }
+    // so plans the parts of a query stack into are refused whole
+    let half = MAX_PLAN_DEPTH / 2;
+    plan_refused(ds.query(&format!(
+        "SELECT * {{ {} BIND(1 AS ?z) {} }}",
+        ground(half),
+        ground(half)
+    )));
+    plan_refused(ds.query(&format!(
+        "SELECT * {{ {} {{ SELECT * {{ {} }} }} }}",
+        ground(half),
+        ground(half)
+    )));
+    plan_refused(ds.query(&format!("SELECT * {{ {} }}", blank(half / 2 + 1))));
+}
+
+fn plan_refused<T>(r: sparkles::Result<T>) {
+    let want = format!("query plan nested deeper than {MAX_PLAN_DEPTH} levels");
+    match r {
+        Err(e) => assert!(e.to_string().contains(&want), "{e}"),
+        Ok(_) => panic!("not refused"),
+    }
 }
