@@ -507,6 +507,18 @@ impl Node {
         }
     }
 
+    /// How many levels the plan nests, counted without recursion: 1 for a leaf. The code
+    /// that plans, runs, clones and drops a plan recurses that deep.
+    pub(super) fn depth(&self) -> usize {
+        let mut deepest = 0;
+        let mut todo = vec![(self, 1)];
+        while let Some((n, d)) = todo.pop() {
+            deepest = deepest.max(d);
+            todo.extend(n.children.iter().map(|c| (c, d + 1)));
+        }
+        deepest
+    }
+
     pub fn empty(vars: Vec<VarId>) -> Node {
         Node::leaf(Kind::Empty, vars, 0.0, "empty".into())
     }
@@ -1528,7 +1540,8 @@ impl<'a> Planner<'a> {
                 self.collect_path(mid, b, o, g, items)?;
             }
             // ARQ's PathCompiler: `p{n,m}` with n ≥ 1 is n steps of p, then p{0,m-n}
-            // (p{*} when unbounded); the steps are joined like a sequence's
+            // (p{*} when unbounded); the steps are joined like a sequence's. A change to
+            // this arm must change `Walk::path_levels` in depth.rs, which counts the steps.
             PP::Range { path, min, max } if (1..=RANGE_UNROLL).contains(min) => {
                 let mut from = s;
                 for i in 0..*min {

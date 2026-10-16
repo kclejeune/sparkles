@@ -1485,7 +1485,7 @@ async fn deep_nesting_is_a_syntax_error() {
     }
 }
 
-/// A basic graph pattern counts one plan level per triple pattern. At the plan limit the
+/// A basic graph pattern counts two plan levels per triple pattern. At the plan limit the
 /// tools explain it on these small stacks, and one more triple pattern is refused.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_basic_graph_pattern_at_the_plan_limit() {
@@ -1493,7 +1493,7 @@ async fn a_basic_graph_pattern_at_the_plan_limit() {
     let mut c = Client::start(fixture_server());
     let bgp = |n: usize| format!("SELECT * WHERE {{ {}}}", "?s a ?o . ".repeat(n));
     // the projection and the group are plan levels too
-    let n = MAX_PLAN_DEPTH - 3;
+    let n = (MAX_PLAN_DEPTH - 3) / 2;
     let s = c
         .structured("explain_query", json!({"query": bgp(n)}))
         .await;

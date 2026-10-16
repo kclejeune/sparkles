@@ -692,6 +692,8 @@ struct PreparedQuery {
     pattern: GraphPattern,
     bound: Vec<(table::VarId, Id)>,
     kind: QueryKind,
+    /// the depth of `node`, which the evaluation and the drop of the plan need stack for
+    plan_depth: usize,
 }
 
 /// Semantic preparation shared by eager execution and snapshot-owning cursors.
@@ -750,6 +752,8 @@ fn prepare_query(
     let planned = rdfs::apply(&ctx, &pattern);
     ioacct::mark("plan");
     let node = planner.plan(&planned, &ActiveGraph::Default, Vec::new())?;
+    // the count of the parsed query bounds the plan, and this makes it true of the plan
+    let plan_depth = depth::check_plan(node.depth())?;
     ioacct::mark("planned");
     exec::prefetch_scans(&ctx, &node);
     if let Some(automatic) = automatic
@@ -770,6 +774,7 @@ fn prepare_query(
         pattern,
         bound,
         kind,
+        plan_depth,
     })
 }
 
@@ -782,7 +787,9 @@ fn execute_parsed(
     let t1 = Instant::now();
     let prepared = prepare_query(snap, parsed, opts, None, None)?;
     let plan_ms = t1.elapsed().as_secs_f64() * 1000.0;
-    execute_prepared(parsed, opts, parse_ms, plan_ms, prepared)
+    depth::with_stack(prepared.plan_depth, || {
+        execute_prepared(parsed, opts, parse_ms, plan_ms, prepared)
+    })
 }
 
 fn execute_prepared(
@@ -798,6 +805,7 @@ fn execute_prepared(
         pattern,
         bound,
         kind,
+        plan_depth: _,
     } = prepared;
     let (_, dataset, _) = split(parsed);
     let t2 = Instant::now();
@@ -975,6 +983,7 @@ pub fn explain(snap: Arc<Snapshot>, q: &str, opts: &QueryOptions) -> Result<(Str
         };
         let pattern = rdfs::apply(&ctx, &pattern);
         let node = planner.plan(&pattern, &ActiveGraph::Default, Vec::new())?;
+        depth::check_plan(node.depth())?;
         let mut info = exec::describe(&ctx, &node);
         if matches!(kind, QueryKind::Construct | QueryKind::Describe) {
             info = graph_root(kind, info, Instant::now());

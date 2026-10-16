@@ -514,6 +514,7 @@ fn open_pattern_cursor(
             let planning = Instant::now();
             let prepared = super::prepare_query(snapshot, &parsed, options, Some(started), None)?;
             let plan_ms = planning.elapsed().as_secs_f64() * 1000.0;
+            let levels = levels.max(prepared.plan_depth);
             from_prepared(
                 prepared, &parsed, query, options, cursor, started, parse_ms, plan_ms, levels, kind,
             )
@@ -766,9 +767,10 @@ pub fn query_execution(
                 if result.kind == QueryKind::Select {
                     super::select_star_order(query, &mut result);
                 }
+                let depth = levels.max(result.plan.depth());
                 return Ok(QueryExecution::Eager(Box::new(MaterializedResult {
                     result: Some(result),
-                    depth: levels,
+                    depth,
                 })));
             }
             if cursor.batch_rows == 0 || cursor.batch_bytes == 0 {
@@ -781,6 +783,7 @@ pub fn query_execution(
                 super::prepare_query(snapshot, &parsed, options, Some(started), Some(cursor))?;
             let plan_ms = planning.elapsed().as_secs_f64() * 1000.0;
             let kind = prepared.kind;
+            let levels = levels.max(prepared.plan_depth);
             if prepared.ctx.is_cursor() {
                 let (cursor, _, _) = from_prepared(
                     prepared, &parsed, query, options, cursor, started, parse_ms, plan_ms, levels,
@@ -788,15 +791,17 @@ pub fn query_execution(
                 )?;
                 Ok(QueryExecution::Select(Box::new(cursor)))
             } else {
-                let mut result =
+                let mut result = depth::with_stack(levels, || {
                     super::execute_prepared(&parsed, options, parse_ms, plan_ms, prepared)
-                        .map_err(|f| f.error)?;
+                })
+                .map_err(|f| f.error)?;
                 if result.kind == QueryKind::Select {
                     super::select_star_order(query, &mut result);
                 }
+                let depth = levels.max(result.plan.depth());
                 Ok(QueryExecution::Eager(Box::new(MaterializedResult {
                     result: Some(result),
-                    depth: levels,
+                    depth,
                 })))
             }
         })

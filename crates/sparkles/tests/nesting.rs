@@ -543,22 +543,30 @@ fn delete_where(n: usize) -> String {
     u
 }
 
-/// The most triple patterns a [`bgp`] may hold: the projection and the group around
-/// it are plan levels too.
+/// The most triple patterns a [`bgp`] may hold: the planner can join and sort each of
+/// them, and the projection and the group around them are plan levels too.
 fn largest_bgp() -> usize {
-    let n = MAX_PLAN_DEPTH - 3;
-    let parsed = spargebra::SparqlParser::new().parse_query(&bgp(n)).unwrap();
-    assert_eq!(check_query(&parsed).unwrap(), MAX_PLAN_DEPTH);
+    let n = (MAX_PLAN_DEPTH - 3) / 2;
+    let check = |n: usize| {
+        let parsed = spargebra::SparqlParser::new().parse_query(&bgp(n)).unwrap();
+        check_query(&parsed)
+    };
+    assert!(check(n).unwrap() <= MAX_PLAN_DEPTH);
+    assert!(check(n + 1).is_err());
     n
 }
 
 /// The most triple patterns a [`delete_where`] may hold.
 fn largest_delete_where() -> usize {
-    let n = MAX_PLAN_DEPTH - 2;
-    let parsed = spargebra::SparqlParser::new()
-        .parse_update(&delete_where(n))
-        .unwrap();
-    assert_eq!(check_update(&parsed).unwrap(), MAX_PLAN_DEPTH);
+    let n = (MAX_PLAN_DEPTH - 2) / 2;
+    let check = |n: usize| {
+        let parsed = spargebra::SparqlParser::new()
+            .parse_update(&delete_where(n))
+            .unwrap();
+        check_update(&parsed)
+    };
+    assert!(check(n).unwrap() <= MAX_PLAN_DEPTH);
+    assert!(check(n + 1).is_err());
     n
 }
 
@@ -605,98 +613,217 @@ fn a_basic_graph_pattern_past_the_plan_limit_is_refused() {
     });
 }
 
-#[test]
-fn the_measured_plan_depth_bounds_the_plan() {
-    // the planner flattens joins and sorts before a blank node joins on, so a group of
-    // basic graph patterns and a blank node count as deep as the plan they make
-    let ds = dataset();
-    let opts = sparkles::sparql::QueryOptions::default();
-    let ground = |n: usize| "<urn:s> <urn:p> ?x . ".repeat(n);
-    let chain = |n: usize, v: &str| {
-        (0..n)
-            .map(|i| format!("?{v}{i} <urn:p> ?{v}{} . ", i + 1))
-            .collect::<String>()
-    };
-    let blank = |n: usize| "?s <urn:p> [ <urn:p> ?o ] . ".repeat(n);
-    let queries = [
-        format!("SELECT * {{ {} }}", chain(100, "a")),
-        format!("SELECT * {{ {} }}", blank(50)),
-        format!(
-            "SELECT * {{ {} }}",
-            "?s <urn:p> [ <urn:p> [ <urn:p> ?o ] ] . ".repeat(30)
+/// Four triples with a cycle and a second predicate, so that the planner cannot order a
+/// join by a constant and builds joins and sorts for variable joins.
+fn cyclic() -> Dataset {
+    let ds = Dataset::memory();
+    ds.load_str(
+        "<urn:s> <urn:p> <urn:o> . <urn:o> <urn:p> <urn:s> . \
+         <urn:s> <urn:q> 1 . <urn:o> <urn:q> 2 .",
+        RdfFormat::Turtle,
+    )
+    .unwrap();
+    ds
+}
+
+/// Shapes of `n` triple patterns, each joined to the one before it by a variable.
+fn plan_shapes(n: usize) -> Vec<(String, String)> {
+    let select = |body: String| format!("SELECT * {{ {body} }}");
+    let each = |f: &dyn Fn(usize) -> String| (0..n).map(f).collect::<String>();
+    let mut shapes = vec![
+        (
+            "chain",
+            select(each(&|i| format!("?a{i} <urn:p> ?a{} . ", i + 1))),
         ),
-        format!("SELECT * {{ {} BIND(1 AS ?z) {} }}", ground(50), ground(50)),
-        format!(
-            "SELECT * {{ {} {{ SELECT * {{ {} }} }} }}",
-            ground(50),
-            ground(50)
+        (
+            "reversed chain",
+            select(
+                (0..n)
+                    .rev()
+                    .map(|i| format!("?a{i} <urn:p> ?a{} . ", i + 1))
+                    .collect(),
+            ),
         ),
-        format!(
-            "SELECT * {{ {} GRAPH ?g {{ {} }} }}",
-            ground(50),
-            ground(50)
+        (
+            "tree",
+            select(each(&|i| format!("?a{} <urn:p> ?a{} . ", i / 2, i + 1))),
         ),
-        format!(
-            "SELECT * {{ {} OPTIONAL {{ ?x <urn:p> ?y }} {} }}",
-            ground(50),
-            ground(50)
+        (
+            "pairs",
+            select(each(&|i| format!("?x <urn:p> ?y{i} . ?y{i} <urn:q> ?z . "))),
         ),
-        format!(
-            "SELECT * {{ {} FILTER(?x != 1) {} }}",
-            ground(50),
-            ground(50)
+        (
+            "chain with a second predicate",
+            select(each(&|i| {
+                format!("?a{i} <urn:p> ?a{} . ?a{} <urn:q> [] . ", i + 1, i + 1)
+            })),
         ),
-        format!(
-            "SELECT * {{ {} OPTIONAL {{ {} }} }}",
-            chain(50, "a"),
-            chain(50, "b")
+        (
+            "chain with values",
+            select(each(&|i| {
+                format!(
+                    "?a{i} <urn:p> ?a{} . VALUES ?a{} {{ <urn:s> <urn:o> }} ",
+                    i + 1,
+                    i + 1
+                )
+            })),
         ),
-        format!(
-            "SELECT * {{ {{ {} }} UNION {{ {} }} }}",
-            ground(50),
-            ground(50)
+        (
+            "chain with filters",
+            select(each(&|i| {
+                format!("?a{i} <urn:p> ?a{} . FILTER(isIRI(?a{i})) ", i + 1)
+            })),
         ),
-        format!(
-            "SELECT * {{ {} MINUS {{ {} }} }}",
-            chain(50, "a"),
-            chain(50, "b")
-        ),
-        format!(
-            "SELECT * {{ {} FILTER EXISTS {{ {} }} {} }}",
-            chain(50, "a"),
-            chain(50, "b"),
-            chain(50, "c")
-        ),
-        format!("SELECT * {{ ?s <urn:p>{{3,5}} ?o . {} }}", ground(50)),
-        format!("ASK {{ {} }}", chain(100, "a")),
-        format!(
-            "CONSTRUCT {{ ?a0 <urn:p> ?a1 }} WHERE {{ {} }}",
-            chain(100, "a")
+        (
+            "chain with optionals",
+            select(each(&|i| {
+                format!(
+                    "?a{i} <urn:p> ?a{} . OPTIONAL {{ ?a{} <urn:q> ?c{i} }} ",
+                    i + 1,
+                    i + 1
+                )
+            })),
         ),
     ];
-    for q in &queries {
-        let parsed = spargebra::SparqlParser::new().parse_query(q).unwrap();
-        let measured = check_query(&parsed).unwrap();
-        let (_, plan) = sparkles::sparql::explain(ds.snapshot(), q, &opts).unwrap();
-        assert!(
-            plan.depth() <= measured,
-            "{} > {measured}: {q}",
-            plan.depth()
-        );
+    // shapes that do not grow with n
+    if n == 100 {
+        let fixed = [
+            ("nested ranges 8", "?s ((<urn:p>{8}){8}){8} ?o"),
+            ("nested ranges 16", "?s ((<urn:p>{16}){16}){4} ?o"),
+            ("nested ranges 3 to 5", "?s ((<urn:p>{3,5}){3,5}){3,5} ?o"),
+            ("alternative", "?s (<urn:p>|<urn:q>)/(<urn:p>/<urn:q>)* ?o"),
+            ("negated set", "?s !(<urn:p>)/<urn:p>{2} ?o"),
+        ];
+        shapes.extend(fixed.map(|(what, body)| (what, select(body.to_string()))));
     }
-    // so plans the parts of a query stack into are refused whole
-    let half = MAX_PLAN_DEPTH / 2;
-    plan_refused(ds.query(&format!(
-        "SELECT * {{ {} BIND(1 AS ?z) {} }}",
-        ground(half),
-        ground(half)
-    )));
-    plan_refused(ds.query(&format!(
-        "SELECT * {{ {} {{ SELECT * {{ {} }} }} }}",
-        ground(half),
-        ground(half)
-    )));
-    plan_refused(ds.query(&format!("SELECT * {{ {} }}", blank(half / 2 + 1))));
+    shapes
+        .into_iter()
+        .map(|(what, q)| (format!("{what} of {n}"), q))
+        .collect()
+}
+
+#[test]
+fn the_measured_plan_depth_bounds_the_plan() {
+    on_small_stack(|| {
+        let ds = cyclic();
+        let opts = sparkles::sparql::QueryOptions::default();
+        // the planner flattens joins and sorts before a blank node joins on, so a group of
+        // basic graph patterns and a blank node count as deep as the plan they make
+        let ground = |n: usize| "<urn:s> <urn:p> ?x . ".repeat(n);
+        let chain = |n: usize, v: &str| {
+            (0..n)
+                .map(|i| format!("?{v}{i} <urn:p> ?{v}{} . ", i + 1))
+                .collect::<String>()
+        };
+        let blank = |n: usize| "?s <urn:p> [ <urn:p> ?o ] . ".repeat(n);
+        // (planning a few hundred of the joins takes minutes in a debug build)
+        let mut queries: Vec<(String, String)> =
+            [100, 200].into_iter().flat_map(plan_shapes).collect();
+        let more = [
+            format!("SELECT * {{ {} }}", blank(50)),
+            format!(
+                "SELECT * {{ {} }}",
+                "?s <urn:p> [ <urn:p> [ <urn:p> ?o ] ] . ".repeat(30)
+            ),
+            format!("SELECT * {{ {} BIND(1 AS ?z) {} }}", ground(50), ground(50)),
+            format!(
+                "SELECT * {{ {} {{ SELECT * {{ {} }} }} }}",
+                ground(50),
+                ground(50)
+            ),
+            format!(
+                "SELECT * {{ {} GRAPH ?g {{ {} }} }}",
+                ground(50),
+                ground(50)
+            ),
+            format!(
+                "SELECT * {{ {} OPTIONAL {{ ?x <urn:p> ?y }} {} }}",
+                ground(50),
+                ground(50)
+            ),
+            format!(
+                "SELECT * {{ {} FILTER(?x != 1) {} }}",
+                ground(50),
+                ground(50)
+            ),
+            format!(
+                "SELECT * {{ {} OPTIONAL {{ {} }} }}",
+                chain(50, "a"),
+                chain(50, "b")
+            ),
+            format!(
+                "SELECT * {{ {{ {} }} UNION {{ {} }} }}",
+                ground(50),
+                ground(50)
+            ),
+            format!(
+                "SELECT * {{ {} MINUS {{ {} }} }}",
+                chain(50, "a"),
+                chain(50, "b")
+            ),
+            format!(
+                "SELECT * {{ {} FILTER EXISTS {{ {} }} {} }}",
+                chain(50, "a"),
+                chain(50, "b"),
+                chain(50, "c")
+            ),
+            format!("SELECT * {{ ?s <urn:p>{{3,5}} ?o . {} }}", ground(50)),
+            format!("ASK {{ {} }}", chain(100, "a")),
+            format!(
+                "CONSTRUCT {{ ?a0 <urn:p> ?a1 }} WHERE {{ {} }}",
+                chain(100, "a")
+            ),
+        ];
+        queries.extend(more.into_iter().map(|q| (q.clone(), q)));
+        for (what, q) in &queries {
+            let parsed = spargebra::SparqlParser::new().parse_query(q).unwrap();
+            let measured = check_query(&parsed).unwrap();
+            let (_, plan) = sparkles::sparql::explain(ds.snapshot(), q, &opts).unwrap();
+            assert!(
+                plan.depth() <= measured,
+                "{what}: {} > {measured}",
+                plan.depth()
+            );
+        }
+        // so plans the parts of a query stack into are refused whole
+        let ds = dataset();
+        let half = MAX_PLAN_DEPTH / 4;
+        plan_refused(ds.query(&format!(
+            "SELECT * {{ {} BIND(1 AS ?z) {} }}",
+            ground(half),
+            ground(half)
+        )));
+        plan_refused(ds.query(&format!(
+            "SELECT * {{ {} {{ SELECT * {{ {} }} }} }}",
+            ground(half),
+            ground(half)
+        )));
+        plan_refused(ds.query(&format!("SELECT * {{ {} }}", blank(MAX_PLAN_DEPTH / 4 + 1))));
+    });
+}
+
+#[test]
+fn nested_ranges_are_refused_not_overflowed() {
+    on_small_stack(|| {
+        let ds = dataset();
+        let opts = sparkles::sparql::QueryOptions::default();
+        let cursor = sparkles::sparql::CursorOptions::default();
+        // 4096 unrolled steps, from 44 bytes
+        let q = "SELECT * { ?s ((<urn:p>{32}){32}){4} ?o }";
+        plan_refused(ds.query(q));
+        plan_refused(sparkles::sparql::explain(ds.snapshot(), q, &opts));
+        plan_refused(sparkles::sparql::query_cursor(
+            ds.snapshot(),
+            q,
+            &opts,
+            &cursor,
+        ));
+        // 32 steps of 32 is within the bound
+        let q = "SELECT * { ?s (<urn:p>{32}){32} ?o }";
+        let parsed = spargebra::SparqlParser::new().parse_query(q).unwrap();
+        check_query(&parsed).unwrap();
+        sparkles::sparql::explain(ds.snapshot(), q, &opts).unwrap();
+    });
 }
 
 fn plan_refused<T>(r: sparkles::Result<T>) {
