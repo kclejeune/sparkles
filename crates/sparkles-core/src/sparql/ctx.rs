@@ -481,8 +481,8 @@ pub struct Ctx {
     pub rdfs: Option<Arc<super::rdfs::RdfsSchema>>,
     pub opt: Optimizations,
     /// the I/O counters when the query began, taken only under a profile (see
-    /// [`Ctx::io_stats`])
-    io_start: crate::ioacct::IoSnapshot,
+    /// [`Ctx::io_stats`]); boxed, so that a context without a profile stays small
+    io_start: Option<Box<crate::ioacct::IoSnapshot>>,
     /// parsed geometries of this query
     pub geo: crate::geo::memo::GeoMemo,
     /// notes for the plan's reader, without duplicates (see [`Ctx::warn`])
@@ -571,11 +571,8 @@ impl Ctx {
             service_scope: Arc::from(""),
             rdfs: None,
             opt: Optimizations::default(),
-            io_start: if crate::ioacct::profiling() {
-                crate::ioacct::IoSnapshot::now()
-            } else {
-                Default::default()
-            },
+            io_start: crate::ioacct::profiling()
+                .then(|| Box::new(crate::ioacct::IoSnapshot::now())),
             geo: Default::default(),
             warnings: Default::default(),
             failed: Default::default(),
@@ -592,7 +589,11 @@ impl Ctx {
     /// is alive, so the result is meaningful only for a query made under one: otherwise it
     /// holds everything the process has counted.
     pub fn io_stats(&self) -> crate::ioacct::IoSnapshot {
-        crate::ioacct::IoSnapshot::now().since(&self.io_start)
+        let now = crate::ioacct::IoSnapshot::now();
+        match &self.io_start {
+            Some(start) => now.since(start),
+            None => now.since(&Default::default()),
+        }
     }
 
     /// The query's `NOW()`: the clock at its first call, the same value at every later

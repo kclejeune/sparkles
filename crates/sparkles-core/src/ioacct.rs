@@ -129,11 +129,19 @@ pub(crate) fn willneed(file: IoFile, base: *const u8, off: usize, len: usize) {
 }
 
 /// The pages of `len` bytes at `off` in a mapping are about to be read (profile only).
-#[inline]
+#[inline(always)]
 pub(crate) fn touch(file: IoFile, base: *const u8, off: usize, len: usize) {
     if profiling() {
-        profile::record(file, base, off, len, None);
+        touch_cold(file, base, off, len);
     }
+}
+
+// The profile-only bodies stay out of line, so that the hot paths that call these
+// functions on every block or term carry only the load and the branch.
+#[cold]
+#[inline(never)]
+fn touch_cold(file: IoFile, base: *const u8, off: usize, len: usize) {
+    profile::record(file, base, off, len, None);
 }
 
 /// Retained mapping-page identities for independent test oracles. No mapped bytes are read.
@@ -143,11 +151,17 @@ pub(crate) fn sampled_page_indices(file: IoFile, base: *const u8) -> Vec<usize> 
 }
 
 /// Vocabulary lookups, counted by a profile only for the same reason as the blocks.
-#[inline]
+#[inline(always)]
 pub(crate) fn vocab_find() {
     if profiling() {
-        counters().vocab_finds.fetch_add(1, Relaxed);
+        count_cold(&counters().vocab_finds, 1);
     }
+}
+
+#[cold]
+#[inline(never)]
+fn count_cold(counter: &AtomicU64, n: u64) {
+    counter.fetch_add(n, Relaxed);
 }
 
 #[inline]
@@ -158,10 +172,10 @@ pub(crate) fn vocab_group_hinted() {
 /// Front-coded blocks scanned. Only a profile counts them: a pass over the vocabulary scans
 /// millions of blocks on many threads, and one shared counter that all of them add to costs
 /// more than the scans (10 to 20% of a cold `CONTAINS` over 100M triples).
-#[inline]
+#[inline(always)]
 pub(crate) fn vocab_blocks_scanned(n: u64) {
     if profiling() {
-        counters().vocab_blocks_scanned.fetch_add(n, Relaxed);
+        count_cold(&counters().vocab_blocks_scanned, n);
     }
 }
 
@@ -182,26 +196,42 @@ pub(crate) enum Phase {
 /// Times a phase while a profile is alive, and adds the time to its counter when it drops.
 pub(crate) struct Timer(Option<(Instant, Phase)>);
 
-#[inline]
+#[inline(always)]
 pub(crate) fn timer(phase: Phase) -> Timer {
-    Timer(profiling().then(|| (Instant::now(), phase)))
+    if profiling() {
+        timer_cold(phase)
+    } else {
+        Timer(None)
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn timer_cold(phase: Phase) -> Timer {
+    Timer(Some((Instant::now(), phase)))
 }
 
 impl Drop for Timer {
-    #[inline]
+    #[inline(always)]
     fn drop(&mut self) {
         if let Some((t, phase)) = self.0 {
-            let c = counters();
-            let ns = t.elapsed().as_nanos() as u64;
-            match phase {
-                Phase::VocabFind => &c.vocab_find_ns,
-                Phase::VocabRead => &c.vocab_read_ns,
-                Phase::IndexDecode => &c.index_decode_ns,
-                Phase::IndexWait => &c.index_wait_ns,
-            }
-            .fetch_add(ns, Relaxed);
+            timer_done(t, phase);
         }
     }
+}
+
+#[cold]
+#[inline(never)]
+fn timer_done(t: Instant, phase: Phase) {
+    let c = counters();
+    let ns = t.elapsed().as_nanos() as u64;
+    match phase {
+        Phase::VocabFind => &c.vocab_find_ns,
+        Phase::VocabRead => &c.vocab_read_ns,
+        Phase::IndexDecode => &c.index_decode_ns,
+        Phase::IndexWait => &c.index_wait_ns,
+    }
+    .fetch_add(ns, Relaxed);
 }
 
 /// Read one byte of every page of `bytes`, so that the pages are in memory when a decoder
@@ -500,6 +530,7 @@ impl Drop for Profile {
 }
 
 /// Mark a point of the query's execution in the event log of a profile.
+#[inline]
 pub fn mark(what: &'static str) {
     if profiling() {
         profile::mark(what);

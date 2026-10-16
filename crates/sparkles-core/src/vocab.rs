@@ -392,10 +392,8 @@ impl Vocab {
     fn block_offset(&self, b: usize) -> usize {
         // Observe residency before the first mapped load, including offsets read
         // while preparing hints or binary-searching block starts.
-        if ioacct::profiling()
-            && let Bytes::Map(o) = &self.offsets
-        {
-            ioacct::touch(IoFile::VocabOff, o.as_ptr(), b * 8, 8);
+        if ioacct::profiling() {
+            self.touch_offset(b);
         }
         let o = self.offsets.as_slice();
         u64::from_le_bytes(o[b * 8..b * 8 + 8].try_into().unwrap()) as usize
@@ -411,12 +409,29 @@ impl Vocab {
         &data[pos..pos + len]
     }
 
-    /// Record the pages of front-coded block `b` as read (profile only).
-    #[inline]
+    /// Record the page of block `b`'s offset as read (profile only, out of line so that
+    /// [`Vocab::block_offset`] stays small).
+    #[cold]
+    #[inline(never)]
+    fn touch_offset(&self, b: usize) {
+        if let Bytes::Map(o) = &self.offsets {
+            ioacct::touch(IoFile::VocabOff, o.as_ptr(), b * 8, 8);
+        }
+    }
+
+    /// Record the pages of front-coded block `b` as read (profile only). The hot paths
+    /// that call it on every block carry the check alone.
+    #[inline(always)]
     fn touch_block(&self, b: usize) {
-        if ioacct::profiling()
-            && let Bytes::Map(m) = &self.data
-        {
+        if ioacct::profiling() {
+            self.touch_block_profiled(b);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn touch_block_profiled(&self, b: usize) {
+        if let Bytes::Map(m) = &self.data {
             let start = self.block_offset(b);
             let end = if b + 1 < self.num_blocks() {
                 self.block_offset(b + 1)
