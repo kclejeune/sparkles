@@ -390,6 +390,26 @@ class Cap(Base):
             px.require_single_ledger(self.root / "other.jsonl")
         px.require_single_ledger(self.root / "ledger.jsonl")
 
+    def test_wait_idle_waits_for_a_request_in_flight(self):
+        gate, started = threading.Event(), threading.Event()
+
+        class Slow(Upstream):
+            def send(self, path, body, timeout):
+                started.set()
+                gate.wait(5)
+                return super().send(path, body, timeout)
+
+        proxy = self.proxy(Slow())
+        proxy.set_case("c")
+        thread = threading.Thread(target=proxy.handle, args=(raw(),))
+        thread.start()
+        started.wait(5)
+        self.assertFalse(proxy.wait_idle(0.05))  # Still in flight.
+        gate.set()
+        self.assertTrue(proxy.wait_idle(5))
+        thread.join(5)
+        self.assertEqual(proxy.case_cost("c"), HAIKU_COST)
+
     def test_costs_by_case_and_model(self):
         proxy = self.proxy(Upstream())
         proxy.set_case("c1")

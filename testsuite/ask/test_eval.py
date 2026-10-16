@@ -449,6 +449,44 @@ class Processes(unittest.TestCase):
             ["timeout", "refusal", "timeout", "invalid_output"],
         )
 
+    def test_exceeding_the_ask_token_budget_is_its_own_status(self):
+        args = self.questions_fixture(["clarify"])
+        self.fake_ask(
+            args,
+            "import json\n"
+            'print(json.dumps({"outcome":"error","error":{"code":"budget-exceeded"}}))\n'
+            "raise SystemExit(2)\n",
+        )
+        _, report = eval_ask.run_matrix(args)
+        self.assertEqual(report["cases"][0]["detail"]["status"], "budget_exceeded")
+        self.assertEqual(report["rows"][0]["failureStatuses"], {"budget_exceeded": 1})
+        self.assertEqual(report["askTokenBudget"], 32768)
+
+    def test_in_flight_requests_settle_before_a_case_cost_is_read(self):
+        order = []
+
+        class Proxy:
+            token, cap_refusals = "t", 0
+
+            def set_case(self, case):
+                order.append(("case", case is not None))
+
+            def wait_idle(self):
+                order.append("idle")
+
+            def case_cost(self, case):
+                order.append("cost")
+                return 7
+
+            def report(self):
+                return {}
+
+        args = self.questions_fixture(["clarify"])
+        self.fake_ask(args, 'import json\nprint(json.dumps({"outcome":"clarify"}))\n')
+        _, report = eval_ask.run_matrix(args, Proxy())
+        self.assertLess(order.index("idle"), order.index("cost"))
+        self.assertEqual(report["rows"][0]["ledgerCostUSD"], 7e-9)
+
     def test_unknown_exit_status_still_stops_the_run(self):
         args = self.questions_fixture(["clarify"] * 2)
         self.fake_ask(
@@ -591,6 +629,9 @@ class Processes(unittest.TestCase):
             token, cap_refusals = "t", 0
 
             def set_case(self, case):
+                pass
+
+            def wait_idle(self):
                 pass
 
             def case_cost(self, case):

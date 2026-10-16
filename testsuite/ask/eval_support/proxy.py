@@ -456,10 +456,21 @@ class Proxy:
         self.last_headers = []
         self.request_bytes = []
         self.mutex = threading.Lock()
+        self.idle = threading.Condition(self.mutex)
+        self.in_flight = 0
         self.server_port = None
 
     def set_case(self, case):
         self.case = case
+
+    def wait_idle(self, timeout=None):
+        """Wait until no request is in flight. A child killed on a timeout can leave
+        one behind, and its cost belongs to the case that sent it."""
+        with self.idle:
+            return self.idle.wait_for(
+                lambda: self.in_flight == 0,
+                self.timeout + 5 if timeout is None else timeout,
+            )
 
     def case_cost(self, case):
         """Nanodollars settled so far for one case, over every model it called."""
@@ -509,6 +520,16 @@ class Proxy:
 
     def handle(self, raw):
         """Forward one request. Return (status, headers, body) for the child."""
+        with self.mutex:
+            self.in_flight += 1
+        try:
+            return self.handle_one(raw)
+        finally:
+            with self.idle:
+                self.in_flight -= 1
+                self.idle.notify_all()
+
+    def handle_one(self, raw):
         try:
             body = self.prepare(raw)
         except Refused as refusal:

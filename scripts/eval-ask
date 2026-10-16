@@ -288,6 +288,8 @@ class Runner:
             steps = (out.get("usage") or {}).get("steps") or []
             if (out.get("error") or {}).get("code") == "timeout":
                 return out, "timeout"
+            if (out.get("error") or {}).get("code") == "budget-exceeded":
+                return out, "budget_exceeded"  # The Ask token budget, a measured limit.
             if any(s.get("outcome") == "refusal" for s in steps):
                 return out, "refusal"
             return out, "provider_error"
@@ -692,7 +694,9 @@ def run_matrix(args, proxy=None, prepared=None, admit=None):
                             "id": q["id"],
                             "status": "failed",
                             "reason": type(error).__name__,
-                            "detail": str(error) if isinstance(error, Invalid) else None,
+                            "detail": str(error)
+                            if isinstance(error, Invalid)
+                            else None,
                             "execution": runner.last_record,
                         }
                     )
@@ -748,6 +752,7 @@ def run_matrix(args, proxy=None, prepared=None, admit=None):
                     if runner.last_record and "pid" in runner.last_record:
                         report["executed"] += 1
                 if proxy:
+                    proxy.wait_idle()  # A killed child can leave a request in flight.
                     proxy.set_case(None)
                     answer["ledgerNanodollars"] = proxy.case_cost(case_id)
                 score = runner.score(q, answer)
