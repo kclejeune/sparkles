@@ -164,6 +164,9 @@ pub struct PdfRuntime {
     /// the child processes that conversions run in, when the binary provides them
     #[cfg(any(feature = "pdf", feature = "office"))]
     isolation: Option<isolate::Isolation>,
+    /// why conversions are refused: the child processes could not start safely
+    #[cfg(any(feature = "pdf", feature = "office"))]
+    broken: Option<String>,
 }
 
 /// One running PDF or Office conversion's worker slot.
@@ -187,6 +190,8 @@ impl PdfRuntime {
             ocr,
             #[cfg(any(feature = "pdf", feature = "office"))]
             isolation: None,
+            #[cfg(any(feature = "pdf", feature = "office"))]
+            broken: None,
         }
     }
 
@@ -200,6 +205,29 @@ impl PdfRuntime {
     #[cfg(any(feature = "pdf", feature = "office"))]
     pub fn isolation(&self) -> Option<&isolate::Isolation> {
         self.isolation.as_ref()
+    }
+
+    /// Refuse every conversion with `why`, because its child process cannot start safely.
+    #[cfg(any(feature = "pdf", feature = "office"))]
+    pub fn with_broken(mut self, why: Option<String>) -> PdfRuntime {
+        self.broken = why;
+        self
+    }
+
+    /// The refusal of a conversion when the child processes cannot start safely.
+    #[cfg(any(feature = "pdf", feature = "office"))]
+    pub fn child_refusal(&self) -> Option<convert::Refusal> {
+        self.broken.as_ref().map(|why| {
+            convert::Refusal::new(
+                "conversion-failed",
+                500,
+                format!(
+                    "this server cannot convert PDF and Office files: its conversion child \
+                     could not start safely ({why}); restart it with --convert-in-process to \
+                     convert on threads without the child's limits"
+                ),
+            )
+        })
     }
 
     /// The OCR configuration, which a conversion child is given.
@@ -483,19 +511,32 @@ pub struct Runtime {
 
 /// The PDF workers of `args`, with child processes when the binary provides them and
 /// `--convert-in-process` is not given.
+/// The PDF workers of `args`, with child processes when the binary provides them, the
+/// platform is Linux and `--convert-in-process` is not given. A child is started once
+/// here to check that it can set its limits. When it cannot, conversions are refused
+/// with an error that names the reason, rather than run without the limits.
 fn pdf_runtime(args: &IngestServeArgs) -> PdfRuntime {
     let rt = PdfRuntime::new(args.pdf_workers, args.ocr.config());
     #[cfg(any(feature = "pdf", feature = "office"))]
-    let rt = rt.with_isolation(
-        isolate::child_exe()
-            .filter(|_| !args.convert_in_process && cfg!(unix))
+    let rt = {
+        // RLIMIT_AS is enforced on Linux only: macOS accepts it and does not apply it
+        let iso = isolate::child_exe()
+            .filter(|_| !args.convert_in_process && cfg!(target_os = "linux"))
             .map(|exe| isolate::Isolation {
                 exe,
                 // below this the binary itself cannot start its threads
                 memory: args.convert_memory.max(256).saturating_mul(1 << 20),
                 prefix: Vec::new(),
-            }),
-    );
+            });
+        let broken = iso.as_ref().and_then(|i| isolate::probe(i).err());
+        if let Some(why) = &broken {
+            tracing::error!(
+                "PDF and Office conversions are refused: the conversion child could not start \
+                 safely ({why}); --convert-in-process converts on threads instead"
+            );
+        }
+        rt.with_isolation(iso).with_broken(broken)
+    };
     rt
 }
 

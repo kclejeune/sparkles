@@ -705,3 +705,46 @@ fn r2_cdata_sections_count_as_nodes() {
     let r = to_markdown(&f, Format::Docx, &Limits::default());
     assert!(matches!(r, Err(Error::TooLarge(_))), "{r:?}");
 }
+
+// Re-review 3: a link inside a link is read as its text. Without that, each of 190 levels
+// copied and charged the whole 1 MiB text of the link once more, and the links together
+// passed the text limit.
+#[test]
+fn r3_nested_hyperlinks_are_read_once() {
+    let _g = serial();
+    let url = "https://example.org/a";
+    let leaf = format!("<w:r><w:t>{}</w:t></w:r>", "a".repeat(1 << 20));
+    let doc = format!(
+        r#"<w:document {W} xmlns:r="{REL_NS}"><w:body><w:p>{}</w:p></w:body></w:document>"#,
+        nest(r#"<w:hyperlink r:id="rId1">"#, "</w:hyperlink>", 190, &leaf)
+    );
+    let r = rels(&[("rId1", "hyperlink", url, true)]);
+    let f = zip(&[
+        ("word/document.xml", &doc),
+        ("word/_rels/document.xml.rels", &r),
+    ]);
+    let md = within(30, move || {
+        to_markdown(&f, Format::Docx, &Limits::default())
+    })
+    .unwrap()
+    .markdown;
+    assert_eq!(md.matches(url).count(), 1);
+    // the same in an OpenDocument text
+    let c = format!(
+        r#"<office:document-content {O} xmlns:xlink="http://www.w3.org/1999/xlink"><office:body><office:text><text:p>{}</text:p></office:text></office:body></office:document-content>"#,
+        nest(
+            &format!(r#"<text:a xlink:href="{url}">"#),
+            "</text:a>",
+            190,
+            &"a".repeat(1 << 20)
+        )
+    );
+    let f = zip(&[
+        ("mimetype", "application/vnd.oasis.opendocument.text"),
+        ("content.xml", &c),
+    ]);
+    let md = within(30, move || to_markdown(&f, Format::Odt, &Limits::default()))
+        .unwrap()
+        .markdown;
+    assert_eq!(md.matches(url).count(), 1);
+}

@@ -37,6 +37,9 @@ pub fn convert(bytes: &[u8], o: &Options) -> Result<Converted, Refusal> {
             "every PDF worker stayed busy until the deadline",
         ));
     };
+    if let Some(r) = o.pdf.child_refusal() {
+        return Err(r);
+    }
     if let Some(iso) = o.pdf.isolation() {
         let job = Job::Pdf {
             allow_partial: o.allow_partial,

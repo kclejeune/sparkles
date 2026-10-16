@@ -3,24 +3,30 @@
 //! A converter reads a file that comes from outside. The converters bound what they
 //! allocate and check the task's deadline, but a parser bug could still loop or allocate
 //! without a check, and a thread cannot be stopped from outside. So the `sparkles` binary
-//! runs each conversion in a child process of its own: the same binary started with the
-//! hidden first argument [`CHILD_ARG`], the file on its standard input and the result on
-//! its standard output. The child runs under `RLIMIT_AS` (`--convert-memory`), a CPU
-//! limit, `RLIMIT_FSIZE` of 0 (it can write no file, unless OCR is configured, whose
-//! libraries are not audited for it) and no core file, and on Linux it is killed when the
-//! server dies. The child sets these limits on itself before it reads a byte of the file,
-//! and refuses to run without them, so that the server can start it with `posix_spawn`. The parent kills it when the task's deadline passes, so a conversion
-//! never outlives its deadline by more than [`GRACE`], its worker slot is always released,
-//! and its memory is bounded whatever the converter does. The parent reads at most a
-//! bounded number of bytes of output.
+//! on Linux runs each conversion in a child process of its own: the same binary, started
+//! through `/proc/self/exe` with the hidden first argument [`CHILD_ARG`], the file on its
+//! standard input and the result on its standard output. The child sets `RLIMIT_AS`
+//! (`--convert-memory`), a CPU limit, `RLIMIT_FSIZE` of 0 (unless OCR is configured, whose
+//! libraries are not audited for it), no core file and the parent-death signal on itself
+//! before it reads a byte of the file, and refuses to run without them, so that the
+//! server can start it with `posix_spawn`. The parent kills it when the task's deadline
+//! passes, so a conversion never outlives its deadline by more than [`GRACE`], its worker
+//! slot is always released, and its address space is bounded whatever the converter does.
+//! The parent reads at most a bounded number of bytes of output.
+//!
+//! This is resource containment and not a sandbox. The child runs as the server's user
+//! with the server's privileges. Its environment is cleared down to a short allowlist, so
+//! that it holds no provider key or token, but it could still read what that user can.
 //!
 //! Only the server binary can serve as the child, so the child process is used only when
-//! `main` has called [`enable`]. Library use of the crate and its unit tests run the
-//! conversion on a thread of the calling process, as does `--convert-in-process`.
+//! `main` has called [`enable`], and only on Linux, where `RLIMIT_AS` is enforced. Library
+//! use of the crate, its unit tests, other platforms and `--convert-in-process` run the
+//! conversion on a thread of the calling process. A server checks at start that a child
+//! can set its limits, and refuses conversions with a clear error when it cannot.
 //!
-//! The reply is a small binary encoding of the result: a tag byte, then fields that are
-//! each a little-endian `u64` or a length-prefixed byte string. Nothing in it is trusted
-//! beyond its framing: a reply that cannot be read is a failed conversion.
+//! The reply starts with [`MAGIC`] and the protocol version, then a tag byte and fields
+//! that are each a little-endian `u64` or a length-prefixed byte string. Nothing in it is
+//! trusted beyond its framing: a reply that cannot be read is a failed conversion.
 
 use super::convert::{Converted, EmbeddedImage, Format, Options, PageReason, Refusal};
 use std::ffi::OsString;
@@ -33,6 +39,46 @@ use std::time::{Duration, Instant};
 /// The first argument that makes the binary a conversion child.
 pub const CHILD_ARG: &str = "__convert-child";
 
+/// The version of the arguments and the reply. A child of another version refuses to run.
+pub const PROTOCOL: u32 = 1;
+
+/// The first bytes of a reply, before the protocol version.
+pub const MAGIC: &[u8; 4] = b"SPKC";
+
+/// Exit codes of a child that wrote no reply.
+const EXIT_INPUT: i32 = 2;
+const EXIT_LIMITS: i32 = 3;
+const EXIT_PROTOCOL: i32 = 4;
+
+/// The variables a child keeps from the server's environment. Everything else, provider
+/// keys and tokens included, is left out.
+const ENV_ALLOW: &[&str] = &[
+    "PATH",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "TMPDIR",
+    "LD_LIBRARY_PATH",
+    "PDFIUM_LIB_PATH",
+    "PDFIUM_DYNAMIC_LIB_PATH",
+    "ORT_DYLIB_PATH",
+];
+
+/// The environment of a child, from the server's.
+pub fn child_env(
+    vars: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Vec<(OsString, OsString)> {
+    let mut out: Vec<(OsString, OsString)> = vars
+        .into_iter()
+        .filter(|(k, _)| k.to_str().is_some_and(|k| ENV_ALLOW.contains(&k)))
+        .collect();
+    // mimalloc reserves 1 GiB of address space when it starts, before the child can set
+    // its limit, which would leave the child no room under a smaller limit
+    out.push(("MIMALLOC_ARENA_RESERVE".into(), "64MiB".into()));
+    out
+}
+
 /// How long past the task's deadline the parent waits for the child, which checks the
 /// same deadline itself and then reports a timeout of its own.
 pub const GRACE: Duration = Duration::from_millis(250);
@@ -40,9 +86,16 @@ pub const GRACE: Duration = Duration::from_millis(250);
 static EXE: OnceLock<PathBuf> = OnceLock::new();
 
 /// Let conversions run in child processes of this binary. Called by `main` of the
-/// `sparkles` binary only, which answers [`CHILD_ARG`].
+/// `sparkles` binary only, which answers [`CHILD_ARG`]. On Linux the child is started
+/// through `/proc/self/exe`, which names the file the server was started from even after
+/// an upgrade replaces or deletes it.
 pub fn enable() {
-    if let Ok(exe) = std::env::current_exe() {
+    let exe = if cfg!(target_os = "linux") && std::path::Path::new("/proc/self/exe").exists() {
+        Some(PathBuf::from("/proc/self/exe"))
+    } else {
+        std::env::current_exe().ok()
+    };
+    if let Some(exe) = exe {
         let _ = EXE.set(exe);
     }
 }
@@ -65,6 +118,8 @@ pub struct Isolation {
 /// What a child converts.
 #[derive(Clone, Copy, Debug)]
 pub enum Job {
+    /// nothing: the child sets its limits and answers, which a server checks at start
+    Probe,
     /// an Office document to Markdown
     #[cfg(feature = "office")]
     Text(Format),
@@ -89,6 +144,7 @@ pub enum Reply {
 fn reply_cap(job: Job, o: &Options) -> usize {
     let slack = 16 << 20;
     match job {
+        Job::Probe => 1 << 16,
         #[cfg(feature = "office")]
         Job::Text(_) => {
             let l = sparkles_office::Limits::default();
@@ -108,6 +164,7 @@ fn reply_cap(job: Job, o: &Options) -> usize {
 
 fn job_args(job: Job) -> Vec<String> {
     match job {
+        Job::Probe => vec!["job=probe".into()],
         #[cfg(feature = "office")]
         Job::Text(f) => vec!["job=text".into(), format!("format={}", format_name(f))],
         #[cfg(feature = "office")]
@@ -164,9 +221,12 @@ pub fn run(iso: &Isolation, job: Job, bytes: &[u8], o: &Options) -> Result<Reply
         // the child reads at most this many bytes, which the callers have checked
         .arg(format!("max_input={}", o.max_input.max(bytes.len())))
         .arg(format!("millis={}", left.as_millis()))
+        .arg(format!("protocol={PROTOCOL}"))
+        .env_clear()
+        .envs(child_env(std::env::vars_os()))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     #[cfg(feature = "pdf-ocr")]
     if let Some(c) = ocr {
         cmd.arg(OsString::from("ocr_models=").tap_push(&c.models));
@@ -174,10 +234,7 @@ pub fn run(iso: &Isolation, job: Job, bytes: &[u8], o: &Options) -> Result<Reply
             cmd.arg(OsString::from("pdfium=").tap_push(p));
         }
     }
-    cmd.args(limit_args(iso.memory, left, ocr.is_none()))
-        // mimalloc reserves 1 GiB of address space when it starts, before the child can
-        // set its limit, which would leave the child no room under a smaller limit
-        .env("MIMALLOC_ARENA_RESERVE", "64MiB");
+    cmd.args(limit_args(iso.memory, left, ocr.is_none()));
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         // the binary is gone, as after an upgrade that replaced it
@@ -198,10 +255,21 @@ pub fn run(iso: &Isolation, job: Job, bytes: &[u8], o: &Options) -> Result<Reply
     };
     let mut stdin = child.stdin.take().expect("piped");
     let mut stdout = child.stdout.take().expect("piped");
+    let mut stderr = child.stderr.take().expect("piped");
     let cap = reply_cap(job, o);
     let wait_until = o.deadline + GRACE;
     let (tx, rx) = std::sync::mpsc::channel();
+    let mut killed = false;
+    let mut err_text = Vec::new();
     let outcome = std::thread::scope(|s| {
+        // the first 2 KiB of the child's errors are kept for the log, and the rest is
+        // drained so that the child never blocks on a full pipe
+        let err_reader = s.spawn(move || {
+            let mut head = Vec::new();
+            let _ = (&mut stderr).take(2048).read_to_end(&mut head);
+            let _ = std::io::copy(&mut stderr, &mut std::io::sink());
+            head
+        });
         // the input is written and the output read on threads of their own, so that a
         // child that writes before it has read everything cannot block the parent
         s.spawn(move || {
@@ -230,6 +298,7 @@ pub fn run(iso: &Isolation, job: Job, bytes: &[u8], o: &Options) -> Result<Reply
                         }
                         _ => {
                             let _ = child.kill();
+                            killed = true;
                             break child.wait().ok();
                         }
                     }
@@ -237,14 +306,31 @@ pub fn run(iso: &Isolation, job: Job, bytes: &[u8], o: &Options) -> Result<Reply
             }
             _ => {
                 let _ = child.kill();
+                killed = true;
                 child.wait().ok()
             }
         };
+        err_text = err_reader.join().unwrap_or_default();
         (got, status)
     });
     let (got, status) = outcome;
+    let failure = |what: &str| {
+        tracing::warn!(
+            status = ?status,
+            stderr = %String::from_utf8_lossy(&err_text),
+            "a conversion child {what}"
+        );
+    };
     match got {
-        Err(_) => Err(Some(timeout())),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(Some(timeout())),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            failure("could not be read");
+            Err(Some(Refusal::new(
+                "conversion-failed",
+                500,
+                "the conversion child's output could not be read",
+            )))
+        }
         Ok(Err(e)) => Err(Some(failed(format!(
             "the conversion's output could not be read: {e}"
         )))),
@@ -255,32 +341,85 @@ pub fn run(iso: &Isolation, job: Job, bytes: &[u8], o: &Options) -> Result<Reply
         ))),
         Ok(Ok(out)) => {
             if out.is_empty() {
-                return Err(Some(ended(status, iso.memory)));
+                failure("ended without a result");
+                return Err(Some(ended(status, killed, iso.memory)));
             }
-            match decode(&out) {
+            if out.len() < 8 || &out[..4] != MAGIC || out[4..8] != PROTOCOL.to_le_bytes() {
+                failure("answered in another protocol");
+                return Err(Some(mismatch()));
+            }
+            match decode(&out[8..]) {
                 Some(Ok(r)) => Ok(r),
                 Some(Err(r)) => Err(Some(r)),
-                None => Err(Some(failed(
-                    "the document could not be read: the converter's reply was damaged",
-                ))),
+                None => {
+                    failure("wrote a damaged reply");
+                    Err(Some(failed(
+                        "the document could not be read: the converter's reply was damaged",
+                    )))
+                }
             }
         }
     }
 }
 
-/// Why a child that wrote nothing ended.
-fn ended(status: Option<std::process::ExitStatus>, memory: u64) -> Refusal {
+/// Start a child that only sets its limits and answers, as a server does once when it
+/// starts. `Err` names why conversions cannot run in a child here.
+pub fn probe(iso: &Isolation) -> Result<(), String> {
+    let o = Options {
+        allow_partial: false,
+        max_input: 0,
+        max_text: 0,
+        deadline: Instant::now() + Duration::from_secs(10),
+        pdf: Default::default(),
+        max_images: 0,
+    };
+    match run(iso, Job::Probe, b"", &o) {
+        Ok(Reply::Text(c)) if c.text == "ready" => Ok(()),
+        Ok(_) => Err("the conversion child answered the probe wrongly".into()),
+        Err(Some(r)) => Err(r.message),
+        Err(None) => Err(format!("{} could not be started", iso.exe.display())),
+    }
+}
+
+fn mismatch() -> Refusal {
+    Refusal::new(
+        "conversion-failed",
+        500,
+        "the conversion child is another version of sparkles than the server: restart the server",
+    )
+}
+
+/// Why a child that wrote nothing ended. `killed` says that the parent killed it.
+fn ended(status: Option<std::process::ExitStatus>, killed: bool, memory: u64) -> Refusal {
+    let unsafe_start = |why: &str| {
+        Refusal::new(
+            "conversion-failed",
+            500,
+            format!("the conversion child could not start safely: {why}"),
+        )
+    };
+    match status.and_then(|s| s.code()) {
+        Some(EXIT_LIMITS) => {
+            return unsafe_start("it could not set its resource limits");
+        }
+        Some(EXIT_PROTOCOL) => return mismatch(),
+        Some(EXIT_INPUT) => return unsafe_start("it could not read the document"),
+        _ => {}
+    }
     #[cfg(unix)]
     if let Some(sig) = status.and_then(|s| std::os::unix::process::ExitStatusExt::signal(&s)) {
-        if sig == libc::SIGXCPU || sig == libc::SIGKILL {
+        // its own CPU limit, or the parent at the deadline
+        if sig == libc::SIGXCPU || (sig == libc::SIGKILL && killed) {
             return timeout();
         }
+        // a SIGKILL from elsewhere is the kernel's or a cgroup's memory limit
         return failed(format!(
-            "the document could not be read: the converter stopped on it (signal {sig}), which it also does when the document needs more than its memory limit of {} MiB",
+            "the document could not be read: the converter stopped on it (signal {sig}), \
+             which it also does when the document needs more than its memory limit of {} MiB",
             memory >> 20
         ));
     }
-    let _ = (status, memory);
+    let _ = (killed, memory);
     failed("the document could not be read: the converter stopped on it")
 }
 
@@ -396,7 +535,10 @@ pub fn child_main(args: Vec<OsString>) -> i32 {
     )
     .is_err()
     {
-        return 3;
+        return EXIT_LIMITS;
+    }
+    if num("protocol") != PROTOCOL as usize {
+        return EXIT_PROTOCOL;
     }
     let millis = num("millis") as u64;
     let deadline = started + Duration::from_millis(millis);
@@ -409,7 +551,7 @@ pub fn child_main(args: Vec<OsString>) -> i32 {
         .is_err()
         || bytes.len() > max_input
     {
-        return 2;
+        return EXIT_INPUT;
     }
     let text = |k: &str| kv.get(k).and_then(|v| v.to_str()).unwrap_or("").to_string();
     let job = text("job");
@@ -439,10 +581,12 @@ pub fn child_main(args: Vec<OsString>) -> i32 {
         // a panic: the parent reports that the converter stopped
         return 101;
     };
-    let reply = encode(&r);
+    let mut reply = MAGIC.to_vec();
+    reply.extend_from_slice(&PROTOCOL.to_le_bytes());
+    reply.extend_from_slice(&encode(&r));
     let mut out = std::io::stdout().lock();
     if out.write_all(&reply).and_then(|_| out.flush()).is_err() {
-        return 2;
+        return EXIT_INPUT;
     }
     0
 }
@@ -455,13 +599,24 @@ fn convert_here(
 ) -> Result<Reply, Refusal> {
     let _ = (bytes, o);
     match (job, format) {
+        ("probe", _) => Ok(Reply::Text(Converted {
+            text: "ready".into(),
+            ..Default::default()
+        })),
         #[cfg(feature = "office")]
         ("text", Some(f)) => super::office::convert_here(bytes, f, o).map(Reply::Text),
         #[cfg(feature = "office")]
         ("sheets", Some(f)) => super::office::sheets_here(bytes, f, o).map(Reply::Sheets),
         #[cfg(feature = "pdf")]
         ("pdf", _) => super::pdf::inspect(bytes, o.allow_partial, &o.pdf).map(Reply::Text),
-        // the tests read the limits that the child runs under
+        // the tests read the environment and the limits that the child runs under
+        #[cfg(debug_assertions)]
+        ("env", _) => Err(failed(
+            std::env::vars_os()
+                .map(|(k, _)| k.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(" "),
+        )),
         #[cfg(all(debug_assertions, unix))]
         ("limits", _) => {
             let get = |res| {
@@ -825,65 +980,144 @@ mod tests {
         let e = r.unwrap_err().unwrap();
         assert_eq!(e.code, "conversion-failed");
         assert!(e.message.contains("memory limit"), "{}", e.message);
+        // a SIGKILL that the parent did not send is a memory limit, not a timeout
+        let r = run(&shell("kill -KILL $$"), JOB, b"x", &o);
+        let e = r.unwrap_err().unwrap();
+        assert_eq!(e.code, "conversion-failed");
+        assert!(e.message.contains("memory limit"), "{}", e.message);
         let r = run(&shell("exit 101"), JOB, b"x", &o);
         assert_eq!(r.unwrap_err().unwrap().code, "conversion-failed");
-        let r = run(&shell("printf garbage"), JOB, b"x", &o);
+        // a child that could not set its limits, or speaks another protocol, is named
+        let r = run(&shell("exit 3"), JOB, b"x", &o).unwrap_err().unwrap();
+        assert_eq!(r.status, 500);
+        assert!(r.message.contains("resource limits"), "{}", r.message);
+        let r = run(&shell("exit 4"), JOB, b"x", &o).unwrap_err().unwrap();
+        assert!(r.message.contains("another version"), "{}", r.message);
+        let r = run(&shell("printf garbage"), JOB, b"x", &o)
+            .unwrap_err()
+            .unwrap();
+        assert!(r.message.contains("another version"), "{}", r.message);
+        let r = run(&shell("printf 'SPKC\\001\\000\\000\\000x'"), JOB, b"x", &o);
         assert!(r.unwrap_err().unwrap().message.contains("damaged"));
+    }
+
+    /// The `sparkles` binary next to this test binary. `cargo test` builds it for the
+    /// integration tests, and a test that needs it fails without it rather than pass.
+    fn binary() -> PathBuf {
+        let exe = std::env::current_exe().unwrap();
+        let b = exe.parent().unwrap().parent().unwrap().join("sparkles");
+        assert!(
+            b.is_file(),
+            "{} is missing: build it with `cargo build -p sparkles-server` or run `cargo test -p sparkles-server`, which builds it",
+            b.display()
+        );
+        b
+    }
+
+    /// The reply of a child of the real binary started with `args`, without its header.
+    fn child_reply(args: &[String], env: Vec<(OsString, OsString)>) -> std::process::Output {
+        Command::new(binary())
+            .arg(CHILD_ARG)
+            .args(args)
+            .env_clear()
+            .envs(env)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    }
+
+    fn refusal_of(out: &std::process::Output) -> Refusal {
+        assert!(out.stdout.starts_with(MAGIC), "{out:?}");
+        match decode(&out.stdout[8..]) {
+            Some(Err(f)) => f,
+            _ => panic!("{out:?}"),
+        }
+    }
+
+    fn base_args() -> Vec<String> {
+        let mut a = limit_args(300 << 20, Duration::from_secs(5), true);
+        a.extend([
+            "max_input=10".into(),
+            "millis=5000".into(),
+            format!("protocol={PROTOCOL}"),
+        ]);
+        a
     }
 
     // The child of the real binary limits its address space, file size and core files
     // before it reads its input.
-    #[cfg(feature = "office")]
     #[test]
     fn the_child_runs_under_its_limits() {
-        let Some(exe) = binary() else {
-            eprintln!("skipped: no sparkles binary next to the test binary");
-            return;
-        };
-        let out = Command::new(exe)
-            .arg(CHILD_ARG)
-            .arg("job=limits")
-            .args(limit_args(300 << 20, Duration::from_secs(5), true))
-            .env("MIMALLOC_ARENA_RESERVE", "64MiB")
-            .args(["max_input=10", "millis=5000"])
-            .stdin(Stdio::null())
-            .output()
-            .unwrap();
-        let Some(Err(f)) = decode(&out.stdout) else {
-            panic!("{out:?}");
-        };
+        let mut args = base_args();
+        args.push("job=limits".into());
+        let out = child_reply(&args, child_env([]));
+        let f = refusal_of(&out);
         assert_eq!(f.message, format!("as={} fsize=0 core=0", 300u64 << 20));
         // a child without limits refuses to start
-        let out = Command::new(binary().unwrap())
-            .args([CHILD_ARG, "job=limits", "max_input=10", "millis=5000"])
-            .stdin(Stdio::null())
-            .output()
-            .unwrap();
-        assert_eq!(out.status.code(), Some(3));
+        let out = child_reply(
+            &[
+                "job=limits".into(),
+                "max_input=10".into(),
+                "millis=5000".into(),
+            ],
+            child_env([]),
+        );
+        assert_eq!(out.status.code(), Some(EXIT_LIMITS));
         assert!(out.stdout.is_empty());
+        // and so does a child of another protocol
+        let mut args = base_args();
+        args.push("protocol=999".into());
+        let out = child_reply(&args, child_env([]));
+        assert_eq!(out.status.code(), Some(EXIT_PROTOCOL));
     }
 
-    #[cfg(feature = "office")]
-    /// The `sparkles` binary next to this test binary, which `cargo test` builds for the
-    /// integration tests.
-    fn binary() -> Option<PathBuf> {
-        let exe = std::env::current_exe().ok()?;
-        let b = exe.parent()?.parent()?.join("sparkles");
-        b.is_file().then_some(b)
+    // The child keeps only the allowlisted variables of the server's environment.
+    #[test]
+    fn the_child_gets_no_secrets_from_the_environment() {
+        let server: Vec<(OsString, OsString)> = vec![
+            ("SPARKLES_TEST_SECRET".into(), "sk-marker".into()),
+            ("ANTHROPIC_API_KEY".into(), "sk-marker".into()),
+            ("TZ".into(), "UTC".into()),
+        ];
+        let env = child_env(server);
+        let mut args = base_args();
+        args.push("job=env".into());
+        let out = child_reply(&args, env);
+        let names = refusal_of(&out).message;
+        let names: Vec<&str> = names.split(' ').collect();
+        assert!(names.contains(&"TZ"), "{names:?}");
+        assert!(names.contains(&"MIMALLOC_ARENA_RESERVE"), "{names:?}");
+        assert!(!names.contains(&"SPARKLES_TEST_SECRET"), "{names:?}");
+        assert!(!names.contains(&"ANTHROPIC_API_KEY"), "{names:?}");
+    }
+
+    // The startup probe passes for the real binary and names the reason for another.
+    #[test]
+    fn the_probe_checks_the_child() {
+        let iso = Isolation {
+            exe: binary(),
+            memory: 512 << 20,
+            prefix: Vec::new(),
+        };
+        probe(&iso).unwrap();
+        let e = probe(&shell("exit 3")).unwrap_err();
+        assert!(e.contains("resource limits"), "{e}");
+        // a server whose probe failed refuses conversions with that reason
+        let rt = super::super::PdfRuntime::new(1, None).with_broken(Some(e));
+        let o = options(Duration::from_secs(20), rt);
+        let docx = sparkles_office::fixtures::docx();
+        let r = super::super::office::convert(&docx, Format::Docx, &o).unwrap_err();
+        assert_eq!(r.status, 500);
+        assert!(r.message.contains("--convert-in-process"), "{}", r.message);
     }
 
     // The same document converts to the same text in a child of the real binary and in
     // this process.
-    #[cfg(feature = "office")]
     #[test]
     fn the_binary_converts_in_a_child() {
-        let Some(exe) = binary() else {
-            eprintln!("skipped: no sparkles binary next to the test binary");
-            return;
-        };
         let docx = sparkles_office::fixtures::docx();
         let iso = Isolation {
-            exe,
+            exe: binary(),
             memory: 512 << 20,
             prefix: Vec::new(),
         };
@@ -898,15 +1132,11 @@ mod tests {
 
     // A PDF, a refused scanned PDF and the sheets of a workbook come back from the child
     // as they come from this process.
-    #[cfg(all(feature = "pdf", feature = "office"))]
+    #[cfg(feature = "pdf")]
     #[test]
     fn the_binary_converts_pdfs_and_sheets_in_a_child() {
-        let Some(exe) = binary() else {
-            eprintln!("skipped: no sparkles binary next to the test binary");
-            return;
-        };
         let iso = Isolation {
-            exe,
+            exe: binary(),
             memory: 1 << 30,
             prefix: Vec::new(),
         };
@@ -939,8 +1169,7 @@ mod tests {
     fn overhead() {
         let exe = std::env::var_os("SPARKLES_CHILD_EXE")
             .map(PathBuf::from)
-            .or_else(binary)
-            .expect("a sparkles binary");
+            .unwrap_or_else(binary);
         let docx = sparkles_office::fixtures::docx();
         let iso = Isolation {
             exe,

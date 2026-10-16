@@ -75,6 +75,9 @@ fn run<T: Send + 'static>(
             "every conversion worker stayed busy until the deadline",
         ));
     };
+    if let Some(r) = o.pdf.child_refusal() {
+        return Err(r);
+    }
     if let Some(iso) = o.pdf.isolation() {
         match isolate::run(iso, job, bytes, o) {
             Ok(r) => {
