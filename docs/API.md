@@ -7582,6 +7582,15 @@ The server refuses such requests with `400` before it parses them. The limits ar
   so a chain of a little under 1024 elements can already be refused. The error reads
   `nested deeper than 1024 levels, counting each operator of an expression, step of a
   property path and element of a group as a level`.
+* A query or update plan nests at most 4000 levels. The planner joins the triple
+  patterns of a basic graph pattern one after another, so a basic graph pattern of a few
+  thousand triple patterns makes a deep plan without any nesting in the text. Each triple
+  pattern counts as one level, and as two when it has a blank node, since the join on a
+  blank node usually needs a sort. The groups of a query that the planner joins into one
+  plan add up, so a BIND, a subquery or a GRAPH between two basic graph patterns does not
+  reset the count, while the branches of a UNION or OPTIONAL count separately. The count
+  is made on the parsed query before planning, and the error reads `query plan nested
+  deeper than 4000 levels; a basic graph pattern counts one level per triple pattern`.
 * RDF read from a request body, an upload, a `LOAD` or the shapes of `/{ds}/shacl` nests
   at most 256 triple terms (`<<( … )>>` or `<< … >>`) in Turtle, TriG, N-Triples, N-Quads
   and N3. A JSON-LD document nests at most 256 arrays and objects, and an RDF/XML
@@ -7595,7 +7604,10 @@ The server refuses such requests with `400` before it parses them. The limits ar
   SERVICE error does.
 
 Real queries stay far below these limits. In the W3C SPARQL test suites, no query nests
-more than 5 brackets deep, and the deepest algebra count is 29. Parsing a query at the
+more than 5 brackets deep, and the deepest algebra count is 29. Among the 2,800 queries of
+the W3C and Jena test suites and the benchmark query sets, the deepest plan count is 57.
+A basic graph pattern at the plan limit takes seconds to plan, because planning time grows
+with the square of the number of triple patterns. Parsing a query at the
 bracket limit takes up to 1.5 MiB of stack, which fits the 2 MiB that Rust, tokio and
 rayon give the threads they start. The server runs requests on threads with 8 MiB
 stacks. The planner and the evaluator size their stack from the parsed query and grow it

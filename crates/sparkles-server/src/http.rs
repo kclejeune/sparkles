@@ -2247,11 +2247,12 @@ async fn explain(
         let (snap, resolved) = history::snapshot_for(&ds, at.as_ref(), &opts)?;
         let seq = snap.commit;
         let (algebra, plan) = sparkles::sparql::explain(snap, &query, &opts)?;
-        let resp = with_commit(
-            Json(json!({ "algebra": algebra, "plan": plan })).into_response(),
-            &ds,
-            seq,
-        );
+        // the JSON value of a plan nests twice as deep as the plan, and writing and
+        // dropping it recurse
+        let body = sparkles::sparql::depth::with_stack(plan.depth(), move || {
+            Json(json!({ "algebra": algebra, "plan": plan })).into_response()
+        });
+        let resp = with_commit(body, &ds, seq);
         Ok(history::history_headers(resp, resolved.as_ref(), &uri))
     })
     .await

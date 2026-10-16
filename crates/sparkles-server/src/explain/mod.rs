@@ -238,11 +238,11 @@ fn read_node(
         parent,
         full_description: full,
     });
+    // borrowed: a copy at each level would copy the subtree once per level above it
     let kids = o
         .get("children")
         .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+        .map_or(&[][..], Vec::as_slice);
     let mut child_ids = Vec::with_capacity(kids.len());
     let mut child_ms = 0.0;
     for (i, c) in kids.iter().enumerate() {

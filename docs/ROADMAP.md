@@ -119,6 +119,7 @@ These items are cheap or foundational.
 | 72 | JSON query languages, and a Datalog surface syntax for rules and queries | [C24](specs/C24-json-query-languages.md), [F17](specs/F17-query-time-reasoning.md) | M–L |
 | 78 | Incremental write-time validation of recursive SHACL shapes and SHACL-SPARQL constraints not anchored at the focus node | [C10](specs/C10-write-time-validation.md#roadmap-follow-ups-2026-10-12) | M–L |
 | 82 | Cheaper vector catch-up and measured half-precision recall. Catch-up scans only new rows, binary16 recall is measured on Euclidean and dot-product data with an offset, a measurement picks the worker pool, and a test cancels a carry. | [F04](specs/F04-vector-search.md#roadmap-follow-ups-2026-10-12) | S–M |
+| 84 | Large basic graph patterns. Planning time grows with the square of the number of triple patterns, and memory blows up near 70,000 patterns. An iterative n-ary join would let the 4000-level plan limit rise. | [X05](specs/X05-streaming-query-execution.md#large-basic-graph-patterns) | M |
 
 ## Tier 5: backlog
 

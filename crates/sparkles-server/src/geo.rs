@@ -321,7 +321,11 @@ pub type Work = [u64; WORK.len()];
 /// exact tests, matches and candidates the index could not place (`None` when the plan
 /// has no spatial operator).
 pub fn plan_work(plan: &sparkles::sparql::PlanInfo) -> Option<Work> {
-    fn walk(p: &sparkles::sparql::PlanInfo, sum: &mut Option<Work>) {
+    // without recursion: this runs on an async worker, outside the query's stack, and a
+    // plan nests up to `MAX_PLAN_DEPTH` levels
+    let mut sum = None;
+    let mut todo = vec![plan];
+    while let Some(p) = todo.pop() {
         if let Some(c) = &p.counters
             && c.contains_key("candidates")
         {
@@ -330,12 +334,8 @@ pub fn plan_work(plan: &sparkles::sparql::PlanInfo) -> Option<Work> {
                 *x += c.get(k).and_then(J::as_u64).unwrap_or(0);
             }
         }
-        for child in &p.children {
-            walk(child, sum);
-        }
+        todo.extend(&p.children);
     }
-    let mut sum = None;
-    walk(plan, &mut sum);
     sum
 }
 

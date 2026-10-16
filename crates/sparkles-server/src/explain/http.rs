@@ -116,15 +116,17 @@ async fn explain_route(
                         }
                     };
                 };
-                sparql_explain(&server, &call, b, &mut on).map(|()| Value::Object(out))
+                let depth = sparql_explain(&server, &call, b, &mut on)?;
+                // written and dropped here, on the stack the plan's depth needs
+                let out = Value::Object(out);
+                Ok(sparkles::sparql::depth::with_stack(depth, move || {
+                    Json(out).into_response()
+                }))
             })
         })
         .await
         .map_err(|e| err_code(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()))?;
-        return match out {
-            Ok(v) => Ok(Json(v).into_response()),
-            Err(e) => Err(crate::mcp::rest::tool_error(&e)),
-        };
+        return out.map_err(|e| crate::mcp::rest::tool_error(&e));
     }
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
     tokio::task::spawn_blocking(move || {

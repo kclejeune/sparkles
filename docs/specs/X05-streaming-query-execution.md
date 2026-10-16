@@ -936,3 +936,16 @@ the rest are sketched here.
   estimate exceeds half the memory budget, and retries an eager query that fails its
   budget before output as a cursor with spill. Each widening needs the matched
   measurements of §10.
+
+### Large basic graph patterns
+
+[ROADMAP](../ROADMAP.md) item 84. The planner joins the triple patterns of a basic graph
+pattern into a binary join tree one level deep per pattern, and the planner, the executor
+and the plan description all recurse through it. A query is refused when its plan would
+nest deeper than 4000 levels, as the [nesting limits](../API.md#nesting-limits) describe.
+Below that limit, planning time grows with the square of the number of triple patterns. A
+ground basic graph pattern of 10,000 triple patterns took 12.5 s to run and a chain of
+10,000 took 62 s to plan in a release build, and a pattern of 70,000 used about 21 GB
+before it was killed. An n-ary join over all the triple patterns of a basic graph pattern,
+built and run iteratively, would make planning close to linear and the plan flat. The
+limit could then rise, or count only the levels that still nest.

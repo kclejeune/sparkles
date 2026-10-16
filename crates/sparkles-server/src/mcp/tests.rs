@@ -1485,6 +1485,37 @@ async fn deep_nesting_is_a_syntax_error() {
     }
 }
 
+/// A basic graph pattern counts one plan level per triple pattern. At the plan limit the
+/// tools explain it on these small stacks, and one more triple pattern is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_basic_graph_pattern_at_the_plan_limit() {
+    use sparkles::sparql::depth::MAX_PLAN_DEPTH;
+    let mut c = Client::start(fixture_server());
+    let bgp = |n: usize| format!("SELECT * WHERE {{ {}}}", "?s a ?o . ".repeat(n));
+    // the projection and the group are plan levels too
+    let n = MAX_PLAN_DEPTH - 3;
+    let s = c
+        .structured("explain_query", json!({"query": bgp(n)}))
+        .await;
+    // a join and a scan for each triple pattern
+    let lines = s["plan"].as_str().unwrap().lines().count();
+    assert_eq!(lines, 2 * n, "{s}");
+    // the notes read plans of up to 256 levels, and a run's deeper plan is refused
+    let args = json!({"query": bgp(n), "notes": true, "profile": "run"});
+    let (t, e) = c.error("explain_query", args).await;
+    assert!(t.contains("the plan nests deeper than 256 levels"), "{t}");
+    assert_eq!(e, json!({"code": "bad-argument", "status": 400}));
+    let s = c
+        .structured("check_query", json!({"query": bgp(n), "explain": true}))
+        .await;
+    assert_eq!(s["ok"], true, "{s}");
+    let limit = format!("query plan nested deeper than {MAX_PLAN_DEPTH} levels");
+    for tool in ["sparql_query", "explain_query"] {
+        let (t, _) = c.error(tool, json!({"query": bgp(n + 1)})).await;
+        assert!(t.contains(&limit), "{tool}: {t}");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a11_timeout() {
     let mut c = Client::start(server_with(

@@ -232,3 +232,74 @@ async fn nested_shex_selectors_get_a_400() {
         refused(&r, 256);
     }
 }
+
+/// A query of one basic graph pattern of `n` triple patterns, each of which matches.
+fn bgp(n: usize) -> String {
+    format!(
+        "PREFIX : <http://ex.org/> SELECT * WHERE {{ {}}}",
+        ":a :p :b . ".repeat(n)
+    )
+}
+
+/// A `DELETE WHERE` of `n` triple patterns that match nothing.
+fn delete_where(n: usize) -> String {
+    let mut u = String::from("PREFIX : <http://ex.org/> DELETE WHERE { ");
+    for i in 0..n {
+        u.push_str(&format!(":x :p :o{i} . "));
+    }
+    u.push('}');
+    u
+}
+
+fn plan_refused(r: &Resp) {
+    let limit = sparkles::sparql::depth::MAX_PLAN_DEPTH;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    assert!(
+        r.text()
+            .contains(&format!("query plan nested deeper than {limit} levels")),
+        "{}",
+        r.text()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_basic_graph_pattern_at_the_plan_limit_runs_and_explains() {
+    use sparkles::sparql::depth::MAX_PLAN_DEPTH;
+    let (_dir, app) = server();
+    // the projection and the group are plan levels too
+    let n = MAX_PLAN_DEPTH - 3;
+    let ct = "application/sparql-query";
+    let r = send(&app, post("/c/sparql", ct, bgp(n))).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let r = send(&app, post("/c/explain", ct, bgp(n))).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(r.body.len() > 100 * n, "{}", r.body.len());
+    let explain = Request::post("/c/sparql/explain")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ACCEPT, "application/json")
+        .body(Body::from(json!({ "query": bgp(n) }).to_string()))
+        .unwrap();
+    // the explanation reads plans of up to 256 levels, and refuses a deeper one cleanly
+    let r = send(&app, explain).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    assert!(r.text().contains("the plan nests deeper than 256 levels"));
+    let u = delete_where(n + 1);
+    let r = send(&app, post("/c/update", "application/sparql-update", u)).await;
+    assert!(r.status.is_success(), "{}", r.text());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_basic_graph_pattern_past_the_plan_limit_gets_a_400() {
+    use sparkles::sparql::depth::MAX_PLAN_DEPTH;
+    let (_dir, app) = server();
+    let ct = "application/sparql-query";
+    for n in [MAX_PLAN_DEPTH - 2, MAX_PLAN_DEPTH + 1, 100_000] {
+        for path in ["/c/sparql", "/c/explain"] {
+            plan_refused(&send(&app, post(path, ct, bgp(n))).await);
+        }
+    }
+    for n in [MAX_PLAN_DEPTH - 1, MAX_PLAN_DEPTH + 1, 100_000] {
+        let u = delete_where(n);
+        plan_refused(&send(&app, post("/c/update", "application/sparql-update", u)).await);
+    }
+}

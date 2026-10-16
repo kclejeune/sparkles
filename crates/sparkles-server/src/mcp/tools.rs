@@ -488,6 +488,9 @@ pub(super) struct ExplainCore {
     /// the error body of a run that a budget stopped
     pub(super) error: Option<Value>,
     pub(super) prefixes: Vec<(String, String)>,
+    /// How deeply `plan` nests: code that reads the JSON form recursively runs on
+    /// `with_stack` of this depth
+    pub(super) depth: usize,
 }
 
 #[derive(Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -1238,6 +1241,8 @@ impl Tools<'_> {
                 stop: None,
                 error: None,
                 prefixes: prefix_vec(&prefix_map),
+                // a given plan was parsed, which nests at most 128 levels
+                depth: 0,
             });
         }
         let snap = self.snapshot(&ds, a.at_commit, a.at.as_ref(), self.call.arrived + timeout)?;
@@ -1332,6 +1337,7 @@ impl Tools<'_> {
         if !run {
             return Ok(ExplainCore {
                 plan_json: serde_json::to_value(&plan).unwrap_or_default(),
+                depth: plan.depth(),
                 plan: Some(plan),
                 out,
                 stop: None,
@@ -1371,6 +1377,7 @@ impl Tools<'_> {
         }
         Ok(ExplainCore {
             plan_json: serde_json::to_value(&plan).unwrap_or_default(),
+            depth: plan.depth(),
             plan: Some(plan),
             out,
             stop,
@@ -1810,24 +1817,26 @@ fn predicate_json(p: &PredicateEntry, terms: &mut Terms) -> Value {
     e
 }
 
-/// `<operator> <description> est=<rows> [<columns>]`, two spaces per depth.
+/// `<operator> <description> est=<rows> [<columns>]`, two spaces per depth. Written
+/// without recursion, since a plan nests up to `MAX_PLAN_DEPTH` levels.
 pub(super) fn plan_lines(p: &PlanInfo, depth: usize, out: &mut String) {
-    out.push_str(&"  ".repeat(depth));
-    out.push_str(&p.operator);
-    if !p.description.is_empty() {
-        out.push(' ');
-        out.push_str(&p.description.replace(['\n', '\r'], " "));
-    }
-    // a view restricted by grants sees no estimates (-1)
-    if p.estimated_rows < 0.0 {
-        out.push_str(" est=?");
-    } else {
-        out.push_str(&format!(" est={}", p.estimated_rows.round() as u64));
-    }
-    let cols: Vec<String> = p.columns.iter().map(|c| format!("?{c}")).collect();
-    out.push_str(&format!(" [{}]\n", cols.join(" ")));
-    for c in &p.children {
-        plan_lines(c, depth + 1, out);
+    let mut todo = vec![(p, depth)];
+    while let Some((p, depth)) = todo.pop() {
+        out.push_str(&"  ".repeat(depth));
+        out.push_str(&p.operator);
+        if !p.description.is_empty() {
+            out.push(' ');
+            out.push_str(&p.description.replace(['\n', '\r'], " "));
+        }
+        // a view restricted by grants sees no estimates (-1)
+        if p.estimated_rows < 0.0 {
+            out.push_str(" est=?");
+        } else {
+            out.push_str(&format!(" est={}", p.estimated_rows.round() as u64));
+        }
+        let cols: Vec<String> = p.columns.iter().map(|c| format!("?{c}")).collect();
+        out.push_str(&format!(" [{}]\n", cols.join(" ")));
+        todo.extend(p.children.iter().rev().map(|c| (c, depth + 1)));
     }
 }
 
@@ -1872,10 +1881,13 @@ pub(super) fn plan_warnings(
 }
 
 fn max_estimate(p: &PlanInfo) -> f64 {
-    p.children
-        .iter()
-        .map(max_estimate)
-        .fold(p.estimated_rows, f64::max)
+    let mut max = p.estimated_rows;
+    let mut todo: Vec<&PlanInfo> = p.children.iter().collect();
+    while let Some(c) = todo.pop() {
+        max = max.max(c.estimated_rows);
+        todo.extend(&c.children);
+    }
+    max
 }
 
 /// A top-level LIMIT (below the projection modifiers).
