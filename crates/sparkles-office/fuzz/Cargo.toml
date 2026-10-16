@@ -1,0 +1,29 @@
+# The cargo-fuzz target of the Office converter. A workspace of its own, with its own
+# lockfile, so libfuzzer-sys and the nightly toolchain stay out of the repository's
+# workspace, its lockfile and its third-party license notices. See README.md.
+[package]
+name = "sparkles-office-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+sparkles-office = { path = ".." }
+
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "office_convert"
+path = "fuzz_targets/office_convert.rs"
+test = false
+doc = false
+bench = false

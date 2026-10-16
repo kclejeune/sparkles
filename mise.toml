@@ -258,6 +258,14 @@ flag "--strict" help="exit 1 when an output differs"
 '''
 run = 'scripts/fmt-jsonld-prettier.sh ${usage_strict:+--strict}'
 
+[tasks."office:fuzz"]
+description = "Fuzz the Office converter with cargo-fuzz (needs a nightly toolchain and cargo-fuzz; see crates/sparkles-office/fuzz/README.md); not part of ci"
+usage = '''
+flag "--time <seconds>" help="seconds to run" default="1800"
+flag "--jobs <n>" help="fuzzing processes" default="2"
+'''
+run = 'crates/sparkles-office/fuzz/run.sh --time "$usage_time" --jobs "$usage_jobs"'
+
 [tasks."fmt:fuzz"]
 description = "Fuzz the formatter with cargo-fuzz (needs a nightly toolchain and cargo-fuzz; see crates/sparkles-fmt/fuzz/README.md); not part of ci"
 usage = '''

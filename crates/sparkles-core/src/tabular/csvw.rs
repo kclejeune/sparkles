@@ -38,7 +38,15 @@ pub struct ColumnDesc {
     pub suppress: bool,
     /// The column's own inherited properties (not yet merged with the schema's).
     pub props: Props,
+    /// The Sparkles lookup of §3.6: cell values and the IRIs that replace the `valueUrl`
+    /// expansion for them. It is never inherited.
+    pub lookup: Option<std::collections::HashMap<String, oxrdf::NamedNode>>,
 }
+
+/// The key of the lookup extension on a column description.
+pub const LOOKUP_KEY: &str = "urn:x-sparkles:lookup";
+/// The most entries of a table's lookups together.
+pub const MAX_LOOKUP: usize = 10_000;
 
 /// The inherited properties. `None` is "not set here".
 #[derive(Clone, Debug, Default)]
@@ -156,6 +164,12 @@ impl Ctx {
             {
                 continue;
             }
+            if k.starts_with("urn:x-sparkles:") {
+                self.warn(format!(
+                    "{what} property {k:?} is not a Sparkles extension that this version reads, and is ignored"
+                ));
+                continue;
+            }
             // common properties (`dc:title`, absolute IRIs) describe the table
             if k.contains(':') {
                 continue;
@@ -241,6 +255,19 @@ pub fn parse(text: &str, location: Option<&str>) -> Result<Metadata, String> {
     }
     if o.contains_key("transformations") {
         cx.warn("transformations are ignored".into());
+    }
+    for t in &tables {
+        let n: usize = t
+            .columns
+            .iter()
+            .filter_map(|c| c.lookup.as_ref())
+            .map(|l| l.len())
+            .sum();
+        if n > MAX_LOOKUP {
+            return Err(format!(
+                "the lookups of a table hold {n} values; the limit is {MAX_LOOKUP}"
+            ));
+        }
     }
     Ok(Metadata {
         tables,
@@ -344,7 +371,7 @@ fn column(o: &Map<String, J>, cx: &mut Ctx) -> Result<ColumnDesc, String> {
     cx.unknown(
         o,
         "column",
-        &["name", "titles", "virtual", "suppressOutput"],
+        &["name", "titles", "virtual", "suppressOutput", LOOKUP_KEY],
     );
     let name = match o.get("name") {
         None => None,
@@ -387,13 +414,65 @@ fn column(o: &Map<String, J>, cx: &mut Ctx) -> Result<ColumnDesc, String> {
         let n = name.as_deref().unwrap_or("(unnamed)");
         return Err(format!("virtual column {n} has no valueUrl"));
     }
+    let lookup = match o.get(LOOKUP_KEY) {
+        None => None,
+        Some(v) => {
+            let n = name.as_deref().unwrap_or("(unnamed)");
+            if is_virtual {
+                return Err(format!("virtual column {n} cannot have a lookup"));
+            }
+            Some(lookup(v).map_err(|e| format!("column {n}: {LOOKUP_KEY}: {e}"))?)
+        }
+    };
     Ok(ColumnDesc {
         name,
         titles,
         is_virtual,
         suppress: bool_prop(o, "suppressOutput")?.unwrap_or(false),
         props,
+        lookup,
     })
+}
+
+/// The entries of a lookup: `{"rdf:value": "text" or ["text", ...], "@id": "IRI"}`.
+fn lookup(v: &J) -> Result<std::collections::HashMap<String, oxrdf::NamedNode>, String> {
+    let entries = v
+        .as_array()
+        .ok_or("the lookup must be an array of entries")?;
+    let mut out: std::collections::HashMap<String, oxrdf::NamedNode> =
+        std::collections::HashMap::new();
+    for e in entries {
+        let e = e.as_object().ok_or("a lookup entry must be an object")?;
+        let id = e
+            .get("@id")
+            .and_then(J::as_str)
+            .ok_or("a lookup entry needs an @id")?;
+        let iri = oxrdf::NamedNode::new(id)
+            .map_err(|err| format!("the @id {id:?} is not an absolute IRI: {err}"))?;
+        let value = e
+            .get("rdf:value")
+            .or_else(|| e.get("http://www.w3.org/1999/02/22-rdf-syntax-ns#value"))
+            .ok_or("a lookup entry needs an rdf:value")?;
+        let keys: Vec<&str> = match value {
+            J::String(s) => vec![s.as_str()],
+            J::Array(a) => a
+                .iter()
+                .map(|k| k.as_str().ok_or("an rdf:value must be a string or strings"))
+                .collect::<Result<_, _>>()?,
+            _ => return Err("an rdf:value must be a string or strings".into()),
+        };
+        for k in keys {
+            match out.get(k) {
+                Some(prev) if prev != &iri => {
+                    return Err(format!("the value {k:?} names two IRIs"));
+                }
+                _ => {
+                    out.insert(k.to_string(), iri.clone());
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn bool_prop(o: &Map<String, J>, k: &str) -> Result<Option<bool>, String> {

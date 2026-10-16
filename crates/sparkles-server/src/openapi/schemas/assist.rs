@@ -178,7 +178,7 @@ fn ingestion(put: &mut dyn FnMut(&str, J)) {
                     "input": any_object("What was ingested: its name, format, size, URL or source and mode. A maintenance task has `kind` `consolidation` or `retention`, and `scheduled`."),
                     "estimate": any_object("The estimate of the extraction: chunks, tokens, the first pair, its estimated cost, the threshold and whether it needs a confirmation."),
                     "usage": any_object("Model calls, tokens, estimated cost, escalations and the pair that answered each chunk."),
-                    "result": any_object("The outcome (`registered`, `proposed`, `no-facts`, `preview`, `merged`, `approved`, `already-registered` or `mapping-draft`), with the source, rendition, branch, pages, proposals, or a table's mapping draft and preview. A consolidation's outcome is `proposed`, `merged`, `dry-run`, `nothing-to-consolidate`, `no-facts` or `pending-review`, with the branch, the repeated facts, the duplicates and the conflicts. A retention's is `deleted`, `dry-run` or `nothing-to-delete`, with each session graph and why it is kept or deleted."),
+                    "result": any_object("The outcome (`registered`, `proposed`, `no-facts`, `preview`, `merged`, `approved`, `already-registered`, `mapping-draft` or `mapping-drafts`), with the source, rendition, branch, pages, proposals, a table's mapping draft and preview, or a workbook's drafts for each sheet. A consolidation's outcome is `proposed`, `merged`, `dry-run`, `nothing-to-consolidate`, `no-facts` or `pending-review`, with the branch, the repeated facts, the duplicates and the conflicts. A retention's is `deleted`, `dry-run` or `nothing-to-delete`, with each session graph and why it is kept or deleted."),
                     "error": any_object("The code and message of a failed task, such as `needs-ocr` with the pages that need OCR and their reasons."),
                 }),
             ),
@@ -194,10 +194,10 @@ fn ingestion(put: &mut dyn FnMut(&str, J)) {
                 json!({
                     "dataset": string(),
                     "tasks": array(sref("IngestTask")),
-                    "capabilities": obj(&["pdf", "ocr"], json!({ "pdf": boolean(), "ocr": boolean() })),
+                    "capabilities": obj(&["pdf", "ocr", "office"], json!({ "pdf": boolean(), "ocr": boolean(), "office": boolean() })),
                 }),
             ),
-            "The caller's ingestion tasks, newest first, and whether this server converts PDFs and reads scanned pages.",
+            "The caller's ingestion tasks, newest first, and whether this server converts PDFs and Office documents and reads scanned pages.",
             "ingestion",
         ),
     );

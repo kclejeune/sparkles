@@ -2196,6 +2196,16 @@ fn print_log(
 pub(crate) const THREAD_STACK: usize = 8 << 20;
 
 fn main() -> Result<()> {
+    // a PDF or Office conversion child of a server (spec C18 §7.1.1), before anything
+    // else of the binary starts
+    #[cfg(any(feature = "pdf", feature = "office"))]
+    {
+        let mut args = std::env::args_os().skip(1);
+        if args.next().as_deref() == Some(std::ffi::OsStr::new(ingest::isolate::CHILD_ARG)) {
+            std::process::exit(ingest::isolate::child_main(args.collect()));
+        }
+        ingest::isolate::enable();
+    }
     run().map_err(rejected_exit)
 }
 

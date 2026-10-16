@@ -95,8 +95,10 @@ pub struct ImportFlags {
     /// The most transcript text one sync imports; the rest waits for the next sync
     #[arg(long, value_name = "N", default_value_t = 32 << 20)]
     pub max_transcript_bytes: u64,
-    /// The transcript a session end hook named, imported even when it is recent
-    #[arg(long, hide = true, value_name = "FILE")]
+    /// A transcript file to import, whatever its harness: the adapter that recognizes
+    /// it reads it, and the generic adapter reads one that none claims. It is imported
+    /// even when it is recent, which is how a session end hook names its transcript
+    #[arg(long, value_name = "FILE")]
     pub transcript: Option<PathBuf>,
     /// Who extracts facts from prose: agent (the skill, default), server or none. With
     /// server, the sync starts an extraction task on the server's extract role for each

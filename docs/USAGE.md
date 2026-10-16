@@ -2888,6 +2888,28 @@ is less than 10 minutes old unless the session's end hook named it. `status` war
 Claude Code transcripts that its `cleanupPeriodDays` will delete soon. `setup
 --transcripts` adds `--transcripts` to the session end hook.
 
+Besides Claude Code and Codex, the import finds the transcripts of Gemini CLI
+(`~/.gemini/tmp/<project hash>/chats`), Cursor
+(`~/.cursor/projects/<project>/agent-transcripts`), the GitHub Copilot CLI
+(`~/.copilot/session-state/<session>/events.jsonl`, for sessions that ran in the
+project) and Aider (`.aider.chat.history.md` in the project). `GEMINI_CLI_HOME` and
+`COPILOT_HOME` move the first and the last of those directories, and
+`AIDER_CHAT_HISTORY_FILE` names Aider's file. The adapter names `gemini-cli`, `cursor`,
+`copilot` and `aider` select them, and a sync without a name reads all of them. Their
+instruction files are the generic adapter's. Gemini CLI, Cursor and Copilot do not
+document their log formats, so a version that writes something new may leave turns out.
+Aider's file does not say which lines are the person's and which are the model's. A reply
+that contains a level-4 Markdown heading is read as a turn of the person, and a reply line
+that starts with `> ` is read as one of Aider's notices and dropped. Cursor's text form
+starts a new turn at any line that begins with `A:` or `user:`, which can also happen
+inside an answer. Aider's log has no session id, so the session is named after the file
+and a short hash of its path below the repository, and the histories in a project's
+directory and in its root are two sessions.
+`--transcript FILE` imports one file, wherever it is. A file that none of these
+adapters recognizes is read by the generic adapter, which understands JSON lines or a
+JSON value of messages with a speaker and a text, Markdown with `## User` and
+`## Assistant` headings, and text with `User:` and `Assistant:` lines.
+
 ### Reviewing imported memory in the terminal
 
 `sparkles memory inbox` lists the review inbox with the signals of each fact and a short
@@ -3055,6 +3077,52 @@ server built with `--features pdf-ocr` reads scanned pages with the PP-OCR model
 directory of `--pdf-ocr-models`. It loads PDFium from `--pdfium-lib` and ONNX Runtime
 from `--onnxruntime-lib`, or from their usual library paths, and never downloads a model.
 `--pdf-workers` (2 by default) limits the conversions that run at once.
+
+On Linux the server converts each PDF and Office file in a child process of its own,
+started from the same `sparkles` binary. The child runs under an address-space limit of
+`--convert-memory` MiB, 2048 by default and at least 256, a CPU-time limit and, without
+OCR, a file-size limit of zero. The server kills it when the task's deadline passes, so
+a file that makes a converter loop or allocate without end fails with
+`conversion-timeout` or `conversion-failed` and frees its worker slot. The child gets a
+cleared environment without the server's keys and tokens, but it runs as the server's
+user, so this limits resources and is not a sandbox. Starting the child adds about 10 ms
+to each document. The server starts one child when it starts. If that child cannot set
+its limits, for example under a system call filter that forbids them, the server logs
+the reason and refuses PDF and Office files with status 500 until it is restarted with
+`--convert-in-process`. That flag converts on threads of the server instead, where a
+conversion that overruns its deadline keeps its worker slot until it ends and its memory
+is bounded only by the converters' own limits. On macOS and other platforms, which do
+not enforce the address-space limit, conversions always run on threads. With OCR, give
+`--convert-memory` at least 4096, because PDFium and ONNX Runtime map their libraries
+and models into the child's address space. OCR in a child has not been measured.
+
+Word, PowerPoint and OpenDocument files (`.docx`, `.pptx`, `.odt`, `.odp`) need a build
+with the `office` feature, which is on by default. The server converts them to Markdown
+with their headings, lists, tables and footnotes. Each slide of a presentation starts
+with a `<!-- Page N -->` marker and a `# Slide N: Title` heading, so the review page
+shows the slide of each fact, and the speaker notes follow the slide's text. A file
+that is encrypted or in an old binary format (`.doc`, `.ppt`, `.xls`) is refused. An
+Excel or OpenDocument spreadsheet (`.xlsx`, `.ods`) gets a mapping draft for each
+visible sheet, up to 20 sheets, with the sheet as CSV to upload with its mapping. Without
+a `base`, the rows of each sheet get their own namespace that includes the sheet's
+position, so two sheets never share one. A hyperlink whose target is longer than 2,048
+bytes keeps its text and loses its URL. Hidden sheets, hidden
+slides and hidden Word text are left out, while the hidden rows and columns of a visible
+sheet are read, because they are data. These conversions share
+the `--pdf-workers` limit and the child processes with PDF conversion. A conversion
+holds at most 128 MiB of output besides the file and its XML trees, so a small file
+cannot ask for more memory, and a file that would is refused with `too-large`.
+
+When the model drafts a mapping that maps a column to IRIs of a class the dataset has,
+the draft links that column's values to the existing entities. The most frequent values
+of the column, up to 500, are looked up by label, and an exact match is written into the
+column's lookup in the mapping (`urn:x-sparkles:lookup`), so the preview and the upload
+use the existing entity's IRI and a second upload with the same mapping links the same
+way. A value with several matching entities is listed under `links` in the draft with
+its candidates and keeps a minted IRI. To choose one, add an entry with the value and
+the candidate's IRI to the column's lookup, and run the dry run again. No cell value goes
+to the model or to an embedding provider while linking. Other CSVW tools ignore the
+lookup and mint the IRIs.
 
 `sparkles ingest` runs the same steps on a database directory while no server holds it,
 one file after another, and prints each result:
@@ -5723,6 +5791,8 @@ above the query budgets (`--query-memory-mb`, `--max-mem-dataset-mb`,
 the container. Add the local models that the server loads. Qwen3-Embedding-0.6B takes
 about 1.2 GB in bf16 while it is loaded. With OCR, add the PP-OCR models and ONNX
 Runtime's working memory for each of the `--pdf-workers` conversions that run at once.
+Each conversion runs in a child process that may use up to `--convert-memory` (2 GiB by
+default), so the container's limit should leave room for `--pdf-workers` of them.
 
 ## Deploying on NixOS
 

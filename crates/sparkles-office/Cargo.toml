@@ -1,0 +1,24 @@
+[package]
+name = "sparkles-office"
+description = "Office documents to Markdown and CSV for Sparkles ingestion: DOCX, PPTX, XLSX and the OpenDocument text, presentation and spreadsheet formats, read from their XML parts under limits on the input and on one output budget"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# ZIP containers, read only. No default features: deflate through flate2, which the server
+# already links; no encryption, bzip2, zstd, xz or LZMA
+zip = { version = "7.2", default-features = false, features = ["deflate-flate2"] }
+# the XML parser of oxrdfxml, already in the tree
+quick-xml = "0.37"
+# the deflate backend of zip, as the server links it
+flate2.workspace = true
+
+[features]
+# small documents of every format (src/fixtures.rs), for the fuzz targets' seeds
+fixtures = []
+
+[[example]]
+name = "seed"
+path = "examples/seed.rs"
+required-features = ["fixtures"]

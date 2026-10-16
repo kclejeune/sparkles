@@ -573,6 +573,7 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
                 "k": {"type":"integer","minimum":1,"maximum":20,"default":5,"description":"Candidates per mention"},
                 "labelPredicates": {"type":"array","items":{"type":"string"},"minItems":1,"maxItems":20,"description":"The predicates that hold labels (default: rdfs:label, skos:prefLabel, schema:name and the other usual ones, then skos:altLabel)"},
                 "graphs": {"type":"array","items":{"type":"string"},"minItems":1,"maxItems":20,"description":"Graph IRIs to search, or `default` (default: every graph you may read)"},
+"vectors": {"type":"boolean","default":true,"description":"false searches by label and full text only, so no mention or context is embedded by a vector index's provider"},
                 "reasoning": rs(),
                 "timeoutSeconds": to(cfg),
                 "atCommit": at(), "at": at_sel()}}),

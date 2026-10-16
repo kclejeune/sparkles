@@ -998,7 +998,7 @@ in
     extraArgs = mkOption {
       type = types.listOf types.str;
       default = [ ];
-      description = "Extra arguments appended to `sparkles serve`.";
+      description = "Extra arguments appended to `sparkles serve`, such as `--convert-memory` for the address-space limit of the PDF and Office conversion children, or `--convert-in-process`.";
     };
 
     installCli = mkOption {

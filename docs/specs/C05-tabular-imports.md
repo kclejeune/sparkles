@@ -171,7 +171,11 @@ examples of the CSVW primer and of "Generating RDF from Tabular Data on the Web"
   wins. `textDirection` is accepted and ignored.
 - Other CSVW properties, such as `notes`, `transformations` and the common properties of
   Dublin Core, are ignored with a warning. Properties outside the vocabulary are ignored
-  with a warning too, as CSVW asks of processors.
+  with a warning too, as CSVW asks of processors. A common property whose name is a
+  prefixed name or an IRI, such as `dc:title`, is accepted without a warning, because it
+  describes the table and does not change the triples. The one exception is a key that
+  starts with `urn:x-sparkles:`, which is a Sparkles extension (§3.7). One that this
+  version does not read gives a warning, so a typo does not go unnoticed.
 
 ### 3.2 Columns and titles
 
@@ -273,6 +277,37 @@ tables over HTTP.
 Without `--mapping` or `--template`, `sparkles load` looks for `data.csv-metadata.json`
 next to `data.csv`, the first location CSVW's locating rules name, and uses it when it
 exists. The command prints that it did, so the choice is never silent.
+
+### 3.7 The Sparkles lookup extension
+
+A column description may carry `urn:x-sparkles:lookup`, a list of entries that name the
+IRI of a cell value. It is a common property in CSVW's sense, an array of objects with
+`rdf:value` and `@id`, so other processors read it as an annotation of the column. They
+write no triples for it and mint the `valueUrl` IRI for every cell, so their output
+differs from Sparkles' by design.
+
+```json
+{ "name": "team", "propertyUrl": "schema:memberOf", "valueUrl": "http://example.org/team/{team}",
+  "urn:x-sparkles:lookup": [
+    { "rdf:value": ["Payments team", "payments TEAM"], "@id": "http://example.org/payments" } ] }
+```
+
+The `rdf:value` of an entry is one string or a list of strings, and `@id` is an absolute
+IRI. When a cell's value, after the steps of §3.3, equals one of the strings, the
+object of the triple is the entry's IRI. Any other value expands the `valueUrl` as
+usual. The comparison is exact and case-sensitive, and a null cell writes no triple and
+is not looked up. A template with `--mapping` binds the column's variable to the same
+IRI.
+
+A lookup belongs to its column and is not inherited. Loading the metadata fails when a
+lookup is on a virtual column, when the column has no `valueUrl` to expand for the
+values it does not list, when it also has a `separator`, when a value names two IRIs,
+when an `@id` is not an absolute IRI, or when the lookups of a table hold more than
+10,000 values.
+
+The lookup is static, so the conversion still reads nothing from the target dataset and
+stays reproducible. The server's mapping draft writes lookups from entity linking
+(C18 §7.8), and a person can edit them like any other part of the mapping.
 
 ## 4. The default mapping
 
@@ -528,6 +563,11 @@ parameter, are a non-goal for this phase.
 - Under the record limit, an unclosed quote ends at the end of the file and the rest of
   the file becomes one cell, as the `csv` crate reads it. Past the limit it fails with
   the row where the record started.
+
+**Added on 2026-10-13 for C18's entity linking.** The lookup extension of §3.7 and the
+option `tally`, which counts the distinct values of the columns it names in
+`Stats::tallies`, in the form the converter sees after the cell steps. The tally is how
+the server's draft records the exact strings that the lookup will be compared with.
 
 **Tests at landing.**
 

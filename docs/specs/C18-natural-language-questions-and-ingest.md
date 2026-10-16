@@ -1461,6 +1461,8 @@ reason, so a person can see what was tried.
 | Markdown | Kept as is, so headings guide chunking. | |
 | HTML | Main content extracted, scripts, styles and navigation removed, headings and lists kept as Markdown. | |
 | PDF | Markdown from pdf-inspector, with headings, lists, tables and reading order across columns, and a page marker before each page. | A page without usable text needs OCR. Without the `pdf-ocr` feature, such a PDF is refused with `needs-ocr` and the pages concerned (§7.1.1). |
+| Word, PowerPoint and OpenDocument text and presentations | Markdown from the XML parts of the file, with headings, lists, tables and footnotes. A presentation has a `<!-- Page N -->` marker and a `# Slide N: Title` heading for each slide, and its speaker notes follow the slide's text. | The marker is the page marker of §7.1.1, so a slide is a page for citations. A Word or ODT document has no page markers. A build without the `office` feature refuses these files with `unsupported-format`. |
+| Excel and OpenDocument spreadsheets | Not converted to text. Each visible sheet becomes CSV. | Each sheet is mapped like a table, one at a time (§7.8). |
 | CSV and TSV | Not converted to text. | The model drafts a C05 mapping, and C05 converts every row deterministically (§7.8). |
 | RDF in any format | Not ingested. | It goes through the existing upload. |
 
@@ -1547,12 +1549,33 @@ recorded in the Outcome, and re-registering an old source then yields a new rend
 with its own digest, which re-ingestion handles as a changed source (§7.9).
 
 **Isolation.** Parsing a PDF is the riskiest step of ingestion, because the file comes
-from outside. The conversion runs on a blocking thread of its own under the task's
-deadline, with the input limit of §7.1 checked before parsing. A panic inside the crate
-is caught and becomes a `conversion-failed` result. A conversion that overruns its
-deadline cannot be interrupted inside the library, so the task reports
-`conversion-timeout` at once and the thread is left to finish, with at most
-`--pdf-workers` conversions, 2 by default, running at any time.
+from outside. The input limit of §7.1 is checked before parsing, and at most
+`--pdf-workers` conversions, 2 by default, run at any time. On Linux the `sparkles`
+binary runs each PDF and Office conversion in a child process of its own, which is the
+same binary started through `/proc/self/exe` with a hidden first argument, so a binary
+replaced by an upgrade is never the child of an older server. The child reads the file
+from a pipe and writes its result to another, and the server reads at most a bounded
+number of bytes of it. Before it reads the file, the child sets an address-space limit
+(`--convert-memory`, 2 GiB by default), a CPU-time limit, a file-size limit of zero
+unless OCR is configured, no core file and death with the server, and it refuses to run
+without them. Its environment is cleared except for the locale, the time zone, the
+library paths that OCR needs and `PATH`, so it holds no provider key or token. This is
+resource containment and not a sandbox, because the child runs as the server's user with
+its privileges. The arguments and the reply carry a protocol version, and a child of
+another version refuses to run. The server kills the child 250 ms after the task's
+deadline, so the task reports `conversion-timeout` and the worker slot is free again
+whatever the converter does. A child that ends without a result, through a panic or its
+memory limit, gives `conversion-failed` with status 422, and one that could not set its
+limits gives `conversion-failed` with status 500, with its exit status and the start of
+its error output in the server's log. The server starts one child when it starts, to
+check that a child can set its limits. When it cannot, every PDF and Office conversion
+is refused with that reason, and `--convert-in-process` is the way to convert without
+the limits. The conversion runs on a blocking thread of its own under the same deadline,
+with a panic caught as `conversion-failed`, in library use of the server crate, its unit
+tests, a server started with `--convert-in-process`, and on macOS, Windows and other
+platforms, where `RLIMIT_AS` is not enforced or does not exist. A conversion on a thread
+that overruns its deadline cannot be interrupted, so the task reports
+`conversion-timeout` at once and the thread is left to finish, holding its slot.
 
 ### 7.2 Sources, renditions and chunks
 
@@ -1703,9 +1726,26 @@ header, 20 sample rows and the ingest profile, and drafts a C05 mapping, either 
 metadata or a CONSTRUCT template. A person reviews the mapping and a preview of the
 first 100 converted rows, and C05 then converts the whole file deterministically
 through an upload with a dry run. The model's cost is therefore independent of the
-file's length, and the conversion is reproducible. Entity linking runs on the values of
-columns that the mapping maps to IRIs of existing classes, and the mapping can use the
-link table as a lookup.
+file's length, and the conversion is reproducible.
+
+Entity linking runs on the values of the columns that the draft maps to IRIs of an
+existing class. The class comes from the predicate's declared range in the profile, or
+from the model's `linkClass` for that column when the profile declares none, and a
+column with neither mints its IRIs. The converter counts the distinct values of each
+such column, and the server links the most frequent ones with `link_entities` in batches
+of 20, at most 500 values for a column, 5 columns and 50 calls for a draft. Values that
+differ only in case and spacing are linked once. What was not tried is minted, and a note
+says how many were. The calls pass `vectors: false`, so linking reads labels and the
+full-text index only and no cell value is embedded by a provider.
+
+An exact link is written into the column's lookup in the mapping (C05 §3.7), so the
+preview and the upload write the existing entity's IRI, and a second upload of the same
+file with the same mapping links the same way. An ambiguous value is listed in the
+draft's `links` with its number of rows and its candidates, and stays a minted IRI until
+a person chooses. The choice is made by adding an entry to the lookup in the mapping and
+running the dry run again. The draft shows the candidates' labels, but the mapping holds
+only IRIs and the values of the file. The lookup is a snapshot of the dataset as the
+drafting person could read it, and the draft reports the commit it linked against.
 
 ### 7.9 Re-ingestion and supersession
 
@@ -2106,6 +2146,11 @@ its roots from flags or from the harness's own environment variables, such as
 | Codex | `~/.codex/AGENTS.md` or `AGENTS.override.md`, and `AGENTS.md`, `AGENTS.override.md` or a configured fallback name in each directory from the repository root down | Instructions in plain Markdown. Codex reads one file per directory and concatenates them from the root down. | `codex` instructions |
 | Codex | `~/.codex/sessions/YYYY/MM/DD/rollout-<time>-<id>.jsonl` | Session logs, one object per line with `timestamp`, `type` and `payload`. The types include `session_meta` with the id, `cwd` and git state, `turn_context`, `response_item` for messages, reasoning and tool calls, and `event_msg`. | `codex` transcript, opt-in |
 | Codex | `~/.codex/memories/` | Memories that Codex generates from idle sessions when its memories feature is on. OpenAI documents the directory but not the files' format, and asks people not to edit them. | `generic`, read-only, kind `generated` |
+| Gemini CLI | `~/.gemini/tmp/<project hash>/chats/session-<time>-<id>.jsonl`, and `GEMINI_CLI_HOME` moves `~/.gemini` | Session recordings. The project hash is the SHA-256 of the project's root path. The first record holds `sessionId`, `projectHash`, `startTime` and `lastUpdated`, and each message record has `id`, `timestamp`, `type` (`user` or `gemini`), `content`, `model`, `thoughts` and `toolCalls`. Records that start with `$` rewind or patch the log. Older versions wrote one JSON object to a `.json` file, and `/chat save` writes a checkpoint of `{role, parts}` contents. | `gemini-cli` transcript, opt-in |
+| Cursor | `~/.cursor/projects/<project>/agent-transcripts/<id>/<id>.jsonl` or `<id>.txt` | The directory name is the project's path with every character other than a letter or a digit turned into `-`. A JSONL entry has a `role` and a `message` with `text` and `tool_use` blocks, and the person's words are inside `<user_query>` tags. The older text form starts each block with `user:` or `A:` and marks reasoning and tools with `[Thinking]`, `[Tool call]` and `[Tool result]`. Cursor's SQLite chat store is not read. | `cursor` transcript, opt-in |
+| GitHub Copilot | `~/.copilot/session-state/<session>/events.jsonl` and `workspace.yaml`, and `COPILOT_HOME` moves `~/.copilot` | The Copilot CLI's event log, which GitHub does not document. An event has `type`, `timestamp` and `data`. The types read are `session.start` with the context's `cwd` and branch, `user.message`, `assistant.message` and `tool.execution_complete`. Copilot Chat in an editor is not read. | `copilot` transcript, opt-in |
+| Aider | `.aider.chat.history.md` in the project, or the file `AIDER_CHAT_HISTORY_FILE` names | Markdown that Aider appends to for every run. A line `# aider chat started at DATE TIME` starts a run, lines that start with `#### ` are the person's input, lines that start with `> ` are Aider's notices, and the rest is the model's reply. | `aider` transcript, opt-in |
+| Any other transcript | A file given with `--transcript FILE` | JSON lines or one JSON value of messages with a speaker and a text, Markdown with `## User` and `## Assistant` headings, or text with `User:` and `Assistant:` lines. A file that matches none of these gives no turns and is skipped. | `generic` transcript, opt-in |
 | Others | `GEMINI.md` at the user and project scopes, `.cursor/rules/**/*.mdc`, `.cursorrules`, `.github/copilot-instructions.md`, and any Markdown file given with `--path` | Markdown, with or without YAML frontmatter. Cursor's rules carry `description`, `globs` and `alwaysApply`. | `generic` |
 
 Claude Code names a project's directory after the repository's path with each
@@ -2187,7 +2232,7 @@ Core terms and schema.org, as C17 and §7.2 do, and add a small namespace `mem:`
 | `mem:Instructions` | class, a subclass of `prov:Entity` | An instruction file such as `CLAUDE.md`, `AGENTS.md`, `GEMINI.md` or a rule. |
 | `mem:Project` | class | A repository or directory that memories belong to. |
 | `mem:Session` | class, a subclass of `prov:Activity` | One session of a harness, from its transcript. |
-| `mem:Harness` | class, a subclass of `prov:SoftwareAgent` | A harness. The vocabulary declares `mem:ClaudeCode`, `mem:Codex`, `mem:GeminiCli`, `mem:Cursor` and `mem:Generic`. |
+| `mem:Harness` | class, a subclass of `prov:SoftwareAgent` | A harness. The vocabulary declares `mem:ClaudeCode`, `mem:Codex`, `mem:GeminiCli`, `mem:Cursor`, `mem:Copilot`, `mem:Aider` and `mem:Generic`. |
 | `mem:kind` | property, literal | The kind exactly as the file states it, such as `"feedback"`, kept also when it maps to no class. |
 | `mem:harness` | property | The harness of a memory, an instruction file, a session or a source. |
 | `mem:project` | property | The project of a memory, a session or a source. |
@@ -4757,6 +4802,167 @@ fact count in the maintenance answer and the brief, and an empty inbox after the
 in the Prometheus text and the JSON snapshot. `ui/src/lib/review-count.test.ts` covers
 the badge's words and the shared count store, and `ui/tests/e2e/pages.spec.ts` the
 badges on the dataset page and the sidebar.
+
+**Roadmap item 15 partly delivered on 2026-10-13.** Office documents, the transcript
+adapters and CSV entity linking shipped, in the order of the item's bullets. Images and
+audio and video remain, and so do the follow-ups listed at the end of this section.
+
+- **Transcript adapters.** The transcript parsers moved from the server's
+  `memory_cmd/transcripts.rs` into `sparkles_memory_import::transcripts`, one module for
+  each harness with Claude Code and Codex among them. Gemini CLI, Cursor, GitHub
+  Copilot's CLI and Aider each have a module that finds the logs of a project and parses
+  them into the same sessions of turns, so redaction, the `## user` and `## assistant`
+  rendering, the size limits, the `--since` and in-progress rules, the opt-in of §8.10.7
+  and the graph layout apply to them unchanged. §8.10.1 documents each location and
+  format. The generic adapter reads any other file given with `--transcript FILE`, which
+  is no longer a hidden flag, when no specific adapter recognizes it. The adapter names
+  `gemini-cli`, `cursor`, `copilot` and `aider` select transcripts only, because their
+  instruction files already belong to the generic adapter. `mem:Copilot` and `mem:Aider`
+  join the harnesses of the vocabulary. Gemini CLI, Cursor and Copilot do not publish the
+  formats of their logs, so the adapters follow what the tools write and what other
+  readers of them accept. Each skips a line or a block it does not understand. Cursor's
+  SQLite chat store and Copilot Chat's editor storage are not read. Aider's log has no
+  session id, so its session is named after the file and a short hash of the file's path
+  below the repository, which keeps the histories of a project's directory and root
+  apart. The log does not mark which lines the person wrote, so a reply with a level-4
+  heading is read as a turn of the person and a reply line that starts with `> ` is read as
+  a notice. Cursor's text form starts a turn at any line that begins with `A:` or `user:`.
+  These are limits of the formats.
+- **CSV entity linking.** A model-drafted mapping now links its IRI columns as §7.8
+  describes. `sparkles::tabular` gained the lookup extension `urn:x-sparkles:lookup` on a
+  column (C05 §3.7), a list of `{ "rdf:value": value or values, "@id": IRI }` entries
+  that is valid CSVW and that other processors ignore, so the CLI converts with the same
+  links and other tools mint the `valueUrl` IRIs. The converter's new `tally` option
+  records the exact strings that the lookup is compared with. The draft's column schema
+  gained `linkClass`, `Vocabulary` now reads the profile's `ranges`, and the result has a
+  `links` array with, for each column, the classes, the commit, the distinct and tried
+  values, how many were linked and minted, how many had only weak candidates and the
+  ambiguous values with their candidates. The decision to keep the lookup in the mapping
+  and not in the dataset keeps C05's rule that a conversion reads nothing from the
+  target. `link_entities` gained `vectors`, which defaults to true, because the values of
+  a whole column are far more text than the 20 sample rows the model sees. The review
+  UI lists the ambiguous values and writes the candidate a person picks into the lookup.
+
+- **Office documents.** The new crate `sparkles-office` reads DOCX, PPTX, XLSX and the
+  OpenDocument text, presentation and spreadsheet formats from their XML parts with
+  `zip` and `quick-xml`, both MIT-licensed and already in the dependency tree. The
+  server uses it behind the `office` feature, which is on by default. A Word or ODT
+  document becomes Markdown with headings from the paragraph styles and outline levels,
+  lists with their numbering, tables, hyperlinks and footnotes. A presentation gets a
+  `<!-- Page N -->` marker and a `# Slide N: Title` heading for each slide, in the order
+  of the presentation, and the speaker notes follow the slide's text under `Notes:`.
+  Hidden slides are left out and keep their numbers. The marker is the page marker of
+  §7.1.1, so `spk:pageStart`, the review page and `factsByPage` work for slides without
+  a change. A line of document text that starts a comment is escaped, so a document
+  cannot forge a marker.
+- **Spreadsheets.** An XLSX or ODS upload is not converted to text. The server reads
+  each visible sheet as CSV and drafts a mapping for each one like an uploaded table
+  named `<workbook>-<sheet>.csv`. The result has the outcome `mapping-drafts`, with one
+  entry per sheet that holds the sheet's name and index, its draft and its CSV, which is
+  the file to upload with the mapping. The sheet's name and index are the marker of that
+  sheet. Cells with a date format become ISO 8601 text, and formulas give their cached
+  values. A sheet's rows get a namespace of their own that includes its position in the
+  workbook, because names that slug alike or are cut at 40 characters would otherwise
+  share one. At most 20 sheets are drafted, each draft being a model call, and a note
+  names how many were left out. Hidden sheets and sheets without data are left out, but hidden rows and
+  columns of a visible sheet are read, because they are data. Hidden slides and Word runs
+  marked as hidden text are left out as well. The comment of an ODS cell is not read into
+  its value. A sheet whose draft fails is reported with its error, and the others go on.
+- **Bounds and isolation.** The converter bounds the entries of the container, the
+  unpacked size of each part and of all parts, the nodes and depth of an XML tree, the
+  cells of a sheet and the size of the text. A ZIP bomb stops at the limit whatever its
+  headers claim, and a DOCTYPE is refused. A review of the first version found small
+  files that asked for gigabytes anyway, such as a Word list level of 4e10, one shared
+  string used by thousands of cells, a row repeated 1,000 times, or a table row whose
+  `gridSpan` pads every other row. A second review found notes and text boxes whose
+  paragraphs were collected once for every level of nesting, and ODT notes inside notes
+  that took exponential time. One output budget, `Limits::max_output`, which is 128 MiB
+  by default, now covers everything a conversion holds besides its input and XML trees,
+  which is the Markdown blocks and table slots, the sparse rows of a sheet, the shared
+  strings, the text of notes and the CSV of all sheets together. The paths that can
+  multiply the size of the input charge the budget before they allocate. Those are
+  repeated and padded cells, table slots, shared strings and the spaces of `text:s`. Each
+  paragraph of a note, a text box or a notes shape is read once however deeply its
+  elements nest. A note inside a note is left out. A third review found values that are
+  as long as a part and are copied, hashed or scanned once per reference to them. One
+  20 MiB relationship target named by 1,000 hyperlinks became 20 GB of links, one 12 MiB
+  number format named by 400,000 cell formats took hours to scan, and a style id based
+  on itself was hashed nine times per paragraph. A relationship target longer than 2,048
+  bytes and a style id, style name or relationship id longer than 256 bytes are now
+  dropped where they are read. A number format code longer than 512 bytes is not a date,
+  and each code is read once. Links are charged to the budget, and all links together
+  may not exceed the text limit, because every link ends up in the text. A link inside a
+  link is read as its text, the notes of a slide are found in one walk, and the cells of
+  a row in descending column order are sorted once instead of inserted one by one. Text
+  and CDATA children count as nodes of an XML tree. The conversion fails with
+  `too-large` when the budget is gone. The tradeoff is memory for safety. A conversion
+  may hold up to 128 MiB of output beside its input and trees, and the budget charges 32
+  bytes for each stored value while a sparse sheet row costs the process about six times
+  its charge. At most `--pdf-workers` conversions run at once. Sheets are stored
+  sparsely, a repeated row is stored once, and the rendering of a table is checked
+  against the text limit after every row. Each XML attribute counts as a node, and an
+  element with more than 1,024 attributes is refused. The conversion also stops at the
+  task's deadline. The readers read the clock every 16 steps of a walk and on every
+  charge of 64 KiB or more, instead of every 1,024 calls, so the overshoot past the
+  deadline is a bounded amount of work. The converter is not registered with the
+  server's query memory pool, which stays part of roadmap item 15's remaining work.
+- **Child processes.** These bounds come from three rounds of review and from tests,
+  and a fourth review could find another path. So the server now runs each PDF and
+  Office conversion on Linux in a child process, as §7.1.1 describes, under an
+  address-space limit of `--convert-memory` MiB, 2,048 by default, a CPU-time limit and a
+  file-size limit of zero unless OCR is configured. The server kills the child 250 ms
+  after the task's deadline, so the worker slot is released and the address space is
+  bounded whatever a converter does. Before, a PDF conversion that overran its deadline
+  kept its slot until pdf-inspector returned, which could be never. The conversion runs
+  on a thread as before in library use and the unit tests of the server crate, with
+  `--convert-in-process`, and on macOS, Windows and other platforms. macOS accepts
+  `RLIMIT_AS` without enforcing it, so a child there would promise a bound it does not
+  keep. A review of the child found that it inherited the server's environment, with its
+  provider keys, that a child unable to set its limits failed every conversion with a
+  generic error and no log line, and that a binary replaced in place would have answered
+  in another protocol. The child's environment is now an allowlist, the server probes the
+  child at start and logs and refuses with the reason, and the child is started through
+  `/proc/self/exe` with a protocol version. The NixOS VM test converts a DOCX in a child
+  under the module's system call filter and a 256 MiB limit. OCR in a child has not been
+  run, because no OCR models were at hand. PDFium and ONNX Runtime map their libraries
+  and model weights into the address space, so a server with OCR should give
+  `--convert-memory` at least 4,096 MiB until a measurement says otherwise. The child sets its limits on itself before it reads the file and refuses to
+  run without them, so the server starts it with `posix_spawn` and does not copy its own
+  page tables, as a `fork` would. The child is given `MIMALLOC_ARENA_RESERVE=64MiB`,
+  because mimalloc otherwise reserves 1 GiB of address space before the limit is set.
+  The flag takes at least 256 MiB, below which the binary cannot start its threads. A
+  build without mimalloc uses glibc's allocator, which reserves 64 MiB of address space
+  for each thread's arena, so a small limit leaves fewer threads room there. The
+  tradeoff is latency and memory for containment. A child costs one process start per
+  conversion, and the server may use up to `--pdf-workers` times `--convert-memory` of
+  address space for conversions on top of its own. On a shared 16-core Linux laptop,
+  converting the 5 KB DOCX fixture took a median of 41 µs in process, or 85 µs with the
+  thread the in-process path starts, and a median of 8.5 ms with a 90th percentile of
+  9.5 ms through a child of the release binary, measured 200 times with the ignored test
+  `ingest::isolate::tests::overhead`, and BENCHMARKS.md records them. Starting
+  `/bin/true` took 2 to 4 ms on the same machine, so most of the cost is starting a
+  process. The cost is small next to the model calls of an ingestion and is paid once per
+  document. The converter has a cargo-fuzz target in
+  `crates/sparkles-office/fuzz`, started with `mise run office:fuzz`, and its normal
+  tests convert 400 seeded mutations of every format's fixture. The fuzz corpus starts
+  from the fixtures and from the amplification shapes of `tests/budget.rs` at the target's
+  size, and the target runs with an output budget of 8 MiB. A first run of 90 seconds
+  executed 435,000 inputs and found nothing. After the budget, a second run of 90 seconds
+  with two jobs on a shared machine executed 296,000 inputs and found nothing.
+- **Deviations.** The converter is a workspace crate rather than a module of the server,
+  so that the fuzz target does not need to build the server. A picture inside a document
+  contributes its alt text as `[Image: …]`. The converter can return the pictures
+  themselves, through `Converted.images` and the `max_images` option, which is tested.
+  Every call site passes 0, so nothing consumes the pictures until the `describe` role
+  exists.
+- **Follow-ups.** The converter should register its peak memory with the server's query
+  memory pool. A workbook should apply the `confirmTokens` estimate to the total of its
+  sheets. Entity linking should report every variant of an ambiguous group, write the
+  choice for all of them, list the first exact links for review and pin `atCommit` from
+  the first batch. A test should import a Copilot or Aider session into a dataset that
+  was created before those harnesses joined the vocabulary. These stay under roadmap
+  item 15. Lexical linking also cannot tell two entities with the same label apart, which
+  is a limit of the method.
 
 ### Roadmap follow-ups (2026-10-12)
 

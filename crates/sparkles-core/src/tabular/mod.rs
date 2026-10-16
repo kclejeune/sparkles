@@ -95,7 +95,13 @@ pub struct Options {
     /// Budgets and timeout of template evaluation.
     pub query: QueryOptions,
     pub check: Option<Check>,
+    /// Columns (by name or header) whose cell values are counted into
+    /// [`Stats::tallies`], with at most [`TALLY_DISTINCT`] distinct values for each.
+    pub tally: Vec<String>,
 }
+
+/// The most distinct values a tallied column keeps.
+pub const TALLY_DISTINCT: usize = 100_000;
 
 impl Options {
     pub fn new(mapping: Mapping, name: impl Into<String>) -> Options {
@@ -110,6 +116,7 @@ impl Options {
             limits: Limits::default(),
             query: QueryOptions::default(),
             check: None,
+            tally: Vec::new(),
         }
     }
 
@@ -128,6 +135,18 @@ pub struct Stats {
     pub rows: u64,
     pub triples: u64,
     pub warnings: Vec<String>,
+    /// The values of the columns of [`Options::tally`], in that order: each as the
+    /// converter sees it after the cell steps of C05 §3.3, with its count.
+    pub tallies: Vec<Tally>,
+}
+
+/// The distinct cell values of one column.
+#[derive(Clone, Debug, Default)]
+pub struct Tally {
+    pub column: String,
+    pub values: std::collections::HashMap<String, u64>,
+    /// values past the limit that were not kept
+    pub dropped: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -458,6 +477,7 @@ struct Column {
     ordered: bool,
     required: bool,
     separator: Option<String>,
+    lookup: Option<std::collections::HashMap<String, NamedNode>>,
 }
 
 /// A parsed cell.
@@ -604,7 +624,23 @@ fn columns(
             ordered: p.ordered.unwrap_or(false),
             required: p.required.unwrap_or(false),
             separator: p.separator.clone().flatten(),
+            lookup: c.lookup.clone(),
         });
+        if c.lookup.is_some() {
+            let col = out.last().expect("pushed");
+            if col.value.is_none() {
+                return Err(format!(
+                    "column {}: a lookup needs a valueUrl for the values it does not list",
+                    col.decoded
+                ));
+            }
+            if col.separator.is_some() {
+                return Err(format!(
+                    "column {}: a lookup cannot be combined with a separator",
+                    col.decoded
+                ));
+            }
+        }
     }
     Ok(out)
 }
@@ -706,6 +742,17 @@ impl Table {
             Slot::Name => Value::Str(Cow::Borrowed(&self.columns[col].decoded)),
             Slot::Undef => Value::Undef,
         }
+    }
+
+    /// The IRI of a column's cell: the lookup's, or the `valueUrl` expanded.
+    fn object(&self, c: &Column, t: &Tpl, r: &RowCtx<'_>, col: usize) -> Result<NamedNode, String> {
+        if let Some(l) = &c.lookup
+            && let Some(Cell::One(lex)) = r.cells.get(col)
+            && let Some(iri) = l.get(lex)
+        {
+            return Ok(iri.clone());
+        }
+        self.iri(t, r, col)
     }
 
     /// Expand a template into an absolute IRI.
@@ -877,6 +924,19 @@ pub fn convert(
         }
         cols[i].required = true;
     }
+    let tally_at: Vec<Option<usize>> = opts
+        .tally
+        .iter()
+        .map(|n| cols.iter().position(|c| &c.decoded == n || &c.name == n))
+        .collect();
+    stats.tallies = opts
+        .tally
+        .iter()
+        .map(|n| Tally {
+            column: n.clone(),
+            ..Default::default()
+        })
+        .collect();
     let table = Table {
         columns: cols,
         url: table_url,
@@ -932,6 +992,17 @@ pub fn convert(
                 ))
             })?;
             cells.push(cell);
+        }
+        for (t, at) in stats.tallies.iter_mut().zip(&tally_at) {
+            if let Some(Cell::One(v)) = at.and_then(|i| cells.get(i)) {
+                if let Some(n) = t.values.get_mut(v) {
+                    *n += 1;
+                } else if t.values.len() < TALLY_DISTINCT {
+                    t.values.insert(v.clone(), 1);
+                } else {
+                    t.dropped += 1;
+                }
+            }
         }
         let r = RowCtx {
             cells: &cells,
@@ -997,7 +1068,7 @@ fn bind(table: &Table, c: &Column, i: usize, r: &RowCtx<'_>) -> Result<Option<Gr
         Cell::Null => None,
         Cell::List(_, raw) => Some(GroundTerm::Literal(Literal::new_simple_literal(raw))),
         Cell::One(lex) => Some(match &c.value {
-            Some(t) => GroundTerm::NamedNode(table.iri(t, r, i).map_err(|m| at(r, i, c, m))?),
+            Some(t) => GroundTerm::NamedNode(table.object(c, t, r, i).map_err(|m| at(r, i, c, m))?),
             None => GroundTerm::Literal(c.datatype.literal(lex.clone(), c.lang.as_deref())),
         }),
     })
@@ -1071,7 +1142,7 @@ fn emit_row(
             }
         };
         if let Some(t) = &c.value {
-            let o = table.iri(t, r, i).map_err(err)?;
+            let o = table.object(c, t, r, i).map_err(err)?;
             out(Triple::new(subject, predicate, o), sink)?;
             continue;
         }

@@ -746,6 +746,24 @@ more during its build, the median writer lock at the switch is 4.9 ms without a 
 index, 64.5 ms when the spatial base is built at the switch, and 25.3 ms when it is built
 with the generation, which is the default.
 
+### Document conversion in a child process
+
+The server converts each PDF and Office document in a child process with resource limits
+(spec C18 §7.1.1). This is a development measurement on a shared 16-core Linux laptop,
+not a quiet-machine benchmark. Each figure is over 200 conversions of the 5 KB DOCX
+fixture with the release binary, made by the ignored test `ingest::isolate::tests::overhead`.
+
+| 5 KB DOCX | Median | 90th percentile |
+|---|---:|---:|
+| In process | 41 µs | 54 µs |
+| On a thread, the fallback path | 85 µs | 184 µs |
+| In a child process | 8.5 ms | 9.5 ms |
+
+Starting `/bin/true` took 2 to 4 ms on the same machine, so most of the child's cost is
+starting a process. The child adds about 10 ms to each document, which is small next to
+the model calls of an ingestion. Each running conversion may also use up to
+`--convert-memory`, 2 GiB by default, of address space beside the server.
+
 ## Writes and updates
 
 Every Sparkles write is durable when it is acknowledged: the WAL record and any new

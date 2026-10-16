@@ -45,6 +45,8 @@ struct LinkArgs {
     at_commit: Option<u64>,
     at: Option<Value>,
     timeout_seconds: Option<f64>,
+    /// false leaves the vector index out, whatever indexes the dataset has
+    vectors: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -233,7 +235,10 @@ impl Tools<'_> {
         let ctx = self.ctx(&names, timeout.as_secs_f64());
         let deadline = self.call.arrived + timeout;
         let r = self.reader(&ds, a.at_commit, a.at.as_ref(), a.reasoning, deadline, &ctx)?;
-        let setup = self.link_setup(&ds, &r, labels, graphs, &ctx)?;
+        let mut setup = self.link_setup(&ds, &r, labels, graphs, &ctx)?;
+        if a.vectors == Some(false) {
+            setup.vector = None;
+        }
         let mut text_used = false;
         let mut vector_used = false;
         let mut terms = Terms::new(&prefixes, 300);
