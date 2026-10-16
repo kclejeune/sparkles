@@ -49,12 +49,19 @@ pub fn convert(pkg: &mut Package, limits: &Limits) -> Result<Document, Error> {
     let rels = pkg.rels("word/document.xml");
     let styles = styles(pkg, limits);
     let numbering = numbering(pkg, limits);
-    let footnotes = notes(pkg, limits, "word/footnotes.xml", "footnote");
-    let endnotes = notes(pkg, limits, "word/endnotes.xml", "endnote");
+    let mut doc = Doc::new(limits);
+    let footnotes = notes(
+        pkg,
+        limits,
+        "word/footnotes.xml",
+        "footnote",
+        &mut doc.budget,
+    )?;
+    let endnotes = notes(pkg, limits, "word/endnotes.xml", "endnote", &mut doc.budget)?;
     let title = title(pkg, limits);
     let mut cx = Cx {
         pkg,
-        doc: Doc::new(limits),
+        doc,
         rels,
         styles,
         numbering,
@@ -163,16 +170,26 @@ fn numbering(pkg: &mut Package, limits: &Limits) -> Numbering {
     out
 }
 
-/// The text of each footnote or endnote, by id.
-fn notes(pkg: &mut Package, limits: &Limits, part: &str, tag: &str) -> HashMap<String, String> {
+/// The text of each footnote or endnote, by id. Each paragraph is read once and charged
+/// to the budget before it is kept.
+fn notes(
+    pkg: &mut Package,
+    limits: &Limits,
+    part: &str,
+    tag: &str,
+    budget: &mut Budget,
+) -> Result<HashMap<String, String>, Error> {
     let mut out = HashMap::new();
     let Ok(Some(b)) = pkg.read(part) else {
-        return out;
+        return Ok(out);
     };
-    let Ok(root) = xml::parse(&b, limits) else {
-        return out;
+    let root = match xml::parse(&b, limits) {
+        Ok(r) => r,
+        Err(Error::Timeout) => return Err(Error::Timeout),
+        Err(_) => return Ok(out),
     };
     for n in root.elements().filter(|n| n.name == tag) {
+        budget.tick()?;
         if matches!(
             n.attr("type"),
             Some("separator" | "continuationSeparator" | "continuationNotice")
@@ -180,15 +197,17 @@ fn notes(pkg: &mut Package, limits: &Limits, part: &str, tag: &str) -> HashMap<S
             continue;
         }
         let Some(id) = n.attr("id") else { continue };
-        let text: Vec<String> = n
-            .descendants("p")
-            .iter()
-            .map(|p| plain_text(p))
-            .filter(|t| !t.trim().is_empty())
-            .collect();
+        let mut text: Vec<String> = Vec::new();
+        for p in n.descendants("p") {
+            let t = plain_text(p);
+            if !t.trim().is_empty() {
+                budget.charge(t.len() + SLOT)?;
+                text.push(t);
+            }
+        }
         out.insert(id.to_string(), text.join(" "));
     }
-    out
+    Ok(out)
 }
 
 /// Whether a run is hidden text (`w:vanish` in its properties, unless it says `0` or
@@ -213,6 +232,9 @@ fn plain_runs(n: &Node, out: &mut String) {
             "tab" | "br" | "cr" => out.push(' '),
             "noBreakHyphen" => out.push('-'),
             "del" | "moveFrom" | "drawing" | "pict" | "pPr" | "rPr" | "Fallback" => {}
+            // a paragraph inside a paragraph is read as a paragraph of its own by whoever
+            // lists them, so that its text is not copied into every paragraph around it
+            "p" => {}
             "r" if hidden(c) => {}
             _ => plain_runs(c, out),
         }
@@ -242,6 +264,7 @@ impl Cx<'_, '_> {
     /// controls.
     fn blocks(&mut self, parent: &Node, max: usize) -> Result<(), Error> {
         for n in parent.elements() {
+            self.doc.budget.tick()?;
             match n.name.as_str() {
                 "p" => self.para(n)?,
                 "tbl" => self.table(n)?,
@@ -448,7 +471,7 @@ impl Cx<'_, '_> {
 
     fn drawing(&mut self, d: &Node, extra: &mut Vec<Block>) {
         // text boxes
-        for tb in d.descendants("txbxContent") {
+        for tb in d.outermost("txbxContent") {
             for p in tb.descendants("p") {
                 let t = plain_text(p);
                 if !t.is_empty() {
@@ -490,6 +513,7 @@ impl Cx<'_, '_> {
 /// empty ones that a `gridSpan` adds included, so a table never exists unbudgeted.
 fn table_rows(t: &Node, rows: &mut Vec<Vec<String>>, budget: &mut Budget) -> Result<(), Error> {
     for tr in t.elements().filter(|n| n.name == "tr") {
+        budget.tick()?;
         let mut row = Vec::new();
         for tc in tr.elements().filter(|n| n.name == "tc") {
             let mut parts: Vec<String> = Vec::new();

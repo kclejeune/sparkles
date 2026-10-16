@@ -249,3 +249,161 @@ fn a_deflate_bomb_stops_at_the_part_limit() {
     assert!(used < 64 << 20, "peak {used} bytes");
     assert!(matches!(r, Err(Error::TooLarge(_))), "{r:?}");
 }
+
+const P: &str = r#"xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships""#;
+
+/// `inner` inside `depth` levels of `open` and `close`.
+fn nest(open: &str, close: &str, depth: usize, inner: &str) -> String {
+    format!("{}{inner}{}", open.repeat(depth), close.repeat(depth))
+}
+
+// Re-review N2: text collected with `descendants` where an element contains another of its
+// kind was copied once for every level. A 2 MiB paragraph under 190 levels is 380 MiB.
+const LEAF: usize = 2 << 20;
+
+#[test]
+fn n2_nested_paragraphs_in_footnotes() {
+    let _g = serial();
+    let leaf = format!("<w:r><w:t>{}</w:t></w:r>", "a".repeat(LEAF));
+    let foot = format!(
+        r#"<w:footnotes {W}><w:footnote w:id="2">{}</w:footnote></w:footnotes>"#,
+        nest("<w:p>", "</w:p>", 190, &leaf)
+    );
+    let doc = format!(
+        r#"<w:document {W}><w:body><w:p><w:r><w:t>x</w:t></w:r><w:r><w:footnoteReference w:id="2"/></w:r></w:p></w:body></w:document>"#
+    );
+    let f = zip(&[("word/document.xml", &doc), ("word/footnotes.xml", &foot)]);
+    let (r, used) = peak(|| to_markdown(&f, Format::Docx, &Limits::default()));
+    assert!(used < BOUND, "peak {used} bytes");
+    assert!(refused_or_ok(&r), "{r:?}");
+}
+
+#[test]
+fn n2_nested_text_boxes() {
+    let _g = serial();
+    let leaf = format!("<w:p><w:r><w:t>{}</w:t></w:r></w:p>", "a".repeat(LEAF));
+    let doc = format!(
+        r#"<w:document {W}><w:body><w:p><w:r><w:drawing>{}</w:drawing></w:r></w:p></w:body></w:document>"#,
+        nest("<w:txbxContent>", "</w:txbxContent>", 190, &leaf)
+    );
+    let f = zip(&[("word/document.xml", &doc)]);
+    let (r, used) = peak(|| to_markdown(&f, Format::Docx, &Limits::default()));
+    assert!(used < BOUND, "peak {used} bytes");
+    assert!(refused_or_ok(&r), "{r:?}");
+}
+
+#[test]
+fn n2_nested_paragraphs_in_odp_notes() {
+    let _g = serial();
+    let c = format!(
+        r#"<office:document-content {O}><office:body><office:presentation><draw:page><presentation:notes><draw:frame presentation:class="notes"><draw:text-box>{}</draw:text-box></draw:frame></presentation:notes></draw:page></office:presentation></office:body></office:document-content>"#,
+        nest("<text:p>", "</text:p>", 190, &"a".repeat(LEAF))
+    );
+    let f = zip(&[
+        (
+            "mimetype",
+            "application/vnd.oasis.opendocument.presentation",
+        ),
+        ("content.xml", &c),
+    ]);
+    let (r, used) = peak(|| to_markdown(&f, Format::Odp, &Limits::default()));
+    assert!(used < BOUND, "peak {used} bytes");
+    assert!(refused_or_ok(&r), "{r:?}");
+}
+
+#[test]
+fn n2_nested_shapes_in_pptx_notes() {
+    let _g = serial();
+    const REL: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+    let pres = format!(
+        r#"<p:presentation {P}><p:sldIdLst><p:sldId id="256" r:id="rId2"/></p:sldIdLst></p:presentation>"#
+    );
+    let prels = format!(
+        r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId2" Type="{REL}/slide" Target="slides/slide1.xml"/></Relationships>"#
+    );
+    let slide = format!(r#"<p:sld {P}><p:cSld><p:spTree/></p:cSld></p:sld>"#);
+    let srels = format!(
+        r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{REL}/notesSlide" Target="../notesSlides/notesSlide1.xml"/></Relationships>"#
+    );
+    let ph = r#"<p:nvSpPr><p:nvPr><p:ph type="body"/></p:nvPr></p:nvSpPr>"#;
+    let leaf = format!(
+        "<p:txBody><a:p><a:r><a:t>{}</a:t></a:r></a:p></p:txBody>",
+        "a".repeat(LEAF)
+    );
+    let shapes = nest(&format!("<p:sp>{ph}"), "</p:sp>", 190, &leaf);
+    let notes = format!(r#"<p:notes {P}><p:cSld><p:spTree>{shapes}</p:spTree></p:cSld></p:notes>"#);
+    let f = zip(&[
+        ("ppt/presentation.xml", &pres),
+        ("ppt/_rels/presentation.xml.rels", &prels),
+        ("ppt/slides/slide1.xml", &slide),
+        ("ppt/slides/_rels/slide1.xml.rels", &srels),
+        ("ppt/notesSlides/notesSlide1.xml", &notes),
+    ]);
+    let (r, used) = peak(|| to_markdown(&f, Format::Pptx, &Limits::default()));
+    assert!(used < BOUND, "peak {used} bytes");
+    assert!(refused_or_ok(&r), "{r:?}");
+}
+
+// Re-review N1: a note inside a note body was walked once by the outer note and once more by
+// the paragraph that holds it, so the work doubled with every level and no deadline check
+// ended it. The conversion runs on a thread so that a hang fails the test.
+#[test]
+fn n1_nested_footnotes_end() {
+    let _g = serial();
+    let mut inner = String::from("leaf");
+    for _ in 0..40 {
+        inner = format!(
+            "<text:p>x<text:note><text:note-body>{inner}</text:note-body></text:note></text:p>"
+        );
+    }
+    let c = format!(
+        r#"<office:document-content {O}><office:body><office:text>{inner}</office:text></office:body></office:document-content>"#
+    );
+    let f = zip(&[
+        ("mimetype", "application/vnd.oasis.opendocument.text"),
+        ("content.xml", &c),
+    ]);
+    let limits = Limits {
+        deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(5)),
+        ..Limits::default()
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(to_markdown(&f, Format::Odt, &limits));
+    });
+    let r = rx
+        .recv_timeout(std::time::Duration::from_secs(15))
+        .expect("the conversion did not end");
+    assert!(
+        matches!(r, Ok(_) | Err(Error::TooLarge(_) | Error::Timeout)),
+        "{r:?}"
+    );
+}
+
+// Re-review N5: a deflate bomb whose header says the part is 1 KiB, so that only the
+// bounded read (`take(cap + 1)`) stops it.
+#[test]
+fn a_deflate_bomb_with_a_lying_header_stops_at_the_part_limit() {
+    let _g = serial();
+    let doc = format!(
+        "<w:document {W}><w:body><w:p><w:r><w:t>{}</w:t></w:r></w:p></w:body></w:document>",
+        "a".repeat(100 << 20)
+    );
+    let mut f = zip(&[("word/document.xml", &doc)]);
+    drop(doc);
+    // the uncompressed size is at offset 22 of a local header and 24 of a directory entry
+    let mut patched = 0;
+    for i in 0..f.len().saturating_sub(30) {
+        let at = match &f[i..i + 4] {
+            b"PK\x03\x04" => 22,
+            b"PK\x01\x02" => 24,
+            _ => continue,
+        };
+        f[i + at..i + at + 4].copy_from_slice(&1024u32.to_le_bytes());
+        patched += 1;
+    }
+    assert_eq!(patched, 2);
+    let (r, used) = peak(|| to_markdown(&f, Format::Docx, &Limits::default()));
+    assert!(used < 64 << 20, "peak {used} bytes");
+    assert!(matches!(r, Err(Error::TooLarge(_))), "{r:?}");
+}

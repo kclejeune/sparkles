@@ -64,6 +64,25 @@ impl Node {
         }
     }
 
+    /// The descendant elements named `name` that are not inside another one, in document
+    /// order. A matching element's own descendants are not searched, so an element that
+    /// holds another of its kind is listed once and its text is read once.
+    pub fn outermost(&self, name: &str) -> Vec<&Node> {
+        let mut out = Vec::new();
+        self.collect_outermost(name, &mut out);
+        out
+    }
+
+    fn collect_outermost<'a>(&'a self, name: &str, out: &mut Vec<&'a Node>) {
+        for n in self.elements() {
+            if n.name == name {
+                out.push(n);
+            } else {
+                n.collect_outermost(name, out);
+            }
+        }
+    }
+
     /// The first descendant element named `name`.
     pub fn find(&self, name: &str) -> Option<&Node> {
         for n in self.elements() {

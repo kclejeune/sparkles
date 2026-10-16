@@ -29,6 +29,8 @@ struct Cx<'p, 'a> {
     /// list style name to the ordered flag of each level
     list_styles: HashMap<String, Vec<bool>>,
     footnotes: Vec<(String, String)>,
+    /// how many note bodies the walk is inside
+    in_note: usize,
 }
 
 pub fn text(pkg: &mut Package, limits: &Limits) -> Result<Document, Error> {
@@ -126,11 +128,13 @@ impl<'p, 'a> Cx<'p, 'a> {
             doc: Doc::new(limits),
             list_styles,
             footnotes: Vec::new(),
+            in_note: 0,
         }
     }
 
     fn blocks(&mut self, parent: &Node, max: usize) -> Result<(), Error> {
         for n in parent.elements() {
+            self.doc.budget.tick()?;
             match n.name.as_str() {
                 "h" => {
                     let level = n
@@ -196,6 +200,7 @@ impl<'p, 'a> Cx<'p, 'a> {
                 continue;
             }
             for c in item.elements() {
+                self.doc.budget.tick()?;
                 match c.name.as_str() {
                     "p" | "h" => {
                         let mut extra = Vec::new();
@@ -228,6 +233,7 @@ impl<'p, 'a> Cx<'p, 'a> {
     /// included, is charged to the budget before it is pushed.
     fn table_rows(&mut self, t: &Node, rows: &mut Vec<Vec<String>>) -> Result<(), Error> {
         for n in t.elements() {
+            self.doc.budget.tick()?;
             match n.name.as_str() {
                 "table-row" => {
                     let mut row = Vec::new();
@@ -297,6 +303,7 @@ impl<'p, 'a> Cx<'p, 'a> {
         in_notes: bool,
     ) -> Result<(), Error> {
         for n in parent.elements() {
+            self.doc.budget.tick()?;
             match n.name.as_str() {
                 "frame" => {
                     let class = n.attr("class").unwrap_or("");
@@ -399,6 +406,7 @@ impl<'p, 'a> Cx<'p, 'a> {
         out: &mut String,
     ) -> Result<(), Error> {
         for c in &n.children {
+            self.doc.budget.tick()?;
             match c {
                 xml::Child::Text(t) => {
                     // runs of white space are one space in ODF
@@ -443,19 +451,34 @@ impl<'p, 'a> Cx<'p, 'a> {
                             out.push_str(&inner);
                         }
                     }
+                    // a note inside a note is not legal and is left out, which also keeps
+                    // the walk linear: its paragraphs are listed with the outer note's
+                    "note" if self.in_note > 0 => {}
+                    // a paragraph inside a paragraph is read as one of its own by whoever
+                    // lists the paragraphs, so that its text is not copied into every
+                    // paragraph around it
+                    "p" | "h" => {}
                     "note" => {
                         let id = self.footnotes.len() + 1;
                         let label = format!("fn{id}");
                         let mut body: Vec<String> = Vec::new();
                         if let Some(b) = e.first("note-body") {
+                            self.in_note += 1;
                             for p in b.descendants("p") {
                                 let mut x = Vec::new();
-                                let t = self.inline(p, true, &mut x)?;
+                                let t = match self.inline(p, true, &mut x) {
+                                    Ok(t) => t,
+                                    Err(e) => {
+                                        self.in_note -= 1;
+                                        return Err(e);
+                                    }
+                                };
                                 let t = t.trim();
                                 if !t.is_empty() {
                                     body.push(t.to_string());
                                 }
                             }
+                            self.in_note -= 1;
                         }
                         if !body.is_empty() && self.footnotes.len() < 1000 {
                             out.push_str(&format!("[^{label}]"));

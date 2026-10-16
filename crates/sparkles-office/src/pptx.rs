@@ -9,7 +9,7 @@ use crate::md::{self, Block, Doc};
 use crate::package::{Package, Rel};
 use crate::xml::{self, Node};
 use crate::{Document, Error, Limits};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub fn convert(pkg: &mut Package, limits: &Limits) -> Result<Document, Error> {
     let bytes = pkg.need("ppt/presentation.xml")?;
@@ -52,7 +52,7 @@ pub fn convert(pkg: &mut Package, limits: &Limits) -> Result<Document, Error> {
             s.shapes(tree)?;
         }
         let Slide { title, blocks, .. } = s;
-        let notes_text = notes_of(pkg, limits, &srels);
+        let notes_text = notes_of(pkg, limits, &srels, &mut doc.budget)?;
         doc.push(Block::Page(n))?;
         let heading = match title.as_deref().map(md::cell).filter(|t| !t.is_empty()) {
             Some(t) => format!("Slide {n}: {t}"),
@@ -89,33 +89,48 @@ pub fn convert(pkg: &mut Package, limits: &Limits) -> Result<Document, Error> {
 }
 
 /// The paragraphs of a slide's speaker notes.
-fn notes_of(pkg: &mut Package, limits: &Limits, rels: &HashMap<String, Rel>) -> Vec<String> {
+fn notes_of(
+    pkg: &mut Package,
+    limits: &Limits,
+    rels: &HashMap<String, Rel>,
+    budget: &mut Budget,
+) -> Result<Vec<String>, Error> {
     let Some(r) = rels
         .values()
         .find(|r| r.kind == "notesSlide" && !r.external)
     else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let Ok(Some(b)) = pkg.read(&r.target) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
-    let Ok(root) = xml::parse(&b, limits) else {
-        return Vec::new();
+    let root = match xml::parse(&b, limits) {
+        Ok(r) => r,
+        Err(Error::Timeout) => return Err(Error::Timeout),
+        Err(_) => return Ok(Vec::new()),
     };
     let mut out = Vec::new();
+    // a shape inside a shape lists the paragraphs of the inner one again, so each
+    // paragraph is read once
+    let mut seen: HashSet<*const Node> = HashSet::new();
     for sp in root.descendants("sp") {
+        budget.tick()?;
         let Some(ph) = placeholder(sp) else { continue };
         if ph.attr("type") != Some("body") {
             continue;
         }
         for p in sp.descendants("p") {
+            if !seen.insert(p as *const Node) {
+                continue;
+            }
             let t = para_text(p, &HashMap::new(), true);
             if !t.trim().is_empty() {
+                budget.charge(t.len() + SLOT)?;
                 out.push(t.trim().to_string());
             }
         }
     }
-    out
+    Ok(out)
 }
 
 fn placeholder(sp: &Node) -> Option<&Node> {
@@ -133,6 +148,7 @@ struct Slide<'a, 'p, 'd> {
 impl Slide<'_, '_, '_> {
     fn shapes(&mut self, tree: &Node) -> Result<(), Error> {
         for n in tree.elements() {
+            self.doc.budget.tick()?;
             match n.name.as_str() {
                 "sp" => self.shape(n),
                 "grpSp" => self.shapes(n)?,
