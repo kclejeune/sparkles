@@ -305,7 +305,9 @@ that work by priority and links each item to its design spec.
   typing when the process is killed or exits without closing the store, so after that the
   first writes to a recursive schema over a large connected graph may be validated in
   full. A typing file is used only for the schema copy it was written for, and a file of
-  another version is discarded. [Roadmap](ROADMAP.md) items 48, 54, 78.
+  another version is discarded. A ShEx schema copy that is edited outside Sparkles is
+  compiled and trusted, because the guard does not check the copy against the digest that
+  it recorded. [Roadmap](ROADMAP.md) items 48, 54, 78, 83.
 * **Formats and change logs.** TriX, RDF Thrift, RDF Protobuf and RDF/JSON are read and
   written by the server, `sparkles load`, `sparkles convert`, the Python bindings and the
   library's `Dataset::load_file` and `dump`. The loader reads them by rewriting each file
