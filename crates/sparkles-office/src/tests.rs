@@ -156,7 +156,8 @@ fn refusals() {
         to_markdown(b"not a zip", Format::Docx, &lim()),
         Err(Error::Corrupt(_))
     ));
-    // a part that unpacks past the limit, whatever the header says
+    // a stored part larger than the limit; a deflate bomb, whose header cannot be trusted
+    // to name its size, is `a_deflate_bomb_stops_at_the_part_limit` in `tests/budget.rs`
     let big = format!(
         "<w:document {W}><w:body><w:p><w:r><w:t>{}</w:t></w:r></w:p></w:body></w:document>",
         "x".repeat(4096)

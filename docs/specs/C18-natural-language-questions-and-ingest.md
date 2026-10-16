@@ -4847,8 +4847,11 @@ badges on the dataset page and the sidebar.
   the task's deadline with a panic caught as `conversion-failed`, and shares the
   `--pdf-workers` slots with PDF conversion. The converter has a cargo-fuzz target in
   `crates/sparkles-office/fuzz`, started with `mise run office:fuzz`, and its normal
-  tests convert 400 seeded mutations of every format's fixture. A first run of 90
-  seconds executed 435,000 inputs and found nothing.
+  tests convert 400 seeded mutations of every format's fixture. The fuzz corpus starts
+  from the fixtures and from the amplification shapes of `tests/budget.rs` at the target's
+  size, and the target runs with an output budget of 8 MiB. A first run of 90 seconds
+  executed 435,000 inputs and found nothing. After the budget, a second run of 90 seconds
+  with two jobs on a shared machine executed 296,000 inputs and found nothing.
 - **Deviations.** The converter is a workspace crate rather than a module of the server,
   so that the fuzz target does not need to build the server. Embedded pictures are read
   by the image path below. Until a `describe` model is configured, a picture contributes
