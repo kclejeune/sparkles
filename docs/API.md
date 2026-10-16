@@ -5200,13 +5200,21 @@ take, fails with `400`.
 | `algo:kCore` | `algo:core` | none |
 | `algo:bfs` | `algo:depth` | `source`, `graphalytics` |
 | `algo:sssp` | `algo:distance` | `source`, `graphalytics` |
-| `algo:fastRP` | `algo:embedding` | `dimension` (128, at most 16384), `iterationWeights`, `normalizationStrength`, `seed` |
+| `algo:fastRP` | `algo:embedding` | `dimension` (128, at most 16384), `iterationWeights` (0, 1, 1), `nodeSelfInfluence` (0), `normalizationStrength` (0), `seed` |
 | `algo:node2vec` | `algo:embedding` | `dimension` (128, at most 16384), `walkLength` (80), `walksPerNode` (10), `windowSize` (10), `returnFactor`, `inOutFactor`, `negativeSamples` (5), `epochs` (1), `learningRate` (0.025), `seed` |
 
 Every algorithm also has `algo:node` and `algo:summary` as outputs, and takes
 `algo:concurrency`, `algo:maxMemory` and `algo:limit` as parameters. `algo:source` is a
 constant or a variable that another pattern of the group binds. The call then runs once
 for all its values and joins its rows with the group's.
+
+FastRP takes `iterationWeights` and `nodeSelfInfluence` with the meaning they have in
+Neo4j GDS. The list has one weight for each propagation, and the weight at index `i`
+applies to the embedding after `i + 1` propagations. The default propagates three times
+and weights the second and third. `nodeSelfInfluence` is the weight of the random
+starting vectors, as if they were a 0th iteration. A call with an empty list and a zero
+`nodeSelfInfluence` is refused. In a JSON request, `"iterationWeights": []` is the empty
+list.
 
 With `algo:graphalytics true`, clustering defaults to forward edges and returns the
 coefficient without triangle counts. An explicit direction on the projection or an

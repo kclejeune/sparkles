@@ -152,3 +152,32 @@ fn fastrp_dimension_bounds() {
         0
     );
 }
+
+/// `nodeSelfInfluence` is a FastRP parameter, and an empty `iterationWeights` needs it.
+#[test]
+fn fastrp_node_self_influence_is_a_parameter() {
+    let s = trig("ex:a ex:p ex:b . ex:b ex:p ex:c .");
+    let run = |params: &str| {
+        let q = format!(
+            "{PREFIXES}SELECT ?n ?e WHERE {{ SERVICE algo:fastRP {{ [] algo:predicate ex:p ; algo:dimension 8 ; {params} algo:node ?n ; algo:embedding ?e }} }}"
+        );
+        query(s.snapshot(), &q, &QueryOptions::default())
+    };
+    assert_eq!(
+        run("algo:iterationWeights (1.0) ; algo:nodeSelfInfluence 0.5 ;")
+            .unwrap()
+            .len(),
+        3
+    );
+    assert_eq!(
+        run("algo:iterationWeights () ; algo:nodeSelfInfluence 1 ;")
+            .unwrap()
+            .len(),
+        3
+    );
+    let Err(e) = run("algo:iterationWeights () ;") else {
+        panic!("an empty list with no self influence was accepted");
+    };
+    assert!(e.to_string().contains("iterationWeights"), "{e}");
+    assert_eq!(run("").unwrap().len(), 3);
+}

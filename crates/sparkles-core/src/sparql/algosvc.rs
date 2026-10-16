@@ -98,6 +98,7 @@ pub(super) const NUMERIC: &[(&str, Kd)] = &[
     ("maxPairs", Kd::Int),
     ("dimension", Kd::Int),
     ("normalizationStrength", Kd::Float),
+    ("nodeSelfInfluence", Kd::Float),
     ("walkLength", Kd::Int),
     ("walksPerNode", Kd::Int),
     ("windowSize", Kd::Int),
@@ -226,6 +227,7 @@ impl Algo {
             Algo::FastRp => &[
                 "dimension",
                 "iterationWeights",
+                "nodeSelfInfluence",
                 "normalizationStrength",
                 "seed",
             ],
@@ -629,7 +631,14 @@ pub(super) fn algo_leaf(
                 }
             }
             "iterationWeights" => {
-                let Some(items) = super::pathsearch::list_items(o) else {
+                // `()` is rdf:nil, the empty list, which nodeSelfInfluence can stand alone with
+                let items = if matches!(o, TermPattern::NamedNode(n) if *n == oxrdf::vocab::rdf::NIL)
+                {
+                    Some(Vec::new())
+                } else {
+                    super::pathsearch::list_items(o)
+                };
+                let Some(items) = items else {
                     return Err(bad("algo:iterationWeights takes a list of numbers"));
                 };
                 iteration_weights = Some(
@@ -1874,6 +1883,7 @@ fn rows(
                         ctl,
                     )?
                     .into_output(),
+                    node_self_influence: spec.float("nodeSelfInfluence", 0.0),
                     normalization_strength: spec.float("normalizationStrength", 0.0),
                     seed: spec.int("seed", 0),
                 };

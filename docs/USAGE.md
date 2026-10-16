@@ -2051,6 +2051,12 @@ writing a query. The parameters and outputs of each algorithm are in
 [API.md](API.md#graph-algorithms), and the design is in
 [F14](specs/F14-graph-algorithms.md).
 
+FastRP reads `iterationWeights` and `nodeSelfInfluence` as Neo4j GDS does. The list has
+one weight for each propagation over the graph, and `nodeSelfInfluence` weights the
+random starting vectors. The default propagates three times and weights the second and
+third rounds, so results compare with GDS runs that use the defaults. A dimension above
+16384, the largest of a vector index, is refused for FastRP and node2vec.
+
 Weighted betweenness accepts only finite, strictly positive weights in the stored
 `f32` representation. A zero, negative or nonfinite weight refuses the whole call,
 including a SERVICE value that rounds to zero or infinity during conversion. A

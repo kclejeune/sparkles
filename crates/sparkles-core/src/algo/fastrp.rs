@@ -5,8 +5,12 @@
 //! probabilities 1/6, 1/6 and 2/3, drawn from a generator seeded by the run's seed and the
 //! node, so the vector does not depend on the number of threads. Round `k` replaces each
 //! node's vector with the weighted mean of its neighbours' vectors from round `k - 1`.
-//! The embedding is the sum of the L2-normalized rounds, each times its iteration weight,
-//! normalized once more.
+//!
+//! The parameters mean what they do in Neo4j GDS. The length of `iterationWeights` is the
+//! number of propagations, and `iterationWeights[i]` weights round `i + 1`. The random
+//! vectors are round 0, and `nodeSelfInfluence` is its weight, so it behaves like an
+//! iteration weight for a 0th iteration. The embedding is the sum of the L2-normalized
+//! rounds, each times its weight, normalized once more.
 
 use super::memory::Buffer;
 use super::{BLOCK, Control, Graph, Par, Rng, bad};
@@ -15,8 +19,10 @@ use crate::error::Result;
 #[derive(Clone, Debug)]
 pub struct Params {
     pub dimension: usize,
-    /// the weight of round 0, 1, ...: round 0 is the random vectors themselves
+    /// the weight of round 1, 2, ...: one propagation for each entry
     pub iteration_weights: Vec<f64>,
+    /// the weight of round 0, the random vectors themselves
+    pub node_self_influence: f64,
     /// the random vector of a node is scaled by its degree to this power
     pub normalization_strength: f64,
     pub seed: u64,
@@ -27,6 +33,7 @@ impl Default for Params {
         Params {
             dimension: 128,
             iteration_weights: vec![0.0, 1.0, 1.0],
+            node_self_influence: 0.0,
             normalization_strength: 0.0,
             seed: 0,
         }
@@ -49,8 +56,11 @@ pub fn run(g: &Graph, p: &Params, par: &Par, ctl: &Control) -> Result<Vec<f32>> 
     if d == 0 {
         return Err(bad("fastRP", "dimension must be above 0"));
     }
-    if p.iteration_weights.is_empty() {
-        return Err(bad("fastRP", "iterationWeights must not be empty"));
+    if p.iteration_weights.is_empty() && p.node_self_influence == 0.0 {
+        return Err(bad(
+            "fastRP",
+            "iterationWeights must not be empty unless nodeSelfInfluence is not zero",
+        ));
     }
     if d > crate::vector::MAX_DIM {
         return Err(bad(
@@ -109,9 +119,18 @@ pub fn run(g: &Graph, p: &Params, par: &Par, ctl: &Control) -> Result<Vec<f32>> 
             Ok(())
         })
     };
-    add(&mut sum, &prev, p.iteration_weights[0], par)?;
-    let mut cur = Buffer::<f32>::zeroed("fastrp-next", len, ctl)?;
-    for &weight in &p.iteration_weights[1..] {
+    add(&mut sum, &prev, p.node_self_influence, par)?;
+    // the propagated round needs a second array only when there is a propagation
+    let mut cur = Buffer::<f32>::zeroed(
+        "fastrp-next",
+        if p.iteration_weights.is_empty() {
+            0
+        } else {
+            len
+        },
+        ctl,
+    )?;
+    for &weight in &p.iteration_weights {
         ctl.check()?;
         let prev_ref = &*prev;
         par.chunks_mut(&mut cur, (BLOCK / 8).max(1) * d, |lo, chunk| {
@@ -202,6 +221,111 @@ mod tests {
             let e = run(&g, &p, &Par::single(), &Control::unlimited()).unwrap_err();
             assert!(e.to_string().contains("dimension"), "{e}");
         }
+    }
+
+    fn path3() -> Graph {
+        ugraph(3, &[(0, 1), (1, 2)])
+    }
+
+    fn embed(g: &Graph, weights: &[f64], self_influence: f64) -> Vec<f32> {
+        let p = Params {
+            dimension: 32,
+            iteration_weights: weights.to_vec(),
+            node_self_influence: self_influence,
+            seed: 5,
+            ..Params::default()
+        };
+        run(g, &p, &Par::single(), &Control::unlimited()).unwrap()
+    }
+
+    fn close(a: &[f32], b: &[f32]) {
+        assert_eq!(a.len(), b.len());
+        for (x, y) in a.iter().zip(b) {
+            assert!((x - y).abs() < 1e-5, "{a:?} != {b:?}");
+        }
+    }
+
+    /// The length of `iterationWeights` is the number of propagations, as in GDS, so the
+    /// random vectors are not weighted by `iterationWeights[0]`.
+    #[test]
+    fn one_iteration_weight_is_one_propagation() {
+        let g = path3();
+        let d = 32;
+        // the normalized random vectors, which are round 0 alone
+        let random = embed(&g, &[], 1.0);
+        let one = embed(&g, &[1.0], 0.0);
+        // node 0 has the single neighbour 1, so its first round is the random vector of 1
+        close(&one[..d], &random[d..2 * d]);
+        // node 2 has the single neighbour 1 as well
+        close(&one[2 * d..], &random[d..2 * d]);
+        // and the old reading, where the first weight scaled the random vectors, is gone
+        assert!(
+            one[..d]
+                .iter()
+                .zip(&random[..d])
+                .any(|(a, b)| (a - b).abs() > 1e-3)
+        );
+    }
+
+    #[test]
+    fn node_self_influence_weights_the_random_vectors() {
+        let g = path3();
+        let d = 32;
+        let random = embed(&g, &[], 1.0);
+        // a lone round 0 is the normalized random vector, whatever its weight
+        close(&embed(&g, &[], 3.0), &random);
+        // a zero iteration weight adds nothing
+        close(&embed(&g, &[0.0], 1.0), &random);
+        // both rounds, with equal weights, are not either one alone
+        let both = embed(&g, &[1.0], 1.0);
+        let one = embed(&g, &[1.0], 0.0);
+        assert_ne!(&both[..d], &one[..d]);
+        assert_ne!(&both[..d], &random[..d]);
+    }
+
+    #[test]
+    fn empty_iteration_weights_need_a_node_self_influence() {
+        let p = Params {
+            iteration_weights: vec![],
+            ..Params::default()
+        };
+        let e = run(&path3(), &p, &Par::single(), &Control::unlimited()).unwrap_err();
+        assert!(e.to_string().contains("iterationWeights"), "{e}");
+    }
+
+    #[test]
+    fn the_default_runs_three_propagations() {
+        // the GDS default (0.0, 1.0, 1.0) with no self influence weights A^2 and A^3
+        let g = two_cliques();
+        let p = Params {
+            dimension: 16,
+            seed: 2,
+            ..Params::default()
+        };
+        let a = run(&g, &p, &Par::single(), &Control::unlimited()).unwrap();
+        let b = run(
+            &g,
+            &Params {
+                iteration_weights: vec![0.0, 1.0, 1.0],
+                node_self_influence: 0.0,
+                ..p.clone()
+            },
+            &Par::with_threads(3),
+            &Control::unlimited(),
+        )
+        .unwrap();
+        assert_eq!(a, b);
+        let two = run(
+            &g,
+            &Params {
+                iteration_weights: vec![0.0, 1.0],
+                ..p
+            },
+            &Par::single(),
+            &Control::unlimited(),
+        )
+        .unwrap();
+        assert_ne!(a, two);
     }
 
     #[test]
