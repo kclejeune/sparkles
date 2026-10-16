@@ -1,6 +1,6 @@
 [package]
 name = "sparkles-office"
-description = "Office documents to Markdown and CSV for Sparkles ingestion: DOCX, PPTX, XLSX and the OpenDocument text, presentation and spreadsheet formats, read from their XML parts with bounds on every size"
+description = "Office documents to Markdown and CSV for Sparkles ingestion: DOCX, PPTX, XLSX and the OpenDocument text, presentation and spreadsheet formats, read from their XML parts under limits on the input and on one output budget"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

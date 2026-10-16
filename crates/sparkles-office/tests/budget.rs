@@ -1,7 +1,8 @@
 //! Amplification inputs: small files whose conversion would allocate far more than the
 //! file's size. A counting allocator caps the process at `CAP` bytes, so a converter
 //! that is not budgeted aborts here at once instead of exhausting the machine.
-//! The allocator counts every thread, so the tests take a lock and run one at a time.
+//! The allocator counts every thread, so each test takes a lock for its whole body,
+//! building its input included, and the tests run one at a time.
 
 use sparkles_office::{Error, Format, Limits, sheets, to_markdown};
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -35,10 +36,14 @@ unsafe impl GlobalAlloc for Capped {
 #[global_allocator]
 static A: Capped = Capped;
 
+/// Held by a test from its first line, so that another test's input never counts here.
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Peak bytes allocated while `f` runs, above what was live before it.
 fn peak<T>(f: impl FnOnce() -> T) -> (T, usize) {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let base = LIVE.load(Ordering::Relaxed);
     PEAK.store(base, Ordering::Relaxed);
     let r = f();
@@ -69,6 +74,7 @@ fn refused_or_ok<T>(r: &Result<T, Error>) -> bool {
 // F1: a list level of 4e10 asked `Vec::resize` for 320 GB.
 #[test]
 fn f1_huge_list_level_in_a_paragraph() {
+    let _g = serial();
     let doc = format!(
         r#"<w:document {W}><w:body><w:p><w:pPr><w:numPr><w:ilvl w:val="40000000000"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>deep</w:t></w:r></w:p></w:body></w:document>"#
     );
@@ -80,6 +86,7 @@ fn f1_huge_list_level_in_a_paragraph() {
 
 #[test]
 fn f1_huge_list_level_in_a_style() {
+    let _g = serial();
     let doc = format!(
         r#"<w:document {W}><w:body><w:p><w:pPr><w:pStyle w:val="L"/></w:pPr><w:r><w:t>deep</w:t></w:r></w:p></w:body></w:document>"#
     );
@@ -112,8 +119,8 @@ fn workbook(sheet_count: usize, shared: &str, sheet: &str) -> Vec<u8> {
 
 // F2, shared strings: one 1 MiB string named by 2,000 cells is 2 GiB of rows.
 #[test]
-#[ignore = "step 2"]
 fn f2_one_shared_string_in_many_cells() {
+    let _g = serial();
     let shared = format!("<sst {X}><si><t>{}</t></si></sst>", "a".repeat(1 << 20));
     let mut sheet = format!("<worksheet {X}><sheetData>");
     for r in 1..=2000 {
@@ -131,8 +138,8 @@ fn f2_one_shared_string_in_many_cells() {
 
 // F2, sparse rows: a row whose one cell is in column XFD is a 16,384-slot vector.
 #[test]
-#[ignore = "step 2"]
 fn f2_sparse_rows() {
+    let _g = serial();
     let mut sheet = format!("<worksheet {X}><sheetData>");
     for r in 1..=20_000 {
         sheet.push_str(&format!(r#"<row r="{r}"><c r="XFD{r}"><v>1</v></c></row>"#));
@@ -147,8 +154,8 @@ fn f2_sparse_rows() {
 // Missed by the review: each sheet stays under `max_csv`, but all of them together do
 // not, and a workbook may name one small sheet part many times.
 #[test]
-#[ignore = "step 2"]
 fn many_sheets_each_under_the_csv_limit() {
+    let _g = serial();
     let shared = format!("<sst {X}><si><t>{}</t></si></sst>", "a".repeat(1 << 20));
     let mut sheet = format!("<worksheet {X}><sheetData>");
     for r in 1..=9 {
@@ -176,8 +183,8 @@ fn ods(table: &str) -> Vec<u8> {
 // F3 A: an empty cell repeated 16,000 times puts the next value at column 16,000, and the
 // row repeated 1,000 times clones that 390 KB vector.
 #[test]
-#[ignore = "step 2"]
 fn f3_repeated_wide_rows() {
+    let _g = serial();
     let row = r#"<table:table-row table:number-rows-repeated="1000"><table:table-cell table:number-columns-repeated="16000"/><table:table-cell office:value-type="float" office:value="1"/></table:table-row>"#;
     let f = ods(&format!(
         r#"<table:table table:name="T">{}</table:table>"#,
@@ -190,8 +197,8 @@ fn f3_repeated_wide_rows() {
 
 // F3 B: one 1 MiB value repeated over 1,000 columns and 1,000 rows is 10^6 cells of 1 MiB.
 #[test]
-#[ignore = "step 2"]
 fn f3_repeated_large_value() {
+    let _g = serial();
     let row = format!(
         r#"<table:table-row table:number-rows-repeated="1000"><table:table-cell table:number-columns-repeated="1000" office:value-type="string"><text:p>{}</text:p></table:table-cell></table:table-row>"#,
         "a".repeat(1 << 20)
@@ -208,8 +215,8 @@ fn f3_repeated_large_value() {
 // (gridSpan 64 on 2,000 cells) and 20,000 narrow rows render as gigabytes before the text
 // limit is checked once, after the whole table.
 #[test]
-#[ignore = "step 2"]
 fn a_wide_table_with_many_rows() {
+    let _g = serial();
     let mut t = String::from("<w:tbl><w:tr>");
     for _ in 0..2000 {
         t.push_str(r#"<w:tc><w:tcPr><w:gridSpan w:val="64"/></w:tcPr><w:p/></w:tc>"#);
@@ -230,6 +237,7 @@ fn a_wide_table_with_many_rows() {
 // while it inflates, whatever the entry's header says.
 #[test]
 fn a_deflate_bomb_stops_at_the_part_limit() {
+    let _g = serial();
     let doc = format!(
         "<w:document {W}><w:body><w:p><w:r><w:t>{}</w:t></w:r></w:p></w:body></w:document>",
         "a".repeat(100 << 20)

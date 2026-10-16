@@ -1,5 +1,6 @@
 //! A small Markdown writer for the blocks the converters find.
 
+use crate::budget::{Budget, SLOT};
 use crate::{Error, Image};
 
 pub enum Block {
@@ -38,15 +39,36 @@ pub fn cell(s: &str) -> String {
     one.replace('|', "\\|")
 }
 
-#[derive(Default)]
 pub struct Doc {
     pub blocks: Vec<Block>,
     pub images: Vec<Image>,
+    /// what the blocks cost, shared with the code that builds tables
+    pub budget: Budget,
 }
 
 impl Doc {
-    pub fn push(&mut self, b: Block) {
+    pub fn new(max_output: usize) -> Doc {
+        Doc {
+            blocks: Vec::new(),
+            images: Vec::new(),
+            budget: Budget::new(max_output),
+        }
+    }
+
+    /// Add a block, charging its text and a slot for it. A table is not charged here:
+    /// whoever builds a table charges each of its slots before the slot exists, so that
+    /// the padding of a wide row cannot be allocated unbudgeted.
+    pub fn push(&mut self, b: Block) -> Result<(), Error> {
+        let cost = match &b {
+            Block::Heading(_, t) | Block::Para(t) | Block::Item(_, _, t) | Block::Quote(t) => {
+                t.len() + SLOT
+            }
+            Block::Table(_) => 0,
+            Block::Page(_) | Block::Image(_) => SLOT,
+        };
+        self.budget.charge(cost)?;
         self.blocks.push(b);
+        Ok(())
     }
 
     /// The block for a picture: its placeholder, or the alt text alone when there is no
@@ -105,27 +127,35 @@ impl Doc {
                         }
                         out.push_str("> ");
                         out.push_str(l);
+                        too_long(&out, max)?;
                     }
                 }
-                Block::Table(rows) => table(rows, &mut out),
+                Block::Table(rows) => table(rows, &mut out, max)?,
                 Block::Page(n) => out.push_str(&format!("<!-- Page {n} -->")),
                 Block::Image(k) => out.push_str(&format!("<!-- image:{k} -->")),
             }
-            if out.len() > max {
-                return Err(Error::TooLarge(format!(
-                    "the document's text is longer than {max} bytes"
-                )));
-            }
+            too_long(&out, max)?;
         }
         out.push('\n');
         Ok(out)
     }
 }
 
-fn table(rows: &[Vec<String>], out: &mut String) {
+/// Refuse a rendition that has passed `max`. It is called after every table row and
+/// every quote line, so the output never grows more than one row past the limit.
+fn too_long(out: &str, max: usize) -> Result<(), Error> {
+    if out.len() > max {
+        return Err(Error::TooLarge(format!(
+            "the document's text is longer than {max} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn table(rows: &[Vec<String>], out: &mut String, max: usize) -> Result<(), Error> {
     let width = rows.iter().map(Vec::len).max().unwrap_or(0);
     if width == 0 {
-        return;
+        return Ok(());
     }
     for (i, r) in rows.iter().enumerate() {
         if i > 0 {
@@ -144,5 +174,7 @@ fn table(rows: &[Vec<String>], out: &mut String) {
                 out.push_str(" --- |");
             }
         }
+        too_long(out, max)?;
     }
+    Ok(())
 }

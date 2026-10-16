@@ -6,11 +6,13 @@
 //! mapping that sees a float cannot tell a date from a count. Hidden and very hidden
 //! sheets and chart sheets are left out, and so are sheets without a cell.
 
+use crate::budget::Budget;
 use crate::package::Package;
 use crate::sheet::{self, SheetBuilder};
 use crate::xml;
 use crate::{Error, Limits, Sheet};
 use quick_xml::events::Event;
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 pub fn sheets(pkg: &mut Package, limits: &Limits) -> Result<Vec<Sheet>, Error> {
@@ -24,6 +26,7 @@ pub fn sheets(pkg: &mut Package, limits: &Limits) -> Result<Vec<Sheet>, Error> {
     let dates = date_styles(pkg, limits);
     let shared = shared_strings(pkg, limits)?;
     let mut out = Vec::new();
+    let mut budget = Budget::new(limits.max_output);
     for (i, s) in wb.descendants("sheet").into_iter().enumerate() {
         let name = s.attr("name").unwrap_or("").to_string();
         if matches!(s.attr("state"), Some("hidden" | "veryHidden")) {
@@ -38,8 +41,8 @@ pub fn sheets(pkg: &mut Package, limits: &Limits) -> Result<Vec<Sheet>, Error> {
         let Some(bytes) = pkg.read(&rel.target)? else {
             continue;
         };
-        let b = read_sheet(&bytes, &shared, &dates, date1904, limits)?;
-        if let Some(sh) = b.finish(&name, i + 1, limits.max_csv)? {
+        let b = read_sheet(&bytes, &shared, &dates, date1904, limits, &mut budget)?;
+        if let Some(sh) = b.finish(&name, i + 1, limits.max_csv, &mut budget)? {
             out.push(sh);
         }
     }
@@ -171,6 +174,7 @@ fn read_sheet(
     dates: &[bool],
     date1904: bool,
     limits: &Limits,
+    budget: &mut Budget,
 ) -> Result<SheetBuilder, Error> {
     #[derive(PartialEq)]
     enum Target {
@@ -181,7 +185,7 @@ fn read_sheet(
     let mut b = SheetBuilder::new(limits.max_cells);
     let mut r = xml::reader(bytes);
     let mut buf = Vec::new();
-    let mut row: Vec<String> = Vec::new();
+    let mut row: sheet::Cells = Vec::new();
     let mut next_col = 0usize;
     let mut col = 0usize;
     let mut kind = String::new();
@@ -227,10 +231,10 @@ fn read_sheet(
                     in_cell = false;
                     let v = cell_value(&kind, &text, style, shared, dates, date1904);
                     if !v.is_empty() {
-                        sheet::set(&mut row, col, v);
+                        sheet::set(&mut row, col, v, budget)?;
                     }
                 }
-                "row" => b.row(std::mem::take(&mut row))?,
+                "row" => b.row(std::mem::take(&mut row), 1)?,
                 _ => {}
             },
             Event::DocType(_) => return Err(corrupt("a DOCTYPE is not allowed")),
@@ -242,22 +246,24 @@ fn read_sheet(
     Ok(b)
 }
 
-fn cell_value(
+fn cell_value<'a>(
     kind: &str,
     text: &str,
     style: usize,
-    shared: &[String],
+    shared: &'a [String],
     dates: &[bool],
     date1904: bool,
-) -> String {
-    match kind {
-        "s" => text
+) -> Cow<'a, str> {
+    // a shared string is borrowed, so that the budget can refuse it before it is copied
+    if kind == "s" {
+        return text
             .trim()
             .parse::<usize>()
             .ok()
             .and_then(|i| shared.get(i))
-            .cloned()
-            .unwrap_or_default(),
+            .map_or(Cow::Borrowed(""), |s| Cow::Borrowed(s.as_str()));
+    }
+    Cow::Owned(match kind {
         "b" => if text.trim() == "1" { "TRUE" } else { "FALSE" }.to_string(),
         "str" | "inlineStr" | "e" | "d" => text.to_string(),
         _ => {
@@ -266,9 +272,9 @@ fn cell_value(
                 && let Ok(n) = t.parse::<f64>()
                 && let Some(d) = sheet::excel_date(n, date1904)
             {
-                return d;
+                return Cow::Owned(d);
             }
             t.to_string()
         }
-    }
+    })
 }

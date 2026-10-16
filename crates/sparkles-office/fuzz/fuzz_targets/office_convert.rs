@@ -21,6 +21,7 @@ fuzz_target!(|data: &[u8]| {
         max_cells: 50_000,
         max_images: 4,
         max_image_bytes: 1 << 20,
+        max_output: 8 << 20,
         ..Limits::default()
     };
     let _ = sniff(file);

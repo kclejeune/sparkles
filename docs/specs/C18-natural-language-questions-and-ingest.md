@@ -4821,7 +4821,18 @@ badges on the dataset page and the sidebar.
 - **Bounds and isolation.** The converter bounds the entries of the container, the
   unpacked size of each part and of all parts, the nodes and depth of an XML tree, the
   cells of a sheet and the size of the text. A ZIP bomb stops at the limit whatever its
-  headers claim, and a DOCTYPE is refused. A conversion runs on a thread of its own under
+  headers claim, and a DOCTYPE is refused. A review of the first version found small
+  files that asked for gigabytes anyway, such as a Word list level of 4e10, one shared
+  string used by thousands of cells, a row repeated 1,000 times, or a table row whose
+  `gridSpan` pads every other row. One output budget, `Limits::max_output` (128 MiB by
+  default), now covers everything a conversion holds besides its input and XML trees,
+  which is the Markdown blocks and table slots, the sparse rows of a sheet and the CSV of
+  all sheets together. Every path that makes the output larger than the input charges the
+  budget before it allocates, and the conversion fails with `too-large` when the budget
+  is gone. The tradeoff is memory for safety. A conversion may hold up to 128 MiB of
+  output beside its input and trees, and at most `--pdf-workers` conversions run at once.
+  Sheets are stored sparsely, a repeated row is stored once, and the rendering of a
+  table is checked against the text limit after every row. A conversion runs on a thread of its own under
   the task's deadline with a panic caught as `conversion-failed`, and shares the
   `--pdf-workers` slots with PDF conversion. The converter has a cargo-fuzz target in
   `crates/sparkles-office/fuzz`, started with `mise run office:fuzz`, and its normal

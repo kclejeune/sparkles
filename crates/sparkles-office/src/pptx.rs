@@ -4,6 +4,7 @@
 //! the presentation, so it is the number PowerPoint shows. Hidden slides are skipped and
 //! keep their numbers.
 
+use crate::budget::{Budget, SLOT};
 use crate::md::{self, Block, Doc};
 use crate::package::{Package, Rel};
 use crate::xml::{self, Node};
@@ -26,7 +27,7 @@ pub fn convert(pkg: &mut Package, limits: &Limits) -> Result<Document, Error> {
     if slides.is_empty() {
         return Err(Error::Corrupt("the presentation has no slides".into()));
     }
-    let mut doc = Doc::default();
+    let mut doc = Doc::new(limits.max_output);
     let mut notes: Vec<String> = Vec::new();
     for (i, path) in slides.iter().enumerate() {
         let n = i + 1;
@@ -52,19 +53,19 @@ pub fn convert(pkg: &mut Package, limits: &Limits) -> Result<Document, Error> {
         }
         let Slide { title, blocks, .. } = s;
         let notes_text = notes_of(pkg, limits, &srels);
-        doc.push(Block::Page(n));
+        doc.push(Block::Page(n))?;
         let heading = match title.as_deref().map(md::cell).filter(|t| !t.is_empty()) {
             Some(t) => format!("Slide {n}: {t}"),
             None => format!("Slide {n}"),
         };
-        doc.push(Block::Heading(1, heading));
+        doc.push(Block::Heading(1, heading))?;
         for b in blocks {
-            doc.push(b);
+            doc.push(b)?;
         }
         if !notes_text.is_empty() {
-            doc.push(Block::Para("Notes:".into()));
+            doc.push(Block::Para("Notes:".into()))?;
             for t in notes_text {
-                doc.push(Block::Para(md::plain(&t)));
+                doc.push(Block::Para(md::plain(&t)))?;
             }
         }
     }
@@ -137,7 +138,7 @@ impl Slide<'_, '_, '_> {
                 "grpSp" => self.shapes(n)?,
                 "graphicFrame" => {
                     if let Some(t) = n.find("tbl") {
-                        let rows = table(t);
+                        let rows = table(t, &mut self.doc.budget)?;
                         if !rows.iter().all(|r| r.iter().all(String::is_empty)) {
                             self.blocks.push(Block::Table(rows));
                         }
@@ -271,12 +272,14 @@ fn para_text(p: &Node, rels: &HashMap<String, Rel>, flat: bool) -> String {
     out
 }
 
-fn table(t: &Node) -> Vec<Vec<String>> {
+/// The rows of a table, each cell charged to the budget as it is made.
+fn table(t: &Node, budget: &mut Budget) -> Result<Vec<Vec<String>>, Error> {
     let mut rows = Vec::new();
     for tr in t.elements().filter(|n| n.name == "tr") {
         let mut row = Vec::new();
         for tc in tr.elements().filter(|n| n.name == "tc") {
             if tc.attr("hMerge") == Some("1") || tc.attr("vMerge") == Some("1") {
+                budget.charge(SLOT)?;
                 row.push(String::new());
                 continue;
             }
@@ -286,9 +289,11 @@ fn table(t: &Node) -> Vec<Vec<String>> {
                 .map(|p| para_text(p, &HashMap::new(), true))
                 .filter(|t| !t.trim().is_empty())
                 .collect();
-            row.push(md::cell(&text.join(" ")));
+            let text = md::cell(&text.join(" "));
+            budget.charge(text.len() + SLOT)?;
+            row.push(text);
         }
         rows.push(row);
     }
-    rows
+    Ok(rows)
 }

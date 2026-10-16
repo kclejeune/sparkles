@@ -1,14 +1,59 @@
 //! Rows of cells collected from a sheet, and their CSV.
 
+use crate::budget::{Budget, SLOT};
 use crate::{Error, Sheet};
+use std::borrow::Cow;
 
 /// The widest sheet read: Excel's own limit of 16,384 columns.
 pub const MAX_COLUMNS: usize = 16_384;
 
+/// The non-empty cells of a row as (column, value), sorted by column.
+pub type Cells = Vec<(u32, String)>;
+
+struct Row {
+    cells: Cells,
+    /// how many times the row occurs in a row, for `number-rows-repeated`
+    repeat: u32,
+}
+
 pub struct SheetBuilder {
-    rows: Vec<Vec<String>>,
+    rows: Vec<Row>,
     cells: usize,
     max_cells: usize,
+    /// the first and the last column that holds a cell
+    min_col: usize,
+    max_col: usize,
+    /// bytes charged to the budget for the stored cells
+    charged: usize,
+}
+
+/// Put `value` in column `col` of a row. Columns past [`MAX_COLUMNS`] are ignored. The
+/// value is charged to the budget before it is copied, and a value already in that
+/// column (an XLSX row may name a column twice) is replaced and its charge given back.
+pub fn set(
+    row: &mut Cells,
+    col: usize,
+    value: Cow<'_, str>,
+    budget: &mut Budget,
+) -> Result<(), Error> {
+    if col >= MAX_COLUMNS {
+        return Ok(());
+    }
+    let col = col as u32;
+    budget.charge(value.len() + SLOT)?;
+    let value = value.into_owned();
+    match row.last() {
+        Some((c, _)) if *c < col => row.push((col, value)),
+        None => row.push((col, value)),
+        _ => match row.binary_search_by_key(&col, |(c, _)| *c) {
+            Ok(i) => {
+                let old = std::mem::replace(&mut row[i].1, value);
+                budget.release(old.len() + SLOT);
+            }
+            Err(i) => row.insert(i, (col, value)),
+        },
+    }
+    Ok(())
 }
 
 impl SheetBuilder {
@@ -17,64 +62,106 @@ impl SheetBuilder {
             rows: Vec::new(),
             cells: 0,
             max_cells,
+            min_col: usize::MAX,
+            max_col: 0,
+            charged: 0,
         }
     }
 
-    /// Add a row. Trailing empty cells are dropped, and a row with no cell is skipped.
-    pub fn row(&mut self, mut cells: Vec<String>) -> Result<(), Error> {
-        while cells.last().is_some_and(String::is_empty) {
-            cells.pop();
-        }
-        if cells.is_empty() {
+    /// Add a row that occurs `repeat` times. A row with no cell is skipped. The cells
+    /// were charged to the budget as they were stored, and the row is kept once, not once
+    /// per repeat.
+    pub fn row(&mut self, mut cells: Cells, repeat: usize) -> Result<(), Error> {
+        cells.retain(|(_, v)| !v.is_empty());
+        let (Some(first), Some(last)) = (cells.first(), cells.last()) else {
             return Ok(());
-        }
-        self.cells += cells.iter().filter(|c| !c.is_empty()).count();
+        };
+        let repeat = repeat.clamp(1, 1000);
+        self.cells = self
+            .cells
+            .saturating_add(cells.len().saturating_mul(repeat));
         if self.cells > self.max_cells {
             return Err(Error::TooLarge(format!(
                 "a sheet has more than {} cells",
                 self.max_cells
             )));
         }
-        self.rows.push(cells);
+        self.min_col = self.min_col.min(first.0 as usize);
+        self.max_col = self.max_col.max(last.0 as usize);
+        self.charged += cells.iter().map(|(_, v)| v.len() + SLOT).sum::<usize>();
+        self.rows.push(Row {
+            cells,
+            repeat: repeat as u32,
+        });
         Ok(())
     }
 
+    /// Drop the rows of a sheet that is not wanted and give their charge back.
+    pub fn discard(self, budget: &mut Budget) {
+        budget.release(self.charged);
+    }
+
     /// The sheet as CSV, without the columns that are empty at its left, or `None` when it
-    /// holds no cell.
-    pub fn finish(self, name: &str, index: usize, max_csv: usize) -> Result<Option<Sheet>, Error> {
+    /// holds no cell. The CSV is charged to the budget as it is written and stays charged,
+    /// because the caller keeps it. The rows are dropped here and their charge is given
+    /// back.
+    pub fn finish(
+        self,
+        name: &str,
+        index: usize,
+        max_csv: usize,
+        budget: &mut Budget,
+    ) -> Result<Option<Sheet>, Error> {
         if self.rows.is_empty() {
             return Ok(None);
         }
-        let first = self
-            .rows
-            .iter()
-            .filter_map(|r| r.iter().position(|c| !c.is_empty()))
-            .min()
-            .unwrap_or(0);
-        let width = self.rows.iter().map(Vec::len).max().unwrap_or(0) - first;
+        let first = self.min_col;
+        let width = self.max_col + 1 - first;
         let mut csv = String::new();
+        let mut rows = 0usize;
         for r in &self.rows {
+            let before = csv.len();
+            let mut cells = r.cells.iter().peekable();
             for c in 0..width {
                 if c > 0 {
                     csv.push(',');
                 }
-                field(r.get(first + c).map_or("", String::as_str), &mut csv);
+                if let Some((_, v)) = cells.next_if(|(col, _)| *col as usize == first + c) {
+                    field(v, &mut csv);
+                }
             }
             csv.push('\n');
-            if csv.len() > max_csv {
-                return Err(Error::TooLarge(format!(
-                    "the sheet {name:?} is longer than {max_csv} bytes as CSV"
-                )));
+            let line = csv.len() - before;
+            for _ in 1..r.repeat {
+                budget.charge(line)?;
+                if csv.len() + line > max_csv {
+                    return Err(too_long(name, max_csv));
+                }
+                csv.extend_from_within(before..before + line);
             }
+            budget.charge(line)?;
+            if csv.len() > max_csv {
+                return Err(too_long(name, max_csv));
+            }
+            rows += r.repeat as usize;
         }
+        budget.release(self.charged);
+        // the doubling of the buffer would otherwise hold up to twice what was charged
+        csv.shrink_to_fit();
         Ok(Some(Sheet {
             name: name.to_string(),
             index,
             csv,
-            rows: self.rows.len(),
+            rows,
             columns: width,
         }))
     }
+}
+
+fn too_long(name: &str, max_csv: usize) -> Error {
+    Error::TooLarge(format!(
+        "the sheet {name:?} is longer than {max_csv} bytes as CSV"
+    ))
 }
 
 fn field(s: &str, out: &mut String) {
@@ -90,17 +177,6 @@ fn field(s: &str, out: &mut String) {
     } else {
         out.push_str(s);
     }
-}
-
-/// Put `value` in column `col` of a row, growing it.
-pub fn set(row: &mut Vec<String>, col: usize, value: String) {
-    if col >= MAX_COLUMNS {
-        return;
-    }
-    if row.len() <= col {
-        row.resize(col + 1, String::new());
-    }
-    row[col] = value;
 }
 
 /// The 0-based column of an A1 reference such as `AB12`.

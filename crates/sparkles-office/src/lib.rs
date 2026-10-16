@@ -10,10 +10,16 @@
 //! The file comes from outside, so every size is bounded by [`Limits`]: the number of
 //! entries in the container, the uncompressed size of a part and of all parts together
 //! (a ZIP bomb stops at the limit, whatever its header says), the nodes of an XML tree,
-//! the cells of a sheet and the text that comes out. A file past a limit is refused with
-//! [`Error::TooLarge`]. A damaged file gives [`Error::Corrupt`] and never a panic, which
+//! the cells of a sheet and the text that comes out. One output budget, [`Limits::max_output`],
+//! also bounds everything a conversion holds besides the input and its XML trees: Markdown
+//! blocks and table slots, sheet rows and the CSV of all sheets together. Every path that
+//! can make the output larger than the input charges it before it allocates, so a small
+//! file cannot ask for gigabytes. The tradeoff is memory for safety: a conversion may hold
+//! up to `max_output` bytes (128 MiB by default) beside its input and XML trees. A file
+//! past a limit is refused with [`Error::TooLarge`]. A damaged file gives [`Error::Corrupt`] and never a panic, which
 //! the tests and the cargo-fuzz targets of `fuzz/` check.
 
+mod budget;
 mod docx;
 mod format;
 mod md;
@@ -49,6 +55,9 @@ pub struct Limits {
     pub max_images: usize,
     /// bytes of one returned image
     pub max_image_bytes: usize,
+    /// bytes of converted output a conversion may hold: Markdown blocks and table cells,
+    /// sheet rows, and the CSV of all sheets together
+    pub max_output: usize,
 }
 
 impl Default for Limits {
@@ -64,6 +73,7 @@ impl Default for Limits {
             max_cells: 2_000_000,
             max_images: 0,
             max_image_bytes: 5 << 20,
+            max_output: 128 << 20,
         }
     }
 }

@@ -5,6 +5,7 @@
 //! Footnotes and endnotes are kept as Markdown footnotes at the end. Comments, headers,
 //! footers and deleted text are left out.
 
+use crate::budget::{Budget, SLOT};
 use crate::md::{self, Block, Doc};
 use crate::package::{Package, Rel};
 use crate::xml::{self, Node};
@@ -51,7 +52,7 @@ pub fn convert(pkg: &mut Package, limits: &Limits) -> Result<Document, Error> {
     let title = title(pkg, limits);
     let mut cx = Cx {
         pkg,
-        doc: Doc::default(),
+        doc: Doc::new(limits.max_output),
         rels,
         styles,
         numbering,
@@ -67,7 +68,7 @@ pub fn convert(pkg: &mut Package, limits: &Limits) -> Result<Document, Error> {
     let notes: Vec<(String, String)> = std::mem::take(&mut cx.used_notes);
     for (label, text) in notes {
         cx.doc
-            .push(Block::Para(format!("[^{label}]: {}", md::plain(&text))));
+            .push(Block::Para(format!("[^{label}]: {}", md::plain(&text))))?;
     }
     let markdown = cx.doc.render(limits.max_text)?;
     Ok(Document {
@@ -230,8 +231,8 @@ impl Cx<'_, '_> {
     fn blocks(&mut self, parent: &Node, max: usize) -> Result<(), Error> {
         for n in parent.elements() {
             match n.name.as_str() {
-                "p" => self.para(n),
-                "tbl" => self.table(n),
+                "p" => self.para(n)?,
+                "tbl" => self.table(n)?,
                 "sdt" => {
                     if let Some(c) = n.first("sdtContent") {
                         self.blocks(c, max)?;
@@ -249,7 +250,7 @@ impl Cx<'_, '_> {
         Ok(())
     }
 
-    fn para(&mut self, p: &Node) {
+    fn para(&mut self, p: &Node) -> Result<(), Error> {
         let ppr = p.first("pPr");
         let style_id = ppr.and_then(|p| val(p, "pStyle"));
         let mut heading: Option<usize> = None;
@@ -323,7 +324,7 @@ impl Cx<'_, '_> {
         if !text.is_empty() {
             let line = md::plain(&text);
             if let Some(l) = heading {
-                self.doc.push(Block::Heading(l, line.replace('\n', " ")));
+                self.doc.push(Block::Heading(l, line.replace('\n', " ")))?;
             } else if let Some((numid, lvl, ordered_by_name)) = list {
                 let (ordered, number) = match numid {
                     Some(id) => {
@@ -343,16 +344,17 @@ impl Cx<'_, '_> {
                     lvl.min(8),
                     ordered.then_some(number),
                     line.replace('\n', " "),
-                ));
+                ))?;
             } else if quote {
-                self.doc.push(Block::Quote(line));
+                self.doc.push(Block::Quote(line))?;
             } else {
-                self.doc.push(Block::Para(line));
+                self.doc.push(Block::Para(line))?;
             }
         }
         for b in extra {
-            self.doc.push(b);
+            self.doc.push(b)?;
         }
+        Ok(())
     }
 
     /// The text of the runs below `n`, with the pictures and text boxes it finds pushed
@@ -456,53 +458,59 @@ impl Cx<'_, '_> {
         }
     }
 
-    fn table(&mut self, t: &Node) {
+    fn table(&mut self, t: &Node) -> Result<(), Error> {
         let mut rows: Vec<Vec<String>> = Vec::new();
-        self.table_rows(t, &mut rows);
+        table_rows(t, &mut rows, &mut self.doc.budget)?;
         if rows.iter().all(|r| r.iter().all(|c| c.is_empty())) {
-            return;
+            return Ok(());
         }
-        self.doc.push(Block::Table(rows));
+        self.doc.push(Block::Table(rows))
     }
+}
 
-    fn table_rows(&self, t: &Node, rows: &mut Vec<Vec<String>>) {
-        for tr in t.elements().filter(|n| n.name == "tr") {
-            let mut row = Vec::new();
-            for tc in tr.elements().filter(|n| n.name == "tc") {
-                let mut parts: Vec<String> = Vec::new();
-                for c in tc.elements() {
-                    match c.name.as_str() {
-                        "p" => {
-                            let t = plain_text(c);
-                            if !t.is_empty() {
+/// The rows of a table. Every slot is charged to the budget before it is pushed, the
+/// empty ones that a `gridSpan` adds included, so a table never exists unbudgeted.
+fn table_rows(t: &Node, rows: &mut Vec<Vec<String>>, budget: &mut Budget) -> Result<(), Error> {
+    for tr in t.elements().filter(|n| n.name == "tr") {
+        let mut row = Vec::new();
+        for tc in tr.elements().filter(|n| n.name == "tc") {
+            let mut parts: Vec<String> = Vec::new();
+            for c in tc.elements() {
+                match c.name.as_str() {
+                    "p" => {
+                        let t = plain_text(c);
+                        if !t.is_empty() {
+                            parts.push(t);
+                        }
+                    }
+                    "tbl" => {
+                        let mut inner = Vec::new();
+                        table_rows(c, &mut inner, budget)?;
+                        for r in inner {
+                            let t = r.join(" ");
+                            if !t.trim().is_empty() {
                                 parts.push(t);
                             }
                         }
-                        "tbl" => {
-                            let mut inner = Vec::new();
-                            self.table_rows(c, &mut inner);
-                            for r in inner {
-                                let t = r.join(" ");
-                                if !t.trim().is_empty() {
-                                    parts.push(t);
-                                }
-                            }
-                        }
-                        _ => {}
                     }
-                }
-                row.push(md::cell(&parts.join(" ")));
-                let span = tc
-                    .first("tcPr")
-                    .and_then(|p| val(p, "gridSpan"))
-                    .and_then(|v| v.parse::<usize>().ok())
-                    .unwrap_or(1)
-                    .min(64);
-                for _ in 1..span {
-                    row.push(String::new());
+                    _ => {}
                 }
             }
-            rows.push(row);
+            let text = md::cell(&parts.join(" "));
+            budget.charge(text.len() + SLOT)?;
+            row.push(text);
+            let span = tc
+                .first("tcPr")
+                .and_then(|p| val(p, "gridSpan"))
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(1)
+                .min(64);
+            for _ in 1..span {
+                budget.charge(SLOT)?;
+                row.push(String::new());
+            }
         }
+        rows.push(row);
     }
+    Ok(())
 }

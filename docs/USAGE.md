@@ -2873,7 +2873,9 @@ shows the slide of each fact, and the speaker notes follow the slide's text. A f
 that is encrypted or in an old binary format (`.doc`, `.ppt`, `.xls`) is refused. An
 Excel or OpenDocument spreadsheet (`.xlsx`, `.ods`) gets a mapping draft for each
 visible sheet, with the sheet as CSV to upload with its mapping. These conversions share
-the `--pdf-workers` limit with PDF conversion.
+the `--pdf-workers` limit with PDF conversion. A conversion holds at most 128 MiB of
+output besides the file and its XML trees, so a small file cannot ask for more memory,
+and a file that would is refused with `too-large`.
 
 When the model drafts a mapping that maps a column to IRIs of a class the dataset has,
 the draft links that column's values to the existing entities. The most frequent values

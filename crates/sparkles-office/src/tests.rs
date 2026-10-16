@@ -280,3 +280,31 @@ fn damaged_files_never_panic() {
         }
     }
 }
+
+/// The output budget refuses every format, and the fixtures still convert at the default.
+#[test]
+fn the_output_budget_stops_every_format() {
+    let small = Limits {
+        max_output: 64,
+        ..lim()
+    };
+    for (b, f) in [
+        (docx(), Format::Docx),
+        (pptx(), Format::Pptx),
+        (odt(), Format::Odt),
+        (odp(), Format::Odp),
+    ] {
+        assert!(
+            matches!(to_markdown(&b, f, &small), Err(Error::TooLarge(_))),
+            "{f:?}"
+        );
+        assert!(to_markdown(&b, f, &lim()).is_ok(), "{f:?}");
+    }
+    for (b, f) in [(xlsx(), Format::Xlsx), (ods(), Format::Ods)] {
+        assert!(
+            matches!(sheets(&b, f, &small), Err(Error::TooLarge(_))),
+            "{f:?}"
+        );
+        assert!(!sheets(&b, f, &lim()).unwrap().is_empty(), "{f:?}");
+    }
+}
