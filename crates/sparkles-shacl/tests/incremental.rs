@@ -980,3 +980,66 @@ fn computed_value_nodes_read_at_value_fall_back() {
         ),
     }
 }
+
+/// Each `shnex:concat` below lists the one before it twice. The analysis of the shape must
+/// not walk the shared expression once per path, which takes 2^60 steps, and a
+/// configuration that is too big to localize falls back to full validation.
+#[test]
+fn doubling_expressions_are_analyzed_within_a_budget() {
+    let levels = 60;
+    let mut shapes = format!(
+        "@prefix sh: <{SH}> . @prefix ex: <{EX}> .
+         @prefix shnex: <http://www.w3.org/ns/shacl-node-expr#> .
+         _:e0 shnex:pathValues ex:q .\n"
+    );
+    for i in 1..levels {
+        shapes.push_str(&format!(
+            "_:e{i} shnex:concat ( _:e{} _:e{} ) .\n",
+            i - 1,
+            i - 1
+        ));
+    }
+    // the doubling branch is never taken, so evaluation stays cheap
+    shapes.push_str(&format!(
+        "ex:S a sh:NodeShape ; sh:targetNode ex:x ;
+           sh:property [ sh:path ex:p ;
+             sh:values [ shnex:if [ shnex:exists [ shnex:pathValues ex:none ] ] ;
+                         shnex:then _:e{} ] ] .\n",
+        levels - 1
+    ));
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                format!("<{EX}x> <{EX}p> <{EX}y> .\n").into_bytes(),
+                RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+        let r = guard::set_config(
+            &store,
+            Some(config(GuardMode::Reject, BaselinePolicy::Strict, &shapes)),
+        )
+        .map(|o| matches!(o, SetOutcome::Installed(..)))
+        .map_err(|e| format!("{e:#}"));
+        let w = update(
+            &store,
+            &format!("INSERT DATA {{ <{EX}x> <{EX}q> \"1\" }}"),
+            &QueryOptions::default(),
+        )
+        .map(|st| {
+            st.commit
+                .and_then(|c| c.validation)
+                .map(|v| (v.strategy, v.fallback.clone()))
+        })
+        .map_err(|e| e.to_string());
+        let _ = tx.send((r, w));
+    });
+    let (installed, write) = rx
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("the analysis of a doubling expression did not finish");
+    assert_eq!(installed, Ok(true));
+    let (_, fallback) = write.unwrap().expect("the write was validated");
+    assert_eq!(fallback.as_deref(), Some("budget"));
+}

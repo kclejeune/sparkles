@@ -172,11 +172,18 @@ pub struct Model {
 /// references fan out that far is better served by a full validation).
 const MAX_DEPS: usize = 4096;
 
+/// The most steps the analysis of one shape's expressions may take. A shared expression
+/// is walked once per path that reaches it, so a graph that doubles at every level would
+/// otherwise take exponential time while the guard is installed.
+const MAX_EXPR_STEPS: usize = 100_000;
+
 struct Analyzer<'a> {
     shapes: &'a Shapes,
     memo: Vec<Option<Result<Vec<Dep>, Fallback>>>,
     on_stack: Vec<bool>,
     uses_classes: bool,
+    /// steps of `expr_deps` taken for the shape being analyzed
+    expr_steps: usize,
 }
 
 impl Analyzer<'_> {
@@ -204,6 +211,7 @@ impl Analyzer<'_> {
 
     fn compute(&mut self, si: ShapeId) -> Result<Vec<Dep>, Fallback> {
         let shape = &self.shapes.shapes[si];
+        self.expr_steps = 0;
         let mut out: Vec<Dep> = Vec::new();
         if shape.deactivated {
             // a deactivated shape conforms without reading anything
@@ -444,6 +452,10 @@ impl Analyzer<'_> {
         out: &mut Vec<Dep>,
     ) -> Result<Pre, Fallback> {
         let shapes = self.shapes;
+        self.expr_steps += 1;
+        if self.expr_steps > MAX_EXPR_STEPS || out.len() > MAX_DEPS {
+            return Err(Fallback::Budget);
+        }
         let anchored = |at: &Pre| at.clone().ok_or(Fallback::Sparql);
         match &shapes.exprs[e] {
             Expr::Const(_) | Expr::Empty | Expr::List(_) => Ok(None),
@@ -641,6 +653,7 @@ impl Model {
             memo: vec![None; n],
             on_stack: vec![false; n],
             uses_classes: false,
+            expr_steps: 0,
         };
         let mut plans = vec![None; n];
         let mut reads: Option<FxHashSet<NamedNode>> = Some(FxHashSet::default());
