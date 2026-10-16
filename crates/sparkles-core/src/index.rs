@@ -149,6 +149,12 @@ impl Drop for HintTrace {
 }
 
 #[cfg(test)]
+thread_local! {
+    /// [`ReadAhead::before`] calls on this thread (for tests of warm-path overhead)
+    static READ_AHEAD_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
 pub(crate) fn read_ahead_fixture(blocks: usize) -> (tempfile::TempDir, PermIndex) {
     let dir = tempfile::tempdir().unwrap();
     let mut writer = PermWriter::create(dir.path(), Perm::Spo).unwrap();
@@ -306,6 +312,8 @@ impl ReadAhead {
         end: usize,
         columns: &dyn Fn(usize) -> ColMask,
     ) -> bool {
+        #[cfg(test)]
+        READ_AHEAD_CALLS.with(|n| n.set(n.get() + 1));
         let limit = read_window();
         if !io_hints() || limit == 0 {
             return true;
@@ -975,16 +983,21 @@ impl PermIndex {
     /// Ask the kernel to start reading the columns in `mask` of block `b` (and those
     /// between them), unless the cache holds them decoded. A reader that knows the
     /// blocks it will visit asks for all of them first, so that a cold server reads them
-    /// in parallel instead of one after another (see [`io_hints`]).
-    pub fn prefetch(&self, cache: &BlockCache, b: usize, mask: ColMask) {
+    /// in parallel instead of one after another (see [`io_hints`]). Returns whether the
+    /// cache lacked a column of `mask` in block `b`, whether or not hints are on, so that
+    /// a caller can skip its other cold-path work for blocks that are warm.
+    pub fn prefetch(&self, cache: &BlockCache, b: usize, mask: ColMask) -> bool {
         let mask = mask & ALL_COLS;
-        if mask == 0 || !io_hints() || cache.has_cols(self, b, mask) {
-            return;
+        if mask == 0 || cache.has_cols(self, b, mask) {
+            return false;
         }
-        let (Some(data), Some((from, to))) = (self.data.as_ref(), self.span(b, mask)) else {
-            return;
-        };
-        will_need(IoFile::of_perm(self.perm), data, from, to - from);
+        if !io_hints() {
+            return true;
+        }
+        if let (Some(data), Some((from, to))) = (self.data.as_ref(), self.span(b, mask)) {
+            will_need(IoFile::of_perm(self.perm), data, from, to - from);
+        }
+        true
     }
 
     /// The bytes of the file that hold the columns in `mask` of block `b` (and the columns
@@ -1286,6 +1299,29 @@ impl BlockCache {
         })
     }
 
+    /// A block with the columns in `mask` if the cache holds all of them decoded, counting
+    /// a hit for each, and nothing otherwise (no miss, no hit, no decode). A pass uses it
+    /// to skip its read-ahead bookkeeping for warm blocks.
+    pub fn get_cols_cached(&self, idx: &PermIndex, b: usize, mask: ColMask) -> Option<Block> {
+        let mut cols: [Arc<[u64]>; 4] = std::array::from_fn(|_| empty_col());
+        let mut found = 0u64;
+        for (c, col) in cols.iter_mut().enumerate() {
+            if mask & (1 << c) == 0 {
+                continue;
+            }
+            *col = self
+                .cache
+                .get(&(idx.uid, b as u32, self.ns << 8 | c as u32))?;
+            found += 1;
+        }
+        self.hits
+            .fetch_add(found, std::sync::atomic::Ordering::Relaxed);
+        Some(Block {
+            cols,
+            rows: idx.blocks[b].rows as usize,
+        })
+    }
+
     /// Decode the columns in `mask` of `blocks` that the cache lacks, in parallel on a pool
     /// of its own, and keep them. A scan or join that has asked the kernel for these
     /// blocks decodes them one by one otherwise, and on a lookup that touches dozens of
@@ -1478,10 +1514,19 @@ impl PermIndex {
         // the blocks at the two ends of the range are decoded one after the other below:
         // ask for both first, so that a cold server reads them together
         let bc = bound_cols(&lo_key, &hi_key);
-        for e in [lo, hi - 1] {
+        let partial = |e: usize| {
             let m = &self.blocks[e];
-            if !(m.first >= lo_key && m.last <= hi_key) {
-                self.prefetch(cache, e, bc);
+            !(m.first >= lo_key && m.last <= hi_key)
+        };
+        let ends = [lo, hi - 1];
+        // a warm count looks at one end block, the first it must decode
+        if let Some(&first) = ends.iter().find(|&&e| partial(e))
+            && !cache.has_cols(self, first, bc)
+        {
+            for (i, &e) in ends.iter().enumerate() {
+                if partial(e) && (i == 0 || e != ends[0]) {
+                    self.prefetch(cache, e, bc);
+                }
             }
         }
         let mut total = 0u64;
@@ -1607,8 +1652,13 @@ impl PermIndex {
             let m = &self.blocks[b];
             let mask = columns(b);
             let whole = m.first >= *lo_key && m.last <= *hi_key;
-            let hint = ahead.before(self, cache, b, hi, &columns);
-            let blk = cache.get_cols_hinted(self, b, mask, hint)?;
+            let blk = match cache.get_cols_cached(self, b, mask) {
+                Some(blk) => blk,
+                None => {
+                    let hint = ahead.before(self, cache, b, hi, &columns);
+                    cache.get_cols_hinted(self, b, mask, hint)?
+                }
+            };
             let go_on = if whole {
                 f(&blk, 0, blk.len())?
             } else {
@@ -2362,6 +2412,65 @@ mod tests {
                 "outstanding advice exceeds target plus one block extension"
             );
         }
+    }
+
+    #[test]
+    fn a_warm_pass_does_no_read_ahead_bookkeeping() {
+        let (_dir, idx) = read_ahead_fixture(8);
+        let cache = BlockCache::new(64 << 20);
+        let (lo, hi) = ([0; 4], [u64::MAX; 4]);
+        let mut rows = 0;
+        let mut pass = |rows: &mut usize| {
+            idx.for_each_key_range_cols(&cache, &lo, &hi, 0b11, |b, s, e| {
+                *rows += e - s;
+                assert_eq!(b.cols[0].len(), b.len());
+                Ok(true)
+            })
+            .unwrap();
+        };
+        pass(&mut rows);
+        let calls = READ_AHEAD_CALLS.with(|n| n.get());
+        assert!(
+            calls >= 8,
+            "the cold pass asks the read-ahead for each block"
+        );
+        let misses = cache.misses();
+        pass(&mut rows);
+        assert_eq!(rows, 2 * 8 * BLOCK_ROWS);
+        assert_eq!(
+            READ_AHEAD_CALLS.with(|n| n.get()),
+            calls,
+            "the warm pass consulted the read-ahead"
+        );
+        assert_eq!(cache.misses(), misses);
+    }
+
+    #[test]
+    fn prefetch_reports_whether_the_cache_lacks_a_column() {
+        let (_dir, idx) = read_ahead_fixture(2);
+        let cache = BlockCache::new(64 << 20);
+        assert!(idx.prefetch(&cache, 0, ALL_COLS));
+        cache.get_cols(&idx, 0, ALL_COLS).unwrap();
+        assert!(!idx.prefetch(&cache, 0, ALL_COLS));
+        assert!(idx.prefetch(&cache, 1, ALL_COLS));
+        assert!(!idx.prefetch(&cache, 1, 0));
+        // a partly cached block still lacks a column
+        cache.get_cols(&idx, 1, 0b1).unwrap();
+        assert!(!idx.prefetch(&cache, 1, 0b1));
+        assert!(idx.prefetch(&cache, 1, 0b11));
+    }
+
+    #[test]
+    fn get_cols_cached_counts_hits_only_for_a_complete_block() {
+        let (_dir, idx) = read_ahead_fixture(1);
+        let cache = BlockCache::new(64 << 20);
+        cache.get_cols(&idx, 0, 0b1).unwrap();
+        let (hits, misses) = (cache.hits(), cache.misses());
+        assert!(cache.get_cols_cached(&idx, 0, 0b11).is_none());
+        assert_eq!((cache.hits(), cache.misses()), (hits, misses));
+        let block = cache.get_cols_cached(&idx, 0, 0b1).unwrap();
+        assert_eq!(block.cols[0].len(), block.len());
+        assert_eq!((cache.hits(), cache.misses()), (hits + 1, misses));
     }
 
     #[test]

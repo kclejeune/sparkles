@@ -2383,19 +2383,22 @@ impl Scan {
                         mask | crate::index::bound_cols(&lo, &hi)
                     }
                 };
-                let hint = base
-                    .ahead
-                    .before(index, &ctx.snap.cache, base.next, base.end, &columns);
-                let block = ctx.snap.cache.get_cols_hinted(
-                    index,
-                    base.next,
-                    if whole {
-                        mask
-                    } else {
-                        mask | crate::index::bound_cols(&lo, &hi)
-                    },
-                    hint,
-                )?;
+                let wanted = columns(base.next);
+                let block = match ctx.snap.cache.get_cols_cached(index, base.next, wanted) {
+                    Some(block) => block,
+                    None => {
+                        let hint = base.ahead.before(
+                            index,
+                            &ctx.snap.cache,
+                            base.next,
+                            base.end,
+                            &columns,
+                        );
+                        ctx.snap
+                            .cache
+                            .get_cols_hinted(index, base.next, wanted, hint)?
+                    }
+                };
                 (base.row, base.row_end) = if whole {
                     (0, block.len())
                 } else {
@@ -2524,19 +2527,22 @@ impl Scan {
                         mask | crate::index::bound_cols(&lo, &hi)
                     }
                 };
-                let hint = base
-                    .ahead
-                    .before(index, &ctx.snap.cache, base.next, base.end, &columns);
-                let block = ctx.snap.cache.get_cols_hinted(
-                    index,
-                    base.next,
-                    if whole {
-                        mask
-                    } else {
-                        mask | crate::index::bound_cols(&lo, &hi)
-                    },
-                    hint,
-                )?;
+                let wanted = columns(base.next);
+                let block = match ctx.snap.cache.get_cols_cached(index, base.next, wanted) {
+                    Some(block) => block,
+                    None => {
+                        let hint = base.ahead.before(
+                            index,
+                            &ctx.snap.cache,
+                            base.next,
+                            base.end,
+                            &columns,
+                        );
+                        ctx.snap
+                            .cache
+                            .get_cols_hinted(index, base.next, wanted, hint)?
+                    }
+                };
                 (base.row, base.row_end) = if whole {
                     (0, block.len())
                 } else {

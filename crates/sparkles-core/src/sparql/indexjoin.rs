@@ -815,10 +815,8 @@ fn prefetch(ctx: &Ctx, perm: Perm, ranges: &Ranges, cols: ColMask) -> Result<()>
     let idx = ctx.snap.perm(perm);
     let mask = cols | ranges.bound_mask() | (1 << perm.col_of(G));
     let mut last = None;
-    let mut warm = ctx
-        .opt
-        .parallel_decode
-        .then(|| ctx.snap.cache.warm_columns(idx));
+    // created at the first block the cache lacks, so a warm request builds nothing
+    let mut warm: Option<crate::index::WarmColumns> = None;
     // a check reads the clock when the request has a deadline, so the loop checks once
     // per `PREFETCH_CHECK_STEPS` ranges and blocks rather than at every one
     let mut steps = 0u32;
@@ -838,10 +836,10 @@ fn prefetch(ctx: &Ctx, perm: Perm, ranges: &Ranges, cols: ColMask) -> Result<()>
             }
             // consecutive ranges often share a block
             if last != Some(b) {
-                idx.prefetch(&ctx.snap.cache, b, mask);
                 last = Some(b);
-                if let Some(warm) = &mut warm {
-                    warm.add(b, mask);
+                if idx.prefetch(&ctx.snap.cache, b, mask) && ctx.opt.parallel_decode {
+                    warm.get_or_insert_with(|| ctx.snap.cache.warm_columns(idx))
+                        .add(b, mask);
                 }
             }
         }
