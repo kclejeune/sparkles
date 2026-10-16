@@ -24,6 +24,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from evaluator import Invalid, strict_json
 
 LEDGER_VERSION = 1
+HARD_CAP = 25 * 10**9  # USD 25 in nanodollars, for the carryover and every run together
 MODELS = ("claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5")
 REQUEST_CAP, RESPONSE_CAP = 128 * 1024, 1024 * 1024
 # Integer USD nanodollars per token as input, 5 minute cache write, 1 hour cache
@@ -180,15 +181,10 @@ class Ledger:
         self.costs = []  # (case, model, cost) for every settled request
         if not self.path.is_absolute() or ".." in self.path.parts:
             raise Invalid("absolute ledger path required")
+        if not 0 < cap or cap + (carryover["cost"] if carryover else 0) > HARD_CAP:
+            raise Invalid("the cap and the carryover together pass the hard cap")
         self.lock = self.path.with_name(self.path.name + ".lock")
-        try:
-            self.lock_fd = os.open(
-                self.lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600
-            )
-        except FileExistsError:
-            raise Invalid(
-                "ledger is locked by another run, or by one that did not exit cleanly"
-            ) from None
+        self.lock_fd = self.acquire_lock()
         try:
             fresh = not self.path.exists()
             self.fd = os.open(
@@ -207,6 +203,39 @@ class Ledger:
         except BaseException:
             self.close()
             raise
+
+    def acquire_lock(self):
+        """Take the run lock. A lock whose owner process is gone is stale and is
+        replaced. A live, unreadable or foreign owner keeps it."""
+        for _ in range(2):
+            try:
+                fd = os.open(
+                    self.lock,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600,
+                )
+            except FileExistsError:
+                if not self.stale_lock():
+                    raise Invalid("ledger is locked by a running evaluation") from None
+                with contextlib.suppress(FileNotFoundError):
+                    self.lock.unlink()
+                continue
+            os.write(fd, str(os.getpid()).encode())
+            os.fsync(fd)
+            return fd
+        raise Invalid("ledger lock could not be taken")
+
+    def stale_lock(self):
+        try:
+            pid = int(self.lock.read_text())
+            if pid <= 0:
+                return False
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except (OSError, ValueError):
+            return False
+        return False
 
     def write(self, line):
         os.write(self.fd, (json.dumps(line, separators=(",", ":")) + "\n").encode())
@@ -327,6 +356,15 @@ class Ledger:
                 setattr(self, name, None)
         with contextlib.suppress(OSError):
             self.lock.unlink()
+
+
+def require_single_ledger(path):
+    """A real run keeps one ledger per directory, so a second file cannot reset the
+    cap. The ledger file is the account of record for the whole spend."""
+    path = pathlib.Path(path)
+    others = [p for p in path.parent.glob("*.jsonl") if p != path]
+    if others:
+        raise Invalid("another ledger file is in the ledger directory")
 
 
 class HTTPUpstream:

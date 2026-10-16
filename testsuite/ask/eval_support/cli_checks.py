@@ -270,7 +270,7 @@ def run_fresh(output, binary, sha):
         d.mkdir(mode=0o700)
         upstream = FakeAnthropic([qset], framing)
         upstream.mode = mode
-        ledger = px.Ledger(d / "ledger.jsonl", 10**12)
+        ledger = px.Ledger(d / "ledger.jsonl", 10**10)
         proxy = px.Proxy(ledger, upstream.upstream(), FAKE_KEY)
         server = proxy.serve()
         thread = threading.Thread(target=server.serve_forever)

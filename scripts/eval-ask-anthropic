@@ -65,11 +65,18 @@ def load_run(path):
     ints = ("localCapNanodollars", "maxOutputTokens", "askTokenBudget")
     if any(type(run[k]) is not int or run[k] <= 0 for k in ints):
         raise Invalid("positive integers required")
-    if run["carryover"] is not None and (
-        type(run["carryover"]["nanodollars"]) is not int
-        or run["carryover"]["nanodollars"] < 0
+    carry = run["carryover"]
+    if (
+        not isinstance(carry, dict)
+        or not isinstance(carry.get("name"), str)
+        or type(carry.get("nanodollars")) is not int
+        or carry["nanodollars"] < 0
     ):
-        raise Invalid("invalid carryover")
+        # The pilot's unresolved liability is part of the USD 25 aggregate, so a
+        # run file without it could spend the whole amount again.
+        raise Invalid("a carryover with a name and nanodollars is required")
+    if run["localCapNanodollars"] + carry["nanodollars"] > px.HARD_CAP:
+        raise Invalid("the cap and the carryover pass the USD 25 aggregate")
     for set_ in run["sets"]:
         if not set_["models"] or set(set_["models"]) - set(px.MODELS):
             raise Invalid("each set needs models from the allowed list")
@@ -126,12 +133,14 @@ def main():
             raise Invalid("ANTHROPIC_API_KEY is not set")
         upstream = px.HTTPUpstream(key)
     out = pathlib.Path(run["out"])
+    if not args.dry_run:
+        px.require_single_ledger(run["ledger"])
     out.mkdir(mode=0o700)
     carry = run["carryover"]
     ledger = px.Ledger(
         run["ledger"],
         run["localCapNanodollars"],
-        carry and {"name": carry["name"], "cost": carry["nanodollars"]},
+        {"name": carry["name"], "cost": carry["nanodollars"]},
     )
     used = {m for s in run["sets"] for m in s["models"]}
     models = [m for m in px.MODELS if m in used]  # the cheapest model first

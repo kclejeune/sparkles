@@ -124,7 +124,7 @@ class Base(unittest.TestCase):
         self.root = pathlib.Path(self.tmp.name)
         self.ledgers = []
 
-    def ledger(self, cap=10**12, carryover=None, name="ledger.jsonl"):
+    def ledger(self, cap=10**10, carryover=None, name="ledger.jsonl"):
         ledger = px.Ledger(self.root / name, cap, carryover)
         self.ledgers.append(ledger)
         self.addCleanup(ledger.close)
@@ -357,6 +357,38 @@ class Cap(Base):
         with self.assertRaises(Invalid):
             px.Ledger(path, 1)
         self.assertFalse((self.root / "ledger.jsonl.lock").exists())
+
+    def test_stale_lock_of_a_dead_owner_is_recovered_and_a_live_one_is_not(self):
+        import subprocess
+
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        lock = self.root / "ledger.jsonl.lock"
+        lock.write_text(str(dead.pid))
+        ledger = self.ledger()  # The owner is gone, so the lock is stale.
+        self.assertEqual(lock.read_text(), str(__import__("os").getpid()))
+        ledger.close()
+        self.assertFalse(lock.exists())
+        for owner in (str(__import__("os").getpid()), "", "not a pid"):
+            with self.subTest(owner=owner):
+                lock.write_text(owner)
+                with self.assertRaises(Invalid):
+                    px.Ledger(self.root / "ledger.jsonl", 10**10)
+                self.assertTrue(lock.exists())
+                lock.unlink()
+
+    def test_the_cap_is_global_not_per_ledger_file(self):
+        carry = {"name": "pilot", "cost": 1_002_560_000}
+        self.assertEqual(px.HARD_CAP, 25 * 10**9)
+        with self.assertRaises(Invalid):
+            px.Ledger(self.root / "big.jsonl", px.HARD_CAP, carry)  # with carryover
+        with self.assertRaises(Invalid):
+            px.Ledger(self.root / "none.jsonl", px.HARD_CAP + 1)
+        self.ledger(cap=px.HARD_CAP - carry["cost"], carryover=carry)
+        # A second ledger file beside the first is refused for a real run.
+        with self.assertRaises(Invalid):
+            px.require_single_ledger(self.root / "other.jsonl")
+        px.require_single_ledger(self.root / "ledger.jsonl")
 
     def test_costs_by_case_and_model(self):
         proxy = self.proxy(Upstream())
