@@ -272,12 +272,14 @@ fn doubling_expressions_are_bounded() {
     assert!(format!("{err:#}").contains("more than"), "{err:#}");
 }
 
-/// A read of the data may return more nodes than the budget of work. A class with over a
-/// million instances is an ordinary size, and the budget only guards against expression
-/// graphs that multiply their own work.
+/// A read of the data may return more nodes than the budget of work, because the data
+/// bounds the read and a class with millions of instances is an ordinary size. A
+/// concatenation that appends the same nodes twice is work that the expression multiplies,
+/// so the budget counts it. The budget here is far below the size of the read, so charging
+/// the nodes of a read would fail the first case.
 #[test]
 fn a_large_read_is_not_charged_to_the_budget() {
-    let n = (1u64 << 20) + 10;
+    let n = 10_000;
     let mut nt = String::from("<http://ex.org/x> <http://ex.org/p> <http://ex.org/y> .\n");
     for i in 0..n {
         nt.push_str(&format!(
@@ -292,20 +294,28 @@ fn a_large_read_is_not_charged_to_the_budget() {
             None,
         )])
         .unwrap();
-    let shapes = Shapes::parse(
-        &format!(
-            "{PREFIXES}ex:S a sh:NodeShape ; sh:targetNode ex:x ;
-               sh:property [ sh:path ex:p ;
-                 sh:values [ shnex:instancesOf ex:C ] ; sh:minCount 1 ; sh:nodeKind sh:IRI ] ."
-        ),
-        RdfFormat::Turtle,
-        None,
-    )
-    .unwrap();
     let opts = ValidateOptions {
         parallel: false,
+        max_expr_nodes: 1_000,
         ..ValidateOptions::default()
     };
-    let r = sparkles_shacl::validate(&store.snapshot(), &shapes, &opts).unwrap();
+    let shapes_with = |values: &str| {
+        Shapes::parse(
+            &format!(
+                "{PREFIXES}ex:S a sh:NodeShape ; sh:targetNode ex:x ;
+                   sh:property [ sh:path ex:p ;
+                     sh:values {values} ; sh:minCount 1 ; sh:nodeKind sh:IRI ] ."
+            ),
+            RdfFormat::Turtle,
+            None,
+        )
+        .unwrap()
+    };
+    let read = shapes_with("[ shnex:instancesOf ex:C ]");
+    let r = sparkles_shacl::validate(&store.snapshot(), &read, &opts).unwrap();
     assert!(r.conforms, "{r}");
+    let twice =
+        shapes_with("[ shnex:concat ( [ shnex:instancesOf ex:C ] [ shnex:instancesOf ex:C ] ) ]");
+    let err = sparkles_shacl::validate(&store.snapshot(), &twice, &opts).unwrap_err();
+    assert!(format!("{err:#}").contains("more than"), "{err:#}");
 }
