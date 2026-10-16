@@ -28,7 +28,7 @@ use std::path::Path;
 
 /// The thread pool that materializations evaluate rules on, when the process set one.
 #[cfg(feature = "reasoning")]
-static POOL: std::sync::RwLock<Option<std::sync::Arc<sparkles_reasoner::ThreadPool>>> =
+static POOL: std::sync::RwLock<Option<std::sync::Arc<sparkles_reasoner::ReasoningPool>>> =
     std::sync::RwLock::new(None);
 
 /// Evaluate the rules of later materializations on a pool of `threads` threads (the
@@ -49,7 +49,7 @@ pub fn default_reason_threads() -> usize {
 }
 
 #[cfg(feature = "reasoning")]
-pub(crate) fn reason_pool() -> Option<std::sync::Arc<sparkles_reasoner::ThreadPool>> {
+pub(crate) fn reason_pool() -> Option<std::sync::Arc<sparkles_reasoner::ReasoningPool>> {
     POOL.read().unwrap_or_else(|e| e.into_inner()).clone()
 }
 

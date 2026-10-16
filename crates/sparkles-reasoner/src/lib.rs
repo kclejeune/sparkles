@@ -25,6 +25,7 @@ mod incremental;
 pub mod inputs;
 mod maintain;
 pub mod parser;
+mod pool;
 mod terms;
 
 pub use extras::{Extras, UnknownVocabulary, Vocabulary};
@@ -141,8 +142,9 @@ pub struct ReasonOptions {
     /// Threads for rule evaluation: at most the size of [`pool`](Self::pool) when there
     /// is one. `None` uses the pool, or the caller's threads.
     pub threads: Option<usize>,
-    /// The thread pool runs evaluate on (the server's reasoning pool).
-    pub pool: Option<Arc<rayon::ThreadPool>>,
+    /// The reasoning pool runs evaluate on and are admitted to (the server's), see
+    /// [`ReasoningPool`].
+    pub pool: Option<Arc<ReasoningPool>>,
 }
 
 impl Default for ReasonOptions {
@@ -170,7 +172,7 @@ impl fmt::Debug for ReasonOptions {
             .field("inputs", &self.inputs)
             .field("max_memory", &self.max_memory)
             .field("threads", &self.threads)
-            .field("pool", &self.pool.as_ref().map(|p| p.current_num_threads()))
+            .field("pool", &self.pool.as_ref().map(|p| p.threads()))
             .finish()
     }
 }
@@ -288,40 +290,34 @@ fn load_graphs(snap: &Snapshot, graphs: &[Id], extra: usize) -> anyhow::Result<g
     Ok(g)
 }
 
-/// The thread pool type of [`ReasonOptions::pool`].
-pub use rayon::ThreadPool;
+pub use pool::ReasoningPool;
 
-/// A thread pool for rule evaluation, of `threads` threads, for
-/// [`ReasonOptions::pool`].
-pub fn thread_pool(threads: usize) -> anyhow::Result<Arc<rayon::ThreadPool>> {
-    Ok(Arc::new(
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(threads.max(1))
-            .thread_name(|i| format!("sparkles-reason-{i}"))
-            .build()?,
-    ))
+/// A reasoning pool of `threads` threads, for [`ReasonOptions::pool`].
+pub fn thread_pool(threads: usize) -> anyhow::Result<Arc<ReasoningPool>> {
+    Ok(Arc::new(ReasoningPool::new(threads)?))
 }
 
-/// Run `f` on the threads the options ask for: a pool of [`ReasonOptions::threads`]
-/// threads (at most the size of [`ReasonOptions::pool`]), the pool itself, or the
-/// caller's.
-fn on_threads<T: Send>(opts: &ReasonOptions, f: impl FnOnce() -> T + Send) -> anyhow::Result<T> {
-    let limit = opts.pool.as_ref().map(|p| p.current_num_threads());
-    match (opts.threads, &opts.pool) {
-        (Some(n), _) if n > 0 && limit.is_none_or(|l| n < l) => Ok(thread_pool(n)?.install(f)),
-        (_, Some(pool)) => Ok(pool.install(f)),
-        _ => Ok(f()),
-    }
+/// Run `f` off rayon, admitted to the threads the options ask for (see [`pool`]).
+fn admitted<T: Send>(
+    opts: &ReasonOptions,
+    f: impl FnOnce(&pool::Exec) -> anyhow::Result<T> + Send,
+) -> anyhow::Result<T> {
+    pool::Exec::refuse_own_threads(opts.pool.as_ref())?;
+    pool::off_rayon(|| {
+        let exec = pool::Exec::admit(opts.threads, opts.pool.as_ref(), opts.cancel.as_deref())?;
+        f(&exec)
+    })
 }
 
 fn derive(
+    exec: &pool::Exec,
     snap: Arc<Snapshot>,
     profile: &Profile,
     extras: &Extras,
     graphs: &[Id],
     opts: &ReasonOptions,
 ) -> anyhow::Result<Derivation> {
-    on_threads(opts, || derive_here(snap, profile, extras, graphs, opts))?
+    exec.install(|| derive_here(snap, profile, extras, graphs, opts))
 }
 
 fn derive_here(
@@ -609,6 +605,10 @@ pub fn materialize_with(
 /// that are not monotonic, or that create blank nodes, need a full run, and so do RDF
 /// lists that change while the rules read lists. The run then materializes in full and
 /// says why in [`ReasonReport::fallback`].
+///
+/// A run is admitted to [`ReasonOptions::pool`] before it takes the writer lock, and a
+/// run called on a rayon worker thread runs on a native thread while the worker waits
+/// (see [`ReasoningPool`]).
 pub fn materialize_incremental(
     store: &Store,
     profile: &Profile,
@@ -619,13 +619,28 @@ pub fn materialize_incremental(
     extras.validate()?;
     opts.inputs.validate()?;
     let t0 = Instant::now();
+    admitted(opts, |exec| {
+        materialize_admitted(exec, store, profile, extras, inc, opts, t0)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn materialize_admitted(
+    exec: &pool::Exec,
+    store: &Store,
+    profile: &Profile,
+    extras: &Extras,
+    inc: Incremental<'_>,
+    opts: &ReasonOptions,
+    t0: Instant,
+) -> anyhow::Result<ReasonReport> {
     let (mut txn, raw, resolved) = lock_with_changes(store, inc, &opts.inputs);
     let snap = txn.base().clone();
     let digest = rules_digest(profile, extras);
     let mut fallback = None;
     if let (Some(since), Some(raw)) = (inc.since, raw) {
         match update_closure(
-            store, &mut txn, &snap, profile, extras, since, digest, &resolved, inc, raw, opts,
+            exec, store, &mut txn, &snap, profile, extras, since, digest, &resolved, inc, raw, opts,
         ) {
             Ok(done) => {
                 return finish(
@@ -639,7 +654,14 @@ pub fn materialize_incremental(
             }
         }
     }
-    let d = derive(snap.clone(), profile, extras, &resolved.ids(&snap), opts)?;
+    let d = derive(
+        exec,
+        snap.clone(),
+        profile,
+        extras,
+        &resolved.ids(&snap),
+        opts,
+    )?;
     progress(opts, 0.8, "writing inferred graph");
     let mut warnings = d.warnings.clone();
     let w = write_full(&mut txn, &snap, &d, opts)?;
@@ -982,6 +1004,7 @@ fn write_full(
 /// write the changes of the inferred graph.
 #[allow(clippy::too_many_arguments)]
 fn update_closure(
+    exec: &pool::Exec,
     store: &Store,
     txn: &mut sparkles_core::store::WriteTxn<'_>,
     snap: &Arc<Snapshot>,
@@ -1045,7 +1068,7 @@ fn update_closure(
     };
     let ch = &ch;
     progress(opts, 0.1, "updating the closure");
-    let (up, threads) = on_threads(opts, || {
+    let (up, threads) = exec.install(|| {
         let up = incremental::update(
             &mut closure,
             &compiled,
@@ -1054,7 +1077,7 @@ fn update_closure(
             &ch.base_removed,
         );
         (up, rayon::current_num_threads())
-    })?;
+    });
     let up = up?;
     let mut generalized = prev.generalized;
     let mut gen_changes = maintain::GeneralizedChanges::default();
@@ -1213,13 +1236,17 @@ pub fn dred_overdeletion(
     profile: &Profile,
     removed: &[Triple],
 ) -> anyhow::Result<usize> {
-    let d = derive(
-        snap,
-        profile,
-        &Extras::default(),
-        &[Id::DEFAULT_GRAPH],
-        &ReasonOptions::default(),
-    )?;
+    let opts = ReasonOptions::default();
+    let d = admitted(&opts, |exec| {
+        derive(
+            exec,
+            snap,
+            profile,
+            &Extras::default(),
+            &[Id::DEFAULT_GRAPH],
+            &opts,
+        )
+    })?;
     let mut warnings = Vec::new();
     let rules = engine::compile(
         &profile_rules(profile, &Extras::default())?,
@@ -1261,7 +1288,9 @@ pub fn infer(
     opts.inputs.validate()?;
     let resolved = inputs::resolve(&snap, &opts.inputs);
     let ids = resolved.ids(&snap);
-    let d = derive(snap, profile, &Extras::default(), &ids, opts)?;
+    let d = admitted(opts, |exec| {
+        derive(exec, snap, profile, &Extras::default(), &ids, opts)
+    })?;
     let mut out = Vec::new();
     for t in d.derived() {
         if !d.valid(t) {
@@ -1311,7 +1340,9 @@ pub fn bench_derive(
     opts.inputs.validate()?;
     let resolved = inputs::resolve(&snap, &opts.inputs);
     let ids = resolved.ids(&snap);
-    let d = derive(snap, profile, &Extras::default(), &ids, opts)?;
+    let d = admitted(opts, |exec| {
+        derive(exec, snap, profile, &Extras::default(), &ids, opts)
+    })?;
     derived();
     let facts = d.derived();
     let (mut set, mut seq) = (0u64, maintain::FNV_START);
