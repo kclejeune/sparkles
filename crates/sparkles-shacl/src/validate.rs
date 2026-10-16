@@ -40,7 +40,14 @@ pub struct ValidateOptions {
     pub cancel: Option<Arc<AtomicBool>>,
     /// Stop with [`TooManyResults`] once the report would hold more results than this.
     pub max_results: Option<usize>,
+    /// The most nodes one node expression evaluation may work through, counting every
+    /// sub-expression's output. A shared sub-expression counts each time it is evaluated,
+    /// so a doubling expression graph stops here and not after exhausting memory.
+    pub max_expr_nodes: u64,
 }
+
+/// The default of [`ValidateOptions::max_expr_nodes`].
+pub const DEFAULT_MAX_EXPR_NODES: u64 = 1 << 20;
 
 /// A report that would hold more than [`ValidateOptions::max_results`] results.
 #[derive(Debug)]
@@ -67,6 +74,7 @@ impl Default for ValidateOptions {
             timeout: None,
             cancel: None,
             max_results: None,
+            max_expr_nodes: DEFAULT_MAX_EXPR_NODES,
         }
     }
 }
@@ -202,6 +210,8 @@ pub(crate) struct Cx {
     stack: Vec<(ShapeId, Id)>,
     /// nesting of node expression evaluations
     pub depth: usize,
+    /// nodes worked through by the top-level evaluation in progress
+    pub expr_work: u64,
 }
 
 pub(crate) struct Engine<'a> {
@@ -217,6 +227,8 @@ pub(crate) struct Engine<'a> {
     pub deadline: Option<Instant>,
     pub cancel: Option<Arc<AtomicBool>>,
     max_results: Option<usize>,
+    /// the most nodes one node expression evaluation may work through
+    pub max_expr_nodes: u64,
     /// results collected so far (checked against `max_results`)
     collected: AtomicUsize,
 }
@@ -284,6 +296,7 @@ impl<'a> Engine<'a> {
             deadline: opts.timeout.map(|t| Instant::now() + t),
             cancel: opts.cancel.clone(),
             max_results: opts.max_results,
+            max_expr_nodes: opts.max_expr_nodes,
             collected: AtomicUsize::new(0),
         })
     }

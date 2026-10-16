@@ -554,7 +554,11 @@ namespace. The code is `nodeexpr.rs`, the expression tree and its parser, and
   focus node and the variable scope of the call. `sh:hasValue` compares RDF terms. The
   two-argument `shnex:hasLang` is `LANGMATCHES(LANG(x), range)`, and `shnex:sameValue` is
   `COALESCE(a = b, false)`. Nesting is limited to 128 levels when parsing and 192 when
-  evaluating, and deep evaluation grows its stack.
+  evaluating, and deep evaluation grows its stack. One evaluation may work through at
+  most 1,048,576 nodes, counting the output of every sub-expression each time it is
+  evaluated, and `ValidateOptions::max_expr_nodes` changes that limit. Past it the
+  evaluation fails, so an expression graph that doubles at every level stops early.
+  Evaluation also honours the timeout and cancellation of the validation.
 * *Write-time validation.* The incremental guard works out the predicates an expression
   reads from the focus node, as it does for anchored SHACL-SPARQL queries. An expression
   that reads the graph away from the focus node falls back to full validation. Value

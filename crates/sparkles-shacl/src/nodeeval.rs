@@ -51,6 +51,9 @@ impl Scope {
 /// The most nested evaluations (a custom function that calls itself ends here).
 const MAX_EVAL_DEPTH: usize = 192;
 
+/// Units of work between two looks at the timeout and cancellation.
+const EXPR_CHECK_EVERY: u64 = 4096;
+
 /// A failure of a node expression evaluation.
 fn fail<T>(msg: impl Into<String>) -> Result<T> {
     Err(ExprFailure(msg.into()).into())
@@ -91,11 +94,53 @@ impl Engine<'_> {
         if cx.depth >= MAX_EVAL_DEPTH {
             return fail("node expressions nested too deeply (a function calls itself?)");
         }
+        if cx.depth == 0 {
+            cx.expr_work = 0;
+        }
         cx.depth += 1;
         // each level is a big frame; grow the stack for a deep expression
         let r = stacker::maybe_grow(128 << 10, 4 << 20, || self.eval_inner(e, focus, scope, cx));
         cx.depth -= 1;
-        r
+        let out = r?;
+        self.charge(cx, out.len())?;
+        Ok(out)
+    }
+
+    /// Count one evaluation that produced `n` nodes against the budget of the top-level
+    /// evaluation, and look at the timeout and cancellation every few thousand units.
+    fn charge(&self, cx: &mut Cx, n: usize) -> Result<()> {
+        let before = cx.expr_work;
+        cx.expr_work = before.saturating_add(1 + n as u64);
+        if cx.expr_work > self.max_expr_nodes {
+            return fail(format!(
+                "a node expression worked through more than {} nodes",
+                self.max_expr_nodes
+            ));
+        }
+        if before / EXPR_CHECK_EVERY != cx.expr_work / EXPR_CHECK_EVERY {
+            self.check_limits()?;
+        }
+        Ok(())
+    }
+
+    /// Append `next` to `out`, unless the result would pass the budget.
+    fn append(&self, out: &mut Vec<Id>, next: Vec<Id>) -> Result<()> {
+        if (out.len() as u64).saturating_add(next.len() as u64) > self.max_expr_nodes {
+            return fail(format!(
+                "a node expression produced more than {} nodes",
+                self.max_expr_nodes
+            ));
+        }
+        out.extend(next);
+        Ok(())
+    }
+
+    /// Look at the timeout and cancellation every few hundred nodes of a loop.
+    fn tick(&self, i: usize) -> Result<()> {
+        if i.is_multiple_of(256) {
+            self.check_limits()?;
+        }
+        Ok(())
     }
 
     fn nodes_or_focus(
@@ -175,7 +220,8 @@ impl Engine<'_> {
             Expr::Concat(xs) => {
                 let mut out = Vec::new();
                 for x in xs {
-                    out.extend(self.eval(*x, focus, scope, cx)?);
+                    let next = self.eval(*x, focus, scope, cx)?;
+                    self.append(&mut out, next)?;
                 }
                 Ok(out)
             }
@@ -187,7 +233,8 @@ impl Engine<'_> {
             Expr::FilterShape { nodes, shape } => {
                 let n = self.eval(*nodes, focus, scope, cx)?;
                 let mut out = Vec::new();
-                for x in n {
+                for (i, x) in n.into_iter().enumerate() {
+                    self.tick(i)?;
                     if self.conforms(*shape, x, cx)? {
                         out.push(x);
                     }
@@ -207,7 +254,8 @@ impl Engine<'_> {
             Expr::OrderBy { nodes, by, desc } => {
                 let n = self.eval(*nodes, focus, scope, cx)?;
                 let mut keyed: Vec<(Id, Option<Value>)> = Vec::with_capacity(n.len());
-                for x in n {
+                for (i, x) in n.into_iter().enumerate() {
+                    self.tick(i)?;
                     let k = self.eval(*by, x, scope, cx)?;
                     let key = k.first().and_then(|k| self.data.value(*k));
                     keyed.push((x, key));
@@ -222,14 +270,17 @@ impl Engine<'_> {
             Expr::FlatMap { nodes, map } => {
                 let n = self.nodes_or_focus(*nodes, focus, scope, cx)?;
                 let mut out = Vec::new();
-                for x in n {
-                    out.extend(self.eval(*map, x, scope, cx)?);
+                for (i, x) in n.into_iter().enumerate() {
+                    self.tick(i)?;
+                    let next = self.eval(*map, x, scope, cx)?;
+                    self.append(&mut out, next)?;
                 }
                 Ok(out)
             }
             Expr::FindFirst { nodes, shape } => {
                 let n = self.nodes_or_focus(*nodes, focus, scope, cx)?;
-                for x in n {
+                for (i, x) in n.into_iter().enumerate() {
+                    self.tick(i)?;
                     if self.conforms(*shape, x, cx)? {
                         return Ok(vec![x]);
                     }
@@ -238,7 +289,8 @@ impl Engine<'_> {
             }
             Expr::MatchAll { nodes, shape } => {
                 let n = self.nodes_or_focus(*nodes, focus, scope, cx)?;
-                for x in n {
+                for (i, x) in n.into_iter().enumerate() {
+                    self.tick(i)?;
                     if !self.conforms(*shape, x, cx)? {
                         return Ok(vec![self.bool_id(false)]);
                     }
@@ -313,7 +365,7 @@ impl Engine<'_> {
             Expr::NodesMatching(shape) => {
                 let mut out = Vec::new();
                 for (i, n) in self.candidates(*shape)?.into_iter().enumerate() {
-                    if i % 256 == 0 {
+                    if i.is_multiple_of(256) {
                         self.check_limits()?;
                     }
                     if self.conforms(*shape, n, cx)? {

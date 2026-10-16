@@ -220,3 +220,54 @@ ex:S a sh:NodeShape ; sh:targetNode ex:x ; sh:expression [ ex:Loop ( 1 ) ] .
         .unwrap_err();
     assert!(format!("{err:#}").contains("too deeply"), "{err:#}");
 }
+
+/// A shared expression graph in which each `shnex:concat` lists the one
+/// before it twice doubles at every level, far below the nesting limit. Evaluation must
+/// charge its output to a budget (and check the deadline) instead of expanding 2^24
+/// nodes.
+#[test]
+fn doubling_expressions_are_bounded() {
+    let levels = 24;
+    let mut shapes = String::from("_:e0 shnex:concat ( ex:a ex:a ) .\n");
+    for i in 1..levels {
+        shapes.push_str(&format!(
+            "_:e{i} shnex:concat ( _:e{} _:e{} ) .\n",
+            i - 1,
+            i - 1
+        ));
+    }
+    shapes.push_str(&format!(
+        "ex:S a sh:NodeShape ; sh:targetNode ex:x ;
+           sh:property [ sh:path ex:p ; sh:values _:e{} ; sh:maxCount 1 ] .\n",
+        levels - 1
+    ));
+    let store = Store::in_memory(StoreOptions::default());
+    store
+        .load(&[Source::from_bytes(
+            format!("{PREFIXES}ex:x ex:p 1 .").into_bytes(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    let shapes = Shapes::parse(&format!("{PREFIXES}{shapes}"), RdfFormat::Turtle, None).unwrap();
+    let opts = ValidateOptions {
+        timeout: Some(std::time::Duration::from_millis(100)),
+        ..ValidateOptions::default()
+    };
+    let start = std::time::Instant::now();
+    let r = sparkles_shacl::validate(&store.snapshot(), &shapes, &opts);
+    assert!(
+        r.is_err(),
+        "expanded 2^{levels} nodes in {:?} and returned a report",
+        start.elapsed()
+    );
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(2),
+        "took {:?}",
+        start.elapsed()
+    );
+    // without a timeout the node budget stops it
+    let err = sparkles_shacl::validate(&store.snapshot(), &shapes, &ValidateOptions::default())
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("more than"), "{err:#}");
+}
