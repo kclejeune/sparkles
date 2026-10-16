@@ -1098,25 +1098,34 @@ pub(super) fn prefetch_scans(ctx: &Ctx, n: &Node) {
     if !ctx.opt.prefetch_first_scan || !crate::index::io_hints() {
         return;
     }
+    /// The columns the reader decodes of block `b` of the range `[lo, hi]`: the scan's own
+    /// inside the range, and the ones that bound it at an end.
+    fn wanted(
+        index: &crate::index::PermIndex,
+        scan: ColMask,
+        (lo, hi): &(Key, Key),
+        b: usize,
+    ) -> ColMask {
+        let m = &index.blocks[b];
+        if m.first >= *lo && m.last <= *hi {
+            scan
+        } else {
+            scan | crate::index::bound_cols(lo, hi)
+        }
+    }
     /// The blocks of a scan with the columns the reader decodes of each, or nothing for a
     /// scan of more than `FEW_BLOCKS` blocks.
     fn blocks(ctx: &Ctx, spec: &ScanSpec, ranges: &[(Key, Key)]) -> Vec<(usize, ColMask)> {
         let index = ctx.snap.perm(spec.perm);
         let scan = scan_mask(ctx, spec);
         let mut out: Vec<(usize, ColMask)> = Vec::new();
-        for (lo, hi) in ranges {
-            let (b0, b1) = index.key_block_range(lo, hi);
+        for range in ranges {
+            let (b0, b1) = index.key_block_range(&range.0, &range.1);
             if b1 - b0 > FEW_BLOCKS {
                 return Vec::new();
             }
-            let bounds = crate::index::bound_cols(lo, hi);
             for b in b0..b1 {
-                let m = &index.blocks[b];
-                let mask = if m.first >= *lo && m.last <= *hi {
-                    scan
-                } else {
-                    scan | bounds
-                };
+                let mask = wanted(index, scan, range, b);
                 match out.last_mut() {
                     Some((last, wanted)) if *last == b => *wanted |= mask,
                     _ => out.push((b, mask)),
@@ -1151,11 +1160,15 @@ pub(super) fn prefetch_scans(ctx: &Ctx, n: &Node) {
         };
         if let Some((spec, ranges)) = ranges {
             let index = ctx.snap.perm(spec.perm);
-            let blocks = blocks(ctx, spec, &ranges);
-            if let Some(&(first, mask)) = blocks.first()
-                && !ctx.snap.cache.has_cols(index, first, mask)
+            // a warm scan costs this one probe, before any other block is listed
+            let first = ranges.iter().find_map(|r| {
+                let (b0, b1) = index.key_block_range(&r.0, &r.1);
+                (b0 < b1).then(|| (b0, wanted(index, scan_mask(ctx, spec), r, b0)))
+            });
+            if let Some((b, mask)) = first
+                && !ctx.snap.cache.has_cols(index, b, mask)
             {
-                for (b, mask) in blocks {
+                for (b, mask) in blocks(ctx, spec, &ranges) {
                     index.prefetch(&ctx.snap.cache, b, mask);
                 }
             }
