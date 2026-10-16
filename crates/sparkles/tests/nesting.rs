@@ -802,6 +802,36 @@ fn the_measured_plan_depth_bounds_the_plan() {
     });
 }
 
+/// Prints how long `explain` takes and how large its JSON plan is for chains of triple
+/// patterns up to the plan limit. The planning time grows with the square of the chain,
+/// and the plan JSON names each node by its path from the root. Run it in a release build
+/// for the numbers in the docs, with
+/// `cargo test --release -p sparkles --test nesting large_bgp_planning_time -- --ignored --nocapture`.
+#[test]
+#[ignore = "measures time, not behaviour"]
+fn large_bgp_planning_time() {
+    let ds = cyclic();
+    let opts = sparkles::sparql::QueryOptions::default();
+    for n in [500, 1000, (MAX_PLAN_DEPTH - 3) / 2] {
+        let q = format!(
+            "SELECT * {{ {} }}",
+            (0..n)
+                .map(|i| format!("?a{i} <urn:p> ?a{} . ", i + 1))
+                .collect::<String>()
+        );
+        let t = std::time::Instant::now();
+        let (_, plan) = sparkles::sparql::explain(ds.snapshot(), &q, &opts).unwrap();
+        let planned = t.elapsed();
+        let bytes = with_stack(plan.depth(), || serde_json::to_string(&plan).unwrap().len());
+        println!(
+            "chain of {n}: explain {planned:?}, plan depth {}, plan JSON {:.1} MB",
+            plan.depth(),
+            bytes as f64 / 1e6
+        );
+        with_stack(plan.depth(), || drop(plan));
+    }
+}
+
 #[test]
 fn nested_ranges_are_refused_not_overflowed() {
     on_small_stack(|| {

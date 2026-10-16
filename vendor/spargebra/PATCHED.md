@@ -141,7 +141,7 @@ The changes, all in `src/parser.rs` unless noted:
   `error at LINE:COLUMN: nested deeper than 256 levels`. The parser recurses once per
   bracket and overflows a 2 MiB thread stack at a few hundred to a few thousand levels.
   The chains it builds in loops (`a || b || …`, the OPTIONALs of a group, the steps of a
-  path) nest in the algebra, and walking or dropping a chain tens of thousands long
+  path, the IRIs after `DESCRIBE`) nest in the algebra, and walking or dropping a chain tens of thousands long
   overflows the stack too. A stack overflow aborts the process, and every caller in
   Sparkles, the formatter included, parses untrusted text. This is not a fix for upstream
   but a guard Sparkles needs: when this copy is dropped, the check must move to the

@@ -7567,7 +7567,9 @@ The backup routes add a machine-readable `code` (see
 The SPARQL parser recurses once for each level of nesting, and so do the planner, the
 evaluator and the code that frees a parsed query. A query nested a few thousand levels
 deep would overflow a thread's stack, and a stack overflow ends the whole server process.
-The server refuses such requests with `400` before it parses them. The limits are fixed:
+The server refuses such requests with `400`. It checks the limits on the text before it
+parses the query, and the plan limit on the parsed query and again on the plan that the
+planner builds. The limits are fixed:
 
 * A query or update nests at most 256 brackets deep. Every `(`, `[`, `{`, `<<`, `<<(` and
   `{|` counts, including the parentheses of a function call or a property path, and so
@@ -7578,19 +7580,26 @@ The server refuses such requests with `400` before it parses them. The limits ar
   brackets around it. Chains are the operators of an expression such as
   `?a || ?b || …` or `1 + 2 + …`, the steps and operators of a property path, and the
   elements of a group: OPTIONAL, MINUS, UNION, FILTER, BIND, VALUES, a nested group, or a
-  triple with a property path. The count is made on the text and errs on the high side,
-  so a chain of a little under 1024 elements can already be refused. The error reads
-  `nested deeper than 1024 levels, counting each operator of an expression, step of a
-  property path and element of a group as a level`.
+  triple with a property path. Each IRI after `DESCRIBE` counts as an element too. The
+  count is made on the text and errs on the high side, so a chain of a little under 1024
+  elements can already be refused. The error reads `nested deeper than 1024 levels,
+  counting each operator of an expression, step of a property path, element of a group
+  and IRI after DESCRIBE as a level`.
 * A query or update plan nests at most 4000 levels. The planner joins the triple
   patterns of a basic graph pattern one after another, so a basic graph pattern of a few
   thousand triple patterns makes a deep plan without any nesting in the text. Each triple
-  pattern counts as one level, and as two when it has a blank node, since the join on a
-  blank node usually needs a sort. The groups of a query that the planner joins into one
-  plan add up, so a BIND, a subquery or a GRAPH between two basic graph patterns does not
-  reset the count, while the branches of a UNION or OPTIONAL count separately. The count
-  is made on the parsed query before planning, and the error reads `query plan nested
-  deeper than 4000 levels; a basic graph pattern counts one level per triple pattern`.
+  pattern counts as two levels, a join and the sort before it, so a basic graph pattern
+  holds at most 1998 triple patterns. A property path counts its steps the same way. A
+  range such as `<p>{n,m}` unrolls its first n steps into joins, and nested ranges
+  multiply, so `((<p>{32}){32}){4}` makes 4096 steps and is refused. A VALUES block and
+  each filter that the planner places between joins add levels as well. The groups of a
+  query that the planner joins into one plan add up, so a BIND, a subquery or a GRAPH
+  between two basic graph patterns does not reset the count, while the branches of a UNION
+  or OPTIONAL count separately. The count is made on the parsed query before planning, and
+  it errs on the high side, because the plan depends on the statistics. The plan that the
+  planner builds is checked against the same limit before it runs. The error reads `query
+  plan nested deeper than 4000 levels; a basic graph pattern counts two levels per triple
+  pattern`.
 * RDF read from a request body, an upload, a `LOAD` or the shapes of `/{ds}/shacl` nests
   at most 256 triple terms (`<<( … )>>` or `<< … >>`) in Turtle, TriG, N-Triples, N-Quads
   and N3. A JSON-LD document nests at most 256 arrays and objects, and an RDF/XML
@@ -7604,10 +7613,18 @@ The server refuses such requests with `400` before it parses them. The limits ar
   SERVICE error does.
 
 Real queries stay far below these limits. In the W3C SPARQL test suites, no query nests
-more than 5 brackets deep, and the deepest algebra count is 29. Among the 2,800 queries of
-the W3C and Jena test suites and the benchmark query sets, the deepest plan count is 57.
-A basic graph pattern at the plan limit takes seconds to plan, because planning time grows
-with the square of the number of triple patterns. Parsing a query at the
+more than 5 brackets deep, and the deepest algebra count is 29.
+
+A basic graph pattern at the plan limit is a chain of about 2000 triple patterns, and
+planning time grows with the square of the number of triple patterns. A chain of 1998
+takes about 1 s to plan in a release build. Planning does not watch the request's timeout
+until it has finished, so a timeout cannot cut it short. The JSON plan of a query at the
+limit, as `/{ds}/explain` and the Sparkles result format write it, reaches about 60 MB,
+because each node is named by its path from the root. A request body of about 40 KB can
+ask for that. [Roadmap](ROADMAP.md) item 84 covers a deadline in planning and a plan that
+is linear in size.
+
+Parsing a query at the
 bracket limit takes up to 1.5 MiB of stack, which fits the 2 MiB that Rust, tokio and
 rayon give the threads they start. The server runs requests on threads with 8 MiB
 stacks. The planner and the evaluator size their stack from the parsed query and grow it
