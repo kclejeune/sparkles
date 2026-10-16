@@ -31,6 +31,7 @@ A machine-readable description of this API is served at `/$/openapi.json`. See
 * [Full-text search](#full-text-search)
 * [Vector similarity](#vector-similarity)
 * [Path search](#path-search)
+* [Graph algorithms](#graph-algorithms)
 * [GeoSPARQL](#geosparql)
 * [Reasoning status and diagnostics](#reasoning-status-and-diagnostics)
 * [RDFS on read](#rdfs-on-read)
@@ -440,9 +441,9 @@ each request class per client:
 | Class | Requests |
 |-------|----------|
 | `auth` | Every path under `/$/auth/`, matched or not: login, token minting, device flow and the OIDC callback. |
-| `query` | `/{ds}/sparql`, `/{ds}/query`, `/{ds}/queries/{name}`, `/{ds}/explain`, `/{ds}/shacl`, `/{ds}/shex`, `/{ds}/diff`, `/{ds}/graphql` and `/{ds}/graphql/schema`, Graph Store `GET`/`HEAD` and reads of `/{ds}/patch`, `/{ds}` with `query=` or a GET, `/$/schema/*`, `/$/stats/*`, `/$/validate/*`, `/$/reason/{ds}/diagnostics`, `/$/graphql/{ds}/draft`, `/$/commits/{ds}/timeline`, `/$/format`, `/$/lint`, and MCP tool calls and resource reads at `/$/mcp` |
-| `update` | `/{ds}/update`, `/{ds}/upload`, `POST` and `PATCH /{ds}/patch`, Graph Store `PUT`/`POST`/`DELETE`, `/{ds}` with `update=` or any other write, and the MCP tools that write (`sparql_update`, `assert_facts`, `create_branch`, `merge_branch` and `delete_branch`). A form POST to `/{ds}` counts as an update. |
-| `admin` | `/$/…` requests other than `GET`, `HEAD` and `OPTIONS` that are not in the `query` class. These cover dataset management, compaction, backups, reasoning, caches and full-text. |
+| `query` | `/{ds}/sparql`, `/{ds}/query`, `/{ds}/queries/{name}`, `/{ds}/explain`, `/{ds}/shacl`, `/{ds}/shex`, `/{ds}/diff`, `/{ds}/graphql` and `/{ds}/graphql/schema`, Graph Store `GET`/`HEAD` and reads of `/{ds}/patch`, `/{ds}` with `query=` or a GET, `/$/schema/*`, `/$/stats/*`, `/$/validate/*`, `/$/reason/{ds}/diagnostics`, `/$/graphql/{ds}/draft`, `/$/commits/{ds}/timeline`, `/$/format`, `/$/lint`, read-only runs and summaries on `POST /$/algo/{ds}/run`, and MCP tool calls and resource reads at `/$/mcp` |
+| `update` | `/{ds}/update`, `/{ds}/upload`, `POST` and `PATCH /{ds}/patch`, Graph Store `PUT`/`POST`/`DELETE`, `/{ds}` with `update=` or any other write, and the MCP tools that write (`sparql_update`, `assert_facts`, `create_branch`, `merge_branch` and `delete_branch`). Write-back requests on `POST /$/algo/{ds}/run` also use this class. A form POST to `/{ds}` counts as an update. |
+| `admin` | `/$/…` requests other than `GET`, `HEAD` and `OPTIONS` that are not in the `query` or `update` class. These cover dataset management, compaction, backups, reasoning, caches and full-text. |
 | `preauth` | Every request, before authentication. Counts failed credential checks per client address and per IPv6 /48. Has no per-dataset form. |
 
 `/$/ping`, `/$/ready*`, `/$/metrics`, the UI and the other `/$/` reads are never limited.
@@ -611,7 +612,7 @@ per-dataset form and no concurrency caps. `preauth=off` turns it off.
 | GET    | `/$/datasets/{ds}`           | `DatasetInfo` |
 | POST   | `/$/datasets/{ds}?state=offline\|active` | Fuseki's dataset state. An offline dataset answers `503 {code: "dataset-offline"}` on its own endpoints (`/{ds}/…`) and keeps its admin routes. The state is not persisted, so a restart brings every dataset back. `400` without `state` or for another value. Needs `admin` on the dataset. |
 | POST   | `/$/datasets/{ds}/rename`    | Renames the dataset with the JSON body `{ "name": "new-name" }`, keeping its identity and data. Returns `200` with `{ "name", "renamedFrom" }` and `Location`. Requires server administration. `400` for invalid names, `404` for a missing source. `409` for an existing target, live requests or views, reservations, a running compaction or reasoning task, a backup policy of the config file that names the dataset, or a grant, protection or active minted token scope that covers one of the two names and not the other. A pattern that covers both names, such as `*`, does not block a rename. The conflict lists the blockers. The rename carries the dataset's request metrics, compaction scheduler state and pending automatic reasoning run over to the new name, and rewrites the backup policies made through the API that name the dataset exactly. A policy that selects it with a glob is left as written, so it selects the dataset afterwards only if the glob matches the new name. |
-| DELETE | `/$/datasets/{ds}`           | Removes the dataset and its files. Requests to the dataset that arrive meanwhile answer `404`. A persistent dataset that a running request or task still holds answers `409`, so that no old handle can write into a dataset later created under the same name. A dataset of the server's command line (`--loc` or `--mem`) answers `409` with the code `declared-dataset` and stays as it is, since the next start would attach it again. Its `DatasetInfo` has `declared: true`. SPARQL Update and the Graph Store Protocol still clear its data. |
+| DELETE | `/$/datasets/{ds}`           | Removes the dataset and its files. Requests to the dataset that arrive meanwhile answer `404`. A persistent dataset that a running request or task still holds answers `409`, so that no old handle can write into a dataset later created under the same name. A dataset of the server's command line (`--loc` or `--mem`) answers `409` with the code `declared-dataset` and stays as it is, since the next start would attach it again. Its `DatasetInfo` has `declared: true`. SPARQL Update and the Graph Store Protocol still clear its data. A copy that `sparkles migrate --keep-old` kept in `.pre-migrate-<version>-<name>` is not removed. |
 | POST   | `/$/datasets/{ds}/clone`     | Copies the dataset, or some of its graphs, into a new persistent or in-memory dataset. Returns `202` with a `Task`. See [Clone](#clone). |
 | GET/POST | `/$/stats/{ds}`            | `DatasetStats`, which includes Fuseki's request counters in `datasets`. |
 | GET/POST | `/$/stats`                 | Fuseki's statistics: `{ "datasets": { "/ds": FusekiCounters } }` for every dataset the caller may read. |
@@ -4850,28 +4851,49 @@ misses.
 With `"hnsw": false` the index keeps only the packed vectors, which are searched
 exactly.
 
-* **Freshness.** The graph covers the generation's base. Every search adds the
-  snapshot's inserted vectors, scored exactly, and leaves out its deleted ones, so new
-  and deleted vectors count at once. Commits do no index work. A compaction or a bulk
-  load starts a new generation, whose index is built in the background. Searches are
-  exact until it is ready.
+* **Freshness.** The graph is built over the generation's base. After each commit, a
+  background thread inserts the vectors the commit added into the graph, so searches
+  find them through it. Until a vector is inserted, searches score it exactly, and they
+  leave out deleted vectors at once, so new and deleted vectors count from their commit
+  on. Commits themselves do no index work. A search sees exactly the vectors of its own
+  snapshot, also when the graph holds vectors inserted after it. The inserts run on the
+  shared worker pool at normal priority, so under sustained writes they compete with
+  queries for the cores. An index created before its predicate has any row takes the
+  vectors inserted later into its graph like any other index.
+* **New generations.** A compaction carries each index over to the new generation before
+  it switches. The new index reuses the old one's vectors and links, repairs the links
+  around deleted vectors and inserts the new ones, so searches use a graph right after
+  the switch. When more than 30 % of the vectors changed, or the graph's settings
+  differ, the graph is built again in the background after the switch, and searches scan
+  exactly until it is ready. A bulk load starts a new generation whose index is built,
+  or carried over, in the background, and searches are exact until it is ready.
 * **Exact fallback.** A search skips the graph and scans exactly in these cases:
   `exact:true` is set, it reads a past commit, its metric is not the index's, the graph
-  is still being built, at most `exactThreshold` rows are in scope, or the active graph
-  holds less than 5 % of the indexed rows. It also falls back when the graph finds fewer
-  than k rows although more exist. The counters of an executed plan name the path
-  (`method`) and the reason (`exactBecause`).
+  is still being built, at most `exactThreshold` rows are in scope, counting every row
+  the snapshot inserted for the predicate whatever its graph, or the active graph holds
+  less than 5 % of the indexed rows. It also falls back when the graph finds fewer than
+  k rows although more exist. The counters of an executed plan name the path (`method`)
+  and the reason (`exactBecause`).
 * **Builds and files.** Creating an index starts a background build, and writes go on
   meanwhile. The build first publishes the packed vectors, which searches then scan
   exactly, and then the graph. A persistent store writes the build to
   `gen-NNNN/vectors/<name>.spkv` and maps it from there, also after a restart. A file
   that is damaged, or was built for another configuration or generation, is built again.
   Changing only `efSearch`, `exactThreshold` or `model` keeps the build.
-* **Memory.** Packed vectors take `4·dim + 28` bytes per row. The graph takes about
-  `(2M + 1)·4 + 4` bytes per vector, 136 bytes with the default M, because it does not
-  copy the vectors. Both count against `--vector-memory-mb`, mapped or not. A build that
+* **Memory.** Packed vectors take `4·dim + 28` bytes per row. The graph takes about `(2M
+  + 1)·4 + 4` bytes per vector, 136 bytes with the default M, because it does not copy
+  the vectors. Both count against `--vector-memory-mb`, mapped or not. A build that
   would pass the budget leaves the index `over-budget`, and searches then scan exactly
-  within the same budget.
+  within the same budget. Vectors inserted into the graph since the base stay in memory
+  with their links until the next compaction, and they count against the budget too. The
+  background thread inserts vectors only while they fit, and leaves the rest pending, so
+  searches score them exactly and the status reports `overBudget`. Raising the budget
+  lets it go on, and the next compaction releases the inserted vectors. Lowering the
+  budget at run time stops further inserts but does not remove vectors already inserted.
+  On x86-64 CPUs with F16C, a build reads a binary16 copy of the vectors, 2 bytes per
+  dimension, which it holds while it runs. A build also holds a 4-byte distance per link
+  slot while it runs, about as much as the graph's links, and it makes the binary16 copy
+  only when the copy and those distances fit in the budget.
 
 | Method | Path | Result |
 |---|---|---|
@@ -4883,10 +4905,13 @@ exactly.
 | POST | `/$/vector/{ds}/{name}/recall?samples=100&k=10&ef=` | Measures recall@k against the exact search, with stored vectors as queries. Returns `{ k, samples, ef, recall, hnswMs, exactMs }`. `recall` is `null` when no vector was sampled, for example while the index has no graph to search. |
 
 A `VectorIndexStatus` is
-`{ name, predicate, dimension, metric, model?, state, progress?, message?, generation, rows, overlay: { inserts, deletes }, skipped: { malformed, wrongDimension, zeroNorm }, memory: { segmentBytes, hnswBytes, residency }, hnsw, exactThreshold, files?, lastBuild?, embedding? }`.
+`{ name, predicate, dimension, metric, model?, state, progress?, message?, generation, rows, overlay: { inserts, deletes, indexed, pending, overBudget }, skipped: { malformed, wrongDimension, zeroNorm }, memory: { segmentBytes, hnswBytes, residency }, hnsw, exactThreshold, files?, lastBuild?, embedding? }`.
 `state` is `ready`, `building`, `failed` or `over-budget`. `rows` counts the packed base
-rows, and `overlay` the changes that searches add exactly. `residency` is `heap` or
-`mmap`. `hnsw` is `null` or `{ m, efConstruction, efSearch, nodes, layers }`, and
+rows, and `overlay` the changes since the base. Of its inserts, `indexed` are in the
+graph and `pending` are still scored exactly. `overBudget` means the pending rows wait
+because the graph's inserted vectors reached `--vector-memory-mb`. `lastBuild` is `{ at, ms, rows, carried? }`,
+where `carried` means the graph was carried over from the previous generation.
+`residency` is `heap` or `mmap`. `hnsw` is `null` or `{ m, efConstruction, efSearch, nodes, layers }`, and
 `files` is `{ bytes, opened }`, where `opened` means the build was read from its file.
 The configuration lives in `vector.json` in the database directory.
 
@@ -5249,6 +5274,326 @@ described under "Edges from a pattern" below.
 * **Plans.** EXPLAIN shows a `PathSearch` operator with the mode, the ends, the
   predicates and the limits. The executed plan adds the searches run, the nodes they
   visited and the paths found.
+
+## Graph algorithms
+
+`SERVICE algo:<name> { … }` runs a graph algorithm on a projection of the active graph
+and returns the result as solutions, one row for each node, node pair, or node and level.
+The service runs inside Sparkles, so it needs no outbound access and ignores
+`--no-service`. The design is in [F14](specs/F14-graph-algorithms.md).
+
+```sparql
+PREFIX algo: <urn:x-sparkles:algo#>
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+SELECT ?person ?rank WHERE {
+  SERVICE algo:pageRank {
+    [] algo:predicate foaf:knows ; algo:node ?person ; algo:score ?rank .
+  }
+}
+ORDER BY DESC(?rank) LIMIT 20
+```
+
+The block holds triples with one subject, usually `[]`. The predicates are the
+parameters and outputs below. An unknown parameter, or one that the algorithm does not
+take, fails with `400`.
+
+### Algorithms
+
+| Algorithm | Outputs | Parameters |
+|---|---|---|
+| `algo:pageRank` | `algo:score` | `dampingFactor` (0.85), `maxIterations` (20), `tolerance` (1e-7), `source`, `graphalytics` |
+| `algo:betweenness` | `algo:score` | `samples`, `seed` |
+| `algo:wcc`, `algo:scc` | `algo:component` | none |
+| `algo:labelPropagation` | `algo:community` | `maxIterations` |
+| `algo:louvain` | `algo:community`, `algo:level` | `resolution` (1), `maxLevels` (10), `tolerance` (1e-4), `maxIterations` |
+| `algo:leiden` | `algo:community`, `algo:level` | the Louvain parameters, `randomness` (0.01), `seed` |
+| `algo:nodeSimilarity` | `algo:otherNode`, `algo:similarity` | `metric` (`jaccard` or `overlap`), `topK` (10), `similarityCutoff`, `degreeCutoff`, `maxPairs` |
+| `algo:triangleCount` | `algo:triangles` | none |
+| `algo:clustering` | `algo:coefficient`, and `algo:triangles` outside Graphalytics mode | `graphalytics` |
+| `algo:kCore` | `algo:core` | none |
+| `algo:bfs` | `algo:depth` | `source`, `graphalytics` |
+| `algo:sssp` | `algo:distance` | `source`, `graphalytics` |
+| `algo:fastRP` | `algo:embedding` | `dimension` (128, at most 16384), `iterationWeights` (0, 1, 1), `nodeSelfInfluence` (0), `normalizationStrength` (0), `seed` |
+| `algo:node2vec` | `algo:embedding` | `dimension` (128, at most 16384), `walkLength` (80), `walksPerNode` (10), `windowSize` (10), `returnFactor`, `inOutFactor`, `negativeSamples` (5), `epochs` (1), `learningRate` (0.025), `seed` |
+
+Every algorithm also has `algo:node` and `algo:summary` as outputs, and takes
+`algo:concurrency`, `algo:maxMemory` and `algo:limit` as parameters. `algo:source` is a
+constant or a variable that another pattern of the group binds. The call then runs once
+for all its values and joins its rows with the group's. Under `GRAPH ?g`, the call runs
+once for each named graph, and `algo:limit` applies to the rows of each graph, not to
+all of them together.
+
+FastRP takes `iterationWeights` and `nodeSelfInfluence` with the meaning they have in
+Neo4j GDS. The list has one weight for each propagation, and the weight at index `i`
+applies to the embedding after `i + 1` propagations. The default propagates three times
+and weights the second and third, where earlier builds propagated twice.
+`nodeSelfInfluence` is the weight of the random starting vectors, as if they were a 0th
+iteration. A call is refused when `nodeSelfInfluence` is zero and the list is empty or has
+only zero weights. In a JSON request, `"iterationWeights": []` is the empty
+list.
+
+With `algo:graphalytics true`, clustering defaults to forward edges and returns the
+coefficient without triangle counts. An explicit direction on the projection or an
+individual predicate still applies. Ordinary clustering defaults to undirected edges
+and exposes both outputs. Explicitly requesting `algo:triangles` in Graphalytics mode
+is refused.
+
+### Projections
+
+Weighted betweenness requires every stored `f32` edge weight to be finite and strictly
+positive. Zero, signed zero, negative and nonfinite weights fail before its workspace or
+incoming edges are built, and the call returns no score rows. This also refuses a
+finite SERVICE weight that overflows to infinity or underflows to zero when converted
+to `f32`. Unweighted betweenness uses unit edges. Zero-weight SSSP and nonnegative
+PageRank weights remain supported. Nonnegative weighted betweenness is tracked as
+[roadmap item 79](ROADMAP.md).
+
+During weighted search, a competitive distance addition that cannot increase its
+source distance at `f64` precision also refuses the whole invocation with `Invalid`.
+A nonfinite computed distance is refused too. This check can run after workspace or
+incoming edges have been allocated. A refused invocation publishes no score rows,
+success statistics or write-back commits. Noncompetitive absorbed edges remain
+accepted. Accepted distances and path counts still use approximate `f64` arithmetic,
+so rounded path ties need not match exact real sums. Sampling checks only the sources
+it searches. [Roadmap item 80](ROADMAP.md) tracks positive-weight numerical robustness.
+
+A projection is the graph the algorithm runs on, built from the active graph when the
+call starts. It holds what the caller may read.
+
+| Parameter | Value | Default | Meaning |
+|---|---|---|---|
+| `algo:predicate` | an IRI, or a list of an IRI and a direction, repeatable | every predicate between resources except `rdf:type` | The predicates whose triples are edges. |
+| `algo:direction` | `algo:forward`, `algo:backward` or `algo:undirected` | the algorithm's own | How an edge is followed. |
+| `algo:nodeClass` | an IRI, repeatable | any node | Keeps the nodes with that `rdf:type`. A node of the class without edges is a node of the projection. |
+| `algo:weight` | an IRI | none | The property of an edge's RDF 1.2 reifier that holds its weight. |
+| `algo:defaultWeight` | a non-negative number | 1 | The weight of an edge without one. |
+| `algo:aggregate` | `none`, `sum`, `max` or `count` | `none` | How several edges between the same nodes combine. `none` keeps them apart, `sum` adds their weights, `max` takes the largest and `count` uses their number. In an unweighted projection, each edge contributes one, so `sum` retains the multiplicity as a weight. |
+| `algo:projection` | a string | none | The name of a [stored projection](#named-projections). It cannot be combined with the parameters above. |
+
+A block can also hold a nested pattern whose solutions are the edges, with
+`algo:start` and `algo:end` naming the variables of an edge's two ends and
+`algo:edgeWeight` the variable of its weight. The pattern is evaluated once, and each
+distinct pair of ends is one edge. Under `GRAPH ?g` the call runs once for each named
+graph and `?g` is bound to it.
+
+Weights are read only for visible resource edges whose ends pass `algo:nodeClass`.
+Each applicable reifier and weight statement must also be visible in the selected graph
+or graph union. The minimum of its visible numeric weights is used. An applicable
+non-numeric weight fails the call, while unrelated weights do not affect it. A nested
+pattern keeps the first solution's weight for each ordered pair, with the default for
+an unbound weight. Every applicable numeric weight must remain finite when converted
+from f64 to the projection's f32 storage, including each candidate before minimum
+selection and the result of sum aggregation. A default is converted only when it
+supplies an accepted edge.
+
+PageRank requires finite non-negative stored weights, including native library inputs.
+Zero weights are valid. A node whose outgoing weights sum to zero distributes its rank
+as a dangling node. Other algorithms retain their own weight domains.
+
+### Results
+
+* **Doubles.** A score is an `xsd:double` whose lowest four mantissa bits are zero, a
+  relative difference below 2^-48 from the computed value. This keeps every score
+  inline in the index, so a run over millions of nodes adds nothing to the vocabulary.
+* **Limits.** `algo:limit N` keeps the N rows with the highest value of the algorithm's
+  main measure before the rows are joined with the rest of the group. Ties go to the node
+  with the lower term id. For `algo:bfs` and `algo:sssp` the nearest nodes come first.
+* **Node pairs.** `algo:nodeSimilarity` returns each pair in both orders, with the
+  `algo:topK` best partners for each node. `SELECT DISTINCT` over the two nodes in a
+  fixed order, for example with `FILTER(STR(?a) < STR(?b))`, keeps one of each pair.
+  `algo:maxPairs` counts distinct ordered nonself candidates sharing an outgoing
+  neighbour before the partner degree, similarity cutoff and topK filters. It is
+  independent of the memory budget and the number of returned rows.
+* **Summary.** `algo:summary ?s` binds an `rdf:JSON` literal with the statistics of the
+  run, such as `nodes`, `edges` and the iterations or modularity of the algorithm. A
+  block that asks only for `algo:summary` emits one statistics row per selected concrete
+  graph, even when its projection or algorithm result is empty. It computes the
+  algorithm's statistics and omits result-row formatting. Normal SPARQL joins still
+  apply, and `GRAPH ?g` emits no row when it selects no named graphs. With other outputs,
+  the summary remains attached to each actual result row.
+
+An explicitly requested PageRank source that matches no projection node gives no
+ranking results. Its summary reports the projection's node and edge counts with
+`iterations: 0` and `converged: true` to describe a run that did no work. It does not
+compute an unpersonalized ranking. Omitting the source still runs ordinary PageRank.
+* **Embeddings.** `algo:embedding` is an `spk:vector` literal, so it can be written
+  with an update and indexed (see [Vector similarity](#vector-similarity)).
+* **Budgets.** A call counts against the query's timeout and memory budget. A projection
+  or a result that does not fit fails the query with a message that names the parameter
+  to change. `algo:maxMemory` sets a lower budget for one call across all selected
+  graphs. Native buffers and retained outputs share the query's memory owner and
+  server pool admission before allocation. Accumulation within a call reuses admitted
+  columns and grows their capacity geometrically. Spare capacity remains charged with
+  the result, so fewer prefix copies can require more admitted memory. Old and
+  replacement append buffers count while both are live. Completed output keeps its
+  query reservation through parent operators and cursor batches. The call's `peakBytes` stops before the final input
+  join, which keeps its existing query estimates. Projection buffers,
+  distinct pairs, key reconstruction and graph construction admit their requested
+  capacities before allocation, including old and replacement storage while both are
+  live. Deduplicated node arrays retain their full capacity charge. Native callers'
+  consumed edge arrays are admitted by actual capacity on entry, since those arrays
+  already exist. Returned graph storage remains charged once. These bounds cover the
+  pinned Rust Global Vec and hashbrown layouts, not allocator metadata, size classes or
+  process RSS. Node similarity reserves reusable counters, touched IDs and a bounded
+  topK heap for each logical workspace, at most the admitted thread count. Its memory
+  peak includes retained worker-output capacity and old/new growth and final-merge
+  overlap. More admitted threads can therefore need more scratch even in sequential
+  pool fallback. Returned pairs stay charged, and temporary storage releases after
+  it is dropped. Node2vec charges
+  fixed embedding and scratch capacities before allocation and checks cancellation
+  throughout its own initialization, walks and training. Its memory peak includes
+  those capacities while live, with returned embeddings still charged to the call.
+  Incoming rows have a separate reservation for every directed-graph caller, including
+  cache hits. Only the caller constructing those rows reserves temporary cursor offsets.
+  Symmetric graphs reuse outgoing rows. PageRank also reserves its five vector arrays,
+  personalized-source copy and one reusable reduction buffer before allocation. Its
+  temporary reservations end after the buffers are dropped, while returned scores stay
+  charged to the call. These Vec-capacity bounds exclude allocator and Rayon bookkeeping,
+  small summary metadata and other algorithm workspaces outside those bounds.
+  PageRank checks cancellation and deadlines before each node in its four iteration
+  passes and around the passes and their reductions. These checks do not bound edge
+  work inside one incoming row or the ordered outgoing-weight sum, strengthen setup
+  polling or guarantee wall-clock preemption.
+* **Threads and cache.** `--algo-threads` and `--algo-max-threads-per-call` limit the
+  threads of all calls and of each call. A one-thread call runs on the caller and
+  holds one slot in that shared budget. Calls waiting for slots check cancellation and
+  their deadline before admission. `--algo-cache-mb` sizes the cache of built projections. Committed views can reuse a built projection independently of the query
+  result cache. A committed write changes the key. Queries over pending transaction
+  changes neither read nor populate the projection cache, including through masked
+  or derived views. The cache reserves fixed base and possible incoming storage once.
+  Each call separately charges the base projection and the incoming rows it uses.
+  Initialization waits check cancellation and deadlines, and failed builds can be retried.
+* **Plans.** EXPLAIN shows an `AlgoCall` operator with the algorithm and its projection.
+  The executed plan adds the nodes, the edges, the milliseconds spent building and running,
+  the peak bytes, and the projections taken from the cache.
+
+### Runs over HTTP
+
+`POST /$/algo/{ds}/run` takes a JSON request and runs it as the query it stands for.
+Read-only requests, including `summary=true`, require `read` through the `query`
+endpoint. Requests with `write` require `write` through the `update` endpoint. The
+server parses the bounded body once and checks that grant before looking up the
+dataset or disclosing a restore task. Input projections and output writes retain the
+selected endpoint's graph and triple restrictions. Both forms use the admin-body
+ceiling, including after request decompression. Projection-management permissions
+are unchanged.
+
+```json
+{
+  "algorithm": "leiden",
+  "projection": { "predicates": ["http://xmlns.com/foaf/0.1/knows"], "direction": "undirected" },
+  "params": { "seed": 7, "resolution": 1.0 }
+}
+```
+
+Without a `write` member the answer is the result of the query, in the format that the
+`Accept` header or `format` parameter asks for, and the request parameters of
+`/{ds}/sparql` apply (`timeout`, `execution` and the budget overrides). With
+`summary=true` the answer holds only the summary. The `projection` is the name of a stored
+projection or a definition, and its `predicates` may be bare IRIs. Prefixed names in
+`params` and `write` use the standard prefixes and the dataset's.
+
+Read-only requests use the Query rate and concurrency policy. The permit covers
+computation and the response body. Blocking and streaming producers keep their
+share until their work ends even if the client disconnects.
+Admitted error bodies retain the same concurrency permit as successful bodies,
+including after the response headers have been discarded.
+
+A request with a `write` member writes its results back as a task.
+Write requests use Update HTTP admission through the `202` response body. The
+background task does not retain that HTTP permit. It uses the existing task queue
+with four running tasks by default, configurable with `--max-tasks`, a precheck
+that refuses when 1,000 tasks are queued, per-dataset algorithm-task checks and
+algorithm-thread admission. These checks do not form a new atomic task reservation.
+Other task kinds and task polling or cancellation permissions are unchanged.
+
+```json
+{
+  "algorithm": "pageRank",
+  "projection": "people",
+  "write": {
+    "graph": "http://example.org/analytics",
+    "mode": "replace",
+    "predicates": { "score": "http://example.org/rank" },
+    "batchSize": 50000
+  }
+}
+```
+
+| Member | Meaning |
+|---|---|
+| `graph` | The graph that receives the results and the run record. |
+| `mode` | `replace` (the default) clears the graph in the first commit. `merge` replaces only the values of the written predicates for each node it writes. |
+| `predicates` | The predicate each output is written with, for at least one output. An output without a predicate is not written. |
+| `batchSize` | The triples in each commit, 100,000 by default. A batch holds whole nodes. |
+| `atomic` | One commit for the whole run. |
+
+A write-back run is an update, so it has the update deadline. It has no deadline unless
+the request gives a `timeout` or the server runs with `--update-timeout`, and
+`--max-timeout` caps a `timeout` that a request asks for. The server's query timeout does
+not apply to it.
+
+The answer is `202` with a task of kind `algo-run`. The task computes at the head commit
+and then writes batches in commits with the message `algo run <uuid> batch i/n`. It needs
+`write` through the update endpoint, and an active-task precheck refuses another
+algorithm task for the same dataset. It does not reserve that name atomically. A run that is
+cancelled with `DELETE /$/tasks/{id}` keeps the batches it committed. When the task
+ends, its `detail` holds the IRI of the run, the commit it computed at, and the rows,
+triples and commits written. Task and query cancellation sources are both checked during
+computation, result preparation and batch writes, including writer admission. A supplied
+timeout starts at operation entry and shares one absolute bound with the task deadline.
+The earlier bound applies through completion and is never renewed for a later phase.
+Built-in SHACL and ShEx guards retain both cancellation sources and that absolute bound,
+including their SPARQL evaluation. History SERVICE calls forward the same controls to
+the native change-log scan. Native Rust history queries also accept an immutable
+composition of cancellation flags alongside their existing flag and absolute deadline.
+Checks occur during the scan and do not preempt indexing, reads or flushing.
+Custom Rust guards must check the full `WriteOptions`
+cooperatively. These controls do not preempt a durability call or other unchecked work.
+
+The run record is a resource in the output graph with `spk:algorithm`, `spk:parameters`,
+`spk:projection`, `spk:sourceCommit`, `prov:startedAtTime`, `spk:triplesPlanned` and
+`spk:batchesPlanned`. Each batch updates `spk:batchesWritten` and `spk:triplesWritten` in
+its own commit, and the last one adds `prov:endedAtTime` and `spk:status`, which is
+`complete`. A partial run that is cancelled or fails attempts one optional commit of
+`cancelled` or `failed`. It skips a busy writer and uses a separate, nonrenewing 100 ms
+cleanup budget. That budget applies at cooperative checks and cannot preempt a durability
+call. Failure to record status preserves the original error and committed batches. If the
+last batch has already committed, a late control error preserves its complete record
+rather than adding a contradictory status. Cancellation can still race the final check.
+`louvain` and `leiden` write each community as the resource
+`urn:x-sparkles:algo:{run}:{level}:{id}`, with the level and a `skos:broader` link to its
+parent at the next level.
+
+A replace run commits its first batch before the others, so a reader sees a graph with
+part of the new results until the run ends. Use `atomic` for a graph that must change at
+once, at the price of one large commit.
+
+### Named projections
+
+| Route | Needs | Meaning |
+|---|---|---|
+| `GET /$/algo/{ds}/projections` | read | The definitions, and the size of the projection cache. |
+| `GET /$/algo/{ds}/projections/{name}` | read | One definition with its revision, as the `ETag` `"r3"`. |
+| `PUT /$/algo/{ds}/projections/{name}` | admin | Create or replace a definition. `If-Match: "r3"` replaces only that revision and `If-None-Match: *` only creates. A bare string in `predicates` means that predicate in the algorithm's direction. |
+| `DELETE /$/algo/{ds}/projections/{name}` | admin | Remove a definition. |
+
+A name has letters, digits, `_` and `-`, at most 64 characters. A definition has the
+members of a projection above in camel case: `predicates`, `direction`, `nodeClasses`,
+`weight`, `defaultWeight` and `aggregate`. An empty `predicates` list is refused with
+`400`, and leaving the member out means every predicate but `rdf:type`. `algo:projection
+"name"` in SPARQL and the `projection` of a run request refer to a definition by name.
+They read the definition as it is when the query is planned, so a query at an older commit
+uses today's definitions.
+
+The definitions are kept in `algo.json` of a persistent dataset, which backups and
+clones include. Its registered format is 1, and a missing format marker also reads as
+1 without rewriting the file. A newer version returns `Unsupported` before dataset
+metadata changes, including when it belongs to an active or retained branch.
+`sparkles migrate --check` applies the same version check without changing files.
+Malformed JSON, duplicate known struct fields or malformed current definitions leave
+the list empty, report why in `warning`, and refuse catalog changes, so that the damaged
+file is never overwritten.
 
 ## GeoSPARQL
 
@@ -7262,10 +7607,12 @@ therefore cannot deadlock. While requests wait, a query may not hold more than h
 pool. A query that exceeds its own `memory` budget still answers `507`.
 
 An eager query keeps its highest estimate in the pool until its result is released, so
-results held by the caller keep their share. A SERVICE call to the same server is admitted
-like any request, so it can answer `503` while its caller holds memory. Uploads and Graph
-Store writes take an admission grant for the whole load, and the memory of the load itself
-is not counted in the pool.
+results held by the caller keep their share. In an embedded catalog with a pool, a
+`QueryResult` and the Python and Node result objects keep their query's peak estimate
+until they are dropped or collected, even when the result is much smaller. A SERVICE call
+to the same server is admitted like any request, so it can answer `503` while its caller
+holds memory. Uploads and Graph Store writes take an admission grant for the whole load,
+and the memory of the load itself is not counted in the pool.
 
 `GET /$/server/memory` needs the `metrics` permission and returns the pool and the shared
 caches.
@@ -7489,6 +7836,9 @@ without the permission is a `403` before any connection or file is opened, even 
 | `/ui/*`, `/$/ping`, `/$/ready`, `/$/openapi.json`, `/$/openapi.yaml` | GET | Nothing. Without `metrics`, `/$/ready` lists only readable datasets. |
 | `/$/whoami`, `/$/auth/config`, `/$/auth/login`, `/$/auth/oidc/*` (including the back-channel logout), `/$/auth/device`, `/$/auth/token` | | Nothing. Invalid credentials are still `401`. |
 | `/$/server`, `/$/datasets` (GET), `/$/tasks`, `/$/tasks/{id}`, `/$/stats`, `/$/backups-list`, `/$/validate/*`, `/$/auth/logout`, `/$/format` (POST), `/$/lint` (POST), `/$/geo/convert` (POST) | | Any caller. `/$/format` and `/$/lint` admit nobody under `--format-endpoint off`, and only signed-in callers under `authenticated`. Listings show readable datasets only, and server-wide tasks only to `server-admin`. `/$/stats` covers the datasets the caller may read, and `/$/backups-list` the files of the datasets it administers. Cancelling a task (DELETE) needs `admin` on its dataset. |
+| `/$/algo/{ds}/run` | POST | Read-only runs need `read` through `query`. Runs with `write` need `write` through `update`. The body selects the policy before dataset access. |
+| `/$/algo/{ds}/projections[/{name}]` | GET | `read` through `info`. |
+| `/$/algo/{ds}/projections/{name}` | PUT, DELETE | Dataset `admin`. |
 | `/$/metrics` | GET | `metrics` |
 | `/$/datasets` | POST | `server-admin` |
 | `/$/datasets/{ds}`, `/$/stats/{ds}`, `/$/schema/{ds}…`, `/$/queries/{ds}…` (GET), `/$/prefixes/{ds}`, `/$/commits/{ds}…`, `/$/ready/{ds}`, `/$/reason/{ds}` (GET), `/$/reason/{ds}/diagnostics`, `/$/text/{ds}` (GET), `/$/geo/{ds}` (GET), `/$/vector/{ds}`, `/$/vector/{ds}/{name}` (GET), `/$/snapshots/{ds}…` (GET), `/$/history/{ds}` (GET), `/$/validation/{ds}` (GET), `/$/rdfs/{ds}` (GET), `/$/describe/{ds}` (GET), `/$/quota/{ds}` (GET), `/$/compaction/{ds}` (GET), `/$/graphql/{ds}…` (GET), `/{ds}/prefixes` (GET) | GET | `read`. `POST /$/vector/{ds}/{name}/recall` needs `read` too. |
@@ -7572,8 +7922,8 @@ server_models = true
 
 | Endpoint | Requests |
 |---|---|
-| `query` | SPARQL queries on `/{ds}/sparql`, `/{ds}/query` and `/{ds}`, stored-query runs on `/{ds}/queries/{name}`, `/{ds}/explain`, `/{ds}/text`, `/{ds}/geo`, and the MCP tools that query |
-| `update` | SPARQL Update on `/{ds}/update` and `/{ds}`, and the MCP tool `sparql_update` |
+| `query` | SPARQL queries on `/{ds}/sparql`, `/{ds}/query` and `/{ds}`, stored-query runs on `/{ds}/queries/{name}`, `/{ds}/explain`, `/{ds}/text`, `/{ds}/geo`, read-only algorithm runs and summaries on `POST /$/algo/{ds}/run`, and the MCP tools that query |
+| `update` | SPARQL Update on `/{ds}/update` and `/{ds}`, algorithm write-back on `POST /$/algo/{ds}/run`, and the MCP tool `sparql_update` |
 | `gsp-r` | Graph Store reads (`GET` and `HEAD` on `/{ds}/data`, `/{ds}/get` and `/{ds}`) |
 | `gsp-rw` | Graph Store reads and writes |
 | `upload` | `/{ds}/upload` |
@@ -8299,6 +8649,7 @@ open-world when SERVICE is allowed. The common arguments are:
 | `explain_query` | `query` (required), `includeAlgebra`, `profile`, `notes`, `timeoutSeconds`, `useServerModel` | `{dataset, commit, queryType, estimatedRows, plan, algebra?, warnings: [{code, message}]}`. `plan` has one line per operator, `<operator> <description> est=<rows> [<columns>]`, indented by depth. With `profile: "run"`, the query runs read-only under `timeoutSeconds` (30 by default), its rows are counted in `rows` without being returned, and a run that a budget stopped is explained from its partial plan with the budget in `error`. With `notes: true`, each line starts with the node id and adds `act=` and `ms=` after a run, and the result adds `nodes`, `notes` and `asks` as `POST /{ds}/sparql/explain` defines them, with `source: "template"`. The tool never calls the server's model providers unless `useServerModel` is `true`, which needs the `serverModels` permission and fails with `server-model-not-allowed` otherwise. Its prose then replaces `asks` and the notes' text with `source: "model"`, and its tokens are charged to the caller. The warnings are `unknown-term` (a constant IRI or literal of a triple pattern that the dataset does not contain), `no-limit` (no top-level LIMIT, and over 10,000 rows estimated), `large-estimate` (an intermediate result over 50M rows) and `service-disabled`. For a caller whose graph grants or triple protections hide data, `unknown-term` looks terms up in the caller's view, so a term that occurs only in hidden data is reported as an absent one is. Such a caller sees no estimates, so `estimatedRows` is `null`, the plan shows `est=?`, there is no `large-estimate`, and `no-limit` applies to every query without a LIMIT. |
 | `describe_resource` | `iri` (required), `direction` (`both`\|`outgoing`\|`incoming`), `maxTriples` (50 per direction, ≤ 500), `lang` (`en`), `mode` (`cbd`\|`scbd`\|`outgoing`) | `{dataset, commit, iri, exists, label?, types, outgoing?, incoming?, description?, prefixes}`. Each side is `{total, predicates: [{p, count}], predicatesTotal, triples: [{p, o, oLabel?}` or `{s, sLabel?, p}], truncated}`. Triples are sampled round-robin by predicate, so a hub's largest predicate does not hide the others. With `mode`, `description` is `{mode, triples: ["s p o"], truncated}`: the resource's [DESCRIBE](#describe) in that mode, at most `maxTriples` triples. |
 | `find_paths` | `source` and `target` (IRIs; at least one), `predicates` (≤ 20 IRIs; default all), `algorithm` (`shortest`\|`allShortest`\|`kShortest`\|`all`), `direction` (`forward`\|`backward`\|`both`), `minLength`, `maxLength`, `k`, `limit` (10, ≤ 100), `maxVisited`, `weight` (an IRI), `defaultWeight`, `graph` (`default` or a named graph IRI), `timeoutSeconds` (30) | `{dataset, commit, algorithm, paths: [{source, target, length, cost, edges: ["s p o"]}], limited, edgesTruncated, prefixes}`: a [path search](#path-search) as `SERVICE path:search` runs it. With one end, the paths to or from every node it connects to, at most `limit`. At most 2000 edges are returned in all. A malformed search is `syntax`, with the `path:search` message. |
+| `graph_algorithm` | `algorithm` (required), `projection` (a stored projection) or `predicates` (≤ 20), `direction`, `nodeClasses` and `weight`, `params` (the algorithm's parameters by name), `limit` (20, ≤ 100), `timeoutSeconds` (30) | `{dataset, commit, algorithm, columns, rows: [[…]], limited, summary, prefixes}`: a [graph algorithm](#graph-algorithms) as `SERVICE algo:<name>` runs it, with the best `limit` rows by the algorithm's main measure and the statistics of the run. Numbers are numbers and other terms are compact strings. The tool never writes results back. |
 | `list_commits` | `limit` (10, ≤ 100), `before` | `{dataset, head, firstRetained, complete, commits: [{seq, timestamp, kind, inserted, deleted, quads}], next: {before} \| null, readable: [{from, to}], snapshots: [{name, commit}]}`. `readable` lists the commits whose state `at` and `atCommit` can read, and `snapshots` the 20 newest named snapshots. |
 | `list_changes` | `subjects`, `predicates`, `objects` and `graphs` (each ≤ 20; objects may be literals in N-Triples syntax, graphs `default` or IRIs), `from` and `to` (a commit or a selector string), `op` (`add`\|`remove`), `order` (`asc`\|`desc`), `limit` (100, ≤ `--mcp-max-rows`), `timeoutSeconds` (30) | `{dataset, head, from, to, changes: [{commit, timestamp, kind, author?, message?, op, quad}], truncated, unrecorded: [{from, to, reason}], prefixes}`: the [history query](#history-queries) of `GET /{ds}/history`, with each quad as one line of terms. It needs the grant of the `diff` endpoint and leaves out the graphs and triples the caller may not read. |
 | `search_text` | `query` (required, ≤ 1000 characters: terms, `"phrases"`, AND/OR, `+required`, `-excluded`), `predicates` (≤ 20 IRIs), `lang`, `limit` (20, ≤ 200), `withTypes` (true) | `{dataset, commit, hits: [{s, score, text, p, label?, types?}], limited, prefixes}`: BM25-ranked matches of `text:query`. `text` is the matched literal, escaped and at most 300 characters long, and `types` has at most 3 entries. Only in builds with the `text` feature. A dataset without an index (`textSearch: false`) gives `text-disabled`. |

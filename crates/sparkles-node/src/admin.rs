@@ -2,6 +2,10 @@
 use super::*;
 use serde::Serialize;
 use sparkles::history::{At, SnapshotOptions};
+#[cfg(feature = "failpoints")]
+mod algo_stats_probe;
+#[cfg(test)]
+mod algo_stats_tests;
 fn value<T: Serialize>(v: T) -> sparkles::Result<Value> {
     serde_json::to_value(v).map_err(|e| EngineError::invalid(e.to_string()))
 }
@@ -175,6 +179,7 @@ fn u64_field(k: &str) -> bool {
             | "bulkMaxQuads"
             | "version"
             | "ifVersion"
+            | "ifRevision"
     )
 }
 fn config_numbers(v: Value, key: &str) -> Value {
@@ -243,6 +248,10 @@ fn writes(op: &str) -> bool {
             | "queries.list"
             | "queries.get"
             | "queries.versions"
+            | "algo.projections.list"
+            | "algo.projections.get"
+            | "algo.queryText"
+            | "algo.stats"
             | "branches.list"
             | "branches.get"
             | "indexes.text.status"
@@ -518,6 +527,65 @@ fn run_admin(
         "settings.changeLog.get" => value(ds.settings().change_log().get())?,
         "settings.changeLog.set" => value(ds.settings().change_log().set(config(a)?)?)?,
         "settings.changeLog.reset" => value(ds.settings().change_log().reset()?)?,
+        "algo.projections.list" => value(
+            ds.algorithms()
+                .projections()
+                .list()
+                .into_iter()
+                .map(|(name, stored)| json!({ "name": name, "stored": stored }))
+                .collect::<Vec<_>>(),
+        )?,
+        "algo.projections.get" => value(ds.algorithms().projections().get(text(a, "name")?))?,
+        "algo.projections.put" => {
+            let def = sparkles::algo::catalog::ProjectionDef::from_json(a["definition"].clone())?;
+            let (stored, created) = ds.algorithms().projections().put(
+                text(a, "name")?,
+                def,
+                a["author"].as_str().map(String::from),
+                if a["ifRevision"].is_null() {
+                    None
+                } else {
+                    Some(number(a, "ifRevision")?)
+                },
+            )?;
+            json!({ "stored": value(stored)?, "created": created })
+        }
+        "algo.projections.delete" => value(ds.algorithms().projections().delete(
+            text(a, "name")?,
+            if a["ifRevision"].is_null() {
+                None
+            } else {
+                Some(number(a, "ifRevision")?)
+            },
+        )?)?,
+        "algo.queryText" => json!(ds.algorithms().query_text(
+            &sparkles::sparql::algorun::AlgoRequest::from_json(a["request"].clone())?,
+            a["summary"].as_bool().unwrap_or(false),
+        )?),
+        "algo.stats" => {
+            #[cfg(feature = "failpoints")]
+            let probe = algo_stats_probe::Probe::install(ctl)?;
+            let result = ds.algorithms().stats(
+                &sparkles::sparql::algorun::AlgoRequest::from_json(a["request"].clone())?,
+                &sparkles::sparql::QueryOptions {
+                    cancel: Some(ctl.cancel.flag()),
+                    deadline: ctl.deadline,
+                    ..Default::default()
+                },
+            );
+            #[cfg(feature = "failpoints")]
+            if let Some(probe) = probe {
+                probe.finish(&result)?;
+            }
+            let text = result?;
+            serde_json::from_str::<Value>(&text).map_err(|e| EngineError::invalid(e.to_string()))?
+        }
+        "algo.runWrite" => value(ds.algorithms().run_write(
+            &sparkles::sparql::algorun::AlgoRequest::from_json(a["request"].clone())?,
+            &sparkles::sparql::QueryOptions::default(),
+            a["author"].as_str().map(Into::into),
+            ctl,
+        )?)?,
         "queries.list" => value(ds.queries().list())?,
         "queries.get" => value(ds.queries().get(
             text(a, "name")?,

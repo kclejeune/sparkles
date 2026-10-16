@@ -35,6 +35,7 @@ from sparkles._errors import (
 from sparkles._sparkles import (
     FEATURES,
     INFERRED_GRAPH,
+    Algorithms,
     BlankNode,
     Branches,
     BranchSettings,
@@ -61,6 +62,7 @@ from sparkles._sparkles import (
     Literal,
     NamedNode,
     PatchStats,
+    Projections,
     Quad,
     QuadIterator,
     QueryCursor,
@@ -105,6 +107,7 @@ from sparkles._sparkles import (
 __all__ = [
     "FEATURES",
     "INFERRED_GRAPH",
+    "Algorithms",
     "BackupError",
     "BlankNode",
     "BranchSettings",
@@ -140,6 +143,7 @@ __all__ = [
     "NotFoundError",
     "ParseError",
     "PatchStats",
+    "Projections",
     "PermissionDeniedError",
     "Quad",
     "QuadIterator",

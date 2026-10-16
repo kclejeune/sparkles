@@ -704,6 +704,25 @@ index.
 
 ## Outcome
 
+Algorithm SERVICE calls now share the query ledger and pool admission with ordinary
+query work. Native allocation and output leases use one admission transaction, and a
+refused increment changes neither live ownership nor the successful native peak.
+Eager owners retain their admitted high-water contribution. Cursor owners retain live
+storage through fallback transfer, sorting, returned batches and early close. Each
+public context operation still reads its current memory limit and grant. Existing
+contributions remain attached to their original grants when those fields change.
+
+Projection and result caches keep plain data rather than query owners. A warm caller
+admits its own storage before use or copying. Closing an algorithm call transfers its
+finished output to query-only ownership without releasing and reacquiring its grant.
+Algorithm accumulation reuses admitted columns and grows them geometrically, keeping
+the incoming part and complete replacement charged while the old backing is live.
+Spare capacity stays charged with the output, trading unused capacity for fewer
+allocations and prefix copies.
+These capacity and ownership checks retain the existing estimates for other executor
+kernels and decoded terms. They exclude allocator metadata, size classes and process
+RSS, and do not establish a performance result.
+
 Phase 1 is built (roadmap item 2). Phases 2 and 3 are not (items 7 and 40).
 
 ### Phase 1a: shared caches
@@ -725,7 +744,12 @@ namespace and so one set of counters.
 * **Result and SERVICE caches.** Keys are `(namespace, string)` and a lookup borrows the
   string. `POST /$/cache/clear/{ds}` removes the namespace's entries with `retain` instead
   of bumping an epoch. It is exact, so the counters report what was cleared, and it costs
-  a pass over the cache.
+  a pass over the cache. Both caches keep an entry up to an eighth of their budget, and
+  quick_cache refuses an entry heavier than 97% of one shard's share, so each has at
+  most four shards. With quick_cache's default of four shards per CPU, a 64 MiB result
+  cache on a host with 16 CPUs had shards of 1 MiB and dropped the 8 MiB entries that it
+  accepted. The block cache keeps the default, because quick_cache keeps at least 32
+  expected columns in each of its shards, so a full column always fits.
 * **History cache.** Each store's materialized states stay a list, charged to a shared
   `ByteBudget` that every mutation settles. A store that finds the budget over evicts its
   own oldest states, and when it still holds only the state it just built, that state is
@@ -749,8 +773,9 @@ namespace and so one set of counters.
 ### Phase 1b: the query memory pool
 
 `QueryPool` and `PoolGrant` are in `sparkles-core` (`sparql/pool.rs`) as §4.1 describes.
-`Charge::add` checks the grant only after its own `mem_live` update. Cursor state returns
-through `Ctx::release_live`, and the pool never makes a running query wait. The grant adds eager contexts' retained estimates to live cursor charges,
+`Charge::add` admits local and pool growth under the query ledger's lock before
+publishing live ownership. Cursor state returns through the same ledger, and the pool
+never makes a running query wait. The grant adds eager contexts' retained estimates to live cursor charges,
 and growth and trimming of one grant run under a lock of its own. The differences from
 the text:
 
@@ -846,10 +871,11 @@ fitting output estimates, separate context lifetimes, graph lexical payload, bud
 failure cleanup and conversion from eager preparation to cursor accounting. The existing
 profile and latency measurements remain pending as described below.
 
-The retained-estimate path keeps its acquire fast read and moves growth into a separate
-helper that is never inlined. The helper preserves the locked recheck, admission of the
-positive contribution and publication only after admission succeeds. An isolated Intel
-comparison covers only `types-grouped` and does not settle the latency gate. The A1
+The query ledger now serializes admission and successful ownership publication for
+ordinary charges and adapted algorithm buffers. Pool releases and wakeups run after
+that lock is released. This changes the retained-estimate path from the earlier fast
+read and separate growth helper. The earlier isolated Intel comparison covered only
+`types-grouped` and does not measure this repair or settle the latency gate. The A1
 anonymous RSS remeasurement, the 10.5M and DBpedia profile runs, and the latency study
 comparing the baseline, fixed build and pool settings remain pending as described below.
 
@@ -917,6 +943,17 @@ comparing the baseline, fixed build and pool settings remain pending as describe
 * **X08-P1-nested-service.** Recognise a SERVICE call to the same server, without a header
   that a client could forge, so that it does not wait behind its caller's grant. Today it
   answers `503` after the admission wait, and `SILENT` turns that into empty results.
+* **X08-P1-admit-after-body.** Admit a POST query or update after its body is read under
+  the existing body limit, give uploads and Graph Store writes no 16 MiB initial grant,
+  and wake only the waiters that fit when memory returns. Today admission happens before
+  the body is read, and the server sets no body read timeout, so a slow client holds its
+  grant while it sends. Every release wakes every waiter.
+* **X08-P1-retained-results.** Shrink an eager context's retained estimate to its result's
+  size when the query finishes. Today an eager `QueryResult` keeps its query's peak
+  estimate until it is dropped, and a Python or Node result object keeps it until the
+  object is collected.
+* A lock-free `try_grant` when no request waits, measured with the latency gate above.
+  Admission takes the queue's lock on every request.
 * The 10.5M and DBpedia runs of the profile gate in §3.3, warm and cold. Only the
   1.05M screen ran.
 * A settings-file profile (C19) and the `small` default for the bindings (§8.2).

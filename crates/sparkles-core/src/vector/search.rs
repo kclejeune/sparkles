@@ -7,7 +7,9 @@
 //! result is the best rows among the graph's candidates and the inserted rows.
 
 use super::config::SearchMode;
+use super::hnsw;
 use super::index::{Built, Segment};
+use super::live::{LiveState, View};
 use super::{Metric, budget, graph_dist, norm, score};
 use crate::error::{Error, Result};
 use crate::index::Perm;
@@ -65,7 +67,14 @@ pub struct SearchInfo {
     pub rows: u64,
     /// base rows scored
     pub scored: u64,
+    /// rows the snapshot inserted since the generation's base, in scope. When the graph's
+    /// live layer has caught up with the snapshot, this is every inserted row of the
+    /// predicate, not only those in the search's graph scope, because counting in scope
+    /// would cost the walk over the rows that the caught-up layer lets the search skip.
     pub inserted: u64,
+    /// of those, the rows scored exactly because the graph does not hold them yet (all
+    /// of them unless the graph answered)
+    pub pending: u64,
     pub deleted: u64,
 }
 
@@ -127,30 +136,21 @@ pub fn search(
         .map(|k| [k[1], k[2], k[3]])
         .collect();
     info.deleted = deleted.len() as u64;
-    let mut inserted: Vec<Hit> = Vec::new();
-    let mut ins_dims: FxHashSet<usize> = FxHashSet::default();
-    for k in snap.delta.ins[pi].range(lo..=hi) {
-        if q.subjects.is_some_and(|s| s.binary_search(&k[1]).is_err()) {
-            continue;
-        }
-        let Some(v) = gv.overlay_vector(snap, k[2]) else {
-            continue;
-        };
-        ins_dims.insert(v.len());
-        if v.len() != dim || !(q.graph)(k[3]) {
-            continue;
-        }
-        if let Some(sc) = score(q.metric, q.query, qnorm, &v, norm(&v)) {
-            inserted.push(Hit {
-                s: k[1],
-                o: k[2],
-                g: k[3],
-                score: sc,
-            });
-        }
-    }
-    info.inserted = inserted.len() as u64;
     let seg = base.segment(dim);
+    // whether the graph answers, decided before the inserted rows are read: the rows its
+    // live layer holds are then found through it and not scored here
+    let plan = match (&base, q.subjects, seg) {
+        (Base::Index(b), None, Some(_)) => Some(ann_plan(snap, b, q, &deleted)),
+        _ => None,
+    };
+    let live = match (&base, &plan) {
+        (Base::Index(b), Some(Ok(_))) => Some(b.live.read()),
+        _ => None,
+    };
+    let mut ins_dims: FxHashSet<usize> = FxHashSet::default();
+    let (mut inserted, covered) = inserted_rows(snap, q, qnorm, live.as_deref(), &mut ins_dims);
+    info.inserted = inserted.len() as u64 + covered;
+    info.pending = inserted.len() as u64;
     if seg.is_none() && inserted.is_empty() {
         let mut dims: Vec<usize> = match &base {
             Base::Implicit(p) => p.by_dim.keys().copied().chain(ins_dims).collect(),
@@ -171,41 +171,98 @@ pub fn search(
     }
     info.rows = seg.map_or(0, |s| s.rows() as u64);
     let ctx = Ctx {
+        snap,
         q,
         qnorm,
         deleted: &deleted,
     };
     let mut cand: Vec<Hit> = match seg {
         None => Vec::new(),
-        Some(seg) => match (q.subjects, &base) {
-            (Some(subjects), _) => {
+        Some(seg) => match (q.subjects, &base, plan) {
+            (Some(subjects), _, _) => {
                 info.method = "candidates";
                 ctx.subjects(seg, subjects, &mut info, check)?
             }
-            (None, Base::Index(b)) => match ann_plan(snap, b, q, &deleted) {
-                Ok(ef) => {
-                    info.method = "hnsw";
-                    info.ef = ef;
-                    match ctx.ann(b, ef, &mut info, check)? {
-                        Some(h) => h,
-                        None => {
-                            // the graph found too few rows: fall back
-                            info.method = "exact";
-                            info.reason = Some("the graph found fewer than k rows");
-                            ctx.exact(seg, &mut info, check)?
-                        }
+            (None, Base::Index(b), Some(Ok(ef))) => {
+                info.method = "hnsw";
+                info.ef = ef;
+                let live = live.as_deref().expect("read with the plan");
+                match ctx.ann(b, live, covered, ef, &mut info, check)? {
+                    Some(h) => h,
+                    None => {
+                        // the graph found too few rows: fall back, scoring every
+                        // inserted row
+                        info.method = "exact";
+                        info.reason = Some("the graph found fewer than k rows");
+                        inserted = inserted_rows(snap, q, qnorm, None, &mut ins_dims).0;
+                        info.pending = inserted.len() as u64;
+                        ctx.exact(seg, &mut info, check)?
                     }
                 }
-                Err(reason) => {
-                    info.reason = reason;
-                    ctx.exact(seg, &mut info, check)?
-                }
-            },
-            (None, _) => ctx.exact(seg, &mut info, check)?,
+            }
+            (None, Base::Index(_), Some(Err(reason))) => {
+                info.reason = reason;
+                ctx.exact(seg, &mut info, check)?
+            }
+            (None, _, _) => ctx.exact(seg, &mut info, check)?,
         },
     };
     cand.extend(inserted);
     Ok((finish(q, cand), info))
+}
+
+/// The snapshot's inserted rows of the predicate in scope, scored exactly, and the
+/// number of rows in scope whose pair the graph's live layer `live` holds, which are not
+/// read here because the graph finds them. When `live` has caught up with a snapshot of
+/// the same delta, it holds every row it can score, so the rows are counted without
+/// reading them, and the count is every inserted row of the predicate. `ins_dims`
+/// collects the dimensions of the rows read.
+fn inserted_rows(
+    snap: &Snapshot,
+    q: &Search<'_>,
+    qnorm: f32,
+    live: Option<&LiveState>,
+    ins_dims: &mut FxHashSet<usize>,
+) -> (Vec<Hit>, u64) {
+    let gv = &snap.generation.vectors;
+    let pi = Perm::Pso.index();
+    let lo = [q.pred, 0, 0, 0];
+    let hi = [q.pred, u64::MAX, u64::MAX, u64::MAX];
+    if let Some(l) = live {
+        let rows = snap.delta.ins[pi].count_between(&lo, &hi) as u64;
+        if l.is_caught_up(snap, rows) {
+            return (Vec::new(), rows);
+        }
+    }
+    let mut out = Vec::new();
+    let mut covered = 0;
+    for k in snap.delta.ins[pi].range(lo..=hi) {
+        if q.subjects.is_some_and(|s| s.binary_search(&k[1]).is_err()) {
+            continue;
+        }
+        if let Some(l) = live
+            && l.node_of(k[1], k[2]).is_some()
+        {
+            covered += (q.graph)(k[3]) as u64;
+            continue;
+        }
+        let Some(v) = gv.overlay_vector(snap, k[2]) else {
+            continue;
+        };
+        ins_dims.insert(v.len());
+        if v.len() != q.query.len() || !(q.graph)(k[3]) {
+            continue;
+        }
+        if let Some(sc) = score(q.metric, q.query, qnorm, &v, norm(&v)) {
+            out.push(Hit {
+                s: k[1],
+                o: k[2],
+                g: k[3],
+                score: sc,
+            });
+        }
+    }
+    (out, covered)
 }
 
 /// Sort, deduplicate and cut the candidates.
@@ -246,7 +303,14 @@ fn ann_plan(
         return Err(Some("the query's metric is not the index's"));
     }
     let accepted = b.rows_in(q.graph).saturating_sub(deleted.len() as u64);
-    if accepted as usize <= b.config.exact_threshold.max(q.k) {
+    // the inserted rows count too, as the graph's live layer finds those it holds (a
+    // range count, with no walk); an index whose base holds few rows still uses its
+    // graph once inserts make it large
+    let pi = Perm::Pso.index();
+    let inserted = snap.delta.ins[pi]
+        .count_between(&[q.pred, 0, 0, 0], &[q.pred, u64::MAX, u64::MAX, u64::MAX])
+        as u64;
+    if (accepted + inserted) as usize <= b.config.exact_threshold.max(q.k) {
         return Err(Some("few rows"));
     }
     // a graph filter that rejects most nodes makes the graph walk most of them
@@ -257,6 +321,7 @@ fn ann_plan(
 }
 
 struct Ctx<'a> {
+    snap: &'a Snapshot,
     q: &'a Search<'a>,
     qnorm: f32,
     deleted: &'a FxHashSet<[u64; 3]>,
@@ -387,10 +452,25 @@ impl Ctx<'_> {
         Ok(out)
     }
 
-    /// The graph's candidates (`None`: too few, while more rows are accepted).
+    /// The graphs of the snapshot's inserted rows of live node `x`'s pair that the
+    /// search accepts.
+    fn live_rows<'s>(&'s self, live: &LiveState, x: u32) -> impl Iterator<Item = u64> + 's {
+        let (s, o) = live.key(x);
+        let p = self.q.pred;
+        self.snap.delta.ins[Perm::Pso.index()]
+            .range([p, s, o, 0]..=[p, s, o, u64::MAX])
+            .map(|k| k[3])
+            .filter(|&g| (self.q.graph)(g))
+    }
+
+    /// The graph's candidates (`None`: too few, while more rows are accepted). `live` is
+    /// the graph's live layer, which holds `covered` of the snapshot's inserted rows in
+    /// scope.
     fn ann(
         &self,
         b: &Built,
+        live: &LiveState,
+        covered: u64,
         ef: usize,
         info: &mut SearchInfo,
         check: &(dyn Fn() -> Result<()> + Sync),
@@ -398,22 +478,47 @@ impl Ctx<'_> {
         let q = self.q;
         let seg = &*b.segment;
         let g = b.graph.as_ref().expect("planned with a graph");
+        let view = View { graph: g, live };
+        let base = live.base();
         let nodes = &b.node_rows;
         let dist = |x: u32| {
-            let r = nodes[x as usize] as usize;
-            graph_dist(q.metric, q.query, self.qnorm, seg.row(r), seg.norms[r])
+            if x < base {
+                let r = nodes[x as usize] as usize;
+                graph_dist(q.metric, q.query, self.qnorm, seg.row(r), seg.norms[r])
+            } else {
+                let (v, n) = live.vector(x);
+                graph_dist(q.metric, q.query, self.qnorm, v, n)
+            }
         };
         let accept = |x: u32| {
-            let r = nodes[x as usize] as usize;
-            (r..seg.run_end(r)).any(|i| self.accepted(seg, i))
+            if x < base {
+                let r = nodes[x as usize] as usize;
+                (r..seg.run_end(r)).any(|i| self.accepted(seg, i))
+            } else {
+                self.live_rows(live, x).next().is_some()
+            }
         };
-        let accepted = b.rows_in(q.graph).saturating_sub(self.deleted.len() as u64);
+        let accepted = b.rows_in(q.graph).saturating_sub(self.deleted.len() as u64) + covered;
         let mut ef = ef;
         loop {
             check()?;
-            let found = g.search(&dist, ef, &accept);
+            let found = hnsw::search(&view, &dist, ef, &accept);
             let mut hits = Vec::with_capacity(found.len());
             for (_, x) in &found {
+                if *x >= base {
+                    let (s, o) = live.key(*x);
+                    let (v, n) = live.vector(*x);
+                    for g in self.live_rows(live, *x) {
+                        info.scored += 1;
+                        if let Some(score) = score(q.metric, q.query, self.qnorm, v, n) {
+                            hits.push(Hit { s, o, g, score });
+                        }
+                        if q.dedup {
+                            break;
+                        }
+                    }
+                    continue;
+                }
                 let r = nodes[*x as usize] as usize;
                 for i in r..seg.run_end(r) {
                     if !self.accepted(seg, i) {

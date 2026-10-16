@@ -115,6 +115,11 @@ pub fn classify(
     }
     let read = matches!(*method, Method::GET | Method::HEAD);
     let r = route?;
+    // The bounded algorithm admission layer selects Query or Update from the body,
+    // once, before the restore guard. Projection management keeps Admin policy.
+    if r == "/$/algo/{ds}/run" && *method == Method::POST {
+        return None;
+    }
     if let Some(admin) = r.strip_prefix("/$/") {
         // MCP charges each message by its tool and dataset (`mcp::http`)
         if admin == "ping" || admin == "metrics" || admin.starts_with("ready") || admin == "mcp" {

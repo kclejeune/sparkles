@@ -192,6 +192,19 @@ fn nested_queries_run_up_to_the_limit() {
 }
 
 #[test]
+fn nested_blank_node_plan_runs_on_a_small_stack() {
+    on_small_stack(|| {
+        let ds = dataset();
+        let (_, query) = nested_queries(100)
+            .into_iter()
+            .find(|(shape, _)| *shape == "blank nodes")
+            .unwrap();
+        let result = ds.query(&query).unwrap();
+        assert_eq!(result.rows().len(), 2);
+    });
+}
+
+#[test]
 fn nested_queries_are_refused_past_the_limit() {
     on_small_stack(|| {
         let ds = dataset();

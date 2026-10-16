@@ -480,7 +480,15 @@
                 <span class="faint">Since the build</span>
                 <span>
                   +{fmtInt(ix.overlay.inserts)} −{fmtInt(ix.overlay.deletes)}
-                  <span class="faint">searched exactly</span>
+                  {#if ix.overlay.indexed}
+                    <span class="faint"
+                      >· {fmtInt(ix.overlay.indexed)} added to the graph{ix.overlay.pending
+                        ? `, ${fmtInt(ix.overlay.pending)} pending${ix.overlay.overBudget ? ' at the memory budget' : ''}`
+                        : ''}</span
+                    >
+                  {:else}
+                    <span class="faint">searched exactly</span>
+                  {/if}
                   {#if share > 0.1}<span class="warn small"
                       >· compacting the dataset folds them into the index</span
                     >{/if}
@@ -499,7 +507,10 @@
                 {#if ix.lastBuild}
                   <span title={fmtTime(ix.lastBuild.at)}>{fmtRelative(ix.lastBuild.at, now)}</span>
                   <span class="faint"
-                    >· {fmtInt(ix.lastBuild.rows)} rows in {fmtMs(ix.lastBuild.ms)}</span
+                    >· {fmtInt(ix.lastBuild.rows)} rows in {fmtMs(ix.lastBuild.ms)}{ix.lastBuild
+                      .carried
+                      ? ', graph carried over from the previous generation'
+                      : ''}</span
                   >
                 {:else if ix.files?.opened}
                   <span class="faint">read from its file, not built in this process</span>

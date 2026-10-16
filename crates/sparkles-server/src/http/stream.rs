@@ -58,6 +58,8 @@ pub struct SwitchWriter {
     tx: Option<mpsc::Sender<Chunk>>,
     deferred: bool,
     control: Option<StreamControl>,
+    #[cfg(test)]
+    producer_gate: Option<Arc<super::algo::probe::Gate>>,
 }
 
 /// Controls for a native cursor's producer, including time spent waiting for a
@@ -224,6 +226,10 @@ impl Write for SwitchWriter {
             let signal = self.signal.take().expect("signal before the switch");
             signal.send(Outcome::Stream(rx)).map_err(|_| gone())?;
             self.tx = Some(tx);
+            #[cfg(test)]
+            if let Some(gate) = self.producer_gate.take() {
+                gate.wait();
+            }
             self.send_chunk()?;
         } else if self.tx.is_some() && self.buf.len() >= CHUNK {
             self.send_chunk()?;
@@ -295,8 +301,23 @@ where
     let body_terminal = terminal.clone();
     let span = tracing::Span::current();
     let held = crate::ratelimit::hold();
+    #[cfg(test)]
+    let probe = super::algo::probe::current();
+    #[cfg(test)]
+    let threshold = if probe.producer.is_some() {
+        1
+    } else {
+        threshold
+    };
     let t0 = Instant::now();
     tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _completion = probe.producer.clone().map(super::algo::probe::Completion);
+        // A local binding drops the permit before the test completion observer,
+        // including unwinding. Ordinary builds keep the original capture/drop path.
+        #[cfg(test)]
+        #[allow(clippy::redundant_locals)]
+        let held = held;
         // released before the body is handed over: this may be the request span's last
         // handle, and the span ends (and is exported) when that drops, which must come
         // before the client can see the response
@@ -308,6 +329,8 @@ where
             tx: None,
             deferred: false,
             control: control.clone(),
+            #[cfg(test)]
+            producer_gate: probe.producer,
         };
         // disconnects are noticed through the channel, not a cancellation flag
         let mut w = LimitedWriter::new(sw, limit, None::<Arc<AtomicBool>>);
@@ -471,6 +494,8 @@ where
         tx: None,
         deferred: false,
         control: None,
+        #[cfg(test)]
+        producer_gate: None,
     };
     let mut w = LimitedWriter::new(sw, limit, None::<Arc<AtomicBool>>);
     let result = write(&mut w).map_err(|e| w.classify(e));
@@ -643,6 +668,7 @@ mod tests {
                 tx: None,
                 deferred: false,
                 control: None,
+                producer_gate: None,
             };
             w.write_all(&vec![b'x'; size])?;
             w.send_chunk()

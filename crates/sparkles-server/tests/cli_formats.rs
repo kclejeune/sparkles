@@ -304,7 +304,8 @@ fn migrate_check_reports_an_interrupted_run_and_changes_nothing() {
     std::fs::create_dir(&stale).unwrap();
     std::fs::write(stale.join("partial"), b"partial").unwrap();
 
-    let out = ok(
+    // a store refuses the database until the run is finished, so --check says so
+    let o = sparkles(
         h,
         &[
             "migrate",
@@ -315,10 +316,21 @@ fn migrate_check_reports_an_interrupted_run_and_changes_nothing() {
             "json",
         ],
     );
+    assert_eq!(o.status.code(), Some(1));
+    let out = String::from_utf8(o.stdout).unwrap();
     let v: J = serde_json::from_str(&out).unwrap();
     let interrupted = v["datasets"][0]["interrupted"].as_str().unwrap_or_default();
     assert!(interrupted.contains(".migrate-books"), "{out}");
+    assert_eq!(v["datasets"][0]["opens"], J::Bool(false), "{out}");
     assert_eq!(std::fs::read(stale.join("partial")).unwrap(), b"partial");
+    let o = sparkles(h, &["migrate", "--data", data.to_str().unwrap(), "--check"]);
+    assert_eq!(o.status.code(), Some(1));
+    let text = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        text.contains("this release refuses it until `sparkles migrate` runs without --check"),
+        "{text}"
+    );
+    assert!(!text.contains("this release opens it"), "{text}");
 
     // a migrate without --check removes the stale copy, and the report no longer lists it
     let out = ok(
@@ -333,5 +345,193 @@ fn migrate_check_reports_an_interrupted_run_and_changes_nothing() {
     );
     let v: J = serde_json::from_str(&out).unwrap();
     assert!(v["datasets"][0]["interrupted"].is_null(), "{out}");
+    assert_eq!(v["datasets"][0]["opens"], J::Bool(true), "{out}");
     assert!(!stale.exists());
+}
+
+/// `check --data` leaves out the copies `sparkles migrate` keeps or builds next to a
+/// database, which are not datasets.
+#[test]
+fn check_data_skips_migration_copies() {
+    let fixture = &fixtures()[0];
+    let tmp = tempfile::tempdir().unwrap();
+    let h = tmp.path();
+    unpack(fixture, h);
+    let data = h.join("data");
+    let dbs = data.join("databases");
+    let kept = dbs.join(".pre-migrate-0.0.0-books");
+    let s = std::process::Command::new("cp")
+        .arg("-r")
+        .arg(dbs.join("books"))
+        .arg(&kept)
+        .status()
+        .unwrap();
+    assert!(s.success());
+    // the kept copy is in a format this release does not read
+    for p in files_named(&kept, "meta.json") {
+        let mut m: J = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        m["format_version"] = 99.into();
+        std::fs::write(&p, serde_json::to_vec(&m).unwrap()).unwrap();
+    }
+    std::fs::create_dir(dbs.join(".migrate-other")).unwrap();
+
+    let o = sparkles(h, &["check", "--data", data.to_str().unwrap()]);
+    let out = String::from_utf8_lossy(&o.stdout);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert_eq!(o.status.code(), Some(0), "stdout: {out}\nstderr: {err}");
+    assert!(
+        !out.contains(".pre-migrate-") && !out.contains(".migrate-"),
+        "{out}"
+    );
+}
+
+fn files_named(root: &Path, name: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p)
+            } else if p.file_name().unwrap() == name {
+                out.push(p)
+            }
+        }
+    }
+    out
+}
+
+/// A newer `meta.json` in a new shape, and a newer log header that uses the bytes after
+/// its version, refuse their datasets alone: the catalog opens, keeps them registered,
+/// and serves the others.
+#[test]
+fn newer_shapes_refuse_only_their_dataset() {
+    let fixture = &fixtures()[0];
+    let tmp = tempfile::tempdir().unwrap();
+    let h = tmp.path();
+    unpack(fixture, h);
+    let data = h.join("data");
+    let d = data.to_str().unwrap();
+    for name in ["logs", "other"] {
+        ok(h, &["dataset", "create", "--data-dir", d, name]);
+    }
+    let dbs = data.join("databases");
+    // books: every meta.json at version 3 without `created`
+    for p in files_named(&dbs.join("books"), "meta.json") {
+        let mut m: J = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        m["format_version"] = 3.into();
+        m.as_object_mut().unwrap().remove("created");
+        std::fs::write(&p, serde_json::to_vec(&m).unwrap()).unwrap();
+    }
+    // logs: every headered log at version 2 with a flag after the version
+    let wals: Vec<_> = files_named(&dbs.join("logs"), "wal.log")
+        .into_iter()
+        .filter(|p| std::fs::read(p).unwrap().first() == Some(&0x89))
+        .collect();
+    assert!(!wals.is_empty(), "no headered log in a new dataset");
+    for p in wals {
+        let mut b = std::fs::read(&p).unwrap();
+        b[8..12].copy_from_slice(&2u32.to_le_bytes());
+        b[12] = 1;
+        std::fs::write(&p, b).unwrap();
+    }
+
+    let o = sparkles(h, &["migrate", "--data", d, "--check", "--format", "json"]);
+    assert_eq!(o.status.code(), Some(1));
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(out.contains("newer release"), "{out}");
+
+    let list = ok(h, &["dataset", "list", "--data-dir", d, "--format", "json"]);
+    assert!(list.contains("\"other\""), "{list}");
+    assert!(!list.contains("\"books\""), "{list}");
+    assert!(!list.contains("\"logs\""), "{list}");
+    let config = std::fs::read_to_string(data.join("config.json")).unwrap();
+    assert!(
+        config.contains("books") && config.contains("logs"),
+        "{config}"
+    );
+}
+
+#[test]
+fn algo_catalog_cli_inventory_and_future_plan() {
+    use std::collections::BTreeMap;
+    fn files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        let mut out = BTreeMap::new();
+        for e in std::fs::read_dir(root).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                out.extend(files(&p));
+            } else {
+                out.insert(p.clone(), std::fs::read(p).unwrap());
+            }
+        }
+        out
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("db");
+    let ds = sparkles::Dataset::open(&db).unwrap();
+    ds.algorithms()
+        .projections()
+        .put(
+            "named",
+            sparkles::algo::catalog::ProjectionDef::default(),
+            None,
+            None,
+        )
+        .unwrap();
+    drop(ds);
+    let args = [
+        "migrate",
+        "--loc",
+        db.to_str().unwrap(),
+        "--check",
+        "--format",
+        "json",
+    ];
+    let before = files(&db);
+    let current = sparkles(tmp.path(), &args);
+    assert!(
+        current.status.success(),
+        "{}",
+        String::from_utf8_lossy(&current.stderr)
+    );
+    let report: J = serde_json::from_slice(&current.stdout).unwrap();
+    let registered: Vec<_> = report["formats"]["settings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|v| v["name"] == "algo.json")
+        .collect();
+    assert_eq!(registered.len(), 1);
+    assert_eq!(registered[0]["writes"], 1);
+    assert_eq!(registered[0]["scope"], "dataset");
+    assert_eq!(report["datasets"][0]["inWindow"], true);
+    assert_eq!(files(&db), before);
+    std::fs::write(db.join("algo.json"), br#"{"format":2,"futureShape":[1,2]}"#).unwrap();
+    let before = files(&db);
+    let future = sparkles(tmp.path(), &args);
+    assert_eq!(future.status.code(), Some(1));
+    let future_report: J = serde_json::from_slice(&future.stdout).unwrap();
+    assert_eq!(future_report["datasets"][0]["inWindow"], false);
+    assert!(
+        future_report["datasets"][0]["refused"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_str().unwrap().contains("algo.json"))
+    );
+    assert_eq!(
+        files(&db),
+        before,
+        "CLI planning must leave even sparkles.lock unchanged"
+    );
+    if let Some(dir) = std::env::var_os("SPARKLES_F3_CLI_EVIDENCE_DIR") {
+        let dir = PathBuf::from(dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, output) in [("current", current), ("future", future)] {
+            let path = dir.join(format!("{name}.json"));
+            assert!(!path.exists());
+            std::fs::write(path,serde_json::to_vec_pretty(&serde_json::json!({"argv":args,"exit":output.status.code(),"stdout":String::from_utf8(output.stdout).unwrap(),"stderr":String::from_utf8(output.stderr).unwrap()})).unwrap()).unwrap();
+        }
+    }
 }

@@ -36,6 +36,10 @@ pub struct ValidateOptions {
     /// to bound the threads one caller's validations may use.
     pub pool: Option<Arc<rayon::ThreadPool>>,
     pub timeout: Option<Duration>,
+    /// Absolute bound shared with an enclosing operation, without phase renewal.
+    pub deadline: Option<Instant>,
+    /// Additional cancellation sources, checked with the existing single flag.
+    pub cancellation: Option<sparkles_core::task::Cancellation>,
     pub cancel: Option<Arc<AtomicBool>>,
     /// Stop with [`TooManyResults`] once the report would hold more results than this.
     pub max_results: Option<usize>,
@@ -64,6 +68,8 @@ impl Default for ValidateOptions {
             parallel: true,
             pool: None,
             timeout: None,
+            deadline: None,
+            cancellation: None,
             cancel: None,
             max_results: None,
         }
@@ -211,6 +217,7 @@ pub(crate) struct Engine<'a> {
     pool: Option<Arc<rayon::ThreadPool>>,
     pub deadline: Option<Instant>,
     pub cancel: Option<Arc<AtomicBool>>,
+    pub cancellation: Option<sparkles_core::task::Cancellation>,
     max_results: Option<usize>,
     /// results collected so far (checked against `max_results`)
     collected: AtomicUsize,
@@ -251,8 +258,13 @@ impl<'a> Engine<'a> {
             paths,
             parallel: opts.parallel,
             pool: opts.pool.clone(),
-            deadline: opts.timeout.map(|t| Instant::now() + t),
+            deadline: opts
+                .deadline
+                .into_iter()
+                .chain(opts.timeout.map(|t| Instant::now() + t))
+                .min(),
             cancel: opts.cancel.clone(),
+            cancellation: opts.cancellation.clone(),
             max_results: opts.max_results,
             collected: AtomicUsize::new(0),
         })
@@ -264,8 +276,11 @@ impl<'a> Engine<'a> {
         {
             bail!("validation cancelled");
         }
+        if let Some(cancellation) = &self.cancellation {
+            cancellation.check()?;
+        }
         if let Some(d) = self.deadline
-            && Instant::now() > d
+            && Instant::now() >= d
         {
             bail!("validation timed out");
         }
@@ -1285,4 +1300,70 @@ pub(crate) fn lang_matches(tag: &str, range: &str) -> bool {
     }
     let (tag, range) = (tag.to_ascii_lowercase(), range.to_ascii_lowercase());
     tag == range || (tag.starts_with(&range) && tag.as_bytes().get(range.len()) == Some(&b'-'))
+}
+
+#[cfg(test)]
+mod control_tests {
+    use super::*;
+    use sparkles_core::io::{RdfFormat, Source};
+    use sparkles_core::store::{Store, StoreOptions};
+
+    #[test]
+    fn operation_controls_reach_engine_and_sparql_context() {
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                b"<urn:focus> <urn:p> <urn:o> .".to_vec(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let snap = store.snapshot();
+        let shapes = Shapes::parse("@prefix sh: <http://www.w3.org/ns/shacl#> . <urn:S> a sh:NodeShape ; sh:targetNode <urn:focus> ; sh:sparql [ sh:select 'SELECT $this WHERE {}' ] .", RdfFormat::Turtle, None).unwrap();
+        let si = shapes
+            .shapes
+            .iter()
+            .position(|s| s.node == Term::NamedNode(NamedNode::new_unchecked("urn:S")))
+            .unwrap();
+        let constraint = shapes.shapes[si]
+            .constraints
+            .iter()
+            .find_map(|c| match c {
+                Constraint::Sparql(c) => Some(c),
+                _ => None,
+            })
+            .unwrap();
+        for source in 0..4 {
+            let flag = Arc::new(AtomicBool::new(false));
+            let primary = Arc::new(AtomicBool::new(source == 1));
+            let opts = ValidateOptions {
+                cancel: Some(primary),
+                cancellation: Some(sparkles_core::task::Cancellation::from_flags(
+                    [flag.clone()],
+                )),
+                deadline: (source == 2).then(Instant::now),
+                timeout: (source == 3).then_some(Duration::ZERO),
+                ..Default::default()
+            };
+            let (mut data, ids) = DataGraph::new(snap.clone(), None, &[], &[], &shapes).unwrap();
+            let focus = data.resolve(
+                &Term::NamedNode(NamedNode::new_unchecked("urn:focus")),
+                false,
+            );
+            let engine = Engine::new(&shapes, &data, ids, &opts).unwrap();
+            if source == 0 {
+                assert!(engine.check_limits().is_ok());
+                flag.store(true, AtomicOrdering::Relaxed);
+            }
+            let native = engine.check_limits().unwrap_err();
+            // check_sparql directly enters its query context, bypassing Engine's
+            // outer limit check, so this proves propagation to actual Ctx checks.
+            let query = engine
+                .check_sparql(si, constraint, focus, &mut Out::collect())
+                .unwrap_err();
+            let expected = if source < 2 { "cancel" } else { "timed out" };
+            assert!(native.to_string().contains(expected), "{native}");
+            assert!(query.to_string().contains(expected), "{query}");
+        }
+    }
 }

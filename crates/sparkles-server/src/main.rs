@@ -4,6 +4,7 @@
 //! `infer` ≈ riot --infer, `shacl` ≈ jena `shacl validate`, `shex` ≈ jena `shex
 //! validate|parse`).
 
+mod algo_cmd;
 mod alloc;
 #[cfg(feature = "mcp")]
 mod ask;
@@ -130,6 +131,20 @@ struct Cli {
     /// per index generation, in MiB
     #[arg(long, global = true, default_value_t = 4096)]
     vector_memory_mb: u64,
+    /// Threads that graph algorithms (`SERVICE algo:…`) may use together, shared by all
+    /// calls (0: half the cores)
+    #[arg(long, global = true, default_value_t = 0)]
+    algo_threads: usize,
+    /// Threads one graph-algorithm call may take
+    #[arg(long, global = true, default_value_t = 4)]
+    algo_max_threads_per_call: usize,
+    /// Memory for built projections of graph algorithms, shared by all datasets, in MiB (0
+    /// disables the cache)
+    #[arg(long, global = true, default_value_t = 256)]
+    algo_cache_mb: u64,
+    /// Most nodes `algo:betweenness` runs on without `algo:samples`
+    #[arg(long, global = true, default_value_t = 100_000)]
+    algo_exact_betweenness_max: usize,
     /// Old index generations named snapshots may keep per dataset
     #[arg(long, global = true, default_value_t = 8)]
     history_max_generations: usize,
@@ -1517,6 +1532,12 @@ enum Cmd {
         #[command(subcommand)]
         cmd: SnapshotCmd,
     },
+    /// Graph algorithms on a database: run PageRank, communities, similarity and
+    /// embeddings, write the results back, and manage named projections
+    Algo {
+        #[command(subcommand)]
+        cmd: algo_cmd::AlgoCmd,
+    },
     /// Stored, parameterized queries of a database: list, get, put, delete and run them
     Queries {
         #[command(subcommand)]
@@ -1923,6 +1944,9 @@ enum Cmd {
 fn store_opts(cli: &Cli) -> StoreOptions {
     sparkles::vector::set_budget(cli.vector_memory_mb << 20);
     let sizes = server_memory::cache_sizes(cli);
+    sparkles::algo::pool::configure(cli.algo_threads, cli.algo_max_threads_per_call);
+    sparkles::algo::cache::set_limit(cli.algo_cache_mb << 20);
+    sparkles::algo::pool::set_exact_betweenness_max(cli.algo_exact_betweenness_max);
     StoreOptions {
         cache_bytes: sizes.blocks,
         result_cache_bytes: sizes.results,
@@ -3493,6 +3517,7 @@ fn run() -> Result<()> {
         }
         Cmd::Dump(args) => dump_cmd::run(args, opts),
         Cmd::Snapshot { cmd } => snapshot_cmd(cmd, opts),
+        Cmd::Algo { cmd } => algo_cmd::run(cmd, opts),
         Cmd::Queries { cmd } => queries_cmd::run(cmd, opts),
         #[cfg(feature = "graphql")]
         Cmd::Graphql(args) => graphql::run(args, opts),

@@ -509,6 +509,7 @@ pub const SETTINGS: &[SettingsFile] = &[
     ds("branches.json", 2),
     ds("branch.json", 1),
     ds("queries.json", 1),
+    ds("algo.json", 1),
     ds("validation.json", 2),
     ds("validation-status.json", 1),
     ds("text.json", 1),
@@ -847,5 +848,31 @@ mod tests {
             .to_string();
         assert!(e.contains("format 9") && e.contains("newer release"), "{e}");
         assert!(settings_from_slice::<serde_json::Value>(name, br#"{"format": "x"}"#).is_err());
+    }
+}
+
+#[cfg(test)]
+mod algo_catalog_registry_tests {
+    use super::*;
+    #[test]
+    fn algo_catalog_writer_is_registered_once() {
+        let name = crate::algo::catalog::FILE;
+        let entries: Vec<_> = SETTINGS.iter().filter(|s| s.name == name).collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "the catalog must have exactly one registry entry"
+        );
+        assert_eq!(entries[0].writes, crate::algo::catalog::FORMAT);
+        assert_eq!(entries[0].scope, Scope::Dataset);
+        let inventory = report();
+        let entries: Vec<_> = inventory["settings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|s| s["name"] == name)
+            .collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["writes"], 1);
     }
 }

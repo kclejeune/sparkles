@@ -40,6 +40,7 @@ without a migration path, so keep backups of anything you cannot regenerate.
 * [Outbound requests (SERVICE and LOAD)](#outbound-requests-service-and-load)
   * [Correlated, bulk and cached SERVICE](#correlated-bulk-and-cached-service)
 * [Finding paths](#finding-paths)
+* [Graph algorithms](#graph-algorithms)
 * [Embeddings computed on write](#embeddings-computed-on-write)
 * [Checking a database](#checking-a-database)
 * [Upgrading databases](#upgrading-databases)
@@ -433,6 +434,10 @@ happens to materialized inferences, and the limits.
 | `--format-max-mb N` | `16` | Largest `POST /$/format` body; `0` means unlimited. |
 | `--format-timeout S` | `10` | Seconds a `POST /$/format` request may take, including the wait for a free slot (one per core). A slower request gets `408`. |
 | `--vector-memory-mb N` | `4096` | Memory for packed vectors and HNSW graphs (`spk:vectorSearch` and vector indexes), per index generation. A build past it leaves the index `over-budget`, and a search past it gets `507`. A global flag. |
+| `--algo-threads N` | half the cores | Threads that graph algorithms (`SERVICE algo:…`) may use together, shared by all calls. A call that asks for more than are free waits, and the wait counts against its timeout. A global flag. |
+| `--algo-max-threads-per-call N` | `4` | Threads one graph-algorithm call may take, whatever `algo:concurrency` asks for. A global flag. |
+| `--algo-cache-mb N` | `256` | Memory for built projections of graph algorithms, shared by all datasets. Calls on the same data and projection reuse one build, and the least recently used build leaves first. `0` disables the cache. A global flag. |
+| `--algo-exact-betweenness-max N` | `100000` | Most nodes `algo:betweenness` runs on exactly, which is without `algo:samples` or with `algo:samples` at or above the node count. A larger projection is refused with a message that names the parameter. A global flag. |
 | `--text NAME[=FILE]` | | Enable full-text search for a dataset. `FILE` is a `text.json`-shaped configuration file. |
 | `--validate NAME[=FILE]` | | Set a dataset's write-time validation from `FILE`, a `PUT /$/validation/{ds}` body, or with `NAME` alone validate the dataset with the configuration it has. Shapes and schemas without inline text are read from the path in `source`, relative to `FILE`. The data is validated in full before the server listens, and the result is logged. A `reject` configuration the data does not pass stops the start ([API](API.md#write-time-validation)). |
 | `--rdfs NAME=FILE` | | Answer a dataset's queries over the RDFS closure of its graphs with respect to the schema in `FILE`, as Fuseki's `--rdfs` does. The setting is kept like one made with `PUT /$/rdfs/{ds}` ([API](API.md#rdfs-on-read)). |
@@ -589,6 +594,8 @@ sparkles quota   --loc db --max-mb 10240      # storage quota; --default removes
 sparkles quota   --server URL --dataset db --max-mb 0   # on a server, as server-admin; 0 is unlimited
 sparkles compaction --loc db --set deltaRatio=0.02     # automatic compaction settings; --default removes them
 sparkles describe-settings --loc db --set mode=scbd   # how DESCRIBE describes a resource; --default removes it
+sparkles algo run --loc db pageRank --predicate http://ex.org/knows   # graph algorithms, see below
+sparkles algo projections put --loc db people --predicate http://ex.org/knows   # a named projection
 sparkles ping    127.0.0.1:3030               # GET /$/ready over HTTP, then HTTPS; exit 0 on 200 (health checks)
 ```
 
@@ -2095,6 +2102,122 @@ benchmark data, the shortest path between two people 17 edges apart takes about 
 where `ASK { … foaf:knows+ … }` for the same pair takes about 125 ms, because the search
 runs from both ends at once ([BENCHMARKS.md](BENCHMARKS.md#path-search)).
 
+## Graph algorithms
+
+PageRank, betweenness, components, communities, node similarity, triangle counts,
+k-cores, breadth-first and shortest-path distances, and two kinds of node embeddings run
+inside the server on a projection of the graph. A query reaches them through
+`SERVICE algo:<name>`, and `sparkles algo` and `POST /$/algo/{ds}/run` run them without
+writing a query. The parameters and outputs of each algorithm are in
+[API.md](API.md#graph-algorithms), and the design is in
+[F14](specs/F14-graph-algorithms.md).
+
+FastRP reads `iterationWeights` and `nodeSelfInfluence` with the meaning they have in
+Neo4j GDS. The list has one weight for each propagation over the graph, and
+`nodeSelfInfluence` weights the random starting vectors. The default propagates three
+times and weights the second and third rounds. Earlier builds propagated twice by default,
+so embeddings written by them differ from new ones and a default call costs about a third
+more. Only the meaning of the parameters matches GDS. The random vectors and the final
+normalization are Sparkles's own, so the numbers differ. A list with no non-zero weight
+and a zero `nodeSelfInfluence` is refused, as is a dimension above 16384, the largest of
+a vector index.
+
+Weighted betweenness accepts only finite, strictly positive weights in the stored
+`f32` representation. A zero, negative or nonfinite weight refuses the whole call,
+including a SERVICE value that rounds to zero or infinity during conversion. A
+refused call returns no score rows. Unweighted betweenness still uses unit edges, SSSP
+still accepts zero weights, and PageRank retains its nonnegative weight domain.
+[Roadmap item 79](ROADMAP.md) tracks nonnegative weighted betweenness semantics.
+
+Some finite positive graphs are also refused during computation. If a competitive
+edge cannot increase the distance at `f64` precision, or a computed distance is
+nonfinite, the invocation fails with `Invalid` and publishes no score rows, success
+statistics or write-back commits. A tiny edge that cannot improve or tie its target
+does not trigger this refusal. Accepted distances and path counts remain approximate,
+and sampling checks only the selected source searches.
+[Roadmap item 80](ROADMAP.md) tracks positive-weight numerical robustness.
+
+The ten most central people of a social graph:
+
+```sh
+sparkles query --loc ./db '
+PREFIX algo: <urn:x-sparkles:algo#>
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+SELECT ?person ?rank WHERE {
+  SERVICE algo:pageRank { [] algo:predicate foaf:knows ; algo:node ?person ; algo:score ?rank }
+} ORDER BY DESC(?rank) LIMIT 10'
+```
+
+The same run from the command line, and a community detection that is written back to a
+graph in commits of 50,000 triples:
+
+```sh
+sparkles algo run --loc ./db pageRank --predicate http://xmlns.com/foaf/0.1/knows --param maxIterations=30
+sparkles algo run --loc ./db leiden --predicate http://xmlns.com/foaf/0.1/knows --direction undirected \
+  --param seed=7 --write-graph http://example.org/analytics \
+  --write community=http://example.org/community --write level=http://example.org/level --batch-size 50000
+```
+
+`--summary` prints the statistics of the run instead of its rows, and `--request FILE`
+takes the whole request as JSON, as the HTTP route does. A write-back run records itself
+in the output graph with the commit it computed at, so a reader knows which state the
+numbers describe. It commits in batches so that a large result does not hold the writer
+lock for long.
+
+A write-back run is an update, so the server's query timeout does not apply to it. It has
+no deadline unless the request has a `timeout` or the server runs with
+`--update-timeout`. Without a deadline, a run that waits for `--algo-threads` waits until
+a thread is free or the run is cancelled. The commits are in batches, but the run decodes
+its whole result in memory before its first batch is written, so a result of many rows
+takes memory in proportion to the rows, up to `--max-rows`.
+
+Query and task cancellation both reach computation, result preparation and writer
+admission. A supplied timeout and task deadline share the earlier absolute bound from
+operation entry through completion, including built-in SHACL and ShEx validation. History
+SERVICE calls retain the same controls at the native change-log scan checks. Rust history
+queries accept composed cancellation flags as well as a single flag and an absolute
+deadline. Checks are cooperative and do not preempt history indexing, reads or flushing.
+Committed batches remain after cancellation. A partial run attempts to record its final
+status without waiting for another writer, with one separate 100 ms cooperative cleanup
+budget. The record can remain unfinished when that attempt fails. This budget does not
+interrupt a durability call. A cancel or deadline that arrives after the last batch is
+committed does not fail the run, because its record already says `complete`.
+
+Define a projection once under a name when several queries use it:
+
+```sh
+sparkles algo projections put --loc ./db people --predicate http://xmlns.com/foaf/0.1/knows --direction undirected
+sparkles algo projections list --loc ./db
+```
+
+A query then writes `algo:projection "people"` instead of the predicates. The server
+keeps built projections in memory (`--algo-cache-mb`), so a second call on unchanged
+data skips the build. `--algo-threads` and `--algo-max-threads-per-call` bound the CPU
+that algorithms take, and a call that is over its memory budget fails with a message that
+names the parameter that would make it fit.
+
+The Rust library, Python and Node.js reach the same runs and projections through the
+dataset's `algorithms` handle. A request is the JSON of the HTTP route as a dict or an
+object:
+
+```python
+ds.algorithms.projections.put("people", {"predicates": ["http://xmlns.com/foaf/0.1/knows"]})
+rows = list(ds.algorithms.run({"algorithm": "pageRank", "projection": "people"}))
+ds.algorithms.run_write({"algorithm": "leiden", "projection": "people",
+                         "write": {"graph": "http://example.org/analytics",
+                                   "predicates": {"community": "http://example.org/community"}}})
+```
+
+In Node.js the calls are `ds.algorithms.run(request)` and `ds.algorithms.runWrite(request)`
+with the same `projections` methods. The JVM binding reaches algorithms only
+through `SERVICE algo:…` queries.
+
+For a clustering request with `params: {"graphalytics": true}`, the Rust, Python and
+Node.js handles return `node` and `coefficient`. The default direction is forward,
+and an explicit projection or predicate direction takes precedence. Summary requests
+remain available. A write mapping for `triangles` is refused before computation,
+while ordinary clustering continues to expose triangle counts.
+
 ## Embeddings computed on write
 
 A vector index can compute its vectors from the dataset's text through an embeddings
@@ -2233,10 +2356,12 @@ provider's endpoint and key, so an index need not repeat them. The fields are in
 `sparkles check --loc db` verifies a database directory without modifying it. It takes
 no lock, truncates no WAL, repairs no catalog and rebuilds no full-text index, so it can
 run next to a server that holds the database. `--data DIR` checks every database in a
-server's data directory. Each check prints one line, `ok`, `warning` or `error`, and
-lists the file, offset, block, row, commit or id of every problem below it.
-`--format json` prints the same report as JSON. The exit status is 0 when everything is
-clean, 1 when any check found an error, and 2 when there are warnings only.
+server's data directory. It leaves out directories whose names start with a dot, which
+hold unfinished clones and the copies that `sparkles migrate` builds or keeps. Each
+check prints one line, `ok`, `warning` or `error`, and lists the file, offset, block,
+row, commit or id of every problem below it. `--format json` prints the same report as
+JSON. The exit status is 0 when everything is clean, 1 when any check found an error,
+and 2 when there are warnings only.
 
 | Check | What it verifies |
 |---|---|
@@ -2291,65 +2416,82 @@ sparkles migrate --loc db --check --format json
 
 `sparkles migrate` works offline. With `--data` it takes the catalog lock, so it fails
 while a server holds the data directory, and it upgrades the persistent datasets that
-`config.json` registers, or those that `--dataset` names. `--check` lists each
-database's `dataset.json` versions, the version of every generation's index, log and
-update vocabulary, whether the release opens the database, and the steps an upgrade
-would run. It never changes a database and does not finish or undo an earlier run, which
-it reports as `interrupted`. The exit status is 1 when a database is outside the window
-and 0 otherwise. The window covers the root of a database and every branch, and a newer
-settings file of a dataset or of one of its branches puts the database outside it.
-Startup checks dataset metadata and settings in every active and retained branch before
-rewriting root metadata, using the same physical branch directories as migration
-planning. Unpublished `.create-*` directories and `.deleting` tombstones are excluded
-from these checks and left unchanged by migration planning. Startup's existing branch
-recovery removes them after compatibility preflight succeeds. An incompatible real
-branch refuses its dataset before cleanup while other datasets remain available.
-The informational files `origin.json` and `restore.json` are the exception, because a
-store ignores a newer one with a warning.
+`config.json` registers, or those that `--dataset` names.
 
-The command makes the database path absolute before mutation. If it contains `..`,
-it resolves the existing parent through the filesystem and preserves the final database
-name. This keeps a valid `db/../db` path usable during the swap and follows the physical
-meaning of symlink parents. If an interrupted run made that alias unresolvable, use the
-database's stable parent path to recover. Paths without `..` continue to support a
-missing database and new nested directories.
+`--check` plans without changing anything. It lists each database's `dataset.json`
+versions, the version of every generation's index, log and update vocabulary, whether
+the release opens the database, and the steps an upgrade would run. It does not finish
+or undo an earlier run, which it reports as `interrupted`. The exit status is 1 when a
+database is outside the window or has an interrupted run, which a server refuses until
+`sparkles migrate` runs without `--check`, and 0 otherwise. The JSON report gives both
+answers, `inWindow` for the formats and `opens` for whether this release opens the
+database now. A generation whose `meta.json` has no usable version is listed as refused,
+and the report goes on with the other generations and databases.
+
+The window covers the root of a database and every branch, and a newer settings file of
+a dataset or of one of its branches puts the database outside it. The informational files
+`origin.json` and `restore.json` are the exception, because a store ignores a newer one
+with a warning. Startup checks the dataset metadata and settings of every active and
+retained branch before it rewrites the root's metadata, and it reads the same branch
+directories as migration planning. Both leave out unpublished `.create-*` directories and
+`.deleting` tombstones, which planning leaves unchanged and which startup's branch
+recovery removes once these checks pass. An incompatible branch refuses its dataset
+before any cleanup, and the other datasets stay available.
+
+The command makes the database path absolute before it changes anything. If the path
+contains `..`, the command resolves the existing parent through the filesystem and keeps
+the final database name. This keeps a valid `db/../db` path usable during the swap and
+follows the physical meaning of symlink parents. If an interrupted run made such a path
+unresolvable, recover through the database's stable parent path. Paths without `..`
+still support a missing database and new nested directories.
 
 Without `--check`, the command copies each database that has steps to run into a
 sibling directory named `.migrate-<name>` and runs the steps on the copy. It then checks
 the copy as `sparkles check` does and swaps it in with two renames. The copy needs as much
-free space as the database. The dataset id, the commit numbers, the commit catalog, the
-branches and the snapshots stay as they were. `--keep-old` keeps the database as it was
-in `.pre-migrate-<version>-<name>`, and without it that directory is removed. The
-command refuses to start while that directory exists, so it never deletes an earlier
-kept copy. It also refuses a database that holds a symlink or another entry that is not a
-regular file or directory, because the copy would leave it out. Replace the entry with the
-files it points to and run again.
+free space as the database. It keeps the mode and the owner of every file and directory,
+and a file that a step rewrites keeps those of the file it replaces. The command must
+therefore run as the user that owns the database or as root, and it refuses to start
+otherwise. It also refuses a database directory that its owner cannot write, and a
+database named through a symlink, which the swap would replace with a directory. Run it
+on the directory the link points to. The dataset id, the commit numbers, the commit catalog, the branches and the
+snapshots stay as they were. `--keep-old` keeps the database as it was in
+`.pre-migrate-<version>-<name>`, and without it that directory is removed. The command
+refuses to start while that directory exists, so it never deletes an earlier kept copy.
+A dataset delete does not remove a kept copy either. The command also refuses a database
+that holds a symlink or another entry that is not a regular file or directory, because
+the copy would leave it out. Replace the entry with the files it points to and run again.
 
 The command takes the lock file `.migrate.lock-<name>` next to the database, which a
-second `sparkles migrate` and a `--check` of the same database respect, and the
-database's own lock, which a server or any other process that has the database open
-holds. It therefore fails with a locked error while a server runs on the database, and it
-leaves the lock file in place after it finishes. A copy that fails the check is removed,
-and the database is left as it was. If the command stops before the swap, the next run
-removes the copy and the database is unchanged. If it stops between the two renames, the
-next run renames the checked copy into place. A server, or any other open of the
+second `sparkles migrate` and a `--check` of the same database respect. It also takes
+the database's own lock, which a server or any other process that has the database open
+holds, so it fails with a locked error while a server runs on the database. The lock
+file stays in place after the command finishes. A server, or any other open of the
 database, refuses a database with a pending `.migrate-<name>` until `sparkles migrate`
-has run on it again, so a stopped run never leads to an empty database. The checked
-copy records a versioned marker with the exact old sibling directory and whether to
-keep it. Recovery uses that recorded directory even when another release finishes the
-run, so it preserves unrelated kept copies. Unknown or damaged markers and duplicate known marker fields refuse recovery
-without changing the copies. Bare legacy `keep-old` or `remove-old` markers also refuse
-automatic recovery because they do not identify the original old directory. Inspect
-the sibling copies and recover through a known original location or restore by hand. After checking
+has run on it again, so a stopped run never leads to an empty database. After it checks
 for a pending migration, startup verifies that its locked file still belongs to the
-current database directory. If migration replaced that directory while startup was
-acquiring its lock, the open refuses with a locked error and can be retried. An offline
-backup restore makes the same check before publication and refuses a stale lock with
-`dataset-busy`, leaving both directories intact. A copy that
-carries no mark of a passed check is never renamed into place. The command reports it and
-leaves both directories alone. A backup restore also refuses to replace the database while
-a migration is pending, including when the database directory is missing between the two
-renames.
+current database directory. If a migration replaced that directory while startup was
+taking its lock, the open refuses with a locked error and can be retried.
+
+Until the copy has passed its check and carries a durable mark that says so, any error
+removes the copy and leaves the database as it was. That covers a step that fails, a
+check that finds errors or fails to run, and a mark that cannot be written. If the
+command stops before the swap, the next run removes the copy, and the database is
+unchanged. If it stops between the two renames, the next run renames the checked copy
+into place. A copy without the mark of a passed check is never renamed into place, and
+the command reports it and leaves both directories alone.
+
+The mark is versioned and records the exact old sibling directory and whether to keep
+it. Recovery uses that recorded directory even when another release finishes the run, so
+it preserves unrelated kept copies. An unknown or damaged mark, or one with a known field
+given twice, refuses recovery without changing the copies. A bare legacy `keep-old` or
+`remove-old` mark also refuses automatic recovery, because it does not name the original
+old directory. In those cases inspect the sibling copies, then recover through a known
+original location or restore by hand.
+
+A backup restore refuses to replace a database while a migration is pending, including
+when the database directory is missing between the two renames. An offline restore also
+checks that its lock belongs to the current database directory before it publishes, and
+refuses a stale lock with `dataset-busy`, leaving both directories intact.
 
 The only step today rewrites a legacy update vocabulary (`delta.vocab`) in the framed
 format, which the first write to it would also do. A server opens such a database
@@ -2402,6 +2544,9 @@ The tools are read-only unless the operator turns on the write tool:
 * `find_paths` finds the shortest path, all shortest paths, the k shortest or all paths
   up to a length between two nodes, or from one node, as
   [`SERVICE path:search`](#finding-paths) does, and returns each path's edges.
+* `graph_algorithm` runs PageRank, communities, similarity, components or embeddings on
+  a projection of the graph, as [`SERVICE algo:…`](#graph-algorithms) does, and returns
+  the best rows with the statistics of the run. It never writes.
 * `list_changes` lists the recorded changes of a range of commits, each quad added or
   removed with its commit, time, author and message, filtered by subject, predicate,
   object and graph. It answers when a fact changed and who changed it.
@@ -3619,10 +3764,12 @@ bar.
 `scripts/eval-ask` runs `sparkles ask` for each pair on a question set and reports, for
 each pair and role, the accuracy overall and by complexity, the share of answers that
 matched the schema without a retry, the latency per call, and the tokens and estimated
-cost per question and per correct answer. With two or more pairs, it also asks every
-question again with the pairs as the role lists, in the order given, and reports the
-cascade's accuracy and cost, the share of answers each pair wrote, and the escalations
-by signal.
+cost per question and per correct answer. With two or more pairs, it also computes a
+cascade row from those runs, in the order given. A question moves to the next pair when
+its Ask failed or ended in an error, and the row counts the cost of every pair that was
+tried. The row reports the cascade's accuracy and cost and the share of answers each
+pair wrote. A provider error, a refusal or a timeout counts as a failed answer, and the
+run goes on.
 
 ```sh
 scripts/eval-ask --model-config models.json --model-secret anthropic=env:ANTHROPIC_API_KEY \
@@ -4233,11 +4380,13 @@ with, so its memory does not grow with the number of datasets. `CatalogOptions::
 can size them separately (`CatalogCaches::Sizes`) or give each dataset its own
 (`CatalogCaches::PerDataset`). `MemoryOptions::pool_bytes` adds a query memory pool, the
 estimated bytes that all the catalog's queries and updates may hold together. A query
-that the pool cannot cover fails with `BudgetKind::ServerMemory`, and nothing queues.
-There is no pool by default. A dataset opened on its own keeps its own caches. Python
-takes `total_query_memory_bytes` in `Catalog(...)` and `Catalog.memory(...)`, and
-Node takes `totalQueryMemoryBytes` in the catalog options. The JVM bindings do not expose
-the pool.
+that the pool cannot cover fails with `BudgetKind::ServerMemory`, and nothing queues. An
+eager result, a Rust `QueryResult` or a Python or Node result object, keeps its query's
+peak estimate in the pool until it is dropped or collected, so a program that holds many
+results should release them when it is done. There is no pool by default. A dataset
+opened on its own keeps its own caches. Python takes `total_query_memory_bytes` in
+`Catalog(...)` and `Catalog.memory(...)`, and Node takes `totalQueryMemoryBytes` in the
+catalog options. The JVM bindings do not expose the pool.
 
 With the feature `backup`, `catalog.repositories()` manages `backup/repositories.json`.
 Its `list`, `get`, `add`, `update`, `remove` and `open` calls share the configuration
@@ -4273,7 +4422,9 @@ login or `SPARKLES_TOKEN`. Remote clones wait for the clone task. Renames preser
 dataset identity and require server administration. They refuse live requests,
 reservations, and grants or active token scopes covering the old or new name, with the
 grants named in the error. `--data-dir` takes the catalog lock and requires a stopped
-server.
+server. A delete leaves alone a copy that `sparkles migrate --keep-old` kept in
+`databases/.pre-migrate-<version>-<name>`, which must be removed by hand once it is no
+longer needed.
 
 ## Python
 

@@ -171,6 +171,7 @@ pub fn apply_defaults(
     if opts.pool.is_none() && opts.grant.is_none() {
         opts.pool = defaults.pool.clone();
     }
+    opts.algo_projections = defaults.algo_projections.clone();
     opts.describe = describe_options(defaults.describe.clone(), args.describe.as_ref())?;
     opts.defaults_applied = true;
     Ok(())
@@ -1373,6 +1374,11 @@ impl PyDataset {
             Ok(r)
         })?;
         admin::to_py(py, &r)
+    }
+
+    #[getter]
+    fn algorithms(slf: Py<Self>) -> crate::algorithms::PyAlgorithms {
+        crate::algorithms::PyAlgorithms { owner: slf }
     }
 
     #[getter]

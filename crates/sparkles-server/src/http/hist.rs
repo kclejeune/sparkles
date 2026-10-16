@@ -111,6 +111,7 @@ pub(super) async fn history(
         descending,
         access: view,
         cancel: opts.cancel.clone(),
+        cancellation: opts.cancellation.clone(),
         deadline: opts.timeout.map(|t| std::time::Instant::now() + t),
     };
     let r = blocking({

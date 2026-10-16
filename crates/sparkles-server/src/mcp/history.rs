@@ -147,6 +147,7 @@ impl Tools<'_> {
             descending: a.order == Some(Order::Desc),
             access: p.view(&ds.name, Endpoint::Diff),
             cancel: Some(self.call.cancel.clone()),
+            cancellation: None,
             deadline: Some(self.call.arrived + timeout),
         };
         let r = ds.store.history_changes(&q).map_err(|e| match e {

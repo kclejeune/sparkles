@@ -1224,6 +1224,18 @@ impl Store {
             build += tg.elapsed();
             pre
         };
+        // the vector indexes too: carried over from the old generation's, so searches
+        // after the switch use a graph at once
+        {
+            let tv = Instant::now();
+            let base_only = self.base_snapshot(&gen_, base.seq);
+            let stop = || cancelled();
+            match &pool {
+                Some(p) => p.install(|| self.prebuild_vectors(&base_only, &snap0, base.seq, &stop)),
+                None => self.prebuild_vectors(&base_only, &snap0, base.seq, &stop),
+            }
+            build += tv.elapsed();
+        }
         self.failpoint("compact-indexed");
         if cancelled() {
             return Err(Error::Cancelled);
@@ -1376,6 +1388,7 @@ impl Store {
         }
         let dvocab_len = gen_.dvocab.len();
         let mut new_snap = Snapshot {
+            cacheable: true,
             dataset_id: self.owner_dataset_id(),
             generation: gen_,
             delta: std::mem::take(&mut cu.delta),
@@ -1617,6 +1630,7 @@ impl Store {
     /// compaction's new generation holds before the commits carried over).
     pub(super) fn base_snapshot(&self, gen_: &Arc<Generation>, seq: u64) -> Snapshot {
         Snapshot {
+            cacheable: true,
             dataset_id: self.owner_dataset_id(),
             generation: gen_.clone(),
             delta: gen_.base_delta(),

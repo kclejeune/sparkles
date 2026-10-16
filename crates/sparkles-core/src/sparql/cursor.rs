@@ -1336,6 +1336,7 @@ fn ranked(kind: &Kind) -> bool {
             | Kind::SpatialKnn(_)
             | Kind::Service { .. }
             | Kind::PathSearch(_)
+            | Kind::AlgoCall(_)
     )
 }
 
@@ -2073,23 +2074,24 @@ impl Operator {
                     scans,
                 } => {
                     if loaded.is_none() {
-                        let (mut table, mut info) = if *inputs {
+                        let (mut output, mut info) = if *inputs {
                             let children = &mut self.children;
                             let mut collect = |i: usize| match &scans[i] {
                                 Some(scan) => {
-                                    let (table, info) = exec::execute(ctx, scan)?;
+                                    let (output, info) = exec::execute_owned(ctx, scan)?;
+                                    let table = &output.table;
                                     let child = &mut children[i];
                                     child.rows = table.len;
                                     child.info.actual_rows = info.actual_rows;
                                     child.info.time_ms = info.time_ms;
                                     child.done = true;
-                                    Ok((table, info))
+                                    Ok((output, info))
                                 }
                                 None => collect_input(ctx, &mut children[i], options),
                             };
                             exec::execute_with_inputs(ctx, node, &mut collect)?
                         } else {
-                            exec::execute(ctx, node)?
+                            exec::execute_owned(ctx, node)?
                         };
                         if *inputs {
                             // The child operators describe themselves.
@@ -2100,11 +2102,25 @@ impl Operator {
                         }
                         info.time_ms = self.info.time_ms;
                         let mut counters = info.counters.take().unwrap_or_default();
-                        counters.insert("materializedRows".into(), table.len.into());
+                        counters.insert("materializedRows".into(), output.table.len.into());
                         info.counters = Some(counters);
                         info.actual_rows = self.rows.min(i64::MAX as usize) as i64;
                         self.info = info;
-                        let mut charge = OwnedCharge::new(ctx, capacity_bytes(&table))?;
+                        #[cfg(feature = "failpoints")]
+                        if output.lease.is_some() {
+                            crate::algo::observe_projection(
+                                crate::algo::ProjectionEvent::Materialized(
+                                    "algorithm-fallback-transfer",
+                                    capacity_bytes(&output.table) as usize,
+                                ),
+                            );
+                        }
+                        let mut charge = if output.lease.is_some() {
+                            OwnedCharge::adopt(ctx, &mut output.lease)?
+                        } else {
+                            OwnedCharge::new(ctx, capacity_bytes(&output.table))?
+                        };
+                        let mut table = output.table;
                         // Parents rely on the planner's order, which the eager result
                         // reports only when its rows hold it.
                         if !table.sorted.starts_with(&self.order) {
@@ -2223,16 +2239,39 @@ fn collect_input(
     ctx: &Arc<Ctx>,
     child: &mut Operator,
     options: &CursorOptions,
-) -> Result<(Table, PlanInfo)> {
+) -> Result<(super::table::Materialized, PlanInfo)> {
+    fn algorithm(n: &Node) -> bool {
+        matches!(n.kind, Kind::AlgoCall(_)) || n.children.iter().any(algorithm)
+    }
+    fn owns_algorithm(op: &Operator) -> bool {
+        matches!(&op.state,State::Fallback {node,..} if algorithm(node))
+            || op.children.iter().any(owns_algorithm)
+    }
+    let keep_lease = owns_algorithm(child);
     let mut input = Buffer::new(ctx, &child.vars, 0)?;
     input.table.sorted.clone_from(&child.order);
     while let Some(batch) = child.next(ctx, options, options.batch_rows)? {
         merge::append(ctx, &mut input, &batch.table, 0..batch.table.len)?;
     }
-    let Buffer { mut table, charge } = input;
-    drop(charge);
-    table.sorted.clone_from(&child.order);
-    Ok((table, child.info.clone()))
+    if !keep_lease {
+        let Buffer { mut table, charge } = input;
+        drop(charge);
+        table.sorted.clone_from(&child.order);
+        return Ok((super::table::Materialized::plain(table), child.info.clone()));
+    }
+    input
+        .charge
+        .resize(capacity_bytes(&input.table).saturating_add(child.order.len() as u64 * 4))?;
+    input.table.sorted.clone_from(&child.order);
+    input.reconcile()?;
+    let info = child.info.clone();
+    Ok((
+        super::table::Materialized {
+            table: input.table,
+            lease: Some(input.charge.into_lease()),
+        },
+        info,
+    ))
 }
 
 fn copy_rows(ctx: &Arc<Ctx>, table: &Table, at: usize, cap: usize) -> Result<Option<Buffer>> {

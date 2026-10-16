@@ -10,6 +10,408 @@ use sparkles_core::{BudgetKind, Error};
 
 const MB: u64 = 1 << 20;
 
+#[cfg(feature = "failpoints")]
+#[test]
+fn algorithm_cursor_fallback_keeps_its_table_admitted_during_transfer() {
+    use sparkles_core::algo::{ProjectionEvent, set_projection_observer};
+    use sparkles_core::sparql::{CursorOptions, FallbackPolicy, select_cursor};
+    use std::sync::{Arc, Mutex};
+    let s = Store::in_memory(StoreOptions::default());
+    let body = (0..1_000)
+        .map(|i| format!("<urn:n{i}> <urn:edge> <urn:n{}> .", i + 1))
+        .collect::<String>();
+    update(
+        &s,
+        &format!("INSERT DATA {{ {body} }}"),
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    let pool = QueryPool::new(64 * MB);
+    let grant = Arc::new(pool.try_grant(0).unwrap());
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    let rows = observations.clone();
+    let observed_grant = grant.clone();
+    set_projection_observer(Some(Arc::new(move |event| {
+        if let ProjectionEvent::Materialized("algorithm-fallback-transfer", capacity) = event {
+            rows.lock()
+                .unwrap()
+                .push((capacity as u64, observed_grant.used()));
+        }
+    })));
+    let mut cursor = select_cursor(s.snapshot(), "PREFIX algo: <urn:x-sparkles:algo#> SELECT ?n ?c WHERE { SERVICE algo:wcc { [] algo:predicate <urn:edge>; algo:node ?n; algo:component ?c } }", &QueryOptions { grant: Some(grant.clone()), no_cache: true, ..Default::default() }, &CursorOptions { batch_rows: 16, fallback: FallbackPolicy::AllowMaterialization, ..Default::default() }).unwrap();
+    let batch = cursor.next_batch().unwrap().unwrap();
+    set_projection_observer(None);
+    let observed = observations.lock().unwrap().clone();
+    drop(cursor);
+    assert_eq!(batch.len(), 16);
+    drop(batch);
+    assert!(
+        !observed.is_empty(),
+        "actual fallback transfer must be reached"
+    );
+    assert!(
+        observed.iter().all(|(bytes, used)| used >= bytes),
+        "algorithm table lost its reservation at transfer: {observed:?}"
+    );
+    assert_eq!(grant.used(), 0);
+    drop(grant);
+    assert_eq!(pool.granted(), 0);
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn algorithm_allocations_are_admitted_by_the_query_grant_before_allocation() {
+    use sparkles_core::algo::{ProjectionEvent, set_projection_observer};
+    use std::sync::{Arc, Mutex};
+    let s = Store::in_memory(StoreOptions::default());
+    let body = (0..60_000)
+        .map(|i| format!("<urn:n{i}> <urn:edge> <urn:n{}> .", i + 1))
+        .collect::<String>();
+    update(
+        &s,
+        &format!("INSERT DATA {{ {body} }}"),
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    let pool = QueryPool::new(4 * MB);
+    let grant = Arc::new(pool.try_grant(0).unwrap());
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    let events = observations.clone();
+    let observed_grant = grant.clone();
+    set_projection_observer(Some(Arc::new(move |event| {
+        if let ProjectionEvent::Allocation(name, capacity, bytes, native_live) = event {
+            events.lock().unwrap().push((
+                name,
+                capacity,
+                bytes,
+                native_live,
+                observed_grant.used(),
+                observed_grant.granted(),
+            ));
+        }
+    })));
+    let result = query(
+        s.snapshot(),
+        "PREFIX algo: <urn:x-sparkles:algo#> SELECT ?n ?c WHERE { SERVICE algo:wcc { [] algo:predicate <urn:edge>; algo:node ?n; algo:component ?c } }",
+        &QueryOptions {
+            grant: Some(grant.clone()),
+            max_memory_bytes: Some(128 * MB),
+            deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(30)),
+            no_cache: true,
+            ..Default::default()
+        },
+    );
+    set_projection_observer(None);
+    let rows = observations.lock().unwrap();
+    assert!(!rows.is_empty(), "must observe real allocation boundaries");
+    let uncovered: Vec<_> = rows.iter().filter(|r| r.4 < r.3 || r.5 < r.3).collect();
+    assert!(
+        uncovered.is_empty(),
+        "native allocation capacity was not admitted through query owner: {uncovered:?}"
+    );
+    assert!(matches!(result, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::ServerMemory));
+    assert_eq!(grant.used(), 0);
+    drop(rows);
+    drop(grant);
+    assert_eq!(pool.granted(), 0);
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn algorithm_warmed_public_cursor_preserves_cache_policy_and_admission_handoff() {
+    use sparkles_core::algo::{ProjectionEvent, set_projection_observer};
+    use sparkles_core::io::{RdfFormat, Source};
+    use sparkles_core::sparql::{CursorOptions, FallbackPolicy, select_cursor};
+    use std::sync::{Arc, Mutex};
+    let s = Store::in_memory(StoreOptions {
+        result_cache_min_ms: 0.0,
+        ..Default::default()
+    });
+    s.load(&[Source::from_bytes(
+        b"<urn:a> <urn:p> <urn:b>. <urn:c> <urn:p> <urn:d>.".to_vec(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    let q = "PREFIX algo:<urn:x-sparkles:algo#> SELECT ?n ?c WHERE { SERVICE algo:wcc { [] algo:predicate <urn:p>;algo:node ?n;algo:component ?c } }";
+    let pool = QueryPool::new(64 * MB);
+    let grant = Arc::new(pool.empty_grant());
+    let options = QueryOptions {
+        grant: Some(grant.clone()),
+        ..Default::default()
+    };
+    let first = query(s.snapshot(), q, &options).unwrap();
+    let expected = first.rows();
+    let weak = Arc::downgrade(&first.ctx);
+    drop(first);
+    assert!(weak.upgrade().is_none());
+    assert_eq!(grant.used(), 0);
+    let hit = query(s.snapshot(), q, &options).unwrap();
+    assert!(hit.plan.cached);
+    assert_eq!(hit.rows(), expected);
+    drop(hit);
+    assert_eq!(grant.used(), 0);
+    let evidence = Arc::new(Mutex::new(Vec::new()));
+    let seen = evidence.clone();
+    let observed = grant.clone();
+    set_projection_observer(Some(Arc::new(move |event| {
+        if let ProjectionEvent::Materialized("algorithm-fallback-transfer", capacity) = event {
+            seen.lock()
+                .unwrap()
+                .push((capacity as u64, observed.used()));
+        }
+    })));
+    let hits = s.result_cache().hits();
+    let mut cursor = select_cursor(
+        s.snapshot(),
+        q,
+        &options,
+        &CursorOptions {
+            batch_rows: 2,
+            fallback: FallbackPolicy::AllowMaterialization,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let retained = cursor.next_batch().unwrap().unwrap();
+    set_projection_observer(None);
+    assert_eq!(
+        s.result_cache().hits(),
+        hits,
+        "public cursor preserves its existing no-result-cache policy"
+    );
+    assert_eq!(retained.len(), 2);
+    drop(cursor);
+    assert!(grant.used() > 0);
+    assert!(retained.row(0).unwrap().iter().all(Option::is_some));
+    drop(retained);
+    let rows = evidence.lock().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(
+        rows[0].1 >= rows[0].0,
+        "warm cached output has a release/admit gap: {rows:?}"
+    );
+    assert_eq!(grant.used(), 0);
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn algorithm_actual_service_boundary_preserves_cancel_timeout_and_unwind_cleanup() {
+    use sparkles_core::algo::{ProjectionEvent, set_projection_observer};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    use std::time::{Duration, Instant};
+    let s = Store::in_memory(Default::default());
+    update(
+        &s,
+        "INSERT DATA {<urn:a> <urn:p> <urn:b>}",
+        &Default::default(),
+    )
+    .unwrap();
+    let q = "PREFIX algo:<urn:x-sparkles:algo#> SELECT ?n ?c WHERE { SERVICE algo:wcc { [] algo:predicate <urn:p>;algo:concurrency 1;algo:node ?n;algo:component ?c } }";
+    for mode in 0..3 {
+        let pool = QueryPool::new(64 * MB);
+        let grant = Arc::new(pool.empty_grant());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let entered = Arc::new(AtomicBool::new(false));
+        let seen = entered.clone();
+        let flag = cancel.clone();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        set_projection_observer(Some(Arc::new(move |event| {
+            if let ProjectionEvent::Allocation("algorithm-pick", n, _, _) = event
+                && n > 0
+            {
+                seen.store(true, Ordering::Release);
+                match mode {
+                    0 => flag.store(true, Ordering::Release),
+                    1 => {
+                        while Instant::now() <= deadline {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                    }
+                    _ => panic!("actual service allocation boundary unwind"),
+                }
+            }
+        })));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            query(
+                s.snapshot(),
+                q,
+                &QueryOptions {
+                    grant: Some(grant.clone()),
+                    cancel: Some(cancel),
+                    deadline: (mode == 1).then_some(deadline),
+                    no_cache: true,
+                    ..Default::default()
+                },
+            )
+        }));
+        set_projection_observer(None);
+        assert!(
+            entered.load(Ordering::Acquire),
+            "must reach actual algorithm/service boundary before refusal"
+        );
+        match mode {
+            0 => assert!(matches!(result.unwrap(), Err(Error::Cancelled))),
+            1 => assert!(matches!(result.unwrap(), Err(Error::Timeout))),
+            _ => assert!(result.is_err()),
+        }
+        assert_eq!(grant.used(), 0);
+        drop(grant);
+        assert_eq!(pool.granted(), 0);
+    }
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn algorithm_sorted_cursor_batches_survive_early_close_and_cancellation() {
+    use sparkles_core::sparql::{CursorOptions, FallbackPolicy, select_cursor};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    let s = Store::in_memory(Default::default());
+    let body = (0..64)
+        .map(|i| format!("<urn:n{i}> <urn:p> <urn:n{}>.", i + 1))
+        .collect::<String>();
+    update(&s, &format!("INSERT DATA {{{body}}}"), &Default::default()).unwrap();
+    for empty in [false, true] {
+        for cancel_after_first in [false, true] {
+            let q = format!(
+                "PREFIX algo:<urn:x-sparkles:algo#> SELECT ?n ?c WHERE {{SERVICE algo:wcc {{[] algo:predicate <urn:p>;algo:node ?n;algo:component ?c}} {}}} ORDER BY DESC(?n)",
+                if empty { "FILTER(false)" } else { "" }
+            );
+            let pool = QueryPool::new(64 * MB);
+            let grant = Arc::new(pool.empty_grant());
+            let cancel = Arc::new(AtomicBool::new(false));
+            let opts = QueryOptions {
+                grant: Some(grant.clone()),
+                cancel: Some(cancel.clone()),
+                no_cache: true,
+                ..Default::default()
+            };
+            let mut cursor = select_cursor(
+                s.snapshot(),
+                &q,
+                &opts,
+                &CursorOptions {
+                    batch_rows: 3,
+                    fallback: FallbackPolicy::AllowMaterialization,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let retained = cursor.next_batch().unwrap();
+            if empty {
+                assert!(retained.is_none());
+            } else {
+                assert_eq!(retained.as_ref().unwrap().len(), 3);
+                if cancel_after_first {
+                    cancel.store(true, Ordering::Release);
+                    assert!(matches!(cursor.next_batch(), Err(Error::Cancelled)));
+                }
+            }
+            drop(cursor);
+            if let Some(batch) = &retained {
+                assert!(grant.used() > 0);
+                assert!(batch.row(0).unwrap().iter().all(Option::is_some));
+            }
+            drop(retained);
+            assert_eq!(grant.used(), 0);
+            drop(opts);
+            drop(grant);
+            assert_eq!(pool.granted(), 0);
+        }
+    }
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn algorithm_concurrent_contexts_keep_separate_or_shared_grant_ownership() {
+    use sparkles_core::algo::{ProjectionEvent, set_projection_observer};
+    use std::sync::{Arc, mpsc};
+    use std::time::Duration;
+    let s = Store::in_memory(Default::default());
+    update(
+        &s,
+        "INSERT DATA {<urn:a> <urn:p> <urn:b>}",
+        &Default::default(),
+    )
+    .unwrap();
+    let q = "PREFIX algo:<urn:x-sparkles:algo#> SELECT ?n ?c WHERE {SERVICE algo:wcc {[] algo:predicate <urn:p>;algo:node ?n;algo:component ?c}}";
+    for shared in [false, true] {
+        let pool = QueryPool::new(64 * MB);
+        let a = Arc::new(pool.empty_grant());
+        let b = if shared {
+            a.clone()
+        } else {
+            Arc::new(pool.empty_grant())
+        };
+        let (tx, rx) = mpsc::channel();
+        let mut joins = Vec::new();
+        let mut release = Vec::new();
+        for (id, grant) in [&a, &b].into_iter().enumerate() {
+            let grant = grant.clone();
+            let snap = s.snapshot();
+            let tx = tx.clone();
+            let (go, wait) = mpsc::channel();
+            release.push(go);
+            joins.push(std::thread::spawn(move || {
+                let observed = grant.clone();
+                set_projection_observer(Some(Arc::new(move |event| {
+                    if let ProjectionEvent::Allocation(_, _, _, live) = event {
+                        assert!(observed.used() >= live);
+                    }
+                })));
+                let result = query(
+                    snap,
+                    q,
+                    &QueryOptions {
+                        grant: Some(grant),
+                        no_cache: true,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                set_projection_observer(None);
+                assert_eq!(result.rows().len(), 2);
+                let used = result.ctx.mem_peak();
+                tx.send((id, used)).unwrap();
+                wait.recv_timeout(Duration::from_secs(10)).unwrap();
+                result
+            }));
+        }
+        drop(tx);
+        let x = rx.recv_timeout(Duration::from_secs(10));
+        let y = rx.recv_timeout(Duration::from_secs(10));
+        for go in release {
+            let _ = go.send(());
+        }
+        let mut results = joins
+            .into_iter()
+            .map(|j| j.join().unwrap())
+            .collect::<Vec<_>>();
+        let mut peaks = [0; 2];
+        for (id, used) in [x.unwrap(), y.unwrap()] {
+            peaks[id] = used;
+        }
+        assert!(peaks.iter().all(|p| *p > 0));
+        if shared {
+            assert_eq!(a.used(), peaks.iter().sum::<u64>());
+        } else {
+            assert_eq!((a.used(), b.used()), (peaks[0], peaks[1]));
+        }
+        drop(results.remove(0));
+        assert!(b.used() > 0);
+        drop(results);
+        assert_eq!((a.used(), b.used()), (0, 0));
+        drop((a, b));
+        assert_eq!(pool.granted(), 0);
+    }
+}
+
 fn store() -> Store {
     store_rows(1_000)
 }
