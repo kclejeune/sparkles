@@ -53,6 +53,9 @@ pub(super) struct Coordinator {
     fail_next_sync: AtomicBool,
     #[cfg(test)]
     fences: AtomicUsize,
+    /// times a waiter parked with its commit still pending
+    #[cfg(test)]
+    parks: AtomicUsize,
 }
 
 impl Coordinator {
@@ -141,6 +144,8 @@ impl Coordinator {
             // waiter must loop and lead it instead of sleeping out the poll.
             let mut s = self.state.lock();
             if ticket.0.load(Ordering::Acquire) == 0 && s.active {
+                #[cfg(test)]
+                self.parks.fetch_add(1, Ordering::Relaxed);
                 self.changed.wait_for(&mut s, Duration::from_millis(20));
             }
         }
@@ -631,7 +636,8 @@ mod tests {
     }
 
     /// A waiter whose fence completes between its own `drive` and its park must lead the
-    /// next fence at once, not sleep out the 20 ms poll with nobody leading.
+    /// next fence at once, not sleep out the 20 ms poll with nobody leading. The waiter is
+    /// released only after that fence finished, so it must not park at all.
     #[test]
     fn a_waiter_does_not_sleep_through_a_finished_fence() {
         let dir = tempfile::tempdir().unwrap();
@@ -651,22 +657,21 @@ mod tests {
             .name("lw-b".into())
             .spawn({
                 let s = s.clone();
-                move || {
-                    insert(&s, "b").unwrap();
-                    Instant::now()
-                }
+                move || insert(&s, "b").unwrap()
             })
             .unwrap();
         parked.recv_timeout(Duration::from_secs(5)).unwrap();
         release_a.send(()).unwrap();
         a.join().unwrap();
-        let resumed = Instant::now();
+        let parks = || s.group.as_ref().unwrap().parks.load(Ordering::Relaxed);
+        let before = parks();
         release_b.send(()).unwrap();
-        let done = b.join().unwrap();
-        let stalled = done.duration_since(resumed);
-        assert!(
-            stalled < Duration::from_millis(10),
-            "the waiter slept {stalled:?} with its commit queued and no fence running"
+        let receipt = b.join().unwrap();
+        assert_eq!(receipt.commit.seq, s.snapshot().commit);
+        assert_eq!(
+            parks() - before,
+            0,
+            "the waiter parked with its commit queued and no fence running"
         );
     }
 
