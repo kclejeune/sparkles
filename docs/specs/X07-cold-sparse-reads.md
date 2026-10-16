@@ -677,6 +677,14 @@ whole process. A test now fails if a warm repeat of the join, the predicate scan
 range top-k or a `LIMIT 1` scan issues a read hint, and counter tests fail if the request
 checks, the read-ahead calls or the value reads of a warm query grow.
 
+The counter tests measured these changes. A prefetch of 1,000 ranges made 1,004 request
+checks before and at most 4 after. A warm predicate scan issued 4 `WILLNEED` requests for
+425,181 bytes before and none after. A second warm pass over 8 blocks made 8 read-ahead
+calls before and none after. The prefetch of a small FILTER table made 3 `get_many`
+calls before and none after. The instruction counts per request of the measurement
+below have not been taken, so the warm cost of the corrected branch against the base is
+still unmeasured.
+
 ### Remaining measurements
 
 Roadmap item 4, §9 and A5 retain the slowdown investigation. The flag ablation that this

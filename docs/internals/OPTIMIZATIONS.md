@@ -380,20 +380,24 @@ little and change nothing. Each one has the same answers with it on and off.
   not change the mapping's random-access advice. `SPARKLES_READ_WINDOW_KB` sets the
   target, 4096 KiB by default. This bounds requested bytes, not physical I/O completion.
   A pass consults its window only at a block the cache does not hold, so a warm pass does
-  no read-ahead work.
-  Passes over the vocabulary in id order use the same configured size.
+  no read-ahead work. Passes over the vocabulary in id order use the same configured size.
 * **Terms of small inputs** (`prefetch_terms`). A FILTER, BIND or ORDER BY over a table of
   2 to 4,095 rows evaluates the rows one at a time. Before the first row, it asks for the
-  vocabulary blocks of the terms it will read, and the pages of the numeric column that
-  hold their kinds. It reads no value and builds no result, so a warm call makes no system
-  call. Larger tables decode their terms in id order
-  as before. The native JSON result writer asks for the blocks of the terms it prints, as
-  the other result writers do.
+  vocabulary blocks of the terms it will read. With a numeric column it also asks for the
+  pages of the values, and for the pages of the kinds and the rank when the column keeps
+  them mapped. It reads no value and builds no result, and each page is asked for once per
+  mapping, so a warm call makes no system call. It does locate each id, which costs a
+  memory read. Larger tables decode their terms in id order as before. The native JSON
+  result writer asks for the blocks of the terms it prints, as the other result writers do.
 * **Parallel decode** (`parallel_decode`). An index join that has asked the kernel for
   its blocks decodes their columns on a small thread pool of the block cache's own, before
   the reader reaches them. Scans do not use it. It decodes only columns the reader decodes
-  anyway and keeps them in the cache, and a request adds at most an eighth of the cache.
-  The pool starts at the first such request, and a failure to start it leaves the decoding
-  to the reader's thread. A lookup that touches dozens of blocks for a few rows each spends most of
-  its time decoding whole 32,768-row columns, and this spreads that time over several
-  cores. Reads through a view that keeps no blocks, such as an export, skip it.
+  anyway and keeps them in the cache. A request adds at most an eighth of the cache, so a
+  single request cannot push out much of what other queries hold. Concurrent requests can
+  still evict each other's decoded columns, which wastes decoding but never changes an
+  answer. The pool starts at the first request that decodes ahead, which pays for starting
+  up to eight threads inside its own deadline. A failure to start the pool leaves the
+  decoding to the reader's thread. A lookup that touches dozens of blocks for a few rows
+  each spends most of its time decoding whole 32,768-row columns, and this spreads that
+  time over several cores. Reads through a view that keeps no blocks, such as an export,
+  skip it.
