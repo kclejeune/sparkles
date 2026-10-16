@@ -1085,7 +1085,7 @@ pub(super) fn run(
         Some(inp) => super::exec::join_algorithm_tables(ctx, &inp, &t.table)?,
         None => t,
     };
-    ctx.produced(out.table.len())?;
+    // `run_node` counts the table once, when this call returns to it
     Ok((out, counters))
 }
 fn append(
