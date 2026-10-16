@@ -1524,15 +1524,11 @@ impl PermIndex {
             let m = &self.blocks[e];
             !(m.first >= lo_key && m.last <= hi_key)
         };
-        let ends = [lo, hi - 1];
-        // a warm count looks at one end block, the first it must decode
-        if let Some(&first) = ends.iter().find(|&&e| partial(e))
-            && !cache.has_cols(self, first, bc)
-        {
-            for (i, &e) in ends.iter().enumerate() {
-                if partial(e) && (i == 0 || e != ends[0]) {
-                    self.prefetch(cache, e, bc);
-                }
+        // each end block that bounds the range, which costs one lookup when it is cached
+        let ends = if hi - 1 == lo { 1 } else { 2 };
+        for e in [lo, hi - 1].into_iter().take(ends) {
+            if partial(e) {
+                self.prefetch(cache, e, bc);
             }
         }
         let mut total = 0u64;
@@ -2471,6 +2467,32 @@ mod tests {
             "the warm pass consulted the read-ahead"
         );
         assert_eq!(cache.misses(), misses);
+    }
+
+    /// The cold end block of a count is asked for even when the other end is cached.
+    #[test]
+    fn count_between_hints_a_cold_end_when_the_other_is_warm() {
+        if !io_hints() {
+            return;
+        }
+        let (_dir, idx) = read_ahead_fixture(8);
+        let cache = BlockCache::new(64 << 20);
+        let (lo, hi) = (
+            [BLOCK_ROWS as u64 / 2, 0, 0, 0],
+            [6 * BLOCK_ROWS as u64 + 5, u64::MAX, u64::MAX, u64::MAX],
+        );
+        let bounds = bound_cols(&lo, &hi);
+        cache.get_cols(&idx, 0, bounds).unwrap();
+        assert!(!cache.has_cols(&idx, 6, bounds));
+        let m = &idx.blocks[6];
+        let end = m.offset as usize + m.col_len.iter().map(|&l| l as usize).sum::<usize>();
+        let trace = idx.trace_hints();
+        idx.count_between(&cache, &lo, &hi).unwrap();
+        let inside = |s: &&(usize, usize)| s.0 >= m.offset as usize && s.1 <= end;
+        let asked = trace.spans();
+        let asked = asked.iter().filter(inside).count();
+        // one request from the prefetch, one from the decode of the block
+        assert!(asked >= 2, "{asked} requests for the cold end block");
     }
 
     #[test]
