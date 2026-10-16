@@ -600,6 +600,36 @@ mod tests {
         assert!(matches!(r, Err(Error::Poisoned)), "{r:?}");
     }
 
+    /// A grouped commit is acknowledged only after a fence, so a write that will not wait is
+    /// refused even on an idle group when it would be grouped, and publishes nothing. With
+    /// the idle fast path it commits directly (rereview N2).
+    #[test]
+    fn a_no_wait_write_that_would_be_grouped_is_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(dir.path(), options()).unwrap();
+        insert(&s, "seed").unwrap();
+        let seeded = s.snapshot().commit;
+        let r = no_wait_insert(&s, "refused");
+        assert!(matches!(r, Err(Error::WriterBusy)), "{r:?}");
+        assert_eq!(s.snapshot().commit, seeded);
+        assert_eq!(s.snapshot().len(), 1);
+        insert(&s, "later").unwrap();
+        assert_eq!(s.snapshot().commit, seeded + 1);
+
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(
+            dir.path(),
+            StoreOptions {
+                experimental_group_commit: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        insert(&s, "seed").unwrap();
+        let seeded = s.snapshot().commit;
+        assert_eq!(no_wait_insert(&s, "direct").unwrap().commit.seq, seeded + 1);
+    }
+
     /// A waiter whose fence completes between its own `drive` and its park must lead the
     /// next fence at once, not sleep out the 20 ms poll with nobody leading.
     #[test]

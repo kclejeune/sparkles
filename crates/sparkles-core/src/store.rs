@@ -5587,6 +5587,11 @@ impl WriteTxn<'_> {
         // cannot acknowledge or capture a speculative predecessor.
         if !grouped || (self.net_ins == 0 && self.net_del == 0) {
             self.store.drain_group(&mut self.guard, Some(&self.opts))?;
+        } else if self.opts.no_wait {
+            // A grouped commit is acknowledged only after a fence, which a write that will
+            // not wait must not wait for. It is refused before the guard runs, and nothing
+            // has reached the WAL.
+            return Err(Error::WriterBusy);
         }
         // a commit with a merge record (a merge, or a commit a merge replays) passes
         if (self.is_dirty() || self.force) && self.merge.is_none() {
@@ -5622,11 +5627,6 @@ impl WriteTxn<'_> {
                 other => other?,
             };
             if grouped {
-                // A grouped commit is acknowledged only after a fence, which a write that
-                // will not wait must not wait for. Nothing has reached the WAL yet.
-                if self.opts.no_wait {
-                    return Err(Error::WriterBusy);
-                }
                 return self.publish_grouped(validation);
             }
             return self.publish_log(validation, sync);
