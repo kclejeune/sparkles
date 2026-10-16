@@ -1,6 +1,6 @@
 //! OpenDocument text, presentations and spreadsheets (`content.xml`) as Markdown and CSV.
 
-use crate::budget::{Budget, SLOT};
+use crate::budget::{Budget, MAX_NAME, SLOT};
 use crate::md::{self, Block, Doc};
 use crate::package::{self, Package};
 use crate::sheet::{self, SheetBuilder};
@@ -31,6 +31,9 @@ struct Cx<'p, 'a> {
     footnotes: Vec<(String, String)>,
     /// how many note bodies the walk is inside
     in_note: usize,
+    /// how many links the walk is inside: a link inside a link is read as its text, so
+    /// that the text is not copied once per level
+    in_link: usize,
 }
 
 pub fn text(pkg: &mut Package, limits: &Limits) -> Result<Document, Error> {
@@ -129,6 +132,7 @@ impl<'p, 'a> Cx<'p, 'a> {
             list_styles,
             footnotes: Vec::new(),
             in_note: 0,
+            in_link: 0,
         }
     }
 
@@ -436,9 +440,13 @@ impl<'p, 'a> Cx<'p, 'a> {
                     }
                     "tab" => out.push(' '),
                     "line-break" => out.push(if flat { ' ' } else { '\n' }),
+                    "a" if self.in_link > 0 => self.inline_into(e, flat, extra, out)?,
                     "a" => {
                         let mut inner = String::new();
-                        self.inline_into(e, flat, extra, &mut inner)?;
+                        self.in_link += 1;
+                        let r = self.inline_into(e, flat, extra, &mut inner);
+                        self.in_link -= 1;
+                        r?;
                         let href = e.attr("href").unwrap_or("");
                         if (href.starts_with("http://")
                             || href.starts_with("https://")
@@ -446,6 +454,7 @@ impl<'p, 'a> Cx<'p, 'a> {
                             && !inner.trim().is_empty()
                             && !href.contains([')', ' '])
                         {
+                            self.doc.budget.link(href.len() + inner.len() + 4)?;
                             out.push_str(&format!("[{}]({href})", inner.trim()));
                         } else {
                             out.push_str(&inner);
@@ -541,11 +550,15 @@ pub fn sheets(pkg: &mut Package, limits: &Limits) -> Result<Vec<Sheet>, Error> {
                                 .find(|(n, _)| n == k || n.ends_with(&format!(":{k}")))
                                 .map(|(_, v)| v.clone())
                         };
+                        // a name longer than any real one is never a hidden table's style
                         style_name = if get("family").as_deref() == Some("table") {
-                            get("name")
+                            get("name").filter(|n| n.len() <= MAX_NAME)
                         } else {
                             None
                         };
+                        if empty {
+                            style_name = None;
+                        }
                     }
                     "table-properties" => {
                         let at = xml::attrs(e)?;
@@ -553,6 +566,7 @@ pub fn sheets(pkg: &mut Package, limits: &Limits) -> Result<Vec<Sheet>, Error> {
                             .iter()
                             .any(|(k, v)| k.ends_with("display") && v == "false")
                             && let Some(s) = &style_name
+                            && !hidden_styles.contains(s)
                         {
                             hidden_styles.insert(s.clone());
                         }
@@ -638,6 +652,7 @@ pub fn sheets(pkg: &mut Package, limits: &Limits) -> Result<Vec<Sheet>, Error> {
             }
             Event::Text(t) if in_p && annotation == 0 => para.push_str(&xml::text_of(t)),
             Event::End(e) => match xml::local(e.name().as_ref()).as_str() {
+                "style" => style_name = None,
                 "annotation" => annotation = annotation.saturating_sub(1),
                 "p" if annotation > 0 => {}
                 "p" if in_p => {
@@ -655,7 +670,11 @@ pub fn sheets(pkg: &mut Package, limits: &Limits) -> Result<Vec<Sheet>, Error> {
                 }
                 "table-row" if depth == 1 => {
                     if let Some(bld) = b.as_mut() {
-                        bld.row(std::mem::take(&mut row), row_rep.clamp(1, 1000))?;
+                        bld.row(
+                            std::mem::take(&mut row),
+                            row_rep.clamp(1, 1000),
+                            &mut budget,
+                        )?;
                     }
                     row.clear();
                 }
@@ -719,8 +738,11 @@ fn finish_cell(
         *col = (*col + rep).min(sheet::MAX_COLUMNS);
         return Ok(());
     }
-    // each copy is charged before it is made
+    // each copy is charged before it is made, and none is made past the last column
     for _ in 0..rep.min(1000) {
+        if *col >= sheet::MAX_COLUMNS {
+            break;
+        }
         sheet::set(row, *col, Cow::Borrowed(v.as_str()), budget)?;
         *col += 1;
     }

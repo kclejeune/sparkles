@@ -23,8 +23,8 @@ pub fn sheets(pkg: &mut Package, limits: &Limits) -> Result<Vec<Sheet>, Error> {
         .find("workbookPr")
         .and_then(|n| n.attr("date1904"))
         .is_some_and(|v| v == "1" || v == "true");
-    let dates = date_styles(pkg, limits);
     let mut budget = Budget::new(limits);
+    let dates = date_styles(pkg, limits, &mut budget)?;
     let shared = shared_strings(pkg, limits, &mut budget)?;
     let mut out = Vec::new();
     for (i, s) in wb.descendants("sheet").into_iter().enumerate() {
@@ -115,46 +115,58 @@ fn corrupt(e: impl std::fmt::Display) -> Error {
     Error::Corrupt(format!("the XML cannot be read: {e}"))
 }
 
-/// For each cell format (`xf`) of `styles.xml`, whether it shows a date or a time.
-fn date_styles(pkg: &mut Package, limits: &Limits) -> Vec<bool> {
+/// The longest number format code read. Real codes are a few dozen characters, and a
+/// longer one is taken as a format that is not a date.
+const MAX_FORMAT_CODE: usize = 512;
+
+/// For each cell format (`xf`) of `styles.xml`, whether it shows a date or a time. Each
+/// custom code is read once, however many cell formats name it.
+fn date_styles(
+    pkg: &mut Package,
+    limits: &Limits,
+    budget: &mut Budget,
+) -> Result<Vec<bool>, Error> {
     let Ok(Some(b)) = pkg.read("xl/styles.xml") else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
-    let Ok(root) = xml::parse(&b, limits) else {
-        return Vec::new();
+    let root = match xml::parse(&b, limits) {
+        Ok(r) => r,
+        Err(Error::Timeout) => return Err(Error::Timeout),
+        Err(_) => return Ok(Vec::new()),
     };
-    let mut custom: HashMap<u32, String> = HashMap::new();
+    drop(b);
+    let mut custom: HashMap<u32, bool> = HashMap::new();
     for f in root.descendants("numFmt") {
+        budget.tick()?;
         if let (Some(id), Some(code)) = (
             f.attr("numFmtId").and_then(|v| v.parse().ok()),
             f.attr("formatCode"),
         ) {
-            custom.insert(id, code.to_string());
+            custom.insert(id, code.len() <= MAX_FORMAT_CODE && is_date_format(code));
         }
     }
     let Some(xfs) = root.first("cellXfs") else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
-    xfs.elements()
-        .filter(|n| n.name == "xf")
-        .map(|xf| {
-            let id: u32 = xf
-                .attr("numFmtId")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0);
-            match custom.get(&id) {
-                Some(code) => is_date_format(code),
-                None => matches!(id, 14..=22 | 27..=36 | 45..=47 | 50..=58),
-            }
-        })
-        .collect()
+    let mut out = Vec::new();
+    for xf in xfs.elements().filter(|n| n.name == "xf") {
+        budget.tick()?;
+        let id: u32 = xf
+            .attr("numFmtId")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        out.push(match custom.get(&id) {
+            Some(date) => *date,
+            None => matches!(id, 14..=22 | 27..=36 | 45..=47 | 50..=58),
+        });
+    }
+    Ok(out)
 }
 
 /// Whether a number format code shows dates or times: it has a date or time letter
 /// outside quotes, escapes and brackets other than elapsed-time brackets.
 pub fn is_date_format(code: &str) -> bool {
     let mut chars = code.chars().peekable();
-    let mut date = false;
     while let Some(c) = chars.next() {
         match c {
             '"' => {
@@ -177,14 +189,14 @@ pub fn is_date_format(code: &str) -> bool {
                 }
                 let l = inner.to_ascii_lowercase();
                 if !l.is_empty() && l.chars().all(|c| matches!(c, 'h' | 'm' | 's')) {
-                    date = true;
+                    return true;
                 }
             }
-            'y' | 'Y' | 'd' | 'D' | 'h' | 'H' | 's' | 'S' | 'm' | 'M' => date = true,
+            'y' | 'Y' | 'd' | 'D' | 'h' | 'H' | 's' | 'S' | 'm' | 'M' => return true,
             _ => {}
         }
     }
-    date
+    false
 }
 
 fn read_sheet(
@@ -257,7 +269,7 @@ fn read_sheet(
                         sheet::set(&mut row, col, v, budget)?;
                     }
                 }
-                "row" => b.row(std::mem::take(&mut row), 1)?,
+                "row" => b.row(std::mem::take(&mut row), 1, budget)?,
                 _ => {}
             },
             Event::DocType(_) => return Err(corrupt("a DOCTYPE is not allowed")),

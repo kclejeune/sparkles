@@ -28,8 +28,9 @@ pub struct SheetBuilder {
 }
 
 /// Put `value` in column `col` of a row. Columns past [`MAX_COLUMNS`] are ignored. The
-/// value is charged to the budget before it is copied, and a value already in that
-/// column (an XLSX row may name a column twice) is replaced and its charge given back.
+/// value is charged to the budget before it is copied. A cell out of column order is
+/// appended, and [`SheetBuilder::row`] sorts the row once, so that cells in descending
+/// order cost no more than cells in order.
 pub fn set(
     row: &mut Cells,
     col: usize,
@@ -39,21 +40,30 @@ pub fn set(
     if col >= MAX_COLUMNS {
         return Ok(());
     }
-    let col = col as u32;
     budget.charge(value.len() + SLOT)?;
-    let value = value.into_owned();
-    match row.last() {
-        Some((c, _)) if *c < col => row.push((col, value)),
-        None => row.push((col, value)),
-        _ => match row.binary_search_by_key(&col, |(c, _)| *c) {
-            Ok(i) => {
-                let old = std::mem::replace(&mut row[i].1, value);
+    row.push((col as u32, value.into_owned()));
+    Ok(())
+}
+
+/// Sort a row by column when it is out of order, keeping the last value of a column that
+/// is named twice (an XLSX row may do so) and giving back the charge of the others.
+fn normalize(cells: &mut Cells, budget: &mut Budget) {
+    if cells.windows(2).all(|w| w[0].0 < w[1].0) {
+        return;
+    }
+    // stable, so that the cells of one column keep the order they were set in
+    cells.sort_by_key(|(c, _)| *c);
+    let mut kept: Cells = Vec::with_capacity(cells.len());
+    for (c, v) in cells.drain(..) {
+        match kept.last_mut() {
+            Some((k, old)) if *k == c => {
+                let old = std::mem::replace(old, v);
                 budget.release(old.len() + SLOT);
             }
-            Err(i) => row.insert(i, (col, value)),
-        },
+            _ => kept.push((c, v)),
+        }
     }
-    Ok(())
+    *cells = kept;
 }
 
 impl SheetBuilder {
@@ -71,7 +81,13 @@ impl SheetBuilder {
     /// Add a row that occurs `repeat` times. A row with no cell is skipped. The cells
     /// were charged to the budget as they were stored, and the row is kept once, not once
     /// per repeat.
-    pub fn row(&mut self, mut cells: Cells, repeat: usize) -> Result<(), Error> {
+    pub fn row(
+        &mut self,
+        mut cells: Cells,
+        repeat: usize,
+        budget: &mut Budget,
+    ) -> Result<(), Error> {
+        normalize(&mut cells, budget);
         cells.retain(|(_, v)| !v.is_empty());
         let (Some(first), Some(last)) = (cells.first(), cells.last()) else {
             return Ok(());

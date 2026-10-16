@@ -407,3 +407,301 @@ fn a_deflate_bomb_with_a_lying_header_stops_at_the_part_limit() {
     assert!(used < 64 << 20, "peak {used} bytes");
     assert!(matches!(r, Err(Error::TooLarge(_))), "{r:?}");
 }
+
+/// Run `f` on a thread of its own and wait at most `secs` seconds for it, so that a
+/// conversion that ignores its deadline fails the test instead of hanging it.
+fn within<T: Send + 'static>(secs: u64, f: impl FnOnce() -> T + Send + 'static) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .stack_size(16 << 20)
+        .spawn(move || {
+            let _ = tx.send(f());
+        })
+        .unwrap();
+    rx.recv_timeout(std::time::Duration::from_secs(secs))
+        .expect("the conversion did not end")
+}
+
+fn deadline_in(secs: u64) -> Limits {
+    Limits {
+        deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(secs)),
+        ..Limits::default()
+    }
+}
+
+const REL_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+
+fn rels(items: &[(&str, &str, &str, bool)]) -> String {
+    let mut s = String::from(
+        r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
+    );
+    for (id, kind, target, external) in items {
+        s.push_str(&format!(
+            r#"<Relationship Id="{id}" Type="{REL_NS}/{kind}" Target="{target}"{}/>"#,
+            if *external {
+                r#" TargetMode="External""#
+            } else {
+                ""
+            }
+        ));
+    }
+    s.push_str("</Relationships>");
+    s
+}
+
+// Re-review 2, F1: one 20 MiB relationship target named by 1,000 hyperlinks of a
+// paragraph was copied once per link, 20 GB from a file of a few tens of KB.
+#[test]
+fn r2_f1_long_target_shared_by_docx_hyperlinks() {
+    let _g = serial();
+    let url = format!("https://example.org/{}", "a".repeat(20 << 20));
+    let link = r#"<w:hyperlink r:id="rId1"><w:r><w:t>x</w:t></w:r></w:hyperlink>"#;
+    let doc = format!(
+        r#"<w:document {W} xmlns:r="{REL_NS}"><w:body><w:p>{}</w:p></w:body></w:document>"#,
+        link.repeat(1000)
+    );
+    let r = rels(&[("rId1", "hyperlink", &url, true)]);
+    let f = zip(&[
+        ("word/document.xml", &doc),
+        ("word/_rels/document.xml.rels", &r),
+    ]);
+    drop((url, r));
+    let (r, used) = peak(|| {
+        within(30, move || {
+            to_markdown(&f, Format::Docx, &Limits::default())
+        })
+    });
+    assert!(used < BOUND, "peak {used} bytes");
+    assert!(refused_or_ok(&r), "{r:?}");
+}
+
+// F1 under the target limit: a 2,000-byte target named by 150,000 hyperlinks is 300 MB of
+// links, which the budget refuses as they are made.
+#[test]
+fn r2_f1_target_under_the_limit_in_many_hyperlinks() {
+    let _g = serial();
+    let url = format!("https://example.org/{}", "a".repeat(2000));
+    let link = r#"<w:hyperlink r:id="rId1"><w:r><w:t>x</w:t></w:r></w:hyperlink>"#;
+    let doc = format!(
+        r#"<w:document {W} xmlns:r="{REL_NS}"><w:body><w:p>{}</w:p></w:body></w:document>"#,
+        link.repeat(150_000)
+    );
+    let r = rels(&[("rId1", "hyperlink", &url, true)]);
+    let f = zip(&[
+        ("word/document.xml", &doc),
+        ("word/_rels/document.xml.rels", &r),
+    ]);
+    drop(doc);
+    let (r, used) = peak(|| {
+        within(30, move || {
+            to_markdown(&f, Format::Docx, &Limits::default())
+        })
+    });
+    assert!(used < BOUND, "peak {used} bytes");
+    assert!(matches!(r, Err(Error::TooLarge(_))), "{r:?}");
+}
+
+/// A presentation of `slides` (presentation.xml body, its rels) and one slide part.
+fn pptx(sld_ids: &str, prels: &str, slide: &str, srels: &str) -> Vec<u8> {
+    let pres =
+        format!(r#"<p:presentation {P}><p:sldIdLst>{sld_ids}</p:sldIdLst></p:presentation>"#);
+    zip(&[
+        ("ppt/presentation.xml", &pres),
+        ("ppt/_rels/presentation.xml.rels", prels),
+        ("ppt/slides/slide1.xml", slide),
+        ("ppt/slides/_rels/slide1.xml.rels", srels),
+    ])
+}
+
+#[test]
+fn r2_f1_long_target_shared_by_pptx_runs() {
+    let _g = serial();
+    let url = format!("https://example.org/{}", "a".repeat(20 << 20));
+    let run = r#"<a:r><a:rPr><a:hlinkClick r:id="rId9"/></a:rPr><a:t>x</a:t></a:r>"#;
+    let slide = format!(
+        r#"<p:sld {P}><p:cSld><p:spTree><p:sp><p:txBody><a:p>{}</a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>"#,
+        run.repeat(1000)
+    );
+    let prels = rels(&[("rId2", "slide", "slides/slide1.xml", false)]);
+    let srels = rels(&[("rId9", "hyperlink", &url, true)]);
+    let f = pptx(r#"<p:sldId id="256" r:id="rId2"/>"#, &prels, &slide, &srels);
+    drop((url, srels));
+    let (r, used) = peak(|| {
+        within(30, move || {
+            to_markdown(&f, Format::Pptx, &Limits::default())
+        })
+    });
+    assert!(used < BOUND, "peak {used} bytes");
+    assert!(refused_or_ok(&r), "{r:?}");
+}
+
+// F1, slide list: 100,000 `sldId` naming one slide whose path is 2,000 bytes long, and
+// which is missing, were 200 MB of copied paths and 200 MB of notes about them.
+#[test]
+fn r2_f1_many_slide_ids_with_one_long_target() {
+    let _g = serial();
+    let target = format!("slides/{}.xml", "s".repeat(2000));
+    let prels = rels(&[("rId2", "slide", &target, false)]);
+    let ids = r#"<p:sldId r:id="rId2"/>"#.repeat(100_000);
+    let f = pptx(&ids, &prels, "<p:sld/>", &rels(&[]));
+    let (r, used) = peak(|| {
+        within(30, move || {
+            to_markdown(&f, Format::Pptx, &Limits::default())
+        })
+    });
+    assert!(used < BOUND, "peak {used} bytes");
+    assert!(
+        matches!(r, Ok(_) | Err(Error::TooLarge(_) | Error::Corrupt(_))),
+        "{r:?}"
+    );
+}
+
+// Re-review 2, F2: one 12 MiB number format named by 400,000 cell formats was scanned once
+// per format, terabytes of characters before the first cell, with no deadline check.
+#[test]
+fn r2_f2_one_long_format_code_in_many_cell_formats() {
+    let _g = serial();
+    let mut styles = format!(
+        r#"<styleSheet {X}><numFmts><numFmt numFmtId="164" formatCode="{}"/></numFmts><cellXfs>"#,
+        "0".repeat(12 << 20)
+    );
+    styles.push_str(&r#"<xf numFmtId="164"/>"#.repeat(400_000));
+    styles.push_str("</cellXfs></styleSheet>");
+    let sheet = format!(
+        r#"<worksheet {X}><sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData></worksheet>"#
+    );
+    let wb = format!(
+        r#"<workbook {X}><sheets><sheet name="S" sheetId="1" r:id="rId1"/></sheets></workbook>"#
+    );
+    let wrels = rels(&[("rId1", "worksheet", "worksheets/sheet1.xml", false)]);
+    let f = zip(&[
+        ("xl/workbook.xml", &wb),
+        ("xl/_rels/workbook.xml.rels", &wrels),
+        ("xl/styles.xml", &styles),
+        ("xl/worksheets/sheet1.xml", &sheet),
+    ]);
+    drop(styles);
+    let r = within(30, move || sheets(&f, Format::Xlsx, &deadline_in(10)));
+    assert!(r.is_ok(), "{r:?}");
+}
+
+// Re-review 2, F3: a body placeholder inside 190 others walked its 400,000 paragraphs once
+// per level, and the deadline was read only a few times.
+#[test]
+fn r2_f3_nested_note_placeholders_over_many_paragraphs() {
+    let _g = serial();
+    let ph = r#"<p:nvSpPr><p:nvPr><p:ph type="body"/></p:nvPr></p:nvSpPr>"#;
+    let leaf = format!("<p:txBody>{}</p:txBody>", "<a:p/>".repeat(400_000));
+    let shapes = nest(&format!("<p:sp>{ph}"), "</p:sp>", 190, &leaf);
+    let notes = format!(r#"<p:notes {P}><p:cSld><p:spTree>{shapes}</p:spTree></p:cSld></p:notes>"#);
+    let prels = rels(&[("rId2", "slide", "slides/slide1.xml", false)]);
+    let srels = rels(&[(
+        "rId1",
+        "notesSlide",
+        "../notesSlides/notesSlide1.xml",
+        false,
+    )]);
+    let pres = format!(
+        r#"<p:presentation {P}><p:sldIdLst><p:sldId r:id="rId2"/></p:sldIdLst></p:presentation>"#
+    );
+    let slide = format!(r#"<p:sld {P}><p:cSld><p:spTree/></p:cSld></p:sld>"#);
+    let f = zip(&[
+        ("ppt/presentation.xml", &pres),
+        ("ppt/_rels/presentation.xml.rels", &prels),
+        ("ppt/slides/slide1.xml", &slide),
+        ("ppt/slides/_rels/slide1.xml.rels", &srels),
+        ("ppt/notesSlides/notesSlide1.xml", &notes),
+    ]);
+    let started = std::time::Instant::now();
+    let r = within(60, move || to_markdown(&f, Format::Pptx, &deadline_in(30)));
+    assert!(r.is_ok(), "{r:?}");
+    assert!(started.elapsed().as_secs() < 5, "{:?}", started.elapsed());
+}
+
+// Re-review 2, F4: a style based on itself with a 7 MiB id cloned and hashed that id nine
+// times per paragraph, and the clock was read once in 1,024 paragraphs.
+#[test]
+fn r2_f4_long_style_id_based_on_itself() {
+    let _g = serial();
+    let id = "L".repeat(7 << 20);
+    let styles = format!(
+        r#"<w:styles {W}><w:style w:styleId="a"><w:basedOn w:val="{id}"/></w:style><w:style w:styleId="{id}"><w:basedOn w:val="{id}"/></w:style></w:styles>"#
+    );
+    let doc = format!(
+        r#"<w:document {W}><w:body>{}</w:body></w:document>"#,
+        r#"<w:p><w:pPr><w:pStyle w:val="a"/></w:pPr></w:p>"#.repeat(200_000)
+    );
+    let f = zip(&[("word/document.xml", &doc), ("word/styles.xml", &styles)]);
+    drop((id, styles));
+    let r = within(30, move || to_markdown(&f, Format::Docx, &deadline_in(10)));
+    assert!(r.is_ok(), "{r:?}");
+}
+
+// F4, ODS: a 4 MiB table style name followed by 300,000 `table-properties` was cloned
+// once per element.
+#[test]
+fn r2_f4_long_table_style_name() {
+    let _g = serial();
+    let name = "n".repeat(4 << 20);
+    let props = r#"<style:table-properties table:display="false"/>"#.repeat(300_000);
+    let c = format!(
+        r#"<office:document-content {O} xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"><office:automatic-styles><style:style style:name="{name}" style:family="table">{props}</style:style></office:automatic-styles><office:body><office:spreadsheet><table:table table:name="T"><table:table-row><table:table-cell office:value-type="float" office:value="1"/></table:table-row></table:table></office:spreadsheet></office:body></office:document-content>"#
+    );
+    let f = zip(&[
+        ("mimetype", "application/vnd.oasis.opendocument.spreadsheet"),
+        ("content.xml", &c),
+    ]);
+    drop((name, props, c));
+    let r = within(30, move || sheets(&f, Format::Ods, &deadline_in(10)));
+    assert!(r.is_ok(), "{r:?}");
+}
+
+// Re-review 2, P3: cells of a row in descending column order were each inserted at the
+// front of the row, a quadratic memmove for every row.
+#[test]
+fn r2_cells_in_descending_column_order() {
+    let _g = serial();
+    let mut row = String::new();
+    for c in (0..16_384usize).rev() {
+        row.push_str(&format!(r#"<c r="{}1"><v>1</v></c>"#, column_name(c)));
+    }
+    let mut sheet = format!("<worksheet {X}><sheetData>");
+    for _ in 0..60 {
+        sheet.push_str(&format!("<row>{row}</row>"));
+    }
+    sheet.push_str("</sheetData></worksheet>");
+    let f = workbook(1, &format!("<sst {X}/>"), &sheet);
+    let started = std::time::Instant::now();
+    let r = within(60, move || sheets(&f, Format::Xlsx, &Limits::default()));
+    let s = r.unwrap();
+    assert_eq!(s[0].columns, 16_384);
+    assert!(started.elapsed().as_secs() < 5, "{:?}", started.elapsed());
+}
+
+fn column_name(mut c: usize) -> String {
+    let mut s = Vec::new();
+    loop {
+        s.push(b'A' + (c % 26) as u8);
+        if c < 26 {
+            break;
+        }
+        c = c / 26 - 1;
+    }
+    s.reverse();
+    String::from_utf8(s).unwrap()
+}
+
+// Re-review 2, P3: text and CDATA children were not counted as nodes, so 2 million empty
+// CDATA sections were a tree of 160 MB under the node limit.
+#[test]
+fn r2_cdata_sections_count_as_nodes() {
+    let _g = serial();
+    let doc = format!(
+        "<w:document {W}><w:body><w:p>{}</w:p></w:body></w:document>",
+        "<![CDATA[]]>".repeat(1_900_000)
+    );
+    let f = zip(&[("word/document.xml", &doc)]);
+    drop(doc);
+    let r = to_markdown(&f, Format::Docx, &Limits::default());
+    assert!(matches!(r, Err(Error::TooLarge(_))), "{r:?}");
+}

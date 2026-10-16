@@ -9,19 +9,23 @@ use crate::md::{self, Block, Doc};
 use crate::package::{Package, Rel};
 use crate::xml::{self, Node};
 use crate::{Document, Error, Limits};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+
+/// How many missing slides the notes name one by one.
+const MISSING_NAMED: usize = 20;
 
 pub fn convert(pkg: &mut Package, limits: &Limits) -> Result<Document, Error> {
     let bytes = pkg.need("ppt/presentation.xml")?;
     let pres = xml::parse(&bytes, limits)?;
     drop(bytes);
     let rels = pkg.rels("ppt/presentation.xml");
-    let mut slides: Vec<String> = Vec::new();
+    // the paths are borrowed from the relationships, because many slide ids may name one
+    let mut slides: Vec<&str> = Vec::new();
     for s in pres.descendants("sldId") {
         if let Some(r) = s.attr("r:id").and_then(|id| rels.get(id))
             && !r.external
         {
-            slides.push(r.target.clone());
+            slides.push(&r.target);
         }
     }
     if slides.is_empty() {
@@ -29,10 +33,16 @@ pub fn convert(pkg: &mut Package, limits: &Limits) -> Result<Document, Error> {
     }
     let mut doc = Doc::new(limits);
     let mut notes: Vec<String> = Vec::new();
+    let mut missing = 0usize;
     for (i, path) in slides.iter().enumerate() {
         let n = i + 1;
+        doc.budget.tick()?;
         let Some(bytes) = pkg.read(path)? else {
-            notes.push(format!("slide {n} ({path}) is missing from the file"));
+            // the first few are named, so that the notes stay small whatever the count
+            missing += 1;
+            if missing <= MISSING_NAMED {
+                notes.push(format!("slide {n} ({path}) is missing from the file"));
+            }
             continue;
         };
         let root = xml::parse(&bytes, limits)?;
@@ -51,6 +61,7 @@ pub fn convert(pkg: &mut Package, limits: &Limits) -> Result<Document, Error> {
         if let Some(tree) = root.find("spTree") {
             s.shapes(tree)?;
         }
+        drop(root);
         let Slide { title, blocks, .. } = s;
         let notes_text = notes_of(pkg, limits, &srels, &mut doc.budget)?;
         doc.push(Block::Page(n))?;
@@ -68,6 +79,12 @@ pub fn convert(pkg: &mut Package, limits: &Limits) -> Result<Document, Error> {
                 doc.push(Block::Para(md::plain(&t)))?;
             }
         }
+    }
+    if missing > MISSING_NAMED {
+        notes.push(format!(
+            "{} more slides are missing from the file",
+            missing - MISSING_NAMED
+        ));
     }
     let markdown = doc.render(limits.max_text)?;
     let title = {
@@ -110,25 +127,37 @@ fn notes_of(
         Err(_) => return Ok(Vec::new()),
     };
     let mut out = Vec::new();
-    // a shape inside a shape lists the paragraphs of the inner one again, so each
-    // paragraph is read once
-    let mut seen: HashSet<*const Node> = HashSet::new();
-    for sp in root.descendants("sp") {
+    // one walk over the tree: a body placeholder's paragraphs are read and the walk does
+    // not go into it, so a shape inside a shape is never visited twice
+    let mut stack: Vec<&Node> = vec![&root];
+    while let Some(n) = stack.pop() {
         budget.tick()?;
-        let Some(ph) = placeholder(sp) else { continue };
-        if ph.attr("type") != Some("body") {
+        if n.name == "sp" && placeholder(n).is_some_and(|ph| ph.attr("type") == Some("body")) {
+            let mut paras: Vec<&Node> = Vec::new();
+            let mut inner: Vec<&Node> = n.elements().collect();
+            inner.reverse();
+            // the paragraphs below the placeholder in document order, each node once
+            while let Some(c) = inner.pop() {
+                budget.tick()?;
+                if c.name == "p" {
+                    paras.push(c);
+                }
+                let at = inner.len();
+                inner.extend(c.elements());
+                inner[at..].reverse();
+            }
+            for p in paras {
+                let t = para_text(p, &HashMap::new(), true, budget)?;
+                if !t.trim().is_empty() {
+                    budget.charge(t.len() + SLOT)?;
+                    out.push(t.trim().to_string());
+                }
+            }
             continue;
         }
-        for p in sp.descendants("p") {
-            if !seen.insert(p as *const Node) {
-                continue;
-            }
-            let t = para_text(p, &HashMap::new(), true);
-            if !t.trim().is_empty() {
-                budget.charge(t.len() + SLOT)?;
-                out.push(t.trim().to_string());
-            }
-        }
+        let at = stack.len();
+        stack.extend(n.elements());
+        stack[at..].reverse();
     }
     Ok(out)
 }
@@ -150,7 +179,7 @@ impl Slide<'_, '_, '_> {
         for n in tree.elements() {
             self.doc.budget.tick()?;
             match n.name.as_str() {
-                "sp" => self.shape(n),
+                "sp" => self.shape(n)?,
                 "grpSp" => self.shapes(n)?,
                 "graphicFrame" => {
                     if let Some(t) = n.find("tbl") {
@@ -191,25 +220,26 @@ impl Slide<'_, '_, '_> {
         }
     }
 
-    fn shape(&mut self, sp: &Node) {
+    fn shape(&mut self, sp: &Node) -> Result<(), Error> {
         let ph = placeholder(sp);
         let kind = ph.and_then(|p| p.attr("type")).unwrap_or("");
         if matches!(kind, "sldNum" | "dt" | "ftr" | "hdr" | "sldImg") {
-            return;
+            return Ok(());
         }
         let Some(body) = sp.first("txBody") else {
-            return;
+            return Ok(());
         };
         let is_title = matches!(kind, "title" | "ctrTitle");
         // placeholders of content are bulleted unless the paragraph says otherwise
         let bulleted = ph.is_some() && matches!(kind, "" | "body" | "obj");
         if is_title {
-            let t: Vec<String> = body
-                .elements()
-                .filter(|p| p.name == "p")
-                .map(|p| para_text(p, self.rels, true))
-                .filter(|t| !t.trim().is_empty())
-                .collect();
+            let mut t: Vec<String> = Vec::new();
+            for p in body.elements().filter(|p| p.name == "p") {
+                let x = para_text(p, self.rels, true, &mut self.doc.budget)?;
+                if !x.trim().is_empty() {
+                    t.push(x);
+                }
+            }
             let t = t.join(" ");
             if !t.trim().is_empty() {
                 if self.title.is_none() {
@@ -218,12 +248,12 @@ impl Slide<'_, '_, '_> {
                     self.blocks.push(Block::Para(md::plain(&t)));
                 }
             }
-            return;
+            return Ok(());
         }
         let mut counters: Vec<u64> = Vec::new();
         for p in body.elements().filter(|p| p.name == "p") {
             let ppr = p.first("pPr");
-            let t = para_text(p, self.rels, false);
+            let t = para_text(p, self.rels, false, &mut self.doc.budget)?;
             let t = t.trim();
             if t.is_empty() {
                 continue;
@@ -253,13 +283,21 @@ impl Slide<'_, '_, '_> {
                 self.blocks.push(Block::Para(md::plain(t)));
             }
         }
+        Ok(())
     }
 }
 
-/// The text of a DrawingML paragraph. `flat` writes line breaks as spaces.
-fn para_text(p: &Node, rels: &HashMap<String, Rel>, flat: bool) -> String {
+/// The text of a DrawingML paragraph. `flat` writes line breaks as spaces. A link target
+/// is copied once per run that names it, so each link is charged to the budget.
+fn para_text(
+    p: &Node,
+    rels: &HashMap<String, Rel>,
+    flat: bool,
+    budget: &mut Budget,
+) -> Result<String, Error> {
     let mut out = String::new();
     for c in p.elements() {
+        budget.tick()?;
         match c.name.as_str() {
             "r" => {
                 let t = c.first("t").map(|t| t.text()).unwrap_or_default();
@@ -271,6 +309,7 @@ fn para_text(p: &Node, rels: &HashMap<String, Rel>, flat: bool) -> String {
                     .filter(|r| r.external && !r.target.contains([')', ' ']));
                 match link {
                     Some(l) if !t.trim().is_empty() => {
+                        budget.link(l.target.len() + t.len() + 4)?;
                         out.push_str(&format!("[{}]({})", t.trim(), l.target))
                     }
                     _ => out.push_str(&t),
@@ -285,7 +324,7 @@ fn para_text(p: &Node, rels: &HashMap<String, Rel>, flat: bool) -> String {
             _ => {}
         }
     }
-    out
+    Ok(out)
 }
 
 /// The rows of a table, each cell charged to the budget as it is made.
@@ -299,12 +338,13 @@ fn table(t: &Node, budget: &mut Budget) -> Result<Vec<Vec<String>>, Error> {
                 row.push(String::new());
                 continue;
             }
-            let text: Vec<String> = tc
-                .descendants("p")
-                .iter()
-                .map(|p| para_text(p, &HashMap::new(), true))
-                .filter(|t| !t.trim().is_empty())
-                .collect();
+            let mut text: Vec<String> = Vec::new();
+            for p in tc.descendants("p") {
+                let t = para_text(p, &HashMap::new(), true, budget)?;
+                if !t.trim().is_empty() {
+                    text.push(t);
+                }
+            }
             let text = md::cell(&text.join(" "));
             budget.charge(text.len() + SLOT)?;
             row.push(text);

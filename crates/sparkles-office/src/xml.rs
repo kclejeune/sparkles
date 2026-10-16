@@ -148,6 +148,13 @@ pub fn text_of(t: &BytesText) -> String {
     }
 }
 
+fn too_many(limits: &Limits) -> Error {
+    Error::TooLarge(format!(
+        "an XML part has more than {} elements, attributes and text nodes",
+        limits.max_nodes
+    ))
+}
+
 fn corrupt(e: impl std::fmt::Display) -> Error {
     Error::Corrupt(format!("the XML cannot be read: {e}"))
 }
@@ -220,12 +227,21 @@ pub fn parse(bytes: &[u8], limits: &Limits) -> Result<Node, Error> {
                 if !(s.trim().is_empty() && s.contains(['\n', '\r']))
                     && let Some(top) = stack.last_mut()
                 {
+                    // a text child costs a slot of the tree like an element does
+                    nodes += 1;
+                    if nodes > limits.max_nodes {
+                        return Err(too_many(limits));
+                    }
                     top.children.push(Child::Text(s));
                 }
             }
             Event::CData(c) => {
                 let s = String::from_utf8_lossy(&c).into_owned();
                 if let Some(top) = stack.last_mut() {
+                    nodes += 1;
+                    if nodes > limits.max_nodes {
+                        return Err(too_many(limits));
+                    }
                     top.children.push(Child::Text(s));
                 }
             }

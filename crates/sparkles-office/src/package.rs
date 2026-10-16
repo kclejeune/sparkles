@@ -17,6 +17,11 @@ pub struct Package<'a> {
     images: usize,
 }
 
+/// The longest relationship target kept. Real targets are paths and URLs of a few hundred
+/// bytes. A target is copied once per reference to it (a hyperlink, a slide id), so a
+/// longer one is dropped with its relationship, as if the part did not name it.
+pub const MAX_TARGET: usize = 2048;
+
 /// One relationship of a part.
 #[derive(Clone, Debug)]
 pub struct Rel {
@@ -120,10 +125,14 @@ impl<'a> Package<'a> {
             let (Some(id), Some(target)) = (r.attr("Id"), r.attr("Target")) else {
                 continue;
             };
+            if target.len() > MAX_TARGET || id.len() > crate::budget::MAX_NAME {
+                continue;
+            }
             let external = r.attr("TargetMode") == Some("External");
             let kind = r
                 .attr("Type")
                 .and_then(|t| t.rsplit('/').next())
+                .filter(|k| k.len() <= crate::budget::MAX_NAME)
                 .unwrap_or("")
                 .to_string();
             let target = if external {

@@ -5,7 +5,7 @@
 //! Footnotes and endnotes are kept as Markdown footnotes at the end. Comments, headers,
 //! footers and deleted text are left out.
 
-use crate::budget::{Budget, SLOT};
+use crate::budget::{Budget, MAX_NAME, SLOT};
 use crate::md::{self, Block, Doc};
 use crate::package::{Package, Rel};
 use crate::xml::{self, Node};
@@ -40,6 +40,9 @@ struct Cx<'p, 'a> {
     used_notes: Vec<(String, String)>,
     /// the labels in `used_notes`, for the membership test
     used_labels: HashSet<String>,
+    /// hyperlinks being read around the current run: a hyperlink inside another is read
+    /// as plain text, so that its text is not copied once per level
+    in_link: usize,
 }
 
 pub fn convert(pkg: &mut Package, limits: &Limits) -> Result<Document, Error> {
@@ -70,6 +73,7 @@ pub fn convert(pkg: &mut Package, limits: &Limits) -> Result<Document, Error> {
         endnotes,
         used_notes: Vec::new(),
         used_labels: HashSet::new(),
+        in_link: 0,
     };
     let body = root
         .first("body")
@@ -111,7 +115,9 @@ fn styles(pkg: &mut Package, limits: &Limits) -> HashMap<String, Style> {
         return out;
     };
     for s in root.elements().filter(|n| n.name == "style") {
-        let Some(id) = s.attr("styleId") else {
+        // a style is looked up and its base followed for every paragraph, so a long id
+        // would be hashed and copied once per paragraph: no real id is near the limit
+        let Some(id) = s.attr("styleId").filter(|i| i.len() <= MAX_NAME) else {
             continue;
         };
         let ppr = s.first("pPr");
@@ -119,7 +125,7 @@ fn styles(pkg: &mut Package, limits: &Limits) -> HashMap<String, Style> {
             id.to_string(),
             Style {
                 name: val(s, "name").unwrap_or_default().to_lowercase(),
-                based_on: val(s, "basedOn"),
+                based_on: val(s, "basedOn").filter(|b| b.len() <= MAX_NAME),
                 outline: ppr
                     .and_then(|p| val(p, "outlineLvl"))
                     .and_then(|v| v.parse().ok()),
@@ -354,7 +360,7 @@ impl Cx<'_, '_> {
             &mut text,
             &mut extra,
             heading.is_some() || list.is_some(),
-        );
+        )?;
         let text = text.trim().to_string();
         if !text.is_empty() {
             let line = md::plain(&text);
@@ -394,40 +400,61 @@ impl Cx<'_, '_> {
 
     /// The text of the runs below `n`, with the pictures and text boxes it finds pushed
     /// to `extra`.
-    fn inline(&mut self, n: &Node, out: &mut String, extra: &mut Vec<Block>, flat: bool) {
+    fn inline(
+        &mut self,
+        n: &Node,
+        out: &mut String,
+        extra: &mut Vec<Block>,
+        flat: bool,
+    ) -> Result<(), Error> {
         for c in n.elements() {
+            self.doc.budget.tick()?;
             match c.name.as_str() {
-                "r" => self.run(c, out, extra, flat),
+                "r" => self.run(c, out, extra, flat)?,
+                // a link inside a link is not legal and is read as its text
+                "hyperlink" if self.in_link > 0 => self.inline(c, out, extra, flat)?,
                 "hyperlink" => {
                     let mut inner = String::new();
-                    self.inline(c, &mut inner, extra, flat);
+                    self.in_link += 1;
+                    let r = self.inline(c, &mut inner, extra, flat);
+                    self.in_link -= 1;
+                    r?;
                     let url = c
                         .attr("id")
                         .and_then(|id| self.rels.get(id))
                         .filter(|r| r.external)
-                        .map(|r| r.target.clone());
+                        .map(|r| r.target.as_str());
                     match url {
                         Some(u) if !inner.trim().is_empty() && !u.contains([')', ' ']) => {
+                            // the target is copied once per link, so it is charged
+                            self.doc.budget.link(u.len() + inner.len() + 4)?;
                             out.push_str(&format!("[{}]({u})", inner.trim()))
                         }
                         _ => out.push_str(&inner),
                     }
                 }
                 "ins" | "smartTag" | "fldSimple" | "sdtContent" | "customXml" | "moveTo"
-                | "sdt" | "bdo" | "dir" => self.inline(c, out, extra, flat),
+                | "sdt" | "bdo" | "dir" => self.inline(c, out, extra, flat)?,
                 "AlternateContent" => {
                     if let Some(ch) = c.first("Choice").or_else(|| c.first("Fallback")) {
-                        self.inline(ch, out, extra, flat);
+                        self.inline(ch, out, extra, flat)?;
                     }
                 }
                 _ => {}
             }
         }
+        Ok(())
     }
 
-    fn run(&mut self, r: &Node, out: &mut String, extra: &mut Vec<Block>, flat: bool) {
+    fn run(
+        &mut self,
+        r: &Node,
+        out: &mut String,
+        extra: &mut Vec<Block>,
+        flat: bool,
+    ) -> Result<(), Error> {
         if hidden(r) {
-            return;
+            return Ok(());
         }
         for c in r.elements() {
             match c.name.as_str() {
@@ -461,12 +488,13 @@ impl Cx<'_, '_> {
                 "drawing" | "pict" | "object" => self.drawing(c, extra),
                 "AlternateContent" => {
                     if let Some(ch) = c.first("Choice").or_else(|| c.first("Fallback")) {
-                        self.run(ch, out, extra, flat);
+                        self.run(ch, out, extra, flat)?;
                     }
                 }
                 _ => {}
             }
         }
+        Ok(())
     }
 
     fn drawing(&mut self, d: &Node, extra: &mut Vec<Block>) {
