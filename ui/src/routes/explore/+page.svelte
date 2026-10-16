@@ -969,7 +969,9 @@
   $effect(() => {
     const iri = selectedClass;
     const name = ds;
-    const key = `${name} ${schemaGraph} ${schemaInferences} ${schemaFor} ${iri}`;
+    // the profile is of the state the schema shows
+    const at = schemaTimeOpen && exAt ? exAt : undefined;
+    const key = `${name} ${schemaGraph} ${schemaInferences} ${schemaFor} ${iri} ${at ?? ''}`;
     if (!iri || !name || !schema || profileFor === key) return;
     untrack(() => {
       const owns = profileRuns.claim('profile');
@@ -981,6 +983,7 @@
           graph: schemaGraph,
           reasoning: hasInferences ? schemaInferences : undefined,
           classes: [iri],
+          at,
         })
         .then((p) => {
           if (owns()) profile = p.classes.find((c) => c.class === iri) ?? null;

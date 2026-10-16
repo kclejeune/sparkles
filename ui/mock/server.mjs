@@ -1690,6 +1690,56 @@ function expand(pn) {
 
 const builtin = (iri) => Object.values(NS).some((ns) => iri.startsWith(ns));
 
+/**
+ * `/$/schema/{ds}/profiles`: for each class asked for, its instance count and the predicates
+ * its instances use, over the default graph of `ds` (a store at a past commit for `at=`).
+ * The kinds of value are left out.
+ */
+function classProfiles(ds, p) {
+  const all = ds.store
+    .match(null, null, null, null)
+    .filter((q) => q.graph.termType === 'DefaultGraph');
+  const typed = new Map();
+  for (const q of all) {
+    if (q.predicate.value !== RDF_TYPE_IRI || q.object.termType !== 'NamedNode') continue;
+    const set = typed.get(q.object.value) ?? new Set();
+    set.add(String(q.subject));
+    typed.set(q.object.value, set);
+  }
+  const wanted = p.getAll('class');
+  const profile = (iri) => {
+    const members = typed.get(iri) ?? new Set();
+    const used = new Map();
+    for (const q of all) {
+      if (q.predicate.value === RDF_TYPE_IRI || !members.has(String(q.subject))) continue;
+      const e = used.get(q.predicate.value) ?? new Map();
+      e.set(String(q.subject), (e.get(String(q.subject)) ?? 0) + 1);
+      used.set(q.predicate.value, e);
+    }
+    return {
+      class: iri,
+      builtin: false,
+      instances: members.size,
+      properties: [...used].map(([predicate, per]) => ({
+        predicate,
+        instances: per.size,
+        triples: [...per.values()].reduce((a, b) => a + b, 0),
+        minPerInstance: Math.min(...per.values()),
+        maxPerInstance: Math.max(...per.values()),
+        objects: {},
+        objectClasses: [],
+      })),
+      incoming: [],
+    };
+  };
+  return {
+    profileFormat: 1,
+    snapshot: { commit: headCommit(ds)?.seq ?? 0 },
+    selection: { graph: p.get('graph') || 'default', reasoning: false },
+    classes: (wanted.length ? wanted : [...typed.keys()]).map(profile),
+  };
+}
+
 /** The schema report of a dataset (all items; the router paginates). */
 function schemaReport(ds, p) {
   const graph = p.get('graph') || 'default';
@@ -2394,6 +2444,7 @@ const server = http.createServer(async (req, res) => {
             if (at.error) return send(res, ...at.error);
             if (at.store) view = pastView(ds, at.store);
           }
+          if (extra === 'profiles') return send(res, 200, classProfiles(view, url.searchParams));
           const r = schemaReport(view, url.searchParams);
           if (r.error) return fail(res, r.status, r.error);
           const cursor = url.searchParams.get('cursor');

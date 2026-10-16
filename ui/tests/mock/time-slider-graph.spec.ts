@@ -187,6 +187,51 @@ test('A9: the compare dialog opens the slider on its two states', async ({ page 
   ).toHaveAttribute('aria-valuenow', '1');
 });
 
+test.describe('U4: the class profile follows the schema slider', () => {
+  const put = (request: APIRequestContext, sparql: string, message: string) =>
+    request
+      .post('/typed/update', {
+        headers: {
+          'Content-Type': 'application/sparql-update',
+          'Sparkles-Commit-Message': message,
+        },
+        data: `PREFIX ex: <${EX}> ${sparql}`,
+      })
+      .then((r) => expect(r.ok(), `update: ${message}`).toBe(true));
+
+  test.beforeAll(async ({ request }) => {
+    const r = await request.post('/$/datasets', {
+      data: { dbName: 'typed', dbType: 'persistent' },
+    });
+    if (r.status() === 409) return;
+    expect(r.ok()).toBe(true);
+    await put(request, 'INSERT DATA { ex:a a ex:Thing ; ex:size 1 }', 'First thing');
+    await put(request, 'INSERT DATA { ex:b a ex:Thing ; ex:size 2 }', 'Second thing');
+    await put(request, 'INSERT DATA { ex:c a ex:Thing ; ex:size 3 }', 'Third thing');
+  });
+
+  test('the profile is read at the commit the schema shows', async ({ page }) => {
+    await page.addInitScript(() => localStorage.setItem('sparkles.dataset', 'typed'));
+    const asked: string[] = [];
+    page.on('request', (req) => {
+      const u = new URL(req.url());
+      if (u.pathname === '/$/schema/typed/profiles') asked.push(u.searchParams.get('at') ?? 'head');
+    });
+    await page.goto('/ui/explore?ds=typed&tab=schema');
+    await page.getByRole('button', { name: 'Schema history' }).click();
+    await page.getByText('Thing', { exact: true }).first().click();
+    const lines = page.locator('.profile-line');
+    await expect(lines).toContainText('3 of 3');
+    const handle = right(page, 'Schema history');
+    await handle.focus();
+    await page.keyboard.press('ArrowLeft');
+    await page.keyboard.press('ArrowLeft');
+    await expect(handle).toHaveAttribute('aria-valuenow', '1');
+    await expect(lines).toContainText('1 of 1');
+    expect(asked.at(-1)).toBe('commit:1');
+  });
+});
+
 // --- a history too long to list ---------------------------------------------------------------
 
 const T0 = Date.parse('2026-01-01T00:00:00Z');
