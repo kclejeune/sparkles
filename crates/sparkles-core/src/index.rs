@@ -1174,6 +1174,8 @@ pub struct BlockCache {
 #[cfg(test)]
 thread_local! {
     static DECODE_POOL_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// [`BlockCache::has_cols`] calls on this thread
+    static HAS_COLS_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The threads that decode blocks ahead of a reader (see [`BlockCache::warm`]). They are
@@ -1377,6 +1379,8 @@ impl BlockCache {
     /// Whether the columns in `mask` of block `b` are decoded in the cache, without
     /// decoding them or counting a hit or miss.
     pub fn has_cols(&self, idx: &PermIndex, b: usize, mask: ColMask) -> bool {
+        #[cfg(test)]
+        HAS_COLS_CALLS.with(|n| n.set(n.get() + 1));
         (0..4).all(|c| {
             mask & (1 << c) == 0
                 || self
@@ -1530,11 +1534,16 @@ impl PermIndex {
             let m = &self.blocks[e];
             !(m.first >= lo_key && m.last <= hi_key)
         };
-        // each end block that bounds the range, which costs one lookup when it is cached
+        // each end block that bounds the range: a cached one is taken from the cache here,
+        // once, and a cold one is asked for before either is decoded
         let ends = if hi - 1 == lo { 1 } else { 2 };
-        for e in [lo, hi - 1].into_iter().take(ends) {
+        let mut cached: [Option<Block>; 2] = [None, None];
+        for (slot, e) in cached.iter_mut().zip([lo, hi - 1]).take(ends) {
             if partial(e) {
-                self.prefetch(cache, e, bc);
+                *slot = cache.get_cols_cached(self, e, bc);
+                if slot.is_none() {
+                    self.prefetch(cache, e, bc);
+                }
             }
         }
         let mut total = 0u64;
@@ -1554,7 +1563,17 @@ impl PermIndex {
                 total += self.blocks[e].row_start + self.blocks[e].rows as u64 - m.row_start;
                 b = e + 1;
             } else {
-                let blk = cache.get_cols(self, b, bound_cols(&lo_key, &hi_key))?;
+                let held = if b == lo {
+                    cached[0].take()
+                } else if b == hi - 1 {
+                    cached[1].take()
+                } else {
+                    None
+                };
+                let blk = match held {
+                    Some(blk) => blk,
+                    None => cache.get_cols(self, b, bc)?,
+                };
                 let (s, e) = blk.key_range(&lo_key, &hi_key);
                 total += (e - s) as u64;
                 b += 1;
@@ -2514,6 +2533,26 @@ mod tests {
         let asked = asked.iter().filter(inside).count();
         // one request from the prefetch, one from the decode of the block
         assert!(asked >= 2, "{asked} requests for the cold end block");
+    }
+
+    /// A warm count takes each end block from the cache once, without asking the cache
+    /// whether it holds the block first.
+    #[test]
+    fn count_between_looks_a_warm_end_block_up_once() {
+        let (_dir, idx) = read_ahead_fixture(8);
+        let cache = BlockCache::new(64 << 20);
+        let (lo, hi) = (
+            [BLOCK_ROWS as u64 / 2, 0, 0, 0],
+            [6 * BLOCK_ROWS as u64 + 5, u64::MAX, u64::MAX, u64::MAX],
+        );
+        let cold = idx.count_between(&cache, &lo, &hi).unwrap();
+        let (hits, misses) = (cache.hits(), cache.misses());
+        let calls = HAS_COLS_CALLS.with(|n| n.get());
+        assert_eq!(idx.count_between(&cache, &lo, &hi).unwrap(), cold);
+        assert_eq!(HAS_COLS_CALLS.with(|n| n.get()), calls);
+        assert_eq!(cache.misses(), misses);
+        let cols = u64::from(bound_cols(&lo, &hi).count_ones());
+        assert_eq!(cache.hits() - hits, 2 * cols);
     }
 
     #[test]
