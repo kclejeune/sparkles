@@ -181,6 +181,18 @@ impl<T> Buffer<T> {
         self.values.push(value);
         Ok(())
     }
+    /// A buffer of `capacity` default values, charged before it is allocated. Unlike
+    /// [`Buffer::filled`] it fills with one pass of the allocator's zeroing, so a large
+    /// array of numbers costs no per-element bookkeeping.
+    pub(crate) fn zeroed(name: &'static str, capacity: usize, ctl: &Control) -> Result<Self>
+    where
+        T: Copy + Default,
+    {
+        let mut b = Self::new(name, capacity, ctl)?;
+        b.values.resize(capacity, T::default());
+        ctl.check()?;
+        Ok(b)
+    }
     pub(crate) fn filled(
         name: &'static str,
         capacity: usize,

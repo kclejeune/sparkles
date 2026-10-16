@@ -103,3 +103,52 @@ fn algorithm_rows_fit_a_budget_of_their_own_count() {
         assert!(r.rows_produced <= cold.rows_produced);
     }
 }
+
+/// A huge FastRP dimension fails with an error, not a panic or an abort.
+#[test]
+fn fastrp_huge_dimension_is_refused() {
+    // four nodes: 4 * 2^62 wraps usize to 0
+    let s = trig("ex:a ex:p ex:b . ex:c ex:p ex:d .");
+    for algo in ["fastRP", "node2vec"] {
+        for dim in ["4611686018427387904", "100000", "16385", "1e20"] {
+            let q = format!(
+                "{PREFIXES}SELECT ?n ?e WHERE {{ SERVICE algo:{algo} {{ [] algo:predicate ex:p ; algo:dimension {dim} ; algo:node ?n ; algo:embedding ?e }} }}"
+            );
+            let snap = s.snapshot();
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                query(snap, &q, &QueryOptions::default()).map(|r| r.len())
+            }));
+            match r {
+                Err(_) => panic!("{algo} dimension {dim}: the query panicked"),
+                Ok(Ok(n)) => panic!("{algo} dimension {dim}: accepted with {n} rows"),
+                Ok(Err(e)) => assert!(
+                    e.to_string().contains("dimension"),
+                    "{algo} dimension {dim}: {e}"
+                ),
+            }
+        }
+    }
+}
+
+/// The largest dimension of a vector index is still accepted, and an empty graph still
+/// returns no rows.
+#[test]
+fn fastrp_dimension_bounds() {
+    let s = trig("ex:a ex:p ex:b .");
+    let q = format!(
+        "{PREFIXES}SELECT ?n ?e WHERE {{ SERVICE algo:fastRP {{ [] algo:predicate ex:p ; algo:dimension 16384 ; algo:node ?n ; algo:embedding ?e }} }}"
+    );
+    assert_eq!(
+        query(s.snapshot(), &q, &QueryOptions::default())
+            .unwrap()
+            .len(),
+        2
+    );
+    let empty = trig("ex:a ex:q ex:b .");
+    assert_eq!(
+        query(empty.snapshot(), &q, &QueryOptions::default())
+            .unwrap()
+            .len(),
+        0
+    );
+}

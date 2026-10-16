@@ -5200,8 +5200,8 @@ take, fails with `400`.
 | `algo:kCore` | `algo:core` | none |
 | `algo:bfs` | `algo:depth` | `source`, `graphalytics` |
 | `algo:sssp` | `algo:distance` | `source`, `graphalytics` |
-| `algo:fastRP` | `algo:embedding` | `dimension` (128), `iterationWeights`, `normalizationStrength`, `seed` |
-| `algo:node2vec` | `algo:embedding` | `dimension` (128), `walkLength` (80), `walksPerNode` (10), `windowSize` (10), `returnFactor`, `inOutFactor`, `negativeSamples` (5), `epochs` (1), `learningRate` (0.025), `seed` |
+| `algo:fastRP` | `algo:embedding` | `dimension` (128, at most 16384), `iterationWeights`, `normalizationStrength`, `seed` |
+| `algo:node2vec` | `algo:embedding` | `dimension` (128, at most 16384), `walkLength` (80), `walksPerNode` (10), `windowSize` (10), `returnFactor`, `inOutFactor`, `negativeSamples` (5), `epochs` (1), `learningRate` (0.025), `seed` |
 
 Every algorithm also has `algo:node` and `algo:summary` as outputs, and takes
 `algo:concurrency`, `algo:maxMemory` and `algo:limit` as parameters. `algo:source` is a

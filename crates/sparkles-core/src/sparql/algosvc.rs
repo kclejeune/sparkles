@@ -783,6 +783,15 @@ pub(super) fn algo_leaf(
             return Err(bad(format!("algo:{name} must be at least {min}")));
         }
     }
+    // an embedding is a `spk:vector`, which a vector index caps at the same value
+    if let Some(d) = nums.get("dimension")
+        && *d > crate::vector::MAX_DIM as f64
+    {
+        return Err(bad(format!(
+            "algo:dimension must be at most {}",
+            crate::vector::MAX_DIM
+        )));
+    }
     // each output its own variable
     let ovars: Vec<VarId> = [
         outs.node,

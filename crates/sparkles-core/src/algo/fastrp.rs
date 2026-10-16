@@ -8,6 +8,7 @@
 //! The embedding is the sum of the L2-normalized rounds, each times its iteration weight,
 //! normalized once more.
 
+use super::memory::Buffer;
 use super::{BLOCK, Control, Graph, Par, Rng, bad};
 use crate::error::Result;
 
@@ -51,11 +52,21 @@ pub fn run(g: &Graph, p: &Params, par: &Par, ctl: &Control) -> Result<Vec<f32>> 
     if p.iteration_weights.is_empty() {
         return Err(bad("fastRP", "iterationWeights must not be empty"));
     }
+    if d > crate::vector::MAX_DIM {
+        return Err(bad(
+            "fastRP",
+            format!("dimension must be at most {}", crate::vector::MAX_DIM),
+        ));
+    }
     let n = g.n();
-    // the vectors of the last round, of this round and the sum
-    ctl.charge(n as u64 * d as u64 * 4 * 3)?;
+    let len = n
+        .checked_mul(d)
+        .filter(|len| len.checked_mul(std::mem::size_of::<f32>() * 3).is_some())
+        .ok_or_else(|| bad("fastRP", "the embeddings of this graph are too large"))?;
+    // the vectors of the last round, of this round and the sum, each charged to the call
+    // before it is allocated
     let sqrt_s = 3f32.sqrt();
-    let mut prev = vec![0f32; n * d];
+    let mut prev = Buffer::<f32>::zeroed("fastrp-round", len, ctl)?;
     par.chunks_mut(&mut prev, (BLOCK / 8).max(1) * d, |lo, chunk| {
         ctl.check()?;
         for (i, v) in chunk.chunks_mut(d).enumerate() {
@@ -81,7 +92,7 @@ pub fn run(g: &Graph, p: &Params, par: &Par, ctl: &Control) -> Result<Vec<f32>> 
         }
         Ok(())
     })?;
-    let mut sum = vec![0f32; n * d];
+    let mut sum = Buffer::<f32>::zeroed("fastrp-sum", len, ctl)?;
     let add = |sum: &mut [f32], round: &[f32], weight: f64, par: &Par| -> Result<()> {
         if weight == 0.0 {
             return Ok(());
@@ -99,10 +110,10 @@ pub fn run(g: &Graph, p: &Params, par: &Par, ctl: &Control) -> Result<Vec<f32>> 
         })
     };
     add(&mut sum, &prev, p.iteration_weights[0], par)?;
-    let mut cur = vec![0f32; n * d];
+    let mut cur = Buffer::<f32>::zeroed("fastrp-next", len, ctl)?;
     for &weight in &p.iteration_weights[1..] {
         ctl.check()?;
-        let prev_ref = &prev;
+        let prev_ref = &*prev;
         par.chunks_mut(&mut cur, (BLOCK / 8).max(1) * d, |lo, chunk| {
             for (i, v) in chunk.chunks_mut(d).enumerate() {
                 let u = (lo / d + i) as u32;
@@ -134,7 +145,7 @@ pub fn run(g: &Graph, p: &Params, par: &Par, ctl: &Control) -> Result<Vec<f32>> 
         }
         Ok(())
     })?;
-    Ok(sum)
+    Ok(sum.into_output())
 }
 
 #[cfg(test)]
@@ -178,6 +189,19 @@ mod tests {
         )
         .unwrap();
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn a_dimension_beyond_a_vector_index_is_refused() {
+        let g = two_cliques();
+        for dimension in [crate::vector::MAX_DIM + 1, usize::MAX, 1 << 62] {
+            let p = Params {
+                dimension,
+                ..Params::default()
+            };
+            let e = run(&g, &p, &Par::single(), &Control::unlimited()).unwrap_err();
+            assert!(e.to_string().contains("dimension"), "{e}");
+        }
     }
 
     #[test]

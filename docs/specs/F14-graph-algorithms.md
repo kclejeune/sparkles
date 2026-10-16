@@ -311,8 +311,8 @@ definition.
 | `algo:kCore` | undirected | `core` | Batagelj and Zaversnik's bucket algorithm, linear in edges. |
 | `algo:bfs` | forward | `depth` | From `algo:source`. Levels expanded in parallel. Unreached nodes are left out, or bound with depth `"inf"` under `graphalytics`. |
 | `algo:sssp` | forward | `distance` | From one `algo:source`, Dijkstra's algorithm with weights, BFS without. |
-| `algo:fastRP` | undirected | `embedding` | `dimension` 128, `iterationWeights` (0.0, 1.0, 1.0), `normalizationStrength` 0, `seed`. Very sparse random projection, then powers of the normalized adjacency, as Chen et al. define. |
-| `algo:node2vec` | forward | `embedding` | `dimension` 128, `walkLength` 80, `walksPerNode` 10, `windowSize` 10, `returnFactor` (p) 1, `inOutFactor` (q) 1, `negativeSamples` 5, `epochs` 1, `learningRate` 0.025, `seed`. Biased second-order walks, then skip-gram with negative sampling. |
+| `algo:fastRP` | undirected | `embedding` | `dimension` 128, at most 16384 as in a vector index, `iterationWeights` (0.0, 1.0, 1.0), `normalizationStrength` 0, `seed`. Very sparse random projection, then powers of the normalized adjacency, as Chen et al. define. |
+| `algo:node2vec` | forward | `embedding` | `dimension` 128, at most 16384, `walkLength` 80, `walksPerNode` 10, `windowSize` 10, `returnFactor` (p) 1, `inOutFactor` (q) 1, `negativeSamples` 5, `epochs` 1, `learningRate` 0.025, `seed`. Biased second-order walks, then skip-gram with negative sampling. |
 
 **Determinism.** Every algorithm is deterministic for a commit, a projection, its
 parameters and a seed when it runs on one thread. Parallel PageRank, components, BFS,
