@@ -8,6 +8,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE / "eval_support"))
@@ -423,6 +424,9 @@ class Processes(unittest.TestCase):
     def test_each_ask_failure_has_a_status(self):
         args = self.questions_fixture(["clarify"] * 4)
         args.deadline = 0.5
+        grace = mock.patch.object(eval_ask, "QUERY_GRACE_SECONDS", 0.2)
+        grace.start()
+        self.addCleanup(grace.stop)
         self.fake_ask(
             args,
             "import json,sys,time\n"
@@ -503,6 +507,55 @@ class Processes(unittest.TestCase):
         self.assertTrue(report["complete"], report["error"])
         self.assertEqual(report["cases"][0]["detail"]["status"], "provider_error")
         self.assertFalse(report["cases"][0]["correct"])
+
+    def test_query_and_ask_children_get_grace_beyond_the_server_timeout(self):
+        import evaluator
+
+        args = self.questions_fixture(["answerable"])
+        s = json.loads(pathlib.Path(args.set).read_text())
+        s["questions"][0]["gold"] = "EMPTY"
+        pathlib.Path(args.set).write_text(json.dumps(s))
+        args.timeout, args.deadline = 0.3, 0.3
+        self.fake_ask(
+            args,
+            "import json,sys,time\n"
+            "time.sleep(0.8)  # past the server timeout, within the grace\n"
+            'if sys.argv[1] == "query":\n'
+            '    print(json.dumps({"head":{"vars":["x"]},"results":{"bindings":[]}}))\n'
+            "else:\n"
+            '    print(json.dumps({"outcome":"answered","result":{"query":"SELECT"}}))\n',
+        )
+        _, report = eval_ask.run_matrix(args)
+        self.assertGreaterEqual(evaluator.QUERY_GRACE_SECONDS, 5)
+        self.assertEqual(report["goldPreflight"][0]["status"], "complete")
+        self.assertIsNone(report["cases"][0]["detail"].get("status"), report["cases"])
+
+    def test_slow_gold_is_reported_as_a_gold_problem(self):
+        args = self.questions_fixture(["answerable"])
+        s = json.loads(pathlib.Path(args.set).read_text())
+        s["questions"][0]["gold"] = "SLOW"
+        pathlib.Path(args.set).write_text(json.dumps(s))
+        self.fake_ask(args, "raise SystemExit(1)\n")
+        _, report = eval_ask.run_matrix(args)
+        self.assertFalse(report["complete"])
+        self.assertEqual(report["error"], "GoldFault")
+        self.assertIn("q1", report["errorDetail"])
+        self.assertEqual(report["goldPreflight"][0]["status"], "failed")
+        self.assertEqual(report["executed"], 0)
+
+    def test_run_with_a_shorter_query_timeout_than_the_gold_was_made_with(self):
+        args = self.questions_fixture(["clarify"])
+        s = json.loads(pathlib.Path(args.set).read_text())
+        s["goldTimeoutSecs"] = 60
+        pathlib.Path(args.set).write_text(json.dumps(s))
+        args.timeout = 5
+        with self.assertRaises(Invalid):
+            eval_ask.validate_args(args)
+        args = self.questions_fixture(["clarify"])
+        s["goldTimeoutSecs"] = 5
+        pathlib.Path(args.set).write_text(json.dumps(s))
+        args.out = str(self.root / "second")
+        eval_ask.validate_args(args)
 
     def test_systematic_provider_errors_stop_the_run_as_incomplete(self):
         args = self.questions_fixture(["clarify"] * 8)

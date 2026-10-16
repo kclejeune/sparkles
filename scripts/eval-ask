@@ -19,6 +19,8 @@ import time
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "testsuite/ask/eval_support"))
 from evaluator import (
+    QUERY_GRACE_SECONDS,
+    GoldFault,
     HarnessFault,
     Invalid,
     OfflinePolicy,
@@ -142,6 +144,8 @@ def validate_args(args):
     ):
         raise Invalid("only evaluation gate secret reference is allowed")
     qset = load_questions(args)
+    if args.timeout < qset.get("goldTimeoutSecs", 0):
+        raise Invalid("query timeout is below the one the gold answers were made with")
     out = (
         pathlib.Path(args.out)
         if args.out
@@ -208,7 +212,12 @@ class Runner:
         record = capture_child(
             argv,
             directory,
-            min(self.deadline, time.monotonic() + (child_limit or self.args.deadline)),
+            min(
+                self.deadline,
+                time.monotonic()
+                + (child_limit or self.args.deadline)
+                + QUERY_GRACE_SECONDS,
+            ),
             self.env,
         )
         self.last_record = record
@@ -683,10 +692,13 @@ def run_matrix(args, proxy=None, prepared=None, admit=None):
                             "id": q["id"],
                             "status": "failed",
                             "reason": type(error).__name__,
+                            "detail": str(error) if isinstance(error, Invalid) else None,
                             "execution": runner.last_record,
                         }
                     )
-                    raise
+                    if isinstance(error, HarnessFault):
+                        raise
+                    raise GoldFault(f"gold query of {q['id']} failed") from None
                 report["goldPreflight"].append(
                     {
                         "id": q["id"],

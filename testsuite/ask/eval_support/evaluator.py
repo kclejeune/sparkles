@@ -28,6 +28,16 @@ class Unsupported(Invalid):
     pass
 
 
+# A child may run this long past the timeout that it was given, so that process start,
+# database open and shutdown never make the harness kill a query the server still
+# allows. The evaluator and the QALD converter share the setting.
+QUERY_GRACE_SECONDS = 10
+
+
+class GoldFault(Invalid):
+    """A gold query that failed, timed out or cannot be scored."""
+
+
 class HarnessFault(Invalid):
     """A fault of the harness itself, never a measurement of the model."""
 
