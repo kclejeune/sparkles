@@ -67,7 +67,10 @@ pub struct SearchInfo {
     pub rows: u64,
     /// base rows scored
     pub scored: u64,
-    /// rows the snapshot inserted since the generation's base, in scope
+    /// rows the snapshot inserted since the generation's base, in scope. When the graph's
+    /// live layer has caught up with the snapshot, this is every inserted row of the
+    /// predicate, not only those in the search's graph scope, because counting in scope
+    /// would cost the walk over the rows that the caught-up layer lets the search skip.
     pub inserted: u64,
     /// of those, the rows scored exactly because the graph does not hold them yet (all
     /// of them unless the graph answered)
@@ -210,9 +213,10 @@ pub fn search(
 
 /// The snapshot's inserted rows of the predicate in scope, scored exactly, and the
 /// number of rows in scope whose pair the graph's live layer `live` holds, which are not
-/// read here because the graph finds them. When `live` has caught up with the snapshot's
-/// commit, it holds every row it can score, so the rows are counted without reading
-/// them. `ins_dims` collects the dimensions of the rows read.
+/// read here because the graph finds them. When `live` has caught up with a snapshot of
+/// the same delta, it holds every row it can score, so the rows are counted without
+/// reading them, and the count is every inserted row of the predicate. `ins_dims`
+/// collects the dimensions of the rows read.
 fn inserted_rows(
     snap: &Snapshot,
     q: &Search<'_>,
@@ -226,7 +230,7 @@ fn inserted_rows(
     let hi = [q.pred, u64::MAX, u64::MAX, u64::MAX];
     if let Some(l) = live {
         let rows = snap.delta.ins[pi].count_between(&lo, &hi) as u64;
-        if l.caught() == Some((snap.commit, rows)) {
+        if l.is_caught_up(snap, rows) {
             return (Vec::new(), rows);
         }
     }

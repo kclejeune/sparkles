@@ -843,3 +843,83 @@ fn bulk_commits_carry_the_graph_over() {
     assert_eq!(info.method, "hnsw");
     assert_eq!(hits[0].0, snap.lookup_iri("urn:n80009").unwrap().0);
 }
+
+/// A later operation of one Update request searches the transaction's own view, which
+/// shares the published commit number and row count after a delta vector is replaced.
+/// The replacement row must still be found.
+#[test]
+fn transaction_view_finds_a_replaced_delta_vector() {
+    let all = clustered(2_002, 31);
+    let (vs, extra) = all.split_at(2_000);
+    let s = store_with(Store::in_memory(StoreOptions::default()), vs);
+    s.create_vector_index("emb", config(0)).unwrap();
+    s.wait_vector_index("emb").unwrap();
+    load(&s, nt(&[(50_000, &extra[0])]));
+    assert!(s.wait_vector_catch_up(std::time::Duration::from_secs(60)));
+    let st = s.vector_index("emb").unwrap();
+    assert_eq!((st.overlay.indexed, st.overlay.pending), (1, 0));
+    // a vector far from every clustered point, so it is the single best hit
+    let far: Vec<f32> = (0..DIM)
+        .map(|i| if i % 2 == 0 { 5.0 } else { -5.0 })
+        .collect();
+    let lit = |v: &[f32]| format!("\"{}\"^^<urn:x-sparkles:vector>", vector::canonical(v));
+    update(
+        &s,
+        &format!(
+            "DELETE DATA {{ <urn:n50000> <{EMB}> {} }} ;\n\
+             INSERT DATA {{ <urn:n50001> <{EMB}> {} }} ;\n\
+             INSERT {{ <urn:found> <urn:is> ?s }} WHERE {{ (?s ?score) <urn:x-sparkles:vectorSearch> (<{EMB}> {} 1) }}",
+            lit(&extra[0]),
+            lit(&far),
+            lit(&far),
+        ),
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    let r = query(
+        s.snapshot(),
+        "ASK { <urn:found> <urn:is> <urn:n50001> }",
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    assert!(
+        r.boolean,
+        "the search in the transaction view missed the replacement row"
+    );
+}
+
+/// Control: the same request with catch-up held finds the replacement row.
+#[test]
+fn transaction_view_control_without_catch_up() {
+    let all = clustered(2_002, 31);
+    let (vs, extra) = all.split_at(2_000);
+    let s = store_with(Store::in_memory(StoreOptions::default()), vs);
+    s.create_vector_index("emb", config(0)).unwrap();
+    s.wait_vector_index("emb").unwrap();
+    s.pause_vector_catch_up(true);
+    load(&s, nt(&[(50_000, &extra[0])]));
+    let far: Vec<f32> = (0..DIM)
+        .map(|i| if i % 2 == 0 { 5.0 } else { -5.0 })
+        .collect();
+    let lit = |v: &[f32]| format!("\"{}\"^^<urn:x-sparkles:vector>", vector::canonical(v));
+    update(
+        &s,
+        &format!(
+            "DELETE DATA {{ <urn:n50000> <{EMB}> {} }} ;\n\
+             INSERT DATA {{ <urn:n50001> <{EMB}> {} }} ;\n\
+             INSERT {{ <urn:found> <urn:is> ?s }} WHERE {{ (?s ?score) <urn:x-sparkles:vectorSearch> (<{EMB}> {} 1) }}",
+            lit(&extra[0]),
+            lit(&far),
+            lit(&far),
+        ),
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    let r = query(
+        s.snapshot(),
+        "ASK { <urn:found> <urn:is> <urn:n50001> }",
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    assert!(r.boolean);
+}

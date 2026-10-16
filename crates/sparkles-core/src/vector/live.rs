@@ -36,6 +36,7 @@ use super::index::{Built, Segment};
 use super::{Metric, graph_dist, norm};
 use crate::index::Perm;
 use crate::store::Snapshot;
+use crate::store::keyset::KeySet;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockUpgradableReadGuard};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -80,10 +81,23 @@ pub struct LiveState {
     entry: Option<(u32, usize)>,
     /// bytes of links in `links` and `side`
     link_bytes: u64,
-    /// the commit of the last snapshot whose rows were all looked at, and its inserted
-    /// rows under the predicate: a search of a snapshot at that commit with as many rows
-    /// has no row to score exactly
-    caught: Option<(u64, u64)>,
+    /// the last snapshot whose rows were all looked at: a search of a snapshot with the
+    /// same delta has no row to score exactly
+    caught: Option<Caught>,
+}
+
+/// The snapshot a layer last caught up with.
+#[derive(Clone)]
+struct Caught {
+    /// its commit
+    commit: u64,
+    /// its inserted rows under the predicate
+    rows: u64,
+    /// its inserted keys in PSO order, which identify the delta: a transaction's view at
+    /// the same commit that changed the delta, or an access view that masks part of it,
+    /// has another root. Holding the set keeps its root alive, so a later tree cannot
+    /// reuse the address and match falsely.
+    ins: KeySet,
 }
 
 impl Live {
@@ -218,12 +232,17 @@ impl LiveState {
         self.by_key.contains_key(&(s, o))
     }
 
-    /// The commit of the last snapshot whose delta's rows under the predicate the layer
-    /// holds all of (those it can score), and the number of those rows. A snapshot of
-    /// the same store at that commit has the same delta, or a part of it under an access
-    /// view, which the row count tells apart.
-    pub fn caught(&self) -> Option<(u64, u64)> {
-        self.caught
+    /// Whether the layer holds every row it can score of `snap`'s delta under the
+    /// predicate, of which there are `rows`: the layer last caught up with a snapshot at
+    /// the same commit, with as many rows and the same inserted keys. A transaction's
+    /// view shares the published commit and may hold as many rows after a replacement,
+    /// so the keys' identity tells it apart.
+    pub fn is_caught_up(&self, snap: &Snapshot, rows: u64) -> bool {
+        self.caught.as_ref().is_some_and(|c| {
+            c.commit == snap.commit
+                && c.rows == rows
+                && c.ins.same(&snap.delta.ins[Perm::Pso.index()])
+        })
     }
 
     /// The first live node's number (the frozen graph's node count).
@@ -485,8 +504,12 @@ pub(crate) fn catch_up(snap: &Snapshot, b: &Built, cancel: &dyn Fn() -> bool) ->
         if keys.is_empty() {
             let rows = snap.delta.ins[pi].count_between(&lo, &hi) as u64;
             let mut st = b.live.state.write();
-            if st.caught.is_none_or(|c| c.0 <= snap.commit) {
-                st.caught = Some((snap.commit, rows));
+            if st.caught.as_ref().is_none_or(|c| c.commit <= snap.commit) {
+                st.caught = Some(Caught {
+                    commit: snap.commit,
+                    rows,
+                    ins: snap.delta.ins[pi].clone(),
+                });
             }
             return total;
         }
