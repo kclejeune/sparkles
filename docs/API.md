@@ -3536,9 +3536,10 @@ stops the comparison within a few thousand rows. The hashes, the table of the re
 being read and the listed rows count against the memory budget (`--query-memory-mb`, or
 the request's `memory-mb`) and against the server memory pool when it is on. A comparison
 beyond the request's budget fails with `507` and `budget: "memory"`, and one the pool
-cannot cover fails with `503` and `budget: "server-memory"`. The hashes cost about 48
-bytes for each distinct row of the earlier result, which is the memory the comparison
-trades for not keeping the rows.
+cannot cover fails with `503` and `budget: "server-memory"`. The table of hashes is
+charged by its real size, 33 bytes for each of its slots, and while it doubles the old and
+the new table are both charged. That is the memory the comparison trades for not keeping
+the rows.
 
 ### Change feed
 

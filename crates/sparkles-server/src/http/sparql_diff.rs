@@ -9,8 +9,8 @@
 //!
 //! The comparison keeps a 128-bit hash for each distinct row of the first result and no
 //! row. Everything it keeps is charged to the request's memory budget and to the server's
-//! memory pool, see [`Charge`]. The second result is read against those hashes, which finds the rows only it has
-//! and keeps up to `limit` of them as they go by. The rows only the first result has are
+//! memory pool, see [`Charge`]. The second result is read against those hashes, which
+//! finds the rows only it has and keeps up to `limit` of them as they go by. The rows only the first result has are
 //! found by running its query once more. That makes three executions, and the request
 //! counts twice against the `query` rate limit. The query must return the same rows each
 //! time it runs, and a request whose query does not is refused with `409`.
@@ -20,7 +20,6 @@ use sparkles::history::At;
 use sparkles::sparql::pool::PoolGrant;
 use sparkles::sparql::{QueryKind, QueryResult};
 use std::collections::HashMap;
-use std::collections::hash_map::Entry;
 use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,10 +27,6 @@ use std::time::{Duration, Instant};
 
 /// How many rows a loop reads between two looks at the deadline and the cancel flag.
 const CHECK_EVERY: usize = 4096;
-/// What a distinct row costs in the table of hashes: a 32-byte slot, which the 16-byte
-/// alignment of the key makes of a `(u128, u32)`, a control byte, and room for the load
-/// factor and for the table's growth.
-const SEEN_ENTRY_BYTES: u64 = 48;
 /// The rows listed for each side without `limit`.
 const DEFAULT_LIMIT: usize = 100;
 /// The most rows listed for each side.
@@ -70,6 +65,57 @@ fn row_json(r: &QueryResult, i: usize) -> J {
         }
     }
     J::Object(o)
+}
+
+/// What a table of hashes takes when it can hold `capacity` entries: the slots of a
+/// `(u128, u32)`, which the 16-byte alignment of the key makes 32 bytes, a control byte
+/// for each, and the control bytes of the last group. A table has a power of two of slots
+/// and holds up to seven eighths of them.
+fn seen_bytes(capacity: usize) -> u64 {
+    if capacity == 0 {
+        return 0;
+    }
+    let slots = (capacity.saturating_mul(8) / 7).next_power_of_two().max(4) as u64;
+    slots * 33 + 16
+}
+
+/// The table of hashes with its bytes charged by its real capacity: when it is full the
+/// next insert doubles it, so the new table is charged while the old one is still held (the
+/// growth copies from one to the other), and the old one is released once it is gone.
+struct Seen {
+    map: HashMap<u128, u32>,
+    charged: u64,
+}
+
+impl Seen {
+    fn new() -> Seen {
+        Seen {
+            map: HashMap::new(),
+            charged: 0,
+        }
+    }
+
+    /// Count one more of the row with this hash.
+    fn add(&mut self, hash: u128, charge: &mut Charge) -> Result<(), sparkles::Error> {
+        if !self.map.contains_key(&hash) && self.map.len() == self.map.capacity() {
+            // charge the table the growth will make before it makes it
+            let target = (self.map.capacity() * 2).max(4);
+            let next = seen_bytes(target);
+            charge.charge(next)?;
+            self.map.reserve(target - self.map.len());
+            // the table that was allocated may be larger than the one that was charged
+            let real = seen_bytes(self.map.capacity());
+            if real > next {
+                charge.charge(real - next)?;
+            } else {
+                charge.release(next - real);
+            }
+            charge.release(self.charged);
+            self.charged = real;
+        }
+        *self.map.entry(hash).or_default() += 1;
+        Ok(())
+    }
 }
 
 /// The deadline of the whole comparison, which the three executions and the loops between
@@ -306,16 +352,10 @@ pub(super) async fn sparql_diff(
             // the table is held for as long as `left` is
             let left_bytes = table_bytes(&left);
             charge.charge(left_bytes)?;
-            let mut seen: HashMap<u128, u32> = HashMap::new();
+            let mut seen = Seen::new();
             for i in 0..left.len() {
                 deadline.check(i)?;
-                match seen.entry(row_hash(&left, i, &mut buf)) {
-                    Entry::Occupied(mut e) => *e.get_mut() += 1,
-                    Entry::Vacant(e) => {
-                        charge.charge(SEEN_ENTRY_BYTES)?;
-                        e.insert(1);
-                    }
-                }
+                seen.add(row_hash(&left, i, &mut buf), &mut charge)?;
             }
             drop(left);
             charge.release(left_bytes);
@@ -330,7 +370,7 @@ pub(super) async fn sparql_diff(
             let mut listed = Listed::new(max_bytes);
             for i in 0..right.len() {
                 deadline.check(i)?;
-                match seen.get_mut(&row_hash(&right, i, &mut buf)) {
+                match seen.map.get_mut(&row_hash(&right, i, &mut buf)) {
                     Some(n) if *n > 0 => {
                         *n -= 1;
                         same += 1;
@@ -346,7 +386,7 @@ pub(super) async fn sparql_diff(
             drop(right);
             charge.release(right_bytes);
             // what is left of the earlier hashes is only there: read that state again for the rows
-            let removed: u64 = seen.values().map(|n| u64::from(*n)).sum();
+            let removed: u64 = seen.map.values().map(|n| u64::from(*n)).sum();
             let mut removed_rows = Vec::new();
             if removed > 0 {
                 let again = At::Commit(from_at.commit.seq);
@@ -359,7 +399,7 @@ pub(super) async fn sparql_diff(
                     if removed_rows.len() >= limit {
                         break;
                     }
-                    if let Some(n) = seen.get_mut(&row_hash(&left, i, &mut buf))
+                    if let Some(n) = seen.map.get_mut(&row_hash(&left, i, &mut buf))
                         && *n > 0
                     {
                         *n -= 1;
@@ -381,7 +421,7 @@ pub(super) async fn sparql_diff(
                 }
             }
             // the hashes are no longer needed
-            charge.release(seen.len() as u64 * SEEN_ENTRY_BYTES);
+            charge.release(seen.charged);
             drop(seen);
             let side = |r: &sparkles::history::Resolved| {
                 let mut commit = json!(r.commit);
@@ -449,6 +489,46 @@ mod tests {
         cancel.store(true, Ordering::Relaxed);
         assert!(matches!(d.check(0), Err(sparkles::Error::Cancelled)));
         assert!(matches!(d.left(), Err(sparkles::Error::Cancelled)));
+    }
+
+    #[test]
+    fn the_table_of_hashes_is_charged_by_its_capacity_and_the_old_table_is_released() {
+        let mut charge = Charge {
+            grant: None,
+            limit: None,
+            held: 0,
+        };
+        let mut seen = Seen::new();
+        let mut doubled = 0;
+        let mut last = 0;
+        for i in 0..5_000u128 {
+            seen.add(i, &mut charge).unwrap();
+            // only the table that is held is charged once a growth has ended
+            assert_eq!(charge.held, seen.charged);
+            // and it covers every slot the map really has
+            assert!(seen.charged >= 32 * seen.map.capacity() as u64);
+            if seen.charged != last {
+                doubled += 1;
+                last = seen.charged;
+            }
+        }
+        assert!(doubled >= 8, "the table grew {doubled} times");
+        // a repeated row adds nothing
+        let held = charge.held;
+        seen.add(7, &mut charge).unwrap();
+        assert_eq!((charge.held, seen.map[&7]), (held, 2));
+        // a request budget between two tables stops the growth that would pass it
+        let mut tight = Charge {
+            grant: None,
+            limit: Some(seen_bytes(64) + seen_bytes(128) - 1),
+            held: 0,
+        };
+        let mut seen = Seen::new();
+        let failed = (0..1_000u128).find_map(|i| seen.add(i, &mut tight).err());
+        assert!(matches!(
+            failed,
+            Some(sparkles::Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory
+        ));
     }
 
     #[test]

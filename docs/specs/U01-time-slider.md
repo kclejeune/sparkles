@@ -447,8 +447,8 @@ client parity table list all three.
 - **Memory of the server comparison.** `POST /{ds}/sparql/diff` charges the hashes it
   keeps, the table of the result it is reading and the rows it lists to the request's
   memory budget and to the request's grant in the server memory pool, as the engine charges
-  its own execution. A hash costs about 48 bytes, so the comparison trades memory for not
-  keeping the rows, and a comparison past the budget fails with `507` and `budget:
+  its own execution. The table of hashes is charged by its real capacity, including the old
+  table while it doubles, so the comparison trades memory for not keeping the rows, and a comparison past the budget fails with `507` and `budget:
   "memory"`. The response also obeys the result byte budget, and the request's timeout
   covers all three executions together.
 - **Queries that change between runs.** The rows only the earlier state has come from
