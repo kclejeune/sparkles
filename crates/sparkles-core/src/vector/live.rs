@@ -472,10 +472,19 @@ pub(crate) fn params_of(b: &Built) -> Option<Params> {
     })
 }
 
+/// The id of `b`'s predicate in `snap`: the one the build found, or, when the predicate
+/// had no row in the generation's base, the one the delta's vocabulary gave it since.
+/// Delta ids are stable within a generation, so the id is valid for every later
+/// snapshot of it.
+pub(crate) fn pred_in(b: &Built, snap: &Snapshot) -> Option<u64> {
+    b.pred
+        .or_else(|| snap.lookup_iri(&b.config.predicate).map(|i| i.0))
+}
+
 /// Insert the rows of `snap`'s delta that `b`'s graph lacks, in batches, until none is
 /// left or `cancel` says stop. Returns the nodes added.
 pub(crate) fn catch_up(snap: &Snapshot, b: &Built, cancel: &dyn Fn() -> bool) -> usize {
-    let (Some(_), Some(pred), Some(p)) = (b.graph.as_ref(), b.pred, params_of(b)) else {
+    let (Some(_), Some(pred), Some(p)) = (b.graph.as_ref(), pred_in(b, snap), params_of(b)) else {
         return 0;
     };
     let gv = &snap.generation.vectors;
@@ -524,7 +533,7 @@ pub(crate) fn catch_up(snap: &Snapshot, b: &Built, cancel: &dyn Fn() -> bool) ->
 /// The rows of `snap`'s delta under `b`'s predicate that its graph holds, and those
 /// still pending (vectors of the index's dimension it can score but does not hold yet).
 pub(crate) fn overlay_split(snap: &Snapshot, b: &Built) -> (u64, u64) {
-    let (Some(_), Some(pred)) = (b.graph.as_ref(), b.pred) else {
+    let (Some(_), Some(pred)) = (b.graph.as_ref(), pred_in(b, snap)) else {
         return (0, 0);
     };
     let gv = &snap.generation.vectors;

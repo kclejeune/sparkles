@@ -923,3 +923,43 @@ fn transaction_view_control_without_catch_up() {
     .unwrap();
     assert!(r.boolean);
 }
+
+/// An index created before its predicate has any row still takes rows inserted later
+/// into its graph, and its status reports them.
+#[test]
+fn indexes_created_before_their_predicate_catch_up() {
+    let vs = clustered(600, 37);
+    let s = Store::in_memory(StoreOptions::default());
+    // a base without the predicate
+    load(&s, "<urn:a> <urn:p> <urn:b> .\n".to_string());
+    s.compact().unwrap();
+    s.create_vector_index("emb", config(0)).unwrap();
+    s.wait_vector_index("emb").unwrap();
+    for (c, chunk) in vs.chunks(100).enumerate() {
+        let mut body = String::new();
+        for (i, v) in chunk.iter().enumerate() {
+            body += &format!(
+                "<urn:n{}> <{EMB}> \"{}\"^^<urn:x-sparkles:vector> .\n",
+                c * 100 + i,
+                vector::canonical(v)
+            );
+        }
+        update(
+            &s,
+            &format!("INSERT DATA {{ {body} }}"),
+            &QueryOptions::default(),
+        )
+        .unwrap();
+    }
+    assert!(s.wait_vector_catch_up(std::time::Duration::from_secs(60)));
+    let st = s.vector_index("emb").unwrap();
+    let (_, info) = search(&s.snapshot(), &vs[7], 10, SearchMode::default());
+    assert_eq!(st.overlay.inserts, 600);
+    assert_eq!(
+        st.overlay.indexed + st.overlay.pending,
+        600,
+        "every inserted row is either indexed or reported pending"
+    );
+    assert_eq!((st.overlay.indexed, st.overlay.pending), (600, 0));
+    assert_eq!((info.method, info.pending), ("hnsw", 0));
+}

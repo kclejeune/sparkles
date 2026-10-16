@@ -4766,7 +4766,9 @@ exactly.
   find them through it. Until a vector is inserted, searches score it exactly, and they
   leave out deleted vectors at once, so new and deleted vectors count from their commit
   on. Commits themselves do no index work. A search sees exactly the vectors of its own
-  snapshot, also when the graph holds vectors inserted after it.
+  snapshot, also when the graph holds vectors inserted after it. An index created before
+  its predicate has any row takes the vectors inserted later into its graph like any
+  other index.
 * **New generations.** A compaction carries each index over to the new generation
   before it switches. The new index reuses the old one's vectors and links, repairs the
   links around deleted vectors and inserts the new ones, so searches use a graph right
@@ -4776,9 +4778,9 @@ exactly.
   ready.
 * **Exact fallback.** A search skips the graph and scans exactly in these cases:
   `exact:true` is set, it reads a past commit, its metric is not the index's, the graph
-  is still being built, at most `exactThreshold` rows are in scope, or the active graph
-  holds less than 5 % of the indexed rows. It also falls back when the graph finds fewer
-  than k rows although more exist. The counters of an executed plan name the path
+  is still being built, at most `exactThreshold` base and inserted rows together are in
+  scope, or the active graph holds less than 5 % of the indexed rows. It also falls back
+  when the graph finds fewer than k rows although more exist. The counters of an executed plan name the path
   (`method`) and the reason (`exactBecause`).
 * **Builds and files.** Creating an index starts a background build, and writes go on
   meanwhile. The build first publishes the packed vectors, which searches then scan

@@ -303,7 +303,14 @@ fn ann_plan(
         return Err(Some("the query's metric is not the index's"));
     }
     let accepted = b.rows_in(q.graph).saturating_sub(deleted.len() as u64);
-    if accepted as usize <= b.config.exact_threshold.max(q.k) {
+    // the inserted rows count too, as the graph's live layer finds those it holds (a
+    // range count, with no walk); an index whose base holds few rows still uses its
+    // graph once inserts make it large
+    let pi = Perm::Pso.index();
+    let inserted = snap.delta.ins[pi]
+        .count_between(&[q.pred, 0, 0, 0], &[q.pred, u64::MAX, u64::MAX, u64::MAX])
+        as u64;
+    if (accepted + inserted) as usize <= b.config.exact_threshold.max(q.k) {
         return Err(Some("few rows"));
     }
     // a graph filter that rejects most nodes makes the graph walk most of them
