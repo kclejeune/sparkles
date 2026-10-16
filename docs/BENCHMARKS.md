@@ -695,6 +695,27 @@ checks. The table lists the changes larger than 25%.
 | `range_pushdown` | `optional-chain` 1.3× slower (93.0 against 73.2 ms) |
 | `topk_first_key` | `expr-order-key` 8.3× slower (174.1 against 20.9 ms) |
 
+### The fixed cost of a plain query
+
+The graph algorithm work (F14) first put every query behind a memory ledger, which added a
+fixed cost to queries that never call an algorithm. A plain query now charges a lock-free
+fast account and creates the ledger only when it calls an algorithm, keeps an output lease
+or moves to a cursor. The runs used forge with the 1.05M triple dataset and the small
+queries of the suite, where a fixed cost per query is the largest share of the time.
+
+| Comparison | Measure | Result |
+|---|---|---|
+| Lazy ledger against the build before it | Instructions per HTTP request on the small queries | 6 to 9 thousand fewer |
+| Lazy ledger against the build before it | Median execution time of distinct-obj | 3.75 µs down to 3.19 µs |
+| Lazy ledger against origin/main at 20f01c82 | Execution time of the three smallest queries | 0.5 to 0.7 µs higher |
+| Lazy ledger against origin/main at 20f01c82 | Wall time of the benchmark queries | Within 0.7 to 3.3% |
+
+The baseline is origin/main at 20f01c82, the release before F14. The remaining 0.5 to 0.7
+µs on the smallest queries is spread over the operator result plumbing. The fast account
+adds a mutex, four atomic counters and a lazily set grant to each query context and saves
+the ledger allocation of a plain query, so a plain query does not use more memory than it
+did before.
+
 ## Loading and index builds
 
 Sparkles builds its index in one parallel pass. Parsing and vocabulary merging run on all

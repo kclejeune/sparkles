@@ -571,9 +571,14 @@ Charges made before that point grow and release there. Algorithm admission runs 
 on the `/$/algo/{ds}/run` route, and the global restore guard skips that route because
 it has its own guard inside admission. On forge with 1.05M triples, these changes cut
 the instructions per HTTP request by 6 to 9 thousand on the small benchmark queries, and
-the median execution time of distinct-obj from 3.75 to 3.19 µs. Against the release
-before F14, the execution time of the three smallest queries stays 0.5 to 0.7 µs
-higher, spread over the operator result plumbing, and wall time is within 0.7 to 3.3%.
+the median execution time of distinct-obj from 3.75 to 3.19 µs, compared with the build
+before the lazy ledger. Against origin/main at 20f01c82, the release before F14, the
+execution time of the three smallest queries stays 0.5 to 0.7 µs higher, and the wall
+time of the benchmark queries stays within 0.7 to 3.3% of that release. The numbers are
+in [BENCHMARKS](../BENCHMARKS.md#the-fixed-cost-of-a-plain-query). The fast account adds
+a mutex, four atomic counters and a lazily set grant to each query context, and saves the
+ledger that a plain query no longer allocates. A plain query's contribution to its grant
+is unchanged.
 
 A call's `algo:maxMemory` covers all selected graphs together, including retained
 outputs and old and replacement append buffers while both are live. Accumulation
