@@ -9046,9 +9046,12 @@ OCR instead and records them as `spk:ocrPage`. It loads PDFium from `--pdfium-li
 ONNX Runtime from `--onnxruntime-lib` or their usual search paths, and never downloads a
 model. Conversions of PDF and Office files run at most `--pdf-workers` (2) at a time.
 A build without `pdf` refuses a PDF with `unsupported-format`, and a build without
-`office` refuses the Office formats the same way. A damaged or password-protected Office
-file fails with `conversion-failed`, an old binary file with `unsupported-format`, and a
-file past a bound of the converter, such as a ZIP bomb, with `too-large`.
+`office` refuses the Office formats the same way. A damaged Office file fails with
+`conversion-failed`. A password-protected file or an old binary one, such as `.doc`,
+`.ppt` or `.xls`, fails with `unsupported-format`, whatever its name says. A file past a
+bound of the converter, such as a ZIP bomb or a small file that would need more than
+128 MiB of output, fails with `too-large`, and a conversion that outlasts the task's
+deadline with `conversion-timeout`.
 
 Before any model call the task estimates the extraction's tokens from the chunks, the
 profile and the answer, and its cost from the first pair's pricing. Above the dataset's

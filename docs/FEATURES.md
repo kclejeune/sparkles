@@ -307,7 +307,9 @@ that work by priority and links each item to its design spec.
   images or audio. Scanned PDF pages need a build with `pdf-ocr` and
   OCR models from the operator. A CSV mapping draft links the values of an IRI column
   only to entities whose labels match exactly or after folding case and spacing, and a
-  value with several matches keeps a minted IRI until a person chooses. [Roadmap](ROADMAP.md) items 15, 77.
+  value with several matches keeps a minted IRI until a person chooses, and the lookup reports only the first variant of an
+  ambiguous group. The Office converter is not registered with the query memory pool, and a workbook's token estimate for
+  `confirmTokens` is not taken over all its sheets. [Roadmap](ROADMAP.md) items 15, 77.
 * **Memory representation.** Sources, cited assertions, sessions and imported memory
   already have a representation. There is no shared profile connecting these to personal
   notes, decisions and tasks with explicit evidence, dependency and validity semantics.

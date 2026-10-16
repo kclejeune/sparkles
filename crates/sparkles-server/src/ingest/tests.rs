@@ -485,6 +485,9 @@ async fn office_documents_become_renditions() {
     ole.extend_from_slice(&[0; 32]);
     let v = ingest(&app, office_upload(&ole, "old.docx", &[])).await;
     assert_eq!(v["error"]["code"], "unsupported-format", "{v}");
+    // so is one whose name says nothing about Office, which was once read as text
+    let v = ingest(&app, office_upload(&ole, "x.doc", &[])).await;
+    assert_eq!(v["error"]["code"], "unsupported-format", "{v}");
 }
 
 /// A workbook gets one mapping draft for each visible sheet with data (§7.8), each with

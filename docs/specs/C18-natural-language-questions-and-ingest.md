@@ -4766,7 +4766,9 @@ in the Prometheus text and the JSON snapshot. `ui/src/lib/review-count.test.ts` 
 the badge's words and the shared count store, and `ui/tests/e2e/pages.spec.ts` the
 badges on the dataset page and the sidebar.
 
-**Roadmap item 15 delivered on 2026-10-13, in the order of its bullets.**
+**Roadmap item 15 partly delivered on 2026-10-13.** Office documents, the transcript
+adapters and CSV entity linking shipped, in the order of the item's bullets. Images and
+audio and video remain, and so do the follow-ups listed at the end of this section.
 
 - **Transcript adapters.** The transcript parsers moved from the server's
   `memory_cmd/transcripts.rs` into `sparkles_memory_import::transcripts`, one module for
@@ -4782,7 +4784,13 @@ badges on the dataset page and the sidebar.
   join the harnesses of the vocabulary. Gemini CLI, Cursor and Copilot do not publish the
   formats of their logs, so the adapters follow what the tools write and what other
   readers of them accept. Each skips a line or a block it does not understand. Cursor's
-  SQLite chat store and Copilot Chat's editor storage are not read.
+  SQLite chat store and Copilot Chat's editor storage are not read. Aider's log has no
+  session id, so its session is named after the file and a short hash of the file's path
+  below the repository, which keeps the histories of a project's directory and root
+  apart. The log does not mark which lines the person wrote, so a reply with a level-4
+  heading is read as a turn of the person and a reply line that starts with `> ` is read as
+  a notice. Cursor's text form starts a turn at any line that begins with `A:` or `user:`.
+  These are limits of the formats.
 - **CSV entity linking.** A model-drafted mapping now links its IRI columns as §7.8
   describes. `sparkles::tabular` gained the lookup extension `urn:x-sparkles:lookup` on a
   column (C05 §3.7), a list of `{ "rdf:value": value or values, "@id": IRI }` entries
@@ -4853,9 +4861,19 @@ badges on the dataset page and the sidebar.
   executed 435,000 inputs and found nothing. After the budget, a second run of 90 seconds
   with two jobs on a shared machine executed 296,000 inputs and found nothing.
 - **Deviations.** The converter is a workspace crate rather than a module of the server,
-  so that the fuzz target does not need to build the server. Embedded pictures are read
-  by the image path below. Until a `describe` model is configured, a picture contributes
-  its alt text as `[Image: …]` and nothing else.
+  so that the fuzz target does not need to build the server. A picture inside a document
+  contributes its alt text as `[Image: …]`. The converter can return the pictures
+  themselves, through `Converted.images` and the `max_images` option, which is tested.
+  Every call site passes 0, so nothing consumes the pictures until the `describe` role
+  exists.
+- **Follow-ups.** The converter should register its peak memory with the server's query
+  memory pool. A workbook should apply the `confirmTokens` estimate to the total of its
+  sheets. Entity linking should report every variant of an ambiguous group, write the
+  choice for all of them, list the first exact links for review and pin `atCommit` from
+  the first batch. A test should import a Copilot or Aider session into a dataset that
+  was created before those harnesses joined the vocabulary. These stay under roadmap
+  item 15. Lexical linking also cannot tell two entities with the same label apart, which
+  is a limit of the method.
 
 ### Roadmap follow-ups (2026-10-12)
 

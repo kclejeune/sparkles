@@ -67,6 +67,9 @@ pub enum Format {
     Ods,
 }
 
+/// The first bytes of an OLE compound file.
+const OLE_SIGNATURE: &[u8] = &[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
+
 impl Format {
     pub fn media_type(self) -> &'static str {
         match self {
@@ -188,6 +191,15 @@ impl Format {
         }
         if let Some(f) = Format::sniff(bytes) {
             return Ok(f);
+        }
+        // an OLE compound file is a legacy binary Office document or a password-protected
+        // one, whatever its name says, and it is not text
+        if bytes.starts_with(OLE_SIGNATURE) {
+            return Err(Refusal::new(
+                "unsupported-format",
+                415,
+                "the file is a legacy binary Office document or a password-protected one: save it as docx, pptx or xlsx without a password",
+            ));
         }
         if let Some(f) = name.and_then(Format::from_name) {
             return Ok(f);
