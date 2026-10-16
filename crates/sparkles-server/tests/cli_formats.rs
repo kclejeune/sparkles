@@ -450,6 +450,7 @@ fn newer_shapes_refuse_only_their_dataset() {
         config.contains("books") && config.contains("logs"),
         "{config}"
     );
+}
 
 #[test]
 fn algo_catalog_cli_inventory_and_future_plan() {
