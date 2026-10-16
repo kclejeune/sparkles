@@ -228,6 +228,11 @@ that work by priority and links each item to its design spec.
   budget, although the projection, the main arrays and the results are.
   [Roadmap](ROADMAP.md) item 8.
 
+* **Graph algorithm run deadlines.** A write-back run is an update and has no deadline
+  unless the request or `--update-timeout` gives one. A run that waits for
+  `--algo-threads` then waits until a thread is free or the run is cancelled, and a run
+  does not pass through the server's memory admission. [Roadmap](ROADMAP.md) item 8.
+
 * **Weighted betweenness.** Betweenness requires finite, strictly positive stored edge
   weights. Zero-weight shortest-path counting needs defined cycle semantics and a
   validated algorithm. SSSP still accepts zero weights, and PageRank retains its

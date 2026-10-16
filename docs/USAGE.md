@@ -2051,11 +2051,15 @@ writing a query. The parameters and outputs of each algorithm are in
 [API.md](API.md#graph-algorithms), and the design is in
 [F14](specs/F14-graph-algorithms.md).
 
-FastRP reads `iterationWeights` and `nodeSelfInfluence` as Neo4j GDS does. The list has
-one weight for each propagation over the graph, and `nodeSelfInfluence` weights the
-random starting vectors. The default propagates three times and weights the second and
-third rounds, so results compare with GDS runs that use the defaults. A dimension above
-16384, the largest of a vector index, is refused for FastRP and node2vec.
+FastRP reads `iterationWeights` and `nodeSelfInfluence` with the meaning they have in
+Neo4j GDS. The list has one weight for each propagation over the graph, and
+`nodeSelfInfluence` weights the random starting vectors. The default propagates three
+times and weights the second and third rounds. Earlier builds propagated twice by default,
+so embeddings written by them differ from new ones and a default call costs about a third
+more. Only the meaning of the parameters matches GDS. The random vectors and the final
+normalization are Sparkles's own, so the numbers differ. A list with no non-zero weight
+and a zero `nodeSelfInfluence` is refused, as is a dimension above 16384, the largest of
+a vector index.
 
 Weighted betweenness accepts only finite, strictly positive weights in the stored
 `f32` representation. A zero, negative or nonfinite weight refuses the whole call,
@@ -2097,22 +2101,26 @@ sparkles algo run --loc ./db leiden --predicate http://xmlns.com/foaf/0.1/knows 
 takes the whole request as JSON, as the HTTP route does. A write-back run records itself
 in the output graph with the commit it computed at, so a reader knows which state the
 numbers describe. It commits in batches so that a large result does not hold the writer
-lock for long. A write-back run is an update, so the server's query timeout does not
-apply to it. It has no deadline unless the request has a `timeout` or the server runs with
-`--update-timeout`. The commits are in batches, but the run decodes its whole result in
-memory before its first batch is written, so a result of many rows takes memory in
-proportion to the rows, up to `--max-rows`. Query and task cancellation both reach computation, result preparation and
-writer admission. A supplied timeout and task deadline share the earlier absolute bound
-from operation entry through completion, including built-in SHACL and ShEx validation.
-History SERVICE calls retain the same controls at the native change-log scan checks.
-Rust history queries accept composed cancellation flags as well as a single flag and
-an absolute deadline. Checks are cooperative and do not preempt history indexing, reads
-or flushing. Committed batches remain after cancellation.
-A partial run attempts to record its final status without waiting for another writer,
-with one separate 100 ms cooperative cleanup budget. The record can remain unfinished
-when that attempt fails. This budget does not interrupt a durability call. Cancellation
-observed after the last batch can return an error while the durable record remains
-complete, and cancellation can race the final check.
+lock for long.
+
+A write-back run is an update, so the server's query timeout does not apply to it. It has
+no deadline unless the request has a `timeout` or the server runs with
+`--update-timeout`. Without a deadline, a run that waits for `--algo-threads` waits until
+a thread is free or the run is cancelled. The commits are in batches, but the run decodes
+its whole result in memory before its first batch is written, so a result of many rows
+takes memory in proportion to the rows, up to `--max-rows`.
+
+Query and task cancellation both reach computation, result preparation and writer
+admission. A supplied timeout and task deadline share the earlier absolute bound from
+operation entry through completion, including built-in SHACL and ShEx validation. History
+SERVICE calls retain the same controls at the native change-log scan checks. Rust history
+queries accept composed cancellation flags as well as a single flag and an absolute
+deadline. Checks are cooperative and do not preempt history indexing, reads or flushing.
+Committed batches remain after cancellation. A partial run attempts to record its final
+status without waiting for another writer, with one separate 100 ms cooperative cleanup
+budget. The record can remain unfinished when that attempt fails. This budget does not
+interrupt a durability call. A cancel or deadline that arrives after the last batch is
+committed does not fail the run, because its record already says `complete`.
 
 Define a projection once under a name when several queries use it:
 

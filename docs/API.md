@@ -5213,9 +5213,10 @@ all of them together.
 FastRP takes `iterationWeights` and `nodeSelfInfluence` with the meaning they have in
 Neo4j GDS. The list has one weight for each propagation, and the weight at index `i`
 applies to the embedding after `i + 1` propagations. The default propagates three times
-and weights the second and third. `nodeSelfInfluence` is the weight of the random
-starting vectors, as if they were a 0th iteration. A call with an empty list and a zero
-`nodeSelfInfluence` is refused. In a JSON request, `"iterationWeights": []` is the empty
+and weights the second and third, where earlier builds propagated twice.
+`nodeSelfInfluence` is the weight of the random starting vectors, as if they were a 0th
+iteration. A call is refused when `nodeSelfInfluence` is zero and the list is empty or has
+only zero weights. In a JSON request, `"iterationWeights": []` is the empty
 list.
 
 With `algo:graphalytics true`, clustering defaults to forward edges and returns the

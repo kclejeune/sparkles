@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Behavior
+
+FastRP follows the meaning of `iterationWeights` in Neo4j GDS. The list has one weight
+for each propagation, and the new `nodeSelfInfluence` parameter weights the random
+starting vectors. The default `(0.0, 1.0, 1.0)` now propagates three times where it
+propagated twice, so FastRP embeddings written by earlier builds differ from new ones and
+a default call costs about a third more. A call whose weights are all zero with a zero
+`nodeSelfInfluence` is refused. A write-back graph algorithm run now has the update
+timeout instead of the query timeout.
+
 ### Format
 
 Checked migration state in `.migrate-checked` uses JSON format 1. It records the cleanup
