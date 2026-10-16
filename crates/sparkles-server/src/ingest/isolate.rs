@@ -8,7 +8,8 @@
 //! its standard output. The child runs under `RLIMIT_AS` (`--convert-memory`), a CPU
 //! limit, `RLIMIT_FSIZE` of 0 (it can write no file, unless OCR is configured, whose
 //! libraries are not audited for it) and no core file, and on Linux it is killed when the
-//! server dies. The parent kills it when the task's deadline passes, so a conversion
+//! server dies. The child sets these limits on itself before it reads a byte of the file,
+//! and refuses to run without them, so that the server can start it with `posix_spawn`. The parent kills it when the task's deadline passes, so a conversion
 //! never outlives its deadline by more than [`GRACE`], its worker slot is always released,
 //! and its memory is bounded whatever the converter does. The parent reads at most a
 //! bounded number of bytes of output.
@@ -173,10 +174,10 @@ pub fn run(iso: &Isolation, job: Job, bytes: &[u8], o: &Options) -> Result<Reply
             cmd.arg(OsString::from("pdfium=").tap_push(p));
         }
     }
-    #[cfg(unix)]
-    limit(&mut cmd, iso.memory, left, ocr.is_none());
-    #[cfg(not(unix))]
-    let _ = ocr;
+    cmd.args(limit_args(iso.memory, left, ocr.is_none()))
+        // mimalloc reserves 1 GiB of address space when it starts, before the child can
+        // set its limit, which would leave the child no room under a smaller limit
+        .env("MIMALLOC_ARENA_RESERVE", "64MiB");
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         // the binary is gone, as after an upgrade that replaced it
@@ -283,40 +284,61 @@ fn ended(status: Option<std::process::ExitStatus>, memory: u64) -> Refusal {
     failed("the document could not be read: the converter stopped on it")
 }
 
-/// The limits of the child, set between `fork` and `exec`.
-#[cfg(unix)]
-fn limit(cmd: &mut Command, memory: u64, left: Duration, no_files: bool) {
-    use std::os::unix::process::CommandExt;
+/// The limits of the child, as arguments that the child applies to itself before it
+/// reads its input. Setting them in the child instead of between `fork` and `exec` lets
+/// the server start it with `posix_spawn`, which does not copy the server's page tables.
+fn limit_args(memory: u64, left: Duration, no_files: bool) -> Vec<String> {
     // a backstop for a parent that cannot kill the child: CPU time of every thread, so
     // that a converter using all cores is not stopped before its wall-clock deadline
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get()) as u64;
     let cpu = (left.as_secs() + 1).saturating_mul(cores).saturating_add(1);
-    let set = move |res, soft: u64, hard: u64| {
+    vec![
+        format!("memory={memory}"),
+        format!("cpu={cpu}"),
+        format!("files={}", u8::from(!no_files)),
+        format!("parent={}", std::process::id()),
+    ]
+}
+
+/// Apply the limits of [`limit_args`] to this process, or fail.
+#[cfg(unix)]
+fn apply_limits(memory: u64, cpu: u64, files: bool, parent: u32) -> std::io::Result<()> {
+    let set = |res, soft: u64, hard: u64| {
         let l = libc::rlimit {
             rlim_cur: soft as libc::rlim_t,
             rlim_max: hard as libc::rlim_t,
         };
-        // SAFETY: setrlimit only reads the struct, and it is async-signal-safe
-        unsafe { libc::setrlimit(res, &l) }
+        // SAFETY: setrlimit only reads the struct
+        if unsafe { libc::setrlimit(res, &l) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
     };
-    // SAFETY: the closure calls only setrlimit and prctl, which are async-signal-safe,
-    // and allocates nothing
-    unsafe {
-        cmd.pre_exec(move || {
-            if set(libc::RLIMIT_AS, memory, memory) != 0
-                || set(libc::RLIMIT_CPU, cpu, cpu + 1) != 0
-                || set(libc::RLIMIT_CORE, 0, 0) != 0
-                || (no_files && set(libc::RLIMIT_FSIZE, 0, 0) != 0)
-            {
-                return Err(std::io::Error::last_os_error());
-            }
-            #[cfg(target_os = "linux")]
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
+    if memory == 0 || cpu == 0 {
+        return Err(std::io::Error::other(
+            "the child was started without limits",
+        ));
     }
+    set(libc::RLIMIT_AS, memory, memory)?;
+    set(libc::RLIMIT_CPU, cpu, cpu + 1)?;
+    set(libc::RLIMIT_CORE, 0, 0)?;
+    if !files {
+        set(libc::RLIMIT_FSIZE, 0, 0)?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: prctl with these arguments only sets the signal sent at the parent's death
+        if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // the parent may have died before the call above
+        // SAFETY: getppid has no preconditions
+        if unsafe { libc::getppid() } as u32 != parent {
+            return Err(std::io::Error::other("the server has ended"));
+        }
+    }
+    let _ = parent;
+    Ok(())
 }
 
 #[cfg(feature = "pdf-ocr")]
@@ -364,6 +386,18 @@ pub fn child_main(args: Vec<OsString>) -> i32 {
             .and_then(|v| v.parse().ok())
             .unwrap_or(0)
     };
+    // the limits come first, before any byte of the file is read
+    #[cfg(unix)]
+    if apply_limits(
+        num("memory") as u64,
+        num("cpu") as u64,
+        num("files") == 1,
+        num("parent") as u32,
+    )
+    .is_err()
+    {
+        return 3;
+    }
     let millis = num("millis") as u64;
     let deadline = started + Duration::from_millis(millis);
     let max_input = num("max_input");
@@ -427,6 +461,25 @@ fn convert_here(
         ("sheets", Some(f)) => super::office::sheets_here(bytes, f, o).map(Reply::Sheets),
         #[cfg(feature = "pdf")]
         ("pdf", _) => super::pdf::inspect(bytes, o.allow_partial, &o.pdf).map(Reply::Text),
+        // the tests read the limits that the child runs under
+        #[cfg(all(debug_assertions, unix))]
+        ("limits", _) => {
+            let get = |res| {
+                let mut l = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                // SAFETY: getrlimit only writes the struct
+                unsafe { libc::getrlimit(res, &mut l) };
+                l.rlim_cur
+            };
+            Err(failed(format!(
+                "as={} fsize={} core={}",
+                get(libc::RLIMIT_AS),
+                get(libc::RLIMIT_FSIZE),
+                get(libc::RLIMIT_CORE)
+            )))
+        }
         _ => Err(failed("the conversion child was asked for an unknown job")),
     }
 }
@@ -777,17 +830,36 @@ mod tests {
         assert!(r.unwrap_err().unwrap().message.contains("damaged"));
     }
 
-    // The child's address space and file size are limited.
+    // The child of the real binary limits its address space, file size and core files
+    // before it reads its input.
+    #[cfg(feature = "office")]
     #[test]
     fn the_child_runs_under_its_limits() {
-        let iso = shell("ulimit -v; ulimit -f; cat >/dev/null");
-        let mut cmd = Command::new(&iso.exe);
-        cmd.args(&iso.prefix)
-            .stdout(Stdio::piped())
-            .stdin(Stdio::null());
-        limit(&mut cmd, 256 << 20, Duration::from_secs(5), true);
-        let out = cmd.output().unwrap();
-        assert_eq!(String::from_utf8_lossy(&out.stdout), "262144\n0\n");
+        let Some(exe) = binary() else {
+            eprintln!("skipped: no sparkles binary next to the test binary");
+            return;
+        };
+        let out = Command::new(exe)
+            .arg(CHILD_ARG)
+            .arg("job=limits")
+            .args(limit_args(300 << 20, Duration::from_secs(5), true))
+            .env("MIMALLOC_ARENA_RESERVE", "64MiB")
+            .args(["max_input=10", "millis=5000"])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let Some(Err(f)) = decode(&out.stdout) else {
+            panic!("{out:?}");
+        };
+        assert_eq!(f.message, format!("as={} fsize=0 core=0", 300u64 << 20));
+        // a child without limits refuses to start
+        let out = Command::new(binary().unwrap())
+            .args([CHILD_ARG, "job=limits", "max_input=10", "millis=5000"])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(3));
+        assert!(out.stdout.is_empty());
     }
 
     #[cfg(feature = "office")]
