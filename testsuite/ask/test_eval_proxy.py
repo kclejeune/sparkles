@@ -368,6 +368,40 @@ class Cap(Base):
         self.assertEqual(proxy.ledger.case_costs(), {("c1", HAIKU): 2 * HAIKU_COST})
 
 
+class Preflight(Base):
+    def test_every_model_is_tried_with_the_runs_request_shape(self):
+        upstream = Upstream()
+        proxy = self.proxy(upstream, models=px.MODELS)
+        result = px.preflight(proxy, upstream)
+        sent = [body for path, body in upstream.calls if path == "/v1/messages"]
+        self.assertEqual([b["model"] for b in sent], list(px.MODELS))
+        for body in sent:
+            self.assertEqual(body["output_config"]["format"]["type"], "json_schema")
+            self.assertEqual(body["output_config"]["effort"], "medium")
+            self.assertIs(body["stream"], False)
+        self.assertEqual(set(result["models"]), set(px.MODELS))
+
+    def test_a_failing_model_stops_the_preflight(self):
+        ok = (200, [], BODY)
+        for bad in ((400, [], b'{"type":"error"}'), (401, [], b"{}")):
+            with self.subTest(status=bad[0]):
+                upstream = Upstream(ok, ok, bad)  # count_tokens, haiku, sonnet
+                proxy = self.proxy(
+                    upstream,
+                    ledger=self.ledger(name=f"pre-{bad[0]}.jsonl"),
+                    models=px.MODELS,
+                )
+                with self.assertRaises(Invalid):
+                    px.preflight(proxy, upstream)
+
+    def test_a_reply_that_is_not_the_requested_json_stops_the_preflight(self):
+        text = dict(REPLY, content=[{"type": "text", "text": "not json"}])
+        upstream = Upstream((200, [], BODY), (200, [], json.dumps(text).encode()))
+        proxy = self.proxy(upstream)
+        with self.assertRaises(Invalid):
+            px.preflight(proxy, upstream)
+
+
 class Requests(Base):
     def test_refused_requests_cost_nothing(self):
         upstream = Upstream()

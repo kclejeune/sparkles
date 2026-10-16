@@ -609,13 +609,23 @@ class Proxy:
         }
 
 
-def preflight(proxy, upstream, timeout=30):
-    """Check framing and authentication before any evaluation spend.
+SCHEMA = {
+    "type": "object",
+    "properties": {"ok": {"type": "boolean"}},
+    "required": ["ok"],
+    "additionalProperties": False,
+}
 
-    Counting tokens costs nothing. The Messages call asks for 16 tokens from the
-    cheapest model and goes through the ledger like every other request. Returns the
-    two replies' status lines and header names and values for the record, without
-    the rate-limit, request and key-like headers.
+
+def preflight(proxy, upstream, timeout=30):
+    """Check framing, authentication and every model before any evaluation spend.
+
+    Counting tokens costs nothing. Each configured model then gets one small request
+    with the same structured-output shape and effort that the run uses, through the
+    ledger like every other request. A model that the account cannot use, a parameter
+    it rejects or a reply that is not the requested JSON stops the run here, for a
+    fraction of a cent each. Returns the replies' status lines and header names and
+    values for the record, without the rate-limit, request and key-like headers.
     """
     model = proxy.models[0]
     counted = upstream.send(
@@ -627,26 +637,42 @@ def preflight(proxy, upstream, timeout=30):
     )
     if counted[0] != 200 or not isinstance(strict_json(counted[2]), dict):
         raise Invalid("preflight token count failed")
-    request = {
-        "model": model,
-        "max_tokens": 16,
-        "messages": [{"role": "user", "content": "Say ok."}],
-    }
-    start = time.monotonic()
-    status, _, body = proxy.handle(json.dumps(request).encode())
-    if status != 200:
-        raise Invalid("preflight message failed")
 
     def keep(headers):
         dropped = ("anthropic-ratelimit", "request-id", "x-api-key", "set-cookie")
         return [[k, v] for k, v in headers if not k.lower().startswith(dropped)]
 
-    return {
-        "countTokens": {"status": counted[0], "headers": keep(counted[1])},
-        "message": {
+    models = {}
+    for name in proxy.models:
+        request = {
+            "model": name,
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": "Reply with ok true."}],
+            "output_config": {"format": {"type": "json_schema", "schema": SCHEMA}},
+        }
+        start = time.monotonic()
+        status, _, body = proxy.handle(json.dumps(request).encode())
+        if status != 200:
+            raise Invalid(f"preflight failed for {name} with status {status}")
+        try:
+            text = "".join(
+                b.get("text", "")
+                for b in strict_json(body)["content"]
+                if b.get("type") == "text"
+            )
+            valid = isinstance(strict_json(text), dict)
+        except (Invalid, KeyError, TypeError, AttributeError):
+            valid = False
+        if not valid:
+            raise Invalid(f"preflight reply of {name} is not the requested JSON")
+        models[name] = {
             "status": status,
             "headers": keep(proxy.last_headers),
             "seconds": time.monotonic() - start,
-            "bytes": len(body),
-        },
+        }
+    first = models[proxy.models[0]]
+    return {
+        "countTokens": {"status": counted[0], "headers": keep(counted[1])},
+        "message": first,
+        "models": models,
     }

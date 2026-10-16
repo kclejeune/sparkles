@@ -504,6 +504,35 @@ class Processes(unittest.TestCase):
         self.assertEqual(report["cases"][0]["detail"]["status"], "provider_error")
         self.assertFalse(report["cases"][0]["correct"])
 
+    def test_systematic_provider_errors_stop_the_run_as_incomplete(self):
+        args = self.questions_fixture(["clarify"] * 8)
+        args.max_consecutive_errors = 3
+        self.fake_ask(
+            args,
+            "import json\n"
+            'print(json.dumps({"outcome":"error","error":{"code":"provider-unavailable"}}))\n'
+            "raise SystemExit(2)\n",
+        )
+        _, report = eval_ask.run_matrix(args)
+        self.assertFalse(report["complete"])
+        self.assertEqual(report["error"], "HarnessFault")
+        self.assertIn("consecutive", report["errorDetail"])
+        self.assertEqual(report["scored"], 3)
+        # A success in between resets the count.
+        args = self.questions_fixture(["clarify"] * 6)
+        args.max_consecutive_errors = 3
+        self.fake_ask(
+            args,
+            "import json,sys\n"
+            'if int(sys.argv[sys.argv.index("--json") - 1][-1]) % 3:\n'
+            '    print(json.dumps({"outcome":"error","error":{"code":"provider-unavailable"}}))\n'
+            "    raise SystemExit(2)\n"
+            'print(json.dumps({"outcome":"clarify"}))\n',
+        )
+        args.out = str(self.root / "second")
+        _, report = eval_ask.run_matrix(args)
+        self.assertTrue(report["complete"], report["error"])
+
     def test_cap_refusal_is_excluded_and_stops_the_run(self):
         class Proxy:
             token, cap_refusals = "t", 0

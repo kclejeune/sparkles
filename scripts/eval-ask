@@ -699,7 +699,7 @@ def run_matrix(args, proxy=None, prepared=None, admit=None):
                 )
         per_pair = {}
         for pair in args.pair:
-            done, answers, scores = [], [], []
+            done, answers, scores, streak = [], [], [], 0
             per_pair[pair] = ({}, {})
             if report["budgetStopped"] or (admit and not admit(pair, qs)):
                 # The projected cost does not fit what is left of the cap.
@@ -759,11 +759,23 @@ def run_matrix(args, proxy=None, prepared=None, admit=None):
                     report["budgetStopped"] = True
                     report["unattemptedIds"].setdefault(pair, []).append(q["id"])
                     continue
+                streak = (
+                    streak + 1 if answer.get("evalFailure") == "provider_error" else 0
+                )
                 done.append(q)
                 answers.append(answer)
                 scores.append(score)
                 per_pair[pair][0][q["id"]] = answer
                 per_pair[pair][1][q["id"]] = score
+                if (
+                    args.max_consecutive_errors
+                    and streak >= args.max_consecutive_errors
+                ):
+                    # A bad model name, a rejected parameter or a dead key fails every
+                    # case for free. That is a harness problem, not a measurement.
+                    raise HarnessFault(
+                        f"{streak} consecutive provider errors for {pair}"
+                    )
             row = summarize_pair(pair, done, answers, scores)
             for r in row:
                 r["incomplete"] = len(done) < len(qs)
@@ -820,6 +832,12 @@ def parse_args(argv=None):
     ap.add_argument("--deadline", type=float, default=300, help="Ask seconds")
     ap.add_argument("--timeout", type=float, default=5, help="query seconds")
     ap.add_argument("--max-tokens", type=int, default=32768, help="Ask token budget")
+    ap.add_argument(
+        "--max-consecutive-errors",
+        type=int,
+        default=5,
+        help="stop after this many provider errors in a row, 0 for no limit",
+    )
     ap.add_argument(
         "--phase-deadline", type=float, default=0, help="matrix seconds, 0 for none"
     )
