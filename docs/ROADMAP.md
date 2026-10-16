@@ -92,6 +92,7 @@ These items are cheap or foundational.
 | 24 | **GeoSPARQL.** k-NN with arbitrary joins, better polygon approximations than the existing cell grid, QLever's spatial syntax, and geometry limits: geographic CRSs on datums other than WGS 84, grid-based datum shifts, exact Helmert shifts, curved GML segments and solids, 3D constructions, and lines split at crossings | [G01](specs/G01-geosparql.md#roadmap-follow-ups-2026-10-12) | M | Medium |
 | 25 | **Callbacks in other languages** (Python and JavaScript functions inside queries, and native dispatch of Java functions, which today run through ARQ) | [P03](specs/P03-query-extensions.md#roadmap-follow-ups-2026-10-12) | M | Medium |
 | 26 | **Local models.** GPU, ONNX and GGUF, rerankers, and models shared between processes | [F12](specs/F12-local-embeddings.md#roadmap-follow-ups-2026-10-12) | M–L | Medium |
+| 81 | **Shared memory representation for agents and personal knowledge.** Define a common profile for documents, cited assertions, entities, notes, decisions and tasks, with distinct evidence and dependency relations, time and invalidation rules, and knowledge separated from instructions. This is deferred and has no active implementation lane. | [C17](specs/C17-agent-memory.md#shared-memory-representation), [C18](specs/C18-natural-language-questions-and-ingest.md#shared-memory-workflows) | M–L | High |
 
 ## Tier 4: worth doing, not urgent
 
