@@ -114,6 +114,69 @@ mod tests {
         assert!(o.label[4..].iter().all(|&l| l == o.label[4]));
     }
 
+    /// The rule of the module, applied with a map per node over the edge list.
+    fn reference(n: usize, edges: &[(u32, u32)], symmetric: bool, rounds: u32) -> Vec<u32> {
+        let mut label: Vec<u32> = (0..n as u32).collect();
+        for _ in 0..rounds {
+            let mut count: Vec<std::collections::BTreeMap<u32, u32>> = vec![Default::default(); n];
+            for &(a, b) in edges {
+                // a symmetric graph holds both directions already; a directed one
+                // counts the in-neighbours too
+                *count[a as usize].entry(label[b as usize]).or_default() += 1;
+                if !symmetric {
+                    *count[b as usize].entry(label[a as usize]).or_default() += 1;
+                }
+            }
+            let next: Vec<u32> = (0..n)
+                .map(|u| {
+                    let mut best = (label[u], 0);
+                    // ascending labels: a later label wins only with more votes
+                    for (&l, &k) in &count[u] {
+                        if k > best.1 {
+                            best = (l, k);
+                        }
+                    }
+                    best.0
+                })
+                .collect();
+            if next == label {
+                break;
+            }
+            label = next;
+        }
+        label
+    }
+
+    #[test]
+    fn matches_a_reference_on_random_graphs() {
+        let mut rng = crate::algo::Rng::new(5);
+        for case in 0..30 {
+            let n = 20 + rng.below(30) as u32;
+            let mut e: Vec<(u32, u32)> = (0..2 * n)
+                .map(|_| (rng.below(n as usize) as u32, rng.below(n as usize) as u32))
+                .filter(|e| e.0 != e.1)
+                .collect();
+            e.sort_unstable();
+            e.dedup();
+            let rounds = 1 + case % 6;
+            for symmetric in [false, true] {
+                let (g, both) = if symmetric {
+                    // an edge given both ways is two edges, and each counts
+                    let both: Vec<(u32, u32)> =
+                        e.iter().flat_map(|&(a, b)| [(a, b), (b, a)]).collect();
+                    (ugraph(n, &e), both)
+                } else {
+                    (digraph(n, &e), e.clone())
+                };
+                let want = reference(n as usize, &both, symmetric, rounds);
+                for par in [Par::single(), Par::with_threads(3)] {
+                    let o = run(&g, rounds, &par, &Control::unlimited()).unwrap();
+                    assert_eq!(o.label, want, "case {case}, symmetric {symmetric}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn tie_goes_to_the_smallest_label() {
         // node 1 sees labels 0 and 2 once each

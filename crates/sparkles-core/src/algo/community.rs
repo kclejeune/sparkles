@@ -648,6 +648,150 @@ mod tests {
         }
     }
 
+    /// Modularity from its definition over an undirected edge list without repeats.
+    fn reference_modularity(n: usize, edges: &[(u32, u32)], labels: &[u32], res: f64) -> f64 {
+        let m = edges.len() as f64;
+        let mut deg = vec![0.0; n];
+        let mut inside = std::collections::BTreeMap::<u32, f64>::new();
+        let mut tot = std::collections::BTreeMap::<u32, f64>::new();
+        for &(a, b) in edges {
+            deg[a as usize] += 1.0;
+            deg[b as usize] += 1.0;
+            if labels[a as usize] == labels[b as usize] {
+                *inside.entry(labels[a as usize]).or_default() += 1.0;
+            }
+        }
+        for u in 0..n {
+            *tot.entry(labels[u]).or_default() += deg[u];
+        }
+        tot.iter()
+            .map(|(c, t)| inside.get(c).unwrap_or(&0.0) / m - res * (t / (2.0 * m)).powi(2))
+            .sum()
+    }
+
+    fn edges_of(g: &Graph) -> Vec<(u32, u32)> {
+        (0..g.n() as u32)
+            .flat_map(|u| g.out.row(u).iter().map(move |&v| (u, v)))
+            .filter(|&(u, v)| u < v)
+            .collect()
+    }
+
+    /// The modularity a run reports for each level is the modularity of that level's
+    /// partition of the original graph, for Louvain and for Leiden, at several
+    /// resolutions. Louvain reaches the known optimum region on the karate club.
+    #[test]
+    fn reported_modularity_matches_a_recomputation() {
+        let mut graphs = vec![ugraph(34, &karate())];
+        for (n, groups, seed) in [(200, 5, 21), (300, 8, 22), (150, 3, 23)] {
+            graphs.push(planted(n, groups, seed));
+        }
+        for g in &graphs {
+            let e = edges_of(g);
+            for leiden in [false, true] {
+                for resolution in [0.5, 1.0, 2.0] {
+                    let p = Params {
+                        leiden,
+                        resolution,
+                        seed: 4,
+                        ..Params::default()
+                    };
+                    let o = run(g, &p, &Control::unlimited()).unwrap();
+                    assert!(!o.levels.is_empty());
+                    for (l, q) in o.levels.iter().zip(&o.modularity) {
+                        let want = reference_modularity(g.n(), &e, l, resolution);
+                        assert!(
+                            (q - want).abs() < 1e-9,
+                            "n={} leiden={leiden} res={resolution}: {q} against {want}",
+                            g.n()
+                        );
+                    }
+                    // each level is no worse than the one below it
+                    for w in o.modularity.windows(2) {
+                        assert!(w[1] >= w[0] - 1e-12, "{:?}", o.modularity);
+                    }
+                }
+            }
+        }
+        let karate = run(&graphs[0], &Params::default(), &Control::unlimited()).unwrap();
+        assert!(*karate.modularity.last().unwrap() >= 0.41);
+    }
+
+    /// Each part of `refined` is connected through edges inside it.
+    fn parts_are_connected(lv: &Level, refined: &[u32]) -> bool {
+        let n = lv.n();
+        let mut seen = vec![false; n];
+        let mut pieces = std::collections::BTreeMap::<u32, u32>::new();
+        for s in 0..n {
+            if seen[s] {
+                continue;
+            }
+            *pieces.entry(refined[s]).or_default() += 1;
+            seen[s] = true;
+            let mut stack = vec![s];
+            while let Some(u) = stack.pop() {
+                for &v in lv.row(u).0 {
+                    let v = v as usize;
+                    if !seen[v] && refined[v] == refined[s] {
+                        seen[v] = true;
+                        stack.push(v);
+                    }
+                }
+            }
+        }
+        pieces.values().all(|&k| k == 1)
+    }
+
+    /// Leiden's refinement on its own, without the split that `run` applies to what it
+    /// reports. Each refined part lies inside one community and is connected inside it,
+    /// even when a community is given as two pieces with no edge between them, and the
+    /// refinement merges nodes rather than leaving every node alone.
+    #[test]
+    fn refinement_parts_are_connected_and_inside_their_communities() {
+        let ctl = Control::unlimited();
+        let mut cases = Vec::new();
+        // two cliques with no edge between them, given as one community
+        let mut e = Vec::new();
+        for a in 0..5u32 {
+            for b in a + 1..5 {
+                e.push((a, b));
+                e.push((a + 5, b + 5));
+            }
+        }
+        cases.push((ugraph(10, &e), Some(vec![0u32; 10])));
+        cases.push((ugraph(34, &karate()), None));
+        for (n, groups, seed) in [(200, 5, 31), (300, 8, 32), (400, 4, 33)] {
+            cases.push((planted(n, groups, seed), None));
+        }
+        for (g, given) in cases {
+            let lv = Level::from_csr(&g.weighted_sym(&ctl).unwrap(), &ctl).unwrap();
+            let comm = match given {
+                Some(c) => c,
+                None => {
+                    let mut c: Vec<u32> = (0..lv.n() as u32).collect();
+                    local_moving(&lv, &mut c, 1.0, 50, &ctl).unwrap();
+                    c
+                }
+            };
+            for (seed, theta) in [(1, 0.01), (2, 0.01), (3, 0.5)] {
+                let (refined, count) =
+                    refine(&lv, &comm, 1.0, theta, &mut Rng::new(seed), &ctl).unwrap();
+                assert!(count < lv.n(), "the refinement merged nothing");
+                for u in 0..lv.n() {
+                    for v in 0..lv.n() {
+                        if refined[u] == refined[v] {
+                            assert_eq!(comm[u], comm[v], "a part spans two communities");
+                        }
+                    }
+                }
+                assert!(
+                    parts_are_connected(&lv, &refined),
+                    "a refined part is disconnected (n={}, seed {seed})",
+                    lv.n()
+                );
+            }
+        }
+    }
+
     #[test]
     fn isolated_nodes_and_empty_graph() {
         let g = ugraph(3, &[]);

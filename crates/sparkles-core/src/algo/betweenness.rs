@@ -347,6 +347,168 @@ mod tests {
         }
     }
 
+    /// A directed graph with a weight on each edge.
+    fn weighted(n: u32, edges: &[(u32, u32, f32)]) -> Graph {
+        let raw = super::super::RawEdges {
+            nodes: (0..n as u64).collect(),
+            src: edges.iter().map(|e| e.0 as u64).collect(),
+            dst: edges.iter().map(|e| e.1 as u64).collect(),
+            w: Some(edges.iter().map(|e| e.2).collect()),
+            symmetric: false,
+        };
+        Graph::build(
+            raw,
+            super::super::Aggregate::None,
+            &Par::single(),
+            &Control::unlimited(),
+        )
+        .unwrap()
+    }
+
+    /// Betweenness from the distances and path counts of every pair, found by relaxing
+    /// every edge until nothing changes (Bellman and Ford).
+    fn reference(n: usize, edges: &[(u32, u32, f32)]) -> Vec<f64> {
+        let inf = f64::INFINITY;
+        let mut d = vec![vec![inf; n]; n];
+        for (s, row) in d.iter_mut().enumerate() {
+            row[s] = 0.0;
+            loop {
+                let mut changed = false;
+                for &(a, b, w) in edges {
+                    let via = row[a as usize] + w as f64;
+                    if via < row[b as usize] {
+                        row[b as usize] = via;
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+        }
+        // the shortest paths from s to t, counted over the nodes in order of distance
+        let mut c = vec![vec![0f64; n]; n];
+        for s in 0..n {
+            let mut by_distance: Vec<usize> = (0..n).filter(|&t| d[s][t] < inf).collect();
+            by_distance.sort_by(|&x, &y| d[s][x].total_cmp(&d[s][y]));
+            c[s][s] = 1.0;
+            for &u in &by_distance {
+                for &(a, b, w) in edges {
+                    if a as usize == u && d[s][u] + w as f64 == d[s][b as usize] {
+                        c[s][b as usize] += c[s][u];
+                    }
+                }
+            }
+        }
+        (0..n)
+            .map(|v| {
+                let mut b = 0.0;
+                for s in 0..n {
+                    for t in 0..n {
+                        if s != v
+                            && t != v
+                            && s != t
+                            && d[s][t] < inf
+                            && d[s][v] + d[v][t] == d[s][t]
+                        {
+                            b += c[s][v] * c[v][t] / c[s][t];
+                        }
+                    }
+                }
+                b
+            })
+            .collect()
+    }
+
+    fn random_weighted(seed: u64, n: u32, m: usize) -> Vec<(u32, u32, f32)> {
+        let mut rng = Rng::new(seed);
+        let mut e: Vec<(u32, u32, f32)> = Vec::new();
+        while e.len() < m {
+            let (a, b) = (rng.below(n as usize) as u32, rng.below(n as usize) as u32);
+            if a == b || e.iter().any(|x| (x.0, x.1) == (a, b)) {
+                continue;
+            }
+            // small dyadic weights: every path length is exact, and equal lengths
+            // are common, so the path counts are tested
+            e.push((a, b, [0.5f32, 1.0, 1.5, 2.0, 0.25][rng.below(5)]));
+        }
+        e
+    }
+
+    /// Weighted Brandes against the definition. Weights that are sums of powers of two
+    /// make every path length exact in f64, so the equality of two path lengths that
+    /// `accumulate` relies on holds exactly on both sides.
+    #[test]
+    fn weighted_betweenness_matches_a_reference() {
+        for seed in 1..=20u64 {
+            let n = 10 + (seed % 5) as u32;
+            let e = random_weighted(seed, n, 3 * n as usize);
+            let g = weighted(n, &e);
+            let want = reference(n as usize, &e);
+            for par in [Par::single(), Par::with_threads(3)] {
+                let got = run(&g, &Params::default(), &par, &Control::unlimited()).unwrap();
+                for v in 0..n as usize {
+                    assert!(
+                        (got[v] - want[v]).abs() < 1e-9,
+                        "seed {seed}, node {v}: {} against {}",
+                        got[v],
+                        want[v]
+                    );
+                }
+            }
+        }
+    }
+
+    /// A sampled run scales the dependencies of its sources by `n / samples`, so its
+    /// average over many seeds approaches the exact score.
+    #[test]
+    fn sampled_betweenness_estimates_the_exact_score() {
+        let n = 12u32;
+        let e = random_weighted(7, n, 40);
+        let g = weighted(n, &e);
+        let exact = run(
+            &g,
+            &Params::default(),
+            &Par::single(),
+            &Control::unlimited(),
+        )
+        .unwrap();
+        let runs = 600;
+        let mut mean = vec![0.0; n as usize];
+        for seed in 0..runs {
+            let p = Params {
+                samples: n as usize - 1,
+                seed,
+            };
+            let s = run(&g, &p, &Par::single(), &Control::unlimited()).unwrap();
+            for (m, x) in mean.iter_mut().zip(&s) {
+                *m += x / runs as f64;
+            }
+        }
+        let top = exact.iter().copied().fold(0.0, f64::max);
+        assert!(top > 0.0);
+        for v in 0..n as usize {
+            assert!(
+                (mean[v] - exact[v]).abs() <= 0.03 * top,
+                "node {v}: mean {} against {}",
+                mean[v],
+                exact[v]
+            );
+        }
+        // a single sampled run is not the exact score, or the test proves nothing
+        let one = run(
+            &g,
+            &Params {
+                samples: n as usize - 1,
+                seed: 1,
+            },
+            &Par::single(),
+            &Control::unlimited(),
+        )
+        .unwrap();
+        assert_ne!(one, exact);
+    }
+
     #[test]
     fn sampling_with_all_sources_is_exact() {
         let g = ugraph(5, &[(0, 1), (1, 2), (2, 3), (3, 4)]);
