@@ -505,10 +505,10 @@ full-text indexes. See [ROADMAP](../ROADMAP.md) item 3.
   `sparkles_group_commit_fallbacks_total` and `sparkles_group_commit_failures_total`.
   `/$/stats` reports `groupCommit` and `commits` per dataset, where `fences` counts the
   fences that synchronized successfully and `failures` the ones that did not. The fallback
-  reasons are `poisoned`, `kind`, `text`, `geo`, `embed`, `bulk`, `size` and `noop`. The
-  other seven reasons of section 8 (`message`, `precondition`, `guard`, `compaction`,
-  `digests`, `bypass` and `graphs`) name conditions that Phase 2 admits, so they are no
-  longer reasons and have no series.
+  reasons are `poisoned`, `kind`, `text`, `geo`, `embed`, `bulk`, `size` and `noop`.
+  Section 8 also lists `message`, `precondition`, `guard`, `compaction`, `digests`, `bypass`
+  and `graphs`. Phase 2 admits the commits those names describe, so they are no longer
+  reasons and have no series.
 - **Serial latency (A1).** A grouped singleton was 4% to 9% slower than the default writer at
   1.05M, so the idle fast path of section 4.1 was added
   (`StoreOptions::group_commit_idle_direct`, on by default, hidden flag
@@ -531,11 +531,13 @@ full-text indexes. See [ROADMAP](../ROADMAP.md) item 3.
   measurement has to be repeated on `forge`.
 - **Failed synchronization (A4).** A router test fails ten requests of one fence with 503
   and publishes none of them. After reopening, the commit acknowledged before the fence and
-  its insert are present and the head has no gap. Complete records of the failed fence may
-  still recover, because the kernel can write them back before the failed sync, so A4 now
-  says the head is at or after the last acknowledged commit rather than equal to it. A test under an `LD_PRELOAD` shim
-  (`crates/sparkles-core/tests/power_loss.rs`, `tests/support/iofault.c`) fails the WAL, the
-  vocabulary or both at chosen calls and checks the reopened store.
+  its insert are present and the head has no gap. The kernel can write complete records of
+  the failed fence back before the sync fails, and those records may recover. A4 therefore
+  says the head is at or after the last acknowledged commit, not equal to it.
+
+  A second test runs under an `LD_PRELOAD` shim (`crates/sparkles-core/tests/power_loss.rs`
+  and `tests/support/iofault.c`). It fails the WAL, the vocabulary or both at chosen calls
+  and checks the reopened store.
 - **Power loss (A5), partly.** The same test records the store's I/O and replays crash images
   in user space, with each unsynchronized 4 KiB page kept or dropped at random. Every
   acknowledged commit and its message survives, `sparkles check` passes and the next commit
