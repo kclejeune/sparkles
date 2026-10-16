@@ -532,19 +532,39 @@ pub(crate) fn catch_up(snap: &Snapshot, b: &Built, cancel: &dyn Fn() -> bool) ->
             }
             return total;
         }
-        // an upper bound of the batch's bytes: vector, norm, key, level, map entry and a
-        // full list of links per layer-0 slot
-        let per_row = b.segment.dim as u64 * 4 + 4 + 16 + 1 + 24 + (2 * p.m as u64 + 1) * 4;
-        if gv.used_bytes() + keys.len() as u64 * per_row > super::budget() {
+        // the rows that become nodes, as many as fit in the budget; the others stay
+        // unseen for a later pass
+        let dim = b.segment.dim;
+        let per_row = row_bytes(b, &p);
+        let room = super::budget().saturating_sub(gv.used_bytes());
+        let mut fit = room / per_row.max(1);
+        let mut items: Vec<Item> = Vec::with_capacity(keys.len());
+        let mut left = false;
+        for key in keys {
+            let v = gv.overlay_vector(snap, key.1);
+            if v.as_ref().is_some_and(|v| v.len() == dim) {
+                if fit == 0 {
+                    left = true;
+                    continue;
+                }
+                fit -= 1;
+            }
+            items.push((key, v));
+        }
+        if !items.is_empty() {
+            total += b.live.insert(b, items, &p);
+        }
+        if left {
             b.live.state.write().over_budget = true;
             return total;
         }
-        let items = keys
-            .into_iter()
-            .map(|key| (key, gv.overlay_vector(snap, key.1)))
-            .collect();
-        total += b.live.insert(b, items, &p);
     }
+}
+
+/// An upper bound of the bytes one node adds to `b`'s live layer: its vector, norm,
+/// key, level and map entry, and a full list of links on layer 0.
+fn row_bytes(b: &Built, p: &Params) -> u64 {
+    b.segment.dim as u64 * 4 + 4 + 16 + 1 + 24 + (2 * p.m as u64 + 1) * 4
 }
 
 /// The rows of `snap`'s delta under `b`'s predicate that its graph holds, and those

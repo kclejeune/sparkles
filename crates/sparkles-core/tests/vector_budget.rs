@@ -74,37 +74,49 @@ fn top10(s: &Store, q: &[f32], mode: SearchMode) -> (Vec<(u64, f32)>, vector::Se
     (hits.iter().map(|h| (h.s, h.score)).collect(), info)
 }
 
-/// Catch-up stops at the budget: the rows it leaves stay pending, the status says why,
-/// and searches still find them by scoring them exactly.
-#[test]
-fn the_live_layer_stops_at_the_memory_budget() {
-    let all = clustered(2_500, 41);
-    let (base, extra) = all.split_at(2_000);
+/// The tests change the process-wide budget, so they run one at a time.
+static BUDGET: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn config() -> VectorIndexConfig {
+    VectorIndexConfig {
+        hnsw: Some(HnswConfig {
+            m: 8,
+            ef_construction: 64,
+            ef_search: 64,
+        }),
+        exact_threshold: 0,
+        ..VectorIndexConfig::new(EMB, DIM)
+    }
+}
+
+/// A store whose base holds `vs` as `<urn:n0>`, `<urn:n1>` and so on, with an index
+/// built over them, and the bytes the index takes.
+fn indexed_store(vs: &[Vec<f32>]) -> (Store, u64) {
     let s = Store::in_memory(StoreOptions::default());
     s.sequential_vector_builds(true);
     s.load(&[Source::from_bytes(
-        rows(base, 0).into_bytes(),
+        rows(vs, 0).into_bytes(),
         RdfFormat::NTriples,
         None,
     )])
     .unwrap();
     s.compact().unwrap();
-    s.create_vector_index(
-        "emb",
-        VectorIndexConfig {
-            hnsw: Some(HnswConfig {
-                m: 8,
-                ef_construction: 64,
-                ef_search: 64,
-            }),
-            exact_threshold: 0,
-            ..VectorIndexConfig::new(EMB, DIM)
-        },
-    )
-    .unwrap();
+    s.create_vector_index("emb", config()).unwrap();
     s.wait_vector_index("emb").unwrap();
     let st = s.vector_index("emb").unwrap();
     let used = st.memory.segment_bytes + st.memory.hnsw_bytes;
+    (s, used)
+}
+
+/// Catch-up stops at the budget: it inserts the rows that fit, the rows it leaves stay
+/// pending, the status says why, and searches still find them by scoring them exactly.
+#[test]
+fn the_live_layer_stops_at_the_memory_budget() {
+    let _held = BUDGET.lock().unwrap_or_else(|e| e.into_inner());
+    let initial = vector::budget();
+    let all = clustered(2_500, 41);
+    let (base, extra) = all.split_at(2_000);
+    let (s, used) = indexed_store(base);
     // room for a few dozen inserted rows, less than one batch of the 500
     vector::set_budget(used + 50 * 256);
     update(
@@ -117,6 +129,11 @@ fn the_live_layer_stops_at_the_memory_budget() {
     let st = s.vector_index("emb").unwrap();
     assert_eq!(st.overlay.inserts, 500);
     assert!(st.overlay.pending > 0, "{:?}", st.overlay);
+    assert!(
+        st.overlay.indexed > 0,
+        "a batch is admitted in part: {:?}",
+        st.overlay
+    );
     assert!(st.overlay.over_budget, "{:?}", st.overlay);
     assert_eq!(st.overlay.indexed + st.overlay.pending, 500);
     for q in [&extra[3], &extra[250], &base[17]] {
@@ -135,4 +152,55 @@ fn the_live_layer_stops_at_the_memory_budget() {
             exact.iter().map(|h| h.0).collect::<Vec<_>>()
         );
     }
+    vector::set_budget(initial);
+}
+
+/// A compaction releases the live layer that reached the budget, and catch-up then
+/// inserts the rows that later commits add.
+#[test]
+fn catch_up_resumes_after_a_compaction() {
+    let _held = BUDGET.lock().unwrap_or_else(|e| e.into_inner());
+    let initial = vector::budget();
+    let all = clustered(2_270, 53);
+    let (base, rest) = all.split_at(2_000);
+    let (replaced, later) = rest.split_at(250);
+    let (s, used) = indexed_store(base);
+    vector::set_budget(used + 30 * 1024);
+    // 250 rows replaced, which keeps the base's size and needs more than the room left
+    let mut body = String::new();
+    for (i, v) in base.iter().enumerate().take(250) {
+        body += &format!(
+            "DELETE DATA {{ <urn:n{i}> <{EMB}> \"{}\"^^<urn:x-sparkles:vector> }} ;\n",
+            vector::canonical(v)
+        );
+    }
+    body += &format!("INSERT DATA {{ {} }}", rows(replaced, 20_000));
+    update(&s, &body, &QueryOptions::default()).unwrap();
+    assert!(s.wait_vector_catch_up(std::time::Duration::from_secs(60)));
+    let st = s.vector_index("emb").unwrap();
+    assert!(
+        st.overlay.pending > 0 && st.overlay.over_budget,
+        "{:?}",
+        st.overlay
+    );
+    s.compact().unwrap();
+    let st = s.wait_vector_index("emb").unwrap();
+    assert_eq!((st.state.as_str(), st.rows), ("ready", 2_000), "{st:?}");
+    assert_eq!(st.overlay.inserts, 0);
+    update(
+        &s,
+        &format!("INSERT DATA {{ {} }}", rows(later, 30_000)),
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    assert!(s.wait_vector_catch_up(std::time::Duration::from_secs(60)));
+    let st = s.vector_index("emb").unwrap();
+    vector::set_budget(initial);
+    assert_eq!(
+        (st.overlay.indexed, st.overlay.pending),
+        (20, 0),
+        "{:?}",
+        st.overlay
+    );
+    assert!(!st.overlay.over_budget);
 }
