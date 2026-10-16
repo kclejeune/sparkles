@@ -1873,6 +1873,9 @@ enum Cmd {
         /// Largest sh:maxCount drafted (0: none)
         #[arg(long, default_value_t = sparkles::schema::draft::DEFAULT_MAX_COUNT, requires = "draft_shapes")]
         max_count: u64,
+        /// Most inverse property shapes drafted per class (0: none)
+        #[arg(long, default_value_t = sparkles::schema::draft::DEFAULT_MAX_INVERSE, requires = "draft_shapes")]
+        max_inverse: usize,
         /// Draft or profile only this class (IRI; repeatable)
         #[arg(long, value_name = "IRI")]
         class: Vec<String>,
@@ -4037,6 +4040,7 @@ fn run() -> Result<()> {
             closed,
             max_in,
             max_count,
+            max_inverse,
             class,
             min_instances,
             with_inferences,
@@ -4063,6 +4067,7 @@ fn run() -> Result<()> {
                         closed,
                         max_in,
                         max_count,
+                        max_inverse,
                         classes: class,
                         min_instances,
                         with_inferences,
@@ -4235,10 +4240,13 @@ fn schema_constraints(
         if req.guard != Some(false) {
             match sparkles_shacl::guard::configured_shapes(store)? {
                 Some((cfg, s)) => layer.sources.push(configured_source(&cfg, &s)),
-                None if req.guard == Some(true) => {
-                    bail!("the database has no write-time SHACL validation")
-                }
-                None => {}
+                None => match shex_guard_source(store)? {
+                    Some(s) => layer.sources.push(s),
+                    None if req.guard == Some(true) => {
+                        bail!("the database has no write-time validation")
+                    }
+                    None => {}
+                },
             }
         }
         for g in req.graphs.iter().filter(|g| *g != "default") {
@@ -4259,6 +4267,21 @@ fn schema_constraints(
         }
         Ok(None)
     }
+}
+
+/// The source of the schema of the database's write-time ShEx validation, if it has one.
+#[cfg(all(feature = "shacl", feature = "shex"))]
+fn shex_guard_source(
+    store: &sparkles::store::Store,
+) -> Result<Option<sparkles::schema::constraints::ConstraintSource>> {
+    Ok(sparkles_shex::guard::install(store)?.map(|g| sparkles_shex::constraints::guard_source(&g)))
+}
+
+#[cfg(all(feature = "shacl", not(feature = "shex")))]
+fn shex_guard_source(
+    _store: &sparkles::store::Store,
+) -> Result<Option<sparkles::schema::constraints::ConstraintSource>> {
+    Ok(None)
 }
 
 /// `sparkles schema --format text`: the constraints layer, one line per property shape.
@@ -4316,7 +4339,8 @@ constraints from {what}: {} · {} shapes · {} classes",
             for p in &c.properties {
                 writeln!(
                     out,
-                    "    <{}>  {}  [{}]",
+                    "    {}<{}>  {}  [{}]",
+                    if p.inverse { "^" } else { "" },
                     p.path,
                     p.summary(short),
                     p.enforcement.name()
@@ -4620,6 +4644,7 @@ struct SchemaDraftArgs {
     closed: bool,
     max_in: usize,
     max_count: u64,
+    max_inverse: usize,
     classes: Vec<String>,
     min_instances: u64,
     with_inferences: bool,
@@ -4795,6 +4820,12 @@ fn schema_draft(
     if a.max_in > TRACKED_VALUES {
         bail!("--max-in must be at most {TRACKED_VALUES}");
     }
+    if a.max_inverse > sparkles::schema::draft::MAX_INVERSE_LIMIT {
+        bail!(
+            "--max-inverse must be at most {}",
+            sparkles::schema::draft::MAX_INVERSE_LIMIT
+        );
+    }
     let name = loc
         .as_deref()
         .and_then(|l| l.file_name())
@@ -4830,6 +4861,7 @@ fn schema_draft(
         min_instances: a.min_instances,
         max_in: a.max_in,
         max_count: a.max_count,
+        max_inverse: a.max_inverse,
         closed: a.closed,
         prefixes: prefixes.into_iter().collect(),
     };

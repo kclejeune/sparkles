@@ -349,14 +349,47 @@ fn schema_reports_are_kept_paged_and_compared() {
         later.computed
     );
     assert_eq!(later.report.classes.len(), 4);
-    // the old cursor's report is gone
+    // the old cursor's report is no longer kept, so the report of its commit is computed
+    // again: the page continues where the first one ended, in the state it was read in
     let stale = ReportRequest {
         limit: 2,
-        cursor: Some(next),
+        cursor: Some(next.clone()),
+        ..Default::default()
+    };
+    let old = schema.report(&stale).unwrap();
+    assert_eq!(old.computed, Computed::Full);
+    assert_eq!((old.classes().items.len(), old.classes().total), (1, 3));
+    // a cursor of a commit that cannot be read is stale
+    let mut doc: serde_json::Value = serde_json::from_slice(
+        &base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &next).unwrap(),
+    )
+    .unwrap();
+    doc["c"] = 99_999.into();
+    let future = ReportRequest {
+        limit: 2,
+        cursor: Some(base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            serde_json::to_vec(&doc).unwrap(),
+        )),
         ..Default::default()
     };
     assert!(matches!(
-        schema.report(&stale),
+        schema.report(&future),
+        Err(sparkles::Error::Conflict(_))
+    ));
+    // so is a cursor of another dataset
+    doc["d"] = "00000000-0000-0000-0000-000000000000".into();
+    doc["c"] = 1.into();
+    let foreign = ReportRequest {
+        limit: 2,
+        cursor: Some(base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            serde_json::to_vec(&doc).unwrap(),
+        )),
+        ..Default::default()
+    };
+    assert!(matches!(
+        schema.report(&foreign),
         Err(sparkles::Error::Conflict(_))
     ));
     let (diff, _) = schema
@@ -379,6 +412,50 @@ fn schema_reports_are_kept_paged_and_compared() {
     assert!(sparkles::handles::schema_error_of(&e).is_some());
     let layer = schema.constraints(&Default::default()).unwrap();
     assert!(layer.is_empty());
+}
+
+/// A cursor names the dataset and the commit of its report, so it continues after the
+/// process restarts and after a compaction.
+#[test]
+fn schema_cursors_survive_a_restart_and_a_compaction() {
+    use sparkles::handles::ReportRequest;
+    let (dir, ds) = persistent();
+    ds.update(
+        "INSERT DATA { <http://ex.org/a> a <http://ex.org/A> . <http://ex.org/b> a <http://ex.org/B> . <http://ex.org/c> a <http://ex.org/C> }",
+    )
+    .unwrap();
+    let first = ds
+        .schema()
+        .report(&ReportRequest {
+            limit: 2,
+            ..Default::default()
+        })
+        .unwrap();
+    let next = first.classes().next.clone().unwrap();
+    let head = first.snapshot.commit;
+    drop(first);
+    drop(ds);
+
+    let ds = Dataset::open(dir.path().join("db")).unwrap();
+    let at = |cursor: &str| ReportRequest {
+        limit: 2,
+        cursor: Some(cursor.to_string()),
+        ..Default::default()
+    };
+    let r = ds.schema().report(&at(&next)).unwrap();
+    assert_eq!(r.classes().items.len(), 1);
+    assert_eq!(r.report.snapshot.commit, head);
+    // a compaction keeps the commit
+    ds.compact_with(&Default::default(), &sparkles::task::Control::none())
+        .unwrap();
+    let r = ds.schema().report(&at(&next)).unwrap();
+    assert_eq!((r.classes().items.len(), r.classes().total), (1, 3));
+    // and a write after the restart leaves the old state readable
+    ds.update("INSERT DATA { <http://ex.org/d> a <http://ex.org/D> }")
+        .unwrap();
+    let r = ds.schema().report(&at(&next)).unwrap();
+    assert_eq!((r.classes().items.len(), r.classes().total), (1, 3));
+    assert_eq!(r.report.snapshot.commit, head);
 }
 
 #[test]

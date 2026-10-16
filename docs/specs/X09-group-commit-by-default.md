@@ -337,7 +337,7 @@ Measured on `forge` with the harnesses of BENCHMARKS.md, ranges over fresh proce
 |---|---|
 | Serial commits, literal and IRI inserts and deletes, 1.05M and 10.5M | Median and p90 within 5% of the default writer of today |
 | Four writers, 50,000 changes | At least the published group-commit ranges (529–543 and 402–407 transactions/s) |
-| Four writers and two readers, 10.5M | Reader p99 within 10% of the default writer (1.410–1.549 ms) |
+| Four writers and two readers, 10.5M, both settings at the same write rate | Reader p99 within 10% of the default writer |
 | 16 writers | Per-writer throughput within 25% of the mean |
 | Mixed mode of `scripts/bench.sh` | Reads/s within 5% of today, writes/s at least today's |
 | The `updates` churn (5,000 serial commits) | Commits/s within 5% of today |
@@ -418,8 +418,10 @@ logged receipt's commit is present.
   on have a median and p90 within 5% of `--no-group-commit`.
 - **A2 — Concurrent gain kept.** Four writers at 1.05M acknowledge at least 529
   transactions/s with contiguous receipts.
-- **A3 — Reader tail.** With four writers and two readers at 10.5M, reader p99 is
-  within 10% of the run with grouping off.
+- **A3 — Reader tail.** With four writers and two readers at 10.5M, both runs paced to the
+  same write rate, reader p99 is within 10% of the run with grouping off. Pacing keeps the
+  comparison about the cost of grouping, because an unpaced run with grouping on commits
+  more writes and its readers compete with them.
 - **A4 — Failed sync.** A WAL `fdatasync` that fails during a fence of 10 commits fails
   all 10 requests with 503, publishes none of them, and the reopened store's head is at
   or after the last commit acknowledged before the fence, with no gap.
@@ -529,6 +531,13 @@ full-text indexes. See [ROADMAP](../ROADMAP.md) item 3.
   p99 was between 0.73× and 1.19× of the default writer's across runs, with overlapping
   ranges. No fix was made, so the candidate fixes of section 4.2 remain untried and the
   measurement has to be repeated on `forge`.
+
+  The `forge` run on 2026-10-16 used the NVMe device without a delay shim and six rounds.
+  With both settings paced to 3,452 transactions/s, reader p99 was 3.980 ms off and
+  3.986 ms on, a ratio of 1.002, so A3 is met. Unpaced, grouping on committed 1.74 times
+  as many transactions per second as off, and reader p99 rose from 4.639 to 5.039 ms, a
+  ratio of 1.086. That rise is the cost of serving more writes, and it stays inside the
+  10% bound.
 - **Failed synchronization (A4).** A router test fails ten requests of one fence with 503
   and publishes none of them. After reopening, the commit acknowledged before the fence and
   its insert are present and the head has no gap. The kernel can write complete records of
@@ -673,7 +682,7 @@ flagged commit at the WAL tail remain unwritten.
 
 ### Left for Phase 3
 
-1. The gates of section 9 on `forge`, in particular reader p99 and serial parity at 1.05M
+1. The gates of section 9 on `forge`, in particular serial parity at 1.05M
    and 10.5M.
 2. The 1,000-point `log-writes` runs on ext4 and XFS, and the `kill -9` runs.
 3. Full-text, spatial and embedding datasets and the ShEx guard grouping, or measurements

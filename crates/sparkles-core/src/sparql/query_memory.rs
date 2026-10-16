@@ -17,6 +17,8 @@ struct State {
     cursor: bool,
     calls: usize,
 }
+/// The owner id of an eager context's fast account, the first owner of its ledger.
+pub(crate) const PRIMARY: u64 = 1;
 pub(crate) struct MemoryOwner {
     pub(crate) id: u64,
     grant: Option<Arc<PoolGrant>>,
@@ -45,19 +47,55 @@ fn memory(limit: u64, requested: u64) -> Error {
         requested,
     })
 }
-fn same(a: Option<&Arc<PoolGrant>>, b: Option<&Arc<PoolGrant>>) -> bool {
+pub(super) fn same(a: Option<&Arc<PoolGrant>>, b: Option<&Arc<PoolGrant>>) -> bool {
     match (a, b) {
         (None, None) => true,
         (Some(a), Some(b)) => Arc::ptr_eq(a, b),
         _ => false,
     }
 }
+#[cfg(test)]
+thread_local! {
+    /// Ledger creations and lock acquisitions on this thread (for tests of the
+    /// per-query cost of queries that never need the ledger). The counter is
+    /// thread-local, so ledger work on other threads, such as rayon workers, is not
+    /// counted.
+    pub(crate) static LEDGER_OPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 impl QueryMemoryLedger {
-    pub(crate) fn new() -> Arc<Self> {
+    #[inline]
+    fn lock(&self) -> parking_lot::MutexGuard<'_, State> {
+        #[cfg(test)]
+        LEDGER_OPS.with(|n| n.set(n.get() + 1));
+        self.state.lock()
+    }
+    /// A ledger that takes over an eager context's fast account (see
+    /// [`super::ctx::Ctx::memory`]). Owner [`PRIMARY`] is that account, with its live
+    /// bytes and its admitted eager contribution to `grant`, so charges made before the
+    /// ledger existed release to it and the ledger returns its contribution on drop.
+    pub(crate) fn seeded(
+        grant: Option<Arc<PoolGrant>>,
+        live: u64,
+        eager: u64,
+        peak: u64,
+    ) -> Arc<Self> {
+        #[cfg(test)]
+        LEDGER_OPS.with(|n| n.set(n.get() + 1));
+        debug_assert!(grant.is_none() || eager >= live, "eager covers live");
         Arc::new(Self {
-            live: AtomicU64::new(0),
-            peak: AtomicU64::new(0),
-            state: Mutex::new(State::default()),
+            live: AtomicU64::new(live),
+            peak: AtomicU64::new(peak),
+            state: Mutex::new(State {
+                owners: vec![Account {
+                    owner: Arc::new(MemoryOwner { id: PRIMARY, grant }),
+                    live,
+                    eager,
+                    decode: 0,
+                }],
+                next: PRIMARY,
+                cursor: false,
+                calls: 0,
+            }),
         })
     }
     /// Prepare bookkeeping outside the admission lock. Failed and zero-only public
@@ -66,7 +104,7 @@ impl QueryMemoryLedger {
         let mut prepared = None;
         let mut storage = Vec::new();
         loop {
-            let mut state = self.state.lock();
+            let mut state = self.lock();
             if let Some(i) = state.owners.iter().position(|a| {
                 a.live == 0
                     && a.eager == 0
@@ -129,8 +167,7 @@ impl QueryMemoryLedger {
         }
     }
     pub(crate) fn owner_by_id(&self, id: u64) -> Arc<MemoryOwner> {
-        self.state
-            .lock()
+        self.lock()
             .owners
             .iter()
             .find(|a| a.owner.id == id)
@@ -189,7 +226,7 @@ impl QueryMemoryLedger {
         if bytes == 0 {
             return Ok(());
         }
-        self.admit(&mut self.state.lock(), owner, limit, bytes, decode)
+        self.admit(&mut self.lock(), owner, limit, bytes, decode)
     }
     fn release_locked(&self, state: &mut State, id: u64, bytes: u64, decode: bool) -> Release {
         let cursor = state.cursor;
@@ -223,13 +260,13 @@ impl QueryMemoryLedger {
     }
     pub(crate) fn release(&self, id: u64, bytes: u64) {
         let release = {
-            let mut state = self.state.lock();
+            let mut state = self.lock();
             self.release_locked(&mut state, id, bytes, false)
         };
         release.finish();
     }
     pub(crate) fn trim_zero(&self, grant: Option<&Arc<PoolGrant>>) {
-        let cursor = self.state.lock().cursor;
+        let cursor = self.lock().cursor;
         if cursor && let Some(grant) = grant {
             grant.release(0);
         }
@@ -238,7 +275,7 @@ impl QueryMemoryLedger {
         // One original owner at a time; no allocation, grant wake or callback under lock.
         loop {
             let release = {
-                let mut state = self.state.lock();
+                let mut state = self.lock();
                 let Some((id, bytes)) = state
                     .owners
                     .iter()
@@ -253,7 +290,7 @@ impl QueryMemoryLedger {
         }
     }
     pub(crate) fn check_output(&self, owner: &MemoryOwner, limit: u64, bytes: u64) -> Result<()> {
-        let mut state = self.state.lock();
+        let mut state = self.lock();
         let need = self.live.load(Ordering::Relaxed).saturating_add(bytes);
         // Historical Ctx output peak is an attempted estimate, unlike admitted ownership.
         self.peak.fetch_max(need, Ordering::Relaxed);
@@ -283,7 +320,7 @@ impl QueryMemoryLedger {
         Ok(())
     }
     pub(crate) fn check_cursor_transition(&self) -> Result<()> {
-        if self.state.lock().calls != 0 {
+        if self.lock().calls != 0 {
             return Err(Error::invalid(
                 "algorithm call still owns preparation memory",
             ));
@@ -293,7 +330,7 @@ impl QueryMemoryLedger {
     pub(crate) fn cursor_mode(&self) -> Result<()> {
         let mut releases = Vec::new();
         loop {
-            let mut state = self.state.lock();
+            let mut state = self.lock();
             if state.calls != 0 {
                 return Err(Error::invalid(
                     "algorithm call still owns preparation memory",
@@ -330,11 +367,11 @@ impl QueryMemoryLedger {
         Ok(())
     }
     pub(crate) fn start_call(&self) {
-        let mut state = self.state.lock();
+        let mut state = self.lock();
         state.calls = state.calls.checked_add(1).expect("bounded active calls");
     }
     pub(crate) fn start_service_frame(&self, service: &crate::algo::ServiceMemory) -> Result<()> {
-        let mut state = self.state.lock();
+        let mut state = self.lock();
         if service.closed.load(Ordering::Relaxed) {
             return Err(Error::invalid("SERVICE memory owner is closed"));
         }
@@ -351,7 +388,7 @@ impl QueryMemoryLedger {
         Ok(())
     }
     pub(crate) fn end_service_frame(&self, service: &crate::algo::ServiceMemory) {
-        let mut state = self.state.lock();
+        let mut state = self.lock();
         state.calls = state.calls.checked_sub(1).expect("active SERVICE frame");
         service.frames.store(
             service
@@ -366,7 +403,7 @@ impl QueryMemoryLedger {
         let Some(service) = lease.service.as_ref().cloned() else {
             return Ok(());
         };
-        let state = self.state.lock();
+        let state = self.lock();
         if !Arc::ptr_eq(&service.ledger, &lease.ledger)
             || service.owner.id != lease.owner.id
             || service.frames.load(Ordering::Relaxed) != 0
@@ -391,7 +428,7 @@ impl QueryMemoryLedger {
         bytes: u64,
         frame: Option<&AtomicU64>,
     ) -> Result<()> {
-        let mut state = self.state.lock();
+        let mut state = self.lock();
         if service.closed.load(Ordering::Relaxed) {
             return Err(Error::invalid("SERVICE memory owner is closed"));
         }
@@ -428,7 +465,7 @@ impl QueryMemoryLedger {
         service: &crate::algo::ServiceMemory,
         bytes: u64,
     ) -> Result<()> {
-        let _state = self.state.lock();
+        let _state = self.lock();
         if service.closed.load(Ordering::Relaxed) {
             return Err(Error::invalid("SERVICE memory owner is closed"));
         }
@@ -449,7 +486,7 @@ impl QueryMemoryLedger {
         frame: Option<&AtomicU64>,
     ) {
         let release = {
-            let mut state = self.state.lock();
+            let mut state = self.lock();
             let remaining = service
                 .used
                 .load(Ordering::Relaxed)
@@ -475,7 +512,7 @@ impl QueryMemoryLedger {
         bytes: u64,
         frame: &AtomicU64,
     ) -> Result<QueryMemoryLease> {
-        let _state = self.state.lock();
+        let _state = self.lock();
         let next = frame
             .load(Ordering::Relaxed)
             .checked_sub(bytes)
@@ -490,7 +527,7 @@ impl QueryMemoryLedger {
     }
     #[cfg(test)]
     pub(crate) fn owners(&self) -> usize {
-        self.state.lock().owners.len()
+        self.lock().owners.len()
     }
 }
 impl Drop for QueryMemoryLedger {
@@ -586,6 +623,169 @@ mod tests {
         Ctx::new(Store::in_memory(StoreOptions::default()).snapshot())
     }
 
+    /// Queries that call no graph algorithm and keep no lease take no ledger lock and
+    /// create no ledger: the per-query cost F14 added must stay off their path. Updates
+    /// run their WHERE clause on the same context and take no ledger either, so one is
+    /// covered too. The counter is thread-local, so it sees only the calling thread.
+    /// Ledger work on rayon workers is not counted, and this small dataset stays below
+    /// the thresholds of the parallel kernels, so this test guards the serial paths.
+    #[test]
+    fn plain_queries_take_no_ledger_operations() {
+        use crate::io::{RdfFormat, Source};
+        use crate::sparql::{QueryOptions, query};
+        let mut data = String::from("@prefix ex: <http://ex.org/> .\n");
+        for i in 0..300 {
+            data.push_str(&format!(
+                "ex:p{i} a ex:T{} ; ex:name \"n{i}\" ; ex:age {} ; ex:worksFor ex:o{} ; \
+                 ex:knows ex:p{} ; ex:authorOf ex:d{i} .\nex:d{i} ex:title \"t{i}\" .\n",
+                i % 3,
+                i % 90,
+                i % 7,
+                (i * 7 + 1) % 300
+            ));
+        }
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let pool = QueryPool::new(64 * MB);
+        let opts = QueryOptions {
+            prefixes: vec![("ex".into(), "http://ex.org/".into())],
+            pool: Some(pool.clone()),
+            max_memory_bytes: Some(32 * MB),
+            ..Default::default()
+        };
+        for q in [
+            "SELECT (COUNT(DISTINCT ?o) AS ?c) WHERE { ?s ex:knows ?o }",
+            "SELECT ?p (COUNT(*) AS ?c) WHERE { ?s ?p ?o } GROUP BY ?p",
+            "SELECT ?t (COUNT(?s) AS ?c) WHERE { ?s a ?t } GROUP BY ?t ORDER BY DESC(?c)",
+            "SELECT ?p ?n ?a ?k WHERE { VALUES ?p { ex:p1 ex:p10 ex:p100 } \
+             ?p ex:name ?n ; ex:age ?a ; ex:knows ?k }",
+            "SELECT ?p ?n ?a WHERE { ?p ex:worksFor ex:o3 ; ex:name ?n ; ex:age ?a }",
+            "SELECT ?p ?d ?t WHERE { ?p ex:worksFor ex:o3 . ?p ex:authorOf ?d . ?d ex:title ?t }",
+            "SELECT ?p ?a WHERE { ?p ex:name ?n OPTIONAL { ?p ex:age ?a FILTER(?a > 50) } }",
+            "SELECT ?p ?x WHERE { ?p ex:knows+ ?x } LIMIT 500",
+            "SELECT ?p ?x WHERE { ex:p5 (ex:knows|ex:worksFor)* ?x . BIND(ex:p5 AS ?p) }",
+            "CONSTRUCT { ?p ex:friend ?o } WHERE { ?p ex:knows ?o . ?o ex:worksFor ex:o3 }",
+            "DESCRIBE ex:p3 ex:p4",
+        ] {
+            let before = LEDGER_OPS.with(|n| n.get());
+            let r = query(store.snapshot(), q, &opts).unwrap();
+            assert!(!r.rows().is_empty() || !r.triples.is_empty(), "{q}");
+            let ops = LEDGER_OPS.with(|n| n.get()) - before;
+            eprintln!("{ops} ledger operations for {q}");
+            assert_eq!(ops, 0, "{ops} ledger operations for {q}");
+        }
+        let before = LEDGER_OPS.with(|n| n.get());
+        crate::sparql::update::update(
+            &store,
+            "INSERT { ?p ex:colleague ?q } WHERE { ?p ex:worksFor ?o . ?q ex:worksFor ?o . \
+             FILTER(?p != ?q) }",
+            &opts,
+        )
+        .unwrap();
+        assert_eq!(
+            LEDGER_OPS.with(|n| n.get()),
+            before,
+            "ledger operations for an update"
+        );
+        assert_eq!(pool.granted(), 0);
+    }
+    /// A grant set after the first charge would leave that charge on the old grant,
+    /// which debug builds refuse.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "the grant is set before the first charge")]
+    fn set_grant_after_a_charge_is_refused() {
+        let pool = QueryPool::new(64 * MB);
+        let mut ctx = context();
+        ctx.set_grant(Some(Arc::new(pool.empty_grant())));
+        ctx.check_output((MB / 8) as usize, 1).unwrap();
+        ctx.set_grant(None);
+    }
+    /// Charges made before the ledger exists move to its first owner: they grow and
+    /// release there, the eager contribution stays admitted once, and the ledger
+    /// returns it when the context drops.
+    #[test]
+    fn fast_account_hands_over_outstanding_charges_to_the_ledger() {
+        let pool = QueryPool::new(64 * MB);
+        let grant = Arc::new(pool.empty_grant());
+        let mut ctx = context();
+        ctx.reconfigure_grant(Some(grant.clone()));
+        ctx.mem_limit = 8 * MB;
+        let before = LEDGER_OPS.with(|n| n.get());
+        let held = ctx.charge(3 * MB).unwrap();
+        ctx.check_output((MB / 8) as usize, 1).unwrap();
+        drop(ctx.charge(2 * MB).unwrap());
+        assert!(matches!(ctx.check_output((6 * MB / 8) as usize, 1),
+            Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory && b.requested == 9 * MB));
+        assert_eq!(LEDGER_OPS.with(|n| n.get()), before, "no ledger yet");
+        assert_eq!((grant.used(), ctx.mem_peak()), (5 * MB, 9 * MB));
+        // An algorithm call makes the ledger, which takes over the account.
+        let ctl = Control::for_query(&ctx, 8 * MB).unwrap();
+        assert_eq!(ctx.memory().live.load(Ordering::Acquire), 3 * MB);
+        assert_eq!(ctx.memory().owners(), 1);
+        held.add(MB).unwrap();
+        assert_eq!(
+            (ctx.memory().live.load(Ordering::Acquire), grant.used()),
+            (4 * MB, 5 * MB)
+        );
+        held.add(2 * MB).unwrap();
+        assert_eq!(grant.used(), 6 * MB);
+        assert!(
+            matches!(held.add(3 * MB), Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory)
+        );
+        drop(held);
+        assert_eq!(ctx.memory().live.load(Ordering::Acquire), 0);
+        drop(ctl);
+        assert_eq!(ctx.mem_peak(), 9 * MB);
+        drop(ctx);
+        assert_eq!(grant.used(), 0);
+    }
+    /// Charges racing the hand-over to the ledger are counted once, on one side.
+    #[test]
+    fn concurrent_charges_survive_the_hand_over() {
+        for round in 0..20 {
+            let pool = QueryPool::new(1 << 40);
+            let grant = Arc::new(pool.empty_grant());
+            let mut ctx = context();
+            ctx.reconfigure_grant(Some(grant.clone()));
+            let ctx = Arc::new(ctx);
+            let barrier = Arc::new(std::sync::Barrier::new(5));
+            let threads: Vec<_> = (0..4)
+                .map(|t| {
+                    let ctx = ctx.clone();
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        for i in 0..2000u64 {
+                            let c = ctx.charge(1 + (i + t) % 97).unwrap();
+                            ctx.check_output(((i * 13) % 50) as usize, 2).unwrap();
+                            c.add(5).unwrap();
+                            drop(c);
+                        }
+                    })
+                })
+                .collect();
+            barrier.wait();
+            for _ in 0..round * 50 {
+                std::hint::spin_loop();
+            }
+            let ledger = ctx.memory().clone();
+            for t in threads {
+                t.join().unwrap();
+            }
+            assert_eq!(ledger.live.load(Ordering::Acquire), 0);
+            assert!(grant.used() > 0, "the eager contribution stays admitted");
+            drop(ledger);
+            drop(Arc::into_inner(ctx).unwrap());
+            assert_eq!(grant.used(), 0, "round {round}");
+        }
+    }
     #[test]
     fn current_public_limit_and_each_original_grant_remain_authoritative() {
         let pool = QueryPool::new(64 * MB);
@@ -593,9 +793,9 @@ mod tests {
         let b = Arc::new(pool.empty_grant());
         let mut ctx = context();
         ctx.mem_limit = 16 * MB;
-        ctx.grant = Some(a.clone());
+        ctx.reconfigure_grant(Some(a.clone()));
         std::mem::forget(ctx.charge(4 * MB).unwrap());
-        ctx.grant = Some(b.clone());
+        ctx.reconfigure_grant(Some(b.clone()));
         drop(ctx.charge(2 * MB).unwrap());
         assert_eq!((a.used(), b.used()), (4 * MB, 2 * MB));
         ctx.mem_limit = 5 * MB;
@@ -604,9 +804,9 @@ mod tests {
         );
         assert_eq!((a.used(), b.used()), (4 * MB, 2 * MB));
         ctx.mem_limit = 16 * MB;
-        ctx.grant = None;
+        ctx.reconfigure_grant(None);
         drop(ctx.charge(MB).unwrap());
-        ctx.grant = Some(a.clone());
+        ctx.reconfigure_grant(Some(a.clone()));
         drop(ctx.charge(MB).unwrap());
         assert_eq!((a.used(), b.used()), (5 * MB, 2 * MB));
         let weak = Arc::downgrade(ctx.memory());
@@ -621,7 +821,7 @@ mod tests {
         let pool = QueryPool::new(0);
         let mut ctx = context();
         for _ in 0..100 {
-            ctx.grant = Some(Arc::new(pool.empty_grant()));
+            ctx.reconfigure_grant(Some(Arc::new(pool.empty_grant())));
             assert!(
                 matches!(ctx.charge(1),Err(Error::BudgetExceeded(x)) if x.kind==BudgetKind::ServerMemory)
             );
@@ -637,16 +837,16 @@ mod tests {
         let a = Arc::new(pool.empty_grant());
         let b = Arc::new(pool.empty_grant());
         let mut ctx = context();
-        ctx.grant = Some(a.clone());
+        ctx.reconfigure_grant(Some(a.clone()));
         drop(ctx.charge(4 * MB).unwrap());
-        ctx.grant = Some(b.clone());
+        ctx.reconfigure_grant(Some(b.clone()));
         std::mem::forget(ctx.charge(2 * MB).unwrap());
         ctx.enable_cursor_accounting().unwrap();
         assert_eq!((a.used(), b.used()), (0, 2 * MB));
         assert!(ctx.cursor_decode(2000));
         let b_before = b.used();
         assert!(b_before > 2 * MB);
-        ctx.grant = Some(a.clone());
+        ctx.reconfigure_grant(Some(a.clone()));
         assert!(ctx.cursor_decode(4000));
         assert!(a.used() > 0);
         let keep = ctx.charge(300).unwrap();
@@ -662,10 +862,10 @@ mod tests {
         let a = Arc::new(pool.empty_grant());
         let b = Arc::new(pool.empty_grant());
         let mut ctx = context();
-        ctx.grant = Some(a.clone());
+        ctx.reconfigure_grant(Some(a.clone()));
         ctx.mem_limit = 4 * MB;
         let ctl = Control::for_query(&ctx, 8 * MB).unwrap();
-        ctx.grant = Some(b.clone());
+        ctx.reconfigure_grant(Some(b.clone()));
         ctx.mem_limit = MB;
         let output = Buffer::<u8>::new("query-ledger-output", 2 * MB as usize, &ctl)
             .unwrap()
@@ -700,7 +900,7 @@ mod tests {
         let mut ctx = context();
         let pool = QueryPool::new(64 * MB);
         let grant = Arc::new(pool.empty_grant());
-        ctx.grant = Some(grant.clone());
+        ctx.reconfigure_grant(Some(grant.clone()));
         let root = Control::for_query(&ctx, 100).unwrap();
         let frame = root.query_frame().unwrap();
         let data = Buffer::<u8>::new("service-first", 80, &frame)
@@ -811,7 +1011,7 @@ mod tests {
         let pool = QueryPool::new(4 * MB);
         let grant = Arc::new(pool.empty_grant());
         let mut ctx = context();
-        ctx.grant = Some(grant.clone());
+        ctx.reconfigure_grant(Some(grant.clone()));
         let controls = [
             Control::for_query(&ctx, 8 * MB).unwrap(),
             Control::for_query(&ctx, 8 * MB).unwrap(),

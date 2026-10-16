@@ -310,6 +310,7 @@ fn expected_input_schemas() -> Vec<(&'static str, Value)> {
                 "minInstances": {"type":"integer","minimum":1,"default":1},
                 "maxIn": {"type":"integer","minimum":0,"maximum":64,"default":10,"description":"Largest sh:in list (0: none)"},
                 "maxCount": {"type":"integer","minimum":0,"default":1,"description":"Largest sh:maxCount drafted (0: none)"},
+                "maxInverse": {"type":"integer","minimum":0,"maximum":1000,"default":10,"description":"Most inverse property shapes drafted per class (0: none)"},
                 "closed": {"type":"boolean","default":false},
                 "atCommit": at, "at": sel,
                 "timeoutSeconds": to}}),
@@ -780,9 +781,12 @@ async fn draft_shapes_tool() {
     assert_eq!(
         s["shapes"][0]["excluding"],
         json!([
+            {"path": "http://ex.org/age", "component": "minInclusive", "excluded": 1},
+            {"path": "http://ex.org/age", "component": "maxInclusive", "excluded": 1},
             {"path": "http://www.w3.org/2000/01/rdf-schema#label", "component": "datatype", "excluded": 1},
             {"path": "http://www.w3.org/2000/01/rdf-schema#label", "component": "languageIn", "excluded": 1},
-            {"path": "http://ex.org/knows", "component": "minCount", "excluded": 1}])
+            {"path": "http://ex.org/knows", "component": "minCount", "excluded": 1},
+            {"path": "^http://ex.org/knows", "component": "minCount", "excluded": 1}])
     );
     let (text, meta) = c.error("draft_shapes", json!({"support": 2})).await;
     assert!(text.contains("support"), "{text}");

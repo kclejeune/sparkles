@@ -35,6 +35,11 @@ timeout instead of the query timeout.
 
 ### Format
 
+The ShEx write guard's persisted typing, `validation-typing.bin`, is registered as the
+derived format `validation-typing` version 1. The version is the u32 after the `SPXTYP01`
+magic. A file of another version is discarded and the typing is rebuilt by a full
+validation on the next write. The file's header also covers a digest of the schema copy.
+
 Checked migration state in `.migrate-checked` uses JSON format 1. It records the cleanup
 mode and exact old sibling directory so recovery by a later release preserves unrelated
 kept copies. Unknown formats, malformed markers and bare legacy mode markers refuse

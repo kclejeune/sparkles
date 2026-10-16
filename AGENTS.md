@@ -61,13 +61,18 @@ keeps the handoff notes current.
 | Role | Model |
 |---|---|
 | Orchestration, validating review findings, remediation plans, consults | Claude Opus 5.5 |
-| Implementing lanes and fixes | Claude Sonnet 5.5 at high effort |
+| Implementing non-trivial engineering work that has no written plan | Claude Opus 5.5 |
+| Implementing from an explicit plan or a clear-cut spec | Claude Sonnet 5.5 at high effort |
 | Code review | Codex with gpt-6.1-sol at high effort |
 | Mechanical tasks with a deterministic check | Claude Haiku 5.5 |
 
-A lane starts on Opus instead of Sonnet when its core is crash durability or WAL ordering,
-concurrency beyond a parallel iterator, an on-disk format, planner or executor cost
-decisions, or `unsafe` code.
+A lane goes to Sonnet only when someone can write down how to do it: a remediation
+`plan.md` that names the files, the behaviour, the edge cases and the tests, or a spec
+phase that leaves no design decision open. Everything else that takes engineering
+judgment starts on Opus. That includes a refactor whose shape is unclear, a bug whose cause
+is unknown, a spec that leaves behaviour or an API open, and any lane whose core is crash
+durability or WAL ordering, concurrency beyond a parallel iterator, an on-disk format,
+planner or executor cost decisions, or `unsafe` code.
 
 Haiku takes tasks that need a model to read or write language but little judgment, and
 that end in a check a script can run. Examples are triaging test and benchmark logs into

@@ -2815,7 +2815,7 @@ mod projection_capacity_tests {
             let mut ctx = Ctx::new(snapshot.clone());
             let pool = super::super::pool::QueryPool::new(64 << 20);
             let grant = Arc::new(pool.empty_grant());
-            ctx.grant = Some(grant.clone());
+            ctx.set_grant(Some(grant.clone()));
             let mut planner = Planner::new(&ctx);
             planner.source = Some(&parsed);
             let node = planner
@@ -2978,7 +2978,7 @@ mod projection_capacity_tests {
                 Arc::new(pool.empty_grant())
             };
             let mut ctx = Ctx::new(snapshot.clone());
-            ctx.grant = Some(a.clone());
+            ctx.set_grant(Some(a.clone()));
             let (first, info) = super::super::exec::execute_owned(&ctx, &adapter(&ctx)).unwrap();
             let mut leaves = Vec::new();
             algo_infos(&info, &mut leaves);
@@ -2989,7 +2989,7 @@ mod projection_capacity_tests {
             assert!(first.lease.as_ref().unwrap().service.is_none());
             let live = ctx.memory().live.load(Ordering::Acquire);
             let held_a = a.used();
-            ctx.grant = Some(b.clone());
+            ctx.reconfigure_grant(Some(b.clone()));
             let (second, info) = super::super::exec::execute_owned(&ctx, &adapter(&ctx)).unwrap();
             let mut leaves = Vec::new();
             algo_infos(&info, &mut leaves);
@@ -3051,8 +3051,8 @@ mod projection_capacity_tests {
                     64 << 20
                 });
                 let grant = Arc::new(pool.empty_grant());
-                ctx.grant = Some(grant.clone());
-                other.grant = Some(grant.clone());
+                ctx.set_grant(Some(grant.clone()));
+                other.set_grant(Some(grant.clone()));
                 let other_held = other.charge(77).unwrap();
                 let held = ctx.charge(135).unwrap();
                 let ctl = Control::for_query(
@@ -3379,7 +3379,7 @@ mod projection_capacity_tests {
             let mut ctx = Ctx::new(store.snapshot());
             let pool = QueryPool::new(64 << 20);
             let grant = Arc::new(pool.empty_grant());
-            ctx.grant = Some(grant.clone());
+            ctx.set_grant(Some(grant.clone()));
             spec.algo = match case {
                 1 => Algo::FastRp,
                 2 => Algo::Bfs,
@@ -3516,7 +3516,7 @@ mod projection_capacity_tests {
         let snapshot = ctx.snap.clone();
         let pool = QueryPool::new(64 << 20);
         let grant = Arc::new(pool.empty_grant());
-        ctx.grant = Some(grant.clone());
+        ctx.set_grant(Some(grant.clone()));
         let ctl = Control::for_query(&ctx, u64::MAX).unwrap();
         let (g, hit) = projection(&ctx, &spec, None, &Par::single(), &ctl).unwrap();
         assert!(!hit);
@@ -3540,7 +3540,7 @@ mod projection_capacity_tests {
         for _ in 0..2 {
             let mut next = Ctx::new(snapshot.clone());
             let next_grant = Arc::new(pool.empty_grant());
-            next.grant = Some(next_grant.clone());
+            next.set_grant(Some(next_grant.clone()));
             let ctl = Control::for_query(&next, u64::MAX).unwrap();
             let (warm, hit) = projection(&next, &spec, None, &Par::single(), &ctl).unwrap();
             assert!(hit);
@@ -3572,9 +3572,9 @@ mod projection_capacity_tests {
             };
             let pool = QueryPool::new(64 << 20);
             let grant = Arc::new(pool.empty_grant());
-            ctx.grant = Some(grant.clone());
+            ctx.set_grant(Some(grant.clone()));
             let mut other = Ctx::new(ctx.snap.clone());
-            other.grant = Some(grant.clone());
+            other.set_grant(Some(grant.clone()));
             let other_held = other.charge(135).unwrap();
             let scope = memory::probe::install(
                 move |point| {
@@ -3707,7 +3707,7 @@ mod projection_capacity_tests {
         spec.nums.insert("maxMemory".into(), 2048.0);
         let pool = QueryPool::new(64 << 20);
         let grant = Arc::new(pool.empty_grant());
-        ctx.grant = Some(grant.clone());
+        ctx.set_grant(Some(grant.clone()));
         let input = Table {
             vars: vec![4],
             cols: vec![vec![Id(77); 1000]],

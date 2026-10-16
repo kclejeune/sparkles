@@ -5,7 +5,9 @@
 //! request with the same selection at the same state reads it, and one at a newer commit
 //! brings it up to date from the changes when they are few enough
 //! ([`schema::update`](crate::schema::update)). The cursors of the paginated lists name
-//! the report they belong to, so a listing can be finished after a write.
+//! the dataset and the commit they belong to, so a listing can be finished after a write,
+//! after a restart and after a compaction. The report of a commit that is no longer kept is
+//! computed again from the commit when it can still be read ([`At::Commit`]).
 
 use crate::Dataset;
 use crate::access::GraphAccess;
@@ -142,7 +144,8 @@ impl ReportOutcome {
             total: items.len(),
             next: more.then(|| {
                 Cursor {
-                    v: self.report.snapshot.version,
+                    d: self.snapshot.dataset_id.to_string(),
+                    c: self.report.snapshot.commit,
                     h: self.selection,
                     a: items_page.last().map_or_else(
                         || after.unwrap_or_default().to_string(),
@@ -228,11 +231,14 @@ pub struct ConstraintsRequest {
     pub graphs: Option<Arc<GraphAccess>>,
 }
 
-/// Continuation token of a paginated list: base64url JSON.
+/// Continuation token of a paginated list: base64url JSON. It names the state of the
+/// report by dataset and commit, which a restart and a compaction keep.
 #[derive(Serialize, Deserialize)]
 struct Cursor {
-    /// snapshot identity of the report
-    v: u64,
+    /// the dataset id
+    d: String,
+    /// the commit of the report
+    c: u64,
     /// selection hash
     h: u64,
     /// last IRI of the previous page
@@ -283,28 +289,18 @@ impl Schema {
     /// one whose report is gone because the dataset changed is [`Error::Conflict`].
     pub fn report(&self, req: &ReportRequest) -> Result<ReportOutcome> {
         let store = self.ds.store();
-        let (snap, current) = match &req.at {
-            None => {
-                let snap = store.snapshot();
-                let id = schema::snapshot_identity(&snap);
-                (snap, id)
-            }
+        let snap = match &req.at {
+            None => store.snapshot(),
             Some(at) => {
                 let o = HistoryOptions {
                     cancel: req.options.cancel.clone(),
                     deadline: deadline(req.timeout, req.options.deadline),
                 };
-                let (snap, r) = store.snapshot_at(at, &o)?;
-                // a past state never changes: its identity is its commit (live versions
-                // are small counters, so the high bit keeps the two apart)
-                let id = if r.historical {
-                    (1 << 63) | r.commit.seq
-                } else {
-                    schema::snapshot_identity(&snap)
-                };
-                (snap, id)
+                store.snapshot_at(at, &o)?.0
             }
         };
+        // a state is its commit: a restart and a compaction keep it
+        let current = snap.commit;
         let selection = selection(&req.options);
         let cursor = req
             .cursor
@@ -318,7 +314,12 @@ impl Schema {
                     "the cursor belongs to different graph/declaredGraph/reasoning/declared/detail parameters",
                 ));
             }
-            Some(c) => c.v,
+            Some(c) if c.d != snap.dataset_id.to_string() => {
+                return Err(Error::Conflict(
+                    "the cursor belongs to another dataset; restart from the first page".into(),
+                ));
+            }
+            Some(c) => c.c,
             None => current,
         };
         let outcome = |report, computed, snap| ReportOutcome {
@@ -333,9 +334,22 @@ impl Schema {
             return Ok(outcome(report, Computed::Cached, snap));
         }
         if wanted != current {
-            return Err(Error::Conflict(format!(
-                "snapshot changed since the first page (version {wanted} → {current}); restart from the first page"
-            )));
+            // the report of that commit is not kept: read the commit again, when it can be
+            let mut opts = req.options.clone();
+            opts.deadline = deadline(req.timeout, opts.deadline);
+            let o = HistoryOptions {
+                cancel: opts.cancel.clone(),
+                deadline: opts.deadline,
+            };
+            return match self.ds.store().snapshot_at(&At::Commit(wanted), &o) {
+                Ok((past, _)) if past.commit == wanted => {
+                    let report = Arc::new(schema::discover(&past, &opts).map_err(schema_error)?);
+                    Ok(outcome(report, Computed::Full, past))
+                }
+                _ => Err(Error::Conflict(format!(
+                    "snapshot changed since the first page (commit {wanted} → {current}) and the first page's commit can no longer be read; restart from the first page"
+                ))),
+            };
         }
         let mut opts = req.options.clone();
         opts.deadline = deadline(req.timeout, opts.deadline);
@@ -352,7 +366,7 @@ impl Schema {
         snap: &Arc<Snapshot>,
         opts: &SchemaOptions,
     ) -> Result<(Arc<SchemaReport>, Computed)> {
-        let identity = schema::snapshot_identity(snap);
+        let identity = snap.commit;
         let selection = selection(opts);
         if let Some(report) = self.kept(identity, selection, opts.term_totals) {
             return Ok((report, Computed::Cached));
@@ -584,25 +598,31 @@ fn constraints_layer(
     };
     let mut layer = ConstraintsLayer::default();
     if req.guard != Some(false) {
-        let guard = match ds.write_guard() {
-            Some(crate::write_guard::WriteGuard::Shacl(g)) => Some(g),
-            _ => None,
-        };
-        let guard = guard.filter(|g| {
-            g.config()
+        let source = match ds.write_guard() {
+            Some(crate::write_guard::WriteGuard::Shacl(g)) => g
+                .config()
                 .shapes
                 .graphs
                 .iter()
                 .flatten()
                 .all(|s| readable(s))
-        });
-        match guard {
-            Some(g) => layer
-                .sources
-                .push(sparkles_shacl::constraints::guard_source(&g)),
+                .then(|| sparkles_shacl::constraints::guard_source(&g)),
+            #[cfg(feature = "shex")]
+            Some(crate::write_guard::WriteGuard::Shex(g)) => g
+                .config()
+                .schema
+                .graphs
+                .iter()
+                .flatten()
+                .all(|s| readable(s))
+                .then(|| sparkles_shex::constraints::guard_source(&g)),
+            None => None,
+        };
+        match source {
+            Some(s) => layer.sources.push(s),
             None if req.guard == Some(true) => {
                 return Err(Error::NotFound(format!(
-                    "dataset {} has no write-time SHACL validation whose shapes this caller may read",
+                    "dataset {} has no write-time validation whose shapes this caller may read",
                     ds.name().unwrap_or("")
                 )));
             }

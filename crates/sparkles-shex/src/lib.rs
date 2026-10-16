@@ -43,10 +43,12 @@ mod error;
 pub mod check;
 #[doc(hidden)]
 pub mod compile;
+pub mod constraints;
 #[doc(hidden)]
 pub mod engine;
 #[doc(hidden)]
 pub mod explain;
+mod ext;
 pub mod guard;
 #[doc(hidden)]
 pub mod ir;

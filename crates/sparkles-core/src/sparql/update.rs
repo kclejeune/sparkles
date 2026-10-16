@@ -335,7 +335,7 @@ impl Request<'_> {
         if let Some(m) = self.opts.max_memory_bytes {
             ctx.mem_limit = m;
         }
-        ctx.grant = self.grant.clone();
+        ctx.set_grant(self.grant.clone());
         if let Some(m) = self.opts.max_rows_produced {
             ctx.max_rows_produced = m;
         }

@@ -386,7 +386,7 @@ fn fill_externals(out: &mut Schema, resolver: &dyn Resolver) -> Result<(), Schem
             if let Some(e) = lookup(&label)? {
                 declared.insert(label.clone());
                 filled.push(out.shapes.len());
-                out.shapes.push(ShapeDecl { label, expr: e });
+                out.shapes.push(ShapeDecl::new(label, e));
             }
         }
     }
@@ -400,6 +400,7 @@ fn shape_refs(e: &ShapeExpr, out: &mut Vec<Label>) {
         ShapeExpr::Not(x) => shape_refs(x, out),
         ShapeExpr::Ref(l) => out.push(l.clone()),
         ShapeExpr::Shape(s) => {
+            out.extend(s.extends.iter().cloned());
             if let Some(t) = &s.expression {
                 triple_refs(t, out);
             }

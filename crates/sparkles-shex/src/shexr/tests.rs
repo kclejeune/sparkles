@@ -288,7 +288,7 @@ fn errors() {
         "{}",
         e.message
     );
-    let e = err("[] a sx:Schema ; sx:shapes (ex:S) . ex:S a sx:Shape ; sx:extends (ex:T) .");
+    let e = err("[] a sx:Schema ; sx:shapes (ex:S) . ex:S a sx:Shape ; sx:restricts (ex:T) .");
     assert!(e.message.contains("ShEx 2.2"), "{}", e.message);
     let e = err(
         "[] a sx:Schema ; sx:shapes [ <http://www.w3.org/1999/02/22-rdf-syntax-ns#first> ex:S ] .",

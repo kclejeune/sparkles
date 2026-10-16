@@ -695,6 +695,27 @@ checks. The table lists the changes larger than 25%.
 | `range_pushdown` | `optional-chain` 1.3× slower (93.0 against 73.2 ms) |
 | `topk_first_key` | `expr-order-key` 8.3× slower (174.1 against 20.9 ms) |
 
+### The fixed cost of a plain query
+
+The graph algorithm work (F14) first put every query behind a memory ledger, which added a
+fixed cost to queries that never call an algorithm. A plain query now charges a lock-free
+fast account and creates the ledger only when it calls an algorithm, keeps an output lease
+or moves to a cursor. The runs used forge with the 1.05M triple dataset and the small
+queries of the suite, where a fixed cost per query is the largest share of the time.
+
+| Comparison | Measure | Result |
+|---|---|---|
+| Lazy ledger against the build before it | Instructions per HTTP request on the small queries | 6 to 9 thousand fewer |
+| Lazy ledger against the build before it | Median execution time of distinct-obj | 3.75 µs down to 3.19 µs |
+| Lazy ledger against origin/main at 20f01c82 | Execution time of the three smallest queries | 0.5 to 0.7 µs higher |
+| Lazy ledger against origin/main at 20f01c82 | Wall time of the four flagged small queries | 0.7 to 3.3% higher |
+
+The baseline is origin/main at 20f01c82, the release before F14. The remaining 0.5 to 0.7
+µs on the smallest queries is spread over the operator result plumbing. The fast account
+adds a mutex, four atomic counters and a lazily set grant to each query context and saves
+the ledger allocation of a plain query, so a plain query does not use more memory than it
+did before.
+
 ## Loading and index builds
 
 Sparkles builds its index in one parallel pass. Parsing and vocabulary merging run on all
@@ -909,13 +930,28 @@ Group commit synchronizes both files in one fence. In the
 sixteen-writer message run, the largest deviation of a writer's share from the mean was 0.002 for
 group commit and 0.063 for the default writer.
 
-Reader p99 at 10.5M with four writers and two readers is the open measurement. The 40%
-regression above did not reproduce on these instances. With the fast device (80,000
+The reader p99 at 10.5M with four writers and two readers was measured on `forge` in the
+next section. The 40% regression above did not reproduce on these instances. With the fast device (80,000
 changes) p99 was 5.20 ms for the default writer and 4.16 ms for group commit. With the 4 ms
 synchronization it was 0.85, 0.89 and 0.73 ms for the default writer, group commit without
 the idle path and group commit with it, and in a later run 0.91 and 1.09 ms for the default
 writer and group commit, with ranges of 0.66 to 2.56 and 0.73 to 1.87 ms. These overlap, so
-the tail needs `forge` to settle.
+the tail needed `forge` to settle.
+
+### Reader tail of group commit on forge
+
+Four writers and two readers ran against the 10.5M dataset on `forge` with its NVMe device,
+six rounds per setting, on 2026-10-16. In the paced run both settings were held to 3,452
+transactions/s, the most the default writer reaches. The paced run is the X09 acceptance
+gate, and the unpaced run shows the read cost of the higher write rate that group commit
+allows.
+
+| Measure | Unpaced, default | Unpaced, group commit | Ratio | Paced, default | Paced, group commit | Ratio |
+|---|--:|--:|--:|--:|--:|--:|
+| Transactions/s | 3,452.5 | 5,995.8 | 1.737 | 3,426.7 | 3,449.7 | 1.007 |
+| Writer p50 (ms) | 1.126 | 0.634 | 0.563 | 1.119 | 0.712 | 0.636 |
+| Reader p50 (ms) | 0.482 | 0.332 | 0.689 | 0.478 | 0.496 | 1.037 |
+| Reader p99 (ms) | 4.639 | 5.039 | 1.086 | 3.980 | 3.986 | 1.002 |
 
 ### Concurrent writers with snapshot readers
 

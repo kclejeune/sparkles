@@ -149,6 +149,39 @@ pub struct ShapeIr {
     pub max_occ: Vec<Option<u64>>,
     pub class: ShapeClass,
     pub sem_acts: Vec<SemAct>,
+    /// the shapes this one extends, `None` for a shape that extends nothing
+    pub ext: Option<ExtPlan>,
+}
+
+/// How a shape that extends others is matched (ShEx 2.2): its arcs are partitioned over
+/// its own triple expression and the triple expressions of its ancestors (see
+/// [`crate::ext`]).
+#[derive(Clone, Debug)]
+pub struct ExtPlan {
+    /// the ways the extended expressions can be read: an extended declaration that is a
+    /// disjunction of shapes offers one variant per disjunct, and a frame picks one
+    /// variant of each. The shape matches when some frame does.
+    pub frames: Vec<Frame>,
+}
+
+/// One reading of the ancestors of an extending shape.
+#[derive(Clone, Debug)]
+pub struct Frame {
+    /// the ancestors, each once (a shape reached through two parents is one part)
+    pub parts: Vec<Part>,
+}
+
+/// An ancestor of an extending shape.
+#[derive(Clone, Debug)]
+pub struct Part {
+    /// the ancestor's own shape: its triple expression is matched against the arcs of
+    /// the part
+    pub shape: ShapeId,
+    /// the ancestor's other conjuncts, each satisfied by the arcs of the part and of its
+    /// own ancestors
+    pub constraints: Vec<SeId>,
+    /// the parts (indices into [`Frame::parts`]) that are ancestors of this one
+    pub below: Vec<usize>,
 }
 
 /// A pair kind: the shape expression evaluated for its pairs.

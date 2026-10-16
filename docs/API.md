@@ -1039,9 +1039,12 @@ The lists are sorted and left out of the JSON when empty, for example:
 **Pagination.** Every page of a listing comes from the report of one snapshot. The
 server keeps the last report per dataset. The summary and a page request without a cursor
 reuse that report while the snapshot and the selection are unchanged, and compute a new
-one otherwise. A cursor from an older snapshot is still served while its report is the
-one kept. Once a newer report replaces it, the request fails with `409` and the client
-restarts from the first page. Cursors do not survive a restart.
+one otherwise. A cursor names the dataset and the commit of its report, not a process
+counter. A cursor from an older commit is served from the kept report while that is the
+one kept, and otherwise the report is computed again at that commit when the commit is
+still readable like any point-in-time read. A cursor therefore survives a restart and a
+compaction. When the commit is gone, or the cursor belongs to another dataset, the request
+fails with `409` and the client restarts from the first page.
 
 **Errors.** Errors have a `{ "error" }` body.
 
@@ -1051,7 +1054,7 @@ restarts from the first page. Cursors do not survive a restart.
 * `408`: the report did not finish within `timeout`, for example
   `"schema discovery exceeded 60s while scanning predicates (412/9031); narrow graph= or
   raise timeout="`.
-* `409`: a stale cursor, as described above.
+* `409`: a cursor whose commit can no longer be read, as described above.
 * `413`: the dataset has more than `--schema-max-entries` (default 1,000,000) classes or
   predicates, for example `"dataset has 1204331 classes (limit 1000000)"`.
 
@@ -1278,10 +1281,13 @@ type ConstraintSource = {
              otherPaths: number }[];
 };
 type PropertyConstraint = {
-  path: string; shape?: string;   // the property shape's IRI, if it has one
+  path: string;                   // the predicate IRI
+  inverse?: boolean;              // ShEx only: the constraint is on the subjects pointing at the instance (^p)
+  shape?: string;                 // the property shape's IRI, if it has one
   severity: string;               // sh:Violation unless the shape says otherwise
   enforcement: "reject-on-write" | "warn-on-write" | "validated-on-request";
   minCount?: number; maxCount?: number; datatype?: string; class?: string[]; nodeKind?: string;
+  values?: string[];              // ShEx only: the value set, as N-Triples terms
   other?: string[];               // components of the other constraints, such as sh:PatternConstraintComponent
 };
 ```
@@ -1295,8 +1301,22 @@ always those installed now.
 A caller limited to some graphs reads only the shapes graphs it may read. It sees the
 guard's shapes only when it may read every shapes graph of the guard. Otherwise the
 summary leaves the guard source out, and `shapes=guard` answers `404`. `shapes=guard`
-also answers `404` when the dataset has no write-time SHACL validation. A ShEx guard is
-not summarized. A shapes graph with no quads answers `404`, `shapes=union` and a malformed
+also answers `404` when the dataset has no write-time validation whose shapes the caller may
+read.
+
+A ShEx guard is summarized from its compiled schema. A class gets the shapes that the
+guard's shape map selects with `{FOCUS rdf:type C}`, and a shape map entry of any other
+kind counts under `otherTargets`. Each triple constraint of such a shape, and of the
+shapes it extends, is a property constraint with its predicate or, for `^p`, its
+inverse. The cardinality gives `minCount` and `maxCount` when the constraint is part of a
+plain sequence. A constraint inside a choice or a group that has a cardinality of its own
+lists the predicate with `http://www.w3.org/ns/shex#Group` under `other`. A node
+constraint gives `datatype`, `nodeKind` or `values`, and a reference to another shape
+gives `class` when exactly one class selects that shape. Facets map to the SHACL
+component that checks the same thing, and disjunctions, negations, nested shapes,
+unresolved references and semantic actions are named under `other` with a
+`http://www.w3.org/ns/shex#` IRI. The severity of a ShEx constraint is `sh:Violation`, and
+its enforcement follows the guard's mode. A shapes graph with no quads answers `404`, `shapes=union` and a malformed
 IRI answer `400`, and a build without the `shacl` feature answers `501` when shapes are
 named.
 
@@ -1320,11 +1340,25 @@ applies to that satisfy it reaches `support`:
 | `sh:maxCount` | the smallest number of values that enough instances keep to, up to `maxCount` |
 | `sh:nodeKind` | the most specific node kind of the values |
 | `sh:datatype` | the datatype of the values, when they are well-formed literals of one datatype |
+| `sh:or` of datatypes | the smallest set of two or three datatypes that enough instances stay within, when no single datatype reaches the support |
+| `sh:pattern` | for properties whose values are all strings, a fixed prefix such as `^ISBN[-]` or the character-class skeleton most instances share such as `^[A-Z]{2}[0-9]{4}$`, shared by at least two instances |
+| `sh:minInclusive`, `sh:maxInclusive` | for properties whose values are all inline numbers of one datatype, or all dates or dateTimes that agree on a timezone, the smallest and largest value that enough instances stay within, commented as observed and not intended |
+| `sh:node` | the shape of the class that `sh:class` names, when the draft also has a shape for that class, at `support=1` only |
 | `sh:class` | a class all the values belong to, outside the `rdf:`, `rdfs:`, `owl:`, `xsd:` and `sh:` namespaces |
 | `sh:in` | the most used values, at most `maxIn`, each used by two instances or more (not for booleans) |
 | `sh:languageIn`, `sh:uniqueLang` | the language tags of the values, and whether an instance repeats one |
 
-Every constraint other than `sh:minCount` applies to the instances that have a value. At
+Every constraint other than `sh:minCount` applies to the instances that have a value.
+
+Two more kinds of property shape come from the same passes. An inverse property shape
+(`sh:path [ sh:inversePath p ]`, ShEx `^p`) describes the subjects that point at the
+instances of a class, and is drafted for a predicate when enough of the class's instances
+are pointed at over it, at most `maxInverse` per class and the most used first. A sequence
+shape (`sh:path ( p q )`) describes the values of `q` at the blank nodes that `p` leads to,
+when those blank nodes have no drafted class and `p` has a node kind of `sh:BlankNode`. It
+reaches one level only. ShEx has no sequence paths, so the ShExC draft lists them in a
+comment. The references of `sh:node` may form cycles, and the draft says so in a comment,
+since both validators handle recursion. At
 `support=1`, the default, the current data conforms to the draft. Below 1, each drafted
 constraint reports how many instances it excludes, and the best candidate that missed
 the threshold is listed as rejected with the same counts.
@@ -1338,6 +1372,7 @@ the threshold is listed as rejected with the same counts.
 | `minInstances` | `1` | Skip classes with fewer instances. |
 | `maxIn` | `10` | The largest `sh:in` list, at most 64. `0` drafts none. |
 | `maxCount` | `1` | The largest `sh:maxCount` drafted. `0` drafts none. |
+| `maxInverse` | `10` | The most inverse property shapes drafted per class, at most 1000. `0` drafts none. |
 | `closed` | `false` | Draft closed shapes, with `sh:ignoredProperties ( rdf:type )`. |
 | `base` | `urn:x-sparkles:shape:<ds>:` | The namespace of the shape IRIs. |
 | `format` | `json` | `json`, `turtle` (the SHACL shapes), `shaclc` (the SHACL shapes in the compact syntax) or `shexc` (the ShEx schema). `Accept: text/turtle`, `Accept: text/shaclc` and `Accept: text/shex` choose them too. |
@@ -1345,37 +1380,42 @@ the threshold is listed as rejected with the same counts.
 
 ```ts
 type ShapesDraft = {
-  draftFormat: 1; dataset: string;
+  draftFormat: 2; dataset: string;
   snapshot: { version: number; generation: string; computedAt: string };
   selection: { graph: string; reasoning: boolean };
   options: { support: number; minInstances: number; maxIn: number; maxCount: number;
-             closed: boolean; base: string; classes: string[] };
+             maxInverse: number; closed: boolean; base: string; classes: string[] };
   totals: { shapes: number; propertyShapes: number; constraints: number; rejected: number;
             skippedClasses: number };
   shapes: { shape: string; class: string; instances: number; closed: boolean;
-            properties: { path: string; instances: number; maxValues: number;
+            properties: { path: string; inverse?: boolean; then?: string;  // then: a sequence p/q
+                          instances: number; maxValues: number;
                           constraints: Constraint[]; rejected: Constraint[] }[] }[];
   shacl: string;      // the shapes graph in Turtle, with the counts as comments
   shaclc: string;     // the same shapes in SHACLC, with the counts as comments
   shex: string;       // the ShEx schema in ShExC
   shapeMap: string;   // {FOCUS rdf:type <C>}@<shape>, … for the ShEx schema
 };
-type Constraint = { component: "minCount" | "maxCount" | "nodeKind" | "datatype" | "class"
-                               | "in" | "languageIn" | "uniqueLang";
-                    value: number | string | string[] | boolean;  // terms in N-Triples syntax
+type Constraint = { component: "minCount" | "maxCount" | "nodeKind" | "datatype" | "or" | "class"
+                               | "node" | "in" | "languageIn" | "uniqueLang" | "pattern"
+                               | "minInclusive" | "maxInclusive";
+                    // `or` lists datatype IRIs, `node` a shape IRI, `pattern` a regular
+                    // expression, the bounds a term in N-Triples syntax
+                    value: number | string | string[] | boolean;
                     applicable: number; satisfied: number; excluded: number };
 ```
 
 The ShEx schema carries the same constraints. ShEx applies no RDFS, so its class tests
 list the class and its subclasses, `EXTRA rdf:type { rdf:type [ex:C ex:Sub] + }`, and
 the shape map selects the direct instances of each class. `sh:uniqueLang` has no ShEx
-counterpart and is left out of it. The draft reads only the graphs the caller may read,
+counterpart and is left out of it, and so are date ranges, since ShEx has numeric facets
+only. `sh:node` is `@<shape>` in ShEx, and `sh:or` of datatypes is `(A OR B)`. The draft reads only the graphs the caller may read,
 and the errors are those of `/$/schema/{ds}`. Installing a draft is a separate step: send
 the Turtle to `PUT /$/validation/{ds}` with `mode: "warn"`, or use the schema browser's
 **Draft shapes** dialog.
 
 `sparkles schema --loc DB --draft-shapes [--support S] [--closed] [--max-in N]
-[--max-count N] [--class IRI]… [--min-instances N] [--with-inferences]
+[--max-count N] [--max-inverse N] [--class IRI]… [--min-instances N] [--with-inferences]
 [--format turtle|shexc|json]` prints the draft, and the MCP tool `draft_shapes` returns
 it to an agent. The Rust API is `sparkles::schema::draft_shapes`.
 
@@ -6815,6 +6855,13 @@ the shapes graph in the request body, with Fuseki's semantics:
   `sh:memberShape` result has one `sh:detail` per member that does not conform, holding
   that member's results against the member shape. A `sh:uniqueMembers true` result has one
   `sh:detail` per repeated member, with the member as `sh:value`.
+* **Node expressions** are read in targets, `sh:values`,
+  `sh:defaultValue`, `sh:deactivated`, `sh:expression` and `sh:nodeByExpression`. One
+  evaluation may take at most 16,777,216 units of work, where each evaluation of a
+  sub-expression is a unit and so is each node that a concatenation or a mapping appends.
+  The nodes that a read of the data returns are not counted. A shared sub-expression counts
+  each time it is evaluated, so an expression graph that doubles at every level fails
+  quickly. The limit is fixed for requests, and the timeout also stops an evaluation.
 * **Budgets.** The report is bounded like a query result. It fails with `507` and
   `budget: "result-bytes"` once it holds more results than fit in `--max-result-mb` at 48
   bytes each, or in `--query-memory-mb` at an estimated 512 bytes each. It also fails once
@@ -8758,7 +8805,7 @@ open-world when SERVICE is allowed. The common arguments are:
 | `list_datasets` | none | `{datasets: [{name, quads, commit, modified, reasoning: null\|{profile, stale}, textSearch, writable, graphql?}], limits: {defaultMaxRows, maxRows, defaultMaxBytes, maxBytes, defaultTimeoutSeconds, maxTimeoutSeconds, service, updates}}`. `graphql: true` marks a dataset that `graphql_query` reads. |
 | `describe_schema` | `section` (`summary`\|`classes`\|`predicates`\|`constraints`\|`profiles`), `graph` (`default`\|`union`\|IRI), `includeBuiltin`, `limit` (1–500; 25 for the summary, 100 for lists), `cursor`, `subjectClasses`, `shapes`, `classes` (IRIs, with `profiles`) | `{dataset, commit, graph, reasoning, section, totals: {triples, classes, predicates}, builtinClassesHidden, ontology?, roots?, classes?: [{iri, label?, instances, declared, superClasses?, superClassExpressions?}], predicates?: [{iri, label?, triples, distinctSubjects, distinctObjects, maxPerSubject, objects: ["iri 120", "xsd:string 98", "rdf:langString@en,de 12", …], domains?, ranges?, vector?, subjectClasses?: ["ex:Person 120", …, "untyped 3"]}], constraints?: [{source, graphs, mode?, threshold?, classes: [{class, closed?, properties: [{path, constraints: "min 1 · max 1 · datatype xsd:string", enforcement}]}]}], next, prefixes}`. The summary lists the largest classes and predicates. `classes` and `predicates` page through all entries in IRI order. `subjectClasses: true` adds the ten classes of each predicate's subjects with the most triples. `constraints` lists the [constraints layer](#constraints-layer), from the write-time SHACL validation or from the sources in `shapes`. `profiles` lists the [class profiles](#class-profiles) of the classes with the most instances, or of those in `classes`: `profiles: [{class, instances, properties: [{predicate, instances, triples, valuesPerInstance: "1..2", objects: {iri?, "xsd:string"?: n, …}, objectClasses?}], incoming}]`, with at most 25 properties and 10 incoming predicates per class. |
 | `diff_schema` | `from` (a commit, or `time:…` / `snapshot:…`), `to` (the head), `graph`, `reasoning`, `limit` (50, at most 500 entries per list), `timeoutSeconds` | `{dataset, from, to, graph, reasoning, counts, report: [Change], classes: {added: [iri], removed: [iri], changed: [{iri, changes: [Change]}]}, predicates: {…}, truncated, prefixes}`: the [schema diff](#schema-diffs) between two readable states. `404` for a commit beyond the head and `410` for one whose history is gone. |
-| `draft_shapes` | `graph`, `language` (`shacl`\|`shex`), `shapesFormat` (`turtle`\|`shaclc`, for SHACL), `support` (1), `classes` (IRIs), `minInstances` (1), `maxIn` (10), `maxCount` (1), `closed` (false), `timeoutSeconds` (30). `reasoning` defaults to false here. | `{dataset, commit, graph, support, language, totals, shapes: [{class, shape, instances, properties, constraints, excluding: [{path, component, excluded}]}], shapesFormat?, shacl? \| shex?, shapeMap?}`: the [drafted shapes](#drafted-shapes) of the caller's visible graphs, as SHACL in Turtle or SHACLC, or as ShExC with its shape map. `excluding` lists the constraints that reject existing instances. Nothing is installed. |
+| `draft_shapes` | `graph`, `language` (`shacl`\|`shex`), `shapesFormat` (`turtle`\|`shaclc`, for SHACL), `support` (1), `classes` (IRIs), `minInstances` (1), `maxIn` (10), `maxCount` (1), `maxInverse` (10), `closed` (false), `timeoutSeconds` (30). `reasoning` defaults to false here. | `{dataset, commit, graph, support, language, totals, shapes: [{class, shape, instances, properties, constraints, excluding: [{path, component, excluded}]}], shapesFormat?, shacl? \| shex?, shapeMap?}`: the [drafted shapes](#drafted-shapes) of the caller's visible graphs, as SHACL in Turtle or SHACLC, or as ShExC with its shape map. `excluding` lists the constraints that reject existing instances. Nothing is installed. |
 | `sparql_query` | `query` (required), `format` (`table`\|`json`), `maxRows` (100), `maxBytes` (65536), `maxTermChars` (500), `offset`, `exactTotal` (true), `timeoutSeconds` (30) | One text block: a table or a JSON document (below). No `structuredContent`. |
 | `explain_query` | `query` (required), `includeAlgebra`, `profile`, `notes`, `timeoutSeconds`, `useServerModel` | `{dataset, commit, queryType, estimatedRows, plan, planTruncated?, algebra?, warnings: [{code, message}]}`. `plan` has one line per operator, `<operator> <description> est=<rows> [<columns>]`, indented by depth. With `profile: "run"`, the query runs read-only under `timeoutSeconds` (30 by default), its rows are counted in `rows` without being returned, and a run that a budget stopped is explained from its partial plan with the budget in `error`. With `notes: true`, each line starts with the node id and adds `act=` and `ms=` after a run, and the result adds `nodes`, `notes` and `asks` as `POST /{ds}/sparql/explain` defines them, with `source: "template"`. The tool never calls the server's model providers unless `useServerModel` is `true`, which needs the `serverModels` permission and fails with `server-model-not-allowed` otherwise. Its prose then replaces `asks` and the notes' text with `source: "model"`, and its tokens are charged to the caller. The warnings are `unknown-term` (a constant IRI or literal of a triple pattern that the dataset does not contain), `no-limit` (no top-level LIMIT, and over 10,000 rows estimated), `large-estimate` (an intermediate result over 50M rows) and `service-disabled`. For a caller whose graph grants or triple protections hide data, `unknown-term` looks terms up in the caller's view, so a term that occurs only in hidden data is reported as an absent one is. Such a caller sees no estimates, so `estimatedRows` is `null`, the plan shows `est=?`, there is no `large-estimate`, and `no-limit` applies to every query without a LIMIT. |
 | `describe_resource` | `iri` (required), `direction` (`both`\|`outgoing`\|`incoming`), `maxTriples` (50 per direction, ≤ 500), `lang` (`en`), `mode` (`cbd`\|`scbd`\|`outgoing`) | `{dataset, commit, iri, exists, label?, types, outgoing?, incoming?, description?, prefixes}`. Each side is `{total, predicates: [{p, count}], predicatesTotal, triples: [{p, o, oLabel?}` or `{s, sLabel?, p}], truncated}`. Triples are sampled round-robin by predicate, so a hub's largest predicate does not hide the others. With `mode`, `description` is `{mode, triples: ["s p o"], truncated}`: the resource's [DESCRIBE](#describe) in that mode, at most `maxTriples` triples. |

@@ -926,7 +926,7 @@ impl Serialize for NativeJson<'_> {
                 plan: &r.plan,
                 memory: NativeMemory {
                     peak_bytes: r.mem_peak_bytes,
-                    granted_bytes: r.ctx.grant.as_ref().map(|g| g.peak()),
+                    granted_bytes: r.ctx.grant().map(|g| g.peak()),
                 },
                 rows_produced: r.rows_produced,
                 commit: self.metadata.as_ref().map(|m| m.commit),
@@ -1225,7 +1225,7 @@ pub fn sparkles_json(r: &QueryResult, send: Option<usize>) -> J {
     }
     let mut memory = json!({ "peakBytes": r.mem_peak_bytes });
     // the most the query held of the server's memory pool
-    if let Some(g) = &r.ctx.grant {
+    if let Some(g) = r.ctx.grant() {
         memory["grantedBytes"] = json!(g.peak());
     }
     out.insert(

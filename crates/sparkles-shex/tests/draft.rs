@@ -9,7 +9,7 @@ use sparkles_shex::{NoImports, ResultMap, ShapeMap, Status, ValidateOptions};
 
 #[path = "../../sparkles-shacl/tests/draft_fixture/mod.rs"]
 mod draft_fixture;
-use draft_fixture::{EX, fixture, random_data, store};
+use draft_fixture::{EX, extended, fixture, random_data, store};
 
 fn draft(s: &Store, support: f64, closed: bool) -> ShapesDraft {
     let o = DraftOptions {
@@ -95,4 +95,37 @@ fn lower_support_fails_only_excluded_instances() {
     // the misspelt status fails the person shape
     assert!(r.results.iter().any(|x| x.status == Status::Nonconformant
         && x.node.to_string() == format!("<{EX}p7>")));
+}
+
+/// Alternative datatypes, inverse constraints, patterns, ranges and references to the
+/// shape of a class, in ShExC: every association of the draft's shape map conforms.
+#[test]
+fn richer_drafts_conform() {
+    let s = store(&extended());
+    for closed in [false, true] {
+        let d = draft(&s, 1.0, closed);
+        let r = validate(&s, &d);
+        let bad: Vec<_> = r
+            .results
+            .iter()
+            .filter(|x| x.status == Status::Nonconformant)
+            .map(|x| format!("{} @ {:?}: {:?}", x.node, x.shape, x.reason))
+            .collect();
+        assert!(r.conforms, "closed={closed}: {bad:#?}\n{}", d.shex);
+    }
+    let d = draft(&s, 1.0, false);
+    assert!(
+        d.shex.contains("(xsd:decimal OR xsd:integer)"),
+        "{}",
+        d.shex
+    );
+    assert!(d.shex.contains("^ex:team"), "{}", d.shex);
+    assert!(d.shex.contains("/^[A-Z]{2}[0-9]{4}$/"), "{}", d.shex);
+    assert!(d.shex.contains("MININCLUSIVE 10"), "{}", d.shex);
+    assert!(d.shex.contains("@shape:OrgShape"), "{}", d.shex);
+    assert!(
+        d.shex.contains("a sequence path has no ShEx counterpart"),
+        "{}",
+        d.shex
+    );
 }

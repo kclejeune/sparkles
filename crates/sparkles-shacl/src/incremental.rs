@@ -27,6 +27,7 @@
 //! reference cycle (recursive shapes).
 
 use crate::data::DataGraph;
+use crate::nodeexpr::{Expr, ExprId};
 use crate::path::{CPath, PropertyPath};
 use crate::shapes::{Candidates, Constraint, ShapeId, Shapes, Target};
 use crate::vocab::{rdf, rdfs};
@@ -47,7 +48,7 @@ pub enum Fallback {
     /// have too many instances
     Subclass,
     /// a shape has a SHACL-SPARQL constraint or component whose query is not anchored at
-    /// the focus node
+    /// the focus node, or a node expression that reads the graph away from it
     Sparql,
     /// a shape reaches a reference cycle
     Recursive,
@@ -171,11 +172,18 @@ pub struct Model {
 /// references fan out that far is better served by a full validation).
 const MAX_DEPS: usize = 4096;
 
+/// The most steps the analysis of one shape's expressions may take. A shared expression
+/// is walked once per path that reaches it, so a graph that doubles at every level would
+/// otherwise take exponential time while the guard is installed.
+const MAX_EXPR_STEPS: usize = 100_000;
+
 struct Analyzer<'a> {
     shapes: &'a Shapes,
     memo: Vec<Option<Result<Vec<Dep>, Fallback>>>,
     on_stack: Vec<bool>,
     uses_classes: bool,
+    /// steps of `expr_deps` taken for the shape being analyzed
+    expr_steps: usize,
 }
 
 impl Analyzer<'_> {
@@ -195,7 +203,10 @@ impl Analyzer<'_> {
             return Err(Fallback::Recursive);
         }
         self.on_stack[si] = true;
+        // the walk of this shape must not refresh the budget of the walk that reached it
+        let saved = std::mem::replace(&mut self.expr_steps, 0);
         let r = self.compute(si);
+        self.expr_steps = saved;
         self.on_stack[si] = false;
         self.memo[si] = Some(r.clone());
         r
@@ -203,6 +214,7 @@ impl Analyzer<'_> {
 
     fn compute(&mut self, si: ShapeId) -> Result<Vec<Dep>, Fallback> {
         let shape = &self.shapes.shapes[si];
+        self.expr_steps = 0;
         let mut out: Vec<Dep> = Vec::new();
         if shape.deactivated {
             // a deactivated shape conforms without reading anything
@@ -219,8 +231,36 @@ impl Analyzer<'_> {
                 });
             }
         }
+        // the value nodes may include the nodes `sh:values` and `sh:defaultValue` compute;
+        // `None`: some of them are not reached from the focus node
+        let mut anchored_values = true;
+        let mut value_prefix: Vec<PropertyPath> = path.clone();
+        if let Some(e) = shape.deactivated_expr {
+            self.expr_deps(e, &Some(Vec::new()), &None, &mut out)?;
+        }
+        if shape.values.is_some() || shape.default_value.is_some() {
+            let mut reaches = vec![Some(path.clone())];
+            for e in [shape.values, shape.default_value].into_iter().flatten() {
+                reaches.push(self.expr_deps(
+                    e,
+                    &Some(Vec::new()),
+                    &Some(path.clone()),
+                    &mut out,
+                )?);
+            }
+            match alt(reaches) {
+                Some(p) => value_prefix = p,
+                None => anchored_values = false,
+            }
+        }
+        let path_for_values = value_prefix;
+        // where an expression finds the variable `value`: the value nodes, when each is
+        // reached over the path
+        let value_pre: Pre = anchored_values.then(|| path_for_values.clone());
+        // only `sh:class` and `sh:closed` read the graph at the value nodes, and both
+        // check `anchored_values` first
         let at_values = |pred: Option<NamedNode>| Dep {
-            prefix: path.clone(),
+            prefix: path_for_values.clone(),
             pred,
             dir: Dir::Out,
         };
@@ -229,7 +269,7 @@ impl Analyzer<'_> {
         let mut members: Vec<ShapeId> = Vec::new();
         // a list constraint reads `rdf:first` and `rdf:rest` along each value node's list
         let along_lists = || {
-            let mut prefix = path.clone();
+            let mut prefix = path_for_values.clone();
             prefix.push(PropertyPath::ZeroOrMore(Box::new(PropertyPath::Predicate(
                 rdf::REST.into_owned(),
             ))));
@@ -239,6 +279,9 @@ impl Analyzer<'_> {
         for c in &shape.constraints {
             match c {
                 Constraint::Class(_) => {
+                    if !anchored_values {
+                        return Err(Fallback::Sparql);
+                    }
                     self.uses_classes = true;
                     out.push(at_values(Some(rdf::TYPE.into_owned())));
                 }
@@ -254,7 +297,24 @@ impl Analyzer<'_> {
                         });
                     }
                 }
-                Constraint::Closed { .. } => out.push(at_values(None)),
+                Constraint::Closed { .. } => {
+                    if !anchored_values {
+                        return Err(Fallback::Sparql);
+                    }
+                    out.push(at_values(None));
+                }
+                Constraint::Expression(e) => {
+                    self.expr_deps(*e, &Some(Vec::new()), &value_pre, &mut out)?;
+                }
+                // the shapes an expression computes are known only for a constant
+                Constraint::NodeByExpression(e) => match &self.shapes.exprs[*e] {
+                    Expr::Const(t) => {
+                        if let Some(&s) = self.shapes.by_node.get(self.shapes.term(*t)) {
+                            nested.push(s);
+                        }
+                    }
+                    _ => return Err(Fallback::Sparql),
+                },
                 Constraint::Not(s) | Constraint::Node(s) | Constraint::Property(s) => {
                     nested.push(*s)
                 }
@@ -274,8 +334,12 @@ impl Analyzer<'_> {
                 Constraint::Component(c) => {
                     let mut anchors = vec![("this", Vec::new())];
                     if c.ask {
-                        // `$value` is each value node
-                        anchors.push(("value", path.clone()));
+                        // `$value` is each value node, which a computed one is not
+                        // reached over the path
+                        if !anchored_values {
+                            return Err(Fallback::Sparql);
+                        }
+                        anchors.push(("value", path_for_values.clone()));
                     }
                     let reads =
                         crate::localize::reads(&c.parsed, &anchors).ok_or(Fallback::Sparql)?;
@@ -307,6 +371,10 @@ impl Analyzer<'_> {
             }
         }
         if lists {
+            // the lists hang off each value node
+            if !anchored_values {
+                return Err(Fallback::Sparql);
+            }
             for p in [rdf::FIRST, rdf::REST] {
                 out.push(Dep {
                     prefix: along_lists(),
@@ -318,6 +386,9 @@ impl Analyzer<'_> {
         // a member shape is evaluated at each member of each value node
         for s in members {
             for d in self.deps(s)? {
+                if !anchored_values {
+                    return Err(Fallback::Sparql);
+                }
                 let mut prefix = along_lists();
                 prefix.push(PropertyPath::Predicate(rdf::FIRST.into_owned()));
                 prefix.extend(d.prefix);
@@ -330,7 +401,10 @@ impl Analyzer<'_> {
         // a referenced shape is evaluated at each value node
         for s in nested {
             for d in self.deps(s)? {
-                let mut prefix = path.clone();
+                if !anchored_values {
+                    return Err(Fallback::Sparql);
+                }
+                let mut prefix = path_for_values.clone();
                 prefix.extend(d.prefix);
                 out.push(Dep { prefix, ..d });
             }
@@ -341,6 +415,185 @@ impl Analyzer<'_> {
         let mut seen = FxHashSet::default();
         out.retain(|d| seen.insert(d.clone()));
         Ok(out)
+    }
+}
+
+/// A prefix from the focus node to the nodes a part of a shape reaches; `None`: the
+/// nodes are constants or computed, not reached from the focus node.
+type Pre = Option<Vec<PropertyPath>>;
+
+/// The union of several reaches (`None` when one of them is not anchored).
+fn alt(rs: Vec<Pre>) -> Pre {
+    let mut seqs: Vec<Vec<PropertyPath>> = Vec::new();
+    for r in rs {
+        let r = r?;
+        if !seqs.contains(&r) {
+            seqs.push(r);
+        }
+    }
+    match seqs.len() {
+        0 => None,
+        1 => seqs.pop(),
+        _ => Some(vec![PropertyPath::Alternative(
+            seqs.into_iter().map(PropertyPath::Sequence).collect(),
+        )]),
+    }
+}
+
+impl Analyzer<'_> {
+    /// The reads of the node expression `e`, evaluated at the focus node that the prefix
+    /// `base` reaches from the shape's focus node (`None`: an unanchored node), and the
+    /// prefix that reaches its output nodes. `value` is the prefix of the nodes the
+    /// variable `value` holds. An expression that reads the graph at an unanchored node,
+    /// or finds nodes by what they are (instances, nodes matching a shape), is not
+    /// localized.
+    fn expr_deps(
+        &mut self,
+        e: ExprId,
+        base: &Pre,
+        value: &Pre,
+        out: &mut Vec<Dep>,
+    ) -> Result<Pre, Fallback> {
+        let shapes = self.shapes;
+        self.expr_steps += 1;
+        if self.expr_steps > MAX_EXPR_STEPS {
+            return Err(Fallback::Budget);
+        }
+        if out.len() > MAX_DEPS {
+            // repeated reads of one path are one dependency
+            let mut seen = FxHashSet::default();
+            out.retain(|d| seen.insert(d.clone()));
+            if out.len() > MAX_DEPS {
+                return Err(Fallback::Budget);
+            }
+        }
+        let anchored = |at: &Pre| at.clone().ok_or(Fallback::Sparql);
+        match &shapes.exprs[e] {
+            Expr::Const(_) | Expr::Empty | Expr::List(_) => Ok(None),
+            Expr::Var(n) => Ok(match n.as_str() {
+                "focusNode" => base.clone(),
+                "value" => value.clone(),
+                _ => None,
+            }),
+            Expr::PathValues { path, focus } => {
+                let start = match focus {
+                    None => base.clone(),
+                    Some(f) => self.expr_deps(*f, base, value, out)?,
+                };
+                let start = anchored(&start)?;
+                let p = nnf(path, false);
+                for (prefix, pred, dir) in steps(&p) {
+                    let mut full = start.clone();
+                    full.extend(prefix);
+                    out.push(Dep {
+                        prefix: full,
+                        pred: Some(pred),
+                        dir,
+                    });
+                }
+                let mut reach = start;
+                reach.push(p);
+                Ok(Some(reach))
+            }
+            Expr::Exists(x) | Expr::Count(x) | Expr::Min(x) | Expr::Max(x) | Expr::Sum(x) => {
+                self.expr_deps(*x, base, value, out)?;
+                Ok(None)
+            }
+            Expr::Distinct(x) | Expr::Limit { nodes: x, .. } | Expr::Offset { nodes: x, .. } => {
+                self.expr_deps(*x, base, value, out)
+            }
+            Expr::If { cond, then, els } => {
+                self.expr_deps(*cond, base, value, out)?;
+                let mut rs = Vec::new();
+                for b in [then, els].into_iter().flatten() {
+                    rs.push(self.expr_deps(*b, base, value, out)?);
+                }
+                Ok(alt(rs))
+            }
+            Expr::Intersection(xs) | Expr::Concat(xs) => {
+                let mut rs = Vec::new();
+                for x in xs {
+                    rs.push(self.expr_deps(*x, base, value, out)?);
+                }
+                Ok(alt(rs))
+            }
+            Expr::Remove { nodes, remove } => {
+                self.expr_deps(*remove, base, value, out)?;
+                self.expr_deps(*nodes, base, value, out)
+            }
+            Expr::FilterShape { nodes, shape } => {
+                let r = self.expr_deps(*nodes, base, value, out)?;
+                self.shape_at(*shape, &r, out)?;
+                Ok(r)
+            }
+            Expr::OrderBy { nodes, by, .. } => {
+                let r = self.expr_deps(*nodes, base, value, out)?;
+                self.expr_deps(*by, &r, value, out)?;
+                Ok(r)
+            }
+            Expr::FlatMap { nodes, map } => {
+                let r = match nodes {
+                    Some(n) => self.expr_deps(*n, base, value, out)?,
+                    None => base.clone(),
+                };
+                self.expr_deps(*map, &r, value, out)
+            }
+            Expr::FindFirst { nodes, shape } | Expr::MatchAll { nodes, shape } => {
+                let r = match nodes {
+                    Some(n) => self.expr_deps(*n, base, value, out)?,
+                    None => base.clone(),
+                };
+                self.shape_at(*shape, &r, out)?;
+                Ok(if matches!(shapes.exprs[e], Expr::FindFirst { .. }) {
+                    r
+                } else {
+                    None
+                })
+            }
+            Expr::ConformsToShape { node, shape } => {
+                let r = self.expr_deps(*node, base, value, out)?;
+                match &shapes.exprs[*shape] {
+                    Expr::Const(t) => {
+                        if let Some(&s) = shapes.by_node.get(shapes.term(*t)) {
+                            self.shape_at(s, &r, out)?;
+                        }
+                        Ok(None)
+                    }
+                    _ => Err(Fallback::Sparql),
+                }
+            }
+            Expr::SparqlFn { args, .. } => {
+                for a in args {
+                    self.expr_deps(*a, base, value, out)?;
+                }
+                Ok(None)
+            }
+            Expr::Select(q) | Expr::SparqlExpr(q) => {
+                let at = anchored(base)?;
+                let reads =
+                    crate::localize::reads(&q.query, &[("this", at)]).ok_or(Fallback::Sparql)?;
+                out.extend(reads.into_iter().map(Dep::from));
+                Ok(None)
+            }
+            Expr::InstancesOf(_) | Expr::NodesMatching(_) | Expr::Custom { .. } | Expr::Arg(_) => {
+                Err(Fallback::Sparql)
+            }
+        }
+    }
+
+    /// The reads of shape `si` evaluated at the nodes `at` reaches.
+    fn shape_at(&mut self, si: ShapeId, at: &Pre, out: &mut Vec<Dep>) -> Result<(), Fallback> {
+        let deps = self.deps(si)?;
+        if deps.is_empty() {
+            return Ok(());
+        }
+        let at = at.clone().ok_or(Fallback::Sparql)?;
+        for d in deps {
+            let mut prefix = at.clone();
+            prefix.extend(d.prefix);
+            out.push(Dep { prefix, ..d });
+        }
+        Ok(())
     }
 }
 
@@ -411,6 +664,7 @@ impl Model {
             memo: vec![None; n],
             on_stack: vec![false; n],
             uses_classes: false,
+            expr_steps: 0,
         };
         let mut plans = vec![None; n];
         let mut reads: Option<FxHashSet<NamedNode>> = Some(FxHashSet::default());
@@ -425,6 +679,16 @@ impl Model {
                     for t in &shape.targets {
                         let (pred, dir) = match *t {
                             Target::Node(_) => continue,
+                            // a target expression that reads the data graph is not
+                            // localized; one that computes constants reads nothing
+                            Target::Expr(e) => {
+                                a.expr_steps = 0;
+                                if let Err(f) = a.expr_deps(e, &None, &None, &mut Vec::new()) {
+                                    global = Some(f);
+                                    break;
+                                }
+                                continue;
+                            }
                             // membership reads what conformance to the shape reads, and
                             // being a node of the data graph reads every edge of the node
                             Target::Where(w) => {
@@ -748,6 +1012,33 @@ mod tests {
         ));
         assert!(matches!(plan_of(&s, &m, "http://ex.org/Z"), Plan::Local(_)));
         assert!(m.reads.is_none());
+    }
+
+    /// Each target expression below takes about 65,000 steps to walk, and the two of them
+    /// together take more than the budget of one analysis. The budget is per expression, so
+    /// the shape stays localized.
+    #[test]
+    fn each_target_expression_has_its_own_step_budget() {
+        let mut ttl = String::from("@prefix shnex: <http://www.w3.org/ns/shacl-node-expr#> .\n");
+        ttl.push_str("_:e1 shnex:concat ( ex:k ex:k ) .\n");
+        for i in 2..=15 {
+            ttl.push_str(&format!(
+                "_:e{i} shnex:concat ( _:e{} _:e{} ) .\n",
+                i - 1,
+                i - 1
+            ));
+        }
+        ttl.push_str(
+            "ex:S a sh:NodeShape ; sh:property [ sh:path ex:p ; sh:minCount 1 ] ;
+               sh:targetNode [ shnex:concat ( _:e15 ) ] ,
+                             [ shnex:concat ( _:e15 ex:z ) ] .",
+        );
+        let (s, m) = model(&ttl);
+        assert!(
+            matches!(plan_of(&s, &m, "http://ex.org/S"), Plan::Local(_)),
+            "{:?}",
+            plan_of(&s, &m, "http://ex.org/S")
+        );
     }
 
     #[test]

@@ -172,6 +172,7 @@ fn property(shapes: &Shapes, ps: ShapeId, checked: Checked) -> Option<PropertyCo
     let severity = shape.severity.as_str().to_string();
     let mut p = PropertyConstraint {
         path: path.as_str().to_string(),
+        inverse: false,
         shape: match &shape.node {
             Term::NamedNode(n) => Some(n.as_str().to_string()),
             _ => None,
@@ -183,6 +184,7 @@ fn property(shapes: &Shapes, ps: ShapeId, checked: Checked) -> Option<PropertyCo
         datatype: None,
         class: Vec::new(),
         node_kind: None,
+        values: Vec::new(),
         other: Vec::new(),
     };
     let mut other = BTreeSet::new();

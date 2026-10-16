@@ -1415,7 +1415,12 @@ impl Store {
         }
         self.switch_geo_locked(&mut new_snap, &view, geo);
         let quads = new_snap.len();
-        self.current.store(Arc::new(new_snap));
+        let published = Arc::new(new_snap);
+        self.current.store(published.clone());
+        if let Some(g) = self.guard() {
+            g.rekey(&view, &published);
+        }
+        drop(published);
         self.commits.send_replace(view.commit);
         self.vectors_switched(&view);
         self.compaction.rebased(base.seq, cu.oldest_ms);

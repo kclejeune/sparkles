@@ -27,11 +27,19 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use patterns::{PatNames, RangeAcc, Span};
+
 /// Version of the JSON shape of [`ShapesDraft`].
-pub const DRAFT_FORMAT: u32 = 1;
+pub const DRAFT_FORMAT: u32 = 2;
 
 /// Default largest `sh:in` list.
 pub const DEFAULT_MAX_IN: usize = 10;
+
+/// Default most inverse property shapes drafted per class.
+pub const DEFAULT_MAX_INVERSE: usize = 10;
+
+/// The most inverse property shapes per class a draft may ask for.
+pub const MAX_INVERSE_LIMIT: usize = 1000;
 
 /// Default largest `sh:maxCount` drafted.
 pub const DEFAULT_MAX_COUNT: u64 = 1;
@@ -45,6 +53,7 @@ const TRACKED_SETS: usize = 4096;
 
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 const RDFS_SUBCLASS_OF: &str = "http://www.w3.org/2000/01/rdf-schema#subClassOf";
+const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 const RDF_LANG_STRING: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString";
 const XSD_BOOLEAN: &str = "http://www.w3.org/2001/XMLSchema#boolean";
 const SH: &str = "http://www.w3.org/ns/shacl#";
@@ -83,6 +92,8 @@ pub struct DraftOptions {
     pub max_in: usize,
     /// The largest `sh:maxCount` drafted (0: none).
     pub max_count: u64,
+    /// The most inverse property shapes drafted per class (0: none).
+    pub max_inverse: usize,
     /// Draft closed shapes (`sh:closed`, ShEx `CLOSED`).
     pub closed: bool,
     /// The namespace of the shape IRIs (see [`default_base`]).
@@ -104,6 +115,7 @@ impl Default for DraftOptions {
             min_instances: 1,
             max_in: DEFAULT_MAX_IN,
             max_count: DEFAULT_MAX_COUNT,
+            max_inverse: DEFAULT_MAX_INVERSE,
             closed: false,
             base: default_base("data"),
             prefixes: Vec::new(),
@@ -118,8 +130,10 @@ impl Default for DraftOptions {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConstraintDraft {
-    /// `minCount`, `maxCount`, `nodeKind`, `datatype`, `class`, `in`, `languageIn` or
-    /// `uniqueLang` (the SHACL constraint component without its namespace and suffix).
+    /// `minCount`, `maxCount`, `nodeKind`, `datatype`, `or` (alternative datatypes),
+    /// `class`, `node` (the shape of the class), `in`, `languageIn`, `uniqueLang`,
+    /// `pattern`, `minInclusive` or `maxInclusive` (the SHACL constraint component
+    /// without its namespace and suffix).
     pub component: &'static str,
     pub value: ConstraintValue,
     pub applicable: u64,
@@ -127,22 +141,31 @@ pub struct ConstraintDraft {
     pub excluded: u64,
 }
 
-/// The value of a constraint: a count, an IRI, a list of terms in N-Triples syntax or of
-/// language tags, or a boolean.
+/// The value of a constraint: a count, an IRI, a term in N-Triples syntax (the bounds of a
+/// range), text (a pattern), a list of terms in N-Triples syntax, of datatype IRIs (`or`)
+/// or of language tags, or a boolean.
 #[derive(Clone, Debug, Serialize, PartialEq)]
 #[serde(untagged)]
 pub enum ConstraintValue {
     Count(u64),
     Iri(String),
+    Term(String),
+    Text(String),
     List(Vec<String>),
     Bool(bool),
 }
 
-/// A property shape: one predicate of a class.
+/// A property shape: one predicate of a class, the inverse of one (`inverse`: the values
+/// are the subjects that point at the instance), or a predicate followed by another
+/// (`then`: the values are those of `then` at the values of `path`).
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PropertyDraft {
     pub path: String,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub inverse: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub then: Option<String>,
     /// Instances of the class with at least one value.
     pub instances: u64,
     /// The largest number of distinct values of one instance.
@@ -171,6 +194,7 @@ pub struct DraftSettings {
     pub min_instances: u64,
     pub max_in: usize,
     pub max_count: u64,
+    pub max_inverse: usize,
     pub closed: bool,
     pub base: String,
     /// The requested classes (empty: every class).
@@ -245,6 +269,9 @@ struct ObjInfo {
     lang: u32,
     /// a well-formed literal
     valid: bool,
+    /// the skeleton + 1 and the prefix + 1 of a plain string (0: none)
+    skel: u32,
+    head: u32,
 }
 
 /// Datatypes and language tags, interned.
@@ -344,6 +371,15 @@ struct Acc {
     cls: FxHashMap<u32, u64>,
     values: Option<Sets<u64>>,
     langs: Option<Sets<u32>>,
+    /// the sets of datatypes of the instances' values (for alternatives)
+    dtsets: Option<Sets<u32>>,
+    /// every value so far is a plain string
+    strings: bool,
+    /// the skeletons and prefixes of the instances' strings
+    skels: Option<Sets<u32>>,
+    heads: Option<Sets<u32>>,
+    /// the spans of the instances' values (`None`: no range)
+    range: Option<RangeAcc>,
     /// instances with two tagged values
     multi_tagged: bool,
     /// instances with two values in one language
@@ -360,6 +396,11 @@ impl Acc {
             cls: FxHashMap::default(),
             values: Some(Sets::default()),
             langs: Some(Sets::default()),
+            dtsets: Some(Sets::default()),
+            strings: true,
+            skels: Some(Sets::default()),
+            heads: Some(Sets::default()),
+            range: Some(RangeAcc::default()),
             multi_tagged: false,
             dup_lang: 0,
         }
@@ -379,6 +420,18 @@ struct Summary {
     langs: Option<Vec<u32>>,
     tagged: usize,
     dup_lang: bool,
+    /// the sorted distinct datatypes of the values (`None`: a value that is not a
+    /// well-formed literal)
+    dts: Option<Vec<u32>>,
+    /// every value is a plain string
+    strings: bool,
+    /// the sorted distinct skeletons of the strings (`None`: a string with none)
+    skels: Option<Vec<u32>>,
+    /// the sorted distinct prefixes of the strings
+    heads: Vec<u32>,
+    /// the smallest and largest of the values (`None`: not all numbers or dates of one
+    /// kind)
+    span: Option<Span>,
 }
 
 impl Acc {
@@ -401,6 +454,33 @@ impl Acc {
             && !l.add(s.langs.as_deref())
         {
             self.langs = None;
+        }
+        if let Some(d) = &mut self.dtsets
+            && !d.add(s.dts.as_deref())
+        {
+            self.dtsets = None;
+        }
+        if s.strings {
+            if let Some(k) = &mut self.skels
+                && !k.add(s.skels.as_deref())
+            {
+                self.skels = None;
+            }
+            if let Some(h) = &mut self.heads
+                && !h.add(Some(s.heads.as_slice()))
+            {
+                self.heads = None;
+            }
+        } else {
+            self.strings = false;
+        }
+        match (&mut self.range, &s.span) {
+            (Some(r), Some(span)) => {
+                if !r.add(span) {
+                    self.range = None;
+                }
+            }
+            _ => self.range = None,
         }
         self.multi_tagged |= s.tagged >= 2;
         self.dup_lang += s.dup_lang as u64;
@@ -593,7 +673,7 @@ const INLINE_DT: [(Tag, &str); 6] = [
 ];
 
 /// The kind, datatype, language and well-formedness of a literal's key.
-fn literal_info(key: &[u8], dts: &mut Names, langs: &mut Names) -> ObjInfo {
+fn literal_info(key: &[u8], dts: &mut Names, langs: &mut Names, pat: &mut PatNames) -> ObjInfo {
     let suffix = literal_suffix(key);
     let (dt, lang) = match suffix.first() {
         None => (dts.get("http://www.w3.org/2001/XMLSchema#string"), 0),
@@ -610,15 +690,26 @@ fn literal_info(key: &[u8], dts: &mut Names, langs: &mut Names) -> ObjInfo {
         }
         Some(_) => (dts.get(&String::from_utf8_lossy(&suffix[1..])), 0),
     };
-    let valid = match crate::id::key_to_term(key) {
-        Term::Literal(l) => crate::xsd::is_valid(&l),
-        _ => false,
+    let (valid, skel, head) = match crate::id::key_to_term(key) {
+        Term::Literal(l) => {
+            let valid = crate::xsd::is_valid(&l);
+            let plain = lang == 0 && dts.names[dt as usize] == XSD_STRING;
+            let (skel, head) = if valid && plain {
+                pat.intern(l.value())
+            } else {
+                (0, 0)
+            };
+            (valid, skel, head)
+        }
+        _ => (false, 0, 0),
     };
     ObjInfo {
         kind: K_LIT,
         dt,
         lang,
         valid,
+        skel,
+        head,
     }
 }
 
@@ -631,6 +722,7 @@ fn object_infos(
     budget: &Budget,
     dts: &mut Names,
     langs: &mut Names,
+    pat: &mut PatNames,
 ) -> crate::Result<FxHashMap<u64, ObjInfo>> {
     let mut base: Vec<u64> = Vec::new();
     let mut delta: Vec<u64> = Vec::new();
@@ -658,14 +750,14 @@ fn object_infos(
         v.get_sorted(chunk, |payload, key| {
             out.insert(
                 Id::new(Tag::Vocab, payload).0,
-                literal_info(key, dts, langs),
+                literal_info(key, dts, langs, pat),
             );
         });
     }
     for o in delta {
         let info = match snap.key(Id(o)) {
             Some(k) => match k.first() {
-                Some(b'"') => literal_info(&k, dts, langs),
+                Some(b'"') => literal_info(&k, dts, langs, pat),
                 Some(b'<') => ObjInfo::of(K_IRI),
                 Some(b'_') => ObjInfo::of(K_BLANK),
                 Some(b'(') => ObjInfo::of(K_TRIPLE),
@@ -685,16 +777,24 @@ impl ObjInfo {
             dt: 0,
             lang: 0,
             valid: false,
+            skel: 0,
+            head: 0,
         }
     }
 }
 
-/// The interned datatypes of inline literal tags.
-struct InlineDts([u32; 6]);
+/// The interned datatypes of inline literal tags, and of `xsd:string`.
+struct InlineDts {
+    inline: [u32; 6],
+    string: u32,
+}
 
 impl InlineDts {
     fn new(dts: &mut Names) -> InlineDts {
-        InlineDts(INLINE_DT.map(|(_, d)| dts.get(d)))
+        InlineDts {
+            inline: INLINE_DT.map(|(_, d)| dts.get(d)),
+            string: dts.get(XSD_STRING),
+        }
     }
 }
 
@@ -709,9 +809,11 @@ fn info_of(
     if let Some(i) = INLINE_DT.iter().position(|(t, _)| *t == tag) {
         return ObjInfo {
             kind: K_LIT,
-            dt: inline.0[i],
+            dt: inline.inline[i],
             lang: 0,
             valid: true,
+            skel: 0,
+            head: 0,
         };
     }
     match tag {
@@ -743,6 +845,11 @@ fn summarize(
     let mut eligible = objs.len() <= TRACKED_VALUES;
     let mut langs: Vec<u32> = Vec::new();
     let mut untagged = false;
+    let mut dts: Option<Vec<u32>> = Some(Vec::new());
+    let mut strings = true;
+    let mut skels: Option<Vec<u32>> = Some(Vec::new());
+    let mut heads: Vec<u32> = Vec::new();
+    let mut span: Option<Option<Span>> = None; // None: unseen; Some(None): no range
     for &o in objs {
         let info = info_of(snap, o, infos, inline);
         mask |= info.kind;
@@ -752,6 +859,10 @@ fn summarize(
             Some(prev) if prev == this_dt => prev,
             Some(_) => None,
         });
+        match (this_dt, &mut dts) {
+            (Some(d), Some(v)) => v.push(d),
+            _ => dts = None,
+        }
         if info.kind & (K_IRI | K_BLANK) != 0 {
             let cs = types.set_of(o);
             classes = Some(match classes {
@@ -767,12 +878,44 @@ fn summarize(
         } else {
             untagged = true;
         }
+        // strings: skeletons and prefixes
+        if info.kind == K_LIT && info.valid && info.lang == 0 && info.dt == inline.string {
+            match (&mut skels, info.skel) {
+                (Some(v), k) if k > 0 => v.push(k - 1),
+                _ => skels = None,
+            }
+            if info.head > 0 {
+                heads.push(info.head - 1);
+            } else {
+                // an overflowed table: no pattern for the predicate
+                strings = false;
+            }
+        } else {
+            strings = false;
+        }
+        // ranges
+        let key = patterns::key_of(snap, Id(o));
+        span = Some(match (span, key) {
+            (None, Some(k)) => Some(Span::of(k, o)),
+            (Some(Some(mut sp)), Some(k)) => sp.add(k, o).then_some(sp),
+            _ => None,
+        });
     }
     let tagged = langs.len();
     langs.sort_unstable();
     let before = langs.len();
     langs.dedup();
     let dup_lang = langs.len() < before;
+    if let Some(v) = &mut dts {
+        v.sort_unstable();
+        v.dedup();
+    }
+    if let Some(v) = &mut skels {
+        v.sort_unstable();
+        v.dedup();
+    }
+    heads.sort_unstable();
+    heads.dedup();
     Summary {
         n: objs.len() as u64,
         mask,
@@ -786,6 +929,11 @@ fn summarize(
         langs: (!untagged).then_some(langs),
         tagged,
         dup_lang,
+        dts,
+        strings,
+        skels,
+        heads,
+        span: span.flatten(),
     }
 }
 
@@ -818,6 +966,7 @@ struct Ctx<'a> {
     iris: &'a [Option<String>],
     dts: &'a Names,
     langs: &'a Names,
+    pat: &'a PatNames,
     opts: &'a DraftOptions,
 }
 
@@ -832,6 +981,8 @@ fn decide(path: String, instances: u64, acc: &Acc, cx: &Ctx) -> PropertyDraft {
     let w = acc.with;
     let mut out = PropertyDraft {
         path,
+        inverse: false,
+        then: None,
         instances: w,
         max_values: acc.hist.keys().next_back().copied().unwrap_or(0),
         constraints: Vec::new(),
@@ -908,6 +1059,26 @@ fn decide(path: String, instances: u64, acc: &Acc, cx: &Ctx) -> PropertyDraft {
             constraint("datatype", ConstraintValue::Iri(d.clone()), w, *n),
         );
     }
+    // sh:or: the smallest set of up to three datatypes that enough instances stay within
+    let mut drafted_or = false;
+    if drafted_dt.is_none()
+        && let Some(sets) = &acc.dtsets
+    {
+        let order: Vec<u32> = sets.by_use().into_iter().map(|(v, _)| v).collect();
+        let cov = sets.covered(&order);
+        if let Some(k) = (2..=order.len().min(3)).find(|&k| passes(cov[k], w, s)) {
+            let mut names: Vec<String> = order[..k]
+                .iter()
+                .map(|d| cx.dts.names[*d as usize].clone())
+                .collect();
+            names.sort();
+            drafted_or = true;
+            push(
+                true,
+                constraint("or", ConstraintValue::List(names), w, cov[k]),
+            );
+        }
+    }
     // sh:nodeKind: the most specific kind that passes, else the one closest to passing
     let covered = |bits: u8| -> u64 {
         (1..16u8)
@@ -918,7 +1089,7 @@ fn decide(path: String, instances: u64, acc: &Acc, cx: &Ctx) -> PropertyDraft {
     let kinds: Vec<(&str, u64)> = NODE_KINDS.iter().map(|(n, b)| (*n, covered(*b))).collect();
     match kinds.iter().find(|(_, n)| passes(*n, w, s)) {
         Some((k, n)) => {
-            if !(*k == "Literal" && drafted_dt.is_some()) {
+            if !(*k == "Literal" && (drafted_dt.is_some() || drafted_or)) {
                 push(
                     true,
                     constraint("nodeKind", ConstraintValue::Iri(format!("{SH}{k}")), w, *n),
@@ -955,6 +1126,7 @@ fn decide(path: String, instances: u64, acc: &Acc, cx: &Ctx) -> PropertyDraft {
         );
     }
     // sh:in: the most used values, each used by two instances or more, up to max_in
+    let mut drafted_in = false;
     if cx.opts.max_in > 0
         && drafted_dt.as_deref() != Some(XSD_BOOLEAN)
         && let Some(sets) = &acc.values
@@ -975,12 +1147,35 @@ fn decide(path: String, instances: u64, acc: &Acc, cx: &Ctx) -> PropertyDraft {
             };
             let terms: Option<Vec<String>> = order[..k].iter().map(|v| cx.term(*v)).collect();
             if let Some(terms) = terms {
+                drafted_in |= ok;
                 push(
                     ok,
                     constraint("in", ConstraintValue::List(terms), w, cov[k]),
                 );
             }
         }
+    }
+    // sh:pattern: a prefix or a skeleton the strings share (an enumeration says more)
+    if acc.strings
+        && !drafted_in
+        && let Some((ok, c)) =
+            patterns::decide_pattern(cx.pat, acc.skels.as_ref(), acc.heads.as_ref(), w, s)
+    {
+        push(ok, c);
+    }
+    // sh:minInclusive and sh:maxInclusive: the range the values are observed in
+    if let Some(r) = &acc.range
+        && let Some(b) = patterns::decide_range(r, w, s)
+        && let (Some(lo), Some(hi)) = (cx.term(b.min), cx.term(b.max))
+    {
+        push(
+            passes(b.kept_min, w, s),
+            constraint("minInclusive", ConstraintValue::Term(lo), w, b.kept_min),
+        );
+        push(
+            passes(b.kept_max, w, s),
+            constraint("maxInclusive", ConstraintValue::Term(hi), w, b.kept_max),
+        );
     }
     // sh:languageIn and sh:uniqueLang
     if let Some(sets) = &acc.langs
@@ -1076,24 +1271,32 @@ pub fn draft_shapes(snap: &Arc<Snapshot>, opts: &DraftOptions) -> Result<ShapesD
     let mut langs = Names::default();
     let inline = InlineDts::new(&mut dts);
     let mut props: Vec<Vec<PropertyDraft>> = (0..types.ids.len()).map(|_| Vec::new()).collect();
+    let mut inverse: Vec<Vec<PropertyDraft>> = (0..types.ids.len()).map(|_| Vec::new()).collect();
+    let mut seq = paths::Sequences::default();
     if drafted.iter().any(|d| *d) {
         for (i, &p) in preds.iter().enumerate() {
             if Some(p) == rdf_type || !is_iri(snap, p) {
                 continue;
             }
             let phase = || format!("profiling predicates ({}/{})", i + 1, preds.len());
+            let mut pat = PatNames::default();
             let infos = in_phase(
-                object_infos(snap, p, &filter, &budget, &mut dts, &mut langs),
+                object_infos(snap, p, &filter, &budget, &mut dts, &mut langs, &mut pat),
                 phase,
             )?;
             let mut accs: FxHashMap<u32, Acc> = FxHashMap::default();
             let mut subject: Option<u64> = None;
             let mut objs: Vec<u64> = Vec::new();
-            let flush = |s: u64, objs: &[u64], accs: &mut FxHashMap<u32, Acc>| {
+            let pidx = seq.predicate(p);
+            let flush = |s: u64,
+                         objs: &[u64],
+                         accs: &mut FxHashMap<u32, Acc>,
+                         seq: &mut paths::Sequences| {
                 let set = types.set_of(s);
                 if !set.iter().any(|c| drafted[*c as usize]) {
                     return;
                 }
+                seq.note(pidx, s, objs, &types, &drafted);
                 let sum = summarize(objs, snap, &types, &infos, &inline);
                 for c in set {
                     if drafted[*c as usize] {
@@ -1110,7 +1313,7 @@ pub fn draft_shapes(snap: &Arc<Snapshot>, opts: &DraftOptions) -> Result<ShapesD
                     prev = Some((k[1], k[2]));
                     if subject != Some(k[1]) {
                         if let Some(s) = subject {
-                            flush(s, &objs, &mut accs);
+                            flush(s, &objs, &mut accs, &mut seq);
                         }
                         subject = Some(k[1]);
                         objs.clear();
@@ -1120,10 +1323,7 @@ pub fn draft_shapes(snap: &Arc<Snapshot>, opts: &DraftOptions) -> Result<ShapesD
                 phase,
             )?;
             if let Some(s) = subject {
-                flush(s, &objs, &mut accs);
-            }
-            if accs.is_empty() {
-                continue;
+                flush(s, &objs, &mut accs, &mut seq);
             }
             let Some(path) = iris.get(p) else { continue };
             let cx = Ctx {
@@ -1132,12 +1332,66 @@ pub fn draft_shapes(snap: &Arc<Snapshot>, opts: &DraftOptions) -> Result<ShapesD
                 iris: &class_iris,
                 dts: &dts,
                 langs: &langs,
+                pat: &pat,
                 opts,
             };
             for (c, acc) in accs {
                 let d = decide(path.clone(), types.instances[c as usize], &acc, &cx);
                 props[c as usize].push(d);
             }
+            // the subjects that point at instances of a drafted class
+            if opts.max_inverse > 0 {
+                let accs =
+                    paths::inverse_accs(snap, p, &filter, &budget, &types, &drafted, &phase)?;
+                for (c, acc) in accs {
+                    let mut d = decide(path.clone(), types.instances[c as usize], &acc, &cx);
+                    // only a predicate that most instances are pointed at over
+                    if d.constraints.iter().any(|x| x.component == "minCount") {
+                        d.inverse = true;
+                        inverse[c as usize].push(d);
+                    }
+                }
+            }
+        }
+        // sequences through blank nodes no class describes
+        let sequences = paths::sequence_props(
+            &seq,
+            snap,
+            &preds,
+            rdf_type,
+            &filter,
+            &budget,
+            &types,
+            &drafted,
+            &inline,
+            &mut dts,
+            &mut langs,
+            &mut iris,
+            &class_iris,
+            opts,
+        )?;
+        for (c, d) in sequences {
+            // when the blank nodes are the property's values and no class describes them
+            let direct = props[c as usize].iter().find(|x| x.path == d.path);
+            let through_blank_nodes = direct.is_some_and(|x| {
+                x.constraints.iter().any(|k| {
+                    k.component == "nodeKind"
+                        && k.value == ConstraintValue::Iri(format!("{SH}BlankNode"))
+                }) && x.constraints.iter().all(|k| k.component != "class")
+            });
+            if through_blank_nodes {
+                props[c as usize].push(d);
+            }
+        }
+        for (c, list) in inverse.into_iter().enumerate() {
+            let mut list = list;
+            list.sort_by(|a, b| {
+                b.instances
+                    .cmp(&a.instances)
+                    .then_with(|| a.path.cmp(&b.path))
+            });
+            list.truncate(opts.max_inverse);
+            props[c].extend(list);
         }
     }
 
@@ -1152,11 +1406,13 @@ pub fn draft_shapes(snap: &Arc<Snapshot>, opts: &DraftOptions) -> Result<ShapesD
         let class = class_iris[c].clone().unwrap_or_default();
         let instances = types.instances[c];
         let mut properties = std::mem::take(&mut props[c]);
-        // most used first, then by IRI
+        // most used first, then by IRI, direct paths before inverse ones before sequences
         properties.sort_by(|a, b| {
             b.instances
                 .cmp(&a.instances)
                 .then_with(|| a.path.cmp(&b.path))
+                .then_with(|| a.inverse.cmp(&b.inverse))
+                .then_with(|| a.then.cmp(&b.then))
         });
         shapes.push(NodeShapeDraft {
             shape: names.name(&opts.base, &class),
@@ -1176,6 +1432,34 @@ pub fn draft_shapes(snap: &Arc<Snapshot>, opts: &DraftOptions) -> Result<ShapesD
                 closed: opts.closed,
                 properties: Vec::new(),
             });
+        }
+    }
+
+    // a reference to the shape of the class the values belong to: at full support the
+    // values satisfy it, since the shape was drafted from every instance of the class
+    if opts.support >= 1.0 {
+        let shape_of: FxHashMap<String, String> = shapes
+            .iter()
+            .map(|s| (s.class.clone(), s.shape.clone()))
+            .collect();
+        for p in shapes.iter_mut().flat_map(|s| &mut s.properties) {
+            let node = p
+                .constraints
+                .iter()
+                .find_map(|c| match (&c.value, c.component) {
+                    (ConstraintValue::Iri(k), "class") => shape_of
+                        .get(k)
+                        .map(|shape| (shape.clone(), c.applicable, c.satisfied)),
+                    _ => None,
+                });
+            if let Some((shape, applicable, satisfied)) = node {
+                p.constraints.push(constraint(
+                    "node",
+                    ConstraintValue::Iri(shape),
+                    applicable,
+                    satisfied,
+                ));
+            }
         }
     }
 
@@ -1220,6 +1504,7 @@ pub fn draft_shapes(snap: &Arc<Snapshot>, opts: &DraftOptions) -> Result<ShapesD
             min_instances: opts.min_instances,
             max_in: opts.max_in,
             max_count: opts.max_count,
+            max_inverse: opts.max_inverse,
             closed: opts.closed,
             base: opts.base.clone(),
             classes: opts.classes.clone(),
@@ -1275,4 +1560,6 @@ impl ShapeNames {
     }
 }
 
+mod paths;
+mod patterns;
 mod render;

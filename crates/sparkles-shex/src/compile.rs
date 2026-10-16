@@ -14,21 +14,31 @@
 //! * Groups without cardinality or semantic actions inside a group of the same kind are
 //!   spliced into it (`(a ; (b ; c))` is `(a ; b ; c)`), and such a group of one
 //!   expression is that expression.
+//! * A label that is abstract or that other shapes extend (ShEx 2.2) has two pair kinds:
+//!   the declared one, for the declaration's own expression, and a descendant kind that
+//!   references and shape maps use. A node satisfies the descendant kind when it
+//!   satisfies the declaration (unless abstract) or a non-abstract declaration through a
+//!   shape that extends the label, found by [`Compiler::witness`].
+//! * A shape that extends others gets an [`ExtPlan`], resolved once every declaration is
+//!   compiled.
 
 use crate::CompiledSchema;
 use crate::ast::{Label, Schema, Shape, ShapeExpr, TripleExpr, cardinality};
 use crate::check::{Checked, show_label};
 use crate::error::SchemaError;
 use crate::ir::{
-    Dir, Ir, NcId, NcIr, PairKind, PairKindInfo, Se, SeId, ShapeClass, ShapeId, ShapeIr, TcId,
-    TcIr, Te, TeId,
+    Dir, ExtPlan, Frame, Ir, NcId, NcIr, PairKind, PairKindInfo, Part, Se, SeId, ShapeClass,
+    ShapeId, ShapeIr, TcId, TcIr, Te, TeId,
 };
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
 /// The most triple-constraint instances a schema may have once its inclusions are
 /// expanded (nested inclusions multiply).
 pub const MAX_TRIPLE_CONSTRAINTS: usize = 1_000_000;
+
+/// The most readings ([`Frame`]s) one extending shape may have.
+pub const MAX_FRAMES: usize = 64;
 
 /// Compile a checked schema.
 pub fn compile(schema: &Schema, checked: &Checked) -> Result<CompiledSchema, SchemaError> {
@@ -41,6 +51,10 @@ pub fn compile(schema: &Schema, checked: &Checked) -> Result<CompiledSchema, Sch
             ..Ir::default()
         },
         decl_kind: vec![None; schema.shapes.len()],
+        desc_kind: vec![None; schema.shapes.len()],
+        desc_decl: FxHashMap::default(),
+        shape_ast: Vec::new(),
+        ancestors: ancestors(checked),
         values: FxHashMap::default(),
         tcs: 0,
     };
@@ -52,9 +66,9 @@ pub fn compile(schema: &Schema, checked: &Checked) -> Result<CompiledSchema, Sch
         }
     }
     // labels; a bare reference names the pair kind at the end of its chain (acyclic:
-    // checked)
+    // checked); a label that is abstract or extended names its descendant kind
     for (i, d) in schema.shapes.iter().enumerate() {
-        let k = c.kind_of_decl(i);
+        let k = c.decl_ref_kind(i);
         c.ir.labels.insert(d.label.to_shexj(), k);
     }
     for (i, d) in schema.shapes.iter().enumerate() {
@@ -65,7 +79,7 @@ pub fn compile(schema: &Schema, checked: &Checked) -> Result<CompiledSchema, Sch
     }
     if let Some(e) = &schema.start {
         let k = match e {
-            ShapeExpr::Ref(l) => c.kind_of_label(l),
+            ShapeExpr::Ref(l) => c.ref_kind(l),
             _ => {
                 let k = c.new_kind(None, checked.start_stratum);
                 let se = c.se(e)?;
@@ -75,6 +89,7 @@ pub fn compile(schema: &Schema, checked: &Checked) -> Result<CompiledSchema, Sch
         };
         c.ir.start = Some(k);
     }
+    c.finish_extensions()?;
     Ok(CompiledSchema::from_ir(
         c.ir,
         schema.prefixes.clone(),
@@ -88,6 +103,14 @@ struct Compiler<'s, 'c> {
     ir: Ir,
     /// the pair kind of each declaration that is not a bare reference
     decl_kind: Vec<Option<PairKind>>,
+    /// the descendant kind of each declaration that is abstract or extended
+    desc_kind: Vec<Option<PairKind>>,
+    /// the declaration of each descendant kind
+    desc_decl: FxHashMap<PairKind, usize>,
+    /// the AST of each compiled shape
+    shape_ast: Vec<&'s Shape>,
+    /// per declaration, the declarations it extends directly or through others
+    ancestors: Vec<FxHashSet<usize>>,
     /// compiled value expressions, by address: the expression and its pair kind
     values: FxHashMap<usize, (SeId, PairKind)>,
     /// triple-constraint instances so far
@@ -130,6 +153,36 @@ impl<'s> Compiler<'s, '_> {
         self.kind_of_decl(self.checked.decls[l])
     }
 
+    /// Does anything but the declaration's own expression satisfy a reference to it?
+    fn has_descendants(&self, i: usize) -> bool {
+        self.schema.shapes[i].is_abstract || !self.checked.hierarchy.descendants[i].is_empty()
+    }
+
+    /// The pair kind a reference to declaration `i` reads (allocated on first use).
+    fn decl_ref_kind(&mut self, i: usize) -> PairKind {
+        if !self.has_descendants(i) {
+            return self.kind_of_decl(i);
+        }
+        if let Some(k) = self.desc_kind[i] {
+            return k;
+        }
+        let h = &self.checked.hierarchy;
+        let stratum = std::iter::once(i)
+            .chain(h.descendants[i].iter().copied())
+            .map(|d| self.checked.strata[d])
+            .max()
+            .unwrap_or(0);
+        let k = self.new_kind(Some(self.schema.shapes[i].label.clone()), stratum);
+        self.desc_kind[i] = Some(k);
+        self.desc_decl.insert(k, i);
+        k
+    }
+
+    /// The pair kind a reference to `l` reads.
+    fn ref_kind(&mut self, l: &Label) -> PairKind {
+        self.decl_ref_kind(self.checked.decls[l])
+    }
+
     fn push_se(&mut self, se: Se) -> SeId {
         let id = SeId(self.ir.ses.len() as u32);
         self.ir.ses.push(se);
@@ -149,7 +202,7 @@ impl<'s> Compiler<'s, '_> {
             ShapeExpr::Or(v) => Se::Or(v.iter().map(|x| self.se(x)).collect::<Result<_, _>>()?),
             ShapeExpr::And(v) => Se::And(v.iter().map(|x| self.se(x)).collect::<Result<_, _>>()?),
             ShapeExpr::Not(x) => Se::Not(self.se(x)?),
-            ShapeExpr::Ref(l) => Se::Ref(self.kind_of_label(l)),
+            ShapeExpr::Ref(l) => Se::Ref(self.ref_kind(l)),
             ShapeExpr::External => Se::External,
             ShapeExpr::Nc(nc) => {
                 let regex = match &nc.pattern {
@@ -178,7 +231,7 @@ impl<'s> Compiler<'s, '_> {
         }
         let id = self.push_se(Se::External);
         let kind = match e {
-            ShapeExpr::Ref(l) => self.kind_of_label(l),
+            ShapeExpr::Ref(l) => self.ref_kind(l),
             _ => {
                 let k = self.new_kind(None, self.checked.value_stratum(e));
                 self.ir.pairs[k.index()].se = id;
@@ -220,7 +273,9 @@ impl<'s> Compiler<'s, '_> {
             max_occ: b.max_occ,
             class,
             sem_acts: s.sem_acts.clone(),
+            ext: None,
         });
+        self.shape_ast.push(s);
         Ok(id)
     }
 
@@ -324,6 +379,278 @@ impl<'s> Compiler<'s, '_> {
                 _ => out.push(x),
             }
         }
+    }
+}
+
+/// Per declaration, the declarations it extends directly or through others.
+fn ancestors(checked: &Checked<'_>) -> Vec<FxHashSet<usize>> {
+    let parents = &checked.hierarchy.parents;
+    (0..parents.len())
+        .map(|i| {
+            let mut seen = FxHashSet::default();
+            let mut stack = parents[i].clone();
+            while let Some(p) = stack.pop() {
+                if seen.insert(p) {
+                    stack.extend(&parents[p]);
+                }
+            }
+            seen
+        })
+        .collect()
+}
+
+/// An extendable reading of a declaration: its own shape and its other conjuncts.
+type Variant = (ShapeId, Vec<SeId>);
+
+/// An ancestor under construction.
+struct PartBuilder {
+    shape: ShapeId,
+    constraints: Vec<SeId>,
+    /// the parts of the shapes this one extends directly
+    direct: Vec<usize>,
+}
+
+impl<'s> Compiler<'s, '_> {
+    /// The expression of the declared kind behind `k` (a descendant kind stands for its
+    /// declaration).
+    fn exact_se(&self, k: PairKind) -> SeId {
+        match self.desc_decl.get(&k) {
+            Some(&d) => self.ir.pairs[self.kind_of_decl(d).index()].se,
+            None => self.ir.pairs[k.index()].se,
+        }
+    }
+
+    /// The declaration's expressions, once every one is compiled: the plans of the
+    /// shapes that extend others, then the descendant kinds.
+    fn finish_extensions(&mut self) -> Result<(), SchemaError> {
+        for sid in 0..self.shape_ast.len() {
+            let shape = self.shape_ast[sid];
+            if shape.extends.is_empty() {
+                continue;
+            }
+            let frames = self.frames(shape)?;
+            self.ir.shapes[sid].ext = Some(ExtPlan { frames });
+        }
+        let kinds: Vec<(usize, PairKind)> = self
+            .desc_kind
+            .iter()
+            .enumerate()
+            .filter_map(|(i, k)| k.map(|k| (i, k)))
+            .collect();
+        for (i, k) in kinds {
+            let mut alts = Vec::new();
+            if !self.schema.shapes[i].is_abstract {
+                let exact = self.kind_of_decl(i);
+                alts.push(self.push_se(Se::Ref(exact)));
+            }
+            let descendants = self.checked.hierarchy.descendants[i].clone();
+            for d in descendants {
+                if self.schema.shapes[d].is_abstract {
+                    continue;
+                }
+                let se = self.ir.pairs[self.kind_of_decl(d).index()].se;
+                let mut seen = FxHashSet::default();
+                if let Some(w) = self.witness(se, i, &mut seen) {
+                    alts.push(w);
+                }
+            }
+            let se = self.push_se(Se::Or(alts));
+            self.ir.pairs[k.index()].se = se;
+        }
+        Ok(())
+    }
+
+    /// The part of `se` that satisfies a reference to declaration `target` through an
+    /// extension: `se` itself when it is a shape that extends `target`, and what the
+    /// disjunctions, conjunctions and references of `se` leave of that. `None`: no
+    /// shape of `se` extends `target`, so `se` alone does not make a node an instance
+    /// of it.
+    fn witness(&mut self, se: SeId, target: usize, seen: &mut FxHashSet<SeId>) -> Option<SeId> {
+        match self.ir.ses[se.index()].clone() {
+            Se::Shape(sid) => {
+                let extends = self.shape_ast[sid.index()]
+                    .extends
+                    .iter()
+                    .map(|l| self.checked.decls[l]);
+                let mut hit = false;
+                for d in extends {
+                    hit |= d == target || self.ancestors[d].contains(&target);
+                }
+                hit.then_some(se)
+            }
+            Se::Or(xs) => {
+                let alts: Vec<SeId> = xs
+                    .iter()
+                    .filter_map(|&x| self.witness(x, target, seen))
+                    .collect();
+                match alts.len() {
+                    0 => None,
+                    1 => Some(alts[0]),
+                    _ => Some(self.push_se(Se::Or(alts))),
+                }
+            }
+            Se::And(xs) => {
+                let mut alts = Vec::new();
+                for i in 0..xs.len() {
+                    if let Some(w) = self.witness(xs[i], target, seen) {
+                        let mut conj = xs.clone();
+                        conj[i] = w;
+                        alts.push(self.push_se(Se::And(conj)));
+                    }
+                }
+                match alts.len() {
+                    0 => None,
+                    1 => Some(alts[0]),
+                    _ => Some(self.push_se(Se::Or(alts))),
+                }
+            }
+            Se::Ref(k) => {
+                if !seen.insert(se) {
+                    return None;
+                }
+                let inner = self.exact_se(k);
+                self.witness(inner, target, seen)
+            }
+            Se::Not(_) | Se::Nc(_) | Se::External => None,
+        }
+    }
+
+    /// The readings of the shapes that `shape` extends.
+    fn frames(&self, shape: &'s Shape) -> Result<Vec<Frame>, SchemaError> {
+        let mut out = Vec::new();
+        let pending: Vec<(&'s Label, Option<usize>)> =
+            shape.extends.iter().rev().map(|l| (l, None)).collect();
+        self.expand(&mut Vec::new(), pending, &mut out)?;
+        Ok(out)
+    }
+
+    /// Choose a variant for each label still pending, collecting a frame per choice.
+    fn expand(
+        &self,
+        parts: &mut Vec<PartBuilder>,
+        mut pending: Vec<(&'s Label, Option<usize>)>,
+        out: &mut Vec<Frame>,
+    ) -> Result<(), SchemaError> {
+        let Some((label, from)) = pending.pop() else {
+            if out.len() >= MAX_FRAMES {
+                return Err(SchemaError::new(format!(
+                    "a shape that extends disjunctions has more than {MAX_FRAMES} readings"
+                )));
+            }
+            out.push(finish_frame(parts));
+            return Ok(());
+        };
+        let variants = self.variants(label)?;
+        for (main, constraints) in variants {
+            let before = parts.len();
+            let mut next = pending.clone();
+            let idx = match parts.iter().position(|p| p.shape == main) {
+                Some(j) => j,
+                None => {
+                    parts.push(PartBuilder {
+                        shape: main,
+                        constraints,
+                        direct: Vec::new(),
+                    });
+                    let idx = parts.len() - 1;
+                    next.extend(
+                        self.shape_ast[main.index()]
+                            .extends
+                            .iter()
+                            .rev()
+                            .map(|l| (l, Some(idx))),
+                    );
+                    idx
+                }
+            };
+            let linked = match from {
+                Some(f) if !parts[f].direct.contains(&idx) => {
+                    parts[f].direct.push(idx);
+                    true
+                }
+                _ => false,
+            };
+            self.expand(parts, next, out)?;
+            if linked && let Some(f) = from {
+                parts[f].direct.pop();
+            }
+            parts.truncate(before);
+        }
+        Ok(())
+    }
+
+    /// The readings of an extended label's declaration: its shape and its other
+    /// conjuncts, one reading per disjunct of a disjunction.
+    fn variants(&self, label: &Label) -> Result<Vec<Variant>, SchemaError> {
+        let k = self.kind_of_label(label);
+        let mut out = Vec::new();
+        self.variants_of(self.ir.pairs[k.index()].se, &mut out);
+        if out.is_empty() {
+            return Err(SchemaError::new(format!(
+                "{} is extended but is neither a shape nor a conjunction with a shape",
+                show_label(label, &self.schema.prefixes)
+            )));
+        }
+        Ok(out)
+    }
+
+    fn variants_of(&self, se: SeId, out: &mut Vec<Variant>) {
+        match &self.ir.ses[se.index()] {
+            Se::Shape(sid) => out.push((*sid, Vec::new())),
+            Se::And(xs) => {
+                if let Some(i) = xs
+                    .iter()
+                    .position(|x| matches!(self.ir.ses[x.index()], Se::Shape(_)))
+                {
+                    let Se::Shape(sid) = self.ir.ses[xs[i].index()] else {
+                        unreachable!("a shape")
+                    };
+                    let rest = xs
+                        .iter()
+                        .enumerate()
+                        .filter(|(j, _)| *j != i)
+                        .map(|(_, x)| *x)
+                        .collect();
+                    out.push((sid, rest));
+                }
+            }
+            Se::Or(xs) => {
+                for &x in xs {
+                    match self.ir.ses[x.index()] {
+                        Se::Ref(k) => self.variants_of(self.exact_se(k), out),
+                        _ => self.variants_of(x, out),
+                    }
+                }
+            }
+            Se::Ref(k) => self.variants_of(self.exact_se(*k), out),
+            Se::Not(_) | Se::Nc(_) | Se::External => {}
+        }
+    }
+}
+
+/// The frame of a set of parts: each part's ancestors are the parts it reaches.
+fn finish_frame(parts: &[PartBuilder]) -> Frame {
+    let below = |i: usize| {
+        let mut seen = vec![false; parts.len()];
+        let mut stack = parts[i].direct.clone();
+        while let Some(j) = stack.pop() {
+            if !seen[j] {
+                seen[j] = true;
+                stack.extend(&parts[j].direct);
+            }
+        }
+        (0..parts.len()).filter(|&j| seen[j]).collect::<Vec<_>>()
+    };
+    Frame {
+        parts: parts
+            .iter()
+            .enumerate()
+            .map(|(i, p)| Part {
+                shape: p.shape,
+                constraints: p.constraints.clone(),
+                below: below(i),
+            })
+            .collect(),
     }
 }
 

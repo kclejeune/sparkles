@@ -5,7 +5,7 @@
 
 pub mod config;
 
-use crate::commit::CommitKind;
+use crate::commit::{CommitInfo, CommitKind};
 use crate::error::Result;
 use crate::id::Id;
 use crate::store::Snapshot;
@@ -33,6 +33,15 @@ pub trait CommitGuard: Send + Sync {
     fn speculative(&self) -> bool {
         false
     }
+    /// Called when the store closes cleanly, under the writer lock, with the head commit
+    /// and the snapshot that shows it, so a guard can keep what it knows of the head for
+    /// the next open. It must not call a method of the store that takes the writer lock,
+    /// and its failures are its own to log.
+    fn close(&self, _head: &CommitInfo, _snapshot: &Snapshot) {}
+    /// Called after a compaction published `new`, which holds the data of `old` with
+    /// renumbered terms, while the writer lock is still held. A guard that keeps ids
+    /// translates them (or forgets them).
+    fn rekey(&self, _old: &Snapshot, _new: &Snapshot) {}
     /// A short description, for errors and status.
     fn describe(&self) -> String;
     /// The shape language this guard validates with.

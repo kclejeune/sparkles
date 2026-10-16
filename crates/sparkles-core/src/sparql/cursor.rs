@@ -834,7 +834,7 @@ impl QueryExecution {
                 emitted_rows: r.result().len() as u64,
                 rows_produced: r.result().rows_produced,
                 mem_peak_bytes: r.result().mem_peak_bytes,
-                granted_bytes: r.result().ctx.grant.as_ref().map(|g| g.peak()),
+                granted_bytes: r.result().ctx.grant().map(|g| g.peak()),
                 timing: r.result().timing.clone(),
                 error: None,
             },
@@ -954,7 +954,7 @@ impl QueryCursor {
             emitted_rows: self.emitted,
             rows_produced: self.ctx.rows_produced(),
             mem_peak_bytes: self.ctx.mem_peak(),
-            granted_bytes: self.ctx.grant.as_ref().map(|g| g.peak()),
+            granted_bytes: self.ctx.grant().map(|g| g.peak()),
             timing,
             error: self.failure.clone(),
         }
