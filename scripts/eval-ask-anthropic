@@ -173,6 +173,19 @@ def main():
         (out / "preflight.json").write_text(
             json.dumps(summary["preflight"], indent=2) + "\n"
         )
+        if not args.dry_run:
+            # The shape of testsuite/ask/fixtures/anthropic-reply-headers.json, which
+            # test_eval_proxy replays as a chunked reply. Copy it there after review.
+            (out / "anthropic-reply-headers.json").write_text(
+                json.dumps(
+                    {
+                        "countTokens": summary["preflight"]["countTokens"],
+                        "message": summary["preflight"]["message"],
+                    },
+                    indent=2,
+                )
+                + "\n"
+            )
         config = proxy.config()
         (out / "models.json").write_text(json.dumps(config, indent=2) + "\n")
         done = []

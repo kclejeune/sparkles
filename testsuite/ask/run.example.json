@@ -1,0 +1,36 @@
+{
+  "schema": 1,
+  "binary": "/ABSOLUTE/PATH/TO/sparkles-built-from-a-named-commit",
+  "binarySha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "ledger": "/ABSOLUTE/NEW/DIRECTORY/ledger.jsonl",
+  "out": "/ABSOLUTE/NEW/DIRECTORY/out",
+  "localCapNanodollars": 23997440000,
+  "carryover": {
+    "name": "ask-anthropic-initial-20261015-root-r1",
+    "nanodollars": 1002560000
+  },
+  "effort": "medium",
+  "maxOutputTokens": 4096,
+  "requestTimeoutSecs": 120,
+  "askDeadlineSecs": 300,
+  "queryTimeoutSecs": 5,
+  "askTokenBudget": 100000,
+  "projectionMargin": 1.25,
+  "priorCaseCostNanodollars": {
+    "claude-haiku-5-5": 3000000,
+    "claude-sonnet-5-5": 45000000,
+    "claude-opus-5-5": 90000000
+  },
+  "sets": [
+    {
+      "name": "demo",
+      "path": "testsuite/ask/demo.json",
+      "loc": null,
+      "models": [
+        "claude-haiku-5-5",
+        "claude-sonnet-5-5",
+        "claude-opus-5-5"
+      ]
+    }
+  ]
+}

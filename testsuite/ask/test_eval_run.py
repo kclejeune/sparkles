@@ -56,6 +56,10 @@ class LoadRun(unittest.TestCase):
     def test_a_complete_run_file_loads(self):
         self.assertEqual(self.load(RUN)["effort"], "medium")
 
+    def test_the_documented_example_loads(self):
+        example = json.loads((HERE / "run.example.json").read_text())
+        self.assertEqual(self.load(example)["askTokenBudget"], 100000)
+
     def test_a_real_run_names_the_pilot_carryover_and_stays_under_the_hard_cap(self):
         for change in (
             {"carryover": None},
