@@ -19,6 +19,7 @@ import time
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "testsuite/ask/eval_support"))
 from evaluator import (
+    HarnessFault,
     Invalid,
     OfflinePolicy,
     answer_set,
@@ -193,7 +194,7 @@ class Runner:
 
     def check(self):
         if time.monotonic() >= self.deadline:
-            raise Invalid("phase deadline expired")
+            raise HarnessFault("phase deadline expired")
 
     def source_args(self, ask=False):
         if self.loc:
@@ -211,6 +212,9 @@ class Runner:
             self.env,
         )
         self.last_record = record
+        if "pid" in record and not record["cleanup"]:
+            # The census could not show that the child's group is gone.
+            raise HarnessFault("child cleanup unconfirmed")
         return record, directory
 
     def execute(self, argv, label, child_limit=None):
@@ -254,11 +258,11 @@ class Runner:
         at all, such as one that is not cleaned up or exits with an unknown status,
         stops the run.
         """
-        if "pid" not in record or not record["cleanup"]:
-            raise Invalid("child execution incomplete")
+        if "pid" not in record:
+            raise HarnessFault("child did not start")
         if record["timeout"]:
             if time.monotonic() >= self.deadline:
-                raise Invalid("phase deadline expired")
+                raise HarnessFault("phase deadline expired")
             return {"outcome": "error", "error": {"code": "timeout"}}, "timeout"
         if record["byteCap"]:
             return {"outcome": "error", "error": {"code": "output-cap"}}, (
@@ -373,6 +377,8 @@ class Runner:
                 "reason": "offline_policy_exclusion",
                 "querySha256": query_sha,
             }
+        except HarnessFault:
+            raise
         except (Invalid, OSError):
             return {
                 "status": "unknown",
@@ -416,6 +422,8 @@ class Runner:
             return failure("missing_query")
         try:
             got, _ = self.query(query)
+        except HarnessFault:
+            raise
         except Invalid:
             return failure("candidate_query_failure")
         ok, scores, detail = score_sets(gold, got, self.check)

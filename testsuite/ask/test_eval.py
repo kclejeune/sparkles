@@ -456,6 +456,54 @@ class Processes(unittest.TestCase):
         self.assertEqual(report["scored"], 0)
         self.assertEqual(report["error"], "Invalid")
 
+    def test_failed_cleanup_of_a_query_child_is_a_harness_fault(self):
+        args = self.questions_fixture(["answerable"])
+        s = json.loads(pathlib.Path(args.set).read_text())
+        s["questions"][0]["gold"] = "EMPTY"
+        pathlib.Path(args.set).write_text(json.dumps(s))
+        self.fake_ask(
+            args,
+            "import json,sys\n"
+            'if sys.argv[1] == "query":\n'
+            '    print(json.dumps({"head":{"vars":["x"]},"results":{"bindings":[]}}))\n'
+            "else:\n"
+            '    print(json.dumps({"outcome":"answered","result":{"query":"SELECT"}}))\n',
+        )
+        original = eval_ask.capture_child
+
+        def capture(argv, directory, deadline, env=None):
+            record = original(argv, directory, deadline, env)
+            if argv[1] == "query" and directory.name.endswith("-query"):
+                record["cleanup"] = False  # as after a failed process census
+            return record
+
+        eval_ask.capture_child = capture
+        self.addCleanup(setattr, eval_ask, "capture_child", original)
+        _, report = eval_ask.run_matrix(args)
+        self.assertFalse(report["complete"])
+        self.assertEqual(report["error"], "HarnessFault")
+        statuses = [c["detail"].get("status") for c in report["cases"]]
+        self.assertNotIn("candidate_query_failure", statuses)
+
+    def test_answerable_failure_status_is_scored(self):
+        args = self.questions_fixture(["answerable"])
+        s = json.loads(pathlib.Path(args.set).read_text())
+        s["questions"][0]["gold"] = "EMPTY"
+        pathlib.Path(args.set).write_text(json.dumps(s))
+        self.fake_ask(
+            args,
+            "import json,sys\n"
+            'if sys.argv[1] == "query":\n'
+            '    print(json.dumps({"head":{"vars":["x"]},"results":{"bindings":[]}}))\n'
+            "else:\n"
+            '    print(json.dumps({"outcome":"error","error":{"code":"provider-unavailable"}}))\n'
+            "    raise SystemExit(2)\n",
+        )
+        _, report = eval_ask.run_matrix(args)
+        self.assertTrue(report["complete"], report["error"])
+        self.assertEqual(report["cases"][0]["detail"]["status"], "provider_error")
+        self.assertFalse(report["cases"][0]["correct"])
+
     def test_cap_refusal_is_excluded_and_stops_the_run(self):
         class Proxy:
             token, cap_refusals = "t", 0
@@ -558,6 +606,57 @@ class Processes(unittest.TestCase):
             next(pathlib.Path(args.out).glob("*/status.json")).read_text()
         )
         self.assertEqual(status["argv"][1], "query")
+
+
+class ProcessCensus(unittest.TestCase):
+    def test_a_process_that_exits_during_the_census_is_not_a_failure(self):
+        # A process can exit between open and read of its /proc stat file, which
+        # raises ProcessLookupError. It aborted a dry run after 127 cases.
+        from unittest import mock
+
+        import evaluator
+
+        real = pathlib.Path.read_text
+        raised = []
+
+        def read_text(path, *a, **kw):
+            if path.name == "stat" and not raised:
+                raised.append(path)
+                raise ProcessLookupError(3, "No such process")
+            return real(path, *a, **kw)
+
+        with mock.patch.object(pathlib.Path, "read_text", read_text):
+            states = evaluator.group_states(1)
+        self.assertTrue(raised)
+        self.assertIsInstance(states, list)
+        # A torn stat line is skipped like a vanished process.
+        with mock.patch.object(pathlib.Path, "read_text", lambda *a, **k: "1 (x"):
+            self.assertEqual(evaluator.group_states(1), [])
+
+    def test_capture_child_survives_the_race(self):
+        from unittest import mock
+
+        real = pathlib.Path.read_text
+        calls = []
+
+        def read_text(path, *a, **kw):
+            if path.name == "stat" and len(calls) < 40:
+                calls.append(path)
+                raise ProcessLookupError(3, "No such process")
+            return real(path, *a, **kw)
+
+        with (
+            tempfile.TemporaryDirectory(prefix="ask-census-") as d,
+            mock.patch.object(pathlib.Path, "read_text", read_text),
+        ):
+            record = capture_child(
+                [PYTHON, "-c", "print(1)"],
+                pathlib.Path(d) / "child",
+                time.monotonic() + 5,
+            )
+        self.assertTrue(calls)
+        self.assertTrue(record["cleanup"])
+        self.assertEqual(record["returncode"], 0)
 
 
 class ExtraInvariants(unittest.TestCase):
