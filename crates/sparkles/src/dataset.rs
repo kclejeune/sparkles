@@ -128,6 +128,8 @@ pub struct DatasetState {
     pub name: Option<String>,
     /// the stored queries (`queries.json`)
     pub queries: crate::stored::Catalog,
+    /// the named projections of graph algorithms (`algo.json`)
+    pub algo: Arc<crate::algo::catalog::Catalog>,
     /// the GraphQL configuration (`graphql.json`)
     #[cfg(feature = "graphql")]
     pub graphql: sparkles_graphql::Catalog,
@@ -260,6 +262,13 @@ impl Dataset {
                 shown()
             );
         }
+        let algo = Arc::new(crate::algo::catalog::Catalog::open_or_broken(store.root()));
+        if let Some(e) = algo.broken() {
+            tracing::error!(
+                "named projections of {}: {e}; they cannot be changed until it is fixed",
+                shown()
+            );
+        }
         #[cfg(feature = "graphql")]
         let graphql = sparkles_graphql::Catalog::open_or_broken(store.root());
         #[cfg(feature = "graphql")]
@@ -283,6 +292,7 @@ impl Dataset {
                 pool: opts.pool,
                 name: opts.name,
                 queries,
+                algo,
                 #[cfg(feature = "graphql")]
                 graphql,
                 reasoning: RwLock::new(reasoning),
@@ -572,6 +582,7 @@ impl Dataset {
             },
             describe: state.store.describe_settings(),
             pool: state.pool.clone(),
+            algo_projections: Some(state.algo.clone()),
             defaults_applied: true,
             ..Default::default()
         }
@@ -612,6 +623,9 @@ impl Dataset {
         }
         if o.pool.is_none() && o.grant.is_none() {
             o.pool = defaults.pool;
+        }
+        if o.algo_projections.is_none() {
+            o.algo_projections = defaults.algo_projections;
         }
         o.defaults_applied = true;
         Cow::Owned(o)
@@ -665,8 +679,15 @@ impl Dataset {
         self.update_with(update, &QueryOptions::default())
     }
 
+    /// [`update`](Self::update) with options. An update takes its options as given,
+    /// except that a call to a graph algorithm in its WHERE clause finds the dataset's
+    /// named projections when `opts` has none.
     pub fn update_with(&self, update: &str, opts: &QueryOptions) -> Result<UpdateStats> {
-        crate::sparql::update::update(&self.inner.store, update, &self.with_pool(opts))
+        let mut o = self.with_pool(opts);
+        if o.algo_projections.is_none() {
+            o.to_mut().algo_projections = Some(self.inner.algo.clone());
+        }
+        crate::sparql::update::update(&self.inner.store, update, &o)
     }
 
     /// Apply an RDF Patch, in the text form or (`binary`) the RDF Thrift form, as one
@@ -1265,7 +1286,11 @@ impl Transaction<'_> {
     /// transaction's changes, and they commit or roll back with it. A `text:query` call
     /// fails once the transaction has changed data, as in [`Transaction::query_with`].
     pub fn update_with(&mut self, update: &str, opts: &QueryOptions) -> Result<UpdateStats> {
-        crate::sparql::update::update_in(&mut self.txn, update, &self.ds.with_pool(opts))
+        let mut o = self.ds.with_pool(opts);
+        if o.algo_projections.is_none() {
+            o.to_mut().algo_projections = Some(self.ds.inner.algo.clone());
+        }
+        crate::sparql::update::update_in(&mut self.txn, update, &o)
     }
 }
 

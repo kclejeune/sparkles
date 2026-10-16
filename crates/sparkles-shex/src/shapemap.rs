@@ -781,8 +781,18 @@ fn sparql_nodes(
     }
     let base = opts.selector_query.clone().unwrap_or_default();
     let qo = sparkles_core::sparql::QueryOptions {
-        timeout: deadline.map(|d| d.saturating_duration_since(Instant::now())),
+        timeout: None,
+        deadline: base
+            .deadline
+            .into_iter()
+            .chain(opts.deadline)
+            .chain(deadline)
+            .min(),
         cancel: opts.cancel.clone(),
+        cancellation: match (&base.cancellation, &opts.cancellation) {
+            (Some(a), Some(b)) => Some(a.combine(b)),
+            (a, b) => a.clone().or_else(|| b.clone()),
+        },
         default_graph_uris,
         named_graph_uris: Vec::new(),
         default_graph_extra: Vec::new(),
@@ -1398,6 +1408,61 @@ mod tests {
         );
         if let Err(e) = e {
             assert!(e.downcast_ref::<SchemaError>().is_some(), "{e:#}");
+        }
+    }
+    #[test]
+    fn operation_controls_reach_sparql_selector_checks() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let store = store();
+        let data = DataGraph::new(store.snapshot(), None, &[], &[]).unwrap();
+        let schema = schema(true);
+        let map = parse(
+            "SPARQL 'SELECT ?focus { ?focus a <http://ex.org/Person> }'@ex:Person",
+            &schema_prefixes(),
+            None,
+        )
+        .unwrap();
+        for source in 0..5 {
+            let flag = Arc::new(AtomicBool::new(false));
+            let deadline = Instant::now() + std::time::Duration::from_secs(30);
+            let opts = ValidateOptions {
+                cancel: Some(Arc::new(AtomicBool::new(source == 1))),
+                cancellation: Some(sparkles_core::task::Cancellation::from_flags(
+                    [flag.clone()],
+                )),
+                deadline: (source == 2).then(Instant::now),
+                selector_query: Some(sparkles_core::sparql::QueryOptions {
+                    deadline: (source == 3).then(Instant::now),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            if source == 0 {
+                flag.store(true, Ordering::Relaxed);
+            }
+            let parent_bound = if source == 4 {
+                Instant::now()
+            } else {
+                deadline
+            };
+            let error = expand(&map, &data, &schema, &opts, Some(parent_bound)).unwrap_err();
+            assert!(
+                if source < 2 {
+                    matches!(
+                        error.downcast_ref::<sparkles_core::Error>(),
+                        Some(sparkles_core::Error::Cancelled)
+                    )
+                } else {
+                    matches!(
+                        error.downcast_ref::<sparkles_core::Error>(),
+                        Some(sparkles_core::Error::Timeout)
+                    )
+                },
+                "{error}"
+            );
         }
     }
 }

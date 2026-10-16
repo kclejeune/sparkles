@@ -7,8 +7,19 @@
 //!   build first publishes the packed vectors (searches then scan them exactly) and then
 //!   the graph. Until then searches pack the predicate themselves, as without a
 //!   configuration. Commits never wait for a build and do no index work.
-//! * **Generation switches** (bulk commits, compactions) start a build for the new
-//!   generation of every index; the replaced generation's files are written no more.
+//! * **Catch-up.** A thread per store ([`Store::start_vector_catch_up`]) wakes after
+//!   each commit and after each build and inserts the rows that commits added to an
+//!   indexed predicate into the graph's live layer ([`crate::vector::live`]), in batches,
+//!   so searches find them through the graph instead of scoring them exactly. It works
+//!   from the published snapshot, after the commit, so writes never wait for it.
+//! * **Generation switches.** A compaction carries each index over to the new
+//!   generation before it switches ([`Store::prebuild_vectors`]): the new segment takes
+//!   the vectors of the rows the old index holds, and the old graph's links map onto the
+//!   new rows, with the rows deleted since repaired around and the new rows inserted.
+//!   Searches keep using the old generation's graph until the switch and the carried one
+//!   right after it. A bulk commit starts a build for the new generation of every index
+//!   after the switch, carrying the old one over in the same way when few rows changed.
+//!   The replaced generation's files are written no more.
 //! * **Files.** A persistent store writes each build to `gen-NNNN/vectors/<name>.spkv`
 //!   and maps it from there, so opening the store again reads the index instead of
 //!   building it. Files that are missing, damaged or made for another configuration or
@@ -21,7 +32,7 @@ use crate::vector::config::{
     VectorIndexConfig, VectorIndexStatus, VectorMemory, VectorOverlay, validate_name,
 };
 use crate::vector::persist::{self, Identity};
-use crate::vector::{BuildCtl, Built, Outcome, build_index};
+use crate::vector::{BuildCtl, Built, Carry, Outcome, build_index};
 use parking_lot::{Condvar, Mutex, RwLock};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -35,6 +46,12 @@ pub(crate) struct VectorRegistry {
     paused: AtomicBool,
     /// test hook: builds insert graph nodes one at a time, so graphs are reproducible
     sequential: AtomicBool,
+    /// the catch-up thread was started
+    catch_up: AtomicBool,
+    /// test hook: the catch-up thread inserts nothing
+    catch_up_paused: AtomicBool,
+    /// wakes the catch-up thread (a build was installed, or catch-up resumed)
+    kick: Arc<tokio::sync::Notify>,
 }
 
 /// One configured index and the state of its builds.
@@ -181,12 +198,13 @@ impl Store {
                         at: crate::commit::rfc3339_ms(crate::commit::now_ms()),
                         ms: last,
                         rows: b.segment.rows() as u64,
+                        carried: b.carried,
                     }),
                 );
             }
             None => {
                 gv.remove_built(name);
-                self.spawn_vector_build(entry, snap, true);
+                self.spawn_vector_build(entry, snap, true, None);
             }
         }
         Ok(created)
@@ -231,7 +249,7 @@ impl Store {
             .get(name)
             .cloned()
             .ok_or_else(|| Error::NotFound(format!("no vector index {name}")))?;
-        self.spawn_vector_build(entry, self.snapshot(), false);
+        self.spawn_vector_build(entry, self.snapshot(), false, None);
         Ok(())
     }
 
@@ -357,6 +375,41 @@ impl Store {
         self.vector.paused.store(on, Ordering::SeqCst);
     }
 
+    /// Test hook: hold (or release) the background insertion of new rows into the
+    /// graphs. While held, searches score the rows that commits added exactly.
+    #[doc(hidden)]
+    pub fn pause_vector_catch_up(&self, on: bool) {
+        self.vector.catch_up_paused.store(on, Ordering::SeqCst);
+        if !on {
+            self.vector.kick.notify_one();
+        }
+    }
+
+    /// Wait until the graphs of every ready index hold the rows of the current snapshot
+    /// that they can hold (the overlay's `pending` count is 0) or stopped at the vector
+    /// memory budget, or `timeout` passes. Returns whether they do.
+    pub fn wait_vector_catch_up(&self, timeout: std::time::Duration) -> bool {
+        let end = std::time::Instant::now() + timeout;
+        loop {
+            let snap = self.snapshot();
+            let names: Vec<String> = self.vector.indexes.read().keys().cloned().collect();
+            let done = names.iter().all(|n| {
+                snap.generation.vectors.built(n).is_none_or(|b| {
+                    crate::vector::live::overlay_split(&snap, &b).1 == 0
+                        || crate::vector::live::at_budget(&snap, &b)
+                })
+            });
+            if done {
+                return true;
+            }
+            if std::time::Instant::now() >= end {
+                return false;
+            }
+            self.vector.kick.notify_one();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
     /// Test hook: build the HNSW graphs of later builds one node at a time. A parallel
     /// build's graph depends on the order in which its threads insert nodes, and so on
     /// the machine's load; a sequential one is the same every time.
@@ -371,6 +424,9 @@ impl Store {
         let c = &e.config;
         let pred = snap.lookup_iri(&c.predicate).map(|i| i.0);
         let (inserts, deletes) = crate::vector::overlay_counts(snap, pred);
+        let (indexed, pending) = built
+            .as_ref()
+            .map_or((0, 0), |b| crate::vector::live::overlay_split(snap, b));
         let state = if info.state == "ready" && built.as_ref().is_none_or(|b| b.hnsw_pending) {
             "building"
         } else {
@@ -388,12 +444,23 @@ impl Store {
             message: info.message.clone(),
             generation: snap.generation.name.clone(),
             rows: built.as_ref().map_or(0, |b| b.segment.rows() as u64),
-            overlay: VectorOverlay { inserts, deletes },
+            overlay: VectorOverlay {
+                inserts,
+                deletes,
+                indexed,
+                pending,
+                over_budget: pending > 0
+                    && built
+                        .as_ref()
+                        .is_some_and(|b| crate::vector::live::at_budget(snap, b)),
+            },
             skipped: built.as_ref().map(|b| b.skipped).unwrap_or_default(),
             memory: VectorMemory {
                 segment_bytes: built.as_ref().map_or(0, |b| b.segment.bytes()),
                 hnsw_bytes: built.as_ref().map_or(0, |b| {
-                    b.graph.as_ref().map_or(0, |g| g.bytes()) + b.node_rows.len() as u64 * 4
+                    b.graph.as_ref().map_or(0, |g| g.bytes())
+                        + b.node_rows.len() as u64 * 4
+                        + b.live.read().bytes()
                 }),
                 residency: if built.as_ref().is_some_and(|b| b.mapped()) {
                     "mmap"
@@ -406,10 +473,9 @@ impl Store {
                 m: h.m,
                 ef_construction: h.ef_construction,
                 ef_search: h.ef_search,
-                nodes: built
-                    .as_ref()
-                    .and_then(|b| b.graph.as_ref())
-                    .map_or(0, |g| g.nodes as u64),
+                nodes: built.as_ref().map_or(0, |b| {
+                    b.graph.as_ref().map_or(0, |g| g.nodes as u64) + b.live.read().nodes() as u64
+                }),
                 layers: built
                     .as_ref()
                     .and_then(|b| b.graph.as_ref())
@@ -484,26 +550,174 @@ impl Store {
             .vectors
             .set_configured(Arc::new(file.indexes));
         for e in entries {
-            self.spawn_vector_build(e, snap.clone(), true);
+            self.spawn_vector_build(e, snap.clone(), true, None);
         }
     }
 
     /// After a generation switch (with the writer lock held): the replaced generation's
-    /// files are written no more, and every index is built for the new one.
+    /// files are written no more, and every index is built for the new one, unless the
+    /// compaction carried it over already ([`Store::prebuild_vectors`]). A build carries
+    /// the previous generation's index over when it can.
     pub(super) fn vectors_switched(&self, prev: &Snapshot) {
         prev.generation.vectors.retire();
         let entries: Vec<Arc<IndexEntry>> = self.vector.indexes.read().values().cloned().collect();
+        let snap = self.snapshot();
+        let gv = &snap.generation.vectors;
+        // a carried index whose configuration was dropped or replaced meanwhile goes
+        for name in gv.built_names() {
+            let keep = entries
+                .iter()
+                .find(|e| e.name == name)
+                .zip(gv.built(&name))
+                .is_some_and(|(e, b)| b.config.build_hash() == e.config.build_hash());
+            if !keep {
+                gv.remove_built(&name);
+                if let Some(dir) = self.vector_dir(&snap) {
+                    gv.with_files(|| persist::remove(&dir, Some(&name)));
+                }
+            }
+        }
         if entries.is_empty() {
             return;
         }
-        let snap = self.snapshot();
-        snap.generation
-            .vectors
-            .set_configured(Arc::new(self.vector_configs()));
-        snap.generation.vectors.set_embedder(&self.embed);
+        gv.set_configured(Arc::new(self.vector_configs()));
+        gv.set_embedder(&self.embed);
+        let prev = Arc::new(prev.clone());
         for e in entries {
-            self.spawn_vector_build(e, snap.clone(), true);
+            if let Some(b) = gv.built(&e.name).filter(|b| !b.hnsw_pending) {
+                // carried over before the switch
+                let epoch = e.epoch.fetch_add(1, Ordering::SeqCst) + 1;
+                e.finish(
+                    epoch,
+                    "ready",
+                    None,
+                    Some(VectorBuild {
+                        at: crate::commit::rfc3339_ms(crate::commit::now_ms()),
+                        ms: b.built_ms,
+                        rows: b.segment.rows() as u64,
+                        carried: b.carried,
+                    }),
+                );
+                self.vector.kick.notify_one();
+                continue;
+            }
+            let carry = prev.generation.vectors.built(&e.name).map(|old| Carry {
+                old,
+                snap: prev.clone(),
+            });
+            self.spawn_vector_build(e, snap.clone(), true, carry);
         }
+    }
+
+    /// During a compaction, before the switch: carry every index of `prev`'s generation
+    /// over to the new generation, whose base `new` reads, and install the results there,
+    /// so searches right after the switch use a graph. `base_seq` is the new generation's
+    /// base commit. An index that cannot be carried (no graph yet, one built with other
+    /// settings, or one whose nodes changed by more than the carry limit) is built after
+    /// the switch instead, so this never runs a full graph build. Runs on the
+    /// compaction's thread, without the writer lock.
+    pub(super) fn prebuild_vectors(
+        &self,
+        new: &Snapshot,
+        prev: &Arc<Snapshot>,
+        base_seq: u64,
+        cancel: &(dyn Fn() -> bool + Sync),
+    ) {
+        let entries: Vec<Arc<IndexEntry>> = self.vector.indexes.read().values().cloned().collect();
+        let gv = &new.generation.vectors;
+        for e in entries {
+            let Some(old) =
+                prev.generation.vectors.built(&e.name).filter(|b| {
+                    b.graph.is_some() && b.config.build_hash() == e.config.build_hash()
+                })
+            else {
+                continue;
+            };
+            let superseded = || cancel() || e.retired.load(Ordering::SeqCst);
+            let (files, write) = self.vector_files(new, &e.config);
+            // `commit.json`, which gives the files' base commit, is written at the switch
+            let files = files.map(|(d, mut id)| {
+                id.base_seq = base_seq;
+                (d, id)
+            });
+            let ctl = BuildCtl {
+                budget: crate::vector::budget(),
+                progress: &|_| {},
+                cancel: &superseded,
+                files,
+                load: false,
+                write,
+                sequential: self.vector.sequential.load(Ordering::SeqCst),
+                carry: Some(Carry {
+                    old,
+                    snap: prev.clone(),
+                }),
+                carry_only: true,
+            };
+            let reading = new.without_cache_fill();
+            let t0 = std::time::Instant::now();
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                build_index(&reading, &e.name, &e.config, &ctl, &|_| {})
+            }));
+            match r {
+                Ok(Ok(Outcome::Ready(b))) if !superseded() => {
+                    tracing::info!(
+                        target: "sparkles::store::vector",
+                        "vector index {}: {} rows {} for the new generation in {:?}",
+                        e.name,
+                        b.segment.rows(),
+                        if b.carried { "carried over" } else { "built" },
+                        t0.elapsed()
+                    );
+                    gv.install(b);
+                }
+                Ok(Err(err)) => {
+                    tracing::warn!(target: "sparkles::store::vector", "vector index {}: carrying it over failed: {err}; it is built after the switch", e.name);
+                }
+                Err(_) => {
+                    tracing::error!(target: "sparkles::store::vector", "vector index {}: carrying it over failed; it is built after the switch", e.name);
+                }
+                _ => {}
+            }
+            if cancel() {
+                return;
+            }
+        }
+    }
+
+    /// Where `snap`'s generation keeps the files of an index configured as `cfg`, and
+    /// what they must match, and whether this store writes them.
+    fn vector_files(
+        &self,
+        snap: &Snapshot,
+        cfg: &VectorIndexConfig,
+    ) -> (Option<(std::path::PathBuf, Identity)>, bool) {
+        let files = if persist::SUPPORTED {
+            self.vector_dir(snap).map(|dir| {
+                let gdir = snap
+                    .generation
+                    .linked()
+                    .map(|l| l.base_dir().to_path_buf())
+                    .or_else(|| snap.generation._base.as_ref().and_then(|b| b.dir.clone()))
+                    .or_else(|| snap.generation.dir.clone())
+                    .unwrap_or_default();
+                (
+                    dir,
+                    Identity::of(
+                        &gdir,
+                        snap.generation.meta.quads,
+                        snap.generation.meta.terms,
+                        cfg.build_hash(),
+                    ),
+                )
+            })
+        } else {
+            None
+        };
+        let write = self.opts.vector_files
+            && snap.generation.linked().is_none()
+            && snap.generation._base.is_none();
+        (files, write)
     }
 
     /// The directory of `snap`'s generation's index files (`None`: an in-memory store).
@@ -522,10 +736,79 @@ impl Store {
         Some(persist::dir_of(gdir))
     }
 
+    /// Start the store's catch-up thread, once. It runs a pass over the current
+    /// snapshot's ready indexes, inserting the rows their graphs lack, then sleeps until
+    /// the next commit or a kick. It holds no strong reference to the store between
+    /// passes and ends when the store's commit channel closes.
+    fn start_vector_catch_up(&self) {
+        if self.vector.catch_up.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let mut commits = self.commits.subscribe();
+        let current = Arc::downgrade(&self.current);
+        let registry = Arc::downgrade(&self.vector);
+        let kick = self.vector.kick.clone();
+        let spawned = std::thread::Builder::new()
+            .name("vector-catch-up".into())
+            .spawn(move || {
+                loop {
+                    let (Some(cur), Some(reg)) = (current.upgrade(), registry.upgrade()) else {
+                        return;
+                    };
+                    if !reg.catch_up_paused.load(Ordering::SeqCst) {
+                        let snap = cur.load_full();
+                        let uid = snap.generation.uid;
+                        drop(cur);
+                        let names: Vec<String> = reg.indexes.read().keys().cloned().collect();
+                        for name in names {
+                            let Some(b) = snap.generation.vectors.built(&name) else {
+                                continue;
+                            };
+                            let gv = &snap.generation.vectors;
+                            let stop = || {
+                                reg.catch_up_paused.load(Ordering::SeqCst)
+                                    || current
+                                        .upgrade()
+                                        .is_none_or(|c| c.load().generation.uid != uid)
+                                    || gv.built(&name).is_none_or(|n| !Arc::ptr_eq(&n, &b))
+                            };
+                            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                crate::vector::live::catch_up(&snap, &b, &stop)
+                            }));
+                            if r.is_err() {
+                                tracing::error!(target: "sparkles::store::vector", "vector index {name}: inserting new rows failed");
+                            }
+                        }
+                    } else {
+                        drop(cur);
+                    }
+                    drop(reg);
+                    if !wait_commit_or_kick(&mut commits, &kick) {
+                        return;
+                    }
+                }
+            });
+        if let Err(e) = spawned {
+            self.vector.catch_up.store(false, Ordering::SeqCst);
+            tracing::error!(target: "sparkles::store::vector", "cannot start the vector catch-up thread: {e}");
+        }
+    }
+
     /// Build index `entry` for `snap`'s generation on a background thread (with `load`,
-    /// from its file when it fits) and install it, unless it was superseded: by a newer
-    /// build, a drop, a generation switch or the store's closing.
-    fn spawn_vector_build(&self, entry: Arc<IndexEntry>, snap: Arc<Snapshot>, load: bool) {
+    /// from its file when it fits, and with `carry`, from the previous generation's build
+    /// when few rows changed) and install it, unless it was superseded: by a newer build,
+    /// a drop, a generation switch or the store's closing.
+    fn spawn_vector_build(
+        &self,
+        entry: Arc<IndexEntry>,
+        snap: Arc<Snapshot>,
+        load: bool,
+        carry: Option<Carry>,
+    ) {
+        if entry.config.hnsw.is_some() {
+            self.start_vector_catch_up();
+        }
+        let kick = self.vector.kick.clone();
         let epoch = entry.epoch.fetch_add(1, Ordering::SeqCst) + 1;
         {
             let mut i = entry.info.lock();
@@ -533,31 +816,7 @@ impl Store {
             i.message = None;
         }
         entry.progress.store(0f32.to_bits(), Ordering::Relaxed);
-        let files = if persist::SUPPORTED {
-            self.vector_dir(&snap).map(|dir| {
-                let gdir = snap
-                    .generation
-                    .linked()
-                    .map(|l| l.base_dir().to_path_buf())
-                    .or_else(|| snap.generation._base.as_ref().and_then(|b| b.dir.clone()))
-                    .or_else(|| snap.generation.dir.clone())
-                    .unwrap_or_default();
-                (
-                    dir,
-                    Identity::of(
-                        &gdir,
-                        snap.generation.meta.quads,
-                        snap.generation.meta.terms,
-                        entry.config.build_hash(),
-                    ),
-                )
-            })
-        } else {
-            None
-        };
-        let write = self.opts.vector_files
-            && snap.generation.linked().is_none()
-            && snap.generation._base.is_none();
+        let (files, write) = self.vector_files(&snap, &entry.config);
         let sequential = self.vector.sequential.load(Ordering::SeqCst);
         let current = Arc::downgrade(&self.current);
         let registry = Arc::downgrade(&self.vector);
@@ -582,6 +841,8 @@ impl Store {
                     load,
                     write,
                     sequential,
+                    carry,
+                    carry_only: false,
                 };
                 let gv = &snap.generation.vectors;
                 let install = |b: Arc<Built>| {
@@ -607,7 +868,10 @@ impl Store {
                 match r {
                     Ok(Ok(Outcome::Ready(b))) => {
                         let rows = b.segment.rows() as u64;
+                        let carried = b.carried;
                         install(b);
+                        // the rows committed during the build go into the graph
+                        kick.notify_one();
                         tracing::info!(
                             target: "sparkles::store::vector",
                             "vector index {}: {rows} rows ready in {:?}",
@@ -622,6 +886,7 @@ impl Store {
                                 at: crate::commit::rfc3339_ms(crate::commit::now_ms()),
                                 ms: t0.elapsed().as_secs_f64() * 1000.0,
                                 rows,
+                                carried,
                             }),
                         );
                     }
@@ -657,5 +922,33 @@ impl Store {
             tracing::error!(target: "sparkles::store::vector", "cannot start the vector index build: {e}");
             failed.finish(epoch, "failed", Some(format!("build failed: {e}")), None);
         }
+    }
+}
+
+/// Block until a commit is published or `kick` is notified (`false`: the store is gone).
+fn wait_commit_or_kick(
+    commits: &mut tokio::sync::watch::Receiver<u64>,
+    kick: &tokio::sync::Notify,
+) -> bool {
+    use std::future::Future;
+    use std::task::{Context, Poll, Wake};
+    struct Unpark(std::thread::Thread);
+    impl Wake for Unpark {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    let waker = Arc::new(Unpark(std::thread::current())).into();
+    let mut cx = Context::from_waker(&waker);
+    let mut changed = std::pin::pin!(commits.changed());
+    let mut notified = std::pin::pin!(kick.notified());
+    loop {
+        if let Poll::Ready(r) = changed.as_mut().poll(&mut cx) {
+            return r.is_ok();
+        }
+        if notified.as_mut().poll(&mut cx).is_ready() {
+            return true;
+        }
+        std::thread::park();
     }
 }

@@ -4,6 +4,65 @@
  */
 
 export interface paths {
+    "/$/algo/{ds}/projections": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List the named projections */
+        get: operations["listAlgorithmProjections"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/algo/{ds}/projections/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get a named projection */
+        get: operations["getAlgorithmProjection"];
+        /**
+         * Define a named projection
+         * @description Stores the definition as the next revision. `If-Match: "r<N>"` replaces only revision N, and `If-None-Match: *` only creates. A bare string in `predicates` is a predicate in the algorithm's own direction.
+         */
+        put: operations["putAlgorithmProjection"];
+        post?: never;
+        /** Delete a named projection */
+        delete: operations["deleteAlgorithmProjection"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/algo/{ds}/run": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Run a graph algorithm
+         * @description Without `write` the run is the SPARQL query its request stands for, answered as `/{ds}/sparql` answers (`Accept`, `timeout`, `execution` and the budget overrides apply), one row per node, node pair or node and level. `summary=true` returns only the statistics of the run. With `write` the run is a task that computes at the head commit and writes the rows in batched commits, with a run record in the graph. Read-only runs need read through the query endpoint and use Query rate/concurrency limits. Write-back runs need write through the update endpoint and use Update HTTP admission through the 202 response body. Background work uses the existing task queue and algorithm-thread admission, not an HTTP permit. A task can be cancelled with `DELETE /$/tasks/{id}`.
+         */
+        post: operations["runAlgorithm"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/asks/{ds}": {
         parameters: {
             query?: never;
@@ -3454,6 +3513,64 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** @description A named projection of a dataset. A PUT sends the definition, or this object with its `definition` member. */
+        AlgoProjection: {
+            author?: string;
+            definition: components["schemas"]["AlgoProjectionDefinition"];
+            name: string;
+            /** @description 1 for a new projection, one more for each replacement. */
+            revision: number;
+            updated: string;
+        };
+        /** @description The edges of a projection. Without `predicates` every predicate between resources counts, except `rdf:type`. An empty `predicates` list is refused. */
+        AlgoProjectionDefinition: {
+            /** @enum {string} */
+            aggregate?: "none" | "sum" | "max" | "count";
+            defaultWeight?: number;
+            /** @enum {string} */
+            direction?: "forward" | "backward" | "undirected";
+            nodeClasses?: string[];
+            predicates?: (string | {
+                /** @enum {string} */
+                direction?: "forward" | "backward" | "undirected";
+                iri: string;
+            })[];
+            /** @description The property of an edge's reifier that holds its weight. */
+            weight?: string;
+        };
+        /** @description A dataset's named projections and the size of the cache of built projections. */
+        AlgoProjectionList: {
+            cache: {
+                bytes: number;
+                entries: number;
+            };
+            dataset: string;
+            projections: components["schemas"]["AlgoProjection"][];
+            /** @description Why `algo.json` could not be read. The list is then empty and refuses changes. */
+            warning?: string;
+        };
+        /** @description A run of one algorithm. With `write` the results are written to a graph in batched commits. */
+        AlgoRequest: {
+            /** @enum {string} */
+            algorithm: "pageRank" | "betweenness" | "wcc" | "scc" | "labelPropagation" | "louvain" | "leiden" | "nodeSimilarity" | "triangleCount" | "clustering" | "kCore" | "bfs" | "sssp" | "fastRP" | "node2vec";
+            /** @description The parameters of the algorithm, named as in `algo:` without the prefix, such as `maxIterations`, `seed` or `topK`. */
+            params?: {
+                [key: string]: unknown;
+            };
+            /** @description The name of a stored projection, or a definition. */
+            projection?: string | components["schemas"]["AlgoProjectionDefinition"];
+            write?: {
+                atomic?: boolean;
+                batchSize?: number;
+                graph: string;
+                /** @enum {string} */
+                mode?: "replace" | "merge";
+                /** @description The predicate that each output is written with, such as `{"score": "ex:rank"}`. */
+                predicates: {
+                    [key: string]: string;
+                };
+            };
+        };
         /** @description Feedback on an answer. */
         AskFeedback: {
             /** @description At most 1000 characters. */
@@ -8071,6 +8188,7 @@ export interface components {
             } | null;
             lastBuild?: {
                 at: string;
+                carried?: boolean;
                 ms: number;
                 rows?: number;
             };
@@ -8087,7 +8205,10 @@ export interface components {
             name: string;
             overlay: {
                 deletes: number;
+                indexed: number;
                 inserts: number;
+                overBudget: boolean;
+                pending: number;
             };
             predicate: string;
             progress?: number;
@@ -8551,6 +8672,201 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    listAlgorithmProjections: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The definitions and the projection cache. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AlgoProjectionList"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getAlgorithmProjection: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
+                name: components["parameters"]["name"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The definition with its revision. */
+            200: {
+                headers: {
+                    /** @description `"r<N>"` */
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AlgoProjection"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    putAlgorithmProjection: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Entity tags. A write needs a tag that names the current head. */
+                "If-Match"?: components["parameters"]["ifMatch"];
+                /** @description Entity tags, or `*`. */
+                "If-None-Match"?: components["parameters"]["ifNoneMatch"];
+            };
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
+                name: components["parameters"]["name"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AlgoProjectionDefinition"];
+            };
+        };
+        responses: {
+            /** @description Replaced. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AlgoProjection"];
+                };
+            };
+            /** @description Created. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AlgoProjection"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            412: components["responses"]["PreconditionFailed"];
+            default: components["responses"]["Error"];
+        };
+    };
+    deleteAlgorithmProjection: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Entity tags. A write needs a tag that names the current head. */
+                "If-Match"?: components["parameters"]["ifMatch"];
+            };
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
+                name: components["parameters"]["name"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            412: components["responses"]["PreconditionFailed"];
+            default: components["responses"]["Error"];
+        };
+    };
+    runAlgorithm: {
+        parameters: {
+            query?: {
+                /** @description The response format, in place of `Accept`. Fuseki's `output` and `results` are the same parameter. */
+                format?: components["parameters"]["format"];
+                /** @description Seconds. Capped at the server's `--max-timeout`. */
+                timeout?: components["parameters"]["timeout"];
+                /** @description Bypass the query result cache. */
+                nocache?: components["parameters"]["nocache"];
+                /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto conservatively selects streaming for large immutable SELECT scans and eligible uncached OPTIONAL counts, and eager execution otherwise. The default remains eager. Explicit streaming SELECT does not support Thrift results, and auto runs those requests eagerly. Deadlines include blocked response writes; late failures abort the body. */
+                execution?: components["parameters"]["execution"];
+                /** @description Return only the summary of the run. */
+                summary?: boolean;
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AlgoRequest"];
+            };
+        };
+        responses: {
+            /** @description The rows of the run, or its summary. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/sparql-results+json": Record<string, never>;
+                };
+            };
+            /** @description A run with `write`, started as a task. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Task"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            413: components["responses"]["PayloadTooLarge"];
+            429: components["responses"]["TooManyRequests"];
+            503: components["responses"]["Unavailable"];
+            507: components["responses"]["InsufficientStorage"];
+            default: components["responses"]["Error"];
+        };
+    };
     listAsks: {
         parameters: {
             query?: {

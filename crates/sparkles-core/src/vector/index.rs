@@ -97,13 +97,20 @@ pub struct Built {
     pub file_bytes: u64,
     /// the segment is usable and the graph is still being built
     pub hnsw_pending: bool,
+    /// the nodes inserted into the graph since the build ([`super::live`])
+    pub live: Arc<super::live::Live>,
+    /// the graph was carried over from the previous generation's build
+    pub carried: bool,
 }
 
 impl Built {
+    /// Heap and mapped bytes: the segment, the graph and the live layer of nodes
+    /// inserted since the build. Takes the live layer's read lock.
     pub fn bytes(&self) -> u64 {
         self.segment.bytes()
             + self.graph.as_ref().map_or(0, |g| g.bytes())
             + self.node_rows.len() as u64 * 4
+            + self.live.read().bytes()
     }
 
     pub fn mapped(&self) -> bool {
@@ -132,6 +139,9 @@ pub struct GenerationVectors {
     overlay: Mutex<OverlayCache>,
     /// the generation was replaced: its index files are written no more
     retired: Mutex<bool>,
+    /// indexes whose carry from the previous generation was declined for this one, so
+    /// a later build of the generation does not map the old nodes again
+    declined: Mutex<rustc_hash::FxHashSet<String>>,
     /// the store's embedding state (environment and cache), for searches with text
     embedder: RwLock<Option<std::sync::Weak<super::embed::Embedder>>>,
 }
@@ -192,6 +202,16 @@ impl GenerationVectors {
                 .sum::<u64>()
     }
 
+    /// Record that carrying index `name` over to this generation was declined.
+    fn decline_carry(&self, name: &str) {
+        self.declined.lock().insert(name.to_string());
+    }
+
+    /// Whether carrying index `name` over to this generation was declined.
+    fn carry_declined(&self, name: &str) -> bool {
+        self.declined.lock().contains(name)
+    }
+
     pub fn set_configured(&self, c: Arc<BTreeMap<String, VectorIndexConfig>>) {
         *self.configured.write() = c;
     }
@@ -235,6 +255,11 @@ impl GenerationVectors {
         self.built.write().insert(b.name.clone(), b);
     }
 
+    /// The names of the indexes built (or being built) for this generation.
+    pub(crate) fn built_names(&self) -> Vec<String> {
+        self.built.read().keys().cloned().collect()
+    }
+
     pub(crate) fn remove_built(&self, name: &str) -> Option<Arc<Built>> {
         self.built.write().remove(name)
     }
@@ -274,7 +299,7 @@ impl GenerationVectors {
         if let Some(v) = self.by_pred.lock().get(&p) {
             return Ok(v.clone());
         }
-        let packed = pack(snap, p, None, &|_| {}, &|| false)?;
+        let packed = pack(snap, p, None, &|_| {}, &|| false, None)?;
         let bytes: u64 = packed.by_dim.values().map(Segment::bytes).sum();
         let used = self.used_bytes();
         if used + bytes > budget {
@@ -307,13 +332,16 @@ struct Packed {
 /// Literals parsed per batch while packing.
 const PARSE_BATCH: usize = 1 << 15;
 
-/// Pack the base rows of predicate `p`: every dimension, or only `only`.
+/// Pack the base rows of predicate `p`: every dimension, or only `only`. The rows whose
+/// pair the previous generation's index `known` holds take their vector from it instead
+/// of parsing the literal again.
 fn pack(
     snap: &Snapshot,
     p: u64,
     only: Option<usize>,
     progress: &dyn Fn(f32),
     cancel: &dyn Fn() -> bool,
+    known: Option<&Old<'_>>,
 ) -> Result<Packed> {
     use rayon::prelude::*;
     let base = snap.perm(Perm::Pso);
@@ -357,9 +385,16 @@ fn pack(
         if cancel() {
             return Err(Error::Cancelled);
         }
+        // the previous index's node of each row, if it has one
+        let olds: Vec<Option<u32>> = batch
+            .iter()
+            .map(|k| known.and_then(|o| o.find(k[0], k[1])))
+            .collect();
         let mut objs: Vec<u64> = batch
             .iter()
-            .map(|k| k[1])
+            .zip(&olds)
+            .filter(|(_, old)| old.is_none())
+            .map(|(k, _)| k[1])
             .filter(|&o| Id(o).tag() == Tag::Vocab)
             .collect();
         objs.sort_unstable();
@@ -384,7 +419,15 @@ fn pack(
             })
             .collect();
         drop(raw);
-        for k in batch {
+        for (k, old) in batch.iter().zip(&olds) {
+            if let (Some(o), Some(x)) = (known, old) {
+                let (v, n) = o.vector(*x);
+                let (ids, norms, data) = by_dim.entry(v.len()).or_default();
+                ids.push(*k);
+                norms.push(n);
+                data.extend_from_slice(v);
+                continue;
+            }
             match parsed.get(&k[1]) {
                 Some(Lit::Vector(v)) => {
                     let (ids, norms, data) = by_dim.entry(v.len()).or_default();
@@ -466,6 +509,99 @@ impl hnsw::Space for SegSpace<'_> {
     }
 }
 
+/// Half-precision copies of the nodes' vectors in node order, which a graph build reads
+/// instead of the segment's `f32` rows. The build is limited by memory bandwidth (a
+/// node's insertion reads a few thousand rows spread over the whole segment), so half
+/// the bytes per row makes it faster, and node order drops the step from node to row.
+/// Under cosine the copies are of the unit vectors, so the distance is `1 − dot`. The
+/// graph's distances round differently from the `f32` ones, which can only change which
+/// links it keeps. Searches still read the `f32` rows, and scores never come from here.
+///
+/// The copy takes 2 bytes per dimension per node for as long as the build runs (768 MB
+/// at 1M × 384), on top of the segment.
+pub(crate) struct HalfSpace {
+    dim: usize,
+    metric: Metric,
+    data: Vec<u16>,
+}
+
+impl HalfSpace {
+    /// The copies of `rows` of `seg` (`None`: the CPU has no fast half-precision path,
+    /// or a value is beyond binary16's range for the dot or euclidean metric).
+    pub(crate) fn new(seg: &Segment, rows: &[u32], metric: Metric) -> Option<HalfSpace> {
+        use rayon::prelude::*;
+        let dim = seg.dim;
+        if !super::fast::f16_fast() || dim == 0 {
+            return None;
+        }
+        if metric != Metric::Cosine
+            && rows
+                .par_iter()
+                .any(|&r| seg.row(r as usize).iter().any(|x| x.abs() > 65_000.0))
+        {
+            return None;
+        }
+        let mut data = vec![0u16; rows.len() * dim];
+        data.par_chunks_mut(dim).zip(rows.par_iter()).for_each_init(
+            || vec![0f32; dim],
+            |buf, (out, &r)| {
+                let row = seg.row(r as usize);
+                if metric == Metric::Cosine {
+                    let n = seg.norms[r as usize];
+                    for (b, x) in buf.iter_mut().zip(row) {
+                        *b = x / n;
+                    }
+                    super::fast::to_f16(buf, out);
+                } else {
+                    super::fast::to_f16(row, out);
+                }
+            },
+        );
+        Some(HalfSpace { dim, metric, data })
+    }
+
+    #[inline]
+    fn row(&self, x: u32) -> &[u16] {
+        &self.data[x as usize * self.dim..(x as usize + 1) * self.dim]
+    }
+}
+
+impl hnsw::Space for HalfSpace {
+    fn len(&self) -> usize {
+        self.data.len() / self.dim
+    }
+
+    fn dist(&self, a: u32, b: u32) -> f32 {
+        let (x, y) = (self.row(a), self.row(b));
+        let d = match self.metric {
+            Metric::Cosine => 1.0 - super::fast::dot_f16(x, y),
+            Metric::Dot => -super::fast::dot_f16(x, y),
+            Metric::Euclidean => super::fast::l2sq_f16(x, y),
+        };
+        if d.is_nan() { f32::INFINITY } else { d }
+    }
+
+    #[inline]
+    fn prefetch(&self, a: u32) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let row = self.row(a);
+            let p = row.as_ptr().cast::<i8>();
+            let bytes = row.len() * 2;
+            let mut o = 0;
+            while o < bytes {
+                // SAFETY: a prefetch is a hint; the address is inside the row.
+                unsafe {
+                    std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(p.add(o))
+                };
+                o += 64;
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = a;
+    }
+}
+
 /// The rows per graph of a segment.
 fn graph_rows(seg: &Segment) -> Vec<(u64, u64)> {
     let mut m: FxHashMap<u64, u64> = FxHashMap::default();
@@ -493,6 +629,257 @@ pub(crate) struct BuildCtl<'a> {
     pub write: bool,
     /// build the graph one node at a time (see [`hnsw::Params::sequential`])
     pub sequential: bool,
+    /// the previous generation's build of the index, to carry over
+    pub carry: Option<Carry>,
+    /// only carry the graph over: when there is no usable carry, or it changed too much,
+    /// end with [`Outcome::Cancelled`] instead of building the graph from scratch. A
+    /// compaction sets it, so its thread never runs a full build, which the background
+    /// build after the switch does instead.
+    pub carry_only: bool,
+}
+
+/// The previous generation's build of an index, which the new generation's build reuses:
+/// its vectors instead of parsing the literals again, and its graph's links.
+pub(crate) struct Carry {
+    pub old: Arc<Built>,
+    /// a snapshot of the previous generation, which reads the old term ids' keys
+    pub snap: Arc<Snapshot>,
+}
+
+/// The share of nodes that may differ between the previous graph and the new segment
+/// for the graph to be carried over (dropped old nodes and new rows, over the new
+/// nodes). Past it the graph is built again.
+pub(crate) const CARRY_MAX_CHANGE: f64 = 0.3;
+
+/// The previous generation's index as a carried build reads it.
+pub(crate) struct Old<'a> {
+    built: &'a Built,
+    graph: &'a Graph,
+    live: &'a super::live::LiveState,
+    /// (new subject id, new object id, old node) of every old node whose terms the new
+    /// generation has, sorted
+    keys: Vec<(u64, u64, u32)>,
+}
+
+impl<'a> Old<'a> {
+    /// Map the old nodes' terms to the ids of `new`'s generation (`None`: cancelled).
+    fn new(
+        c: &'a Carry,
+        live: &'a super::live::LiveState,
+        new: &Snapshot,
+        cancel: &(dyn Fn() -> bool + Sync),
+    ) -> Option<Old<'a>> {
+        use rayon::prelude::*;
+        let graph = c.old.graph.as_deref()?;
+        let f = graph.nodes;
+        let total = f + live.nodes();
+        let tr = |id: u64| -> Option<u64> {
+            match Id(id).tag() {
+                Tag::Vocab | Tag::Delta => c
+                    .snap
+                    .key(Id(id))
+                    .and_then(|k| new.lookup_key(&k))
+                    .map(|i| i.0),
+                _ => Some(id),
+            }
+        };
+        let mut keys: Vec<(u64, u64, u32)> = (0..total as u32)
+            .into_par_iter()
+            .filter_map(|x| {
+                if x.is_multiple_of(4096) && cancel() {
+                    return None;
+                }
+                let (s, o) = if (x as usize) < f {
+                    let [s, o, _] = c.old.segment.ids[c.old.node_rows[x as usize] as usize];
+                    (s, o)
+                } else {
+                    live.key(x)
+                };
+                Some((tr(s)?, tr(o)?, x))
+            })
+            .collect();
+        if cancel() {
+            return None;
+        }
+        keys.par_sort_unstable();
+        Some(Old {
+            built: &c.old,
+            graph,
+            live,
+            keys,
+        })
+    }
+
+    /// The old node of the pair (s, o) of new ids.
+    fn find(&self, s: u64, o: u64) -> Option<u32> {
+        let i = self.keys.partition_point(|k| (k.0, k.1) < (s, o));
+        self.keys
+            .get(i)
+            .filter(|k| (k.0, k.1) == (s, o))
+            .map(|k| k.2)
+    }
+
+    /// The vector and norm of old node `x`.
+    fn vector(&self, x: u32) -> (&[f32], f32) {
+        if (x as usize) < self.graph.nodes {
+            let r = self.built.node_rows[x as usize] as usize;
+            (self.built.segment.row(r), self.built.segment.norms[r])
+        } else {
+            self.live.vector(x)
+        }
+    }
+
+    fn nodes(&self) -> usize {
+        self.graph.nodes + self.live.nodes()
+    }
+
+    fn level(&self, frozen: &[u8], x: u32) -> u8 {
+        if (x as usize) < self.graph.nodes {
+            frozen[x as usize]
+        } else {
+            self.live.level(x) as u8
+        }
+    }
+}
+
+/// Which old node each new node continues, which new node each old one became, and the
+/// new nodes that continue none.
+struct CarryMap {
+    old_of_new: Vec<u32>,
+    new_of_old: Vec<u32>,
+    fresh: Vec<u32>,
+}
+
+/// A node with no counterpart in a [`CarryMap`].
+const NONE: u32 = u32::MAX;
+
+/// Map the nodes of the new segment to `old`'s, or `None` when more than
+/// [`CARRY_MAX_CHANGE`] of the nodes differ and the graph is built again instead.
+fn carry_map(seg: &Segment, nodes: &[u32], old: &Old<'_>) -> Option<CarryMap> {
+    let n = nodes.len();
+    let mut old_of_new = vec![NONE; n];
+    let mut new_of_old = vec![NONE; old.nodes()];
+    for (j, &r) in nodes.iter().enumerate() {
+        let [s, o, _] = seg.ids[r as usize];
+        if let Some(x) = old.find(s, o)
+            && new_of_old[x as usize] == NONE
+        {
+            old_of_new[j] = x;
+            new_of_old[x as usize] = j as u32;
+        }
+    }
+    let fresh: Vec<u32> = (0..n as u32)
+        .filter(|&j| old_of_new[j as usize] == NONE)
+        .collect();
+    let dropped = new_of_old.iter().filter(|&&j| j == NONE).count();
+    if n == 0 || (fresh.len() + dropped) as f64 > CARRY_MAX_CHANGE * n as f64 {
+        return None;
+    }
+    Some(CarryMap {
+        old_of_new,
+        new_of_old,
+        fresh,
+    })
+}
+
+/// Whether the previous generation's delta at `c.snap` changed so many of `c.old`'s
+/// nodes that a carry would be declined, estimated from the delta alone before anything
+/// is packed: the inserted rows the live layer `live` does not hold count as new nodes,
+/// and the deleted rows as dropped ones. Rows of other dimensions or in several graphs
+/// count too, so the estimate can only overstate the change.
+fn carry_declined_early(c: &Carry, live: &super::live::LiveState) -> bool {
+    let (Some(g), Some(p)) = (&c.old.graph, super::live::pred_in(&c.old, &c.snap)) else {
+        return false;
+    };
+    let pi = Perm::Pso.index();
+    let (lo, hi) = ([p, 0, 0, 0], [p, u64::MAX, u64::MAX, u64::MAX]);
+    let dropped = c.snap.delta.del[pi].count_between(&lo, &hi);
+    let fresh = c.snap.delta.ins[pi]
+        .range(lo..=hi)
+        .filter(|k| !live.seen(k[1], k[2]))
+        .count();
+    let n = (g.nodes + live.nodes() + fresh).saturating_sub(dropped);
+    (fresh + dropped) as f64 > CARRY_MAX_CHANGE * n as f64
+}
+
+/// The graph over `nodes` of the new segment, carried over from `old`: each old node
+/// whose pair is still a row becomes the node of that row with its level, and its links
+/// map through. A node that lost neighbours (rows deleted since) has its links chosen
+/// again by the heuristic from the surviving ones and the neighbours of the lost ones,
+/// as Algorithm 4 repairs on insert. The new rows are then inserted. `map` comes from
+/// [`carry_map`]. `Err(())` when cancelled.
+fn carry_graph(
+    nodes: &[u32],
+    space: &dyn hnsw::Space,
+    params: &hnsw::Params,
+    old: &Old<'_>,
+    map: CarryMap,
+    ctl: &hnsw::Ctl<'_>,
+) -> std::result::Result<Graph, ()> {
+    use rayon::prelude::*;
+    let n = nodes.len();
+    let CarryMap {
+        old_of_new,
+        new_of_old,
+        fresh,
+    } = map;
+    let frozen_levels = old.graph.levels();
+    let levels: Vec<u8> = (0..n)
+        .map(|j| match old_of_new[j] {
+            NONE => hnsw::level_of(j as u32, params) as u8,
+            x => old.level(&frozen_levels, x),
+        })
+        .collect();
+    let b = hnsw::Builder::new(space, params, levels.clone());
+    let view = super::live::View {
+        graph: old.graph,
+        live: old.live,
+    };
+    let map = |y: u32| Some(new_of_old[y as usize]).filter(|&m| m != NONE);
+    (0..n as u32).into_par_iter().for_each(|j| {
+        let x = old_of_new[j as usize];
+        if x == NONE {
+            return;
+        }
+        let mut links = Vec::new();
+        for l in 0..=levels[j as usize] as usize {
+            links.clear();
+            hnsw::Layers::links(&view, l, x, &mut links);
+            let mapped: Vec<u32> = links.iter().filter_map(|&y| map(y)).collect();
+            if mapped.len() == links.len() {
+                b.seed(l, j, &mapped);
+                continue;
+            }
+            // repair: the survivors and the lost neighbours' neighbours
+            let mut cand: rustc_hash::FxHashSet<u32> = mapped.iter().copied().collect();
+            let mut two = Vec::new();
+            for &y in links.iter().filter(|&&y| map(y).is_none()) {
+                two.clear();
+                hnsw::Layers::links(&view, l, y, &mut two);
+                cand.extend(two.iter().filter_map(|&z| map(z)).filter(|&m| m != j));
+            }
+            let mut c: Vec<hnsw::Near> = cand
+                .into_iter()
+                .map(|m| hnsw::Near(space.dist(j, m), m))
+                .collect();
+            c.sort_unstable();
+            b.seed(l, j, &hnsw::select(space, &c, params.cap(l)));
+        }
+    });
+    let entry = hnsw::Layers::entry(&view)
+        .and_then(|(e, _)| map(e))
+        .or_else(|| {
+            (0..n as u32)
+                .filter(|&j| old_of_new[j as usize] != NONE)
+                .max_by_key(|&j| (levels[j as usize], std::cmp::Reverse(j)))
+        });
+    if let Some(e) = entry {
+        b.set_entry(e);
+    }
+    if !b.insert_all(&fresh, ctl) {
+        return Err(());
+    }
+    Ok(b.freeze())
 }
 
 /// How a build ended.
@@ -505,7 +892,7 @@ pub(crate) enum Outcome {
 }
 
 /// The seed of every graph build (builds are reproducible).
-const SEED: u64 = 0x5eed_5eed;
+pub(crate) const SEED: u64 = 0x5eed_5eed;
 
 /// Build index `name` for `snap`'s generation from its base: read it from its file when
 /// `ctl.load` and the file fits, else pack the predicate's vectors, publish them through
@@ -540,6 +927,34 @@ pub(crate) fn build_index(
     }
     let cancelled = || (ctl.cancel)();
     let hnsw_share = if cfg.hnsw.is_some() { 0.3 } else { 1.0 };
+    // the previous generation's build, when its graph was built with these settings
+    let carry = ctl.carry.as_ref().filter(|c| {
+        c.old.graph.is_some()
+            && !c.old.hnsw_pending
+            && c.old.config.build_hash() == cfg.build_hash()
+            && pred.is_some()
+    });
+    // a copy of its live layer, so the old generation's inserts go on meanwhile
+    let old_live = carry.map(|c| c.old.live.read().clone());
+    // a compaction that changed too much leaves the build to the background at once,
+    // without mapping the old nodes or packing the vectors
+    if ctl.carry_only
+        && let (Some(c), Some(l)) = (carry, &old_live)
+        && carry_declined_early(c, l)
+    {
+        return Ok(Outcome::Cancelled);
+    }
+    let old = match (carry, &old_live) {
+        (Some(c), Some(l)) => match Old::new(c, l, snap, ctl.cancel) {
+            Some(o) => Some(o),
+            None => return Ok(Outcome::Cancelled),
+        },
+        _ => None,
+    };
+    // nothing to carry over: the vectors would be packed only to be dropped
+    if ctl.carry_only && (old.is_none() || cfg.hnsw.is_none()) {
+        return Ok(Outcome::Cancelled);
+    }
     let (segment, skipped) = match pred {
         None => (
             Segment {
@@ -555,6 +970,7 @@ pub(crate) fn build_index(
                 Some(cfg.dimension),
                 &|f| (ctl.progress)(f * hnsw_share),
                 &cancelled,
+                old.as_ref(),
             ) {
                 Ok(x) => x,
                 Err(Error::Cancelled) => return Ok(Outcome::Cancelled),
@@ -609,16 +1025,47 @@ pub(crate) fn build_index(
         opened: false,
         file_bytes: 0,
         hnsw_pending: cfg.hnsw.is_some(),
+        live: Default::default(),
+        carried: false,
     };
     if let Some(h) = cfg.hnsw {
         partial(Arc::new(Built {
             node_rows: Arc::new(Slice::Owned(Vec::new())),
             ..clone_meta(&built)
         }));
-        let space = SegSpace {
+        let seg_space = SegSpace {
             seg: &segment,
             nodes: &nodes,
             metric: cfg.metric,
+        };
+        // which old node each node continues, decided before the half-precision copy so
+        // a declined carry on a compaction's thread makes no copy; a carry this
+        // generation declined before is not tried again
+        let map = match &old {
+            Some(o) if !gv.carry_declined(name) => match carry_map(&segment, &nodes, o) {
+                Some(m) => Some(m),
+                None => {
+                    gv.decline_carry(name);
+                    None
+                }
+            },
+            _ => None,
+        };
+        if ctl.carry_only && map.is_none() {
+            // the background build after the switch builds the graph
+            return Ok(Outcome::Cancelled);
+        }
+        // the half-precision copy only when it fits in the budget beside the index and
+        // the builder's link distances, one `f32` per link slot, which the build holds
+        // while it runs and which take about as much as the graph's links
+        let half_bytes = (nodes.len() * segment.dim * 2) as u64;
+        let dist_bytes = graph_estimate;
+        let half = (used + need + dist_bytes + half_bytes <= ctl.budget)
+            .then(|| HalfSpace::new(&segment, &nodes, cfg.metric))
+            .flatten();
+        let space: &dyn hnsw::Space = match &half {
+            Some(h) => h,
+            None => &seg_space,
         };
         let n = nodes.len().max(1);
         let progress =
@@ -629,16 +1076,26 @@ pub(crate) fn build_index(
             seed: SEED,
             sequential: ctl.sequential,
         };
-        let Some(g) = Graph::build(
-            &space,
-            &params,
-            &hnsw::Ctl {
-                progress: &progress,
-                cancel: &cancelled,
-            },
-        ) else {
-            return Ok(Outcome::Cancelled);
+        let hctl = hnsw::Ctl {
+            progress: &progress,
+            cancel: &cancelled,
         };
+        let carried = match (&old, map) {
+            (Some(o), Some(map)) => match carry_graph(&nodes, space, &params, o, map, &hctl) {
+                Ok(g) => Some(g),
+                Err(()) => return Ok(Outcome::Cancelled),
+            },
+            _ => None,
+        };
+        built.carried = carried.is_some();
+        let g = match carried {
+            Some(g) => g,
+            None => match Graph::build(space, &params, &hctl) {
+                Some(g) => g,
+                None => return Ok(Outcome::Cancelled),
+            },
+        };
+        built.live = Arc::new(super::live::Live::new(g.nodes, segment.dim));
         built.graph = Some(Arc::new(g));
         built.node_rows = Arc::new(Slice::Owned(nodes));
         built.hnsw_pending = false;
@@ -662,6 +1119,7 @@ pub(crate) fn build_index(
             Some(Ok(mut b)) => {
                 b.opened = false;
                 b.built_ms = built.built_ms;
+                b.carried = built.carried;
                 return Ok(Outcome::Ready(Arc::new(b)));
             }
             Some(Err(e)) => tracing::warn!(
@@ -690,6 +1148,8 @@ fn clone_meta(b: &Built) -> Built {
         opened: b.opened,
         file_bytes: b.file_bytes,
         hnsw_pending: b.hnsw_pending,
+        live: b.live.clone(),
+        carried: b.carried,
     }
 }
 
@@ -824,6 +1284,10 @@ fn read_file(
         (None, Slice::Owned(Vec::new()))
     };
     let zero = seg.norms.iter().filter(|&&n| n == 0.0).count() as u64;
+    let live = Arc::new(super::live::Live::new(
+        graph.as_ref().map_or(0, |g| g.nodes),
+        dim,
+    ));
     Ok(Built {
         name: name.to_string(),
         config: cfg.clone(),
@@ -841,6 +1305,8 @@ fn read_file(
         opened: true,
         file_bytes: f.file_len(),
         hnsw_pending: false,
+        live,
+        carried: false,
     })
 }
 

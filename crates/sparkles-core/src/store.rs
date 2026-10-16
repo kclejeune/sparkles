@@ -80,6 +80,8 @@ pub use compaction::{
 pub use describe::DESCRIBE_FILE;
 pub use diff::{Diff, DiffMethod, DiffOp, DiffOptions, StateMark, key_id};
 pub use history_query::{HistoryBound, HistoryChange, HistoryQuery, HistoryResult};
+#[cfg(feature = "failpoints")]
+pub use history_query::{HistoryCheckObserver, HistoryCheckOutcome, set_history_check_observer};
 pub use link::{Linked, read_link_file};
 pub use merge::{INFERRED_GRAPH, conflict_error};
 pub use partial::PartialMode;
@@ -201,15 +203,9 @@ impl Generation {
     }
 
     fn open_with(dir: &Path, name: &str, dvocab: DeltaVocab) -> Result<Generation> {
-        let meta: IndexMeta = serde_json::from_slice(&std::fs::read(dir.join("meta.json"))?)
-            .map_err(|e| Error::Corrupt(format!("meta.json: {e}")))?;
         // the database's directory holds the generation (a branch's holds its own)
-        let written_by = || dir.parent().and_then(commit::read_written_by);
-        crate::formats::INDEX.check(
-            &dir.display().to_string(),
-            meta.format_version,
-            written_by().as_deref(),
-        )?;
+        let written_by = dir.parent().and_then(commit::read_written_by);
+        let meta: IndexMeta = crate::builder::read_index_meta(dir, written_by.as_deref())?;
         let stats: Stats = serde_json::from_slice(&std::fs::read(dir.join("stats.json"))?)
             .map_err(|e| Error::Corrupt(format!("stats.json: {e}")))?;
         Ok(Generation {
@@ -438,6 +434,10 @@ pub struct Snapshot {
     pub cache: Arc<BlockCache>,
     /// query result cache shared by all snapshots of the store
     pub results: Arc<crate::sparql::cache::ResultCache>,
+    /// Whether committed-view identity safely keys result and projection caches.
+    /// Uncommitted and synthetic views must not read or populate those caches.
+    /// This does not control the block cache.
+    pub cacheable: bool,
     /// delta-vocabulary size visible to this snapshot
     pub dvocab_len: u64,
     /// the commit (`seq`) this snapshot reflects
@@ -881,10 +881,15 @@ impl Snapshot {
     }
 
     /// Distinct values of the first key column (e.g. graph names from GSPO), by skipping.
-    pub fn distinct_first(&self, perm: Perm) -> Result<Vec<u64>> {
-        let mut out = Vec::new();
+    fn distinct_first_checked(
+        &self,
+        perm: Perm,
+        mut check: impl FnMut() -> Result<()>,
+        mut each: impl FnMut(u64) -> Result<()>,
+    ) -> Result<()> {
         let mut cur: Option<u64> = None;
         loop {
+            check()?;
             let from = match cur {
                 None => 0,
                 Some(u64::MAX) => break,
@@ -915,6 +920,7 @@ impl Snapshot {
             // a count would walk every inserted and deleted key of the delta under `v`
             let mut any = false;
             self.scan(perm, &[v], |c| {
+                check()?;
                 any = match c {
                     Chunk::Block(_, start, end) => start < end,
                     Chunk::Row(_) => true,
@@ -922,11 +928,41 @@ impl Snapshot {
                 Ok(!any)
             })?;
             if any {
-                out.push(v);
+                each(v)?;
             }
             cur = Some(v);
         }
+        Ok(())
+    }
+
+    /// Distinct values of the first key column (e.g. graph names from GSPO), by skipping.
+    pub fn distinct_first(&self, perm: Perm) -> Result<Vec<u64>> {
+        let mut out = Vec::new();
+        self.distinct_first_checked(
+            perm,
+            || Ok(()),
+            |value| {
+                out.push(value);
+                Ok(())
+            },
+        )?;
         Ok(out)
+    }
+
+    /// Visit visible named graph IDs in the same order as graph_ids, without a list.
+    /// The query adapter supplies its control check; callback errors propagate directly.
+    pub(crate) fn for_each_graph_id_checked(
+        &self,
+        check: impl FnMut() -> Result<()>,
+        mut each: impl FnMut(Id) -> Result<()>,
+    ) -> Result<()> {
+        self.distinct_first_checked(Perm::Gspo, check, |value| {
+            let graph = Id(value);
+            if graph != Id::DEFAULT_GRAPH {
+                each(graph)?;
+            }
+            Ok(())
+        })
     }
 
     /// All named graph ids (excludes the default graph).
@@ -1444,6 +1480,7 @@ impl Store {
             root: None,
             group: None,
             current: Arc::new(ArcSwap::from_pointee(Snapshot {
+                cacheable: true,
                 dataset_id,
                 generation: gen_,
                 delta: Delta::default(),
@@ -1831,6 +1868,7 @@ impl Store {
                 .experimental_group_commit
                 .then(|| Box::new(group::Coordinator::default())),
             current: Arc::new(ArcSwap::from_pointee(Snapshot {
+                cacheable: true,
                 dataset_id: branching
                     .ident
                     .as_ref()
@@ -2263,6 +2301,7 @@ impl Store {
         let bytes = delta_bytes(&delta);
         let dvocab_len = generation.dvocab.len();
         let snap = Arc::new(Snapshot {
+            cacheable: true,
             dataset_id: self.owner_dataset_id(),
             generation,
             delta,
@@ -3603,10 +3642,12 @@ impl Store {
         let w = {
             // counted while it waits, so a long holder of the lock can give way
             let _waiting = Waiting::new(&self.writers_waiting);
+            #[cfg(any(test, feature = "failpoints"))]
+            self.failpoint("writer-acquiring");
             if o.no_wait {
                 o.check()?;
                 self.writer.try_lock().ok_or(Error::WriterBusy)?
-            } else if o.cancel.is_none() && o.deadline.is_none() {
+            } else if o.cancel.is_none() && o.cancellation.is_none() && o.deadline.is_none() {
                 self.writer.lock()
             } else {
                 loop {
@@ -3712,7 +3753,8 @@ impl Store {
         o: Option<crate::guard::WriteOptions>,
         dir: &Path,
     ) -> Option<crate::builder::InterruptFn> {
-        let o = o.filter(|o| o.cancel.is_some() || o.deadline.is_some());
+        let o =
+            o.filter(|o| o.cancel.is_some() || o.cancellation.is_some() || o.deadline.is_some());
         let reserve = self.root.as_ref().and(self.opts.min_free_disk_bytes);
         if o.is_none() && reserve.is_none() {
             return None;
@@ -4322,6 +4364,7 @@ impl Store {
         let head_seq = w.head.seq;
         let candidate = || {
             Arc::new(Snapshot {
+                cacheable: false,
                 dataset_id: self.owner_dataset_id(),
                 generation: gen_.clone(),
                 delta: Delta::default(),
@@ -4454,6 +4497,7 @@ impl Store {
         let old_name = snap.generation.name.clone();
         let dvocab_len = gen_.dvocab.len();
         let mut new_snap = Snapshot {
+            cacheable: true,
             dataset_id: self.owner_dataset_id(),
             generation: gen_,
             delta: Delta::default(),
@@ -5048,10 +5092,12 @@ impl WriteTxn<'_> {
     }
 
     /// Snapshot view including this transaction's uncommitted changes. It keeps the
-    /// committed version number but not its result cache: the data differs from that
-    /// version, so cached results must neither be read nor written through this view.
+    /// committed version number, but marks the view non-cacheable and disables its
+    /// result cache. Its data differs from that committed identity, so result and
+    /// projection caches must neither be read nor populated through this view.
     pub fn view(&self) -> Snapshot {
         Snapshot {
+            cacheable: false,
             dataset_id: self.base.dataset_id,
             generation: self.base.generation.clone(),
             delta: self.delta.clone(),
@@ -5650,6 +5696,7 @@ impl WriteTxn<'_> {
         }
         let version = self.base.version + 1;
         let mut snap = Snapshot {
+            cacheable: true,
             dataset_id: self.base.dataset_id,
             generation: gen_.clone(),
             delta: std::mem::take(&mut self.delta),
@@ -6314,6 +6361,7 @@ pub(crate) fn replay_wal(
     // commit's net counts), from its first change in the transaction
     let mut start: rustc_hash::FxHashMap<Key, bool> = Default::default();
     let probe = Snapshot {
+        cacheable: false,
         dataset_id: uuid::Uuid::nil(),
         generation: from.generation.clone(),
         delta: Delta::default(),
@@ -7247,6 +7295,42 @@ ex:a ex:p 1, 2, 3 . ex:b ex:p 2 . ex:c ex:q "hello"@en .
     }
 
     #[test]
+    fn checked_graph_ids_stream_order_and_preserve_callback_errors() {
+        let store = Store::in_memory(StoreOptions::default());
+        store.load(&[Source::from_bytes(
+            b"<urn:s> <urn:p> <urn:o> . <urn:g1> { <urn:s> <urn:p> <urn:o> . } <urn:g2> { <urn:s> <urn:p> <urn:o> . }".to_vec(),
+            RdfFormat::TriG, None,
+        )]).unwrap();
+        let snap = store.snapshot();
+        let mut found = Vec::new();
+        snap.for_each_graph_id_checked(
+            || Ok(()),
+            |id| {
+                found.push(id);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(found, snap.graph_ids().unwrap());
+        assert_eq!(found.len(), 2);
+        let mut callbacks = 0;
+        let stopped = snap.for_each_graph_id_checked(
+            || Ok(()),
+            |_| {
+                callbacks += 1;
+                Err(Error::Cancelled)
+            },
+        );
+        assert!(matches!(stopped, Err(Error::Cancelled)));
+        assert_eq!(callbacks, 1);
+        let denied = snap.for_each_graph_id_checked(
+            || Err(Error::Timeout),
+            |_| panic!("control failure must precede a graph callback"),
+        );
+        assert!(matches!(denied, Err(Error::Timeout)));
+    }
+
+    #[test]
     fn mem_store_and_graphs() {
         let store = Store::in_memory(StoreOptions::default());
         let trig = r#"@prefix ex: <http://ex.org/> .
@@ -7264,6 +7348,16 @@ ex:a ex:p 1, 2, 3 . ex:b ex:p 2 . ex:c ex:q "hello"@en .
         assert_eq!(s.len(), 4);
         let graphs = s.graph_ids().unwrap();
         assert_eq!(graphs.len(), 2);
+        let mut streamed = Vec::new();
+        s.for_each_graph_id_checked(
+            || Ok(()),
+            |g| {
+                streamed.push(g);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(streamed, graphs);
         // small incremental load goes through the delta
         store
             .load(&[Source::from_bytes(
@@ -7276,6 +7370,16 @@ ex:a ex:p 1, 2, 3 . ex:b ex:p 2 . ex:c ex:q "hello"@en .
         assert_eq!(s.len(), 5);
         assert_eq!(s.delta.inserts(), 1);
         assert_eq!(s.graph_ids().unwrap().len(), 3);
+        let mut streamed = Vec::new();
+        s.for_each_graph_id_checked(
+            || Ok(()),
+            |g| {
+                streamed.push(g);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(streamed, s.graph_ids().unwrap());
         // deleting every quad of a graph through the delta drops it, and deleting some
         // of a graph's quads keeps it
         let gquad = |o: &str, g: &str| {

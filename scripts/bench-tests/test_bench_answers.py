@@ -385,6 +385,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # the main query gets two rows with the same key, the probe (LIMIT 3) gets three
             count = 3 if "LIMIT+3" in sent else 2
             vals = ["5"] * count
+        elif self.path == "/asc":
+            vals = ["1", "2"]
         else:
             vals = ["2", "1"]
         body = json.dumps({"head": {"vars": ["x"]}, "results": {"bindings": [
@@ -432,6 +434,14 @@ class RequestTests(unittest.TestCase):
         self.assertEqual(up["value"], down["value"])
         none, _ = self.answer("/ok", "SELECT ?x { ?s ?p ?x }")
         self.assertNotIn("order", none)
+
+    def test_order_digest_tells_opposite_orders_apart(self):
+        # the same rows in opposite orders: the multisets agree and the sequences do not
+        down, _ = self.answer("/ok", "SELECT ?x { ?s ?p ?x } ORDER BY ?x")
+        up, _ = self.answer("/asc", "SELECT ?x { ?s ?p ?x } ORDER BY ?x")
+        self.assertNotEqual(up["order"], down["order"])
+        self.assertEqual(up["exact"], down["exact"])
+        self.assertEqual(up["value"], down["value"])
 
     def test_the_probe_request_is_wired_through_main(self):
         Handler.bodies.clear()

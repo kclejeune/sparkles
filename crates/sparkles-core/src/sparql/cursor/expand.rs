@@ -139,11 +139,14 @@ impl Expand {
                     let info = child.info.clone();
                     exec::execute_with_inputs(ctx, &self.node, &mut |_| {
                         Ok((
-                            input.take().expect("one input table per batch"),
+                            crate::sparql::table::Materialized::plain(
+                                input.take().expect("one input table per batch"),
+                            ),
                             info.clone(),
                         ))
                     })?
                     .0
+                    .table
                 }
             };
             let mut output = Buffer {

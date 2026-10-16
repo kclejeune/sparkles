@@ -443,6 +443,7 @@ impl Engine<'_> {
         let mut ctx = Ctx::new(self.data.snap.clone());
         ctx.use_cache = false;
         ctx.deadline = self.deadline;
+        ctx.cancellation = self.cancellation.clone();
         if let Some(c) = &self.cancel {
             ctx.cancel = c.clone();
         }

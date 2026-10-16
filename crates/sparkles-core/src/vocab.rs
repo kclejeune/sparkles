@@ -768,6 +768,139 @@ impl Vocab {
         result
     }
 
+    /// Fallible checked reconstruction for call-owned projection scratch. Public
+    /// dictionary readers retain their existing allocation and access paths.
+    fn scan_block_checked(
+        &self,
+        b: usize,
+        reserve: &mut impl FnMut(usize) -> crate::error::Result<()>,
+        mut f: impl FnMut(usize, &[u8]) -> crate::error::Result<bool>,
+    ) -> crate::error::Result<()> {
+        let data = self.data.as_slice();
+        let mut pos = self.block_offset(b);
+        let n = FC_BLOCK.min(self.len as usize - b * FC_BLOCK);
+        let mut key = Vec::new();
+        for i in 0..n {
+            let shared = read_varint(data, &mut pos) as usize;
+            let len = read_varint(data, &mut pos) as usize;
+            let need = key
+                .len()
+                .min(shared)
+                .checked_add(len)
+                .ok_or_else(|| crate::error::Error::invalid("vocabulary scratch overflows"))?;
+            if need > key.capacity() {
+                reserve(need)?;
+                key.try_reserve_exact(need - key.len()).map_err(|e| {
+                    crate::error::Error::invalid(format!("vocabulary allocation failed: {e}"))
+                })?;
+                if key.capacity() != need {
+                    return Err(crate::error::Error::invalid(
+                        "unsupported vocabulary scratch capacity",
+                    ));
+                }
+                #[cfg(any(test, feature = "failpoints"))]
+                crate::algo::observe_projection(crate::algo::ProjectionEvent::Materialized(
+                    "vocab-scratch-allocated",
+                    key.capacity(),
+                ));
+            }
+            key.truncate(shared);
+            key.extend_from_slice(&data[pos..pos + len]);
+            pos += len;
+            if !f(i, &key)? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn get_with_fallible<T>(
+        &self,
+        id: u64,
+        mut reserve: impl FnMut(usize) -> crate::error::Result<()>,
+        mut f: impl FnMut(&[u8]) -> T,
+    ) -> crate::error::Result<Option<T>> {
+        if id >= self.len {
+            return Ok(None);
+        }
+        let b = id as usize / FC_BLOCK;
+        self.ahead_for(&[id]).at(self, b);
+        let wanted = id as usize % FC_BLOCK;
+        let mut result = None;
+        self.scan_block_checked(b, &mut reserve, |i, key| {
+            if i == wanted {
+                result = Some(f(key));
+                Ok(false)
+            } else {
+                Ok(true)
+            }
+        })?;
+        Ok(result)
+    }
+
+    pub(crate) fn find_with_checked(
+        &self,
+        key: &[u8],
+        mut reserve: impl FnMut(usize) -> crate::error::Result<()>,
+    ) -> crate::error::Result<std::result::Result<u64, u64>> {
+        let nb = self.num_blocks();
+        if nb == 0 {
+            return Ok(Err(0));
+        }
+        // last block whose first key <= key
+        let (mut lo, mut hi) = (0usize, nb);
+        if let Some(s) = &self.sparse {
+            // the group of blocks that holds the key, from memory; then only its offsets
+            // and data are read, each asked for in one request
+            let g = partition_point_by(s.len(), |g| s.key(g) <= key);
+            if g == 0 {
+                return Ok(Err(0));
+            }
+            let g = g - 1;
+            lo = g * IDX_BLOCKS;
+            hi = ((g + 1) * IDX_BLOCKS).min(nb);
+            if crate::index::io_hints() && s.first_hint(g) {
+                if let Bytes::Map(m) = &self.offsets {
+                    crate::index::will_need(m, lo * 8, (hi - lo) * 8);
+                }
+                let end = s
+                    .offsets
+                    .get(g + 1)
+                    .map_or(self.data.as_slice().len(), |&o| o as usize);
+                self.data.will_need(s.offsets[g] as usize, end);
+            }
+            // block `lo` starts with the group's key, which is not above `key`
+            lo += 1;
+        }
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if self.block_first(mid) <= key {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo == 0 {
+            return Ok(Err(0));
+        }
+        let b = lo - 1;
+        let mut result = Err(((b + 1) * FC_BLOCK).min(self.len as usize) as u64);
+        self.scan_block_checked(b, &mut reserve, |i, k| {
+            Ok(match k.cmp(key) {
+                std::cmp::Ordering::Less => true,
+                std::cmp::Ordering::Equal => {
+                    result = Ok((b * FC_BLOCK + i) as u64);
+                    false
+                }
+                std::cmp::Ordering::Greater => {
+                    result = Err((b * FC_BLOCK + i) as u64);
+                    false
+                }
+            })
+        })?;
+        Ok(result)
+    }
+
     /// Id range `[lo, hi)` of keys with the given byte prefix.
     pub fn prefix_range(&self, prefix: &[u8]) -> (u64, u64) {
         let lo = match self.find(prefix) {
@@ -1125,6 +1258,66 @@ impl AppendVocab {
 mod tests {
     use super::*;
 
+    #[test]
+    fn projection_find_matches_public_search_and_rejects_before_growth() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = write_keys(dir.path(), 3 * FC_BLOCK * IDX_BLOCKS + 77);
+        let v = Vocab::open(dir.path()).unwrap();
+        for key in keys
+            .iter()
+            .step_by(127)
+            .chain([b"".to_vec(), b"zzzz".to_vec()].iter())
+        {
+            assert_eq!(v.find_with_checked(key, |_| Ok(())).unwrap(), v.find(key));
+            let mut absent = key.clone();
+            absent.push(0);
+            assert_eq!(
+                v.find_with_checked(&absent, |_| Ok(())).unwrap(),
+                v.find(&absent)
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = VocabWriter::create(dir.path()).unwrap();
+        let keys = [
+            b"<a".to_vec(),
+            format!("<b{}", "x".repeat(4096)).into_bytes(),
+            b"<c".to_vec(),
+        ];
+        for key in &keys {
+            writer.push(key).unwrap();
+        }
+        writer.finish().unwrap();
+        let v = Vocab::open(dir.path()).unwrap();
+        for allowed in [0, 1] {
+            let observed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let seen = observed.clone();
+            crate::algo::set_projection_observer(Some(std::sync::Arc::new(move |event| {
+                if let crate::algo::ProjectionEvent::Materialized("vocab-scratch-allocated", _) =
+                    event
+                {
+                    seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            })));
+            let mut calls = 0;
+            let result = v.find_with_checked(&keys[2], |_| {
+                calls += 1;
+                if calls > allowed {
+                    Err(crate::Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            });
+            crate::algo::set_projection_observer(None);
+            assert!(matches!(result, Err(crate::Error::Cancelled)));
+            assert_eq!(observed.load(std::sync::atomic::Ordering::Relaxed), allowed);
+        }
+        assert_eq!(
+            v.get_with_fallible(2, |_| Ok(()), |key| key.to_vec())
+                .unwrap(),
+            Some(keys[2].clone())
+        );
+        assert_eq!(v.get_with_fallible(3, |_| Ok(()), |_| ()).unwrap(), None);
+    }
     #[test]
     fn checked_decode_reserves_intermediate_keys_before_growth() {
         let keys = [

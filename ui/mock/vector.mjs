@@ -97,7 +97,13 @@ function status(ds, name) {
     ...(e.building ? { progress: e.building.progress ?? 0, message: 'packing vectors' } : {}),
     generation: persistent ? 'gen-0001' : 'mem',
     rows,
-    overlay: { inserts: Math.max(0, diff), deletes: Math.max(0, -diff) },
+    overlay: {
+      inserts: Math.max(0, diff),
+      deletes: Math.max(0, -diff),
+      // the server adds inserted rows to a ready graph in the background
+      indexed: cfg.hnsw && !e.building ? Math.max(0, diff) : 0,
+      pending: 0,
+    },
     skipped,
     memory: {
       segmentBytes: rows * (4 * cfg.dimension + 28),
@@ -301,6 +307,7 @@ export function vectorIndexFor(ds, predicate, dim, opts) {
       rows,
       scored: ann ? Math.min(rows, ef) : rows,
       overlayInserts: 0,
+      overlayPending: 0,
       overlayDeletes: 0,
     },
   };
