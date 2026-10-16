@@ -463,6 +463,9 @@ class Processes(unittest.TestCase):
             def set_case(self, case):
                 pass
 
+            def case_cost(self, case):
+                return 0
+
             def report(self):
                 return {"capRefusals": self.cap_refusals}
 
@@ -493,6 +496,20 @@ class Processes(unittest.TestCase):
         self.assertTrue(row["incomplete"])
         self.assertEqual(report["unattemptedIds"], {"p/m": ["q1", "q2", "q3"]})
         self.assertEqual(report["cases"][0]["detail"]["status"], "budget_refused")
+
+    def test_unadmitted_pair_is_not_run_and_the_cascade_is_withheld(self):
+        args = self.questions_fixture(["clarify"] * 2)
+        pathlib.Path(args.model_config).write_text(
+            json.dumps({"models": {"providers": {"p": {"models": {"a": {}, "b": {}}}}}})
+        )
+        args.pair = ["p/a", "p/b"]
+        self.fake_ask(args, 'import json\nprint(json.dumps({"outcome":"clarify"}))\n')
+        _, report = eval_ask.run_matrix(args, admit=lambda pair, qs: pair == "p/a")
+        self.assertFalse(report["complete"])
+        self.assertEqual(report["executed"], 2)
+        self.assertEqual(report["notRun"], [{"pair": "p/b", "reason": "budget"}])
+        self.assertEqual([r["pair"] for r in report["rows"]], ["p/a"])
+        self.assertEqual(report["unattemptedIds"], {"p/b": ["q1", "q2"]})
 
     def test_cascade_row_is_computed_from_pair_runs(self):
         args = self.questions_fixture(["clarify"] * 3)

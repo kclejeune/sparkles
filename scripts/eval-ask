@@ -459,6 +459,10 @@ def summarize_pair(pair, qs, answers, scores):
         and all(a.get("cliEstimatedCostKnown", True) for a in answers)
         else None
     )
+    nano = [a.get("ledgerNanodollars") for a in answers]
+    ledger_cost = (
+        sum(nano) / 1e9 if answers and all(type(v) is int for v in nano) else None
+    )
     clar = [i for i, a in enumerate(answers) if a.get("outcome") == "clarify"]
     refusal = [i for i, q in enumerate(qs) if q["kind"] == "unanswerable"]
     selects = [scores[i][2] for i in answerable if scores[i][2]["kind"] == "select"]
@@ -514,6 +518,10 @@ def summarize_pair(pair, qs, answers, scores):
                 for b in ("simple", "medium", "complex")
             },
             "cliEstimatedCostUSD": cost,
+            "ledgerCostUSD": ledger_cost,
+            "ledgerCostPerCorrectUSD": ledger_cost / correct
+            if ledger_cost is not None and correct
+            else None,
             "citationChecks": "unjudged",
             "cliInputTokens": sum(
                 (a.get("usage") or {}).get("inputTokens", 0) for a in answers
@@ -566,6 +574,10 @@ def cascade_cases(pairs, qs, answers, scores):
             sum(costs) if all(type(c) in (int, float) for c in costs) else None
         )
         merged["usage"] = usage
+        ledger = [a.get("ledgerNanodollars") for a in spent]
+        merged["ledgerNanodollars"] = (
+            sum(ledger) if all(type(v) is int for v in ledger) else None
+        )
         merged["cliEstimatedCostKnown"] = all(
             a.get("cliEstimatedCostKnown", True) for a in spent
         )
@@ -581,6 +593,7 @@ def finish_run(report, out_dir, runner, error=None):
         error is None
         and report["executed"] == report["planned"]
         and not report["budgetStopped"]
+        and not report["notRun"]
     )
     report["error"] = error
     report["unattempted"] = report["planned"] - report["attempted"]
@@ -608,7 +621,7 @@ def finish_run(report, out_dir, runner, error=None):
     return out_dir, report
 
 
-def run_matrix(args, proxy=None, prepared=None):
+def run_matrix(args, proxy=None, prepared=None, admit=None):
     started = time.monotonic()
     qset, out_dir = prepared or validate_args(args)
     qs = qset["questions"]
@@ -644,6 +657,7 @@ def run_matrix(args, proxy=None, prepared=None):
         "scored": 0,
         "budgetStopped": False,
         "unattemptedIds": {},
+        "notRun": [],
         "rows": [],
         "cases": [],
         "goldPreflight": [],
@@ -679,6 +693,11 @@ def run_matrix(args, proxy=None, prepared=None):
         for pair in args.pair:
             done, answers, scores = [], [], []
             per_pair[pair] = ({}, {})
+            if report["budgetStopped"] or (admit and not admit(pair, qs)):
+                # The projected cost does not fit what is left of the cap.
+                report["notRun"].append({"pair": pair, "reason": "budget"})
+                report["unattemptedIds"][pair] = [q["id"] for q in qs]
+                continue
             for q in qs:
                 runner.check()
                 if report["budgetStopped"]:
@@ -710,6 +729,7 @@ def run_matrix(args, proxy=None, prepared=None):
                         report["executed"] += 1
                 if proxy:
                     proxy.set_case(None)
+                    answer["ledgerNanodollars"] = proxy.case_cost(case_id)
                 score = runner.score(q, answer)
                 report["scored"] += 1
                 report["cases"].append(
@@ -742,7 +762,7 @@ def run_matrix(args, proxy=None, prepared=None):
                 r["unattemptedQuestions"] = len(qs) - len(done)
                 r["failureStatuses"] = failure_counts(answers)
             report["rows"] += row
-        if len(args.pair) > 1:
+        if len(args.pair) > 1 and not report["notRun"]:
             used, c_answers, c_scores, tally = cascade_cases(
                 args.pair,
                 qs,
@@ -759,6 +779,9 @@ def run_matrix(args, proxy=None, prepared=None):
         return finish_run(report, out_dir, runner)
     except (Invalid, OSError) as error:
         # No raw subprocess/provider exception or environment is published here.
+        # Harness faults carry fixed messages and never provider text or a key.
+        if isinstance(error, Invalid):
+            report["errorDetail"] = str(error)
         return finish_run(report, out_dir, runner, type(error).__name__)
 
 
