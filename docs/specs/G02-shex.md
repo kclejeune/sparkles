@@ -1871,9 +1871,9 @@ against a clone of shexTest too.
   arc that no part takes may remain only when the extending shape lists its predicate
   in `EXTRA` and the arc satisfies no triple constraint on it. When the typing is not yet
   known for the arc's value, leaving the arc over is undecided and not a success.
-  `CLOSED` forbids an outgoing arc that no part can match. The search spends the `max_partitions` budget
-  once per candidate assignment and once per abandoned option, and running out of it is
-  an error, never a false result. The search keeps its own stack, so a node with tens of
+  `CLOSED` forbids an outgoing arc that no part can match. The search spends the
+  `max_partitions` budget once per candidate assignment and once per abandoned option,
+  and running out of it is an error, never a false result. The search keeps its own stack, so a node with tens of
   thousands of arcs does not exhaust the thread's stack, and it checks the timeout and
   cancellation as it goes. Failures of an extending shape are reported as one `NoMatch`.
 * The write guard treats an extending shape as reading every outgoing arc of its nodes,

@@ -562,10 +562,13 @@ namespace. The code is `nodeexpr.rs`, the expression tree and its parser, and
   node that a concatenation or a mapping appends. The nodes that a read of the data
   returns are not counted, because the data bounds them and a class with millions of
   instances is a legitimate result. A shared sub-expression counts each time it is
-  evaluated, so an expression graph that doubles at every level fails early, holding at
-  most 128 MiB of node ids. The Rust field `ValidateOptions::max_expr_nodes` changes the
-  limit, and the other nesting limits are fixed in the same way, so requests and the guard
-  keep the default. Evaluation also honours the timeout and cancellation of the
+  evaluated, so an expression graph that doubles at every level fails early. The ids that
+  a concatenation appends come to 128 MiB at the limit, and that is a floor. The output
+  and the appended vector are both live, and each worker thread of a parallel validation
+  can hold such a vector, so the peak is a small multiple of 128 MiB for each evaluation
+  that runs at once. The Rust field `ValidateOptions::max_expr_nodes` changes the limit
+  and counts units of work, not nodes. The other nesting limits are fixed in the same
+  way, so requests and the guard keep the default. Evaluation also honours the timeout and cancellation of the
   validation, which it checks every 4096 nodes that evaluations produce. A read of the
   data that is repeated many times over a shared sub-expression costs one unit each time
   and is bounded by the timeout, not by the budget.

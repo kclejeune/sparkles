@@ -48,7 +48,11 @@ pub struct ValidateOptions {
     /// sub-expression is one unit, and so is each node that a concatenation or a mapping
     /// appends. The nodes that a read of the data returns are not counted, so a large
     /// result is fine. A shared sub-expression counts each time it is evaluated, so a
-    /// doubling expression graph stops here and not after exhausting memory.
+    /// doubling expression graph stops here and not after exhausting memory. The name
+    /// predates the accounting and the field counts units of work, not nodes. At the
+    /// default the ids a concatenation appends take 128 MiB, which is a floor, because
+    /// the output and the appended vector are both live and each worker thread of a
+    /// parallel validation can hold one.
     pub max_expr_nodes: u64,
 }
 

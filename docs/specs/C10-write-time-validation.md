@@ -1296,13 +1296,13 @@ cover editable memory sources, ShExJ prefix preservation and SHACLC backup conve
 
 ### Known gap, schema copy digest (2026-10-16)
 
-`validation-status.json` records the SHA-256 of the ShEx schema copy, but the guard does
-not compare it with the copy when it loads. `load_copy` in `guard.rs` ignores
-`schema.sha256`. A copy edited outside Sparkles is therefore compiled and used, and the
+`validation.json` records the SHA-256 of the ShEx schema copy as `schema.sha256`, but the
+guard does not compare it with the copy when it loads. `load_copy` in `guard.rs` ignores
+the digest. A copy edited outside Sparkles is therefore compiled and used, and the
 stored baseline counts are trusted for it until the next full validation. The persisted
 typing does not depend on this, because its fingerprint covers the digest of the copy
-itself. Roadmap item 83 checks the digest at install and refuses the guard or validates
-in full on a mismatch.
+itself. Roadmap item 83 will check the digest at install and refuse the guard or validate in
+full on a mismatch.
 
 ### Roadmap follow-ups (2026-10-12)
 
