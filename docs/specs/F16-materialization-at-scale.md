@@ -689,8 +689,9 @@ without reasoning, and the status is fresh within 10 s after the writes stop.
 
 ## Outcome
 
-**Phase 1 delivered** on 2026-10-13. Phases 2, 3 and 4 are not built. See
-[ROADMAP](../ROADMAP.md) item 9.
+**Phase 1 built** on 2026-10-13, and its review findings fixed on 2026-10-16. Three
+parts of Phase 1 are still open, listed under "Open parts of Phase 1" below, so the phase
+is not complete. Phases 2, 3 and 4 are not built. See [ROADMAP](../ROADMAP.md) item 9.
 
 * **Base tier.** `crates/sparkles-reasoner/src/facts.rs` reads the input graphs from the
   snapshot's permutations. A lookup with one input graph and a bound subject uses GSPO.
@@ -711,19 +712,24 @@ without reasoning, and the status is fresh within 10 s after the writes stop.
   second step.
 * **Planner.** Join order reads the per-predicate counts of the base tier, and the
   derived tier adds its own counts.
-* **Limits and reports.** `ReasonOptions::max_memory` fails a run whose derived tier and
-  candidate buffers are estimated above the limit, with the rule that produced the most
-  candidates. `ReasonReport` and the recorded `run` gain `peakBytes`, `baseScans` and
-  `threads`.
+* **Limits and reports.** `ReasonOptions::max_memory` bounds the estimated heap of the
+  whole run, as described under "Memory budget" below. `ReasonReport` and the recorded
+  `run` gain `peakBytes`, `baseScans` and `threads`.
 * **Reasoning pool.** `serve --reason-threads N` sets one rayon pool for all runs, half the
   cores by default, and `0` uses the global pool. A request's `threads` field or query
   parameter asks for fewer threads. `sparkles infer --threads N` sets the threads of a
-  local run.
+  local run. Runs are admitted to the pool as described under "Reasoning pool admission"
+  below.
 * **GeoSPARQL default geometries.** Incremental runs no longer fall back to a full run with
   `geoDefaultGeometry`. The default geometries count as explicit facts in the closure, and
   those of the features whose `geo:hasGeometry` or `geo:hasDefaultGeometry` facts changed
   join the run's added and removed facts. The kept closure is now kept for these runs too.
-* **`dt-not-type`.** The check `literal-not-in-datatype` and `datatype-range.rq` follow §8.
+  The closure remembers its default geometries, so an update reads only the changed
+  features, with two probes bound to the feature and the property. A closure read back
+  from the dataset does not know them, and that run reads them with one scan of each
+  property. `baseScans` counts these reads for incremental runs.
+* **`dt-not-type`.** The check `literal-not-in-datatype` and `datatype-range.rq` follow §8,
+  with the corrections under "Diagnostics" below.
 * **LUBM.** `cargo run --release -p sparkles-reasoner --example lubm` generates
   Univ-Bench-style data, loads it and runs the reasoner. It reports the derived count, the
   peak heap, and digests of the derived set and of its row order.
@@ -758,15 +764,99 @@ when `--reason-cache-triples` admits the closure, the run reads the input graphs
 memory at its end and the server keeps the same memory as before. The memory saving
 applies to the run itself, and to the server only for closures the cache does not keep.
 
+**Reasoning pool admission.** The review found that a run called on a rayon worker could
+deadlock. While it held the writer lock, the waiting worker could take another queued job
+that asked for the same lock. It also found that runs asking for fewer threads than the
+pool each built a pool of their own beside it, so their threads added up past the pool's
+size. `pool.rs` now owns both concerns. A run called on a rayon worker moves to a native
+thread of its own while the worker waits without taking other jobs, and a run is
+admitted to its `ReasoningPool` before it takes the writer lock. Admission is first come,
+first served, against a capacity equal to the pool's threads. Runs that use the whole pool
+share its threads and run together. A run that asks for fewer threads counts those
+threads against the capacity, waits until they fit, and then evaluates on a pool of
+exactly that size. That pool's threads are joined before the run gives its threads back,
+also when the run fails or panics. A waiting run checks its cancel flag every 20 ms. A
+run started on a thread of its own reasoning pool is refused with an error, since it
+would wait for itself. Without a pool, a run on a rayon worker keeps the size of the
+caller's pool on a pool of its own.
+
+**Graph-major visitation.** With several input graphs, the base tier now visits the facts
+graph by graph, in the order of the input graphs, and within a graph in key order, as the
+in-memory copy did. A fact in several input graphs is visited with the first. Rule
+evaluation, list builtins and the order of derived rows therefore match the copy again.
+An existence probe still reads one pass.
+
+**Memory budget.** Every run has one budget, shared by its threads, and every structure
+the run owns is charged to it before it grows: the derived tier with its indexes and the
+cache of base facts found by merges, the local terms the rules make, the candidates and
+lookup caches of rule evaluation, the merge's buffers, the previous closure of an
+incremental run with its search state, the buffers that write the inferred graph, and the
+closure kept for the next run. Sizes come from capacities and from the growth rules of
+`Vec` and of hashbrown's tables, so the figures estimate the reasoner's own heap. The
+store's block cache is shared with queries and not counted. A charge that would pass the
+limit fails the run where it happens, with the rule or the phase in the message.
+`strConcat`, `regex` and the other builtins charge the text they read and the literal they
+build before building it, and a term that is interned twice is charged once. A run whose
+charges passed the limit fails before its commit, also when they are back under it, so a
+run that succeeds reports a peak within its limit. After the commit, keeping the closure
+for the next run is charged strictly, and a closure that does not fit is not kept. A
+closure kept in memory is taken by a run only when it fits that run's budget, so a run
+that fails for memory leaves it for the next one. To keep the shared counter out of the
+hot paths, each holder of charges takes 16 KiB at a time and keeps up to two such steps of
+what it frees. A step is taken only when it fits, so a run that fits its limit still runs,
+and the reported peak can exceed the bytes in use by up to two steps per holder. The cache
+of base facts that merges found keeps at most 128 facts per shard and starts over when
+full. A fact it no longer holds is found again in the base tier, so an identity rule over
+a large input no longer grows it without bound.
+
+The tests are `f16_local_term_budget`, `f16_shared_candidate_budget`,
+`f16_incremental_runs_are_charged` and `f16_incremental_reports_peak` in
+`tests/memory.rs`, and `f16_identity_rule_membership_cache_bound` in `graph.rs`. With
+16 threads and a limit of 48,000 bytes, a run over 200,000 candidates allocated 2.5 MB
+beyond its starting heap before it failed, and now allocates 185 KB, mostly decoded store
+blocks. On atlas, with 1 million generated triples and interleaved runs, inference took
+1,333 ms for RDFS and 1,363 ms for OWL 2 RL before the budget and 1,330 ms and 1,368 ms
+with it. Incremental runs that read the closure back from a persistent dataset of 200,000
+triples took about 8% longer, 120 ms instead of 112 ms for a run without changes, mostly
+in the last step, which commits and saves the generalized facts. The figures are A/B measurements on
+a shared host, not published benchmarks.
+
+**Diagnostics.** `literal-not-in-datatype` judges each candidate before it counts toward
+the finding limit, so valid literals no longer hide a violation behind the limit. It reads
+the candidates in pages of one total order, from 256 to 16,384 rows, and stops at the
+first finding past the limit, at the end of the candidates, at the deadline or after
+262,144 candidate rows. The check is truncated in the first and the last case, and a
+truncated check without findings makes the report incomplete. Every page runs the query
+and its sort again, which trades repeated query work for memory bounded by one page.
+Integer bounds compare exactly at any number of digits. Names follow the XML 1.0
+productions. `xsd:dateTime` values with a timezone are in `xsd:dateTimeStamp`,
+`xsd:hexBinary` and `xsd:base64Binary` share one value space, and `rdf:PlainLiteral`
+holds well-typed literals of the types derived from `xsd:string`. A literal whose own
+datatype the check does not implement is undecided for every range and never reported.
+`xsd:double` and `xsd:float` are treated as one value space, which never reports a
+literal that OWL 2 would report, so the check stays sound.
+
+**Build.** `Cargo.lock` is current again, so `cargo metadata --locked` succeeds.
+
+**Open parts of Phase 1.** These stay open under [ROADMAP](../ROADMAP.md) item 9 until
+they are built or their scope is changed.
+
+1. §3.5, the kept closure without the explicit facts. The kept closure still holds them,
+   and so do `Derivation::into_closure` and the closure read back from the dataset. The
+   memory budget charges them.
+2. §8's coverage. Ill-typed literals are found among the literal objects that the query
+   returns, not by a scan of the vocabulary remembered per generation, and the check does
+   not read the generalized facts of a kept closure.
+3. The acceptance runs of §11 and §12. A1 at 1,000 universities, OWL2Bench, and the LUBM
+   and OWL2Bench runs in X06's harness have not been run. The measurements above come
+   from the example's own LUBM-style generator at 100 universities.
+
 **Deviations.**
-* §3.5 is not built. The kept closure holds the explicit facts with a flag, as before, and
-  the cache limit counts them.
-* OWL2Bench was not run, and the runs are not part of X06's harness. The LUBM data comes
-  from the example's own generator, with about 131,000 triples per university, not from
-  the UBA generator.
-* `literal-not-in-datatype` narrows the candidates with one SPARQL query. Ill-typed
-  literals are found by a scan of the literal objects, filtered in the query, instead of a
-  vocabulary scan remembered per generation. The check does not read a kept closure's
-  generalized facts.
+* §3.5 is not built, as listed under the open parts. The kept closure holds the explicit
+  facts with a flag, as before, and the cache limit counts them.
+* The LUBM data comes from the example's own generator, with about 131,000 triples per
+  university, not from the UBA generator.
+* `literal-not-in-datatype` narrows the candidates with one SPARQL query per page of
+  candidates.
 * `examples/reasoner-bench.rs` and `examples/incremental.rs` did not gain flags. The new
   example takes `RAYON_NUM_THREADS`.

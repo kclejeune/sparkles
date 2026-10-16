@@ -18,7 +18,7 @@
 //! use the shared pool share its workers, so any number of them run together, but not
 //! beside a run with a pool of its own. A run is admitted before it takes the writer lock,
 //! waits for admission only while it is not cancelled, and gives its workers back when its
-//! own pool's threads have exited, also when it fails or panics.
+//! own pool's threads have ended, also when it fails or panics.
 
 use parking_lot::{Condvar, Mutex};
 use std::collections::VecDeque;
