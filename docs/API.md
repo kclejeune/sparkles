@@ -5392,7 +5392,10 @@ all of them together.
 An integer parameter such as `seed` or `maxIterations` keeps its exact value when it is
 written as an integer, also above 2^53. A decimal or double value is accepted for an
 integer parameter only when it is whole and at most 2^53, where it is exact, and is
-refused otherwise.
+refused otherwise. An integer written as an integer ranges from 0 to 2^63 - 1, and a
+larger one is refused with a message that names that range. `maxIterations` and
+`maxLevels` are held in 32 bits, so a value above 4294967295 is refused and not
+reduced.
 
 FastRP takes `iterationWeights` and `nodeSelfInfluence` with the meaning they have in
 Neo4j GDS. The list has one weight for each propagation, and the weight at index `i`

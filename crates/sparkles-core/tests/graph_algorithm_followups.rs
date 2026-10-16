@@ -90,6 +90,72 @@ fn integer_parameters_keep_their_exact_value() {
     }
 }
 
+/// An exact integer above `i64::MAX` is refused with a message that says what an integer
+/// parameter may be, not with "takes a number".
+#[test]
+fn an_integer_above_the_exact_range_is_refused_by_name() {
+    let s = trig("ex:a ex:p ex:b . ex:b ex:p ex:c . ex:c ex:p ex:a .");
+    for big in [
+        "9223372036854775808",
+        "18446744073709551615",
+        "99999999999999999999",
+    ] {
+        let q = format!(
+            "{PREFIXES}SELECT ?n WHERE {{ SERVICE algo:fastRP {{ [] algo:predicate ex:p ; algo:seed {big} ; algo:node ?n }} }}"
+        );
+        let e = query(s.snapshot(), &q, &QueryOptions::default())
+            .err()
+            .unwrap_or_else(|| panic!("{big} was accepted"))
+            .to_string();
+        assert!(
+            e.contains("algo:seed takes an integer from 0 to 9223372036854775807"),
+            "{big}: {e}"
+        );
+    }
+}
+
+/// The iteration and level counts are 32-bit. A larger value is refused instead of
+/// wrapping to a few iterations or none.
+#[test]
+fn a_count_above_u32_is_refused_and_not_wrapped() {
+    let s = trig("ex:a ex:p ex:b . ex:b ex:p ex:c . ex:c ex:p ex:a .");
+    let run = |algo: &str, param: &str, value: &str| {
+        query(
+            s.snapshot(),
+            &format!(
+                "{PREFIXES}SELECT ?n WHERE {{ SERVICE algo:{algo} {{ [] algo:predicate ex:p ; algo:{param} {value} ; algo:node ?n }} }}"
+            ),
+            &QueryOptions::default(),
+        )
+    };
+    for (algo, param) in [
+        ("pageRank", "maxIterations"),
+        ("labelPropagation", "maxIterations"),
+        ("louvain", "maxIterations"),
+        ("louvain", "maxLevels"),
+        ("leiden", "maxLevels"),
+    ] {
+        // 2^32 wrapped to 0
+        for value in ["4294967296", "4294967297", "9223372036854775807"] {
+            let e = run(algo, param, value)
+                .err()
+                .unwrap_or_else(|| panic!("{algo} {param} {value} was accepted"))
+                .to_string();
+            assert!(
+                e.contains(&format!("algo:{param} must be at most 4294967295")),
+                "{algo} {param} {value}: {e}"
+            );
+        }
+    }
+    // the largest 32-bit count is still accepted
+    assert_eq!(
+        run("pageRank", "maxIterations", "4294967295")
+            .unwrap()
+            .len(),
+        3
+    );
+}
+
 /// The test changes a process-wide limit, so it is the only betweenness test of this
 /// file. In `graph_algorithms.rs` it raced the betweenness tests that run without
 /// sampling.

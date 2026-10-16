@@ -407,6 +407,12 @@ impl AlgoSpec {
         self.num(name).map_or(default, Num::u64)
     }
 
+    /// A count that the algorithm holds in 32 bits. Planning refuses a larger value, so
+    /// the clamp only guards a spec that was built without planning.
+    fn int_u32(&self, name: &str, default: u64) -> u32 {
+        u32::try_from(self.int(name, default)).unwrap_or(u32::MAX)
+    }
+
     fn float(&self, name: &str, default: f64) -> f64 {
         self.num(name).map_or(default, Num::f64)
     }
@@ -441,6 +447,9 @@ fn number(t: &TermPattern, name: &str, kind: Kd) -> Result<f64> {
     Ok(v)
 }
 
+const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
+const XSD_UNSIGNED_LONG: &str = "http://www.w3.org/2001/XMLSchema#unsignedLong";
+
 /// 2^53. A double holds every integer up to it exactly.
 const EXACT_DOUBLE: f64 = 9_007_199_254_740_992.0;
 
@@ -450,6 +459,22 @@ const EXACT_DOUBLE: f64 = 9_007_199_254_740_992.0;
 fn param(t: &TermPattern, name: &str, kind: Kd) -> Result<Num> {
     if kind == Kd::Float {
         return number(t, name, kind).map(Num::Float);
+    }
+    if let TermPattern::Literal(l) = t
+        && matches!(l.datatype().as_str(), XSD_INTEGER | XSD_UNSIGNED_LONG)
+    {
+        // an exact integer that i64 cannot hold is refused by name, not as "not a number"
+        let text = l.value().trim();
+        let digits = text.strip_prefix('+').unwrap_or(text);
+        if !digits.is_empty()
+            && digits.bytes().all(|b| b.is_ascii_digit())
+            && digits.parse::<i64>().is_err()
+        {
+            return Err(bad(format!(
+                "algo:{name} takes an integer from 0 to {}",
+                i64::MAX
+            )));
+        }
     }
     if let TermPattern::Literal(l) = t
         && let Value::Integer(i) = Value::from_literal(l)
@@ -491,6 +516,7 @@ pub(super) fn algo_leaf(
     let NamedNodePattern::NamedNode(sn) = service else {
         return Err(bad("the service must be an algo: IRI"));
     };
+    p.ctx.note_algorithm_call();
     let algo = Algo::from_iri(sn.as_str()).ok_or_else(|| bad(format!("unknown algorithm {sn}")))?;
     let what = format!("algo:{}", algo.name());
     let (patterns, edge_gp) = super::pathsearch::split_block(inner, NS, &what)?;
@@ -516,7 +542,6 @@ pub(super) fn algo_leaf(
     let mut outs = Outs::default();
     let (mut start, mut end_var, mut edge_weight) = (None, None, None);
     let mut seen: Vec<String> = Vec::new();
-    p.ctx.note_algorithm_call();
     let mut default_weight_given = false;
     let mut named: Option<String> = None;
     let mut pred_names: Vec<String> = Vec::new();
@@ -843,6 +868,15 @@ pub(super) fn algo_leaf(
     ] {
         if nums.get(name).is_some_and(|v| v.f64() < min) {
             return Err(bad(format!("algo:{name} must be at least {min}")));
+        }
+    }
+    // these counts are 32-bit; a larger value is refused, not wrapped
+    for name in ["maxIterations", "maxLevels"] {
+        if nums
+            .get(name)
+            .is_some_and(|v| v.u64() > u64::from(u32::MAX))
+        {
+            return Err(bad(format!("algo:{name} must be at most {}", u32::MAX)));
         }
     }
     // an embedding is a `spk:vector`, which a vector index caps at the same value
@@ -1579,7 +1613,7 @@ fn rows(
         Algo::PageRank => {
             let p = algo::pagerank::Params {
                 damping: spec.float("dampingFactor", 0.85),
-                max_iterations: spec.int("maxIterations", 20) as u32,
+                max_iterations: spec.int_u32("maxIterations", 20),
                 tolerance: spec.float("tolerance", 1e-7),
                 sources: copied("algorithm-pagerank-sources", sources, ctl)?.into_output(),
                 fixed: spec.graphalytics,
@@ -1649,7 +1683,7 @@ fn rows(
             })
         }
         Algo::LabelPropagation => {
-            let r = algo::labelprop::run(g, spec.int("maxIterations", 10) as u32, par, ctl)?;
+            let r = algo::labelprop::run(g, spec.int_u32("maxIterations", 10), par, ctl)?;
             // the community is the node it is named for, as a store term
             let c = b.col(o.community);
             let mut stats = algo::Stats::new();
@@ -1669,12 +1703,12 @@ fn rows(
         Algo::Louvain | Algo::Leiden => {
             let p = algo::community::Params {
                 resolution: spec.float("resolution", 1.0),
-                max_levels: spec.int("maxLevels", 10) as u32,
+                max_levels: spec.int_u32("maxLevels", 10),
                 tolerance: spec.float("tolerance", 1e-4),
                 leiden: spec.algo == Algo::Leiden,
                 randomness: spec.float("randomness", 0.01),
                 seed: spec.int("seed", 0),
-                max_sweeps: spec.int("maxIterations", 100) as u32,
+                max_sweeps: spec.int_u32("maxIterations", 100),
             };
             let r = algo::community::run(g, &p, ctl)?;
             let mut stats = algo::Stats::new();
