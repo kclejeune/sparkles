@@ -385,9 +385,12 @@ fn r7_algorithm_invocations_hold_incoming_once_and_release_it() {
     assert_eq!(ctl.peak(), 220);
     assert_eq!(ctl.remaining(), 220 - 32);
     drop(output);
-    // Incoming is cached now; four source searches share its one call charge.
-    let ctl = Control::new(Default::default(), None, 52 + 4 * 36);
+    // Incoming is cached now; four source searches share its one call charge. The peak
+    // holds the sources (16), incoming (52), the scores of the thread (32) and the
+    // search arrays (dist, sigma, delta 96, order 16, settled 4). Only the output (32)
+    // stays charged.
+    let ctl = Control::new(Default::default(), None, 216);
     crate::algo::betweenness::run(&g, &Default::default(), &Par::single(), &ctl).unwrap();
-    assert_eq!(ctl.peak(), 52 + 4 * 36);
-    assert_eq!(ctl.remaining(), 52);
+    assert_eq!(ctl.peak(), 216);
+    assert_eq!(ctl.remaining(), 216 - 32);
 }

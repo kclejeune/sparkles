@@ -118,6 +118,21 @@ impl<'a> Work<'a> {
         }
         Ok(())
     }
+
+    /// Count `units` operations of one vector loop at once, so the loop itself has no
+    /// check in it.
+    #[inline]
+    fn tick_n(&mut self, units: usize, _phase: &'static str) -> Result<()> {
+        #[cfg(test)]
+        probe::at(probe::Point::Work(_phase));
+        if units >= self.left {
+            self.ctl.check()?;
+            self.left = CHECK_EVERY;
+        } else {
+            self.left -= units;
+        }
+        Ok(())
+    }
 }
 
 fn bytes<T>(capacity: usize) -> Result<u64> {
@@ -391,10 +406,8 @@ pub fn run(g: &Graph, p: &Params, ctl: &Control) -> Result<Vec<f32>> {
                             continue;
                         }
                         let l1 = center * d;
-                        for value in neu1e.iter_mut() {
-                            work.tick("clear-gradient")?;
-                            *value = 0.0;
-                        }
+                        work.tick_n(d, "clear-gradient")?;
+                        neu1e.fill(0.0);
                         for s in 0..samples {
                             work.tick("negative")?;
                             let (target, label) = if s == 0 {
@@ -409,20 +422,22 @@ pub fn run(g: &Graph, p: &Params, ctl: &Control) -> Result<Vec<f32>> {
                             };
                             let l2 = target * d;
                             let mut dot = 0f32;
-                            for c in 0..d {
-                                work.tick("dot")?;
-                                dot += syn0[l1 + c] * syn1[l2 + c];
+                            work.tick_n(d, "dot")?;
+                            let input = &syn0[l1..l1 + d];
+                            for (a, b) in input.iter().zip(&syn1[l2..l2 + d]) {
+                                dot += a * b;
                             }
                             let gr = (label - sigmoid(dot)) * alpha;
-                            for c in 0..d {
-                                work.tick("update-output")?;
-                                neu1e[c] += gr * syn1[l2 + c];
-                                syn1[l2 + c] += gr * syn0[l1 + c];
+                            work.tick_n(d, "update-output")?;
+                            let output = &mut syn1[l2..l2 + d];
+                            for ((e, o), i) in neu1e.iter_mut().zip(output).zip(input) {
+                                *e += gr * *o;
+                                *o += gr * *i;
                             }
                         }
-                        for c in 0..d {
-                            work.tick("update-input")?;
-                            syn0[l1 + c] += neu1e[c];
+                        work.tick_n(d, "update-input")?;
+                        for (x, e) in syn0[l1..l1 + d].iter_mut().zip(neu1e.iter()) {
+                            *x += e;
                         }
                     }
                 }

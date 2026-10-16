@@ -5,7 +5,8 @@
 //! label of the largest total edge weight. A directed projection counts the labels of
 //! the in-neighbours as well, once for each edge.
 
-use super::{BLOCK, Control, Graph, Par};
+use super::memory::{Buffer, Growing, Work};
+use super::{BLOCK, CHECK_EVERY, Control, Graph, Par};
 use crate::error::Result;
 
 pub struct Output {
@@ -17,9 +18,8 @@ pub struct Output {
 
 pub fn run(g: &Graph, max_iterations: u32, par: &Par, ctl: &Control) -> Result<Output> {
     let n = g.n();
-    ctl.charge(n as u64 * 8)?;
-    let mut label: Vec<u32> = (0..n as u32).collect();
-    let mut next = label.clone();
+    let mut label = Buffer::collect("labelprop-label", n, 0..n as u32, ctl)?;
+    let mut next = Buffer::<u32>::zeroed("labelprop-next", n, ctl)?;
     let incoming = g.inn(ctl)?;
     let inn = &*incoming;
     let mut iterations = 0;
@@ -28,7 +28,9 @@ pub fn run(g: &Graph, max_iterations: u32, par: &Par, ctl: &Control) -> Result<O
         ctl.check()?;
         let prev = &label;
         par.chunks_mut(&mut next, BLOCK, |lo, chunk| {
-            let mut seen: Vec<(u32, f64)> = Vec::new();
+            let mut work = Work::new(ctl)?;
+            // the labels around one node, charged as the largest row needs
+            let mut seen: Growing<(u32, f64)> = Growing::new("labelprop-seen", ctl)?;
             for (i, slot) in chunk.iter_mut().enumerate() {
                 let u = (lo + i) as u32;
                 seen.clear();
@@ -39,8 +41,10 @@ pub fn run(g: &Graph, max_iterations: u32, par: &Par, ctl: &Control) -> Result<O
                 };
                 for csr in sides {
                     let (r, w) = (csr.row(u), csr.wrow(u));
+                    work.tick_n(r.len() + 1, "labelprop-node")?;
+                    seen.reserve(r.len())?;
                     for (k, &v) in r.iter().enumerate() {
-                        seen.push((prev[v as usize], w.map_or(1.0, |w| w[k] as f64)));
+                        seen.push((prev[v as usize], w.map_or(1.0, |w| w[k] as f64)))?;
                     }
                 }
                 if seen.is_empty() {
@@ -67,7 +71,14 @@ pub fn run(g: &Graph, max_iterations: u32, par: &Par, ctl: &Control) -> Result<O
             Ok(())
         })?;
         iterations = it + 1;
-        let same = label == next;
+        let mut same = true;
+        for (a, b) in label.chunks(CHECK_EVERY).zip(next.chunks(CHECK_EVERY)) {
+            ctl.check()?;
+            if a != b {
+                same = false;
+                break;
+            }
+        }
         std::mem::swap(&mut label, &mut next);
         if same {
             converged = true;
@@ -75,7 +86,7 @@ pub fn run(g: &Graph, max_iterations: u32, par: &Par, ctl: &Control) -> Result<O
         }
     }
     Ok(Output {
-        label,
+        label: label.into_output(),
         iterations,
         converged,
     })

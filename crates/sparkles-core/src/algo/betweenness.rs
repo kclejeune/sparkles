@@ -10,11 +10,11 @@
 //! additions that cannot retain a strict increase in f64 arithmetic.
 
 use super::Rng;
+use super::memory::{Buffer, Heap, Work};
 use super::traverse::OrdF64;
 use super::{CHECK_EVERY, Control, Graph, Par, bad};
 use crate::error::Result;
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
 
 #[derive(Clone, Debug, Default)]
 pub struct Params {
@@ -39,11 +39,13 @@ pub fn run(g: &Graph, p: &Params, par: &Par, ctl: &Control) -> Result<Vec<f64>> 
             }
         }
     }
-    let mut sources: Vec<u32> = (0..n as u32).collect();
+    let mut sources = Buffer::collect("betweenness-sources", n, 0..n as u32, ctl)?;
+    let mut work = Work::new(ctl)?;
     if p.samples > 0 && p.samples < n {
         let mut rng = Rng::new(p.seed);
         // a partial Fisher-Yates shuffle
         for i in 0..p.samples {
+            work.tick("betweenness-sample")?;
             let j = i + rng.below(n - i);
             sources.swap(i, j);
         }
@@ -53,29 +55,31 @@ pub fn run(g: &Graph, p: &Params, par: &Par, ctl: &Control) -> Result<Vec<f64>> 
     let incoming = g.inn(ctl)?;
     let inn = &*incoming;
     let threads = par.threads();
-    // per thread: the score array and the working arrays of one source
-    ctl.charge(threads as u64 * n as u64 * (8 + 8 + 8 + 4 + 8))?;
     let per = sources.len().div_ceil(threads.max(1)).max(1);
+    // per block of sources: the score array and the working arrays of one source, each
+    // charged before it is allocated, and the Dijkstra heap as it grows
     let parts = par.blocks(sources.len(), per, |lo, hi| {
-        let mut acc = vec![0f64; n];
-        let mut w = Work::new(n);
-        for (k, &s) in sources[lo..hi].iter().enumerate() {
-            if k % 16 == 0 {
-                ctl.check()?;
-            }
+        let mut acc = Buffer::<f64>::zeroed("betweenness-scores", n, ctl)?;
+        let mut w = Search::new(n, ctl)?;
+        let mut work = Work::new(ctl)?;
+        for &s in &sources[lo..hi] {
+            work.tick("betweenness-source")?;
             if weighted {
-                w.dijkstra(g, s)?;
+                w.dijkstra(g, s, &mut work)?;
             } else {
-                w.bfs(g, s);
+                w.bfs(g, s, &mut work)?;
             }
-            w.accumulate(inn, s, &mut acc);
+            w.accumulate(inn, s, &mut acc, &mut work)?;
         }
         Ok(acc)
     })?;
-    let mut score = vec![0f64; n];
+    let mut score = Buffer::<f64>::zeroed("betweenness-output", n, ctl)?;
     for part in parts {
-        for (s, x) in score.iter_mut().zip(part) {
-            *s += x;
+        for (s, x) in score.chunks_mut(CHECK_EVERY).zip(part.chunks(CHECK_EVERY)) {
+            ctl.check()?;
+            for (s, x) in s.iter_mut().zip(x) {
+                *s += x;
+            }
         }
     }
     let mut scale = 1.0;
@@ -86,82 +90,91 @@ pub fn run(g: &Graph, p: &Params, par: &Par, ctl: &Control) -> Result<Vec<f64>> 
         scale *= 0.5;
     }
     if scale != 1.0 {
-        for s in &mut score {
+        for s in score.iter_mut() {
             *s *= scale;
         }
     }
-    Ok(score)
+    Ok(score.into_output())
 }
 
 /// The arrays of one single-source search.
-struct Work {
-    dist: Vec<f64>,
-    sigma: Vec<f64>,
-    delta: Vec<f64>,
-    /// nodes in the order they were settled
-    order: Vec<u32>,
-    done: Vec<bool>,
+struct Search {
+    dist: Buffer<f64>,
+    sigma: Buffer<f64>,
+    delta: Buffer<f64>,
+    /// nodes in the order they were settled; each settles once
+    order: Buffer<u32>,
+    done: Buffer<bool>,
+    heap: Heap<Reverse<(OrdF64, u32)>>,
 }
 
-impl Work {
-    fn new(n: usize) -> Work {
-        Work {
-            dist: vec![f64::INFINITY; n],
-            sigma: vec![0.0; n],
-            delta: vec![0.0; n],
-            order: Vec::new(),
-            done: vec![false; n],
-        }
+impl Search {
+    fn new(n: usize, ctl: &Control) -> Result<Search> {
+        Ok(Search {
+            dist: Buffer::splat("betweenness-distance", n, f64::INFINITY, ctl)?,
+            sigma: Buffer::zeroed("betweenness-paths", n, ctl)?,
+            delta: Buffer::zeroed("betweenness-dependency", n, ctl)?,
+            order: Buffer::new("betweenness-order", n, ctl)?,
+            done: Buffer::splat("betweenness-settled", n, false, ctl)?,
+            heap: Heap::new(ctl)?,
+        })
     }
 
-    fn reset(&mut self) {
-        for &v in &self.order {
+    fn reset(&mut self, work: &mut Work<'_>) -> Result<()> {
+        work.tick_n(self.order.len() + 1, "betweenness-reset")?;
+        for &v in self.order.iter() {
             self.dist[v as usize] = f64::INFINITY;
             self.sigma[v as usize] = 0.0;
             self.delta[v as usize] = 0.0;
             self.done[v as usize] = false;
         }
         self.order.clear();
+        self.heap.clear();
+        Ok(())
     }
 
-    fn bfs(&mut self, g: &Graph, s: u32) {
-        self.reset();
+    fn bfs(&mut self, g: &Graph, s: u32, work: &mut Work<'_>) -> Result<()> {
+        self.reset(work)?;
         self.dist[s as usize] = 0.0;
         self.sigma[s as usize] = 1.0;
-        self.order.push(s);
+        self.order.push(s)?;
         let mut head = 0;
         while head < self.order.len() {
             let u = self.order[head];
             head += 1;
             let du = self.dist[u as usize];
-            for &v in g.out.row(u) {
+            let row = g.out.row(u);
+            work.tick_n(row.len() + 1, "betweenness-bfs")?;
+            for &v in row {
                 if self.dist[v as usize].is_infinite() {
                     self.dist[v as usize] = du + 1.0;
-                    self.order.push(v);
+                    self.order.push(v)?;
                 }
                 if self.dist[v as usize] == du + 1.0 {
                     self.sigma[v as usize] += self.sigma[u as usize];
                 }
             }
         }
+        Ok(())
     }
 
-    fn dijkstra(&mut self, g: &Graph, s: u32) -> Result<()> {
-        self.reset();
+    fn dijkstra(&mut self, g: &Graph, s: u32, work: &mut Work<'_>) -> Result<()> {
+        self.reset(work)?;
         self.dist[s as usize] = 0.0;
         self.sigma[s as usize] = 1.0;
-        let mut heap = BinaryHeap::new();
-        heap.push(Reverse((OrdF64(0.0), s)));
+        self.heap.push(Reverse((OrdF64(0.0), s)))?;
         // nodes settle in order of distance and are collected in `order` as they do
-        while let Some(Reverse((OrdF64(d), u))) = heap.pop() {
+        while let Some(Reverse((OrdF64(d), u))) = self.heap.pop() {
             // a stale entry, or a node reached by two paths of equal length that already
             // settled
             if d > self.dist[u as usize] || self.done[u as usize] {
+                work.tick("betweenness-stale")?;
                 continue;
             }
             self.done[u as usize] = true;
-            self.order.push(u);
-            let (row, ws) = (g.out.row(u), g.out.wrow(u).unwrap());
+            self.order.push(u)?;
+            let (row, ws) = (g.out.row(u), g.out.wrow(u).unwrap_or_default());
+            work.tick_n(row.len() + 1, "betweenness-dijkstra")?;
             for (i, &v) in row.iter().enumerate() {
                 let nd = d + ws[i] as f64;
                 let dv = self.dist[v as usize];
@@ -179,7 +192,7 @@ impl Work {
                 if nd < dv {
                     self.dist[v as usize] = nd;
                     self.sigma[v as usize] = self.sigma[u as usize];
-                    heap.push(Reverse((OrdF64(nd), v)));
+                    self.heap.push(Reverse((OrdF64(nd), v)))?;
                 } else if nd == dv {
                     self.sigma[v as usize] += self.sigma[u as usize];
                 }
@@ -189,12 +202,19 @@ impl Work {
     }
 
     /// Add the dependencies of source `s` to `acc`, walking the settled nodes backwards.
-    fn accumulate(&mut self, inn: &super::Csr, s: u32, acc: &mut [f64]) {
+    fn accumulate(
+        &mut self,
+        inn: &super::Csr,
+        s: u32,
+        acc: &mut [f64],
+        work: &mut Work<'_>,
+    ) -> Result<()> {
         for i in (0..self.order.len()).rev() {
             let w = self.order[i];
             // the predecessors of w: nodes u with an edge u -> w on a shortest path. Walk
             // the in-edges.
             let (row, ws) = (inn.row(w), inn.wrow(w));
+            work.tick_n(row.len() + 1, "betweenness-accumulate")?;
             let dw = self.dist[w as usize];
             let coeff = (1.0 + self.delta[w as usize]) / self.sigma[w as usize];
             for (k, &u) in row.iter().enumerate() {
@@ -211,6 +231,7 @@ impl Work {
                 acc[w as usize] += self.delta[w as usize];
             }
         }
+        Ok(())
     }
 }
 

@@ -41,6 +41,16 @@ impl Reservation {
         }
         Ok(())
     }
+    /// Hold exactly `bytes`: charge more, or give back what is no longer needed.
+    pub(crate) fn set(&mut self, bytes: u64) -> Result<()> {
+        if bytes > self.bytes {
+            self.grow_to(bytes)
+        } else {
+            self.ctl.release(self.bytes - bytes);
+            self.bytes = bytes;
+            Ok(())
+        }
+    }
     pub(crate) fn belongs_to(&self, ctl: &Control) -> bool {
         self.ctl.same(ctl)
     }
@@ -193,6 +203,35 @@ impl<T> Buffer<T> {
         ctl.check()?;
         Ok(b)
     }
+    /// A buffer of `capacity` copies of `value`, charged before it is allocated and
+    /// filled in one pass, like [`Buffer::zeroed`].
+    pub(crate) fn splat(
+        name: &'static str,
+        capacity: usize,
+        value: T,
+        ctl: &Control,
+    ) -> Result<Self>
+    where
+        T: Clone,
+    {
+        let mut b = Self::new(name, capacity, ctl)?;
+        b.values.resize(capacity, value);
+        ctl.check()?;
+        Ok(b)
+    }
+    /// A buffer of the first `capacity` values of `values`, charged before it is
+    /// allocated.
+    pub(crate) fn collect(
+        name: &'static str,
+        capacity: usize,
+        values: impl IntoIterator<Item = T>,
+        ctl: &Control,
+    ) -> Result<Self> {
+        let mut b = Self::new(name, capacity, ctl)?;
+        b.values.extend(values.into_iter().take(capacity));
+        ctl.check()?;
+        Ok(b)
+    }
     pub(crate) fn filled(
         name: &'static str,
         capacity: usize,
@@ -260,6 +299,152 @@ impl<'a> Work<'a> {
             self.left = CHECK_EVERY;
         }
         Ok(())
+    }
+
+    /// Count `units` operations at once, such as the edges of one row, and check the
+    /// control when the count since the last check reaches [`CHECK_EVERY`]. A loop that
+    /// counts a row at a time costs one subtraction per row, and a hub row is still
+    /// polled before the next row starts.
+    #[inline]
+    pub(crate) fn tick_n(&mut self, units: usize, phase: &'static str) -> Result<()> {
+        #[cfg(test)]
+        probe::at(probe::Point::Work(phase));
+        let _ = phase;
+        if units >= self.left {
+            self.ctl.check()?;
+            self.left = CHECK_EVERY;
+        } else {
+            self.left -= units;
+        }
+        Ok(())
+    }
+}
+
+/// A growable vector whose capacity is charged to a call before it grows. A growth
+/// holds the old and the new capacity while the values move, and keeps only the new
+/// one after. The allocation is fallible, so a failure is an error and not an abort.
+pub(crate) struct Growing<T> {
+    values: Vec<T>,
+    charge: Reservation,
+    name: &'static str,
+}
+
+impl<T> Growing<T> {
+    pub(crate) fn new(name: &'static str, ctl: &Control) -> Result<Self> {
+        Ok(Self {
+            values: Vec::new(),
+            charge: Reservation::new(ctl, 0)?,
+            name,
+        })
+    }
+
+    /// Make room for `extra` more values, growing the capacity at least twofold.
+    pub(crate) fn reserve(&mut self, extra: usize) -> Result<()> {
+        let need = self
+            .values
+            .len()
+            .checked_add(extra)
+            .ok_or_else(|| bad("memory", "buffer growth overflows"))?;
+        if need <= self.values.capacity() {
+            return Ok(());
+        }
+        let old = self.values.capacity();
+        let capacity = old
+            .checked_mul(2)
+            .map(|c| c.max(need).max(16))
+            .ok_or_else(|| bad("memory", "buffer growth overflows"))?;
+        let (was, next) = (bytes::<T>(old)?, bytes::<T>(capacity)?);
+        self.charge.grow_to(sum(&[was, next])?)?;
+        #[cfg(test)]
+        if probe::fails(self.name) {
+            return Err(bad("memory", "injected allocation failure"));
+        }
+        let _ = self.name;
+        self.values
+            .try_reserve_exact(capacity - self.values.len())
+            .map_err(|e| bad("memory", format!("buffer allocation failed: {e}")))?;
+        self.charge.set(bytes::<T>(self.values.capacity())?)
+    }
+
+    #[inline]
+    pub(crate) fn push(&mut self, value: T) -> Result<()> {
+        if self.values.len() == self.values.capacity() {
+            self.reserve(1)?;
+        }
+        self.values.push(value);
+        Ok(())
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.values.clear();
+    }
+
+    pub(crate) fn pop(&mut self) -> Option<T> {
+        self.values.pop()
+    }
+
+    pub(crate) fn truncate(&mut self, len: usize) {
+        self.values.truncate(len);
+    }
+}
+
+impl<T> Deref for Growing<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        &self.values
+    }
+}
+
+impl<T> DerefMut for Growing<T> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        &mut self.values
+    }
+}
+
+/// A binary heap whose capacity is charged as it grows, like [`Growing`].
+pub(crate) struct Heap<T: Ord> {
+    heap: std::collections::BinaryHeap<T>,
+    charge: Reservation,
+}
+
+impl<T: Ord> Heap<T> {
+    pub(crate) fn new(ctl: &Control) -> Result<Self> {
+        Ok(Self {
+            heap: std::collections::BinaryHeap::new(),
+            charge: Reservation::new(ctl, 0)?,
+        })
+    }
+
+    #[inline]
+    pub(crate) fn push(&mut self, value: T) -> Result<()> {
+        if self.heap.len() == self.heap.capacity() {
+            let old = self.heap.capacity();
+            let capacity = old
+                .checked_mul(2)
+                .map(|c| c.max(16))
+                .ok_or_else(|| bad("memory", "heap growth overflows"))?;
+            let (was, next) = (bytes::<T>(old)?, bytes::<T>(capacity)?);
+            self.charge.grow_to(sum(&[was, next])?)?;
+            #[cfg(test)]
+            if probe::fails("heap") {
+                return Err(bad("memory", "injected allocation failure"));
+            }
+            self.heap
+                .try_reserve_exact(capacity - self.heap.len())
+                .map_err(|e| bad("memory", format!("heap allocation failed: {e}")))?;
+            self.charge.set(bytes::<T>(self.heap.capacity())?)?;
+        }
+        self.heap.push(value);
+        Ok(())
+    }
+
+    #[inline]
+    pub(crate) fn pop(&mut self) -> Option<T> {
+        self.heap.pop()
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.heap.clear();
     }
 }
 

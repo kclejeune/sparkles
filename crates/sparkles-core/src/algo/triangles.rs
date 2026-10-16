@@ -5,6 +5,7 @@
 //! the arboricity of the graph. Each triangle is found once and counted for its three
 //! nodes with atomic adds, which do not depend on the order.
 
+use super::memory::{Buffer, Growing, Work};
 use super::{BLOCK, Control, Csr, Graph, Par};
 use crate::error::Result;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -17,22 +18,27 @@ pub fn count(g: &Graph, par: &Par, ctl: &Control) -> Result<Vec<u32>> {
 
 fn count_in(s: &Csr, par: &Par, ctl: &Control) -> Result<Vec<u32>> {
     let n = s.n();
-    ctl.charge(n as u64 * 12 + s.nnz() as u64 * 4 + n as u64 * 8)?;
+    let mut work = Work::new(ctl)?;
     // rank by (degree, index)
-    let mut order: Vec<u32> = (0..n as u32).collect();
+    let mut order = Buffer::collect("triangles-order", n, 0..n as u32, ctl)?;
+    ctl.check()?;
     order.sort_unstable_by_key(|&u| (s.deg(u), u));
-    let mut rank = vec![0u32; n];
+    ctl.check()?;
+    let mut rank = Buffer::<u32>::zeroed("triangles-rank", n, ctl)?;
     for (r, &u) in order.iter().enumerate() {
+        work.tick("triangles-rank")?;
         rank[u as usize] = r as u32;
     }
-    // the neighbours of higher rank, sorted by rank
-    let mut off = vec![0u64; n + 1];
-    let mut adj: Vec<u32> = Vec::with_capacity(s.nnz() / 2);
+    // the neighbours of higher rank, sorted by rank: half the stored edges
+    let mut off = Buffer::<u64>::zeroed("triangles-offsets", n + 1, ctl)?;
+    let mut adj = Buffer::<u32>::new("triangles-edges", s.nnz() / 2, ctl)?;
     for u in 0..n as u32 {
         let start = adj.len();
-        for &v in s.row(u) {
+        let row = s.row(u);
+        work.tick_n(row.len() + 1, "triangles-orient")?;
+        for &v in row {
             if rank[v as usize] > rank[u as usize] {
-                adj.push(rank[v as usize]);
+                adj.push(rank[v as usize])?;
             }
         }
         adj[start..].sort_unstable();
@@ -43,13 +49,20 @@ fn count_in(s: &Csr, par: &Par, ctl: &Control) -> Result<Vec<u32>> {
         let u = order[r as usize] as usize;
         &adj[off[u] as usize..off[u + 1] as usize]
     };
-    let tri: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(0)).collect();
+    let tri = Buffer::collect(
+        "triangles-counts",
+        n,
+        (0..n).map(|_| AtomicU32::new(0)),
+        ctl,
+    )?;
     par.blocks(n, BLOCK / 4, |lo, hi| {
-        ctl.check()?;
+        let mut work = Work::new(ctl)?;
         for r in lo as u32..hi as u32 {
             let a = up(r);
+            work.tick_n(a.len() + 1, "triangles-node")?;
             for &q in a {
                 let b = up(q);
+                work.tick_n(a.len() + b.len(), "triangles-intersect")?;
                 // common elements of a and b
                 let (mut i, mut j) = (0, 0);
                 while i < a.len() && j < b.len() {
@@ -70,7 +83,14 @@ fn count_in(s: &Csr, par: &Par, ctl: &Control) -> Result<Vec<u32>> {
         }
         Ok(())
     })?;
-    Ok(tri.into_iter().map(|t| t.into_inner()).collect())
+    drop((order, rank, off, adj));
+    let out = Buffer::collect(
+        "triangles-output",
+        n,
+        tri.iter().map(|t| t.load(Ordering::Relaxed)),
+        ctl,
+    )?;
+    Ok(out.into_output())
 }
 
 pub struct Clustering {
@@ -83,18 +103,19 @@ pub struct Clustering {
 pub fn clustering(g: &Graph, par: &Par, ctl: &Control) -> Result<Clustering> {
     let s = g.simple(ctl)?;
     let triangles = count_in(&s, par, ctl)?;
-    let coefficient = (0..s.n() as u32)
-        .map(|u| {
-            let d = s.deg(u) as f64;
-            if d < 2.0 {
-                0.0
-            } else {
-                2.0 * triangles[u as usize] as f64 / (d * (d - 1.0))
-            }
-        })
-        .collect();
+    let mut coefficient = Buffer::new("clustering-output", s.n(), ctl)?;
+    let mut work = Work::new(ctl)?;
+    for u in 0..s.n() as u32 {
+        work.tick("clustering-output")?;
+        let d = s.deg(u) as f64;
+        coefficient.push(if d < 2.0 {
+            0.0
+        } else {
+            2.0 * triangles[u as usize] as f64 / (d * (d - 1.0))
+        })?;
+    }
     Ok(Clustering {
-        coefficient,
+        coefficient: coefficient.into_output(),
         triangles,
     })
 }
@@ -104,28 +125,42 @@ pub fn clustering(g: &Graph, par: &Par, ctl: &Control) -> Result<Clustering> {
 /// edges among them over the number of ordered pairs of them.
 pub fn clustering_graphalytics(g: &Graph, par: &Par, ctl: &Control) -> Result<Vec<f64>> {
     let n = g.n();
-    ctl.charge(n as u64 * 8)?;
+    let mut out = Buffer::<f64>::zeroed("clustering-output", n, ctl)?;
     let incoming = g.inn(ctl)?;
     let inn = &*incoming;
-    let mut out = vec![0f64; n];
     par.chunks_mut(&mut out, BLOCK / 4, |lo, chunk| {
-        ctl.check()?;
-        let mut nb: Vec<u32> = Vec::new();
+        let mut work = Work::new(ctl)?;
+        let mut nb: Growing<u32> = Growing::new("clustering-neighbours", ctl)?;
         for (i, slot) in chunk.iter_mut().enumerate() {
             let v = (lo + i) as u32;
             nb.clear();
-            nb.extend(g.out.row(v).iter().copied().filter(|&u| u != v));
-            nb.extend(inn.row(v).iter().copied().filter(|&u| u != v));
+            let (o, r) = (g.out.row(v), inn.row(v));
+            work.tick_n(o.len() + r.len() + 1, "clustering-neighbours")?;
+            nb.reserve(o.len() + r.len())?;
+            for &u in o.iter().chain(r) {
+                if u != v {
+                    nb.push(u)?;
+                }
+            }
             nb.sort_unstable();
-            nb.dedup();
+            let mut kept = 0;
+            for i in 0..nb.len() {
+                if i == 0 || nb[i] != nb[kept - 1] {
+                    nb[kept] = nb[i];
+                    kept += 1;
+                }
+            }
+            nb.truncate(kept);
             let d = nb.len();
             if d < 2 {
                 continue;
             }
             let mut edges = 0u64;
-            for &u in &nb {
+            for &u in nb.iter() {
                 let mut last = u32::MAX;
-                for &w in g.out.row(u) {
+                let row = g.out.row(u);
+                work.tick_n(row.len() + 1, "clustering-edges")?;
+                for &w in row {
                     // parallel edges count once
                     if w != last && w != u && nb.binary_search(&w).is_ok() {
                         edges += 1;
@@ -137,7 +172,7 @@ pub fn clustering_graphalytics(g: &Graph, par: &Par, ctl: &Control) -> Result<Ve
         }
         Ok(())
     })?;
-    Ok(out)
+    Ok(out.into_output())
 }
 
 #[cfg(test)]

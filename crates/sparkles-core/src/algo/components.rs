@@ -3,7 +3,8 @@
 //! Components are numbered from 0 in the order of their smallest node, so the numbers
 //! are stable for a commit and a projection.
 
-use super::{BLOCK, CHECK_EVERY, Control, Graph, Par};
+use super::memory::{Buffer, Growing, Work};
+use super::{BLOCK, Control, Graph, Par};
 use crate::error::Result;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -13,22 +14,27 @@ pub struct Components {
     pub count: u32,
 }
 
-/// Number the components by the smallest node: `root[v]` is a representative of `v`'s
+/// Number the components by the smallest node: `root(v)` is a representative of `v`'s
 /// component, and any representative works.
-fn number(root: &[u32]) -> Components {
-    let n = root.len();
-    let mut first = vec![u32::MAX; n];
-    let mut comp = vec![0u32; n];
+fn number(n: usize, mut root: impl FnMut(usize) -> u32, ctl: &Control) -> Result<Components> {
+    let mut first = Buffer::splat("components-first", n, u32::MAX, ctl)?;
+    let mut comp = Buffer::zeroed("components-output", n, ctl)?;
+    let mut work = Work::new(ctl)?;
     let mut count = 0u32;
     for v in 0..n {
-        let r = root[v] as usize;
+        work.tick("components-number")?;
+        let r = root(v) as usize;
         if first[r] == u32::MAX {
             first[r] = count;
             count += 1;
         }
         comp[v] = first[r];
     }
-    Components { comp, count }
+    ctl.check()?;
+    Ok(Components {
+        comp: comp.into_output(),
+        count,
+    })
 }
 
 /// Weakly connected components: union-find with path halving, parallel over nodes. The
@@ -36,8 +42,7 @@ fn number(root: &[u32]) -> Components {
 /// node whatever the order of the unions.
 pub fn wcc(g: &Graph, par: &Par, ctl: &Control) -> Result<Components> {
     let n = g.n();
-    ctl.charge(n as u64 * 8)?;
-    let parent: Vec<AtomicU32> = (0..n as u32).map(AtomicU32::new).collect();
+    let parent = Buffer::collect("wcc-parent", n, (0..n as u32).map(AtomicU32::new), ctl)?;
     let find = |mut x: u32| -> u32 {
         loop {
             let p = parent[x as usize].load(Ordering::Relaxed);
@@ -56,9 +61,11 @@ pub fn wcc(g: &Graph, par: &Par, ctl: &Control) -> Result<Components> {
         }
     };
     par.blocks(n, BLOCK, |lo, hi| {
-        ctl.check()?;
+        let mut work = Work::new(ctl)?;
         for u in lo..hi {
-            for &v in g.out.row(u as u32) {
+            let row = g.out.row(u as u32);
+            work.tick_n(row.len() + 1, "wcc-union")?;
+            for &v in row {
                 let (mut a, mut b) = (find(u as u32), find(v));
                 while a != b {
                     let (hi, lo) = if a > b { (a, b) } else { (b, a) };
@@ -79,47 +86,48 @@ pub fn wcc(g: &Graph, par: &Par, ctl: &Control) -> Result<Components> {
         }
         Ok(())
     })?;
-    let root: Vec<u32> = (0..n as u32).map(find).collect();
-    Ok(number(&root))
+    number(n, |v| find(v as u32), ctl)
 }
 
 /// Strongly connected components: Tarjan's algorithm with an explicit stack.
 pub fn scc(g: &Graph, ctl: &Control) -> Result<Components> {
     let n = g.n();
-    ctl.charge(n as u64 * 24)?;
     const UNSEEN: u32 = u32::MAX;
-    let mut index = vec![UNSEEN; n];
-    let mut low = vec![0u32; n];
-    let mut on_stack = vec![false; n];
-    let mut root = vec![UNSEEN; n];
-    let mut stack: Vec<u32> = Vec::new();
-    let mut call: Vec<(u32, u32)> = Vec::new();
+    let mut index = Buffer::splat("scc-index", n, UNSEEN, ctl)?;
+    let mut low = Buffer::<u32>::zeroed("scc-low", n, ctl)?;
+    let mut on_stack = Buffer::splat("scc-on-stack", n, false, ctl)?;
+    let mut root = Buffer::splat("scc-root", n, UNSEEN, ctl)?;
+    let mut stack: Growing<u32> = Growing::new("scc-stack", ctl)?;
+    let mut call: Growing<(u32, u32)> = Growing::new("scc-call", ctl)?;
+    let mut work = Work::new(ctl)?;
     let mut next = 0u32;
     for s in 0..n as u32 {
-        if (s as usize).is_multiple_of(CHECK_EVERY) {
-            ctl.check()?;
-        }
+        work.tick("scc-start")?;
         if index[s as usize] != UNSEEN {
             continue;
         }
-        call.push((s, 0));
+        call.push((s, 0))?;
         index[s as usize] = next;
         low[s as usize] = next;
         next += 1;
-        stack.push(s);
+        stack.push(s)?;
         on_stack[s as usize] = true;
         while let Some(&(u, i)) = call.last() {
+            // one step reads one edge or finishes one node
+            work.tick("scc-dfs")?;
             let row = g.out.row(u);
             if (i as usize) < row.len() {
                 let v = row[i as usize];
-                call.last_mut().unwrap().1 += 1;
+                if let Some(top) = call.last_mut() {
+                    top.1 += 1;
+                }
                 if index[v as usize] == UNSEEN {
                     index[v as usize] = next;
                     low[v as usize] = next;
                     next += 1;
-                    stack.push(v);
+                    stack.push(v)?;
                     on_stack[v as usize] = true;
-                    call.push((v, 0));
+                    call.push((v, 0))?;
                 } else if on_stack[v as usize] {
                     low[u as usize] = low[u as usize].min(index[v as usize]);
                 }
@@ -141,7 +149,8 @@ pub fn scc(g: &Graph, ctl: &Control) -> Result<Components> {
             }
         }
     }
-    Ok(number(&root))
+    drop((index, low, on_stack, stack, call));
+    number(n, |v| root[v], ctl)
 }
 
 #[cfg(test)]
@@ -200,7 +209,7 @@ mod tests {
                     break;
                 }
             }
-            let reference = number(&lab);
+            let reference = number(lab.len(), |v| lab[v], &Control::unlimited()).unwrap();
             assert_eq!(one.comp, reference.comp);
         }
     }

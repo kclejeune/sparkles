@@ -124,20 +124,14 @@ pub fn run(g: &Graph, p: &Params, par: &Par, ctl: &Control) -> Result<Output> {
         ctl.check()?;
         #[cfg(test)]
         c1_probe::at(c1_probe::Event::Iteration, ctl);
+        // The passes check the control at the start of each block of BLOCK nodes, and
+        // the pass over the incoming rows also every CHECK_EVERY edges, so a hub row is
+        // polled too. A check per node cost a clock read per node under a deadline.
         // the rank of the nodes with no out-edges, which is spread over the teleport set
-        ctl.check()?;
         par.chunks_mut(&mut partials, 1, |lo, c| {
+            ctl.check()?;
             let start = lo * BLOCK;
-            let mut failure = None;
             c[0] = (start..(start + BLOCK).min(n))
-                // Stop fallibly without changing the ordered floating-point sum.
-                .take_while(|_| match ctl.check() {
-                    Ok(()) => true,
-                    Err(error) => {
-                        failure = Some(error);
-                        false
-                    }
-                })
                 .filter(|&u| {
                     #[cfg(test)]
                     c1_probe::at(c1_probe::Event::Node(0), ctl);
@@ -145,22 +139,17 @@ pub fn run(g: &Graph, p: &Params, par: &Par, ctl: &Control) -> Result<Output> {
                 })
                 .map(|u| score[u])
                 .sum::<f64>();
-            if let Some(error) = failure {
-                return Err(error);
-            }
             Ok(())
         })?;
         ctl.check()?;
         let dangling: f64 = partials.iter().copied().sum();
-        ctl.check()?;
         if !dangling.is_finite() {
             return Err(bad("pageRank", "dangling rank total is not finite"));
         }
         // what each node sends along one unit of edge weight
-        ctl.check()?;
         par.chunks_mut(&mut contrib, BLOCK, |lo, c| {
+            ctl.check()?;
             for (i, x) in c.iter_mut().enumerate() {
-                ctl.check()?;
                 let u = lo + i;
                 #[cfg(test)]
                 c1_probe::at(c1_probe::Event::Node(1), ctl);
@@ -178,14 +167,14 @@ pub fn run(g: &Graph, p: &Params, par: &Par, ctl: &Control) -> Result<Output> {
         ctl.check()?;
         {
             let (contrib_ref, tele_ref) = (&contrib, &tele);
-            ctl.check()?;
             par.chunks_mut(&mut next, BLOCK, |lo, c| {
+                let mut work = Work::new(ctl)?;
                 for (i, x) in c.iter_mut().enumerate() {
-                    ctl.check()?;
                     let v = lo + i;
                     #[cfg(test)]
                     c1_probe::at(c1_probe::Event::Node(2), ctl);
                     let (r, w) = (inn.row(v as u32), inn.wrow(v as u32));
+                    work.tick_n(r.len() + 1, "pagerank-pull")?;
                     let mut s = 0.0;
                     match (weighted, w) {
                         (true, Some(w)) => {
@@ -207,34 +196,22 @@ pub fn run(g: &Graph, p: &Params, par: &Par, ctl: &Control) -> Result<Output> {
                 }
                 Ok(())
             })?;
-            ctl.check()?;
         }
         ctl.check()?;
         par.chunks_mut(&mut partials, 1, |lo, c| {
+            ctl.check()?;
             let start = lo * BLOCK;
-            let mut failure = None;
             c[0] = (start..(start + BLOCK).min(n))
-                .take_while(|_| match ctl.check() {
-                    Ok(()) => true,
-                    Err(error) => {
-                        failure = Some(error);
-                        false
-                    }
-                })
                 .map(|v| {
                     #[cfg(test)]
                     c1_probe::at(c1_probe::Event::Node(3), ctl);
                     (next[v] - score[v]).abs()
                 })
                 .sum::<f64>();
-            if let Some(error) = failure {
-                return Err(error);
-            }
             Ok(())
         })?;
         ctl.check()?;
         delta = partials.iter().copied().sum();
-        ctl.check()?;
         if !delta.is_finite() {
             return Err(bad("pageRank", "rank change is not finite"));
         }
@@ -250,7 +227,11 @@ pub fn run(g: &Graph, p: &Params, par: &Par, ctl: &Control) -> Result<Output> {
     }
     stats.insert("iterations".into(), iterations.into());
     stats.insert("converged".into(), converged.into());
-    stats.insert("delta".into(), serde_json::json!(delta));
+    // no iteration ran: the change of the last one is not known, and JSON has no
+    // infinity, so the summary leaves `delta` out
+    if iterations > 0 {
+        stats.insert("delta".into(), serde_json::json!(delta));
+    }
     ctl.check()?;
     Ok(Output {
         score: score.into_output(),
@@ -412,6 +393,25 @@ mod tests {
 
     fn pr(g: &Graph, p: &Params, par: &Par) -> Vec<f64> {
         run(g, p, par, &Control::unlimited()).unwrap().score
+    }
+
+    /// With no iteration the change is unknown. JSON has no infinity, so the summary
+    /// leaves `delta` out instead of writing null.
+    #[test]
+    fn zero_iterations_report_no_delta() {
+        let p = Params {
+            max_iterations: 0,
+            ..Params::default()
+        };
+        let out = run(&a1(), &p, &Par::single(), &Control::unlimited()).unwrap();
+        assert_eq!(out.stats["iterations"], 0);
+        assert!(!out.stats.contains_key("delta"), "{:?}", out.stats);
+        let p = Params {
+            max_iterations: 1,
+            ..Params::default()
+        };
+        let out = run(&a1(), &p, &Par::single(), &Control::unlimited()).unwrap();
+        assert!(out.stats["delta"].as_f64().is_some_and(f64::is_finite));
     }
 
     #[test]
