@@ -199,9 +199,26 @@ async fn a_failed_fence_fails_every_request_of_its_group_with_503() {
     drop(dataset);
     drop(app);
     drop(state);
-    // complete unacknowledged records may recover, but never as a gap
+    // The head is at or after the commit acknowledged before the fence. Complete
+    // unacknowledged records may recover, but never as a gap.
     let reopened = sparkles::store::Store::open(&root, Default::default()).unwrap();
-    assert_eq!(reopened.snapshot().len(), reopened.snapshot().commit);
+    let snap = reopened.snapshot();
+    assert!(snap.commit >= 1, "the acknowledged commit was lost");
+    let id = |iri: &str| {
+        snap.lookup_term(&oxrdf::Term::NamedNode(oxrdf::NamedNode::new(iri).unwrap()))
+            .unwrap_or_else(|| panic!("{iri} is not in the reopened store"))
+    };
+    let acknowledged = [
+        id("urn:s0"),
+        id("urn:p"),
+        id("urn:o"),
+        sparkles::id::Id::DEFAULT_GRAPH,
+    ];
+    assert!(
+        snap.contains(&acknowledged).unwrap(),
+        "the acknowledged insert is missing after reopening"
+    );
+    assert_eq!(snap.len(), snap.commit);
 }
 
 /// Spec X09 A6 and section 6: 32 concurrent writes of each HTTP kind join the group, each

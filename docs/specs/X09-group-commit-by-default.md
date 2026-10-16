@@ -419,8 +419,8 @@ logged receipt's commit is present.
 - **A3 — Reader tail.** With four writers and two readers at 10.5M, reader p99 is
   within 10% of the run with grouping off.
 - **A4 — Failed sync.** A WAL `fdatasync` that fails during a fence of 10 commits fails
-  all 10 requests with 503, publishes none of them, and the reopened store's head is
-  the last commit acknowledged before the fence.
+  all 10 requests with 503, publishes none of them, and the reopened store's head is at
+  or after the last commit acknowledged before the fence, with no gap.
 - **A5 — Power loss.** On ext4 and XFS, 1,000 replayed crash points each recover a head
   at or after the last acknowledged receipt, with `sparkles check` passing.
 - **A6 — Messages.** 32 concurrent updates with commit messages are grouped (the size
@@ -528,7 +528,10 @@ full-text indexes. See [ROADMAP](../ROADMAP.md) item 3.
   ranges. No fix was made, so the candidate fixes of section 4.2 remain untried and the
   measurement has to be repeated on `forge`.
 - **Failed synchronization (A4).** A router test fails ten requests of one fence with 503
-  and publishes none of them. A test under an `LD_PRELOAD` shim
+  and publishes none of them. After reopening, the commit acknowledged before the fence and
+  its insert are present and the head has no gap. Complete records of the failed fence may
+  still recover, because the kernel can write them back before the failed sync, so A4 now
+  says the head is at or after the last acknowledged commit rather than equal to it. A test under an `LD_PRELOAD` shim
   (`crates/sparkles-core/tests/power_loss.rs`, `tests/support/iofault.c`) fails the WAL, the
   vocabulary or both at chosen calls and checks the reopened store.
 - **Power loss (A5), partly.** The same test records the store's I/O and replays crash images
