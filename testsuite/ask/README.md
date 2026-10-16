@@ -3,7 +3,8 @@
 `scripts/eval-ask` runs `sparkles ask` on a question set and scores each answer against
 gold results. The demo set `demo.json` holds 68 questions over `org.ttl`. There are 59
 answerable questions, four clarification questions and five unanswerable questions. The
-set does not stand in for QALD or Text2SPARQL'25.
+set does not stand in for QALD or Text2SPARQL'25. `scripts/qald9plus-convert` builds a
+QALD-9-plus set in the same format, and `--loc DIR` runs a set against a database.
 
 ## What is scored
 

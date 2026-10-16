@@ -3946,8 +3946,9 @@ built.
 - The matrix runs each pair in the draft, repair and summarize roles at once. The
   cascade row is computed from those runs, moving a question on when the server sees a
   failure, rather than from separate runs with escalation, which needs Phase 2.
-- QALD-9-plus and Text2SPARQL'25 are not converted. `scripts/eval-ask` takes any set in
-  the demo set's format with its own data file.
+- `scripts/qald9plus-convert` converts the QALD-9-plus test split (item 6). Text2SPARQL'25
+  is not converted. `scripts/eval-ask` takes any set in the demo set's format with its
+  own data file or, with `--loc`, a database directory.
 - Promotion and rejection in the review inbox, and `actedOnBehalfOf` in citations, are
   left to Phase 3.
 - A stored query named `suggestions` cannot be read at `/$/queries/{ds}/suggestions`,
@@ -4792,6 +4793,15 @@ another run are not authorized. The remaining evaluation work follows.
   and a large local model through Ollama, an OpenAI-compatible model, and Haiku-, Sonnet-
   and Opus-class Anthropic models. Each run fixes the prompts, the dataset's commit and
   the provider's model version, and the report records them.
+- `scripts/qald9plus-convert` fetches the 150 questions of the QALD-9-plus DBpedia test
+  split from the KGQA repository at a pinned commit, checks the file's SHA256 and writes
+  a set in the demo set's format. The data is licensed CC BY 4.0 and is not vendored.
+  With `--loc` and `--sparkles` it runs every gold query on a DBpedia database, as §11.1
+  says, and drops the questions whose gold returns nothing, fails, or cannot be scored,
+  and the set counts them with the release and the binary's SHA256. The recompute on the
+  DBpedia 2022.12.01 database of [BENCHMARKING](../BENCHMARKING.md), a check of its
+  full-text index for `link_entities` and a dry run that measures the grounding size, the
+  Ask latency and the query timeouts still need the host that holds the database.
 - Publish per model and role the metrics of §11.1 and §11.4 (execution accuracy with
   QALD's precision, recall and F1, valid-query rate, repair rate, latency and cost per
   correct answer) in a section of [BENCHMARKS](../BENCHMARKS.md), and replace §3.7's

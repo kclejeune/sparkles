@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+"""Convert the QALD-9-plus DBpedia test split into an Ask question set.
+
+The split comes from the KGQA/QALD_9_plus repository at a pinned commit, and its
+SHA256 is checked before use. The data is licensed CC BY 4.0 and is not vendored.
+With --loc and --sparkles, each gold query is run on a DBpedia database. Questions
+whose gold returns nothing or that the evaluator cannot score are dropped and counted
+in the set. C18 section 11.1 describes why the gold answers are recomputed.
+"""
+
+import argparse
+import json
+import pathlib
+import re
+import sys
+import tempfile
+import time
+import urllib.request
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "testsuite/ask/eval_support"))
+from evaluator import (
+    Invalid,
+    OfflinePolicy,
+    Unsupported,
+    answer_set,
+    bounded_file,
+    capture_child,
+    digest,
+    offline_query,
+    parse_child,
+    strict_json,
+)
+
+REPO = "KGQA/QALD_9_plus"
+COMMIT = "b9fb0380902e6935efc9505170bc3652e8c242c1"
+FILE = "data/qald_9_plus_test_dbpedia.json"
+SHA256 = "7831fd113d9c5ad66c429bfb39b079fdb101578e57c095777a468f206201787f"
+URL = f"https://raw.githubusercontent.com/{REPO}/{COMMIT}/{FILE}"
+SIZE_CAP = 8 * 1024 * 1024
+
+
+def fetch(target):
+    with urllib.request.urlopen(URL, timeout=60) as reply:
+        data = reply.read(SIZE_CAP + 1)
+    if len(data) > SIZE_CAP:
+        raise Invalid("QALD-9-plus download is too large")
+    pathlib.Path(target).write_bytes(data)
+
+
+def category(query):
+    """A coarse label from the shape of the gold query."""
+    text = re.sub(r"\s+", " ", query).upper()
+    body = re.sub(r"PREFIX [^ ]+ <[^>]*> ?", "", text)
+    if body.lstrip().startswith("ASK"):
+        return "ask"
+    if re.search(r"\b(COUNT|SUM|AVG|MIN|MAX)\s*\(|GROUP BY|HAVING", body):
+        return "aggregate"
+    if re.search(r"NOT EXISTS|MINUS|FILTER\s*\(\s*!", body):
+        return "negation"
+    if "ORDER BY" in body:
+        return "ordering"
+    if "UNION" in body:
+        return "union"
+    if "FILTER" in body:
+        return "filter"
+    return "join" if body.count(" . ") + body.count(" ; ") >= 1 else "lookup"
+
+
+def english(entry):
+    for q in entry.get("question", []):
+        if q.get("language") == "en" and isinstance(q.get("string"), str):
+            return q["string"].strip()
+    return None
+
+
+def gold_result(args, query, directory):
+    """Run one gold query. Return an answer set or a reason for dropping it."""
+    try:
+        offline_query(query)
+    except OfflinePolicy:
+        return None, "unsupported"
+    record = capture_child(
+        [
+            args.sparkles,
+            "query",
+            "--loc",
+            args.loc,
+            "--results",
+            "json",
+            "--timeout",
+            str(args.timeout),
+            "--outbound-block-private",
+            "--outbound-allow",
+            "no-remote-eval.invalid",
+            query,
+        ],
+        directory,
+        time.monotonic() + args.timeout + 10,
+    )
+    try:
+        result = answer_set(parse_child(record, directory))
+    except Unsupported:
+        return None, "unsupported"
+    except Invalid:
+        return None, "failed"
+    if type(result) is not bool and not result.rows:
+        return None, "empty"
+    return result, None
+
+
+def convert(args, source):
+    data = strict_json(bounded_file(source, SIZE_CAP))
+    questions, dropped = (
+        [],
+        {"empty": [], "failed": [], "unsupported": [], "noEnglish": []},
+    )
+    scratch = pathlib.Path(tempfile.mkdtemp(prefix="qald9plus-"))
+    recompute = bool(args.loc)
+    for n, entry in enumerate(data["questions"]):
+        ident = "qald9p-" + str(entry["id"])
+        text, query = english(entry), (entry.get("query") or {}).get("sparql")
+        if not text or not isinstance(query, str) or not query.strip():
+            dropped["noEnglish"].append(ident)
+            continue
+        if recompute:
+            _, reason = gold_result(args, query, scratch / f"{n:04d}")
+            if reason:
+                dropped[reason].append(ident)
+                continue
+        questions.append(
+            {
+                "id": ident,
+                "kind": "answerable",
+                "category": category(query),
+                "question": text,
+                "gold": query,
+            }
+        )
+    out = {
+        "description": (
+            "The QALD-9-plus test split over DBpedia, converted for scripts/eval-ask. "
+            "The text is English. Gold answers "
+            + (
+                "were recomputed on the loaded DBpedia release. "
+                if recompute
+                else "are not recomputed. "
+            )
+            + "Questions whose gold returns nothing or that the evaluator cannot score "
+            "are dropped and counted."
+        ),
+        "dataset": "dbpedia",
+        "source": {
+            "repository": REPO,
+            "commit": COMMIT,
+            "file": FILE,
+            "sha256": SHA256,
+            "license": "CC BY 4.0",
+        },
+        "goldRecomputed": recompute,
+        "dbpediaRelease": args.release if recompute else None,
+        "goldBinarySha256": digest(args.sparkles) if recompute else None,
+        "sourceQuestions": len(data["questions"]),
+        "dropped": {k: {"count": len(v), "ids": v} for k, v in dropped.items()},
+        "prefixes": {},
+        "questions": questions,
+    }
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser(description=(__doc__ or "").split("\n")[0])
+    ap.add_argument("--out", required=True, help="a new set file")
+    ap.add_argument("--input", help="a local copy of the split, checked by SHA256")
+    ap.add_argument("--loc", help="DBpedia database directory for the gold recompute")
+    ap.add_argument("--sparkles", help="absolute path of the binary, with --loc")
+    ap.add_argument("--release", default="2022.12.01")
+    ap.add_argument("--timeout", type=float, default=60)
+    args = ap.parse_args()
+    if bool(args.loc) != bool(args.sparkles):
+        raise Invalid("--loc and --sparkles go together")
+    if args.sparkles and not pathlib.Path(args.sparkles).is_absolute():
+        raise Invalid("absolute --sparkles required")
+    out = pathlib.Path(args.out)
+    if out.exists():
+        raise Invalid("--out must be a new file")
+    source = args.input
+    if not source:
+        source = pathlib.Path(tempfile.mkdtemp(prefix="qald9plus-src-")) / "test.json"
+        fetch(source)
+    if digest(source) != SHA256:
+        raise Invalid("QALD-9-plus split does not match the pinned SHA256")
+    result = convert(args, source)
+    with out.open("x") as f:
+        json.dump(result, f, indent=1)
+        f.write("\n")
+    dropped = {k: v["count"] for k, v in result["dropped"].items()}
+    print(
+        f"kept {len(result['questions'])} of {result['sourceQuestions']}, dropped {dropped}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (Invalid, OSError) as error:
+        print(f"qald9plus-convert: {error}", file=sys.stderr)
+        sys.exit(2)
