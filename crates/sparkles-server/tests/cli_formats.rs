@@ -304,7 +304,8 @@ fn migrate_check_reports_an_interrupted_run_and_changes_nothing() {
     std::fs::create_dir(&stale).unwrap();
     std::fs::write(stale.join("partial"), b"partial").unwrap();
 
-    let out = ok(
+    // a store refuses the database until the run is finished, so --check says so
+    let o = sparkles(
         h,
         &[
             "migrate",
@@ -315,10 +316,21 @@ fn migrate_check_reports_an_interrupted_run_and_changes_nothing() {
             "json",
         ],
     );
+    assert_eq!(o.status.code(), Some(1));
+    let out = String::from_utf8(o.stdout).unwrap();
     let v: J = serde_json::from_str(&out).unwrap();
     let interrupted = v["datasets"][0]["interrupted"].as_str().unwrap_or_default();
     assert!(interrupted.contains(".migrate-books"), "{out}");
+    assert_eq!(v["datasets"][0]["opens"], J::Bool(false), "{out}");
     assert_eq!(std::fs::read(stale.join("partial")).unwrap(), b"partial");
+    let o = sparkles(h, &["migrate", "--data", data.to_str().unwrap(), "--check"]);
+    assert_eq!(o.status.code(), Some(1));
+    let text = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        text.contains("this release refuses it until `sparkles migrate` runs without --check"),
+        "{text}"
+    );
+    assert!(!text.contains("this release opens it"), "{text}");
 
     // a migrate without --check removes the stale copy, and the report no longer lists it
     let out = ok(
@@ -333,7 +345,44 @@ fn migrate_check_reports_an_interrupted_run_and_changes_nothing() {
     );
     let v: J = serde_json::from_str(&out).unwrap();
     assert!(v["datasets"][0]["interrupted"].is_null(), "{out}");
+    assert_eq!(v["datasets"][0]["opens"], J::Bool(true), "{out}");
     assert!(!stale.exists());
+}
+
+/// `check --data` leaves out the copies `sparkles migrate` keeps or builds next to a
+/// database, which are not datasets.
+#[test]
+fn check_data_skips_migration_copies() {
+    let fixture = &fixtures()[0];
+    let tmp = tempfile::tempdir().unwrap();
+    let h = tmp.path();
+    unpack(fixture, h);
+    let data = h.join("data");
+    let dbs = data.join("databases");
+    let kept = dbs.join(".pre-migrate-0.0.0-books");
+    let s = std::process::Command::new("cp")
+        .arg("-r")
+        .arg(dbs.join("books"))
+        .arg(&kept)
+        .status()
+        .unwrap();
+    assert!(s.success());
+    // the kept copy is in a format this release does not read
+    for p in files_named(&kept, "meta.json") {
+        let mut m: J = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        m["format_version"] = 99.into();
+        std::fs::write(&p, serde_json::to_vec(&m).unwrap()).unwrap();
+    }
+    std::fs::create_dir(dbs.join(".migrate-other")).unwrap();
+
+    let o = sparkles(h, &["check", "--data", data.to_str().unwrap()]);
+    let out = String::from_utf8_lossy(&o.stdout);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert_eq!(o.status.code(), Some(0), "stdout: {out}\nstderr: {err}");
+    assert!(
+        !out.contains(".pre-migrate-") && !out.contains(".migrate-"),
+        "{out}"
+    );
 }
 
 fn files_named(root: &Path, name: &str) -> Vec<PathBuf> {

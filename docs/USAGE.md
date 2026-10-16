@@ -2172,7 +2172,8 @@ provider's endpoint and key, so an index need not repeat them. The fields are in
 `sparkles check --loc db` verifies a database directory without modifying it. It takes
 no lock, truncates no WAL, repairs no catalog and rebuilds no full-text index, so it can
 run next to a server that holds the database. `--data DIR` checks every database in a
-server's data directory. Each check prints one line, `ok`, `warning` or `error`, and
+server's data directory. It leaves out directories whose names start with a dot, which
+hold unfinished clones and the copies that `sparkles migrate` builds or keeps. Each check prints one line, `ok`, `warning` or `error`, and
 lists the file, offset, block, row, commit or id of every problem below it.
 `--format json` prints the same report as JSON. The exit status is 0 when everything is
 clean, 1 when any check found an error, and 2 when there are warnings only.
@@ -2235,7 +2236,9 @@ database's `dataset.json` versions, the version of every generation's index, log
 update vocabulary, whether the release opens the database, and the steps an upgrade
 would run. It never changes a database and does not finish or undo an earlier run, which
 it reports as `interrupted`. The exit status is 1 when a database is outside the window
-and 0 otherwise. The window covers the root of a database and every branch, and a newer
+or has an interrupted run, which a server refuses until `sparkles migrate` runs without
+`--check`, and 0 otherwise. The JSON report gives both answers, `inWindow` for the
+formats and `opens` for whether this release opens the database now. The window covers the root of a database and every branch, and a newer
 settings file of a dataset or of one of its branches puts the database outside it.
 Startup checks dataset metadata and settings in every active and retained branch before
 rewriting root metadata, using the same physical branch directories as migration
@@ -4215,7 +4218,9 @@ login or `SPARKLES_TOKEN`. Remote clones wait for the clone task. Renames preser
 dataset identity and require server administration. They refuse live requests,
 reservations, and grants or active token scopes covering the old or new name, with the
 grants named in the error. `--data-dir` takes the catalog lock and requires a stopped
-server.
+server. A delete leaves alone a copy that `sparkles migrate --keep-old` kept in
+`databases/.pre-migrate-<version>-<name>`, which must be removed by hand once it is no
+longer needed.
 
 ## Python
 

@@ -106,9 +106,17 @@ pub struct Plan {
 }
 
 impl Plan {
-    /// Whether this build opens the database, directly or after the planned steps.
+    /// Whether this build reads every file of the database, directly or after the planned
+    /// steps.
     pub fn in_window(&self) -> bool {
         self.refused.is_empty()
+    }
+
+    /// Whether this build opens the database now: it is inside the window and no
+    /// interrupted migration is pending, which a store refuses until `sparkles migrate`
+    /// finishes or undoes it.
+    pub fn opens(&self) -> bool {
+        self.in_window() && self.interrupted.is_none()
     }
 }
 
@@ -749,7 +757,8 @@ pub fn migrate(root: &Path, keep_old: bool) -> Result<Outcome> {
 }
 
 /// [`migrate`] with a hook called at named points (`copied`, `checked`, `moved-aside`,
-/// `swapped`), for interruption tests.
+/// `swapped`), for interruption tests. An error at `before-check` stands for a check
+/// that fails to run, which removes the copy like any error before the mark.
 #[doc(hidden)]
 pub fn migrate_with(
     root: &Path,
@@ -838,7 +847,13 @@ fn migrate_planned_with(
     copy_tree_meta(root, &work, &owner, root).inspect_err(|_| {
         let _ = std::fs::remove_dir_all(&work);
     })?;
-    let report = crate::check::check(&work, &crate::check::CheckOptions { quick: false })?;
+    // Until the mark is durable the copy is only a candidate, so any error removes it and
+    // leaves the database as it was. After that, recovery owns the copy.
+    let report = hook("before-check")
+        .and_then(|()| crate::check::check(&work, &crate::check::CheckOptions { quick: false }))
+        .inspect_err(|_| {
+            let _ = std::fs::remove_dir_all(&work);
+        })?;
     if report.status == crate::check::Status::Error {
         let _ = std::fs::remove_dir_all(&work);
         return Err(Error::Corrupt(format!(
@@ -847,7 +862,9 @@ fn migrate_planned_with(
             report.errors
         )));
     }
-    write_mark(&work, &mark)?;
+    write_mark(&work, &mark).inspect_err(|_| {
+        let _ = std::fs::remove_dir_all(&work);
+    })?;
     hook("checked")?;
     // The database's lock is released before its directory is renamed, since a directory
     // with an open handle cannot be renamed on every platform. From here on exclusion
@@ -906,6 +923,25 @@ mod tests {
     fn count(root: &Path) -> usize {
         let s = Store::open(root, StoreOptions::default()).unwrap();
         s.snapshot().len() as usize
+    }
+
+    /// A failure before the copy is marked as checked removes the copy, so the database
+    /// is not left pending.
+    #[test]
+    fn a_failure_before_the_mark_removes_the_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        legacy_database(&root);
+        let r = migrate_with(&root, false, &mut |at| {
+            if at == "before-check" {
+                Err(Error::Invalid("stop".into()))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(r.is_err(), "{r:?}");
+        assert!(!work_dir(&absolute(&root).unwrap()).exists());
+        Store::open(&root, StoreOptions::default()).unwrap();
     }
 
     #[test]
