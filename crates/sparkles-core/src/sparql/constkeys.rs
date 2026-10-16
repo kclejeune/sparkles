@@ -10,8 +10,14 @@ use oxrdf::Term;
 use spargebra::algebra::{Expression, GraphPattern, PropertyPathExpression};
 use spargebra::term::{GroundTerm, NamedNodePattern, TermPattern, TriplePattern};
 
-/// The keys of the IRIs and the non-inline literals that `pattern` names, with duplicates.
-/// Constants of expressions are included for the usual comparisons and calls.
+/// The most keys collected: a `VALUES` list of thousands of constants would otherwise
+/// allocate a key for each, and the first groups the lookups reach are the ones worth
+/// asking for.
+pub(crate) const MAX_KEYS: usize = 4096;
+
+/// The keys of the IRIs and the non-inline literals that `pattern` names, with duplicates,
+/// up to [`MAX_KEYS`]. Constants of expressions are included for the usual comparisons and
+/// calls.
 pub(crate) fn constant_keys(pattern: &GraphPattern) -> Vec<Vec<u8>> {
     let mut out = Keys::default();
     out.pattern(pattern);
@@ -25,13 +31,18 @@ struct Keys {
 
 impl Keys {
     fn term(&mut self, t: &Term) {
-        if id::inline_id(t).is_none() && !matches!(t, Term::BlankNode(_) | Term::Triple(_)) {
+        if self.keys.len() < MAX_KEYS
+            && id::inline_id(t).is_none()
+            && !matches!(t, Term::BlankNode(_) | Term::Triple(_))
+        {
             self.keys.push(id::term_key(t));
         }
     }
 
     fn iri(&mut self, iri: &str) {
-        self.keys.push(id::iri_key(iri));
+        if self.keys.len() < MAX_KEYS {
+            self.keys.push(id::iri_key(iri));
+        }
     }
 
     fn term_pattern(&mut self, t: &TermPattern) {
@@ -198,5 +209,17 @@ mod tests {
         }
         // 7 is an inline integer and needs no key
         assert!(!k.iter().any(|s| s.contains('7') && !s.contains("org7")));
+    }
+
+    #[test]
+    fn collects_at_most_the_cap() {
+        let values: String = (0..10_000).map(|i| format!("<urn:v{i}> ")).collect();
+        let parsed = spargebra::SparqlParser::new()
+            .parse_query(&format!("SELECT * WHERE {{ VALUES ?x {{ {values} }} }}"))
+            .unwrap();
+        let spargebra::Query::Select { pattern, .. } = parsed else {
+            panic!()
+        };
+        assert_eq!(constant_keys(&pattern).len(), MAX_KEYS);
     }
 }

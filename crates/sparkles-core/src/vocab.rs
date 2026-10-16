@@ -762,6 +762,11 @@ impl Vocab {
         }
     }
 
+    /// Whether the vocabulary has a sparse index, which [`Vocab::prefetch_keys`] needs.
+    pub fn has_sparse(&self) -> bool {
+        self.sparse.is_some()
+    }
+
     /// Ask for the sparse-index groups that hold these keys, all at once, before the keys
     /// are looked up one after the other with [`Vocab::find`] (which would wait for each
     /// group before looking for the next key). Groups read before are left alone. Does

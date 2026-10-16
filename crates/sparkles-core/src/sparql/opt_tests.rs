@@ -1611,9 +1611,31 @@ mod cold_reads {
         assert_eq!(on.len(), 600);
     }
 
-    /// A query's reads are counted: the columns it decoded.
+    /// A query's reads are counted: the columns it decoded. The counters are process-wide
+    /// and `io_stats` starts from them only under a profile, so the check runs alone in a
+    /// child process with a profile alive.
     #[test]
     fn a_query_counts_the_columns_it_decodes() {
+        const CHILD: &str = "SPARKLES_IO_COUNT_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "sparql::opt_tests::cold_reads::a_query_counts_the_columns_it_decodes",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         let s = Store::in_memory(StoreOptions::default());
         load(&s, &people(2000), RdfFormat::NTriples);
         let opts = QueryOptions {
@@ -1621,9 +1643,17 @@ mod cold_reads {
             ..Default::default()
         };
         let q = format!("{PREFIXES}SELECT ?p WHERE {{ ?p ex:worksFor <http://ex.org/org1> }}");
+        let _profile = crate::ioacct::Profile::start();
+        let before = crate::ioacct::IoSnapshot::now();
         let r = query(s.snapshot(), &q, &opts).unwrap();
         assert_eq!(r.len(), 400);
         let io = r.ctx.io_stats();
         assert!(io.columns_decoded() > 0, "{io:?}");
+        assert_eq!(
+            io.columns_decoded(),
+            crate::ioacct::IoSnapshot::now()
+                .since(&before)
+                .columns_decoded()
+        );
     }
 }

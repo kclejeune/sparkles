@@ -480,7 +480,8 @@ pub struct Ctx {
     /// RDFS on read (see [`super::rdfs`])
     pub rdfs: Option<Arc<super::rdfs::RdfsSchema>>,
     pub opt: Optimizations,
-    /// the I/O counters when the query began (see [`Ctx::io_stats`])
+    /// the I/O counters when the query began, taken only under a profile (see
+    /// [`Ctx::io_stats`])
     io_start: crate::ioacct::IoSnapshot,
     /// parsed geometries of this query
     pub geo: crate::geo::memo::GeoMemo,
@@ -570,7 +571,11 @@ impl Ctx {
             service_scope: Arc::from(""),
             rdfs: None,
             opt: Optimizations::default(),
-            io_start: crate::ioacct::IoSnapshot::now(),
+            io_start: if crate::ioacct::profiling() {
+                crate::ioacct::IoSnapshot::now()
+            } else {
+                Default::default()
+            },
             geo: Default::default(),
             warnings: Default::default(),
             failed: Default::default(),
@@ -583,7 +588,9 @@ impl Ctx {
     /// What the read path counted since this context was made: index columns decoded,
     /// bytes asked of the kernel and vocabulary lookups (see [`crate::ioacct`]). The
     /// counters are process-wide, so reads of queries that run at the same time are
-    /// included.
+    /// included. The starting counters are taken only while a [`Profile`](crate::ioacct::Profile)
+    /// is alive, so the result is meaningful only for a query made under one: otherwise it
+    /// holds everything the process has counted.
     pub fn io_stats(&self) -> crate::ioacct::IoSnapshot {
         crate::ioacct::IoSnapshot::now().since(&self.io_start)
     }

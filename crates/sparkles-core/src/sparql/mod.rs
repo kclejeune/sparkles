@@ -690,7 +690,11 @@ fn prepare_query(
         ctx.attach_cursor_owner();
     }
     crate::geo::validate_query(pattern, &mut |w| ctx.warn(w))?;
-    if ctx.opt.prefetch_constants {
+    // the keys are collected only when asking for their groups can do something
+    if ctx.opt.prefetch_constants
+        && crate::index::io_hints()
+        && ctx.snap.generation.vocab.has_sparse()
+    {
         ctx.snap
             .generation
             .vocab
