@@ -9,13 +9,16 @@
 //! refused together. Every other option is fixed here, so the same PDF always gives the
 //! same Markdown until the pinned version changes.
 //!
-//! Parsing runs on a thread of its own, at most `--pdf-workers` at a time, with a panic
-//! caught as `conversion-failed`. A conversion that overruns the task's deadline cannot
-//! be stopped inside the library: the task reports `conversion-timeout`, and the thread
-//! keeps its worker slot until it ends.
+//! Parsing runs in a child process of the server ([`super::isolate`]), at most
+//! `--pdf-workers` at a time, and the child is killed when the task's deadline passes.
+//! Without a child process (library use, tests and `--convert-in-process`) it runs on a
+//! thread of its own with a panic caught as `conversion-failed`. A conversion on a thread
+//! that overruns the task's deadline cannot be stopped inside the library: the task
+//! reports `conversion-timeout`, and the thread keeps its worker slot until it ends.
 
 use super::PdfRuntime;
 use super::convert::{Converted, Options, PageReason, Refusal};
+use super::isolate::{self, Job, Reply};
 use crate::mcp::memory::ingest::normalize;
 use pdf_inspector::{PdfError, PdfOptions, ProcessMode};
 use std::collections::BTreeMap;
@@ -34,6 +37,25 @@ pub fn convert(bytes: &[u8], o: &Options) -> Result<Converted, Refusal> {
             "every PDF worker stayed busy until the deadline",
         ));
     };
+    if let Some(iso) = o.pdf.isolation() {
+        let job = Job::Pdf {
+            allow_partial: o.allow_partial,
+        };
+        match isolate::run(iso, job, bytes, o) {
+            Ok(Reply::Text(c)) => return Ok(c),
+            #[cfg(feature = "office")]
+            Ok(Reply::Sheets(_)) => {
+                return Err(Refusal::new(
+                    "conversion-failed",
+                    422,
+                    "the conversion child answered with the wrong kind of result",
+                ));
+            }
+            Err(Some(r)) => return Err(r),
+            // no child could be started: convert in process
+            Err(None) => {}
+        }
+    }
     let bytes = bytes.to_vec();
     let allow_partial = o.allow_partial;
     let rt = o.pdf.clone();
@@ -143,7 +165,12 @@ fn needing(
     out
 }
 
-fn inspect(bytes: &[u8], allow_partial: bool, rt: &Arc<PdfRuntime>) -> Result<Converted, Refusal> {
+/// The conversion in this process, as the child or the worker thread runs it.
+pub(super) fn inspect(
+    bytes: &[u8],
+    allow_partial: bool,
+    rt: &Arc<PdfRuntime>,
+) -> Result<Converted, Refusal> {
     let r = pdf_inspector::process_pdf_mem_with_options(bytes, options(None)).map_err(failed)?;
     let per_page = pdf_inspector::extract_pages_markdown_mem(bytes, None).map_err(failed)?;
     let need = needing(&r, &per_page);

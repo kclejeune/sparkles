@@ -23,6 +23,8 @@ mod csv;
 mod extract;
 mod html;
 pub mod http;
+#[cfg(any(feature = "pdf", feature = "office"))]
+pub mod isolate;
 mod link;
 pub mod maintain;
 #[cfg(feature = "office")]
@@ -58,15 +60,37 @@ pub const MAX_TASKS: usize = 500;
 /// The most tasks that may be active at once.
 pub const MAX_ACTIVE: usize = 32;
 
+/// The default `--convert-memory`, in MiB.
+pub const DEFAULT_CONVERT_MEMORY_MIB: u64 = 2048;
+
 /// `serve` flags of ingestion.
-#[derive(clap::Args, Clone, Debug, Default)]
+#[derive(clap::Args, Clone, Debug)]
 pub struct IngestServeArgs {
-    /// How many PDF and Office conversions may run at once; a conversion that overruns
-    /// its deadline keeps its slot until it ends (spec C18 §7.1.1)
+    /// How many PDF and Office conversions may run at once (spec C18 §7.1.1)
     #[arg(long, value_name = "N", default_value_t = DEFAULT_PDF_WORKERS)]
     pub pdf_workers: usize,
+    /// The address-space limit of each PDF or Office conversion's child process, in MiB
+    /// (at least 256)
+    #[arg(long, value_name = "MIB", default_value_t = DEFAULT_CONVERT_MEMORY_MIB)]
+    pub convert_memory: u64,
+    /// Convert PDF and Office files on threads of the server instead of in child
+    /// processes; a conversion that overruns its deadline then keeps its slot until it
+    /// ends, and its memory is bounded only by the converters' own limits
+    #[arg(long)]
+    pub convert_in_process: bool,
     #[command(flatten)]
     pub ocr: OcrArgs,
+}
+
+impl Default for IngestServeArgs {
+    fn default() -> IngestServeArgs {
+        IngestServeArgs {
+            pdf_workers: DEFAULT_PDF_WORKERS,
+            convert_memory: DEFAULT_CONVERT_MEMORY_MIB,
+            convert_in_process: false,
+            ocr: OcrArgs::default(),
+        }
+    }
 }
 
 /// The OCR flags of `serve` and `sparkles ingest` (feature `pdf-ocr`).
@@ -137,6 +161,9 @@ pub struct PdfRuntime {
     used: Mutex<usize>,
     cv: Condvar,
     ocr: Option<OcrConfig>,
+    /// the child processes that conversions run in, when the binary provides them
+    #[cfg(any(feature = "pdf", feature = "office"))]
+    isolation: Option<isolate::Isolation>,
 }
 
 /// One running PDF or Office conversion's worker slot.
@@ -158,7 +185,27 @@ impl PdfRuntime {
             used: Mutex::new(0),
             cv: Condvar::new(),
             ocr,
+            #[cfg(any(feature = "pdf", feature = "office"))]
+            isolation: None,
         }
+    }
+
+    /// Run conversions in child processes as `iso` says.
+    #[cfg(any(feature = "pdf", feature = "office"))]
+    pub fn with_isolation(mut self, iso: Option<isolate::Isolation>) -> PdfRuntime {
+        self.isolation = iso;
+        self
+    }
+
+    #[cfg(any(feature = "pdf", feature = "office"))]
+    pub fn isolation(&self) -> Option<&isolate::Isolation> {
+        self.isolation.as_ref()
+    }
+
+    /// The OCR configuration, which a conversion child is given.
+    #[cfg(any(feature = "pdf", feature = "office"))]
+    pub fn ocr_config(&self) -> Option<&OcrConfig> {
+        self.ocr.as_ref()
     }
 
     /// A worker slot, waiting until `deadline` for one.
@@ -434,10 +481,28 @@ pub struct Runtime {
     pub review: crate::mcp::memory::pending::Registry,
 }
 
+/// The PDF workers of `args`, with child processes when the binary provides them and
+/// `--convert-in-process` is not given.
+fn pdf_runtime(args: &IngestServeArgs) -> PdfRuntime {
+    let rt = PdfRuntime::new(args.pdf_workers, args.ocr.config());
+    #[cfg(any(feature = "pdf", feature = "office"))]
+    let rt = rt.with_isolation(
+        isolate::child_exe()
+            .filter(|_| !args.convert_in_process && cfg!(unix))
+            .map(|exe| isolate::Isolation {
+                exe,
+                // below this the binary itself cannot start its threads
+                memory: args.convert_memory.max(256).saturating_mul(1 << 20),
+                prefix: Vec::new(),
+            }),
+    );
+    rt
+}
+
 impl Runtime {
     pub fn new(args: &IngestServeArgs) -> Runtime {
         Runtime {
-            pdf: Arc::new(PdfRuntime::new(args.pdf_workers, args.ocr.config())),
+            pdf: Arc::new(pdf_runtime(args)),
             tasks: Mutex::default(),
             review: Default::default(),
         }

@@ -3,12 +3,14 @@
 //! sheet, which the mapping draft of §7.8 takes one at a time. The reading is
 //! `sparkles-office`, which bounds every size of the file.
 //!
-//! Like a PDF, the file comes from outside, so it is read on a thread of its own under
-//! the task's deadline, with a panic caught as `conversion-failed`, and at most
-//! `--pdf-workers` conversions of PDF and Office files run at once.
+//! Like a PDF, the file comes from outside, so it is read under the task's deadline in a
+//! child process of the server ([`super::isolate`]), or on a thread of its own when there
+//! is none, with a panic caught as `conversion-failed`. At most `--pdf-workers`
+//! conversions of PDF and Office files run at once.
 
 use super::PdfRuntime;
 use super::convert::{Converted, EmbeddedImage, Format, Options, Refusal};
+use super::isolate::{self, Job, Reply};
 use crate::mcp::memory::ingest::normalize;
 use sparkles_office::{Error, Limits};
 use std::sync::mpsc;
@@ -57,10 +59,13 @@ fn refusal(e: Error) -> Refusal {
     }
 }
 
-/// Run `f` on a worker thread under `o`'s deadline.
+/// Run `job` in a child process, or `f` on a worker thread when the server has no child
+/// process to use, under `o`'s deadline.
 fn run<T: Send + 'static>(
     bytes: &[u8],
     o: &Options,
+    job: Job,
+    from_child: impl FnOnce(Reply) -> Option<T>,
     f: impl FnOnce(&[u8]) -> Result<T, Error> + Send + 'static,
 ) -> Result<T, Refusal> {
     let Some(slot) = PdfRuntime::acquire(&o.pdf, o.deadline) else {
@@ -70,6 +75,22 @@ fn run<T: Send + 'static>(
             "every conversion worker stayed busy until the deadline",
         ));
     };
+    if let Some(iso) = o.pdf.isolation() {
+        match isolate::run(iso, job, bytes, o) {
+            Ok(r) => {
+                return from_child(r).ok_or_else(|| {
+                    Refusal::new(
+                        "conversion-failed",
+                        422,
+                        "the conversion child answered with the wrong kind of result",
+                    )
+                });
+            }
+            Err(Some(r)) => return Err(r),
+            // no child could be started: convert in process
+            Err(None) => {}
+        }
+    }
     let bytes = bytes.to_vec();
     let (tx, rx) = mpsc::channel();
     let spawned = std::thread::Builder::new()
@@ -110,8 +131,35 @@ fn run<T: Send + 'static>(
 pub fn convert(bytes: &[u8], format: Format, o: &Options) -> Result<Converted, Refusal> {
     let f = format_of(format);
     let l = limits(o);
-    let d = run(bytes, o, move |b| sparkles_office::to_markdown(b, f, &l))?;
-    Ok(Converted {
+    run(
+        bytes,
+        o,
+        Job::Text(format),
+        |r| match r {
+            Reply::Text(c) => Some(c),
+            Reply::Sheets(_) => None,
+        },
+        move |b| sparkles_office::to_markdown(b, f, &l).map(|d| converted(d, format)),
+    )
+}
+
+/// The conversion in this process, as the child runs it.
+pub fn convert_here(bytes: &[u8], format: Format, o: &Options) -> Result<Converted, Refusal> {
+    let d = sparkles_office::to_markdown(bytes, format_of(format), &limits(o)).map_err(refusal)?;
+    Ok(converted(d, format))
+}
+
+/// The sheets in this process, as the child reads them.
+pub fn sheets_here(
+    bytes: &[u8],
+    format: Format,
+    o: &Options,
+) -> Result<Vec<sparkles_office::Sheet>, Refusal> {
+    sparkles_office::sheets(bytes, format_of(format), &limits(o)).map_err(refusal)
+}
+
+fn converted(d: sparkles_office::Document, format: Format) -> Converted {
+    Converted {
         text: normalize(&d.markdown),
         media_type: format.media_type().into(),
         title: d.title,
@@ -126,7 +174,7 @@ pub fn convert(bytes: &[u8], format: Format, o: &Options) -> Result<Converted, R
             .collect(),
         notes: d.notes,
         ..Default::default()
-    })
+    }
 }
 
 /// The visible sheets of a workbook as CSV.
@@ -137,5 +185,14 @@ pub fn sheets(
 ) -> Result<Vec<sparkles_office::Sheet>, Refusal> {
     let f = format_of(format);
     let l = limits(o);
-    run(bytes, o, move |b| sparkles_office::sheets(b, f, &l))
+    run(
+        bytes,
+        o,
+        Job::Sheets(format),
+        |r| match r {
+            Reply::Sheets(s) => Some(s),
+            Reply::Text(_) => None,
+        },
+        move |b| sparkles_office::sheets(b, f, &l),
+    )
 }

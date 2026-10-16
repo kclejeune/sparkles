@@ -112,6 +112,7 @@ pub fn run_cli(args: IngestArgs, store_opts: StoreOptions) -> Result<()> {
     st.ingest = super::Runtime::new(&super::IngestServeArgs {
         pdf_workers: 1,
         ocr: args.ocr.clone(),
+        ..Default::default()
     });
     let st = Arc::new(st);
     st.attach(&args.dataset, DbType::Persistent, Some(&args.loc))?;
