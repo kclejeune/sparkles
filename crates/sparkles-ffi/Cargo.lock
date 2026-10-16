@@ -3272,6 +3272,7 @@ name = "sparkles-reasoner"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "hashbrown 0.16.1",
  "oxrdf",
  "oxsdatatypes",
  "oxttl",
@@ -3281,6 +3282,7 @@ dependencies = [
  "rustc-hash 2.1.3",
  "serde",
  "serde_json",
+ "smallvec",
  "sparkles-core",
  "thiserror 2.0.21",
  "tracing",
