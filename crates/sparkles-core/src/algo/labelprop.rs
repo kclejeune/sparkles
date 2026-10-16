@@ -42,9 +42,10 @@ pub fn run(g: &Graph, max_iterations: u32, par: &Par, ctl: &Control) -> Result<O
                 for csr in sides {
                     let (r, w) = (csr.row(u), csr.wrow(u));
                     work.tick_n(r.len() + 1, "labelprop-node")?;
-                    seen.reserve(r.len())?;
-                    for (k, &v) in r.iter().enumerate() {
-                        seen.push((prev[v as usize], w.map_or(1.0, |w| w[k] as f64)))?;
+                    match w {
+                        Some(w) => seen
+                            .extend(r.iter().zip(w).map(|(&v, &w)| (prev[v as usize], w as f64)))?,
+                        None => seen.extend(r.iter().map(|&v| (prev[v as usize], 1.0)))?,
                     }
                 }
                 if seen.is_empty() {

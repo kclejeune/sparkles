@@ -50,6 +50,91 @@ fn graph(n: usize, m: usize, par: &Par) -> Graph {
     Graph::build(raw, Aggregate::None, par, &Control::unlimited()).unwrap()
 }
 
+/// The cost of polling cancellation: each algorithm runs `ALGO_ROUNDS` times on
+/// `ALGO_THREADS` threads under a control with a far deadline, as a query's call has,
+/// and the fastest round is printed. Run it on two builds and compare. Ignored by
+/// default:
+///
+/// ```text
+/// ALGO_NODES=1000000 ALGO_EDGES=5000000 ALGO_ROUNDS=5 cargo test --release \
+///     -p sparkles-core --test graph_algorithms_scale polling_cost -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore]
+fn polling_cost() {
+    use sparkles_core::algo::{betweenness, fastrp, traverse};
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+    let n = env("ALGO_NODES", 200_000);
+    let m = env("ALGO_EDGES", 1_000_000);
+    let rounds = env("ALGO_ROUNDS", 5);
+    let threads = env("ALGO_THREADS", 1);
+    let g = graph(n, m, &Par::with_threads(8));
+    let ctl = Control::new(
+        Arc::new(AtomicBool::new(false)),
+        Some(Instant::now() + Duration::from_secs(24 * 3600)),
+        u64::MAX,
+    );
+    let par = Par::with_threads(threads);
+    let only = std::env::var("ALGO_ONLY").ok();
+    let time = |name: &str, f: &dyn Fn()| {
+        if only
+            .as_deref()
+            .is_some_and(|o| !o.split(',').any(|o| o == name))
+        {
+            return;
+        }
+        let mut best = f64::INFINITY;
+        for _ in 0..rounds {
+            let t = Instant::now();
+            f();
+            best = best.min(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        println!("POLL {name:<12} {best:>9.1} ms");
+    };
+    time("pageRank", &|| {
+        pagerank::run(&g, &pagerank::Params::default(), &par, &ctl).unwrap();
+    });
+    time("wcc", &|| {
+        components::wcc(&g, &par, &ctl).unwrap();
+    });
+    time("scc", &|| {
+        components::scc(&g, &ctl).unwrap();
+    });
+    time("bfs", &|| {
+        traverse::bfs(&g, &[0], &par, &ctl).unwrap();
+    });
+    time("labelProp", &|| {
+        labelprop::run(&g, 10, &par, &ctl).unwrap();
+    });
+    time("triangles", &|| {
+        triangles::count(&g, &par, &ctl).unwrap();
+    });
+    time("kCore", &|| {
+        kcore::run(&g, &ctl).unwrap();
+    });
+    time("betweenness", &|| {
+        let p = betweenness::Params {
+            samples: 16,
+            seed: 1,
+        };
+        betweenness::run(&g, &p, &par, &ctl).unwrap();
+    });
+    time("fastRP", &|| {
+        let p = fastrp::Params {
+            dimension: 64,
+            ..fastrp::Params::default()
+        };
+        fastrp::run(&g, &p, &par, &ctl).unwrap();
+    });
+    if std::env::var_os("ALGO_COMMUNITY").is_some() {
+        time("louvain", &|| {
+            community::run(&g, &community::Params::default(), &ctl).unwrap();
+        });
+    }
+}
+
 #[test]
 #[ignore]
 fn scaling() {

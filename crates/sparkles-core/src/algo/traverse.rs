@@ -39,12 +39,14 @@ pub fn bfs(g: &Graph, sources: &[u32], par: &Par, ctl: &Control) -> Result<Vec<u
             for &u in &frontier[lo..hi] {
                 let row = g.out.row(u);
                 work.tick_n(row.len() + 1, "bfs-frontier")?;
+                // room for every neighbour, charged before the row is read
+                next.reserve(row.len())?;
                 for &v in row {
                     if depth[v as usize]
                         .compare_exchange(UNREACHED, level, Ordering::Relaxed, Ordering::Relaxed)
                         .is_ok()
                     {
-                        next.push(v)?;
+                        next.push_reserved(v);
                     }
                 }
             }
@@ -55,7 +57,8 @@ pub fn bfs(g: &Graph, sources: &[u32], par: &Par, ctl: &Control) -> Result<Vec<u
         drop(frontier);
         frontier = Buffer::new("bfs-frontier", total, ctl)?;
         for part in parts {
-            frontier.extend(&part)?;
+            ctl.check()?;
+            frontier.extend_within(part.iter().copied())?;
         }
     }
     drop(frontier);

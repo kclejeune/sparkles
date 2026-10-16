@@ -509,11 +509,7 @@ impl Graph {
             if self.symmetric {
                 let row = self.out.row(u);
                 work.tick_n(row.len() + 1, "simple-rows")?;
-                for &v in row {
-                    if v != u {
-                        adj.push(v)?;
-                    }
-                }
+                adj.extend_within(row.iter().copied().filter(|&v| v != u))?;
             } else {
                 let (a, b) = (self.out.row(u), inn.row(u));
                 work.tick_n(a.len() + b.len() + 1, "simple-rows")?;
@@ -606,20 +602,20 @@ impl Graph {
 
 /// Append the merge of two sorted rows.
 fn merge_rows(a: &[u32], b: &[u32], out: &mut Buffer<u32>) -> Result<()> {
+    if out.room() < a.len() + b.len() {
+        return Err(super::bad("memory", "fixed buffer capacity exceeded"));
+    }
     let (mut i, mut j) = (0, 0);
     while i < a.len() && j < b.len() {
         if a[i] <= b[j] {
-            out.push(a[i])?;
+            out.push_within(a[i]);
             i += 1;
         } else {
-            out.push(b[j])?;
+            out.push_within(b[j]);
             j += 1;
         }
     }
-    for &x in a[i..].iter().chain(&b[j..]) {
-        out.push(x)?;
-    }
-    Ok(())
+    out.extend_within(a[i..].iter().chain(&b[j..]).copied())
 }
 
 #[cfg(test)]

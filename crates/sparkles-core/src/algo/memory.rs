@@ -191,6 +191,32 @@ impl<T> Buffer<T> {
         self.values.push(value);
         Ok(())
     }
+    /// Append a value the caller knows fits, as a hot loop that appends each node at
+    /// most once to a buffer of one entry per node does. A value past the capacity is
+    /// an error of the caller, which a debug build stops at and a release build keeps
+    /// correct at the price of an uncharged growth.
+    #[inline]
+    pub(crate) fn push_within(&mut self, value: T) {
+        debug_assert!(self.values.len() < self.values.capacity());
+        self.values.push(value);
+    }
+    /// The values that still fit in the capacity.
+    #[inline]
+    pub(crate) fn room(&self) -> usize {
+        self.values.capacity() - self.values.len()
+    }
+    /// Append `values` within the capacity, without a check per value in a hot loop.
+    /// Fails, keeping the values that fit, when they do not all fit.
+    #[inline]
+    pub(crate) fn extend_within(&mut self, values: impl IntoIterator<Item = T>) -> Result<()> {
+        let room = self.values.capacity() - self.values.len();
+        let mut values = values.into_iter();
+        self.values.extend(values.by_ref().take(room));
+        if values.next().is_some() {
+            return Err(bad("memory", "fixed buffer capacity exceeded"));
+        }
+        Ok(())
+    }
     /// A buffer of `capacity` default values, charged before it is allocated. Unlike
     /// [`Buffer::filled`] it fills with one pass of the allocator's zeroing, so a large
     /// array of numbers costs no per-element bookkeeping.
@@ -289,6 +315,7 @@ impl<'a> Work<'a> {
             left: CHECK_EVERY,
         })
     }
+    #[inline]
     pub(crate) fn tick(&mut self, phase: &'static str) -> Result<()> {
         #[cfg(test)]
         probe::at(probe::Point::Work(phase));
@@ -339,7 +366,16 @@ impl<T> Growing<T> {
     }
 
     /// Make room for `extra` more values, growing the capacity at least twofold.
+    #[inline]
     pub(crate) fn reserve(&mut self, extra: usize) -> Result<()> {
+        if self.values.capacity() - self.values.len() >= extra {
+            return Ok(());
+        }
+        self.grow(extra)
+    }
+
+    #[cold]
+    fn grow(&mut self, extra: usize) -> Result<()> {
         let need = self
             .values
             .len()
@@ -372,6 +408,25 @@ impl<T> Growing<T> {
             self.reserve(1)?;
         }
         self.values.push(value);
+        Ok(())
+    }
+
+    /// Append a value after [`Growing::reserve`] made room for it, without a check that
+    /// can fail. A value past the reserved room is an error of the caller, which a debug
+    /// build stops at and a release build keeps correct at the price of an uncharged
+    /// growth.
+    #[inline]
+    pub(crate) fn push_reserved(&mut self, value: T) {
+        debug_assert!(self.values.len() < self.values.capacity());
+        self.values.push(value);
+    }
+
+    /// Append the values of an iterator of known length, charging the room first, so a
+    /// hot loop has no check per value.
+    #[inline]
+    pub(crate) fn extend(&mut self, values: impl ExactSizeIterator<Item = T>) -> Result<()> {
+        self.reserve(values.len())?;
+        self.values.extend(values);
         Ok(())
     }
 

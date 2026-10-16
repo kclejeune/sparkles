@@ -148,7 +148,7 @@ impl Search {
             for &v in row {
                 if self.dist[v as usize].is_infinite() {
                     self.dist[v as usize] = du + 1.0;
-                    self.order.push(v)?;
+                    self.order.push_within(v);
                 }
                 if self.dist[v as usize] == du + 1.0 {
                     self.sigma[v as usize] += self.sigma[u as usize];
@@ -172,7 +172,7 @@ impl Search {
                 continue;
             }
             self.done[u as usize] = true;
-            self.order.push(u)?;
+            self.order.push_within(u);
             let (row, ws) = (g.out.row(u), g.out.wrow(u).unwrap_or_default());
             work.tick_n(row.len() + 1, "betweenness-dijkstra")?;
             for (i, &v) in row.iter().enumerate() {

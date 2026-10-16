@@ -36,11 +36,8 @@ fn count_in(s: &Csr, par: &Par, ctl: &Control) -> Result<Vec<u32>> {
         let start = adj.len();
         let row = s.row(u);
         work.tick_n(row.len() + 1, "triangles-orient")?;
-        for &v in row {
-            if rank[v as usize] > rank[u as usize] {
-                adj.push(rank[v as usize])?;
-            }
-        }
+        let ru = rank[u as usize];
+        adj.extend_within(row.iter().map(|&v| rank[v as usize]).filter(|&rv| rv > ru))?;
         adj[start..].sort_unstable();
         off[u as usize + 1] = adj.len() as u64;
     }
@@ -59,10 +56,16 @@ fn count_in(s: &Csr, par: &Par, ctl: &Control) -> Result<Vec<u32>> {
         let mut work = Work::new(ctl)?;
         for r in lo as u32..hi as u32 {
             let a = up(r);
-            work.tick_n(a.len() + 1, "triangles-node")?;
+            // a node counts its merge steps, checked before each merge once they pass
+            // the interval, so a node with long merges is polled between them
+            let mut steps = a.len() + 1;
             for &q in a {
                 let b = up(q);
-                work.tick_n(a.len() + b.len(), "triangles-intersect")?;
+                steps += a.len() + b.len();
+                if steps >= 4096 {
+                    work.tick_n(steps, "triangles-intersect")?;
+                    steps = 0;
+                }
                 // common elements of a and b
                 let (mut i, mut j) = (0, 0);
                 while i < a.len() && j < b.len() {
@@ -80,6 +83,7 @@ fn count_in(s: &Csr, par: &Par, ctl: &Control) -> Result<Vec<u32>> {
                     }
                 }
             }
+            work.tick_n(steps, "triangles-node")?;
         }
         Ok(())
     })?;
