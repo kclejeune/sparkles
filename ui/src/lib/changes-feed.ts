@@ -7,16 +7,20 @@ import { SseParser } from './ask-api';
 export type FeedCommit = { seq: number; timestamp?: string; kind?: string; message?: string };
 
 /**
- * Open `GET /{ds}/changes` as an event stream after the head and call `on` for each commit
- * made from now on. Resolves when the stream ends (the server closes it after five minutes)
- * and rejects with the `ApiError` when it cannot be opened. Abort `signal` to stop.
+ * Open `GET /{ds}/changes` as an event stream after commit `after` and call `on` for each
+ * commit made since, including the ones made before the stream opened. Resolves with the
+ * number of the last commit delivered (`after` when there was none) when the stream ends,
+ * which the server does after five minutes, so that the next call resumes from it. Rejects
+ * with the `ApiError` when it cannot be opened. Abort `signal` to stop.
  */
 export async function followCommits(
   ds: string,
+  after: number,
   on: (c: FeedCommit) => void,
   signal: AbortSignal,
-): Promise<void> {
-  const res = await request(`/${encodeURIComponent(ds)}/changes?limit=1`, {
+): Promise<number> {
+  let last = after;
+  const res = await request(`/${encodeURIComponent(ds)}/changes?limit=1&after=commit:${after}`, {
     headers: { Accept: 'text/event-stream' },
     signal,
   });
@@ -27,20 +31,24 @@ export async function followCommits(
       try {
         const body = JSON.parse(data) as { commit?: FeedCommit } & FeedCommit;
         const c = body.commit ?? body;
-        if (typeof c.seq === 'number') on(c);
+        if (typeof c.seq === 'number') {
+          last = Math.max(last, c.seq);
+          on(c);
+        }
       } catch {
         /* not JSON: skipped */
       }
     }
   };
   const reader = res.body?.getReader();
-  if (!reader) return;
+  if (!reader) return last;
   const dec = new TextDecoder();
   for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
     deliver(dec.decode(value, { stream: true }));
   }
+  return last;
 }
 
 /** Why Follow stopped, in a sentence. */

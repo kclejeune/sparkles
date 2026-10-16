@@ -481,12 +481,17 @@
     if (!follow || rightSeq !== track.head || given) return;
     const ctl = new AbortController();
     followNote = null;
+    // resume from the last commit seen, so that none made between a read and the connection,
+    // or during the pause between two connections, is skipped
+    let after = track.head;
     (async () => {
       while (!ctl.signal.aborted) {
         try {
-          await followCommits(
+          after = await followCommits(
             ds,
-            () => {
+            after,
+            (c) => {
+              after = Math.max(after, c.seq);
               void load().then(() => {
                 if (!ctl.signal.aborted && rightSeq !== track.head) rightSeq = track.head;
                 emit();
