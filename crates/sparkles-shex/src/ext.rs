@@ -396,6 +396,8 @@ impl Cx<'_, '_, '_> {
                 continue;
             }
             self.budget.charge(1)?;
+            // a leaf costs a pass over the arcs, so the limits are looked at before each one
+            self.env.limits.check()?;
             let mut leaf = self.leaf(st)?;
             if left_over > 0 {
                 leaf = leaf.and(Tri::Unknown);
