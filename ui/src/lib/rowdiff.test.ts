@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { Term } from './api';
 import {
+  compareResults,
   compareRows,
   diffRows,
   diffTriples,
@@ -148,5 +149,30 @@ describe('a comparison made on the server', () => {
     expect(
       serverSummary({ ...base, added: 1, truncated: { added: false, removed: false } }),
     ).toMatch(/^1 row added/);
+  });
+});
+
+describe('compareResults', () => {
+  const meta = (sent: number, total = sent) => ({ sentRows: sent, totalRows: total }) as never;
+  const a = [u('a')];
+  const c = [u('c')];
+
+  it('compares complete tables and complete graphs as bags', () => {
+    const d = compareResults({ rows: [a], meta: meta(1) }, { rows: [a, c], meta: meta(2) });
+    expect(d && !isTooLarge(d) && d.marks).toEqual(['kept', 'added']);
+    const t: [Term, Term, Term] = [u('s'), u('p'), u('o')];
+    const g = compareResults({ triples: [], meta: meta(0) }, { triples: [t], meta: meta(1) });
+    expect(g && !isTooLarge(g) && g.added).toBe(1);
+  });
+
+  it('compares counts only when a read cut its rows, whichever side', () => {
+    const cut = compareResults({ rows: [a], meta: meta(1, 5) }, { rows: [a, c], meta: meta(2) });
+    expect(cut).toEqual({ tooLarge: true, cut: true, left: 5, right: 2 });
+    const cutRight = compareResults({ rows: [a], meta: meta(1) }, { rows: [a], meta: meta(1, 9) });
+    expect(cutRight && isTooLarge(cutRight) && cutRight.cut).toBe(true);
+  });
+
+  it('says nothing about a table against a graph', () => {
+    expect(compareResults({ rows: [a], meta: meta(1) }, { triples: [], meta: meta(0) })).toBeNull();
   });
 });

@@ -2,7 +2,7 @@
 // §4.2). Two results are compared as bags of rows, as C18 §6.7.5 compares them: a row is
 // its terms in column order, and a row that occurs twice on one side and once on the other
 // is one added or removed row.
-import type { SparqlDiff, Term } from './api';
+import type { SparklesResult, SparqlDiff, Term } from './api';
 import { termKey } from './rdf';
 
 export type Row = (Term | null)[];
@@ -31,8 +31,11 @@ export type RowDiff = {
   unchanged: number;
 };
 
-/** The rows are too many to compare in the browser. */
-export type TooLarge = { tooLarge: true; left: number; right: number };
+/**
+ * The rows cannot be compared in the browser: they are too many, or (`cut`) a read sent only
+ * a prefix of them. `left` and `right` count the rows each side has in all.
+ */
+export type TooLarge = { tooLarge: true; left: number; right: number; cut?: boolean };
 
 /** Compare `left` (the earlier state) with `right` as bags. */
 export function diffRows(left: readonly Row[], right: readonly Row[]): RowDiff {
@@ -90,6 +93,32 @@ export function compareRows(
   if (left.length > limit || right.length > limit)
     return { tooLarge: true, left: left.length, right: right.length };
   return diffRows(left, right);
+}
+
+/**
+ * Compare two results as bags, or say that the browser cannot: a read that cut its rows
+ * (`sentRows` below `totalRows`) compares as a prefix, and a prefix says nothing about what
+ * the rows beyond it were, so only the counts are known (docs/specs/U01-time-slider.md §2.3).
+ * `null` when the results are not both tables or both graphs.
+ */
+export function compareResults(
+  base: Pick<SparklesResult, 'rows' | 'triples' | 'meta'>,
+  result: Pick<SparklesResult, 'rows' | 'triples' | 'meta'>,
+  limit = ROW_DIFF_LIMIT,
+): RowDiff | TooLarge | null {
+  const rows = result.rows && base.rows;
+  const triples = result.triples && base.triples;
+  if (!rows && !triples) return null;
+  const cut = (r: Pick<SparklesResult, 'meta'>) => r.meta.sentRows < r.meta.totalRows;
+  if (cut(base) || cut(result))
+    return {
+      tooLarge: true,
+      cut: true,
+      left: base.meta.totalRows,
+      right: result.meta.totalRows,
+    };
+  if (rows) return compareRows(base.rows!, result.rows!, limit);
+  return compareRows(base.triples!, result.triples!, limit);
 }
 
 export const isTooLarge = (d: RowDiff | TooLarge): d is TooLarge => 'tooLarge' in d;

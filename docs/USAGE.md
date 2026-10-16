@@ -1451,8 +1451,11 @@ Compare mode also takes the head of another branch as its left side. Choose it i
 graph and schema tab compare the two heads, which shows what a branch has changed before a
 merge.
 
-A comparison in the browser lists at most 10,000 rows on each side. When a result is
-larger, or the row limit cut it, the page offers **Compare on the server**. It calls
+A comparison in the browser lists at most 10,000 rows on each side, and it compares only
+complete results. When a result is larger, or the row limit cut it, the page compares the
+counts, marks no row and says so, because a prefix of the rows says nothing about the rows
+after it. For a query that was typed in, and not for a stored query or a comparison with
+another branch, the page then offers **Compare on the server**. It calls
 `POST /{ds}/sparql/diff`, which runs the query at both states and returns the rows only
 one of them has ([API](API.md#comparing-a-query-between-two-states)). The table then
 lists those rows.

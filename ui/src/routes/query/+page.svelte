@@ -11,7 +11,7 @@
   import { atLabel, normalizeAt, validAt } from '$lib/history';
   import {
     CHANGE_FILTERS,
-    compareRows,
+    compareResults,
     filterDiff,
     isTooLarge,
     serverRows,
@@ -1504,9 +1504,7 @@
     if (!comparing || !o?.result || !o.base) return null;
     const r = o.result;
     const b = o.base;
-    if (r.rows && b.rows) return compareRows(b.rows, r.rows);
-    if (r.triples && b.triples) return compareRows(b.triples, r.triples);
-    return null;
+    return compareResults(b, r);
   });
   /** The Map view draws both states in compare mode, the changed rows marked. */
   const mapDiff = $derived(diffView && !isTooLarge(diffView) ? diffView : null);
@@ -1552,13 +1550,14 @@
   const serverTable = $derived(
     serverNow?.status === 'done' && serverNow.data ? serverRows(serverNow.data) : null,
   );
-  /** The results cannot be compared in the browser: too many rows, or the read cut them. */
+  /**
+   * The browser cannot compare the results (too many rows, or a read cut them) and the server
+   * can: it runs the query text at both states, which a stored query or another branch has not.
+   */
   const needsServer = $derived.by(() => {
     const o = outcome;
     if (!comparing || !o?.result || !o.base || !o.query || timeAgainst) return false;
-    if (diffView && isTooLarge(diffView)) return true;
-    const cut = (r: api.SparklesResult) => r.meta.sentRows < r.meta.totalRows;
-    return cut(o.result) || cut(o.base);
+    return !!diffView && isTooLarge(diffView);
   });
 
   async function compareOnServer() {
@@ -2531,12 +2530,19 @@
         <div class="diffbar" role="group" aria-label="Changes between the two commits">
           {#if isTooLarge(diffView)}
             <Icon name="info" size={14} />
-            <span
-              >More than {fmtInt(ROW_DIFF_LIMIT)} rows on one side ({fmtInt(diffView.left)} before,
-              {fmtInt(diffView.right)} after), so the browser does not compare them and shows the later
-              state.</span
-            >
-            {@render serverCompare()}
+            {#if diffView.cut}
+              <span
+                >The read cut the rows ({fmtInt(diffView.left)} before, {fmtInt(diffView.right)} after),
+                so only the counts are compared and the later state is shown.</span
+              >
+            {:else}
+              <span
+                >More than {fmtInt(ROW_DIFF_LIMIT)} rows on one side ({fmtInt(diffView.left)} before,
+                {fmtInt(diffView.right)} after), so the browser does not compare them and shows the later
+                state.</span
+              >
+            {/if}
+            {#if needsServer}{@render serverCompare()}{/if}
           {:else}
             {#if outcome.view !== 'table'}
               <span
@@ -2562,10 +2568,6 @@
                 ? `against the head of ${timeAgainst}`
                 : 'since the earlier commit'}
             </span>
-            {#if needsServer}
-              <span class="faint small">The read cut the rows, so this comparison is partial.</span>
-              {@render serverCompare()}
-            {/if}
           {/if}
         </div>
       {/if}

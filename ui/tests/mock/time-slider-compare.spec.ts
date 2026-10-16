@@ -198,3 +198,18 @@ test('Compare on the server lists the rows the browser did not read', async ({ p
     page.getByRole('status').filter({ hasText: 'Compared on the server' }),
   ).toBeVisible();
 });
+
+test('a read that cut its rows compares counts only, with no marks', async ({ page }) => {
+  await prepare(page, 'bulk', `${PREFIXES}\nSELECT ?s ?v WHERE { ?s ex:v ?v } ORDER BY ?v`, 1_000);
+  await page.goto('/ui/query');
+  await run(page);
+  await expect(grid(page)).toBeVisible();
+  await page.getByRole('button', { name: 'History', exact: true }).click();
+  await right(page).focus();
+  await page.keyboard.press('c');
+  await expect(page.getByText('The read cut the rows')).toBeVisible();
+  await expect(page.getByText('so only the counts are compared')).toBeVisible();
+  // a prefix of the rows says nothing about the rest, so no row carries a mark
+  await expect(grid(page).getByRole('gridcell', { name: /^(added|removed)$/ })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Compare on the server' })).toBeVisible();
+});
