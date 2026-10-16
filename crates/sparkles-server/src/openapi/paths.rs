@@ -1613,8 +1613,8 @@ fn history(p: &mut Paths) {
             .query("graph", s(), "A graph IRI or `default`.")
             .query(
                 "term",
-                s(),
-                "Only the changes whose subject or object is this term, an N-Triples term or a bare IRI. Repeat for several, up to 1,000. Not for RDF Patch.",
+                json!({ "type": "array", "items": { "type": "string" }, "maxItems": 1000 }),
+                "Only the changes whose subject or object is this term, an N-Triples term or a bare IRI. Repeat the parameter for several, up to 1,000. Not for RDF Patch.",
             )
             .query("quads", boolean(), "JSON: list the quads.")
             .query("limit", int(), "The most quads listed.")

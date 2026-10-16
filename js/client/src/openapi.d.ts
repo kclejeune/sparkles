@@ -16105,8 +16105,8 @@ export interface operations {
                 to?: string;
                 /** @description A graph IRI or `default`. */
                 graph?: string;
-                /** @description Only the changes whose subject or object is this term, an N-Triples term or a bare IRI. Repeat for several, up to 1,000. Not for RDF Patch. */
-                term?: string;
+                /** @description Only the changes whose subject or object is this term, an N-Triples term or a bare IRI. Repeat the parameter for several, up to 1,000. Not for RDF Patch. */
+                term?: string[];
                 /** @description JSON: list the quads. */
                 quads?: boolean;
                 /** @description The most quads listed. */
