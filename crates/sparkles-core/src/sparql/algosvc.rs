@@ -1057,7 +1057,16 @@ pub(super) fn run(
                     if let Some(t) = input.as_ref()
                         && let Some(c) = t.col_of(*v)
                     {
-                        for &id in &t.cols[c] {
+                        // a row of the group bound to another graph is not a source of
+                        // this graph's run
+                        let scope = match (gid, spec.graph_var) {
+                            (Some(g), Some(gv)) => t.col_of(gv).map(|cg| (cg, g)),
+                            _ => None,
+                        };
+                        for (i, &id) in t.cols[c].iter().enumerate() {
+                            if scope.is_some_and(|(cg, g)| t.cols[cg][i] != g) {
+                                continue;
+                            }
                             if !id.is_undef() {
                                 add(id)?;
                             }
@@ -2431,9 +2440,26 @@ fn build_graph_in_graph(
             ));
         };
         let cw = w.and_then(|v| t.col_of(v));
+        // Under `GRAPH ?g` the call runs once for each graph, and the nested pattern's
+        // rows of the other graphs are not edges of this one. The planner gives each
+        // graph its own call with a constant graph, so this applies only when a call
+        // carries the graph variable itself.
+        let scope = match (spec.graph_var, filter) {
+            (Some(gv), GraphFilter::One(g)) => Some((
+                t.col_of(gv).ok_or_else(|| {
+                    bad("the nested pattern does not bind the graph variable of GRAPH")
+                })?,
+                *g,
+            )),
+            (Some(_), _) => return Err(bad("a call under GRAPH runs for one graph at a time")),
+            (None, _) => None,
+        };
         let mut seen = Distinct::new(ctl)?;
         for i in 0..t.len() {
             work.tick("projection-pattern")?;
+            if scope.is_some_and(|(c, g)| t.cols[c][i].0 != g) {
+                continue;
+            }
             let (a, b) = (t.cols[cs][i], t.cols[ce][i]);
             if !resource(ctx, a, ctl)? || !resource(ctx, b, ctl)? || !allowed(a.0, b.0) {
                 continue;
@@ -2454,49 +2480,10 @@ fn build_graph_in_graph(
             col.push(a.0, b.0, value, call_dir)?;
         }
     } else {
-        let mut scan_work = Work::new(ctl)?;
-        let mut scan = |lo: u64, hi: u64, dir: Dir| -> Result<()> {
-            let mut last = None;
-            ctx.snap.scan_between_cols(
-                Perm::Pso,
-                pad(&[lo], 0),
-                pad(&[hi], u64::MAX),
-                0b1111,
-                |chunk| {
-                    let mut each = |k: [u64; 4]| -> Result<()> {
-                        scan_work.tick("projection-edge")?;
-                        let [p, s, o, g] = k;
-                        if !filter.accepts(g) || last == Some((p, s, o)) {
-                            return Ok(());
-                        }
-                        last = Some((p, s, o));
-                        if !resource(ctx, Id(s), ctl)?
-                            || !resource(ctx, Id(o), ctl)?
-                            || !allowed(s, o)
-                        {
-                            return Ok(());
-                        }
-                        let value = if has_weights {
-                            weight_in_graph(ctx, proj, s, p, o, ctl, filter)?
-                        } else {
-                            0.0
-                        };
-                        col.push(s, o, value, dir)
-                    };
-                    match chunk {
-                        Chunk::Block(b, s, e) => {
-                            for i in s..e {
-                                each([b.cols[0][i], b.cols[1][i], b.cols[2][i], b.cols[3][i]])?;
-                            }
-                        }
-                        Chunk::Row(k) => each(k)?,
-                    }
-                    Ok(true)
-                },
-            )
-        };
+        // the direction of each projected predicate: the last listing of one wins
+        let listed = proj.predicates.as_ref().map_or(0, Vec::len);
+        let mut dirs = Buffer::new("projection-predicates", listed, ctl)?;
         if let Some(ps) = &proj.predicates {
-            let mut dirs = Buffer::new("projection-predicates", ps.len(), ctl)?;
             for (i, &(p, d)) in ps.iter().enumerate() {
                 work.tick("projection-predicates")?;
                 dirs.push((p, i, d.unwrap_or(call_dir)))?;
@@ -2504,29 +2491,112 @@ fn build_graph_in_graph(
             ctl.check()?;
             dirs.sort_unstable_by_key(|d| (d.0, d.1));
             ctl.check()?;
-            let mut i = 0;
-            while i < dirs.len() {
+            let mut kept = 0;
+            for i in 0..dirs.len() {
                 work.tick("projection-predicates")?;
-                let mut j = i + 1;
-                while j < dirs.len() && dirs[j].0 == dirs[i].0 {
-                    work.tick("projection-predicates")?;
-                    j += 1;
+                if i + 1 == dirs.len() || dirs[i + 1].0 != dirs[i].0 {
+                    dirs[kept] = dirs[i];
+                    kept += 1;
                 }
-                let (p, _, d) = dirs[j - 1];
-                scan(p, p, d)?;
-                i = j;
             }
-        } else {
-            match proj.rdf_type {
-                Some(t) => {
-                    if t > 0 {
-                        scan(0, t - 1, call_dir)?;
+            dirs.truncate(kept);
+        }
+        let direction_of = |p: u64| -> Option<Dir> {
+            match &proj.predicates {
+                Some(_) => dirs
+                    .binary_search_by_key(&p, |d| d.0)
+                    .ok()
+                    .map(|i| dirs[i].2),
+                None => (Some(p) != proj.rdf_type).then_some(call_dir),
+            }
+        };
+        let edge = |col: &mut Collect<'_>, p: u64, s: u64, o: u64, dir: Dir| -> Result<()> {
+            if !resource(ctx, Id(s), ctl)? || !resource(ctx, Id(o), ctl)? || !allowed(s, o) {
+                return Ok(());
+            }
+            let value = if has_weights {
+                weight_in_graph(ctx, proj, s, p, o, ctl, filter)?
+            } else {
+                0.0
+            };
+            col.push(s, o, value, dir)
+        };
+        let mut scan_work = Work::new(ctl)?;
+        // A call for one graph reads that graph's own quads when they are fewer than the
+        // quads of its predicates in all graphs. The calls of `GRAPH ?g` then read each
+        // graph once between them, instead of every graph's edges once per graph.
+        let graph_first = match filter {
+            GraphFilter::One(g) => {
+                let in_graph = ctx.snap.count(Perm::Gspo, &[*g])?;
+                let mut by_predicate = 0u64;
+                if proj.predicates.is_some() {
+                    for d in dirs.iter() {
+                        work.tick("projection-predicates")?;
+                        by_predicate =
+                            by_predicate.saturating_add(ctx.snap.count(Perm::Pso, &[d.0])?);
                     }
-                    if t < u64::MAX {
-                        scan(t + 1, u64::MAX, call_dir)?;
-                    }
+                } else {
+                    by_predicate = ctx.snap.count(Perm::Pso, &[])?;
                 }
-                None => scan(0, u64::MAX, call_dir)?,
+                (in_graph < by_predicate).then_some(*g)
+            }
+            _ => None,
+        };
+        if let Some(g) = graph_first {
+            projection_rows(ctx, Perm::Gspo, &[g], |k| {
+                scan_work.tick("projection-edge")?;
+                let [_, s, p, o] = k;
+                match direction_of(p) {
+                    Some(dir) => edge(&mut col, p, s, o, dir),
+                    None => Ok(()),
+                }
+            })?;
+        } else {
+            let mut scan = |lo: u64, hi: u64, dir: Dir| -> Result<()> {
+                let mut last = None;
+                ctx.snap.scan_between_cols(
+                    Perm::Pso,
+                    pad(&[lo], 0),
+                    pad(&[hi], u64::MAX),
+                    0b1111,
+                    |chunk| {
+                        let mut each = |k: [u64; 4]| -> Result<()> {
+                            scan_work.tick("projection-edge")?;
+                            let [p, s, o, g] = k;
+                            if !filter.accepts(g) || last == Some((p, s, o)) {
+                                return Ok(());
+                            }
+                            last = Some((p, s, o));
+                            edge(&mut col, p, s, o, dir)
+                        };
+                        match chunk {
+                            Chunk::Block(b, s, e) => {
+                                for i in s..e {
+                                    each([b.cols[0][i], b.cols[1][i], b.cols[2][i], b.cols[3][i]])?;
+                                }
+                            }
+                            Chunk::Row(k) => each(k)?,
+                        }
+                        Ok(true)
+                    },
+                )
+            };
+            if proj.predicates.is_some() {
+                for &(p, _, d) in dirs.iter() {
+                    scan(p, p, d)?;
+                }
+            } else {
+                match proj.rdf_type {
+                    Some(t) => {
+                        if t > 0 {
+                            scan(0, t - 1, call_dir)?;
+                        }
+                        if t < u64::MAX {
+                            scan(t + 1, u64::MAX, call_dir)?;
+                        }
+                    }
+                    None => scan(0, u64::MAX, call_dir)?,
+                }
             }
         }
     }
@@ -4131,7 +4201,9 @@ mod projection_capacity_tests {
         spec.proj.node_classes.clear();
         spec.proj.node_class_names.clear();
         spec.proj.weight = None;
-        spec.proj.graph = GraphFilter::One(0);
+        // a set of graphs reads by predicate and rejects every row; a single empty
+        // graph would read its own quads, which are none
+        spec.proj.graph = GraphFilter::Set(vec![0]);
         let cancel = Arc::new(AtomicBool::new(false));
         let ctl = Control::new(cancel.clone(), None, 64);
         let observed = std::rc::Rc::new(std::cell::Cell::new(0));
@@ -4169,5 +4241,160 @@ mod projection_capacity_tests {
         assert!(warm.remaining() < prior);
         drop(incoming);
         assert_eq!(warm.remaining(), prior);
+    }
+}
+
+/// A call that carries the graph variable of `GRAPH ?g` itself. Query text never plans
+/// one, because the planner gives each graph its own call, so these tests plan the
+/// pattern under the variable directly.
+#[cfg(test)]
+mod graph_variable_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    fn store(data: &str) -> crate::store::Store {
+        use crate::io::{RdfFormat, Source};
+        let store = crate::store::Store::in_memory(crate::store::StoreOptions {
+            result_cache_bytes: 0,
+            ..Default::default()
+        });
+        store
+            .load(&[Source::from_bytes(
+                format!("@prefix ex:<http://ex/>.\n{data}").into_bytes(),
+                RdfFormat::TriG,
+                None,
+            )])
+            .unwrap();
+        store
+    }
+
+    /// The rows of `query` planned under `GRAPH ?g`, as local names and integers.
+    fn rows_under_graph_var(store: &crate::store::Store, query: &str) -> BTreeSet<Vec<String>> {
+        let text = format!("PREFIX ex:<http://ex/> PREFIX algo:<urn:x-sparkles:algo#> {query}");
+        let parsed = super::super::parse_query(&text, None, &[]).unwrap();
+        let spargebra::Query::Select { pattern, .. } = &parsed else {
+            panic!("SELECT");
+        };
+        let snapshot = store.snapshot();
+        let ctx = Ctx::new(snapshot.clone());
+        let mut planner = Planner::new(&ctx);
+        planner.source = Some(&parsed);
+        let node = planner
+            .plan(pattern, &ActiveGraph::Var(ctx.var("g")), Vec::new())
+            .unwrap();
+        let (out, _) = super::super::exec::execute_owned(&ctx, &node).unwrap();
+        let name = |id: Id| -> String {
+            if let Some(i) = (0..10).find(|&i| Id::from_i64(i) == Some(id)) {
+                return i.to_string();
+            }
+            for local in ["a", "b", "c", "d", "g1", "g2"] {
+                if snapshot.lookup_iri(&format!("http://ex/{local}")) == Some(id) {
+                    return local.to_string();
+                }
+            }
+            format!("{id:?}")
+        };
+        let wanted: Vec<usize> = ["g", "n", "d"]
+            .iter()
+            .filter_map(|v| out.table.col_of(ctx.var(v)))
+            .collect();
+        (0..out.table.len)
+            .map(|i| wanted.iter().map(|&c| name(out.table.cols[c][i])).collect())
+            .collect()
+    }
+
+    fn set(rows: &[&[&str]]) -> BTreeSet<Vec<String>> {
+        rows.iter()
+            .map(|r| r.iter().map(|s| s.to_string()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn a_nested_pattern_gives_each_graph_its_own_edges() {
+        let s = store("ex:g1 { ex:a ex:p ex:b } ex:g2 { ex:c ex:p ex:d }");
+        let got = rows_under_graph_var(
+            &s,
+            "SELECT ?g ?n WHERE { SERVICE algo:wcc { [] algo:start ?s ; algo:end ?e ; algo:node ?n ; algo:component ?c . ?s ex:p ?e } }",
+        );
+        assert_eq!(
+            got,
+            set(&[&["g1", "a"], &["g1", "b"], &["g2", "c"], &["g2", "d"]])
+        );
+    }
+
+    #[test]
+    fn a_variable_source_uses_the_rows_of_its_own_graph() {
+        let s = store(
+            "ex:g1 { ex:a ex:p ex:b . ex:b ex:p ex:c . ex:a a ex:Seed } ex:g2 { ex:a ex:p ex:b . ex:b ex:p ex:c . ex:c a ex:Seed }",
+        );
+        let got = rows_under_graph_var(
+            &s,
+            "SELECT ?g ?n ?d WHERE { ?s a ex:Seed . SERVICE algo:bfs { [] algo:predicate ex:p ; algo:source ?s ; algo:node ?n ; algo:depth ?d } }",
+        );
+        assert_eq!(
+            got,
+            set(&[
+                &["g1", "a", "0"],
+                &["g1", "b", "1"],
+                &["g1", "c", "2"],
+                &["g2", "c", "0"],
+            ])
+        );
+    }
+
+    /// Under `GRAPH ?g` the call of each graph reads that graph's quads, so the edges
+    /// read grow with the data and not with the data times the graphs.
+    #[test]
+    fn the_calls_of_graph_g_read_each_graph_once() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let graphs = 40;
+        let mut data = String::new();
+        for g in 0..graphs {
+            data.push_str(&format!(
+                "ex:g{g:03} {{ ex:a ex:p ex:b{g} . ex:b{g} ex:q ex:c }}"
+            ));
+        }
+        let s = store(&data);
+        let read = Rc::new(Cell::new(0usize));
+        let r = read.clone();
+        let hook = memory::probe::install(
+            move |point| {
+                if let memory::probe::Point::Work("projection-edge") = point {
+                    r.set(r.get() + 1);
+                }
+            },
+            None,
+        );
+        let q = "PREFIX ex:<http://ex/> PREFIX algo:<urn:x-sparkles:algo#> SELECT ?g ?n ?c WHERE { GRAPH ?g { SERVICE algo:wcc { [] algo:predicate ex:p ; algo:concurrency 1 ; algo:node ?n ; algo:component ?c } } }";
+        let o = super::super::QueryOptions {
+            no_cache: true,
+            ..Default::default()
+        };
+        let result = super::super::query(s.snapshot(), q, &o).unwrap();
+        drop(hook);
+        assert_eq!(result.len(), 2 * graphs);
+        // two quads in each graph, read once
+        assert!(
+            read.get() <= 2 * graphs,
+            "{} edges read for {graphs} graphs",
+            read.get()
+        );
+        // a predicate with fewer quads than the graph still reads by predicate
+        let read = Rc::new(Cell::new(0usize));
+        let r = read.clone();
+        let hook = memory::probe::install(
+            move |point| {
+                if let memory::probe::Point::Work("projection-edge") = point {
+                    r.set(r.get() + 1);
+                }
+            },
+            None,
+        );
+        let q = "PREFIX ex:<http://ex/> PREFIX algo:<urn:x-sparkles:algo#> SELECT ?n WHERE { GRAPH ex:g000 { SERVICE algo:wcc { [] algo:predicate ex:missing ; algo:concurrency 1 ; algo:node ?n ; algo:component ?c } } }";
+        let result = super::super::query(s.snapshot(), q, &o).unwrap();
+        drop(hook);
+        assert_eq!(result.len(), 0);
+        assert_eq!(read.get(), 0);
     }
 }
