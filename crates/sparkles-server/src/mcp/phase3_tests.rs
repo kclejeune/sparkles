@@ -134,6 +134,24 @@ async fn graph_algorithm() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn graph_algorithm_refuses_injected_source() {
+    let mut c = Client::start(server_with(&[("t", &[CHAIN])], McpConfig::default()));
+    for source in [
+        "ex:a> ; algo:node ?n0 } ?node ?score ?summary } #",
+        "ex:a b",
+        "<http://ex/a>b>",
+    ] {
+        let (_, e) = c
+            .error(
+                "graph_algorithm",
+                json!({"algorithm": "bfs", "predicates": ["ex:next"], "params": {"source": source}}),
+            )
+            .await;
+        assert_eq!(e["code"], "bad-argument", "{source}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn list_changes() {
     let server = fixture_server();
     let ds = server.state.get("t").unwrap();

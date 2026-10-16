@@ -115,15 +115,22 @@ pub fn expand_iri(s: &str, prefixes: &[(String, String)]) -> Result<String> {
         && !local.starts_with("//")
         && let Some((_, ns)) = prefixes.iter().find(|(n, _)| n == p)
     {
-        return Ok(format!("{ns}{local}"));
+        // The expansion is spliced into query text between `<` and `>`, so it must be a
+        // valid absolute IRI on its own. A local part with `>` or a space is refused.
+        let full = format!("{ns}{local}");
+        return oxiri::Iri::parse(full.as_str())
+            .map(|_| full.clone())
+            .map_err(|_| not_an_iri(s));
     }
     oxiri::Iri::parse(bare)
         .map(|_| bare.to_string())
-        .map_err(|_| {
-            invalid(format!(
-                "'{s}' is not an absolute IRI or a known prefixed name"
-            ))
-        })
+        .map_err(|_| not_an_iri(s))
+}
+
+fn not_an_iri(s: &str) -> Error {
+    invalid(format!(
+        "'{s}' is not an absolute IRI or a known prefixed name"
+    ))
 }
 
 fn iri_term(s: &str) -> String {
