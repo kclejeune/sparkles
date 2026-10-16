@@ -227,14 +227,15 @@ that work by priority and links each item to its design spec.
   budget fails. There is no FSST vocabulary compression, IRI encoding, pattern trick,
   pinned results, materialized views or live query monitoring. [Roadmap](ROADMAP.md) items 1, 7, 16, 17, 27, 40.
 * **Query memory pool.** A SERVICE call from a query to the same server is admitted like
-  any request, so it waits behind its caller's grant and answers `503` after the admission
-  wait, which `SILENT` turns into no rows. MCP tool calls are not admitted, so their queries fail with `server-memory` instead of
-  waiting when the pool is short. Routes
-  such as GraphQL, SHACL, ShEx, diff and the `/$/stats`, `/$/schema` and `/$/validate`
-  reads hold their admitted grant idle while their own query takes a second one. A
-  query or update takes its initial grant before the server reads its body, so a slow
-  client holds pool memory while it sends. With a pool set, an eager result keeps its
-  query's peak estimate until the result object is released. [Roadmap](ROADMAP.md) item 7.
+  any request, so it waits behind its caller's grant and answers `503` after the
+  admission wait, which `SILENT` turns into no rows. MCP tool calls are not admitted, so
+  their queries fail with `server-memory` instead of waiting when the pool is short.
+  Routes such as GraphQL, SHACL, ShEx, diff and the `/$/stats`, `/$/schema` and
+  `/$/validate` reads hold their admitted grant idle while their own query takes a
+  second one. A query or update takes its initial grant before the server reads its
+  body, so a slow client holds pool memory while it sends. With a pool set, an eager
+  result keeps its query's peak estimate until the result object is released.
+  [Roadmap](ROADMAP.md) item 7.
 * **Inference.** Inference is forward materialization, plus Jena's RDFS on read. There
   are no other on-the-fly rules and no backward (LP) rules. Incremental maintenance does not cover rules with `noValue`,
   `now` or new blank nodes, or RDF lists that change under OWL 2 RL. Those runs, and the

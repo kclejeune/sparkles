@@ -2173,10 +2173,11 @@ provider's endpoint and key, so an index need not repeat them. The fields are in
 no lock, truncates no WAL, repairs no catalog and rebuilds no full-text index, so it can
 run next to a server that holds the database. `--data DIR` checks every database in a
 server's data directory. It leaves out directories whose names start with a dot, which
-hold unfinished clones and the copies that `sparkles migrate` builds or keeps. Each check prints one line, `ok`, `warning` or `error`, and
-lists the file, offset, block, row, commit or id of every problem below it.
-`--format json` prints the same report as JSON. The exit status is 0 when everything is
-clean, 1 when any check found an error, and 2 when there are warnings only.
+hold unfinished clones and the copies that `sparkles migrate` builds or keeps. Each
+check prints one line, `ok`, `warning` or `error`, and lists the file, offset, block,
+row, commit or id of every problem below it. `--format json` prints the same report as
+JSON. The exit status is 0 when everything is clean, 1 when any check found an error,
+and 2 when there are warnings only.
 
 | Check | What it verifies |
 |---|---|
@@ -4190,13 +4191,13 @@ with, so its memory does not grow with the number of datasets. `CatalogOptions::
 can size them separately (`CatalogCaches::Sizes`) or give each dataset its own
 (`CatalogCaches::PerDataset`). `MemoryOptions::pool_bytes` adds a query memory pool, the
 estimated bytes that all the catalog's queries and updates may hold together. A query
-that the pool cannot cover fails with `BudgetKind::ServerMemory`, and nothing queues.
-An eager result, a Rust `QueryResult` or a Python or Node result object, keeps its
-query's peak estimate in the pool until it is dropped or collected, so a program that
-holds many results should release them when it is done. There is no pool by default. A dataset opened on its own keeps its own caches. Python
-takes `total_query_memory_bytes` in `Catalog(...)` and `Catalog.memory(...)`, and
-Node takes `totalQueryMemoryBytes` in the catalog options. The JVM bindings do not expose
-the pool.
+that the pool cannot cover fails with `BudgetKind::ServerMemory`, and nothing queues. An
+eager result, a Rust `QueryResult` or a Python or Node result object, keeps its query's
+peak estimate in the pool until it is dropped or collected, so a program that holds many
+results should release them when it is done. There is no pool by default. A dataset
+opened on its own keeps its own caches. Python takes `total_query_memory_bytes` in
+`Catalog(...)` and `Catalog.memory(...)`, and Node takes `totalQueryMemoryBytes` in the
+catalog options. The JVM bindings do not expose the pool.
 
 With the feature `backup`, `catalog.repositories()` manages `backup/repositories.json`.
 Its `list`, `get`, `add`, `update`, `remove` and `open` calls share the configuration
