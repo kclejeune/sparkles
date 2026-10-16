@@ -203,7 +203,10 @@ impl Analyzer<'_> {
             return Err(Fallback::Recursive);
         }
         self.on_stack[si] = true;
+        // the walk of this shape must not refresh the budget of the walk that reached it
+        let saved = std::mem::replace(&mut self.expr_steps, 0);
         let r = self.compute(si);
+        self.expr_steps = saved;
         self.on_stack[si] = false;
         self.memo[si] = Some(r.clone());
         r
@@ -453,8 +456,16 @@ impl Analyzer<'_> {
     ) -> Result<Pre, Fallback> {
         let shapes = self.shapes;
         self.expr_steps += 1;
-        if self.expr_steps > MAX_EXPR_STEPS || out.len() > MAX_DEPS {
+        if self.expr_steps > MAX_EXPR_STEPS {
             return Err(Fallback::Budget);
+        }
+        if out.len() > MAX_DEPS {
+            // repeated reads of one path are one dependency
+            let mut seen = FxHashSet::default();
+            out.retain(|d| seen.insert(d.clone()));
+            if out.len() > MAX_DEPS {
+                return Err(Fallback::Budget);
+            }
         }
         let anchored = |at: &Pre| at.clone().ok_or(Fallback::Sparql);
         match &shapes.exprs[e] {
@@ -671,6 +682,7 @@ impl Model {
                             // a target expression that reads the data graph is not
                             // localized; one that computes constants reads nothing
                             Target::Expr(e) => {
+                                a.expr_steps = 0;
                                 if let Err(f) = a.expr_deps(e, &None, &None, &mut Vec::new()) {
                                     global = Some(f);
                                     break;
@@ -1000,6 +1012,33 @@ mod tests {
         ));
         assert!(matches!(plan_of(&s, &m, "http://ex.org/Z"), Plan::Local(_)));
         assert!(m.reads.is_none());
+    }
+
+    /// Each target expression below takes about 65,000 steps to walk, and the two of them
+    /// together take more than the budget of one analysis. The budget is per expression, so
+    /// the shape stays localized.
+    #[test]
+    fn each_target_expression_has_its_own_step_budget() {
+        let mut ttl = String::from("@prefix shnex: <http://www.w3.org/ns/shacl-node-expr#> .\n");
+        ttl.push_str("_:e1 shnex:concat ( ex:k ex:k ) .\n");
+        for i in 2..=15 {
+            ttl.push_str(&format!(
+                "_:e{i} shnex:concat ( _:e{} _:e{} ) .\n",
+                i - 1,
+                i - 1
+            ));
+        }
+        ttl.push_str(
+            "ex:S a sh:NodeShape ; sh:property [ sh:path ex:p ; sh:minCount 1 ] ;
+               sh:targetNode [ shnex:concat ( _:e15 ) ] ,
+                             [ shnex:concat ( _:e15 ex:z ) ] .",
+        );
+        let (s, m) = model(&ttl);
+        assert!(
+            matches!(plan_of(&s, &m, "http://ex.org/S"), Plan::Local(_)),
+            "{:?}",
+            plan_of(&s, &m, "http://ex.org/S")
+        );
     }
 
     #[test]
