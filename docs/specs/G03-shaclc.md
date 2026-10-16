@@ -544,14 +544,17 @@ namespace. The code is `nodeexpr.rs`, the expression tree and its parser, and
   `shnex:pathValues`, a list parameter function, such as `sparql:plus`, or a list
   expression. Constants are IRIs, literals and triple terms, and a blank node without
   triples is the empty expression. Functions declared in the shapes graph with
-  `sh:bodyExpression` are called the same way. Expressions are read as targets, as the
-  values of constraint parameters, as `sh:deactivated`, and as the expression
-  constraint that reports each focus node whose result is not `true`. A `sh:targetNode`
+  `sh:bodyExpression` are called the same way. Expressions are read as targets, as
+  `sh:values` and `sh:defaultValue`, as `sh:deactivated`, as the shapes
+  `sh:nodeByExpression` names, and as the expression constraint that reports each focus
+  node whose result is not `true`. A `sh:targetNode`
   whose blank node value is not a valid expression stays a plain node.
 * *Where it differs from the design above.* `sh:values` and `sh:defaultValue` are built,
   as derivations made during validation that add nothing to the data, so the reasoner
   still owns every inferred triple. An argument of a custom function is evaluated in the
   focus node and the variable scope of the call. `sh:hasValue` compares RDF terms. The
+  design allowed a computed `sh:hasValue` or `sh:in`, but both take constants, and `sh:in`
+  needs an RDF list. The draft does not define computed forms of either. The
   two-argument `shnex:hasLang` is `LANGMATCHES(LANG(x), range)`, and `shnex:sameValue` is
   `COALESCE(a = b, false)`. Nesting is limited to 128 levels when parsing and 192 when
   evaluating, and deep evaluation grows its stack. One evaluation may work through at
