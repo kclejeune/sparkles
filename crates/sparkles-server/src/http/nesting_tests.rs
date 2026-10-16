@@ -335,3 +335,43 @@ async fn a_basic_graph_pattern_past_the_plan_limit_gets_a_400() {
         plan_refused(&send(&app, post("/c/update", "application/sparql-update", u)).await);
     }
 }
+
+/// The JSON of a failed plan nests twice as deep as the plan, and writing it and dropping
+/// it recurse. A debug build needs more stack for that than a 2 MiB thread has.
+#[test]
+fn a_failed_plan_at_the_limit_is_written_on_a_small_stack() {
+    use sparkles::sparql::depth::MAX_PLAN_DEPTH;
+    std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(|| {
+            // built without recursion (`json!` would copy the plan by recursion): each plan
+            // level is an object and an array
+            let mut plan = json!({ "operator": "scan" });
+            for _ in 0..MAX_PLAN_DEPTH {
+                let mut node = serde_json::Map::new();
+                node.insert("operator".into(), "join".into());
+                node.insert("children".into(), serde_json::Value::Array(vec![plan]));
+                plan = serde_json::Value::Object(node);
+            }
+            let mut body = serde_json::Map::new();
+            body.insert("error".into(), "timed out".into());
+            body.insert("plan".into(), plan);
+            let body = serde_json::Value::Object(body);
+            let depth = json_depth(&body);
+            assert!(depth > 2 * MAX_PLAN_DEPTH, "{depth}");
+            let mut resp = ApiError(StatusCode::REQUEST_TIMEOUT, body).into_response();
+            assert_eq!(resp.status(), StatusCode::REQUEST_TIMEOUT);
+            // the middleware that adds the request id writes the body again
+            add_request_id(&mut resp, Some("r1".into()));
+            let length: usize = resp.headers()[header::CONTENT_LENGTH]
+                .to_str()
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!(length > 20 * MAX_PLAN_DEPTH, "{length}");
+            drop(resp);
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}

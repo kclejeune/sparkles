@@ -164,6 +164,8 @@ pub(super) async fn run(ds: Arc<Dataset>, request: Request) -> ApiResult {
             }
             .map_err(|e| writer.classify(e));
             if result.is_err() && (format == SolutionsFormat::Sparkles || native_graph) {
+                // a cursor's plan serializes on stack segments it grows per level, and
+                // the response writer sizes the stack for writing and dropping the value
                 *plan_slot.lock() = match &cursor {
                     QueryExecution::Select(c) => serde_json::to_value(c.plan()).ok(),
                     QueryExecution::Graph(c) => serde_json::to_value(c.plan()).ok(),
