@@ -354,11 +354,16 @@ little and change nothing. Each one has the same answers with it on and off.
   the constants of a query one by one, it collects the IRIs and literals of the patterns,
   paths, VALUES rows, graph names and the common FILTER comparisons. It asks for the
   sparse-index group of every one of them in one pass (`Vocab::prefetch_keys`), so the
-  group reads overlap instead of following each other.
+  group reads overlap instead of following each other. It collects at most 4,096 keys,
+  and it does nothing without a sparse index or with the read hints off.
 * **Scans requested before they run** (`prefetch_first_scan`). When the plan is built,
-  every scan of 64 blocks or fewer, and every `COUNT` scan, asks the kernel for the
-  columns it will decode, including the two blocks at the ends of its key range that
-  `count` decodes while the scan is set up. A scan of more blocks reads ahead as it goes.
+  every scan of 64 blocks or fewer asks the kernel for the columns the reader will decode.
+  A block inside the key range needs the scan's columns, and a block at an end of the range
+  also needs the columns that bound it. A range scan asks for the blocks of its id ranges.
+  A scan whose first block is already decoded in the cache is skipped, so a warm plan
+  costs one lookup per scan. A scan under a `LIMIT`, and a scan of more blocks, reads ahead
+  as it goes. A `COUNT` scan asks for the two blocks at the ends of its range when it
+  decodes them, and only if the first of them is not cached.
 * **A read-ahead window per scan.** Index and vocabulary files are mapped for random
   access, so the kernel reads nothing ahead of a page fault. Every pass over consecutive
   blocks of a permutation (`ReadAhead` in `index.rs`) keeps its own window of requests
@@ -374,15 +379,21 @@ little and change nothing. Each one has the same answers with it on and off.
   position do not add another window. Concurrent scans share no coverage state and do
   not change the mapping's random-access advice. `SPARKLES_READ_WINDOW_KB` sets the
   target, 4096 KiB by default. This bounds requested bytes, not physical I/O completion.
+  A pass consults its window only at a block the cache does not hold, so a warm pass does
+  no read-ahead work.
   Passes over the vocabulary in id order use the same configured size.
 * **Terms of small inputs** (`prefetch_terms`). A FILTER, BIND or ORDER BY over a table of
   2 to 4,095 rows evaluates the rows one at a time. Before the first row, it asks for the
-  vocabulary blocks of the terms it will read. Larger tables decode their terms in id order
+  vocabulary blocks of the terms it will read, and the pages of the numeric column that
+  hold their kinds. It reads no value and builds no result, so a warm call makes no system
+  call. Larger tables decode their terms in id order
   as before. The native JSON result writer asks for the blocks of the terms it prints, as
   the other result writers do.
-* **Parallel decode** (`parallel_decode`). A join or a scan that has asked the kernel for
+* **Parallel decode** (`parallel_decode`). An index join that has asked the kernel for
   its blocks decodes their columns on a small thread pool of the block cache's own, before
-  the reader reaches them. It decodes only columns the reader decodes anyway and keeps them
-  in the cache. A lookup that touches dozens of blocks for a few rows each spends most of
+  the reader reaches them. Scans do not use it. It decodes only columns the reader decodes
+  anyway and keeps them in the cache, and a request adds at most an eighth of the cache.
+  The pool starts at the first such request, and a failure to start it leaves the decoding
+  to the reader's thread. A lookup that touches dozens of blocks for a few rows each spends most of
   its time decoding whole 32,768-row columns, and this spreads that time over several
   cores. Reads through a view that keeps no blocks, such as an export, skip it.

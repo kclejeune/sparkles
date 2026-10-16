@@ -198,7 +198,7 @@ pub struct Optimizations {
     pub prefetch_terms: bool,
     /// the blocks of a plan's scans with few blocks are requested before any operator runs
     pub prefetch_first_scan: bool,
-    /// the columns of the blocks that a join or a scan has asked the kernel for are decoded
+    /// the columns of the blocks that an index join has asked the kernel for are decoded
     /// in parallel on a pool of the cache's own, before the reader gets to them
     pub parallel_decode: bool,
 }

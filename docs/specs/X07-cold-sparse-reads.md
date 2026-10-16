@@ -653,13 +653,42 @@ forge by the ratio of their `star-lookup` and `path-plus` base times, `star-look
 and `employee-docs` land near their targets and cannot be called either way. Oxigraph
 does not run on the instance, so the same-host comparison was not made.
 
+### Warm-path counts
+
+The Namespace screen flagged `employee-docs`, a query of 76 µs, at 8.5 µs slower than
+the base. Counting the work of a warm run on the base and on the integrated branch, with
+the same 60,000-person store and a server that runs with `--timeout 600`, explained the
+gap. A warm query made 143 request checks against 19 on the base, 44 decoded-cache peeks
+from `has_cols` against 16, and 12 further peeks from the join warm-up. It made no
+`madvise(WILLNEED)` call on either build. Each check reads the clock when the request has a
+deadline. The checks came from the per-range and per-block checks of the join prefetch,
+and the peeks from block hints that were repeated on every warm pass. Switching the four
+flags off and setting the window to zero did not restore the base counts, because those
+paths are not behind a flag. A flag ablation therefore cannot isolate this cost.
+
+The corrected branch checks the request once per 1,024 ranges and blocks in a join
+prefetch. A pass consults its read-ahead window only at a block the cache lacks. The
+plan-time scan hints use the columns the reader decodes, skip a scan whose first block
+is cached, and skip a scan under a `LIMIT`. The constant collector runs only with a sparse
+index and caps its keys at 4,096. A small FILTER table hints numeric pages without reading
+values. The decode pool starts on first use, and a request may add at most an eighth of
+the cache. `profile=io` needs the `metrics` permission, because the counters cover the
+whole process. A test now fails if a warm repeat of the join, the predicate scan, the
+range top-k or a `LIMIT 1` scan issues a read hint, and counter tests fail if the request
+checks, the read-ahead calls or the value reads of a warm query grow.
+
 ### Remaining measurements
 
-Roadmap item 4, §9 and A5 retain the slowdown investigation. After correctness review
-and integration, compare the corrected default build with the approved baseline.
-Repeat that comparison with the candidate's four flags disabled and
-`SPARKLES_READ_WINDOW_KB=0`.
-Window zero restores per-block index advice and the original 1 MiB vocabulary window.
+Roadmap item 4, §9 and A5 retain the slowdown investigation. The flag ablation that this
+section once proposed does not recreate the base, so it is replaced by an instruction
+count per request. Build the base and the corrected tip in release mode and load the
+1.05M store once for each. Start `sparkles --result-cache-mb 0 serve --timeout 600`
+pinned to one core, send 200 warm-up requests, then measure `instructions:u` with
+`perf stat` over 2,000 further requests and divide. Repeat for `employee-docs`,
+`star-lookup`, `values-star`, `path-plus` and the five shortest queries, and count
+`madvise` calls over one warm pass of every query. The pass condition is `employee-docs`
+within 2% of the base instructions, no query more than 5% above, and no `madvise` call per
+warm query. The timing screen on Namespace and then on forge follows only after that.
 The comparisons need source, binary, input and driver hashes, exact flags, valid answers,
 balanced samples, cold preparation and raw distributions. Historical comparisons against
 `899fb251` remain separate from these corrected-source measurements.
@@ -698,3 +727,8 @@ including page faults, and the index wait are together larger than the gap to th
 Phase 3 and Phase 4, the 1.01B gates (A5 and the forge targets), a per-query set of
 hinted blocks in the context to avoid a second hint of a block, I/O priority for
 read-ahead, and a `FILTER` constant collector beyond the common comparison nodes.
+`bench-regressions.py` has no `--io` option, so the Namespace screen reports no I/O
+counters, and its primary metric excludes the plan time and serialization time in which
+the prefetch work runs. The profile reads `getrusage(RUSAGE_SELF)` for process-wide
+faults, and a per-operator `RUSAGE_THREAD` breakdown is not built. `/$/stats` has no I/O
+counters, which are available only through `profile=io` and `/$/metrics`.
