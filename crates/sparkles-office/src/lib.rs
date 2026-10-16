@@ -58,6 +58,10 @@ pub struct Limits {
     /// bytes of converted output a conversion may hold: Markdown blocks and table cells,
     /// sheet rows, and the CSV of all sheets together
     pub max_output: usize,
+    /// when to stop: a conversion that is still running at this time fails with
+    /// [`Error::Timeout`]. It is checked while the XML is read and while the output is
+    /// charged, so a thread that the caller has given up on ends soon after the deadline.
+    pub deadline: Option<std::time::Instant>,
 }
 
 impl Default for Limits {
@@ -74,6 +78,7 @@ impl Default for Limits {
             max_images: 0,
             max_image_bytes: 5 << 20,
             max_output: 128 << 20,
+            deadline: None,
         }
     }
 }
@@ -90,6 +95,8 @@ pub enum Error {
     /// the file is an Office format that this crate does not read, such as the binary
     /// `.doc`, `.xls` and `.ppt` formats
     Unsupported(String),
+    /// the conversion was still running at [`Limits::deadline`]
+    Timeout,
 }
 
 impl std::fmt::Display for Error {
@@ -97,6 +104,7 @@ impl std::fmt::Display for Error {
         match self {
             Error::Corrupt(m) | Error::TooLarge(m) | Error::Unsupported(m) => f.write_str(m),
             Error::Encrypted => f.write_str("the document is encrypted with a password"),
+            Error::Timeout => f.write_str("the conversion did not end before its deadline"),
         }
     }
 }

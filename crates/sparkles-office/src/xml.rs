@@ -6,6 +6,7 @@
 //! expands only the five predefined entities and character references, so a document
 //! cannot expand entities into more text.
 
+use crate::budget::check_deadline;
 use crate::{Error, Limits};
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, BytesText, Event};
@@ -101,16 +102,24 @@ pub fn local(name: &[u8]) -> String {
     String::from_utf8_lossy(n).into_owned()
 }
 
-pub fn attrs(e: &BytesStart) -> Vec<(String, String)> {
+/// The most attributes an element may have. Real documents have a few dozen.
+pub const MAX_ATTRS: usize = 1024;
+
+pub fn attrs(e: &BytesStart) -> Result<Vec<(String, String)>, Error> {
     let mut out = Vec::new();
     for a in e.attributes().with_checks(false).flatten() {
+        if out.len() >= MAX_ATTRS {
+            return Err(Error::TooLarge(format!(
+                "an XML element has more than {MAX_ATTRS} attributes"
+            )));
+        }
         let v = match a.unescape_value() {
             Ok(v) => v.into_owned(),
             Err(_) => String::from_utf8_lossy(&a.value).into_owned(),
         };
         out.push((String::from_utf8_lossy(a.key.as_ref()).into_owned(), v));
     }
-    out
+    Ok(out)
 }
 
 pub fn text_of(t: &BytesText) -> String {
@@ -136,11 +145,18 @@ pub fn parse(bytes: &[u8], limits: &Limits) -> Result<Node, Error> {
     let mut buf = Vec::new();
     let mut stack: Vec<Node> = vec![Node::default()];
     let mut nodes = 0usize;
+    let mut events = 0u32;
     loop {
+        if events.is_multiple_of(1024) {
+            check_deadline(limits.deadline)?;
+        }
+        events = events.wrapping_add(1);
         let ev = r.read_event_into(&mut buf).map_err(corrupt)?;
         match ev {
             Event::Start(e) => {
-                nodes += 1;
+                let attrs = attrs(&e)?;
+                // each attribute counts as a node, so that wide elements are bounded too
+                nodes += 1 + attrs.len();
                 if nodes > limits.max_nodes || stack.len() > limits.max_depth {
                     return Err(Error::TooLarge(format!(
                         "an XML part has more than {} elements or is nested deeper than {}",
@@ -149,12 +165,13 @@ pub fn parse(bytes: &[u8], limits: &Limits) -> Result<Node, Error> {
                 }
                 stack.push(Node {
                     name: local(e.name().as_ref()),
-                    attrs: attrs(&e),
+                    attrs,
                     children: Vec::new(),
                 });
             }
             Event::Empty(e) => {
-                nodes += 1;
+                let attrs = attrs(&e)?;
+                nodes += 1 + attrs.len();
                 if nodes > limits.max_nodes {
                     return Err(Error::TooLarge(format!(
                         "an XML part has more than {} elements",
@@ -163,7 +180,7 @@ pub fn parse(bytes: &[u8], limits: &Limits) -> Result<Node, Error> {
                 }
                 let n = Node {
                     name: local(e.name().as_ref()),
-                    attrs: attrs(&e),
+                    attrs,
                     children: Vec::new(),
                 };
                 if let Some(top) = stack.last_mut() {

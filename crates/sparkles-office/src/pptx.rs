@@ -27,7 +27,7 @@ pub fn convert(pkg: &mut Package, limits: &Limits) -> Result<Document, Error> {
     if slides.is_empty() {
         return Err(Error::Corrupt("the presentation has no slides".into()));
     }
-    let mut doc = Doc::new(limits.max_output);
+    let mut doc = Doc::new(limits);
     let mut notes: Vec<String> = Vec::new();
     for (i, path) in slides.iter().enumerate() {
         let n = i + 1;

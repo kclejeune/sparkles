@@ -1,7 +1,7 @@
 //! A small Markdown writer for the blocks the converters find.
 
 use crate::budget::{Budget, SLOT};
-use crate::{Error, Image};
+use crate::{Error, Image, Limits};
 
 pub enum Block {
     Heading(usize, String),
@@ -51,11 +51,11 @@ pub struct Doc {
 }
 
 impl Doc {
-    pub fn new(max_output: usize) -> Doc {
+    pub fn new(limits: &Limits) -> Doc {
         Doc {
             blocks: Vec::new(),
             images: Vec::new(),
-            budget: Budget::new(max_output),
+            budget: Budget::new(limits),
         }
     }
 

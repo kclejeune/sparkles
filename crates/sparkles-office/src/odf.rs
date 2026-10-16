@@ -36,7 +36,7 @@ pub fn text(pkg: &mut Package, limits: &Limits) -> Result<Document, Error> {
     let body = root
         .find("text")
         .ok_or_else(|| Error::Corrupt("content.xml has no text body".into()))?;
-    let mut cx = Cx::new(pkg, &root, limits.max_output);
+    let mut cx = Cx::new(pkg, &root, limits);
     cx.blocks(body, limits.max_text)?;
     for (l, t) in std::mem::take(&mut cx.footnotes) {
         cx.doc
@@ -58,7 +58,7 @@ pub fn presentation(pkg: &mut Package, limits: &Limits) -> Result<Document, Erro
     let pres = root
         .find("presentation")
         .ok_or_else(|| Error::Corrupt("content.xml has no presentation body".into()))?;
-    let mut cx = Cx::new(pkg, &root, limits.max_output);
+    let mut cx = Cx::new(pkg, &root, limits);
     let mut slides = 0;
     for (i, page) in pres.elements().filter(|n| n.name == "page").enumerate() {
         let n = i + 1;
@@ -99,7 +99,7 @@ pub fn presentation(pkg: &mut Package, limits: &Limits) -> Result<Document, Erro
 }
 
 impl<'p, 'a> Cx<'p, 'a> {
-    fn new(pkg: &'p mut Package<'a>, root: &Node, max_output: usize) -> Cx<'p, 'a> {
+    fn new(pkg: &'p mut Package<'a>, root: &Node, limits: &Limits) -> Cx<'p, 'a> {
         let mut list_styles = HashMap::new();
         for s in root.descendants("list-style") {
             let Some(name) = s.attr("name") else { continue };
@@ -123,7 +123,7 @@ impl<'p, 'a> Cx<'p, 'a> {
         }
         Cx {
             pkg,
-            doc: Doc::new(max_output),
+            doc: Doc::new(limits),
             list_styles,
             footnotes: Vec::new(),
         }
@@ -482,7 +482,7 @@ pub fn sheets(pkg: &mut Package, limits: &Limits) -> Result<Vec<Sheet>, Error> {
     let mut r = xml::reader(&bytes);
     let mut buf = Vec::new();
     let mut out: Vec<Sheet> = Vec::new();
-    let mut budget = Budget::new(limits.max_output);
+    let mut budget = Budget::new(limits);
     let mut hidden_styles: HashSet<String> = HashSet::new();
     let mut style_name: Option<String> = None;
     // the table being read, at depth 1
@@ -504,6 +504,7 @@ pub fn sheets(pkg: &mut Package, limits: &Limits) -> Result<Vec<Sheet>, Error> {
     // bytes charged for the paragraphs and spaces of the current cell
     let mut transient = 0usize;
     loop {
+        budget.tick()?;
         let ev = r.read_event_into(&mut buf).map_err(corrupt)?;
         match &ev {
             Event::Start(e) | Event::Empty(e) => {
@@ -511,7 +512,7 @@ pub fn sheets(pkg: &mut Package, limits: &Limits) -> Result<Vec<Sheet>, Error> {
                 let tag = xml::local(e.name().as_ref());
                 match tag.as_str() {
                     "style" => {
-                        let at = xml::attrs(e);
+                        let at = xml::attrs(e)?;
                         let get = |k: &str| {
                             at.iter()
                                 .find(|(n, _)| n == k || n.ends_with(&format!(":{k}")))
@@ -524,7 +525,7 @@ pub fn sheets(pkg: &mut Package, limits: &Limits) -> Result<Vec<Sheet>, Error> {
                         };
                     }
                     "table-properties" => {
-                        let at = xml::attrs(e);
+                        let at = xml::attrs(e)?;
                         if at
                             .iter()
                             .any(|(k, v)| k.ends_with("display") && v == "false")
@@ -536,7 +537,7 @@ pub fn sheets(pkg: &mut Package, limits: &Limits) -> Result<Vec<Sheet>, Error> {
                     "table" => {
                         depth += 1;
                         if depth == 1 {
-                            let at = xml::attrs(e);
+                            let at = xml::attrs(e)?;
                             let get = |k: &str| {
                                 at.iter()
                                     .find(|(n, _)| n.ends_with(&format!(":{k}")))
@@ -552,7 +553,7 @@ pub fn sheets(pkg: &mut Package, limits: &Limits) -> Result<Vec<Sheet>, Error> {
                         }
                     }
                     "table-row" if depth == 1 => {
-                        let at = xml::attrs(e);
+                        let at = xml::attrs(e)?;
                         row.clear();
                         col = 0;
                         row_rep = at
@@ -565,7 +566,7 @@ pub fn sheets(pkg: &mut Package, limits: &Limits) -> Result<Vec<Sheet>, Error> {
                         }
                     }
                     "table-cell" | "covered-table-cell" if depth == 1 => {
-                        let at = xml::attrs(e);
+                        let at = xml::attrs(e)?;
                         let get = |k: &str| {
                             at.iter()
                                 .find(|(n, _)| n.ends_with(&format!(":{k}")))
@@ -597,7 +598,7 @@ pub fn sheets(pkg: &mut Package, limits: &Limits) -> Result<Vec<Sheet>, Error> {
                         para.clear();
                     }
                     "s" if in_p => {
-                        let n = xml::attrs(e)
+                        let n = xml::attrs(e)?
                             .iter()
                             .find(|(k, _)| k.ends_with(":c"))
                             .and_then(|(_, v)| v.parse::<usize>().ok())

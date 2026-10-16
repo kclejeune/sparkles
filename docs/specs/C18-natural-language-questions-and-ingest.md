@@ -4834,7 +4834,13 @@ badges on the dataset page and the sidebar.
   is gone. The tradeoff is memory for safety. A conversion may hold up to 128 MiB of
   output beside its input and trees, and at most `--pdf-workers` conversions run at once.
   Sheets are stored sparsely, a repeated row is stored once, and the rendering of a
-  table is checked against the text limit after every row. A conversion runs on a thread of its own under
+  table is checked against the text limit after every row. Each XML attribute counts as a
+  node, and an element with more than 1,024 attributes is refused. The conversion also
+  stops at the task's deadline. The readers check it while they read the XML and while
+  they charge the budget, so the thread that a task has given up on ends soon after the
+  deadline and frees its `--pdf-workers` slot, and the task reports `conversion-timeout`.
+  The converter is not registered with the server's query memory pool, which stays part
+  of roadmap item 15's remaining work. A conversion runs on a thread of its own under
   the task's deadline with a panic caught as `conversion-failed`, and shares the
   `--pdf-workers` slots with PDF conversion. The converter has a cargo-fuzz target in
   `crates/sparkles-office/fuzz`, started with `mise run office:fuzz`, and its normal

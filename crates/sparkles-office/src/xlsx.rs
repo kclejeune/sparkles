@@ -24,9 +24,9 @@ pub fn sheets(pkg: &mut Package, limits: &Limits) -> Result<Vec<Sheet>, Error> {
         .and_then(|n| n.attr("date1904"))
         .is_some_and(|v| v == "1" || v == "true");
     let dates = date_styles(pkg, limits);
-    let shared = shared_strings(pkg, limits)?;
+    let mut budget = Budget::new(limits);
+    let shared = shared_strings(pkg, limits, &mut budget)?;
     let mut out = Vec::new();
-    let mut budget = Budget::new(limits.max_output);
     for (i, s) in wb.descendants("sheet").into_iter().enumerate() {
         let name = s.attr("name").unwrap_or("").to_string();
         if matches!(s.attr("state"), Some("hidden" | "veryHidden")) {
@@ -57,7 +57,11 @@ pub fn sheets(pkg: &mut Package, limits: &Limits) -> Result<Vec<Sheet>, Error> {
 }
 
 /// The text of each shared string.
-fn shared_strings(pkg: &mut Package, limits: &Limits) -> Result<Vec<String>, Error> {
+fn shared_strings(
+    pkg: &mut Package,
+    limits: &Limits,
+    budget: &mut Budget,
+) -> Result<Vec<String>, Error> {
     let Some(bytes) = pkg.read("xl/sharedStrings.xml")? else {
         return Ok(Vec::new());
     };
@@ -69,6 +73,7 @@ fn shared_strings(pkg: &mut Package, limits: &Limits) -> Result<Vec<String>, Err
     let mut skip = 0usize; // inside rPh, the phonetic runs
     let mut total = 0usize;
     loop {
+        budget.tick()?;
         match r.read_event_into(&mut buf).map_err(corrupt)? {
             Event::Start(e) => match xml::local(e.name().as_ref()).as_str() {
                 "si" => cur.clear(),
@@ -204,6 +209,7 @@ fn read_sheet(
     let mut in_cell = false;
     let mut phonetic = 0usize; // inside rPh, the phonetic runs of an inline string
     loop {
+        budget.tick()?;
         let ev = r.read_event_into(&mut buf).map_err(corrupt)?;
         match &ev {
             Event::Start(e) | Event::Empty(e) => {
@@ -214,7 +220,7 @@ fn read_sheet(
                         next_col = 0;
                     }
                     "c" => {
-                        let at = xml::attrs(e);
+                        let at = xml::attrs(e)?;
                         let get =
                             |k: &str| at.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
                         col = get("r").and_then(sheet::column_of).unwrap_or(next_col);

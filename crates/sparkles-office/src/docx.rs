@@ -10,7 +10,7 @@ use crate::md::{self, Block, Doc};
 use crate::package::{Package, Rel};
 use crate::xml::{self, Node};
 use crate::{Document, Error, Limits};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Default, Clone)]
 struct Style {
@@ -38,6 +38,8 @@ struct Cx<'p, 'a> {
     footnotes: HashMap<String, String>,
     endnotes: HashMap<String, String>,
     used_notes: Vec<(String, String)>,
+    /// the labels in `used_notes`, for the membership test
+    used_labels: HashSet<String>,
 }
 
 pub fn convert(pkg: &mut Package, limits: &Limits) -> Result<Document, Error> {
@@ -52,7 +54,7 @@ pub fn convert(pkg: &mut Package, limits: &Limits) -> Result<Document, Error> {
     let title = title(pkg, limits);
     let mut cx = Cx {
         pkg,
-        doc: Doc::new(limits.max_output),
+        doc: Doc::new(limits),
         rels,
         styles,
         numbering,
@@ -60,6 +62,7 @@ pub fn convert(pkg: &mut Package, limits: &Limits) -> Result<Document, Error> {
         footnotes,
         endnotes,
         used_notes: Vec::new(),
+        used_labels: HashSet::new(),
     };
     let body = root
         .first("body")
@@ -421,10 +424,13 @@ impl Cx<'_, '_> {
                     } else {
                         &self.endnotes
                     };
-                    if let Some(t) = map.get(id).cloned() {
+                    if map.contains_key(id) {
                         let label = format!("{}{id}", if foot { "fn" } else { "en" });
                         out.push_str(&format!("[^{label}]"));
-                        if !self.used_notes.iter().any(|(l, _)| *l == label) {
+                        // the text is copied once, for the first reference
+                        if !self.used_labels.contains(&label) {
+                            let t = map[id].clone();
+                            self.used_labels.insert(label.clone());
                             self.used_notes.push((label, t));
                         }
                     }

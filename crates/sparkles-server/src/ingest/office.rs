@@ -28,6 +28,9 @@ fn limits(o: &Options) -> Limits {
     Limits {
         max_text: o.max_text,
         max_images: o.max_images,
+        // the conversion stops at the task's deadline, so that the thread the task has
+        // given up on ends soon after and frees its worker slot
+        deadline: Some(o.deadline),
         ..Limits::default()
     }
 }
@@ -46,6 +49,11 @@ fn refusal(e: Error) -> Refusal {
         ),
         Error::TooLarge(m) => Refusal::new("too-large", 413, m),
         Error::Unsupported(m) => Refusal::new("unsupported-format", 415, m),
+        Error::Timeout => Refusal::new(
+            "conversion-timeout",
+            504,
+            "the document's conversion did not end before the deadline",
+        ),
     }
 }
 

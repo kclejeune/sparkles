@@ -352,3 +352,75 @@ fn the_phonetic_runs_of_an_inline_string_are_left_out() {
     let s = sheets(&f, Format::Xlsx, &lim()).unwrap();
     assert_eq!(s[0].csv, "Tokyo\n");
 }
+
+#[test]
+fn an_element_with_thousands_of_attributes_is_refused() {
+    let attrs: String = (0..2000).map(|i| format!(r#" a{i}="1""#)).collect();
+    let doc = format!(r#"<w:document {W}><w:body><w:p{attrs}/></w:body></w:document>"#);
+    let b = container(&[("word/document.xml", &doc)]);
+    assert!(matches!(
+        to_markdown(&b, Format::Docx, &lim()),
+        Err(Error::TooLarge(_))
+    ));
+    // the streaming readers refuse it as well
+    let sheet = format!(
+        r#"<worksheet {X}><sheetData><row r="1"><c r="A1"{attrs}><v>1</v></c></row></sheetData></worksheet>"#
+    );
+    let f = workbook_with(r#"<sheet name="S" sheetId="1" x:id="rId1"/>"#, &sheet);
+    assert!(matches!(
+        sheets(&f, Format::Xlsx, &lim()),
+        Err(Error::TooLarge(_))
+    ));
+}
+
+#[test]
+fn a_deadline_that_has_passed_stops_every_format() {
+    let past = std::time::Instant::now();
+    let l = Limits {
+        deadline: Some(past),
+        ..lim()
+    };
+    for (b, f) in [
+        (docx(), Format::Docx),
+        (pptx(), Format::Pptx),
+        (odt(), Format::Odt),
+        (odp(), Format::Odp),
+    ] {
+        assert_eq!(to_markdown(&b, f, &l).unwrap_err(), Error::Timeout, "{f:?}");
+    }
+    for (b, f) in [(xlsx(), Format::Xlsx), (ods(), Format::Ods)] {
+        assert_eq!(sheets(&b, f, &l).unwrap_err(), Error::Timeout, "{f:?}");
+    }
+    // a deadline in the future changes nothing
+    let l = Limits {
+        deadline: Some(past + std::time::Duration::from_secs(3600)),
+        ..lim()
+    };
+    assert!(to_markdown(&docx(), Format::Docx, &l).is_ok());
+}
+
+#[test]
+fn twenty_thousand_footnote_references_convert_quickly() {
+    let n = 20_000;
+    let mut body = String::new();
+    let mut notes = String::new();
+    for i in 1..=n {
+        body.push_str(&format!(
+            r#"<w:p><w:r><w:t>p{i}</w:t></w:r><w:r><w:footnoteReference w:id="{i}"/></w:r></w:p>"#
+        ));
+        notes.push_str(&format!(
+            r#"<w:footnote w:id="{i}"><w:p><w:r><w:t>note {i}</w:t></w:r></w:p></w:footnote>"#
+        ));
+    }
+    let doc = format!(r#"<w:document {W}><w:body>{body}</w:body></w:document>"#);
+    let foot = format!(r#"<w:footnotes {W}>{notes}</w:footnotes>"#);
+    let b = container(&[("word/document.xml", &doc), ("word/footnotes.xml", &foot)]);
+    let l = Limits {
+        max_text: 64 << 20,
+        ..lim()
+    };
+    let start = std::time::Instant::now();
+    let d = to_markdown(&b, Format::Docx, &l).unwrap();
+    assert!(d.markdown.contains("[^fn20000]: note 20000"));
+    assert!(start.elapsed().as_secs_f64() < 2.0, "{:?}", start.elapsed());
+}
