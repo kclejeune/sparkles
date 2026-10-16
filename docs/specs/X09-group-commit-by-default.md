@@ -239,8 +239,11 @@ deployments that try the flag before the default changes.
   after its write starts. The commit's tracing span already records its sequence number
   (`seq`). The access log gains the same field for writes, so an operator can find the
   commit of a disconnected request.
-- **`no_wait`.** A write with `no_wait` that would have to drain a queue fails with
-  `Error::WriterBusy`, as `Coordinator::drain` does today.
+- **`no_wait`.** A write with `no_wait` never waits for a fence. It fails with
+  `Error::WriterBusy` when it finds a fence running or commits queued once it holds the
+  writer lock, and when its own commit would be grouped, before anything reaches the WAL.
+  The server's in-place updates set `no_wait` and retry a `WriterBusy` on the blocking
+  pool, so a runtime worker never parks in a fence.
 - **Fairness.** The queue is first in, first out, and prefixes are published in order.
   A transaction that waits for the writer lock is not overtaken by grouped commits
   except through the lock's own order. Phase 1 measures, with 16 writers, the spread of

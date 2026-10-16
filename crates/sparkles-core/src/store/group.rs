@@ -607,6 +607,59 @@ mod tests {
         );
     }
 
+    /// A write that asked not to wait (the server's in-place updates) is refused with
+    /// `WriterBusy` instead of parking in another commit's fence (review X09-1).
+    #[test]
+    fn a_no_wait_write_never_parks_in_a_fence() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(Store::open(dir.path(), options()).unwrap());
+        insert(&s, "seed").unwrap();
+        let seeded = s.snapshot().commit;
+        let (sealed, release) = pause_thread(&s, "group-sealed", "nw-a");
+        let a = thread::Builder::new()
+            .name("nw-a".into())
+            .spawn({
+                let s = s.clone();
+                move || insert(&s, "a").unwrap()
+            })
+            .unwrap();
+        sealed.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let b = thread::spawn({
+            let s = s.clone();
+            move || {
+                let r = (|| {
+                    let mut t = s.try_write_with(
+                        CommitKind::Update,
+                        crate::guard::WriteOptions {
+                            no_wait: true,
+                            ..Default::default()
+                        },
+                    )?;
+                    let q = Quad::new(
+                        NamedNode::new("urn:b").unwrap(),
+                        NamedNode::new("urn:p").unwrap(),
+                        NamedNode::new("urn:o").unwrap(),
+                        GraphName::DefaultGraph,
+                    );
+                    let ids = t.encode_quad(&q, &mut Default::default())?;
+                    t.insert(ids)?;
+                    t.commit().map(|_| ())
+                })();
+                let _ = tx.send(r);
+            }
+        });
+        let r = rx.recv_timeout(Duration::from_secs(2));
+        release.send(()).unwrap();
+        a.join().unwrap();
+        b.join().unwrap();
+        assert!(
+            matches!(r, Ok(Err(Error::WriterBusy))),
+            "a no_wait write behind a running fence: {r:?}"
+        );
+        assert_eq!(s.snapshot().commit, seeded + 1);
+    }
+
     fn pause(s: &Store, name: &'static str) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
         let (hit, observed) = mpsc::channel();
         let (resume, go) = mpsc::channel();
@@ -807,12 +860,20 @@ mod tests {
                 check,
                 AbortCheck::Leading | AbortCheck::Late | AbortCheck::Core
             );
-        if waits {
+        if no_wait {
+            // a write that will not wait is refused at once while a fence runs, before it
+            // could start from the speculative head (review X09-1)
+            assert!(
+                matches!(first, AbortEvent::Done),
+                "a no_wait abort must not drain: {check:?}, {first:?}"
+            );
+            assert!(completed);
+        } else if waits {
             assert!(
                 matches!(first, AbortEvent::Draining),
                 "checked abort must wait: {check:?}, {first:?}"
             );
-            assert_eq!(completed, no_wait);
+            assert!(!completed);
         } else {
             assert!(
                 matches!(first, AbortEvent::Done),
@@ -826,7 +887,7 @@ mod tests {
             assert_eq!(held.unwrap().commit.seq, expected);
         }
         let result = result.unwrap();
-        if waits && no_wait {
+        if no_wait {
             assert!(matches!(result, Err(Error::WriterBusy)), "{result:?}");
         } else if waits && fail {
             assert!(matches!(result, Err(Error::Poisoned)), "{result:?}");
@@ -899,15 +960,9 @@ mod tests {
         false,
         false
     );
+    abort_case!(plain_patch_abort_no_wait_is_busy, Plain, false, true, false);
     abort_case!(
-        plain_patch_abort_no_wait_reports_published_success,
-        Plain,
-        false,
-        true,
-        false
-    );
-    abort_case!(
-        plain_patch_abort_no_wait_reports_published_failure,
+        plain_patch_abort_no_wait_is_busy_before_a_failed_fence,
         Plain,
         true,
         true,

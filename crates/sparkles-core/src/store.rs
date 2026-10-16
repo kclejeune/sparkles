@@ -3629,6 +3629,11 @@ impl Store {
         opts: crate::guard::WriteOptions,
     ) -> Result<WriteTxn<'_>> {
         let mut guard = self.raw_writer(&opts)?;
+        // A write that will not wait must not start from a speculative head either: its
+        // commit would then wait for the fence that makes that head durable.
+        if opts.no_wait && self.group.as_ref().is_some_and(|g| !g.idle()) {
+            return Err(Error::WriterBusy);
+        }
         if !self.speculative_base(kind, &opts, &guard) {
             self.drain_group(&mut guard, Some(&opts))?;
         }
@@ -3702,6 +3707,12 @@ impl Store {
             crate::annotations::validate_message(m)?;
         }
         Ok(())
+    }
+
+    /// Whether this store groups commits
+    /// ([`StoreOptions::experimental_group_commit`] on a persistent store).
+    pub fn groups_commits(&self) -> bool {
+        self.group.is_some()
     }
 
     /// The error of a write that may have started from the speculative head of a group
@@ -5603,6 +5614,11 @@ impl WriteTxn<'_> {
                 other => other?,
             };
             if grouped {
+                // A grouped commit is acknowledged only after a fence, which a write that
+                // will not wait must not wait for. Nothing has reached the WAL yet.
+                if self.opts.no_wait {
+                    return Err(Error::WriterBusy);
+                }
                 return self.publish_grouped(validation);
             }
             return self.publish_log(validation, sync);

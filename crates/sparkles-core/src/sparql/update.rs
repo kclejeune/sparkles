@@ -245,13 +245,15 @@ fn run_update(
     if wopts.deadline.is_none() {
         wopts.deadline = req.deadline;
     }
-    let after = wopts.clone();
+    // only a store that groups commits drains on a refusal, so only it needs a copy
+    let after = store.groups_commits().then(|| wopts.clone());
     let mut txn = store.try_write_with(kind, wopts)?;
     for op in &parsed.operations {
         req.check()?;
         // An error that rests on data waits for the state it saw to be durable.
         // Triple protections may already have drained; a second drain is then a no-op.
-        run_op(&mut txn, op, &req, &mut stats).map_err(|e| store.after_refusal(e, Some(&after)))?;
+        run_op(&mut txn, op, &req, &mut stats)
+            .map_err(|e| store.after_refusal(e, after.as_ref()))?;
     }
     // a request cancelled or timed out before this point publishes nothing
     req.check()?;
