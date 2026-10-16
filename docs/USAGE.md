@@ -2173,9 +2173,14 @@ lock for long.
 A write-back run is an update, so the server's query timeout does not apply to it. It has
 no deadline unless the request has a `timeout` or the server runs with
 `--update-timeout`. Without a deadline, a run that waits for `--algo-threads` waits until
-a thread is free or the run is cancelled. The commits are in batches, but the run decodes
-its whole result in memory before its first batch is written, so a result of many rows
-takes memory in proportion to the rows, up to `--max-rows`.
+a thread is free or the run is cancelled. Thread admission has no queue order, so a run
+that asks for several threads can wait while one-thread calls keep taking the free slots.
+The run keeps the algorithm's result as term identifiers and decodes the terms of one
+batch at a time, so the decoded terms of a large result never sit in memory together.
+The identifiers of the whole result stay in memory until the run ends, up to
+`--max-rows` rows. On a server with a query memory pool, a run takes its initial grant
+when its task starts and waits for it up to `--query-admission-wait`, as a request
+does.
 
 Query and task cancellation both reach computation, result preparation and writer
 admission. A supplied timeout and task deadline share the earlier absolute bound from
