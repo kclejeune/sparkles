@@ -109,26 +109,31 @@ export function buildBucketTrack(
   opts: { fork?: number | null; readable?: readonly Range[] } = {},
 ): Track {
   const readableRanges = opts.readable ?? tl.readable;
-  const stops: Stop[] = tl.buckets.map((b) => {
-    const time = Date.parse(b.lastTime);
-    const kinds = Object.keys(b.kinds);
-    const single = b.commits === 1 || kinds.length === 1;
-    return {
-      seq: b.lastSeq,
-      time: Number.isNaN(time) ? 0 : time,
-      timestamp: b.lastTime,
-      kind: single ? (kinds[0] ?? 'update') : 'bucket',
-      inserted: b.inserted,
-      deleted: b.deleted,
-      readable: b.lastSeq === tl.head || inRanges(b.lastSeq, readableRanges),
-      snapshots: [],
-      merge: b.merges > 0,
-      fork: opts.fork != null && opts.fork >= b.firstSeq && opts.fork <= b.lastSeq,
-      head: b.lastSeq === tl.head,
-      count: b.commits,
-      first: b.firstSeq,
-    };
-  });
+  // a commit made while the server read the catalog can give a bucket past the head the
+  // answer names: it is left out, and one that straddles the head ends at it
+  const stops: Stop[] = tl.buckets
+    .filter((b) => b.firstSeq <= tl.head)
+    .map((b) => {
+      const lastSeq = Math.min(b.lastSeq, tl.head);
+      const time = Date.parse(b.lastTime);
+      const kinds = Object.keys(b.kinds);
+      const single = b.commits === 1 || kinds.length === 1;
+      return {
+        seq: lastSeq,
+        time: Number.isNaN(time) ? 0 : time,
+        timestamp: b.lastTime,
+        kind: single ? (kinds[0] ?? 'update') : 'bucket',
+        inserted: b.inserted,
+        deleted: b.deleted,
+        readable: lastSeq === tl.head || inRanges(lastSeq, readableRanges),
+        snapshots: [],
+        merge: b.merges > 0,
+        fork: opts.fork != null && opts.fork >= b.firstSeq && opts.fork <= lastSeq,
+        head: lastSeq === tl.head,
+        count: b.commits,
+        first: b.firstSeq,
+      };
+    });
   if (!stops.some((s) => s.head)) {
     const last = stops.at(-1);
     stops.push({

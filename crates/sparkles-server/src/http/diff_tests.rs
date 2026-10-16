@@ -1523,3 +1523,41 @@ async fn sparql_diff_runs_under_one_timeout() {
     let r = sparql_diff(&s.app, "/h/sparql/diff?from=5&to=5&timeout=0.000001", q).await;
     assert_eq!(r.status, StatusCode::REQUEST_TIMEOUT, "{}", head_of(&r));
 }
+
+#[tokio::test]
+async fn the_timeline_reads_only_the_range_and_stops_at_the_head() {
+    let s = server(|_| {}).await;
+    // two commits of the range, and the commit count says so
+    let j = get(&s.app, "/$/commits/h/timeline?from=2&to=3")
+        .await
+        .json();
+    assert_eq!(j["commits"], 2);
+    assert_eq!(j["firstSeq"], 2);
+    assert_eq!(j["lastSeq"], 3);
+    // a `to` past the head is the head, and no bucket passes it
+    let j = get(&s.app, "/$/commits/h/timeline?to=99").await.json();
+    assert_eq!(j["head"], 4);
+    assert_eq!(j["lastSeq"], 4);
+    for b in j["buckets"].as_array().unwrap() {
+        assert!(b["lastSeq"].as_u64().unwrap() <= 4);
+    }
+    let j = get(
+        &s.app,
+        "/$/commits/h/timeline?from=3&to=18446744073709551615",
+    )
+    .await
+    .json();
+    assert_eq!(
+        (j["firstSeq"].as_u64(), j["lastSeq"].as_u64()),
+        (Some(3), Some(4))
+    );
+    // a range after the head holds nothing
+    let j = get(&s.app, "/$/commits/h/timeline?from=50").await.json();
+    assert_eq!(j["commits"], 0);
+    assert!(j["buckets"].as_array().unwrap().is_empty());
+    // the first commit is in a range that starts at 0
+    let j = get(&s.app, "/$/commits/h/timeline?from=0&to=0")
+        .await
+        .json();
+    assert_eq!(j["commits"], 1);
+}

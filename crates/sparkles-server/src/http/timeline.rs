@@ -9,12 +9,19 @@
 
 use super::*;
 use sparkles::commit::{CommitInfo, CommitKind, CommitRange};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// The buckets of a request without `buckets`.
 const DEFAULT_BUCKETS: u64 = 200;
 /// The most buckets a request may ask for.
 const MAX_BUCKETS: u64 = 2_000;
+
+/// The most commits one request reads. The catalog hands over its commits as one list, so
+/// this bounds the memory of a request, which a range of this size holds for a few hundred
+/// bytes a commit.
+const MAX_RANGE: u64 = 10_000_000;
+/// How many commits are bucketed between two looks at the cancel flag.
+const CHECK_EVERY: usize = 65_536;
 
 /// One run of consecutive commits.
 struct Bucket {
@@ -85,6 +92,22 @@ fn bad(msg: impl Into<String>) -> ApiError {
     err(StatusCode::BAD_REQUEST, msg)
 }
 
+/// The commit numbers from `lo` to `hi` (the head at most): how many commits a request
+/// reads, none when the range starts after the head, and a `400` beyond [`MAX_RANGE`].
+fn range_len(lo: u64, hi: u64) -> ApiResult<u64> {
+    let wanted = if lo > hi {
+        0
+    } else {
+        (hi - lo).saturating_add(1)
+    };
+    if wanted > MAX_RANGE {
+        return Err(bad(format!(
+            "the range holds {wanted} commits, more than the {MAX_RANGE} a timeline reads: narrow it with from and to"
+        )));
+    }
+    Ok(wanted)
+}
+
 pub(super) async fn timeline(
     State(st): St,
     Path(name): Path<String>,
@@ -110,63 +133,97 @@ pub(super) async fn timeline(
     if lo > hi {
         return Err(bad("from is after to"));
     }
-    let head = ds.store.head_commit();
-    // every commit whose metadata the catalog keeps, oldest first
-    let all: Vec<CommitInfo> = if ds.kind == DbType::Persistent {
-        let main = ds.main().unwrap_or_else(|| ds.clone());
-        let branch = ds.branch_name().to_string();
-        let mut v = blocking(move || {
-            Ok(main
-                .store
-                .branch_commits(&branch, CommitRange::Latest, usize::MAX)?
-                .into_iter()
-                .map(|c| c.commit)
-                .collect::<Vec<_>>())
-        })
-        .await?;
-        v.reverse();
-        v
-    } else {
-        let mut v = ds
-            .dataset
-            .history()
-            .commits(CommitRange::Latest, usize::MAX)
-            .commits;
-        v.reverse();
-        v
-    };
-    let commits: Vec<&CommitInfo> = all.iter().filter(|c| c.seq >= lo && c.seq <= hi).collect();
-    let pins = ds.dataset.snapshots().list();
-    let first = commits.first().map_or(0, |c| c.seq);
-    let last = commits.last().map_or(0, |c| c.seq);
-    // buckets of equal width in commit numbers, so a slider maps a position to a number
-    let span = last.saturating_sub(first) + 1;
-    let width = span.div_ceil(buckets).max(1);
-    let mut out: Vec<Bucket> = Vec::new();
-    let mut current = None;
-    for c in &commits {
-        let index = (c.seq - first) / width;
-        if current != Some(index) {
-            out.push(Bucket::new(c));
-            current = Some(index);
-        }
-        let snaps = pins.iter().filter(|p| p.seq == c.seq).count() as u64;
-        if let Some(b) = out.last_mut() {
-            b.add(c, snaps);
-        }
-    }
+    // the head first, and no commit after it: a commit made while the catalog is read
+    // would otherwise give a bucket past the head the response names
+    let head = ds.store.head_commit().seq;
+    let hi = hi.min(head);
+    let wanted = range_len(lo, hi)?;
+    let (cancel, _cancel_on_drop) = cancel_on_drop();
     let restricted = p.restricted(&ds.name);
+    let (width, first, last, count, out) = blocking({
+        let ds = ds.clone();
+        move || {
+            let n = wanted as usize;
+            // only the range, newest first, from the catalog of the branch
+            let mut commits: Vec<CommitInfo> = if n == 0 {
+                Vec::new()
+            } else if ds.kind == DbType::Persistent {
+                let main = ds.main().unwrap_or_else(|| ds.clone());
+                let branch = ds.branch_name().to_string();
+                main.store
+                    .branch_commits(&branch, CommitRange::Before(hi + 1), n)?
+                    .into_iter()
+                    .map(|c| c.commit)
+                    .collect()
+            } else {
+                ds.dataset
+                    .history()
+                    .commits(CommitRange::Before(hi + 1), n)
+                    .commits
+            };
+            // the catalog may skip commits, and a store that reads its own newer head can
+            // return more than was asked for
+            commits.retain(|c| c.seq >= lo && c.seq <= hi);
+            commits.reverse();
+            let mut snapshots: HashMap<u64, u64> = HashMap::new();
+            for s in ds.dataset.snapshots().list() {
+                *snapshots.entry(s.seq).or_default() += 1;
+            }
+            let first = commits.first().map_or(0, |c| c.seq);
+            let last = commits.last().map_or(0, |c| c.seq);
+            // buckets of equal width in commit numbers, so a slider maps a position to a number
+            let span = last.saturating_sub(first) + 1;
+            let width = span.div_ceil(buckets).max(1);
+            let mut out: Vec<Bucket> = Vec::new();
+            let mut current = None;
+            for (i, c) in commits.iter().enumerate() {
+                if i % CHECK_EVERY == 0 && cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(sparkles::Error::Cancelled.into());
+                }
+                let index = (c.seq - first) / width;
+                if current != Some(index) {
+                    out.push(Bucket::new(c));
+                    current = Some(index);
+                }
+                if let Some(b) = out.last_mut() {
+                    b.add(c, snapshots.get(&c.seq).copied().unwrap_or(0));
+                }
+            }
+            Ok((width, first, last, commits.len(), out))
+        }
+    })
+    .await?;
     let (oldest, readable, _) = history::commit_list_extras(&ds, &[]);
     Ok(Json(json!({
         "dataset": name,
         "datasetId": ds.store.owner_dataset_id(),
-        "head": head.seq,
+        "head": head,
         "firstSeq": first,
         "lastSeq": last,
-        "commits": commits.len(),
+        "commits": count,
         "bucketWidth": width,
         "oldestReconstructable": oldest,
         "readable": readable,
         "buckets": out.iter().map(|b| b.json(restricted)).collect::<Vec<_>>(),
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_range_is_counted_and_capped() {
+        assert_eq!(range_len(0, 0).ok(), Some(1));
+        assert_eq!(range_len(2, 3).ok(), Some(2));
+        // from after the clamped head: nothing to read
+        assert_eq!(range_len(50, 4).ok(), Some(0));
+        assert_eq!(range_len(0, MAX_RANGE - 1).ok(), Some(MAX_RANGE));
+        let Err(e) = range_len(0, MAX_RANGE) else {
+            panic!("a range past the ceiling is refused");
+        };
+        assert_eq!(e.0, StatusCode::BAD_REQUEST);
+        assert!(e.1["error"].as_str().unwrap().contains("10000000"));
+        assert!(range_len(0, u64::MAX).is_err());
+    }
 }

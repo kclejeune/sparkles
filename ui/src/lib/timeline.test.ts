@@ -422,6 +422,24 @@ describe('buildBucketTrack', () => {
     expect(t.head).toBe(4999);
   });
 
+  it('leaves out a bucket past the head and keeps the stops in order', () => {
+    // a commit made while the server read its catalog: the answer names head 4999
+    const raced = timeline([bucket(0, 2499), bucket(2500, 4999), bucket(5000, 5000)], {
+      head: 4999,
+    });
+    const t = buildBucketTrack(raced);
+    expect(t.stops.map((s) => s.seq)).toEqual([2499, 4999]);
+    expect(t.stops.filter((s) => s.head).length).toBe(1);
+    const seqs = t.stops.map((s) => s.seq);
+    expect(seqs).toEqual([...seqs].sort((a, b) => a - b));
+    // a bucket that straddles the head ends at it
+    const straddle = buildBucketTrack(
+      timeline([bucket(0, 2499), bucket(2500, 5200)], { head: 4999 }),
+    );
+    expect(straddle.stops.map((s) => s.seq)).toEqual([2499, 4999]);
+    expect(straddle.stops[1].head).toBe(true);
+  });
+
   it('takes readability from the ranges and marks the unreadable stretch', () => {
     const t = buildBucketTrack(tl);
     expect(t.stops.map((s) => s.readable)).toEqual([false, false, true, true]);

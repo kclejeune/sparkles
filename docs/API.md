@@ -2781,9 +2781,14 @@ digest chains from 32 zero bytes. The exact input is defined in
 
 `GET /$/commits/{ds}/timeline` cuts the commits of a branch into runs of consecutive
 numbers, so that a client can draw a history of any length. It reads the commit catalog
-once, needs read permission and counts against the `query` rate-limit class. `branch=` names the branch, as for the other commit
-routes. `from` and `to` are commit numbers that limit the range, and by default it covers
-the first retained commit to the head. `buckets` is the most buckets, 200 by default and
+once, needs read permission and counts against the `query` rate-limit class. `branch=`
+names the branch, as for the other commit routes. `from` and `to` are commit numbers that
+limit the range, and by default it covers the first retained commit to the head. The
+server reads only the commits of that range, up to the head it saw when the request began,
+so a commit made during the read never gives a bucket past `head`. A range of more than
+10,000,000 commits is a `400`, since the catalog hands the commits over as one list, and
+`from` and `to` narrow it. A range that starts after the head holds no commit and gives no
+buckets. `buckets` is the most buckets, 200 by default and
 at most 2,000. Every bucket spans `bucketWidth` commit numbers, which is the width of the
 range divided by `buckets` and rounded up, so a position on a track maps to a commit by
 arithmetic. A bucket with no retained commit is left out.
