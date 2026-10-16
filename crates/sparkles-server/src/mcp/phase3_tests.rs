@@ -90,6 +90,68 @@ async fn find_paths() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn graph_algorithm() {
+    let mut c = Client::start(server_with(&[("t", &[CHAIN])], McpConfig::default()));
+    let s = c
+        .structured(
+            "graph_algorithm",
+            json!({"algorithm": "pageRank", "predicates": ["ex:next"], "limit": 2}),
+        )
+        .await;
+    assert_eq!(s["columns"], json!(["node", "score"]));
+    assert_eq!(s["rows"].as_array().unwrap().len(), 2, "{s}");
+    assert_eq!(s["limited"], true);
+    assert_eq!(s["summary"]["nodes"], 4, "{s}");
+    // the best node of a chain is its end
+    assert_eq!(s["rows"][0][0], "ex:d");
+    let s = c
+        .structured(
+            "graph_algorithm",
+            json!({"algorithm": "wcc", "direction": "undirected"}),
+        )
+        .await;
+    assert_eq!(s["rows"].as_array().unwrap().len(), 4);
+    assert_eq!(s["limited"], false);
+    // errors
+    let (_, e) = c
+        .error("graph_algorithm", json!({"algorithm": "nope"}))
+        .await;
+    assert_eq!(e["code"], "bad-argument");
+    let (_, e) = c
+        .error(
+            "graph_algorithm",
+            json!({"algorithm": "wcc", "projection": "p", "predicates": ["ex:next"]}),
+        )
+        .await;
+    assert_eq!(e["code"], "bad-argument");
+    let (_, e) = c
+        .error(
+            "graph_algorithm",
+            json!({"algorithm": "wcc", "params": {"limit": 5}}),
+        )
+        .await;
+    assert_eq!(e["code"], "bad-argument");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn graph_algorithm_refuses_injected_source() {
+    let mut c = Client::start(server_with(&[("t", &[CHAIN])], McpConfig::default()));
+    for source in [
+        "ex:a> ; algo:node ?n0 } ?node ?score ?summary } #",
+        "ex:a b",
+        "<http://ex/a>b>",
+    ] {
+        let (_, e) = c
+            .error(
+                "graph_algorithm",
+                json!({"algorithm": "bfs", "predicates": ["ex:next"], "params": {"source": source}}),
+            )
+            .await;
+        assert_eq!(e["code"], "bad-argument", "{source}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn list_changes() {
     let server = fixture_server();
     let ds = server.state.get("t").unwrap();

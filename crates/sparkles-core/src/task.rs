@@ -64,6 +64,36 @@ impl std::fmt::Debug for Cancel {
     }
 }
 
+/// An immutable composition of cancellation flags owned by the caller.
+/// Checking it never changes any flag and needs no watcher thread.
+#[derive(Clone, Default, Debug)]
+pub struct Cancellation(Arc<[Arc<AtomicBool>]>);
+
+impl Cancellation {
+    pub fn from_flags(flags: impl IntoIterator<Item = Arc<AtomicBool>>) -> Self {
+        let mut unique = Vec::new();
+        for flag in flags {
+            if !unique.iter().any(|other| Arc::ptr_eq(other, &flag)) {
+                unique.push(flag);
+            }
+        }
+        Self(unique.into())
+    }
+
+    /// Intersect this cancellation source with another composition.
+    pub fn combine(&self, other: &Self) -> Self {
+        Self::from_flags(self.0.iter().chain(other.0.iter()).cloned())
+    }
+
+    pub fn check(&self) -> Result<()> {
+        if self.0.iter().any(|flag| flag.load(Ordering::Relaxed)) {
+            Err(Error::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+}
+
 /// Where progress reports go. The default discards them.
 #[derive(Clone, Default)]
 pub struct Progress(Option<ProgressFn>);

@@ -7,7 +7,7 @@ use super::plan::{
     Agg, GraphFilter, JoinAlgo, Kind, Node, OrderedTopK, PathEnd, PathSpec, RangeSpec, ScanSpec,
 };
 use super::sortkey::{Entry, Screen, SortKey, TopK};
-use super::table::{Table, VarId};
+use super::table::{Materialized, Table, VarId};
 use super::value::{NumOp, Value, arith, order_cmp};
 use crate::error::{Error, Result};
 use crate::id::Id;
@@ -389,10 +389,21 @@ const LEFT_EMPTY: &str = "the left side produced no rows";
 /// Execute with the result cache: subtrees that are cheap to recompute (leaf scans and
 /// value tables) bypass it; everything else is looked up and stored.
 pub fn execute(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
+    let (output, info) = execute_owned(ctx, n)?;
+    Ok((output.table, info))
+}
+pub(super) fn execute_owned(ctx: &Ctx, n: &Node) -> Result<(Materialized, PlanInfo)> {
+    execute_owned_inner(ctx, n, contains_algorithm(n))
+}
+fn contains_algorithm(n: &Node) -> bool {
+    matches!(n.kind, Kind::AlgoCall(_)) || n.children.iter().any(contains_algorithm)
+}
+fn execute_owned_inner(ctx: &Ctx, n: &Node, algorithm: bool) -> Result<(Materialized, PlanInfo)> {
     ctx.check()
         .inspect_err(|_| fail(ctx, n, Instant::now(), Vec::new()))?;
     let results = &ctx.snap.results;
-    let cacheable = ctx.use_cache
+    let cacheable = ctx.snap.cacheable
+        && ctx.use_cache
         && results.enabled()
         && !matches!(
             n.kind,
@@ -417,10 +428,15 @@ pub fn execute(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
             eprintln!("CACHEKEY {} :: {}", n.operator(), k.key);
         }
         let start = Instant::now();
-        if let Some(t) = results.get(k, ctx)? {
-            ctx.produced(t.len())?;
+        let hit = if algorithm {
+            results.get_owned(k, ctx)?
+        } else {
+            results.get(k, ctx)?.map(Materialized::plain)
+        };
+        if let Some(t) = hit {
+            ctx.produced(t.table.len())?;
             let mut info = describe(ctx, n);
-            info.actual_rows = t.len() as i64;
+            info.actual_rows = t.table.len() as i64;
             info.time_ms = start.elapsed().as_secs_f64() * 1000.0;
             info.cached = true;
             // the subtree it was computed from, which did not run this time
@@ -431,22 +447,22 @@ pub fn execute(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
             return Ok((t, info));
         }
     }
-    let (t, info) = execute_uncached(ctx, n)?;
+    let (t, info) = execute_uncached(ctx, n, algorithm)?;
     if let Some(k) = key {
         // only worth caching when recomputation is not trivially cheap
         if info.time_ms >= results.min_ms {
-            results.put(k, &t, ctx);
+            results.put(k, &t.table, ctx);
         }
     }
     Ok((t, info))
 }
 
-fn execute_uncached(ctx: &Ctx, n: &Node) -> Result<(Table, PlanInfo)> {
-    execute_node(ctx, n, None)
+fn execute_uncached(ctx: &Ctx, n: &Node, algorithm: bool) -> Result<(Materialized, PlanInfo)> {
+    execute_node(ctx, n, None, algorithm)
 }
 
 /// The inputs of an operator, from a caller that produces each child's table itself.
-pub(super) type Inputs<'a> = &'a mut dyn FnMut(usize) -> Result<(Table, PlanInfo)>;
+pub(super) type Inputs<'a> = &'a mut dyn FnMut(usize) -> Result<(Materialized, PlanInfo)>;
 
 /// Whether `execute_with_inputs` reads every child of a node of this kind only as an
 /// input table. Other kinds run a child plan themselves, read their child scans in
@@ -466,12 +482,17 @@ pub(super) fn execute_with_inputs(
     ctx: &Ctx,
     n: &Node,
     inputs: Inputs<'_>,
-) -> Result<(Table, PlanInfo)> {
+) -> Result<(Materialized, PlanInfo)> {
     debug_assert!(reads_inputs(n));
-    execute_node(ctx, n, Some(inputs))
+    execute_node(ctx, n, Some(inputs), contains_algorithm(n))
 }
 
-fn execute_node(ctx: &Ctx, n: &Node, inputs: Option<Inputs<'_>>) -> Result<(Table, PlanInfo)> {
+fn execute_node(
+    ctx: &Ctx,
+    n: &Node,
+    inputs: Option<Inputs<'_>>,
+    algorithm: bool,
+) -> Result<(Materialized, PlanInfo)> {
     let start = Instant::now();
     let mut failing = Failing {
         ctx,
@@ -489,6 +510,7 @@ fn execute_node(ctx: &Ctx, n: &Node, inputs: Option<Inputs<'_>>) -> Result<(Tabl
         start,
         &mut failing.infos,
         &mut failing.armed,
+        algorithm,
     )
 }
 
@@ -561,23 +583,35 @@ fn run_node(
     start: Instant,
     infos: &mut Vec<PlanInfo>,
     failing: &mut bool,
-) -> Result<(Table, PlanInfo)> {
+    algorithm: bool,
+) -> Result<(Materialized, PlanInfo)> {
     // the children's tables count against the memory budget until this operator is done
     let held = ctx.charge(0)?;
+    let owned_input = std::cell::Cell::new(false);
     let mut child = |i: usize, infos: &mut Vec<PlanInfo>| -> Result<Table> {
-        let (t, info) = match inputs.as_mut() {
+        let (mut t, info) = match inputs.as_mut() {
             Some(inputs) => inputs(i)?,
-            None => execute(ctx, &n.children[i])?,
+            None => execute_owned_inner(
+                ctx,
+                &n.children[i],
+                algorithm && contains_algorithm(&n.children[i]),
+            )?,
         };
         infos.push(info);
-        held.add(t.mem_bytes())?;
-        Ok(t)
+        if t.lease.is_some() {
+            held.adopt(&mut t.lease)?;
+            owned_input.set(true);
+        } else {
+            held.add(t.table.mem_bytes())?;
+        }
+        Ok(t.table)
     };
     // runtime detail for EXPLAIN (which variant of the operator ran)
     let mut note: Option<String> = None;
     let mut counters = None;
     // expressions evaluated per distinct value
     let mut expr_report = ExprReport::default();
+    let mut output_lease = None;
     let mut table = match &n.kind {
         Kind::Empty => Table::empty(n.vars.clone()),
         Kind::Values(t) => t.clone(),
@@ -597,10 +631,18 @@ fn run_node(
             }
             None => {
                 // the values are not totally ordered: the generic plan decides
-                let (t, info) = execute(ctx, &spec.fallback)?;
+                let (mut out, info) = execute_owned_inner(
+                    ctx,
+                    &spec.fallback,
+                    algorithm && contains_algorithm(&spec.fallback),
+                )?;
+                if out.lease.is_some() {
+                    held.adopt(&mut out.lease)?;
+                    owned_input.set(true);
+                }
                 infos.push(info);
                 note = Some("[values not totally ordered: ran the generic plan]".into());
-                t
+                out.table
             }
         },
         Kind::GroupCountScan {
@@ -814,10 +856,16 @@ fn run_node(
         } => {
             // LIMIT without ORDER BY: any `offset + limit` solutions will do, so the
             // input is computed with early termination
-            let (t, info, _) = execute_limited(ctx, &n.children[0], offset.saturating_add(*limit))?;
+            let (mut t, info, _) =
+                execute_limited(ctx, &n.children[0], offset.saturating_add(*limit))?;
             infos.push(info);
-            held.add(t.mem_bytes())?;
-            t.slice(*offset, Some(*limit))
+            if t.lease.is_some() {
+                held.adopt(&mut t.lease)?;
+                owned_input.set(true);
+            } else {
+                held.add(t.table.mem_bytes())?;
+            }
+            t.table.slice(*offset, Some(*limit))
         }
         Kind::Slice { offset, limit } => child(0, infos)?.slice(*offset, *limit),
         Kind::Group { keys, aggs } => {
@@ -940,6 +988,22 @@ fn run_node(
             counters = Some(c);
             t
         }
+        Kind::AlgoCall(spec) => {
+            // the input when a source is a variable, then the nested pattern of edges
+            let reads_input = n.children.len() > spec.proj.pattern.is_some() as usize;
+            let input = match reads_input {
+                false => None,
+                true => Some(child(0, infos)?),
+            };
+            let edges = match spec.proj.pattern {
+                Some(_) => Some(child(n.children.len() - 1, infos)?),
+                None => None,
+            };
+            let (t, c) = super::algosvc::run(ctx, spec, input, edges, &n.vars)?;
+            counters = Some(c);
+            output_lease = t.lease;
+            t.table
+        }
         Kind::HistoryChanges(spec) => {
             let input = match n.children.len() {
                 0 => None,
@@ -1039,8 +1103,16 @@ fn run_node(
     }
     ctx.check()?;
     // the inputs are gone (or became the output): only the output is alive now
+    if output_lease.is_none() && owned_input.get() {
+        output_lease = Some(held.output_lease(super::algosvc::table_capacity(&table)?)?);
+    }
     drop(held);
-    ctx.check_output(table.len(), table.width())?;
+    if let Some(lease) = &mut output_lease {
+        lease.resize(ctx.mem_limit, super::algosvc::table_capacity(&table)?)?;
+        ctx.check_output_rows(table.len())?;
+    } else {
+        ctx.check_output(table.len(), table.width())?;
+    }
     ctx.produced(table.len())?;
     let info = PlanInfo {
         fidelity: node_fidelity(ctx, n),
@@ -1061,7 +1133,13 @@ fn run_node(
         warnings: Vec::new(),
     };
     *failing = false;
-    Ok((table, info))
+    Ok((
+        Materialized {
+            table,
+            lease: output_lease,
+        },
+        info,
+    ))
 }
 
 /// Both operators' counters (the expression cache's next to those of EXISTS).
@@ -1861,7 +1939,7 @@ pub(super) fn apply_blocking(
 /// early; operators whose output over a prefix of their input is a subset of their full
 /// output re-run with a geometrically growing input budget until they have enough rows.
 /// Returns `(table, info, complete)`; `complete` means no further rows exist.
-fn execute_limited(ctx: &Ctx, n: &Node, want: usize) -> Result<(Table, PlanInfo, bool)> {
+fn execute_limited(ctx: &Ctx, n: &Node, want: usize) -> Result<(Materialized, PlanInfo, bool)> {
     ctx.check()
         .inspect_err(|_| fail(ctx, n, Instant::now(), Vec::new()))?;
     let start = Instant::now();
@@ -1883,12 +1961,12 @@ fn run_limited(
     want: usize,
     start: Instant,
     done: &mut Vec<(usize, PlanInfo)>,
-) -> Result<(Table, PlanInfo, bool)> {
-    let finish = |t: Table, children: Vec<PlanInfo>, complete: bool| {
-        ctx.produced(t.len())?;
+) -> Result<(Materialized, PlanInfo, bool)> {
+    let finish = |t: Materialized, children: Vec<PlanInfo>, complete: bool| {
+        ctx.produced(t.table.len())?;
         let mut info = describe(ctx, n);
         info.children = children;
-        info.actual_rows = t.len() as i64;
+        info.actual_rows = t.table.len() as i64;
         info.time_ms = start.elapsed().as_secs_f64() * 1000.0;
         if !complete {
             info.description = format!("{} [stopped early]", info.description);
@@ -1899,7 +1977,7 @@ fn run_limited(
     match &n.kind {
         Kind::Scan(spec) => {
             let (t, truncated) = scan_limited(ctx, spec, &n.vars, Some(want))?;
-            finish(t, Vec::new(), !truncated)
+            finish(Materialized::plain(t), Vec::new(), !truncated)
         }
         Kind::Filter(_)
         | Kind::Extend(..)
@@ -1911,7 +1989,7 @@ fn run_limited(
             // the child's runs so far, added up
             let mut runs: Option<PlanInfo> = None;
             loop {
-                let (input, cinfo, complete) = execute_limited(ctx, &n.children[0], budget)?;
+                let (mut input, cinfo, complete) = execute_limited(ctx, &n.children[0], budget)?;
                 let cinfo = match runs.take() {
                     Some(earlier) => earlier.merge_run(cinfo),
                     None => cinfo,
@@ -1919,15 +1997,32 @@ fn run_limited(
                 let mut report = ExprReport::default();
                 let mut note = None;
                 let mut counters = None;
-                let out =
-                    match apply_unary_noted(ctx, n, input, &mut report, &mut note, &mut counters) {
-                        Ok(out) => out,
-                        Err(e) => {
-                            done.push((0, cinfo));
-                            return Err(e);
-                        }
-                    };
-                if out.len() >= want || complete {
+                let input_held = ctx.charge(0)?;
+                let owned = input.lease.is_some();
+                if owned {
+                    input_held.adopt(&mut input.lease)?;
+                }
+                let out = match apply_unary_noted(
+                    ctx,
+                    n,
+                    input.table,
+                    &mut report,
+                    &mut note,
+                    &mut counters,
+                ) {
+                    Ok(out) => out,
+                    Err(e) => {
+                        done.push((0, cinfo));
+                        return Err(e);
+                    }
+                };
+                let lease = if owned {
+                    Some(input_held.output_lease(super::algosvc::table_capacity(&out)?)?)
+                } else {
+                    None
+                };
+                let out = Materialized { table: out, lease };
+                if out.table.len() >= want || complete {
                     let (t, mut info, complete) = finish(out, vec![cinfo], complete)?;
                     if let Kind::Filter(exprs) = &n.kind {
                         super::exists::annotate(ctx, &mut info, exprs);
@@ -1955,8 +2050,15 @@ fn run_limited(
             } else {
                 1
             };
-            let (other, oinfo) = execute(ctx, &n.children[1 - lim])?;
-            let _held = ctx.charge(other.mem_bytes())?;
+            let (mut other, oinfo) = execute_owned(ctx, &n.children[1 - lim])?;
+            let other_owned = other.lease.is_some();
+            let other_held = ctx.charge(0)?;
+            if other_owned {
+                other_held.adopt(&mut other.lease)?;
+            } else {
+                other_held.add(other.table.mem_bytes())?;
+            }
+            let other = other.table;
             if other.is_empty() {
                 let mut e = Table::empty(n.vars.clone());
                 e.sorted.clear();
@@ -1967,23 +2069,30 @@ fn run_limited(
                 } else {
                     vec![oinfo, skipped]
                 };
-                return finish(e, infos, true);
+                return finish(Materialized::plain(e), infos, true);
             }
             let mut budget = want.max(64);
             let mut runs: Option<PlanInfo> = None;
             loop {
-                let (part, pinfo, complete) = match execute_limited(ctx, &n.children[lim], budget) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        // the other side ran
-                        done.push((1 - lim, oinfo));
-                        return Err(e);
-                    }
-                };
+                let (mut part, pinfo, complete) =
+                    match execute_limited(ctx, &n.children[lim], budget) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            // the other side ran
+                            done.push((1 - lim, oinfo));
+                            return Err(e);
+                        }
+                    };
                 let pinfo = match runs.take() {
                     Some(earlier) => earlier.merge_run(pinfo),
                     None => pinfo,
                 };
+                let part_owned = part.lease.is_some();
+                let part_held = ctx.charge(0)?;
+                if part_owned {
+                    part_held.adopt(&mut part.lease)?;
+                }
+                let part = part.table;
                 let (l, r) = if lim == 0 {
                     (&part, &other)
                 } else {
@@ -2000,13 +2109,20 @@ fn run_limited(
                     } else {
                         vec![oinfo, pinfo]
                     };
-                    return finish(out, infos, complete);
+                    let lease = if other_owned || part_owned {
+                        Some(ctx.output_lease(super::algosvc::table_capacity(&out)?)?)
+                    } else {
+                        None
+                    };
+                    return finish(Materialized { table: out, lease }, infos, complete);
                 }
                 runs = Some(pinfo);
                 budget = budget.saturating_mul(8);
             }
         }
         Kind::Union => {
+            let held = ctx.charge(0)?;
+            let mut owned = false;
             let mut out = Table::new(n.vars.clone());
             let mut complete = true;
             for (i, c) in n.children.iter().enumerate() {
@@ -2020,25 +2136,39 @@ fn run_limited(
                     }));
                     break;
                 }
-                let (t, info, c_complete) = execute_limited(ctx, c, want - out.len())?;
+                let (mut t, info, c_complete) = execute_limited(ctx, c, want - out.len())?;
                 complete &= c_complete;
                 done.push((i, info));
-                out.append(t);
+                if t.lease.is_some() {
+                    held.adopt(&mut t.lease)?;
+                    owned = true;
+                }
+                out.append(t.table);
                 ctx.check_output(out.len(), out.width())?;
             }
             let infos = std::mem::take(done).into_iter().map(|(_, i)| i).collect();
-            finish(out, infos, complete)
+            let lease = if owned {
+                Some(held.output_lease(super::algosvc::table_capacity(&out)?)?)
+            } else {
+                None
+            };
+            finish(Materialized { table: out, lease }, infos, complete)
         }
         Kind::Slice {
             offset,
             limit: Some(limit),
         } => {
-            let (t, info, _) = execute_limited(ctx, &n.children[0], offset.saturating_add(*limit))?;
-            // the slice's output does not grow with a larger budget
-            finish(t.slice(*offset, Some(*limit)), vec![info], true)
+            let (mut t, info, _) =
+                execute_limited(ctx, &n.children[0], offset.saturating_add(*limit))?;
+            // Slice consumes the same backing; keep its ownership through the move.
+            t.table = t.table.slice(*offset, Some(*limit));
+            if let Some(lease) = &mut t.lease {
+                lease.resize(ctx.mem_limit, super::algosvc::table_capacity(&t.table)?)?;
+            }
+            finish(t, vec![info], true)
         }
         _ => {
-            let (t, info) = execute(ctx, n)?;
+            let (t, info) = execute_owned(ctx, n)?;
             Ok((t, info, true))
         }
     }
@@ -3192,6 +3322,48 @@ pub(super) fn join_tables(
     join_noted(ctx, l, r, merge, &mut None)
 }
 
+/// Algorithm output uses the same pair-generation and materialization semantics.
+/// The final backing is admitted while the two inputs and pair array are still live.
+pub(super) fn join_algorithm_tables(ctx: &Ctx, l: &Table, r: &Table) -> Result<Materialized> {
+    use crate::algo::memory;
+    let lay = layout(l, r);
+    let pairs = join_pairs(ctx, l, r, &lay, false, &mut None)?;
+    ctx.check_output(pairs.len(), lay.vars.len() + 1)?;
+    let sorted_len = kept_order_iter(l, r, &lay, &pairs).count();
+    let col = memory::bytes::<Id>(pairs.len())?;
+    let bytes = memory::sum(&[
+        col.checked_mul(lay.vars.len() as u64)
+            .ok_or_else(|| Error::invalid("algorithm join capacity overflows"))?,
+        memory::bytes::<VarId>(lay.vars.len())?,
+        memory::bytes::<Vec<Id>>(lay.vars.len())?,
+        memory::bytes::<VarId>(sorted_len)?,
+        128,
+        if lay.vars.is_empty() { col } else { 0 },
+    ])?;
+    let mut out = Materialized {
+        table: Table::empty(Vec::new()),
+        lease: Some(ctx.output_lease(bytes)?),
+    };
+    out.table = materialize(l, r, &lay, &pairs);
+    let ctl = crate::algo::Control::with_cancellation(
+        ctx.cancel.clone(),
+        ctx.cancellation.clone(),
+        ctx.deadline,
+        u64::MAX,
+    );
+    let mut sorted = memory::allocate("algorithm-join-order", sorted_len, &ctl)?;
+    for v in kept_order_iter(l, r, &lay, &pairs) {
+        sorted.push(v);
+    }
+    out.table.sorted = sorted;
+    if super::algosvc::table_capacity(&out.table)? != bytes {
+        return Err(Error::invalid(
+            "algorithm join allocator exceeded admitted capacity",
+        ));
+    }
+    Ok(out)
+}
+
 /// The join of two tables, with a note on how the rows were matched.
 pub(super) fn join_noted(
     ctx: &Ctx,
@@ -3213,16 +3385,27 @@ pub(super) fn join_noted(
 /// first one shared with the other side where the side holds unbound values (the other
 /// side fills them).
 fn kept_order(l: &Table, r: &Table, lay: &JoinLayout, pairs: &[(u32, u32)]) -> Vec<VarId> {
+    kept_order_iter(l, r, lay, pairs).collect()
+}
+fn kept_order_iter<'a>(
+    l: &'a Table,
+    r: &'a Table,
+    lay: &'a JoinLayout,
+    pairs: &[(u32, u32)],
+) -> impl Iterator<Item = VarId> + 'a {
     let (t, left) = if pairs.windows(2).all(|w| w[0].0 <= w[1].0) {
         (l, true)
     } else if pairs.windows(2).all(|w| w[0].1 <= w[1].1) {
         (r, false)
     } else {
-        return Vec::new();
+        (l, false)
     };
-    t.sorted
+    let ordered =
+        pairs.windows(2).all(|w| w[0].0 <= w[1].0) || pairs.windows(2).all(|w| w[0].1 <= w[1].1);
+    let sorted = if ordered { &t.sorted[..] } else { &[] };
+    sorted
         .iter()
-        .take_while(|v| {
+        .take_while(move |v| {
             let Some(c) = t.col_of(**v) else {
                 return false;
             };
@@ -3233,7 +3416,6 @@ fn kept_order(l: &Table, r: &Table, lay: &JoinLayout, pairs: &[(u32, u32)]) -> V
             !shared || !has_undef(t, c)
         })
         .copied()
-        .collect()
 }
 
 fn cross(ctx: &Ctx, l: &Table, r: &Table) -> Result<Table> {

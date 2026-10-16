@@ -1,6 +1,7 @@
 //! Per-query execution context: snapshot, local vocabulary, decode cache,
 //! cancellation and dataset description.
 
+use super::query_memory::{QueryMemoryLease, QueryMemoryLedger};
 use super::table::VarId;
 use super::value::Value;
 use crate::error::{Budget, BudgetKind, Error, Result};
@@ -403,6 +404,7 @@ pub struct Ctx {
     literal_bnodes: parking_lot::Mutex<FxHashMap<String, Id>>,
     pub deadline: Option<Instant>,
     pub cancel: Arc<AtomicBool>,
+    pub cancellation: Option<crate::task::Cancellation>,
     pub dataset: DatasetSpec,
     /// the request's graph view when it does not read every graph: `dataset` is already
     /// limited to it (see [`DatasetSpec::restrict`]), and plans are redacted
@@ -418,18 +420,8 @@ pub struct Ctx {
     /// Budget for the estimated bytes of intermediate results alive at once
     /// (`u64::MAX`: unlimited). See [`Ctx::charge`] and [`Ctx::check_output`].
     pub mem_limit: u64,
-    /// estimated bytes of the tables currently held by running operators
-    mem_live: AtomicU64,
-    /// the bytes reserved from the server's query memory pool for this query, which
-    /// follows live cursor charges or this eager context's admitted peak (`None`: no pool)
+    /// Current public grant configuration; contributions retain their original grant.
     pub grant: Option<Arc<super::pool::PoolGrant>>,
-    /// This eager context's contribution to its grant, retained until context drop.
-    /// Unlike mem_peak, this counts only successfully admitted estimates.
-    eager_reserved: AtomicU64,
-    /// Serializes only increases of this context's admitted contribution.
-    eager_resize: parking_lot::Mutex<()>,
-    /// highest estimate seen (held tables plus an output under construction)
-    mem_peak: AtomicU64,
     /// Budget for the rows all operators produce together (`u64::MAX`: unlimited). See
     /// [`Ctx::produced`].
     pub max_rows_produced: u64,
@@ -450,6 +442,8 @@ pub struct Ctx {
     /// the caller's scope in the cache of remote SERVICE results (see
     /// [`QueryOptions::service_scope`](super::QueryOptions::service_scope))
     pub service_scope: Arc<str>,
+    /// the dataset's named projections (see [`crate::algo::catalog`])
+    pub algo_projections: Option<Arc<crate::algo::catalog::Catalog>>,
     /// RDFS on read (see [`super::rdfs`])
     pub rdfs: Option<Arc<super::rdfs::RdfsSchema>>,
     pub opt: Optimizations,
@@ -479,6 +473,8 @@ pub struct Ctx {
     callback_terms: parking_lot::Mutex<FxHashMap<Id, u64>>,
     // Opt-in cursor accounting stays after the ordinary execution fields.
     cursor_memory: Option<Box<CursorMemory>>,
+    // Data and weak retained caches drop before final ledger ownership.
+    memory: std::sync::OnceLock<Arc<QueryMemoryLedger>>,
 }
 
 struct CursorMemory {
@@ -491,6 +487,10 @@ struct CursorMemory {
 }
 
 impl Ctx {
+    pub(crate) fn memory(&self) -> &Arc<QueryMemoryLedger> {
+        self.memory.get_or_init(QueryMemoryLedger::new)
+    }
+
     pub fn new(snap: Arc<Snapshot>) -> Ctx {
         Ctx {
             extension_families: Vec::new(),
@@ -502,6 +502,7 @@ impl Ctx {
             callback_bnodes: Default::default(),
             callback_terms: Default::default(),
             cursor_memory: None,
+            memory: Default::default(),
             snap,
             local: RwLock::new(AppendVocab::default()),
             values: (0..VALUE_SHARDS)
@@ -513,6 +514,7 @@ impl Ctx {
             literal_bnodes: Default::default(),
             deadline: None,
             cancel: Arc::new(AtomicBool::new(false)),
+            cancellation: None,
             dataset: DatasetSpec::default(),
             graphs: None,
             now: std::sync::OnceLock::new(),
@@ -520,11 +522,7 @@ impl Ctx {
             var_names: RwLock::new(Vec::new()),
             max_rows: 200_000_000,
             mem_limit: u64::MAX,
-            mem_live: AtomicU64::new(0),
             grant: None,
-            eager_reserved: AtomicU64::new(0),
-            eager_resize: Default::default(),
-            mem_peak: AtomicU64::new(0),
             max_rows_produced: u64::MAX,
             rows_produced: Arc::new(AtomicU64::new(0)),
             allow_service: true,
@@ -533,6 +531,7 @@ impl Ctx {
             outbound_budget: crate::outbound::RequestBudget::new(&Default::default()),
             use_cache: true,
             service_scope: Arc::from(""),
+            algo_projections: None,
             rdfs: None,
             opt: Optimizations::default(),
             geo: Default::default(),
@@ -757,8 +756,11 @@ impl Ctx {
         if self.cancel.load(Ordering::Relaxed) {
             return Err(Error::Cancelled);
         }
+        if let Some(cancellation) = &self.cancellation {
+            cancellation.check()?;
+        }
         if let Some(d) = self.deadline
-            && Instant::now() > d
+            && Instant::now() >= d
         {
             return Err(Error::Timeout);
         }
@@ -766,11 +768,13 @@ impl Ctx {
     }
 
     pub(super) fn enable_cursor_accounting(&mut self) -> Result<()> {
+        self.memory().check_cursor_transition()?;
         for shard in &self.values {
             *shard.write() = FxHashMap::default();
         }
         let bytes = self.local.read().bytes() as u64;
         std::mem::forget(self.charge(bytes)?);
+        self.memory().cursor_mode()?;
         self.cursor_memory = Some(Box::new(CursorMemory {
             failure: Default::default(),
             failed: AtomicBool::new(false),
@@ -779,15 +783,6 @@ impl Ctx {
             owner: Default::default(),
             regex: Default::default(),
         }));
-        // Preparation may already have admitted an eager peak. Its live state now
-        // belongs to the cursor; transfer that ownership without charging it twice,
-        // and return the excess conservative peak that cursor execution will not pin.
-        let retained = self.eager_reserved.swap(0, Ordering::AcqRel);
-        if let Some(grant) = &self.grant {
-            let live = *self.mem_live.get_mut();
-            debug_assert!(retained >= live);
-            grant.release(retained - live);
-        }
         self.use_cache = false;
         self.opt.sampled_filters = false;
         #[cfg(feature = "geo")]
@@ -828,8 +823,8 @@ impl Ctx {
         if owner.strong_count() == 0 {
             return Err(Error::invalid("cursor context owner has not been attached"));
         }
-        charge.bytes.set(0);
-        Ok(Some(RetainedCharge { owner, bytes }))
+        let id = charge.disarm();
+        Ok(Some(RetainedCharge { owner, id, bytes }))
     }
 
     pub(super) fn cursor_regex(
@@ -847,12 +842,12 @@ impl Ctx {
     /// Give back `bytes` of estimated memory, and the pool's granules the query no
     /// longer needs.
     #[inline]
-    fn release_live(&self, bytes: u64) {
-        self.mem_live.fetch_sub(bytes, Ordering::SeqCst);
-        if self.is_cursor()
-            && let Some(g) = &self.grant
-        {
-            g.release(bytes);
+    fn release_live(&self, owner: Option<u64>, bytes: u64) {
+        if let Some(id) = owner {
+            self.memory().release(id, bytes);
+        } else {
+            debug_assert_eq!(bytes, 0);
+            self.memory().trim_zero(self.grant.as_ref());
         }
     }
 
@@ -863,15 +858,15 @@ impl Ctx {
 
     pub(super) fn memory_remaining(&self) -> u64 {
         self.mem_limit
-            .saturating_sub(self.mem_live.load(Ordering::Relaxed))
+            .saturating_sub(self.memory().live.load(Ordering::Relaxed))
     }
 
     pub(super) fn release_cursor_work(&self) {
         if let Some(memory) = &self.cursor_memory {
             memory.regex.clear();
-            let bytes = std::mem::take(&mut *memory.decode_peak.lock());
+            let _bytes = std::mem::take(&mut *memory.decode_peak.lock());
             memory.decoded_reserved.store(0, Ordering::Release);
-            self.release_live(bytes);
+            self.memory().release_decode();
         }
     }
 
@@ -917,6 +912,20 @@ impl Ctx {
         }
     }
 
+    fn retain_cursor_decode_bytes(&self, bytes: u64) -> bool {
+        let result = self
+            .memory()
+            .owner(self.grant.as_ref())
+            .and_then(|owner| self.memory().reserve(&owner, self.mem_limit, bytes, true));
+        match result {
+            Ok(()) => true,
+            Err(error) => {
+                self.fail_cursor(&error);
+                false
+            }
+        }
+    }
+
     /// Reserve a conservative high-water estimate for transient term decoding.
     /// Cursor evaluation does not retain the eager per-ID value cache.
     pub(super) fn cursor_decode(&self, bytes: usize) -> bool {
@@ -940,7 +949,7 @@ impl Ctx {
         }
         let mut peak = memory.decode_peak.lock();
         if need > *peak {
-            if !self.retain_cursor_bytes(need - *peak) {
+            if !self.retain_cursor_decode_bytes(need - *peak) {
                 return false;
             }
             *peak = need;
@@ -1010,9 +1019,15 @@ impl Ctx {
     /// a query over budget fails fast. Records the peak estimate.
     #[inline]
     pub fn check_output(&self, rows: usize, width: usize) -> Result<()> {
+        self.check_output_rows(rows)?;
+        let owner = self.memory().owner(self.grant.as_ref())?;
+        self.memory()
+            .check_output(&owner, self.mem_limit, table_bytes(rows, width))
+    }
+
+    pub(super) fn check_output_rows(&self, rows: usize) -> Result<()> {
         self.check_rows(rows)?;
         if self.max_rows_produced != u64::MAX {
-            // the output will count as produced: fail before it is built
             let total = self
                 .rows_produced
                 .load(Ordering::Relaxed)
@@ -1021,57 +1036,28 @@ impl Ctx {
                 return Err(self.produced_exceeded(total));
             }
         }
-        let need = self
-            .mem_live
-            .load(Ordering::Relaxed)
-            .saturating_add(table_bytes(rows, width));
-        self.note_peak(need);
-        if need > self.mem_limit {
-            return Err(self.memory_exceeded(need));
-        }
-        if let Some(g) = &self.grant {
-            if self.is_cursor() {
-                let need = g.used().saturating_add(table_bytes(rows, width));
-                if need > g.granted() {
-                    g.cover_transient(need)?;
-                }
-            } else {
-                self.retain_eager_estimate(need)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Admit only this eager context's increase, independently of other contexts
-    /// using its grant. Already covered estimates do not acquire the growth lock.
-    #[inline]
-    fn retain_eager_estimate(&self, need: u64) -> Result<()> {
-        let Some(grant) = &self.grant else {
-            return Ok(());
-        };
-        if need <= self.eager_reserved.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        self.retain_eager_estimate_slow(grant, need)
-    }
-
-    #[inline(never)]
-    fn retain_eager_estimate_slow(&self, grant: &super::pool::PoolGrant, need: u64) -> Result<()> {
-        let _lock = self.eager_resize.lock();
-        let held = self.eager_reserved.load(Ordering::Relaxed);
-        if need > held {
-            grant.charge(need - held)?;
-            self.eager_reserved.store(need, Ordering::Release);
-        }
         Ok(())
     }
 
     /// Hold `bytes` against the local budget until the guard drops. An eager
     /// context also retains its admitted pool peak until the context drops.
+    pub(super) fn output_lease(&self, bytes: u64) -> Result<QueryMemoryLease> {
+        let ledger = self.memory();
+        let owner = ledger.owner(self.grant.as_ref())?;
+        ledger.reserve(&owner, self.mem_limit, bytes, false)?;
+        Ok(QueryMemoryLease {
+            ledger: ledger.clone(),
+            owner,
+            bytes,
+            service: None,
+        })
+    }
+
     pub fn charge(&self, bytes: u64) -> Result<Charge<'_>> {
         let c = Charge {
             ctx: self,
             bytes: std::cell::Cell::new(0),
+            owner: std::cell::Cell::new(None),
         };
         c.add(bytes)?;
         Ok(c)
@@ -1079,7 +1065,7 @@ impl Ctx {
 
     /// The highest memory estimate of this context so far.
     pub fn mem_peak(&self) -> u64 {
-        self.mem_peak.load(Ordering::Relaxed)
+        self.memory().peak.load(Ordering::Relaxed)
     }
 
     /// How many rows of `width` columns fit in what is left of the memory budget (for
@@ -1090,15 +1076,8 @@ impl Ctx {
         }
         let left = self
             .mem_limit
-            .saturating_sub(self.mem_live.load(Ordering::Relaxed));
+            .saturating_sub(self.memory().live.load(Ordering::Relaxed));
         usize::try_from(left / table_bytes(1, width)).unwrap_or(usize::MAX)
-    }
-
-    #[inline]
-    fn note_peak(&self, bytes: u64) {
-        if bytes > self.mem_peak.load(Ordering::Relaxed) {
-            self.mem_peak.fetch_max(bytes, Ordering::Relaxed);
-        }
     }
 
     pub(super) fn memory_exceeded(&self, requested: u64) -> Error {
@@ -1279,6 +1258,50 @@ impl Ctx {
         Id::local(local.insert(key).0)
     }
 
+    /// SERVICE-created encoded terms retain the existing key-byte estimate in eager
+    /// and cursor execution. This is not an allocator/RSS bound for AppendVocab.
+    pub(super) fn intern_algorithm_key(
+        &self,
+        key: &[u8],
+        ctl: &crate::algo::Control,
+    ) -> Result<Id> {
+        let mut scratch = crate::algo::memory::Reservation::new(ctl, 0)?;
+        if let Ok(i) = self.snap.generation.vocab.find_with_checked(key, |need| {
+            scratch.grow_to(
+                crate::algo::memory::bytes::<u8>(need)?
+                    .checked_mul(2)
+                    .ok_or_else(|| self.memory_exceeded(u64::MAX))?,
+            )
+        })? {
+            return Ok(Id::vocab(i));
+        }
+        if let Some(i) = self
+            .snap
+            .generation
+            .dvocab
+            .find(key)
+            .filter(|&i| i < self.snap.dvocab_len)
+        {
+            return Ok(Id::delta(i));
+        }
+        if let Some(i) = self.local.read().find(key) {
+            return Ok(Id::local(i));
+        }
+        let estimate = u64::try_from(key.len())
+            .ok()
+            .and_then(|n| n.checked_add(96))
+            .ok_or_else(|| self.memory_exceeded(u64::MAX))?;
+        let charge = self.charge(estimate)?;
+        self.check()?;
+        let mut local = self.local.write();
+        if let Some(i) = local.find(key) {
+            return Ok(Id::local(i));
+        }
+        let id = Id::local(local.insert(key).0);
+        std::mem::forget(charge);
+        Ok(id)
+    }
+
     pub fn intern_value(&self, v: &Value) -> Id {
         match v {
             Value::Bool(b) => Id::from_bool(*b),
@@ -1359,6 +1382,49 @@ impl Ctx {
             },
             f,
         )
+    }
+
+    /// Algorithm-owned key reconstruction never populates the eager value cache.
+    pub(super) fn with_algo_key<T>(
+        &self,
+        id: Id,
+        ctl: &crate::algo::Control,
+        mut f: impl FnMut(&[u8]) -> Result<T>,
+    ) -> Result<Option<T>> {
+        use crate::algo::memory::{Reservation, bytes};
+        ctl.check()?;
+        match id.tag() {
+            Tag::Vocab => {
+                let mut scratch = Reservation::new(ctl, 0)?;
+                self.snap
+                    .generation
+                    .vocab
+                    .get_with_fallible(
+                        id.payload(),
+                        |need| {
+                            let bound = bytes::<u8>(need)?
+                                .checked_mul(2)
+                                .ok_or_else(|| Error::invalid("algorithm key scratch overflows"))?;
+                            scratch.grow_to(bound)
+                        },
+                        &mut f,
+                    )?
+                    .transpose()
+            }
+            Tag::Delta => self.snap.generation.dvocab.with(|v| {
+                if id.payload() >= self.snap.dvocab_len {
+                    return Ok(None);
+                }
+                v.get(id.payload()).map(&mut f).transpose()
+            }),
+            Tag::Local => self.with_local_key(id.payload(), &mut f).transpose(),
+            Tag::BNode => {
+                let mut key = [b'_'; 9];
+                key[1..].copy_from_slice(&id.payload().to_be_bytes());
+                f(&key).map(Some)
+            }
+            _ => Ok(None),
+        }
     }
 
     pub(super) fn with_local_key<T>(&self, id: u64, f: impl FnOnce(&[u8]) -> T) -> Option<T> {
@@ -1532,146 +1598,168 @@ pub fn table_bytes(rows: usize, width: usize) -> u64 {
 pub struct Charge<'a> {
     ctx: &'a Ctx,
     bytes: std::cell::Cell<u64>,
+    owner: std::cell::Cell<Option<u64>>,
 }
-
 impl Charge<'_> {
-    /// Hold `bytes` more; fails (holding nothing more) when that would exceed the
-    /// context's memory budget.
     pub fn add(&self, bytes: u64) -> Result<()> {
         if bytes == 0 {
             return Ok(());
         }
-        let ctx = self.ctx;
-        // Validate local ownership before publishing a global increment. Rejected
-        // requests never transiently wrap or consume another thread's allowance.
         let owned = self
             .bytes
             .get()
             .checked_add(bytes)
-            .ok_or_else(|| ctx.memory_exceeded(u64::MAX))?;
-        let prior = ctx
-            .mem_live
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |live| {
-                live.checked_add(bytes)
-                    .filter(|next| *next <= ctx.mem_limit)
-            })
-            .map_err(|live| ctx.memory_exceeded(live.saturating_add(bytes)))?;
-        let live = prior + bytes;
-        if let Some(g) = &ctx.grant {
-            let admitted = if ctx.is_cursor() {
-                g.charge(bytes)
-            } else {
-                ctx.retain_eager_estimate(live)
-            };
-            if let Err(error) = admitted {
-                ctx.mem_live.fetch_sub(bytes, Ordering::SeqCst);
-                return Err(error);
-            }
-        }
+            .ok_or_else(|| self.ctx.memory_exceeded(u64::MAX))?;
+        let ledger = self.ctx.memory();
+        let owner = match self.owner.get() {
+            Some(id) => ledger.owner_by_id(id),
+            None => ledger.owner(self.ctx.grant.as_ref())?,
+        };
+        ledger.reserve(&owner, self.ctx.mem_limit, bytes, false)?;
+        self.owner.set(Some(owner.id));
         self.bytes.set(owned);
-        ctx.note_peak(live);
+        Ok(())
+    }
+    fn disarm(&self) -> Option<u64> {
+        self.bytes.set(0);
+        self.owner.take()
+    }
+    /// Move query-only input ownership into the returned backing without a release
+    /// interval. Existing nonalgorithm kernels retain their estimate policy.
+    pub(super) fn output_lease(&self, bytes: u64) -> Result<QueryMemoryLease> {
+        if bytes > self.bytes.get() {
+            self.add(bytes - self.bytes.get())?;
+        } else {
+            self.ctx
+                .release_live(self.owner.get(), self.bytes.get() - bytes);
+            self.bytes.set(bytes);
+        }
+        let ledger = self.ctx.memory();
+        let owner = self
+            .owner
+            .get()
+            .map(|id| ledger.owner_by_id(id))
+            .map_or_else(|| ledger.owner(self.ctx.grant.as_ref()), Ok)?;
+        self.disarm();
+        Ok(QueryMemoryLease {
+            ledger: ledger.clone(),
+            owner,
+            bytes,
+            service: None,
+        })
+    }
+    pub(super) fn adopt(&self, slot: &mut Option<QueryMemoryLease>) -> Result<()> {
+        let lease = slot.as_ref().expect("admitted input");
+        if lease.service.is_some()
+            || !Arc::ptr_eq(self.ctx.memory(), &lease.ledger)
+            || self.owner.get().is_some_and(|id| id != lease.owner.id)
+        {
+            return Err(Error::invalid(
+                "algorithm input belongs to another query owner",
+            ));
+        }
+        let bytes = self
+            .bytes
+            .get()
+            .checked_add(lease.bytes)
+            .ok_or_else(|| self.ctx.memory_exceeded(u64::MAX))?;
+        self.owner.set(Some(lease.owner.id));
+        self.bytes.set(bytes);
+        slot.take().expect("admitted input").bytes = 0;
         Ok(())
     }
 }
-
-impl Drop for Ctx {
-    /// Return only this context's ownership. Eager contexts own their admitted peak;
-    /// cursor contexts own remaining live charges, including weak retained state.
-    fn drop(&mut self) {
-        if let Some(g) = &self.grant {
-            let bytes = if self.cursor_memory.is_some() {
-                *self.mem_live.get_mut()
-            } else {
-                *self.eager_reserved.get_mut()
-            };
-            g.release(bytes);
-        }
-    }
-}
-
 impl Drop for Charge<'_> {
     fn drop(&mut self) {
-        self.ctx.release_live(self.bytes.get());
+        self.ctx.release_live(self.owner.get(), self.bytes.get());
     }
 }
 
-/// An owned charge that follows a cursor buffer across pulls and threads.
-pub(super) struct OwnedCharge {
-    ctx: Arc<Ctx>,
-    bytes: u64,
-}
-
+/// Weak retained state never owns the context, grant or ledger.
 pub(super) struct RetainedCharge {
     owner: Weak<Ctx>,
+    id: Option<u64>,
     bytes: u64,
 }
-
 impl RetainedCharge {
     pub(super) fn owner(&self) -> Option<Arc<Ctx>> {
         self.owner.upgrade()
     }
-
     pub(super) fn bytes(&self) -> u64 {
         self.bytes
     }
-
     pub(super) fn resize(&mut self, bytes: u64) -> Result<()> {
         let ctx = self
             .owner
             .upgrade()
             .ok_or_else(|| Error::invalid("cursor context was released"))?;
         if bytes > self.bytes {
-            let added = ctx.charge(bytes - self.bytes)?;
-            added.bytes.set(0);
+            let ledger = ctx.memory();
+            let owner = self
+                .id
+                .map(|id| ledger.owner_by_id(id))
+                .map_or_else(|| ledger.owner(ctx.grant.as_ref()), Ok)?;
+            ledger.reserve(&owner, ctx.mem_limit, bytes - self.bytes, false)?;
+            self.id = Some(owner.id);
         } else {
-            ctx.release_live(self.bytes - bytes);
+            ctx.release_live(self.id, self.bytes - bytes);
         }
         self.bytes = bytes;
+        if bytes == 0 {
+            self.id = None;
+        }
         Ok(())
     }
 }
-
 impl Drop for RetainedCharge {
     fn drop(&mut self) {
         if let Some(ctx) = self.owner.upgrade() {
-            ctx.release_live(self.bytes);
+            ctx.release_live(self.id, self.bytes);
         }
     }
 }
 
+/// Cursor ownership can adopt an admitted algorithm lease without release/recharge.
+pub(super) struct OwnedCharge {
+    ctx: Arc<Ctx>,
+    lease: QueryMemoryLease,
+}
 impl OwnedCharge {
     pub(super) fn bytes(&self) -> u64 {
-        self.bytes
+        self.lease.bytes
     }
-
     pub(super) fn new(ctx: &Arc<Ctx>, bytes: u64) -> Result<Self> {
-        let mut owned = Self {
+        let ledger = ctx.memory();
+        let owner = ledger.owner(ctx.grant.as_ref())?;
+        ledger.reserve(&owner, ctx.mem_limit, bytes, false)?;
+        Ok(Self {
             ctx: ctx.clone(),
-            bytes: 0,
-        };
-        owned.resize(bytes)?;
-        Ok(owned)
+            lease: QueryMemoryLease {
+                ledger: ledger.clone(),
+                owner,
+                bytes,
+                service: None,
+            },
+        })
     }
-
-    pub(super) fn resize(&mut self, bytes: u64) -> Result<()> {
-        if bytes > self.bytes {
-            let charge = self.ctx.charge(bytes - self.bytes)?;
-            charge.bytes.set(0);
-        } else {
-            self.ctx.release_live(self.bytes - bytes);
+    pub(super) fn adopt(ctx: &Arc<Ctx>, slot: &mut Option<QueryMemoryLease>) -> Result<Self> {
+        let lease = slot.as_ref().expect("admitted output");
+        if !Arc::ptr_eq(ctx.memory(), &lease.ledger) {
+            return Err(Error::invalid("algorithm output belongs to another query"));
         }
-        self.bytes = bytes;
-        Ok(())
+        Ok(Self {
+            ctx: ctx.clone(),
+            lease: slot.take().expect("admitted output"),
+        })
     }
-
+    pub(super) fn resize(&mut self, bytes: u64) -> Result<()> {
+        self.lease.resize(self.ctx.mem_limit, bytes)
+    }
     pub(super) fn retain(mut self) {
-        self.bytes = 0;
+        self.lease.bytes = 0;
     }
-}
-
-impl Drop for OwnedCharge {
-    fn drop(&mut self) {
-        self.ctx.release_live(self.bytes);
+    pub(super) fn into_lease(self) -> QueryMemoryLease {
+        self.lease
     }
 }
 
@@ -1707,13 +1795,13 @@ mod charge_tests {
         context.enable_cursor_accounting().unwrap();
         let context = Arc::new(context);
         context.attach_cursor_owner();
-        let before = context.mem_live.load(Ordering::Relaxed);
+        let before = context.memory().live.load(Ordering::Relaxed);
         let mut retained = context.retained_charge(4096).unwrap().unwrap();
-        assert_eq!(context.mem_live.load(Ordering::Relaxed), before + 4096);
+        assert_eq!(context.memory().live.load(Ordering::Relaxed), before + 4096);
         retained.resize(2048).unwrap();
-        assert_eq!(context.mem_live.load(Ordering::Relaxed), before + 2048);
+        assert_eq!(context.memory().live.load(Ordering::Relaxed), before + 2048);
         drop(retained);
-        assert_eq!(context.mem_live.load(Ordering::Relaxed), before);
+        assert_eq!(context.memory().live.load(Ordering::Relaxed), before);
         let retained = context.retained_charge(4096).unwrap();
         let weak = Arc::downgrade(&context);
         drop(context);
@@ -1729,20 +1817,20 @@ mod charge_tests {
             ctx.mem_limit = limit;
             let charge = ctx.charge(80).unwrap();
             assert!(charge.add(u64::MAX).is_err());
-            assert_eq!(ctx.mem_live.load(Ordering::Relaxed), 80);
+            assert_eq!(ctx.memory().live.load(Ordering::Relaxed), 80);
             assert_eq!(charge.bytes.get(), 80);
             charge.add(20).unwrap();
             drop(charge);
-            assert_eq!(ctx.mem_live.load(Ordering::Relaxed), 0);
+            assert_eq!(ctx.memory().live.load(Ordering::Relaxed), 0);
             // A different guard can overflow the global count while its own count
             // is representable. Failure must not corrupt either guard's release.
             let first = ctx.charge(limit).unwrap();
             assert!(ctx.charge(1).is_err());
-            assert_eq!(ctx.mem_live.load(Ordering::Relaxed), limit);
+            assert_eq!(ctx.memory().live.load(Ordering::Relaxed), limit);
             drop(first);
-            assert_eq!(ctx.mem_live.load(Ordering::Relaxed), 0);
+            assert_eq!(ctx.memory().live.load(Ordering::Relaxed), 0);
             drop(ctx.charge(1).unwrap());
-            assert_eq!(ctx.mem_live.load(Ordering::Relaxed), 0);
+            assert_eq!(ctx.memory().live.load(Ordering::Relaxed), 0);
         }
     }
 
@@ -1768,9 +1856,9 @@ mod charge_tests {
                     });
                 }
             });
-            assert_eq!(ctx.mem_live.load(Ordering::Relaxed), limit - 10);
+            assert_eq!(ctx.memory().live.load(Ordering::Relaxed), limit - 10);
             drop(owner);
-            assert_eq!(ctx.mem_live.load(Ordering::Relaxed), 0);
+            assert_eq!(ctx.memory().live.load(Ordering::Relaxed), 0);
         }
     }
 
@@ -1843,7 +1931,7 @@ mod charge_tests {
             if b.kind == BudgetKind::ServerMemory));
         assert!(matches!(ctx.check_output((56 * MIB / 8) as usize, 1),
             Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory));
-        assert_eq!(ctx.mem_live.load(Ordering::SeqCst), 0);
+        assert_eq!(ctx.memory().live.load(Ordering::SeqCst), 0);
         assert_eq!(grant.used(), 24 * MIB);
         drop(ctx.charge(0).unwrap());
         ctx.check_output(0, 0).unwrap();
@@ -1905,7 +1993,7 @@ mod charge_tests {
         let id = ctx.intern_term(&term);
         assert!(ctx.local_len() > 0);
         ctx.enable_cursor_accounting().unwrap();
-        let live = ctx.mem_live.load(Ordering::SeqCst);
+        let live = ctx.memory().live.load(Ordering::SeqCst);
         assert!(live >= MIB);
         assert_eq!(grant.used(), live);
         assert!(grant.granted() <= 16 * MIB);

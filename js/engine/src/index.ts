@@ -496,6 +496,20 @@ export class Dataset extends Queryable {
   get queries() {
     return this.administration.queries;
   }
+  /**
+   * Graph algorithms: `run` returns the rows of a request such as
+   * `{ algorithm: 'pageRank', projection: { predicates: ['http://ex.org/knows'] } }`,
+   * `stats` its summary, and `runWrite` writes the results back to a graph in batched
+   * commits. `projections` holds the named projections of the dataset.
+   */
+  get algorithms() {
+    const admin = this.administration.algorithms;
+    return {
+      ...admin,
+      run: async (request: Configuration, options: QueryOptions = {}) =>
+        this.query(await admin.queryText(request, false), options),
+    };
+  }
   get branches() {
     return this.administration.branches;
   }

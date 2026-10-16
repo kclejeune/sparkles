@@ -196,6 +196,7 @@ impl Tools<'_> {
             bypass_validation: false,
             deadline: Some(deadline),
             cancel: Some(self.call.cancel.clone()),
+            cancellation: None,
             report_limit: None,
             message: message.clone(),
             author: crate::http::author(&self.call.principal),

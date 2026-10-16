@@ -183,6 +183,59 @@ impl ResultCache {
         })
     }
 
+    /// Only algorithm-owned execution uses this private clone boundary. Entries stay
+    /// plain data; the caller acquires its own capacity before copying any columns.
+    pub(super) fn get_owned(
+        &self,
+        key: &CacheKey,
+        ctx: &Ctx,
+    ) -> crate::error::Result<Option<super::table::Materialized>> {
+        use super::table::Materialized;
+        use crate::algo::memory;
+        use crate::id::Id;
+        let Some(c) = self.store.cache.as_ref() else {
+            return Ok(None);
+        };
+        let lookup = NsKeyRef {
+            ns: self.ns,
+            key: &key.key,
+        };
+        let Some(e) = c.get(&lookup) else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+            return Ok(None);
+        };
+        ctx.check_output_rows(e.len)?;
+        let data = e.cols.iter().try_fold(0u64, |n, c| {
+            memory::sum(&[n, memory::bytes::<Id>(c.len())?])
+        })?;
+        let bytes = memory::sum(&[
+            data.max(if e.cols.is_empty() {
+                memory::bytes::<Id>(e.len)?
+            } else {
+                0
+            }),
+            memory::bytes::<VarId>(e.vars.len())?,
+            memory::bytes::<VarId>(e.sorted.len())?,
+            memory::bytes::<Vec<Id>>(e.cols.len())?,
+            128,
+        ])?;
+        let mut out = Materialized {
+            table: Table::empty(Vec::new()),
+            lease: Some(ctx.output_lease(bytes)?),
+        };
+        self.hits.fetch_add(1, Ordering::Relaxed);
+        out.table.vars = e.vars.iter().map(|n| ctx.var(key.resolve(n))).collect();
+        out.table.sorted = e.sorted.iter().map(|n| ctx.var(key.resolve(n))).collect();
+        out.table.cols = (*e.cols).clone();
+        out.table.len = e.len;
+        if super::algosvc::table_capacity(&out.table)? != bytes {
+            return Err(crate::error::Error::invalid(
+                "algorithm result clone exceeded its admitted capacity",
+            ));
+        }
+        Ok(Some(out))
+    }
+
     /// Cache a result unless it holds query-local terms or is too large.
     pub fn put(&self, key: CacheKey, t: &Table, ctx: &Ctx) {
         let Some(c) = &self.store.cache else { return };
@@ -350,12 +403,19 @@ pub fn key(n: &Node, ctx: &Ctx) -> Option<CacheKey> {
     Some(CacheKey { key, anon })
 }
 
-fn raw_key(n: &Node, ctx: &Ctx) -> Option<String> {
-    let mut s = String::with_capacity(256);
+/// What the data a query reads is a function of: the generation instance and the commit
+/// (a compaction makes a new instance; a past state shares its generation's instance),
+/// the graphs of the request, and the mask of a view that hides triples.
+pub(super) fn view_key(ctx: &Ctx) -> String {
+    let mut s = String::with_capacity(64);
+    let _ = write_view_key(ctx, &mut s);
+    s
+}
+
+/// The shared encoding, also used by pre-admitted algorithm key storage.
+pub(super) fn write_view_key(ctx: &Ctx, mut s: impl std::fmt::Write) -> std::fmt::Result {
     let ds = &ctx.dataset;
-    // the data is a function of the generation instance and the commit (a compaction
-    // makes a new instance; a past state shares its generation's instance)
-    let _ = write!(
+    write!(
         s,
         "g{}|c{}|{:?}|{:?}|{}|{}|",
         ctx.snap.generation.uid,
@@ -365,11 +425,17 @@ fn raw_key(n: &Node, ctx: &Ctx) -> Option<String> {
         ds.union_default,
         // a request may override the store's union default graph
         ctx.snap.union_default_graph
-    );
+    )?;
     // a view that hides triples reads other data than the commit holds
     if let Some(m) = &ctx.snap.mask {
-        let _ = write!(s, "m{}|", m.key);
+        write!(s, "m{}|", m.key)?;
     }
+    Ok(())
+}
+
+fn raw_key(n: &Node, ctx: &Ctx) -> Option<String> {
+    let mut s = view_key(ctx);
+    s.reserve(256);
     write_node(n, ctx, &mut s).then_some(s)
 }
 
@@ -474,6 +540,11 @@ fn write_node(n: &Node, ctx: &Ctx, s: &mut String) -> bool {
         }
         // the change log grows and retention trims it: not cached
         Kind::HistoryChanges(_) => false,
+        Kind::AlgoCall(spec) => {
+            // every parameter is in the spec, ids and variables included
+            let _ = write!(s, "{spec:?}");
+            true
+        }
         Kind::PathSearch(spec) => {
             // every parameter is in the spec, ids and variables included
             let _ = write!(s, "{spec:?}");

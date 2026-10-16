@@ -10,6 +10,7 @@
 //! off unless allowed, and the default tool set cannot write.
 
 mod adapter;
+mod algo;
 pub(crate) mod branches;
 #[cfg(feature = "auth")]
 mod bridge;

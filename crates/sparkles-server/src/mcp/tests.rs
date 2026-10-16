@@ -384,6 +384,22 @@ fn expected_input_schemas() -> Vec<(&'static str, Value)> {
                 "atCommit": at, "at": sel}}),
         ),
         (
+            "graph_algorithm",
+            json!({"type":"object","additionalProperties":false,"required":["algorithm"],"properties":{
+                "dataset": ds,
+                "algorithm": {"enum":["pageRank","betweenness","wcc","scc","labelPropagation","louvain","leiden","nodeSimilarity","triangleCount","clustering","kCore","bfs","sssp","fastRP","node2vec"],"description":"The algorithm of SERVICE algo:<name>"},
+                "projection": {"type":"string","description":"The name of a stored projection. Not with predicates, direction, nodeClasses or weight"},
+                "predicates": {"type":"array","items":{"type":"string"},"maxItems":20,"description":"The predicates whose triples are edges (default: every predicate between resources but rdf:type)"},
+                "direction": {"enum":["forward","backward","undirected"],"description":"How edges are followed (default: the algorithm's own)"},
+                "nodeClasses": {"type":"array","items":{"type":"string"},"maxItems":20,"description":"Keep the nodes with one of these rdf:type classes"},
+                "weight": {"type":"string","description":"The property of an edge's RDF 1.2 reifier that holds its weight"},
+                "params": {"type":"object","description":"The algorithm's parameters, named as in algo: without the prefix, such as maxIterations, seed, topK or source (an IRI)"},
+                "limit": {"type":"integer","minimum":1,"maximum":100,"default":20,"description":"The most rows returned: the best by the algorithm's main measure"},
+                "reasoning": rs,
+                "timeoutSeconds": to,
+                "atCommit": at, "at": sel}}),
+        ),
+        (
             "list_commits",
             json!({"type":"object","additionalProperties":false,"properties":{
                 "dataset": ds,
@@ -585,6 +601,7 @@ async fn a03_tool_list() {
             "explain_query",
             "describe_resource",
             "find_paths",
+            "graph_algorithm",
             "list_commits",
             "list_changes",
             #[cfg(feature = "text")]
