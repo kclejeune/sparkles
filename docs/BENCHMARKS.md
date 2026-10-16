@@ -930,13 +930,28 @@ Group commit synchronizes both files in one fence. In the
 sixteen-writer message run, the largest deviation of a writer's share from the mean was 0.002 for
 group commit and 0.063 for the default writer.
 
-Reader p99 at 10.5M with four writers and two readers is the open measurement. The 40%
-regression above did not reproduce on these instances. With the fast device (80,000
+The reader p99 at 10.5M with four writers and two readers was measured on `forge` in the
+next section. The 40% regression above did not reproduce on these instances. With the fast device (80,000
 changes) p99 was 5.20 ms for the default writer and 4.16 ms for group commit. With the 4 ms
 synchronization it was 0.85, 0.89 and 0.73 ms for the default writer, group commit without
 the idle path and group commit with it, and in a later run 0.91 and 1.09 ms for the default
 writer and group commit, with ranges of 0.66 to 2.56 and 0.73 to 1.87 ms. These overlap, so
-the tail needs `forge` to settle.
+the tail needed `forge` to settle.
+
+### Reader tail of group commit on forge
+
+Four writers and two readers ran against the 10.5M dataset on `forge` with its NVMe device,
+six rounds per setting, on 2026-10-16. In the paced run both settings were held to 3,452
+transactions/s, the most the default writer reaches. The paced run is the X09 acceptance
+gate, and the unpaced run shows the read cost of the higher write rate that group commit
+allows.
+
+| Measure | Unpaced, default | Unpaced, group commit | Ratio | Paced, default | Paced, group commit | Ratio |
+|---|--:|--:|--:|--:|--:|--:|
+| Transactions/s | 3,452.5 | 5,995.8 | 1.737 | 3,426.7 | 3,449.7 | 1.007 |
+| Writer p50 (ms) | 1.126 | 0.634 | 0.563 | 1.119 | 0.712 | 0.636 |
+| Reader p50 (ms) | 0.482 | 0.332 | 0.689 | 0.478 | 0.496 | 1.037 |
+| Reader p99 (ms) | 4.639 | 5.039 | 1.086 | 3.980 | 3.986 | 1.002 |
 
 ### Concurrent writers with snapshot readers
 
