@@ -3538,8 +3538,9 @@ the request's `memory-mb`) and against the server memory pool when it is on. A c
 beyond the request's budget fails with `507` and `budget: "memory"`, and one the pool
 cannot cover fails with `503` and `budget: "server-memory"`. The table of hashes is
 charged by its real size, 33 bytes for each of its slots, and while it doubles the old and
-the new table are both charged. That is the memory the comparison trades for not keeping
-the rows.
+the new table are both charged. Each execution runs with the budget that the comparison
+leaves, so the engine and the comparison together stay within the request's budget. That is
+the memory the comparison trades for not keeping the rows.
 
 ### Change feed
 

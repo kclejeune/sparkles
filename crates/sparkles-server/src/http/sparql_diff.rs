@@ -201,6 +201,22 @@ impl Charge {
         Ok(())
     }
 
+    /// What the next execution may use: the request's budget less what the comparison holds,
+    /// so that the two ledgers together stay within it. It fails when nothing is left.
+    fn engine_budget(&self) -> Result<Option<u64>, sparkles::Error> {
+        let Some(limit) = self.limit else {
+            return Ok(None);
+        };
+        if self.held >= limit {
+            return Err(sparkles::Error::BudgetExceeded(sparkles::Budget {
+                kind: sparkles::BudgetKind::Memory,
+                limit,
+                requested: self.held,
+            }));
+        }
+        Ok(Some(limit - self.held))
+    }
+
     /// Account for `n` fewer bytes.
     fn release(&mut self, n: u64) {
         let n = n.min(self.held);
@@ -346,6 +362,7 @@ pub(super) async fn sparql_diff(
             let mut charge = Charge::new(&opts);
             // the earlier state: a hash for each distinct row, and how many of it there are
             opts.timeout = deadline.left()?;
+            opts.max_memory_bytes = charge.engine_budget()?;
             let (left, from_at) = run(&ds, &from, &query, &opts)?;
             let vars = left.vars.clone();
             let left_rows = left.len() as u64;
@@ -361,6 +378,7 @@ pub(super) async fn sparql_diff(
             charge.release(left_bytes);
             // the later state: a row without a partner is only there, and kept as it goes by
             opts.timeout = deadline.left()?;
+            opts.max_memory_bytes = charge.engine_budget()?;
             let (right, to_at) = run(&ds, &to, &query, &opts)?;
             let right_rows = right.len() as u64;
             let right_bytes = table_bytes(&right);
@@ -391,6 +409,7 @@ pub(super) async fn sparql_diff(
             if removed > 0 {
                 let again = At::Commit(from_at.commit.seq);
                 opts.timeout = deadline.left()?;
+                opts.max_memory_bytes = charge.engine_budget()?;
                 let (left, _) = run(&ds, &again, &query, &opts)?;
                 let again_bytes = table_bytes(&left);
                 charge.charge(again_bytes)?;
@@ -582,6 +601,33 @@ mod tests {
         };
         assert!(c.charge(11).is_err());
         assert!(c.charge(10).is_ok());
+    }
+
+    #[test]
+    fn an_execution_gets_the_budget_the_comparison_leaves() {
+        let mut c = Charge {
+            grant: None,
+            limit: Some(1_000),
+            held: 0,
+        };
+        assert_eq!(c.engine_budget().ok(), Some(Some(1_000)));
+        c.charge(400).unwrap();
+        assert_eq!(c.engine_budget().ok(), Some(Some(600)));
+        c.charge(600).unwrap();
+        // nothing left: the next execution is refused as a memory budget error
+        assert!(matches!(
+            c.engine_budget(),
+            Err(sparkles::Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory
+        ));
+        c.release(600);
+        assert_eq!(c.engine_budget().ok(), Some(Some(600)));
+        // no budget, no limit for the execution either
+        let none = Charge {
+            grant: None,
+            limit: None,
+            held: 0,
+        };
+        assert_eq!(none.engine_budget().ok(), Some(None));
     }
 
     #[test]
