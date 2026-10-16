@@ -522,15 +522,7 @@ fn finalize_error_response(resp: &mut Response, id: Option<String>, turtle: bool
     add_request_id(resp, id);
 }
 
-/// Answer `503` with `Retry-After: 5` to any request whose `{ds}` is being replaced in
-/// place (an in-place restore takes the dataset out of service for the swap), so
-/// clients see the old state, the new one, or a retryable error, never a 404.
-///
-/// A request that passes holds the dataset until its handler answers: the swap waits
-/// for such requests before it takes the dataset out of the map, so a handler never
-/// looks up a dataset that went missing after this check.
-/// The route of graph algorithm runs, whose own layers admit the run and then guard
-/// the restore (see [`algo::admit_run`]).
+/// The route of graph algorithm runs, which has its own admission and restore guard.
 const ALGO_RUN: &str = "/$/algo/{ds}/run";
 
 /// [`restoring_guard`] for every route but [`ALGO_RUN`], which has its own.
@@ -549,6 +541,13 @@ async fn global_restoring_guard(
     restoring_guard(st, req, next).await
 }
 
+/// Answer `503` with `Retry-After: 5` to any request whose `{ds}` is being replaced in
+/// place (an in-place restore takes the dataset out of service for the swap), so
+/// clients see the old state, the new one, or a retryable error, never a 404.
+///
+/// A request that passes holds the dataset until its handler answers: the swap waits
+/// for such requests before it takes the dataset out of the map, so a handler never
+/// looks up a dataset that went missing after this check.
 async fn restoring_guard(
     State(st): St,
     req: axum::extract::Request,
