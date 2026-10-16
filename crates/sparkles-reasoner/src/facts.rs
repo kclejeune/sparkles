@@ -5,10 +5,17 @@
 //! other permutations otherwise pick the bound positions as the key prefix (PSO for a
 //! predicate and a subject or a predicate alone, POS for a predicate and an object, OSP
 //! for an object alone, SPO for a subject alone). Every permutation key ends with the
-//! graph column, so a scan keeps the rows of the input graphs and drops the repeats of a
-//! triple held in two of them, which are adjacent. The rows come out in the order an
-//! in-memory copy of one graph would list them (`(s, p, o)` order filtered by the bound
-//! positions), so evaluation over this tier visits facts in the same order.
+//! graph column, so the rows of one triple in several input graphs are adjacent.
+//!
+//! Facts come out in the order an in-memory copy of the input graphs would list them:
+//! graph by graph, in the order the run resolved them, each graph's facts in `(s, p, o)`
+//! order filtered by the bound positions, and a triple held in several input graphs at
+//! its first graph only. With one input graph a scan reads its rows once. With several,
+//! a scan makes one pass per input graph over the key range and emits, in pass `i`, the
+//! triples whose first input graph is graph `i`. Rule evaluation and the list builtins
+//! therefore see facts in the same order as when the input was copied into memory. The
+//! passes cost one read of the range per input graph, a tradeoff of scan time for not
+//! holding the input in memory.
 //!
 //! Rule evaluation looks facts up once per candidate of the step before, so lookups go
 //! through a [`Memo`] of the blocks the caller read last: a lookup in one of them is a
@@ -36,12 +43,15 @@ pub(crate) struct ProbeFilter {
     po: FxHashMap<(u64, u64), bool>,
 }
 
-/// A contiguous key range of one permutation, a share of a scan.
+/// A contiguous key range of one permutation, a share of a scan, in the pass of one
+/// input graph.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct BaseRange {
     perm: Perm,
     lo: Key,
     hi: Key,
+    /// the position of the input graph whose triples the share emits
+    pass: usize,
 }
 
 /// The blocks a reader used last.
@@ -80,8 +90,10 @@ impl Memo {
 
 pub(crate) struct Base {
     pub snap: Arc<Snapshot>,
-    /// the input graph ids, sorted
+    /// the input graph ids, in the order the run resolved them, without repeats
     graphs: Vec<u64>,
+    /// the input graph ids, sorted, with their positions in `graphs`
+    sorted: Vec<(u64, usize)>,
     /// an upper bound of the number of facts (the sum over the input graphs)
     len: u32,
     /// per predicate: quads in the store (an upper bound of the tier's)
@@ -121,9 +133,15 @@ fn touched(snap: &Snapshot, perm: Perm, lo: &Key, hi: &Key) -> bool {
 impl Base {
     /// The base tier of `graphs` in `snap`.
     pub fn new(snap: Arc<Snapshot>, graphs: &[Id]) -> anyhow::Result<Base> {
-        let mut ids: Vec<u64> = graphs.iter().map(|g| g.0).collect();
-        ids.sort_unstable();
-        ids.dedup();
+        // the first occurrence of each graph keeps its place
+        let mut ids: Vec<u64> = Vec::with_capacity(graphs.len());
+        for g in graphs {
+            if !ids.contains(&g.0) {
+                ids.push(g.0);
+            }
+        }
+        let mut sorted: Vec<(u64, usize)> = ids.iter().enumerate().map(|(i, &g)| (g, i)).collect();
+        sorted.sort_unstable();
         let mut n = 0u64;
         for g in &ids {
             n += snap.count(Perm::Gspo, &[*g])?;
@@ -134,6 +152,7 @@ impl Base {
         Ok(Base {
             snap,
             graphs: ids,
+            sorted,
             len: n as u32,
             counts: RwLock::new(FxHashMap::default()),
             scans: AtomicU64::new(0),
@@ -146,7 +165,7 @@ impl Base {
         self.len
     }
 
-    /// The input graphs.
+    /// The input graphs, in the order the run resolved them.
     pub fn graph_ids(&self) -> Vec<Id> {
         self.graphs.iter().map(|&g| Id(g)).collect()
     }
@@ -170,6 +189,21 @@ impl Base {
         }
     }
 
+    /// The position of input graph `g` in the run's order.
+    #[inline]
+    fn order_of(&self, g: u64) -> Option<usize> {
+        self.sorted
+            .binary_search_by_key(&g, |x| x.0)
+            .ok()
+            .map(|i| self.sorted[i].1)
+    }
+
+    /// The passes of an ordered scan: one per input graph.
+    #[inline]
+    fn passes(&self) -> usize {
+        self.graphs.len().max(1)
+    }
+
     /// The permutation and the key range of a pattern.
     fn access(&self, s: Option<u64>, p: Option<u64>, o: Option<u64>) -> (Perm, Key, Key) {
         let (perm, prefix, n): (Perm, [u64; 4], usize) = match (self.single(), s, p, o) {
@@ -188,8 +222,8 @@ impl Base {
         (perm, pad(&prefix[..n], 0), pad(&prefix[..n], u64::MAX))
     }
 
-    /// Visit the facts matching a pattern, in order. `f` returns false to stop; the
-    /// result is false when it did.
+    /// Visit the facts matching a pattern, in the order of the module documentation.
+    /// `f` returns false to stop; the result is false when it did.
     pub fn for_each(
         &self,
         s: Option<u64>,
@@ -210,7 +244,26 @@ impl Base {
         f: impl FnMut(Triple) -> bool,
     ) -> anyhow::Result<bool> {
         let (perm, lo, hi) = self.access(s, p, o);
-        self.scan(memo, perm, lo, hi, [s, p, o], f)
+        let mut f = f;
+        for pass in 0..self.passes() {
+            if !self.scan(memo, perm, lo, hi, [s, p, o], Some(pass), &mut f)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Whether a fact matches the pattern: one pass, whatever the number of input
+    /// graphs.
+    pub fn any(
+        &self,
+        memo: &mut Memo,
+        s: Option<u64>,
+        p: Option<u64>,
+        o: Option<u64>,
+    ) -> anyhow::Result<bool> {
+        let (perm, lo, hi) = self.access(s, p, o);
+        Ok(!self.scan(memo, perm, lo, hi, [s, p, o], None, |_| false)?)
     }
 
     /// [`for_each`](Self::for_each) over one share of a pattern's scan.
@@ -223,9 +276,13 @@ impl Base {
         o: Option<u64>,
         f: impl FnMut(Triple) -> bool,
     ) -> anyhow::Result<bool> {
-        self.scan(memo, r.perm, r.lo, r.hi, [s, p, o], f)
+        self.scan(memo, r.perm, r.lo, r.hi, [s, p, o], Some(r.pass), f)
     }
 
+    /// Scan `[lo, hi]` of `perm`. With several input graphs, pass `Some(i)` emits the
+    /// triples whose first input graph is the one at position `i`, and `None` emits each
+    /// triple once, in key order.
+    #[allow(clippy::too_many_arguments)]
     fn scan(
         &self,
         memo: &mut Memo,
@@ -233,6 +290,7 @@ impl Base {
         lo: Key,
         hi: Key,
         bound: [Option<u64>; 3],
+        pass: Option<usize>,
         mut f: impl FnMut(Triple) -> bool,
     ) -> anyhow::Result<bool> {
         memo.scans += 1;
@@ -241,15 +299,23 @@ impl Base {
         // a graph column outside the key prefix needs a check
         let check_graph = !(perm == Perm::Gspo && single.is_some());
         let multi = single.is_none();
-        let graphs = &self.graphs[..];
-        let mut prev: Option<Triple> = None;
+        // the triple of the rows read last, and the first input graph position among
+        // them: its rows are adjacent, so it is emitted once they end
+        let mut cur: Option<(Triple, usize)> = None;
         let mut completed = true;
-        let mut row = |k: [u64; 4]| -> bool {
+        let mut row = |k: [u64; 4], f: &mut dyn FnMut(Triple) -> bool| -> bool {
+            let mut order = 0;
             if check_graph {
                 let g = k[at[3]];
                 let ok = match single {
                     Some(x) => g == x,
-                    None => graphs.binary_search(&g).is_ok(),
+                    None => match self.order_of(g) {
+                        Some(i) => {
+                            order = i;
+                            true
+                        }
+                        None => false,
+                    },
                 };
                 if !ok {
                     return true;
@@ -261,18 +327,32 @@ impl Base {
                     return true;
                 }
             }
-            if multi {
-                if prev == Some(t) {
+            if !multi {
+                if f(t) {
                     return true;
                 }
-                prev = Some(t);
-            }
-            if f(t) {
-                true
-            } else {
                 completed = false;
-                false
+                return false;
             }
+            match &mut cur {
+                Some((x, first)) if *x == t => {
+                    *first = (*first).min(order);
+                    true
+                }
+                _ => match cur.replace((t, order)) {
+                    Some((x, first)) if pass.is_none_or(|p| p == first) && !f(x) => {
+                        completed = false;
+                        cur = None;
+                        false
+                    }
+                    _ => true,
+                },
+            }
+        };
+        // the last triple of a multi-graph scan that ran to the end
+        let last = |cur: Option<(Triple, usize)>, f: &mut dyn FnMut(Triple) -> bool| match cur {
+            Some((x, first)) if pass.is_none_or(|p| p == first) => f(x),
+            _ => true,
         };
         let snap = &*self.snap;
         if touched(snap, perm, &lo, &hi) {
@@ -280,34 +360,37 @@ impl Base {
                 Ok(match c {
                     Chunk::Block(b, s, e) => {
                         let cols = &b.cols;
-                        (s..e).all(|i| row([cols[0][i], cols[1][i], cols[2][i], cols[3][i]]))
+                        (s..e)
+                            .all(|i| row([cols[0][i], cols[1][i], cols[2][i], cols[3][i]], &mut f))
                     }
-                    Chunk::Row(k) => row(k),
+                    Chunk::Row(k) => row(k, &mut f),
                 })
             })?;
-            return Ok(completed);
-        }
-        let idx = snap.perm(perm);
-        let (b0, b1) = idx.key_block_range(&lo, &hi);
-        for b in b0..b1 {
-            let m = &idx.blocks[b];
-            let whole = m.first >= lo && m.last <= hi;
-            let blk = memo.block(snap, idx, b)?;
-            let (s, e) = if whole {
-                (0, blk.len())
-            } else {
-                blk.key_range(&lo, &hi)
-            };
-            let cols = &blk.cols;
-            if !(s..e).all(|i| row([cols[0][i], cols[1][i], cols[2][i], cols[3][i]])) {
-                break;
+        } else {
+            let idx = snap.perm(perm);
+            let (b0, b1) = idx.key_block_range(&lo, &hi);
+            for b in b0..b1 {
+                let m = &idx.blocks[b];
+                let whole = m.first >= lo && m.last <= hi;
+                let blk = memo.block(snap, idx, b)?;
+                let (s, e) = if whole {
+                    (0, blk.len())
+                } else {
+                    blk.key_range(&lo, &hi)
+                };
+                let cols = &blk.cols;
+                if !(s..e).all(|i| row([cols[0][i], cols[1][i], cols[2][i], cols[3][i]], &mut f)) {
+                    break;
+                }
             }
         }
-        Ok(completed)
+        Ok(completed && last(cur, &mut f))
     }
 
-    /// The pattern's scan cut into contiguous shares of about `rows` rows each, in
-    /// order.
+    /// The pattern's scan cut into contiguous shares of about `rows` rows each, in the
+    /// order of [`for_each`](Self::for_each): the shares of the first input graph's pass,
+    /// then those of the next. No cut separates the rows of one triple, so a share sees
+    /// every input graph that holds its triples.
     pub fn ranges(
         &self,
         s: Option<u64>,
@@ -323,10 +406,19 @@ impl Base {
         // the blocks when there are few
         let within = b1 - b0 < 64;
         let mut cuts: Vec<Key> = Vec::new();
+        // with several input graphs, the first key of the triple of `k`: the graph
+        // column, which is last, at its least
+        let multi = self.single().is_none();
+        let triple_start = |mut k: Key| {
+            if multi {
+                k[3] = 0;
+            }
+            k
+        };
         for b in b0..b1 {
             let m = &idx.blocks[b];
             if b > b0 && m.first > lo {
-                cuts.push(m.first);
+                cuts.push(triple_start(m.first));
             }
             if within && m.rows as usize > rows {
                 let blk = self.snap.cache.get_cols(idx, b, ALL_COLS)?;
@@ -337,7 +429,7 @@ impl Base {
                 };
                 let mut i = s0 + rows;
                 while i < e0 {
-                    let k = blk.key(i);
+                    let k = triple_start(blk.key(i));
                     if k > lo {
                         cuts.push(k);
                     }
@@ -347,20 +439,23 @@ impl Base {
         }
         cuts.sort_unstable();
         cuts.dedup();
-        let mut out = Vec::with_capacity(cuts.len() + 1);
+        let mut keys = Vec::with_capacity(cuts.len() + 1);
         let mut from = lo;
         for c in cuts {
             if c <= from || c > hi {
                 continue;
             }
-            out.push(BaseRange {
-                perm,
-                lo: from,
-                hi: pred(c),
-            });
+            keys.push((from, pred(c)));
             from = c;
         }
-        out.push(BaseRange { perm, lo: from, hi });
+        keys.push((from, hi));
+        let mut out = Vec::with_capacity(keys.len() * self.passes());
+        for pass in 0..self.passes() {
+            out.extend(
+                keys.iter()
+                    .map(|&(lo, hi)| BaseRange { perm, lo, hi, pass }),
+            );
+        }
         Ok(out)
     }
 

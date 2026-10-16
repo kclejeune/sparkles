@@ -811,7 +811,7 @@ impl Graph {
     ) -> bool {
         if let Some(b) = &self.base
             && self.reads_base(0, hi)
-            && !b.for_each_with(memo, s, p, o, |_| false).unwrap_or(true)
+            && b.any(memo, s, p, o).unwrap_or(false)
         {
             return true;
         }
