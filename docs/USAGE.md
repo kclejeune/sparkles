@@ -2175,6 +2175,12 @@ no deadline unless the request has a `timeout` or the server runs with
 `--update-timeout`. Without a deadline, a run that waits for `--algo-threads` waits until
 a thread is free or the run is cancelled. Thread admission has no queue order, so a run
 that asks for several threads can wait while one-thread calls keep taking the free slots.
+On a server with a query memory pool, the task holds its initial grant of the pool while
+it waits for threads, because it takes the grant when it starts. A dataset has at most
+one write-back task at a time, so the grants held this way add up to one initial grant
+for each dataset. The wait has no deadline, so those grants stay held until the threads
+are free or the task is cancelled, and queries can answer `503` meanwhile if the pool is
+otherwise full.
 The run keeps the algorithm's result as term identifiers and decodes the terms of one
 batch at a time, so the decoded terms of a large result never sit in memory together.
 The identifiers of the whole result stay in memory until the run ends, up to
@@ -2210,6 +2216,15 @@ keeps built projections in memory (`--algo-cache-mb`), so a second call on uncha
 data skips the build. `--algo-threads` and `--algo-max-threads-per-call` bound the CPU
 that algorithms take, and a call that is over its memory budget fails with a message that
 names the parameter that would make it fit.
+
+An algorithm checks cancellation and the deadline after every 64K units of work in its
+loops over nodes, edges and heap entries. A sort runs as one step that cannot be
+interrupted. Triangle counting sorts all node indexes by degree, which takes time
+proportional to `n log n` for `n` nodes. Triangle counting, clustering, community
+detection and label propagation also sort one row, the neighbouring communities of one
+community or the labels around one node, and the degree of that row or community bounds
+each of those sorts. Building a projection sorts all of its edge keys. A cancel or
+deadline that arrives inside a sort takes effect when the sort ends.
 
 The Rust library, Python and Node.js reach the same runs and projections through the
 dataset's `algorithms` handle. A request is the JSON of the HTTP route as a dict or an

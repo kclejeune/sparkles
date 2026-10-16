@@ -346,13 +346,30 @@ queue order. A call that asks for four slots waits until four are free at once, 
 one-thread calls that arrive meanwhile can keep taking single free slots, so the wide
 call can wait until its timeout. A write-back run has no deadline unless the request or
 `--update-timeout` gives one, so it waits for its slots until they are free or the task
-is cancelled.
+is cancelled. On a server with a query memory pool, a write-back task holds its initial
+grant of the pool while it waits, because it takes the grant when it starts and asks for
+its slots only when it computes. The held memory is bounded, since a dataset has at most
+one write-back task at a time, so the grants held by waiting tasks add up to one initial
+grant for each dataset. The wait has no deadline, so those grants stay held for as long
+as the slots stay taken, and queries can answer `503` meanwhile with no work running. A
+read run has its grant before it asks for slots, and the calls that hold slots are
+computing, so the wait cannot form a cycle with the pool.
 
 Each call checks the query's timeout and cancel flag between iterations, and every
-long loop inside one counts its work and checks after 64K units. A unit is a node, an
-edge of a row, a heap entry or one step of an intersection. A row is counted before it
-is read, so a node of high degree is checked before the next row starts, and a loop
-over one row's edges is not interrupted. Node2vec also checks at entry, before returning
+long loop over nodes, rows, heap entries or intersection steps inside one counts its
+work and checks after 64K units. A unit is a node, an edge of a row, a heap entry or one
+step of an intersection. A row is counted before it is read, so a node of high degree is
+checked before the next row starts, and a loop over one row's edges is not interrupted.
+The sorts that sit between two checks run as one step that cannot be interrupted. They
+are the sort of all node indexes by degree in triangle counting, which takes time
+proportional to `n log n` for `n` nodes, the sort of one row in triangle counting,
+clustering and the merging of weighted rows, which is bounded by that row's stored edges,
+the sort of the neighbouring communities of one community in Louvain and Leiden, and the
+sort of the labels around one node in label propagation. The last two are bounded by the
+degree of the community or node. Building a projection also sorts all of its edge keys,
+bounded by the number of stored edges. A cancel or deadline that arrives inside a sort
+takes effect when the sort ends, so the wait grows with the size of the sort and has not
+been measured. Node2vec also checks at entry, before returning
 and at most every 64K operations across its own initialization, shuffle, walk, neighbor
 and training loops. Binary searches count as one operation and take at most the machine
 word's bit width in comparisons. PageRank counts the rows of each block in its four

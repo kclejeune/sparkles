@@ -1,4 +1,4 @@
-//! Every long loop of every algorithm polls the cancel flag and the deadline (spec F14
+//! Every long loop over nodes, rows or heap entries of every algorithm polls the cancel flag and the deadline (spec F14
 //! §5). Each test cancels the call from inside one loop, on a graph where that loop
 //! alone holds more than [`CHECK_EVERY`] operations, and expects the call to stop
 //! before the loop ends, within one polling interval.

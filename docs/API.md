@@ -5523,12 +5523,17 @@ compute an unpersonalized ranking. Omitting the source still runs ordinary PageR
   including the heap of single-source shortest paths, search stacks and per-thread
   scratch, and grows them only after charging the new capacity. These Vec-capacity
   bounds exclude allocator and Rayon bookkeeping and small summary metadata.
-* **Cancellation.** Every long loop of an algorithm counts its work, a node, an edge of
-  a row or a heap entry at a time, and checks cancellation and the deadline after
-  64K units. A row is counted before it is read, so a node of high degree is checked
-  before the next row starts. PageRank counts the rows of each block in its four
-  iteration passes. These are work bounds, and they do not preempt one row's edges or
-  guarantee a wall-clock bound.
+* **Cancellation.** Every long loop of an algorithm over nodes, rows or heap entries
+  counts its work, a node, an edge of a row or a heap entry at a time, and checks
+  cancellation and the deadline after 64K units. A row is counted before it is read, so
+  a node of high degree is checked before the next row starts. PageRank counts the rows
+  of each block in its four iteration passes. These are work bounds, and they do not
+  preempt one row's edges or guarantee a wall-clock bound. A sort runs as one step that
+  cannot be interrupted. Triangle counting sorts all node indexes by degree, which takes
+  time proportional to `n log n`, and a few algorithms sort one row, the neighbouring
+  communities of one community or the labels around one node, which the degree of that
+  row bounds. Building a projection sorts all of its edge keys. A cancel that arrives in
+  a sort takes effect when the sort ends.
 * **Threads and cache.** `--algo-threads` and `--algo-max-threads-per-call` limit the
   threads of all calls and of each call. A one-thread call runs on the caller and
   holds one slot in that shared budget. Calls waiting for slots check cancellation and
