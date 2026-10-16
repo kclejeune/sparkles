@@ -275,6 +275,9 @@ pub(crate) struct Model {
     pub(crate) reads: Option<Vec<String>>,
     /// what a write can affect
     plan: incremental::Plan,
+    /// the SHA-256 of the schema copy's text, which identifies the schema the typing
+    /// file belongs to
+    pub(crate) digest: String,
 }
 
 impl Model {
@@ -282,6 +285,7 @@ impl Model {
         Model {
             reads: read_predicates(loaded.compiled.ir(), &map),
             plan: incremental::Plan::new(loaded.compiled.ir(), &map),
+            digest: sha256_hex(loaded.text.as_bytes()),
             schema: Arc::new(loaded.compiled),
             map,
             shape_count: loaded.shape_count,
@@ -1563,7 +1567,7 @@ pub fn set_config(
     cfg.check()?;
     let view = Arc::new(txn.view());
     let in_graphs = cfg.schema.graphs.is_some();
-    let mut loaded = match cfg.schema.inline.take() {
+    let loaded = match cfg.schema.inline.take() {
         _ if in_graphs => load_graphs(&cfg, &view)?,
         Some(text) => {
             cfg.schema.sha256 = Some(sha256_hex(text.as_bytes()));
@@ -1595,7 +1599,8 @@ pub fn set_config(
         }
     }
     let file = loaded.file;
-    let text = std::mem::take(&mut loaded.text);
+    // the model keeps the text's digest, so the text stays in `loaded` until then
+    let text = loaded.text.clone();
     let mut guard = ShexGuard::new(cfg, loaded, map, None);
     if root.is_none() && !in_graphs {
         guard.copy = Some(text.clone());

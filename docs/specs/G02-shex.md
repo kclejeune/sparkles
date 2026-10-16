@@ -1907,8 +1907,12 @@ compaction. It differs from the design above in where and when it writes.
   the new generation's ids in memory, by vocabulary key, and drops the typing if it
   cannot. This avoids a file round trip, and a failed compaction loses nothing.
 * The header names the dataset, the head commit with its time and quad count, the SHA-256
-  of `validation.json` and a fingerprint of the compiled schema's pair kinds, and a
-  SHA-256 of the whole file ends it. Nodes are stored as the store's vocabulary key, or
+  of `validation.json` and a fingerprint of the compiled schema's pair kinds. The
+  fingerprint also covers the SHA-256 of the schema copy, so an edited copy never takes
+  the typing of the schema it replaced. A SHA-256 of the whole file ends it. That digest
+  detects damage and not tampering. The file is trusted like the rest of the database
+  directory, because anyone who can write it can also write `validation.json` or the
+  schema copy. Nodes are stored as the store's vocabulary key, or
   as the raw id for inline values and blank nodes, whose ids come from their labels. A
   term the store no longer has is dropped with its pairs, which a changed store can
   only make smaller. At install the guard reads the file when every field matches the
@@ -1927,8 +1931,14 @@ compaction. It differs from the design above in where and when it writes.
   changed file, a file of an older commit and a replaced configuration.
 * A process that exits without dropping the store, or one that is killed, leaves no file
   or an old one that is never trusted, and the first write validates in full as before.
-* The file has a magic number and a format number of its own, and it is not yet listed in
-  the file-format registry that [X12](X12-release-engineering.md) adds.
+* The file has a magic number and a format number of its own, and it is registered in the
+  file-format registry that [X12](X12-release-engineering.md) adds as the derived kind
+  `validation-typing`. A file of a version this build does not read is discarded and the
+  typing is rebuilt by a full validation, which is logged.
+* *Limitation.* The schema copy's own digest in `validation-status.json` is not checked
+  when the guard loads, which is older than this work. The typing file no longer relies on
+  it, since it carries a digest of the copy it was written for. The gap is recorded under
+  the follow-ups of [C10](C10-write-time-validation.md).
 
 **Guards, schema sources and CLI controls** (item 54, Tier 5,
 [ROADMAP](../ROADMAP.md)).

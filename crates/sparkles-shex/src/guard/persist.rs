@@ -11,8 +11,11 @@
 //! The file is trusted only for the head it was written for. Its header names the dataset,
 //! the head commit (sequence number, time and quad count), the configuration the guard
 //! runs with (the SHA-256 of `validation.json`, which also names the schema copy's
-//! hash) and a fingerprint of the compiled schema's pair kinds, and a SHA-256 of the whole
-//! file ends it. Anything that does not match leaves the typing unknown, and the first
+//! hash) and a fingerprint of the compiled schema's pair kinds that also covers the
+//! SHA-256 of the schema copy, so an edited copy never takes the typing of the schema it
+//! replaced. A SHA-256 of the whole file ends it. That digest detects damage and not
+//! tampering. The file is trusted like the rest of the database directory, because anyone
+//! who can write it can also write `validation.json` and turn the guard off. Anything that does not match leaves the typing unknown, and the first
 //! write validates in full as before. The first commit after an open removes the file,
 //! so a head that moved on can never be mistaken for the one in the file: it is written
 //! again on a clean close, and only then. A crash leaves no file or a stale one that is
@@ -30,6 +33,7 @@ use crate::typing::Verdict;
 use rustc_hash::FxHashMap;
 use sha2::{Digest, Sha256};
 use sparkles_core::commit::CommitInfo;
+use sparkles_core::formats::VALIDATION_TYPING;
 use sparkles_core::guard::config::TYPING_FILE;
 use sparkles_core::id::{Id, Tag};
 use sparkles_core::store::Snapshot;
@@ -38,9 +42,10 @@ use std::path::Path;
 
 const MAGIC: &[u8; 8] = b"SPXTYP01";
 
-/// Version of the layout. A change to it, or to the numbering of pair kinds, goes with a
-/// new number (the crate version is part of the fingerprint as well).
-const TYPING_FORMAT: u32 = 1;
+/// Version of the layout, registered as [`VALIDATION_TYPING`]. A change to it, or to the
+/// numbering of pair kinds, goes with a new number (the crate version is part of the
+/// fingerprint as well).
+const TYPING_FORMAT: u32 = VALIDATION_TYPING.writes;
 
 /// Node ids written as they are: inline values and blank nodes.
 const NODE_RAW: u8 = 0;
@@ -57,9 +62,10 @@ pub(super) struct Header<'a> {
     pub fingerprint: [u8; 32],
 }
 
-/// A digest of what the numbers of pair kinds mean: two compilers that number them
-/// differently give different fingerprints.
-pub(super) fn fingerprint(ir: &Ir) -> [u8; 32] {
+/// A digest of what the numbers of pair kinds mean, and of the schema they come from: two
+/// compilers that number them differently, and two schemas that differ in any constraint,
+/// give different fingerprints. `schema_digest` is the SHA-256 of the schema copy.
+pub(super) fn fingerprint(ir: &Ir, schema_digest: &str) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(env!("CARGO_PKG_VERSION").as_bytes());
     h.update(TYPING_FORMAT.to_le_bytes());
@@ -76,6 +82,7 @@ pub(super) fn fingerprint(ir: &Ir) -> [u8; 32] {
         }
         h.update([0xff]);
     }
+    h.update(schema_digest.as_bytes());
     h.finalize().into()
 }
 
@@ -246,13 +253,26 @@ pub(super) fn read(
 }
 
 fn parse(bytes: &[u8], snap: &Snapshot, head: &Header<'_>, pairs: usize) -> Option<HeadTyping> {
+    // the version comes first: a layout this build does not know cannot be checked by its
+    // trailing digest, and is a rebuild and not damage
+    if bytes.get(..8)? != MAGIC {
+        return None;
+    }
+    let version = u32::from_le_bytes(bytes.get(8..12)?.try_into().ok()?);
+    if !VALIDATION_TYPING.reads(version) {
+        tracing::info!(
+            "{TYPING_FILE} has version {version}; this build reads version {}, so the typing is rebuilt by a full validation",
+            VALIDATION_TYPING.readable()
+        );
+        return None;
+    }
     let body = bytes.len().checked_sub(32)?;
     let (data, digest) = bytes.split_at(body);
     if Sha256::digest(data).as_slice() != digest {
         return None;
     }
     let mut c = Cursor { b: data, at: 0 };
-    if c.take(8)? != MAGIC || c.u32()? != TYPING_FORMAT || c.take(16)? != head.dataset {
+    if c.take(8)? != MAGIC || c.u32()? != version || c.take(16)? != head.dataset {
         return None;
     }
     if c.u64()? != head.commit || c.u64()? as i64 != head.timestamp_ms || c.u64()? != head.quads {
@@ -350,7 +370,10 @@ impl ShexGuard {
             timestamp_ms: head.timestamp_ms,
             quads: head.quads,
             config_hash: hash,
-            fingerprint: fingerprint(self.model().schema.ir()),
+            fingerprint: {
+                let model = self.model();
+                fingerprint(model.schema.ir(), &model.digest)
+            },
         }
     }
 

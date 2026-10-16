@@ -266,6 +266,7 @@ locking whose semantics differ from `flock`.
 | Full-text index | Tantivy directory and `text.json` | `FORMAT` 2 (`text.rs`); another format is rebuilt on open | derived |
 | Vector index | `vector.json`, index files | config `FORMAT_VERSION` 1, file `SPKVEC` `FILE_VERSION` 1 | derived |
 | Spatial index | `geo.json`, index files | config `FORMAT_VERSION` 1, `LITERALS_VERSION` 2, file `SPKGEO` `FILE_VERSION` 1 | derived |
+| ShEx guard typing | `validation-typing.bin` | magic `SPXTYP01` and a u32 format 1; another version is discarded and rebuilt | derived |
 | Checked migration state | `.migrate-checked` at the root or checked copy | JSON format 1 records the cleanup mode and the exact old sibling directory. Unknown versions and ambiguous bare legacy markers are refused. | config |
 | Settings and state | `describe.json`, `compaction.json`, `queries.json`, `validation.json`, `models.json`, `assistant.json` and others | `FORMAT` fields on some (stored queries 1, GraphQL 1, ShEx guard 2), none on most | config |
 | Backup repository | layout, blobs, manifests, key slots | layout `FORMAT` 1, blob `FORMAT` 1, slot `SLOT_FORMAT` 2, manifest `indexFormat` | archive |

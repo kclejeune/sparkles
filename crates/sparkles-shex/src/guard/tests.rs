@@ -1431,3 +1431,74 @@ fn unusable_schema_graphs_are_refused() {
         .unwrap();
     assert!(format!("{e:#}").contains("shapeMap"), "{e:#}");
 }
+
+/// An edit of the schema copy that keeps the pair numbering (a datatype
+/// changes) must not let the typing of the old schema be restored.
+#[test]
+fn typing_of_another_schema_is_not_restored() {
+    use sparkles_core::guard::config::SHEX_SCHEMA_SHEXC_FILE;
+    let n = 20;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let s = open(&root);
+    s.load(&[Source::from_bytes(
+        ring(n).into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    let (g, _) = installed(set_config(&s, Some(cfg("reject", SCHEMA, MAP)), &NoImports).unwrap());
+    upd(&s, "INSERT DATA { ex:p0 foaf:knows ex:p7 }").unwrap();
+    drop(g);
+    drop(s);
+    assert!(exists(&root, TYPING_FILE));
+    // the copy now asks for boolean names: no person conforms any more
+    let copy = root.join(SHEX_SCHEMA_SHEXC_FILE);
+    let text = std::fs::read_to_string(&copy).unwrap();
+    assert!(text.contains("xsd:string"), "{text}");
+    std::fs::write(&copy, text.replace("xsd:string", "xsd:boolean")).unwrap();
+    let s = open(&root);
+    let g = install(&s).unwrap().unwrap();
+    assert_eq!(
+        typing_commit(&g),
+        None,
+        "the typing of the old schema was restored for the new one"
+    );
+    // the first write validates in full against the new schema
+    let r = upd(
+        &s,
+        "INSERT DATA { ex:new a ex:Person ; foaf:name true ; foaf:knows ex:p3 }",
+    );
+    assert!(matches!(r, Err(sparkles_core::Error::Rejected(_))), "{r:?}");
+}
+
+/// A typing file of a version this build does not read is discarded, and the typing is
+/// rebuilt, even when the file is intact.
+#[test]
+fn typing_of_another_version_is_discarded() {
+    use sha2::{Digest, Sha256};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let s = open(&root);
+    s.load(&[Source::from_bytes(
+        ring(20).into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    let (g, _) = installed(set_config(&s, Some(cfg("reject", SCHEMA, MAP)), &NoImports).unwrap());
+    upd(&s, "INSERT DATA { ex:p0 foaf:knows ex:p7 }").unwrap();
+    drop(g);
+    drop(s);
+    let path = root.join(TYPING_FILE);
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes.truncate(bytes.len() - 32);
+    bytes[8..12].copy_from_slice(&2u32.to_le_bytes());
+    let digest = Sha256::digest(&bytes);
+    bytes.extend_from_slice(&digest);
+    std::fs::write(&path, &bytes).unwrap();
+    let s = open(&root);
+    let g = install(&s).unwrap().unwrap();
+    assert_eq!(typing_commit(&g), None);
+    assert!(!exists(&root, TYPING_FILE));
+}

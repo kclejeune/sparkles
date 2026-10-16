@@ -1294,6 +1294,16 @@ browser and real-server browser tests cover source retention, configuration conf
 memory datasets and rejected writes that leave the data unchanged. Rust regressions
 cover editable memory sources, ShExJ prefix preservation and SHACLC backup conversion.
 
+### Known gap, schema copy digest (2026-10-16)
+
+`validation-status.json` records the SHA-256 of the ShEx schema copy, but the guard does
+not compare it with the copy when it loads (`load_copy` in `guard.rs`). A copy edited
+outside Sparkles is therefore compiled and used, and the stored baseline counts are
+trusted for it until the next full validation. The persisted typing does not depend on
+this, because its fingerprint covers the copy's own digest. Checking the digest at
+install, and refusing or revalidating on a mismatch, is a follow-up that has no roadmap
+item yet.
+
 ### Roadmap follow-ups (2026-10-12)
 
 **Item 78 (Tier 4, [ROADMAP](../ROADMAP.md)): incremental validation of recursive shapes
