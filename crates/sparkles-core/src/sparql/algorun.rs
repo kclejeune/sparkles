@@ -17,6 +17,7 @@
 //! the written predicates of the nodes in the result, read inside each batch's own
 //! transaction.
 
+use super::pool::PoolGrant;
 use super::{QueryOptions, query};
 use crate::algo::catalog::{PredicateDef, ProjectionDef};
 use crate::commit::CommitKind;
@@ -361,6 +362,12 @@ thread_local! {
     static DECODED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static DECODED_AT_FIRST_COMMIT: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
+    /// The bytes charged to the run's grant before the plan was made, and when the
+    /// first batch committed.
+    static CHARGED_BEFORE_PLAN: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+    static CHARGED_AT_FIRST_COMMIT: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// One term of the result, decoded when a batch needs it.
@@ -439,10 +446,34 @@ type Communities = BTreeMap<(i64, i64), Option<(i64, i64)>>;
 struct Batches {
     /// the rows with a node, ordered by node, keeping the order of a node's rows
     order: Vec<usize>,
+    /// the bytes of `order` charged to the run's grant, given back when the plan drops
+    _charge: Option<Charged>,
     communities: Communities,
     /// the groups (nodes, then community resources) written up to the end of each batch
     ends: Vec<usize>,
     triples: u64,
+}
+
+/// Bytes charged to a grant for as long as this value lives.
+struct Charged {
+    grant: Arc<PoolGrant>,
+    bytes: u64,
+}
+
+impl Charged {
+    fn new(grant: &Arc<PoolGrant>, bytes: u64) -> Result<Charged> {
+        grant.charge(bytes)?;
+        Ok(Charged {
+            grant: grant.clone(),
+            bytes,
+        })
+    }
+}
+
+impl Drop for Charged {
+    fn drop(&mut self) {
+        self.grant.release(self.bytes);
+    }
 }
 
 impl Layout {
@@ -468,9 +499,18 @@ impl Layout {
         result: &super::QueryResult,
         w: &WriteSpec,
         control: &WriteOptions,
+        grant: Option<&Arc<PoolGrant>>,
     ) -> Result<Batches> {
         let table = &result.table;
         let nodes = &table.cols[self.node];
+        // one index entry for each row, charged before it is built
+        let charge = match grant {
+            Some(g) => Some(Charged::new(
+                g,
+                (table.len() as u64).saturating_mul(std::mem::size_of::<usize>() as u64),
+            )?),
+            None => None,
+        };
         let mut order = Vec::new();
         order
             .try_reserve_exact(table.len())
@@ -484,8 +524,9 @@ impl Layout {
             }
         }
         control.check()?;
-        // stable: a node's rows keep their order
-        order.sort_by_key(|&i| nodes[i]);
+        // The row number breaks ties, so a node's rows keep their order without the
+        // buffer of a stable sort.
+        order.sort_unstable_by_key(|&i| (nodes[i], i));
         control.check()?;
         let size = w.batch_size.unwrap_or(DEFAULT_BATCH).max(1);
         let mut communities: Communities = BTreeMap::new();
@@ -564,6 +605,7 @@ impl Layout {
         }
         Ok(Batches {
             order,
+            _charge: charge,
             communities,
             ends,
             triples,
@@ -703,6 +745,9 @@ pub fn run_write(
     o.timeout = None;
     o.deadline = deadline;
     o.cancellation = Some(cancellation.clone());
+    // The run's grant, which the plan of the write-back charges its row index to.
+    let grant = o.query_grant();
+    o.grant = grant.clone();
     let result = query(snap, &q, &o)?;
     operation.check()?;
     let run = uuid::Uuid::new_v4().to_string();
@@ -710,7 +755,9 @@ pub fn run_write(
     // The result stays as identifiers. Each batch decodes the terms of its own nodes
     // when it is written, so the memory of a run is the result and one batch.
     let layout = layout(req, w, &result.vars, prefixes, &operation)?;
-    let plan = layout.batches(&result, w, &operation)?;
+    #[cfg(test)]
+    CHARGED_BEFORE_PLAN.with(|d| d.set(grant.as_ref().map(|g| g.used())));
+    let plan = layout.batches(&result, w, &operation, grant.as_ref())?;
     let total_triples = plan.triples;
     let mut groups = Groups {
         result: &result,
@@ -887,6 +934,7 @@ pub fn run_write(
             #[cfg(test)]
             if bi == 0 {
                 DECODED_AT_FIRST_COMMIT.with(|d| d.set(Some(DECODED.with(|n| n.get()))));
+                CHARGED_AT_FIRST_COMMIT.with(|d| d.set(grant.as_ref().map(|g| g.used())));
             }
             txn.commit()?;
             commits += 1;
@@ -1017,6 +1065,34 @@ mod tests {
             "{first} terms decoded before the first commit"
         );
         assert_eq!(DECODED.with(|d| d.get()), 2 * 301);
+    }
+
+    /// The row index of the write-back plan is charged to the run's grant while the plan
+    /// lives, so the grant's peak covers it, and it is given back when the run ends.
+    #[test]
+    fn write_back_charges_its_row_index_to_the_grant() {
+        use crate::sparql::pool::QueryPool;
+        let s = chain(300);
+        let req = request("wcc", serde_json::json!({"component": "http://ex/c"}), 10);
+        let pool = QueryPool::new(256 << 20);
+        let grant = Arc::new(pool.try_grant(16 << 20).unwrap());
+        let opts = QueryOptions {
+            grant: Some(grant.clone()),
+            ..Default::default()
+        };
+        CHARGED_BEFORE_PLAN.with(|d| d.set(None));
+        CHARGED_AT_FIRST_COMMIT.with(|d| d.set(None));
+        let rep = run_write(&s, &req, &[], &opts, None, &Control::none()).unwrap();
+        assert_eq!(rep.rows, 301);
+        let before = CHARGED_BEFORE_PLAN.with(|d| d.get()).unwrap();
+        let at_commit = CHARGED_AT_FIRST_COMMIT.with(|d| d.get()).unwrap();
+        let index = 301 * std::mem::size_of::<usize>() as u64;
+        assert!(
+            at_commit - before >= index,
+            "the plan charged {} bytes, its index takes {index}",
+            at_commit - before
+        );
+        assert_eq!(grant.used(), 0, "the run gave its charges back");
     }
 
     /// Hierarchical communities are written as resources after the nodes, with their

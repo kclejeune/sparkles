@@ -2178,7 +2178,11 @@ that asks for several threads can wait while one-thread calls keep taking the fr
 The run keeps the algorithm's result as term identifiers and decodes the terms of one
 batch at a time, so the decoded terms of a large result never sit in memory together.
 The identifiers of the whole result stay in memory until the run ends, up to
-`--max-rows` rows. On a server with a query memory pool, a run takes its initial grant
+`--max-rows` rows. The plan of the write-back also keeps an index of the rows that have a
+node, ordered by node, which takes 8 bytes for each row. A run under a memory pool charges
+that index to its grant before it builds it, and gives it back when the run ends. The
+index is the price of writing each node's rows together without decoding the result up
+front. On a server with a query memory pool, a run takes its initial grant
 when its task starts and waits for it up to `--query-admission-wait`, as a request
 does.
 
