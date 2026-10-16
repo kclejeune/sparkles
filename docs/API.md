@@ -4766,7 +4766,9 @@ exactly.
   find them through it. Until a vector is inserted, searches score it exactly, and they
   leave out deleted vectors at once, so new and deleted vectors count from their commit
   on. Commits themselves do no index work. A search sees exactly the vectors of its own
-  snapshot, also when the graph holds vectors inserted after it. An index created before
+  snapshot, also when the graph holds vectors inserted after it. The inserts run on the
+  shared worker pool at normal priority, so under sustained writes they compete with
+  queries for the cores. An index created before
   its predicate has any row takes the vectors inserted later into its graph like any
   other index.
 * **New generations.** A compaction carries each index over to the new generation
@@ -4800,8 +4802,10 @@ exactly.
   `overBudget`. The next compaction releases the inserted vectors and the thread
   resumes. Lowering the budget at run time stops further inserts but does not remove
   vectors already inserted. On x86-64 CPUs with F16C, a build reads a
-  binary16 copy of the vectors, 2 bytes per dimension, which it holds while it runs and
-  makes only when it fits in the budget.
+  binary16 copy of the vectors, 2 bytes per dimension, which it holds while it runs. A
+  build also holds a 4-byte distance per link slot while it runs, about as much as the
+  graph's links, and it makes the binary16 copy only when the copy and those distances
+  fit in the budget.
 
 | Method | Path | Result |
 |---|---|---|

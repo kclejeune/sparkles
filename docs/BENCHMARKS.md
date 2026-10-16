@@ -705,7 +705,7 @@ Decompression runs as one stream in front of the parallel parser and adds 0.1–
 | Full-text index, 10.5M triples | **6.48 s** (Fuseki 25.98, QLever 19.35) | 122.5 MB (QLever **99.9**, Fuseki 227.8) |
 | Full-text document store, every string literal of 10.5M (1,540,012 documents) | 6.17 s with zstd, 6.07 s with LZ4 | 114.1 MB with zstd (the default), 117.3 MB with LZ4 |
 | HNSW vector index, 100,000 × 384 dimensions, `M=16`, `efConstruction=128` | 6.43 s (14.02 s before the half-precision build) | 163 MB of mapped files, 1,044.4 MB peak RSS |
-| HNSW vector index, 1,000,000 × 384 dimensions, in-process example | 63.5 s (139.5 s before, USearch 2.26.2 in half precision 50.0 s) | recall@10 0.963 at `ef=128`, 12.6 GB peak RSS |
+| HNSW vector index, 1,000,000 × 384 dimensions, in-process example | 63.5 s, down from 139.5 s. USearch 2.26.2 in half precision takes 50.0 s. | Recall@10 is 0.963 at `ef=128`. Peak RSS is 12.6 GB, up from 10.2 GB. |
 | Spatial index, 180,640 geometries | 0.54 s | 13.8 MiB |
 | RDFS materialization, 1,001,418 triples to 2,751,996 with inferences | 3.974 s, of which inference takes 2.323 s | — |
 | Numeric column added to the DBpedia index by `sparkles vocab-index` | 4.8 s | 20.7 MB |

@@ -243,7 +243,9 @@ that work by priority and links each item to its design spec.
   Enabling or reconfiguring a full-text index builds it while writes wait. A write
   transaction cannot search the full-text index after it has changed data, because the
   index covers committed data only ([API.md](API.md#full-text-search)). A vector index has no quantization,
-  so its packed vectors take 4 bytes per dimension. [Roadmap](ROADMAP.md) items 23, 34, 35.
+  so its packed vectors take 4 bytes per dimension. Each pass that inserts new rows into
+  a vector index's graph scans all rows inserted since the last compaction, so its cost
+  grows until the next compaction. [Roadmap](ROADMAP.md) items 23, 34, 35, 82.
 * **Query languages.** There is no openCypher frontend and no JSON query language. [Roadmap](ROADMAP.md) items 20, 72.
 * **GeoSPARQL.** EPSG codes come from a table of proj4 definitions rather than the EPSG
   database, and the library includes the table only with its `geo-epsg` feature.

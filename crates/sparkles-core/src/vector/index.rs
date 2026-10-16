@@ -971,9 +971,12 @@ pub(crate) fn build_index(
             nodes: &nodes,
             metric: cfg.metric,
         };
-        // the half-precision copy only when it fits in the budget beside the index
+        // the half-precision copy only when it fits in the budget beside the index and
+        // the builder's link distances, one `f32` per link slot, which the build holds
+        // while it runs and which take about as much as the graph's links
         let half_bytes = (nodes.len() * segment.dim * 2) as u64;
-        let half = (used + need + half_bytes <= ctl.budget)
+        let dist_bytes = graph_estimate;
+        let half = (used + need + dist_bytes + half_bytes <= ctl.budget)
             .then(|| HalfSpace::new(&segment, &nodes, cfg.metric))
             .flatten();
         let space: &dyn hnsw::Space = match &half {

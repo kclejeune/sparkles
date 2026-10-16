@@ -1214,7 +1214,7 @@ rebuild's.
   only when its own snapshot's delta holds a row of the node's (subject, vector) pair,
   so a snapshot never sees a row inserted after it or one it deleted, and the rows its
   delta holds that the layer lacks are still scored exactly. When the layer has caught
-  up with the snapshot's commit, a search does not read the delta's rows at all. The
+  up with a snapshot of the same delta, a search does not read the delta's rows at all. The
   status overlay gains `indexed` and `pending`, the plan counters gain
   `overlayPending`, and the index card shows both. The layer is not written to the index
   file. Reopening a store inserts the delta's rows again.
@@ -1289,11 +1289,64 @@ between passes of the same binary by a factor of two, in both builds, so the ef 
 ef = 32 figures do not separate the two. A Namespace A/B screen of the SPARQL suite
 found no change outside noise, with a geometric mean of 0.962.
 
-The binary16 copy takes 2 bytes per dimension per node while a build runs, 768 MB at
-1M × 384. A compaction holds the old and new segments at once while it carries an index
-over. The live layer holds each inserted vector and its links in memory until the next
-compaction. The example's peak RSS at 1M rose from 10.2 GB to 12.6 GB, which includes
-all three.
+**Memory.** This item trades memory for speed in four places.
+
+* The live layer holds each inserted vector at 4 bytes per dimension, with its norm,
+  key, level, links and map entry, until the next compaction. That is about 1.8 KB per
+  row at 384 dimensions and M = 16, so 1M rows inserted between compactions take about
+  1.8 GB. The layer counts against `--vector-memory-mb`, and catch-up stops at the
+  budget and leaves the remaining rows to be scored exactly.
+* A build holds a binary16 copy of the nodes' vectors, 2 bytes per dimension per node,
+  768 MB at 1M × 384.
+* The builder keeps the distance of every link slot beside the link, 4 bytes per slot.
+  That is about 132 bytes per node on layer 0 at M = 16 and doubles the builder's link
+  memory on that layer. The build makes the binary16 copy only when the copy and these
+  distances fit in the budget beside the index.
+* A compaction holds the old and new segments at once while it carries an index over,
+  1.5 GB of extra vectors at 1M × 384, and it clones the old live layer.
+
+In exchange, inserted rows are found through the graph instead of being parsed and
+scored on every query, a compaction leaves no window of exact scans, and the build at
+1M × 384 takes 63.5 s instead of 139.5 s. The example's peak RSS at 1M rose from 10.2 GB
+to 12.6 GB. The binary16 copy, the link distances and the second segment during a
+carry-over all contribute to that rise, and no breakdown between them was measured.
+
+**Design notes.** The hand-written x86-64 graph kernels and the software binary16
+conversions are kept because the build at 1M × 384 was limited by memory bandwidth, and
+reading half-precision rows through wide distance lanes gave the largest part of the
+build speedup. They decide only which links the graph keeps, so no search result or
+score depends on them. A (subject, vector) pair that is both a frozen node and a live
+node, because a commit added its row in another graph, keeps both nodes. Merging them
+would make every visit to a frozen node also look up the snapshot's delta for rows of
+its pair. The cost of keeping both is one extra vector per such pair until the next
+compaction, where the pair counts as a changed node in the 30 % limit.
+
+**Fixes after review (2026-10-16).** A transaction's view that replaced a delta vector
+could share the published commit and row count with the snapshot the live layer caught
+up with, and the search then skipped the replacement row. The layer now keeps the
+inserted key set it caught up with and compares its identity. An index created before
+its predicate had any row ignored the rows inserted later, and its searches stayed
+exact, because the predicate id was resolved once at the build and the search plan
+counted only base rows. Both now take the inserted rows into account. The live layer
+counts against the vector memory budget. A compaction whose carry is declined no longer
+runs a full build on its own thread, as described under *Graphs across compactions*.
+
+**Catch-up cost and half-precision recall** (item 82, Tier 4, [ROADMAP](../ROADMAP.md)).
+The review of item 10 left four questions that need measurements rather than code.
+
+* **Catch-up scans.** Each catch-up batch scans the delta's rows of the predicate from
+  the start, and the status and `wait_vector_catch_up` walk them again under the layer's
+  read lock, so the work grows with the delta between compactions. A cursor per build
+  would let catch-up scan only the keys added since its last pass, and counters for the
+  status walk would show what it costs.
+* **Half-precision recall.** The build reads binary16 vectors and falls back to `f32`
+  only when a value is beyond 65,000. Recall for Euclidean and dot-product data with a
+  large common offset, where binary16 loses relative precision, has not been measured.
+* **Worker pool.** Catch-up runs on the shared worker pool at normal priority. A
+  measurement under sustained writes and queries should decide between a small pool of
+  its own, a lower priority, or no change.
+* **Cancelled prebuilds.** A failpoint test should cancel a compaction while it carries
+  an index over and check that the new generation keeps no partial index file.
 
 **Quantization, result caching and statistics** (item 34, Tier 4,
 [ROADMAP](../ROADMAP.md)). *Deviations* above records that there is no quantization

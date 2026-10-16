@@ -118,6 +118,7 @@ These items are cheap or foundational.
 | 44 | A local-first engine in WebAssembly that syncs through RDF Patch and branches | [F20](specs/F20-local-first-engine.md) | XL |
 | 72 | JSON query languages, and a Datalog surface syntax for rules and queries | [C24](specs/C24-json-query-languages.md), [F17](specs/F17-query-time-reasoning.md) | M–L |
 | 78 | Incremental write-time validation of recursive SHACL shapes and SHACL-SPARQL constraints not anchored at the focus node | [C10](specs/C10-write-time-validation.md#roadmap-follow-ups-2026-10-12) | M–L |
+| 82 | Vector catch-up cost and half-precision recall: a cursor so catch-up scans only new rows, recall of binary16 builds on Euclidean and dot-product data with an offset, a measured choice of worker pool, and a cancelled-prebuild test | [F04](specs/F04-vector-search.md#roadmap-follow-ups-2026-10-12) | S–M |
 
 ## Tier 5: backlog
 
