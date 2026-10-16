@@ -1,30 +1,20 @@
-"""Finite retained-CLI checks with a counted loopback Anthropic double only.
+"""Finite checks of the evaluator against a loopback Anthropic double.
 
 The fake upstream deliberately supplies model text. These observations establish
-routing/accounting controls, never real accuracy, spend, latency or provider behavior.
+routing, accounting and failure handling, never real accuracy, spend, latency or
+provider behavior.
 """
 
-import hashlib
-import http.client
 import importlib.machinery
 import importlib.util
 import json
 import pathlib
-import sqlite3
 import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from anthropic_gate import (
-    MODELS,
-    RESPONSE_CAP,
-    Gate,
-    GateError,
-    Wallet,
-    effective_config,
-    serve_gate,
-)
+import proxy as px
 from evaluator import (
     Invalid,
     OfflinePolicy,
@@ -35,17 +25,24 @@ from evaluator import (
 )
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
-RETAINED_SHA = "8453532536b45d74c730906f441dd662389a5a088bea432d4a0f05d20db3074d"
+MODELS = px.MODELS
+FAKE_KEY = "FAKE_ECHO_NOT_A_CREDENTIAL"
+FAKE_USAGE = {
+    "input_tokens": 100,
+    "output_tokens": 40,
+    "service_tier": "standard",
+    "inference_geo": "global",
+}
 
 
 def load_evaluator():
-    l = importlib.machinery.SourceFileLoader(
+    loader = importlib.machinery.SourceFileLoader(
         "finite_eval_cli", str(ROOT / "scripts/eval-ask")
     )
-    spec = importlib.util.spec_from_loader(l.name, l)
-    m = importlib.util.module_from_spec(spec)
-    l.exec_module(m)
-    return m
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
 
 
 def need(value, message):
@@ -54,11 +51,19 @@ def need(value, message):
 
 
 class FakeAnthropic:
-    def __init__(self, qset):
-        self.questions = {q["question"]: q for q in qset["questions"]}
-        self.mode, self.calls, self.structured_failures = "oracle", [], 0
+    """A counted loopback stand-in for the Messages API.
+
+    `mode` picks the behavior. `framing` picks how a 200 reply is delimited.
+    """
+
+    def __init__(self, qsets, framing="content-length"):
+        self.questions = {}
+        for qset in qsets:
+            self.questions.update({q["question"]: q for q in qset["questions"]})
+        self.mode, self.calls, self.framing = "oracle", [], framing
+        self.structured_failures = 0
         self.http_requests = []
-        self.wallet_path = None
+        self.errors_sent, self.ok_models = 0, []
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -74,147 +79,112 @@ class FakeAnthropic:
                 return valid
 
             def do_GET(self):
-                owner.calls.append({"method": "GET", "path": self.path})
                 self.send_error(400)
+
+            def send_json(self, status, out):
+                self.send_response(status)
+                self.send_header("content-type", "application/json")
+                if status == 200 and owner.framing == "chunked":
+                    self.send_header("transfer-encoding", "chunked")
+                    self.end_headers()
+                    half = len(out) // 2
+                    for part in (out[:half], out[half:]):
+                        self.wfile.write(b"%x\r\n" % len(part) + part + b"\r\n")
+                    self.wfile.write(b"0\r\n\r\n")
+                    return
+                if status == 200 and owner.framing == "close":
+                    self.send_header("connection", "close")
+                    self.end_headers()
+                else:
+                    self.send_header("content-length", str(len(out)))
+                    self.end_headers()
+                self.wfile.write(out)
 
             def do_POST(self):
                 size = int(self.headers.get("content-length", "0"))
-                if size > 128 * 1024:
-                    self.send_error(413)
-                    return
                 raw = self.rfile.read(size)
+                need(self.headers.get("x-api-key") == FAKE_KEY, "upstream key")
+                if self.path == "/v1/messages/count_tokens":
+                    return self.send_json(200, b'{"input_tokens": 8}')
                 body = strict_json(raw)
-                db = sqlite3.connect(owner.wallet_path, timeout=1)
-                try:
-                    prior = db.execute(
-                        "SELECT id,case_id,model,payload_sha,bound FROM attempts WHERE state='RESERVED_UNRESOLVED' AND payload_sha=?",
-                        (hashlib.sha256(raw).hexdigest(),),
-                    ).fetchall()
-                finally:
-                    db.close()
-                need(
-                    len(prior) == 1 and prior[0][2] == body["model"],
-                    "upstream received a request without a prior committed matching reservation",
-                )
+                output = body.get("output_config") or {}
                 owner.calls.append(
                     {
                         "model": body["model"],
-                        "sha256": hashlib.sha256(raw).hexdigest(),
-                        "schema": "output_config" in body,
-                        "priorCommittedReservation": prior[0],
-                        "controls": {
-                            k: body[k]
-                            for k in (
-                                "max_tokens",
-                                "stream",
-                                "service_tier",
-                                "inference_geo",
-                            )
-                        },
+                        "schema": "format" in output,
+                        "effort": output.get("effort"),
+                        "bytes": len(raw),
+                        "stream": body.get("stream"),
                     }
                 )
-                if owner.mode in ("429", "schema-reject"):
-                    out = b'{"error":{"message":"FAKE_ECHO_NOT_A_CREDENTIAL"}}'
-                    status = 429 if owner.mode == "429" else 400
+                if owner.mode == "429":
+                    return self.send_json(429, b'{"error":{"message":"FAKE_ECHO"}}')
+                if owner.mode == "529-then-ok" and owner.errors_sent < 1:
+                    owner.errors_sent += 1
+                    return self.send_json(529, b'{"error":{"message":"overloaded"}}')
+                if owner.mode == "schema-reject" and "format" in output:
+                    return self.send_json(400, b'{"error":{"message":"no schema"}}')
+                user = body["messages"][0]["content"]
+                question = user.split("\n", 1)[0].removeprefix("Question: ").strip()
+                q = owner.questions.get(question)
+                if "rows of a query result" in body.get("system", ""):
+                    content = {
+                        "text": "The result answers the question [1].",
+                        "citations": [1],
+                    }
                 else:
-                    status = 200
-                    user = body["messages"][0]["content"]
-                    question = user.split("\n", 1)[0].removeprefix("Question: ").strip()
-                    q = owner.questions.get(question)
-                    if "rows of a query result" in body["system"]:
-                        content = {
-                            "text": "The result answers the question [1].",
-                            "citations": [1],
+                    content = {
+                        "query": "",
+                        "explanation": "A fixture answer.",
+                        "assumptions": [],
+                        "clarify": {"question": "", "choices": []},
+                        "graph": {"subject": "", "predicate": "", "object": ""},
+                    }
+                    if q is None:
+                        # Repair messages include earlier context; locate the
+                        # original exact question, rather than fabricate gold.
+                        q = next(
+                            (x for t, x in owner.questions.items() if t in user), None
+                        )
+                    if q is None:
+                        content["explanation"] = (
+                            "The fake could not identify the question."
+                        )
+                    elif q["kind"] == "clarify":
+                        content["query"] = "SELECT ?s WHERE { ?s a ex:Team }"
+                        content["clarify"] = {
+                            "question": "Which reading?",
+                            "choices": ["the first", "the second"],
                         }
-                    else:
-                        content = {
-                            "query": "",
-                            "explanation": "A fixture answer.",
-                            "assumptions": [],
-                            "clarify": {"question": "", "choices": []},
-                            "graph": {"subject": "", "predicate": "", "object": ""},
-                        }
-                        if q is None:
-                            # Repair messages include earlier context; locate the
-                            # original exact question, rather than fabricate gold.
-                            q = next(
-                                (
-                                    x
-                                    for text, x in owner.questions.items()
-                                    if text in user
-                                ),
-                                None,
-                            )
-                        if q is None:
-                            content["explanation"] = (
-                                "The fake could not identify the question."
-                            )
-                        elif q["kind"] == "clarify":
-                            content["query"] = "SELECT ?s WHERE { ?s a ex:Team }"
-                            content["clarify"] = {
-                                "question": "Which reading?",
-                                "choices": ["the first", "the second"],
-                            }
-                        elif q["kind"] == "answerable":
-                            content["query"] = q["gold"]
-                        if owner.mode == "cascade" and body["model"] == MODELS[0]:
-                            content["query"] = "SELECT ?s WHERE { ?s a ex:Teem }"
-                        if (
-                            owner.mode == "structured"
-                            and owner.structured_failures == 0
-                        ):
-                            content = {}
-                            owner.structured_failures += 1
-                    out = json.dumps(
-                        {
-                            "id": "fake-message",
-                            "type": "message",
-                            "role": "assistant",
-                            "model": body["model"],
-                            "content": [{"type": "text", "text": json.dumps(content)}],
-                            "stop_reason": "end_turn",
-                            "usage": {
-                                "input_tokens": 100,
-                                "output_tokens": 40,
-                                "service_tier": "standard",
-                                "inference_geo": "global",
-                            },
-                        }
-                    ).encode()
-                self.send_response(status)
-                self.send_header("content-type", "application/json")
-                self.send_header("content-length", str(len(out)))
-                self.end_headers()
-                self.wfile.write(out)
+                    elif q["kind"] == "answerable":
+                        content["query"] = q["gold"]
+                    if owner.mode == "cascade" and body["model"] == MODELS[0]:
+                        content["query"] = "SELECT ?s WHERE { ?s a ex:Teem }"
+                    if owner.mode == "structured" and owner.structured_failures == 0:
+                        content = {}
+                        owner.structured_failures += 1
+                out = json.dumps(
+                    {
+                        "id": "fake-message",
+                        "type": "message",
+                        "role": "assistant",
+                        "model": body["model"],
+                        "content": [{"type": "text", "text": json.dumps(content)}],
+                        "stop_reason": "end_turn",
+                        "usage": FAKE_USAGE,
+                    }
+                ).encode()
+                owner.ok_models.append(body["model"])
+                self.send_json(200, out)
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.thread = threading.Thread(target=self.server.serve_forever)
         self.thread.start()
 
-    def dispatch(self, payload, key, timeout):
-        c = http.client.HTTPConnection(
-            "127.0.0.1", self.server.server_port, timeout=min(timeout, 2)
+    def upstream(self):
+        return px.HTTPUpstream(
+            FAKE_KEY, "127.0.0.1", self.server.server_port, tls=False
         )
-        try:
-            # Explicit fake sentinel only; no real credential can be configured.
-            c.request(
-                "POST",
-                "/v1/messages",
-                payload,
-                {
-                    "content-type": "application/json",
-                    "x-api-key": "FAKE_ECHO_NOT_A_CREDENTIAL",
-                },
-            )
-            r = c.getresponse()
-            if not 200 <= r.status < 300:
-                raise GateError("upstream_status")
-            b = r.read(RESPONSE_CAP + 1)
-            if len(b) > RESPONSE_CAP:
-                raise GateError("upstream_cap")
-            return b
-        finally:
-            c.close()
 
     def close(self):
         self.server.shutdown()
@@ -222,10 +192,10 @@ class FakeAnthropic:
         self.server.server_close()
 
 
-def run_fresh(output, binary):
-    need(digest(binary) == RETAINED_SHA, "exact retained CLI hash mismatch")
+def run_fresh(output, binary, sha):
     output = pathlib.Path(output)
     output.mkdir(mode=0o700)
+    need(digest(binary) == sha, "binary hash mismatch")
     module = load_evaluator()
     qset = strict_json((ROOT / "testsuite/ask/demo.json").read_bytes())
     # One answer, clarification and refusal exercise the whole-pipeline semantics.
@@ -235,7 +205,7 @@ def run_fresh(output, binary):
         next(q for q in qset["questions"] if q["kind"] == "unanswerable"),
     ]
     checks = []
-    offline = FakeAnthropic(qset)
+    offline = FakeAnthropic([qset])
     try:
         remote_query = (
             "SELECT ?s WHERE {SERVICE <http://127.0.0.1:"
@@ -288,64 +258,45 @@ def run_fresh(output, binary):
         )
     finally:
         offline.close()
-    for mode in (
-        "oracle",
-        "structured",
-        "cascade",
-        "429",
-        "schema-reject",
-        "transport-retry",
+    for mode, framing in (
+        ("oracle", "chunked"),
+        ("structured", "content-length"),
+        ("cascade", "close"),
+        ("429", "content-length"),
+        ("schema-reject", "content-length"),
+        ("529-then-ok", "content-length"),
     ):
         d = output / mode
         d.mkdir(mode=0o700)
-        upstream = FakeAnthropic(qset)
-        wallet = Wallet(d / "wallet", d / "grant", {"run": "synthetic-" + mode})
-        upstream.wallet_path = wallet.path / "wallet.sqlite3"
-        gate = Gate(wallet, "FAKE_ECHO_NOT_A_CREDENTIAL", upstream.dispatch)
-        server = serve_gate(gate)
-        if mode == "transport-retry":
-            base_handler = server.RequestHandlerClass
-
-            class RetryStatusFixture(base_handler):
-                """Test-only status adapter triggers the actual Rust retry loop.
-
-                It masks the first two terminal refusals as 429, while the real
-                gate/SQLite path still refuses all later upstream dispatch.
-                """
-
-                rewritten = 0
-
-                def send_response(self, code, message=None):
-                    if code in (400, 402) and type(self).rewritten < 2:
-                        type(self).rewritten += 1
-                        code = 429
-                    super().send_response(code, message)
-
-            server.RequestHandlerClass = RetryStatusFixture
-        gate.server_port = server.server_port
+        upstream = FakeAnthropic([qset], framing)
+        upstream.mode = mode
+        ledger = px.Ledger(d / "ledger.jsonl", 10**12)
+        proxy = px.Proxy(ledger, upstream.upstream(), FAKE_KEY)
+        server = proxy.serve()
         thread = threading.Thread(target=server.serve_forever)
         thread.start()
         try:
-            cfg = effective_config(gate)
+            cfg = proxy.config()
             if mode == "schema-reject":
                 cfg["models"]["providers"]["evaluation"]["structuredOutput"] = "auto"
             path = d / "models.json"
             path.write_text(json.dumps(cfg))
-            upstream.mode = "429" if mode == "transport-retry" else mode
+            oracle = mode == "oracle"
             pairs = (
-                [v for m in MODELS for v in ("--pair", "evaluation/" + m)]
-                if mode == "oracle"
-                else ["--pair", "evaluation/" + MODELS[0]]
+                list(MODELS)
+                if oracle
+                else list(MODELS[:2])
+                if mode == "cascade"
+                else [MODELS[0]]
             )
-            only = (
-                ",".join(q["id"] for q in selected) if mode == "oracle" else "lookup-02"
-            )
+            labels = ["evaluation/" + m for m in pairs]
+            only = ",".join(q["id"] for q in selected) if oracle else "lookup-02"
             args = module.parse_args(
                 [
                     "--sparkles",
                     str(binary),
                     "--sparkles-sha256",
-                    RETAINED_SHA,
+                    sha,
                     "--model-config",
                     str(path),
                     "--set",
@@ -354,75 +305,85 @@ def run_fresh(output, binary):
                     only,
                     "--out",
                     str(d / "report"),
-                    "--jobs",
-                    "1",
                     "--deadline",
-                    "30",
-                    "--phase-deadline",
-                    "120",
+                    "60",
                     "--allow-loopback",
                     "--model-secret",
                     "evalgate=env:SPARKLES_EVAL_GATE_TOKEN",
                 ]
-                + pairs
+                + [v for m in pairs for v in ("--pair", "evaluation/" + m)]
             )
-            if mode == "cascade":
-                args.pair = ["evaluation/" + m for m in MODELS[:2]]
-            _, report = module.run_matrix(args, gate)
-            money = wallet.snapshot_report()
+            _, report = module.run_matrix(args, proxy)
+            money = ledger.report()
+            rows = {r["pair"]: r for r in report["rows"]}
+            need(report["complete"], "evaluator did not finish " + mode)
             need(
                 all(r["cliEstimatedCostUSD"] is None for r in report["rows"]),
                 "unpriced SDK zero must remain unknown, not free",
             )
-            if mode in ("429", "schema-reject", "transport-retry"):
+            need(
+                all(
+                    c["effort"] == "medium" and c["stream"] is False
+                    for c in upstream.calls
+                ),
+                "the proxy did not set effort and nonstreaming",
+            )
+            need(
+                money["settledNanodollars"]
+                == sum(px.cost(m, FAKE_USAGE) for m in upstream.ok_models)
+                and money["unresolvedNanodollars"] == 0,
+                "ledger does not match the counted replies",
+            )
+            if mode in ("oracle", "structured", "529-then-ok"):
                 need(
-                    not report["complete"]
-                    and len(upstream.calls) == 1
-                    and money["unresolvedUpperNanodollars"] > 0,
-                    "ambiguous billing did not stop real client",
+                    all(c["correct"] for c in report["cases"]),
+                    "fixture oracle scoring failed",
                 )
-                if mode == "schema-reject":
-                    need(
-                        gate.received >= 2,
-                        "actual auto downgrade did not return through the gate",
-                    )
-                if mode == "transport-retry":
-                    need(
-                        gate.received == 3 and RetryStatusFixture.rewritten == 2,
-                        "actual Rust three-attempt retry was not exercised",
-                    )
-            else:
-                need(report["complete"], "retained CLI did not complete " + mode)
-                if mode in ("oracle", "structured"):
-                    need(
-                        all(c["correct"] for c in report["cases"]),
-                        "fixture oracle scoring failed",
-                    )
-                if mode == "structured":
-                    need(
-                        upstream.structured_failures == 1
-                        and len(upstream.calls) >= 3
-                        and money["acceptedRequests"] == len(upstream.calls),
-                        "real structured retry was not separately reserved",
-                    )
-                if mode == "cascade":
-                    c = [c for c in report["cases"] if " > " in c["pair"]]
-                    need(
-                        c and c[0]["correct"],
-                        "real cascade did not recover with later model",
-                    )
-                    need(
-                        any(row["model"] == MODELS[1] for row in upstream.calls),
-                        "cascade did not dispatch second pair",
-                    )
+            if oracle:
+                need(" > ".join(labels) in rows, "cascade row missing")
+                need(rows[" > ".join(labels)]["answeredBy"][labels[0]] == 3, "cascade")
+            if mode == "structured":
+                need(
+                    upstream.structured_failures == 1 and len(upstream.calls) >= 3,
+                    "real structured retry was not separately reserved",
+                )
+            if mode == "cascade":
+                cascade = rows[" > ".join(labels)]
+                need(
+                    rows["evaluation/" + MODELS[0]]["endToEndSuccess"]["numerator"] == 0
+                    and cascade["endToEndSuccess"]["numerator"] == 1
+                    and cascade["answeredBy"]["evaluation/" + MODELS[1]] == 1,
+                    "cascade did not recover with the later model",
+                )
+                need(
+                    any(c["model"] == MODELS[1] for c in upstream.calls),
+                    "cascade did not dispatch the second pair",
+                )
+            if mode == "429":
+                need(
+                    report["cases"][0]["detail"]["status"] == "provider_error"
+                    and len(upstream.calls) >= 1
+                    and money["settledNanodollars"] == 0,
+                    "a rate limit was not scored as a free provider error",
+                )
+            if mode == "529-then-ok":
+                need(
+                    upstream.errors_sent == 1 and len(upstream.calls) >= 2,
+                    "the client did not retry through the proxy",
+                )
+            if mode == "schema-reject":
+                need(
+                    upstream.calls[0]["schema"]
+                    and any(not c["schema"] for c in upstream.calls),
+                    "auto structured output did not downgrade through the proxy",
+                )
             checks.append(
                 {
                     "case": mode,
+                    "framing": framing,
                     "complete": report["complete"],
                     "upstreamCalls": len(upstream.calls),
-                    "validInboundRequests": gate.received,
-                    "transportStatusAdapter": mode == "transport-retry",
-                    "wallet": money,
+                    "ledger": money,
                     "wireRequests": upstream.calls,
                     "httpRequests": upstream.http_requests,
                 }
@@ -430,18 +391,17 @@ def run_fresh(output, binary):
             with (d / "check.json").open("x") as f:
                 json.dump(checks[-1], f, indent=2)
         finally:
-            gate.set_case(None)
             server.shutdown()
             thread.join(2)
             server.server_close()
-            wallet.close()
+            ledger.close()
             upstream.close()
     with (output / "result.json").open("x") as f:
         json.dump(
             {
-                "schema": 2,
+                "schema": 3,
                 "binary": str(binary),
-                "binarySha256": RETAINED_SHA,
+                "binarySha256": sha,
                 "realExternalCalls": 0,
                 "cases": checks,
             },
@@ -452,16 +412,11 @@ def run_fresh(output, binary):
 
 
 def self_test(args):
-    if args.sparkles_sha256 is None:
-        args.sparkles_sha256 = RETAINED_SHA
-    need(
-        args.sparkles_sha256 == RETAINED_SHA,
-        "self-test requires the admitted retained binary",
-    )
+    sha = args.sparkles_sha256 or digest(args.sparkles)
     out = args.out or str(
         pathlib.Path(tempfile.gettempdir())
-        / ("sparkles-ask-gate-selftest-" + __import__("secrets").token_hex(12))
+        / ("sparkles-ask-selftest-" + __import__("secrets").token_hex(12))
     )
-    run_fresh(out, args.sparkles)
-    print("eval-ask: retained CLI fake-provider checks passed")
+    run_fresh(out, args.sparkles, sha)
+    print("eval-ask: fake-provider checks passed")
     return 0

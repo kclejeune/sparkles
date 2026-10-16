@@ -1,39 +1,53 @@
 #!/usr/bin/env python3
-"""Root-admitted initial Anthropic demo; one nonrenewable aggregate USD25 wallet.
+"""Run Ask evaluation sets against Anthropic models under a local cost cap.
 
-No runtime admission is included in this repository. Root must supply a SHA-bound
-manifest after separate source review and fresh validation. fnox may launch this
-owner later; its real key is never inherited by a leaf CLI or written to evidence.
+A run file names the sets, models, cap and binary. The proxy alone reads
+ANTHROPIC_API_KEY, so launch it through a secret manager, for example
+`fnox exec -- scripts/eval-ask-anthropic --run RUN.json`. --dry-run replaces the
+API with a local fake and reads no key. --preflight-only stops after the checks.
 """
 
-import _sqlite3
 import argparse
 import importlib.machinery
 import importlib.util
 import json
+import math
 import os
 import pathlib
-import sqlite3
 import sys
+import tempfile
 import threading
+import time
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "testsuite/ask/eval_support"))
-from anthropic_gate import (
-    AUTHORITY_HASHES,
-    MODELS,
-    Gate,
-    Wallet,
-    effective_config,
-    safe_absolute,
-    serve_gate,
-)
+import proxy as px
+from cli_checks import FAKE_KEY, FakeAnthropic
 from evaluator import Invalid, bounded_file, digest, strict_json
+
+FIELDS = {
+    "schema",
+    "binary",
+    "binarySha256",
+    "ledger",
+    "out",
+    "localCapNanodollars",
+    "carryover",
+    "effort",
+    "maxOutputTokens",
+    "requestTimeoutSecs",
+    "askDeadlineSecs",
+    "queryTimeoutSecs",
+    "askTokenBudget",
+    "projectionMargin",
+    "priorCaseCostNanodollars",
+    "sets",
+}
 
 
 def evaluator_module():
     loader = importlib.machinery.SourceFileLoader(
-        "eval_ask_initial", str(ROOT / "scripts/eval-ask")
+        "eval_ask", str(ROOT / "scripts/eval-ask")
     )
     spec = importlib.util.spec_from_loader(loader.name, loader)
     module = importlib.util.module_from_spec(spec)
@@ -41,222 +55,185 @@ def evaluator_module():
     return module
 
 
-def runtime_identity():
-    return {
-        "pythonVersion": sys.version,
-        "pythonPrefix": sys.base_prefix,
-        "sqliteVersion": sqlite3.sqlite_version,
-        "sqliteModuleSha256": digest(_sqlite3.__file__),
-        "pythonBinarySha256": digest(pathlib.Path(sys.base_prefix) / "bin/python3"),
-    }
+def load_run(path):
+    run = strict_json(bounded_file(path, 1024 * 1024))
+    if not isinstance(run, dict) or run.get("schema") != 1 or run.keys() - FIELDS:
+        raise Invalid("unknown run file schema or field")
+    for name in ("binary", "ledger", "out"):
+        if not pathlib.Path(run[name]).is_absolute():
+            raise Invalid("absolute paths required")
+    ints = ("localCapNanodollars", "maxOutputTokens", "askTokenBudget")
+    if any(type(run[k]) is not int or run[k] <= 0 for k in ints):
+        raise Invalid("positive integers required")
+    if run["carryover"] is not None and (
+        type(run["carryover"]["nanodollars"]) is not int
+        or run["carryover"]["nanodollars"] < 0
+    ):
+        raise Invalid("invalid carryover")
+    for set_ in run["sets"]:
+        if not set_["models"] or set(set_["models"]) - set(px.MODELS):
+            raise Invalid("each set needs models from the allowed list")
+        if any(m not in run["priorCaseCostNanodollars"] for m in set_["models"]):
+            raise Invalid("a prior case cost is needed for every model")
+    return run
 
 
-def validate_admission(path, expected):
-    if digest(path) != expected:
-        raise Invalid("admission hash mismatch")
-    a = strict_json(bounded_file(path, 65536))
-    fields = {
-        "schema",
-        "paid_run_admitted",
-        "run_id",
-        "wallet_path",
-        "grant_claim_path",
-        "local_filesystem",
-        "wallet_parent_device",
-        "authorities",
-        "sources",
-        "runtime",
-        "binary",
-        "binary_sha256",
-        "set",
-        "set_sha256",
-        "data_sha256",
-        "only",
-        "key_environment",
-        "output",
-    }
-    if (
-        not isinstance(a, dict)
-        or set(a) != fields
-        or a["schema"] != 2
-        or a["paid_run_admitted"] is not True
-    ):
-        raise Invalid("missing runtime admission")
-    if (
-        not isinstance(a["run_id"], str)
-        or not a["run_id"]
-        or len(a["run_id"]) > 128
-        or a["key_environment"] != "ANTHROPIC_API_KEY"
-    ):
-        raise Invalid("invalid run identity")
-    if (
-        not isinstance(a["only"], str)
-        or len(a["only"].split(",")) != 17
-        or len(set(a["only"].split(","))) != 17
-        or "" in a["only"].split(",")
-    ):
-        raise Invalid("initial admission requires exactly 17 distinct pilot IDs")
-    if a["local_filesystem"] not in ("ext4", "xfs", "btrfs"):
-        raise Invalid("root must verify local durable filesystem")
-    for key in ("wallet_path", "grant_claim_path", "output"):
-        p = safe_absolute(a[key])
-        if p.exists() or not p.parent.is_dir():
-            raise Invalid("fresh wallet/claim/output required")
-    if (
-        type(a["wallet_parent_device"]) is not int
-        or os.stat(pathlib.Path(a["wallet_path"]).parent).st_dev
-        != a["wallet_parent_device"]
-    ):
-        raise Invalid("wallet parent device mismatch")
-    if (
-        os.stat(pathlib.Path(a["grant_claim_path"]).parent).st_dev
-        != a["wallet_parent_device"]
-    ):
-        raise Invalid("grant claim must share the verified local filesystem")
-    if set(a["authorities"]) != set(AUTHORITY_HASHES):
-        raise Invalid("authority set mismatch")
-    for kind, expected_hash in AUTHORITY_HASHES.items():
-        record = a["authorities"][kind]
-        if (
-            set(record) != {"path", "sha256"}
-            or record["sha256"] != expected_hash
-            or digest(record["path"]) != expected_hash
-        ):
-            raise Invalid("stale or unknown authority")
-        strict_json(bounded_file(record["path"], 4 * 1024 * 1024))
-    sources = [
-        "scripts/eval-ask",
-        "scripts/eval-ask-anthropic",
-        "testsuite/ask/eval_support/evaluator.py",
-        "testsuite/ask/eval_support/anthropic_gate.py",
-    ]
-    if set(a["sources"]) != set(sources) or any(
-        digest(ROOT / p) != a["sources"][p] for p in sources
-    ):
-        raise Invalid("source binding mismatch")
-    runtime = a["runtime"]
-    if runtime != runtime_identity():
-        raise Invalid("runtime binding mismatch")
-    if digest(a["binary"]) != a["binary_sha256"] or digest(a["set"]) != a["set_sha256"]:
-        raise Invalid("input binding mismatch")
-    q = strict_json(bounded_file(a["set"], 4 * 1024 * 1024))
-    if digest(pathlib.Path(a["set"]).parent / q["data"]) != a["data_sha256"]:
-        raise Invalid("data binding mismatch")
-    return a
+def percentile(values, share):
+    ordered = sorted(values)
+    return ordered[max(0, math.ceil(share * len(ordered)) - 1)] if ordered else None
+
+
+def admission(ledger, run):
+    """Admit a model's block only when its projected cost fits what the cap leaves."""
+
+    def admit(pair, questions):
+        model = pair.split("/", 1)[1]
+        seen = [v for (_, m), v in ledger.case_costs().items() if m == model]
+        unit = (
+            percentile(seen, 0.9)
+            if len(seen) >= 5
+            else run["priorCaseCostNanodollars"][model]
+        )
+        projected = len(questions) * unit * run["projectionMargin"]
+        return ledger.spent() + projected <= ledger.cap
+
+    return admit
 
 
 def main():
-    ap = argparse.ArgumentParser(
-        description=(__doc__ or "Initial Anthropic evaluation owner").split("\n")[0]
-    )
-    ap.add_argument("--admission", required=True)
-    ap.add_argument("--admission-sha256", required=True)
+    ap = argparse.ArgumentParser(description=(__doc__ or "").split("\n")[0])
+    ap.add_argument("--run", required=True)
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--preflight-only", action="store_true")
     args = ap.parse_args()
-    a = validate_admission(args.admission, args.admission_sha256)
+    run = load_run(args.run)
     mod = evaluator_module()
-    # Do all setup/input validation and claim the exclusively new report directory
-    # before looking up the admitted credential name. No key discovery/fnox capture.
-    ev = mod.parse_args(
-        [
-            "--sparkles",
-            a["binary"],
-            "--sparkles-sha256",
-            a["binary_sha256"],
-            "--set",
-            a["set"],
-            "--out",
-            a["output"],
-            "--jobs",
-            "1",
-            "--deadline",
-            "30",
-            "--timeout",
-            "5",
-            "--phase-deadline",
-            "900",
-            "--allow-loopback",
-            "--only",
-            a["only"],
-            "--model-config",
-            a["output"] + "/models.json",
-            "--model-secret",
-            "evalgate=env:SPARKLES_EVAL_GATE_TOKEN",
+    started = time.monotonic()
+    fake = None
+    key = None
+    if args.dry_run:
+        scratch = pathlib.Path(tempfile.mkdtemp(prefix="sparkles-ask-dry-"))
+        run["ledger"], run["out"] = str(scratch / "ledger.jsonl"), str(scratch / "out")
+        qsets = [
+            strict_json(bounded_file(ROOT / s["path"], 4 * 1024 * 1024))
+            for s in run["sets"]
         ]
-        + [v for m in MODELS for v in ("--pair", "evaluation/" + m)]
-    )
-    # The endpoint has to exist before config validation; it cannot dispatch until
-    # a case is active, and admission is already fully bound before wallet creation.
-    wallet = Wallet(
-        a["wallet_path"],
-        a["grant_claim_path"],
-        {
-            "run": a["run_id"],
-            "admissionSha256": args.admission_sha256,
-            "authority": AUTHORITY_HASHES,
-        },
-    )
-    server = None
-    thread = None
-    try:
-        key = os.environ.get(a["key_environment"])
+        fake = FakeAnthropic(qsets)
+        upstream, key = fake.upstream(), FAKE_KEY
+    else:
+        key = os.environ.pop("ANTHROPIC_API_KEY", "")
         if not key:
-            raise Invalid("admitted credential unavailable")
-        gate = Gate(wallet, key)
-        server = serve_gate(gate)
-        gate.server_port = server.server_port
-        config = effective_config(gate)
-        # Exact one-provider boundary. Rendered JSON is checked, not an unexamined
-        # template that could leave a direct provider or credentials enabled.
-        if set(config["models"]["providers"]) != {"evaluation"} or config["models"][
-            "providers"
-        ]["evaluation"]["allowedModels"] != list(MODELS):
-            raise Invalid("effective config mismatch")
-        out = safe_absolute(a["output"])
-        out.mkdir(mode=0o700)
-        with (out / "models.json").open("x") as f:
-            json.dump(config, f, indent=2)
-        if strict_json(bounded_file(out / "models.json", 65536)) != config:
-            raise Invalid("rendered config mismatch")
-        # validate_args normally creates out. This directory is already exclusively
-        # owned and contains only the rendered gate config, so validate using a
-        # separate prospective sibling and retain the actual owned out below.
-        prospective = ev.out
-        ev.out = str(out) + ".setup-claim"
-        qset, setup_claim = mod.validate_args(ev)
-        setup_claim.rmdir()
-        ev.out = prospective
-        thread = threading.Thread(target=server.serve_forever, daemon=False)
-        thread.start()
-        _, report = mod.run_matrix(ev, gate, (qset, out))
-        with (out / "runtime-admission.json").open("x") as f:
-            json.dump(
-                {
-                    "schema": 2,
-                    "admissionSha256": args.admission_sha256,
-                    "run": a["run_id"],
-                    "runtime": a["runtime"],
-                    "authority": AUTHORITY_HASHES,
-                },
-                f,
-                indent=2,
-            )
-        return 0 if report["complete"] else 2
+            raise Invalid("ANTHROPIC_API_KEY is not set")
+        upstream = px.HTTPUpstream(key)
+    out = pathlib.Path(run["out"])
+    out.mkdir(mode=0o700)
+    carry = run["carryover"]
+    ledger = px.Ledger(
+        run["ledger"],
+        run["localCapNanodollars"],
+        carry and {"name": carry["name"], "cost": carry["nanodollars"]},
+    )
+    used = {m for s in run["sets"] for m in s["models"]}
+    models = [m for m in px.MODELS if m in used]  # the cheapest model first
+    proxy = px.Proxy(
+        ledger,
+        upstream,
+        key,
+        models,
+        run["maxOutputTokens"],
+        run["effort"],
+        run["requestTimeoutSecs"],
+    )
+    server = proxy.serve()
+    thread = threading.Thread(target=server.serve_forever)
+    thread.start()
+    summary = {
+        "schema": 1,
+        "dryRun": args.dry_run,
+        "runFileSha256": digest(args.run),
+        "binary": run["binary"],
+        "binarySha256": run["binarySha256"],
+        "effort": run["effort"],
+        "maxOutputTokens": run["maxOutputTokens"],
+        "askTokenBudget": run["askTokenBudget"],
+        "sets": {},
+    }
+    code = 2
+    try:
+        summary["preflight"] = px.preflight(proxy, upstream)
+        (out / "preflight.json").write_text(
+            json.dumps(summary["preflight"], indent=2) + "\n"
+        )
+        config = proxy.config()
+        (out / "models.json").write_text(json.dumps(config, indent=2) + "\n")
+        done = []
+        for set_ in run["sets"] if not args.preflight_only else []:
+            argv = [
+                "--sparkles",
+                run["binary"],
+                "--sparkles-sha256",
+                run["binarySha256"],
+                "--set",
+                str(ROOT / set_["path"]),
+                "--out",
+                str(out / set_["name"]),
+                "--deadline",
+                str(run["askDeadlineSecs"]),
+                "--timeout",
+                str(run["queryTimeoutSecs"]),
+                "--max-tokens",
+                str(run["askTokenBudget"]),
+                "--allow-loopback",
+                "--model-config",
+                str(out / "models.json"),
+                "--model-secret",
+                "evalgate=env:SPARKLES_EVAL_GATE_TOKEN",
+            ]
+            if set_.get("loc"):
+                argv += ["--loc", set_["loc"]]
+            for model in set_["models"]:
+                argv += ["--pair", "evaluation/" + model]
+            ev = mod.parse_args(argv)
+            prepared = mod.validate_args(ev)
+            _, report = mod.run_matrix(ev, proxy, prepared, admission(ledger, run))
+            summary["sets"][set_["name"]] = {
+                "complete": report["complete"],
+                "report": str(out / set_["name"] / "report.json"),
+                "notRun": report["notRun"],
+                "budgetStopped": report["budgetStopped"],
+            }
+            done.append(report["complete"])
+        code = 0 if all(done) else 2
+        if args.preflight_only:
+            code = 0
     finally:
-        if server:
-            if thread:
-                server.shutdown()
-                thread.join(timeout=2)
-            server.server_close()
-        wallet.close()
+        server.shutdown()
+        thread.join(5)
+        server.server_close()
+        summary["ledger"] = proxy.report()
+        sizes = proxy.request_bytes
+        summary["requestBytes"] = {
+            "count": len(sizes),
+            "p50": percentile(sizes, 0.5),
+            "p90": percentile(sizes, 0.9),
+            "max": max(sizes, default=None),
+        }
+        summary["elapsedSeconds"] = time.monotonic() - started
+        (out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+        ledger.close()
+        if fake:
+            fake.close()
+    print(f"eval-ask-anthropic: summary in {out / 'summary.json'}")
+    return code
 
 
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except Exception:  # noqa: BLE001 -- never expose credential-bearing exceptions
-        # Do not interpolate exceptions that could carry an echoed credential.
+    except Exception as error:  # noqa: BLE001 -- never print a message that could hold the key
+        text = str(error) if isinstance(error, Invalid) else ""
         print(
-            "eval-ask-anthropic: refused or incomplete; inspect bounded nonsecret ledger/status",
+            f"eval-ask-anthropic: {type(error).__name__} {text}".strip(),
             file=sys.stderr,
         )
         sys.exit(2)

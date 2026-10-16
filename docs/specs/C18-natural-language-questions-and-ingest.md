@@ -3899,17 +3899,21 @@ built.
   answerable questions with gold queries in seven categories, four that need a
   clarification and five that the data cannot answer. A test runs every gold query
   and checks its stored complexity. The initial `scripts/eval-ask` report now uses
-  one whole-pipeline row per pair and a separate real cascade. Schema 2 reports
-  strict RDF-term row-set precision and recall under one global column mapping,
+  one whole-pipeline row per pair and a cascade row computed from those runs.
+  A failed Ask counts as a scored failure, so one provider error no longer ends a
+  matrix. Schema 3 reports strict RDF-term row-set precision and recall under one
+  global column mapping,
   separate answerable, clarification and refusal denominators, and bounded child
   execution statuses. A bounded first-draft query probe distinguishes an actually
   failed first draft from repair invocation. Incomplete probes stay unknown and
   outside the conditional repair denominator. Gold preflight must succeed before any model call. Reports
-  require a new output directory and an exact pinned binary. The private
-  `scripts/eval-ask-anthropic` owner requires separate runtime admission and keeps
-  one durable aggregate USD25 wallet across models and retries. Uncertain billing
-  retains its full reservation and stops further dispatch. Credential-free tests
-  exercise the retained CLI against a loopback fake provider. They establish
+  require a new output directory and an exact pinned binary. The paid wrapper
+  `scripts/eval-ask-anthropic` runs a loopback proxy that alone holds the API key and
+  forwards each request once with the standard library, which decodes every reply
+  framing. An append-only ledger reserves an upper bound before each request, settles
+  the cost from the reply's usage afterwards and refuses a request that would pass the
+  local cap. Error replies pass through to the client's own retries and cost nothing.
+  Credential-free tests drive the CLI against a loopback fake provider. They establish
   execution and accounting controls, not real accuracy or provider behavior.
   Independent role experiments and public corpus alignment remain roadmap item 6.
 - **Access.** `sparkles auth grant --template agent` prints the grants of §8.6 (A30).
@@ -3942,8 +3946,9 @@ built.
 - The matrix runs each pair in the draft, repair and summarize roles at once. The
   cascade row is computed from those runs, moving a question on when the server sees a
   failure, rather than from separate runs with escalation, which needs Phase 2.
-- QALD-9-plus and Text2SPARQL'25 are not converted. `scripts/eval-ask` takes any set in
-  the demo set's format with its own data file.
+- `scripts/qald9plus-convert` converts the QALD-9-plus test split (item 6). Text2SPARQL'25
+  is not converted. `scripts/eval-ask` takes any set in the demo set's format with its
+  own data file or, with `--loc`, a database directory.
 - Promotion and rejection in the review inbox, and `actedOnBehalfOf` in citations, are
   left to Phase 3.
 - A stored query named `suggestions` cannot be read at `/$/queries/{ds}/suggestions`,
@@ -4004,8 +4009,8 @@ rather than measured ones.
   server scripts the pipeline for the Playwright tests in `ui/tests/mock/ask.spec.ts`.
 - **CLI and matrix.** `sparkles ask` reads `assistant.json` of a database, walks the role
   lists without `--pair`, and takes `--try-harder N`. The cascade row of
-  `scripts/eval-ask` comes from real runs with the pairs as the role lists of a copy of
-  the model configuration, and reports the escalations by signal (A43).
+  `scripts/eval-ask` is computed from the per-pair runs, moving a question on when the
+  server sees a failed Ask, and reports the share answered by each pair (A43).
 
 **Deviations and additions of Phase 2.**
 
@@ -4764,28 +4769,25 @@ the matrix of §11.4 on the demo set of `testsuite/ask/demo.json`, with `--self-
 against a mock provider. Its offline scorer refuses SERVICE before a query child
 starts, including after CR, LF and CRLF comment endings. An excluded first draft
 remains unknown and does not enter the conditional failed-first denominator. The
-initial spending gate requires a status permitting response content and complete,
-unique Content-Length response framing before settlement. It refuses 204 and 205
-before reading a body because neither can supply the required usage response. It
-enforces a cumulative 64 KiB bound on raw status and header
-bytes across informational and final responses. Truncated or ambiguous framing
-keeps the full reservation unresolved and stops dispatch. Valid chunked and
-close-delimited responses are also refused because this transport supports only
-Content-Length framing. A nonstreaming request does not guarantee that framing
-from a provider. A complete real-model matrix and published numbers remain missing.
+paid wrapper is a loopback proxy and an append-only cost ledger. The proxy forwards
+each request once, and the ledger holds a bound before the request and the exact cost
+after the reply. Error replies reach the client's retries unchanged, and a failed Ask is a
+scored failure. A complete real-model matrix and published numbers remain missing.
 
 The initial Anthropic demo pilot on 2026-10-15 passed all 13 local gold checks and
-stopped on the first Haiku request with `upstream_framing`. It attempted and executed
-one of 68 planned Ask executions, scored no cases and left 67 unattempted. The closed
-wallet recorded zero settled spend and retained 1002560000 USD nanodollars, or
-$1.002560, as its full unresolved liability. Actual billed spend is unknown. The
-retained status does not identify which framing check failed, and this pilot supplies
-no accuracy results.
+stopped on the first Haiku request with `upstream_framing`. It ran 17 of the 68 demo
+questions on four pipelines, which were three pairs and a real cascade, so it planned 68
+Ask executions. It attempted and executed one, scored no cases and left 67 unattempted.
+Its wallet recorded zero settled spend and retained 1002560000 USD nanodollars, or
+$1.002560, as its full unresolved liability. Actual billed spend is unknown and is
+probably under one cent for one Haiku call. The retained status does not identify which
+framing check failed, and this pilot supplies no accuracy results.
 
-Compatible upstream framing, bounded nonsecret diagnostics that distinguish framing
-refusals and a separate closed-wallet recovery design remain part of item 6. The
-existing wallet and grant claim must be preserved. Recovery, reset, another grant and
-another run are not authorized. The remaining evaluation work follows.
+The gate that the pilot used is replaced. The new ledger opens with the pilot's
+$1.002560 as a carryover line, so the local cap of $25 leaves $23.997440. The pilot's
+wallet, grant claim and report are kept as the record and are never reopened. The next run
+uses a binary built from a named commit outside the private notes. What remains is a paid
+run of the demo set and the converted QALD-9-plus set, and the work listed below.
 
 - Run the matrix of §11.4 with real providers on the demo set, QALD-9-plus (DBpedia
   questions, gold answers recomputed on the loaded release as §11.1 says) and the
@@ -4793,6 +4795,15 @@ another run are not authorized. The remaining evaluation work follows.
   and a large local model through Ollama, an OpenAI-compatible model, and Haiku-, Sonnet-
   and Opus-class Anthropic models. Each run fixes the prompts, the dataset's commit and
   the provider's model version, and the report records them.
+- `scripts/qald9plus-convert` fetches the 150 questions of the QALD-9-plus DBpedia test
+  split from the KGQA repository at a pinned commit, checks the file's SHA256 and writes
+  a set in the demo set's format. The data is licensed CC BY 4.0 and is not vendored.
+  With `--loc` and `--sparkles` it runs every gold query on a DBpedia database, as §11.1
+  says, and drops the questions whose gold returns nothing, fails, or cannot be scored,
+  and the set counts them with the release and the binary's SHA256. The recompute on the
+  DBpedia 2022.12.01 database of [BENCHMARKING](../BENCHMARKING.md), a check of its
+  full-text index for `link_entities` and a dry run that measures the grounding size, the
+  Ask latency and the query timeouts still need the host that holds the database.
 - Publish per model and role the metrics of §11.1 and §11.4 (execution accuracy with
   QALD's precision, recall and F1, valid-query rate, repair rate, latency and cost per
   correct answer) in a section of [BENCHMARKS](../BENCHMARKS.md), and replace §3.7's
