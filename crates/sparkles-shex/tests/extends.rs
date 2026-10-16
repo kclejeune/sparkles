@@ -320,3 +320,57 @@ fn an_undecided_extra_arc_is_not_left_over_for_sure() {
                  ex:Child EXTENDS @ex:Base EXTRA ex:p { ex:q . }";
     assert_eq!(check(plain, data, &[("n", "Child")]), [false]);
 }
+
+/// The partition search recursed once per arc with a choice; a node with
+/// tens of thousands of such arcs overflowed the stack and aborted the process.
+#[test]
+fn many_arcs_with_a_choice_do_not_overflow_the_stack() {
+    let schema = "ex:A { ex:p . * }
+                  ex:B EXTENDS @ex:A { ex:p . * }";
+    let mut data = String::new();
+    for i in 0..50_000 {
+        data.push_str(&format!("ex:n ex:p {i} .\n"));
+    }
+    // run on a thread with the default 2 MiB stack, as a server worker does
+    let r = std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(move || check(schema, &data, &[("n", "B")]))
+        .unwrap()
+        .join()
+        .unwrap();
+    assert_eq!(r, [true]);
+}
+
+/// Every branch of this search hits a cap before a leaf, so a budget charged only at
+/// leaves never stops it (about C(51,25) paths). It must end with the validation-work
+/// budget error.
+#[test]
+fn a_search_without_leaves_is_bounded() {
+    let schema = compile("ex:A { ex:p . {25} } ex:B EXTENDS @ex:A { ex:p . {25} }").unwrap();
+    let mut data = String::new();
+    for i in 0..51 {
+        data.push_str(&format!("ex:n ex:p {i} .\n"));
+    }
+    let store = store(&data);
+    let map = ShapeMap(vec![Association {
+        node: NodeSelector::Term(Term::from(NamedNode::new_unchecked(format!("{EX}n")))),
+        shape: ShapeLabel::Iri(format!("{EX}B")),
+    }]);
+    let opts = ValidateOptions {
+        max_partitions: Some(1000),
+        timeout: Some(std::time::Duration::from_secs(5)),
+        ..ValidateOptions::default()
+    };
+    // a watchdog: before the fix the search runs for hours and ignores the timeout
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let r = sparkles_shex::validate(&store.snapshot(), &schema, &map, &opts)
+            .map(|r| r.results[0].status == Status::Conformant);
+        let _ = tx.send(r.map_err(|e| e.to_string()));
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+        Ok(Ok(conformant)) => assert!(!conformant, "51 arcs cannot match 25 + 25"),
+        Ok(Err(_budget_or_timeout)) => {}
+        Err(_) => panic!("the partition search ran past its timeout and budget"),
+    }
+}

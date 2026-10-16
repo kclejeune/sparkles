@@ -314,32 +314,93 @@ impl Cx<'_, '_, '_> {
         if let Some(e) = self.error.borrow_mut().take() {
             return Err(e);
         }
-        self.dfs(&mut st, 0)
+        self.dfs(&mut st)
     }
 
-    fn dfs(&mut self, st: &mut Search<'_>, i: usize) -> anyhow::Result<Tri> {
-        if i == st.choices.len() {
+    /// The disjunction of the leaves under the arcs that have a choice, found depth first
+    /// with an explicit stack, since a node can have tens of thousands of such arcs. The
+    /// first descent is free. Each leaf, each option abandoned on backtracking and each
+    /// option that its part's cap rules out is charged to the partition budget, so a
+    /// search that never reaches a leaf is bounded as well, and the timeout and
+    /// cancellation are checked as it goes.
+    fn dfs(&mut self, st: &mut Search<'_>) -> anyhow::Result<Tri> {
+        /// Steps between two checks of the timeout and cancellation.
+        const CHECK_EVERY: usize = 4096;
+        /// The state of the search at one choice.
+        struct Level {
+            /// the next option of the choice to try
+            next: usize,
+            /// the entry of the part the current option filled
+            applied: Option<(usize, usize)>,
+            /// whether the current option leaves the arc over
+            remainder: bool,
+        }
+        let n = st.choices.len();
+        if n == 0 {
             self.budget.charge(1)?;
             return self.leaf(st);
         }
-        let arc = st.choices[i].arc;
-        let opts = st.choices[i].opts.clone();
         let mut res = Tri::False;
-        for opt in opts {
+        let mut stack = vec![Level {
+            next: 0,
+            applied: None,
+            remainder: false,
+        }];
+        // the arcs the current partition leaves over: a leaf under one is undecided at
+        // best, because the arc may match after all
+        let mut left_over = 0usize;
+        let mut steps = 0usize;
+        while !stack.is_empty() {
+            steps += 1;
+            if steps.is_multiple_of(CHECK_EVERY) {
+                self.env.limits.check()?;
+            }
+            let i = stack.len() - 1;
+            let level = &mut stack[i];
+            // back out of the option this level tried last
+            if let Some((p, e)) = level.applied.take() {
+                st.counts[p][e] -= 1;
+                st.assign[p].pop();
+                self.budget.charge(1)?;
+            }
+            if std::mem::take(&mut level.remainder) {
+                left_over -= 1;
+                self.budget.charge(1)?;
+            }
+            let Some(&opt) = st.choices[i].opts.get(level.next) else {
+                stack.pop();
+                continue;
+            };
+            level.next += 1;
             match opt {
                 Opt::Part(p, e) => {
                     if over(&st.caps, &st.counts, p, e) {
+                        self.budget.charge(1)?;
                         continue;
                     }
                     st.counts[p][e] += 1;
-                    st.assign[p].push(arc);
-                    let r = self.dfs(st, i + 1);
-                    st.counts[p][e] -= 1;
-                    st.assign[p].pop();
-                    res = res.or(r?);
+                    st.assign[p].push(st.choices[i].arc);
+                    level.applied = Some((p, e));
                 }
-                Opt::Remainder => res = res.or(self.dfs(st, i + 1)?.and(Tri::Unknown)),
+                Opt::Remainder => {
+                    left_over += 1;
+                    level.remainder = true;
+                }
             }
+            if i + 1 < n {
+                stack.push(Level {
+                    next: 0,
+                    applied: None,
+                    remainder: false,
+                });
+                continue;
+            }
+            self.budget.charge(1)?;
+            let mut leaf = self.leaf(st)?;
+            if left_over > 0 {
+                leaf = leaf.and(Tri::Unknown);
+            }
+            res = res.or(leaf);
             if res == Tri::True {
                 break;
             }
