@@ -184,6 +184,8 @@ struct OwnPool {
     pool: Option<rayon::ThreadPool>,
     threads: usize,
     exited: Arc<(Mutex<usize>, Condvar)>,
+    /// the workers' threads, joined when the pool stops
+    handles: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
 }
 
 /// How long a run's own pool may take to stop before its workers are given back anyway.
@@ -192,10 +194,18 @@ const STOP_WAIT: Duration = Duration::from_secs(30);
 impl OwnPool {
     fn new(threads: usize) -> anyhow::Result<OwnPool> {
         let exited: Arc<(Mutex<usize>, Condvar)> = Arc::default();
+        let handles: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>> = Arc::default();
         let e = exited.clone();
+        let h = handles.clone();
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
-            .thread_name(|i| format!("reason-run-{i}"))
+            .spawn_handler(move |t| {
+                let j = std::thread::Builder::new()
+                    .name(format!("reason-run-{}", t.index()))
+                    .spawn(|| t.run())?;
+                h.lock().push(j);
+                Ok(())
+            })
             .exit_handler(move |_| {
                 *e.0.lock() += 1;
                 e.1.notify_all();
@@ -205,11 +215,14 @@ impl OwnPool {
             pool: Some(pool),
             threads,
             exited,
+            handles,
         })
     }
 }
 
 impl Drop for OwnPool {
+    /// Stop the workers and wait until their threads have ended, so that the workers
+    /// given back are not still running beside the next run's.
     fn drop(&mut self) {
         drop(self.pool.take());
         let (n, cv) = &*self.exited;
@@ -222,8 +235,13 @@ impl Drop for OwnPool {
                     exited = *n,
                     "a reasoning run's threads did not stop in time"
                 );
-                break;
+                return;
             }
+        }
+        drop(n);
+        // every worker left its loop: its thread ends at once
+        for j in self.handles.lock().drain(..) {
+            let _ = j.join();
         }
     }
 }

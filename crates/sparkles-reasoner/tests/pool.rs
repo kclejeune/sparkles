@@ -31,12 +31,16 @@ fn store(n: usize) -> Store {
     s
 }
 
+/// The tests of this file one at a time: one counts the threads of the whole process.
+static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+
 /// Run `f` on a thread of its own and fail when it does not end within `limit`.
 fn within<T: Send + 'static>(
     limit: Duration,
     what: &str,
     f: impl FnOnce() -> T + Send + 'static,
 ) -> T {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let _ = tx.send(f());
