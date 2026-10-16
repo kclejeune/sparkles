@@ -773,7 +773,10 @@ namespace and so one set of counters.
 ### Phase 1b: the query memory pool
 
 `QueryPool` and `PoolGrant` are in `sparkles-core` (`sparql/pool.rs`) as §4.1 describes.
-`Charge::add` admits local and pool growth under the query ledger's lock before
+A plain eager query charges a lock-free fast account of atomic counters, and
+`Charge::add` admits its growth there with a compare-and-swap. A query that calls a graph
+algorithm, keeps an output lease or moves to a cursor is promoted to the query ledger, and
+from then on `Charge::add` admits local and pool growth under the ledger's lock before
 publishing live ownership. Cursor state returns through the same ledger, and the pool
 never makes a running query wait. The grant adds eager contexts' retained estimates to live cursor charges,
 and growth and trimming of one grant run under a lock of its own. The differences from
@@ -871,9 +874,10 @@ fitting output estimates, separate context lifetimes, graph lexical payload, bud
 failure cleanup and conversion from eager preparation to cursor accounting. The existing
 profile and latency measurements remain pending as described below.
 
-The query ledger now serializes admission and successful ownership publication for
-ordinary charges and adapted algorithm buffers. Pool releases and wakeups run after
-that lock is released. This changes the retained-estimate path from the earlier fast
+A plain query charges the lock-free fast account and never takes the ledger lock. Once a
+query is promoted to the ledger, the ledger serializes admission and successful
+ownership publication for its charges and adapted algorithm buffers. Pool releases and
+wakeups run after that lock is released. This changes the retained-estimate path from the earlier fast
 read and separate growth helper. The earlier isolated Intel comparison covered only
 `types-grouped` and does not measure this repair or settle the latency gate. The A1
 anonymous RSS remeasurement, the 10.5M and DBpedia profile runs, and the latency study

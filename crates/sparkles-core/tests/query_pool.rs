@@ -819,8 +819,8 @@ fn empty_and_ask_results_release_each_distinct_grant() {
     assert!(held[0].boolean);
     assert!(held[1].is_empty());
     assert!(!std::sync::Arc::ptr_eq(
-        held[0].ctx.grant.as_ref().unwrap(),
-        held[1].ctx.grant.as_ref().unwrap()
+        held[0].ctx.grant().unwrap(),
+        held[1].ctx.grant().unwrap()
     ));
     drop(held);
     assert_eq!(pool.granted(), 0);
