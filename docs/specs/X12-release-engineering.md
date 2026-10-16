@@ -634,18 +634,21 @@ fallback, and the sealer recognizes the whole family while decoding only v1. Thi
 registration changes neither the v1 encoding and AAD nor the dataset reader capability.
 
 **Version markers.** A write-ahead log created by this build starts with a header
-record: the magic `\x89SPKWAL\n`, the version (1) and zeros. The spec asked for a 16-byte
-header. The header is instead 33 bytes, the size of every record, so the records after
-it keep their alignment. Every reader that steps through records at multiples of 33
-from the start of the log, and every saved position of byte 0 meaning "before the first
-commit" (the history index, branch link segments, the backward replay), works unchanged
-by skipping the record where the log starts. A log without the header is version 0 and
-reads as before. Existing logs are never rewritten. The header arrives with the next
-generation, at a compaction, a bulk load, a branch or a clone. Because an older release
-would read the header as a damaged record and could truncate the log as a torn tail,
-`dataset.json` gains reader capability 5 (`DATASET_READER`), and a store raises
-`minimumReader` to 5 when it opens a database for writing, after every file it read
-proved readable.
+record: the magic `\x89SPKWAL\n`, the version (1) and zeros. The spec asked for a
+16-byte header. The header is instead 33 bytes, the size of every record, so the records
+after it keep their alignment. Every reader that steps through records at multiples of
+33 from the start of the log, and every saved position of byte 0 meaning "before the
+first commit" (the history index, branch link segments, the backward replay), works
+unchanged by skipping the record where the log starts. A log without the header is
+version 0 and reads as before. Readers of the log header and of a generation's
+`meta.json` take the version before anything else and refuse an unknown one as
+`Unsupported`, so a newer release may use the header's trailing bytes or give
+`meta.json` another shape, and the catalog still refuses only that dataset. Existing
+logs are never rewritten. The header arrives with the next generation, at a compaction,
+a bulk load, a branch or a clone. Because an older release would read the header as a
+damaged record and could truncate the log as a torn tail, `dataset.json` gains reader
+capability 5 (`DATASET_READER`), and a store raises `minimumReader` to 5 when it opens a
+database for writing, after every file it read proved readable.
 
 The catalog's `config.json` and the settings files gain a member, absent meaning 1, read
 and written through `formats::settings_from_slice`, `settings_to_vec`,

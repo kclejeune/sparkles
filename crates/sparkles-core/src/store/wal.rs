@@ -20,7 +20,10 @@
 //! A log created by this release starts with a header record: 33 bytes, like every
 //! record, so the records after it keep their alignment. Its first eight bytes are
 //! [`MAGIC`], whose first byte [`WAL_HEADER`] is no record type, then the log's version
-//! ([`crate::formats::WAL_VERSION`]) as a little-endian `u32`, then zeros. A log without
+//! ([`crate::formats::WAL_VERSION`]) as a little-endian `u32`. The bytes after the version
+//! are zero in every version this build reads, and a newer version may use them, so a
+//! reader takes the version first and refuses an unknown one before it looks at the rest.
+//! A log without
 //! the header was written before it existed and is version 0. Its records are the same.
 //! Readers skip the header where a log starts, so a position of byte 0 still means "the
 //! generation's base, before any commit". A log whose version this build does not read
@@ -49,14 +52,17 @@ pub(crate) fn header_record() -> [u8; WAL_REC] {
 /// The version in a header record (`rec[0]` is [`WAL_HEADER`]), checked against the
 /// versions this build reads.
 pub(crate) fn header_version(rec: &[u8], path: &Path) -> Result<u32> {
-    if rec.len() < WAL_REC || rec[..8] != MAGIC || rec[12..WAL_REC].iter().any(|&b| b != 0) {
-        return Err(Error::Corrupt(format!(
-            "{}: damaged header record",
-            path.display()
-        )));
+    let damaged = || Error::Corrupt(format!("{}: damaged header record", path.display()));
+    if rec.len() < WAL_REC || rec[..8] != MAGIC {
+        return Err(damaged());
     }
     let v = u32::from_le_bytes(rec[8..12].try_into().unwrap());
+    // a newer version may define the bytes after its version, so check it first
     crate::formats::WAL.check(&path.display().to_string(), v, None)?;
+    // every version this build reads leaves them zero
+    if rec[12..WAL_REC].iter().any(|&b| b != 0) {
+        return Err(damaged());
+    }
     Ok(v)
 }
 

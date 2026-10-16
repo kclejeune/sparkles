@@ -81,7 +81,7 @@ pub fn run(a: MigrateArgs) -> Result<()> {
             plans.push((name.clone(), p));
         }
     }
-    let refused = plans.iter().any(|(_, p)| !p.in_window());
+    let refused = plans.iter().any(|(_, p)| !p.opens());
     let mut out = std::io::stdout().lock();
     if a.format == "json" {
         let json = serde_json::json!({
@@ -90,6 +90,7 @@ pub fn run(a: MigrateArgs) -> Result<()> {
                 "name": n,
                 "root": p.root,
                 "inWindow": p.in_window(),
+                "opens": p.opens(),
                 "dataset": p.dataset,
                 "files": p.files,
                 "steps": p.steps,
@@ -157,8 +158,13 @@ fn write_plan(out: &mut impl Write, p: &Plan) -> std::io::Result<()> {
     if let Some(i) = &p.interrupted {
         writeln!(out, "{i}")?;
     }
-    if p.in_window() {
+    if p.opens() {
         writeln!(out, "inside the window: this release opens it")?;
+    } else if p.in_window() {
+        writeln!(
+            out,
+            "interrupted: this release refuses it until `sparkles migrate` runs without --check"
+        )?;
     } else {
         writeln!(out, "outside the window: this release refuses it")?;
         for r in &p.refused {

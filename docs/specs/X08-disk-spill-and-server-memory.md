@@ -725,7 +725,12 @@ namespace and so one set of counters.
 * **Result and SERVICE caches.** Keys are `(namespace, string)` and a lookup borrows the
   string. `POST /$/cache/clear/{ds}` removes the namespace's entries with `retain` instead
   of bumping an epoch. It is exact, so the counters report what was cleared, and it costs
-  a pass over the cache.
+  a pass over the cache. Both caches keep an entry up to an eighth of their budget, and
+  quick_cache refuses an entry heavier than 97% of one shard's share, so each has at
+  most four shards. With quick_cache's default of four shards per CPU, a 64 MiB result
+  cache on a host with 16 CPUs had shards of 1 MiB and dropped the 8 MiB entries that it
+  accepted. The block cache keeps the default, because quick_cache keeps at least 32
+  expected columns in each of its shards, so a full column always fits.
 * **History cache.** Each store's materialized states stay a list, charged to a shared
   `ByteBudget` that every mutation settles. A store that finds the budget over evicts its
   own oldest states, and when it still holds only the state it just built, that state is
@@ -917,6 +922,17 @@ comparing the baseline, fixed build and pool settings remain pending as describe
 * **X08-P1-nested-service.** Recognise a SERVICE call to the same server, without a header
   that a client could forge, so that it does not wait behind its caller's grant. Today it
   answers `503` after the admission wait, and `SILENT` turns that into empty results.
+* **X08-P1-admit-after-body.** Admit a POST query or update after its body is read under
+  the existing body limit, give uploads and Graph Store writes no 16 MiB initial grant,
+  and wake only the waiters that fit when memory returns. Today admission happens before
+  the body is read, and the server sets no body read timeout, so a slow client holds its
+  grant while it sends. Every release wakes every waiter.
+* **X08-P1-retained-results.** Shrink an eager context's retained estimate to its result's
+  size when the query finishes. Today an eager `QueryResult` keeps its query's peak
+  estimate until it is dropped, and a Python or Node result object keeps it until the
+  object is collected.
+* A lock-free `try_grant` when no request waits, measured with the latency gate above.
+  Admission takes the queue's lock on every request.
 * The 10.5M and DBpedia runs of the profile gate in §3.3, warm and cold. Only the
   1.05M screen ran.
 * A settings-file profile (C19) and the `small` default for the bindings (§8.2).

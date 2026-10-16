@@ -654,17 +654,17 @@ fn a_lookup_error_makes_a_bulk_commit_a_summary() {
         DiffOp::Add => (a + 1, d),
         _ => (a, d + 1),
     });
-    if (adds, removes) == (0, 0) {
-        assert!(
-            r.unrecorded
-                .iter()
-                .any(|u| u.from <= 2 && 2 <= u.to && u.reason == UnrecordedReason::Bulk),
-            "{:?}",
-            r.unrecorded
-        );
-    } else {
-        assert_eq!((adds, removes), (10, 10), "{:?}", r.unrecorded);
-    }
+    // The lookups that decide which quads changed read the damaged SPO block, so the
+    // commit is recorded as a summary. If a later change makes those lookups read
+    // another permutation, this fails and the test needs a new way to break them.
+    assert_eq!((adds, removes), (0, 0), "{:?}", r.unrecorded);
+    assert!(
+        r.unrecorded
+            .iter()
+            .any(|u| u.from <= 2 && 2 <= u.to && u.reason == UnrecordedReason::Bulk),
+        "{:?}",
+        r.unrecorded
+    );
 }
 
 #[test]

@@ -83,8 +83,10 @@ pub fn run(loc: Option<PathBuf>, data: Option<PathBuf>, format: &str, quick: boo
     })
 }
 
-/// The databases of a server data directory (`databases/*`), by name; unfinished
-/// clones are left out.
+/// The databases of a server data directory (`databases/*`), by name. Names that start
+/// with `.` are left out: the catalog refuses them as dataset names, and they belong to
+/// unfinished clones (`.clone-*`) and to the copies `sparkles migrate` builds
+/// (`.migrate-*`) or keeps (`.pre-migrate-*`).
 fn datasets(data: &Path) -> Result<Vec<(Option<String>, PathBuf)>> {
     let dir = data.join("databases");
     let mut out: Vec<(Option<String>, PathBuf)> = std::fs::read_dir(&dir)
@@ -92,7 +94,7 @@ fn datasets(data: &Path) -> Result<Vec<(Option<String>, PathBuf)>> {
         .flatten()
         .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
         .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| !n.starts_with(".clone-"))
+        .filter(|n| !n.starts_with('.'))
         .map(|n| (Some(n.clone()), dir.join(n)))
         .collect();
     out.sort();

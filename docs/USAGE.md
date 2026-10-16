@@ -2172,10 +2172,12 @@ provider's endpoint and key, so an index need not repeat them. The fields are in
 `sparkles check --loc db` verifies a database directory without modifying it. It takes
 no lock, truncates no WAL, repairs no catalog and rebuilds no full-text index, so it can
 run next to a server that holds the database. `--data DIR` checks every database in a
-server's data directory. Each check prints one line, `ok`, `warning` or `error`, and
-lists the file, offset, block, row, commit or id of every problem below it.
-`--format json` prints the same report as JSON. The exit status is 0 when everything is
-clean, 1 when any check found an error, and 2 when there are warnings only.
+server's data directory. It leaves out directories whose names start with a dot, which
+hold unfinished clones and the copies that `sparkles migrate` builds or keeps. Each
+check prints one line, `ok`, `warning` or `error`, and lists the file, offset, block,
+row, commit or id of every problem below it. `--format json` prints the same report as
+JSON. The exit status is 0 when everything is clean, 1 when any check found an error,
+and 2 when there are warnings only.
 
 | Check | What it verifies |
 |---|---|
@@ -2230,65 +2232,82 @@ sparkles migrate --loc db --check --format json
 
 `sparkles migrate` works offline. With `--data` it takes the catalog lock, so it fails
 while a server holds the data directory, and it upgrades the persistent datasets that
-`config.json` registers, or those that `--dataset` names. `--check` lists each
-database's `dataset.json` versions, the version of every generation's index, log and
-update vocabulary, whether the release opens the database, and the steps an upgrade
-would run. It never changes a database and does not finish or undo an earlier run, which
-it reports as `interrupted`. The exit status is 1 when a database is outside the window
-and 0 otherwise. The window covers the root of a database and every branch, and a newer
-settings file of a dataset or of one of its branches puts the database outside it.
-Startup checks dataset metadata and settings in every active and retained branch before
-rewriting root metadata, using the same physical branch directories as migration
-planning. Unpublished `.create-*` directories and `.deleting` tombstones are excluded
-from these checks and left unchanged by migration planning. Startup's existing branch
-recovery removes them after compatibility preflight succeeds. An incompatible real
-branch refuses its dataset before cleanup while other datasets remain available.
-The informational files `origin.json` and `restore.json` are the exception, because a
-store ignores a newer one with a warning.
+`config.json` registers, or those that `--dataset` names.
 
-The command makes the database path absolute before mutation. If it contains `..`,
-it resolves the existing parent through the filesystem and preserves the final database
-name. This keeps a valid `db/../db` path usable during the swap and follows the physical
-meaning of symlink parents. If an interrupted run made that alias unresolvable, use the
-database's stable parent path to recover. Paths without `..` continue to support a
-missing database and new nested directories.
+`--check` plans without changing anything. It lists each database's `dataset.json`
+versions, the version of every generation's index, log and update vocabulary, whether
+the release opens the database, and the steps an upgrade would run. It does not finish
+or undo an earlier run, which it reports as `interrupted`. The exit status is 1 when a
+database is outside the window or has an interrupted run, which a server refuses until
+`sparkles migrate` runs without `--check`, and 0 otherwise. The JSON report gives both
+answers, `inWindow` for the formats and `opens` for whether this release opens the
+database now. A generation whose `meta.json` has no usable version is listed as refused,
+and the report goes on with the other generations and databases.
+
+The window covers the root of a database and every branch, and a newer settings file of
+a dataset or of one of its branches puts the database outside it. The informational files
+`origin.json` and `restore.json` are the exception, because a store ignores a newer one
+with a warning. Startup checks the dataset metadata and settings of every active and
+retained branch before it rewrites the root's metadata, and it reads the same branch
+directories as migration planning. Both leave out unpublished `.create-*` directories and
+`.deleting` tombstones, which planning leaves unchanged and which startup's branch
+recovery removes once these checks pass. An incompatible branch refuses its dataset
+before any cleanup, and the other datasets stay available.
+
+The command makes the database path absolute before it changes anything. If the path
+contains `..`, the command resolves the existing parent through the filesystem and keeps
+the final database name. This keeps a valid `db/../db` path usable during the swap and
+follows the physical meaning of symlink parents. If an interrupted run made such a path
+unresolvable, recover through the database's stable parent path. Paths without `..`
+still support a missing database and new nested directories.
 
 Without `--check`, the command copies each database that has steps to run into a
 sibling directory named `.migrate-<name>` and runs the steps on the copy. It then checks
 the copy as `sparkles check` does and swaps it in with two renames. The copy needs as much
-free space as the database. The dataset id, the commit numbers, the commit catalog, the
-branches and the snapshots stay as they were. `--keep-old` keeps the database as it was
-in `.pre-migrate-<version>-<name>`, and without it that directory is removed. The
-command refuses to start while that directory exists, so it never deletes an earlier
-kept copy. It also refuses a database that holds a symlink or another entry that is not a
-regular file or directory, because the copy would leave it out. Replace the entry with the
-files it points to and run again.
+free space as the database. It keeps the mode and the owner of every file and directory,
+and a file that a step rewrites keeps those of the file it replaces. The command must
+therefore run as the user that owns the database or as root, and it refuses to start
+otherwise. It also refuses a database directory that its owner cannot write, and a
+database named through a symlink, which the swap would replace with a directory. Run it
+on the directory the link points to. The dataset id, the commit numbers, the commit catalog, the branches and the
+snapshots stay as they were. `--keep-old` keeps the database as it was in
+`.pre-migrate-<version>-<name>`, and without it that directory is removed. The command
+refuses to start while that directory exists, so it never deletes an earlier kept copy.
+A dataset delete does not remove a kept copy either. The command also refuses a database
+that holds a symlink or another entry that is not a regular file or directory, because
+the copy would leave it out. Replace the entry with the files it points to and run again.
 
 The command takes the lock file `.migrate.lock-<name>` next to the database, which a
-second `sparkles migrate` and a `--check` of the same database respect, and the
-database's own lock, which a server or any other process that has the database open
-holds. It therefore fails with a locked error while a server runs on the database, and it
-leaves the lock file in place after it finishes. A copy that fails the check is removed,
-and the database is left as it was. If the command stops before the swap, the next run
-removes the copy and the database is unchanged. If it stops between the two renames, the
-next run renames the checked copy into place. A server, or any other open of the
+second `sparkles migrate` and a `--check` of the same database respect. It also takes
+the database's own lock, which a server or any other process that has the database open
+holds, so it fails with a locked error while a server runs on the database. The lock
+file stays in place after the command finishes. A server, or any other open of the
 database, refuses a database with a pending `.migrate-<name>` until `sparkles migrate`
-has run on it again, so a stopped run never leads to an empty database. The checked
-copy records a versioned marker with the exact old sibling directory and whether to
-keep it. Recovery uses that recorded directory even when another release finishes the
-run, so it preserves unrelated kept copies. Unknown or damaged markers and duplicate known marker fields refuse recovery
-without changing the copies. Bare legacy `keep-old` or `remove-old` markers also refuse
-automatic recovery because they do not identify the original old directory. Inspect
-the sibling copies and recover through a known original location or restore by hand. After checking
+has run on it again, so a stopped run never leads to an empty database. After it checks
 for a pending migration, startup verifies that its locked file still belongs to the
-current database directory. If migration replaced that directory while startup was
-acquiring its lock, the open refuses with a locked error and can be retried. An offline
-backup restore makes the same check before publication and refuses a stale lock with
-`dataset-busy`, leaving both directories intact. A copy that
-carries no mark of a passed check is never renamed into place. The command reports it and
-leaves both directories alone. A backup restore also refuses to replace the database while
-a migration is pending, including when the database directory is missing between the two
-renames.
+current database directory. If a migration replaced that directory while startup was
+taking its lock, the open refuses with a locked error and can be retried.
+
+Until the copy has passed its check and carries a durable mark that says so, any error
+removes the copy and leaves the database as it was. That covers a step that fails, a
+check that finds errors or fails to run, and a mark that cannot be written. If the
+command stops before the swap, the next run removes the copy, and the database is
+unchanged. If it stops between the two renames, the next run renames the checked copy
+into place. A copy without the mark of a passed check is never renamed into place, and
+the command reports it and leaves both directories alone.
+
+The mark is versioned and records the exact old sibling directory and whether to keep
+it. Recovery uses that recorded directory even when another release finishes the run, so
+it preserves unrelated kept copies. An unknown or damaged mark, or one with a known field
+given twice, refuses recovery without changing the copies. A bare legacy `keep-old` or
+`remove-old` mark also refuses automatic recovery, because it does not name the original
+old directory. In those cases inspect the sibling copies, then recover through a known
+original location or restore by hand.
+
+A backup restore refuses to replace a database while a migration is pending, including
+when the database directory is missing between the two renames. An offline restore also
+checks that its lock belongs to the current database directory before it publishes, and
+refuses a stale lock with `dataset-busy`, leaving both directories intact.
 
 The only step today rewrites a legacy update vocabulary (`delta.vocab`) in the framed
 format, which the first write to it would also do. A server opens such a database
@@ -4172,11 +4191,13 @@ with, so its memory does not grow with the number of datasets. `CatalogOptions::
 can size them separately (`CatalogCaches::Sizes`) or give each dataset its own
 (`CatalogCaches::PerDataset`). `MemoryOptions::pool_bytes` adds a query memory pool, the
 estimated bytes that all the catalog's queries and updates may hold together. A query
-that the pool cannot cover fails with `BudgetKind::ServerMemory`, and nothing queues.
-There is no pool by default. A dataset opened on its own keeps its own caches. Python
-takes `total_query_memory_bytes` in `Catalog(...)` and `Catalog.memory(...)`, and
-Node takes `totalQueryMemoryBytes` in the catalog options. The JVM bindings do not expose
-the pool.
+that the pool cannot cover fails with `BudgetKind::ServerMemory`, and nothing queues. An
+eager result, a Rust `QueryResult` or a Python or Node result object, keeps its query's
+peak estimate in the pool until it is dropped or collected, so a program that holds many
+results should release them when it is done. There is no pool by default. A dataset
+opened on its own keeps its own caches. Python takes `total_query_memory_bytes` in
+`Catalog(...)` and `Catalog.memory(...)`, and Node takes `totalQueryMemoryBytes` in the
+catalog options. The JVM bindings do not expose the pool.
 
 With the feature `backup`, `catalog.repositories()` manages `backup/repositories.json`.
 Its `list`, `get`, `add`, `update`, `remove` and `open` calls share the configuration
@@ -4212,7 +4233,9 @@ login or `SPARKLES_TOKEN`. Remote clones wait for the clone task. Renames preser
 dataset identity and require server administration. They refuse live requests,
 reservations, and grants or active token scopes covering the old or new name, with the
 grants named in the error. `--data-dir` takes the catalog lock and requires a stopped
-server.
+server. A delete leaves alone a copy that `sparkles migrate --keep-old` kept in
+`databases/.pre-migrate-<version>-<name>`, which must be removed by hand once it is no
+longer needed.
 
 ## Python
 

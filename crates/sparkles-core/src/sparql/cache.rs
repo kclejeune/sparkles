@@ -51,9 +51,15 @@ impl ResultStore {
     /// Storage of at most `bytes` for results (0 turns it off) and `service_bytes` for
     /// remote SERVICE results.
     pub fn new(bytes: u64, service_bytes: u64) -> ResultStore {
+        Self::with_shards(bytes, service_bytes, super::svccache::host_shards())
+    }
+
+    /// [`new`](Self::new) asking for `shards` shards, of which the cache keeps at most
+    /// [`MAX_SHARDS`](super::svccache::MAX_SHARDS), so an entry up to an eighth of the
+    /// budget always fits its shard.
+    fn with_shards(bytes: u64, service_bytes: u64, shards: usize) -> ResultStore {
         ResultStore {
-            cache: (bytes > 0)
-                .then(|| quick_cache::sync::Cache::with_weighter(10_000, bytes, Weighter)),
+            cache: (bytes > 0).then(|| super::svccache::bounded_cache(bytes, shards, Weighter)),
             max_entry_bytes: bytes / 8,
             service: Arc::new(ServiceStore::new(service_bytes)),
         }
@@ -623,5 +629,43 @@ mod tests {
         }
         // ordinary short variable names are left alone
         assert!(anon_regex().captures("(Bind [?c := ?abc] {?t})").is_none());
+    }
+}
+
+#[cfg(test)]
+mod shard_tests {
+    use super::*;
+
+    /// The largest entry `put` accepts is kept, whatever number of shards the host asks
+    /// for. The default asks for four per CPU, so 64 on a host with 16 CPUs.
+    #[test]
+    fn largest_accepted_result_is_kept_on_any_host() {
+        let budget = 64u64 << 20;
+        for shards in [1, 4, 16, 64, 128, 256, 1024] {
+            let store = ResultStore::with_shards(budget, 0, shards);
+            let c = store.cache.as_ref().unwrap();
+            let key = NsKey {
+                ns: 0,
+                key: "k0".to_string(),
+            };
+            let rows = ((store.max_entry_bytes - 64 - key.key.len() as u64) / 8) as usize;
+            let entry = Arc::new(Entry {
+                vars: vec!["x".into()],
+                sorted: vec![],
+                cols: Arc::new(vec![vec![Id(0); rows]]),
+                len: rows,
+            });
+            c.insert(key.clone(), entry);
+            assert!(
+                c.get(&NsKeyRef {
+                    ns: 0,
+                    key: &key.key
+                })
+                .is_some(),
+                "{shards} shards ({} of {} bytes) dropped an entry that put accepts",
+                c.num_shards(),
+                c.shard_capacity()
+            );
+        }
     }
 }
