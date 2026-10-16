@@ -1611,6 +1611,34 @@ mod cold_reads {
         assert_eq!(on.len(), 600);
     }
 
+    /// A FILTER over a small table asks for the numeric column's pages without reading
+    /// the values or building a result (spec X07 §9, gate 4).
+    #[test]
+    fn a_small_filter_hints_numeric_pages_without_reading_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(dir.path(), StoreOptions::default()).unwrap();
+        let mut ttl = String::from(
+            "@prefix ex: <http://ex.org/> . @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n",
+        );
+        for i in 0..100 {
+            ttl.push_str(&format!("ex:n{i} ex:w \"{i}.25\"^^xsd:float .\n"));
+        }
+        load(&s, &ttl, RdfFormat::Turtle);
+        assert!(s.snapshot().generation.vocab.numeric().is_some());
+        let q = "SELECT ?s WHERE { ?s ex:w ?v FILTER(?v * 2 > 100) }";
+        let calls = || crate::vocab::numeric::GET_MANY_CALLS.with(|n| n.get());
+        // the expression itself reads the values (once, then from its cache), prefetch or not
+        let off = Optimizations::ALL.disable("prefetch_terms").unwrap();
+        let before = calls();
+        assert_eq!(run(&s, q, off).len(), 50);
+        let without = calls() - before;
+        for _ in 0..2 {
+            let before = calls();
+            assert_eq!(run(&s, q, Optimizations::ALL).len(), 50);
+            assert!(calls() - before <= without, "the prefetch read the values");
+        }
+    }
+
     /// A query's reads are counted: the columns it decoded. The counters are process-wide
     /// and `io_stats` starts from them only under a profile, so the check runs alone in a
     /// child process with a profile alive.

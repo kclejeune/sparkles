@@ -720,6 +720,17 @@ impl Vocab {
         }
     }
 
+    /// Ask for the pages that evaluating these ids' values reads (ids sorted ascending), for
+    /// a FILTER over a few rows: the front-coded blocks of every id and the numeric
+    /// column's pages (see [`numeric::NumColumn::advise_ids`]). It reads no value, so a
+    /// warm call costs the block lookups alone.
+    pub fn prefetch_value_pages(&self, ids: &[u64]) {
+        self.prefetch_sorted(ids);
+        if let Some(num) = &self.num {
+            num.advise_ids(ids);
+        }
+    }
+
     /// Overlap the vocabulary reads of a medium-sized result decoded in row order.
     /// With a sparse index, use its in-memory offsets and hint each group once, as
     /// `find` does. Warm requests then avoid sorting their cells or repeating hints.

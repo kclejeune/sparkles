@@ -361,10 +361,10 @@ impl NumColumn {
     }
 
     #[inline]
-    fn value_word(&self, r: u64) -> u64 {
+    fn value_word(&self, b: &[u8], r: u64) -> u64 {
         let at = self.values + r as usize * 8;
         self.touch_mapped(at, 8);
-        word(self.bytes.as_slice(), at)
+        word(b, at)
     }
 
     /// The kind of base id `id` and, for a valued kind, the index of its value.
@@ -394,7 +394,9 @@ impl NumColumn {
     pub fn get(&self, id: u64) -> Numeric {
         match self.locate(id) {
             (NOT_NUMERIC, _) => Numeric::NotNumeric,
-            (k, r) if k & 8 != 0 && r < self.count => Numeric::of(k, self.value_word(r)),
+            (k, r) if k & 8 != 0 && r < self.count => {
+                Numeric::of(k, self.value_word(self.bytes.as_slice(), r))
+            }
             _ => Numeric::Unknown,
         }
     }
@@ -404,7 +406,7 @@ impl NumColumn {
     /// [`crate::index::io_hints`]). Nearby chunks are asked for in one request. A warm
     /// pass makes no system call, and a cold one finds its pages read by a few large
     /// requests rather than one fault per page.
-    fn advise(&self, ranges: impl Iterator<Item = (usize, usize)>) {
+    fn advise(&self, ranges: impl Iterator<Item = (usize, usize)>) -> bool {
         let len = self.bytes.as_slice().len();
         let mut fresh = Vec::new();
         for (s, e) in ranges {
@@ -418,7 +420,7 @@ impl NumColumn {
             }
         }
         let (Some(&first), Some(&last)) = (fresh.first(), fresh.last()) else {
-            return;
+            return false;
         };
         crate::ioacct::numeric_pages(fresh.len() as u64);
         // When the chunks cover a good part of their span, one request for the whole
@@ -446,12 +448,49 @@ impl NumColumn {
             cur.0 * HINT_CHUNK,
             (cur.1 * HINT_CHUNK).min(len),
         );
+        true
+    }
+
+    /// Ask for the pages that [`NumColumn::get_many`] would read for `ids` (best sorted
+    /// ascending), without reading the values or building a result. The pages of the kinds
+    /// and the rank come first. The pages of the values follow only when those were new to
+    /// this mapping: a warm request then makes no system call and reads nothing. A column
+    /// held in memory has nothing to ask for.
+    pub fn advise_ids(&self, ids: &[u64]) {
+        if !crate::index::io_hints() || ids.len() < 2 || self.head.is_some() {
+            return;
+        }
+        let inside = || ids.iter().filter_map(|&id| self.position(id));
+        let kinds = self.advise(inside().map(|id| {
+            let first = (id / RANK_IDS) * RANK_IDS / 16;
+            (
+                HEADER + first as usize * 8,
+                HEADER + (id / 16 + 1) as usize * 8,
+            )
+        }));
+        let ranks = self.advise(inside().map(|id| {
+            let at = self.rank + (id / RANK_IDS) as usize * 4;
+            (at, at + 4)
+        }));
+        if kinds || ranks {
+            self.advise(
+                ids.iter()
+                    .map(|&id| self.locate(id))
+                    .filter(|&(k, r)| k & 8 != 0 && r < self.count)
+                    .map(|(_, r)| {
+                        let at = self.values + r as usize * 8;
+                        (at, at + 8)
+                    }),
+            );
+        }
     }
 
     /// What the column says about each of `ids` (best sorted ascending), reading a cold
     /// column in large requests: first the kinds and rank entries of the ids, unless
     /// they are in memory, then the values they point to.
     pub fn get_many(&self, ids: &[u64]) -> Vec<Numeric> {
+        #[cfg(test)]
+        GET_MANY_CALLS.with(|n| n.set(n.get() + 1));
         let hints = crate::index::io_hints() && ids.len() > 1;
         if hints && self.head.is_none() {
             let inside = || ids.iter().filter_map(|&id| self.position(id));
@@ -479,15 +518,22 @@ impl NumColumn {
                     }),
             );
         }
+        let b = self.bytes.as_slice();
         located
             .into_iter()
             .map(|(k, r)| match k {
                 NOT_NUMERIC => Numeric::NotNumeric,
-                k if k & 8 != 0 && r < self.count => Numeric::of(k, self.value_word(r)),
+                k if k & 8 != 0 && r < self.count => Numeric::of(k, self.value_word(b, r)),
                 _ => Numeric::Unknown,
             })
             .collect()
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`NumColumn::get_many`] calls on this thread (for tests of what a query reads)
+    pub(crate) static GET_MANY_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Builds `vocab.num` while a vocabulary is written, one key at a time in id order.

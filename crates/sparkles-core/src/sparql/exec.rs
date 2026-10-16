@@ -3831,7 +3831,7 @@ fn prefetch_column_terms(ctx: &Ctx, t: &Table, vars: &[VarId]) {
     ids.sort_unstable();
     ids.dedup();
     if ids.len() >= 2 {
-        ctx.snap.generation.vocab.prefetch_values(&ids);
+        ctx.snap.generation.vocab.prefetch_value_pages(&ids);
     }
 }
 
