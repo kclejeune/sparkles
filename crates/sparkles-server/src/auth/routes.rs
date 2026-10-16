@@ -135,6 +135,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/algo/{ds}/projections", &["GET"]),
     ("/$/algo/{ds}/projections/{name}", &["GET", "PUT", "DELETE"]),
     ("/$/commits/{ds}", &["GET"]),
+    ("/$/commits/{ds}/timeline", &["GET"]),
     ("/$/commits/{ds}/{reference}", &["GET"]),
     // branches and merges: the handlers check each branch a request names
     ("/$/branches/{ds}", &["GET", "POST", "PATCH"]),
@@ -213,6 +214,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     // the memory tools over HTTP (feature `mcp`, spec C18 §10)
     ("/{ds}/check", &["POST"]),
     ("/{ds}/recall", &["POST"]),
+    ("/{ds}/sparql/diff", &["POST"]),
     ("/{ds}/sparql/diagnose", &["POST"]),
     // the explanation of a query (feature `mcp`, spec C18 §6.6)
     ("/{ds}/sparql/explain", &["POST"]),
@@ -380,6 +382,7 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/reason/{ds}/diagnostics"
         | "/$/prefixes/{ds}"
         | "/$/commits/{ds}"
+        | "/$/commits/{ds}/timeline"
         | "/$/commits/{ds}/{reference}"
         | "/$/queries/{ds}"
         | "/$/queries/{ds}/{name}/versions"
@@ -392,6 +395,7 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/{ds}/check"
         | "/{ds}/recall"
         | "/{ds}/sparql/diagnose"
+        | "/{ds}/sparql/diff"
         | "/{ds}/sparql/explain"
         | "/{ds}/ask"
         | "/{ds}/text"
@@ -514,6 +518,7 @@ pub fn endpoint(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) ->
         | "/{ds}/check"
         | "/{ds}/recall"
         | "/{ds}/sparql/diagnose"
+        | "/{ds}/sparql/diff"
         | "/{ds}/sparql/explain"
         | "/{ds}/ask"
         | "/{ds}/memory/brief"

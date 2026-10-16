@@ -32,6 +32,7 @@ without a migration path, so keep backups of anything you cannot regenerate.
   * [GraphQL](#graphql)
   * [Loading CSV and TSV](#loading-csv-and-tsv)
 * [Branches and merges](#branches-and-merges)
+* [The time slider](#the-time-slider)
 * [Automatic compaction](#automatic-compaction)
 * [Formatting](#formatting)
 * [Linting](#linting)
@@ -1410,6 +1411,66 @@ A branch costs almost nothing while it stays linked. Its memory then holds the u
 delta at the starting commit, and its first compaction builds a full index, about what a
 clone costs. `--max-branches` (64) limits the branches of a dataset, and the dataset's
 storage quota covers every branch.
+
+## The time slider
+
+The web UI reads a past state of a dataset with a slider. It is a bar under the toolbar of
+a view, and moving its handle reads that view again at another commit. It writes the same
+`at` selector that the query page's **At** field and `?at=` take, so the two always name
+the same state. The slider needs a dataset whose history is readable, which
+[Point-in-time reads and snapshots](API.md#point-in-time-reads-and-snapshots) describes.
+A commit that retention has dropped is hatched on the track and labelled **gone**.
+
+The slider appears over five views.
+
+* **Query results.** The **History** button on the query page (shortcut `H`) opens it.
+  The query runs again at the commit the handle names, and the result says which state it
+  read.
+* **An entity.** In Explore, the properties panel of a selected resource has a **History**
+  button (`H`). Its track holds only the commits that changed the resource's triples.
+* **The graph.** **Graph history** (`Shift+H`) reads the drawn neighbourhood at a commit.
+  The nodes you expanded are expanded again at that commit, and nodes that appear or
+  disappear fade in and out. With reduced motion set in the system, nothing animates.
+* **The schema.** **Schema history** on the schema tab reads the class tree and the
+  property list at a commit.
+* **Agent memory.** The Memory tab's **As of** control is the same slider.
+
+Press `C`, or use **Compare**, to add a second handle. The view then shows the state at the
+right handle and marks what changed since the left one. A row only the later state has
+carries a `+` and a row only the earlier state has carries a `−`, and the chips above the
+table filter by **added**, **removed** and **unchanged**. In the graph, added elements are
+solid with a `+` badge and removed ones stay as dashed ghosts. The schema tab shows the
+change of each count, such as `+120`. On the map, added features are drawn larger and
+removed ones faded. Each change is marked by a symbol and a shape as well as colour.
+
+The arrow keys move the focused handle by one commit and `PageUp` and `PageDown` by ten.
+`Home` and `End` go to the oldest readable commit and to head. `S` and `Shift+S` jump to the
+next and previous named snapshot, `Space` plays through the commits, and `Escape` closes the
+slider. **Play** waits for each read to finish before it takes the next step. **Follow**
+keeps a view at head up to date by listening to the dataset's change feed.
+
+When a branch has more than 2,000 commits, the track shows buckets of commits with the
+size of their changes, and zooming narrows the range until each commit is listed. The
+buckets come from `GET /$/commits/{ds}/timeline` ([API](API.md#the-commit-timeline)).
+
+Compare mode also takes the head of another branch as its left side. Choose it in the
+**Compare with** menu. The query page then runs the query on both branches and the Explore
+graph and schema tab compare the two heads, which shows what a branch has changed before a
+merge.
+
+A comparison in the browser lists at most 10,000 rows on each side, and it compares only
+complete results. When a result is larger, or the row limit cut it, the page compares the
+counts, marks no row and says so, because a prefix of the rows says nothing about the rows
+after it. For a query that was typed in, and not for a stored query or a comparison with
+another branch, the page then offers **Compare on the server**. It calls
+`POST /{ds}/sparql/diff`, which runs the query at both states and returns the rows only
+one of them has ([API](API.md#comparing-a-query-between-two-states)). The table then
+lists those rows.
+
+The address keeps the view. The query page adds `ds`, `at`, `from`, `against` and `branch`
+to its URL while the slider is open, and Explore uses `at`, `from` and `against` next to its
+existing `ds`, `iri` and `tab`. Opening such a link restores the same handles and the same
+table.
 
 ## Automatic compaction
 

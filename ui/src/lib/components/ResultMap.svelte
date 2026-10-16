@@ -6,6 +6,7 @@
   import { fmtInt } from '$lib/format';
   import { abbreviate, geoCells, isGeoLiteral, resolveGeometries, type Resolved } from '$lib/geo';
   import type { PrefixMap } from '$lib/rdf';
+  import type { Mark } from '$lib/rowdiff';
   import MapView, { type MapFeature } from './MapView.svelte';
   import TermView from './TermView.svelte';
 
@@ -15,6 +16,7 @@
     columns,
     prefixes,
     onopen,
+    marks,
   }: {
     vars: string[];
     rows: (api.Term | null)[][];
@@ -22,7 +24,14 @@
     columns: string[];
     prefixes: PrefixMap;
     onopen?: (iri: string) => void;
+    /** In compare mode, the change of each row: added rows draw bold, removed ones faded. */
+    marks?: readonly Mark[];
   } = $props();
+
+  const changeOf = (row: number) => {
+    const m = marks?.[row];
+    return m === 'added' || m === 'removed' ? m : undefined;
+  };
 
   /** Most literals drawn; a larger result draws its first rows. */
   const MAX_DRAWN = 20_000;
@@ -57,7 +66,12 @@
     if (!resolved) return [];
     const out: MapFeature[] = [];
     resolved.forEach((r, i) => {
-      if ('geometry' in r) out.push({ geometry: r.geometry, group: drawnCells[i].row });
+      if ('geometry' in r)
+        out.push({
+          geometry: r.geometry,
+          group: drawnCells[i].row,
+          change: changeOf(drawnCells[i].row),
+        });
     });
     return out;
   });
@@ -75,7 +89,10 @@
 
 {#snippet rowPopup(row: number)}
   <div class="popup">
-    <div class="faint">Row {row + 1}</div>
+    <div class="faint">
+      Row {row + 1}{#if changeOf(row) === 'added'}, added{:else if changeOf(row) === 'removed'},
+        removed{/if}
+    </div>
     <table>
       <tbody>
         {#each vars as v, i (v)}
@@ -139,6 +156,11 @@
           onclick={() => (selected = selected === row ? null : row)}
         >
           <span class="n faint">{row + 1}</span>
+          {#if changeOf(row) === 'added'}
+            <span class="plus" title="Added" aria-label="added">+</span>
+          {:else if changeOf(row) === 'removed'}
+            <span class="minus" title="Removed" aria-label="removed">−</span>
+          {/if}
           <span class="mono label"
             >{#if label}<TermView term={label[1]} {prefixes} />{:else}row {row + 1}{/if}</span
           >
@@ -233,6 +255,14 @@
     min-width: 28px;
     text-align: right;
     font-variant-numeric: tabular-nums;
+  }
+  .row-item .plus {
+    color: var(--added);
+    font-weight: 600;
+  }
+  .row-item .minus {
+    color: var(--removed);
+    font-weight: 600;
   }
   .row-item .label {
     overflow: hidden;

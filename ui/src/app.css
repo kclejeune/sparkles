@@ -53,6 +53,11 @@
   --danger: #c93c3c;
   --danger-soft: rgba(201, 60, 60, 0.1);
   --ok-soft: rgba(31, 143, 85, 0.12);
+  /* the time slider's compare mode: what a later state added, and what it removed */
+  --added: var(--ok);
+  --removed: var(--danger);
+  --added-soft: var(--ok-soft);
+  --removed-soft: var(--danger-soft);
 
   --shadow-pop: 0 10px 30px -8px rgba(20, 26, 40, 0.25), 0 0 0 1px rgba(20, 26, 40, 0.06);
   --focus: 0 0 0 2px var(--surface), 0 0 0 4px rgba(36, 89, 199, 0.55);

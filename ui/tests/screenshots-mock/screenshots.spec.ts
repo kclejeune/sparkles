@@ -202,3 +202,52 @@ test('memory', async ({ page }) => {
   await expect(search.getByRole('region', { name: /Facts about/ }).first()).toBeVisible();
   await shoot(page, 'memory');
 });
+
+test('time-slider', async ({ page }) => {
+  // the last two commits of main moved Lea to the platform team and corrected Kai's date
+  const query = `PREFIX ex: <http://example.org/ontology#>
+PREFIX res: <http://example.org/resource/>
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+SELECT ?name ?team WHERE {
+  VALUES ?person { res:lea res:kai res:noor }
+  ?person foaf:name ?name ; ex:memberOf ?team .
+} ORDER BY ?name`;
+  await page.addInitScript(
+    ([q]) =>
+      localStorage.setItem(
+        'sparkles.queryTabs',
+        JSON.stringify({ tabs: [{ id: 't1', title: 'Team members', query: q }], active: 't1' }),
+      ),
+    [query],
+  );
+  await page.goto(`/ui/query?ds=${DATASET}`);
+  await page.getByRole('button', { name: /^Run/ }).click();
+  await expect(page.getByRole('grid')).toBeVisible({ timeout: 30_000 });
+  await page.getByRole('button', { name: 'History', exact: true }).click();
+  const slider = page.getByRole('region', { name: 'History time slider' });
+  const right = slider.getByRole('slider', { name: /^(Commit|Compared to)$/ });
+  await right.focus();
+  await page.keyboard.press('c');
+  const left = slider.getByRole('slider', { name: 'Compared from' });
+  await left.focus();
+  await page.keyboard.press('ArrowLeft');
+  await expect(page.getByRole('grid').getByRole('gridcell', { name: 'removed' })).not.toHaveCount(
+    0,
+  );
+  await shoot(page, 'time-slider');
+});
+
+test('time-slider-graph', async ({ page }) => {
+  await page.goto(
+    `/ui/explore?ds=${DATASET}&iri=${encodeURIComponent('http://example.org/resource/lea')}`,
+  );
+  await expect(page.locator('.wrap[data-graph]')).toBeVisible({ timeout: 30_000 });
+  await page.getByRole('button', { name: 'Graph history' }).click();
+  const bar = page.getByRole('region', { name: 'Graph history time slider' });
+  await bar.getByRole('slider', { name: /^(Commit|Compared to)$/ }).focus();
+  await page.keyboard.press('c');
+  await bar.getByRole('slider', { name: 'Compared from' }).focus();
+  await page.keyboard.press('ArrowLeft');
+  await expect(bar.getByRole('status')).toContainText('added', { timeout: 30_000 });
+  await shoot(page, 'time-slider-graph');
+});

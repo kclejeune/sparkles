@@ -157,6 +157,7 @@ impl ChangesOptions {
             cancel: self.cancel.clone(),
             deadline: self.deadline,
             graphs: self.graphs.clone(),
+            terms: None,
         }
     }
 }

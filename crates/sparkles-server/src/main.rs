@@ -2685,6 +2685,7 @@ fn run() -> Result<()> {
                 min_free_disk_bytes: mib(min_free_disk_mb),
                 max_timeout: (max_timeout.is_finite() && max_timeout > 0.0)
                     .then(|| Duration::from_secs_f64(max_timeout)),
+                max_timeline_commits: state::Limits::default().max_timeline_commits,
             };
             #[cfg(feature = "fmt")]
             {

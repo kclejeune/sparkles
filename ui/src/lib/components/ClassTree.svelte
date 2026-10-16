@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { Schema } from '$lib/explore';
+  import { deltaText, type CountChange } from '$lib/explore-time';
   import { fmtCompact } from '$lib/format';
   import { shortLabel } from '$lib/graph';
   import type { PrefixMap } from '$lib/rdf';
@@ -16,6 +17,7 @@
     ontoggle,
     depth = 0,
     path = [],
+    changes,
   }: {
     schema: Schema;
     iris: string[];
@@ -26,6 +28,8 @@
     ontoggle: (iri: string) => void;
     depth?: number;
     path?: string[];
+    /** Comparing two commits: the change of each class's instances. */
+    changes?: ReadonlyMap<string, CountChange>;
   } = $props();
 </script>
 
@@ -35,6 +39,7 @@
     {#if c && !path.includes(iri)}
       {@const kids = c.subs.filter((s) => !path.includes(s))}
       {@const isOpen = open.has(iri)}
+      {@const ch = changes?.get(iri)}
       <li
         role="treeitem"
         aria-expanded={kids.length ? isOpen : undefined}
@@ -71,6 +76,19 @@
           {#if kids.length}<span class="kids faint" title="{kids.length} subclasses"
               >{kids.length}</span
             >{/if}
+          {#if ch}
+            <span
+              class="delta"
+              class:add={ch.delta > 0 || ch.mark === 'added'}
+              class:del={ch.delta < 0}
+              title={ch.mark === 'added'
+                ? 'Added since the earlier commit'
+                : 'Instances since the earlier commit'}
+              >{#if ch.mark === 'added'}<span class="tag new">added</span>{/if}{deltaText(
+                ch.delta,
+              )}</span
+            >
+          {/if}
           <span class="count" class:zero={!c.instances} title="{c.instances} instances"
             >{fmtCompact(c.instances)}</span
           >
@@ -86,6 +104,7 @@
             {ontoggle}
             depth={depth + 1}
             path={[...path, iri]}
+            {changes}
           />
         {/if}
       </li>
@@ -187,6 +206,25 @@
     font-weight: 600;
     font-variant-numeric: tabular-nums;
     color: var(--literal);
+  }
+  .delta {
+    flex: none;
+    display: inline-flex;
+    align-items: baseline;
+    gap: 4px;
+    font-size: var(--fs-xs);
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+  }
+  .delta.add {
+    color: var(--added);
+  }
+  .delta.del {
+    color: var(--removed);
+  }
+  .tag.new {
+    color: var(--added);
+    border-color: var(--added);
   }
   .count.zero {
     color: var(--text-3);

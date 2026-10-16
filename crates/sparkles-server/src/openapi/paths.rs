@@ -1577,6 +1577,27 @@ fn history(p: &mut Paths) {
     p.add(
         op(
             GET,
+            "/$/commits/{ds}/timeline",
+            "commitTimeline",
+            "History",
+            "Commit timeline",
+        )
+        .doc("The commits of the branch in buckets of consecutive numbers, with the commits' times, kinds and quad counts, and the ranges whose state can still be read. For a time slider over a long history.")
+        .see("commits")
+        .param("branch")
+        .query(
+            "buckets",
+            json!({ "type": "integer", "minimum": 1, "maximum": 2000, "default": 200 }),
+            "The most buckets.",
+        )
+        .query("from", int(), "The first commit number; the first by default.")
+        .query("to", int(), "The last commit number; the head by default.")
+        .json("200", "The buckets.", "CommitTimeline")
+        .errors(&[400]),
+    );
+    p.add(
+        op(
+            GET,
             "/$/commits/{ds}/{reference}",
             "getCommit",
             "History",
@@ -1676,6 +1697,11 @@ fn history(p: &mut Paths) {
             )
             .query("to", s(), "A selector; by default the head.")
             .query("graph", s(), "A graph IRI or `default`.")
+            .query(
+                "term",
+                json!({ "type": "array", "items": { "type": "string" }, "maxItems": 1000 }),
+                "Only the changes whose subject or object is this term, an N-Triples term or a bare IRI. Repeat the parameter for several, up to 1,000. Not for RDF Patch.",
+            )
             .query("quads", boolean(), "JSON: list the quads.")
             .query("limit", int(), "The most quads listed.")
             .param("format")
@@ -1691,6 +1717,26 @@ fn history(p: &mut Paths) {
             )
             .resp("304", "Not modified.", None)
             .errors(&[400, 410, 507]),
+    );
+    p.add(
+        op(POST, "/{ds}/sparql/diff", "sparqlDiff", "History", "Diff a query between two states")
+            .doc("Runs one SELECT query at two states and returns the rows only one of them has, as bags of their terms. The server keeps a hash for each row of the earlier result and no row, then reads the later result against them and the earlier query once more to list up to `limit` differing rows of each side. The request counts twice against the `query` rate limit. A query that returns different rows when it runs again is refused with `409`.")
+            .see("comparing-a-query-between-two-states")
+            .query("from", s(), "A selector of the earlier state.")
+            .query("to", s(), "A selector of the later state; the head by default.")
+            .query("limit", json!({ "type": "integer", "minimum": 1, "maximum": 10000, "default": 100 }), "The most differing rows listed for each side.")
+            .params(&["branch", "reasoning"])
+            .body(
+                true,
+                "The SELECT query.",
+                json!({
+                    "application/sparql-query": { "schema": { "type": "string" } },
+                    "application/x-www-form-urlencoded": { "schema": { "type": "object", "required": ["query"], "properties": { "query": { "type": "string" } } } },
+                    "application/json": { "schema": { "type": "object", "required": ["query"], "properties": { "query": { "type": "string" }, "from": { "type": "string" }, "to": { "type": "string" }, "limit": { "type": "integer" } } } },
+                }),
+            )
+            .json("200", "The differing rows and the counts.", "SparqlDiff")
+            .errors(&[400, 408, 409, 410, 507]),
     );
     p.add(
         op(GET, "/{ds}/changes", "changes", "History", "Change feed")

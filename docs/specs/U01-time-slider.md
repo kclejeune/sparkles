@@ -1,17 +1,20 @@
 # U01: A time slider over graphs, results, entities and the schema
 
-> **Status:** specified
+> **Status:** implemented
 >
-> **Phases:** None shipped. Phase 1 is the slider component, the query page's table and
-> graph results at any commit with row diffs, and an entity's properties in Explore over
-> time. Phase 2 adds the Explore graph with animated additions and removals, the schema
-> tab, a bucketed commit timeline and a term filter on diffs. Phase 3 adds comparison
-> across branches, result diffs computed on the server and the map view.
+> **Phases:** All three shipped. Phase 1 is the slider component, the query page's table
+> and graph results at any commit with row diffs, and an entity's properties in Explore
+> over time. Phase 2 adds the Explore graph with animated additions and removals, the
+> schema tab, a bucketed commit timeline and a term filter on diffs. Phase 3 adds
+> comparison across branches, result diffs computed on the server and the map view.
 >
-> **User docs:** none, because nothing is built.
+> **User docs:** [USAGE: The time slider](../USAGE.md#the-time-slider), and in
+> [API](../API.md) the sections on [the commit timeline](../API.md#the-commit-timeline),
+> the `term` parameter of diffs and
+> [comparing a query between two states](../API.md#comparing-a-query-between-two-states).
 >
-> This is the design as written before implementation. The [Outcome](#outcome) section at
-> the end will record how it lands.
+> The sections before the Outcome are the design as written before implementation. The
+> [Outcome](#outcome) records where the build differs from it.
 
 This design was written from the Sparkles code and specs: point-in-time reads, diffs, the
 change feed and history queries ([F06](F06-snapshots-and-point-in-time.md)), branches and
@@ -393,4 +396,93 @@ commit 2.
 
 ## Outcome
 
-Not built. See [ROADMAP](../ROADMAP.md) item 11.
+All three phases are built. The slider is `ui/src/lib/components/TimeSlider.svelte`, its
+pure model is `ui/src/lib/timeline.ts`, and the row and triple diffs are
+`ui/src/lib/rowdiff.ts`. The server gained `GET /$/commits/{ds}/timeline`
+(`http/timeline.rs`), the `term` filter on `GET /{ds}/diff` (`DiffOptions::only_terms` in
+`sparkles-core`, applied where the diff nets the changes) and `POST /{ds}/sparql/diff`
+(`http/sparql_diff.rs`). The route table, the OpenAPI description, `docs/API.md` and the
+client parity table list all three.
+
+### What was checked
+
+- **Phase 1.** Vitest covers the track model and the diffs. The mock-server Playwright
+  suite covers A1 to A6, A8 and A10, and the real-server suite covers A1, A2 and A5 and a
+  scrub of the History view.
+- **Phase 2.** Rust tests cover the timeline's buckets against the commit list and the
+  term filter against an unfiltered diff for both diff methods. Playwright covers A7 and
+  A9 and the bucketed track against the mock server, and A7 and A9 against a real
+  server.
+- **Phase 3.** Rust tests cover `/sparql/diff` against two runs compared in the test and
+  its charge of two against the `query` rate-limit class. They also cover its result byte
+  budget, its charges to the memory budget and to the server memory pool, its single
+  deadline and its refusal of a query that is not repeatable. Playwright covers marks on the
+  map, a comparison with another branch on the query page and in the Explore graph, and
+  **Compare on the server**, against the mock server and against a real one.
+
+### Where the build differs from the design
+
+- **Change marks.** Graph elements carry a `change` field on `GNode` and `GEdge` in
+  `lib/graph.ts` instead of `GraphView` taking a map of ids to changes. A change is a
+  property of the element, and this keeps the marks through the layout's rebuilds. The
+  Map view takes a `change` on each `MapFeature` the same way.
+- **URL.** The query page's address also carries `ds` while the slider is open, so that a
+  link names the dataset. Explore's and the query page's address add `against` for the
+  branch of a comparison.
+- **Branch comparison.** The design proposed selectors such as `from=main:commit:40`.
+  `GET /{ds}/diff` already takes `fromBranch` and `toBranch`, so the slider compares the
+  head of another branch with the state it is at, and the selector syntax was not added.
+  The query page reads the query on both branches and compares the results in the
+  browser. `POST /{ds}/sparql/diff` compares two states of one branch and is not offered
+  across branches. The merge-base question of open question 1 is therefore not needed,
+  because a diff across branches compares the two states with a sorted merge.
+- **Follow.** It listens to `GET /{ds}/changes` as server-sent events, not by long poll.
+  It is off by default on every view, which answers open question 2.
+- **Timeline buckets.** The route buckets by commit number only. A track by time over
+  years of commits still places the buckets by their commit times, and calendar
+  boundaries (open question 3) remain unbuilt. The client switches to the timeline route
+  when a branch has more than 2,000 commits.
+- **The `507` of a history read.** The slider reports the server's `507` with the limit it
+  names, as designed. For a past state the budget it names is `memory`.
+- **Memory of the server comparison.** `POST /{ds}/sparql/diff` charges the hashes it
+  keeps, the table of the result it is reading and the rows it lists to the request's
+  memory budget and to the request's grant in the server memory pool, as the engine charges
+  its own execution. The table of hashes is charged by its real capacity, including the old
+  table while it doubles, so the comparison trades memory for not keeping the rows, and a comparison past the budget fails with `507` and `budget:
+  "memory"`. The response also obeys the result byte budget, and the request's timeout
+  covers all three executions together.
+- **Queries that change between runs.** The rows only the earlier state has come from
+  running its query a third time. A query whose rows differ from run to run, such as one
+  that calls `STRUUID` or `RAND`, would list fewer rows than the server counted, so the
+  server answers `409` with `code: "not-repeatable"`.
+- **Timeline reads.** The timeline reads only the commits of the requested range, up to the
+  head it saw at the start, and refuses a range of more than 10,000,000 commits. The client
+  also ignores a bucket that lies past the head.
+- **Term filter cost.** The `log` method still reads every record of the commit range and
+  keeps only the matching changes, so memory stays proportional to the matches and not to
+  the range. The filter cannot be combined with RDF Patch output, and the server answers
+  `400` for that pair.
+- **Marks on the drawn view.** A diff lists the changes of every graph, and the Explore
+  graph draws one view of them. The compare step therefore runs two candidate queries
+  beside the diff. One asks the earlier state which of the edges marked added it already
+  had, and the other asks the later state which of the ghost edges it still has. Both are
+  read as the graph is read, so they see the same default graph, union and inference
+  settings, and an edge that a diff quad changed only in another graph keeps no mark. A
+  diff that lists fewer changes than it counts says so under the graph.
+- **Graph rebuilds.** The Explore graph is rebuilt at a commit from the expansions the
+  person made, so a node added by hand with the graph's link action is not kept when the
+  slider moves.
+- **Test hooks.** The graph view exposes `data-graph`, `data-motion` and `data-animations`
+  on its wrapper, and the map exposes `data-added` and `data-removed`, so that Playwright
+  can read what was drawn.
+- **Mock server.** Its seeded `foaf` dataset has history that cannot be read, and serves as
+  the gone case of A6.
+
+### Not built
+
+A calendar-aware track by time, a branch-qualified selector and a server comparison
+across branches. The first needs a decision on the buckets of a track that spans years,
+and the other two have a workable alternative in the slider's comparison with the head of
+another branch.
+
+See [ROADMAP](../ROADMAP.md) item 11.

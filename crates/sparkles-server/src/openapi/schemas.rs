@@ -592,6 +592,62 @@ pub(super) fn schemas() -> Map<String, J> {
             },
         }),
     );
+    put(
+        "SparqlDiff",
+        json!({
+            "type": "object",
+            "required": ["dataset", "datasetId", "from", "to", "vars", "fromRows", "toRows", "same", "added", "removed", "addedRows", "removedRows", "truncated"],
+            "properties": {
+                "dataset": { "type": "string" },
+                "datasetId": { "type": "string" },
+                "from": { "type": "object", "properties": { "selector": { "type": "string" }, "commit": sref("Commit") } },
+                "to": { "type": "object", "properties": { "selector": { "type": "string" }, "commit": sref("Commit") } },
+                "vars": array(json!({ "type": "string" })),
+                "fromRows": { "type": "integer", "description": "Rows at the earlier state." },
+                "toRows": { "type": "integer", "description": "Rows at the later state." },
+                "same": { "type": "integer", "description": "Rows both states have, counted as a bag." },
+                "added": { "type": "integer", "description": "Rows only the later state has." },
+                "removed": { "type": "integer", "description": "Rows only the earlier state has." },
+                "addedRows": array(json!({ "type": "object", "description": "The bound variables as SPARQL JSON terms.", "additionalProperties": true })),
+                "removedRows": array(json!({ "type": "object", "additionalProperties": true })),
+                "truncated": { "type": "object", "properties": { "added": { "type": "boolean" }, "removed": { "type": "boolean" } } },
+            },
+        }),
+    );
+    put(
+        "CommitTimeline",
+        json!({
+            "type": "object",
+            "required": ["dataset", "datasetId", "head", "firstSeq", "lastSeq", "commits", "bucketWidth", "readable", "buckets"],
+            "properties": {
+                "dataset": { "type": "string" },
+                "datasetId": { "type": "string" },
+                "head": { "type": "integer" },
+                "firstSeq": { "type": "integer" },
+                "lastSeq": { "type": "integer" },
+                "commits": { "type": "integer", "description": "The commits in range whose metadata is retained." },
+                "bucketWidth": { "type": "integer", "description": "The commit numbers each bucket spans." },
+                "oldestReconstructable": nullable("integer"),
+                "readable": { "type": "array", "items": { "type": "object", "properties": { "from": { "type": "integer" }, "to": { "type": "integer" } } } },
+                "buckets": array(json!({
+                    "type": "object",
+                    "required": ["firstSeq", "lastSeq", "firstTime", "lastTime", "commits", "kinds", "merges", "snapshots"],
+                    "properties": {
+                        "firstSeq": { "type": "integer" },
+                        "lastSeq": { "type": "integer" },
+                        "firstTime": { "type": "string" },
+                        "lastTime": { "type": "string" },
+                        "commits": { "type": "integer" },
+                        "inserted": { "type": "integer", "description": "Quads added by the bucket's commits; left out for a caller limited to some graphs." },
+                        "deleted": { "type": "integer", "description": "Quads removed by the bucket's commits; left out for a caller limited to some graphs." },
+                        "kinds": { "type": "object", "additionalProperties": { "type": "integer" } },
+                        "merges": { "type": "integer" },
+                        "snapshots": { "type": "integer" },
+                    },
+                })),
+            },
+        }),
+    );
     // ---------------------------------------------------------------- branches --
     let commit_ref = || {
         json!({

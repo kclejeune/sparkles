@@ -134,6 +134,7 @@ pub fn classify(
             || admin.starts_with("stats/")
             || admin == "reason/{ds}/diagnostics"
             || admin == "graphql/{ds}/draft"
+            || admin == "commits/{ds}/timeline"
         {
             return Some(Class::Query);
         }
@@ -147,6 +148,7 @@ pub fn classify(
         | "/{ds}/check"
         | "/{ds}/recall"
         | "/{ds}/sparql/diagnose"
+        | "/{ds}/sparql/diff"
         | "/{ds}/sparql/explain"
         | "/{ds}/ask"
         | "/{ds}/memory/brief"
@@ -177,6 +179,16 @@ pub fn classify(
             }
         }
         _ => None,
+    }
+}
+
+/// What a request of a route costs in requests of its class: one, or the number of times
+/// the route runs its query.
+fn weight(route: &str) -> u32 {
+    match route {
+        // `POST /{ds}/sparql/diff` reads two states and then one of them again
+        "/{ds}/sparql/diff" => 2,
+        _ => 1,
     }
 }
 
@@ -1867,6 +1879,11 @@ where
         return run(req).await;
     };
     let p = &inner.policies[pi as usize];
+    // a request that runs its query twice or more is charged for each run
+    let cost = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map_or(1, |m| weight(m.as_str()));
     let slot = p.needs_slot().then(|| {
         inner.buckets.slot(SlotKey {
             policy: p.id,
@@ -1900,7 +1917,7 @@ where
     }
     let mut admitted = None;
     if let (Some(g), Some(s)) = (p.gcra, &slot) {
-        match s.acquire(rl.clock.now(), g, 1) {
+        match s.acquire(rl.clock.now(), g, cost) {
             Ok(a) => admitted = Some(a),
             Err(wait) => {
                 return reject(p, StatusCode::TOO_MANY_REQUESTS, secs_ceil(wait), "rate", 0);

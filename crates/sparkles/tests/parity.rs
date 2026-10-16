@@ -244,6 +244,15 @@ fn entries() -> Vec<(&'static str, Entry)> {
             ds.history()
                 .commits(sparkles::commit::CommitRange::Latest, 10);
         }),
+        // runs the query at two states: the library reads each with `at`
+        op!("sparqlDiff", "dataset.query_with", |ds| {
+            ds.query_with("ASK {}", &Default::default());
+        }),
+        // the timeline buckets the same commit listing
+        op!("commitTimeline", "history.commits", |ds| {
+            ds.history()
+                .commits(sparkles::commit::CommitRange::Latest, usize::MAX);
+        }),
         op!("getCommit", "history.commit", |ds| {
             ds.history().commit(&sparkles::handles::CommitRef::Head);
         }),

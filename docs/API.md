@@ -441,7 +441,7 @@ each request class per client:
 | Class | Requests |
 |-------|----------|
 | `auth` | Every path under `/$/auth/`, matched or not: login, token minting, device flow and the OIDC callback. |
-| `query` | `/{ds}/sparql`, `/{ds}/query`, `/{ds}/queries/{name}`, `/{ds}/explain`, `/{ds}/shacl`, `/{ds}/shex`, `/{ds}/diff`, `/{ds}/graphql` and `/{ds}/graphql/schema`, Graph Store `GET`/`HEAD` and reads of `/{ds}/patch`, `/{ds}` with `query=` or a GET, `/$/schema/*`, `/$/stats/*`, `/$/validate/*`, `/$/reason/{ds}/diagnostics`, `/$/graphql/{ds}/draft`, `/$/format`, `/$/lint`, read-only runs and summaries on `POST /$/algo/{ds}/run`, and MCP tool calls and resource reads at `/$/mcp` |
+| `query` | `/{ds}/sparql`, `/{ds}/query`, `/{ds}/queries/{name}`, `/{ds}/explain`, `/{ds}/shacl`, `/{ds}/shex`, `/{ds}/diff`, `/{ds}/graphql` and `/{ds}/graphql/schema`, Graph Store `GET`/`HEAD` and reads of `/{ds}/patch`, `/{ds}` with `query=` or a GET, `/$/schema/*`, `/$/stats/*`, `/$/validate/*`, `/$/reason/{ds}/diagnostics`, `/$/graphql/{ds}/draft`, `/$/commits/{ds}/timeline`, `/$/format`, `/$/lint`, read-only runs and summaries on `POST /$/algo/{ds}/run`, and MCP tool calls and resource reads at `/$/mcp` |
 | `update` | `/{ds}/update`, `/{ds}/upload`, `POST` and `PATCH /{ds}/patch`, Graph Store `PUT`/`POST`/`DELETE`, `/{ds}` with `update=` or any other write, and the MCP tools that write (`sparql_update`, `assert_facts`, `create_branch`, `merge_branch` and `delete_branch`). Write-back requests on `POST /$/algo/{ds}/run` also use this class. A form POST to `/{ds}` counts as an update. |
 | `admin` | `/$/…` requests other than `GET`, `HEAD` and `OPTIONS` that are not in the `query` or `update` class. These cover dataset management, compaction, backups, reasoning, caches and full-text. |
 | `preauth` | Every request, before authentication. Counts failed credential checks per client address and per IPv6 /48. Has no per-dataset form. |
@@ -2775,7 +2775,40 @@ digest chains from 32 zero bytes. The exact input is defined in
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/$/commits/{ds}` | Lists commits, newest first. `?limit=` sets the page size (default 50, max 1000). `?before=<seq>` pages backwards, and `?after=<seq>` lists the commits after `seq`, oldest first. Returns `{dataset, datasetId, head, firstRetained, complete, commits: Commit[], next: string \| null}`. |
+| GET | `/$/commits/{ds}/timeline` | The commits of a branch in buckets, for a time slider over a long history. See [the commit timeline](#the-commit-timeline). |
 | GET | `/$/commits/{ds}/{ref}` | One commit. `ref` is `42`, `commit:42` or `head`. `404` beyond the head, `410` if the commit is no longer retained. |
+
+### The commit timeline
+
+`GET /$/commits/{ds}/timeline` cuts the commits of a branch into runs of consecutive
+numbers, so that a client can draw a history of any length. It reads the commit catalog
+once, needs read permission and counts against the `query` rate-limit class. `branch=`
+names the branch, as for the other commit routes. `from` and `to` are commit numbers that
+limit the range, and by default it covers the first retained commit to the head. The
+server reads only the commits of that range, up to the head it saw when the request began,
+so a commit made during the read never gives a bucket past `head`. A range of more than
+10,000,000 commits is a `400`, since the catalog hands the commits over as one list, and
+`from` and `to` narrow it. A range that starts after the head holds no commit and gives no
+buckets. `buckets` is the most buckets, 200 by default and at most 2,000. Every bucket
+spans `bucketWidth` commit numbers, which is the width of the range divided by `buckets`
+and rounded up, so a position on a track maps to a commit by arithmetic. A bucket with no
+retained commit is left out.
+
+```json
+{ "dataset": "ds", "datasetId": "3f1c9a2e-…", "head": 4999, "firstSeq": 0, "lastSeq": 4999,
+  "commits": 5000, "bucketWidth": 25, "oldestReconstructable": 1200,
+  "readable": [ { "from": 1200, "to": 4999 } ],
+  "buckets": [ { "firstSeq": 0, "lastSeq": 24, "firstTime": "2026-09-01T08:00:00.000Z",
+                 "lastTime": "2026-09-01T09:12:41.310Z", "commits": 25,
+                 "inserted": 1200, "deleted": 40, "kinds": { "update": 24, "load": 1 },
+                 "merges": 0, "snapshots": 0 }, … ] }
+```
+
+`inserted` and `deleted` add up the quads the bucket's commits changed. A caller whose
+grants cover only some graphs gets no quad counts, because they cover every graph, as for
+[commits](#commits). `readable` lists the ranges of commits whose state a
+[point-in-time read](#point-in-time-reads-and-snapshots) can still see. A `400` names a
+parameter that is out of range.
 
 Entries of `GET /$/datasets[/{ds}]` gain `id`, `head` and `modified`, the head's timestamp.
 `sparkles log --loc DB [--limit N] [--before SEQ | --after SEQ | --at REF] [--format json]`
@@ -3387,7 +3420,12 @@ added quads are those `to` has and `from` lacks, and the removed quads are the r
 Both parameters take
 the selectors of `at`. `to` defaults to the head and `from` to the commit before `to`, so
 `?to=commit:42` shows what commit 42 changed. The two may come in either order.
-`graph=IRI` or `default` limits the diff to one graph.
+`graph=IRI` or `default` limits the diff to one graph. `term=` keeps the changes whose
+subject or object is that term, as an N-Triples term or a bare IRI. It may repeat, up to
+1,000 times. The UI uses it to diff only the resources a graph draws. The filter applies
+while the commits' changes are read, so the memory a diff needs follows the changes that
+match, but the time still follows every change in range. It does not combine with the RDF
+Patch formats, which must list every change and answer `400`.
 
 | Format | How to ask | Body |
 |---|---|---|
@@ -3453,6 +3491,57 @@ labels in. The binary form is a sequence of `RDF_Patch_Row` structs of Jena's RD
 schema in the Thrift compact protocol. Its literals carry the base direction of
 directional language strings, which Jena's binary reader ignores. A patch always lists
 every change, so `limit` with a patch format is `400`.
+
+### Comparing a query between two states
+
+`POST /{ds}/sparql/diff?from=SEL&to=SEL` runs one SELECT query at two states and returns
+the rows only one of them has. The query is the body, as `application/sparql-query`, a
+form with `query`, or JSON with `query` and the parameters. `from` is required. `to`
+defaults to the head, and both take the selectors of `at`. `branch` and `reasoning` are as
+for [the query endpoint](#per-dataset-sparql-protocol-fuseki-compatible). The caller
+needs read permission, and an ASK, CONSTRUCT or DESCRIBE query is a `400`. The UI offers
+this comparison when a result is too large to compare in the browser.
+
+Rows are compared as bags of their terms in column order. A row that occurs twice in one
+result and once in the other differs once. Blank nodes compare by label, so a query that
+makes new blank nodes for each run reports them as different. A query whose rows change
+between runs, as with `STRUUID`, `UUID`, `RAND`, `NOW`, `BNODE` or `SERVICE`, cannot be
+listed, because the rows only the earlier state has are found by running it again. The
+request is refused with `409` and `code: "not-repeatable"` instead of listing fewer rows
+than it counted.
+
+```json
+{ "dataset": "ds", "datasetId": "3f1c9a2e-…",
+  "from": { "selector": "commit:1", "commit": { "seq": 1, … } },
+  "to": { "selector": "commit:4", "commit": { "seq": 4, … } },
+  "vars": ["s", "o"], "fromRows": 1, "toRows": 1, "same": 0, "added": 1, "removed": 1,
+  "addedRows": [ { "s": { "type": "uri", "value": "urn:c" }, "o": { "type": "literal", "value": "three" } } ],
+  "removedRows": [ { "s": { "type": "uri", "value": "urn:a" }, "o": { "type": "literal", "value": "1", "datatype": "http://www.w3.org/2001/XMLSchema#integer" } } ],
+  "truncated": { "added": false, "removed": false } }
+```
+
+`addedRows` are the rows only the later state has and `removedRows` those only the earlier
+state has, each as SPARQL JSON terms with unbound variables left out. `limit` caps each
+list, 100 by default and at most 10,000, and `truncated` says that a list is cut. The
+counts are always complete. The body obeys `--max-result-mb` and the request's own
+`max-result-mb`, and a comparison whose listed rows would pass it fails with `507` and
+`budget: "result-bytes"`, so that a few very large literals cannot make a large response.
+
+The server keeps a 128-bit hash for each distinct row of the earlier result and no row.
+It reads the later result against those hashes, which finds its own rows as they go by,
+and runs the earlier query once more to list the rows that no row of the later result
+matched. That is three executions of the query, each with the request's budgets, so the
+request counts twice against the `query` rate limit. The request's timeout covers the
+whole comparison, and each execution gets the time that is left. A client that disconnects
+stops the comparison within a few thousand rows. The hashes, the table of the result
+being read and the listed rows count against the memory budget (`--query-memory-mb`, or
+the request's `memory-mb`) and against the server memory pool when it is on. A comparison
+beyond the request's budget fails with `507` and `budget: "memory"`, and one the pool
+cannot cover fails with `503` and `budget: "server-memory"`. The table of hashes is
+charged by its real size, 33 bytes for each of its slots, and while it doubles the old and
+the new table are both charged. Each execution runs with the budget that the comparison
+leaves, so the engine and the comparison together stay within the request's budget. That is
+the memory the comparison trades for not keeping the rows.
 
 ### Change feed
 

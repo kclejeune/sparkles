@@ -7,6 +7,8 @@
     group: number;
     /** Drawn in the accent colour (the resource a map is about). */
     accent?: boolean;
+    /** In compare mode, a geometry only the later state has (added) or only the earlier one (removed). */
+    change?: 'added' | 'removed';
   };
 </script>
 
@@ -71,7 +73,7 @@
         type: 'Feature' as const,
         id: i,
         geometry: f.geometry,
-        properties: { group: f.group, accent: f.accent === true },
+        properties: { group: f.group, accent: f.accent === true, change: f.change ?? '' },
       })),
     };
   }
@@ -79,23 +81,37 @@
   function addLayers(m: MlMap) {
     const ink = [
       'case',
+      ['==', ['get', 'change'], 'added'],
+      token('--added', '#1a7f37'),
+      ['==', ['get', 'change'], 'removed'],
+      token('--removed', '#c0392b'),
       ['get', 'accent'],
       token('--literal', '#0b7d69'),
       token('--iri', '#2459c7'),
     ];
+    const gone = ['==', ['get', 'change'], 'removed'];
+    const fresh = ['==', ['get', 'change'], 'added'];
     const hot = token('--spark', '#e5a117');
     const halo = token('--surface', '#ffffff');
     m.addSource('features', { type: 'geojson', data: collection(features) as never });
     const sel = ['==', ['get', 'group'], -1];
     const layer = (id: string, type: string, filter: unknown, paint: object) =>
       m.addLayer({ id, type, source: 'features', filter, paint } as never);
-    layer('f-fill', 'fill', POLY, { 'fill-color': ink, 'fill-opacity': 0.18 });
-    layer('f-line', 'line', ['!', POINT], { 'line-color': ink, 'line-width': 1.6 });
+    layer('f-fill', 'fill', POLY, {
+      'fill-color': ink,
+      'fill-opacity': ['case', gone, 0.06, fresh, 0.28, 0.18],
+    });
+    layer('f-line', 'line', ['!', POINT], {
+      'line-color': ink,
+      'line-width': ['case', fresh, 2.4, 1.6],
+    });
+    // removed geometries are outlines, so they read as gone without colour
     layer('f-point', 'circle', POINT, {
       'circle-color': ink,
-      'circle-radius': 5,
-      'circle-stroke-color': halo,
-      'circle-stroke-width': 1.5,
+      'circle-opacity': ['case', gone, 0.15, 1],
+      'circle-radius': ['case', fresh, 7, 5],
+      'circle-stroke-color': ['case', gone, ink, halo],
+      'circle-stroke-width': ['case', gone, 2, 1.5],
     });
     layer('h-fill', 'fill', ['all', POLY, sel], { 'fill-color': hot, 'fill-opacity': 0.35 });
     layer('h-line', 'line', ['all', ['!', POINT], sel], { 'line-color': hot, 'line-width': 3 });
@@ -261,6 +277,8 @@
   data-state={status}
   data-features={features.length}
   data-selected={selected ?? ''}
+  data-added={features.filter((f) => f.change === 'added').length}
+  data-removed={features.filter((f) => f.change === 'removed').length}
 >
   <div class="canvas" bind:this={host}></div>
   {#if status === 'loading'}

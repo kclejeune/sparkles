@@ -1,5 +1,6 @@
 import type { Term } from './api';
 import type { GEdge, GNode } from './components/GraphView.svelte';
+import type { Mark } from './rowdiff';
 import {
   displayIri,
   literalText,
@@ -42,11 +43,15 @@ export function kindOf(t: Term): GNode['kind'] {
   return t.type === 'uri' ? 'iri' : t.type;
 }
 
-/** Turn triples into graph elements. Literals get one node per (subject, predicate, value). */
+/**
+ * Turn triples into graph elements. Literals get one node per (subject, predicate, value).
+ * With `marks` (parallel to `triples`) each edge carries the change of its triple between
+ * two states, and a node is added or removed when every triple it appears in is.
+ */
 export function triplesToGraph(
   triples: Triple[],
   prefixes: PrefixMap,
-  opts: { hideTypes?: boolean; hideLiterals?: boolean; maxNodes?: number } = {},
+  opts: { hideTypes?: boolean; hideLiterals?: boolean; maxNodes?: number; marks?: Mark[] } = {},
 ): GraphBuild {
   const max = opts.maxNodes ?? 500;
   const labels = new Map<string, string>();
@@ -60,6 +65,14 @@ export function triplesToGraph(
   const edges: GEdge[] = [];
   let truncated = false;
   const seenNodeIds = new Set<string>();
+  // per node: how many of its triples were added, removed or kept
+  const seen = new Map<string, { added: number; removed: number; kept: number }>();
+  const count = (id: string, m: Mark | undefined) => {
+    if (!m) return;
+    const c = seen.get(id) ?? { added: 0, removed: 0, kept: 0 };
+    c[m === 'added' ? 'added' : m === 'removed' ? 'removed' : 'kept']++;
+    seen.set(id, c);
+  };
 
   const ensure = (t: Term, id: string): boolean => {
     seenNodeIds.add(id);
@@ -88,6 +101,7 @@ export function triplesToGraph(
       // Label literals are already shown as the node label.
       if (opts.hideLiterals || labels.get(termKey(s)) === o.value) {
         ensure(s, termKey(s));
+        count(termKey(s), opts.marks?.[i]);
         return;
       }
     }
@@ -95,6 +109,9 @@ export function triplesToGraph(
     const oid = o.type === 'literal' ? `lit:${sid}|${termKey(p)}|${termKey(o)}` : termKey(o);
     if (!ensure(s, sid)) return;
     if (!ensure(o, oid)) return;
+    const mark = opts.marks?.[i];
+    count(sid, mark);
+    count(oid, mark);
     edges.push({
       id: `e${i}:${sid}|${termKey(p)}|${oid}`,
       source: sid,
@@ -102,7 +119,15 @@ export function triplesToGraph(
       label: p.type === 'uri' ? shortLabel(p.value, prefixes) : nodeLabel(p, prefixes),
       title: p.type === 'uri' ? p.value : undefined,
       isType,
+      ...(mark ? { change: mark } : {}),
     });
   });
+  if (opts.marks) {
+    for (const [id, c] of seen) {
+      const n = nodes.get(id);
+      if (!n) continue;
+      n.change = c.kept || (c.added && c.removed) ? 'kept' : c.added ? 'added' : 'removed';
+    }
+  }
   return { nodes: [...nodes.values()], edges, truncated, totalNodes: seenNodeIds.size };
 }

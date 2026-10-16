@@ -95,9 +95,25 @@ const T0: i64 = 1_893_456_000_000; // 2030-01-01T00:00:00Z
 
 /// A persistent dataset `h`: 1 (+a), 2 (+b in g1), 3 (−a), 4 (+c).
 async fn server(limits: impl FnOnce(&mut crate::state::Limits)) -> Server {
+    server_with_pool(None, limits).await
+}
+
+/// The same dataset on a server whose query memory pool has `pool` bytes, if any.
+async fn server_with_pool(
+    pool: Option<u64>,
+    limits: impl FnOnce(&mut crate::state::Limits),
+) -> Server {
     let dir = tempfile::tempdir().unwrap();
-    let mut st =
-        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap();
+    let mut st = match pool {
+        None => AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)),
+        Some(p) => AppState::with_memory(
+            dir.path(),
+            StoreOptions::default(),
+            Duration::from_secs(30),
+            Some(p),
+        ),
+    }
+    .unwrap();
     limits(&mut st.limits);
     let state = Arc::new(st);
     state.attach("h", DbType::Persistent, None).unwrap();
@@ -1148,4 +1164,472 @@ async fn history_queries_over_http() {
     let r = get(&s.app, "/h/history").await;
     assert_eq!(r.status, StatusCode::NOT_IMPLEMENTED, "{}", r.text());
     assert_eq!(r.json()["code"], "history-unsupported");
+}
+
+#[tokio::test]
+async fn diffs_keep_the_changes_of_some_terms() {
+    let s = server(|_| {}).await;
+    let count = |j: &J| (j["added"].as_u64().unwrap(), j["removed"].as_u64().unwrap());
+    // a subject, an object, and the terms of both
+    let j = get(&s.app, "/h/diff?from=0&term=urn:c").await.json();
+    assert_eq!(count(&j), (1, 0));
+    let j = get(&s.app, "/h/diff?from=0&term=%22three%22").await.json();
+    assert_eq!(count(&j), (1, 0));
+    let j = get(&s.app, "/h/diff?from=0&term=urn:c&term=urn:b")
+        .await
+        .json();
+    assert_eq!(count(&j), (2, 0));
+    // a quad added and removed is no change; a removal alone is
+    let j = get(&s.app, "/h/diff?from=0&term=urn:a").await.json();
+    assert_eq!(count(&j), (0, 0));
+    let j = get(&s.app, "/h/diff?from=1&to=4&term=urn:a&quads=true")
+        .await
+        .json();
+    assert_eq!(count(&j), (0, 1));
+    assert_eq!(j["quads"][0]["subject"], "<urn:a>");
+    // the filter is part of the entity tag
+    let all = get(&s.app, "/h/diff?from=1&to=4").await;
+    let some = get(&s.app, "/h/diff?from=1&to=4&term=urn:a").await;
+    assert_ne!(all.header("etag"), some.header("etag"));
+    // a patch lists every change
+    let r = get(&s.app, "/h/diff?from=1&to=4&term=urn:a&format=patch").await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    let r = get(&s.app, "/h/diff?from=1&to=4&term=not%20an%20iri").await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    // states compared rather than logs read
+    s.state.attach("m", DbType::Mem, None).unwrap();
+    let r = put_json(&s.app, "/$/history/m", r#"{"keepCommits":5}"#).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    update(&s.app, "m", "INSERT DATA { <urn:x> <urn:p> 1 }").await;
+    update(&s.app, "m", "INSERT DATA { <urn:y> <urn:p> 2 }").await;
+    update(&s.app, "m", "DELETE DATA { <urn:x> <urn:p> 1 }").await;
+    let j = get(&s.app, "/m/diff?from=1&to=3&term=urn:y").await.json();
+    assert_eq!(j["method"], "compare");
+    assert_eq!(count(&j), (1, 0));
+    let j = get(&s.app, "/m/diff?from=1&to=3&term=urn:x").await.json();
+    assert_eq!(count(&j), (0, 1));
+}
+
+#[tokio::test]
+async fn the_timeline_buckets_the_commits() {
+    let s = server(|_| {}).await;
+    let list = get(&s.app, "/$/commits/h?limit=100").await.json();
+    let commits = list["commits"].as_array().unwrap();
+    assert_eq!(commits.len(), 5);
+    let j = get(&s.app, "/$/commits/h/timeline").await.json();
+    assert_eq!(j["head"], 4);
+    assert_eq!(j["commits"], 5);
+    // by default every commit has a bucket of its own
+    let b = j["buckets"].as_array().unwrap();
+    assert_eq!(b.len(), 5);
+    assert_eq!(b[0]["firstSeq"], 0);
+    assert_eq!(b[4]["lastSeq"], 4);
+    assert_eq!(b[1]["kinds"]["update"], 1);
+    assert_eq!(b[1]["inserted"], commits[3]["inserted"]);
+    assert!(j["readable"].as_array().is_some());
+    // two buckets of three and two commits
+    let j = get(&s.app, "/$/commits/h/timeline?buckets=2").await.json();
+    assert_eq!(j["bucketWidth"], 3);
+    let b = j["buckets"].as_array().unwrap();
+    assert_eq!(b.len(), 2);
+    let ends = |x: &J| {
+        (
+            x["firstSeq"].as_u64().unwrap(),
+            x["lastSeq"].as_u64().unwrap(),
+        )
+    };
+    assert_eq!((ends(&b[0]), ends(&b[1])), ((0, 2), (3, 4)));
+    assert_eq!(b[0]["commits"], 3);
+    let sum: u64 = b.iter().map(|x| x["inserted"].as_u64().unwrap()).sum();
+    let total: u64 = commits
+        .iter()
+        .map(|c| c["inserted"].as_u64().unwrap())
+        .sum();
+    assert_eq!(sum, total);
+    // a range
+    let j = get(&s.app, "/$/commits/h/timeline?from=2&to=3")
+        .await
+        .json();
+    assert_eq!(
+        (j["firstSeq"].as_u64(), j["lastSeq"].as_u64()),
+        (Some(2), Some(3))
+    );
+    assert_eq!(j["buckets"].as_array().unwrap().len(), 2);
+    for bad in ["buckets=0", "buckets=2001", "from=x", "from=3&to=2"] {
+        let r = get(&s.app, &format!("/$/commits/h/timeline?{bad}")).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{bad}: {}", r.text());
+    }
+    // an in-memory dataset
+    s.state.attach("m", DbType::Mem, None).unwrap();
+    update(&s.app, "m", "INSERT DATA { <urn:x> <urn:p> 1 }").await;
+    let j = get(&s.app, "/$/commits/m/timeline").await.json();
+    assert!(j["commits"].as_u64().unwrap() >= 1);
+}
+
+async fn sparql_diff(app: &Router, uri: &str, query: &str) -> Resp {
+    send(
+        app,
+        Request::post(uri)
+            .header(header::CONTENT_TYPE, "application/sparql-query")
+            .body(Body::from(query.to_string()))
+            .unwrap(),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn sparql_diff_lists_the_rows_one_state_lacks() {
+    let s = server(|_| {}).await;
+    let q = "SELECT ?s ?o WHERE { ?s <urn:p> ?o }";
+    // commit 1 has (a, 1) and commit 4 has (c, "three")
+    let r = sparql_diff(&s.app, "/h/sparql/diff?from=1&to=4", q).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(
+        (
+            j["fromRows"].as_u64(),
+            j["toRows"].as_u64(),
+            j["same"].as_u64(),
+            j["added"].as_u64(),
+            j["removed"].as_u64()
+        ),
+        (Some(1), Some(1), Some(0), Some(1), Some(1))
+    );
+    assert_eq!(j["vars"], serde_json::json!(["s", "o"]));
+    assert_eq!(j["addedRows"][0]["s"]["value"], "urn:c");
+    assert_eq!(j["addedRows"][0]["o"]["value"], "three");
+    assert_eq!(j["removedRows"][0]["s"]["value"], "urn:a");
+    assert_eq!(j["from"]["commit"]["seq"], 1);
+    assert_eq!(j["to"]["selector"], "commit:4");
+    assert_eq!(j["truncated"]["added"], false);
+    // commits 1 and 2 hold the same rows of the default graph
+    let j = sparql_diff(&s.app, "/h/sparql/diff?from=1&to=2", q)
+        .await
+        .json();
+    assert_eq!(
+        (
+            j["same"].as_u64(),
+            j["added"].as_u64(),
+            j["removed"].as_u64()
+        ),
+        (Some(1), Some(0), Some(0))
+    );
+    // the other way round
+    let j = sparql_diff(&s.app, "/h/sparql/diff?from=4&to=1", q)
+        .await
+        .json();
+    assert_eq!(j["addedRows"][0]["s"]["value"], "urn:a");
+    assert_eq!(j["removedRows"][0]["s"]["value"], "urn:c");
+    // rows are a bag: two rows against one differ once
+    update(
+        &s.app,
+        "h",
+        "INSERT DATA { <urn:d> <urn:p> 5 . <urn:e> <urn:p> 6 }",
+    )
+    .await;
+    let p = "SELECT ?p WHERE { ?s ?p ?o }";
+    let j = sparql_diff(&s.app, "/h/sparql/diff?from=4&to=5", p)
+        .await
+        .json();
+    assert_eq!(
+        (
+            j["same"].as_u64(),
+            j["added"].as_u64(),
+            j["removed"].as_u64()
+        ),
+        (Some(1), Some(2), Some(0))
+    );
+    // `limit` caps the rows listed, not the counts
+    let j = sparql_diff(&s.app, "/h/sparql/diff?from=4&to=5&limit=1", p)
+        .await
+        .json();
+    assert_eq!(j["added"], 2);
+    assert_eq!(j["addedRows"].as_array().unwrap().len(), 1);
+    assert_eq!(j["truncated"]["added"], true);
+    // the query and the selectors may come in a form or in JSON
+    let r = send(
+        &s.app,
+        Request::post("/h/sparql/diff")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({ "query": q, "from": "1", "to": "4" }).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["added"], 1);
+    // errors
+    let r = sparql_diff(&s.app, "/h/sparql/diff", q).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    let r = sparql_diff(&s.app, "/h/sparql/diff?from=1", "ASK {}").await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    let r = sparql_diff(&s.app, "/h/sparql/diff?from=1&limit=0", q).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    let r = sparql_diff(&s.app, "/h/sparql/diff?from=1", "SELECT nonsense").await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    let r = sparql_diff(&s.app, "/h/sparql/diff?from=1", "").await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    let r = sparql_diff(&s.app, "/h/sparql/diff?from=99", q).await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.text());
+}
+
+/// The start of a response body, for the message of a failed assertion.
+fn head_of(r: &Resp) -> String {
+    r.text().chars().take(200).collect()
+}
+
+#[tokio::test]
+async fn sparql_diff_keeps_the_result_byte_budget() {
+    let s = server(|l| l.max_result_bytes = Some(4096)).await;
+    let big = "x".repeat(10_000);
+    update(
+        &s.app,
+        "h",
+        &format!("INSERT DATA {{ <urn:d> <urn:p> \"{big}\" }}"),
+    )
+    .await;
+    let r = sparql_diff(
+        &s.app,
+        "/h/sparql/diff?from=4&to=5",
+        "SELECT ?s ?o WHERE { ?s <urn:p> ?o }",
+    )
+    .await;
+    assert_eq!(
+        r.status,
+        StatusCode::INSUFFICIENT_STORAGE,
+        "{}",
+        head_of(&r)
+    );
+    assert_eq!(r.json()["budget"], "result-bytes");
+}
+
+#[tokio::test]
+async fn sparql_diff_keeps_the_result_budget_a_request_asks_for() {
+    // no server limit: the request's own `max-result-mb` applies
+    let s = server(|_| {}).await;
+    let big = "x".repeat(2 << 20);
+    update(
+        &s.app,
+        "h",
+        &format!("INSERT DATA {{ <urn:d> <urn:p> \"{big}\" }}"),
+    )
+    .await;
+    let q = "SELECT ?s ?o WHERE { ?s <urn:p> ?o }";
+    let r = sparql_diff(&s.app, "/h/sparql/diff?from=4&to=5&max-result-mb=1", q).await;
+    assert_eq!(
+        r.status,
+        StatusCode::INSUFFICIENT_STORAGE,
+        "{}",
+        head_of(&r)
+    );
+    // without it, or with a larger one, the answer is the whole body
+    let r = sparql_diff(&s.app, "/h/sparql/diff?from=4&to=5&max-result-mb=8", q).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", head_of(&r));
+    assert_eq!(r.json()["added"], 1);
+    let r = sparql_diff(&s.app, "/h/sparql/diff?from=4&to=5&max-result-mb=0", q).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+}
+
+async fn big_server(memory: Option<u64>, n: usize) -> Server {
+    let s = server(|l| l.query_memory_bytes = memory).await;
+    let mut u = String::from("INSERT DATA {");
+    for i in 0..n {
+        u.push_str(&format!(" <urn:r{i}> <urn:q> <urn:o> ."));
+    }
+    u.push('}');
+    update(&s.app, "h", &u).await;
+    s
+}
+
+#[tokio::test]
+async fn sparql_diff_charges_its_hashes_to_the_memory_budget() {
+    let q = "SELECT ?s WHERE { ?s <urn:q> <urn:o> }";
+    let n = 20_000;
+    let probe = big_server(None, n).await;
+    let ds = probe.state.datasets()["h"].clone();
+    let (snap, _) = history::snapshot_for(&ds, None, &QueryOptions::default()).unwrap();
+    let peak = sparkles::sparql::query_with_plan(snap, q, &QueryOptions::default())
+        .ok()
+        .unwrap()
+        .mem_peak_bytes;
+    let budget = (peak * 2).max(1);
+    // a HashMap<u128, u32> of n entries takes at least 32 bytes a slot
+    let map_bytes = (n as u64).next_power_of_two() * 32;
+    assert!(
+        map_bytes > budget,
+        "precondition: the map ({map_bytes}) must exceed the budget ({budget})"
+    );
+    let s = big_server(Some(budget), n).await;
+    // the query alone fits the budget
+    let r = get(
+        &s.app,
+        "/h/sparql?query=SELECT%20%3Fs%20WHERE%20%7B%20%3Fs%20%3Curn%3Aq%3E%20%3Curn%3Ao%3E%20%7D",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let r = sparql_diff(&s.app, "/h/sparql/diff?from=5&to=5", q).await;
+    assert_eq!(
+        r.status,
+        StatusCode::INSUFFICIENT_STORAGE,
+        "{}",
+        head_of(&r)
+    );
+    assert_eq!(r.json()["budget"], "memory");
+}
+
+#[tokio::test]
+async fn sparql_diff_charges_the_server_memory_pool() {
+    const MIB: u64 = 1 << 20;
+    let q = "SELECT ?s WHERE { ?s <urn:q> <urn:o> }";
+    let s = server_with_pool(Some(4 * MIB), |_| {}).await;
+    let pool = s.state.catalog.pool().expect("a pool").clone();
+    let ds = s.state.datasets()["h"].clone();
+    // 100,000 rows: the query fits the pool, and its hashes (about 4.8 MB) do not
+    let nt: String = (0..100_000)
+        .map(|i| format!("<urn:r{i}> <urn:q> <urn:o> .\n"))
+        .collect();
+    ds.store
+        .load(&[sparkles::io::Source::from_bytes(
+            nt.into_bytes(),
+            oxrdfio::RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+    let head = ds.store.head_commit().seq;
+    let uri = format!("/h/sparql/diff?from={head}&to={head}");
+    let r = sparql_diff(&s.app, &uri, q).await;
+    assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE, "{}", head_of(&r));
+    assert_eq!(r.json()["budget"], "server-memory");
+    // the grant went back to the pool on the error
+    assert_eq!(pool.granted(), 0);
+    // a comparison that fits is answered, and gives everything back too
+    let small = sparql_diff(
+        &s.app,
+        &format!("/h/sparql/diff?from={head}&to={head}"),
+        "SELECT ?s WHERE { ?s <urn:q> <urn:o> } LIMIT 100",
+    )
+    .await;
+    assert_eq!(small.status, StatusCode::OK, "{}", head_of(&small));
+    assert_eq!(small.json()["same"], 100);
+    assert_eq!(pool.granted(), 0);
+}
+
+#[tokio::test]
+async fn sparql_diff_runs_under_one_timeout() {
+    let q = "SELECT ?s WHERE { ?s <urn:q> <urn:o> }";
+    let s = big_server(None, 20_000).await;
+    // a request that cannot finish in a microsecond answers the timeout status
+    let r = sparql_diff(&s.app, "/h/sparql/diff?from=5&to=5&timeout=0.000001", q).await;
+    assert_eq!(r.status, StatusCode::REQUEST_TIMEOUT, "{}", head_of(&r));
+    // the body names the timeout that applied, as the query endpoint's does
+    assert!(
+        r.json()["timeoutSeconds"].as_f64().is_some(),
+        "{}",
+        head_of(&r)
+    );
+}
+
+#[tokio::test]
+async fn the_timeline_reads_only_the_range_and_stops_at_the_head() {
+    let s = server(|_| {}).await;
+    // two commits of the range, and the commit count says so
+    let j = get(&s.app, "/$/commits/h/timeline?from=2&to=3")
+        .await
+        .json();
+    assert_eq!(j["commits"], 2);
+    assert_eq!(j["firstSeq"], 2);
+    assert_eq!(j["lastSeq"], 3);
+    // a `to` past the head is the head, and no bucket passes it
+    let j = get(&s.app, "/$/commits/h/timeline?to=99").await.json();
+    assert_eq!(j["head"], 4);
+    assert_eq!(j["lastSeq"], 4);
+    for b in j["buckets"].as_array().unwrap() {
+        assert!(b["lastSeq"].as_u64().unwrap() <= 4);
+    }
+    let j = get(
+        &s.app,
+        "/$/commits/h/timeline?from=3&to=18446744073709551615",
+    )
+    .await
+    .json();
+    assert_eq!(
+        (j["firstSeq"].as_u64(), j["lastSeq"].as_u64()),
+        (Some(3), Some(4))
+    );
+    // a range after the head holds nothing
+    let j = get(&s.app, "/$/commits/h/timeline?from=50").await.json();
+    assert_eq!(j["commits"], 0);
+    assert!(j["buckets"].as_array().unwrap().is_empty());
+    // the first commit is in a range that starts at 0
+    let j = get(&s.app, "/$/commits/h/timeline?from=0&to=0")
+        .await
+        .json();
+    assert_eq!(j["commits"], 1);
+}
+
+#[tokio::test]
+async fn sparql_diff_refuses_a_query_that_is_not_repeatable() {
+    let s = server(|_| {}).await;
+    let r = sparql_diff(
+        &s.app,
+        "/h/sparql/diff?from=1&to=2",
+        "SELECT (STRUUID() AS ?id) WHERE {}",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.text());
+    assert_eq!(r.json()["code"], "not-repeatable");
+    // a query that returns the same rows every time is not refused
+    let q = "SELECT ?s ?o WHERE { ?s <urn:p> ?o }";
+    let r = sparql_diff(&s.app, "/h/sparql/diff?from=1&to=4", q).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+}
+
+#[tokio::test]
+async fn sparql_diff_gives_its_three_executions_one_deadline() {
+    // a query no other test runs, so that its executions can be told apart
+    let q = "SELECT ?s ?o WHERE { ?s <urn:p> ?o } # one-deadline";
+    let s = server(|_| {}).await;
+    let r = sparql_diff(&s.app, "/h/sparql/diff?from=1&to=4&timeout=60", q).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", head_of(&r));
+    // commit 1 has a row that commit 4 lacks, so the earlier state is read a second time
+    assert_eq!(r.json()["removed"], 1);
+    let runs: Vec<Option<std::time::Duration>> = super::sparql_diff::RUNS
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(query, _)| query == q)
+        .map(|(_, t)| *t)
+        .collect();
+    assert_eq!(runs.len(), 3, "{runs:?}");
+    let [a, b, c] = [runs[0].unwrap(), runs[1].unwrap(), runs[2].unwrap()];
+    // each execution gets the time that is left, not the whole timeout again
+    let sixty = std::time::Duration::from_secs(60);
+    assert!(a < sixty && b < a && c < b, "{a:?} {b:?} {c:?}");
+}
+
+#[tokio::test]
+async fn the_timeline_range_is_clamped_to_the_head_before_it_is_capped() {
+    // a ceiling of three commits, and a head of 4 (five commits)
+    let s = server(|l| l.max_timeline_commits = 3).await;
+    let uri = |q: &str| format!("/$/commits/h/timeline?{q}");
+    // all five commits are more than the ceiling
+    let r = get(&s.app, &uri("")).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    assert!(r.text().contains("narrow it with from and to"));
+    // a `to` far past the head is the head, so three commits are read and fit
+    let r = get(&s.app, &uri("from=2&to=99999999999")).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(
+        (j["commits"].as_u64(), j["lastSeq"].as_u64()),
+        (Some(3), Some(4))
+    );
+    // one commit more than the ceiling is still refused
+    let r = get(&s.app, &uri("from=1&to=99999999999")).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    // and a range after the head reads nothing, whatever its size
+    let r = get(&s.app, &uri("from=50&to=99999999999")).await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(r.json()["commits"], 0);
 }
