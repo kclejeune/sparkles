@@ -199,7 +199,10 @@ async fn models_layers_and_routes() {
     assert!(m.provider("gw").is_some());
     assert_eq!(m.pairs(crate::models::Role::Draft)[0].provider, "gw");
     let file = f.dir.path().join("data").join(server::MODELS_FILE);
-    let stored: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    let mut stored: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    // the file carries its version, which is not a setting
+    assert_eq!(stored["format"], 1);
+    stored.as_object_mut().unwrap().remove("format");
     assert_eq!(stored, v["runtime"]);
     // a request in flight keeps the configuration it started with
     let held = f.st.models().unwrap();
@@ -955,10 +958,10 @@ async fn a_read_only_server_refuses_settings_writes() {
     assert!(!dir.path().join("data/secrets").exists());
 }
 
-/// A server state over `dir/data` like [`open`], with the runtime secrets sealed by the
-/// key of `--secrets-key key` when there is one. The error is the one that stops the
-/// start.
-#[cfg(all(feature = "backup-encryption", target_os = "linux"))]
+/// A server state over `dir/data` like [`open`], with the runtime secrets kept as
+/// `serve --secrets-key key` keeps them, or as `serve` without the option keeps them.
+/// The error is the one that stops the start.
+#[cfg(all(feature = "backup", unix))]
 fn open_sealed(
     dir: &std::path::Path,
     models: &Value,
@@ -971,14 +974,12 @@ fn open_sealed(
     )
     .unwrap();
     st.outbound.allow_private = true;
-    if let Some(key) = key {
-        // the key is read on a runtime of its own, as `serve` does before its runtime
-        let (key, data) = (key.to_string(), dir.join("data"));
-        st.settings.server.sealing =
-            std::thread::spawn(move || super::secrets::Sealing::load(&key, &data))
-                .join()
-                .unwrap()?;
-    }
+    // the key is read on a runtime of its own, as `serve` does before its runtime
+    let (key, data) = (key.map(str::to_string), dir.join("data"));
+    st.settings.server.sealing =
+        std::thread::spawn(move || super::secrets::Sealing::start(key.as_deref(), &data))
+            .join()
+            .unwrap()?;
     let f = dir.join("models.json");
     std::fs::write(&f, models.to_string()).unwrap();
     let args = crate::models::ModelArgs {
@@ -994,7 +995,7 @@ fn open_sealed(
 /// `serve --secrets-key`: a plaintext value is sealed at the start and read back
 /// transparently, new values are stored sealed, and a wrong key, a missing key or a
 /// sealed file copied to another secret's name stop the start. `storage` tells which.
-#[cfg(all(feature = "backup-encryption", target_os = "linux"))]
+#[cfg(all(feature = "backup", unix))]
 #[tokio::test(flavor = "multi_thread")]
 async fn sealed_runtime_secrets() {
     use std::os::unix::fs::PermissionsExt;
@@ -1019,8 +1020,8 @@ async fn sealed_runtime_secrets() {
         .await
     };
 
-    // without a key: plaintext, and `storage` says so
-    let (st, app) = open_sealed(dir.path(), &models, None).unwrap();
+    // `--secrets-key none`: plaintext, and `storage` says so
+    let (st, app) = open_sealed(dir.path(), &models, Some("none")).unwrap();
     let (s, _, _) = send(
         &app,
         "PUT",
@@ -1032,6 +1033,9 @@ async fn sealed_runtime_secrets() {
     assert_eq!(std::fs::read_to_string(&gw).unwrap(), "runtime-key-456");
     let (_, v, _) = send(&app, "GET", "/$/server/secrets", None).await;
     assert_eq!(v["storage"], "plaintext", "{v}");
+    assert_eq!(v["keySource"], Value::Null, "{v}");
+    assert_eq!(v["keyMemory"], Value::Null, "{v}");
+    assert!(!dir.path().join("data/secrets.key").exists());
     drop((st, app));
 
     // with a key: the plaintext value is sealed at the start and still used
@@ -1045,6 +1049,11 @@ async fn sealed_runtime_secrets() {
     );
     let (_, v, _) = send(&app, "GET", "/$/server/secrets", None).await;
     assert_eq!(v["storage"], "sealed", "{v}");
+    assert_eq!(v["keySource"], "configured", "{v}");
+    assert!(
+        ["locked", "heap"].contains(&v["keyMemory"].as_str().unwrap()),
+        "{v}"
+    );
     let (_, v, _) = test(app.clone()).await;
     assert_eq!(v["ok"], true, "{v}");
     assert_eq!(bearer(&m).as_deref(), Some("Bearer runtime-key-456"));
@@ -1077,8 +1086,16 @@ async fn sealed_runtime_secrets() {
         .unwrap()
         .to_string();
     assert!(e.contains("does not open") && e.contains("gw"), "{e}");
-    // so does a start without a key
+    // so does a start without a key, which finds no secrets.key to open them with
     let e = open_sealed(dir.path(), &models, None)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(e.contains("--secrets-key") && e.contains("gw"), "{e}");
+    assert!(e.contains("secrets.key"), "{e}");
+    assert!(!dir.path().join("data/secrets.key").exists());
+    // and a start with --secrets-key none
+    let e = open_sealed(dir.path(), &models, Some("none"))
         .err()
         .unwrap()
         .to_string();
@@ -1098,11 +1115,279 @@ async fn sealed_runtime_secrets() {
 
     // a key source that is not one of the four forms
     let e = std::thread::spawn(|| {
-        super::secrets::Sealing::load("vault:x", std::path::Path::new("/nonexistent"))
+        super::secrets::Sealing::start(Some("vault:x"), std::path::Path::new("/nonexistent"))
     })
     .join()
     .unwrap()
     .unwrap_err()
     .to_string();
     assert!(e.contains("file:PATH"), "{e}");
+}
+
+/// `serve` without `--secrets-key`: the first stored value generates
+/// `<dataDir>/secrets.key` with mode 0400 and is sealed with it, a restart opens it, and
+/// the plaintext values of a data directory from a release that did not seal are sealed
+/// at the start with a key generated then.
+#[cfg(all(feature = "backup", unix))]
+#[tokio::test(flavor = "multi_thread")]
+async fn generated_secrets_key() {
+    use std::os::unix::fs::PermissionsExt;
+    let m = key_mock();
+    let models = declared_models(&format!("{}/v1", m.url()));
+    let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    let test = |app: axum::Router| async move {
+        send(
+            &app,
+            "POST",
+            "/$/models/local/test",
+            Some(json!({"model": "m"})),
+        )
+        .await
+    };
+
+    // a first start with no key: sealing is on, and no key exists until a value does
+    let dir = tempfile::tempdir().unwrap();
+    let key = dir.path().join("data/secrets.key");
+    let gw = dir.path().join("data/secrets/gw");
+    let (st, app) = open_sealed(dir.path(), &models, None).unwrap();
+    let (_, v, _) = send(&app, "GET", "/$/server/secrets", None).await;
+    assert_eq!(v["storage"], "sealed", "{v}");
+    assert_eq!(v["keySource"], "generated", "{v}");
+    assert_eq!(v["keyMemory"], Value::Null, "{v}");
+    assert!(!key.exists());
+    let (s, _, _) = send(
+        &app,
+        "PUT",
+        "/$/server/secrets/gw",
+        Some(json!({"value": "runtime-key-456"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    assert_eq!(mode(&key), 0o400);
+    let text = std::fs::read_to_string(&key).unwrap();
+    assert_eq!(text.trim().len(), 64, "a key of 64 hexadecimal digits");
+    let sealed = std::fs::read_to_string(&gw).unwrap();
+    assert!(sealed.starts_with("sparkles-sealed-secret/1 "), "{sealed}");
+    assert!(!sealed.contains("runtime-key-456"));
+    let (_, v, _) = send(&app, "GET", "/$/server/secrets", None).await;
+    assert!(
+        ["locked", "heap"].contains(&v["keyMemory"].as_str().unwrap()),
+        "{v}"
+    );
+    test(app.clone()).await;
+    assert_eq!(bearer(&m).as_deref(), Some("Bearer runtime-key-456"));
+    // a second value uses the same key
+    send(
+        &app,
+        "PUT",
+        "/$/server/secrets/other",
+        Some(json!({"value": "other-key"})),
+    )
+    .await;
+    assert_eq!(std::fs::read_to_string(&key).unwrap(), text);
+    drop((st, app));
+
+    // a restart reads the key and opens the value
+    let (st, app) = open_sealed(dir.path(), &models, None).unwrap();
+    let (_, v, _) = test(app.clone()).await;
+    assert_eq!(v["ok"], true, "{v}");
+    assert_eq!(bearer(&m).as_deref(), Some("Bearer runtime-key-456"));
+    drop((st, app));
+
+    // a key file that others can read is refused
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let e = open_sealed(dir.path(), &models, None)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(e.contains("secrets.key") && e.contains("0400"), "{e}");
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o400)).unwrap();
+    // a changed key file does not open the values, and the start says which
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::write(&key, format!("{}\n", "ab".repeat(32))).unwrap();
+    let e = open_sealed(dir.path(), &models, None)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(e.contains("does not open") && e.contains("gw"), "{e}");
+
+    // the plaintext values of a release that did not seal are sealed at the first start
+    let old = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(old.path().join("data/secrets")).unwrap();
+    let old_gw = old.path().join("data/secrets/gw");
+    std::fs::write(&old_gw, "runtime-key-old").unwrap();
+    std::fs::set_permissions(&old_gw, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let (_st, app) = open_sealed(old.path(), &models, None).unwrap();
+    let sealed = std::fs::read_to_string(&old_gw).unwrap();
+    assert!(sealed.starts_with("sparkles-sealed-secret/1 "), "{sealed}");
+    assert_eq!(mode(&old.path().join("data/secrets.key")), 0o400);
+    test(app).await;
+    assert_eq!(bearer(&m).as_deref(), Some("Bearer runtime-key-old"));
+}
+
+/// `sparkles secrets unseal` writes the values back as plaintext, which a server that
+/// does not seal reads, and `rekey` seals them under a configured key and removes the
+/// generated one. Both refuse a data directory whose catalog lock is held.
+#[cfg(all(feature = "backup", unix))]
+#[tokio::test(flavor = "multi_thread")]
+async fn unseal_and_rekey() {
+    use super::secrets::{rekey, unseal};
+    use std::os::unix::fs::PermissionsExt;
+    let m = key_mock();
+    let models = declared_models(&format!("{}/v1", m.url()));
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let gw = data.join("secrets/gw");
+    let test = |app: axum::Router| async move {
+        send(
+            &app,
+            "POST",
+            "/$/models/local/test",
+            Some(json!({"model": "m"})),
+        )
+        .await
+    };
+    let (st, app) = open_sealed(dir.path(), &models, None).unwrap();
+    send(
+        &app,
+        "PUT",
+        "/$/server/secrets/gw",
+        Some(json!({"value": "runtime-key-456"})),
+    )
+    .await;
+    // a running server holds the catalog lock
+    let d = data.clone();
+    let e = std::thread::spawn(move || unseal(&d, None))
+        .join()
+        .unwrap()
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("stop the server"), "{e}");
+    drop((st, app));
+
+    // unseal: plaintext again, and the key file stays
+    let d = data.clone();
+    let done = std::thread::spawn(move || unseal(&d, None))
+        .join()
+        .unwrap()
+        .unwrap();
+    assert_eq!(done.values, 1);
+    assert_eq!(std::fs::read_to_string(&gw).unwrap(), "runtime-key-456");
+    assert_eq!(
+        std::fs::metadata(&gw).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert!(data.join("secrets.key").exists());
+    // the previous release reads plaintext values without a key, as a server with
+    // --secrets-key none does
+    let (st, app) = open_sealed(dir.path(), &models, Some("none")).unwrap();
+    test(app.clone()).await;
+    assert_eq!(bearer(&m).as_deref(), Some("Bearer runtime-key-456"));
+    assert_eq!(std::fs::read_to_string(&gw).unwrap(), "runtime-key-456");
+    drop((st, app));
+
+    // the next start seals them again with the same key; rekey moves them to another
+    let (st, app) = open_sealed(dir.path(), &models, None).unwrap();
+    drop((st, app));
+    assert!(
+        std::fs::read_to_string(&gw)
+            .unwrap()
+            .starts_with("sparkles-sealed-secret/1 ")
+    );
+    let new = dir.path().join("new.key");
+    std::fs::write(&new, format!("{}\n", "07".repeat(32))).unwrap();
+    std::fs::set_permissions(&new, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let source = format!("file:{}", new.display());
+    let (d, s) = (data.clone(), source.clone());
+    let done = std::thread::spawn(move || rekey(&d, None, &s))
+        .join()
+        .unwrap()
+        .unwrap();
+    assert_eq!(done.values, 1);
+    assert_eq!(done.removed_key, Some(data.join("secrets.key")));
+    assert!(!data.join("secrets.key").exists());
+    let (_st, app) = open_sealed(dir.path(), &models, Some(&source)).unwrap();
+    test(app).await;
+    assert_eq!(bearer(&m).as_deref(), Some("Bearer runtime-key-456"));
+    // `--new-key none` is not a key
+    let d = data.clone();
+    let e = std::thread::spawn(move || rekey(&d, None, "none"))
+        .join()
+        .unwrap()
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("unseal"), "{e}");
+}
+
+/// A `rekey` that stops partway is finished by running it again. The values already
+/// sealed with the new key are kept, the old generated key stays until every value opens
+/// with the new one, and a start in between says what to do.
+#[cfg(all(feature = "backup", unix))]
+#[tokio::test(flavor = "multi_thread")]
+async fn rekey_resumes_after_a_failed_write() {
+    use super::secrets::{Sealing, rekey};
+    use std::os::unix::fs::PermissionsExt;
+    let m = key_mock();
+    let models = declared_models(&format!("{}/v1", m.url()));
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let (st, app) = open_sealed(dir.path(), &models, None).unwrap();
+    for (name, value) in [("a", "value-a"), ("b", "value-b")] {
+        let (s, _, _) = send(
+            &app,
+            "PUT",
+            &format!("/$/server/secrets/{name}"),
+            Some(json!({"value": value})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::NO_CONTENT);
+    }
+    drop((st, app));
+    let new = dir.path().join("new.key");
+    std::fs::write(&new, format!("{}\n", "07".repeat(32))).unwrap();
+    std::fs::set_permissions(&new, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let source = format!("file:{}", new.display());
+    let run = |data: std::path::PathBuf, source: String| {
+        std::thread::spawn(move || rekey(&data, None, &source))
+            .join()
+            .unwrap()
+    };
+
+    // the write of b fails, after a is sealed with the new key
+    let block = data.join(format!("secrets/.b.{}.tmp", std::process::id()));
+    std::fs::create_dir(&block).unwrap();
+    let e = run(data.clone(), source.clone()).unwrap_err().to_string();
+    assert!(e.contains("secret b") && e.contains("run the same"), "{e}");
+    assert!(data.join("secrets.key").exists());
+    // a start now says that the rekey can be finished
+    let e = open_sealed(dir.path(), &models, None)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(e.contains("run the same command again"), "{e}");
+
+    // the same command finishes it
+    std::fs::remove_dir(&block).unwrap();
+    let done = run(data.clone(), source.clone()).unwrap();
+    assert_eq!(done.values, 1);
+    assert_eq!(done.already, 1);
+    assert_eq!(done.removed_key, Some(data.join("secrets.key")));
+    assert!(!data.join("secrets.key").exists());
+    let (_st, _app) = open_sealed(dir.path(), &models, Some(&source)).unwrap();
+    for (name, value) in [("a", "value-a"), ("b", "value-b")] {
+        let (d, s, path) = (
+            data.clone(),
+            source.clone(),
+            data.join("secrets").join(name),
+        );
+        let got = std::thread::spawn(move || {
+            Sealing::start(Some(&s), &d)
+                .unwrap()
+                .read(&path, name)
+                .unwrap()
+        })
+        .join()
+        .unwrap();
+        assert_eq!(got, value);
+    }
 }

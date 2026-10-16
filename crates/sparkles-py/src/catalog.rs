@@ -121,12 +121,18 @@ impl PyCatalog {
 #[pymethods]
 impl PyCatalog {
     #[new]
-    #[pyo3(signature=(path,*,union_default_graph=false))]
-    fn new(py: Python<'_>, path: PathBuf, union_default_graph: bool) -> PyResult<Self> {
-        let opts = CatalogOptions::from(sparkles::store::StoreOptions {
+    #[pyo3(signature=(path,*,union_default_graph=false,total_query_memory_bytes=None))]
+    fn new(
+        py: Python<'_>,
+        path: PathBuf,
+        union_default_graph: bool,
+        total_query_memory_bytes: Option<u64>,
+    ) -> PyResult<Self> {
+        let mut opts = CatalogOptions::from(sparkles::store::StoreOptions {
             union_default_graph,
             ..Default::default()
         });
+        opts.memory.pool_bytes = total_query_memory_bytes;
         let absolute = std::path::absolute(&path)?;
         let cat = py
             .detach(|| Catalog::open(&path, opts))
@@ -139,15 +145,14 @@ impl PyCatalog {
         Ok(Self::from_catalog(cat))
     }
     #[staticmethod]
-    #[pyo3(signature=(*,union_default_graph=false))]
-    fn memory(union_default_graph: bool) -> Self {
-        Self::from_catalog(Catalog::memory(
-            sparkles::store::StoreOptions {
-                union_default_graph,
-                ..Default::default()
-            }
-            .into(),
-        ))
+    #[pyo3(signature=(*,union_default_graph=false,total_query_memory_bytes=None))]
+    fn memory(union_default_graph: bool, total_query_memory_bytes: Option<u64>) -> Self {
+        let mut opts = CatalogOptions::from(sparkles::store::StoreOptions {
+            union_default_graph,
+            ..Default::default()
+        });
+        opts.memory.pool_bytes = total_query_memory_bytes;
+        Self::from_catalog(Catalog::memory(opts))
     }
     #[staticmethod]
     fn inspect(py: Python<'_>, path: PathBuf) -> PyResult<Vec<PyDatasetInfo>> {

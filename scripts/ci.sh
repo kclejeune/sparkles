@@ -84,6 +84,7 @@ main() {
     case "$t" in
       lint | lint:features | test | ui:check | ui:test | licenses:check) prep+=(ui:build) ;;
       ui:fmt:check) prep+=(ui:install) ;;
+      node:fmt:check | node:client:check) prep+=(node:install) ;;
       node:test) prep+=(node:build) ;;
       jvm:test) prep+=(jvm:native) ;;
     esac

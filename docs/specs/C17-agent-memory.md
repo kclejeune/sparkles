@@ -1334,3 +1334,47 @@ Phases 1b and 1c). See the [roadmap](../ROADMAP.md).
 - **Keeping a branch.** `create_branch` takes `keep: true` for a branch that should not
   expire, and a caller with `admin` can clear the scratch mark with
   `Store::set_branch_scratch`, which turns it into an ordinary branch.
+
+### Shared memory representation
+
+[Roadmap](../ROADMAP.md) item 81 extends the existing memory model to a shared profile
+for agent memory and personal knowledge, sometimes called a second brain. It is deferred
+and has no active implementation lane. The current data model, vocabulary and shipped
+behaviour remain as recorded above. The workflow requirements are in
+[C18](C18-natural-language-questions-and-ingest.md#shared-memory-workflows).
+
+The profile will connect sources and document renditions, cited assertions, shared
+entities, notes, decisions and tasks. Human notes and agent episodes can describe the
+same entity while retaining separate assertions, authors, graph access and review
+status. A source's identity and its content versions must remain distinguishable, and
+two sources supporting one triple must retain their separate evidence records.
+
+The design will reuse RDF, PROV-O, Dublin Core terms, schema.org and the existing
+`mem:` and `spk:` terms where their meanings fit. It will declare additional classes
+and predicates only for missing meanings, with definitions, examples, SHACL shapes and
+ingest profiles. Exact new term names and their cardinalities remain design decisions.
+The work does not require a separate memory store or the F21 ontology object API.
+
+The profile must distinguish a reference to a document, evidence supporting an
+assertion, a conflicting assertion, derivation of a conclusion, and a dependency between
+tasks or decisions. One generic dependency predicate must not stand for all these
+relations. It must also distinguish observations, hypotheses, preferences, decisions
+and instructions so that retrieved source text cannot become an instruction merely
+because it was stored as memory. Review status records review, rather than proof that
+an assertion is true.
+
+Time semantics must separate when an assertion was recorded from when it applies in
+the world, and define expiry and supersession. When supporting evidence changes, the
+profile must identify which conclusions or decisions need review without assuming that
+every dependent assertion is false. Independent surviving support must remain visible.
+Application dependencies and cited derivations do not imply automatic recomputation.
+Exact engine-maintained derivations remain the separate work of
+[F13](F13-incremental-views-and-provenance.md) and
+[F18](F18-explanations-and-entailment-diffs.md).
+
+Acceptance requires a compact vocabulary and shape set, example datasets, ingestion
+mappings and executable queries. The examples must answer why an assertion is believed,
+which independent sources support it, what was believed at a chosen time, and which
+notes, decisions or tasks need review after evidence is revised. Compatibility examples
+must preserve current imports, citations, supersession and access boundaries, including
+conflicting sources and a copied source that is not independent corroboration.

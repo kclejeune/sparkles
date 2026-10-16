@@ -9,7 +9,7 @@ use zeroize::Zeroizing;
 pub const MAX_SLOTS: usize = 32;
 pub const MAX_SLOT_BYTES: usize = 16384;
 /// The slot format written for new slots. Format 1 slots remain readable.
-pub const SLOT_FORMAT: u32 = 2;
+pub const SLOT_FORMAT: u32 = sparkles_core::formats::BACKUP_SLOTS.writes;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -35,7 +35,7 @@ impl LocalKeySource {
 pub struct LocalKey {
     pub label: String,
     pub source: LocalKeySource,
-    pub(super) secret: std::sync::Arc<super::memory::LockedKey>,
+    pub(crate) secret: std::sync::Arc<super::memory::LockedKey>,
 }
 impl std::fmt::Debug for LocalKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

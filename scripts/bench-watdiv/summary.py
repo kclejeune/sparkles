@@ -65,7 +65,7 @@ status, ref_rows, notes = {}, {}, []
 for n in names:
     an = answers.get(n, {})
     ok = {c: v for c, v in an.items() if v["rows"] != "error"}
-    by_value = {c: v.get("value", v["rows"]) for c, v in ok.items()}
+    by_value = {c: f"{v.get('value', v['rows'])}/{v.get('order', '')}" for c, v in ok.items()}
     ref = majority(by_value)
     split = ref is None and len(set(by_value.values())) > 1
     ref_rows[n] = next((ok[c]["rows"] for c in ok if by_value[c] == ref), None) if ref is not None else None

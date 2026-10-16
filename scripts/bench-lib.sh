@@ -80,6 +80,27 @@ LOADNAME=([sparkles]=sparkles [jena]=jena-tdb2 [qlever]=qlever [fluree]=fluree [
 PORT=([sparkles]=$PORT_BASE [qlever]=$((PORT_BASE + 1)) [jena]=$((PORT_BASE + 2)) [fluree]=$((PORT_BASE + 3)) [oxigraph]=$((PORT_BASE + 4)))
 FILEOF=([sparkles]=sparkles.db [jena]=jena.db [qlever]=qlever-index [fluree]=fluree [oxigraph]=oxigraph.db)
 STORE=${STORE:-$WORK}
+# Settings of the shared functions below. They are plain assignments, so an exported value of
+# the same name in the caller's environment cannot change a run. A suite script reassigns them
+# after sourcing this file.
+DATAFILE=data.nt         # the file load_all loads, relative to WORK
+LOADRES=results          # the directory load_all writes the load numbers to
+COUNT_ONLY="export-500k" # queries whose answers are compared by row count only (bench.sh's)
+NO_CHECK=""              # queries whose answers are not compared (DESCRIBE)
+# The longest a request may take, in seconds. The clients (curl, the answer check, the BSBM
+# driver) give up after MAX_TIME and record a timeout. The servers' own query timeouts are
+# MAX_TIME plus a margin, so that a server stops a query the client has already given up on
+# and the next measurement does not start behind it.
+MAX_TIME=${MAX_TIME:-300}
+export MAX_TIME
+# MAX_TIME and TIMEOUT_MARGIN may be fractional. The servers take whole seconds, so their
+# timeout is rounded up.
+if ! { [[ $MAX_TIME =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]] && awk -v m="$MAX_TIME" 'BEGIN { exit !(m > 0) }'; }; then
+  die "MAX_TIME must be a positive number of seconds, not '$MAX_TIME'"
+fi
+[[ ${TIMEOUT_MARGIN:-15} =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]] ||
+  die "TIMEOUT_MARGIN must be a nonnegative number of seconds, not '${TIMEOUT_MARGIN}'"
+SERVER_TIMEOUT=$(awk -v m="$MAX_TIME" -v g="${TIMEOUT_MARGIN:-15}" 'BEGIN { t = m + g; s = int(t); if (s < t) s++; print s }')
 
 # the loaded store of an engine in WORK (SPARKLES_DB overrides Sparkles')
 source_store() {
@@ -156,19 +177,19 @@ start() {
     sparkles)
       # shellcheck disable=SC2086 # SPARKLES_ARGS is a list of flags
       "${CAP[@]}" "$SPARKLES" --result-cache-mb 0 serve --data "$STORE/sparkles-server" --loc bench="$(store_of sparkles)" \
-        --port "$p" --timeout 600 ${SPARKLES_ARGS:-} > "$STORE/sparkles.log" 2>&1 &
+        --port "$p" --timeout "$SERVER_TIMEOUT" ${SPARKLES_ARGS:-} > "$STORE/sparkles.log" 2>&1 &
       URL[$e]=localhost:$p/bench/sparql
       UPDURL[$e]=localhost:$p/bench/update
       ready="localhost:$p/\$/ping"
       ;;
     jena)
-      JVM_ARGS="-Xmx${JENA_HEAP:-8G}" "${CAP[@]}" "$FUSEKI" --update --port "$p" --loc "$(store_of jena)" /bench > "$STORE/fuseki.log" 2>&1 &
+      JVM_ARGS="-Xmx${JENA_HEAP:-8G}" "${CAP[@]}" "$FUSEKI" --update --timeout="$((SERVER_TIMEOUT * 1000))" --port "$p" --loc "$(store_of jena)" /bench > "$STORE/fuseki.log" 2>&1 &
       URL[$e]=localhost:$p/bench/sparql
       UPDURL[$e]=localhost:$p/bench/update
       ready="localhost:$p/\$/ping"
       ;;
     qlever)
-      (cd "$(store_of qlever)" && exec "${CAP[@]}" "$QSERVER" -i bench -p "$p" -m 8G -c 2G -e 0B -s 600s -a bench -j 16 > server.log 2>&1) &
+      (cd "$(store_of qlever)" && exec "${CAP[@]}" "$QSERVER" -i bench -p "$p" -m 8G -c 2G -e 0B -s "${SERVER_TIMEOUT}s" -a bench -j 16 > server.log 2>&1) &
       URL[$e]=localhost:$p/
       UPDURL[$e]=localhost:$p/
       UPDFIELD[$e]=access-token=bench
@@ -176,7 +197,7 @@ start() {
       ;;
     fluree)
       # property-path traversal is capped at 1M visited nodes by default (knows-reach at 10M)
-      (cd "$(store_of fluree)" && FLUREE_CACHE_MAX_MB=4096 FLUREE_PATH_MAX_VISITED=20000000 FLUREE_QUERY_TIMEOUT_MS=600000 \
+      (cd "$(store_of fluree)" && FLUREE_CACHE_MAX_MB=4096 FLUREE_PATH_MAX_VISITED=20000000 FLUREE_QUERY_TIMEOUT_MS=$((SERVER_TIMEOUT * 1000)) \
         exec "${CAP[@]}" "$FLUREE" server run --listen-addr "127.0.0.1:$p" --storage-path "$(store_of fluree)/.fluree/storage" \
         --log-level warn > "$STORE/fluree.log" 2>&1) &
       URL[$e]=localhost:$p/v1/fluree/query/bench:main
@@ -184,7 +205,7 @@ start() {
       ready="localhost:$p/health"
       ;;
     oxigraph)
-      "${CAP[@]}" "$OXIGRAPH" serve --location "$(store_of oxigraph)" --bind "127.0.0.1:$p" --timeout-s 600 > "$STORE/oxigraph.log" 2>&1 &
+      "${CAP[@]}" "$OXIGRAPH" serve --location "$(store_of oxigraph)" --bind "127.0.0.1:$p" --timeout-s "$SERVER_TIMEOUT" > "$STORE/oxigraph.log" 2>&1 &
       URL[$e]=localhost:$p/query
       UPDURL[$e]=localhost:$p/update
       ready="localhost:$p/query?query=ASK%7B%7D"
@@ -309,12 +330,12 @@ EOF
 }
 
 # ------------------------------------------------------------------------------- load
-# load_all: DATAFILE (default data.nt, relative to WORK) into every selected engine
-# (LOADRES, default results, gets the numbers). Each load runs under GNU time for its
+# load_all: DATAFILE (relative to WORK) into every selected engine
+# (LOADRES gets the numbers). Each load runs under GNU time for its
 # peak RSS (the largest of the processes it waits
 # for); load.json and load-details.json get the time, peak RSS and index size.
 load_all() {
-  local gtime e cmd t0 t1 df=${DATAFILE:-data.nt}
+  local gtime e cmd t0 t1 df=$DATAFILE
   gtime=$(gnu_time)
   for e in $ENGINES; do
     case $e in
@@ -327,16 +348,20 @@ load_all() {
       # Fluree's bulk import (`create --from`) builds the index directly; without
       # --chunk-size-mb it parses the file as a single chunk (about 3x slower)
       fluree) cmd="mkdir -p fluree && cd fluree && '$FLUREE' init -q && '$FLUREE' --memory-budget-mb 8192 create bench --from ../$df --chunk-size-mb 16" ;;
-      # Oxigraph's bulk loader (parallel, writes RocksDB files directly), then the compaction
-      # it recommends before read-heavy workloads (`optimize`); both are timed as the load
-      oxigraph) cmd="'$OXIGRAPH' load --location oxigraph.db --file $df && '$OXIGRAPH' optimize --location oxigraph.db" ;;
+      # Oxigraph's bulk loader (writes RocksDB files directly), then the compaction it
+      # recommends before read-heavy workloads (`optimize`); both are timed as the load. The
+      # data goes in on standard input: with `--file`, Oxigraph 0.5.11 parses N-Triples in
+      # parallel chunks and gives a blank node label that occurs in two chunks two different
+      # nodes (SP2Bench at 1M triples: 109,384 blank nodes instead of 86,870), which changes
+      # query answers. On standard input the labels stay whole, at about 3x the load time.
+      oxigraph) cmd="'$OXIGRAPH' load --location oxigraph.db --format nt < $df && '$OXIGRAPH' optimize --location oxigraph.db" ;;
     esac
     rm -rf "${WORK:?}/${FILEOF[$e]}"
     log "$e: loading (log: logs/load-$e.log)"
     t0=$(date +%s.%N)
     "$gtime" -v -o "logs/load-$e.time" bash -c "$cmd" > "logs/load-$e.log" 2>&1 || die "$e: load failed, see logs/load-$e.log"
     t1=$(date +%s.%N)
-    record_load "${LOADRES:-results}" "${LOADNAME[$e]}" "$(awk "BEGIN {print $t1 - $t0}")" "logs/load-$e.time" "$WORK/${FILEOF[$e]}"
+    record_load "$LOADRES" "${LOADNAME[$e]}" "$(awk "BEGIN {print $t1 - $t0}")" "logs/load-$e.time" "$WORK/${FILEOF[$e]}"
   done
 }
 
@@ -345,13 +370,16 @@ load_all() {
 # queries/<name>.rq), RES (the results directory) and selected <name> before calling these.
 # qform <file>: select, ask, construct or describe (the first of these words outside IRIs and comments)
 qform() { sed -e 's/<[^<>[:space:]]*>//g' -e 's/#.*//' "$1" | grep -ioE '\b(select|construct|describe|ask)\b' | head -1 | tr '[:upper:]' '[:lower:]'; }
-q() { # curl command for endpoint + query name (fails on HTTP errors); the answer format follows the query form
-  local accept=text/tab-separated-values
-  case "$(qform "queries/$2.rq")" in
-    ask) accept=application/sparql-results+json ;;
-    construct | describe) accept=application/n-triples ;;
+# accept_of <query name>: the result format a timed request asks for, by the query form
+accept_of() {
+  case "$(qform "queries/$1.rq")" in
+    ask) echo application/sparql-results+json ;;
+    construct | describe) echo application/n-triples ;;
+    *) echo text/tab-separated-values ;;
   esac
-  echo "curl -sf --max-time ${MAX_TIME:-300} -o /dev/null -H 'Accept: $accept' --data-urlencode query@queries/$2.rq $1"
+}
+q() { # curl command for endpoint + query name (fails on HTTP errors)
+  echo "curl -sf --max-time $MAX_TIME -o /dev/null -H 'Accept: $(accept_of "$2")' --data-urlencode query@queries/$2.rq $1"
 }
 # hyperfine arguments for every selected engine: engine_args <command-fn>
 engine_args() { for e in $ENGINES; do printf '%s\0' --command-name "${NAME[$e]}" "$($1 "$e")"; done; }
@@ -377,7 +405,6 @@ start_all() {
 # Each request is also the query's memory reading: the server's peak RSS is reset
 # (clear_refs) before it, and mem.json gets the peak (VmHWM) after it and its rise over
 # the RSS at the reset.
-COUNT_ONLY=${COUNT_ONLY-export-500k}
 answer_check() {
   local n e r before peak kv
   echo
@@ -388,7 +415,7 @@ answer_check() {
     selected "$n" || continue
     local flag=()
     [[ " $COUNT_ONLY " == *" $n "* ]] && flag=(--count-only)
-    [[ " ${NO_CHECK:-} " == *" $n "* ]] && flag+=(--no-check)
+    [[ " $NO_CHECK " == *" $n "* ]] && flag+=(--no-check)
     printf '%-16s' "$n"
     kv=()
     for e in $ENGINES; do
@@ -416,7 +443,7 @@ answer_check() {
 # cold.json gets the median time (the format bench-billion.sh writes), cold-runs.json
 # every run's time and time to ready.
 cold() {
-  local e=$1 n i t times ready
+  local e=$1 n i t rc times ready
   for n in "${NAMES[@]}"; do
     selected "$n" || continue
     times=()
@@ -426,10 +453,13 @@ cold() {
       evict "$e"
       start "$e"
       ready+=("${READY_S[$e]}")
-      # curl prints the time even when the request fails, so a failure replaces it
-      if ! t=$(curl -sf --max-time "${MAX_TIME:-300}" -o /dev/null -w '%{time_total}' -H 'Accept: text/tab-separated-values' \
-        --data-urlencode "query@queries/$n.rq" "${URL[$e]}"); then
-        t=error
+      # curl prints the time even when the request fails. A failure that took as long as the
+      # limit (the client gave up, or the server's own timeout fired) is a timeout, any other an error.
+      rc=0
+      t=$(curl -sf --max-time "$MAX_TIME" -o /dev/null -w '%{time_total}' -H "Accept: $(accept_of "$n")" \
+        --data-urlencode "query@queries/$n.rq" "${URL[$e]}") || rc=$?
+      if [ "$rc" -ne 0 ]; then
+        if [ "$rc" = 28 ] || awk -v t="${t:-0}" -v m="$MAX_TIME" 'BEGIN {exit !(t >= 0.95 * m)}'; then t=timeout; else t=error; fi
       fi
       times+=("$t")
       log "cold $e $n run $i: ready ${READY_S[$e]} s, query $t s"
@@ -439,13 +469,13 @@ cold() {
 import json, os, statistics, sys
 d, e, n, times, ready = sys.argv[1:]
 times, ready = times.split(), [float(r) for r in ready.split()]
-ok = [float(t) for t in times if t != "error"]
+ok = [float(t) for t in times if t not in ("error", "timeout")]
 def put(f, v):
     j = json.load(open(f)) if os.path.exists(f) else {}
     j.setdefault(e, {})[n] = v
     json.dump(j, open(f, "w"), indent=1)
 put(f"{d}/cold.json", statistics.median(ok) if ok else "error")
-put(f"{d}/cold-runs.json", {"times": [float(t) if t != "error" else t for t in times], "ready": ready})
+put(f"{d}/cold-runs.json", {"times": [t if t in ("error", "timeout") else float(t) for t in times], "ready": ready})
 EOF
   done
 }

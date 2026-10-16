@@ -681,6 +681,7 @@ fn budget_index(k: BudgetKind) -> usize {
         BudgetKind::RowsProduced => 6,
         BudgetKind::DatasetBytes => 7,
         BudgetKind::HiddenQuads => 8,
+        BudgetKind::ServerMemory => 9,
     }
 }
 
@@ -1093,6 +1094,11 @@ struct DsGauges {
 fn gauges(st: &AppState) -> BTreeMap<String, DsGauges> {
     let datasets: Vec<_> = st.datasets().values().cloned().collect();
     let mut out: BTreeMap<String, DsGauges> = BTreeMap::new();
+    // the caches are shared, so one pass over each gives every dataset's bytes
+    let (block_usage, result_usage) = match st.catalog.caches() {
+        Some(c) => (Some(c.blocks().usage()), Some(c.results().usage())),
+        None => (None, None),
+    };
     for d in datasets {
         let label = if st.metrics.enabled {
             st.metrics.series(Some(&d.name)).0
@@ -1101,7 +1107,6 @@ fn gauges(st: &AppState) -> BTreeMap<String, DsGauges> {
         };
         let g = out.entry(label).or_default();
         let snap = d.store.snapshot();
-        let opts = d.store.options();
         let (c, r) = (d.store.cache(), d.store.result_cache());
         g.quads += snap.len();
         g.delta_inserts += snap.delta.inserts() as u64;
@@ -1111,19 +1116,29 @@ fn gauges(st: &AppState) -> BTreeMap<String, DsGauges> {
         let quota = d.dataset.settings().quota().get();
         g.disk_bytes += quota.used_bytes;
         g.quota_bytes += quota.max_bytes.unwrap_or(0);
-        g.cache_bytes += c.bytes();
-        g.cache_capacity += opts.cache_bytes;
-        g.cache_entries += c.entries() as u64;
+        let cu = match &block_usage {
+            Some(u) => u.get(&c.namespace()).copied().unwrap_or_default(),
+            None => sparkles::index::NamespaceUsage {
+                bytes: c.bytes(),
+                entries: c.entries() as u64,
+            },
+        };
+        g.cache_bytes += cu.bytes;
+        g.cache_capacity = c.capacity();
+        g.cache_entries += cu.entries;
         g.cache_hits += c.hits();
         g.cache_misses += c.misses();
         g.rcache_enabled |= r.enabled();
-        g.rcache_bytes += r.bytes();
-        g.rcache_capacity += if r.enabled() {
-            opts.result_cache_bytes
-        } else {
-            0
+        let ru = match &result_usage {
+            Some(u) => u.get(&r.namespace()).copied().unwrap_or_default(),
+            None => sparkles::index::NamespaceUsage {
+                bytes: r.bytes(),
+                entries: r.entries() as u64,
+            },
         };
-        g.rcache_entries += r.entries() as u64;
+        g.rcache_bytes += ru.bytes;
+        g.rcache_capacity = r.capacity();
+        g.rcache_entries += ru.entries;
         g.rcache_hits += r.hits();
         g.rcache_misses += r.misses();
         for (h, reason) in g.rebuilds.iter_mut().zip(RebuildReason::ALL) {
@@ -1533,7 +1548,7 @@ pub fn render_prometheus(st: &AppState) -> String {
     }
 
     type Field = fn(&DsGauges) -> u64;
-    let per_dataset: [(&str, &str, &str, Field); 12] = [
+    let per_dataset: [(&str, &str, &str, Field); 10] = [
         (
             "sparkles_dataset_quads",
             "gauge",
@@ -1565,12 +1580,6 @@ pub fn render_prometheus(st: &AppState) -> String {
             |g| g.cache_bytes,
         ),
         (
-            "sparkles_block_cache_capacity_bytes",
-            "gauge",
-            "Capacity of the decoded-block cache.",
-            |g| g.cache_capacity,
-        ),
-        (
             "sparkles_block_cache_hits_total",
             "counter",
             "Decoded-block cache hits.",
@@ -1589,12 +1598,6 @@ pub fn render_prometheus(st: &AppState) -> String {
             |g| g.rcache_bytes,
         ),
         (
-            "sparkles_result_cache_capacity_bytes",
-            "gauge",
-            "Capacity of the query result cache.",
-            |g| g.rcache_capacity,
-        ),
-        (
             "sparkles_result_cache_hits_total",
             "counter",
             "Query result cache hits.",
@@ -1607,6 +1610,35 @@ pub fn render_prometheus(st: &AppState) -> String {
             |g| g.rcache_misses,
         ),
     ];
+    // the caches are sized once for the server, so their capacities carry no label
+    {
+        let (block, result) = (
+            gauges.values().map(|g| g.cache_capacity).max().unwrap_or(0),
+            gauges
+                .values()
+                .map(|g| g.rcache_capacity)
+                .max()
+                .unwrap_or(0),
+        );
+        let (block, result) = st.catalog.caches().map_or((block, result), |c| {
+            (c.blocks().capacity(), c.results().capacity())
+        });
+        family(
+            &mut o,
+            "sparkles_block_cache_capacity_bytes",
+            "gauge",
+            "Capacity of the decoded-block cache, shared by all datasets.",
+        );
+        let _ = writeln!(o, "sparkles_block_cache_capacity_bytes {block}");
+        family(
+            &mut o,
+            "sparkles_result_cache_capacity_bytes",
+            "gauge",
+            "Capacity of the query result cache, shared by all datasets.",
+        );
+        let _ = writeln!(o, "sparkles_result_cache_capacity_bytes {result}");
+    }
+    crate::server_memory::render_prometheus(st, &mut o);
     for (name, kind, help, f) in per_dataset {
         family(&mut o, name, kind, help);
         for (ds, g) in &gauges {

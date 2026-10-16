@@ -678,7 +678,7 @@ pub(crate) fn probe(root: &std::path::Path, _checksums: bool) -> TextProbe {
         Ok(b) => {
             p.configured = true;
             p.unsupported = true;
-            if let Err(e) = serde_json::from_slice::<TextConfig>(&b) {
+            if let Err(e) = crate::formats::settings_from_slice::<TextConfig>("text.json", &b) {
                 p.config_error = Some(e.to_string());
             }
         }
@@ -1104,9 +1104,7 @@ mod imp {
     /// `<root>/text.json`, if the dataset has full-text search enabled.
     pub(crate) fn read_config(root: &Path) -> Result<Option<TextConfig>> {
         match std::fs::read(root.join("text.json")) {
-            Ok(b) => serde_json::from_slice(&b)
-                .map(Some)
-                .map_err(|e| Error::Invalid(format!("text.json: {e}"))),
+            Ok(b) => crate::formats::settings_from_slice("text.json", &b).map(Some),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e.into()),
         }
@@ -2796,6 +2794,20 @@ mod imp {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn a_newer_text_config_is_refused() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("text.json");
+            let newer = crate::formats::settings_file("text.json").unwrap().writes + 1;
+            std::fs::write(&path, format!(r#"{{"format": {newer}, "maxHits": 5}}"#)).unwrap();
+            assert!(matches!(
+                read_config(dir.path()),
+                Err(Error::Unsupported(_))
+            ));
+            std::fs::write(&path, r#"{"maxHits": 5}"#).unwrap();
+            assert_eq!(read_config(dir.path()).unwrap().unwrap().max_hits, 5);
+        }
 
         #[test]
         fn open_classification_is_metadata_only() {

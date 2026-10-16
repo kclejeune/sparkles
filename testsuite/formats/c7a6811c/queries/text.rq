@@ -1,0 +1,2 @@
+PREFIX text: <http://jena.apache.org/text#>
+SELECT ?s WHERE { ?s text:query 'dragons' } ORDER BY ?s

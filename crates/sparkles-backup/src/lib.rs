@@ -37,6 +37,7 @@ pub mod manifest;
 pub mod policy;
 pub mod repo;
 pub mod restore;
+pub mod seal;
 mod security;
 pub mod throttle;
 pub mod types;
@@ -46,6 +47,7 @@ pub use capture::Source;
 pub use error::{BackupError, Code, Result};
 pub use object_store;
 pub use repo::Repository;
+pub use seal::{KeyMemory, SEALED_SECRET_PREFIX, SecretSealer};
 pub use types::*;
 
 use object_store::ObjectStore;

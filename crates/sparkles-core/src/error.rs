@@ -4,7 +4,7 @@ use std::io;
 pub enum Error {
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
-    /// An exclusive database or catalog lock is held by another opener.
+    /// A database or catalog lock is held by another opener, or its directory changed.
     #[error("{}", locked_message(path, *pid))]
     Locked {
         path: std::path::PathBuf,
@@ -163,10 +163,13 @@ pub enum BudgetKind {
     DatasetBytes,
     /// quads a caller's triple-level access rules hide at one commit
     HiddenQuads,
+    /// the server-wide query memory pool could not admit a request or grow a query's
+    /// grant; a retry can succeed when the server is less busy
+    ServerMemory,
 }
 
 impl BudgetKind {
-    pub const ALL: [BudgetKind; 9] = [
+    pub const ALL: [BudgetKind; 10] = [
         BudgetKind::Rows,
         BudgetKind::Memory,
         BudgetKind::ResultBytes,
@@ -176,6 +179,7 @@ impl BudgetKind {
         BudgetKind::RowsProduced,
         BudgetKind::DatasetBytes,
         BudgetKind::HiddenQuads,
+        BudgetKind::ServerMemory,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -189,6 +193,7 @@ impl BudgetKind {
             BudgetKind::RowsProduced => "rows-produced",
             BudgetKind::DatasetBytes => "dataset-bytes",
             BudgetKind::HiddenQuads => "hidden-quads",
+            BudgetKind::ServerMemory => "server-memory",
         }
     }
 }
@@ -250,6 +255,12 @@ impl std::fmt::Display for Budget {
                 f,
                 "the access rules of this request hide more than {} quads at this commit",
                 self.limit
+            ),
+            BudgetKind::ServerMemory => write!(
+                f,
+                "the server's query memory is in use (pool of {}, request needs about {}); retry shortly",
+                human_bytes(self.limit),
+                human_bytes(self.requested)
             ),
         }
     }
@@ -328,7 +339,9 @@ fn locked_message(path: &std::path::Path, pid: Option<u32>) -> String {
             "directory {path} is in use by another process (pid {pid}); stop it or talk to it over HTTP"
         ),
         None => {
-            format!("directory {path} is in use by another opener; stop it or talk to it over HTTP")
+            format!(
+                "directory {path} is in use by another opener or its lock changed; retry the open, stop the other opener or talk to it over HTTP"
+            )
         }
     }
 }
@@ -355,7 +368,9 @@ mod tests {
         assert!(!own.contains("Some("), "{own}");
         let unknown = locked(None);
         assert!(
-            unknown.contains("another opener") && !unknown.contains("None"),
+            unknown.contains("another opener")
+                && unknown.contains("retry the open")
+                && !unknown.contains("None"),
             "{unknown}"
         );
     }

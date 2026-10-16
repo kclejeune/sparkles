@@ -422,7 +422,17 @@ mode, before authorization is consulted. The converter writes one value per data
 as approximated. A dataset's description lists `gsp-direct-r` or `gsp-direct-rw` as its
 mode says. The tests are `read_only_direct_naming_refuses_writes` in
 `http/router_tests/fuseki.rs` and `direct_naming_is_per_dataset_and_keeps_its_mode` in
-`fuseki_config/tests.rs`. The modes come from the command line, so the setting and its
+`fuseki_config/tests.rs`. Under `--fuseki-config`, a command-line value for a dataset wins
+over the converted one in both directions, and a bare flag covers only the datasets that no
+entry names. The test is `direct_naming_flags_win_over_the_fuseki_config` in `state.rs`. With auth on,
+a write to a read-only direct endpoint needs only read access, as `/{ds}/patch` does for a
+refused method, so readers get the `405` and callers without read access keep the usual
+401, 403 or 404. The test is `read_only_direct_naming_answers_readers_with_405` in
+`http/router_tests/auth/mod.rs`. An assembler body on `POST /$/datasets` that lists
+`gsp-direct-rw` or `gsp-direct-r` is accepted only when `--gsp-direct-naming` covers that
+dataset, and `gsp-direct-rw` is refused for a dataset the flag makes read-only. The test is
+`direct_endpoints_need_their_dataset_named` in `http/fuseki/assembler.rs`.
+The modes come from the command line, so the setting and its
 route in C19's settings, and assembler bodies, remain with item 76 below.
 
 **Item 76 (Tier 5, [ROADMAP](../ROADMAP.md)): complete assembler bodies, and Graph Store
@@ -470,7 +480,7 @@ direct naming per dataset.** The item's third part, JVM metrics, belongs to
   approximated ("--gsp-direct-naming, which applies to every dataset", `service.rs`), and
   an assembler body with such an endpoint is refused unless the flag is on. A read-only
   `gsp-direct-r` endpoint gets the same routes as `gsp-direct-rw`; only grants limit
-  writes.
+  writes. The mode follows the name, so a renamed dataset loses it.
 * **Design: a per-dataset setting.** Direct naming becomes a dataset setting,
   `gspDirectNaming: "off" | "read" | "read-write"`, stored with the dataset's other
   Fuseki-compatibility settings and changed through C19's settings routes as a member of

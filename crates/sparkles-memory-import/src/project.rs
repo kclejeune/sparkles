@@ -19,8 +19,14 @@ pub struct Project {
 impl Project {
     /// The project of a directory: the remote of its repository when it has one.
     pub fn of(dir: &Path) -> Project {
+        Self::of_within(dir, None)
+    }
+
+    /// The project of a directory, looking for its repository no higher than `ceiling`
+    /// when one is given. The ceiling directory itself is still searched.
+    fn of_within(dir: &Path, ceiling: Option<&Path>) -> Project {
         let dir = absolute(dir);
-        let root = repo_root(&dir);
+        let root = repo_root_within(&dir, ceiling);
         let key = root
             .as_ref()
             .and_then(|r| remote_url(r))
@@ -88,10 +94,19 @@ pub fn normalize(p: &Path) -> PathBuf {
 
 /// The nearest directory at or above `dir` with a `.git` entry.
 pub fn repo_root(dir: &Path) -> Option<PathBuf> {
+    repo_root_within(dir, None)
+}
+
+/// `repo_root` that stops after `ceiling`, so that a caller can keep the search out of
+/// directories it does not control.
+fn repo_root_within(dir: &Path, ceiling: Option<&Path>) -> Option<PathBuf> {
     let mut d = Some(dir);
     while let Some(x) = d {
         if x.join(".git").exists() {
             return Some(x.to_path_buf());
+        }
+        if ceiling == Some(x) {
+            return None;
         }
         d = x.parent();
     }
@@ -223,9 +238,12 @@ mod tests {
         .unwrap();
         assert_eq!(Project::of(&wt).key, "github.com/acme/shop");
         // no repository
+        // The search stops at the temporary directory, because a `.git` entry in a
+        // parent of the system temporary directory, such as /tmp/.git, would otherwise
+        // make the directory part of that repository.
         let plain = d.path().join("notes dir");
         std::fs::create_dir_all(&plain).unwrap();
-        let k = Project::of(&plain).key;
+        let k = Project::of_within(&plain, Some(&absolute(d.path()))).key;
         assert!(k.starts_with("local.notes-dir."), "{k}");
         assert_eq!(k.len(), "local.notes-dir.".len() + 8);
     }

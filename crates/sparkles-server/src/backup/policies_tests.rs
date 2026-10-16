@@ -1453,3 +1453,27 @@ fn real_policy_discovery_reads_published_state_without_waiting_for_writer() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].head, 0);
 }
+
+#[test]
+fn a_newer_policy_file_is_refused_and_written_files_carry_the_member() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["policies.json", "policy-state.json", "runs.json"] {
+        let writes = sparkles::formats::settings_file(name).unwrap().writes;
+        std::fs::write(
+            dir.path().join(name),
+            format!(r#"{{"format": {}}}"#, writes + 1),
+        )
+        .unwrap();
+    }
+    let err = format!("{:#}", read_api_policies(dir.path()).unwrap_err());
+    assert!(err.contains("newer release"), "{err}");
+    assert!(read_json::<StateFile>(&dir.path().join("policy-state.json")).is_err());
+    assert!(read_json::<PolicyRunList>(&dir.path().join("runs.json")).is_err());
+    write_json(dir.path(), "runs.json", &PolicyRunList::default()).unwrap();
+    let list: J =
+        serde_json::from_slice(&std::fs::read(dir.path().join("runs.json")).unwrap()).unwrap();
+    assert_eq!(list["format"], 1);
+    assert!(read_json::<PolicyRunList>(&dir.path().join("runs.json")).is_ok());
+    std::fs::write(dir.path().join("policies.json"), r#"{"policies": []}"#).unwrap();
+    assert!(read_api_policies(dir.path()).unwrap().is_empty());
+}

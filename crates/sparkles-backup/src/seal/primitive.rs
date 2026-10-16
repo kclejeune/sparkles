@@ -57,15 +57,55 @@ pub fn mac_verify(key: &[u8], bytes: &[u8], tag: &[u8]) -> bool {
     hmac::verify(&hmac::Key::new(hmac::HMAC_SHA256, key), bytes, tag).is_ok()
 }
 
+#[cfg(test)]
+thread_local! {
+    static TAG_EXTENSION: std::cell::Cell<(usize, bool)> = const { std::cell::Cell::new((0, false)) };
+}
+
+/// Observes only the initialized owned byte vector passed to the actual AWS-LC call.
+#[cfg(test)]
+struct TagAppend<'a>(&'a mut Vec<u8>);
+
+#[cfg(test)]
+impl AsMut<[u8]> for TagAppend<'_> {
+    fn as_mut(&mut self) -> &mut [u8] {
+        self.0.as_mut_slice()
+    }
+}
+
+#[cfg(test)]
+impl<'a> Extend<&'a u8> for TagAppend<'_> {
+    fn extend<T: IntoIterator<Item = &'a u8>>(&mut self, iter: T) {
+        let tag: Vec<u8> = iter.into_iter().copied().collect();
+        TAG_EXTENSION.with(|slot| {
+            let (calls, grew) = slot.get();
+            slot.set((
+                calls + 1,
+                grew || (!self.0.is_empty() && tag.len() > self.0.capacity() - self.0.len()),
+            ));
+        });
+        self.0.extend(tag);
+    }
+}
+
 pub fn seal(key: &[u8], nonce: [u8; 12], aad: &[u8], plain: &[u8]) -> Result<Vec<u8>> {
     let key = aead::LessSafeKey::new(
         aead::UnboundKey::new(&aead::AES_256_GCM, key).map_err(|_| crypto_error())?,
     );
-    let mut out = Zeroizing::new(plain.to_vec());
+    let capacity = plain
+        .len()
+        .checked_add(TAG_BYTES)
+        .ok_or_else(crypto_error)?;
+    let mut out = Zeroizing::new(Vec::with_capacity(capacity));
+    out.extend_from_slice(plain);
+    #[cfg(test)]
+    let in_out = &mut TagAppend(&mut out);
+    #[cfg(not(test))]
+    let in_out = &mut *out;
     key.seal_in_place_append_tag(
         aead::Nonce::assume_unique_for_key(nonce),
         aead::Aad::from(aad),
-        &mut *out,
+        in_out,
     )
     .map_err(|_| crypto_error())?;
     Ok(std::mem::take(&mut *out))
@@ -105,6 +145,22 @@ pub fn padme(len: u64) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn append_tag_does_not_grow_a_plaintext_buffer() {
+        for len in [0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 1024, 65536] {
+            let plain = Zeroizing::new(vec![0x61; len]);
+            TAG_EXTENSION.with(|slot| slot.set((0, false)));
+            let sealed = seal(&[7; 32], [0; 12], b"aad", &plain).unwrap();
+            let (calls, grew) = TAG_EXTENSION.with(|slot| slot.get());
+            assert_eq!(calls, 1, "the actual append-tag call must be observed");
+            assert!(
+                !grew,
+                "tag extension grew a buffer containing {len} plaintext bytes"
+            );
+            assert_eq!(&*open(&[7; 32], [0; 12], b"aad", &sealed).unwrap(), &*plain);
+        }
+    }
 
     #[test]
     fn aes256gcm_nist_empty_plaintext_fixture_and_authenticated_aad() {

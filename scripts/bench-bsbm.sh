@@ -4,9 +4,12 @@
 #
 #   SPARKLES_ALLOW_GPL_BENCHMARK=1 scripts/bench-bsbm.sh [SCALE] [WORKDIR]
 #
-# SCALE is the number of products (2000, the smoke default, gives about 377k triples) or an
-# approximate size in triples with an m suffix: 1m, 10m or 100m (about 190 triples per
-# product, so 10m is 53,000 products). USECASE=explore (default) or bi picks the use case.
+# SCALE is the number of products (2000, the smoke default, gives about 725k triples) or a
+# size in millions of triples with an m suffix. The sizes follow the dataset sizes that BSBM
+# publishes, 2,785 products for 1m, 28,480 for 10m and 284,826 for 100m, and other sizes get
+# 2,848 products per million. The generator makes about 360 triples per product (measured with
+# the options below, 2000 products give 725,305 triples). USECASE=explore (default) or bi picks
+# the use case.
 #
 # The BSBM tools (data generator and test driver, version 0.2) are GPL-3.0. The script
 # downloads them into WORKDIR only when SPARKLES_ALLOW_GPL_BENCHMARK=1 is set, checks them
@@ -70,7 +73,16 @@ case $USECASE in
     ;;
 esac
 case $SCALE_ARG in
-  *m) PRODUCTS=$((${SCALE_ARG%m} * 5300)) ;;
+  1m) PRODUCTS=2785 ;;
+  10m) PRODUCTS=28480 ;;
+  100m) PRODUCTS=284826 ;;
+  [0-9]*m)
+    [[ ${SCALE_ARG%m} =~ ^[0-9]+$ ]] || {
+      echo "SCALE must be a product count or a size such as 10m" >&2
+      exit 1
+    }
+    PRODUCTS=$((${SCALE_ARG%m} * 2848))
+    ;;
   *[!0-9]*)
     echo "SCALE must be a product count or a size such as 10m" >&2
     exit 1
@@ -96,18 +108,22 @@ GENPARAMS="products=$PRODUCTS forward-chaining seed=default"
 if [ -f bsbm/params ] && [ "$(cat bsbm/params)" != "$GENPARAMS" ]; then
   die "$WORK holds data generated with $(cat bsbm/params), not $GENPARAMS; use another workdir"
 fi
-if [ ! -f bsbm/dataset.nt ]; then
+# The data is generated in bsbm-gen and moved to bsbm when complete, with the params file
+# written last, so an interrupted generation is never mistaken for finished data.
+if [ ! -f bsbm/params ]; then
   log "generating BSBM data ($GENPARAMS)"
-  rm -rf bsbm
+  rm -rf bsbm bsbm-unpack bsbm-gen
   python3 -I -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' bsbmtools-v0.2.zip bsbm-unpack
-  mv bsbm-unpack/bsbmtools-0.2 bsbm
+  mv bsbm-unpack/bsbmtools-0.2 bsbm-gen
   rmdir bsbm-unpack
-  (cd bsbm && "$JAVA" -Xmx"${BSBM_GEN_HEAP:-4g}" -cp ".:lib/*" benchmark.generator.Generator \
+  (cd bsbm-gen && "$JAVA" -Xmx"${BSBM_GEN_HEAP:-4g}" -cp ".:lib/*" benchmark.generator.Generator \
     -fc -pc "$PRODUCTS" -s nt -fn dataset -dir td_data > ../logs/generate.log 2>&1)
-  echo "$GENPARAMS" > bsbm/params
+  echo "$GENPARAMS" > bsbm-gen/params
+  mv bsbm-gen bsbm
 fi
 DATAFILE=bsbm/dataset.nt
-log "dataset: $(wc -l < "$DATAFILE") triples"
+TRIPLES=$(wc -l < "$DATAFILE")
+log "dataset: $TRIPLES triples"
 
 # --------------------------------------------------------------------------- queries
 if [ ! -f "queries/names-$USECASE-$INSTANCES" ]; then
@@ -126,8 +142,10 @@ COUNT_ONLY=""
 POOL=1
 
 # ------------------------------------------------------------------------ query mixes
+# the driver's request timeout in whole milliseconds, rounded up from a possibly fractional MAX_TIME
+DRIVER_TIMEOUT_MS=$(awk -v m="$MAX_TIME" 'BEGIN { t = m * 1000; s = int(t); if (s < t) s++; print s }')
 bsbm_qmph() {
-  local e c
+  local e c rc
   [ -z "${SKIP_QMPH:-}" ] || return 0
   echo
   echo "== query mixes per hour ($BSBM_WARMUP warm-up and $BSBM_RUNS measured mixes)"
@@ -135,15 +153,28 @@ bsbm_qmph() {
     for c in $CLIENTS; do
       rm -f "results/driver-${NAME[$e]}-$c.xml"
       (cd bsbm && "$JAVA" -Xmx2g -cp ".:lib/*" benchmark.testdriver.TestDriver -runs "$BSBM_RUNS" -w "$BSBM_WARMUP" \
-        -mt "$c" -idir td_data -ucf "$UCF" -t $((MAX_TIME * 1000)) -o "$WORK/results/driver-${NAME[$e]}-$c.xml" \
-        "http://${URL[$e]}") > "logs/driver-${NAME[$e]}-$c.log" 2>&1 || true
+        -mt "$c" -idir td_data -ucf "$UCF" -t "$DRIVER_TIMEOUT_MS" -o "$WORK/results/driver-${NAME[$e]}-$c.xml" \
+        "http://${URL[$e]}") > "logs/driver-${NAME[$e]}-$c.log" 2>&1 && rc=0 || rc=$?
       python3 -I "$ROOT/scripts/bench-bsbm/qmph.py" "results/driver-${NAME[$e]}-$c.xml" results/qmph.json \
-        "${NAME[$e]}" "$c" "$USECASE-mix"
+        "${NAME[$e]}" "$c" "$USECASE-mix" "$rc"
     done
   done
 }
 SUITE_EXTRA=bsbm_qmph
+# the driver does not look at results, so the runs are compared by their average result counts
+# DESCRIBE results are left to the engine by the SPARQL specification, so those queries are skipped
+bsbm_check() {
+  local skip f
+  [ -f results/qmph.json ] || return 0
+  skip=""
+  while read -r f; do
+    f=${f##*/query}
+    skip="$skip,${f%.txt}"
+  done < <(grep -il '^ *describe' bsbm/queries/"$USECASE"/query[0-9]*.txt 2> /dev/null || true)
+  python3 -I "$ROOT/scripts/bench-bsbm/qmph.py" --check results/qmph.json "${skip#,}"
+}
+SUITE_AFTER=bsbm_check
 
-DATA_SPECS=("bsbm-$SCALE=$WORK/$DATAFILE|GPL-3.0 (generator)|BSBM tools 0.2 $GENPARAMS")
+DATA_SPECS=("bsbm-$SCALE=$WORK/$DATAFILE|GPL-3.0 (generator)|BSBM tools 0.2 $GENPARAMS triples=$TRIPLES")
 LICENSE_NOTES=("BSBM tools 0.2: GPL-3.0, downloaded at run time, run as separate processes and not committed")
 suite_run

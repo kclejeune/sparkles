@@ -206,9 +206,38 @@ fn a8_allowed_users_with_a_password_file() {
     assert!(auth.anonymous.is_empty());
     let mut report = p.report.clone();
     let toml = write::auth_toml(auth, None, &mut report).unwrap();
-    assert!(!toml.contains("pw1"), "{toml}");
+    #[cfg(not(feature = "auth"))]
+    assert!(
+        !toml.lines().any(|line| {
+            let line = line.trim_start();
+            line == "[[users]]" || line.starts_with("password =")
+        }),
+        "active users need the auth feature"
+    );
     #[cfg(feature = "auth")]
     {
+        let parsed: toml::Value = toml::from_str(&toml).unwrap();
+        assert!(password_fields_match(
+            &toml,
+            &[
+                ("user1", "pw1"),
+                ("user2", "pw2"),
+                ("user3", "pw3"),
+                ("user9", "pw9")
+            ]
+        ));
+        let users = parsed["users"].as_array().unwrap();
+        for user in users {
+            let name = user["name"].as_str().unwrap();
+            let grants = user["datasets"].as_table().unwrap();
+            assert_eq!(grants["database2"].as_str(), Some("read"));
+            if matches!(name, "user1" | "user3") {
+                assert_eq!(grants["database1"].as_str(), Some("read"));
+                assert_eq!(grants.len(), 2);
+            } else {
+                assert_eq!(grants.len(), 1);
+            }
+        }
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join("auth.toml");
         write::write_private(&f, toml.as_bytes()).unwrap();
@@ -417,7 +446,7 @@ fn a10_agrees_with_assembler_bodies() {
         let accepts = |union: bool| {
             let server = assembler::Server {
                 union_default_graph: union,
-                gsp_direct_naming: false,
+                gsp_direct_naming: &crate::state::GspDirectNaming::OFF,
             };
             assembler::parse(&body, oxrdfio::RdfFormat::Turtle, &server).ok()
         };
@@ -550,4 +579,78 @@ fn direct_naming_values_parse() {
     assert!(!GspDirectNaming::default().is_on());
     assert!(GspDirectNaming::parse(&v(&["a=write"])).is_err());
     assert!(GspDirectNaming::parse(&v(&["=read"])).is_err());
+}
+
+#[cfg(feature = "auth")]
+const RETAINED_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$IY9gTcuk5XaTpb3ovQUYxA$Dk0/beLxqbNZiieSoWzVpw10rL/XQz1u5JQa6ec0+VA";
+
+#[cfg(feature = "auth")]
+#[test]
+fn password_fields_accept_a_valid_hash_with_a_password_substring() {
+    use argon2::password_hash::PasswordVerifier;
+    assert!(
+        argon2::Argon2::default()
+            .verify_password(b"pw3", RETAINED_HASH)
+            .is_ok()
+    );
+    let text =
+        format!("version = 1\n[[users]]\nname = \"user3\"\npassword = \"{RETAINED_HASH}\"\n");
+    assert!(
+        text.contains("pw1"),
+        "retained hash must reproduce the old false positive"
+    );
+    assert!(password_fields_match(&text, &[("user3", "pw3")]));
+    assert!(!password_fields_match(
+        &text,
+        &[("user3", "wrong-password")]
+    ));
+    for bad in [
+        "pw3",
+        "$argon2id$v=19$m=19456,t=2,p=1$invalid!$broken",
+        "$argon2id$",
+    ] {
+        assert!(!password_fields_match(
+            &text.replace(RETAINED_HASH, bad),
+            &[("user3", "pw3")]
+        ));
+    }
+}
+
+/// Validate each complete field by its user rather than searching random hash text.
+#[cfg(feature = "auth")]
+fn password_fields_match(text: &str, expected: &[(&str, &str)]) -> bool {
+    use argon2::{PasswordHash, PasswordVerifier};
+    let Ok(parsed) = toml::from_str::<toml::Value>(text) else {
+        return false;
+    };
+    let Some(users) = parsed.get("users").and_then(toml::Value::as_array) else {
+        return false;
+    };
+    if users.len() != expected.len() {
+        return false;
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    users.iter().all(|user| {
+        let Some(name) = user.get("name").and_then(toml::Value::as_str) else {
+            return false;
+        };
+        let Some((_, password)) = expected.iter().find(|(candidate, _)| *candidate == name) else {
+            return false;
+        };
+        let Some(field) = user.get("password").and_then(toml::Value::as_str) else {
+            return false;
+        };
+        let Ok(phc) = PasswordHash::new(field) else {
+            return false;
+        };
+        seen.insert(name)
+            && !expected.iter().any(|(_, plain)| field == *plain)
+            && phc.algorithm.as_str() == "argon2id"
+            && phc.version == Some(19)
+            && phc.salt.is_some()
+            && phc.hash.is_some()
+            && argon2::Argon2::default()
+                .verify_password(password.as_bytes(), field)
+                .is_ok()
+    })
 }
