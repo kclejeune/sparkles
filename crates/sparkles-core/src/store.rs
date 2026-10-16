@@ -3630,9 +3630,17 @@ impl Store {
     ) -> Result<WriteTxn<'_>> {
         let mut guard = self.raw_writer(&opts)?;
         // A write that will not wait must not start from a speculative head either: its
-        // commit would then wait for the fence that makes that head durable.
-        if opts.no_wait && self.group.as_ref().is_some_and(|g| !g.idle()) {
-            return Err(Error::WriterBusy);
+        // commit would then wait for the fence that makes that head durable. A failed group
+        // never becomes idle again, so that write is refused as poisoned, not as busy.
+        if opts.no_wait
+            && let Some(g) = &self.group
+        {
+            if g.failed() {
+                return Err(Error::Poisoned);
+            }
+            if !g.idle() {
+                return Err(Error::WriterBusy);
+            }
         }
         if !self.speculative_base(kind, &opts, &guard) {
             self.drain_group(&mut guard, Some(&opts))?;

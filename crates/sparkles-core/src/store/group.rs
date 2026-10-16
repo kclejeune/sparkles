@@ -567,6 +567,39 @@ mod tests {
         assert!(t.insert(ids)?);
         t.commit()
     }
+    /// An insert that asks not to wait for the writer or for a fence.
+    fn no_wait_insert(s: &Store, name: &str) -> Result<Receipt> {
+        let mut t = s.try_write_with(
+            CommitKind::Update,
+            crate::guard::WriteOptions {
+                no_wait: true,
+                ..Default::default()
+            },
+        )?;
+        let q = Quad::new(
+            NamedNode::new(format!("urn:{name}")).unwrap(),
+            NamedNode::new("urn:p").unwrap(),
+            NamedNode::new("urn:o").unwrap(),
+            GraphName::DefaultGraph,
+        );
+        let ids = t.encode_quad(&q, &mut Default::default())?;
+        assert!(t.insert(ids)?);
+        t.commit()
+    }
+
+    /// After a failed fence the writer is poisoned for good, so a write that will not wait
+    /// is refused as poisoned, not as busy, which an embedder would retry (rereview N1).
+    #[test]
+    fn a_no_wait_write_on_a_failed_group_is_poisoned() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(dir.path(), options()).unwrap();
+        insert(&s, "seed").unwrap();
+        s.fail_next_group_sync();
+        assert!(matches!(insert(&s, "lost"), Err(Error::Poisoned)));
+        let r = no_wait_insert(&s, "after");
+        assert!(matches!(r, Err(Error::Poisoned)), "{r:?}");
+    }
+
     /// A waiter whose fence completes between its own `drive` and its park must lead the
     /// next fence at once, not sleep out the 20 ms poll with nobody leading.
     #[test]
