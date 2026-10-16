@@ -711,7 +711,7 @@ pub(crate) fn decode(b: &[u8]) -> Option<Result<Reply, Refusal>> {
     r.0.is_empty().then_some(out)
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, unix, feature = "office"))]
 mod tests {
     use super::*;
 
@@ -728,6 +728,7 @@ mod tests {
     }
 
     /// An isolation that runs `script` in `sh` in place of the binary.
+    #[cfg(feature = "office")]
     fn shell(script: &str) -> Isolation {
         Isolation {
             exe: "/bin/sh".into(),
