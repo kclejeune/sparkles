@@ -22,8 +22,17 @@ pub trait CommitGuard: Send + Sync {
     fn check(&self, c: &Candidate<'_>) -> Result<ValidationSummary>;
     /// Called after a commit the guard saw was published (with its sequence number).
     fn committed(&self, _seq: u64) {}
-    /// Called when a write bypassed the guard.
-    fn bypassed(&self) {}
+    /// Called when a write bypassed the guard. `seq` is the commit number the
+    /// bypassing write will take.
+    fn bypassed(&self, _seq: u64) {}
+    /// Whether the guard can check a commit against a state whose commit is not yet
+    /// durable, and keep track of the states of the commits in flight until each is
+    /// published ([`committed`](Self::committed) is called in commit order, possibly
+    /// after the next commit was checked). A guard that cannot has its commits checked
+    /// against the durable head, one group commit at a time.
+    fn speculative(&self) -> bool {
+        false
+    }
     /// A short description, for errors and status.
     fn describe(&self) -> String;
     /// The shape language this guard validates with.
@@ -109,8 +118,11 @@ pub struct WriteOptions {
     pub author: Option<Arc<str>>,
     /// checked once the writer lock is held, before anything is written
     pub precondition: Option<Precondition>,
-    /// fail with [`Error::WriterBusy`](crate::Error::WriterBusy) instead of waiting
-    /// when another write holds the writer lock
+    /// Fail with [`Error::WriterBusy`](crate::Error::WriterBusy) instead of waiting for
+    /// another write. With group commit this also covers a running fence, queued commits
+    /// and a commit that would be grouped, since a grouped commit waits for its fence. On a
+    /// store whose group commit has failed, the write fails with
+    /// [`Error::Poisoned`](crate::Error::Poisoned), which no retry can fix.
     pub no_wait: bool,
     /// The graphs the write may change (`None`: every graph). An insert or delete in
     /// another graph fails with [`Error::NotPermitted`](crate::Error::NotPermitted)

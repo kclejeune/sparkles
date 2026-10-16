@@ -21,6 +21,7 @@ mod changelog;
 mod changes;
 mod clone;
 mod commit_graph;
+mod commit_stats;
 mod compaction;
 #[cfg(test)]
 mod compaction_tests;
@@ -72,6 +73,9 @@ pub use changelog::{
 pub use changes::{ChangePage, ChangesOptions, CommitChanges};
 pub use clone::{CloneMethod, CloneMode, CloneOptions, CloneReport};
 pub use commit_graph::{CommitGraph, CommitGraphOptions, GraphBranch, GraphCommit, GraphCursor};
+pub use commit_stats::{
+    CommitMetrics, Fallback, HistogramSnapshot, SIZE_BUCKETS, SYNC_BUCKETS, SyncPath,
+};
 pub use compaction::{
     Blocker, COMPACTION_FILE, CompactOptions, CompactReport, CompactionMeasures, CompactionPolicy,
     CompactionSettings, REBUILD_BUCKETS, RELINK_CATCHING_UP, RELINK_READING, RELINK_WRITING,
@@ -1123,6 +1127,11 @@ pub struct StoreOptions {
     /// Experimental durable prefix grouping for ordinary persistent WAL writes.
     /// Off by default; unsupported operations drain and use the ordinary commit path.
     pub experimental_group_commit: bool,
+    /// With group commit on, a commit that is the only writer (nothing queued, no fence
+    /// running, no transaction waiting for the writer lock) takes the ordinary path with
+    /// its write-through writes, which need no cache flush. On by default; off, every
+    /// admitted commit goes through the group, for comparing and for tests of the group.
+    pub group_commit_idle_direct: bool,
     /// Record each commit's net changes in the change log ([`ChangeLog`]), which history
     /// queries read and which outlives compactions. A dataset's `changelog.json` can
     /// turn it off or on.
@@ -1193,6 +1202,7 @@ impl Default for StoreOptions {
             wal_prealloc_bytes: DEFAULT_WAL_PREALLOC_BYTES,
             wal_direct_writes: true,
             experimental_group_commit: false,
+            group_commit_idle_direct: true,
             change_log: true,
             change_log_max_bytes: DEFAULT_CHANGE_LOG_MAX_BYTES,
             change_log_segment_bytes: 16 << 20,
@@ -1286,6 +1296,8 @@ pub struct Store {
     root: Option<PathBuf>,
     opts: StoreOptions,
     group: Option<Box<group::Coordinator>>,
+    /// synchronization, group size and fallback counters of the commit path
+    commit_stats: commit_stats::CommitStats,
     // `current`, `writer`, `catalog`, `clock` and `history` are shared (weakly) with
     // backup lease guards, whose drop collects history without a `&Store`
     current: Arc<ArcSwap<Snapshot>>,
@@ -1479,6 +1491,7 @@ impl Store {
         let store = Store {
             root: None,
             group: None,
+            commit_stats: Default::default(),
             current: Arc::new(ArcSwap::from_pointee(Snapshot {
                 cacheable: true,
                 dataset_id,
@@ -1756,6 +1769,7 @@ impl Store {
             (gen_.meta.quads + delta.inserts() as u64).saturating_sub(delta.deletes() as u64);
         let mut wal_len = 0u64;
         let mut wal_index = wal::WalIndex::new(base.seq, fold_legacy);
+        let annotated = crate::annotations::seqs_of(root, dataset_id);
         if wal_path.exists() {
             let mut buf = Vec::new();
             File::open(&wal_path)?.read_to_end(&mut buf)?;
@@ -1770,6 +1784,7 @@ impl Store {
                 keep_touched: text_on,
                 path: &wal_path,
                 start: gen_.base_delta(),
+                annotated: annotated.as_ref(),
             };
             let r = replay_wal(&from, &buf, &mut |_, _| Ok(()))?;
             if r.good != buf.len() {
@@ -1867,6 +1882,7 @@ impl Store {
             group: opts
                 .experimental_group_commit
                 .then(|| Box::new(group::Coordinator::default())),
+            commit_stats: Default::default(),
             current: Arc::new(ArcSwap::from_pointee(Snapshot {
                 cacheable: true,
                 dataset_id: branching
@@ -2947,6 +2963,35 @@ impl Store {
         changes: impl FnOnce() -> Option<(Vec<String>, Vec<String>)>,
     ) -> Result<crate::annotations::Annotation> {
         let mut a = self.annotations.lock();
+        let ann = self.annotation_of(&a, c, message, changes);
+        a.append(c.seq, ann.clone(), self.dataset_id)?;
+        Ok(ann)
+    }
+
+    /// [`annotate`](Self::annotate) for a commit of a group: the record is written but not
+    /// synced, and the file to sync before the commit is acknowledged comes with it.
+    fn annotate_unsynced(
+        &self,
+        c: &CommitInfo,
+        message: Option<Arc<str>>,
+        changes: impl FnOnce() -> Option<(Vec<String>, Vec<String>)>,
+    ) -> Result<(crate::annotations::Annotation, Option<Arc<File>>)> {
+        let mut a = self.annotations.lock();
+        let ann = self.annotation_of(&a, c, message, changes);
+        // a grouped commit never takes its record back, so only the file is needed
+        let file = a
+            .append_unsynced(c.seq, ann.clone(), self.dataset_id)?
+            .map(|(f, _)| f);
+        Ok((ann, file))
+    }
+
+    fn annotation_of(
+        &self,
+        a: &crate::annotations::Annotations,
+        c: &CommitInfo,
+        message: Option<Arc<str>>,
+        changes: impl FnOnce() -> Option<(Vec<String>, Vec<String>)>,
+    ) -> crate::annotations::Annotation {
         let digest = if a.digests() {
             changes().map(|(deleted, inserted)| {
                 let parent = c.parent().and_then(|p| a.get(p)).and_then(|p| p.digest);
@@ -2961,9 +3006,7 @@ impl Store {
         } else {
             None
         };
-        let ann = crate::annotations::Annotation { message, digest };
-        a.append(c.seq, ann.clone(), self.dataset_id)?;
-        Ok(ann)
+        crate::annotations::Annotation { message, digest }
     }
 
     /// In-memory stores keep annotations only for the commits their catalog keeps.
@@ -3625,10 +3668,23 @@ impl Store {
         opts: crate::guard::WriteOptions,
     ) -> Result<WriteTxn<'_>> {
         let mut guard = self.raw_writer(&opts)?;
+        // A write that will not wait must not start from a speculative head either: its
+        // commit would then wait for the fence that makes that head durable. A failed group
+        // never becomes idle again, so that write is refused as poisoned, not as busy.
+        if opts.no_wait
+            && let Some(g) = &self.group
+        {
+            if g.failed() {
+                return Err(Error::Poisoned);
+            }
+            if !g.idle() {
+                return Err(Error::WriterBusy);
+            }
+        }
         if !self.speculative_base(kind, &opts, &guard) {
             self.drain_group(&mut guard, Some(&opts))?;
         }
-        self.check_write_options(&opts)?;
+        self.check_write_options(&opts, &mut guard)?;
         if guard.poisoned {
             return Err(Error::Poisoned);
         }
@@ -3667,21 +3723,68 @@ impl Store {
     fn lock_writer(&self, o: &crate::guard::WriteOptions) -> Result<MutexGuard<'_, WriterState>> {
         let mut w = self.raw_writer(o)?;
         self.drain_group(&mut w, Some(o))?;
-        self.check_write_options(o)?;
+        self.check_write_options(o, &mut w)?;
         Ok(w)
     }
 
-    fn check_write_options(&self, o: &crate::guard::WriteOptions) -> Result<()> {
+    /// The write's precondition, checked against the head the transaction starts from:
+    /// the speculative head, when group commit has commits written but not yet synced. A
+    /// refusal never rests on state that a failed sync could still take back, so one that
+    /// the speculative head causes waits for the queue to become durable and is checked
+    /// again against the durable head. If the sync fails instead, the write is refused as
+    /// poisoned, not as a failed precondition.
+    fn check_write_options(
+        &self,
+        o: &crate::guard::WriteOptions,
+        w: &mut WriterState,
+    ) -> Result<()> {
         // a dry run reports the precondition with the rest of its preview
         if let Some(p) = &o.precondition
             && o.dry_run.is_none()
         {
-            p.check(&self.snapshot())?;
+            match w.staged.clone() {
+                None => p.check(&self.snapshot())?,
+                Some(speculative) => {
+                    if p.check(&speculative).is_err() {
+                        self.drain_group(w, Some(o))?;
+                        p.check(&self.snapshot())?;
+                    }
+                }
+            }
         }
         if let Some(m) = &o.message {
             crate::annotations::validate_message(m)?;
         }
         Ok(())
+    }
+
+    /// Whether this store groups commits
+    /// ([`StoreOptions::experimental_group_commit`] on a persistent store).
+    pub fn groups_commits(&self) -> bool {
+        self.group.is_some()
+    }
+
+    /// The error of a write that may have started from the speculative head of a group
+    /// commit, once it is known to rest on durable state: it waits until the commits in
+    /// flight are durable, and answers [`Error::Poisoned`] when their sync failed, so a
+    /// client is never told that a graph exists, or that its patch does not apply, because
+    /// of state that a failed sync took back. Errors that say nothing about the data pass
+    /// through at once.
+    pub(crate) fn after_refusal(&self, e: Error, o: Option<&crate::guard::WriteOptions>) -> Error {
+        let Some(group) = &self.group else {
+            return e;
+        };
+        if matches!(
+            e,
+            Error::Poisoned | Error::Cancelled | Error::Timeout | Error::WriterBusy
+        ) {
+            return e;
+        }
+        match group.drain(self, o) {
+            Ok(()) => e,
+            Err(_) if group.failed() => Error::Poisoned,
+            Err(drain) => drain,
+        }
     }
 
     fn drain_group(
@@ -3707,7 +3810,8 @@ impl Store {
     }
 
     /// Whether a new write transaction may start from the speculative head that group
-    /// commit has written but not yet synced. Only SPARQL updates do. An update's caller
+    /// commit has written but not yet synced. SPARQL updates, Graph Store writes,
+    /// uploads and RDF Patches may do so. An update's caller
     /// sees nothing of the state it reads, and its commit fails with its predecessor's.
     /// An explicit transaction hands that state to its caller through
     /// [`WriteTxn::view`] and queries, and could be dropped without committing, so the
@@ -3719,7 +3823,26 @@ impl Store {
         o: &crate::guard::WriteOptions,
         w: &WriterState,
     ) -> bool {
-        kind == CommitKind::Update && self.group_admission(kind, o, w)
+        Self::speculative_kind(kind)
+            && self.group_admission(kind, o, w)
+            // a guard that keeps one state only is told of each commit before the next is
+            // checked, which a speculative chain does not do
+            && self.guard().is_none_or(|g| g.speculative())
+    }
+
+    /// The writes whose result a caller sees only after the commit is acknowledged, so
+    /// that a transaction of this kind can start from the speculative head: SPARQL
+    /// Updates, Graph Store writes, uploads and RDF Patches.
+    fn speculative_kind(kind: CommitKind) -> bool {
+        matches!(
+            kind,
+            CommitKind::Update
+                | CommitKind::GspPut
+                | CommitKind::GspPost
+                | CommitKind::GspDelete
+                | CommitKind::Upload
+                | CommitKind::Patch
+        )
     }
 
     fn group_admission(
@@ -3728,22 +3851,40 @@ impl Store {
         o: &crate::guard::WriteOptions,
         w: &WriterState,
     ) -> bool {
-        self.group.is_some()
-            && !w.poisoned
-            && w.wal.is_some()
-            && w.tap.is_none()
-            && matches!(kind, CommitKind::Transaction | CommitKind::Update)
-            && !o.bypass_validation
-            && o.dry_run.is_none()
-            && o.message.is_none()
-            && o.precondition.is_none()
-            && o.graphs.is_none()
-            && !self.commit_digests()
-            && !self.guard_required()
-            && self.guard.read().is_none()
-            && !self.text_enabled()
-            && self.geo.load().is_none()
-            && self.embed.works.lock().is_empty()
+        self.group_check(kind, o, w).is_ok()
+    }
+
+    /// `Ok` when a commit with these options may join a group. `Err(None)` when group
+    /// commit does not apply (it is off, the store has no WAL, or the write is a dry
+    /// run), and `Err(Some(why))` with the first condition that sends the commit down
+    /// the ordinary path.
+    fn group_check(
+        &self,
+        kind: CommitKind,
+        o: &crate::guard::WriteOptions,
+        w: &WriterState,
+    ) -> std::result::Result<(), Option<Fallback>> {
+        use Fallback::*;
+        if self.group.is_none() || w.wal.is_none() || o.dry_run.is_some() {
+            return Err(None);
+        }
+        let first = if w.poisoned {
+            Some(Poisoned)
+        } else if !(kind == CommitKind::Transaction || Self::speculative_kind(kind)) {
+            Some(Kind)
+        } else if self.text_enabled() {
+            // the index follows each commit as it is published, which a group's
+            // coordinator does not do, and a build or recovery that installs a view under
+            // the writer lock must not meet a commit publishing an older one
+            Some(Text)
+        } else if self.geo.load().is_some() {
+            Some(Geo)
+        } else if !self.embed.works.lock().is_empty() {
+            Some(Embed)
+        } else {
+            None
+        };
+        first.map_or(Ok(()), |f| Err(Some(f)))
     }
 
     /// What stops a rebuild into `dir` early: the write's cancellation and deadline, and
@@ -3847,6 +3988,10 @@ impl Store {
     }
 
     /// Install (or remove) the write guard run before every commit.
+    ///
+    /// Call this before any writer exists, or while holding the writer lock through a
+    /// drained transaction, as validation configuration changes do. This keeps a
+    /// speculative transaction on the guard it began with until its check completes.
     pub fn set_guard(&self, g: Option<Arc<dyn crate::guard::CommitGuard>>) {
         crate::sparql::extensions::assert_family(self.owner_dataset_id());
         *self.guard.write() = g;
@@ -3911,7 +4056,7 @@ impl Store {
                 return Ok(Some(Arc::new(summary)));
             }
             if let Some(g) = &g {
-                g.bypassed();
+                g.bypassed(head + 1);
             }
             if let Some(o) = &observer
                 && (g.is_some() || self.guard_required())
@@ -4990,6 +5135,23 @@ impl Drop for WriteTxn<'_> {
     }
 }
 
+/// Retain an ordinary synchronization sample until the consumed transaction has
+/// released its writer, including when publication unwinds after synchronization.
+struct OrdinarySyncObservation<'a> {
+    store: &'a Store,
+    sample: Option<(SyncPath, std::time::Duration)>,
+}
+
+impl Drop for OrdinarySyncObservation<'_> {
+    fn drop(&mut self) {
+        if let Some((path, took)) = self.sample.take() {
+            self.store.commit_stats.synced(path, took);
+            #[cfg(test)]
+            ordinary_sync_probe::published(self.store, path);
+        }
+    }
+}
+
 impl WriteTxn<'_> {
     /// [`Error::NotPermitted`] unless the write's graph view lets it change graph `g`.
     /// Called before a quad is looked up, so the answer never depends on the data.
@@ -5035,11 +5197,14 @@ impl WriteTxn<'_> {
         if self.requested.is_none() {
             return Ok(());
         }
-        self.base_check()?;
-        match self.base_check.as_mut() {
-            Some(c) => c.check(q, pred, graph),
-            None => Ok(()),
-        }
+        let checked = (|| {
+            self.base_check()?;
+            match self.base_check.as_mut() {
+                Some(c) => c.check(q, pred, graph),
+                None => Ok(()),
+            }
+        })();
+        checked.map_err(|e| self.store.after_refusal(e, Some(&self.opts)))
     }
 
     fn base_check(&mut self) -> Result<()> {
@@ -5438,7 +5603,12 @@ impl WriteTxn<'_> {
             deleted = tracing::field::Empty,
         );
         let _entered = span.enter();
-        let r = self.commit_inner();
+        let mut observation = OrdinarySyncObservation {
+            store: self.store,
+            sample: None,
+        };
+        let r = self.commit_inner(&mut observation.sample);
+        drop(observation);
         if let Ok(r) = &r
             && r.committed
         {
@@ -5450,28 +5620,31 @@ impl WriteTxn<'_> {
         r
     }
 
-    fn commit_inner(mut self) -> Result<Receipt> {
+    fn commit_inner(
+        mut self,
+        sync: &mut Option<(SyncPath, std::time::Duration)>,
+    ) -> Result<Receipt> {
         self._callback_owner.check()?;
         if self.guard.poisoned || self.store.group.as_ref().is_some_and(|g| g.failed()) {
             return Err(Error::Poisoned);
         }
-        let grouped = self.bulk.is_empty()
-            && !self.force
-            && self.merge.is_none()
-            && self.wal_bytes() <= group::MAX_BYTES
-            && self
-                .store
-                .group_admission(self.kind, &self.opts, &self.guard);
+        let grouped = self.group_admitted();
         // A dependent no-op, preview, validation, bulk rebuild or other fallback
         // cannot acknowledge or capture a speculative predecessor.
         if !grouped || (self.net_ins == 0 && self.net_del == 0) {
             self.store.drain_group(&mut self.guard, Some(&self.opts))?;
+        } else if self.opts.no_wait {
+            // A grouped commit is acknowledged only after a fence, which a write that will
+            // not wait must not wait for. It is refused before the guard runs, and nothing
+            // has reached the WAL.
+            return Err(Error::WriterBusy);
         }
         // a commit with a merge record (a merge, or a commit a merge replays) passes
         if (self.is_dirty() || self.force) && self.merge.is_none() {
             self.store.check_protected(self.kind)?;
         }
-        self.check_requested_all()?;
+        self.check_requested_all()
+            .map_err(|e| self.store.after_refusal(e, Some(&self.opts)))?;
         // a write cancelled (its client gone) or past its deadline publishes nothing
         self.opts.check()?;
         if self.bulk.is_empty() {
@@ -5480,7 +5653,7 @@ impl WriteTxn<'_> {
             }
             if self.net_ins == 0 && self.net_del == 0 && !self.force {
                 // no net change: no commit, nothing to validate
-                return self.publish_log(None);
+                return self.publish_log(None, sync);
             }
             let head = self.guard.head.seq;
             let validation = self.store.run_guard(
@@ -5490,14 +5663,19 @@ impl WriteTxn<'_> {
                 crate::guard::Changes::Log(&self.log),
                 &self.opts,
                 head,
-            )?;
-            if grouped && validation.is_none() {
-                return self.publish_grouped();
-            }
+            );
+            let validation = match validation {
+                // A refusal is reported only when the state it was judged against is
+                // durable. If its fence fails instead, the write is refused as poisoned.
+                Err(e) => {
+                    return Err(self.store.after_refusal(e, Some(&self.opts)));
+                }
+                other => other?,
+            };
             if grouped {
-                self.store.drain_group(&mut self.guard, Some(&self.opts))?;
+                return self.publish_grouped(validation);
             }
-            return self.publish_log(validation);
+            return self.publish_log(validation, sync);
         }
         // Build the new generation from this transaction's view (base + uncommitted delta)
         // plus the bulk quads; switching CURRENT is the atomic commit point, so the
@@ -5537,9 +5715,38 @@ impl WriteTxn<'_> {
         Ok(receipt)
     }
 
+    /// Whether this commit joins a group. A commit of a store with group commit on that
+    /// does not is counted under the first reason it fell back for.
+    fn group_admitted(&self) -> bool {
+        let why = match self.store.group_check(self.kind, &self.opts, &self.guard) {
+            Err(None) => return false,
+            Err(Some(why)) => Some(why),
+            Ok(()) if !self.bulk.is_empty() => Some(Fallback::Bulk),
+            Ok(()) if self.force || self.merge.is_some() => Some(Fallback::Kind),
+            Ok(()) if self.wal_bytes() > group::MAX_BYTES => Some(Fallback::Size),
+            Ok(()) if self.net_ins == 0 && self.net_del == 0 => Some(Fallback::Noop),
+            Ok(()) => None,
+        };
+        if let Some(why) = why {
+            self.store.commit_stats.fell_back(why);
+        }
+        // a no-op is counted, but still drains and is answered by the ordinary path
+        if why.is_some() {
+            return why == Some(Fallback::Noop);
+        }
+        // Idle fast path: the only writer, with no fence running, commits as the ordinary
+        // writer does, with write-through writes that need no cache flush. A commit that
+        // finds another writer waiting for the lock groups instead.
+        let alone = self.store.opts.group_commit_idle_direct
+            && self.store.writers_waiting() == 0
+            && self.store.group.as_ref().is_some_and(|g| g.idle());
+        !alone
+    }
+
     fn publish_log(
         &mut self,
         validation: Option<Arc<crate::guard::ValidationSummary>>,
+        sync: &mut Option<(SyncPath, std::time::Duration)>,
     ) -> Result<Receipt> {
         let gen_ = &self.base.generation;
         let head = self.guard.head;
@@ -5600,6 +5807,16 @@ impl WriteTxn<'_> {
             } else {
                 0
             };
+            // the record says no earlier commit may be missing from disk, so a fence
+            // that is still running would make that untrue
+            debug_assert!(
+                self.store
+                    .group
+                    .as_ref()
+                    .is_none_or(|g| g.idle() || g.failed())
+                    && w.head.seq == self.store.current.load().commit,
+                "an ordinary commit while group commit has commits in flight"
+            );
             commit::seal_wal_commit(&mut rec, c.seq, c.timestamp_ms, c.kind, flags, &data);
             data.extend_from_slice(&rec);
             // once the first byte is written, a failure leaves the WAL in an unknown
@@ -5617,7 +5834,39 @@ impl WriteTxn<'_> {
                 if wal::DirectLog::fits(w.wal_len, data.len(), w.wal_alloc)
                     && let Some(direct) = w.wal_direct.handle(path.as_deref(), wal.get_ref())
                 {
-                    if commit_direct(direct, w.wal_len, &data, &gen_.dvocab, &mut w.vocab_sync)? {
+                    let t = std::time::Instant::now();
+                    let direct_written = {
+                        #[cfg(not(test))]
+                        {
+                            commit_direct(
+                                direct,
+                                w.wal_len,
+                                &data,
+                                &gen_.dvocab,
+                                &mut w.vocab_sync,
+                            )?
+                        }
+                        #[cfg(test)]
+                        {
+                            // Branch-selection control, not a physical EINVAL fault:
+                            // refuse before this helper performs any mutation.
+                            if ordinary_sync_probe::skip_direct(self.store) {
+                                false
+                            } else {
+                                commit_direct(
+                                    direct,
+                                    w.wal_len,
+                                    &data,
+                                    &gen_.dvocab,
+                                    &mut w.vocab_sync,
+                                )?
+                            }
+                        }
+                    };
+                    if direct_written {
+                        *sync = Some((SyncPath::Direct, t.elapsed()));
+                        #[cfg(test)]
+                        ordinary_sync_probe::captured(self.store);
                         return Ok(());
                     }
                     // the file system refused direct I/O: write this commit and the
@@ -5631,7 +5880,12 @@ impl WriteTxn<'_> {
                     gen_.dvocab.flush()?;
                 }
                 wal::write_commit(wal.get_ref(), w.wal_len, &mut w.wal_alloc, &data, prealloc)?;
-                sync_commit_reused(wal.get_ref(), &gen_.dvocab, &mut w.vocab_sync)
+                let t = std::time::Instant::now();
+                let synced = sync_commit_reused(wal.get_ref(), &gen_.dvocab, &mut w.vocab_sync);
+                *sync = Some((SyncPath::Buffered, t.elapsed()));
+                #[cfg(test)]
+                ordinary_sync_probe::captured(self.store);
+                synced
             });
             if let Err(e) = written {
                 w.poisoned = true;
@@ -6268,6 +6522,8 @@ pub(crate) struct ReplayFrom<'a> {
     pub path: &'a Path,
     /// the delta the generation's base holds (empty except for a linked generation)
     pub start: Delta,
+    /// the commits that have a record in `annotations.bin`, when the file can be read
+    pub annotated: Option<&'a std::collections::BTreeSet<u64>>,
 }
 
 /// What a WAL replay yields.
@@ -6302,8 +6558,10 @@ pub(crate) struct Replay {
 /// records admit it, so damage anywhere in that unsynced suffix is a torn tail.
 ///
 /// A record from a release without commit metadata carries no count. It is taken to
-/// prove its predecessors durable, which keeps such logs as strict as they always were.
-pub(crate) fn wal_torn_from(buf: &[u8], at: usize, seq: u64) -> bool {
+/// prove its predecessors durable in a headerless log, even after v2 records (CI 5.6).
+/// Only a validated v1 header establishes strict modern framing, where absent metadata
+/// may be torn. Headerless modern partial records remain ambiguous with legacy data.
+pub(crate) fn wal_torn_from(buf: &[u8], at: usize, seq: u64, framed_metadata: bool) -> bool {
     let recs = buf.as_chunks::<WAL_REC>().0;
     for (i, rec) in recs.iter().enumerate().skip(at + 1) {
         if rec[0] != WAL_COMMIT {
@@ -6324,7 +6582,8 @@ pub(crate) fn wal_torn_from(buf: &[u8], at: usize, seq: u64) -> bool {
                     return false;
                 }
             }
-            None => return false,
+            None if !framed_metadata => return false,
+            None => {}
         }
     }
     true
@@ -6381,6 +6640,7 @@ pub(crate) fn replay_wal(
     };
     let mut quads = out.base_quads;
     let mut seen_v2 = false;
+    let mut framed_metadata = false;
     // the commit the transaction being read would be
     let next_seq = |out: &Replay| out.commits.last().map_or(from.base.seq, |c| c.seq) + 1;
     for (i, rec) in recs.iter().enumerate() {
@@ -6397,14 +6657,24 @@ pub(crate) fn replay_wal(
             // the header record that starts a log written by this release: the replay
             // accepts it as the log's first complete part
             WAL_HEADER if i == 0 => {
-                wal::header_version(rec, from.path)?;
+                framed_metadata = wal::header_version(rec, from.path)? == 1;
                 txn_start = 1;
                 out.good = WAL_REC;
             }
             WAL_COMMIT => {
                 let meta = commit::open_wal_commit(rec, &buf[txn_start * WAL_REC..i * WAL_REC]);
+                if meta.is_none() && framed_metadata {
+                    if wal_torn_from(buf, i, next_seq(&out), framed_metadata) {
+                        break;
+                    }
+                    return Err(Error::Corrupt(format!(
+                        "{}: missing modern commit metadata in the transaction ending at byte {}",
+                        from.path.display(),
+                        (i + 1) * WAL_REC
+                    )));
+                }
                 if matches!(meta, Some(Err(()))) {
-                    if wal_torn_from(buf, i, next_seq(&out)) {
+                    if wal_torn_from(buf, i, next_seq(&out), framed_metadata) {
                         break;
                     }
                     return Err(Error::Corrupt(format!(
@@ -6418,7 +6688,7 @@ pub(crate) fn replay_wal(
                 // may name terms that did not reach `delta.vocab`.
                 let needs = delta_ids_end(pending.iter().map(|(_, q)| q));
                 if needs > dvocab_len {
-                    if wal_torn_from(buf, i, next_seq(&out)) {
+                    if wal_torn_from(buf, i, next_seq(&out), framed_metadata) {
                         break;
                     }
                     return Err(Error::Corrupt(format!(
@@ -6427,6 +6697,25 @@ pub(crate) fn replay_wal(
                         (i + 1) * WAL_REC,
                         needs - 1
                     )));
+                }
+                // A commit of a group syncs its annotation together with its WAL records,
+                // and the kernel may write the records back first: after a crash, a commit
+                // that was not acknowledged can lack the annotation it asked for. It is
+                // then a torn tail like one that names terms the vocabulary lacks. When a
+                // later record shows the commit was durable, its fence synced the
+                // annotation as well, so the file lost it afterwards: the commit stays.
+                if let (Some(set), Some(Ok((seq, _, _, flags)))) = (from.annotated, &meta)
+                    && flags & commit::WAL_FLAG_ANNOTATED != 0
+                    && !set.contains(seq)
+                {
+                    if wal_torn_from(buf, i, next_seq(&out), framed_metadata) {
+                        break;
+                    }
+                    tracing::warn!(
+                        target: "sparkles::annotations",
+                        commit = *seq,
+                        "the annotation of a durable commit is missing from annotations.bin"
+                    );
                 }
                 let (mut ins, mut del) = (0i64, 0i64);
                 let touched: Vec<[Id; 4]> = if from.keep_touched {
@@ -6518,7 +6807,7 @@ pub(crate) fn replay_wal(
             // Truncating damage that a later record proves durable would drop the
             // committed transactions after it.
             op => {
-                if wal_torn_from(buf, i, next_seq(&out)) {
+                if wal_torn_from(buf, i, next_seq(&out), framed_metadata) {
                     break;
                 }
                 return Err(Error::Corrupt(format!(
@@ -7417,5 +7706,567 @@ ex:a ex:p 1, 2, 3 . ex:b ex:p 2 . ex:c ex:q "hello"@en .
         })
         .unwrap();
         assert_eq!(n, 3);
+    }
+}
+
+// Private diagnostic probes are scoped to one Store and one calling thread. No timed
+// release build contains the observer, fault selection, or post-capture panic point.
+#[cfg(test)]
+mod ordinary_sync_probe {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    #[derive(Default)]
+    pub(super) struct Probe {
+        target: Cell<usize>,
+        pub publications: Cell<usize>,
+        pub last: Cell<Option<(SyncPath, bool)>>,
+        pub skip_direct: Cell<bool>,
+        pub skipped: Cell<bool>,
+        pub panic_after_capture: Cell<bool>,
+    }
+
+    thread_local! {
+        static ACTIVE: RefCell<Option<Rc<Probe>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) struct Scope(Option<Rc<Probe>>);
+
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            ACTIVE.with(|active| *active.borrow_mut() = self.0.take());
+        }
+    }
+
+    pub(super) fn install(store: &Store, probe: &Rc<Probe>) -> Scope {
+        probe.target.set(std::ptr::from_ref(store) as usize);
+        Scope(ACTIVE.with(|active| active.replace(Some(probe.clone()))))
+    }
+
+    fn with_probe<T: Default>(store: &Store, f: impl FnOnce(&Probe) -> T) -> T {
+        ACTIVE.with(|active| {
+            let Ok(active) = active.try_borrow() else {
+                return T::default();
+            };
+            active
+                .as_ref()
+                .filter(|p| p.target.get() == std::ptr::from_ref(store) as usize)
+                .map_or_else(T::default, |p| f(p))
+        })
+    }
+
+    pub(super) fn published(store: &Store, path: SyncPath) {
+        with_probe(store, |p| {
+            let writer = store.writer.try_lock();
+            let free = writer.is_some();
+            drop(writer);
+            p.last.set(Some((path, free)));
+            p.publications.set(p.publications.get() + 1);
+        });
+    }
+
+    pub(super) fn captured(store: &Store) {
+        // The observer itself never panics. Inject only inside publish_log, after
+        // the original sample publication (R) or sample capture (S).
+        if with_probe(store, |p| p.panic_after_capture.replace(false)) {
+            panic!("private diagnostic panic after ordinary sync sample");
+        }
+    }
+
+    pub(super) fn skip_direct(store: &Store) -> bool {
+        with_probe(store, |p| {
+            let skip = p.skip_direct.replace(false);
+            p.skipped.set(skip);
+            skip
+        })
+    }
+}
+
+#[cfg(test)]
+mod ordinary_sync_tests {
+    use super::*;
+    use std::rc::Rc;
+
+    fn transaction<'a>(store: &'a Store, name: &str) -> Result<WriteTxn<'a>> {
+        let mut txn = store.write_with(CommitKind::Update, Default::default());
+        let quad = Quad::new(
+            NamedNode::new(format!("urn:{name}")).unwrap(),
+            NamedNode::new("urn:p").unwrap(),
+            NamedNode::new("urn:o").unwrap(),
+            GraphName::DefaultGraph,
+        );
+        let q = txn.encode_quad(&quad, &mut Default::default())?;
+        txn.insert(q)?;
+        Ok(txn)
+    }
+
+    fn insert(store: &Store, name: &str) -> Result<Receipt> {
+        transaction(store, name)?.commit()
+    }
+
+    fn insert_known_fit(store: &Store, name: &str) -> Result<Receipt> {
+        let txn = transaction(store, name)?;
+        assert!(
+            wal::DirectLog::fits(
+                txn.guard.wal_len,
+                txn.wal_bytes() as usize,
+                txn.guard.wal_alloc,
+            ),
+            "the selected ordinary write must fit its allocated direct window"
+        );
+        txn.commit()
+    }
+
+    fn unavailable_handle(store: &Store) {
+        let dir = store.snapshot().generation.dir.clone().unwrap();
+        let missing = dir.join("private-missing-direct-candidate");
+        assert!(!missing.exists());
+        let wal_path = dir.join("wal.log");
+        let before = std::fs::read(&wal_path).unwrap();
+        let mut state = wal::Direct::Untried;
+        let mut writer = store.writer.lock();
+        let descriptor = writer.wal.as_ref().unwrap().get_ref();
+        assert!(state.handle(Some(&missing), descriptor).is_none());
+        assert!(matches!(state, wal::Direct::Off));
+        writer.wal_direct = state;
+        drop(writer);
+        assert_eq!(std::fs::read(&wal_path).unwrap(), before);
+        eprintln!(
+            "controlled real Direct::handle None; cached Off; WAL bytes untouched; requested direct remains true"
+        );
+    }
+
+    // A requested option or an acquired handle is not capability evidence. This
+    // separate successful write calibrates the real path before observing an attempt.
+    fn calibrate(store: &Store, unavailable: bool) -> bool {
+        insert(store, "warm").unwrap();
+        if unavailable {
+            unavailable_handle(store);
+        }
+        let before = counts(store);
+        assert!(insert_known_fit(store, "calibration").unwrap().committed);
+        let after = counts(store);
+        let mut expected = before;
+        expected[SyncPath::Direct as usize] += 1;
+        let direct = after == expected;
+        if !direct {
+            expected = before;
+            expected[SyncPath::Buffered as usize] += 1;
+            assert_eq!(after, expected);
+        }
+        assert_eq!(
+            selected_path(store, direct),
+            if direct {
+                SyncPath::Direct
+            } else {
+                SyncPath::Buffered
+            }
+        );
+        eprintln!(
+            "calibration requested_direct={} controlled_unavailable={unavailable}: successful actual {}; counts {before:?} -> {after:?}",
+            store.opts.wal_direct_writes,
+            if direct { "Direct" } else { "Buffered" }
+        );
+        direct
+    }
+
+    fn selected_path(store: &Store, calibrated_direct: bool) -> SyncPath {
+        match &store.writer.lock().wal_direct {
+            wal::Direct::Open(_) => {
+                assert!(
+                    calibrated_direct,
+                    "Direct requires a successful prior Direct calibration"
+                );
+                SyncPath::Direct
+            }
+            // A later EINVAL can legitimately disable even a calibrated handle.
+            wal::Direct::Off => SyncPath::Buffered,
+            wal::Direct::Untried => {
+                panic!("known-fit calibration must resolve direct availability")
+            }
+        }
+    }
+
+    fn counts(store: &Store) -> [u64; 3] {
+        store.commit_metrics().sync.map(|h| h.count())
+    }
+
+    fn expected_free() -> bool {
+        // Reference runs explicitly request "held". The retained S test defaults
+        // to its required writer-free publication invariant.
+        std::env::var("SPARKLES_SYNC_PUBLICATION_EXPECT").as_deref() != Ok("held")
+    }
+
+    fn assert_observed(probe: &ordinary_sync_probe::Probe, path: SyncPath) {
+        assert_eq!(probe.publications.get(), 1);
+        assert_eq!(probe.last.get(), Some((path, expected_free())));
+    }
+
+    #[test]
+    fn ordinary_sync_success_and_unwind_preserve_samples_and_observe_writer() {
+        for (direct, unavailable) in [(false, false), (true, false), (true, true)] {
+            for panic in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let store = Store::open(
+                    dir.path(),
+                    StoreOptions {
+                        wal_direct_writes: direct,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                let calibrated = calibrate(&store, unavailable);
+                let before = counts(&store);
+                let head = store.snapshot().commit;
+                let len = store.snapshot().len();
+                let probe = Rc::new(ordinary_sync_probe::Probe::default());
+                probe.panic_after_capture.set(panic);
+                let scope = ordinary_sync_probe::install(&store, &probe);
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    insert_known_fit(&store, "observed")
+                }));
+                drop(scope);
+                assert_eq!(result.is_err(), panic);
+                if let Ok(result) = result {
+                    assert!(result.unwrap().committed);
+                }
+                let path = selected_path(&store, calibrated);
+                let mut expected = before;
+                expected[path as usize] += 1;
+                assert_eq!(
+                    counts(&store),
+                    expected,
+                    "direct={direct}, unavailable={unavailable}, panic={panic}"
+                );
+                assert_observed(&probe, path);
+                eprintln!(
+                    "observed success/unwind requested_direct={direct} controlled_unavailable={unavailable} calibrated_direct={calibrated} panic={panic}: actual {path:?}, counts {before:?} -> {expected:?}"
+                );
+                assert!(store.writer.try_lock().is_some());
+                if !panic {
+                    assert_eq!(store.snapshot().commit, head + 1);
+                }
+                drop(store);
+                let reopened = Store::open(dir.path(), Default::default()).unwrap();
+                // An injected panic has no acknowledged receipt. Orderly close
+                // trims that unpublished suffix using the unchanged head.
+                assert_eq!(reopened.snapshot().commit, head + u64::from(!panic));
+                assert_eq!(reopened.snapshot().len(), len + u64::from(!panic));
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_sync_error_and_fallback_sample_rules_are_unchanged() {
+        for (direct, unavailable) in [(false, false), (true, false), (true, true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::open(
+                dir.path(),
+                StoreOptions {
+                    wal_direct_writes: direct,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let calibrated = calibrate(&store, unavailable);
+            let before = counts(&store);
+            let head = store.snapshot().commit;
+            let len = store.snapshot().len();
+            let probe = Rc::new(ordinary_sync_probe::Probe::default());
+            let scope = ordinary_sync_probe::install(&store, &probe);
+            store.snapshot().generation.dvocab.fail_next_sync();
+            let error = insert_known_fit(&store, "failing").unwrap_err();
+            drop(scope);
+            assert!(
+                error.to_string().contains("injected sync failure"),
+                "{error:?}"
+            );
+            assert_eq!(store.snapshot().commit, head);
+            let path = selected_path(&store, calibrated);
+            let mut expected = before;
+            if path == SyncPath::Direct {
+                // A real commit_direct error precedes its sample site.
+                assert_eq!(probe.publications.get(), 0);
+            } else {
+                expected[SyncPath::Buffered as usize] += 1;
+                assert_observed(&probe, SyncPath::Buffered);
+            }
+            eprintln!(
+                "injected vocabulary error requested_direct={direct} controlled_unavailable={unavailable} calibrated_direct={calibrated}: actual {path:?}, counts {before:?} -> {expected:?}"
+            );
+            assert_eq!(counts(&store), expected);
+            assert!(matches!(insert(&store, "poisoned"), Err(Error::Poisoned)));
+            assert_eq!(counts(&store), expected);
+            drop(store);
+            let reopened = Store::open(dir.path(), Default::default()).unwrap();
+            assert_eq!(reopened.snapshot().commit, head + 1);
+            assert_eq!(reopened.snapshot().len(), len + 1);
+        }
+        for unavailable in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::open(dir.path(), Default::default()).unwrap();
+            let calibrated = calibrate(&store, unavailable);
+            let before = counts(&store);
+            let head = store.snapshot().commit;
+            let len = store.snapshot().len();
+            let probe = Rc::new(ordinary_sync_probe::Probe::default());
+            probe.skip_direct.set(true);
+            let scope = ordinary_sync_probe::install(&store, &probe);
+            insert_known_fit(&store, "fallback").unwrap();
+            drop(scope);
+            // This labeled control selects false before any helper mutation. If
+            // acquisition was unavailable it is not called; Buffered still runs.
+            assert_eq!(probe.skipped.get(), calibrated);
+            assert!(matches!(store.writer.lock().wal_direct, wal::Direct::Off));
+            let mut expected = before;
+            expected[SyncPath::Buffered as usize] += 1;
+            assert_eq!(counts(&store), expected);
+            assert_observed(&probe, SyncPath::Buffered);
+            eprintln!(
+                "direct-false caller adapter calibrated_direct={calibrated} controlled_unavailable={unavailable}: exercised={}; actual Buffered",
+                probe.skipped.get()
+            );
+            drop(store);
+            let reopened = Store::open(dir.path(), Default::default()).unwrap();
+            assert_eq!(reopened.snapshot().commit, head + 1);
+            assert_eq!(reopened.snapshot().len(), len + 1);
+        }
+    }
+
+    #[test]
+    fn ordinary_sync_excludes_noop_dry_bulk_memory_and_group_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), Default::default()).unwrap();
+        insert(&store, "warm").unwrap();
+        let before = counts(&store);
+        let probe = Rc::new(ordinary_sync_probe::Probe::default());
+        let scope = ordinary_sync_probe::install(&store, &probe);
+        assert!(!store.write().commit().unwrap().committed);
+        let mut txn = store.write_with(
+            CommitKind::Update,
+            crate::guard::WriteOptions {
+                dry_run: Some(Default::default()),
+                ..Default::default()
+            },
+        );
+        let q = txn
+            .encode_quad(
+                &Quad::new(
+                    NamedNode::new("urn:preview").unwrap(),
+                    NamedNode::new("urn:p").unwrap(),
+                    NamedNode::new("urn:o").unwrap(),
+                    GraphName::DefaultGraph,
+                ),
+                &mut Default::default(),
+            )
+            .unwrap();
+        txn.insert(q).unwrap();
+        assert!(matches!(txn.commit(), Err(Error::DryRun(_))));
+        // Actual commit_inner error before the synchronization sites.
+        store.writer.lock().poisoned = true;
+        assert!(matches!(store.write().commit(), Err(Error::Poisoned)));
+        drop(scope);
+        assert_eq!(counts(&store), before);
+        assert_eq!(probe.publications.get(), 0);
+
+        for (memory, bulk, group) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let opts = StoreOptions {
+                experimental_group_commit: group,
+                bulk_threshold: if bulk { 0 } else { 250_000 },
+                group_commit_idle_direct: false,
+                ..Default::default()
+            };
+            let store = if memory {
+                Store::in_memory(opts)
+            } else {
+                Store::open(dir.path(), opts).unwrap()
+            };
+            let probe = Rc::new(ordinary_sync_probe::Probe::default());
+            let scope = ordinary_sync_probe::install(&store, &probe);
+            if bulk {
+                let mut txn = store.write();
+                let q = txn
+                    .encode_quad(
+                        &Quad::new(
+                            NamedNode::new("urn:bulk").unwrap(),
+                            NamedNode::new("urn:p").unwrap(),
+                            NamedNode::new("urn:o").unwrap(),
+                            GraphName::DefaultGraph,
+                        ),
+                        &mut Default::default(),
+                    )
+                    .unwrap();
+                txn.insert_bulk(vec![q]).unwrap();
+                txn.commit().unwrap();
+            } else {
+                insert(&store, "other").unwrap();
+            }
+            drop(scope);
+            assert_eq!(counts(&store), [0, 0, u64::from(group)]);
+            assert_eq!(probe.publications.get(), 0);
+            assert_eq!(store.snapshot().len(), 1);
+            if !memory {
+                drop(store);
+                assert_eq!(
+                    Store::open(dir.path(), Default::default())
+                        .unwrap()
+                        .snapshot()
+                        .len(),
+                    1
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ordinary_sync_owned_file_faults_preserve_sample_and_failure_rules() {
+        use std::process::Command;
+        const CHILD: &str = "SPARKLES_SYNC_FAULT_CHILD";
+        if let Ok(case) = std::env::var(CHILD) {
+            let root = PathBuf::from(std::env::var("SPARKLES_IO_ROOT").unwrap());
+            let db = root.join("db");
+            let direct = case.starts_with("direct-write");
+            let store = Store::open(
+                &db,
+                StoreOptions {
+                    wal_direct_writes: direct,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let calibrated = calibrate(&store, case == "direct-write-unavailable");
+            let before = counts(&store);
+            let head = store.snapshot().commit;
+            let len = store.snapshot().len();
+            let probe = Rc::new(ordinary_sync_probe::Probe::default());
+            let scope = ordinary_sync_probe::install(&store, &probe);
+            let arm = PathBuf::from(std::env::var("SPARKLES_IO_ARM").unwrap());
+            std::fs::write(&arm, b"armed").unwrap();
+            let result = insert_known_fit(&store, "failed");
+            std::fs::remove_file(&arm).unwrap();
+            drop(scope);
+            let error = result.unwrap_err();
+            eprintln!("owned-file fault {case}: {error:?}");
+            assert!(
+                error.to_string().contains("Input/output error"),
+                "{error:?}"
+            );
+            let mut expected = before;
+            if case.starts_with("buffered-sync") {
+                expected[SyncPath::Buffered as usize] += 1;
+                assert_observed(&probe, SyncPath::Buffered);
+            } else {
+                assert_eq!(probe.publications.get(), 0);
+            }
+            let actual = selected_path(&store, calibrated);
+            if direct && actual == SyncPath::Direct {
+                assert!(calibrated);
+                assert!(matches!(
+                    store.writer.lock().wal_direct,
+                    wal::Direct::Open(_)
+                ));
+                eprintln!("{case}: actual Direct EIO after successful real Direct calibration");
+            } else if direct {
+                eprintln!(
+                    "{case}: direct unavailable or subsequently refused; actual Buffered pre-sync write EIO, not Direct coverage"
+                );
+            }
+            assert_eq!(counts(&store), expected);
+            eprintln!(
+                "sample counts {before:?} -> {expected:?}; publication {:?}; no acknowledgement; published head {head}",
+                probe.last.get()
+            );
+            assert_eq!(store.snapshot().commit, head);
+            assert!(matches!(insert(&store, "poisoned"), Err(Error::Poisoned)));
+            assert_eq!(counts(&store), expected);
+            drop(store);
+            let reopened = Store::open(&db, Default::default()).unwrap();
+            let present = case.starts_with("buffered-sync");
+            assert_eq!(reopened.snapshot().commit, head + u64::from(present));
+            assert_eq!(reopened.snapshot().len(), len + u64::from(present));
+            return;
+        }
+        // Each child owns its files, fault shim and process environment. The real
+        // syscall fault occurs only after the warmed store has been opened.
+        let root = tempfile::tempdir().unwrap();
+        let shim = root.path().join("libiofault.so");
+        assert!(
+            Command::new("cc")
+                .args(["-shared", "-fPIC", "-O1", "-o"])
+                .arg(&shim)
+                .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/iofault.c"))
+                .arg("-ldl")
+                .status()
+                .unwrap()
+                .success()
+        );
+        for (case, fault) in [
+            ("buffered-sync-wal", "fdatasync:wal.log:1"),
+            ("buffered-sync-vocab", "fdatasync:delta.vocab:1"),
+            ("buffered-write", "pwrite:wal.log:1"),
+            ("direct-write", "pwrite:wal.log:1"),
+            ("direct-write-unavailable", "pwrite:wal.log:1"),
+        ] {
+            let owned = root.path().join(case);
+            std::fs::create_dir(&owned).unwrap();
+            let out = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "store::ordinary_sync_tests::ordinary_sync_owned_file_faults_preserve_sample_and_failure_rules", "--nocapture"])
+                .env(CHILD, case)
+                .env("LD_PRELOAD", &shim)
+                .env("SPARKLES_IO_ROOT", &owned)
+                .env("SPARKLES_IO_ARM", owned.join("armed"))
+                .env("SPARKLES_IO_LOG", owned.join("io.log"))
+                .env("SPARKLES_IO_FAULT", fault)
+                .output().unwrap();
+            eprintln!(
+                "{case}: {}\n{}\n{}",
+                out.status,
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            if let Some(destination) = std::env::var_os("SPARKLES_SYNC_FAULT_EVIDENCE") {
+                let destination = PathBuf::from(destination);
+                std::fs::create_dir_all(&destination).unwrap();
+                std::fs::copy(
+                    owned.join("io.log"),
+                    destination.join(format!("{case}.io.log")),
+                )
+                .unwrap();
+            }
+            assert!(out.status.success(), "owned-file fault {case}");
+        }
+    }
+
+    #[test]
+    fn ordinary_sync_group_enabled_idle_fallback_remains_ordinary() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(
+            dir.path(),
+            StoreOptions {
+                experimental_group_commit: true,
+                group_commit_idle_direct: true,
+                wal_direct_writes: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let probe = Rc::new(ordinary_sync_probe::Probe::default());
+        let scope = ordinary_sync_probe::install(&store, &probe);
+        let receipt = insert(&store, "idle").unwrap();
+        drop(scope);
+        assert_eq!(counts(&store), [0, 1, 0]);
+        assert_observed(&probe, SyncPath::Buffered);
+        assert!(receipt.committed);
+        drop(store);
+        let reopened = Store::open(dir.path(), Default::default()).unwrap();
+        assert_eq!(reopened.snapshot().commit, receipt.commit.seq);
+        assert_eq!(reopened.snapshot().len(), 1);
     }
 }

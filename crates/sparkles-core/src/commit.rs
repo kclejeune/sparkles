@@ -1305,6 +1305,13 @@ pub(crate) const WAL_COMMIT_V2: u8 = 2;
 /// validation. Records written before it existed have zero there.
 pub(crate) const WAL_FLAG_UNVALIDATED: u8 = 1;
 
+/// The flag of byte 27 of a WAL commit record: the commit has an annotation (a message or
+/// a change digest) that was appended to `annotations.bin` without its own sync, because
+/// the commit belongs to a group commit and the group's fence syncs both files. Only
+/// records of such commits carry it. Replay uses it to find a commit that reached the disk
+/// without its annotation (see `annotations`). Readers that predate it ignore the bit.
+pub(crate) const WAL_FLAG_ANNOTATED: u8 = 2;
+
 /// Fill bytes 9..33 of a WAL commit record (`rec[0]` = op, `rec[1..9]` = next blank
 /// node): seq, timestamp, kind, version, flags (byte 27) and a CRC over the
 /// transaction's data records followed by bytes 0..29 of this record. Byte 28 is zero,

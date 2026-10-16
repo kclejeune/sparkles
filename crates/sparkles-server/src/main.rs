@@ -190,6 +190,10 @@ struct Cli {
     /// Experimental durable grouping of concurrent ordinary WAL commits
     #[arg(long, global = true, hide = true)]
     experimental_group_commit: bool,
+    /// With group commit on, send every commit through the group, including one that is
+    /// the only writer (which otherwise commits with write-through writes), for comparing
+    #[arg(long, global = true, hide = true)]
+    no_group_commit_idle_direct: bool,
     /// Log format on stderr: text, or json (one object per line)
     #[arg(long, global = true, value_enum, default_value_t = LogFormat::Text)]
     log_format: LogFormat,
@@ -1962,6 +1966,7 @@ fn store_opts(cli: &Cli) -> StoreOptions {
         wal_prealloc_bytes: cli.wal_prealloc_kb << 10,
         wal_direct_writes: !cli.no_wal_direct_writes,
         experimental_group_commit: cli.experimental_group_commit,
+        group_commit_idle_direct: !cli.no_group_commit_idle_direct,
         change_log: !cli.no_change_log,
         change_log_max_bytes: cli.change_log_mb << 20,
         ..Default::default()

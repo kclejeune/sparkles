@@ -1249,15 +1249,21 @@ impl Checker<'_> {
         let recs = buf.as_chunks::<WAL_REC>().0;
         // whether damage at record `i` is a torn tail that open truncates, by the rule
         // open uses
-        let torn_at = |i: usize, prev_seq: Option<u64>| {
-            crate::store::wal_torn_from(buf, i, prev_seq.map_or(0, |s| s + 1))
+        let torn_at = |i: usize, prev_seq: Option<u64>, framed_metadata: bool| {
+            crate::store::wal_torn_from(buf, i, prev_seq.map_or(0, |s| s + 1), framed_metadata)
         };
+        // the commits that have an annotation, to find a commit of a group that reached
+        // the disk without the one it asked for (see `commit::WAL_FLAG_ANNOTATED`)
+        let annotated = self
+            .dataset_id
+            .and_then(|id| crate::annotations::seqs_of(self.root, id));
         let (mut prev_seq, mut prev_ts) = (base_seq, base_ts);
         let mut commits: Vec<(u64, i64, u8)> = Vec::new();
         let (mut folded, mut data_recs) = (0usize, 0usize);
         let mut txn_start = 0usize;
         let mut good = 0usize;
         let mut seen_v2 = false;
+        let mut framed_metadata = false;
         let mut torn = false;
         // the log's version: 0 without a header record
         let mut version = 0u32;
@@ -1277,7 +1283,10 @@ impl Checker<'_> {
                 // the header record of a log written by a release with log versions
                 WAL_HEADER if i == 0 => {
                     match crate::store::wal::header_version(rec, &dir.join("wal.log")) {
-                        Ok(v) => version = v,
+                        Ok(v) => {
+                            version = v;
+                            framed_metadata = v == 1;
+                        }
                         Err(e) => {
                             run.add(Issue::error(e.to_string()).file(&file).offset(0));
                             torn = true;
@@ -1309,12 +1318,35 @@ impl Checker<'_> {
                     let n = i - txn_start;
                     let n = format!("{n} data record{}", if n == 1 { "" } else { "s" });
                     let meta = commit::open_wal_commit(rec, data);
+                    if meta.is_none() && framed_metadata {
+                        let suffix_torn = torn_at(i, prev_seq, framed_metadata);
+                        let message = if suffix_torn {
+                            format!(
+                                "the transaction ({n} from offset {}) has lost its modern commit metadata, and no later commit shows it was durable: it is treated as torn and truncated on open",
+                                txn_start * WAL_REC
+                            )
+                        } else {
+                            format!(
+                                "missing modern commit metadata in the transaction ({n} from offset {}) ending at byte {}: a later commit proves it durable, so open refuses the database",
+                                txn_start * WAL_REC,
+                                (i + 1) * WAL_REC
+                            )
+                        };
+                        let issue = if suffix_torn {
+                            Issue::warning(message)
+                        } else {
+                            Issue::error(message)
+                        };
+                        run.add(issue.file(&file).offset(at).row(i as u64));
+                        torn = true;
+                        break;
+                    }
                     let issues = std::mem::take(&mut txn_issues);
                     let missing_terms = std::mem::take(&mut txn_missing_terms);
                     // damage that no later commit record shows was durable is a torn tail
                     let torn_here = (matches!(meta, Some(Err(())))
                         || (missing_terms && matches!(meta, Some(Ok(_)))))
-                        && torn_at(i, prev_seq);
+                        && torn_at(i, prev_seq, framed_metadata);
                     if torn_here && missing_terms && matches!(meta, Some(Ok(_))) {
                         run.add(
                             Issue::warning(format!(
@@ -1327,6 +1359,31 @@ impl Checker<'_> {
                         );
                         torn = true;
                         break;
+                    }
+                    if let (Some(set), Some(Ok((seq, _, _, flags)))) = (&annotated, &meta)
+                        && flags & commit::WAL_FLAG_ANNOTATED != 0
+                        && !set.contains(seq)
+                    {
+                        if torn_at(i, prev_seq, framed_metadata) {
+                            run.add(
+                                Issue::warning(format!(
+                                    "the annotation of commit {seq} is missing from annotations.bin, and no later commit shows it was durable: it did not reach the disk before a crash, so the commit is treated as torn and truncated on open"
+                                ))
+                                .file(&file)
+                                .offset(at)
+                                .row(i as u64)
+                                .seq(*seq),
+                            );
+                            torn = true;
+                            break;
+                        }
+                        run.add(
+                            Issue::warning(format!(
+                                "the annotation of commit {seq} is missing from annotations.bin; a later commit shows it was durable, so it keeps its place without its message"
+                            ))
+                            .file("annotations.bin")
+                            .seq(*seq),
+                        );
                     }
                     // a torn transaction is truncated whole, whatever ids it names
                     if !torn_here {
@@ -1404,7 +1461,7 @@ impl Checker<'_> {
                     txn_start = i + 1;
                 }
                 op => {
-                    if !torn_at(i, prev_seq) {
+                    if !torn_at(i, prev_seq, framed_metadata) {
                         run.add(
                             Issue::error(format!(
                                 "record {i} has unknown type {op}, and a later commit record shows its transaction was durable: open refuses the database"

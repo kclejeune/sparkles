@@ -1109,7 +1109,7 @@ pub(super) fn schemas() -> Map<String, J> {
                 "prefixesRemoved": { "type": "integer" },
                 "rows": { "type": "integer", "description": "The rows read, up to a `TA` that aborted the patch." },
                 "aborted": { "type": "boolean", "description": "A `TA` row aborted the patch, and nothing was applied." },
-                "prevChecked": { "type": "boolean", "description": "The patch's `prev` header named a commit of this dataset, which was the head." },
+                "prevChecked": { "type": "boolean", "description": "An own-dataset `prev` was successfully checked against the transaction head." },
                 "timing": { "type": "object" },
             },
         }),

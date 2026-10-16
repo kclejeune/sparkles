@@ -34,7 +34,7 @@ The store follows TDB2's model of bulk loads, transactions, compaction and backu
 * CSV and TSV imports ([C05](specs/C05-tabular-imports.md)). `sparkles load`, `sparkles csv`, `POST /{ds}/upload` and the web UI's upload form map tables to triples with a default mapping (a key column or the row number names each row), with W3C CSVW metadata (datatypes and formats, null values, defaults, lists, virtual columns and RFC 6570 URI templates), or with Tarql-style CONSTRUCT templates run in batches by the SPARQL engine. Tables stream, compressed or not, and an invalid cell stops the load with its row and column ([USAGE.md](USAGE.md#loading-csv-and-tsv)).
 * Planner statistics for predicates (counts, distinct subjects and objects), classes and graphs.
 * MVCC snapshots with a single writer (MR+SW), and a WAL with crash-safe replay.
-* Durable commits. A commit is acknowledged after its WAL record and any new vocabulary entries are synchronized, with the two writes issued in parallel. The update vocabulary is written in checksummed chunks, so a torn tail is detected and trimmed at open. Opt-in group commit (`--experimental-group-commit`) shares one synchronization among concurrent writers.
+* Durable commits. A commit is acknowledged after its WAL record and any new vocabulary entries are synchronized, with the two writes issued in parallel. The update vocabulary is written in checksummed chunks, so a torn tail is detected and trimmed at open. Opt-in group commit (`--experimental-group-commit`) shares one synchronization among concurrent writers. It takes SPARQL updates, Graph Store writes, uploads, RDF Patch, commit messages and change digests, preconditions, graph-restricted writes, SHACL-guarded writes and writes during a compaction. A commit that does not qualify, such as one on a dataset with a full-text, spatial or embedding index, takes the ordinary path. A commit by the only writer, with no fence running, is synchronized as the default writer synchronizes it. ShEx-guarded datasets commit through the group path one at a time. `/$/metrics` and `/$/stats` report the synchronization time, the commits per fence, the wait, and why commits fell back or failed ([X09](specs/X09-group-commit-by-default.md)).
 * Durable commit ids. Each dataset has a UUID and a gap-free commit sequence with timestamps and net counts. Writes return receipts and `Sparkles-Commit` headers, and the commit catalog is available through `/$/commits` and `sparkles log`.
 * Commit messages and change digests. A write's `Sparkles-Commit-Message` header, or `--message` on `update` and `load`, is stored with its commit and shown in receipts, `/$/commits` and `sparkles log`. An optional SHA-256 digest chains each commit's net changes (`--commit-digests`).
 * Entity tags on Graph Store GET and HEAD, named after the commit read. `If-None-Match` answers `304`, and `If-Match` on PUT, POST and DELETE is an optimistic-concurrency check made under the writer lock (`412` on a mismatch).
@@ -266,6 +266,11 @@ that work by priority and links each item to its design spec.
   body, so a slow client holds pool memory while it sends. With a pool set, an eager
   result keeps its query's peak estimate until the result object is released.
   [Roadmap](ROADMAP.md) item 7.
+* Headerless WALs preserve legacy-record interpretation even after v2 metadata, so
+  existing mixed histories remain readable. Torn modern metadata can be byte-identical
+  to legacy metadata, and the existing rules may reconstruct it or conservatively refuse
+  the image. [Roadmap](ROADMAP.md) item 3 and
+  [X09 Phase 3](specs/X09-group-commit-by-default.md#left-for-phase-3).
 * **Inference.** Inference is forward materialization, plus Jena's RDFS on read. There
   are no other on-the-fly rules and no backward (LP) rules. Incremental maintenance does not cover rules with `noValue`,
   `now` or new blank nodes, or RDF lists that change under OWL 2 RL. Those runs, and the

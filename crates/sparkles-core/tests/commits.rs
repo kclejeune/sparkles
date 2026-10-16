@@ -821,6 +821,18 @@ fn compaction_keeps_the_head_and_bulk_writes_are_commits() {
 
 #[test]
 fn databases_from_older_versions_get_a_baseline_commit() {
+    let preserved_payload = |s: &Store| {
+        for (pattern, expected) in [("<urn:x> <urn:p> 1", 1), ("<urn:a0> <urn:p> 0", 0)] {
+            let rows = sparkles_core::sparql::query(
+                s.snapshot(),
+                &format!("SELECT * {{ {pattern} }}"),
+                &QueryOptions::default(),
+            )
+            .unwrap()
+            .len();
+            assert_eq!(rows, expected, "legacy payload {pattern}");
+        }
+    };
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("db");
     {
@@ -832,7 +844,15 @@ fn databases_from_older_versions_get_a_baseline_commit() {
     // make it look like an older version's database: legacy WAL commit records, no
     // dataset.json, commit.json or catalog
     let path = wal(&root);
+    let checked = sparkles_core::check::check(&root, &Default::default()).unwrap();
+    assert_eq!(checked.status, sparkles_core::check::Status::Ok);
     let mut w = std::fs::read(&path).unwrap();
+    assert!(w.len() >= 33);
+    assert_eq!(&w[..8], b"\x89SPKWAL\n");
+    assert_eq!(u32::from_le_bytes(w[8..12].try_into().unwrap()), 1);
+    assert!(w[12..33].iter().all(|b| *b == 0));
+    w.drain(..33);
+    assert_ne!(w[0], 0x89, "the legacy fixture is headerless");
     for rec in w.as_chunks_mut::<33>().0 {
         if rec[0] == 3 {
             rec[9..].fill(0);
@@ -843,6 +863,12 @@ fn databases_from_older_versions_get_a_baseline_commit() {
     std::fs::remove_file(root.join(cur.trim()).join("commit.json")).unwrap();
     std::fs::remove_file(root.join("dataset.json")).unwrap();
     std::fs::remove_file(root.join("commits.bin")).unwrap();
+    let checked = sparkles_core::check::check(&root, &Default::default()).unwrap();
+    assert_ne!(
+        checked.status,
+        sparkles_core::check::Status::Error,
+        "{checked:?}"
+    );
     let id;
     {
         let s = Store::open(&root, StoreOptions::default()).unwrap();
@@ -851,10 +877,12 @@ fn databases_from_older_versions_get_a_baseline_commit() {
             (h.seq, h.kind, h.inserted, h.quads),
             (0, CommitKind::Baseline, 3, 3)
         );
+        preserved_payload(&s);
         id = s.dataset_id();
         assert_eq!(upd(&s, "INSERT DATA { <urn:y> <urn:p> 1 }").commit.seq, 1);
     }
     let s = Store::open(&root, StoreOptions::default()).unwrap();
+    preserved_payload(&s);
     assert_eq!(s.dataset_id(), id);
     assert_eq!(seqs(&s), [1, 0]);
     assert_eq!(s.commit(0).unwrap().kind, CommitKind::Baseline);

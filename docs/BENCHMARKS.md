@@ -819,6 +819,60 @@ completes all 50,000 inserts with contiguous receipts and the correct final stat
 | Request p50 (ms) | 19.016–19.211 | **9.051–9.104** | 19.338–19.415 | **9.709–9.735** |
 | Request p99 (ms) | 39.972–41.342 | **15.693–15.894** | 41.066–41.200 | **16.089–16.171** |
 
+### Group commit on Namespace instances
+
+These runs are approximate screens of group commit, not the published numbers above. They
+ran on ephemeral Namespace instances (8 vCPUs, ext4, AMD EPYC) with `scripts/nsc-writes.sh`,
+which alternates the variants in one instance, the server on six CPUs and the client on two.
+The instances are shared, so ranges are wide, and a quiet run is the exception. The
+dataset is the 10.5M-triple one (1,000,000 people). The default writer is `off`. The
+group commit variant is `--experimental-group-commit`, which includes the idle fast path:
+a commit that finds no other writer waiting and no fence running synchronizes as the default
+writer does.
+
+| Serial commits, 10.5M, 8 rounds of 5,000 | Default | Group commit | Ratio |
+|---|---:|---:|---:|
+| Literal insert, p50 / p90 (ms) | 0.183 / 0.218 | 0.184 / 0.223 | 1.005 / 1.021 |
+| IRI insert, p50 / p90 (ms) | 0.177 / 0.217 | 0.178 / 0.222 | 1.003 / 1.023 |
+
+The serial literal, IRI and commit-message throughput figures from these runs are
+withdrawn. The client excluded warmups from latency samples but included them in the
+elapsed denominator used for serial transactions per second. Delete seeding was already
+untimed. The retained latency rows excluded warmups and remain provisional Namespace evidence.
+Corrected serial throughput requires new measurements.
+
+An earlier serial run on a noisier instance had group commit 6.5% above at p50 and 19% above at
+p90 for literal inserts, with a spread of 3.7× between the fastest and slowest default-writer
+runs. Without the idle fast path, group commit was 4% to 9% slower than the default writer
+in serial runs at 1.05M, which is why the path exists.
+
+The instances sync in about 0.2 ms, which hides the cost of a slow device. The runs below add
+4 ms to every synchronization and write-through write (`delay-us=4000` in
+`scripts/nsc-writes.sh`), which reproduces the default writer's 230 transactions/s on
+`forge`. Four rounds each.
+
+| 10.5M, 4 ms synchronization | Default | Group commit | Ratio |
+|---|---:|---:|---:|
+| Four writers with two readers, transactions/s | 233 | 466 | 2.0 |
+| Four writers with two readers, writer p50 (ms) | 17.1 | 8.5 | 0.50 |
+| Sixteen writers, transactions/s | 229 | 1,783 | 7.8 |
+| Four writers, commit message on every update, transactions/s | 112.8 | 429.0 | 3.8 |
+| Sixteen writers, commit message on every update, transactions/s | 112.7 | 1,636.6 | 14.5 |
+
+A commit message costs the default writer a second synchronization, for the annotation
+file. The concurrent message rows show the cost of that additional synchronization.
+Group commit synchronizes both files in one fence. In the
+sixteen-writer message run, the largest deviation of a writer's share from the mean was 0.002 for
+group commit and 0.063 for the default writer.
+
+Reader p99 at 10.5M with four writers and two readers is the open measurement. The 40%
+regression above did not reproduce on these instances. With the fast device (80,000
+changes) p99 was 5.20 ms for the default writer and 4.16 ms for group commit. With the 4 ms
+synchronization it was 0.85, 0.89 and 0.73 ms for the default writer, group commit without
+the idle path and group commit with it, and in a later run 0.91 and 1.09 ms for the default
+writer and group commit, with ranges of 0.66 to 2.56 and 0.73 to 1.87 ms. These overlap, so
+the tail needs `forge` to settle.
+
 ### Concurrent writers with snapshot readers
 
 Four writers insert 5,000 fresh quads while two readers each issue up to 25 queries per

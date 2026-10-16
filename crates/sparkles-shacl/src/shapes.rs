@@ -16,6 +16,20 @@ use sparkles_core::io::Source;
 use sparkles_core::sparql::value::Value;
 use std::fmt;
 
+/// The guard may repair invalid syntax, but cannot validate an unreadable schema.
+pub(crate) enum GraphShapesError {
+    Read(anyhow::Error),
+    Parse(anyhow::Error),
+}
+
+impl GraphShapesError {
+    fn into_error(self) -> anyhow::Error {
+        match self {
+            Self::Read(e) | Self::Parse(e) => e,
+        }
+    }
+}
+
 /// Index into the term table of a [`Shapes`].
 pub type Tid = u32;
 /// Index of a shape in [`Shapes::shapes`].
@@ -338,13 +352,26 @@ impl Shapes {
         graphs: &[String],
         extra: Option<&Graph>,
     ) -> Result<Shapes> {
+        Self::from_store_graphs_classified(snap, graphs, extra)
+            .map_err(GraphShapesError::into_error)
+    }
+
+    pub(crate) fn from_store_graphs_classified(
+        snap: &sparkles_core::store::Snapshot,
+        graphs: &[String],
+        extra: Option<&Graph>,
+    ) -> std::result::Result<Shapes, GraphShapesError> {
         let mut g = extra.cloned().unwrap_or_default();
         for iri in graphs {
-            if let Ok(part) = crate::data::read_graph(snap, Some(iri)) {
-                g.extend(part.iter());
+            if sparkles_core::validation::graph_id(snap, iri).is_none() {
+                continue;
             }
+            let part = crate::data::read_graph(snap, Some(iri)).map_err(GraphShapesError::Read)?;
+            g.extend(part.iter());
         }
-        let mut shapes = Parser::new(&g).parse(true)?;
+        let mut shapes = Parser::new(&g)
+            .parse(true)
+            .map_err(GraphShapesError::Parse)?;
         shapes.source_graph = graphs.first().cloned();
         Ok(shapes)
     }
@@ -1032,4 +1059,62 @@ pub(crate) fn compile_regex(pattern: &str, flags: Option<&str>) -> Result<regex:
     }
     b.build()
         .with_context(|| format!("invalid sh:pattern {pattern:?}"))
+}
+
+#[cfg(test)]
+mod graph_read_tests {
+    use super::*;
+    use sparkles_core::id::Id;
+    use sparkles_core::index::Perm;
+    use sparkles_core::sparql::{QueryOptions, update::update};
+    use sparkles_core::store::Store;
+
+    #[test]
+    fn a_shapes_graph_read_error_is_not_an_empty_schema() {
+        let store = Store::in_memory(Default::default());
+        update(&store, "INSERT DATA { GRAPH <urn:shapes> { <urn:Shape> a <http://www.w3.org/ns/shacl#NodeShape> } }", &QueryOptions::default()).unwrap();
+        let mut snap = (*store.snapshot()).clone();
+        let g = snap.lookup_iri("urn:shapes").unwrap();
+        let p = snap.lookup_iri(rdf::TYPE.as_str()).unwrap();
+        let o = snap.lookup_iri(sh::NODE_SHAPE.as_str()).unwrap();
+        let bad = [Id::vocab(1 << 40), p, o, g];
+        snap.delta.ins[Perm::Gspo.index()].insert(Perm::Gspo.to_key(&bad));
+        let direct = crate::data::read_graph(&snap, Some("urn:shapes")).unwrap_err();
+        assert!(
+            direct.to_string().contains("cannot decode quad"),
+            "{direct:#}"
+        );
+        let shapes = Shapes::from_store_graphs_with(&snap, &["urn:shapes".into()], None);
+        assert!(
+            shapes.is_err(),
+            "a failed read must not compile a partial shapes graph"
+        );
+    }
+
+    #[test]
+    fn an_unknown_shapes_graph_contributes_no_shapes() {
+        let store = Store::in_memory(Default::default());
+        let shapes =
+            Shapes::from_store_graphs_with(&store.snapshot(), &["urn:absent".into()], None)
+                .unwrap();
+        assert!(shapes.is_empty());
+        update(&store, "INSERT DATA { GRAPH <urn:present> { <urn:graphShape> a <http://www.w3.org/ns/shacl#NodeShape> } }", &QueryOptions::default()).unwrap();
+        let extra = Shapes::read_graph(
+            "<urn:fileShape> a <http://www.w3.org/ns/shacl#NodeShape> .",
+            ShapesSyntax::default(),
+            None,
+        )
+        .unwrap();
+        let merged = Shapes::from_store_graphs_with(
+            &store.snapshot(),
+            &["urn:absent".into(), "urn:present".into()],
+            Some(&extra),
+        )
+        .unwrap();
+        assert_eq!(
+            merged.len(),
+            2,
+            "missing graphs do not discard valid graph or file sources"
+        );
+    }
 }

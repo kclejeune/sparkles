@@ -154,6 +154,50 @@ fn p4_prev_is_a_precondition_within_the_dataset() {
 }
 
 #[test]
+fn leading_prev_dry_run_preserves_precondition_preview() {
+    for bulk_threshold in [1, u64::MAX] {
+        let opts = StoreOptions {
+            bulk_threshold,
+            ..Default::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let persistent = Store::open(&dir.path().join("db"), opts.clone()).unwrap();
+        for s in [Store::in_memory(opts), persistent] {
+            let id = s.dataset_id();
+            for expected in [0, 99] {
+                let patch = format!(
+                    "H prev <{}> .\nA <urn:preview> <urn:p> 1 .\nTC .\n",
+                    commit_iri(id, expected)
+                );
+                let e = s
+                    .apply_patch(
+                        patch.as_bytes(),
+                        &PatchOptions {
+                            write: sparkles_core::guard::WriteOptions {
+                                dry_run: Some(Default::default()),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap_err();
+                let Error::DryRun(preview) = e else {
+                    panic!("{e}")
+                };
+                assert_eq!(preview.head.seq, 0);
+                assert_eq!(
+                    preview.precondition.as_ref().unwrap().is_ok(),
+                    expected == 0
+                );
+                assert_eq!(s.head_commit().seq, 0);
+                assert!(s.snapshot().is_empty());
+                assert!(!ask(&s, "ASK { <urn:preview> ?p ?o }"));
+            }
+        }
+    }
+}
+
+#[test]
 fn p5_ta_aborts_the_whole_patch() {
     let s = mem();
     for p in [

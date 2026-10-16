@@ -622,7 +622,9 @@ impl From<Error> for ApiError {
                 StatusCode::SERVICE_UNAVAILABLE
             }
             Error::BudgetExceeded(_) => StatusCode::INSUFFICIENT_STORAGE,
-            Error::Poisoned | Error::TextUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            Error::Poisoned | Error::WriterBusy | Error::TextUnavailable(_) => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             Error::Service(_) => StatusCode::BAD_GATEWAY,
             Error::NotPermitted(_) => StatusCode::FORBIDDEN,
             Error::StorageFull(_) => StatusCode::INSUFFICIENT_STORAGE,
@@ -5085,6 +5087,31 @@ mod spool_tests {
 #[cfg(test)]
 mod tests {
     use super::{negotiate, syntax_error_body};
+
+    #[test]
+    fn writer_busy_maps_to_service_unavailable() {
+        use super::{ApiError, Error, StatusCode};
+
+        let busy = ApiError::from(Error::WriterBusy);
+        assert_eq!(busy.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            busy.1,
+            serde_json::json!({"error": "another write is in progress"})
+        );
+        for (error, expected) in [
+            (
+                Error::PreconditionFailed("changed".into()),
+                StatusCode::PRECONDITION_FAILED,
+            ),
+            (
+                Error::NotPermitted("protected".into()),
+                StatusCode::FORBIDDEN,
+            ),
+            (Error::Poisoned, StatusCode::SERVICE_UNAVAILABLE),
+        ] {
+            assert_eq!(ApiError::from(error).0, expected);
+        }
+    }
 
     #[test]
     fn syntax_errors() {

@@ -1089,6 +1089,8 @@ struct DsGauges {
     rcache_misses: u64,
     /// published rebuilds per [`RebuildReason::ALL`]
     rebuilds: [RebuildHistogram; 2],
+    /// the commit path's synchronization, group and fallback counters
+    commit: sparkles::store::CommitMetrics,
 }
 
 fn gauges(st: &AppState) -> BTreeMap<String, DsGauges> {
@@ -1141,6 +1143,7 @@ fn gauges(st: &AppState) -> BTreeMap<String, DsGauges> {
         g.rcache_entries += ru.entries;
         g.rcache_hits += r.hits();
         g.rcache_misses += r.misses();
+        g.commit.merge(&d.store.commit_metrics());
         for (h, reason) in g.rebuilds.iter_mut().zip(RebuildReason::ALL) {
             let d = d.store.rebuilds(reason);
             for (a, b) in h.buckets.iter_mut().zip(d.buckets) {
@@ -1150,6 +1153,116 @@ fn gauges(st: &AppState) -> BTreeMap<String, DsGauges> {
         }
     }
     out
+}
+
+/// The commit path's histograms and counters (spec X09 section 8).
+fn render_commit_metrics(o: &mut String, gauges: &BTreeMap<String, DsGauges>) {
+    use sparkles::store::{Fallback, SIZE_BUCKETS, SYNC_BUCKETS, SyncPath};
+    let family = |o: &mut String, name: &str, kind: &str, help: &str| {
+        let _ = writeln!(o, "# HELP {name} {help}");
+        let _ = writeln!(o, "# TYPE {name} {kind}");
+    };
+    fn histogram(
+        o: &mut String,
+        name: &str,
+        labels: &str,
+        bounds: &[f64],
+        h: &sparkles::store::HistogramSnapshot,
+    ) {
+        let mut acc = 0;
+        for (i, n) in h.buckets.iter().enumerate() {
+            acc += n;
+            let le = bounds.get(i).map_or("+Inf".to_string(), |b| b.to_string());
+            let _ = writeln!(o, "{name}_bucket{{{labels},le=\"{le}\"}} {acc}");
+        }
+        let _ = writeln!(o, "{name}_sum{{{labels}}} {}", h.sum);
+        let _ = writeln!(o, "{name}_count{{{labels}}} {acc}");
+    }
+    family(
+        o,
+        "sparkles_commit_sync_seconds",
+        "histogram",
+        "Time of each commit synchronization in seconds, by path: direct (write-through), buffered (fdatasync of one commit) or group (one fdatasync for the commits of a fence).",
+    );
+    for (ds, g) in gauges {
+        let ds = escape_label(ds);
+        for (h, path) in g.commit.sync.iter().zip(SyncPath::ALL) {
+            if h.count() > 0 {
+                let labels = format!("dataset=\"{ds}\",path=\"{}\"", path.as_str());
+                histogram(o, "sparkles_commit_sync_seconds", &labels, &SYNC_BUCKETS, h);
+            }
+        }
+    }
+    family(
+        o,
+        "sparkles_group_commit_size",
+        "histogram",
+        "Commits per group commit fence.",
+    );
+    for (ds, g) in gauges {
+        if g.commit.size.count() > 0 {
+            let labels = format!("dataset=\"{}\"", escape_label(ds));
+            histogram(
+                o,
+                "sparkles_group_commit_size",
+                &labels,
+                &SIZE_BUCKETS,
+                &g.commit.size,
+            );
+        }
+    }
+    family(
+        o,
+        "sparkles_group_commit_wait_seconds",
+        "histogram",
+        "Time from a grouped commit joining the queue to its acknowledgement, in seconds.",
+    );
+    for (ds, g) in gauges {
+        if g.commit.wait.count() > 0 {
+            let labels = format!("dataset=\"{}\"", escape_label(ds));
+            histogram(
+                o,
+                "sparkles_group_commit_wait_seconds",
+                &labels,
+                &SYNC_BUCKETS,
+                &g.commit.wait,
+            );
+        }
+    }
+    family(
+        o,
+        "sparkles_group_commit_fallbacks_total",
+        "counter",
+        "Commits of a dataset with group commit on that took the ordinary path, by the first condition that kept them out of a group.",
+    );
+    for (ds, g) in gauges {
+        let ds = escape_label(ds);
+        for (n, why) in g.commit.fallbacks.iter().zip(Fallback::ALL) {
+            if *n > 0 {
+                let _ = writeln!(
+                    o,
+                    "sparkles_group_commit_fallbacks_total{{dataset=\"{ds}\",reason=\"{}\"}} {n}",
+                    why.as_str()
+                );
+            }
+        }
+    }
+    family(
+        o,
+        "sparkles_group_commit_failures_total",
+        "counter",
+        "Group commit fences whose synchronization failed.",
+    );
+    for (ds, g) in gauges {
+        if g.commit.group_commit {
+            let _ = writeln!(
+                o,
+                "sparkles_group_commit_failures_total{{dataset=\"{}\"}} {}",
+                escape_label(ds),
+                g.commit.failures
+            );
+        }
+    }
 }
 
 /// Resident set size of this process (Linux: `VmRSS` of `/proc/self/status`).
@@ -1718,6 +1831,7 @@ pub fn render_prometheus(st: &AppState) -> String {
             );
         }
     }
+    render_commit_metrics(&mut o, &gauges);
     family(
         &mut o,
         "sparkles_result_cache_entries",
@@ -1826,6 +1940,17 @@ pub fn metrics_json(st: &AppState) -> J {
                 "deltaInserts": g.delta_inserts,
                 "deltaDeletes": g.delta_deletes,
                 "walBytes": g.wal_bytes,
+                "groupCommit": g.commit.group_commit,
+                "commits": {
+                    "fences": g.commit.size.count(),
+                    "failures": g.commit.failures,
+                    "fallbacks": sparkles::store::Fallback::ALL
+                        .iter()
+                        .zip(g.commit.fallbacks)
+                        .filter(|(_, n)| *n > 0)
+                        .map(|(why, n)| (why.as_str().to_string(), J::from(n)))
+                        .collect::<serde_json::Map<_, _>>(),
+                },
                 "diskBytes": g.disk_bytes,
                 "quotaBytes": g.quota_bytes,
                 "resultRows": counters.get(&ds).map_or(J::from(0), |c| c["resultRows"].clone()),

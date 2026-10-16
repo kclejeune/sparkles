@@ -6024,6 +6024,16 @@ export interface components {
                 budgetExceeded: {
                     [key: string]: number;
                 } | null;
+                commits: {
+                    /** @description Fences whose synchronization failed. */
+                    failures: number;
+                    /** @description Commits that took the ordinary path, by the first condition that kept them out of a group. */
+                    fallbacks: {
+                        [key: string]: number;
+                    };
+                    /** @description Group commit fences that synchronized successfully since the dataset was opened. Failed fences are counted in failures. */
+                    fences: number;
+                };
                 deltaDeletes: number;
                 deltaInserts: number;
                 diskBytes: number;
@@ -6040,6 +6050,8 @@ export interface components {
                         tail: number;
                     };
                 } | null;
+                /** @description Whether concurrent commits of this persistent dataset share one synchronization. */
+                groupCommit: boolean;
                 name: string;
                 quads: number;
                 /** @description 0 means unlimited. */
@@ -6377,7 +6389,7 @@ export interface components {
             inserted?: number;
             prefixesRemoved?: number;
             prefixesSet?: number;
-            /** @description The patch's `prev` header named a commit of this dataset, which was the head. */
+            /** @description An own-dataset `prev` was successfully checked against the transaction head. */
             prevChecked?: boolean;
             /** @description The rows read, up to a `TA` that aborted the patch. */
             rows?: number;

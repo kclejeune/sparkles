@@ -67,8 +67,10 @@ pub enum Error {
     /// did not hold; nothing was written.
     #[error("{0}")]
     PreconditionFailed(String),
-    /// A write asked not to wait ([`WriteOptions::no_wait`](crate::guard::WriteOptions))
-    /// found the writer lock taken; nothing was written.
+    /// A write that asked not to wait ([`WriteOptions::no_wait`](crate::guard::WriteOptions))
+    /// would have had to wait. Another write held the writer lock, or with group commit a
+    /// fence was running, commits were queued, or the write's own commit would have
+    /// waited for a fence. Nothing was written, and the write can be retried.
     #[error("another write is in progress")]
     WriterBusy,
     /// A dry run ([`WriteOptions::dry_run`](crate::guard::WriteOptions)) stopped where

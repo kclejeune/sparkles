@@ -26,3 +26,5 @@ tempfile.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# the hooks that pause a group commit's fence
+sparkles-core = { workspace = true, features = ["failpoints"] }

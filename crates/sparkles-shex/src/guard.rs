@@ -1170,7 +1170,7 @@ impl CommitGuard for ShexGuard {
         }
     }
 
-    fn bypassed(&self) {
+    fn bypassed(&self, _seq: u64) {
         self.counters.count(GuardStatus::Bypassed);
         if let Some(b) = self.baseline.lock().as_mut() {
             b.conforms = None;

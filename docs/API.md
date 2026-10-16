@@ -210,6 +210,11 @@ validators (`sparkles_shacl`, `sparkles_shex`).
 | `sparkles_validation_fallbacks_total` | counter. Validated writes that ran a full validation, or validated some shapes in full. | `dataset`, `language`, `reason` = `baseline` \| `shapes` \| `subclass` \| `sparql` \| `recursive` \| `bulk` \| `budget` |
 | `sparkles_rebuilds_total` | counter. New generations published since the dataset was opened. `compact` counts the compactions that published, and `bulk` the bulk commits, such as a large load, that wrote the data into a new generation. | `dataset`, `reason` = `compact` \| `bulk` |
 | `sparkles_rebuild_duration_seconds` | histogram (0.1 s … 3600 s). The duration of those rebuilds. A reason has series once it has a rebuild. | `dataset`, `reason` |
+| `sparkles_commit_sync_seconds` | histogram (0.1 ms … 5 s). The time of each commit synchronization. `direct` is a write-through write of the WAL records, `buffered` an `fdatasync` for one commit, and `group` the one `fdatasync` for the commits of a group commit fence. A path has series once it has a commit. | `dataset`, `path` = `direct` \| `buffered` \| `group` |
+| `sparkles_group_commit_size` | histogram (1 … 64 commits, ×2). The commits in each group commit fence that synchronized successfully. | `dataset` |
+| `sparkles_group_commit_wait_seconds` | histogram (0.1 ms … 5 s). The time from a grouped commit joining the queue to its acknowledgement. | `dataset` |
+| `sparkles_group_commit_fallbacks_total` | counter. Commits of a dataset with group commit on that took the ordinary path, by the first condition that kept them out of a group. A reason has series once it has a commit. | `dataset`, `reason` = `poisoned` \| `kind` \| `text` \| `geo` \| `embed` \| `bulk` \| `size` \| `noop` |
+| `sparkles_group_commit_failures_total` | counter. Group commit fences whose synchronization failed. Each one poisons the dataset's writer. | `dataset` |
 | `sparkles_compactions_total` | counter. Compactions since the server started. | `dataset`, `mode` = `auto` \| `manual`, `outcome` = `done` \| `abandoned` \| `cancelled` \| `failed` |
 | `sparkles_compaction_seconds`, `sparkles_compaction_lock_seconds` | summary (`_sum`, `_count`). The duration of the compactions that published a generation, and how long their switch held the writer lock. | `dataset` |
 | `sparkles_compaction_lock_seconds_max` | gauge. The longest switch since the server started. | `dataset` |
@@ -324,6 +329,8 @@ type MetricsSnapshot = {
   datasets: {
     name: string; quads: number; deltaInserts: number; deltaDeletes: number;
     walBytes: number; diskBytes: number; quotaBytes: number /* 0: unlimited */; resultRows: number;
+    groupCommit: boolean;                  // concurrent commits share one synchronization
+    commits: { fences: number; failures: number; fallbacks: Record<string, number> }; // group commit counters, fences counts successful fences
     budgetExceeded: Record<BudgetKind, number> | null;
     rateLimited: Record<"auth" | "query" | "update" | "admin" | "preauth", number> | null;
     blockCache: { bytes: number; capacityBytes: number; entries: number; hits: number; misses: number };
@@ -2240,6 +2247,16 @@ The default graph and the whole dataset always exist, and a named graph exists w
 holds a triple. A `PUT` with `If-None-Match: *` therefore creates a named graph only if it
 is absent. A missing graph is still a `404` on `GET`, whatever the conditions say.
 
+With group commit, a precondition or permission refusal based on the dataset's state
+waits for earlier writes to become durable. The core `WriteOptions::no_wait` option
+never waits. It returns `WriterBusy` when another write holds the writer lock, when a
+group commit fence is running or commits are queued, when the write's own commit would be
+grouped, and when a refusal would need to wait. After a failed fence it returns
+`Poisoned`, because the dataset accepts no write until it is reopened. The HTTP error
+conversion maps an escaping `WriterBusy` to `503`. There is no HTTP header for this option.
+Ordinary HTTP writes leave it disabled. The server's internal inline attempt enables
+it, consumes `WriterBusy` and retries through the blocking path.
+
 RFC 9110 asks `If-Match` to use the strong comparison, under which a weak tag never
 matches. Sparkles compares the commit a tag names instead. Its tags identify the data
 exactly, even though they cannot promise identical bytes, and that is what a concurrency
@@ -2412,7 +2429,12 @@ graphs it writes, and gets `403` for a row in another graph and for any `PA` or 
 row.
 
 The default answer is `200` with JSON. `inserted` and `deleted` count the rows that took
-effect, and `rows` counts the rows read.
+effect, and `rows` counts the rows read. `prevChecked` means an own-dataset `prev` was
+successfully checked against the transaction head. An aborted dry run skips its leading
+check and reports `false`, while a successful late comparison reports `true`. After
+normal writer admission, a plain abort reports the published head and its matching
+message without adding a wait for an independent pending write. An abort that
+successfully checked a pending head waits for its fence and propagates a failure.
 
 ```json
 { "committed": true, "inserted": 2, "deleted": 1, "prefixesSet": 0, "prefixesRemoved": 0,
