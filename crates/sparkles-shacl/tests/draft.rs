@@ -472,3 +472,31 @@ fn references_need_full_support() {
             .all(|p| p.constraints.iter().all(|c| c.component != "node"))
     );
 }
+
+/// A `p` value that a drafted class describes is left out of the `p/q` profile, yet a
+/// drafted `p/q` shape would reach it, so the source data would fail the support-1 draft.
+#[test]
+fn sequence_paths_skip_partly_typed_intermediate_nodes() {
+    let mut data = String::from("@prefix ex: <http://ex.org/> .\n");
+    for i in 0..3 {
+        data.push_str(&format!(
+            "ex:x{i} a ex:X ; ex:p [ ex:q \"a{i}\" ] , [ a ex:Y ; ex:q \"b{i}\" ] .\n"
+        ));
+    }
+    let s = store(&data);
+    let d = draft(&s, 1.0, false, &[]);
+    let r = check(&s, &d);
+    assert!(r.conforms, "{}\n{r}", d.shacl);
+    let x = d
+        .shapes
+        .iter()
+        .find(|s| s.class == format!("{EX}X"))
+        .expect("a shape for ex:X");
+    assert!(
+        x.properties
+            .iter()
+            .all(|p| p.then.as_deref() != Some("http://ex.org/q")),
+        "{}",
+        d.shacl
+    );
+}

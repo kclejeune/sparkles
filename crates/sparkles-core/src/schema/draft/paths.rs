@@ -4,7 +4,9 @@
 //! class over one predicate, counted in the pass over `POS[p]`. A sequence `p/q` describes
 //! the values of `q` at the blank nodes `p` leads to, for the blank nodes that no drafted
 //! class describes (an address node, say), found by one more pass over the predicates
-//! after the direct profiles.
+//! after the direct profiles. A predicate that also leads to a blank node some drafted
+//! class describes has no sequences, since the drafted shape would reach that node too and
+//! the profile leaves it out.
 
 use super::{
     Acc, Budget, Ctx, DraftOptions, GraphFilter, InlineDts, Iris, K_BLANK, K_IRI, K_TRIPLE, Names,
@@ -13,7 +15,7 @@ use super::{
 };
 use crate::id::{Id, Tag};
 use crate::index::Perm;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 /// Blank nodes tracked for sequence paths; past it there are none.
 const MAX_SEQUENCE_NODES: usize = 1_000_000;
@@ -133,6 +135,9 @@ pub(super) struct Sequences {
     preds: Vec<u64>,
     /// blank node → (predicate number, instance) for each instance it is a value of
     by_node: FxHashMap<u64, Vec<(u32, u64)>>,
+    /// predicates with a blank node value that a drafted class describes: a sequence
+    /// `p/q` would reach that node too, and the profile does not cover it
+    mixed: FxHashSet<u32>,
     entries: usize,
     full: bool,
 }
@@ -150,7 +155,12 @@ impl Sequences {
             if self.full {
                 return;
             }
-            if Id(o).tag() == Tag::BNode && !types.set_of(o).iter().any(|c| drafted[*c as usize]) {
+            if Id(o).tag() != Tag::BNode {
+                continue;
+            }
+            if types.set_of(o).iter().any(|c| drafted[*c as usize]) {
+                self.mixed.insert(pred);
+            } else {
                 if self.entries >= MAX_SEQUENCE_NODES {
                     self.full = true;
                     self.by_node.clear();
@@ -203,6 +213,9 @@ pub(super) fn sequence_props(
                 prev = Some((k[1], k[2]));
                 if let Some(owners) = seq.by_node.get(&k[1]) {
                     for &owner in owners {
+                        if seq.mixed.contains(&owner.0) {
+                            continue;
+                        }
                         hits.entry(owner).or_default().push(k[2]);
                     }
                 }

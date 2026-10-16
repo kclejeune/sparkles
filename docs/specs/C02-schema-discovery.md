@@ -1207,7 +1207,9 @@ where this section says otherwise. `DRAFT_FORMAT` is now 2, because property sha
 * *Sequence paths.* One extra pass over the predicates profiles the values of `q` at the
   blank nodes that no drafted class describes, reached from instances over `p`. The
   sequence `p/q` is drafted for a class when its direct property `p` has the node kind
-  `sh:BlankNode` and no class. It goes one level deep. ShExC has no sequence paths, so
+  `sh:BlankNode` and no class, and no value of `p` anywhere is a blank node that a
+  drafted class describes. Without that condition the shape would reach nodes the profile
+  left out, and the source data could fail its own draft. It goes one level deep. ShExC has no sequence paths, so
   the schema lists them in a comment.
 * *Class references.* `sh:node` is drafted beside `sh:class` when the draft has a shape
   for that class, and ShExC writes `@<shape>` in place of the class test. It is drafted
