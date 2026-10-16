@@ -4880,3 +4880,41 @@ in `recall` and the brief.
   checked against a mock provider that records what it received; an import with an
   allow-listed test key left in place; `secretPatterns` from an existing `memory.json`
   read as `redaction.patterns`.
+
+### Shared memory workflows
+
+[Roadmap](../ROADMAP.md) item 81 is deferred and has no active implementation lane.
+[C17](C17-agent-memory.md#shared-memory-representation) owns the shared representation
+for agent memory and personal knowledge. This follow-up defines how ingestion, recall,
+review and maintenance will use that profile. It does not change the shipped phases or
+adopt new predicates now.
+
+Ingestion must map human notes, documents and agent episodes to the same entity
+identities and declared vocabulary, while preserving each source, rendition, supporting
+span and assertion. Notes, decisions and tasks need explicit links to their evidence
+and their dependencies. An imported instruction remains identifiable as an instruction
+and does not become executable policy through ordinary recall. Existing graph grants,
+redaction, review and supersession apply throughout.
+
+Recall and the memory brief must be able to distinguish current reviewed knowledge,
+unreviewed observations, hypotheses, preferences and instructions under the chosen
+profile. They must expose conflicting evidence and uncertainty rather than treating
+consolidation, a summary or review as proof. When a source changes, maintenance must
+identify affected conclusions and decisions for review, retain independent surviving
+support and explain the dependency path. Source correction, changed valid time and
+expiry need separate examples from retraction or deletion.
+
+Acceptance will use a small realistic project and personal knowledge dataset containing
+documents, notes, sessions, entities, decisions and tasks. It must demonstrate cited
+recall, a decision traced to its evidence, conflicting sources, temporal questions and
+a revised document that marks the appropriate dependents for review. It must also
+preserve unrelated facts and prove that a retrieved instruction is treated as data.
+Fixtures and deterministic queries come first, followed by an end-to-end evaluation
+with reported accuracy and retrieval failures before claiming practical effectiveness.
+This evaluation is separate from item 6's Ask model matrix and item 15's input formats.
+
+The shared profile can be used before the incremental core of
+[F13](F13-incremental-views-and-provenance.md). Automatic exact derivation maintenance
+remains in F13 and explanations in [F18](F18-explanations-and-entailment-diffs.md).
+Community reports from [C22](C22-graph-rag-community-summaries.md) will cite the same
+assertions and evidence, while retaining their own generated and reviewed status.
