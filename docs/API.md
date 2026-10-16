@@ -440,7 +440,7 @@ each request class per client:
 | Class | Requests |
 |-------|----------|
 | `auth` | Every path under `/$/auth/`, matched or not: login, token minting, device flow and the OIDC callback. |
-| `query` | `/{ds}/sparql`, `/{ds}/query`, `/{ds}/queries/{name}`, `/{ds}/explain`, `/{ds}/shacl`, `/{ds}/shex`, `/{ds}/diff`, `/{ds}/graphql` and `/{ds}/graphql/schema`, Graph Store `GET`/`HEAD` and reads of `/{ds}/patch`, `/{ds}` with `query=` or a GET, `/$/schema/*`, `/$/stats/*`, `/$/validate/*`, `/$/reason/{ds}/diagnostics`, `/$/graphql/{ds}/draft`, `/$/format`, `/$/lint`, and MCP tool calls and resource reads at `/$/mcp` |
+| `query` | `/{ds}/sparql`, `/{ds}/query`, `/{ds}/queries/{name}`, `/{ds}/explain`, `/{ds}/shacl`, `/{ds}/shex`, `/{ds}/diff`, `/{ds}/graphql` and `/{ds}/graphql/schema`, Graph Store `GET`/`HEAD` and reads of `/{ds}/patch`, `/{ds}` with `query=` or a GET, `/$/schema/*`, `/$/stats/*`, `/$/validate/*`, `/$/reason/{ds}/diagnostics`, `/$/graphql/{ds}/draft`, `/$/commits/{ds}/timeline`, `/$/format`, `/$/lint`, and MCP tool calls and resource reads at `/$/mcp` |
 | `update` | `/{ds}/update`, `/{ds}/upload`, `POST` and `PATCH /{ds}/patch`, Graph Store `PUT`/`POST`/`DELETE`, `/{ds}` with `update=` or any other write, and the MCP tools that write (`sparql_update`, `assert_facts`, `create_branch`, `merge_branch` and `delete_branch`). A form POST to `/{ds}` counts as an update. |
 | `admin` | `/$/…` requests other than `GET`, `HEAD` and `OPTIONS` that are not in the `query` class. These cover dataset management, compaction, backups, reasoning, caches and full-text. |
 | `preauth` | Every request, before authentication. Counts failed credential checks per client address and per IPv6 /48. Has no per-dataset form. |
@@ -2781,7 +2781,7 @@ digest chains from 32 zero bytes. The exact input is defined in
 
 `GET /$/commits/{ds}/timeline` cuts the commits of a branch into runs of consecutive
 numbers, so that a client can draw a history of any length. It reads the commit catalog
-once and needs read permission. `branch=` names the branch, as for the other commit
+once, needs read permission and counts against the `query` rate-limit class. `branch=` names the branch, as for the other commit
 routes. `from` and `to` are commit numbers that limit the range, and by default it covers
 the first retained commit to the head. `buckets` is the most buckets, 200 by default and
 at most 2,000. Every bucket spans `bucketWidth` commit numbers, which is the width of the

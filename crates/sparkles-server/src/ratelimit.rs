@@ -129,6 +129,7 @@ pub fn classify(
             || admin.starts_with("stats/")
             || admin == "reason/{ds}/diagnostics"
             || admin == "graphql/{ds}/draft"
+            || admin == "commits/{ds}/timeline"
         {
             return Some(Class::Query);
         }

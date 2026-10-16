@@ -1150,3 +1150,36 @@ async fn a_query_diff_counts_twice_against_the_query_class() {
     assert_eq!(call("/ds/sparql/diff").await, StatusCode::OK);
     assert_eq!(call("/ds/sparql").await, StatusCode::TOO_MANY_REQUESTS);
 }
+
+#[tokio::test]
+async fn the_timeline_is_query_work() {
+    assert_eq!(
+        classify(
+            Some("/$/commits/{ds}/timeline"),
+            &Method::GET,
+            &"/$/commits/ds/timeline".parse().unwrap(),
+            &HeaderMap::new()
+        ),
+        Some(Class::Query)
+    );
+    let (rl, _) = limiter(&["query=1/min,burst=1"]);
+    let app = Router::new()
+        .route(
+            "/$/commits/{ds}/timeline",
+            axum::routing::get(|| async { "ok" }),
+        )
+        .layer(axum::middleware::from_fn_with_state(rl, limit));
+    let call = || {
+        let app = app.clone();
+        async move {
+            let mut req = HttpRequest::get("/$/commits/ds/timeline")
+                .body(Body::empty())
+                .unwrap();
+            let addr: SocketAddr = "192.0.2.1:1".parse().unwrap();
+            req.extensions_mut().insert(ConnectInfo(addr));
+            app.oneshot(req).await.unwrap().status()
+        }
+    };
+    assert_eq!(call().await, StatusCode::OK);
+    assert_eq!(call().await, StatusCode::TOO_MANY_REQUESTS);
+}
