@@ -6751,6 +6751,8 @@ export interface components {
             rerun?: boolean;
             /** @description The rules of the `rules` profile, in Jena's rule syntax. */
             rules?: string;
+            /** @description Threads the run evaluates rules on, at most those of the server's reasoning pool. */
+            threads?: number;
             /**
              * @description Built-in vocabularies added to the profile.
              * @example [
@@ -6802,6 +6804,7 @@ export interface components {
              */
             profile: string;
             run?: {
+                baseScans?: number;
                 changes?: {
                     checked?: number;
                     derived?: number;
@@ -6816,6 +6819,8 @@ export interface components {
                 inferredRemoved: number;
                 /** @enum {string} */
                 method: "full" | "incremental";
+                peakBytes?: number;
+                threads?: number;
             };
             stale: boolean | null;
             staleReason?: string;

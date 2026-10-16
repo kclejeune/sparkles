@@ -149,8 +149,13 @@ fn reasoning_threads() -> usize {
 fn f16_reduced_requests_share_capacity() {
     within(Duration::from_secs(120), "the pool runs", || {
         let pool = thread_pool(8).unwrap();
-        // the pool's own threads start with it
+        // the pool's own threads start with it, but appear in /proc a little later
+        let t0 = Instant::now();
+        while reasoning_threads() < 8 && t0.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         let base = reasoning_threads();
+        assert_eq!(base, 8, "the pool's threads");
         let stores: Vec<Arc<Store>> = (0..5).map(|_| Arc::new(store(100))).collect();
         let done = Arc::new(AtomicBool::new(false));
         let peak = Arc::new(AtomicUsize::new(0));
