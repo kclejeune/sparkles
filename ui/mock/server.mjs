@@ -12,6 +12,17 @@ import { performance } from 'node:perf_hooks';
 import ox from 'oxigraph';
 import { handleBackups } from './backups.mjs';
 import {
+  decorate,
+  handleHistoryChanges,
+  handleSnapshots,
+  handleSparqlDiff,
+  pastView,
+  readableFields,
+  recordState,
+  resolveAt,
+  timeline,
+} from './history.mjs';
+import {
   allCommits,
   chooseBranch,
   createBranch,
@@ -110,7 +121,10 @@ function addCommit(ds, kind, inserted, deleted, opts = {}) {
     branch: ds.branchName,
     branchId: ds.branchId,
   };
+  if (opts.message) c.message = opts.message;
   ds.commits.push(c);
+  // the seeded history of the demo datasets has no states, so that its commits answer 410
+  if (opts.state !== false) recordState(ds, c);
   return c;
 }
 
@@ -156,14 +170,15 @@ function seedHistory(ds) {
   let quads = size - net;
   ds.commits = [];
   const start = now - 12 * 86400_000;
-  addCommit(ds, 'create', 0, 0, { at: start, quads: 0 });
-  addCommit(ds, 'load', quads, 0, { at: start + 60_000, quads, bulk: true });
+  addCommit(ds, 'create', 0, 0, { at: start, quads: 0, state: false });
+  addCommit(ds, 'load', quads, 0, { at: start + 60_000, quads, bulk: true, state: false });
   updates.forEach((u, i) => {
     quads += u.inserted - u.deleted;
     const kind = i === 20 ? 'gsp-put' : i === 33 ? 'upload' : 'update';
     const at = start + 3600_000 + ((now - 3600_000 - start) * i) / updates.length;
     addCommit(ds, kind, u.inserted, u.deleted, {
       at,
+      state: false,
       quads,
       bulk: kind === 'upload',
       exact: !(kind === 'upload' && u.deleted > 0),
@@ -241,7 +256,7 @@ function send(res, status, body, type = 'application/json', headers = {}) {
     'Content-Type': type,
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Expose-Headers':
-      'X-Request-Id, Sparkles-Commit, Sparkles-Dataset-Id, Sparkles-Branch, Sparkles-Branch-Id',
+      'X-Request-Id, Sparkles-Commit, Sparkles-Dataset-Id, Sparkles-Branch, Sparkles-Branch-Id, Sparkles-At, Sparkles-Head, Memento-Datetime',
     'X-Request-Id': res.requestId ?? '',
     ...headers,
   });
@@ -1183,6 +1198,16 @@ function pickFormat(accept, candidates) {
 async function handleQuery(req, res, ds, p) {
   const query = p.get('query');
   if (!query) return fail(res, 400, 'Missing query parameter');
+  // a past state (`at=`): the same query over the store of that commit
+  let readSeq = headCommit(ds).seq;
+  let atHeaders = {};
+  if (p.has('at')) {
+    const at = resolveAt(ds, p.get('at'));
+    if (at.error) return send(res, ...at.error);
+    readSeq = at.seq;
+    atHeaders = at.headers;
+    if (at.store) ds = pastView(ds, at.store);
+  }
   if (handleSearchQuery(req, res, ds, p, query)) return;
   const near = geoQuery(ds, query, Number(p.get('send') ?? Infinity), headCommit(ds).seq);
   if (near) return send(res, 200, near, 'application/x-sparkles+json', commitHeaders(ds));
@@ -1287,12 +1312,12 @@ async function handleQuery(req, res, ds, p) {
           totalMs: +(parseMs + planMs + execMs + serializeMs).toFixed(3),
         },
         plan: plan(query, total, execMs, true),
-        commit: headCommit(ds).seq,
+        commit: readSeq,
         datasetId: ds.id,
       },
     },
     'application/x-sparkles+json',
-    commitHeaders(ds),
+    { ...commitHeaders(ds, readSeq), ...atHeaders },
   );
 }
 
@@ -1349,7 +1374,9 @@ function handleUpdate(req, res, ds, p) {
   } catch (e) {
     return send(res, 400, parseErr(e));
   }
-  const receipt = commitWrite(ds, 'update', before);
+  const receipt = commitWrite(ds, 'update', before, {
+    message: req.headers['sparkles-commit-message'] || undefined,
+  });
   ds.deltaInserts += receipt.committed ? receipt.commit.inserted : 0;
   ds.deltaDeletes += receipt.committed ? receipt.commit.deleted : 0;
   ds.cache = { entries: 0, bytes: 0, hits: ds.cache.hits, misses: ds.cache.misses };
@@ -1662,6 +1689,56 @@ function expand(pn) {
 }
 
 const builtin = (iri) => Object.values(NS).some((ns) => iri.startsWith(ns));
+
+/**
+ * `/$/schema/{ds}/profiles`: for each class asked for, its instance count and the predicates
+ * its instances use, over the default graph of `ds` (a store at a past commit for `at=`).
+ * The kinds of value are left out.
+ */
+function classProfiles(ds, p) {
+  const all = ds.store
+    .match(null, null, null, null)
+    .filter((q) => q.graph.termType === 'DefaultGraph');
+  const typed = new Map();
+  for (const q of all) {
+    if (q.predicate.value !== RDF_TYPE_IRI || q.object.termType !== 'NamedNode') continue;
+    const set = typed.get(q.object.value) ?? new Set();
+    set.add(String(q.subject));
+    typed.set(q.object.value, set);
+  }
+  const wanted = p.getAll('class');
+  const profile = (iri) => {
+    const members = typed.get(iri) ?? new Set();
+    const used = new Map();
+    for (const q of all) {
+      if (q.predicate.value === RDF_TYPE_IRI || !members.has(String(q.subject))) continue;
+      const e = used.get(q.predicate.value) ?? new Map();
+      e.set(String(q.subject), (e.get(String(q.subject)) ?? 0) + 1);
+      used.set(q.predicate.value, e);
+    }
+    return {
+      class: iri,
+      builtin: false,
+      instances: members.size,
+      properties: [...used].map(([predicate, per]) => ({
+        predicate,
+        instances: per.size,
+        triples: [...per.values()].reduce((a, b) => a + b, 0),
+        minPerInstance: Math.min(...per.values()),
+        maxPerInstance: Math.max(...per.values()),
+        objects: {},
+        objectClasses: [],
+      })),
+      incoming: [],
+    };
+  };
+  return {
+    profileFormat: 1,
+    snapshot: { commit: headCommit(ds)?.seq ?? 0 },
+    selection: { graph: p.get('graph') || 'default', reasoning: false },
+    classes: (wanted.length ? wanted : [...typed.keys()]).map(profile),
+  };
+}
 
 /** The schema report of a dataset (all items; the router paginates). */
 function schemaReport(ds, p) {
@@ -1998,9 +2075,25 @@ function schemaPage(items, limit, cursor) {
 // ---------------------------------------------------------------------------
 // router
 
+/** Requests whose client went away before the answer was written (`GET /$/mock/aborted`). */
+const abortedRequests = [];
+
 const server = http.createServer(async (req, res) => {
   if (LATENCY) await new Promise((r) => setTimeout(r, LATENCY));
   const url = new URL(req.url ?? '/', 'http://localhost');
+  // test hooks: `mockDelay=MS` holds the answer, and the aborted requests are listed
+  res.on('close', () => {
+    if (!res.writableFinished) abortedRequests.push(`${req.method} ${req.url}`);
+  });
+  if (url.pathname === '/$/mock/aborted') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify(abortedRequests));
+  }
+  const hold = Number(url.searchParams.get('mockDelay'));
+  if (hold > 0) {
+    await new Promise((r) => setTimeout(r, Math.min(hold, 10_000)));
+    if (res.destroyed) return;
+  }
   let path = decodeURIComponent(url.pathname);
   let seg = path.split('/').filter(Boolean);
   const incoming = String(req.headers['x-request-id'] ?? '');
@@ -2069,6 +2162,10 @@ const server = http.createServer(async (req, res) => {
     )
       return;
     if (handleDiff(req, res, url, seg, { datasets, send, fail })) return;
+    if (handleHistoryChanges(req, res, url, seg, { datasets, send, fail })) return;
+    if (await handleSparqlDiff(req, res, url, seg, { datasets, send, fail, readBody, termJson }))
+      return;
+    if (await handleSnapshots(req, res, url, seg, { datasets, send, fail, readBody })) return;
     if (req.method === 'OPTIONS') {
       res.writeHead(204, {
         'Access-Control-Allow-Origin': '*',
@@ -2356,7 +2453,15 @@ const server = http.createServer(async (req, res) => {
           const limit = Number(url.searchParams.get('limit') ?? 1000);
           if (!Number.isInteger(limit) || limit < 1 || limit > 10000)
             return fail(res, 400, 'limit must be an integer from 1 to 10000');
-          const r = schemaReport(ds, url.searchParams);
+          // a past state (`at=`): the report over the store of that commit
+          let view = ds;
+          if (url.searchParams.has('at')) {
+            const at = resolveAt(ds, url.searchParams.get('at'));
+            if (at.error) return send(res, ...at.error);
+            if (at.store) view = pastView(ds, at.store);
+          }
+          if (extra === 'profiles') return send(res, 200, classProfiles(view, url.searchParams));
+          const r = schemaReport(view, url.searchParams);
           if (r.error) return fail(res, r.status, r.error);
           const cursor = url.searchParams.get('cursor');
           if (extra === 'shapes')
@@ -2522,13 +2627,14 @@ const server = http.createServer(async (req, res) => {
               return fail(res, 410, `commit metadata before ${seq + 1} is no longer retained`);
             return send(res, 200, { dataset: name, datasetId: ds.id, commit: c });
           }
+          if (extra === 'timeline') return send(res, 200, timeline(ds, url.searchParams));
           const limit = Math.min(num('limit') ?? 50, 1000);
           if (!(limit > 0)) return fail(res, 400, 'invalid commit range: limit=0');
           const before = num('before');
           const after = num('after');
           if (before != null && after != null)
             return fail(res, 400, 'invalid commit range: use either before or after');
-          const list =
+          const list = (
             after != null
               ? allCommits(ds)
                   .filter((c) => c.seq > after)
@@ -2536,7 +2642,8 @@ const server = http.createServer(async (req, res) => {
               : allCommits(ds)
                   .filter((c) => before == null || c.seq < before)
                   .reverse()
-                  .slice(0, limit);
+                  .slice(0, limit)
+          ).map((c) => decorate(ds, c));
           const last = list[list.length - 1];
           const next = !last
             ? null
@@ -2556,6 +2663,7 @@ const server = http.createServer(async (req, res) => {
               head: head.seq,
               firstRetained: ds.firstRetained,
               complete: true,
+              ...readableFields(ds),
               commits: list,
               next,
             },

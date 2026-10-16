@@ -676,15 +676,11 @@ impl Catalog {
         let doc = match root {
             Some(r) => match std::fs::read(r.join(FILE)) {
                 Ok(b) => {
-                    let d: FileDoc =
+                    let v: serde_json::Value =
                         serde_json::from_slice(&b).map_err(|e| invalid(format!("{FILE}: {e}")))?;
-                    if d.format != FORMAT {
-                        return Err(invalid(format!(
-                            "{FILE}: unknown format {} (this version reads {FORMAT})",
-                            d.format
-                        )));
-                    }
-                    d
+                    // a newer format is Unsupported, a malformed file is not
+                    crate::formats::check_settings(FILE, &v)?;
+                    serde_json::from_value(v).map_err(|e| invalid(format!("{FILE}: {e}")))?
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => FileDoc {
                     format: FORMAT,

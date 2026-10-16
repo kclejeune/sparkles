@@ -533,3 +533,73 @@ vocabulary to the Working Draft fetched when the work starts, as C10 §2 did for
 Other SHACL 1.2 Core additions that are not supported, such as constraints on RDF 1.2
 reifiers, are listed against the same draft when this work starts, each with whether
 it is built here or left out and why.
+
+**Outcome of the node expression work (2026-10-13).** Node expressions are built against the
+Working Group's `shacl12-node-expr` draft as it stood in the `w3c/data-shapes` repository
+at commit 056ab61a on 13 October 2026, and the vocabulary is that draft's `shnex:`
+namespace. The code is `nodeexpr.rs`, the expression tree and its parser, and
+`nodeeval.rs`, the evaluator, in `sparkles-shacl`.
+
+* *What is read.* A blank node that has triples is a named parameter function, such as
+  `shnex:pathValues`, a list parameter function, such as `sparql:plus`, or a list
+  expression. Constants are IRIs, literals and triple terms, and a blank node without
+  triples is the empty expression. Functions declared in the shapes graph with
+  `sh:bodyExpression` are called the same way. Expressions are read as targets, as
+  `sh:values` and `sh:defaultValue`, as `sh:deactivated`, as the shapes
+  `sh:nodeByExpression` names, and as the expression constraint that reports each focus
+  node whose result is not `true`. A `sh:targetNode`
+  whose blank node value is not a valid expression stays a plain node.
+* *Where it differs from the design above.* `sh:values` and `sh:defaultValue` are built,
+  as derivations made during validation that add nothing to the data, so the reasoner
+  still owns every inferred triple. An argument of a custom function is evaluated in the
+  focus node and the variable scope of the call. `sh:hasValue` compares RDF terms. The
+  design allowed a computed `sh:hasValue` or `sh:in`, but both take constants, and `sh:in`
+  needs an RDF list. The draft does not define computed forms of either. The
+  two-argument `shnex:hasLang` is `LANGMATCHES(LANG(x), range)`, and `shnex:sameValue` is
+  `COALESCE(a = b, false)`. Nesting is limited to 128 levels when parsing and 192 when
+  evaluating, and deep evaluation grows its stack. One evaluation may take at most
+  16,777,216 units of work. Each evaluation of a sub-expression is a unit, and so is each
+  node that a concatenation or a mapping appends. The nodes that a read of the data
+  returns are not counted, because the data bounds them and a class with millions of
+  instances is a legitimate result. A shared sub-expression counts each time it is
+  evaluated, so an expression graph that doubles at every level fails early. The ids that
+  a concatenation appends come to 128 MiB at the limit, and that is a floor. The output
+  and the appended vector are both live, and each worker thread of a parallel validation
+  can hold such a vector, so the peak is a small multiple of 128 MiB for each evaluation
+  that runs at once. The Rust field `ValidateOptions::max_expr_nodes` changes the limit
+  and counts units of work, not nodes. The other nesting limits are fixed in the same
+  way, so requests and the guard keep the default. Evaluation also honours the timeout and cancellation of the
+  validation, which it checks every 4096 nodes that evaluations produce. A read of the
+  data that is repeated many times over a shared sub-expression costs one unit each time
+  and is bounded by the timeout, not by the budget.
+* *Write-time validation.* The incremental guard works out the predicates an expression
+  reads from the focus node, as it does for anchored SHACL-SPARQL queries. An expression
+  that reads the graph away from the focus node falls back to full validation. Value
+  nodes that `sh:values` or `sh:defaultValue` compute are not reached over the property's
+  path, so a constraint that reads the graph at them falls back as well. These are
+  `sh:class`, `sh:closed`, nested shapes, list constraints, an expression that reads the
+  variable `value`, and a SHACL-SPARQL component that asks about `$value`. Constraints
+  that look only at the value itself, such as `sh:datatype`, stay incremental. The
+  analysis of one shape stops after 100,000 steps, so an expression graph that shares
+  sub-expressions many times falls back to full validation with the budget reason. The
+  differential test of the guard now includes shapes with expressions.
+* *SHACLC.* Unchanged, as designed. Shapes with expressions are Turtle.
+* *Tests.* The Working Group's node expression library is vendored under
+  `crates/sparkles-shacl/tests/shacl12/node-expr`. All 143 `sht:EvalNodeExpr` tests
+  and the 3 validation tests of the suite pass, in `w3c_shacl12_node_expr`, and
+  `tests/node_expr.rs` adds eight tests. The earlier suites are unchanged, with SHACLC at
+  32 pairs and no failures, Core at 98 of 98, SHACL-SPARQL at 20 of 20 and the list
+  constraints at 8 of 8.
+* *Not built.* The Working Group's own SHACL 1.2 Core tests, run with
+  `SPARKLES_SHACL_TESTS` pointing at `shacl12-test-suite/tests`, pass 115 of 144 and are
+  not part of the repository's runner. This work does not change that number. The 29
+  failures are Core additions of SHACL 1.2 that are not expression syntax, namely the
+  constraints on reifiers (`sh:reifierShape` and the reified forms of deactivation),
+  `sh:uniqueValuesFor`, `sh:subsetOf`, `sh:someValue`, `sh:rootClass`, `sh:singleLine`,
+  `equals`, `disjoint` and `lessThan` with paths, the new severity cases, a few
+  closed, datatype, class, node-kind and unique-language cases, and implicit class
+  targets. The same suite's SHACL-SPARQL group passes 21 of 26, and three of the five
+  failures are custom functions that SPARQL queries call. Each is left out here because it
+  is a separate change to the constraint model, and none of them blocks node
+  expressions.
+

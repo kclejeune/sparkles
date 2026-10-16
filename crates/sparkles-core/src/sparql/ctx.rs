@@ -1,6 +1,8 @@
 //! Per-query execution context: snapshot, local vocabulary, decode cache,
 //! cancellation and dataset description.
 
+use super::pool::PoolGrant;
+use super::query_memory::{PRIMARY, QueryMemoryLease, QueryMemoryLedger, same};
 use super::table::VarId;
 use super::value::Value;
 use crate::error::{Budget, BudgetKind, Error, Result};
@@ -190,10 +192,21 @@ pub struct Optimizations {
     /// ORDER BY with LIMIT keeps the best rows in a bounded heap of offset + limit rows,
     /// evaluating the later keys only for rows whose first key can still enter
     pub topk_heap: bool,
+    /// the vocabulary groups that hold a query's constants are requested together before
+    /// the planner looks the constants up one after the other
+    pub prefetch_constants: bool,
+    /// a FILTER, BIND or ORDER BY over a table of fewer than 4,096 rows asks for the
+    /// vocabulary pages of the terms it evaluates before the first row
+    pub prefetch_terms: bool,
+    /// the blocks of a plan's scans with few blocks are requested before any operator runs
+    pub prefetch_first_scan: bool,
+    /// the columns of the blocks that an index join has asked the kernel for are decoded
+    /// in parallel on a pool of the cache's own, before the reader gets to them
+    pub parallel_decode: bool,
 }
 
 impl Optimizations {
-    pub const NAMES: [&str; 34] = [
+    pub const NAMES: [&str; 38] = [
         "range_pushdown",
         "incremental_group",
         "count_join_runs",
@@ -228,6 +241,10 @@ impl Optimizations {
         "text_subject_pushdown",
         "vector_topk",
         "topk_heap",
+        "prefetch_constants",
+        "prefetch_terms",
+        "prefetch_first_scan",
+        "parallel_decode",
     ];
 
     /// Everything on.
@@ -266,6 +283,10 @@ impl Optimizations {
         text_subject_pushdown: true,
         vector_topk: true,
         topk_heap: true,
+        prefetch_constants: true,
+        prefetch_terms: true,
+        prefetch_first_scan: true,
+        parallel_decode: true,
     };
 
     /// Everything off: the generic operators only.
@@ -304,6 +325,10 @@ impl Optimizations {
         text_subject_pushdown: false,
         vector_topk: false,
         topk_heap: false,
+        prefetch_constants: false,
+        prefetch_terms: false,
+        prefetch_first_scan: false,
+        parallel_decode: false,
     };
 
     fn flag(&mut self, name: &str) -> Option<&mut bool> {
@@ -342,6 +367,10 @@ impl Optimizations {
             "text_subject_pushdown" => &mut self.text_subject_pushdown,
             "vector_topk" => &mut self.vector_topk,
             "topk_heap" => &mut self.topk_heap,
+            "prefetch_constants" => &mut self.prefetch_constants,
+            "prefetch_terms" => &mut self.prefetch_terms,
+            "prefetch_first_scan" => &mut self.prefetch_first_scan,
+            "parallel_decode" => &mut self.parallel_decode,
             _ => return None,
         })
     }
@@ -403,6 +432,7 @@ pub struct Ctx {
     literal_bnodes: parking_lot::Mutex<FxHashMap<String, Id>>,
     pub deadline: Option<Instant>,
     pub cancel: Arc<AtomicBool>,
+    pub cancellation: Option<crate::task::Cancellation>,
     pub dataset: DatasetSpec,
     /// the request's graph view when it does not read every graph: `dataset` is already
     /// limited to it (see [`DatasetSpec::restrict`]), and plans are redacted
@@ -418,10 +448,9 @@ pub struct Ctx {
     /// Budget for the estimated bytes of intermediate results alive at once
     /// (`u64::MAX`: unlimited). See [`Ctx::charge`] and [`Ctx::check_output`].
     pub mem_limit: u64,
-    /// estimated bytes of the tables currently held by running operators
-    mem_live: AtomicU64,
-    /// highest estimate seen (held tables plus an output under construction)
-    mem_peak: AtomicU64,
+    /// The grant the query charges, fixed before its first charge (see [`Ctx::set_grant`]).
+    /// Contributions retain the grant they were admitted under.
+    grant: Option<Arc<super::pool::PoolGrant>>,
     /// Budget for the rows all operators produce together (`u64::MAX`: unlimited). See
     /// [`Ctx::produced`].
     pub max_rows_produced: u64,
@@ -442,9 +471,14 @@ pub struct Ctx {
     /// the caller's scope in the cache of remote SERVICE results (see
     /// [`QueryOptions::service_scope`](super::QueryOptions::service_scope))
     pub service_scope: Arc<str>,
+    /// the dataset's named projections (see [`crate::algo::catalog`])
+    pub algo_projections: Option<Arc<crate::algo::catalog::Catalog>>,
     /// RDFS on read (see [`super::rdfs`])
     pub rdfs: Option<Arc<super::rdfs::RdfsSchema>>,
     pub opt: Optimizations,
+    /// the I/O counters when the query began, taken only under a profile (see
+    /// [`Ctx::io_stats`]); boxed, so that a context without a profile stays small
+    io_start: Option<Box<crate::ioacct::IoSnapshot>>,
     /// parsed geometries of this query
     pub geo: crate::geo::memo::GeoMemo,
     /// notes for the plan's reader, without duplicates (see [`Ctx::warn`])
@@ -471,6 +505,71 @@ pub struct Ctx {
     callback_terms: parking_lot::Mutex<FxHashMap<Id, u64>>,
     // Opt-in cursor accounting stays after the ordinary execution fields.
     cursor_memory: Option<Box<CursorMemory>>,
+    // Data and weak retained caches drop before final ledger ownership.
+    fast: FastMemory,
+    memory: std::sync::OnceLock<Arc<QueryMemoryLedger>>,
+}
+
+/// Set in [`FastMemory::live`] once the ledger has taken the account over.
+const PROMOTED: u64 = 1 << 63;
+
+/// The memory account of an eager context until something needs the query ledger: a
+/// graph algorithm call, a lease that outlives an operator, cursor accounting or a
+/// change of the grant. Plain queries charge and check it with a few atomic operations
+/// and never create the ledger. [`Ctx::memory`] hands the account to the ledger as its
+/// [`PRIMARY`] owner, after which every charge goes through the ledger.
+#[derive(Default)]
+struct FastMemory {
+    /// live bytes, with [`PROMOTED`] set once the ledger took the account over
+    live: AtomicU64,
+    /// the highest estimate seen while the account was fast
+    peak: AtomicU64,
+    /// the account's admitted contribution to `grant`, kept until the context drops
+    eager: AtomicU64,
+    /// the grant the account charges, fixed at its first use
+    grant: std::sync::OnceLock<Option<Arc<PoolGrant>>>,
+    /// serializes growth of `eager` with the hand-over to the ledger
+    resize: parking_lot::Mutex<()>,
+}
+
+impl FastMemory {
+    #[inline]
+    fn note_peak(&self, bytes: u64) {
+        if bytes > self.peak.load(Ordering::Relaxed) {
+            self.peak.fetch_max(bytes, Ordering::Relaxed);
+        }
+    }
+
+    /// Give back `bytes` of the account's live estimate. `false` once the ledger owns
+    /// the account.
+    #[inline]
+    fn release(&self, bytes: u64) -> bool {
+        let mut cur = self.live.load(Ordering::Acquire);
+        loop {
+            if cur & PROMOTED != 0 {
+                return false;
+            }
+            let next = cur.checked_sub(bytes).expect("query live bytes");
+            match self
+                .live
+                .compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return true,
+                Err(c) => cur = c,
+            }
+        }
+    }
+}
+
+impl Drop for FastMemory {
+    /// An account the ledger never took over returns its eager contribution here.
+    fn drop(&mut self) {
+        if *self.live.get_mut() & PROMOTED == 0
+            && let Some(Some(grant)) = self.grant.get()
+        {
+            grant.release(*self.eager.get_mut());
+        }
+    }
 }
 
 struct CursorMemory {
@@ -482,7 +581,168 @@ struct CursorMemory {
     regex: super::cursor_regex::RegexCache,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// [`Ctx::check`] calls on this thread (for tests of per-query overhead)
+    pub(crate) static CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl Ctx {
+    /// The query's memory ledger, made on first use from the fast account (see
+    /// [`FastMemory`]).
+    pub(crate) fn memory(&self) -> &Arc<QueryMemoryLedger> {
+        self.memory.get_or_init(|| self.promote())
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn promote(&self) -> Arc<QueryMemoryLedger> {
+        let fast = &self.fast;
+        // No eager growth is in flight, and none starts on the fast account after this.
+        let _resize = fast.resize.lock();
+        let live = fast.live.fetch_or(PROMOTED, Ordering::AcqRel);
+        debug_assert_eq!(live & PROMOTED, 0, "one hand-over");
+        let grant = match fast.grant.get() {
+            Some(grant) => grant.clone(),
+            None => self.grant.clone(),
+        };
+        QueryMemoryLedger::seeded(
+            grant,
+            live,
+            fast.eager.load(Ordering::Acquire),
+            fast.peak.load(Ordering::Acquire),
+        )
+    }
+
+    /// The grant the query charges, if it has one.
+    pub fn grant(&self) -> Option<&Arc<PoolGrant>> {
+        self.grant.as_ref()
+    }
+
+    /// Set the grant before any charge, and fix it as the fast account's grant without
+    /// a lazy initialization on the first charge. A grant that changes after a charge
+    /// would leave charges on the old one, so a call after the first charge is a bug
+    /// that debug builds refuse.
+    pub(crate) fn set_grant(&mut self, grant: Option<Arc<PoolGrant>>) {
+        debug_assert!(
+            self.memory.get().is_none()
+                && self.fast.live.load(Ordering::Relaxed) == 0
+                && self.fast.eager.load(Ordering::Relaxed) == 0
+                && self.fast.peak.load(Ordering::Relaxed) == 0,
+            "the grant is set before the first charge"
+        );
+        self.fast.grant = std::sync::OnceLock::from(grant.clone());
+        self.grant = grant;
+    }
+
+    /// Change the grant after charges were made, to test that the ledger keeps each
+    /// contribution on the grant it was admitted under.
+    #[cfg(test)]
+    pub(crate) fn reconfigure_grant(&mut self, grant: Option<Arc<PoolGrant>>) {
+        self.grant = grant;
+    }
+
+    /// The fast account's grant, or `None` when the ledger must take the request: it
+    /// exists already, or the public grant changed since the fast account began.
+    #[inline]
+    fn fast_grant(&self) -> Option<Option<&Arc<PoolGrant>>> {
+        if self.memory.get().is_some() {
+            return None;
+        }
+        let grant = self.fast.grant.get_or_init(|| self.grant.clone()).as_ref();
+        same(grant, self.grant.as_ref()).then_some(grant)
+    }
+
+    /// Admit `bytes` more live estimate (`add`) or check a transient output of
+    /// `bytes` on the fast account, with the ledger's semantics for a single eager
+    /// owner. `None` when the ledger must take the request.
+    #[inline]
+    fn fast_admit(&self, bytes: u64, add: bool) -> Option<Result<()>> {
+        let grant = self.fast_grant()?;
+        let fast = &self.fast;
+        let mut cur = fast.live.load(Ordering::Acquire);
+        loop {
+            if cur & PROMOTED != 0 {
+                return None;
+            }
+            let need = cur.checked_add(bytes).filter(|n| *n < PROMOTED)?;
+            if !add {
+                // Like the ledger, an output check records the attempted estimate.
+                fast.note_peak(need);
+            }
+            if need > self.mem_limit {
+                return Some(Err(self.memory_exceeded(need)));
+            }
+            if let Some(grant) = grant
+                && need > fast.eager.load(Ordering::Acquire)
+            {
+                return self.fast_grow(grant, bytes, add);
+            }
+            if !add {
+                return Some(Ok(()));
+            }
+            match fast
+                .live
+                .compare_exchange_weak(cur, need, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => {
+                    fast.note_peak(need);
+                    return Some(Ok(()));
+                }
+                Err(c) => cur = c,
+            }
+        }
+    }
+
+    /// [`Ctx::fast_admit`] when the estimate passes the eager contribution: grow it
+    /// from the grant first, so a refused grant changes nothing.
+    #[cold]
+    #[inline(never)]
+    fn fast_grow(&self, grant: &Arc<PoolGrant>, bytes: u64, add: bool) -> Option<Result<()>> {
+        let fast = &self.fast;
+        let _resize = fast.resize.lock();
+        let mut cur = fast.live.load(Ordering::Acquire);
+        loop {
+            if cur & PROMOTED != 0 {
+                return None;
+            }
+            let need = cur.checked_add(bytes).filter(|n| *n < PROMOTED)?;
+            if need > self.mem_limit {
+                return Some(Err(self.memory_exceeded(need)));
+            }
+            let eager = fast.eager.load(Ordering::Acquire);
+            if need > eager {
+                if let Err(error) = grant.charge(need - eager) {
+                    return Some(Err(error));
+                }
+                fast.eager.store(need, Ordering::Release);
+            }
+            if !add {
+                return Some(Ok(()));
+            }
+            // Lock-free admissions in between stayed within the old contribution.
+            match fast
+                .live
+                .compare_exchange(cur, need, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => {
+                    fast.note_peak(need);
+                    return Some(Ok(()));
+                }
+                Err(c) => cur = c,
+            }
+        }
+    }
+
+    /// The query's live estimate, from the ledger once it exists.
+    #[inline]
+    fn live_bytes(&self) -> u64 {
+        match self.memory.get() {
+            Some(ledger) => ledger.live.load(Ordering::Relaxed),
+            None => self.fast.live.load(Ordering::Relaxed) & !PROMOTED,
+        }
+    }
+
     pub fn new(snap: Arc<Snapshot>) -> Ctx {
         Ctx {
             extension_families: Vec::new(),
@@ -494,6 +754,8 @@ impl Ctx {
             callback_bnodes: Default::default(),
             callback_terms: Default::default(),
             cursor_memory: None,
+            fast: Default::default(),
+            memory: Default::default(),
             snap,
             local: RwLock::new(AppendVocab::default()),
             values: (0..VALUE_SHARDS)
@@ -505,6 +767,7 @@ impl Ctx {
             literal_bnodes: Default::default(),
             deadline: None,
             cancel: Arc::new(AtomicBool::new(false)),
+            cancellation: None,
             dataset: DatasetSpec::default(),
             graphs: None,
             now: std::sync::OnceLock::new(),
@@ -512,8 +775,7 @@ impl Ctx {
             var_names: RwLock::new(Vec::new()),
             max_rows: 200_000_000,
             mem_limit: u64::MAX,
-            mem_live: AtomicU64::new(0),
-            mem_peak: AtomicU64::new(0),
+            grant: None,
             max_rows_produced: u64::MAX,
             rows_produced: Arc::new(AtomicU64::new(0)),
             allow_service: true,
@@ -522,14 +784,31 @@ impl Ctx {
             outbound_budget: crate::outbound::RequestBudget::new(&Default::default()),
             use_cache: true,
             service_scope: Arc::from(""),
+            algo_projections: None,
             rdfs: None,
             opt: Optimizations::default(),
+            io_start: crate::ioacct::profiling()
+                .then(|| Box::new(crate::ioacct::IoSnapshot::now())),
             geo: Default::default(),
             warnings: Default::default(),
             failed: Default::default(),
             sampled: Default::default(),
             stars: Default::default(),
             probes: Default::default(),
+        }
+    }
+
+    /// What the read path counted since this context was made: index columns decoded,
+    /// bytes asked of the kernel and vocabulary lookups (see [`crate::ioacct`]). The
+    /// counters are process-wide, so reads of queries that run at the same time are
+    /// included. The starting counters are taken only while a [`Profile`](crate::ioacct::Profile)
+    /// is alive, so the result is meaningful only for a query made under one: otherwise it
+    /// holds everything the process has counted.
+    pub fn io_stats(&self) -> crate::ioacct::IoSnapshot {
+        let now = crate::ioacct::IoSnapshot::now();
+        match &self.io_start {
+            Some(start) => now.since(start),
+            None => now.since(&Default::default()),
         }
     }
 
@@ -736,6 +1015,8 @@ impl Ctx {
 
     #[inline]
     pub fn check(&self) -> Result<()> {
+        #[cfg(test)]
+        CHECKS.with(|n| n.set(n.get() + 1));
         self.check_cursor_memory()?;
         if self.calls_extensions
             && let Some(state) = &self.extension_failure
@@ -746,8 +1027,11 @@ impl Ctx {
         if self.cancel.load(Ordering::Relaxed) {
             return Err(Error::Cancelled);
         }
+        if let Some(cancellation) = &self.cancellation {
+            cancellation.check()?;
+        }
         if let Some(d) = self.deadline
-            && Instant::now() > d
+            && Instant::now() >= d
         {
             return Err(Error::Timeout);
         }
@@ -755,11 +1039,13 @@ impl Ctx {
     }
 
     pub(super) fn enable_cursor_accounting(&mut self) -> Result<()> {
+        self.memory().check_cursor_transition()?;
         for shard in &self.values {
             *shard.write() = FxHashMap::default();
         }
         let bytes = self.local.read().bytes() as u64;
         std::mem::forget(self.charge(bytes)?);
+        self.memory().cursor_mode()?;
         self.cursor_memory = Some(Box::new(CursorMemory {
             failure: Default::default(),
             failed: AtomicBool::new(false),
@@ -808,8 +1094,8 @@ impl Ctx {
         if owner.strong_count() == 0 {
             return Err(Error::invalid("cursor context owner has not been attached"));
         }
-        charge.bytes.set(0);
-        Ok(Some(RetainedCharge { owner, bytes }))
+        let id = charge.disarm();
+        Ok(Some(RetainedCharge { owner, id, bytes }))
     }
 
     pub(super) fn cursor_regex(
@@ -824,17 +1110,38 @@ impl Ctx {
             .get(self, pattern, flags)
     }
 
+    /// Give back `bytes` of estimated memory, and the pool's granules the query no
+    /// longer needs.
+    #[inline]
+    fn release_live(&self, owner: Option<u64>, bytes: u64) {
+        match owner {
+            Some(PRIMARY) if self.fast.release(bytes) => {}
+            Some(id) => self.memory().release(id, bytes),
+            None => {
+                debug_assert_eq!(bytes, 0);
+                // Only cursor accounting trims, and it always has a ledger.
+                if let Some(ledger) = self.memory.get() {
+                    ledger.trim_zero(self.grant.as_ref());
+                }
+            }
+        }
+    }
+
+    /// The bytes this query holds in the server's query memory pool (0 without a pool).
+    pub fn granted_bytes(&self) -> u64 {
+        self.grant.as_ref().map_or(0, |g| g.granted())
+    }
+
     pub(super) fn memory_remaining(&self) -> u64 {
-        self.mem_limit
-            .saturating_sub(self.mem_live.load(Ordering::Relaxed))
+        self.mem_limit.saturating_sub(self.live_bytes())
     }
 
     pub(super) fn release_cursor_work(&self) {
         if let Some(memory) = &self.cursor_memory {
             memory.regex.clear();
-            let bytes = std::mem::take(&mut *memory.decode_peak.lock());
+            let _bytes = std::mem::take(&mut *memory.decode_peak.lock());
             memory.decoded_reserved.store(0, Ordering::Release);
-            self.mem_live.fetch_sub(bytes, Ordering::Relaxed);
+            self.memory().release_decode();
         }
     }
 
@@ -880,6 +1187,20 @@ impl Ctx {
         }
     }
 
+    fn retain_cursor_decode_bytes(&self, bytes: u64) -> bool {
+        let result = self
+            .memory()
+            .owner(self.grant.as_ref())
+            .and_then(|owner| self.memory().reserve(&owner, self.mem_limit, bytes, true));
+        match result {
+            Ok(()) => true,
+            Err(error) => {
+                self.fail_cursor(&error);
+                false
+            }
+        }
+    }
+
     /// Reserve a conservative high-water estimate for transient term decoding.
     /// Cursor evaluation does not retain the eager per-ID value cache.
     pub(super) fn cursor_decode(&self, bytes: usize) -> bool {
@@ -903,7 +1224,7 @@ impl Ctx {
         }
         let mut peak = memory.decode_peak.lock();
         if need > *peak {
-            if !self.retain_cursor_bytes(need - *peak) {
+            if !self.retain_cursor_decode_bytes(need - *peak) {
                 return false;
             }
             *peak = need;
@@ -973,9 +1294,18 @@ impl Ctx {
     /// a query over budget fails fast. Records the peak estimate.
     #[inline]
     pub fn check_output(&self, rows: usize, width: usize) -> Result<()> {
+        self.check_output_rows(rows)?;
+        let bytes = table_bytes(rows, width);
+        if let Some(checked) = self.fast_admit(bytes, false) {
+            return checked;
+        }
+        let owner = self.memory().owner(self.grant.as_ref())?;
+        self.memory().check_output(&owner, self.mem_limit, bytes)
+    }
+
+    pub(super) fn check_output_rows(&self, rows: usize) -> Result<()> {
         self.check_rows(rows)?;
         if self.max_rows_produced != u64::MAX {
-            // the output will count as produced: fail before it is built
             let total = self
                 .rows_produced
                 .load(Ordering::Relaxed)
@@ -984,23 +1314,28 @@ impl Ctx {
                 return Err(self.produced_exceeded(total));
             }
         }
-        let need = self
-            .mem_live
-            .load(Ordering::Relaxed)
-            .saturating_add(table_bytes(rows, width));
-        self.note_peak(need);
-        if need > self.mem_limit {
-            return Err(self.memory_exceeded(need));
-        }
         Ok(())
     }
 
-    /// Hold `bytes` of estimated memory until the returned guard drops (see
-    /// [`Charge::add`]).
+    /// Hold `bytes` against the local budget until the guard drops. An eager
+    /// context also retains its admitted pool peak until the context drops.
+    pub(super) fn output_lease(&self, bytes: u64) -> Result<QueryMemoryLease> {
+        let ledger = self.memory();
+        let owner = ledger.owner(self.grant.as_ref())?;
+        ledger.reserve(&owner, self.mem_limit, bytes, false)?;
+        Ok(QueryMemoryLease {
+            ledger: ledger.clone(),
+            owner,
+            bytes,
+            service: None,
+        })
+    }
+
     pub fn charge(&self, bytes: u64) -> Result<Charge<'_>> {
         let c = Charge {
             ctx: self,
             bytes: std::cell::Cell::new(0),
+            owner: std::cell::Cell::new(None),
         };
         c.add(bytes)?;
         Ok(c)
@@ -1008,7 +1343,10 @@ impl Ctx {
 
     /// The highest memory estimate of this context so far.
     pub fn mem_peak(&self) -> u64 {
-        self.mem_peak.load(Ordering::Relaxed)
+        let fast = self.fast.peak.load(Ordering::Relaxed);
+        self.memory
+            .get()
+            .map_or(fast, |ledger| fast.max(ledger.peak.load(Ordering::Relaxed)))
     }
 
     /// How many rows of `width` columns fit in what is left of the memory budget (for
@@ -1017,17 +1355,8 @@ impl Ctx {
         if self.mem_limit == u64::MAX {
             return usize::MAX;
         }
-        let left = self
-            .mem_limit
-            .saturating_sub(self.mem_live.load(Ordering::Relaxed));
+        let left = self.mem_limit.saturating_sub(self.live_bytes());
         usize::try_from(left / table_bytes(1, width)).unwrap_or(usize::MAX)
-    }
-
-    #[inline]
-    fn note_peak(&self, bytes: u64) {
-        if bytes > self.mem_peak.load(Ordering::Relaxed) {
-            self.mem_peak.fetch_max(bytes, Ordering::Relaxed);
-        }
     }
 
     pub(super) fn memory_exceeded(&self, requested: u64) -> Error {
@@ -1208,6 +1537,50 @@ impl Ctx {
         Id::local(local.insert(key).0)
     }
 
+    /// SERVICE-created encoded terms retain the existing key-byte estimate in eager
+    /// and cursor execution. This is not an allocator/RSS bound for AppendVocab.
+    pub(super) fn intern_algorithm_key(
+        &self,
+        key: &[u8],
+        ctl: &crate::algo::Control,
+    ) -> Result<Id> {
+        let mut scratch = crate::algo::memory::Reservation::new(ctl, 0)?;
+        if let Ok(i) = self.snap.generation.vocab.find_with_checked(key, |need| {
+            scratch.grow_to(
+                crate::algo::memory::bytes::<u8>(need)?
+                    .checked_mul(2)
+                    .ok_or_else(|| self.memory_exceeded(u64::MAX))?,
+            )
+        })? {
+            return Ok(Id::vocab(i));
+        }
+        if let Some(i) = self
+            .snap
+            .generation
+            .dvocab
+            .find(key)
+            .filter(|&i| i < self.snap.dvocab_len)
+        {
+            return Ok(Id::delta(i));
+        }
+        if let Some(i) = self.local.read().find(key) {
+            return Ok(Id::local(i));
+        }
+        let estimate = u64::try_from(key.len())
+            .ok()
+            .and_then(|n| n.checked_add(96))
+            .ok_or_else(|| self.memory_exceeded(u64::MAX))?;
+        let charge = self.charge(estimate)?;
+        self.check()?;
+        let mut local = self.local.write();
+        if let Some(i) = local.find(key) {
+            return Ok(Id::local(i));
+        }
+        let id = Id::local(local.insert(key).0);
+        std::mem::forget(charge);
+        Ok(id)
+    }
+
     pub fn intern_value(&self, v: &Value) -> Id {
         match v {
             Value::Bool(b) => Id::from_bool(*b),
@@ -1288,6 +1661,49 @@ impl Ctx {
             },
             f,
         )
+    }
+
+    /// Algorithm-owned key reconstruction never populates the eager value cache.
+    pub(super) fn with_algo_key<T>(
+        &self,
+        id: Id,
+        ctl: &crate::algo::Control,
+        mut f: impl FnMut(&[u8]) -> Result<T>,
+    ) -> Result<Option<T>> {
+        use crate::algo::memory::{Reservation, bytes};
+        ctl.check()?;
+        match id.tag() {
+            Tag::Vocab => {
+                let mut scratch = Reservation::new(ctl, 0)?;
+                self.snap
+                    .generation
+                    .vocab
+                    .get_with_fallible(
+                        id.payload(),
+                        |need| {
+                            let bound = bytes::<u8>(need)?
+                                .checked_mul(2)
+                                .ok_or_else(|| Error::invalid("algorithm key scratch overflows"))?;
+                            scratch.grow_to(bound)
+                        },
+                        &mut f,
+                    )?
+                    .transpose()
+            }
+            Tag::Delta => self.snap.generation.dvocab.with(|v| {
+                if id.payload() >= self.snap.dvocab_len {
+                    return Ok(None);
+                }
+                v.get(id.payload()).map(&mut f).transpose()
+            }),
+            Tag::Local => self.with_local_key(id.payload(), &mut f).transpose(),
+            Tag::BNode => {
+                let mut key = [b'_'; 9];
+                key[1..].copy_from_slice(&id.payload().to_be_bytes());
+                f(&key).map(Some)
+            }
+            _ => Ok(None),
+        }
     }
 
     pub(super) fn with_local_key<T>(&self, id: u64, f: impl FnOnce(&[u8]) -> T) -> Option<T> {
@@ -1461,125 +1877,176 @@ pub fn table_bytes(rows: usize, width: usize) -> u64 {
 pub struct Charge<'a> {
     ctx: &'a Ctx,
     bytes: std::cell::Cell<u64>,
+    owner: std::cell::Cell<Option<u64>>,
 }
-
 impl Charge<'_> {
-    /// Hold `bytes` more; fails (holding nothing more) when that would exceed the
-    /// context's memory budget.
     pub fn add(&self, bytes: u64) -> Result<()> {
         if bytes == 0 {
             return Ok(());
         }
-        let ctx = self.ctx;
-        // Validate local ownership before publishing a global increment. Rejected
-        // requests never transiently wrap or consume another thread's allowance.
         let owned = self
             .bytes
             .get()
             .checked_add(bytes)
-            .ok_or_else(|| ctx.memory_exceeded(u64::MAX))?;
-        let prior = ctx
-            .mem_live
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
-                live.checked_add(bytes)
-                    .filter(|next| *next <= ctx.mem_limit)
-            })
-            .map_err(|live| ctx.memory_exceeded(live.saturating_add(bytes)))?;
-        let live = prior + bytes;
+            .ok_or_else(|| self.ctx.memory_exceeded(u64::MAX))?;
+        if self.owner.get().is_none_or(|id| id == PRIMARY)
+            && let Some(admitted) = self.ctx.fast_admit(bytes, true)
+        {
+            admitted?;
+            self.owner.set(Some(PRIMARY));
+            self.bytes.set(owned);
+            return Ok(());
+        }
+        let ledger = self.ctx.memory();
+        let owner = match self.owner.get() {
+            Some(id) => ledger.owner_by_id(id),
+            None => ledger.owner(self.ctx.grant.as_ref())?,
+        };
+        ledger.reserve(&owner, self.ctx.mem_limit, bytes, false)?;
+        self.owner.set(Some(owner.id));
         self.bytes.set(owned);
-        ctx.note_peak(live);
+        Ok(())
+    }
+    fn disarm(&self) -> Option<u64> {
+        self.bytes.set(0);
+        self.owner.take()
+    }
+    /// Move query-only input ownership into the returned backing without a release
+    /// interval. Existing nonalgorithm kernels retain their estimate policy.
+    pub(super) fn output_lease(&self, bytes: u64) -> Result<QueryMemoryLease> {
+        if bytes > self.bytes.get() {
+            self.add(bytes - self.bytes.get())?;
+        } else {
+            self.ctx
+                .release_live(self.owner.get(), self.bytes.get() - bytes);
+            self.bytes.set(bytes);
+        }
+        let ledger = self.ctx.memory();
+        let owner = self
+            .owner
+            .get()
+            .map(|id| ledger.owner_by_id(id))
+            .map_or_else(|| ledger.owner(self.ctx.grant.as_ref()), Ok)?;
+        self.disarm();
+        Ok(QueryMemoryLease {
+            ledger: ledger.clone(),
+            owner,
+            bytes,
+            service: None,
+        })
+    }
+    pub(super) fn adopt(&self, slot: &mut Option<QueryMemoryLease>) -> Result<()> {
+        let lease = slot.as_ref().expect("admitted input");
+        if lease.service.is_some()
+            || !Arc::ptr_eq(self.ctx.memory(), &lease.ledger)
+            || self.owner.get().is_some_and(|id| id != lease.owner.id)
+        {
+            return Err(Error::invalid(
+                "algorithm input belongs to another query owner",
+            ));
+        }
+        let bytes = self
+            .bytes
+            .get()
+            .checked_add(lease.bytes)
+            .ok_or_else(|| self.ctx.memory_exceeded(u64::MAX))?;
+        self.owner.set(Some(lease.owner.id));
+        self.bytes.set(bytes);
+        slot.take().expect("admitted input").bytes = 0;
         Ok(())
     }
 }
-
 impl Drop for Charge<'_> {
     fn drop(&mut self) {
-        self.ctx
-            .mem_live
-            .fetch_sub(self.bytes.get(), Ordering::Relaxed);
+        self.ctx.release_live(self.owner.get(), self.bytes.get());
     }
 }
 
-/// An owned charge that follows a cursor buffer across pulls and threads.
-pub(super) struct OwnedCharge {
-    ctx: Arc<Ctx>,
-    bytes: u64,
-}
-
+/// Weak retained state never owns the context, grant or ledger.
 pub(super) struct RetainedCharge {
     owner: Weak<Ctx>,
+    id: Option<u64>,
     bytes: u64,
 }
-
 impl RetainedCharge {
     pub(super) fn owner(&self) -> Option<Arc<Ctx>> {
         self.owner.upgrade()
     }
-
     pub(super) fn bytes(&self) -> u64 {
         self.bytes
     }
-
     pub(super) fn resize(&mut self, bytes: u64) -> Result<()> {
         let ctx = self
             .owner
             .upgrade()
             .ok_or_else(|| Error::invalid("cursor context was released"))?;
         if bytes > self.bytes {
-            let added = ctx.charge(bytes - self.bytes)?;
-            added.bytes.set(0);
+            let ledger = ctx.memory();
+            let owner = self
+                .id
+                .map(|id| ledger.owner_by_id(id))
+                .map_or_else(|| ledger.owner(ctx.grant.as_ref()), Ok)?;
+            ledger.reserve(&owner, ctx.mem_limit, bytes - self.bytes, false)?;
+            self.id = Some(owner.id);
         } else {
-            ctx.mem_live
-                .fetch_sub(self.bytes - bytes, Ordering::Relaxed);
+            ctx.release_live(self.id, self.bytes - bytes);
         }
         self.bytes = bytes;
+        if bytes == 0 {
+            self.id = None;
+        }
         Ok(())
     }
 }
-
 impl Drop for RetainedCharge {
     fn drop(&mut self) {
         if let Some(ctx) = self.owner.upgrade() {
-            ctx.mem_live.fetch_sub(self.bytes, Ordering::Relaxed);
+            ctx.release_live(self.id, self.bytes);
         }
     }
 }
 
+/// Cursor ownership can adopt an admitted algorithm lease without release/recharge.
+pub(super) struct OwnedCharge {
+    ctx: Arc<Ctx>,
+    lease: QueryMemoryLease,
+}
 impl OwnedCharge {
     pub(super) fn bytes(&self) -> u64 {
-        self.bytes
+        self.lease.bytes
     }
-
     pub(super) fn new(ctx: &Arc<Ctx>, bytes: u64) -> Result<Self> {
-        let mut owned = Self {
+        let ledger = ctx.memory();
+        let owner = ledger.owner(ctx.grant.as_ref())?;
+        ledger.reserve(&owner, ctx.mem_limit, bytes, false)?;
+        Ok(Self {
             ctx: ctx.clone(),
-            bytes: 0,
-        };
-        owned.resize(bytes)?;
-        Ok(owned)
+            lease: QueryMemoryLease {
+                ledger: ledger.clone(),
+                owner,
+                bytes,
+                service: None,
+            },
+        })
     }
-
-    pub(super) fn resize(&mut self, bytes: u64) -> Result<()> {
-        if bytes > self.bytes {
-            let charge = self.ctx.charge(bytes - self.bytes)?;
-            charge.bytes.set(0);
-        } else {
-            self.ctx
-                .mem_live
-                .fetch_sub(self.bytes - bytes, Ordering::Relaxed);
+    pub(super) fn adopt(ctx: &Arc<Ctx>, slot: &mut Option<QueryMemoryLease>) -> Result<Self> {
+        let lease = slot.as_ref().expect("admitted output");
+        if !Arc::ptr_eq(ctx.memory(), &lease.ledger) {
+            return Err(Error::invalid("algorithm output belongs to another query"));
         }
-        self.bytes = bytes;
-        Ok(())
+        Ok(Self {
+            ctx: ctx.clone(),
+            lease: slot.take().expect("admitted output"),
+        })
     }
-
+    pub(super) fn resize(&mut self, bytes: u64) -> Result<()> {
+        self.lease.resize(self.ctx.mem_limit, bytes)
+    }
     pub(super) fn retain(mut self) {
-        self.bytes = 0;
+        self.lease.bytes = 0;
     }
-}
-
-impl Drop for OwnedCharge {
-    fn drop(&mut self) {
-        self.ctx.mem_live.fetch_sub(self.bytes, Ordering::Relaxed);
+    pub(super) fn into_lease(self) -> QueryMemoryLease {
+        self.lease
     }
 }
 
@@ -1615,13 +2082,13 @@ mod charge_tests {
         context.enable_cursor_accounting().unwrap();
         let context = Arc::new(context);
         context.attach_cursor_owner();
-        let before = context.mem_live.load(Ordering::Relaxed);
+        let before = context.memory().live.load(Ordering::Relaxed);
         let mut retained = context.retained_charge(4096).unwrap().unwrap();
-        assert_eq!(context.mem_live.load(Ordering::Relaxed), before + 4096);
+        assert_eq!(context.memory().live.load(Ordering::Relaxed), before + 4096);
         retained.resize(2048).unwrap();
-        assert_eq!(context.mem_live.load(Ordering::Relaxed), before + 2048);
+        assert_eq!(context.memory().live.load(Ordering::Relaxed), before + 2048);
         drop(retained);
-        assert_eq!(context.mem_live.load(Ordering::Relaxed), before);
+        assert_eq!(context.memory().live.load(Ordering::Relaxed), before);
         let retained = context.retained_charge(4096).unwrap();
         let weak = Arc::downgrade(&context);
         drop(context);
@@ -1637,20 +2104,20 @@ mod charge_tests {
             ctx.mem_limit = limit;
             let charge = ctx.charge(80).unwrap();
             assert!(charge.add(u64::MAX).is_err());
-            assert_eq!(ctx.mem_live.load(Ordering::Relaxed), 80);
+            assert_eq!(ctx.memory().live.load(Ordering::Relaxed), 80);
             assert_eq!(charge.bytes.get(), 80);
             charge.add(20).unwrap();
             drop(charge);
-            assert_eq!(ctx.mem_live.load(Ordering::Relaxed), 0);
+            assert_eq!(ctx.memory().live.load(Ordering::Relaxed), 0);
             // A different guard can overflow the global count while its own count
             // is representable. Failure must not corrupt either guard's release.
             let first = ctx.charge(limit).unwrap();
             assert!(ctx.charge(1).is_err());
-            assert_eq!(ctx.mem_live.load(Ordering::Relaxed), limit);
+            assert_eq!(ctx.memory().live.load(Ordering::Relaxed), limit);
             drop(first);
-            assert_eq!(ctx.mem_live.load(Ordering::Relaxed), 0);
+            assert_eq!(ctx.memory().live.load(Ordering::Relaxed), 0);
             drop(ctx.charge(1).unwrap());
-            assert_eq!(ctx.mem_live.load(Ordering::Relaxed), 0);
+            assert_eq!(ctx.memory().live.load(Ordering::Relaxed), 0);
         }
     }
 
@@ -1676,9 +2143,201 @@ mod charge_tests {
                     });
                 }
             });
-            assert_eq!(ctx.mem_live.load(Ordering::Relaxed), limit - 10);
+            assert_eq!(ctx.memory().live.load(Ordering::Relaxed), limit - 10);
             drop(owner);
-            assert_eq!(ctx.mem_live.load(Ordering::Relaxed), 0);
+            assert_eq!(ctx.memory().live.load(Ordering::Relaxed), 0);
         }
+    }
+
+    const MIB: u64 = 1 << 20;
+
+    fn pooled(store: &Store, grant: &Arc<super::super::pool::PoolGrant>) -> Ctx {
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.set_grant(Some(grant.clone()));
+        ctx
+    }
+
+    #[test]
+    fn a_fitting_eager_output_remains_owned_until_context_drop() {
+        let store = Store::in_memory(StoreOptions::default());
+        let pool = super::super::pool::QueryPool::new(128 * MIB);
+        let grant = Arc::new(pool.try_grant(100 * MIB).unwrap());
+        let ctx = pooled(&store, &grant);
+        let held = ctx.charge(80 * MIB).unwrap();
+        ctx.check_output((20 * MIB / 8) as usize, 1).unwrap();
+        drop(held);
+        assert_eq!(grant.used(), 100 * MIB);
+        assert!(grant.granted() >= 100 * MIB);
+        drop(ctx);
+        assert_eq!(grant.used(), 0);
+        assert_eq!(grant.granted(), 16 * MIB);
+    }
+
+    #[test]
+    fn fitting_eager_contexts_own_distinct_contributions() {
+        let store = Store::in_memory(StoreOptions::default());
+        let pool = super::super::pool::QueryPool::new(128 * MIB);
+        let grant = Arc::new(pool.try_grant(100 * MIB).unwrap());
+        let one = pooled(&store, &grant);
+        let two = pooled(&store, &grant);
+        one.check_output((40 * MIB / 8) as usize, 1).unwrap();
+        two.check_output((24 * MIB / 8) as usize, 1).unwrap();
+        assert_eq!(grant.used(), 64 * MIB);
+        drop(one);
+        assert_eq!(grant.used(), 24 * MIB);
+        drop(two);
+        assert_eq!(grant.used(), 0);
+    }
+
+    #[test]
+    fn eager_live_and_output_estimates_do_not_count_live_bytes_twice() {
+        let store = Store::in_memory(StoreOptions::default());
+        let pool = super::super::pool::QueryPool::new(64 * MIB);
+        let grant = Arc::new(pool.empty_grant());
+        let ctx = pooled(&store, &grant);
+        let held = ctx.charge(40 * MIB).unwrap();
+        ctx.check_output((20 * MIB / 8) as usize, 1).unwrap();
+        assert_eq!(grant.used(), 60 * MIB);
+        ctx.check_output((10 * MIB / 8) as usize, 1).unwrap();
+        assert_eq!(grant.used(), 60 * MIB);
+        drop(held);
+        assert_eq!(grant.used(), 60 * MIB);
+        drop(ctx);
+        assert_eq!(grant.used(), 0);
+    }
+
+    #[test]
+    fn rejected_eager_estimates_preserve_the_successful_contribution() {
+        let store = Store::in_memory(StoreOptions::default());
+        let pool = super::super::pool::QueryPool::new(32 * MIB);
+        let grant = Arc::new(pool.empty_grant());
+        let mut ctx = pooled(&store, &grant);
+        ctx.mem_limit = 48 * MIB;
+        drop(ctx.charge(24 * MIB).unwrap());
+        assert!(matches!(ctx.charge(40 * MIB), Err(Error::BudgetExceeded(b))
+            if b.kind == BudgetKind::ServerMemory));
+        assert!(matches!(ctx.check_output((56 * MIB / 8) as usize, 1),
+            Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory));
+        assert_eq!(ctx.memory().live.load(Ordering::SeqCst), 0);
+        assert_eq!(grant.used(), 24 * MIB);
+        drop(ctx.charge(0).unwrap());
+        ctx.check_output(0, 0).unwrap();
+        assert_eq!(grant.used(), 24 * MIB);
+        drop(ctx);
+        assert_eq!(grant.used(), 0);
+    }
+
+    #[test]
+    fn concurrent_eager_peaks_reserve_only_the_local_maximum() {
+        let store = Store::in_memory(StoreOptions::default());
+        let pool = super::super::pool::QueryPool::new(64 * MIB);
+        let grant = Arc::new(pool.empty_grant());
+        let ctx = pooled(&store, &grant);
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            for bytes in [24 * MIB, 40 * MIB] {
+                let (ctx, barrier) = (&ctx, &barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    ctx.check_output((bytes / 8) as usize, 1).unwrap();
+                });
+            }
+        });
+        assert_eq!(grant.used(), 40 * MIB);
+        drop(ctx);
+        assert_eq!(grant.used(), 0);
+    }
+
+    #[test]
+    fn eager_and_cursor_ownership_share_a_grant_without_pinning_cursor_peaks() {
+        let store = Store::in_memory(StoreOptions::default());
+        let pool = super::super::pool::QueryPool::new(128 * MIB);
+        let grant = Arc::new(pool.empty_grant());
+        let eager = pooled(&store, &grant);
+        eager.check_output((24 * MIB / 8) as usize, 1).unwrap();
+        let mut cursor = pooled(&store, &grant);
+        cursor.enable_cursor_accounting().unwrap();
+        let held = cursor.charge(48 * MIB).unwrap();
+        assert_eq!(grant.used(), 72 * MIB);
+        drop(held);
+        assert_eq!(grant.used(), 24 * MIB);
+        assert!(grant.granted() <= 32 * MIB);
+        drop(eager);
+        assert_eq!(grant.used(), 0);
+        drop(cursor);
+        drop(grant);
+        assert_eq!(pool.granted(), 0);
+    }
+
+    #[test]
+    fn cursor_transition_reconciles_prepared_local_terms_and_eager_peaks() {
+        let store = Store::in_memory(StoreOptions::default());
+        let pool = super::super::pool::QueryPool::new(128 * MIB);
+        let grant = Arc::new(pool.empty_grant());
+        let mut ctx = pooled(&store, &grant);
+        ctx.check_output((64 * MIB / 8) as usize, 1).unwrap();
+        let term = Term::Literal(oxrdf::Literal::new_simple_literal("x".repeat(MIB as usize)));
+        let id = ctx.intern_term(&term);
+        assert!(ctx.local_len() > 0);
+        ctx.enable_cursor_accounting().unwrap();
+        let live = ctx.memory().live.load(Ordering::SeqCst);
+        assert!(live >= MIB);
+        assert_eq!(grant.used(), live);
+        assert!(grant.granted() <= 16 * MIB);
+        assert_eq!(ctx.term(id), Some(term));
+        drop(ctx);
+        assert_eq!(grant.used(), 0);
+        drop(grant);
+        assert_eq!(pool.granted(), 0);
+    }
+
+    #[test]
+    fn a_grant_shared_by_two_contexts_follows_their_sum() {
+        let store = Store::in_memory(StoreOptions::default());
+        let pool = super::super::pool::QueryPool::new(256 * MIB);
+        let grant = Arc::new(pool.empty_grant());
+        let one = pooled(&store, &grant);
+        let two = pooled(&store, &grant);
+        let held = one.charge(50 * MIB).unwrap();
+        drop(two.charge(40 * MIB).unwrap());
+        assert!(grant.granted() >= 50 * MIB, "{}", grant.granted());
+        drop(held);
+    }
+
+    #[test]
+    fn a_trim_never_unbacks_an_accepted_charge() {
+        use std::sync::atomic::AtomicBool;
+        let store = Store::in_memory(StoreOptions::default());
+        let pool = super::super::pool::QueryPool::new(64 * MIB);
+        let g1 = Arc::new(pool.empty_grant());
+        let g2 = Arc::new(pool.empty_grant());
+        let ctx1 = pooled(&store, &g1);
+        let ctx2 = pooled(&store, &g2);
+        let accepted = AtomicU64::new(0);
+        let stop = AtomicBool::new(false);
+        let worker = |ctx: &Ctx, bytes: u64, hold: bool| {
+            while !stop.load(Ordering::Relaxed) {
+                if let Ok(charge) = ctx.charge(bytes) {
+                    let now = accepted.fetch_add(bytes, Ordering::SeqCst) + bytes;
+                    assert!(now <= 64 * MIB, "accepted {now} bytes in a 64 MiB pool");
+                    if hold {
+                        std::thread::yield_now();
+                    }
+                    accepted.fetch_sub(bytes, Ordering::SeqCst);
+                    drop(charge);
+                }
+            }
+        };
+        std::thread::scope(|s| {
+            s.spawn(|| worker(&ctx1, 48 * MIB, true));
+            s.spawn(|| worker(&ctx1, MIB, false));
+            s.spawn(|| worker(&ctx2, 48 * MIB, true));
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            stop.store(true, Ordering::Relaxed);
+        });
+        drop((ctx1, ctx2));
+        assert_eq!(accepted.load(Ordering::SeqCst), 0);
+        drop((g1, g2));
+        assert_eq!(pool.granted(), 0);
     }
 }

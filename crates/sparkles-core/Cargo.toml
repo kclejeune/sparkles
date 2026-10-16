@@ -49,6 +49,8 @@ liblzma.workspace = true
 zstd = { workspace = true, optional = true }
 brotli = { workspace = true, optional = true }
 quick_cache = "0.7.0"
+# Portable identity of the locked file across offline directory publication.
+same-file = "1.0.6"
 # TriX, and GML and KML geometry literals (the version oxrdfxml and sparesults already use)
 quick-xml = "0.37"
 tantivy = { version = "0.26.2", default-features = false, features = ["mmap", "stemmer", "stopwords", "lz4-compression"], optional = true }

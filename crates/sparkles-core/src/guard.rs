@@ -5,7 +5,7 @@
 
 pub mod config;
 
-use crate::commit::CommitKind;
+use crate::commit::{CommitInfo, CommitKind};
 use crate::error::Result;
 use crate::id::Id;
 use crate::store::Snapshot;
@@ -22,8 +22,26 @@ pub trait CommitGuard: Send + Sync {
     fn check(&self, c: &Candidate<'_>) -> Result<ValidationSummary>;
     /// Called after a commit the guard saw was published (with its sequence number).
     fn committed(&self, _seq: u64) {}
-    /// Called when a write bypassed the guard.
-    fn bypassed(&self) {}
+    /// Called when a write bypassed the guard. `seq` is the commit number the
+    /// bypassing write will take.
+    fn bypassed(&self, _seq: u64) {}
+    /// Whether the guard can check a commit against a state whose commit is not yet
+    /// durable, and keep track of the states of the commits in flight until each is
+    /// published ([`committed`](Self::committed) is called in commit order, possibly
+    /// after the next commit was checked). A guard that cannot has its commits checked
+    /// against the durable head, one group commit at a time.
+    fn speculative(&self) -> bool {
+        false
+    }
+    /// Called when the store closes cleanly, under the writer lock, with the head commit
+    /// and the snapshot that shows it, so a guard can keep what it knows of the head for
+    /// the next open. It must not call a method of the store that takes the writer lock,
+    /// and its failures are its own to log.
+    fn close(&self, _head: &CommitInfo, _snapshot: &Snapshot) {}
+    /// Called after a compaction published `new`, which holds the data of `old` with
+    /// renumbered terms, while the writer lock is still held. A guard that keeps ids
+    /// translates them (or forgets them).
+    fn rekey(&self, _old: &Snapshot, _new: &Snapshot) {}
     /// A short description, for errors and status.
     fn describe(&self) -> String;
     /// The shape language this guard validates with.
@@ -97,6 +115,8 @@ pub struct WriteOptions {
     /// the request's deadline (a guard also applies its own budget)
     pub deadline: Option<Instant>,
     pub cancel: Option<Arc<AtomicBool>>,
+    /// Additional cancellation sources, intersected with `cancel`.
+    pub cancellation: Option<crate::task::Cancellation>,
     /// results carried in a summary (the guard's default if `None`)
     pub report_limit: Option<usize>,
     /// the message recorded with the commit (see
@@ -107,8 +127,11 @@ pub struct WriteOptions {
     pub author: Option<Arc<str>>,
     /// checked once the writer lock is held, before anything is written
     pub precondition: Option<Precondition>,
-    /// fail with [`Error::WriterBusy`](crate::Error::WriterBusy) instead of waiting
-    /// when another write holds the writer lock
+    /// Fail with [`Error::WriterBusy`](crate::Error::WriterBusy) instead of waiting for
+    /// another write. With group commit this also covers a running fence, queued commits
+    /// and a commit that would be grouped, since a grouped commit waits for its fence. On a
+    /// store whose group commit has failed, the write fails with
+    /// [`Error::Poisoned`](crate::Error::Poisoned), which no retry can fix.
     pub no_wait: bool,
     /// The graphs the write may change (`None`: every graph). An insert or delete in
     /// another graph fails with [`Error::NotPermitted`](crate::Error::NotPermitted)
@@ -160,7 +183,10 @@ impl WriteOptions {
         {
             return Err(crate::Error::Cancelled);
         }
-        if self.deadline.is_some_and(|d| Instant::now() > d) {
+        if let Some(cancellation) = &self.cancellation {
+            cancellation.check()?;
+        }
+        if self.deadline.is_some_and(|d| Instant::now() >= d) {
             return Err(crate::Error::Timeout);
         }
         Ok(())

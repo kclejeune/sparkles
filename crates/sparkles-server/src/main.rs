@@ -4,6 +4,7 @@
 //! `infer` ≈ riot --infer, `shacl` ≈ jena `shacl validate`, `shex` ≈ jena `shex
 //! validate|parse`).
 
+mod algo_cmd;
 mod alloc;
 #[cfg(feature = "mcp")]
 mod ask;
@@ -44,6 +45,7 @@ mod lsp;
 mod mcp;
 #[cfg(feature = "memory")]
 mod memory_cmd;
+mod migrate_cmd;
 mod model_store;
 // the pipeline that uses most of the model clients (`ask`) needs the `mcp` feature
 #[cfg_attr(not(feature = "mcp"), allow(dead_code, unused_imports))]
@@ -66,6 +68,7 @@ mod reasoning;
 #[cfg(feature = "auth")]
 mod remote;
 mod secrets_cmd;
+mod server_memory;
 mod settings;
 mod settings_cmd;
 #[cfg(feature = "shacl")]
@@ -102,26 +105,46 @@ use std::time::{Duration, Instant};
     about = "High-performance RDF/SPARQL database (Jena/Fuseki compatible)"
 )]
 struct Cli {
-    /// Block cache size in MiB
-    #[arg(long, global = true, default_value_t = 1024)]
-    cache_mb: u64,
-    /// Query result cache size in MiB (0 disables it)
-    #[arg(long, global = true, default_value_t = 512)]
-    result_cache_mb: u64,
-    /// Cache of remote SERVICE results (`SERVICE <cache:…>`) per dataset, in MiB (0
-    /// disables it)
-    #[arg(long, global = true, default_value_t = 64)]
-    service_cache_mb: u64,
+    /// Defaults for the cache sizes (and, with `serve`, the query memory limits): `default`
+    /// or `small` for constrained hosts. A flag given on the command line overrides it.
+    #[arg(long, global = true, value_enum, default_value_t = server_memory::Profile::Default)]
+    memory_profile: server_memory::Profile,
+    /// Block cache size in MiB, for the whole server (default 1024, `small`: 256)
+    #[arg(long, global = true)]
+    cache_mb: Option<u64>,
+    /// Query result cache size in MiB, for the whole server (0 disables it; default 256,
+    /// `small`: 64)
+    #[arg(long, global = true)]
+    result_cache_mb: Option<u64>,
+    /// Cache of remote SERVICE results (`SERVICE <cache:…>`) for the whole server, in MiB
+    /// (0 disables it; default 64, `small`: 16)
+    #[arg(long, global = true)]
+    service_cache_mb: Option<u64>,
     /// Treat the default graph as the union of all named graphs
     #[arg(long, global = true)]
     union_default_graph: bool,
-    /// Memory for materialized past states (point-in-time reads), in MiB
-    #[arg(long, global = true, default_value_t = 1024)]
-    history_cache_mb: u64,
+    /// Memory for materialized past states (point-in-time reads), for the whole server,
+    /// in MiB (default 512, `small`: 128)
+    #[arg(long, global = true)]
+    history_cache_mb: Option<u64>,
     /// Memory for packed vectors and HNSW graphs (`spk:vectorSearch`, vector indexes),
     /// per index generation, in MiB
     #[arg(long, global = true, default_value_t = 4096)]
     vector_memory_mb: u64,
+    /// Threads that graph algorithms (`SERVICE algo:…`) may use together, shared by all
+    /// calls (0: half the cores)
+    #[arg(long, global = true, default_value_t = 0)]
+    algo_threads: usize,
+    /// Threads one graph-algorithm call may take
+    #[arg(long, global = true, default_value_t = 4)]
+    algo_max_threads_per_call: usize,
+    /// Memory for built projections of graph algorithms, shared by all datasets, in MiB (0
+    /// disables the cache)
+    #[arg(long, global = true, default_value_t = 256)]
+    algo_cache_mb: u64,
+    /// Most nodes `algo:betweenness` runs on without `algo:samples`
+    #[arg(long, global = true, default_value_t = 100_000)]
+    algo_exact_betweenness_max: usize,
     /// Old index generations named snapshots may keep per dataset
     #[arg(long, global = true, default_value_t = 8)]
     history_max_generations: usize,
@@ -167,6 +190,10 @@ struct Cli {
     /// Experimental durable grouping of concurrent ordinary WAL commits
     #[arg(long, global = true, hide = true)]
     experimental_group_commit: bool,
+    /// With group commit on, send every commit through the group, including one that is
+    /// the only writer (which otherwise commits with write-through writes), for comparing
+    #[arg(long, global = true, hide = true)]
+    no_group_commit_idle_direct: bool,
     /// Log format on stderr: text, or json (one object per line)
     #[arg(long, global = true, value_enum, default_value_t = LogFormat::Text)]
     log_format: LogFormat,
@@ -904,8 +931,10 @@ enum Cmd {
         /// Seal the runtime secret values of `/$/server/secrets` in the data directory
         /// with this key, read once at the start: file:PATH, env:VAR, credential:NAME
         /// (in $CREDENTIALS_DIRECTORY) or command:CMD. The key is 32 bytes as 64
-        /// hexadecimal digits or base64. Plaintext values are sealed at the start
-        /// (needs the backup-encryption feature)
+        /// hexadecimal digits or base64. Without it the server uses the credential
+        /// sparkles-secrets-key, then <data>/secrets.key, which it generates when it
+        /// first stores a value. Plaintext values are sealed at the start. `none` keeps
+        /// the values as plaintext files
         #[arg(long, value_name = "SOURCE", env = "SPARKLES_SECRETS_KEY")]
         secrets_key: Option<String>,
         #[cfg(feature = "mcp")]
@@ -974,11 +1003,19 @@ enum Cmd {
         // what the imports of a ShEx schema may read
         #[command(flatten)]
         shex_imports: shex_cmd::ImportArgs,
-        /// Fuseki's Graph Store direct naming on every dataset: a request to
-        /// /{ds}/{path} that names no endpoint reads or writes the graph whose IRI is
-        /// the request URL
-        #[arg(long)]
-        gsp_direct_naming: bool,
+        /// Fuseki's Graph Store direct naming: a request to /{ds}/{path} that names no
+        /// endpoint reads or writes the graph whose IRI is the request URL. Alone, the
+        /// flag turns it on for every dataset. `--gsp-direct-naming=NAME` does so for
+        /// one dataset, and `=NAME=read` or `=NAME=read-write` sets what it allows.
+        #[arg(
+            long,
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "",
+            action = clap::ArgAction::Append,
+            value_name = "NAME[=read|read-write]"
+        )]
+        gsp_direct_naming: Vec<String>,
         /// Do not log one line per request (target `sparkles::access`)
         #[arg(long)]
         no_access_log: bool,
@@ -998,9 +1035,21 @@ enum Cmd {
         #[arg(long, value_name = "HOST:PORT", conflicts_with = "no_metrics")]
         metrics_addr: Option<String>,
         /// Budget for the estimated memory of a query's intermediate results, in MiB
-        /// (0: unlimited)
-        #[arg(long, default_value_t = 8192)]
-        query_memory_mb: u64,
+        /// (0: unlimited; default 8192, `small`: 1024)
+        #[arg(long)]
+        query_memory_mb: Option<u64>,
+        /// Estimated memory that all queries and updates may hold together, in MiB: the
+        /// query memory pool. A request waits for a share of it before it runs, and a
+        /// query whose state outgrows what is left fails with `503`. The default is
+        /// half of the memory available to the process (its cgroup limit or the physical
+        /// memory) less the caches, and at least 256 MiB; `small` sets 2048. 0 turns the
+        /// pool off.
+        #[arg(long)]
+        total_query_memory_mb: Option<u64>,
+        /// Seconds a request waits for the query memory pool before it answers `503`
+        /// with `Retry-After`
+        #[arg(long, default_value_t = 2.0)]
+        query_admission_wait: f64,
         /// Budget for the serialized body of a SPARQL query response, in MiB (0: unlimited)
         #[arg(long, default_value_t = 1024)]
         max_result_mb: u64,
@@ -1491,6 +1540,12 @@ enum Cmd {
         #[command(subcommand)]
         cmd: SnapshotCmd,
     },
+    /// Graph algorithms on a database: run PageRank, communities, similarity and
+    /// embeddings, write the results back, and manage named projections
+    Algo {
+        #[command(subcommand)]
+        cmd: algo_cmd::AlgoCmd,
+    },
     /// Stored, parameterized queries of a database: list, get, put, delete and run them
     Queries {
         #[command(subcommand)]
@@ -1614,6 +1669,10 @@ enum Cmd {
         #[arg(long)]
         quick: bool,
     },
+    /// Upgrade a stopped server's databases (--data) or one database (--loc) to the
+    /// file versions this release writes; --check lists their versions and the steps
+    /// without changing anything. Exits 1 when a database is outside the window
+    Migrate(migrate_cmd::MigrateArgs),
     /// The quads added and removed between two commits (N, commit:N, time:<RFC 3339>,
     /// snapshot:NAME, head)
     Diff {
@@ -1821,6 +1880,9 @@ enum Cmd {
         /// Largest sh:maxCount drafted (0: none)
         #[arg(long, default_value_t = sparkles::schema::draft::DEFAULT_MAX_COUNT, requires = "draft_shapes")]
         max_count: u64,
+        /// Most inverse property shapes drafted per class (0: none)
+        #[arg(long, default_value_t = sparkles::schema::draft::DEFAULT_MAX_INVERSE, requires = "draft_shapes")]
+        max_inverse: usize,
         /// Draft or profile only this class (IRI; repeatable)
         #[arg(long, value_name = "IRI")]
         class: Vec<String>,
@@ -1895,12 +1957,16 @@ enum Cmd {
 
 fn store_opts(cli: &Cli) -> StoreOptions {
     sparkles::vector::set_budget(cli.vector_memory_mb << 20);
+    let sizes = server_memory::cache_sizes(cli);
+    sparkles::algo::pool::configure(cli.algo_threads, cli.algo_max_threads_per_call);
+    sparkles::algo::cache::set_limit(cli.algo_cache_mb << 20);
+    sparkles::algo::pool::set_exact_betweenness_max(cli.algo_exact_betweenness_max);
     StoreOptions {
-        cache_bytes: cli.cache_mb << 20,
-        result_cache_bytes: cli.result_cache_mb << 20,
-        service_cache_bytes: cli.service_cache_mb << 20,
+        cache_bytes: sizes.blocks,
+        result_cache_bytes: sizes.results,
+        service_cache_bytes: sizes.service,
         union_default_graph: cli.union_default_graph,
-        history_cache_bytes: cli.history_cache_mb << 20,
+        history_cache_bytes: sizes.history,
         history_max_generations: cli.history_max_generations,
         max_snapshots: cli.max_snapshots,
         max_branches: cli.max_branches,
@@ -1910,6 +1976,7 @@ fn store_opts(cli: &Cli) -> StoreOptions {
         wal_prealloc_bytes: cli.wal_prealloc_kb << 10,
         wal_direct_writes: !cli.no_wal_direct_writes,
         experimental_group_commit: cli.experimental_group_commit,
+        group_commit_idle_direct: !cli.no_group_commit_idle_direct,
         change_log: !cli.no_change_log,
         change_log_max_bytes: cli.change_log_mb << 20,
         ..Default::default()
@@ -2144,6 +2211,16 @@ fn print_log(
 pub(crate) const THREAD_STACK: usize = 8 << 20;
 
 fn main() -> Result<()> {
+    // a PDF or Office conversion child of a server (spec C18 §7.1.1), before anything
+    // else of the binary starts
+    #[cfg(any(feature = "pdf", feature = "office"))]
+    {
+        let mut args = std::env::args_os().skip(1);
+        if args.next().as_deref() == Some(std::ffi::OsStr::new(ingest::isolate::CHILD_ARG)) {
+            std::process::exit(ingest::isolate::child_main(args.collect()));
+        }
+        ingest::isolate::enable();
+    }
     run().map_err(rejected_exit)
 }
 
@@ -2324,6 +2401,8 @@ fn run() -> Result<()> {
         geo::register_crs_file(path)?;
     }
     let opts = store_opts(&cli);
+    let cli_memory_profile = cli.memory_profile;
+    let cli_cache_sizes = server_memory::cache_sizes(&cli);
     let no_validate = cli.no_validate;
     match cli.cmd {
         Cmd::Serve {
@@ -2361,13 +2440,15 @@ fn run() -> Result<()> {
             #[cfg(feature = "graphql")]
             graphql,
             shex_imports,
-            mut gsp_direct_naming,
+            gsp_direct_naming,
             no_access_log,
             no_metrics,
             metrics_max_datasets,
             mut metrics_fuseki_names,
             metrics_addr,
             query_memory_mb,
+            total_query_memory_mb,
+            query_admission_wait,
             max_result_mb,
             max_export_mb,
             max_rows,
@@ -2422,6 +2503,7 @@ fn run() -> Result<()> {
             // a Fuseki configuration adds datasets, settings and access rules; the flags
             // given on the command line win
             let mut fuseki = None;
+            let mut config_direct: Vec<String> = Vec::new();
             let (mut timeout, mut update_timeout) = (timeout, update_timeout);
             if let Some(path) = &fuseki_config {
                 let f = fuseki_config::for_serve(path, &data, auth_config.is_some())?;
@@ -2433,7 +2515,7 @@ fn run() -> Result<()> {
                 timeout = timeout.or(f.timeout);
                 update_timeout = update_timeout.or(f.update_timeout);
                 read_only |= f.read_only;
-                gsp_direct_naming |= f.gsp_direct_naming;
+                config_direct = f.gsp_direct_naming.clone();
                 metrics_fuseki_names |= f.metrics_fuseki_names && !no_metrics;
                 if auth_config.is_none() {
                     auth_config = f.auth_config.clone();
@@ -2509,7 +2591,30 @@ fn run() -> Result<()> {
             } else {
                 Vec::new()
             };
-            let mut st = state::AppState::new(&data, opts, Duration::from_secs_f64(timeout))?;
+            let caches = cli_cache_sizes;
+            let pool_bytes =
+                server_memory::pool_capacity(total_query_memory_mb, cli_memory_profile, &caches);
+            if !(query_admission_wait.is_finite() && query_admission_wait >= 0.0) {
+                bail!("--query-admission-wait must be a number of seconds, 0 or more");
+            }
+            tracing::info!(
+                "memory profile {}: block cache {} MiB, result cache {} MiB, SERVICE cache {} MiB, history cache {} MiB, query budget {} MiB, query pool {}",
+                cli_memory_profile.name(),
+                caches.blocks >> 20,
+                caches.results >> 20,
+                caches.service >> 20,
+                caches.history >> 20,
+                query_memory_mb.unwrap_or_else(|| cli_memory_profile.query_memory_mb()),
+                pool_bytes.map_or("off".to_string(), |b| format!("{} MiB", b >> 20)),
+            );
+            let mut st = state::AppState::with_memory(
+                &data,
+                opts,
+                Duration::from_secs_f64(timeout),
+                pool_bytes,
+            )?;
+            st.admission.profile = cli_memory_profile;
+            st.admission.wait = Duration::from_secs_f64(query_admission_wait);
             st.auth = auth;
             st.cors_origins = cors_origin;
             st.hosts = hosts;
@@ -2552,9 +2657,8 @@ fn run() -> Result<()> {
             // the model configuration is the `models` settings kind (spec C19 §11): the
             // declared --model-config, the runtime layer of the data directory and the
             // locks of the settings file
-            if let Some(source) = &secrets_key {
-                st.settings.server.sealing = settings::secrets::Sealing::load(source, &data)?;
-            }
+            st.settings.server.sealing =
+                settings::secrets::Sealing::start(secrets_key.as_deref(), &data)?;
             settings::server::start(&mut st, settings.as_deref(), &models)?;
             #[cfg(feature = "mcp")]
             {
@@ -2572,7 +2676,9 @@ fn run() -> Result<()> {
             {
                 st.graphql_limits = graphql.limits();
             }
-            st.gsp_direct_naming = gsp_direct_naming;
+            st.gsp_direct_naming =
+                state::GspDirectNaming::layered(&config_direct, &gsp_direct_naming)
+                    .map_err(|e| anyhow::anyhow!(e))?;
             st.allow_unvalidated_writes = allow_unvalidated_writes;
             st.http_compression = compress::HttpCompression::parse(
                 &http_compression,
@@ -2587,7 +2693,9 @@ fn run() -> Result<()> {
             st.compaction = auto_compact.state()?;
             let mib = |m: u64| (m > 0).then_some(m << 20);
             st.limits = state::Limits {
-                query_memory_bytes: mib(query_memory_mb),
+                query_memory_bytes: mib(
+                    query_memory_mb.unwrap_or_else(|| cli_memory_profile.query_memory_mb())
+                ),
                 max_result_bytes: mib(max_result_mb),
                 max_export_bytes: mib(max_export_mb),
                 max_rows,
@@ -2603,6 +2711,7 @@ fn run() -> Result<()> {
                 min_free_disk_bytes: mib(min_free_disk_mb),
                 max_timeout: (max_timeout.is_finite() && max_timeout > 0.0)
                     .then(|| Duration::from_secs_f64(max_timeout)),
+                max_timeline_commits: state::Limits::default().max_timeline_commits,
             };
             #[cfg(feature = "fmt")]
             {
@@ -3440,6 +3549,7 @@ fn run() -> Result<()> {
         }
         Cmd::Dump(args) => dump_cmd::run(args, opts),
         Cmd::Snapshot { cmd } => snapshot_cmd(cmd, opts),
+        Cmd::Algo { cmd } => algo_cmd::run(cmd, opts),
         Cmd::Queries { cmd } => queries_cmd::run(cmd, opts),
         #[cfg(feature = "graphql")]
         Cmd::Graphql(args) => graphql::run(args, opts),
@@ -3624,6 +3734,7 @@ fn run() -> Result<()> {
             format,
             quick,
         } => check_cmd::run(loc, data, &format, quick),
+        Cmd::Migrate(a) => migrate_cmd::run(a),
         Cmd::Branch { cmd } => branch_cmd::run_branch(cmd, opts),
         Cmd::Merge(a) => {
             let code = branch_cmd::run_merge(a, opts)?;
@@ -3945,6 +4056,7 @@ fn run() -> Result<()> {
             closed,
             max_in,
             max_count,
+            max_inverse,
             class,
             min_instances,
             with_inferences,
@@ -3971,6 +4083,7 @@ fn run() -> Result<()> {
                         closed,
                         max_in,
                         max_count,
+                        max_inverse,
                         classes: class,
                         min_instances,
                         with_inferences,
@@ -4143,10 +4256,13 @@ fn schema_constraints(
         if req.guard != Some(false) {
             match sparkles_shacl::guard::configured_shapes(store)? {
                 Some((cfg, s)) => layer.sources.push(configured_source(&cfg, &s)),
-                None if req.guard == Some(true) => {
-                    bail!("the database has no write-time SHACL validation")
-                }
-                None => {}
+                None => match shex_guard_source(store)? {
+                    Some(s) => layer.sources.push(s),
+                    None if req.guard == Some(true) => {
+                        bail!("the database has no write-time validation")
+                    }
+                    None => {}
+                },
             }
         }
         for g in req.graphs.iter().filter(|g| *g != "default") {
@@ -4167,6 +4283,21 @@ fn schema_constraints(
         }
         Ok(None)
     }
+}
+
+/// The source of the schema of the database's write-time ShEx validation, if it has one.
+#[cfg(all(feature = "shacl", feature = "shex"))]
+fn shex_guard_source(
+    store: &sparkles::store::Store,
+) -> Result<Option<sparkles::schema::constraints::ConstraintSource>> {
+    Ok(sparkles_shex::guard::install(store)?.map(|g| sparkles_shex::constraints::guard_source(&g)))
+}
+
+#[cfg(all(feature = "shacl", not(feature = "shex")))]
+fn shex_guard_source(
+    _store: &sparkles::store::Store,
+) -> Result<Option<sparkles::schema::constraints::ConstraintSource>> {
+    Ok(None)
 }
 
 /// `sparkles schema --format text`: the constraints layer, one line per property shape.
@@ -4224,7 +4355,8 @@ constraints from {what}: {} · {} shapes · {} classes",
             for p in &c.properties {
                 writeln!(
                     out,
-                    "    <{}>  {}  [{}]",
+                    "    {}<{}>  {}  [{}]",
+                    if p.inverse { "^" } else { "" },
                     p.path,
                     p.summary(short),
                     p.enforcement.name()
@@ -4528,6 +4660,7 @@ struct SchemaDraftArgs {
     closed: bool,
     max_in: usize,
     max_count: u64,
+    max_inverse: usize,
     classes: Vec<String>,
     min_instances: u64,
     with_inferences: bool,
@@ -4703,6 +4836,12 @@ fn schema_draft(
     if a.max_in > TRACKED_VALUES {
         bail!("--max-in must be at most {TRACKED_VALUES}");
     }
+    if a.max_inverse > sparkles::schema::draft::MAX_INVERSE_LIMIT {
+        bail!(
+            "--max-inverse must be at most {}",
+            sparkles::schema::draft::MAX_INVERSE_LIMIT
+        );
+    }
     let name = loc
         .as_deref()
         .and_then(|l| l.file_name())
@@ -4738,6 +4877,7 @@ fn schema_draft(
         min_instances: a.min_instances,
         max_in: a.max_in,
         max_count: a.max_count,
+        max_inverse: a.max_inverse,
         closed: a.closed,
         prefixes: prefixes.into_iter().collect(),
     };

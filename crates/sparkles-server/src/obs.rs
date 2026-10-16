@@ -261,7 +261,7 @@ fn route_op(route: Option<&str>, req: &Request) -> Op {
         return Op::Admin;
     }
     match r {
-        "/{ds}/sparql" | "/{ds}/query" | "/{ds}/queries/{name}" => Op::Query,
+        "/{ds}/sparql" | "/{ds}/query" | "/{ds}/sparql/diff" | "/{ds}/queries/{name}" => Op::Query,
         "/{ds}/update" => Op::Update,
         "/{ds}/data" | "/{ds}/get" | "/{ds}/{*graph}" => Op::Gsp,
         "/{ds}/upload" => Op::Upload,
@@ -681,6 +681,7 @@ fn budget_index(k: BudgetKind) -> usize {
         BudgetKind::RowsProduced => 6,
         BudgetKind::DatasetBytes => 7,
         BudgetKind::HiddenQuads => 8,
+        BudgetKind::ServerMemory => 9,
     }
 }
 
@@ -1088,11 +1089,18 @@ struct DsGauges {
     rcache_misses: u64,
     /// published rebuilds per [`RebuildReason::ALL`]
     rebuilds: [RebuildHistogram; 2],
+    /// the commit path's synchronization, group and fallback counters
+    commit: sparkles::store::CommitMetrics,
 }
 
 fn gauges(st: &AppState) -> BTreeMap<String, DsGauges> {
     let datasets: Vec<_> = st.datasets().values().cloned().collect();
     let mut out: BTreeMap<String, DsGauges> = BTreeMap::new();
+    // the caches are shared, so one pass over each gives every dataset's bytes
+    let (block_usage, result_usage) = match st.catalog.caches() {
+        Some(c) => (Some(c.blocks().usage()), Some(c.results().usage())),
+        None => (None, None),
+    };
     for d in datasets {
         let label = if st.metrics.enabled {
             st.metrics.series(Some(&d.name)).0
@@ -1101,7 +1109,6 @@ fn gauges(st: &AppState) -> BTreeMap<String, DsGauges> {
         };
         let g = out.entry(label).or_default();
         let snap = d.store.snapshot();
-        let opts = d.store.options();
         let (c, r) = (d.store.cache(), d.store.result_cache());
         g.quads += snap.len();
         g.delta_inserts += snap.delta.inserts() as u64;
@@ -1111,21 +1118,32 @@ fn gauges(st: &AppState) -> BTreeMap<String, DsGauges> {
         let quota = d.dataset.settings().quota().get();
         g.disk_bytes += quota.used_bytes;
         g.quota_bytes += quota.max_bytes.unwrap_or(0);
-        g.cache_bytes += c.bytes();
-        g.cache_capacity += opts.cache_bytes;
-        g.cache_entries += c.entries() as u64;
+        let cu = match &block_usage {
+            Some(u) => u.get(&c.namespace()).copied().unwrap_or_default(),
+            None => sparkles::index::NamespaceUsage {
+                bytes: c.bytes(),
+                entries: c.entries() as u64,
+            },
+        };
+        g.cache_bytes += cu.bytes;
+        g.cache_capacity = c.capacity();
+        g.cache_entries += cu.entries;
         g.cache_hits += c.hits();
         g.cache_misses += c.misses();
         g.rcache_enabled |= r.enabled();
-        g.rcache_bytes += r.bytes();
-        g.rcache_capacity += if r.enabled() {
-            opts.result_cache_bytes
-        } else {
-            0
+        let ru = match &result_usage {
+            Some(u) => u.get(&r.namespace()).copied().unwrap_or_default(),
+            None => sparkles::index::NamespaceUsage {
+                bytes: r.bytes(),
+                entries: r.entries() as u64,
+            },
         };
-        g.rcache_entries += r.entries() as u64;
+        g.rcache_bytes += ru.bytes;
+        g.rcache_capacity = r.capacity();
+        g.rcache_entries += ru.entries;
         g.rcache_hits += r.hits();
         g.rcache_misses += r.misses();
+        g.commit.merge(&d.store.commit_metrics());
         for (h, reason) in g.rebuilds.iter_mut().zip(RebuildReason::ALL) {
             let d = d.store.rebuilds(reason);
             for (a, b) in h.buckets.iter_mut().zip(d.buckets) {
@@ -1135,6 +1153,116 @@ fn gauges(st: &AppState) -> BTreeMap<String, DsGauges> {
         }
     }
     out
+}
+
+/// The commit path's histograms and counters (spec X09 section 8).
+fn render_commit_metrics(o: &mut String, gauges: &BTreeMap<String, DsGauges>) {
+    use sparkles::store::{Fallback, SIZE_BUCKETS, SYNC_BUCKETS, SyncPath};
+    let family = |o: &mut String, name: &str, kind: &str, help: &str| {
+        let _ = writeln!(o, "# HELP {name} {help}");
+        let _ = writeln!(o, "# TYPE {name} {kind}");
+    };
+    fn histogram(
+        o: &mut String,
+        name: &str,
+        labels: &str,
+        bounds: &[f64],
+        h: &sparkles::store::HistogramSnapshot,
+    ) {
+        let mut acc = 0;
+        for (i, n) in h.buckets.iter().enumerate() {
+            acc += n;
+            let le = bounds.get(i).map_or("+Inf".to_string(), |b| b.to_string());
+            let _ = writeln!(o, "{name}_bucket{{{labels},le=\"{le}\"}} {acc}");
+        }
+        let _ = writeln!(o, "{name}_sum{{{labels}}} {}", h.sum);
+        let _ = writeln!(o, "{name}_count{{{labels}}} {acc}");
+    }
+    family(
+        o,
+        "sparkles_commit_sync_seconds",
+        "histogram",
+        "Time of each commit synchronization in seconds, by path: direct (write-through), buffered (fdatasync of one commit) or group (one fdatasync for the commits of a fence).",
+    );
+    for (ds, g) in gauges {
+        let ds = escape_label(ds);
+        for (h, path) in g.commit.sync.iter().zip(SyncPath::ALL) {
+            if h.count() > 0 {
+                let labels = format!("dataset=\"{ds}\",path=\"{}\"", path.as_str());
+                histogram(o, "sparkles_commit_sync_seconds", &labels, &SYNC_BUCKETS, h);
+            }
+        }
+    }
+    family(
+        o,
+        "sparkles_group_commit_size",
+        "histogram",
+        "Commits per group commit fence.",
+    );
+    for (ds, g) in gauges {
+        if g.commit.size.count() > 0 {
+            let labels = format!("dataset=\"{}\"", escape_label(ds));
+            histogram(
+                o,
+                "sparkles_group_commit_size",
+                &labels,
+                &SIZE_BUCKETS,
+                &g.commit.size,
+            );
+        }
+    }
+    family(
+        o,
+        "sparkles_group_commit_wait_seconds",
+        "histogram",
+        "Time from a grouped commit joining the queue to its acknowledgement, in seconds.",
+    );
+    for (ds, g) in gauges {
+        if g.commit.wait.count() > 0 {
+            let labels = format!("dataset=\"{}\"", escape_label(ds));
+            histogram(
+                o,
+                "sparkles_group_commit_wait_seconds",
+                &labels,
+                &SYNC_BUCKETS,
+                &g.commit.wait,
+            );
+        }
+    }
+    family(
+        o,
+        "sparkles_group_commit_fallbacks_total",
+        "counter",
+        "Commits of a dataset with group commit on that took the ordinary path, by the first condition that kept them out of a group.",
+    );
+    for (ds, g) in gauges {
+        let ds = escape_label(ds);
+        for (n, why) in g.commit.fallbacks.iter().zip(Fallback::ALL) {
+            if *n > 0 {
+                let _ = writeln!(
+                    o,
+                    "sparkles_group_commit_fallbacks_total{{dataset=\"{ds}\",reason=\"{}\"}} {n}",
+                    why.as_str()
+                );
+            }
+        }
+    }
+    family(
+        o,
+        "sparkles_group_commit_failures_total",
+        "counter",
+        "Group commit fences whose synchronization failed.",
+    );
+    for (ds, g) in gauges {
+        if g.commit.group_commit {
+            let _ = writeln!(
+                o,
+                "sparkles_group_commit_failures_total{{dataset=\"{}\"}} {}",
+                escape_label(ds),
+                g.commit.failures
+            );
+        }
+    }
 }
 
 /// Resident set size of this process (Linux: `VmRSS` of `/proc/self/status`).
@@ -1533,7 +1661,7 @@ pub fn render_prometheus(st: &AppState) -> String {
     }
 
     type Field = fn(&DsGauges) -> u64;
-    let per_dataset: [(&str, &str, &str, Field); 12] = [
+    let per_dataset: [(&str, &str, &str, Field); 10] = [
         (
             "sparkles_dataset_quads",
             "gauge",
@@ -1565,12 +1693,6 @@ pub fn render_prometheus(st: &AppState) -> String {
             |g| g.cache_bytes,
         ),
         (
-            "sparkles_block_cache_capacity_bytes",
-            "gauge",
-            "Capacity of the decoded-block cache.",
-            |g| g.cache_capacity,
-        ),
-        (
             "sparkles_block_cache_hits_total",
             "counter",
             "Decoded-block cache hits.",
@@ -1589,12 +1711,6 @@ pub fn render_prometheus(st: &AppState) -> String {
             |g| g.rcache_bytes,
         ),
         (
-            "sparkles_result_cache_capacity_bytes",
-            "gauge",
-            "Capacity of the query result cache.",
-            |g| g.rcache_capacity,
-        ),
-        (
             "sparkles_result_cache_hits_total",
             "counter",
             "Query result cache hits.",
@@ -1607,6 +1723,35 @@ pub fn render_prometheus(st: &AppState) -> String {
             |g| g.rcache_misses,
         ),
     ];
+    // the caches are sized once for the server, so their capacities carry no label
+    {
+        let (block, result) = (
+            gauges.values().map(|g| g.cache_capacity).max().unwrap_or(0),
+            gauges
+                .values()
+                .map(|g| g.rcache_capacity)
+                .max()
+                .unwrap_or(0),
+        );
+        let (block, result) = st.catalog.caches().map_or((block, result), |c| {
+            (c.blocks().capacity(), c.results().capacity())
+        });
+        family(
+            &mut o,
+            "sparkles_block_cache_capacity_bytes",
+            "gauge",
+            "Capacity of the decoded-block cache, shared by all datasets.",
+        );
+        let _ = writeln!(o, "sparkles_block_cache_capacity_bytes {block}");
+        family(
+            &mut o,
+            "sparkles_result_cache_capacity_bytes",
+            "gauge",
+            "Capacity of the query result cache, shared by all datasets.",
+        );
+        let _ = writeln!(o, "sparkles_result_cache_capacity_bytes {result}");
+    }
+    crate::server_memory::render_prometheus(st, &mut o);
     for (name, kind, help, f) in per_dataset {
         family(&mut o, name, kind, help);
         for (ds, g) in &gauges {
@@ -1686,6 +1831,7 @@ pub fn render_prometheus(st: &AppState) -> String {
             );
         }
     }
+    render_commit_metrics(&mut o, &gauges);
     family(
         &mut o,
         "sparkles_result_cache_entries",
@@ -1717,6 +1863,7 @@ pub fn render_prometheus(st: &AppState) -> String {
     crate::mcp::branches::metrics(&mut o);
     #[cfg(feature = "mcp")]
     crate::mcp::memory::pending::metrics(st, &mut o);
+    io_metrics(&mut o);
     if let Some(rss) = resident_bytes() {
         family(
             &mut o,
@@ -1727,6 +1874,54 @@ pub fn render_prometheus(st: &AppState) -> String {
         let _ = writeln!(o, "process_resident_memory_bytes {rss}");
     }
     o
+}
+
+/// What the read path asked of the kernel and decoded since the process started, as
+/// Prometheus counters (spec X07 §4). They are process-wide: datasets share the readers.
+fn io_metrics(o: &mut String) {
+    use sparkles::index::Perm;
+    use sparkles::ioacct::{IoFile, IoSnapshot};
+    let s = IoSnapshot::now();
+    fn family(o: &mut String, name: &str, help: &str) {
+        let _ = writeln!(o, "# HELP {name} {help}");
+        let _ = writeln!(o, "# TYPE {name} counter");
+    }
+    family(
+        o,
+        "sparkles_index_columns_decoded_total",
+        "Index block columns decoded, by permutation.",
+    );
+    for p in Perm::ALL {
+        let _ = writeln!(
+            o,
+            "sparkles_index_columns_decoded_total{{permutation=\"{}\"}} {}",
+            p.name(),
+            s.cols_decoded[p.index()]
+        );
+    }
+    family(
+        o,
+        "sparkles_index_readahead_bytes_total",
+        "Bytes of index and vocabulary files requested from the kernel with WILLNEED, by file.",
+    );
+    for f in IoFile::ALL {
+        let _ = writeln!(
+            o,
+            "sparkles_index_readahead_bytes_total{{file=\"{}\"}} {}",
+            f.name(),
+            s.willneed_bytes[f as usize]
+        );
+    }
+    family(
+        o,
+        "sparkles_vocab_groups_read_total",
+        "Vocabulary groups read ahead by a first lookup.",
+    );
+    let _ = writeln!(
+        o,
+        "sparkles_vocab_groups_read_total {}",
+        s.vocab_groups_hinted
+    );
 }
 
 /// The JSON snapshot of the registry (`/$/metrics?format=json`) for the UI.
@@ -1794,6 +1989,17 @@ pub fn metrics_json(st: &AppState) -> J {
                 "deltaInserts": g.delta_inserts,
                 "deltaDeletes": g.delta_deletes,
                 "walBytes": g.wal_bytes,
+                "groupCommit": g.commit.group_commit,
+                "commits": {
+                    "fences": g.commit.size.count(),
+                    "failures": g.commit.failures,
+                    "fallbacks": sparkles::store::Fallback::ALL
+                        .iter()
+                        .zip(g.commit.fallbacks)
+                        .filter(|(_, n)| *n > 0)
+                        .map(|(why, n)| (why.as_str().to_string(), J::from(n)))
+                        .collect::<serde_json::Map<_, _>>(),
+                },
                 "diskBytes": g.disk_bytes,
                 "quotaBytes": g.quota_bytes,
                 "resultRows": counters.get(&ds).map_or(J::from(0), |c| c["resultRows"].clone()),
@@ -1827,6 +2033,7 @@ pub fn metrics_json(st: &AppState) -> J {
         "uptimeSeconds": st.started.elapsed().as_secs_f64(),
         "ready": ready(st).0,
         "processResidentBytes": resident_bytes(),
+        "io": sparkles::ioacct::IoSnapshot::now().report(),
         "limits": st.limits.json(st.default_timeout),
         "bucketBounds": BUCKETS.to_vec(),
         "active": active,

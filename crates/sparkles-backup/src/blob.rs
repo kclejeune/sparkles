@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 use std::io::Read;
 
 pub const MAGIC: &[u8; 4] = b"SPKB";
-pub const FORMAT: u8 = 1;
+pub const FORMAT: u8 = sparkles_core::formats::BACKUP_BLOB.writes as u8;
 pub const HEADER_LEN: usize = 16;
 
 /// How a blob's payload is encoded.

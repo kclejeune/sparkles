@@ -23,6 +23,7 @@ sparkles-graphql = { path = "crates/sparkles-graphql" }
 sparkles-memory-import = { path = "crates/sparkles-memory-import" }
 sparkles-modelstore = { path = "crates/sparkles-modelstore" }
 sparkles-embed = { path = "crates/sparkles-embed" }
+sparkles-office = { path = "crates/sparkles-office" }
 oxrdf = { version = "0.3", features = ["rdfc-10", "rdf-12"] }
 oxrdfio = { version = "0.2", features = ["rdf-12"] }
 oxttl = { version = "0.2", features = ["rdf-12"] }
@@ -35,7 +36,7 @@ imbl = "7"
 arc-swap = "1"
 parking_lot = "0.12"
 rustc-hash = "2"
-hashbrown = { version = "0.16", default-features = false }
+hashbrown = { version = "=0.16.1", default-features = false }
 smallvec = "1"
 memmap2 = "0.9"
 lz4_flex = "0.14"

@@ -572,6 +572,7 @@ fn lookup(ctx: &Ctx, spec: &HistorySpec, vars: &[VarId]) -> Result<Table> {
         descending: spec.descending,
         access: ctx.graphs.clone(),
         cancel: Some(ctx.cancel.clone()),
+        cancellation: ctx.cancellation.clone(),
         deadline: ctx.deadline,
     };
     // a `head` bound means the state the query reads

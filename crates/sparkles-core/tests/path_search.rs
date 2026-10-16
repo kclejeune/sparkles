@@ -8,6 +8,7 @@ use sparkles_core::sparql::{QueryOptions, query};
 use sparkles_core::store::{Store, StoreOptions};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 const PREFIXES: &str = "PREFIX ex: <http://ex/> PREFIX path: <urn:x-sparkles:path#> ";
 
@@ -476,6 +477,202 @@ fn weights_from_reifiers() {
 }
 
 #[test]
+fn all_shortest_over_zero_weight_edges() {
+    // A-Z1: s -> m and s -> t cost 1, and m -> t costs 0. Both `s t` and `s m t` cost 1.
+    // The dictionary numbers terms in sorted order, so the two names decide whether the
+    // search settles m or t first.
+    for (m, t) in [("a", "t"), ("z", "t"), ("t", "a"), ("t", "z")] {
+        let (m, t) = (format!("n{m}"), format!("n{t}"));
+        let edges = format!(
+            "ex:s ex:p ex:{m} {{| ex:w 1 |}} . ex:s ex:p ex:{t} {{| ex:w 1 |}} . \
+             ex:{m} ex:p ex:{t} {{| ex:w 0 |}} ."
+        );
+        let params = format!(
+            "path:source ex:s ; path:target ex:{t} ; path:weight ex:w ; \
+             path:algorithm path:allShortest"
+        );
+        let want: BTreeSet<String> = [format!("s {t}"), format!("s {m} {t}")].into();
+        let s = store_of(&edges);
+        assert_eq!(sequences(&s, &params), want, "{m} {t}");
+        let costs = rows(
+            &s,
+            &format!("SELECT ?c WHERE {{ SERVICE path:search {{ [] {params} ; path:cost ?c }} }}"),
+        );
+        assert_eq!(costs.len(), 2, "{m} {t}");
+        for r in costs {
+            assert_eq!(r["c"].parse::<f64>().unwrap(), 1.0, "{m} {t}");
+        }
+        // A-Z2: a zero-weight edge back from t to m makes a cycle, which is not followed
+        let s = store_of(&format!("{edges} ex:{t} ex:p ex:{m} {{| ex:w 0 |}} ."));
+        assert_eq!(sequences(&s, &params), want, "{m} {t} with a cycle");
+        // an unbound target gets every cheapest simple path to each node
+        let r = rows(
+            &s,
+            "SELECT ?t ?path WHERE { SERVICE path:search { [] path:source ex:s ; \
+             path:weight ex:w ; path:algorithm path:allShortest ; path:target ?t ; \
+             path:pathIndex ?path } }",
+        );
+        let to_t: BTreeSet<&String> = r
+            .iter()
+            .filter(|x| x["t"] == t)
+            .map(|x| &x["path"])
+            .collect();
+        assert_eq!(to_t.len(), 2, "{m} {t} with an unbound target");
+    }
+}
+
+/// `s -> a -> t` of weight 1, and a zero-weight clique of `n` nodes joined to `t`.
+fn clique_behind_target(n: usize) -> String {
+    let mut ttl = String::from("ex:s ex:p ex:a {| ex:w 1 |} . ex:a ex:p ex:t {| ex:w 1 |} . ");
+    for i in 0..n {
+        ttl += &format!("ex:t ex:p ex:c{i} {{| ex:w 0 |}} . ex:c{i} ex:p ex:t {{| ex:w 0 |}} . ");
+        for j in (0..n).filter(|&j| j != i) {
+            ttl += &format!("ex:c{i} ex:p ex:c{j} {{| ex:w 0 |}} . ");
+        }
+    }
+    ttl
+}
+
+#[test]
+fn all_shortest_prunes_a_zero_weight_cycle_behind_the_target() {
+    let s = store_of(&clique_behind_target(10));
+    let params = "path:source ex:s ; path:target ex:t ; path:weight ex:w ; \
+                  path:algorithm path:allShortest";
+    let opts = QueryOptions {
+        timeout: Some(Duration::from_secs(1)),
+        ..Default::default()
+    };
+    let q = format!(
+        "{PREFIXES}SELECT ?path WHERE {{ SERVICE path:search {{ [] {params} ; path:limit 2 ; \
+         path:pathIndex ?path }} }}"
+    );
+    let r = query(s.snapshot(), &q, &opts).expect("the search finishes inside its deadline");
+    assert_eq!(r.rows().len(), 1);
+    assert_eq!(sequences(&s, params), BTreeSet::from(["s a t".to_string()]));
+    // with an unbound target the clique's paths are real output, and pruning keeps them
+    let s = store_of(&clique_behind_target(4));
+    let r = rows(
+        &s,
+        "SELECT ?t ?path WHERE { SERVICE path:search { [] path:source ex:s ; \
+         path:weight ex:w ; path:algorithm path:allShortest ; path:target ?t ; \
+         path:pathIndex ?path } }",
+    );
+    let mut per: BTreeMap<String, usize> = BTreeMap::new();
+    for x in &r {
+        *per.entry(x["t"].clone()).or_default() += 1;
+    }
+    assert_eq!(per["t"], 1);
+    assert_eq!(per["a"], 1);
+    for i in 0..4 {
+        assert_eq!(per[&format!("c{i}")], 16, "c{i}");
+    }
+}
+
+#[test]
+fn all_shortest_path_enumeration_honours_the_timeout() {
+    let s = store_of(&clique_behind_target(9));
+    let opts = QueryOptions {
+        timeout: Some(Duration::from_millis(200)),
+        ..Default::default()
+    };
+    let started = Instant::now();
+    let r = query(
+        s.snapshot(),
+        &format!(
+            "{PREFIXES}SELECT (COUNT(*) AS ?n) WHERE {{ SERVICE path:search {{ [] \
+             path:source ex:s ; path:weight ex:w ; path:algorithm path:allShortest ; \
+             path:target ?t ; path:pathIndex ?path }} }}"
+        ),
+        &opts,
+    );
+    let err = r.err().expect("the enumeration is cut off").to_string();
+    assert!(err.contains("timed out"), "{err}");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+/// A zero-weight chain `ex:n0 ... ex:n{len}` with an edge in each direction.
+fn two_way_zero_weight_chain(len: usize) -> String {
+    let mut ttl = String::new();
+    for i in 0..len {
+        ttl += &format!("ex:n{i} ex:p ex:n{} {{| ex:w 0 |}} . ", i + 1);
+        ttl += &format!("ex:n{} ex:p ex:n{i} {{| ex:w 0 |}} . ", i + 1);
+    }
+    ttl
+}
+
+#[test]
+fn zero_weight_chains_reconstruct_inside_the_deadline() {
+    const LEN: usize = 2000;
+    let s = store_of(&two_way_zero_weight_chain(LEN));
+    let opts = QueryOptions {
+        timeout: Some(Duration::from_secs(5)),
+        ..Default::default()
+    };
+    let want: Vec<String> = (0..=LEN).map(|i| format!("n{i}")).collect();
+    for algorithm in ["path:shortest", "path:allShortest"] {
+        let r = rows_with(
+            &s,
+            &search(&format!(
+                "path:source ex:n0 ; path:target ex:n{LEN} ; path:weight ex:w ; \
+                 path:algorithm {algorithm}"
+            )),
+            &opts,
+        );
+        let paths = node_paths(&r);
+        assert_eq!(paths.len(), 1, "{algorithm}");
+        assert_eq!(paths.into_values().next().unwrap(), want, "{algorithm}");
+    }
+}
+
+#[test]
+fn all_shortest_charges_its_settling_order_to_the_memory_budget() {
+    // a zero-weight star: with an unbound target both shortest modes settle every leaf,
+    // and path:limit 1 stops the output after the first path
+    let mut ttl = String::new();
+    for i in 0..10_000 {
+        ttl += &format!("ex:c ex:p ex:l{i} {{| ex:w 0 |}} . ");
+    }
+    let s = store_of(&ttl);
+    let run = |algorithm: &str, memory: Option<u64>| {
+        let opts = QueryOptions {
+            max_memory_bytes: memory,
+            ..Default::default()
+        };
+        query(
+            s.snapshot(),
+            &format!(
+                "{PREFIXES}SELECT ?t WHERE {{ SERVICE path:search {{ [] path:source ex:c ; \
+                 path:target ?t ; path:weight ex:w ; path:algorithm {algorithm} ; \
+                 path:limit 1 }} }}"
+            ),
+            &opts,
+        )
+    };
+    let shortest = run("path:shortest", None).unwrap();
+    let peak = shortest.mem_peak_bytes;
+    assert!(peak > 0);
+    // the settling-order map that allShortest builds is held in memory, so the budget
+    // that was enough for the shortest mode is not enough for it
+    run("path:shortest", Some(peak)).expect("the shortest mode fits its own peak");
+    match run("path:allShortest", Some(peak)) {
+        Err(sparkles_core::Error::BudgetExceeded(b)) => {
+            assert_eq!(b.kind, sparkles_core::BudgetKind::Memory);
+        }
+        r => panic!("expected a memory error: {:?}", r.map(|r| r.len())),
+    }
+    let all = run("path:allShortest", None).unwrap();
+    assert!(
+        all.mem_peak_bytes >= peak + 10_000 * 16,
+        "{}",
+        all.mem_peak_bytes
+    );
+}
+
+#[test]
 fn hidden_triples_are_not_edges() {
     // A9: a protection hides the triples of e, so the path through e is gone
     let s = store_of(&format!("{GRAPH} ex:e a ex:Hidden ."));
@@ -720,13 +917,19 @@ fn random_graphs_against_brute_force() {
 #[test]
 fn random_weighted_graphs_against_brute_force() {
     let mut r = Rng(0x0dd_ba11_7e57);
-    for case in 0..6 {
+    for case in 0..40 {
         let n = 5 + r.below(3);
         let m = n + r.below(2 * n);
         let mut triples: BTreeMap<E, Option<usize>> = BTreeMap::new();
         for _ in 0..m {
-            let w = r.below(4);
-            triples.insert((r.below(n), 0, r.below(n)), (w > 0).then_some(w));
+            // 0 stands for an edge without a weight, 4 for a weight of zero (A-Z3)
+            let w = r.below(5);
+            let w = match w {
+                0 => None,
+                4 => Some(0),
+                w => Some(w),
+            };
+            triples.insert((r.below(n), 0, r.below(n)), w);
         }
         let ttl: String = triples
             .iter()

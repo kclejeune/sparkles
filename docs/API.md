@@ -31,6 +31,7 @@ A machine-readable description of this API is served at `/$/openapi.json`. See
 * [Full-text search](#full-text-search)
 * [Vector similarity](#vector-similarity)
 * [Path search](#path-search)
+* [Graph algorithms](#graph-algorithms)
 * [GeoSPARQL](#geosparql)
 * [Reasoning status and diagnostics](#reasoning-status-and-diagnostics)
 * [RDFS on read](#rdfs-on-read)
@@ -190,12 +191,17 @@ validators (`sparkles_shacl`, `sparkles_shex`).
 | `sparkles_rows_produced_total` | counter. The rows every operator of a query or an update produced, the work that `--max-rows-produced` limits. | `dataset` |
 | `sparkles_query_memory_peak_bytes` | histogram (1 MiB … 16 GiB, ×4). The estimated memory peak of each query, the measure that `--query-memory-mb` limits. | `dataset` |
 | `sparkles_budget_exceeded_total` | counter | `dataset`, `budget` |
+| `sparkles_query_pool_capacity_bytes`, `sparkles_query_pool_granted_bytes` | gauge. The [query memory pool](#query-memory-pool) and the part of it granted to running queries. Present while the pool is on. | |
+| `sparkles_query_admission_waiting` | gauge. Requests waiting for a share of the pool. | |
+| `sparkles_query_admission_wait_seconds` | histogram (1 ms … 2 s). How long each admitted request waited for its share. | |
+| `sparkles_query_admission_rejected_total` | counter. Requests answered `503` because the pool stayed full for `--query-admission-wait`. | |
 | `sparkles_dataset_quads`, `sparkles_wal_bytes`, `sparkles_disk_bytes` | gauge | `dataset` |
 | `sparkles_dataset_quota_bytes` | gauge. The storage quota of a persistent dataset, `0` when unlimited. | `dataset` |
 | `sparkles_delta_quads` | gauge | `dataset`, `kind` = `insert` \| `delete` |
-| `sparkles_block_cache_bytes`, `…_capacity_bytes` | gauge | `dataset` |
+| `sparkles_block_cache_bytes` | gauge. The bytes of the shared block cache that the dataset's blocks hold. | `dataset` |
+| `sparkles_block_cache_capacity_bytes`, `sparkles_result_cache_capacity_bytes` | gauge. The size of the shared cache. The caches are sized once for the server, so these carry no label. | |
 | `sparkles_block_cache_hits_total`, `…_misses_total` | counter | `dataset` |
-| `sparkles_result_cache_bytes`, `…_capacity_bytes`, `…_entries` | gauge | `dataset` |
+| `sparkles_result_cache_bytes`, `…_entries` | gauge. What the dataset holds in the shared result cache. | `dataset` |
 | `sparkles_result_cache_hits_total`, `…_misses_total` | counter | `dataset` |
 | `sparkles_validation_total` | counter | `dataset`, `language` = `shacl` \| `shex`, `status` = `passed` \| `warned` \| `rejected` \| `skipped` \| `bypassed` \| `timeout` \| `error` |
 | `sparkles_validation_duration_seconds` | histogram (1 ms … 300 s) | `dataset`, `language`, `strategy` = `full` \| `incremental` |
@@ -204,6 +210,11 @@ validators (`sparkles_shacl`, `sparkles_shex`).
 | `sparkles_validation_fallbacks_total` | counter. Validated writes that ran a full validation, or validated some shapes in full. | `dataset`, `language`, `reason` = `baseline` \| `shapes` \| `subclass` \| `sparql` \| `recursive` \| `bulk` \| `budget` |
 | `sparkles_rebuilds_total` | counter. New generations published since the dataset was opened. `compact` counts the compactions that published, and `bulk` the bulk commits, such as a large load, that wrote the data into a new generation. | `dataset`, `reason` = `compact` \| `bulk` |
 | `sparkles_rebuild_duration_seconds` | histogram (0.1 s … 3600 s). The duration of those rebuilds. A reason has series once it has a rebuild. | `dataset`, `reason` |
+| `sparkles_commit_sync_seconds` | histogram (0.1 ms … 5 s). The time of each commit synchronization. `direct` is a write-through write of the WAL records, `buffered` an `fdatasync` for one commit, and `group` the one `fdatasync` for the commits of a group commit fence. A path has series once it has a commit. | `dataset`, `path` = `direct` \| `buffered` \| `group` |
+| `sparkles_group_commit_size` | histogram (1 … 64 commits, ×2). The commits in each group commit fence that synchronized successfully. | `dataset` |
+| `sparkles_group_commit_wait_seconds` | histogram (0.1 ms … 5 s). The time from a grouped commit joining the queue to its acknowledgement. | `dataset` |
+| `sparkles_group_commit_fallbacks_total` | counter. Commits of a dataset with group commit on that took the ordinary path, by the first condition that kept them out of a group. A reason has series once it has a commit. | `dataset`, `reason` = `poisoned` \| `kind` \| `text` \| `geo` \| `embed` \| `bulk` \| `size` \| `noop` |
+| `sparkles_group_commit_failures_total` | counter. Group commit fences whose synchronization failed. Each one poisons the dataset's writer. | `dataset` |
 | `sparkles_compactions_total` | counter. Compactions since the server started. | `dataset`, `mode` = `auto` \| `manual`, `outcome` = `done` \| `abandoned` \| `cancelled` \| `failed` |
 | `sparkles_compaction_seconds`, `sparkles_compaction_lock_seconds` | summary (`_sum`, `_count`). The duration of the compactions that published a generation, and how long their switch held the writer lock. | `dataset` |
 | `sparkles_compaction_lock_seconds_max` | gauge. The longest switch since the server started. | `dataset` |
@@ -229,8 +240,11 @@ its first request, and from then on with all nine outcomes. The `denied` outcome
 refusal by the auth layer. Health checks (`/$/ping`, `/$/ready`), `/$/metrics` and UI
 assets are not counted. The validation series cover every validated write to a dataset
 with write-time validation, whether it comes over HTTP, over MCP or from a reasoning task.
-Deleting a dataset removes its series. Each dataset has its own block cache and result
-cache, each sized to the global `--cache-mb` / `--result-cache-mb`.
+Deleting a dataset removes its series. The block, result, SERVICE and history caches are
+shared by all datasets and sized once by `--cache-mb`, `--result-cache-mb`,
+`--service-cache-mb` and `--history-cache-mb`. The per-dataset cache series count the
+bytes, entries, hits and misses that the dataset caused. Before this sharing, the capacity
+series carried a `dataset` label and each dataset had its own cache of that size.
 
 When rate limits are configured or authentication is on, the counter
 `sparkles_rate_limited_total{dataset,class}` counts refused requests per limit class,
@@ -315,6 +329,8 @@ type MetricsSnapshot = {
   datasets: {
     name: string; quads: number; deltaInserts: number; deltaDeletes: number;
     walBytes: number; diskBytes: number; quotaBytes: number /* 0: unlimited */; resultRows: number;
+    groupCommit: boolean;                  // concurrent commits share one synchronization
+    commits: { fences: number; failures: number; fallbacks: Record<string, number> }; // group commit counters, fences counts successful fences
     budgetExceeded: Record<BudgetKind, number> | null;
     rateLimited: Record<"auth" | "query" | "update" | "admin" | "preauth", number> | null;
     blockCache: { bytes: number; capacityBytes: number; entries: number; hits: number; misses: number };
@@ -432,9 +448,9 @@ each request class per client:
 | Class | Requests |
 |-------|----------|
 | `auth` | Every path under `/$/auth/`, matched or not: login, token minting, device flow and the OIDC callback. |
-| `query` | `/{ds}/sparql`, `/{ds}/query`, `/{ds}/queries/{name}`, `/{ds}/explain`, `/{ds}/shacl`, `/{ds}/shex`, `/{ds}/diff`, `/{ds}/graphql` and `/{ds}/graphql/schema`, Graph Store `GET`/`HEAD` and reads of `/{ds}/patch`, `/{ds}` with `query=` or a GET, `/$/schema/*`, `/$/stats/*`, `/$/validate/*`, `/$/reason/{ds}/diagnostics`, `/$/graphql/{ds}/draft`, `/$/format`, `/$/lint`, and MCP tool calls and resource reads at `/$/mcp` |
-| `update` | `/{ds}/update`, `/{ds}/upload`, `POST` and `PATCH /{ds}/patch`, Graph Store `PUT`/`POST`/`DELETE`, `/{ds}` with `update=` or any other write, and the MCP tools that write (`sparql_update`, `assert_facts`, `create_branch`, `merge_branch` and `delete_branch`). A form POST to `/{ds}` counts as an update. |
-| `admin` | `/$/…` requests other than `GET`, `HEAD` and `OPTIONS` that are not in the `query` class. These cover dataset management, compaction, backups, reasoning, caches and full-text. |
+| `query` | `/{ds}/sparql`, `/{ds}/query`, `/{ds}/queries/{name}`, `/{ds}/explain`, `/{ds}/shacl`, `/{ds}/shex`, `/{ds}/diff`, `/{ds}/graphql` and `/{ds}/graphql/schema`, Graph Store `GET`/`HEAD` and reads of `/{ds}/patch`, `/{ds}` with `query=` or a GET, `/$/schema/*`, `/$/stats/*`, `/$/validate/*`, `/$/reason/{ds}/diagnostics`, `/$/graphql/{ds}/draft`, `/$/commits/{ds}/timeline`, `/$/format`, `/$/lint`, read-only runs and summaries on `POST /$/algo/{ds}/run`, and MCP tool calls and resource reads at `/$/mcp` |
+| `update` | `/{ds}/update`, `/{ds}/upload`, `POST` and `PATCH /{ds}/patch`, Graph Store `PUT`/`POST`/`DELETE`, `/{ds}` with `update=` or any other write, and the MCP tools that write (`sparql_update`, `assert_facts`, `create_branch`, `merge_branch` and `delete_branch`). Write-back requests on `POST /$/algo/{ds}/run` also use this class. A form POST to `/{ds}` counts as an update. |
+| `admin` | `/$/…` requests other than `GET`, `HEAD` and `OPTIONS` that are not in the `query` or `update` class. These cover dataset management, compaction, backups, reasoning, caches and full-text. |
 | `preauth` | Every request, before authentication. Counts failed credential checks per client address and per IPv6 /48. Has no per-dataset form. |
 
 `/$/ping`, `/$/ready*`, `/$/metrics`, the UI and the other `/$/` reads are never limited.
@@ -603,7 +619,7 @@ per-dataset form and no concurrency caps. `preauth=off` turns it off.
 | GET    | `/$/datasets/{ds}`           | `DatasetInfo` |
 | POST   | `/$/datasets/{ds}?state=offline\|active` | Fuseki's dataset state. An offline dataset answers `503 {code: "dataset-offline"}` on its own endpoints (`/{ds}/…`) and keeps its admin routes. The state is not persisted, so a restart brings every dataset back. `400` without `state` or for another value. Needs `admin` on the dataset. |
 | POST   | `/$/datasets/{ds}/rename`    | Renames the dataset with the JSON body `{ "name": "new-name" }`, keeping its identity and data. Returns `200` with `{ "name", "renamedFrom" }` and `Location`. Requires server administration. `400` for invalid names, `404` for a missing source. `409` for an existing target, live requests or views, reservations, a running compaction or reasoning task, a backup policy of the config file that names the dataset, or a grant, protection or active minted token scope that covers one of the two names and not the other. A pattern that covers both names, such as `*`, does not block a rename. The conflict lists the blockers. The rename carries the dataset's request metrics, compaction scheduler state and pending automatic reasoning run over to the new name, and rewrites the backup policies made through the API that name the dataset exactly. A policy that selects it with a glob is left as written, so it selects the dataset afterwards only if the glob matches the new name. |
-| DELETE | `/$/datasets/{ds}`           | Removes the dataset and its files. Requests to the dataset that arrive meanwhile answer `404`. A persistent dataset that a running request or task still holds answers `409`, so that no old handle can write into a dataset later created under the same name. A dataset of the server's command line (`--loc` or `--mem`) answers `409` with the code `declared-dataset` and stays as it is, since the next start would attach it again. Its `DatasetInfo` has `declared: true`. SPARQL Update and the Graph Store Protocol still clear its data. |
+| DELETE | `/$/datasets/{ds}`           | Removes the dataset and its files. Requests to the dataset that arrive meanwhile answer `404`. A persistent dataset that a running request or task still holds answers `409`, so that no old handle can write into a dataset later created under the same name. A dataset of the server's command line (`--loc` or `--mem`) answers `409` with the code `declared-dataset` and stays as it is, since the next start would attach it again. Its `DatasetInfo` has `declared: true`. SPARQL Update and the Graph Store Protocol still clear its data. A copy that `sparkles migrate --keep-old` kept in `.pre-migrate-<version>-<name>` is not removed. |
 | POST   | `/$/datasets/{ds}/clone`     | Copies the dataset, or some of its graphs, into a new persistent or in-memory dataset. Returns `202` with a `Task`. See [Clone](#clone). |
 | GET/POST | `/$/stats/{ds}`            | `DatasetStats`, which includes Fuseki's request counters in `datasets`. |
 | GET/POST | `/$/stats`                 | Fuseki's statistics: `{ "datasets": { "/ds": FusekiCounters } }` for every dataset the caller may read. |
@@ -671,7 +687,7 @@ type DatasetInfo = {
   "ds.state": boolean;     // false while offline
   "ds.services": { "srv.type": string; "srv.description": string; "srv.endpoints": string[] }[];
                            // query, update, gsp-rw, gsp-r, upload, prefixes-rw, SHACL, and
-                           // gsp-direct-rw with --gsp-direct-naming; "" is the dataset URL
+                           // gsp-direct-rw or gsp-direct-r with --gsp-direct-naming; "" is the dataset URL
 };
 
 type FusekiCounters = {
@@ -863,8 +879,9 @@ way older Fuseki versions did. Fuseki 6 itself refuses such bodies. The syntaxes
   served at the dataset URL and `update`, and `gsp-rw` and `gsp-r` at the dataset URL,
   `data` and `get`. `patch` is served at the dataset URL and `patch`. `upload` and
   `shacl` keep their names, and `prefixes-r` and
-  `prefixes-rw` are served at `prefixes`. `gsp-direct-rw` and `gsp-direct-r` need a
-  server started with `--gsp-direct-naming`.
+  `prefixes-rw` are served at `prefixes`. `gsp-direct-rw` and `gsp-direct-r` need the
+  server's `--gsp-direct-naming` to cover the dataset, which sets its mode. A
+  `gsp-direct-rw` endpoint is refused for a dataset the flag makes read-only.
 * A dataset of type `tdb2:DatasetTDB2` or `tdb:DatasetTDB` becomes a persistent dataset,
   unless its location is `--mem--`. A `ja:MemoryDataset`, `ja:DatasetTxnMem` or
   `ja:RDFDataset` becomes an in-memory dataset.
@@ -1022,9 +1039,12 @@ The lists are sorted and left out of the JSON when empty, for example:
 **Pagination.** Every page of a listing comes from the report of one snapshot. The
 server keeps the last report per dataset. The summary and a page request without a cursor
 reuse that report while the snapshot and the selection are unchanged, and compute a new
-one otherwise. A cursor from an older snapshot is still served while its report is the
-one kept. Once a newer report replaces it, the request fails with `409` and the client
-restarts from the first page. Cursors do not survive a restart.
+one otherwise. A cursor names the dataset and the commit of its report, not a process
+counter. A cursor from an older commit is served from the kept report while that is the
+one kept, and otherwise the report is computed again at that commit when the commit is
+still readable like any point-in-time read. A cursor therefore survives a restart and a
+compaction. When the commit is gone, or the cursor belongs to another dataset, the request
+fails with `409` and the client restarts from the first page.
 
 **Errors.** Errors have a `{ "error" }` body.
 
@@ -1034,7 +1054,7 @@ restarts from the first page. Cursors do not survive a restart.
 * `408`: the report did not finish within `timeout`, for example
   `"schema discovery exceeded 60s while scanning predicates (412/9031); narrow graph= or
   raise timeout="`.
-* `409`: a stale cursor, as described above.
+* `409`: a cursor whose commit can no longer be read, as described above.
 * `413`: the dataset has more than `--schema-max-entries` (default 1,000,000) classes or
   predicates, for example `"dataset has 1204331 classes (limit 1000000)"`.
 
@@ -1261,10 +1281,13 @@ type ConstraintSource = {
              otherPaths: number }[];
 };
 type PropertyConstraint = {
-  path: string; shape?: string;   // the property shape's IRI, if it has one
+  path: string;                   // the predicate IRI
+  inverse?: boolean;              // ShEx only: the constraint is on the subjects pointing at the instance (^p)
+  shape?: string;                 // the property shape's IRI, if it has one
   severity: string;               // sh:Violation unless the shape says otherwise
   enforcement: "reject-on-write" | "warn-on-write" | "validated-on-request";
   minCount?: number; maxCount?: number; datatype?: string; class?: string[]; nodeKind?: string;
+  values?: string[];              // ShEx only: the value set, as N-Triples terms
   other?: string[];               // components of the other constraints, such as sh:PatternConstraintComponent
 };
 ```
@@ -1278,8 +1301,22 @@ always those installed now.
 A caller limited to some graphs reads only the shapes graphs it may read. It sees the
 guard's shapes only when it may read every shapes graph of the guard. Otherwise the
 summary leaves the guard source out, and `shapes=guard` answers `404`. `shapes=guard`
-also answers `404` when the dataset has no write-time SHACL validation. A ShEx guard is
-not summarized. A shapes graph with no quads answers `404`, `shapes=union` and a malformed
+also answers `404` when the dataset has no write-time validation whose shapes the caller may
+read.
+
+A ShEx guard is summarized from its compiled schema. A class gets the shapes that the
+guard's shape map selects with `{FOCUS rdf:type C}`, and a shape map entry of any other
+kind counts under `otherTargets`. Each triple constraint of such a shape, and of the
+shapes it extends, is a property constraint with its predicate or, for `^p`, its
+inverse. The cardinality gives `minCount` and `maxCount` when the constraint is part of a
+plain sequence. A constraint inside a choice or a group that has a cardinality of its own
+lists the predicate with `http://www.w3.org/ns/shex#Group` under `other`. A node
+constraint gives `datatype`, `nodeKind` or `values`, and a reference to another shape
+gives `class` when exactly one class selects that shape. Facets map to the SHACL
+component that checks the same thing, and disjunctions, negations, nested shapes,
+unresolved references and semantic actions are named under `other` with a
+`http://www.w3.org/ns/shex#` IRI. The severity of a ShEx constraint is `sh:Violation`, and
+its enforcement follows the guard's mode. A shapes graph with no quads answers `404`, `shapes=union` and a malformed
 IRI answer `400`, and a build without the `shacl` feature answers `501` when shapes are
 named.
 
@@ -1303,11 +1340,25 @@ applies to that satisfy it reaches `support`:
 | `sh:maxCount` | the smallest number of values that enough instances keep to, up to `maxCount` |
 | `sh:nodeKind` | the most specific node kind of the values |
 | `sh:datatype` | the datatype of the values, when they are well-formed literals of one datatype |
+| `sh:or` of datatypes | the smallest set of two or three datatypes that enough instances stay within, when no single datatype reaches the support |
+| `sh:pattern` | for properties whose values are all strings, a fixed prefix such as `^ISBN[-]` or the character-class skeleton most instances share such as `^[A-Z]{2}[0-9]{4}$`, shared by at least two instances |
+| `sh:minInclusive`, `sh:maxInclusive` | for properties whose values are all inline numbers of one datatype, or all dates or dateTimes that agree on a timezone, the smallest and largest value that enough instances stay within, commented as observed and not intended |
+| `sh:node` | the shape of the class that `sh:class` names, when the draft also has a shape for that class, at `support=1` only |
 | `sh:class` | a class all the values belong to, outside the `rdf:`, `rdfs:`, `owl:`, `xsd:` and `sh:` namespaces |
 | `sh:in` | the most used values, at most `maxIn`, each used by two instances or more (not for booleans) |
 | `sh:languageIn`, `sh:uniqueLang` | the language tags of the values, and whether an instance repeats one |
 
-Every constraint other than `sh:minCount` applies to the instances that have a value. At
+Every constraint other than `sh:minCount` applies to the instances that have a value.
+
+Two more kinds of property shape come from the same passes. An inverse property shape
+(`sh:path [ sh:inversePath p ]`, ShEx `^p`) describes the subjects that point at the
+instances of a class, and is drafted for a predicate when enough of the class's instances
+are pointed at over it, at most `maxInverse` per class and the most used first. A sequence
+shape (`sh:path ( p q )`) describes the values of `q` at the blank nodes that `p` leads to,
+when those blank nodes have no drafted class and `p` has a node kind of `sh:BlankNode`. It
+reaches one level only. ShEx has no sequence paths, so the ShExC draft lists them in a
+comment. The references of `sh:node` may form cycles, and the draft says so in a comment,
+since both validators handle recursion. At
 `support=1`, the default, the current data conforms to the draft. Below 1, each drafted
 constraint reports how many instances it excludes, and the best candidate that missed
 the threshold is listed as rejected with the same counts.
@@ -1321,6 +1372,7 @@ the threshold is listed as rejected with the same counts.
 | `minInstances` | `1` | Skip classes with fewer instances. |
 | `maxIn` | `10` | The largest `sh:in` list, at most 64. `0` drafts none. |
 | `maxCount` | `1` | The largest `sh:maxCount` drafted. `0` drafts none. |
+| `maxInverse` | `10` | The most inverse property shapes drafted per class, at most 1000. `0` drafts none. |
 | `closed` | `false` | Draft closed shapes, with `sh:ignoredProperties ( rdf:type )`. |
 | `base` | `urn:x-sparkles:shape:<ds>:` | The namespace of the shape IRIs. |
 | `format` | `json` | `json`, `turtle` (the SHACL shapes), `shaclc` (the SHACL shapes in the compact syntax) or `shexc` (the ShEx schema). `Accept: text/turtle`, `Accept: text/shaclc` and `Accept: text/shex` choose them too. |
@@ -1328,37 +1380,42 @@ the threshold is listed as rejected with the same counts.
 
 ```ts
 type ShapesDraft = {
-  draftFormat: 1; dataset: string;
+  draftFormat: 2; dataset: string;
   snapshot: { version: number; generation: string; computedAt: string };
   selection: { graph: string; reasoning: boolean };
   options: { support: number; minInstances: number; maxIn: number; maxCount: number;
-             closed: boolean; base: string; classes: string[] };
+             maxInverse: number; closed: boolean; base: string; classes: string[] };
   totals: { shapes: number; propertyShapes: number; constraints: number; rejected: number;
             skippedClasses: number };
   shapes: { shape: string; class: string; instances: number; closed: boolean;
-            properties: { path: string; instances: number; maxValues: number;
+            properties: { path: string; inverse?: boolean; then?: string;  // then: a sequence p/q
+                          instances: number; maxValues: number;
                           constraints: Constraint[]; rejected: Constraint[] }[] }[];
   shacl: string;      // the shapes graph in Turtle, with the counts as comments
   shaclc: string;     // the same shapes in SHACLC, with the counts as comments
   shex: string;       // the ShEx schema in ShExC
   shapeMap: string;   // {FOCUS rdf:type <C>}@<shape>, … for the ShEx schema
 };
-type Constraint = { component: "minCount" | "maxCount" | "nodeKind" | "datatype" | "class"
-                               | "in" | "languageIn" | "uniqueLang";
-                    value: number | string | string[] | boolean;  // terms in N-Triples syntax
+type Constraint = { component: "minCount" | "maxCount" | "nodeKind" | "datatype" | "or" | "class"
+                               | "node" | "in" | "languageIn" | "uniqueLang" | "pattern"
+                               | "minInclusive" | "maxInclusive";
+                    // `or` lists datatype IRIs, `node` a shape IRI, `pattern` a regular
+                    // expression, the bounds a term in N-Triples syntax
+                    value: number | string | string[] | boolean;
                     applicable: number; satisfied: number; excluded: number };
 ```
 
 The ShEx schema carries the same constraints. ShEx applies no RDFS, so its class tests
 list the class and its subclasses, `EXTRA rdf:type { rdf:type [ex:C ex:Sub] + }`, and
 the shape map selects the direct instances of each class. `sh:uniqueLang` has no ShEx
-counterpart and is left out of it. The draft reads only the graphs the caller may read,
+counterpart and is left out of it, and so are date ranges, since ShEx has numeric facets
+only. `sh:node` is `@<shape>` in ShEx, and `sh:or` of datatypes is `(A OR B)`. The draft reads only the graphs the caller may read,
 and the errors are those of `/$/schema/{ds}`. Installing a draft is a separate step: send
 the Turtle to `PUT /$/validation/{ds}` with `mode: "warn"`, or use the schema browser's
 **Draft shapes** dialog.
 
 `sparkles schema --loc DB --draft-shapes [--support S] [--closed] [--max-in N]
-[--max-count N] [--class IRI]… [--min-instances N] [--with-inferences]
+[--max-count N] [--max-inverse N] [--class IRI]… [--min-instances N] [--with-inferences]
 [--format turtle|shexc|json]` prints the draft, and the MCP tool `draft_shapes` returns
 it to an agent. The Rust API is `sparkles::schema::draft_shapes`.
 
@@ -1476,7 +1533,7 @@ leaves a `DST.clone-tmp-PID` directory, which the next run into `DST` removes.
 | any        | `/{ds}`               | Also the update endpoint (`update=` or `application/sparql-update`), the patch endpoint for a `POST` of `application/rdf-patch` or `application/rdf-patch+thrift`, and the Graph Store endpoint for any other body. A form body (`application/x-www-form-urlencoded`) must hold `query` or `update`. A form with neither is refused and never read as RDF. The refusal is a `400`, or a write's authorization error for a caller without write access. |
 | POST       | `/{ds}/update`        | SPARQL 1.1 Update protocol, with an `update=` form or an `application/sparql-update` body. `using-graph-uri` and `using-named-graph-uri` are the `USING` and `USING NAMED` of every `DELETE`/`INSERT` operation. An operation with `USING`, `USING NAMED` or `WITH` of its own makes them a `400`. An update sent with GET (`/{ds}?update=…`) gets `405`. |
 | GET/PUT/POST/DELETE/HEAD | `/{ds}/data` , `/{ds}/get` | Graph Store Protocol, with `?default` or `?graph=<iri>`. `?graph=default` and `?graph=urn:x-arq:DefaultGraph` name the default graph. `?graph=union` and `?graph=urn:x-arq:UnionGraph` read the union of the named graphs, each triple once. Writing to it is a `400`. A GET with neither parameter returns the whole dataset as N-Quads or TriG. GET is streamed from one snapshot (see [Budgets](#budgets)). |
-| any        | `/{ds}/{path}`        | Fuseki's direct naming, with `sparkles serve --gsp-direct-naming`: the Graph Store Protocol on the graph whose IRI is the request URL without its query, such as `http://host:3030/ds/graphs/one`. The scheme and host are `X-Forwarded-Proto` and `X-Forwarded-Host` when a proxy sends them, else `http` and `Host`. Endpoint names (`sparql`, `data`, `shacl`, …) keep their meaning, so a graph cannot be named by one of them. `?graph=` and `?default` are a `400`. Without the flag the path is a `404`. |
+| any        | `/{ds}/{path}`        | Fuseki's direct naming, with `sparkles serve --gsp-direct-naming`: the Graph Store Protocol on the graph whose IRI is the request URL without its query, such as `http://host:3030/ds/graphs/one`. The scheme and host are `X-Forwarded-Proto` and `X-Forwarded-Host` when a proxy sends them, else `http` and `Host`. Endpoint names (`sparql`, `data`, `shacl`, …) keep their meaning, so a graph cannot be named by one of them. `?graph=` and `?default` are a `400`. Without the flag the path is a `404`. With `--gsp-direct-naming=NAME=read` the dataset is read-only there, and a write answers `405` with `Allow: GET, HEAD, OPTIONS` for any caller who may read the dataset. |
 | POST       | `/{ds}/upload`        | Multipart file upload. The format comes from the file name extension or the content type. Optional `graph` field. CSV and TSV tables are mapped to triples, as [CSV and TSV uploads](#csv-and-tsv-uploads) describes. |
 | POST/PATCH | `/{ds}/patch`         | Applies an RDF Patch in one commit, as Fuseki's `patch` operation. See [Applying RDF Patch](#applying-rdf-patch). |
 | POST       | `/{ds}/shacl`         | SHACL validation, as in Fuseki's `/{ds}/shacl`. See [SHACL validation](#shacl-validation). |
@@ -1531,6 +1588,10 @@ Query parameters beyond the standard protocol:
 
   A write whose client disconnects is cancelled and commits nothing, even while it waits
   for the dataset's writer lock. A commit that has already started completes.
+* `profile=io` adds an `io` object to the metadata of an `application/x-sparkles+json`
+  result. It needs the `metrics` permission, which every caller has without authentication,
+  and answers `403` otherwise. Any other value of `profile` answers `400`. See
+  [the I/O profile](#the-io-profile).
 * `execution=eager|streaming|auto` chooses how the query runs. The default is `eager`.
   `streaming` supports SELECT in JSON, XML, CSV, TSV and native Sparkles JSON, ASK,
   and CONSTRUCT and DESCRIBE in RDF or native Sparkles JSON. The query reads from a
@@ -1574,7 +1635,7 @@ Query parameters beyond the standard protocol:
   `true` if the dataset has any.
 * `nocache=true` bypasses the query result cache, so nothing is read from it or stored in
   it. It is meant for benchmarking, and `explain` accepts it too. `sparkles serve
-  --result-cache-mb N` sets the server-wide cache budget (default 512, `0` disables the
+  --result-cache-mb N` sets the server-wide cache budget (default 256, `0` disables the
   cache). The cache is keyed by snapshot version, so updates invalidate it.
   `POST /$/cache/clear/{ds}` empties it. `nocache=true` also skips the cache of remote
   results that `SERVICE <cache:…>` uses ([SERVICE options](#service-options-loop-bulk-and-cache)).
@@ -2097,7 +2158,7 @@ budget. A caller without `federate`, or a server with SERVICE turned off, is ref
 when the cache holds the answer. Cache entries are kept per caller and per endpoint of
 the request, so callers with different credentials or graph views never read each
 other's entries. Library users choose the scope with `QueryOptions::service_scope`. The
-cache holds `--service-cache-mb` (64) per dataset, skips any entry larger than an eighth
+cache holds `--service-cache-mb` (64) for the whole server, skips any entry larger than an eighth
 of that, and keeps no entry for a response that was cut short. `POST /$/cache/clear/{ds}`
 empties it, the `no_cache` query option skips it, and the dataset's statistics report it
 as `serviceCache`.
@@ -2229,6 +2290,16 @@ matches in any serialization, so a Turtle `GET` can be followed by a `PUT` of N-
 The default graph and the whole dataset always exist, and a named graph exists while it
 holds a triple. A `PUT` with `If-None-Match: *` therefore creates a named graph only if it
 is absent. A missing graph is still a `404` on `GET`, whatever the conditions say.
+
+With group commit, a precondition or permission refusal based on the dataset's state
+waits for earlier writes to become durable. The core `WriteOptions::no_wait` option
+never waits. It returns `WriterBusy` when another write holds the writer lock, when a
+group commit fence is running or commits are queued, when the write's own commit would be
+grouped, and when a refusal would need to wait. After a failed fence it returns
+`Poisoned`, because the dataset accepts no write until it is reopened. The HTTP error
+conversion maps an escaping `WriterBusy` to `503`. There is no HTTP header for this option.
+Ordinary HTTP writes leave it disabled. The server's internal inline attempt enables
+it, consumes `WriterBusy` and retries through the blocking path.
 
 RFC 9110 asks `If-Match` to use the strong comparison, under which a weak tag never
 matches. Sparkles compares the commit a tag names instead. Its tags identify the data
@@ -2402,7 +2473,12 @@ graphs it writes, and gets `403` for a row in another graph and for any `PA` or 
 row.
 
 The default answer is `200` with JSON. `inserted` and `deleted` count the rows that took
-effect, and `rows` counts the rows read.
+effect, and `rows` counts the rows read. `prevChecked` means an own-dataset `prev` was
+successfully checked against the transaction head. An aborted dry run skips its leading
+check and reports `false`, while a successful late comparison reports `true`. After
+normal writer admission, a plain abort reports the published head and its matching
+message without adding a wait for an independent pending write. An abort that
+successfully checked a pending head waits for its fence and propagates a failure.
 
 ```json
 { "committed": true, "inserted": 2, "deleted": 1, "prefixesSet": 0, "prefixesRemoved": 0,
@@ -2765,7 +2841,40 @@ digest chains from 32 zero bytes. The exact input is defined in
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/$/commits/{ds}` | Lists commits, newest first. `?limit=` sets the page size (default 50, max 1000). `?before=<seq>` pages backwards, and `?after=<seq>` lists the commits after `seq`, oldest first. Returns `{dataset, datasetId, head, firstRetained, complete, commits: Commit[], next: string \| null}`. |
+| GET | `/$/commits/{ds}/timeline` | The commits of a branch in buckets, for a time slider over a long history. See [the commit timeline](#the-commit-timeline). |
 | GET | `/$/commits/{ds}/{ref}` | One commit. `ref` is `42`, `commit:42` or `head`. `404` beyond the head, `410` if the commit is no longer retained. |
+
+### The commit timeline
+
+`GET /$/commits/{ds}/timeline` cuts the commits of a branch into runs of consecutive
+numbers, so that a client can draw a history of any length. It reads the commit catalog
+once, needs read permission and counts against the `query` rate-limit class. `branch=`
+names the branch, as for the other commit routes. `from` and `to` are commit numbers that
+limit the range, and by default it covers the first retained commit to the head. The
+server reads only the commits of that range, up to the head it saw when the request began,
+so a commit made during the read never gives a bucket past `head`. A range of more than
+10,000,000 commits is a `400`, since the catalog hands the commits over as one list, and
+`from` and `to` narrow it. A range that starts after the head holds no commit and gives no
+buckets. `buckets` is the most buckets, 200 by default and at most 2,000. Every bucket
+spans `bucketWidth` commit numbers, which is the width of the range divided by `buckets`
+and rounded up, so a position on a track maps to a commit by arithmetic. A bucket with no
+retained commit is left out.
+
+```json
+{ "dataset": "ds", "datasetId": "3f1c9a2e-…", "head": 4999, "firstSeq": 0, "lastSeq": 4999,
+  "commits": 5000, "bucketWidth": 25, "oldestReconstructable": 1200,
+  "readable": [ { "from": 1200, "to": 4999 } ],
+  "buckets": [ { "firstSeq": 0, "lastSeq": 24, "firstTime": "2026-09-01T08:00:00.000Z",
+                 "lastTime": "2026-09-01T09:12:41.310Z", "commits": 25,
+                 "inserted": 1200, "deleted": 40, "kinds": { "update": 24, "load": 1 },
+                 "merges": 0, "snapshots": 0 }, … ] }
+```
+
+`inserted` and `deleted` add up the quads the bucket's commits changed. A caller whose
+grants cover only some graphs gets no quad counts, because they cover every graph, as for
+[commits](#commits). `readable` lists the ranges of commits whose state a
+[point-in-time read](#point-in-time-reads-and-snapshots) can still see. A `400` names a
+parameter that is out of range.
 
 Entries of `GET /$/datasets[/{ds}]` gain `id`, `head` and `modified`, the head's timestamp.
 `sparkles log --loc DB [--limit N] [--before SEQ | --after SEQ | --at REF] [--format json]`
@@ -3363,8 +3472,8 @@ longer kept is `410 history-gone`, and the body lists the readable ranges:
   "reconstructable": [ { "from": 40, "to": 57 } ], "metadata": { "seq": 12, … } }
 ```
 
-Materializing a past state is bounded by `--history-cache-mb` (default 1024, `507`
-beyond it) and by the request timeout. Results are cached, and one materialization runs
+Materializing a past state is bounded by `--history-cache-mb` (default 512 for the whole
+server, `507` beyond it) and by the request timeout. Results are cached, and one materialization runs
 at a time. A state starts from the nearest known state of its generation in the
 write-ahead log: the generation's base, a cached past state before or after it, or the
 live state. Later states replay the log forward, and earlier ones undo it backward, so a
@@ -3377,7 +3486,12 @@ added quads are those `to` has and `from` lacks, and the removed quads are the r
 Both parameters take
 the selectors of `at`. `to` defaults to the head and `from` to the commit before `to`, so
 `?to=commit:42` shows what commit 42 changed. The two may come in either order.
-`graph=IRI` or `default` limits the diff to one graph.
+`graph=IRI` or `default` limits the diff to one graph. `term=` keeps the changes whose
+subject or object is that term, as an N-Triples term or a bare IRI. It may repeat, up to
+1,000 times. The UI uses it to diff only the resources a graph draws. The filter applies
+while the commits' changes are read, so the memory a diff needs follows the changes that
+match, but the time still follows every change in range. It does not combine with the RDF
+Patch formats, which must list every change and answer `400`.
 
 | Format | How to ask | Body |
 |---|---|---|
@@ -3443,6 +3557,57 @@ labels in. The binary form is a sequence of `RDF_Patch_Row` structs of Jena's RD
 schema in the Thrift compact protocol. Its literals carry the base direction of
 directional language strings, which Jena's binary reader ignores. A patch always lists
 every change, so `limit` with a patch format is `400`.
+
+### Comparing a query between two states
+
+`POST /{ds}/sparql/diff?from=SEL&to=SEL` runs one SELECT query at two states and returns
+the rows only one of them has. The query is the body, as `application/sparql-query`, a
+form with `query`, or JSON with `query` and the parameters. `from` is required. `to`
+defaults to the head, and both take the selectors of `at`. `branch` and `reasoning` are as
+for [the query endpoint](#per-dataset-sparql-protocol-fuseki-compatible). The caller
+needs read permission, and an ASK, CONSTRUCT or DESCRIBE query is a `400`. The UI offers
+this comparison when a result is too large to compare in the browser.
+
+Rows are compared as bags of their terms in column order. A row that occurs twice in one
+result and once in the other differs once. Blank nodes compare by label, so a query that
+makes new blank nodes for each run reports them as different. A query whose rows change
+between runs, as with `STRUUID`, `UUID`, `RAND`, `NOW`, `BNODE` or `SERVICE`, cannot be
+listed, because the rows only the earlier state has are found by running it again. The
+request is refused with `409` and `code: "not-repeatable"` instead of listing fewer rows
+than it counted.
+
+```json
+{ "dataset": "ds", "datasetId": "3f1c9a2e-…",
+  "from": { "selector": "commit:1", "commit": { "seq": 1, … } },
+  "to": { "selector": "commit:4", "commit": { "seq": 4, … } },
+  "vars": ["s", "o"], "fromRows": 1, "toRows": 1, "same": 0, "added": 1, "removed": 1,
+  "addedRows": [ { "s": { "type": "uri", "value": "urn:c" }, "o": { "type": "literal", "value": "three" } } ],
+  "removedRows": [ { "s": { "type": "uri", "value": "urn:a" }, "o": { "type": "literal", "value": "1", "datatype": "http://www.w3.org/2001/XMLSchema#integer" } } ],
+  "truncated": { "added": false, "removed": false } }
+```
+
+`addedRows` are the rows only the later state has and `removedRows` those only the earlier
+state has, each as SPARQL JSON terms with unbound variables left out. `limit` caps each
+list, 100 by default and at most 10,000, and `truncated` says that a list is cut. The
+counts are always complete. The body obeys `--max-result-mb` and the request's own
+`max-result-mb`, and a comparison whose listed rows would pass it fails with `507` and
+`budget: "result-bytes"`, so that a few very large literals cannot make a large response.
+
+The server keeps a 128-bit hash for each distinct row of the earlier result and no row.
+It reads the later result against those hashes, which finds its own rows as they go by,
+and runs the earlier query once more to list the rows that no row of the later result
+matched. That is three executions of the query, each with the request's budgets, so the
+request counts twice against the `query` rate limit. The request's timeout covers the
+whole comparison, and each execution gets the time that is left. A client that disconnects
+stops the comparison within a few thousand rows. The hashes, the table of the result
+being read and the listed rows count against the memory budget (`--query-memory-mb`, or
+the request's `memory-mb`) and against the server memory pool when it is on. A comparison
+beyond the request's budget fails with `507` and `budget: "memory"`, and one the pool
+cannot cover fails with `503` and `budget: "server-memory"`. The table of hashes is
+charged by its real size, 33 bytes for each of its slots, and while it doubles the old and
+the new table are both charged. Each execution runs with the budget that the comparison
+leaves, so the engine and the comparison together stay within the request's budget. That is
+the memory the comparison trades for not keeping the rows.
 
 ### Change feed
 
@@ -3607,8 +3772,8 @@ as `/{ds}/diff`.
 
 `unrecorded` names the commits whose changes the log does not hold. `before-log` commits
 are older than the log, because it started later or retention dropped them. A `bulk`
-commit loaded more than 1,000,000 quads into a non-empty dataset and is recorded with its
-counts only. A `gap` is a stretch the log could not record. A SPARQL history query skips
+commit loaded, or dropped graphs of, more than 1,000,000 quads in a non-empty dataset and
+is recorded with its counts only. A `gap` is a stretch the log could not record. A SPARQL history query skips
 these commits silently. `sparkles history --loc DB --subject IRI` prints the same changes
 from the command line.
 
@@ -4752,28 +4917,49 @@ misses.
 With `"hnsw": false` the index keeps only the packed vectors, which are searched
 exactly.
 
-* **Freshness.** The graph covers the generation's base. Every search adds the
-  snapshot's inserted vectors, scored exactly, and leaves out its deleted ones, so new
-  and deleted vectors count at once. Commits do no index work. A compaction or a bulk
-  load starts a new generation, whose index is built in the background. Searches are
-  exact until it is ready.
+* **Freshness.** The graph is built over the generation's base. After each commit, a
+  background thread inserts the vectors the commit added into the graph, so searches
+  find them through it. Until a vector is inserted, searches score it exactly, and they
+  leave out deleted vectors at once, so new and deleted vectors count from their commit
+  on. Commits themselves do no index work. A search sees exactly the vectors of its own
+  snapshot, also when the graph holds vectors inserted after it. The inserts run on the
+  shared worker pool at normal priority, so under sustained writes they compete with
+  queries for the cores. An index created before its predicate has any row takes the
+  vectors inserted later into its graph like any other index.
+* **New generations.** A compaction carries each index over to the new generation before
+  it switches. The new index reuses the old one's vectors and links, repairs the links
+  around deleted vectors and inserts the new ones, so searches use a graph right after
+  the switch. When more than 30 % of the vectors changed, or the graph's settings
+  differ, the graph is built again in the background after the switch, and searches scan
+  exactly until it is ready. A bulk load starts a new generation whose index is built,
+  or carried over, in the background, and searches are exact until it is ready.
 * **Exact fallback.** A search skips the graph and scans exactly in these cases:
   `exact:true` is set, it reads a past commit, its metric is not the index's, the graph
-  is still being built, at most `exactThreshold` rows are in scope, or the active graph
-  holds less than 5 % of the indexed rows. It also falls back when the graph finds fewer
-  than k rows although more exist. The counters of an executed plan name the path
-  (`method`) and the reason (`exactBecause`).
+  is still being built, at most `exactThreshold` rows are in scope, counting every row
+  the snapshot inserted for the predicate whatever its graph, or the active graph holds
+  less than 5 % of the indexed rows. It also falls back when the graph finds fewer than
+  k rows although more exist. The counters of an executed plan name the path (`method`)
+  and the reason (`exactBecause`).
 * **Builds and files.** Creating an index starts a background build, and writes go on
   meanwhile. The build first publishes the packed vectors, which searches then scan
   exactly, and then the graph. A persistent store writes the build to
   `gen-NNNN/vectors/<name>.spkv` and maps it from there, also after a restart. A file
   that is damaged, or was built for another configuration or generation, is built again.
   Changing only `efSearch`, `exactThreshold` or `model` keeps the build.
-* **Memory.** Packed vectors take `4·dim + 28` bytes per row. The graph takes about
-  `(2M + 1)·4 + 4` bytes per vector, 136 bytes with the default M, because it does not
-  copy the vectors. Both count against `--vector-memory-mb`, mapped or not. A build that
+* **Memory.** Packed vectors take `4·dim + 28` bytes per row. The graph takes about `(2M
+  + 1)·4 + 4` bytes per vector, 136 bytes with the default M, because it does not copy
+  the vectors. Both count against `--vector-memory-mb`, mapped or not. A build that
   would pass the budget leaves the index `over-budget`, and searches then scan exactly
-  within the same budget.
+  within the same budget. Vectors inserted into the graph since the base stay in memory
+  with their links until the next compaction, and they count against the budget too. The
+  background thread inserts vectors only while they fit, and leaves the rest pending, so
+  searches score them exactly and the status reports `overBudget`. Raising the budget
+  lets it go on, and the next compaction releases the inserted vectors. Lowering the
+  budget at run time stops further inserts but does not remove vectors already inserted.
+  On x86-64 CPUs with F16C, a build reads a binary16 copy of the vectors, 2 bytes per
+  dimension, which it holds while it runs. A build also holds a 4-byte distance per link
+  slot while it runs, about as much as the graph's links, and it makes the binary16 copy
+  only when the copy and those distances fit in the budget.
 
 | Method | Path | Result |
 |---|---|---|
@@ -4785,10 +4971,13 @@ exactly.
 | POST | `/$/vector/{ds}/{name}/recall?samples=100&k=10&ef=` | Measures recall@k against the exact search, with stored vectors as queries. Returns `{ k, samples, ef, recall, hnswMs, exactMs }`. `recall` is `null` when no vector was sampled, for example while the index has no graph to search. |
 
 A `VectorIndexStatus` is
-`{ name, predicate, dimension, metric, model?, state, progress?, message?, generation, rows, overlay: { inserts, deletes }, skipped: { malformed, wrongDimension, zeroNorm }, memory: { segmentBytes, hnswBytes, residency }, hnsw, exactThreshold, files?, lastBuild?, embedding? }`.
+`{ name, predicate, dimension, metric, model?, state, progress?, message?, generation, rows, overlay: { inserts, deletes, indexed, pending, overBudget }, skipped: { malformed, wrongDimension, zeroNorm }, memory: { segmentBytes, hnswBytes, residency }, hnsw, exactThreshold, files?, lastBuild?, embedding? }`.
 `state` is `ready`, `building`, `failed` or `over-budget`. `rows` counts the packed base
-rows, and `overlay` the changes that searches add exactly. `residency` is `heap` or
-`mmap`. `hnsw` is `null` or `{ m, efConstruction, efSearch, nodes, layers }`, and
+rows, and `overlay` the changes since the base. Of its inserts, `indexed` are in the
+graph and `pending` are still scored exactly. `overBudget` means the pending rows wait
+because the graph's inserted vectors reached `--vector-memory-mb`. `lastBuild` is `{ at, ms, rows, carried? }`,
+where `carried` means the graph was carried over from the previous generation.
+`residency` is `heap` or `mmap`. `hnsw` is `null` or `{ m, efConstruction, efSearch, nodes, layers }`, and
 `files` is `{ bytes, opened }`, where `opened` means the build was read from its file.
 The configuration lives in `vector.json` in the database directory.
 
@@ -5151,6 +5340,326 @@ described under "Edges from a pattern" below.
 * **Plans.** EXPLAIN shows a `PathSearch` operator with the mode, the ends, the
   predicates and the limits. The executed plan adds the searches run, the nodes they
   visited and the paths found.
+
+## Graph algorithms
+
+`SERVICE algo:<name> { … }` runs a graph algorithm on a projection of the active graph
+and returns the result as solutions, one row for each node, node pair, or node and level.
+The service runs inside Sparkles, so it needs no outbound access and ignores
+`--no-service`. The design is in [F14](specs/F14-graph-algorithms.md).
+
+```sparql
+PREFIX algo: <urn:x-sparkles:algo#>
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+SELECT ?person ?rank WHERE {
+  SERVICE algo:pageRank {
+    [] algo:predicate foaf:knows ; algo:node ?person ; algo:score ?rank .
+  }
+}
+ORDER BY DESC(?rank) LIMIT 20
+```
+
+The block holds triples with one subject, usually `[]`. The predicates are the
+parameters and outputs below. An unknown parameter, or one that the algorithm does not
+take, fails with `400`.
+
+### Algorithms
+
+| Algorithm | Outputs | Parameters |
+|---|---|---|
+| `algo:pageRank` | `algo:score` | `dampingFactor` (0.85), `maxIterations` (20), `tolerance` (1e-7), `source`, `graphalytics` |
+| `algo:betweenness` | `algo:score` | `samples`, `seed` |
+| `algo:wcc`, `algo:scc` | `algo:component` | none |
+| `algo:labelPropagation` | `algo:community` | `maxIterations` |
+| `algo:louvain` | `algo:community`, `algo:level` | `resolution` (1), `maxLevels` (10), `tolerance` (1e-4), `maxIterations` |
+| `algo:leiden` | `algo:community`, `algo:level` | the Louvain parameters, `randomness` (0.01), `seed` |
+| `algo:nodeSimilarity` | `algo:otherNode`, `algo:similarity` | `metric` (`jaccard` or `overlap`), `topK` (10), `similarityCutoff`, `degreeCutoff`, `maxPairs` |
+| `algo:triangleCount` | `algo:triangles` | none |
+| `algo:clustering` | `algo:coefficient`, and `algo:triangles` outside Graphalytics mode | `graphalytics` |
+| `algo:kCore` | `algo:core` | none |
+| `algo:bfs` | `algo:depth` | `source`, `graphalytics` |
+| `algo:sssp` | `algo:distance` | `source`, `graphalytics` |
+| `algo:fastRP` | `algo:embedding` | `dimension` (128, at most 16384), `iterationWeights` (0, 1, 1), `nodeSelfInfluence` (0), `normalizationStrength` (0), `seed` |
+| `algo:node2vec` | `algo:embedding` | `dimension` (128, at most 16384), `walkLength` (80), `walksPerNode` (10), `windowSize` (10), `returnFactor`, `inOutFactor`, `negativeSamples` (5), `epochs` (1), `learningRate` (0.025), `seed` |
+
+Every algorithm also has `algo:node` and `algo:summary` as outputs, and takes
+`algo:concurrency`, `algo:maxMemory` and `algo:limit` as parameters. `algo:source` is a
+constant or a variable that another pattern of the group binds. The call then runs once
+for all its values and joins its rows with the group's. Under `GRAPH ?g`, the call runs
+once for each named graph, and `algo:limit` applies to the rows of each graph, not to
+all of them together.
+
+FastRP takes `iterationWeights` and `nodeSelfInfluence` with the meaning they have in
+Neo4j GDS. The list has one weight for each propagation, and the weight at index `i`
+applies to the embedding after `i + 1` propagations. The default propagates three times
+and weights the second and third, where earlier builds propagated twice.
+`nodeSelfInfluence` is the weight of the random starting vectors, as if they were a 0th
+iteration. A call is refused when `nodeSelfInfluence` is zero and the list is empty or has
+only zero weights. In a JSON request, `"iterationWeights": []` is the empty
+list.
+
+With `algo:graphalytics true`, clustering defaults to forward edges and returns the
+coefficient without triangle counts. An explicit direction on the projection or an
+individual predicate still applies. Ordinary clustering defaults to undirected edges
+and exposes both outputs. Explicitly requesting `algo:triangles` in Graphalytics mode
+is refused.
+
+### Projections
+
+Weighted betweenness requires every stored `f32` edge weight to be finite and strictly
+positive. Zero, signed zero, negative and nonfinite weights fail before its workspace or
+incoming edges are built, and the call returns no score rows. This also refuses a
+finite SERVICE weight that overflows to infinity or underflows to zero when converted
+to `f32`. Unweighted betweenness uses unit edges. Zero-weight SSSP and nonnegative
+PageRank weights remain supported. Nonnegative weighted betweenness is tracked as
+[roadmap item 79](ROADMAP.md).
+
+During weighted search, a competitive distance addition that cannot increase its
+source distance at `f64` precision also refuses the whole invocation with `Invalid`.
+A nonfinite computed distance is refused too. This check can run after workspace or
+incoming edges have been allocated. A refused invocation publishes no score rows,
+success statistics or write-back commits. Noncompetitive absorbed edges remain
+accepted. Accepted distances and path counts still use approximate `f64` arithmetic,
+so rounded path ties need not match exact real sums. Sampling checks only the sources
+it searches. [Roadmap item 80](ROADMAP.md) tracks positive-weight numerical robustness.
+
+A projection is the graph the algorithm runs on, built from the active graph when the
+call starts. It holds what the caller may read.
+
+| Parameter | Value | Default | Meaning |
+|---|---|---|---|
+| `algo:predicate` | an IRI, or a list of an IRI and a direction, repeatable | every predicate between resources except `rdf:type` | The predicates whose triples are edges. |
+| `algo:direction` | `algo:forward`, `algo:backward` or `algo:undirected` | the algorithm's own | How an edge is followed. |
+| `algo:nodeClass` | an IRI, repeatable | any node | Keeps the nodes with that `rdf:type`. A node of the class without edges is a node of the projection. |
+| `algo:weight` | an IRI | none | The property of an edge's RDF 1.2 reifier that holds its weight. |
+| `algo:defaultWeight` | a non-negative number | 1 | The weight of an edge without one. |
+| `algo:aggregate` | `none`, `sum`, `max` or `count` | `none` | How several edges between the same nodes combine. `none` keeps them apart, `sum` adds their weights, `max` takes the largest and `count` uses their number. In an unweighted projection, each edge contributes one, so `sum` retains the multiplicity as a weight. |
+| `algo:projection` | a string | none | The name of a [stored projection](#named-projections). It cannot be combined with the parameters above. |
+
+A block can also hold a nested pattern whose solutions are the edges, with
+`algo:start` and `algo:end` naming the variables of an edge's two ends and
+`algo:edgeWeight` the variable of its weight. The pattern is evaluated once, and each
+distinct pair of ends is one edge. Under `GRAPH ?g` the call runs once for each named
+graph and `?g` is bound to it.
+
+Weights are read only for visible resource edges whose ends pass `algo:nodeClass`.
+Each applicable reifier and weight statement must also be visible in the selected graph
+or graph union. The minimum of its visible numeric weights is used. An applicable
+non-numeric weight fails the call, while unrelated weights do not affect it. A nested
+pattern keeps the first solution's weight for each ordered pair, with the default for
+an unbound weight. Every applicable numeric weight must remain finite when converted
+from f64 to the projection's f32 storage, including each candidate before minimum
+selection and the result of sum aggregation. A default is converted only when it
+supplies an accepted edge.
+
+PageRank requires finite non-negative stored weights, including native library inputs.
+Zero weights are valid. A node whose outgoing weights sum to zero distributes its rank
+as a dangling node. Other algorithms retain their own weight domains.
+
+### Results
+
+* **Doubles.** A score is an `xsd:double` whose lowest four mantissa bits are zero, a
+  relative difference below 2^-48 from the computed value. This keeps every score
+  inline in the index, so a run over millions of nodes adds nothing to the vocabulary.
+* **Limits.** `algo:limit N` keeps the N rows with the highest value of the algorithm's
+  main measure before the rows are joined with the rest of the group. Ties go to the node
+  with the lower term id. For `algo:bfs` and `algo:sssp` the nearest nodes come first.
+* **Node pairs.** `algo:nodeSimilarity` returns each pair in both orders, with the
+  `algo:topK` best partners for each node. `SELECT DISTINCT` over the two nodes in a
+  fixed order, for example with `FILTER(STR(?a) < STR(?b))`, keeps one of each pair.
+  `algo:maxPairs` counts distinct ordered nonself candidates sharing an outgoing
+  neighbour before the partner degree, similarity cutoff and topK filters. It is
+  independent of the memory budget and the number of returned rows.
+* **Summary.** `algo:summary ?s` binds an `rdf:JSON` literal with the statistics of the
+  run, such as `nodes`, `edges` and the iterations or modularity of the algorithm. A
+  block that asks only for `algo:summary` emits one statistics row per selected concrete
+  graph, even when its projection or algorithm result is empty. It computes the
+  algorithm's statistics and omits result-row formatting. Normal SPARQL joins still
+  apply, and `GRAPH ?g` emits no row when it selects no named graphs. With other outputs,
+  the summary remains attached to each actual result row.
+
+An explicitly requested PageRank source that matches no projection node gives no
+ranking results. Its summary reports the projection's node and edge counts with
+`iterations: 0` and `converged: true` to describe a run that did no work. It does not
+compute an unpersonalized ranking. Omitting the source still runs ordinary PageRank.
+* **Embeddings.** `algo:embedding` is an `spk:vector` literal, so it can be written
+  with an update and indexed (see [Vector similarity](#vector-similarity)).
+* **Budgets.** A call counts against the query's timeout and memory budget. A projection
+  or a result that does not fit fails the query with a message that names the parameter
+  to change. `algo:maxMemory` sets a lower budget for one call across all selected
+  graphs. Native buffers and retained outputs share the query's memory owner and
+  server pool admission before allocation. Accumulation within a call reuses admitted
+  columns and grows their capacity geometrically. Spare capacity remains charged with
+  the result, so fewer prefix copies can require more admitted memory. Old and
+  replacement append buffers count while both are live. Completed output keeps its
+  query reservation through parent operators and cursor batches. The call's `peakBytes` stops before the final input
+  join, which keeps its existing query estimates. Projection buffers,
+  distinct pairs, key reconstruction and graph construction admit their requested
+  capacities before allocation, including old and replacement storage while both are
+  live. Deduplicated node arrays retain their full capacity charge. Native callers'
+  consumed edge arrays are admitted by actual capacity on entry, since those arrays
+  already exist. Returned graph storage remains charged once. These bounds cover the
+  pinned Rust Global Vec and hashbrown layouts, not allocator metadata, size classes or
+  process RSS. Node similarity reserves reusable counters, touched IDs and a bounded
+  topK heap for each logical workspace, at most the admitted thread count. Its memory
+  peak includes retained worker-output capacity and old/new growth and final-merge
+  overlap. More admitted threads can therefore need more scratch even in sequential
+  pool fallback. Returned pairs stay charged, and temporary storage releases after
+  it is dropped. Node2vec charges
+  fixed embedding and scratch capacities before allocation and checks cancellation
+  throughout its own initialization, walks and training. Its memory peak includes
+  those capacities while live, with returned embeddings still charged to the call.
+  Incoming rows have a separate reservation for every directed-graph caller, including
+  cache hits. Only the caller constructing those rows reserves temporary cursor offsets.
+  Symmetric graphs reuse outgoing rows. PageRank also reserves its five vector arrays,
+  personalized-source copy and one reusable reduction buffer before allocation. Its
+  temporary reservations end after the buffers are dropped, while returned scores stay
+  charged to the call. These Vec-capacity bounds exclude allocator and Rayon bookkeeping,
+  small summary metadata and other algorithm workspaces outside those bounds.
+  PageRank checks cancellation and deadlines before each node in its four iteration
+  passes and around the passes and their reductions. These checks do not bound edge
+  work inside one incoming row or the ordered outgoing-weight sum, strengthen setup
+  polling or guarantee wall-clock preemption.
+* **Threads and cache.** `--algo-threads` and `--algo-max-threads-per-call` limit the
+  threads of all calls and of each call. A one-thread call runs on the caller and
+  holds one slot in that shared budget. Calls waiting for slots check cancellation and
+  their deadline before admission. `--algo-cache-mb` sizes the cache of built projections. Committed views can reuse a built projection independently of the query
+  result cache. A committed write changes the key. Queries over pending transaction
+  changes neither read nor populate the projection cache, including through masked
+  or derived views. The cache reserves fixed base and possible incoming storage once.
+  Each call separately charges the base projection and the incoming rows it uses.
+  Initialization waits check cancellation and deadlines, and failed builds can be retried.
+* **Plans.** EXPLAIN shows an `AlgoCall` operator with the algorithm and its projection.
+  The executed plan adds the nodes, the edges, the milliseconds spent building and running,
+  the peak bytes, and the projections taken from the cache.
+
+### Runs over HTTP
+
+`POST /$/algo/{ds}/run` takes a JSON request and runs it as the query it stands for.
+Read-only requests, including `summary=true`, require `read` through the `query`
+endpoint. Requests with `write` require `write` through the `update` endpoint. The
+server parses the bounded body once and checks that grant before looking up the
+dataset or disclosing a restore task. Input projections and output writes retain the
+selected endpoint's graph and triple restrictions. Both forms use the admin-body
+ceiling, including after request decompression. Projection-management permissions
+are unchanged.
+
+```json
+{
+  "algorithm": "leiden",
+  "projection": { "predicates": ["http://xmlns.com/foaf/0.1/knows"], "direction": "undirected" },
+  "params": { "seed": 7, "resolution": 1.0 }
+}
+```
+
+Without a `write` member the answer is the result of the query, in the format that the
+`Accept` header or `format` parameter asks for, and the request parameters of
+`/{ds}/sparql` apply (`timeout`, `execution` and the budget overrides). With
+`summary=true` the answer holds only the summary. The `projection` is the name of a stored
+projection or a definition, and its `predicates` may be bare IRIs. Prefixed names in
+`params` and `write` use the standard prefixes and the dataset's.
+
+Read-only requests use the Query rate and concurrency policy. The permit covers
+computation and the response body. Blocking and streaming producers keep their
+share until their work ends even if the client disconnects.
+Admitted error bodies retain the same concurrency permit as successful bodies,
+including after the response headers have been discarded.
+
+A request with a `write` member writes its results back as a task.
+Write requests use Update HTTP admission through the `202` response body. The
+background task does not retain that HTTP permit. It uses the existing task queue
+with four running tasks by default, configurable with `--max-tasks`, a precheck
+that refuses when 1,000 tasks are queued, per-dataset algorithm-task checks and
+algorithm-thread admission. These checks do not form a new atomic task reservation.
+Other task kinds and task polling or cancellation permissions are unchanged.
+
+```json
+{
+  "algorithm": "pageRank",
+  "projection": "people",
+  "write": {
+    "graph": "http://example.org/analytics",
+    "mode": "replace",
+    "predicates": { "score": "http://example.org/rank" },
+    "batchSize": 50000
+  }
+}
+```
+
+| Member | Meaning |
+|---|---|
+| `graph` | The graph that receives the results and the run record. |
+| `mode` | `replace` (the default) clears the graph in the first commit. `merge` replaces only the values of the written predicates for each node it writes. |
+| `predicates` | The predicate each output is written with, for at least one output. An output without a predicate is not written. |
+| `batchSize` | The triples in each commit, 100,000 by default. A batch holds whole nodes. |
+| `atomic` | One commit for the whole run. |
+
+A write-back run is an update, so it has the update deadline. It has no deadline unless
+the request gives a `timeout` or the server runs with `--update-timeout`, and
+`--max-timeout` caps a `timeout` that a request asks for. The server's query timeout does
+not apply to it.
+
+The answer is `202` with a task of kind `algo-run`. The task computes at the head commit
+and then writes batches in commits with the message `algo run <uuid> batch i/n`. It needs
+`write` through the update endpoint, and an active-task precheck refuses another
+algorithm task for the same dataset. It does not reserve that name atomically. A run that is
+cancelled with `DELETE /$/tasks/{id}` keeps the batches it committed. When the task
+ends, its `detail` holds the IRI of the run, the commit it computed at, and the rows,
+triples and commits written. Task and query cancellation sources are both checked during
+computation, result preparation and batch writes, including writer admission. A supplied
+timeout starts at operation entry and shares one absolute bound with the task deadline.
+The earlier bound applies through completion and is never renewed for a later phase.
+Built-in SHACL and ShEx guards retain both cancellation sources and that absolute bound,
+including their SPARQL evaluation. History SERVICE calls forward the same controls to
+the native change-log scan. Native Rust history queries also accept an immutable
+composition of cancellation flags alongside their existing flag and absolute deadline.
+Checks occur during the scan and do not preempt indexing, reads or flushing.
+Custom Rust guards must check the full `WriteOptions`
+cooperatively. These controls do not preempt a durability call or other unchecked work.
+
+The run record is a resource in the output graph with `spk:algorithm`, `spk:parameters`,
+`spk:projection`, `spk:sourceCommit`, `prov:startedAtTime`, `spk:triplesPlanned` and
+`spk:batchesPlanned`. Each batch updates `spk:batchesWritten` and `spk:triplesWritten` in
+its own commit, and the last one adds `prov:endedAtTime` and `spk:status`, which is
+`complete`. A partial run that is cancelled or fails attempts one optional commit of
+`cancelled` or `failed`. It skips a busy writer and uses a separate, nonrenewing 100 ms
+cleanup budget. That budget applies at cooperative checks and cannot preempt a durability
+call. Failure to record status preserves the original error and committed batches. If the
+last batch has already committed, a late control error preserves its complete record
+rather than adding a contradictory status. Cancellation can still race the final check.
+`louvain` and `leiden` write each community as the resource
+`urn:x-sparkles:algo:{run}:{level}:{id}`, with the level and a `skos:broader` link to its
+parent at the next level.
+
+A replace run commits its first batch before the others, so a reader sees a graph with
+part of the new results until the run ends. Use `atomic` for a graph that must change at
+once, at the price of one large commit.
+
+### Named projections
+
+| Route | Needs | Meaning |
+|---|---|---|
+| `GET /$/algo/{ds}/projections` | read | The definitions, and the size of the projection cache. |
+| `GET /$/algo/{ds}/projections/{name}` | read | One definition with its revision, as the `ETag` `"r3"`. |
+| `PUT /$/algo/{ds}/projections/{name}` | admin | Create or replace a definition. `If-Match: "r3"` replaces only that revision and `If-None-Match: *` only creates. A bare string in `predicates` means that predicate in the algorithm's direction. |
+| `DELETE /$/algo/{ds}/projections/{name}` | admin | Remove a definition. |
+
+A name has letters, digits, `_` and `-`, at most 64 characters. A definition has the
+members of a projection above in camel case: `predicates`, `direction`, `nodeClasses`,
+`weight`, `defaultWeight` and `aggregate`. An empty `predicates` list is refused with
+`400`, and leaving the member out means every predicate but `rdf:type`. `algo:projection
+"name"` in SPARQL and the `projection` of a run request refer to a definition by name.
+They read the definition as it is when the query is planned, so a query at an older commit
+uses today's definitions.
+
+The definitions are kept in `algo.json` of a persistent dataset, which backups and
+clones include. Its registered format is 1, and a missing format marker also reads as
+1 without rewriting the file. A newer version returns `Unsupported` before dataset
+metadata changes, including when it belongs to an active or retained branch.
+`sparkles migrate --check` applies the same version check without changing files.
+Malformed JSON, duplicate known struct fields or malformed current definitions leave
+the list empty, report why in `warning`, and refuse catalog changes, so that the damaged
+file is never overwritten.
 
 ## GeoSPARQL
 
@@ -6360,6 +6869,13 @@ the shapes graph in the request body, with Fuseki's semantics:
   `sh:memberShape` result has one `sh:detail` per member that does not conform, holding
   that member's results against the member shape. A `sh:uniqueMembers true` result has one
   `sh:detail` per repeated member, with the member as `sh:value`.
+* **Node expressions** are read in targets, `sh:values`,
+  `sh:defaultValue`, `sh:deactivated`, `sh:expression` and `sh:nodeByExpression`. One
+  evaluation may take at most 16,777,216 units of work, where each evaluation of a
+  sub-expression is a unit and so is each node that a concatenation or a mapping appends.
+  The nodes that a read of the data returns are not counted. A shared sub-expression counts
+  each time it is evaluated, so an expression graph that doubles at every level fails
+  quickly. The limit is fixed for requests, and the timeout also stops an evaluation.
 * **Budgets.** The report is bounded like a query result. It fails with `507` and
   `budget: "result-bytes"` once it holds more results than fit in `--max-result-mb` at 48
   bytes each, or in `--query-memory-mb` at an estimated 512 bytes each. It also fails once
@@ -6845,6 +7361,63 @@ false, so the strict policy that refuses eager fallback still accepts the sort.
 `growingState` warns that an operator keeps state that grows as it runs, such as
 generated strings. The batch size alone does not limit that state.
 
+### The I/O profile
+
+With `profile=io`, the metadata of a native result has an `io` object. It reports what the
+query read from the index and vocabulary files, which helps explain the time of a first
+query after a restart. The counters cover the whole process, so the profile needs the
+`metrics` permission, as `/$/metrics` does. A caller without it gets a `403`, and a value
+of `profile` other than `io` gets a `400`. A streaming response keeps the profile running
+until its body ends.
+
+```ts
+type IoProfile = {
+  index: Record<string, {                  // by permutation: spo, sop, pso, pos, osp, ops, gspo
+    columnsDecoded: number; decodedBytes: number; compressedBytes: number }>;
+  readahead: Record<string, {              // by file: the permutations, vocab.dat, vocab.off, vocab.num
+    requests: number; bytes: number }>;    // WILLNEED requests to the kernel
+  vocab: { finds: number; groupsHinted: number; blocksScanned: number };
+  numericPagesRequested: number;
+  timeMs?: { vocabLookup: number; vocabRead: number; indexDecode: number; indexWait: number };
+  majorFaults?: number; minorFaults?: number;
+  pages?: Record<string, { touched: number; residentBefore: number;
+                           residentAfter: number; broughtIn: number }>;
+  pagesTruncated?: boolean;
+  events?: { atUs: number; file: string; what: string; bytes: number }[];
+};
+```
+
+The counters are process-wide, so they include the reads of any query that runs at the
+same time. The profile is meant for one query on a quiet server. `vocab.finds` and
+`vocab.blocksScanned` are counted only while a profile runs, because a scan of the
+vocabulary adds to them millions of times from many threads. `vocabLookup` is the time
+in key lookups, which resolve the constants of the query. `vocabRead` is the time reading
+terms by id. `indexDecode` is the time decompressing index columns, and `indexWait` is the
+time to read their pages into memory before decoding. The times are summed over threads.
+`pages` comes from `mincore(2)` on the pages the query asked for or read, and `events`
+lists the first 512 requests in order. Overlapping profiles share one epoch inventory
+of at most 65,536 distinct file, mapping and page entries. It retains the first admitted
+pages and bounds report scratch storage by that sample. `pagesTruncated` is true when
+an inventory or range cap omitted pages. It is false when no cap omission was recorded,
+which does not guarantee complete coverage. Process counter snapshots omit the flag.
+
+All `pages` fields describe the retained best-effort sample. `touched`, `residentBefore`
+and `residentAfter` are additive lower bounds on those counts for the full observed set.
+`broughtIn` is `max(residentAfter - residentBefore, 0)` for the sample. It is neither a
+lower bound on the full-set delta nor a physical-I/O count, especially when pages are
+evicted. Platforms without mapped page observations report a false truncation flag and
+no page entries. The bounded shared inventory and event log add memory while profiles
+are active, outside any one query's grant. Their allocation size depends on the allocator.
+Profiling adds observation work, whose corrected-source cost remains to be measured.
+Numeric profiles record mapped value loads in both single and bulk lookup paths. Kinds
+and rank entries are observed before access only when read from the mapping, rather
+than a resident copy. These observations work with hints disabled or already issued.
+`numericPagesRequested` keeps counting numeric advice pages and does not count actual
+loads. Observation adds no advice and does not reset the mapping's once-only hint bits.
+
+The same counters are in `/$/metrics` as `sparkles_index_columns_decoded_total`,
+`sparkles_index_readahead_bytes_total` and `sparkles_vocab_groups_read_total`.
+
 ## Explain
 
 `GET|POST /{ds}/explain?query=…` returns `{ "algebra": string /* SSE */, "plan": PlanNode }`.
@@ -7110,6 +7683,9 @@ fails the request with `507 Insufficient Storage` and a body like this:
   at once, at 8 bytes per value. It is checked before large intermediate results are
   built, so an oversized query fails fast. It is an estimate, not a limit on the
   process's memory.
+* `server-memory` is not one of the request's own budgets. It reports that the server's
+  [query memory pool](#query-memory-pool) is in use. It answers `503 Service Unavailable`
+  with `Retry-After: 1`, because a retry can succeed once other queries finish.
 * `result-bytes` (`--max-result-mb`, default 1024) is the serialized, uncompressed body of
   a SPARQL query response. Graph Store GET, the export path for a graph or the whole
   dataset, has its own budget, `--max-export-mb`, which is unlimited (`0`) by default.
@@ -7145,7 +7721,64 @@ fails the request with `507 Insufficient Storage` and a body like this:
 quads for `hidden-quads`. The
 response of `/{ds}/update` includes `memPeakBytes` and `rowsProduced`.
 `meta.memory.peakBytes` and `meta.rowsProduced` in `application/x-sparkles+json` report a
-query's peak memory estimate and the rows its operators produced.
+query's peak memory estimate and the rows its operators produced. With the query memory
+pool on, `meta.memory.grantedBytes` is the most the query held of the pool.
+
+#### Query memory pool
+
+The design is in [X08 Disk spill and server-wide memory](specs/X08-disk-spill-and-server-memory.md).
+The budgets above bound one query. The pool bounds all queries and updates together, so
+that many large queries cannot add up to more memory than the host has. It counts the same
+estimated bytes as `memory`, not the process's resident memory.
+
+`sparkles serve --total-query-memory-mb N` sets the pool. Without it, the pool is half of
+the memory available to the process, less the configured caches, and at least 256 MiB. The
+available memory is the cgroup v2 limit of the server's cgroup when one is set, and the
+physical memory otherwise. `--memory-profile small` sets 2048 MiB, and `0` turns the pool
+off. On a host where the available memory cannot be read, the pool is off until the flag
+sets it.
+
+Each query and update request is admitted before it parses, after the rate limiter's
+concurrency caps have let it through. Admission takes an initial grant of 16 MiB, or the
+request's whole `--query-memory-mb` budget if that is smaller. If the pool cannot give it,
+the request waits in arrival order. After `--query-admission-wait` seconds (default 2) it
+answers `503` with `Retry-After: 1` and the budget `server-memory`. A waiter behind a
+larger one may be served first when the pool has room for it, at most eight times in a
+row. A running query grows its grant in steps of 4 MiB as its estimate grows, and gives
+steps back as its estimate falls. A query never waits for memory once it runs. When the
+pool cannot cover its next step, the query fails with `server-memory`, and the pool
+therefore cannot deadlock. While requests wait, a query may not hold more than half of the
+pool. A query that exceeds its own `memory` budget still answers `507`.
+
+An eager query keeps its highest estimate in the pool until its result is released, so
+results held by the caller keep their share. In an embedded catalog with a pool, a
+`QueryResult` and the Python and Node result objects keep their query's peak estimate
+until they are dropped or collected, even when the result is much smaller. A SERVICE call
+to the same server is admitted like any request, so it can answer `503` while its caller
+holds memory. Uploads and Graph Store writes take an admission grant for the whole load,
+and the memory of the load itself is not counted in the pool.
+
+`GET /$/server/memory` needs the `metrics` permission and returns the pool and the shared
+caches.
+
+```json
+{ "profile": "default", "queryMemoryBytes": 8589934592,
+  "pool": { "enabled": true, "capacityBytes": 4294967296, "grantedBytes": 33554432,
+            "waiting": 0, "admitted": 120, "rejected": 0, "admissionWaitSeconds": 2.0 },
+  "caches": { "shared": true,
+              "block": { "capacityBytes": 1073741824, "bytes": 402653184, "entries": 1536 },
+              "result": { "capacityBytes": 268435456, "bytes": 0, "entries": 0 },
+              "service": { "capacityBytes": 67108864, "bytes": 0, "entries": 0 },
+              "history": { "capacityBytes": 536870912, "bytes": 0 } },
+  "datasets": [ { "name": "ds", "blockBytes": 402653184, "blockEntries": 1536,
+                  "resultBytes": 0, "resultEntries": 0,
+                  "serviceBytes": 0, "serviceEntries": 0 } ] }
+```
+
+Requests that are not queries or updates, such as administration, are not admitted. A
+query that such a request or an MCP tool call runs starts with an empty grant and grows it
+like any other. It does not queue, and it fails with `server-memory` when the pool is
+short.
 
 **Budgets per request.** A query can ask for lower budgets than the server's with
 `memory-mb`, `max-rows`, `max-rows-produced` and `max-result-mb`, in the query string or
@@ -7347,6 +7980,9 @@ without the permission is a `403` before any connection or file is opened, even 
 | `/ui/*`, `/$/ping`, `/$/ready`, `/$/openapi.json`, `/$/openapi.yaml` | GET | Nothing. Without `metrics`, `/$/ready` lists only readable datasets. |
 | `/$/whoami`, `/$/auth/config`, `/$/auth/login`, `/$/auth/oidc/*` (including the back-channel logout), `/$/auth/device`, `/$/auth/token` | | Nothing. Invalid credentials are still `401`. |
 | `/$/server`, `/$/datasets` (GET), `/$/tasks`, `/$/tasks/{id}`, `/$/stats`, `/$/backups-list`, `/$/validate/*`, `/$/auth/logout`, `/$/format` (POST), `/$/lint` (POST), `/$/geo/convert` (POST) | | Any caller. `/$/format` and `/$/lint` admit nobody under `--format-endpoint off`, and only signed-in callers under `authenticated`. Listings show readable datasets only, and server-wide tasks only to `server-admin`. `/$/stats` covers the datasets the caller may read, and `/$/backups-list` the files of the datasets it administers. Cancelling a task (DELETE) needs `admin` on its dataset. |
+| `/$/algo/{ds}/run` | POST | Read-only runs need `read` through `query`. Runs with `write` need `write` through `update`. The body selects the policy before dataset access. |
+| `/$/algo/{ds}/projections[/{name}]` | GET | `read` through `info`. |
+| `/$/algo/{ds}/projections/{name}` | PUT, DELETE | Dataset `admin`. |
 | `/$/metrics` | GET | `metrics` |
 | `/$/datasets` | POST | `server-admin` |
 | `/$/datasets/{ds}`, `/$/stats/{ds}`, `/$/schema/{ds}…`, `/$/queries/{ds}…` (GET), `/$/prefixes/{ds}`, `/$/commits/{ds}…`, `/$/ready/{ds}`, `/$/reason/{ds}` (GET), `/$/reason/{ds}/diagnostics`, `/$/text/{ds}` (GET), `/$/geo/{ds}` (GET), `/$/vector/{ds}`, `/$/vector/{ds}/{name}` (GET), `/$/snapshots/{ds}…` (GET), `/$/history/{ds}` (GET), `/$/validation/{ds}` (GET), `/$/rdfs/{ds}` (GET), `/$/describe/{ds}` (GET), `/$/quota/{ds}` (GET), `/$/compaction/{ds}` (GET), `/$/graphql/{ds}…` (GET), `/{ds}/prefixes` (GET) | GET | `read`. `POST /$/vector/{ds}/{name}/recall` needs `read` too. |
@@ -7430,8 +8066,8 @@ server_models = true
 
 | Endpoint | Requests |
 |---|---|
-| `query` | SPARQL queries on `/{ds}/sparql`, `/{ds}/query` and `/{ds}`, stored-query runs on `/{ds}/queries/{name}`, `/{ds}/explain`, `/{ds}/text`, `/{ds}/geo`, and the MCP tools that query |
-| `update` | SPARQL Update on `/{ds}/update` and `/{ds}`, and the MCP tool `sparql_update` |
+| `query` | SPARQL queries on `/{ds}/sparql`, `/{ds}/query` and `/{ds}`, stored-query runs on `/{ds}/queries/{name}`, `/{ds}/explain`, `/{ds}/text`, `/{ds}/geo`, read-only algorithm runs and summaries on `POST /$/algo/{ds}/run`, and the MCP tools that query |
+| `update` | SPARQL Update on `/{ds}/update` and `/{ds}`, algorithm write-back on `POST /$/algo/{ds}/run`, and the MCP tool `sparql_update` |
 | `gsp-r` | Graph Store reads (`GET` and `HEAD` on `/{ds}/data`, `/{ds}/get` and `/{ds}`) |
 | `gsp-rw` | Graph Store reads and writes |
 | `upload` | `/{ds}/upload` |
@@ -8152,18 +8788,19 @@ open-world when SERVICE is allowed. The common arguments are:
 | `list_datasets` | none | `{datasets: [{name, quads, commit, modified, reasoning: null\|{profile, stale}, textSearch, writable, graphql?}], limits: {defaultMaxRows, maxRows, defaultMaxBytes, maxBytes, defaultTimeoutSeconds, maxTimeoutSeconds, service, updates}}`. `graphql: true` marks a dataset that `graphql_query` reads. |
 | `describe_schema` | `section` (`summary`\|`classes`\|`predicates`\|`constraints`\|`profiles`), `graph` (`default`\|`union`\|IRI), `includeBuiltin`, `limit` (1–500; 25 for the summary, 100 for lists), `cursor`, `subjectClasses`, `shapes`, `classes` (IRIs, with `profiles`) | `{dataset, commit, graph, reasoning, section, totals: {triples, classes, predicates}, builtinClassesHidden, ontology?, roots?, classes?: [{iri, label?, instances, declared, superClasses?, superClassExpressions?}], predicates?: [{iri, label?, triples, distinctSubjects, distinctObjects, maxPerSubject, objects: ["iri 120", "xsd:string 98", "rdf:langString@en,de 12", …], domains?, ranges?, vector?, subjectClasses?: ["ex:Person 120", …, "untyped 3"]}], constraints?: [{source, graphs, mode?, threshold?, classes: [{class, closed?, properties: [{path, constraints: "min 1 · max 1 · datatype xsd:string", enforcement}]}]}], next, prefixes}`. The summary lists the largest classes and predicates. `classes` and `predicates` page through all entries in IRI order. `subjectClasses: true` adds the ten classes of each predicate's subjects with the most triples. `constraints` lists the [constraints layer](#constraints-layer), from the write-time SHACL validation or from the sources in `shapes`. `profiles` lists the [class profiles](#class-profiles) of the classes with the most instances, or of those in `classes`: `profiles: [{class, instances, properties: [{predicate, instances, triples, valuesPerInstance: "1..2", objects: {iri?, "xsd:string"?: n, …}, objectClasses?}], incoming}]`, with at most 25 properties and 10 incoming predicates per class. |
 | `diff_schema` | `from` (a commit, or `time:…` / `snapshot:…`), `to` (the head), `graph`, `reasoning`, `limit` (50, at most 500 entries per list), `timeoutSeconds` | `{dataset, from, to, graph, reasoning, counts, report: [Change], classes: {added: [iri], removed: [iri], changed: [{iri, changes: [Change]}]}, predicates: {…}, truncated, prefixes}`: the [schema diff](#schema-diffs) between two readable states. `404` for a commit beyond the head and `410` for one whose history is gone. |
-| `draft_shapes` | `graph`, `language` (`shacl`\|`shex`), `shapesFormat` (`turtle`\|`shaclc`, for SHACL), `support` (1), `classes` (IRIs), `minInstances` (1), `maxIn` (10), `maxCount` (1), `closed` (false), `timeoutSeconds` (30). `reasoning` defaults to false here. | `{dataset, commit, graph, support, language, totals, shapes: [{class, shape, instances, properties, constraints, excluding: [{path, component, excluded}]}], shapesFormat?, shacl? \| shex?, shapeMap?}`: the [drafted shapes](#drafted-shapes) of the caller's visible graphs, as SHACL in Turtle or SHACLC, or as ShExC with its shape map. `excluding` lists the constraints that reject existing instances. Nothing is installed. |
+| `draft_shapes` | `graph`, `language` (`shacl`\|`shex`), `shapesFormat` (`turtle`\|`shaclc`, for SHACL), `support` (1), `classes` (IRIs), `minInstances` (1), `maxIn` (10), `maxCount` (1), `maxInverse` (10), `closed` (false), `timeoutSeconds` (30). `reasoning` defaults to false here. | `{dataset, commit, graph, support, language, totals, shapes: [{class, shape, instances, properties, constraints, excluding: [{path, component, excluded}]}], shapesFormat?, shacl? \| shex?, shapeMap?}`: the [drafted shapes](#drafted-shapes) of the caller's visible graphs, as SHACL in Turtle or SHACLC, or as ShExC with its shape map. `excluding` lists the constraints that reject existing instances. Nothing is installed. |
 | `sparql_query` | `query` (required), `format` (`table`\|`json`), `maxRows` (100), `maxBytes` (65536), `maxTermChars` (500), `offset`, `exactTotal` (true), `timeoutSeconds` (30) | One text block: a table or a JSON document (below). No `structuredContent`. |
 | `explain_query` | `query` (required), `includeAlgebra`, `profile`, `notes`, `timeoutSeconds`, `useServerModel` | `{dataset, commit, queryType, estimatedRows, plan, algebra?, warnings: [{code, message}]}`. `plan` has one line per operator, `<operator> <description> est=<rows> [<columns>]`, indented by depth. With `profile: "run"`, the query runs read-only under `timeoutSeconds` (30 by default), its rows are counted in `rows` without being returned, and a run that a budget stopped is explained from its partial plan with the budget in `error`. With `notes: true`, each line starts with the node id and adds `act=` and `ms=` after a run, and the result adds `nodes`, `notes` and `asks` as `POST /{ds}/sparql/explain` defines them, with `source: "template"`. The tool never calls the server's model providers unless `useServerModel` is `true`, which needs the `serverModels` permission and fails with `server-model-not-allowed` otherwise. Its prose then replaces `asks` and the notes' text with `source: "model"`, and its tokens are charged to the caller. The warnings are `unknown-term` (a constant IRI or literal of a triple pattern that the dataset does not contain), `no-limit` (no top-level LIMIT, and over 10,000 rows estimated), `large-estimate` (an intermediate result over 50M rows) and `service-disabled`. For a caller whose graph grants or triple protections hide data, `unknown-term` looks terms up in the caller's view, so a term that occurs only in hidden data is reported as an absent one is. Such a caller sees no estimates, so `estimatedRows` is `null`, the plan shows `est=?`, there is no `large-estimate`, and `no-limit` applies to every query without a LIMIT. |
 | `describe_resource` | `iri` (required), `direction` (`both`\|`outgoing`\|`incoming`), `maxTriples` (50 per direction, ≤ 500), `lang` (`en`), `mode` (`cbd`\|`scbd`\|`outgoing`) | `{dataset, commit, iri, exists, label?, types, outgoing?, incoming?, description?, prefixes}`. Each side is `{total, predicates: [{p, count}], predicatesTotal, triples: [{p, o, oLabel?}` or `{s, sLabel?, p}], truncated}`. Triples are sampled round-robin by predicate, so a hub's largest predicate does not hide the others. With `mode`, `description` is `{mode, triples: ["s p o"], truncated}`: the resource's [DESCRIBE](#describe) in that mode, at most `maxTriples` triples. |
 | `find_paths` | `source` and `target` (IRIs; at least one), `predicates` (≤ 20 IRIs; default all), `algorithm` (`shortest`\|`allShortest`\|`kShortest`\|`all`), `direction` (`forward`\|`backward`\|`both`), `minLength`, `maxLength`, `k`, `limit` (10, ≤ 100), `maxVisited`, `weight` (an IRI), `defaultWeight`, `graph` (`default` or a named graph IRI), `timeoutSeconds` (30) | `{dataset, commit, algorithm, paths: [{source, target, length, cost, edges: ["s p o"]}], limited, edgesTruncated, prefixes}`: a [path search](#path-search) as `SERVICE path:search` runs it. With one end, the paths to or from every node it connects to, at most `limit`. At most 2000 edges are returned in all. A malformed search is `syntax`, with the `path:search` message. |
+| `graph_algorithm` | `algorithm` (required), `projection` (a stored projection) or `predicates` (≤ 20), `direction`, `nodeClasses` and `weight`, `params` (the algorithm's parameters by name), `limit` (20, ≤ 100), `timeoutSeconds` (30) | `{dataset, commit, algorithm, columns, rows: [[…]], limited, summary, prefixes}`: a [graph algorithm](#graph-algorithms) as `SERVICE algo:<name>` runs it, with the best `limit` rows by the algorithm's main measure and the statistics of the run. Numbers are numbers and other terms are compact strings. The tool never writes results back. |
 | `list_commits` | `limit` (10, ≤ 100), `before` | `{dataset, head, firstRetained, complete, commits: [{seq, timestamp, kind, inserted, deleted, quads}], next: {before} \| null, readable: [{from, to}], snapshots: [{name, commit}]}`. `readable` lists the commits whose state `at` and `atCommit` can read, and `snapshots` the 20 newest named snapshots. |
 | `list_changes` | `subjects`, `predicates`, `objects` and `graphs` (each ≤ 20; objects may be literals in N-Triples syntax, graphs `default` or IRIs), `from` and `to` (a commit or a selector string), `op` (`add`\|`remove`), `order` (`asc`\|`desc`), `limit` (100, ≤ `--mcp-max-rows`), `timeoutSeconds` (30) | `{dataset, head, from, to, changes: [{commit, timestamp, kind, author?, message?, op, quad}], truncated, unrecorded: [{from, to, reason}], prefixes}`: the [history query](#history-queries) of `GET /{ds}/history`, with each quad as one line of terms. It needs the grant of the `diff` endpoint and leaves out the graphs and triples the caller may not read. |
 | `search_text` | `query` (required, ≤ 1000 characters: terms, `"phrases"`, AND/OR, `+required`, `-excluded`), `predicates` (≤ 20 IRIs), `lang`, `limit` (20, ≤ 200), `withTypes` (true) | `{dataset, commit, hits: [{s, score, text, p, label?, types?}], limited, prefixes}`: BM25-ranked matches of `text:query`. `text` is the matched literal, escaped and at most 300 characters long, and `types` has at most 3 entries. Only in builds with the `text` feature. A dataset without an index (`textSearch: false`) gives `text-disabled`. |
 | `similar_entities` | `predicate` (required), exactly one of `entity` (an IRI with one stored vector under `predicate`) and `vector` (1–16384 numbers), `k` (10, ≤ 100), `metric` (`cosine`\|`dot`\|`euclidean`), `excludeSelf` (true), `withLabels` (true) | `{dataset, commit, metric, higherIsBetter, hits: [{iri, score, label?}], prefixes}`: an exact `spk:vectorSearch` over the stored `spk:vector` literals. The tool never computes embeddings. `no-vectors` when the predicate has none, the dimensions differ, or the entity has no vector. |
 | `check_query` | `query` (required, ≤ 65536 characters), `explain` (false), `maxSuggestions` (3, ≤ 10), `terms` (false), `timeoutSeconds` (30) | `{dataset, commit, ok, issues: [{code, severity, message, term?, line?, column?, suggestions?: [{term, label?, count, why}]}], estimatedRows?, terms?, prefixes}`. With `terms`, `terms` lists every constant IRI of the query as `{term, iri, kind, label?, count?, types?, occurs}`, where `kind` is `class`, `property` or `entity` and `occurs` is `null` when the check did not look the term up. The query is parsed and compared with the caller's view without running it. The errors are `syntax` (with line and column), `not-a-query` (an update), `unknown-predicate` and `unknown-class`. The warnings are `unknown-term`, `class-mismatch`, `datatype-mismatch`, `language-tag` and `unbound-projection`, and with `explain` also `no-limit` and `large-estimate` and the plan's `estimatedRows`, which is left out when the caller's view hides the estimates. `ok` is false only when an issue is an error. A suggestion's `why` is `same-local-name`, `edit-distance` or `label` for an unknown term, `class-profile`, `datatype` or `language-tag` for a mismatch, and `same-name`, `namespace` or `edit-distance` for an undefined prefix. |
 | `similar_queries` | `question` (required, ≤ 2000 characters), `k` (5, ≤ 20), `withText` (true), `embeddingIndex` (a vector index name), `timeoutSeconds` (30) | `{dataset, queries: [{name, tool?, description?, score, matchedBy, parameters: [{name, type, required, description?}], questions?, query?}], ranking, prefixes}`. The [stored queries](#stored-queries) the caller may run whose `mcp` is not `false`, ranked by BM25 over their description, parameters, the words of their IRIs and their `questions`. When the dataset has one vector index whose provider embeds query text, or `embeddingIndex` names one, the cosine similarity of embeddings is fused with BM25 by reciprocal rank (k = 60) and `ranking` is `hybrid`. If the provider fails, the ranking falls back to `text`. `tool` is the query's MCP tool name. |
-| `link_entities` | `mentions` (required, 1–20 of `{text (≤ 200 characters), types? (≤ 5 class IRIs), context? (≤ 500 characters)}`), `k` (5, ≤ 20), `labelPredicates` (≤ 20 IRIs, by default the label predicates of `describe_resource` and `skos:altLabel`), `graphs` (≤ 20 IRIs or `default`), `timeoutSeconds` (30) | `{dataset, commit, mentions: [{text, verdict, candidates: [{iri, label?, altLabels?, types, score, typeMatch, matchedBy, sameAs?, triples}]}], search: {text, vector}, prefixes}`. Candidates come from exact label matches, labels equal after case folding and collapsing white space, `text:query` over the label predicates the full-text index covers, and `spk:vectorSearch` with the mention and its context on a vector index that embeds labels. `verdict` is `exact`, `ambiguous`, `candidates` or `none`, and it is advice. Candidates of a type in `types`, or of a subclass, come first. `triples` holds up to 5 sampled outgoing triples, and `sameAs` the other candidates linked by `owl:sameAs` or `skos:exactMatch`. `search` says which indexes took part. |
+| `link_entities` | `mentions` (required, 1–20 of `{text (≤ 200 characters), types? (≤ 5 class IRIs), context? (≤ 500 characters)}`), `k` (5, ≤ 20), `labelPredicates` (≤ 20 IRIs, by default the label predicates of `describe_resource` and `skos:altLabel`), `graphs` (≤ 20 IRIs or `default`), `vectors` (true; false leaves the vector index out, so nothing is embedded), `timeoutSeconds` (30) | `{dataset, commit, mentions: [{text, verdict, candidates: [{iri, label?, altLabels?, types, score, typeMatch, matchedBy, sameAs?, triples}]}], search: {text, vector}, prefixes}`. Candidates come from exact label matches, labels equal after case folding and collapsing white space, `text:query` over the label predicates the full-text index covers, and `spk:vectorSearch` with the mention and its context on a vector index that embeds labels. `verdict` is `exact`, `ambiguous`, `candidates` or `none`, and it is advice. Candidates of a type in `types`, or of a subclass, come first. `triples` holds up to 5 sampled outgoing triples, and `sameAs` the other candidates linked by `owl:sameAs` or `skos:exactMatch`. `search` says which indexes took part. |
 | `recall` | `query` (≤ 2000 characters) or `seeds` (≤ 20 IRIs) or both, `types` (≤ 5 class IRIs), `graphs` (≤ 20 IRIs or `default`), `hops` (1, ≤ 2), `seedLimit` (10, ≤ 50), `maxTriples` (150, ≤ 1000), `maxBytes` (32768, ≤ `--mcp-max-bytes`), `includeSuperseded` (false), `statuses` (both), `unreviewedWeight` (0.7), `recency` (a half-life such as `90d`), `format` (`text`\|`json`), `timeoutSeconds` (30) | One text block: the facts around the seeds with their citations, described below. No `structuredContent`. |
 | `why_empty` | `query` (required, ≤ 65536 characters), `timeoutSeconds` (30) | `{dataset, commit, empty, first?, steps, unchecked?, complete, message, prefixes}`, described in [Checking and explaining queries](#checking-and-explaining-queries). |
 | `share_query` | `query` (required, ≤ 65536 characters), `question` (≤ 2000 characters), `explanation` (≤ 400 characters), `assumptions` (≤ 5), `branch`, `atCommit` | `{url, dataset, commit, ok, issues, prefixes}`. The link opens the query in a new tab of the UI's query page with the question header. The query is checked and never run. Listed only when the server knows the UI's address, which is the request's own host over HTTP and `--ui-url` over stdio. A payload over 32 KiB is refused with `too-large`, and an update with `not-a-query`. |
@@ -8980,7 +9617,9 @@ The server converts these inputs. Input is limited to 10 MiB and a source's text
 | Plain text and Markdown | Kept as they are, after NFC normalization. |
 | HTML | The first `<main>` or `<article>`, or the body, as Markdown. Scripts, styles, navigation, headers, footers, forms and hidden elements are left out. Headings, lists, tables, code, quotes and links are kept. |
 | PDF | Markdown from pdf-inspector with a `<!-- Page N -->` marker before each page, when the server is built with the `pdf` feature. The rendition records each page's start offset as `spk:pageStart`. |
-| CSV and TSV | Not converted. The model sees the header and 20 rows and drafts a CSVW mapping, and the result holds the mapping, the row and triple counts of the whole file and the triples of the first 100 rows. Nothing is written. The mapping goes to [`POST /{ds}/upload`](#csv-and-tsv-uploads) as its `mapping` part, with `?dryRun=true` first. |
+| DOCX, PPTX, ODT and ODP | Markdown from the file's XML parts, when the server is built with the `office` feature. A presentation has a `<!-- Page N -->` marker and a `# Slide N: Title` heading for each slide, followed by the slide's text, tables and speaker notes, and its slides are recorded as pages. Hidden slides are left out. |
+| XLSX and ODS | Not converted to text. Each visible sheet with data gets the draft of a table, up to 20 sheets with a note for the rest, and the result has the outcome `mapping-drafts` with a `sheets` array. Each entry has the `sheet` name, its `index`, the draft's members (`mapping`, `rows`, `triples`, `preview`), and the sheet as `csv` to upload with the mapping, or an `error` when its draft failed. Without a `base` in the request, each sheet's rows get their own namespace that names the workbook, the sheet's position and the sheet, so sheets with equal names stay apart. |
+| CSV and TSV | Not converted. The model sees the header and 20 rows and drafts a CSVW mapping, and the result holds the mapping, the row and triple counts of the whole file and the triples of the first 100 rows. When the mapping maps a column to IRIs of an existing class, the result also has `links`, one entry for each linked column with its `types`, the `commit` it linked against, the `distinct` values, how many were `tried`, `linked` and `minted`, the `weak` matches, and the `ambiguous` values with their `rows` and `candidates` (`iri`, `label`, `types`), `ambiguousTotal` in all. Exact links are in the mapping as `urn:x-sparkles:lookup` entries on the column. Nothing is written. The mapping goes to [`POST /{ds}/upload`](#csv-and-tsv-uploads) as its `mapping` part, with `?dryRun=true` first. |
 
 A PDF page without usable text needs OCR. Without OCR the task fails with `needs-ocr`
 and lists each page with pdf-inspector's reasons, such as `scanned`, and the fonts whose
@@ -8989,8 +9628,20 @@ are registered and the rendition records the left-out pages as `spk:omittedPage`
 server built with `pdf-ocr` and started with `--pdf-ocr-models DIR` reads those pages by
 OCR instead and records them as `spk:ocrPage`. It loads PDFium from `--pdfium-lib` and
 ONNX Runtime from `--onnxruntime-lib` or their usual search paths, and never downloads a
-model. Conversions run at most `--pdf-workers` (2) at a time. A build without `pdf`
-refuses a PDF with `unsupported-format`.
+model. Conversions of PDF and Office files run at most `--pdf-workers` (2) at a time,
+each in a child process on Linux under the `--convert-memory` address-space limit that the
+server kills at the task's deadline. A conversion that overruns the deadline fails with
+`conversion-timeout`, and one that ends without a result, such as at its memory limit,
+fails with `conversion-failed` and status 422. When the child cannot start with its
+limits, conversions fail with `conversion-failed` and status 500, and the message names
+the reason.
+A build without `pdf` refuses a PDF with `unsupported-format`, and a build without
+`office` refuses the Office formats the same way. A damaged Office file fails with
+`conversion-failed`. A password-protected file or an old binary one, such as `.doc`,
+`.ppt` or `.xls`, fails with `unsupported-format`, whatever its name says. A file past a
+bound of the converter, such as a ZIP bomb or a small file that would need more than
+128 MiB of output, fails with `too-large`, and a conversion that outlasts the task's
+deadline with `conversion-timeout`.
 
 Before any model call the task estimates the extraction's tokens from the chunks, the
 profile and the answer, and its cost from the first pair's pricing. Above the dataset's
@@ -9771,20 +10422,31 @@ the declared source unless the settings file locks `secrets.NAME`. A secret's na
 rule applies to `--model-secret` names and to `apiKey.secret`.
 
 A runtime value is kept in `<dataDir>/secrets/NAME` with mode 0600, in a directory with
-mode 0700, and is written to a temporary file and renamed into place. Without a secrets
-key the files hold the values as plaintext. An operator who does not want keys on disk
-locks the secrets in the settings file or starts the server with a secrets key.
+mode 0700, and is written to a temporary file and renamed into place. Every build with
+the default `backup` feature seals each value with a secrets key. A build without that
+feature keeps plaintext files and refuses `--secrets-key` with any source other than
+`none`. An operator who does not want keys on disk at all locks the secrets in the
+settings file.
 
-`serve --secrets-key SOURCE`, or the environment variable `SPARKLES_SECRETS_KEY`, seals
-each runtime value with a key that the server reads once at the start. The source is
-`file:PATH`, `env:VARIABLE`, `credential:NAME` for a file in systemd's
-`$CREDENTIALS_DIRECTORY`, or `command:PROGRAM ARGS`, which runs an absolute program
-without a shell and reads the key from its standard output. `command:` also takes a JSON
-argv array. The key is 32 bytes written as 64 hexadecimal digits or base64, and the same
-rules apply as to a [backup repository key](USAGE.md#encrypted-repositories). A key file
-must not be readable by group or others and must not lie in the data directory. The
-option needs a build with the `backup-encryption` feature on Linux, and a build without
-it refuses the option at the start.
+`serve --secrets-key SOURCE`, or the environment variable `SPARKLES_SECRETS_KEY`, names
+the key, which the server reads once at the start. The source is `file:PATH`,
+`env:VARIABLE`, `credential:NAME` for a file in systemd's `$CREDENTIALS_DIRECTORY`, or
+`command:PROGRAM ARGS`, which runs an absolute program without a shell and reads the key
+from its standard output. `command:` also takes a JSON argv array. The key is 32 bytes
+written as 64 hexadecimal digits or base64, and the same rules apply as to a
+[backup repository key](USAGE.md#encrypted-repositories). A key file must not be
+readable by group or others and must not lie in the data directory.
+
+Without the option, the server uses the systemd credential `sparkles-secrets-key` when
+`$CREDENTIALS_DIRECTORY` holds one, then `<dataDir>/secrets.key`. When neither exists,
+the first value it stores, or the first plaintext value it finds at the start, makes it
+generate 32 random bytes and write them to `<dataDir>/secrets.key` as 64 hexadecimal
+digits with mode 0400. It writes the file only when the data directory belongs to the
+user the server runs as, and it never replaces an existing file. A generated key does
+not protect the values from someone who can read the whole data directory, but it
+protects copies of `secrets/` made without it. There is no whole-server backup yet
+(roadmap item 61), and dataset backups include neither `secrets/` nor `secrets.key`.
+`--secrets-key none` keeps the values as plaintext files.
 
 A sealed file is one line, `sparkles-sealed-secret/1 SALT CIPHERTEXT`, in base64. Each
 value is encrypted with AES-256-GCM under a key that HKDF-SHA256 derives from the secrets
@@ -9792,12 +10454,22 @@ key and a fresh salt, and the secret's name is part of the authenticated data, s
 copied or renamed to another secret's name does not open. At the start the server opens
 every stored value. A plaintext value is sealed in place, and a value that does not open
 stops the start with an error that names the secrets, whether the key is wrong or a file
-was changed or renamed. A server started without a key refuses to start when it finds a
-sealed value. Declared sources of `--model-secret` are read as before and never sealed.
+was changed or renamed. A server that has no key for a sealed value, because it runs
+with `--secrets-key none` or `secrets.key` is missing, refuses to start. Declared
+sources of `--model-secret` are read as before and never sealed. The key stays in a
+locked page that core dumps leave out on Linux, and in a heap buffer that is zeroed on
+release on other platforms or when the page cannot be locked.
+
+`sparkles secrets unseal --data DIR` writes the sealed values of a stopped server back as
+plaintext, for a downgrade to a release that does not seal them, and
+`sparkles secrets rekey --data DIR --new-key SOURCE` seals them again under another key
+and removes a generated `secrets.key` once every value opens with the new key. Running
+an interrupted `rekey` again finishes it. Both run offline and hold the data directory's
+catalog lock, and both take `--secrets-key SOURCE` for the current key.
 
 | Method | Path | Needs | Effect |
 |---|---|---|---|
-| GET | `/$/server/secrets` | `server-admin` | `{storage, secrets}`. `storage` is `sealed` with a secrets key and `plaintext` without one. Each secret has its `name`, `source` (`declared`, `runtime` or `missing`), whether a `declared` source exists, whether it is `locked`, `setAt` for a runtime value, `overridden` when a lock ignores a stored value, and the `providers` and notification `channels` that use it. |
+| GET | `/$/server/secrets` | `server-admin` | `{storage, keySource, keyMemory, secrets}`. `storage` is `sealed`, or `plaintext` with `--secrets-key none`. `keySource` is `configured` for `--secrets-key` or the systemd credential, `generated` for `<dataDir>/secrets.key`, and `null` for plaintext values. `keyMemory` is `locked` or `heap`, and `null` until there is a key. Each secret has its `name`, `source` (`declared`, `runtime` or `missing`), whether a `declared` source exists, whether it is `locked`, `setAt` for a runtime value, `overridden` when a lock ignores a stored value, and the `providers` and notification `channels` that use it. |
 | PUT | `/$/server/secrets/{name}` | `server-admin` | Stores a runtime value from `{"value": "..."}`, `204`. |
 | DELETE | `/$/server/secrets/{name}` | `server-admin` | Removes the runtime value, so the declared source applies again, `204` whether or not there was one. |
 

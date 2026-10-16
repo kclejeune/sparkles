@@ -425,20 +425,87 @@ pub(crate) fn parse_rfc3339_offset(s: &str) -> Option<i64> {
 
 /// Dataset capabilities supported by this reader (1: legacy, 2: branches,
 /// 3: relinked generations with an immutable base overlay, 4: framed delta
-/// vocabularies, see [`crate::vocab::delta`]).
-pub const DATASET_READER: u32 = 4;
+/// vocabularies, see [`crate::vocab::delta`], 5: write-ahead logs with a header record,
+/// see [`crate::store::wal`]). [`crate::formats::DATASET`] lists them.
+pub const DATASET_READER: u32 = 5;
 fn legacy_reader() -> u32 {
     1
 }
 
-fn check_dataset(f: DatasetFile) -> Result<DatasetFile> {
-    if f.format != 1 || f.minimum_reader > DATASET_READER {
+/// Parse the content of a `dataset.json`. The version members are checked on the raw
+/// JSON first, so that a file from a newer release whose other members changed shape is
+/// refused as [`Error::Unsupported`] and not reported as damaged.
+fn parse_dataset(bytes: &[u8]) -> Result<DatasetFile> {
+    let v: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|e| Error::Corrupt(format!("dataset.json: {e}")))?;
+    let member = |name: &str| -> Result<u64> {
+        match v.get(name) {
+            None | Some(serde_json::Value::Null) => Ok(1),
+            Some(n) => n.as_u64().ok_or_else(|| {
+                Error::Corrupt(format!("dataset.json: {name} {n} is not a version"))
+            }),
+        }
+    };
+    let format = member("format")?;
+    let minimum_reader = member("minimumReader")?;
+    if format != 1 || minimum_reader > u64::from(DATASET_READER) {
+        let by = v
+            .get("writtenBy")
+            .and_then(|w| w.as_str())
+            .map(|v| format!(", written by Sparkles {v},"))
+            .unwrap_or_default();
         return Err(Error::Unsupported(format!(
-            "dataset format {} requires reader {}, this build supports format 1 and reader {}",
-            f.format, f.minimum_reader, DATASET_READER
+            "dataset.json{by} has format {format} and requires reader {minimum_reader}; Sparkles {} reads format 1 up to reader {}. Open the database with a newer release",
+            crate::formats::SPARKLES_VERSION,
+            DATASET_READER
         )));
     }
-    Ok(f)
+    serde_json::from_value(v).map_err(|e| Error::Corrupt(format!("dataset.json: {e}")))
+}
+
+/// The versions `<root>/dataset.json` records, if it exists and this build reads it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DatasetVersions {
+    pub format: u32,
+    pub minimum_reader: u32,
+    /// the release that last opened the database for writing, when one recorded it
+    pub written_by: Option<String>,
+}
+
+/// The versions of `<root>/dataset.json` (`None` without one).
+pub fn read_dataset_versions(root: &Path) -> Result<Option<DatasetVersions>> {
+    Ok(read_dataset(root)?.map(|f| DatasetVersions {
+        format: f.format,
+        minimum_reader: f.minimum_reader,
+        written_by: f.written_by,
+    }))
+}
+
+/// `writtenBy` of `<root>/dataset.json` without checking its reader, for messages about
+/// a database this build may not read.
+pub fn read_written_by(root: &Path) -> Option<String> {
+    let b = std::fs::read(root.join("dataset.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&b).ok()?;
+    v.get("writtenBy")?.as_str().map(str::to_string)
+}
+
+/// Record that this release opens the database at `root` for writing: `writtenBy`
+/// becomes this release, and `minimumReader` rises to the reader of the files this
+/// release creates (a log with a header record, [`crate::store::wal::HEADER_READER`]).
+/// `dataset.json` is rewritten only when either changes.
+pub(crate) fn note_writer(root: &Path) -> Result<()> {
+    let Some(mut ds) = read_dataset(root)? else {
+        return Ok(());
+    };
+    let reader = ds.minimum_reader.max(crate::store::wal::HEADER_READER);
+    let version = crate::formats::SPARKLES_VERSION;
+    if ds.minimum_reader == reader && ds.written_by.as_deref() == Some(version) {
+        return Ok(());
+    }
+    ds.minimum_reader = reader;
+    ds.written_by = Some(version.to_string());
+    write_dataset(root, &ds)
 }
 
 /// Check compatibility without changing any database files.
@@ -462,11 +529,15 @@ pub(crate) fn require_reader(root: &Path, reader: u32) -> Result<()> {
     Ok(())
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct DatasetFile {
     format: u32,
     #[serde(default = "legacy_reader", rename = "minimumReader")]
     minimum_reader: u32,
+    /// the release that last opened the database for writing (absent before releases
+    /// recorded it)
+    #[serde(default, rename = "writtenBy", skip_serializing_if = "Option::is_none")]
+    written_by: Option<String>,
     id: uuid::Uuid,
     created: String,
     origin: String,
@@ -484,6 +555,10 @@ struct DatasetFile {
         skip_serializing_if = "Option::is_none"
     )]
     restored_from: Option<RestoredFrom>,
+    /// members a later release added; kept on rewrite so that an additive change survives
+    /// a write by this release (X12 §4.3)
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Where a cloned dataset came from: the source's dataset id and the commit (`seq`) of
@@ -596,10 +671,7 @@ pub fn set_restored_from(root: &Path, from: &RestoredFrom) -> Result<()> {
 
 fn read_dataset(root: &Path) -> Result<Option<DatasetFile>> {
     match std::fs::read(root.join("dataset.json")) {
-        Ok(b) => check_dataset(
-            serde_json::from_slice(&b).map_err(|e| Error::Corrupt(format!("dataset.json: {e}")))?,
-        )
-        .map(Some),
+        Ok(b) => parse_dataset(&b).map(Some),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.into()),
     }
@@ -625,21 +697,21 @@ pub(crate) fn clone_dataset_file_bytes(
 ) -> Vec<u8> {
     serde_json::to_vec_pretty(&DatasetFile {
         format: 1,
-        minimum_reader: 1,
+        minimum_reader: crate::store::wal::HEADER_READER,
+        written_by: Some(crate::formats::SPARKLES_VERSION.to_string()),
         id,
         created: rfc3339_ms(created_ms),
         origin: "clone".to_string(),
         forked_from: Some(from),
         restored_from: None,
+        extra: Default::default(),
     })
     .unwrap()
 }
 
 /// The dataset id of `dataset.json`'s content.
 pub(crate) fn dataset_id_of(bytes: &[u8]) -> Result<uuid::Uuid> {
-    let f: DatasetFile =
-        serde_json::from_slice(bytes).map_err(|e| Error::Corrupt(format!("dataset.json: {e}")))?;
-    Ok(check_dataset(f)?.id)
+    Ok(parse_dataset(bytes)?.id)
 }
 
 /// When `<root>/dataset.json` says the dataset was created (milliseconds since the
@@ -659,12 +731,14 @@ pub(crate) fn read_dataset_file(root: &Path) -> Result<Option<uuid::Uuid>> {
 pub(crate) fn dataset_file_bytes(id: uuid::Uuid, origin: &str, created_ms: i64) -> Vec<u8> {
     serde_json::to_vec_pretty(&DatasetFile {
         format: 1,
-        minimum_reader: 1,
+        minimum_reader: crate::store::wal::HEADER_READER,
+        written_by: Some(crate::formats::SPARKLES_VERSION.to_string()),
         id,
         created: rfc3339_ms(created_ms),
         origin: origin.to_string(),
         forked_from: None,
         restored_from: None,
+        extra: Default::default(),
     })
     .unwrap()
 }
@@ -1231,6 +1305,13 @@ pub(crate) const WAL_COMMIT_V2: u8 = 2;
 /// validation. Records written before it existed have zero there.
 pub(crate) const WAL_FLAG_UNVALIDATED: u8 = 1;
 
+/// The flag of byte 27 of a WAL commit record: the commit has an annotation (a message or
+/// a change digest) that was appended to `annotations.bin` without its own sync, because
+/// the commit belongs to a group commit and the group's fence syncs both files. Only
+/// records of such commits carry it. Replay uses it to find a commit that reached the disk
+/// without its annotation (see `annotations`). Readers that predate it ignore the bit.
+pub(crate) const WAL_FLAG_ANNOTATED: u8 = 2;
+
 /// Fill bytes 9..33 of a WAL commit record (`rec[0]` = op, `rec[1..9]` = next blank
 /// node): seq, timestamp, kind, version, flags (byte 27) and a CRC over the
 /// transaction's data records followed by bytes 0..29 of this record. Byte 28 is zero,
@@ -1344,5 +1425,55 @@ mod tests {
             assert_eq!(CommitKind::from_code(k.code()), k);
             assert_eq!(CommitKind::from_name(k.name()), Some(k));
         }
+    }
+
+    #[test]
+    fn a_newer_dataset_json_with_other_members_is_unsupported() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("dataset.json"),
+            br#"{"format": 2, "minimumReader": 9, "id": 5}"#,
+        )
+        .unwrap();
+        let e = read_dataset(dir.path()).expect_err("refused");
+        assert!(matches!(e, Error::Unsupported(_)), "{e:?}");
+        let e =
+            dataset_id_of(br#"{"format": 2, "minimumReader": 9, "id": 5}"#).expect_err("refused");
+        assert!(matches!(e, Error::Unsupported(_)), "{e:?}");
+    }
+
+    #[test]
+    fn unknown_dataset_members_survive_a_write_open() {
+        use crate::store::{Store, StoreOptions};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        drop(Store::open(&root, StoreOptions::default()).unwrap());
+        let path = root.join("dataset.json");
+        let edit = |f: &dyn Fn(&mut serde_json::Value)| {
+            let mut v: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            f(&mut v);
+            std::fs::write(&path, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
+        };
+        let read = || -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap()
+        };
+        edit(&|v| {
+            v["futureMember"] = serde_json::json!({"a": 1});
+            v["writtenBy"] = "9.9.9".into();
+        });
+        drop(Store::open(&root, StoreOptions::default()).unwrap());
+        let v = read();
+        assert_eq!(v["writtenBy"], crate::formats::SPARKLES_VERSION);
+        assert_eq!(v["futureMember"], serde_json::json!({"a": 1}));
+        // a member that a later release added never shadows a known one
+        assert_eq!(v["format"], 1);
+        assert_eq!(v["minimumReader"], 5);
+        // raising the reader keeps it too
+        edit(&|v| v["minimumReader"] = 1.into());
+        require_reader(&root, 5).unwrap();
+        let v = read();
+        assert_eq!(v["minimumReader"], 5);
+        assert_eq!(v["futureMember"], serde_json::json!({"a": 1}));
     }
 }

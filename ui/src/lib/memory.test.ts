@@ -4,6 +4,7 @@ import {
   ACTIVITY_QUERY,
   AGENTS_QUERY,
   conflictsOf,
+  factChanges,
   fateLine,
   filterChoices,
   filterFacts,
@@ -161,5 +162,46 @@ describe('the Memory page queries', () => {
     for (const q of [AGENTS_QUERY, SOURCES_QUERY, ACTIVITY_QUERY])
       expect(q).toMatch(/\bLIMIT \d+$/);
     expect(ACTIVITY_QUERY).toMatch(/LIMIT 20$/);
+  });
+});
+
+describe('factChanges', () => {
+  const fact = (p: string, o: string, citation: number | string = 1): RecallFact => ({
+    s: 'ex:ana',
+    p,
+    o,
+    citation,
+  });
+
+  it('lists added, superseded and retracted facts', () => {
+    const before = [
+      fact('org:memberOf', 'res:platform'),
+      fact('schema:email', '"ana@example.org"'),
+      fact('ex:nickname', '"A"'),
+    ];
+    const after = [
+      fact('org:memberOf', 'res:payments', 2),
+      fact('schema:email', '"ana@example.org"'),
+    ];
+    expect(factChanges(before, after)).toEqual([
+      { kind: 'added', p: 'org:memberOf', o: 'res:payments', citations: [2], status: undefined },
+      {
+        kind: 'superseded',
+        p: 'org:memberOf',
+        o: 'res:platform',
+        citations: [1],
+        status: undefined,
+      },
+      { kind: 'retracted', p: 'ex:nickname', o: '"A"', citations: [1], status: undefined },
+    ]);
+  });
+
+  it('reports nothing for equal reads, whatever the citations', () => {
+    expect(factChanges([fact('a', 'b', 1)], [fact('a', 'b', 9)])).toEqual([]);
+    expect(factChanges(undefined, undefined)).toEqual([]);
+  });
+
+  it('treats an entity that did not exist before as all added', () => {
+    expect(factChanges(undefined, [fact('a', 'b')]).map((c) => c.kind)).toEqual(['added']);
   });
 });

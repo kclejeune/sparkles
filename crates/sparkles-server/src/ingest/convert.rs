@@ -1,6 +1,7 @@
 //! Conversion of an ingested document to the text of its rendition (spec C18 §7.1):
 //! plain text and Markdown as they are, HTML to Markdown, PDF to Markdown through
-//! pdf-inspector (§7.1.1), and the refusals of each.
+//! pdf-inspector (§7.1.1), Word, PowerPoint and OpenDocument files to Markdown through
+//! sparkles-office, and the refusals of each.
 //!
 //! The text that comes out is already normalized as `register_source` normalizes it
 //! (NFC, `\n` line ends), so that the page offsets recorded here are offsets in the
@@ -15,6 +16,40 @@ pub const MAX_INPUT_BYTES: usize = 10 << 20;
 /// The default ceiling of the text of one source, in bytes (§7.1).
 pub const MAX_TEXT_BYTES: usize = crate::mcp::memory::ingest::MAX_TEXT_BYTES;
 
+/// The Office formats: short name, media type, format.
+const OFFICE: [(&str, &str, Format); 6] = [
+    (
+        "docx",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        Format::Docx,
+    ),
+    (
+        "pptx",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        Format::Pptx,
+    ),
+    (
+        "xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        Format::Xlsx,
+    ),
+    (
+        "odt",
+        "application/vnd.oasis.opendocument.text",
+        Format::Odt,
+    ),
+    (
+        "odp",
+        "application/vnd.oasis.opendocument.presentation",
+        Format::Odp,
+    ),
+    (
+        "ods",
+        "application/vnd.oasis.opendocument.spreadsheet",
+        Format::Ods,
+    ),
+];
+
 /// What a document is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Format {
@@ -24,7 +59,16 @@ pub enum Format {
     Pdf,
     Csv,
     Tsv,
+    Docx,
+    Pptx,
+    Xlsx,
+    Odt,
+    Odp,
+    Ods,
 }
+
+/// The first bytes of an OLE compound file.
+const OLE_SIGNATURE: &[u8] = &[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
 
 impl Format {
     pub fn media_type(self) -> &'static str {
@@ -35,7 +79,18 @@ impl Format {
             Format::Pdf => "application/pdf",
             Format::Csv => "text/csv",
             Format::Tsv => "text/tab-separated-values",
+            Format::Docx => OFFICE[0].1,
+            Format::Pptx => OFFICE[1].1,
+            Format::Xlsx => OFFICE[2].1,
+            Format::Odt => OFFICE[3].1,
+            Format::Odp => OFFICE[4].1,
+            Format::Ods => OFFICE[5].1,
         }
+    }
+
+    /// Whether the format is a spreadsheet, which is mapped sheet by sheet (§7.8).
+    pub fn is_spreadsheet(self) -> bool {
+        matches!(self, Format::Xlsx | Format::Ods)
     }
 
     /// The short name of the format, as results report it.
@@ -47,6 +102,12 @@ impl Format {
             Format::Pdf => "pdf",
             Format::Csv => "csv",
             Format::Tsv => "tsv",
+            Format::Docx => "docx",
+            Format::Pptx => "pptx",
+            Format::Xlsx => "xlsx",
+            Format::Odt => "odt",
+            Format::Odp => "odp",
+            Format::Ods => "ods",
         }
     }
 
@@ -60,7 +121,12 @@ impl Format {
             "application/pdf" | "pdf" => Format::Pdf,
             "text/csv" | "application/csv" | "csv" => Format::Csv,
             "text/tab-separated-values" | "tsv" | "tab" => Format::Tsv,
-            _ => return None,
+            other => {
+                return OFFICE
+                    .iter()
+                    .find(|(n, m, _)| *n == other || *m == other)
+                    .map(|(_, _, f)| *f);
+            }
         })
     }
 
@@ -74,7 +140,12 @@ impl Format {
             "pdf" => Format::Pdf,
             "csv" => Format::Csv,
             "tsv" | "tab" => Format::Tsv,
-            _ => return None,
+            other => {
+                return OFFICE
+                    .iter()
+                    .find(|(n, _, _)| *n == other)
+                    .map(|(_, _, f)| *f);
+            }
         })
     }
 
@@ -84,6 +155,10 @@ impl Format {
         let head = &bytes[..bytes.len().min(1024)];
         if head.starts_with(b"%PDF-") {
             return Some(Format::Pdf);
+        }
+        #[cfg(feature = "office")]
+        if head.starts_with(b"PK\x03\x04") {
+            return sparkles_office::sniff(bytes).and_then(|f| Format::parse(f.name()));
         }
         let s = String::from_utf8_lossy(head)
             .trim_start()
@@ -116,6 +191,15 @@ impl Format {
         }
         if let Some(f) = Format::sniff(bytes) {
             return Ok(f);
+        }
+        // an OLE compound file is a legacy binary Office document or a password-protected
+        // one, whatever its name says, and it is not text
+        if bytes.starts_with(OLE_SIGNATURE) {
+            return Err(Refusal::new(
+                "unsupported-format",
+                415,
+                "the file is a legacy binary Office document or a password-protected one: save it as docx, pptx or xlsx without a password",
+            ));
         }
         if let Some(f) = name.and_then(Format::from_name) {
             return Ok(f);
@@ -162,7 +246,7 @@ impl Refusal {
             "unsupported-format",
             415,
             format!(
-                "{what} cannot be ingested: send plain text, Markdown, HTML, PDF, CSV or TSV (RDF goes through the upload)"
+                "{what} cannot be ingested: send plain text, Markdown, HTML, PDF, Word, PowerPoint, Excel, OpenDocument, CSV or TSV (RDF goes through the upload)"
             ),
         )
     }
@@ -184,6 +268,14 @@ impl Refusal {
     }
 }
 
+/// A picture inside a document that a `describe` model may read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EmbeddedImage {
+    pub media_type: &'static str,
+    pub bytes: Vec<u8>,
+    pub alt: Option<String>,
+}
+
 /// A converted document.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Converted {
@@ -195,6 +287,9 @@ pub struct Converted {
     pub title: Option<String>,
     /// the code point offset at which each page starts (PDF)
     pub page_starts: Vec<usize>,
+    /// the pictures of an Office document, by the index of the `<!-- image:K -->` line
+    /// that stands for each
+    pub images: Vec<EmbeddedImage>,
     /// pages read by OCR
     pub ocr_pages: Vec<u32>,
     /// pages left out under `allowPartial`
@@ -235,10 +330,11 @@ pub fn page_starts(text: &str) -> Vec<usize> {
 
 /// How to convert.
 #[derive(Clone)]
-// all but the limits serve PDF conversion only
-#[cfg_attr(not(feature = "pdf"), allow(dead_code))]
+// the deadline, the workers and the picture limit serve PDF and Office conversion only
+#[cfg_attr(not(any(feature = "pdf", feature = "office")), allow(dead_code))]
 pub struct Options {
     /// convert what can be read of a PDF that needs OCR, and record the rest
+    #[cfg_attr(not(feature = "pdf"), allow(dead_code))]
     pub allow_partial: bool,
     pub max_input: usize,
     pub max_text: usize,
@@ -246,6 +342,10 @@ pub struct Options {
     pub deadline: Instant,
     /// the PDF workers and the OCR configuration of the server
     pub pdf: std::sync::Arc<super::PdfRuntime>,
+    /// how many pictures of an Office document to return for a `describe` model; 0 leaves
+    /// their alt text in the text
+    #[cfg_attr(not(feature = "office"), allow(dead_code))]
+    pub max_images: usize,
 }
 
 /// Convert `bytes` of format `format`. CSV and TSV are not converted to text (§7.8)
@@ -281,13 +381,14 @@ pub fn convert(bytes: &[u8], format: Format, o: &Options) -> Result<Converted, R
             }
         }
         Format::Pdf => pdf(bytes, o)?,
-        Format::Csv | Format::Tsv => {
+        Format::Csv | Format::Tsv | Format::Xlsx | Format::Ods => {
             return Err(Refusal::new(
                 "unsupported-format",
                 415,
                 "a table is mapped to triples, not converted to text",
             ));
         }
+        Format::Docx | Format::Pptx | Format::Odt | Format::Odp => office(bytes, format, o)?,
     };
     if out.text.trim().is_empty() {
         return Err(Refusal::new("empty", 422, "the document holds no text"));
@@ -303,7 +404,7 @@ pub fn convert(bytes: &[u8], format: Format, o: &Options) -> Result<Converted, R
             ),
         ));
     }
-    if format == Format::Pdf {
+    if matches!(format, Format::Pdf | Format::Pptx | Format::Odp) {
         out.page_starts = page_starts(&out.text);
     }
     Ok(out)
@@ -326,6 +427,20 @@ fn pdf(_bytes: &[u8], _o: &Options) -> Result<Converted, Refusal> {
         415,
         "this server was built without PDF conversion (the pdf feature)",
     ))
+}
+
+#[cfg(not(feature = "office"))]
+fn office(_bytes: &[u8], _format: Format, _o: &Options) -> Result<Converted, Refusal> {
+    Err(Refusal::new(
+        "unsupported-format",
+        415,
+        "this server was built without Office conversion (the office feature)",
+    ))
+}
+
+#[cfg(feature = "office")]
+fn office(bytes: &[u8], format: Format, o: &Options) -> Result<Converted, Refusal> {
+    super::office::convert(bytes, format, o)
 }
 
 #[cfg(feature = "pdf")]

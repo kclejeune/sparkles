@@ -212,7 +212,7 @@ impl Store {
             &gdir.join("commit.json"),
             &commit::gen_commit_bytes(id, "clone", &root),
         )?;
-        File::create(gdir.join("wal.log"))?.sync_all()?;
+        super::wal::create(&gdir.join("wal.log"))?;
         sync_dir(&gdir)?;
         write_atomic(
             &dir.join("dataset.json"),
@@ -248,12 +248,14 @@ impl Store {
             write_atomic(&dir.join(file), &cfg)?;
         }
         // write-time validation stays configured (the clone judges its first write in
-        // full), and the stored queries and the GraphQL configuration come along
+        // full), and the stored queries, the named projections and the GraphQL configuration come
+        // along
         if let Some(root) = &self.root {
-            for f in crate::guard::config::FILES
-                .iter()
-                .chain([&crate::stored::FILE, &"graphql.json"])
-            {
+            for f in crate::guard::config::FILES.iter().chain([
+                &crate::stored::FILE,
+                &crate::algo::catalog::FILE,
+                &"graphql.json",
+            ]) {
                 match std::fs::read(root.join(f)) {
                     Ok(b) => write_atomic(&dir.join(f), &b)?,
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -613,8 +615,9 @@ fn share_generation(
         done += len;
         report(opts, 0.9 * done as f32 / total as f32, "copying files");
     }
-    let mut meta: IndexMeta = serde_json::from_slice(&std::fs::read(src.join("meta.json"))?)
-        .map_err(|e| Error::Corrupt(format!("meta.json: {e}")))?;
+    // the version first, so a newer meta in another shape is refused as newer
+    let written_by = src.parent().and_then(crate::commit::read_written_by);
+    let mut meta: IndexMeta = crate::builder::read_index_meta(src, written_by.as_deref())?;
     if meta.quads != cap.snap.len() {
         return Err(Error::Corrupt(format!(
             "{}: meta.json counts {} quads, the snapshot {}",

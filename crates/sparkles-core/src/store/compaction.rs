@@ -722,6 +722,8 @@ impl CatchUp {
             }
             rec[0] = WAL_COMMIT;
             rec[1..9].copy_from_slice(&c.next_bnode.to_le_bytes());
+            // WAL_FLAG_ANNOTATED is not carried: the commits copied here were durable,
+            // annotation included, before the compaction took the writer lock.
             let flags = if c.info.unvalidated {
                 commit::WAL_FLAG_UNVALIDATED
             } else {
@@ -902,9 +904,7 @@ impl Store {
                 }
             } else {
                 let mut v = serde_json::to_value(&s).expect("settings serialize");
-                v.as_object_mut()
-                    .expect("an object")
-                    .insert("format".into(), 1.into());
+                crate::formats::stamp_settings(COMPACTION_FILE, &mut v);
                 let mut bytes = serde_json::to_vec_pretty(&v).expect("json serializes");
                 bytes.push(b'\n');
                 write_atomic(&path, &bytes)?;
@@ -1226,6 +1226,18 @@ impl Store {
             build += tg.elapsed();
             pre
         };
+        // the vector indexes too: carried over from the old generation's, so searches
+        // after the switch use a graph at once
+        {
+            let tv = Instant::now();
+            let base_only = self.base_snapshot(&gen_, base.seq);
+            let stop = || cancelled();
+            match &pool {
+                Some(p) => p.install(|| self.prebuild_vectors(&base_only, &snap0, base.seq, &stop)),
+                None => self.prebuild_vectors(&base_only, &snap0, base.seq, &stop),
+            }
+            build += tv.elapsed();
+        }
         self.failpoint("compact-indexed");
         if cancelled() {
             return Err(Error::Cancelled);
@@ -1239,7 +1251,8 @@ impl Store {
             } else {
                 None
             },
-            wal_len: 0,
+            // a new log holds its header record
+            wal_len: if persistent { wal::HEADER_BYTES } else { 0 },
             index: wal::WalIndex::new(base.seq, false),
             ids: Default::default(),
             last: base.seq,
@@ -1377,6 +1390,7 @@ impl Store {
         }
         let dvocab_len = gen_.dvocab.len();
         let mut new_snap = Snapshot {
+            cacheable: true,
             dataset_id: self.owner_dataset_id(),
             generation: gen_,
             delta: std::mem::take(&mut cu.delta),
@@ -1401,7 +1415,12 @@ impl Store {
         }
         self.switch_geo_locked(&mut new_snap, &view, geo);
         let quads = new_snap.len();
-        self.current.store(Arc::new(new_snap));
+        let published = Arc::new(new_snap);
+        self.current.store(published.clone());
+        if let Some(g) = self.guard() {
+            g.rekey(&view, &published);
+        }
+        drop(published);
         self.commits.send_replace(view.commit);
         self.vectors_switched(&view);
         self.compaction.rebased(base.seq, cu.oldest_ms);
@@ -1618,6 +1637,7 @@ impl Store {
     /// compaction's new generation holds before the commits carried over).
     pub(super) fn base_snapshot(&self, gen_: &Arc<Generation>, seq: u64) -> Snapshot {
         Snapshot {
+            cacheable: true,
             dataset_id: self.owner_dataset_id(),
             generation: gen_.clone(),
             delta: gen_.base_delta(),
@@ -1747,6 +1767,7 @@ pub(crate) fn read_settings(root: &Path) -> Result<CompactionSettings> {
         Ok(b) => {
             let v: serde_json::Value = serde_json::from_slice(&b)
                 .map_err(|e| Error::Corrupt(format!("{COMPACTION_FILE}: {e}")))?;
+            crate::formats::check_settings(COMPACTION_FILE, &v)?;
             CompactionSettings::from_json(&v)
                 .map_err(|e| Error::Corrupt(format!("{COMPACTION_FILE}: {e}")))
         }
@@ -1835,5 +1856,25 @@ mod tests {
         assert_eq!(t.delta_ratio, Some(0.5));
         assert!(CompactionSettings::from_json(&serde_json::json!({"ratio": 1})).is_err());
         assert!(CompactionSettings::from_json(&serde_json::json!([1])).is_err());
+    }
+
+    #[test]
+    fn a_newer_compaction_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let newer = crate::formats::settings_file(COMPACTION_FILE)
+            .unwrap()
+            .writes
+            + 1;
+        std::fs::write(
+            dir.path().join(COMPACTION_FILE),
+            format!(r#"{{"format": {newer}, "deltaRatio": 0.5}}"#),
+        )
+        .unwrap();
+        assert!(matches!(
+            read_settings(dir.path()),
+            Err(Error::Unsupported(_))
+        ));
+        std::fs::write(dir.path().join(COMPACTION_FILE), r#"{"deltaRatio": 0.5}"#).unwrap();
+        assert_eq!(read_settings(dir.path()).unwrap().delta_ratio, Some(0.5));
     }
 }

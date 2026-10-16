@@ -386,7 +386,7 @@ async fn direct_naming_needs_the_flag() {
     let dir = tempfile::tempdir().unwrap();
     let mut st =
         AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap();
-    st.gsp_direct_naming = true;
+    st.gsp_direct_naming = crate::state::GspDirectNaming::everywhere();
     let st = Arc::new(st);
     st.attach("ds", DbType::Mem, None).unwrap();
     let app = router(st);
@@ -404,6 +404,91 @@ async fn direct_naming_needs_the_flag() {
     assert_eq!(
         get(&app, "/$/no/such/route", "*/*").await.status,
         StatusCode::NOT_FOUND
+    );
+}
+
+/// A dataset with a read-only direct endpoint (`fuseki:gsp-direct-r`) takes no write at a
+/// graph's own URL, and one that names none does not serve the URL at all.
+#[tokio::test]
+async fn read_only_direct_naming_refuses_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut st =
+        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap();
+    st.gsp_direct_naming =
+        crate::state::GspDirectNaming::parse(&["ro=read".to_string(), "rw=read-write".to_string()])
+            .unwrap();
+    let st = Arc::new(st);
+    for n in ["ro", "rw", "off"] {
+        st.attach(n, DbType::Mem, None).unwrap();
+    }
+    let app = router(st);
+    let ttl = |method: &str, ds: &str| {
+        Request::builder()
+            .method(method)
+            .uri(format!("/{ds}/graphs/one"))
+            .header(header::HOST, "localhost:5230")
+            .header(header::CONTENT_TYPE, "text/turtle")
+            .body(Body::from("<urn:s> <urn:p> <urn:o> ."))
+            .unwrap()
+    };
+    // the read-write dataset takes a write and then serves it
+    assert_eq!(send(&app, ttl("PUT", "rw")).await.status, StatusCode::OK);
+    let read = |ds: &str| {
+        Request::get(format!("/{ds}/graphs/one"))
+            .header(header::HOST, "localhost:5230")
+            .header(header::ACCEPT, "text/turtle")
+            .body(Body::empty())
+            .unwrap()
+    };
+    assert_eq!(send(&app, read("rw")).await.status, StatusCode::OK);
+    // the read-only one refuses every kind of write with a 405 that lists what it allows
+    for m in ["PUT", "POST", "DELETE", "PATCH"] {
+        let res = app.clone().oneshot(ttl(m, "ro")).await.unwrap();
+        assert_eq!(res.status(), StatusCode::METHOD_NOT_ALLOWED, "{m}");
+        assert_eq!(
+            res.headers().get(header::ALLOW).unwrap(),
+            "GET, HEAD, OPTIONS",
+            "{m}"
+        );
+    }
+    let ask = |ds: &str| {
+        format!(
+            "/{ds}/sparql?query=ASK%7BGRAPH%20%3Chttp%3A%2F%2Flocalhost%3A5230%2F{ds}%2Fgraphs%2Fone%3E%7B%3Fs%20%3Fp%20%3Fo%7D%7D"
+        )
+    };
+    let r = get(&app, &ask("ro"), "application/sparql-results+json")
+        .await
+        .json();
+    assert_eq!(r["boolean"], false, "nothing was written: {r}");
+    // reads of the read-only dataset still work
+    assert_ne!(
+        send(&app, read("ro")).await.status,
+        StatusCode::METHOD_NOT_ALLOWED
+    );
+    // a dataset that names no direct endpoint does not serve one
+    assert_eq!(
+        send(&app, ttl("PUT", "off")).await.status,
+        StatusCode::NOT_FOUND
+    );
+    // each dataset's description lists the endpoint it has
+    for (ds, want) in [("ro", "gsp-direct-r"), ("rw", "gsp-direct-rw")] {
+        let d = get(&app, &format!("/$/datasets/{ds}"), "*/*").await.json();
+        let kinds: Vec<&str> = d["ds.services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["srv.type"].as_str().unwrap())
+            .filter(|t| t.starts_with("gsp-direct"))
+            .collect();
+        assert_eq!(kinds, [want], "{ds}");
+    }
+    let d = get(&app, "/$/datasets/off", "*/*").await.json();
+    assert!(
+        d["ds.services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| !s["srv.type"].as_str().unwrap().starts_with("gsp-direct"))
     );
 }
 

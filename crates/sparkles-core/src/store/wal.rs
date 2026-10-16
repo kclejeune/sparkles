@@ -14,19 +14,110 @@
 //! way [`replay_wal`](super::replay_wal) does. [`apply_backward`] undoes a range of
 //! transactions read from the end: every change a log records took effect, so applying
 //! the inverse of each change in reverse order is exact.
+//!
+//! # Version
+//!
+//! A log created by this release starts with a header record: 33 bytes, like every
+//! record, so the records after it keep their alignment. Its first eight bytes are
+//! [`MAGIC`], whose first byte [`WAL_HEADER`] is no record type, then the log's version
+//! ([`crate::formats::WAL_VERSION`]) as a little-endian `u32`. The bytes after the version
+//! are zero in every version this build reads, and a newer version may use them, so a
+//! reader takes the version first and refuses an unknown one before it looks at the rest.
+//! A log without
+//! the header was written before it existed and is version 0. Its records are the same.
+//! Readers skip the header where a log starts, so a position of byte 0 still means "the
+//! generation's base, before any commit". A log whose version this build does not read
+//! is refused with [`Error::Unsupported`]. Existing logs are never rewritten to add the
+//! header: it arrives with the next generation, at a compaction or bulk load. The
+//! dataset requires reader [`HEADER_READER`] before a store writes one, so an older
+//! release refuses the dataset instead of reading the header as a damaged record.
 
 use super::*;
 use std::io::{BufReader, Seek, SeekFrom};
 
-/// Open a generation's log for writing, positioned at the end of the file. It is not
-/// opened in append mode: a store that preallocates writes each commit at the log's
-/// logical end, which lies before the zero bytes that follow it.
+/// The first eight bytes of a log's header record.
+pub const MAGIC: [u8; 8] = *b"\x89SPKWAL\n";
+
+/// The dataset reader (`minimumReader` of `dataset.json`) that reads log headers.
+pub const HEADER_READER: u32 = 5;
+
+/// The header record of a new log.
+pub(crate) fn header_record() -> [u8; WAL_REC] {
+    let mut r = [0u8; WAL_REC];
+    r[..8].copy_from_slice(&MAGIC);
+    r[8..12].copy_from_slice(&crate::formats::WAL_VERSION.to_le_bytes());
+    r
+}
+
+/// The version in a header record (`rec[0]` is [`WAL_HEADER`]), checked against the
+/// versions this build reads.
+pub(crate) fn header_version(rec: &[u8], path: &Path) -> Result<u32> {
+    let damaged = || Error::Corrupt(format!("{}: damaged header record", path.display()));
+    if rec.len() < WAL_REC || rec[..8] != MAGIC {
+        return Err(damaged());
+    }
+    let v = u32::from_le_bytes(rec[8..12].try_into().unwrap());
+    // a newer version may define the bytes after its version, so check it first
+    crate::formats::WAL.check(&path.display().to_string(), v, None)?;
+    // every version this build reads leaves them zero
+    if rec[12..WAL_REC].iter().any(|&b| b != 0) {
+        return Err(damaged());
+    }
+    Ok(v)
+}
+
+/// The version of the log whose first bytes are `buf` (0 without a header).
+pub(crate) fn version_of(buf: &[u8], path: &Path) -> Result<u32> {
+    match buf.first() {
+        Some(&WAL_HEADER) => header_version(buf, path),
+        _ => Ok(0),
+    }
+}
+
+/// The version of the log at `path` (0 for a missing or headerless log), for
+/// `sparkles migrate --check`.
+pub fn file_version(path: &Path) -> Result<u32> {
+    let mut buf = [0u8; WAL_REC];
+    let n = match File::open(path) {
+        Ok(mut f) => {
+            let mut n = 0;
+            while n < WAL_REC {
+                match f.read(&mut buf[n..])? {
+                    0 => break,
+                    k => n += k,
+                }
+            }
+            n
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(e) => return Err(e.into()),
+    };
+    version_of(&buf[..n], path)
+}
+
+/// The bytes a new log starts with: its header record.
+pub(crate) const HEADER_BYTES: u64 = WAL_REC as u64;
+
+/// Create a new, empty log at `path` (which must not exist): its header record, synced.
+/// The caller syncs the directory and has already made the dataset require
+/// [`HEADER_READER`] (every persistent store does when it opens).
+pub(crate) fn create(path: &Path) -> std::io::Result<()> {
+    let mut f = OpenOptions::new().write(true).create_new(true).open(path)?;
+    f.write_all(&header_record())?;
+    f.sync_all()
+}
+
+/// Open a generation's log for writing, positioned at the end of the file, creating it
+/// with its header (see [`create`]) if it does not exist. It is not opened in append
+/// mode: a store that preallocates writes each commit at the log's logical end, which
+/// lies before the zero bytes that follow it.
 pub(crate) fn open_for_append(path: &Path) -> std::io::Result<File> {
-    let mut f = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(path)?;
+    match create(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    let mut f = OpenOptions::new().write(true).open(path)?;
     f.seek(SeekFrom::End(0))?;
     Ok(f)
 }
@@ -71,12 +162,12 @@ pub(crate) fn write_commit(
 }
 
 #[cfg(unix)]
-fn write_all_at(file: &File, buf: &[u8], at: u64) -> std::io::Result<()> {
+pub(crate) fn write_all_at(file: &File, buf: &[u8], at: u64) -> std::io::Result<()> {
     std::os::unix::fs::FileExt::write_all_at(file, buf, at)
 }
 
 #[cfg(windows)]
-fn write_all_at(file: &File, mut buf: &[u8], mut at: u64) -> std::io::Result<()> {
+pub(crate) fn write_all_at(file: &File, mut buf: &[u8], mut at: u64) -> std::io::Result<()> {
     while !buf.is_empty() {
         let n = std::os::windows::fs::FileExt::seek_write(file, buf, at)?;
         if n == 0 {
@@ -89,7 +180,7 @@ fn write_all_at(file: &File, mut buf: &[u8], mut at: u64) -> std::io::Result<()>
 }
 
 #[cfg(not(any(unix, windows)))]
-fn write_all_at(_: &File, _: &[u8], _: u64) -> std::io::Result<()> {
+pub(crate) fn write_all_at(_: &File, _: &[u8], _: u64) -> std::io::Result<()> {
     Err(std::io::ErrorKind::Unsupported.into())
 }
 
@@ -451,6 +542,10 @@ impl WalCursor {
             match rec[0] {
                 WAL_INSERT | WAL_DELETE => self.txn.extend_from_slice(&rec),
                 WAL_COMMIT => break,
+                // the header record where the log starts
+                WAL_HEADER if offset == WAL_REC as u64 => {
+                    header_version(&rec, &self.path)?;
+                }
                 // the log's end: its preallocated space, or a torn last transaction
                 _ if is_zero_record(&rec) => return Ok(None),
                 op => {
@@ -663,8 +758,10 @@ pub(crate) fn apply_backward(
         buf.resize((end - start) as usize, 0);
         file.seek(SeekFrom::Start(start))?;
         file.read_exact(&mut buf)?;
-        for rec in buf.as_chunks::<WAL_REC>().0.iter().rev() {
+        for (i, rec) in buf.as_chunks::<WAL_REC>().0.iter().enumerate().rev() {
             match rec[0] {
+                // the header record where the log starts
+                WAL_HEADER if start == 0 && i == 0 => {}
                 WAL_COMMIT => {
                     if let Some(c) = commit.take() {
                         undo(&c, &data, &mut seq, delta)?;

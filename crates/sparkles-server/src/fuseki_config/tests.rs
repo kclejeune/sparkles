@@ -206,9 +206,38 @@ fn a8_allowed_users_with_a_password_file() {
     assert!(auth.anonymous.is_empty());
     let mut report = p.report.clone();
     let toml = write::auth_toml(auth, None, &mut report).unwrap();
-    assert!(!toml.contains("pw1"), "{toml}");
+    #[cfg(not(feature = "auth"))]
+    assert!(
+        !toml.lines().any(|line| {
+            let line = line.trim_start();
+            line == "[[users]]" || line.starts_with("password =")
+        }),
+        "active users need the auth feature"
+    );
     #[cfg(feature = "auth")]
     {
+        let parsed: toml::Value = toml::from_str(&toml).unwrap();
+        assert!(password_fields_match(
+            &toml,
+            &[
+                ("user1", "pw1"),
+                ("user2", "pw2"),
+                ("user3", "pw3"),
+                ("user9", "pw9")
+            ]
+        ));
+        let users = parsed["users"].as_array().unwrap();
+        for user in users {
+            let name = user["name"].as_str().unwrap();
+            let grants = user["datasets"].as_table().unwrap();
+            assert_eq!(grants["database2"].as_str(), Some("read"));
+            if matches!(name, "user1" | "user3") {
+                assert_eq!(grants["database1"].as_str(), Some("read"));
+                assert_eq!(grants.len(), 2);
+            } else {
+                assert_eq!(grants.len(), 1);
+            }
+        }
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join("auth.toml");
         write::write_private(&f, toml.as_bytes()).unwrap();
@@ -417,7 +446,7 @@ fn a10_agrees_with_assembler_bodies() {
         let accepts = |union: bool| {
             let server = assembler::Server {
                 union_default_graph: union,
-                gsp_direct_naming: false,
+                gsp_direct_naming: &crate::state::GspDirectNaming::OFF,
             };
             assembler::parse(&body, oxrdfio::RdfFormat::Turtle, &server).ok()
         };
@@ -478,4 +507,150 @@ fn every_configuration_converts() {
             }
         }
     }
+}
+
+/// A read-only direct endpoint (`fuseki:gsp-direct-r`) becomes a read-only direct naming
+/// of its own dataset, a read-write one a read-write naming, and a dataset without either
+/// serves none (spec G08).
+#[test]
+fn direct_naming_is_per_dataset_and_keeps_its_mode() {
+    let ttl = r#"
+PREFIX fuseki: <http://jena.apache.org/fuseki#>
+PREFIX ja: <http://jena.hpl.hp.com/2005/11/Assembler#>
+[] a fuseki:Server ; fuseki:services ( <#ro> <#rw> <#both> <#none> ) .
+<#ro> a fuseki:Service ; fuseki:name "ro" ;
+    fuseki:endpoint [ fuseki:operation fuseki:query ] ;
+    fuseki:endpoint [ fuseki:operation fuseki:gsp-direct-r ] ;
+    fuseki:dataset <#dsro> .
+<#rw> a fuseki:Service ; fuseki:name "rw" ;
+    fuseki:endpoint [ fuseki:operation fuseki:gsp-direct-rw ] ;
+    fuseki:dataset <#dsrw> .
+<#both> a fuseki:Service ; fuseki:name "both" ;
+    fuseki:endpoint [ fuseki:operation fuseki:gsp-direct-r ] ;
+    fuseki:endpoint [ fuseki:operation fuseki:gsp-direct-rw ] ;
+    fuseki:dataset <#dsboth> .
+<#none> a fuseki:Service ; fuseki:name "none" ;
+    fuseki:endpoint [ fuseki:operation fuseki:query ] ;
+    fuseki:dataset <#dsnone> .
+<#dsro> a ja:MemoryDataset . <#dsrw> a ja:MemoryDataset .
+<#dsboth> a ja:MemoryDataset . <#dsnone> a ja:MemoryDataset .
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("config.ttl");
+    std::fs::write(&f, ttl).unwrap();
+    let p = plan_for(&[f], &UserSource::default(), Mode::Files).unwrap();
+    assert!(!p.report.has_unsupported(), "{}", p.report.text());
+    assert!(!has(&p, Kind::Approximated, "every dataset"));
+    let a = args(&p);
+    for want in [
+        "--gsp-direct-naming=both=read-write",
+        "--gsp-direct-naming=ro=read",
+        "--gsp-direct-naming=rw=read-write",
+    ] {
+        assert!(a.contains(want), "{want} in {a}");
+    }
+    assert!(!a.contains("none="), "{a}");
+    // the server reads the values back as one mode per dataset
+    let n = crate::state::GspDirectNaming::parse(&write::direct_naming_values(&p.server)).unwrap();
+    use crate::state::DirectMode::{Read, ReadWrite};
+    assert_eq!(n.mode("ro"), Some(Read));
+    assert_eq!(n.mode("rw"), Some(ReadWrite));
+    assert_eq!(n.mode("both"), Some(ReadWrite));
+    assert_eq!(n.mode("none"), None);
+}
+
+#[test]
+fn direct_naming_values_parse() {
+    use crate::state::DirectMode::{Read, ReadWrite};
+    use crate::state::GspDirectNaming;
+    let v = |x: &[&str]| x.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let all = GspDirectNaming::parse(&v(&[""])).unwrap();
+    assert_eq!((all.mode("a"), all.is_on()), (Some(ReadWrite), true));
+    let n = GspDirectNaming::parse(&v(&["a=read", "b", ""])).unwrap();
+    assert_eq!(n.mode("a"), Some(Read));
+    assert_eq!(n.mode("b"), Some(ReadWrite));
+    assert_eq!(
+        n.mode("c"),
+        Some(ReadWrite),
+        "the bare flag covers the rest"
+    );
+    let only = GspDirectNaming::parse(&v(&["a=read"])).unwrap();
+    assert_eq!(only.mode("b"), None);
+    assert!(!GspDirectNaming::default().is_on());
+    assert!(GspDirectNaming::parse(&v(&["a=write"])).is_err());
+    assert!(GspDirectNaming::parse(&v(&["=read"])).is_err());
+}
+
+#[cfg(feature = "auth")]
+const RETAINED_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$IY9gTcuk5XaTpb3ovQUYxA$Dk0/beLxqbNZiieSoWzVpw10rL/XQz1u5JQa6ec0+VA";
+
+#[cfg(feature = "auth")]
+#[test]
+fn password_fields_accept_a_valid_hash_with_a_password_substring() {
+    use argon2::password_hash::PasswordVerifier;
+    assert!(
+        argon2::Argon2::default()
+            .verify_password(b"pw3", RETAINED_HASH)
+            .is_ok()
+    );
+    let text =
+        format!("version = 1\n[[users]]\nname = \"user3\"\npassword = \"{RETAINED_HASH}\"\n");
+    assert!(
+        text.contains("pw1"),
+        "retained hash must reproduce the old false positive"
+    );
+    assert!(password_fields_match(&text, &[("user3", "pw3")]));
+    assert!(!password_fields_match(
+        &text,
+        &[("user3", "wrong-password")]
+    ));
+    for bad in [
+        "pw3",
+        "$argon2id$v=19$m=19456,t=2,p=1$invalid!$broken",
+        "$argon2id$",
+    ] {
+        assert!(!password_fields_match(
+            &text.replace(RETAINED_HASH, bad),
+            &[("user3", "pw3")]
+        ));
+    }
+}
+
+/// Validate each complete field by its user rather than searching random hash text.
+#[cfg(feature = "auth")]
+fn password_fields_match(text: &str, expected: &[(&str, &str)]) -> bool {
+    use argon2::{PasswordHash, PasswordVerifier};
+    let Ok(parsed) = toml::from_str::<toml::Value>(text) else {
+        return false;
+    };
+    let Some(users) = parsed.get("users").and_then(toml::Value::as_array) else {
+        return false;
+    };
+    if users.len() != expected.len() {
+        return false;
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    users.iter().all(|user| {
+        let Some(name) = user.get("name").and_then(toml::Value::as_str) else {
+            return false;
+        };
+        let Some((_, password)) = expected.iter().find(|(candidate, _)| *candidate == name) else {
+            return false;
+        };
+        let Some(field) = user.get("password").and_then(toml::Value::as_str) else {
+            return false;
+        };
+        let Ok(phc) = PasswordHash::new(field) else {
+            return false;
+        };
+        seen.insert(name)
+            && !expected.iter().any(|(_, plain)| field == *plain)
+            && phc.algorithm.as_str() == "argon2id"
+            && phc.version == Some(19)
+            && phc.salt.is_some()
+            && phc.hash.is_some()
+            && argon2::Argon2::default()
+                .verify_password(password.as_bytes(), field)
+                .is_ok()
+    })
 }

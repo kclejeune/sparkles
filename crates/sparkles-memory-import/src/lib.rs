@@ -17,6 +17,7 @@ pub mod frontmatter;
 pub mod ids;
 pub mod project;
 pub mod redact;
+pub mod transcripts;
 pub mod vocab;
 
 mod adapters;
@@ -43,16 +44,34 @@ pub enum Adapter {
     ClaudeCode,
     Codex,
     Generic,
+    /// transcripts only: the instruction files of these harnesses are the generic
+    /// adapter's
+    GeminiCli,
+    Cursor,
+    Copilot,
+    Aider,
 }
 
 impl Adapter {
-    pub const ALL: [Adapter; 3] = [Adapter::ClaudeCode, Adapter::Codex, Adapter::Generic];
+    pub const ALL: [Adapter; 7] = [
+        Adapter::ClaudeCode,
+        Adapter::Codex,
+        Adapter::Generic,
+        Adapter::GeminiCli,
+        Adapter::Cursor,
+        Adapter::Copilot,
+        Adapter::Aider,
+    ];
 
     pub fn parse(s: &str) -> Option<Adapter> {
         match s {
             "claude-code" | "claude" => Some(Adapter::ClaudeCode),
             "codex" => Some(Adapter::Codex),
             "generic" => Some(Adapter::Generic),
+            "gemini-cli" | "gemini" => Some(Adapter::GeminiCli),
+            "cursor" => Some(Adapter::Cursor),
+            "copilot" | "github-copilot" => Some(Adapter::Copilot),
+            "aider" => Some(Adapter::Aider),
             _ => None,
         }
     }
@@ -62,6 +81,23 @@ impl Adapter {
             Adapter::ClaudeCode => "claude-code",
             Adapter::Codex => "codex",
             Adapter::Generic => "generic",
+            Adapter::GeminiCli => "gemini-cli",
+            Adapter::Cursor => "cursor",
+            Adapter::Copilot => "copilot",
+            Adapter::Aider => "aider",
+        }
+    }
+
+    /// The harness whose transcripts the adapter reads, when it has any.
+    pub fn transcript_harness(self) -> Option<Harness> {
+        match self {
+            Adapter::ClaudeCode => Some(Harness::ClaudeCode),
+            Adapter::Codex => Some(Harness::Codex),
+            Adapter::GeminiCli => Some(Harness::GeminiCli),
+            Adapter::Cursor => Some(Harness::Cursor),
+            Adapter::Copilot => Some(Harness::Copilot),
+            Adapter::Aider => Some(Harness::Aider),
+            Adapter::Generic => None,
         }
     }
 }
@@ -73,16 +109,30 @@ pub enum Harness {
     Codex,
     GeminiCli,
     Cursor,
+    Copilot,
+    Aider,
     Generic,
 }
 
 impl Harness {
+    pub const ALL: [Harness; 7] = [
+        Harness::ClaudeCode,
+        Harness::Codex,
+        Harness::GeminiCli,
+        Harness::Cursor,
+        Harness::Copilot,
+        Harness::Aider,
+        Harness::Generic,
+    ];
+
     pub fn segment(self) -> &'static str {
         match self {
             Harness::ClaudeCode => "claude-code",
             Harness::Codex => "codex",
             Harness::GeminiCli => "gemini-cli",
             Harness::Cursor => "cursor",
+            Harness::Copilot => "copilot",
+            Harness::Aider => "aider",
             Harness::Generic => "generic",
         }
     }
@@ -93,20 +143,14 @@ impl Harness {
             Harness::Codex => "Codex",
             Harness::GeminiCli => "GeminiCli",
             Harness::Cursor => "Cursor",
+            Harness::Copilot => "Copilot",
+            Harness::Aider => "Aider",
             Harness::Generic => "Generic",
         })
     }
 
     pub fn parse(s: &str) -> Option<Harness> {
-        [
-            Harness::ClaudeCode,
-            Harness::Codex,
-            Harness::GeminiCli,
-            Harness::Cursor,
-            Harness::Generic,
-        ]
-        .into_iter()
-        .find(|h| h.segment() == s)
+        Harness::ALL.into_iter().find(|h| h.segment() == s)
     }
 }
 

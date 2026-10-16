@@ -8,7 +8,7 @@
 //! derived from the data, and nothing in the observed layer is derived from it.
 //!
 //! This module holds the types only. `sparkles_shacl::constraints` builds them from
-//! parsed shapes.
+//! parsed shapes and `sparkles_shex::constraints` from the schema of a ShEx guard.
 
 use serde::Serialize;
 
@@ -109,6 +109,10 @@ pub struct ClassConstraints {
 pub struct PropertyConstraint {
     /// The predicate IRI.
     pub path: String,
+    /// The constraint is on the subjects that point at the instance over `path` (ShEx
+    /// `^p`). SHACL inverse paths are counted under `otherPaths`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub inverse: bool,
     /// The property shape's IRI, when it has one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shape: Option<String>,
@@ -130,6 +134,10 @@ pub struct PropertyConstraint {
     /// `sh:nodeKind`, as the IRI of the node kind, such as `sh:IRI`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub node_kind: Option<String>,
+    /// The value set of a ShEx node constraint, as terms in N-Triples syntax. SHACL
+    /// `sh:in` is listed under `other`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub values: Vec<String>,
     /// The constraint components of the shape's other constraints, such as
     /// `sh:PatternConstraintComponent`, sorted.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -155,6 +163,9 @@ impl PropertyConstraint {
         }
         if let Some(k) = &self.node_kind {
             parts.push(format!("nodeKind {}", short(k)));
+        }
+        if !self.values.is_empty() {
+            parts.push(format!("in [{}]", self.values.join(" ")));
         }
         for o in &self.other {
             let name = o

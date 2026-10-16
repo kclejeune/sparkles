@@ -4,6 +4,7 @@ use oxrdf::{Literal, NamedNode, Term};
 use proptest::prelude::{Strategy as Gen, *};
 use sparkles_core::Error;
 use sparkles_core::guard::Strategy;
+use sparkles_core::guard::config::TYPING_FILE;
 use sparkles_core::io::{RdfFormat, Source};
 use sparkles_core::sparql::QueryOptions;
 use sparkles_core::sparql::update::{UpdateStats, update};
@@ -532,6 +533,39 @@ fn closed_shapes_read_every_predicate() {
     );
 }
 
+/// A shape that extends another reads every outgoing arc of its nodes (its parts and
+/// its remainder), so no write is skipped for its predicate and a write to a parent's
+/// arcs is validated.
+#[test]
+fn extending_shapes_are_revalidated_on_every_write() {
+    let schema = "PREFIX ex: <http://ex.org/>
+        ex:P { ex:name . } ex:S EXTENDS @ex:P { ex:school . }";
+    let compiled = crate::compile(
+        &crate::parse_schema(schema, None, None).unwrap(),
+        &NoImports,
+    )
+    .unwrap();
+    let map = parse_map(
+        &MapSource::Compact("{FOCUS ex:school _}@ex:S".into()),
+        &compiled,
+    )
+    .unwrap();
+    assert_eq!(read_predicates(compiled.ir(), &map), None);
+    let dir = tempfile::tempdir().unwrap();
+    let s = open(&dir.path().join("db"));
+    s.load(&[Source::from_bytes(
+        b"@prefix ex: <http://ex.org/> . ex:a ex:name \"A\" ; ex:school 1 .".to_vec(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    let c = cfg("warn", schema, "{FOCUS ex:school _}@ex:S");
+    let (_, sum) = installed(set_config(&s, Some(c), &NoImports).unwrap());
+    assert_eq!((sum.blocking, sum.total), (0, 1));
+    let v = summary(&upd(&s, "DELETE DATA { ex:a ex:name \"A\" }").unwrap());
+    assert_eq!((v.blocking, v.total), (1, 1));
+}
+
 // ---------------------------------------------------- the predicate skip ---------
 
 const EX: &str = "http://ex.org/";
@@ -932,7 +966,7 @@ fn grandfather_mode_blocks_only_new_associations() {
         Err(Error::Rejected(_))
     ));
     // a full validation (the state unknown) compares with the state before the write
-    s.guard().unwrap().bypassed();
+    s.guard().unwrap().bypassed(s.snapshot().commit + 1);
     let v = summary(&upd(&s, "INSERT DATA { ex:fay a ex:Person ; foaf:name \"F\" }").unwrap());
     assert_eq!(
         (v.strategy, v.fallback.as_deref(), v.introduced),
@@ -993,6 +1027,139 @@ fn typing_changes_propagate_along_references() {
     );
 }
 
+/// A ring of `n` people, each knowing the next, as Turtle.
+fn ring(n: u64) -> String {
+    let mut data = String::from(
+        "@prefix ex: <http://ex.org/> . @prefix foaf: <http://xmlns.com/foaf/0.1/> .\n",
+    );
+    for i in 0..n {
+        data.push_str(&format!(
+            "ex:p{i} a ex:Person ; foaf:name \"P{i}\" ; foaf:knows ex:p{} .\n",
+            (i + 1) % n
+        ));
+    }
+    data
+}
+
+fn typing_commit(g: &ShexGuard) -> Option<u64> {
+    g.typing.lock().as_ref().map(|t| t.commit)
+}
+
+/// The typing of the head is written when the store closes and read when the guard is
+/// installed, so the first write after a restart propagates as every other one. The
+/// first commit removes the file, a file that is not the head's is never trusted, and a
+/// compaction renumbers the typing in memory.
+#[test]
+fn the_typing_survives_a_restart() {
+    let n = 200;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let s = open(&root);
+    s.load(&[Source::from_bytes(
+        ring(n).into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    let (g, sum) = installed(set_config(&s, Some(cfg("warn", SCHEMA, MAP)), &NoImports).unwrap());
+    assert_eq!(sum.total, n);
+    assert!(
+        !exists(&root, TYPING_FILE),
+        "nothing is written before a close"
+    );
+    upd(&s, "INSERT DATA { ex:p0 foaf:knows ex:p7 }").unwrap();
+    let head = s.head_commit().seq;
+    assert_eq!(typing_commit(&g), Some(head));
+    drop(g);
+    drop(s);
+    assert!(exists(&root, TYPING_FILE));
+
+    // the next open has the typing of the head
+    let s = open(&root);
+    let g = install(&s).unwrap().unwrap();
+    assert_eq!(typing_commit(&g), Some(head));
+    assert!(exists(&root, TYPING_FILE), "reading leaves the file");
+    // a write after the restart is judged as in a store that never closed
+    let v = summary(
+        &upd(
+            &s,
+            "INSERT DATA { ex:bad a ex:Person . ex:p3 foaf:knows ex:bad }",
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        (v.strategy, v.focus_nodes, v.blocking, v.total),
+        (Strategy::Incremental, Some(n + 1), n + 1, n + 1)
+    );
+    assert!(!exists(&root, TYPING_FILE), "the first commit removes it");
+    assert_eq!(typing_commit(&g), Some(head + 1));
+    let v = summary(&upd(&s, "INSERT DATA { ex:bad foaf:name \"B\" }").unwrap());
+    assert_eq!((v.focus_nodes, v.blocking), (Some(n + 1), 0));
+
+    // a compaction renumbers the terms: the typing follows
+    s.compact().unwrap();
+    let head = s.head_commit().seq;
+    assert_eq!(typing_commit(&g), Some(head));
+    assert_eq!(
+        g.typing.lock().as_ref().map(|t| t.generation),
+        Some(s.snapshot().generation.uid),
+        "the typing uses the new generation's ids"
+    );
+    let v = summary(&upd(&s, "DELETE DATA { ex:bad foaf:name \"B\" }").unwrap());
+    assert_eq!(
+        (v.strategy, v.focus_nodes, v.blocking),
+        (Strategy::Incremental, Some(n + 1), n + 1)
+    );
+    drop(g);
+    drop(s);
+    assert!(exists(&root, TYPING_FILE));
+
+    // a changed file is not trusted, and goes
+    let path = root.join(TYPING_FILE);
+    let good = std::fs::read(&path).unwrap();
+    let mut bytes = good.clone();
+    let mid = bytes.len() / 2;
+    bytes[mid] ^= 0x55;
+    std::fs::write(&path, &bytes).unwrap();
+    let s = open(&root);
+    let g = install(&s).unwrap().unwrap();
+    assert_eq!(typing_commit(&g), None);
+    assert!(!exists(&root, TYPING_FILE));
+    let v = summary(&upd(&s, "INSERT DATA { ex:bad foaf:name \"B\" }").unwrap());
+    assert_eq!(v.blocking, 0);
+    drop(g);
+    drop(s);
+
+    // another head, another configuration: the file is for neither
+    let s = open(&root);
+    let g = install(&s).unwrap().unwrap();
+    upd(&s, "INSERT DATA { ex:p1 foaf:knows ex:p9 }").unwrap();
+    drop(g);
+    drop(s);
+    std::fs::write(&path, &good).unwrap();
+    let s = open(&root);
+    let g = install(&s).unwrap().unwrap();
+    assert_eq!(typing_commit(&g), None, "the file is of an older commit");
+    drop(g);
+    drop(s);
+    let s = open(&root);
+    let (g, _) = installed(set_config(&s, Some(cfg("reject", SCHEMA, MAP)), &NoImports).unwrap());
+    assert!(
+        !exists(&root, TYPING_FILE),
+        "a new configuration removes it"
+    );
+    drop(g);
+    drop(s);
+    let s = open(&root);
+    let g = install(&s).unwrap().unwrap();
+    assert!(typing_commit(&g).is_some());
+    assert!(matches!(
+        set_config(&s, None, &NoImports).unwrap(),
+        SetOutcome::Removed
+    ));
+    assert!(!exists(&root, TYPING_FILE));
+}
+
 /// Writes after enabling are incremental; the state survives a restart; a bulk load
 /// and an unknown state fall back to a full validation.
 #[test]
@@ -1018,7 +1185,7 @@ fn writes_are_validated_incrementally() {
     let v = summary(&upd(&s, "INSERT DATA { ex:dave foaf:name \"Dave\" }").unwrap());
     assert_eq!((v.strategy, v.blocking), (Strategy::Incremental, 1));
     // an unknown state: the next write is validated in full
-    g.bypassed();
+    g.bypassed(s.snapshot().commit + 1);
     let v = summary(&upd(&s, "INSERT DATA { ex:erin a ex:Person ; foaf:name \"E\" }").unwrap());
     assert_eq!(
         (v.strategy, v.fallback.as_deref(), v.blocking),
@@ -1263,4 +1430,133 @@ fn unusable_schema_graphs_are_refused() {
         .err()
         .unwrap();
     assert!(format!("{e:#}").contains("shapeMap"), "{e:#}");
+}
+
+/// An edit of the schema copy that keeps the pair numbering (a datatype
+/// changes) must not let the typing of the old schema be restored.
+#[test]
+fn typing_of_another_schema_is_not_restored() {
+    use sparkles_core::guard::config::SHEX_SCHEMA_SHEXC_FILE;
+    let n = 20;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let s = open(&root);
+    s.load(&[Source::from_bytes(
+        ring(n).into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    let (g, _) = installed(set_config(&s, Some(cfg("reject", SCHEMA, MAP)), &NoImports).unwrap());
+    upd(&s, "INSERT DATA { ex:p0 foaf:knows ex:p7 }").unwrap();
+    drop(g);
+    drop(s);
+    assert!(exists(&root, TYPING_FILE));
+    // the copy now asks for boolean names: no person conforms any more
+    let copy = root.join(SHEX_SCHEMA_SHEXC_FILE);
+    let text = std::fs::read_to_string(&copy).unwrap();
+    assert!(text.contains("xsd:string"), "{text}");
+    std::fs::write(&copy, text.replace("xsd:string", "xsd:boolean")).unwrap();
+    let s = open(&root);
+    let g = install(&s).unwrap().unwrap();
+    assert_eq!(
+        typing_commit(&g),
+        None,
+        "the typing of the old schema was restored for the new one"
+    );
+    // the first write validates in full against the new schema
+    let r = upd(
+        &s,
+        "INSERT DATA { ex:new a ex:Person ; foaf:name true ; foaf:knows ex:p3 }",
+    );
+    assert!(matches!(r, Err(sparkles_core::Error::Rejected(_))), "{r:?}");
+}
+
+/// A typing file of a version this build does not read is discarded, and the typing is
+/// rebuilt, even when the file is intact.
+#[test]
+fn typing_of_another_version_is_discarded() {
+    use sha2::{Digest, Sha256};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let s = open(&root);
+    s.load(&[Source::from_bytes(
+        ring(20).into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    let (g, _) = installed(set_config(&s, Some(cfg("reject", SCHEMA, MAP)), &NoImports).unwrap());
+    upd(&s, "INSERT DATA { ex:p0 foaf:knows ex:p7 }").unwrap();
+    drop(g);
+    drop(s);
+    let path = root.join(TYPING_FILE);
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes.truncate(bytes.len() - 32);
+    bytes[8..12].copy_from_slice(&2u32.to_le_bytes());
+    let digest = Sha256::digest(&bytes);
+    bytes.extend_from_slice(&digest);
+    std::fs::write(&path, &bytes).unwrap();
+    let s = open(&root);
+    let g = install(&s).unwrap().unwrap();
+    assert_eq!(typing_commit(&g), None);
+    assert!(!exists(&root, TYPING_FILE));
+}
+
+#[test]
+fn operation_controls_survive_guard_adapter_and_runtime() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let s = Store::in_memory(StoreOptions::default());
+    s.load(&[Source::from_bytes(
+        DATA.as_bytes().to_vec(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    let (guard, _) = installed(set_config(&s, Some(cfg("warn", SCHEMA, MAP)), &NoImports).unwrap());
+    let snap = s.snapshot();
+    let model = guard.model();
+    let flag = Arc::new(AtomicBool::new(false));
+    let primary = Arc::new(AtomicBool::new(false));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let opts = WriteOptions {
+        deadline: Some(deadline),
+        cancel: Some(primary.clone()),
+        cancellation: Some(sparkles_core::task::Cancellation::from_flags(
+            [flag.clone()],
+        )),
+        ..Default::default()
+    };
+    for source in 0..4 {
+        flag.store(false, Ordering::Relaxed);
+        primary.store(false, Ordering::Relaxed);
+        let mut opts = opts.clone();
+        if source == 2 {
+            opts.deadline = Some(Instant::now());
+        }
+        let mut vo = guard.options(&snap, &opts, deadline).unwrap();
+        assert_eq!(vo.deadline, opts.deadline);
+        assert!(vo.timeout.is_none());
+        assert!(vo.cancellation.as_ref().unwrap().check().is_ok());
+        if source == 0 {
+            flag.store(true, Ordering::Relaxed);
+        }
+        if source == 1 {
+            primary.store(true, Ordering::Relaxed);
+        }
+        if source == 3 {
+            vo.deadline = None;
+            vo.timeout = Some(Duration::ZERO);
+        }
+        let error = crate::engine::validate_typed(&snap, &model.schema, &model.map, &vo, None, &[])
+            .unwrap_err();
+        assert!(
+            if source < 2 {
+                matches!(error.downcast_ref::<Error>(), Some(Error::Cancelled))
+            } else {
+                matches!(error.downcast_ref::<Error>(), Some(Error::Timeout))
+            },
+            "{error}"
+        );
+    }
 }

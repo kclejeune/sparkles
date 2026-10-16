@@ -20,7 +20,7 @@ use serde_json::Value as J;
 use uuid::Uuid;
 
 /// Repository format written and read by this build.
-pub const FORMAT: u32 = 1;
+pub const FORMAT: u32 = sparkles_core::formats::BACKUP_LAYOUT.writes;
 /// `kind` of the marker.
 pub const MARKER_KIND: &str = "sparkles-backup-repository";
 /// `kind` of a manifest.
@@ -117,7 +117,7 @@ pub fn valid_blob_id(s: &str) -> bool {
 }
 
 /// Files at the database root that a backup may hold.
-pub const ROOT_FILES: [&str; 17] = [
+pub const ROOT_FILES: [&str; 18] = [
     "CURRENT",
     "dataset.json",
     "commits.bin",
@@ -134,6 +134,7 @@ pub const ROOT_FILES: [&str; 17] = [
     "validation-schema.shex",
     "validation-schema.json",
     "queries.json",
+    "algo.json",
     "graphql.json",
 ];
 

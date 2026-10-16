@@ -33,6 +33,8 @@ fn fixture() -> Fixture {
         claude: home.join(".claude"),
         codex: home.join(".codex"),
         gemini: home.join(".gemini"),
+        cursor: home.join(".cursor"),
+        copilot: home.join(".copilot"),
         managed: dir.path().join("etc/claude-code"),
         home: home.clone(),
     };

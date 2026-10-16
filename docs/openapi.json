@@ -331,6 +331,17 @@
           "type": "string"
         }
       },
+      "profile": {
+        "description": "`io` adds an `io` object to the metadata of the `application/x-sparkles+json` result, with what the query read from the index and vocabulary files and the time spent doing so. The counters are process-wide, so concurrent queries add to them. Overlapping profiles share at most 65,536 first-admitted pages; pagesTruncated reports cap omissions, not completeness. Page counts describe the retained sample, and broughtIn is its diagnostic nonnegative resident-count delta rather than physical I/O. Numeric mapped loads are observed independently of advice, including hints-off and previously hinted reads. The counters cover the whole process, so the parameter needs the `metrics` permission and answers `403` without it. Any other value answers `400`.",
+        "in": "query",
+        "name": "profile",
+        "schema": {
+          "enum": [
+            "io"
+          ],
+          "type": "string"
+        }
+      },
       "reasoning": {
         "description": "Include materialized inferences. The default is true when the dataset has any.",
         "in": "query",
@@ -967,6 +978,231 @@
       }
     },
     "schemas": {
+      "AlgoProjection": {
+        "description": "A named projection of a dataset. A PUT sends the definition, or this object with its `definition` member.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#graph-algorithms"
+        },
+        "properties": {
+          "author": {
+            "type": "string"
+          },
+          "definition": {
+            "$ref": "#/components/schemas/AlgoProjectionDefinition"
+          },
+          "name": {
+            "type": "string"
+          },
+          "revision": {
+            "description": "1 for a new projection, one more for each replacement.",
+            "type": "integer"
+          },
+          "updated": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "revision",
+          "updated",
+          "definition"
+        ],
+        "type": "object"
+      },
+      "AlgoProjectionDefinition": {
+        "additionalProperties": false,
+        "description": "The edges of a projection. Without `predicates` every predicate between resources counts, except `rdf:type`. An empty `predicates` list is refused.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#graph-algorithms"
+        },
+        "properties": {
+          "aggregate": {
+            "enum": [
+              "none",
+              "sum",
+              "max",
+              "count"
+            ],
+            "type": "string"
+          },
+          "defaultWeight": {
+            "type": "number"
+          },
+          "direction": {
+            "enum": [
+              "forward",
+              "backward",
+              "undirected"
+            ],
+            "type": "string"
+          },
+          "nodeClasses": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "predicates": {
+            "items": {
+              "description": "An IRI (a prefixed name in a run request), or an object with the direction this predicate is read in.",
+              "oneOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "properties": {
+                    "direction": {
+                      "enum": [
+                        "forward",
+                        "backward",
+                        "undirected"
+                      ],
+                      "type": "string"
+                    },
+                    "iri": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "iri"
+                  ],
+                  "type": "object"
+                }
+              ]
+            },
+            "type": "array"
+          },
+          "weight": {
+            "description": "The property of an edge's reifier that holds its weight.",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "AlgoProjectionList": {
+        "description": "A dataset's named projections and the size of the cache of built projections.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#graph-algorithms"
+        },
+        "properties": {
+          "cache": {
+            "properties": {
+              "bytes": {
+                "type": "integer"
+              },
+              "entries": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "bytes",
+              "entries"
+            ],
+            "type": "object"
+          },
+          "dataset": {
+            "type": "string"
+          },
+          "projections": {
+            "items": {
+              "$ref": "#/components/schemas/AlgoProjection"
+            },
+            "type": "array"
+          },
+          "warning": {
+            "description": "Why `algo.json` could not be read. The list is then empty and refuses changes.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "dataset",
+          "projections",
+          "cache"
+        ],
+        "type": "object"
+      },
+      "AlgoRequest": {
+        "additionalProperties": false,
+        "description": "A run of one algorithm. With `write` the results are written to a graph in batched commits.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#graph-algorithms"
+        },
+        "properties": {
+          "algorithm": {
+            "enum": [
+              "pageRank",
+              "betweenness",
+              "wcc",
+              "scc",
+              "labelPropagation",
+              "louvain",
+              "leiden",
+              "nodeSimilarity",
+              "triangleCount",
+              "clustering",
+              "kCore",
+              "bfs",
+              "sssp",
+              "fastRP",
+              "node2vec"
+            ],
+            "type": "string"
+          },
+          "params": {
+            "additionalProperties": true,
+            "description": "The parameters of the algorithm, named as in `algo:` without the prefix, such as `maxIterations`, `seed` or `topK`.",
+            "type": "object"
+          },
+          "projection": {
+            "description": "The name of a stored projection, or a definition.",
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "$ref": "#/components/schemas/AlgoProjectionDefinition"
+              }
+            ]
+          },
+          "write": {
+            "additionalProperties": false,
+            "properties": {
+              "atomic": {
+                "type": "boolean"
+              },
+              "batchSize": {
+                "type": "integer"
+              },
+              "graph": {
+                "type": "string"
+              },
+              "mode": {
+                "enum": [
+                  "replace",
+                  "merge"
+                ],
+                "type": "string"
+              },
+              "predicates": {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "description": "The predicate that each output is written with, such as `{\"score\": \"ex:rank\"}`.",
+                "type": "object"
+              }
+            },
+            "required": [
+              "graph",
+              "predicates"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "algorithm"
+        ],
+        "type": "object"
+      },
       "AskFeedback": {
         "additionalProperties": false,
         "description": "Feedback on an answer.",
@@ -3341,7 +3577,8 @@
                   "validation-work",
                   "rows",
                   "rows-produced",
-                  "dataset-bytes"
+                  "dataset-bytes",
+                  "server-memory"
                 ],
                 "type": "string"
               },
@@ -3359,7 +3596,7 @@
             "type": "object"
           }
         ],
-        "description": "A `507` for a request over one of its budgets.",
+        "description": "A `507` for a request over one of its budgets. The `server-memory` budget is a `503` with `Retry-After`, because the server's query memory pool is in use and a retry can succeed.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#budgets"
         }
@@ -4114,6 +4351,118 @@
           "dataset",
           "datasetId",
           "commit"
+        ],
+        "type": "object"
+      },
+      "CommitTimeline": {
+        "properties": {
+          "bucketWidth": {
+            "description": "The commit numbers each bucket spans.",
+            "type": "integer"
+          },
+          "buckets": {
+            "items": {
+              "properties": {
+                "commits": {
+                  "type": "integer"
+                },
+                "deleted": {
+                  "description": "Quads removed by the bucket's commits; left out for a caller limited to some graphs.",
+                  "type": "integer"
+                },
+                "firstSeq": {
+                  "type": "integer"
+                },
+                "firstTime": {
+                  "type": "string"
+                },
+                "inserted": {
+                  "description": "Quads added by the bucket's commits; left out for a caller limited to some graphs.",
+                  "type": "integer"
+                },
+                "kinds": {
+                  "additionalProperties": {
+                    "type": "integer"
+                  },
+                  "type": "object"
+                },
+                "lastSeq": {
+                  "type": "integer"
+                },
+                "lastTime": {
+                  "type": "string"
+                },
+                "merges": {
+                  "type": "integer"
+                },
+                "snapshots": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "firstSeq",
+                "lastSeq",
+                "firstTime",
+                "lastTime",
+                "commits",
+                "kinds",
+                "merges",
+                "snapshots"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "commits": {
+            "description": "The commits in range whose metadata is retained.",
+            "type": "integer"
+          },
+          "dataset": {
+            "type": "string"
+          },
+          "datasetId": {
+            "type": "string"
+          },
+          "firstSeq": {
+            "type": "integer"
+          },
+          "head": {
+            "type": "integer"
+          },
+          "lastSeq": {
+            "type": "integer"
+          },
+          "oldestReconstructable": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "readable": {
+            "items": {
+              "properties": {
+                "from": {
+                  "type": "integer"
+                },
+                "to": {
+                  "type": "integer"
+                }
+              },
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "dataset",
+          "datasetId",
+          "head",
+          "firstSeq",
+          "lastSeq",
+          "commits",
+          "bucketWidth",
+          "readable",
+          "buckets"
         ],
         "type": "object"
       },
@@ -7994,7 +8343,7 @@
           },
           "result": {
             "additionalProperties": true,
-            "description": "The outcome (`registered`, `proposed`, `no-facts`, `preview`, `merged`, `approved`, `already-registered` or `mapping-draft`), with the source, rendition, branch, pages, proposals, or a table's mapping draft and preview. A consolidation's outcome is `proposed`, `merged`, `dry-run`, `nothing-to-consolidate`, `no-facts` or `pending-review`, with the branch, the repeated facts, the duplicates and the conflicts. A retention's is `deleted`, `dry-run` or `nothing-to-delete`, with each session graph and why it is kept or deleted.",
+            "description": "The outcome (`registered`, `proposed`, `no-facts`, `preview`, `merged`, `approved`, `already-registered`, `mapping-draft` or `mapping-drafts`), with the source, rendition, branch, pages, proposals, a table's mapping draft and preview, or a workbook's drafts for each sheet. A consolidation's outcome is `proposed`, `merged`, `dry-run`, `nothing-to-consolidate`, `no-facts` or `pending-review`, with the branch, the repeated facts, the duplicates and the conflicts. A retention's is `deleted`, `dry-run` or `nothing-to-delete`, with each session graph and why it is kept or deleted.",
             "type": "object"
           },
           "status": {
@@ -8036,7 +8385,7 @@
         "type": "object"
       },
       "IngestTaskList": {
-        "description": "The caller's ingestion tasks, newest first, and whether this server converts PDFs and reads scanned pages.",
+        "description": "The caller's ingestion tasks, newest first, and whether this server converts PDFs and Office documents and reads scanned pages.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#ingestion"
         },
@@ -8046,13 +8395,17 @@
               "ocr": {
                 "type": "boolean"
               },
+              "office": {
+                "type": "boolean"
+              },
               "pdf": {
                 "type": "boolean"
               }
             },
             "required": [
               "pdf",
-              "ocr"
+              "ocr",
+              "office"
             ],
             "type": "object"
           },
@@ -9087,6 +9440,31 @@
                     }
                   ]
                 },
+                "commits": {
+                  "properties": {
+                    "failures": {
+                      "description": "Fences whose synchronization failed.",
+                      "type": "integer"
+                    },
+                    "fallbacks": {
+                      "additionalProperties": {
+                        "type": "integer"
+                      },
+                      "description": "Commits that took the ordinary path, by the first condition that kept them out of a group.",
+                      "type": "object"
+                    },
+                    "fences": {
+                      "description": "Group commit fences that synchronized successfully since the dataset was opened. Failed fences are counted in failures.",
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "fences",
+                    "failures",
+                    "fallbacks"
+                  ],
+                  "type": "object"
+                },
                 "deltaDeletes": {
                   "type": "integer"
                 },
@@ -9156,6 +9534,10 @@
                       "type": "null"
                     }
                   ]
+                },
+                "groupCommit": {
+                  "description": "Whether concurrent commits of this persistent dataset share one synchronization.",
+                  "type": "boolean"
                 },
                 "name": {
                   "type": "string"
@@ -9232,7 +9614,9 @@
                 "rateLimited",
                 "blockCache",
                 "resultCache",
-                "geo"
+                "geo",
+                "groupCommit",
+                "commits"
               ],
               "type": "object"
             },
@@ -10350,7 +10734,7 @@
             "type": "integer"
           },
           "prevChecked": {
-            "description": "The patch's `prev` header named a commit of this dataset, which was the head.",
+            "description": "An own-dataset `prev` was successfully checked against the transaction head.",
             "type": "boolean"
           },
           "rows": {
@@ -13162,6 +13546,36 @@
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#model-secrets"
         },
         "properties": {
+          "keyMemory": {
+            "description": "Where the server keeps the key: `locked` in a locked page that core dumps leave out, or `heap` in a buffer that is zeroed on release when a protected page is unavailable. `null` until there is a key.",
+            "oneOf": [
+              {
+                "enum": [
+                  "locked",
+                  "heap"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "keySource": {
+            "description": "Where the key that seals the values comes from: `configured` for `serve --secrets-key` or the systemd credential `sparkles-secrets-key`, `generated` for the key the server keeps in `<dataDir>/secrets.key`, which it writes when it first stores a value with sealing enabled. `null` for plaintext values.",
+            "oneOf": [
+              {
+                "enum": [
+                  "configured",
+                  "generated"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "secrets": {
             "items": {
               "properties": {
@@ -13229,7 +13643,7 @@
             "type": "array"
           },
           "storage": {
-            "description": "How runtime values are kept in the data directory: `sealed` with the key of `serve --secrets-key`, or `plaintext` in files with mode 0600.",
+            "description": "How runtime values are kept in the data directory: `sealed` by default in builds with the `backup` feature, or `plaintext` in files with mode 0600 when the server runs with `--secrets-key none` or was built without that feature.",
             "enum": [
               "sealed",
               "plaintext"
@@ -13239,6 +13653,8 @@
         },
         "required": [
           "storage",
+          "keySource",
+          "keyMemory",
           "secrets"
         ],
         "type": "object"
@@ -13278,11 +13694,130 @@
             },
             "type": "array"
           },
+          "formats": {
+            "description": "The on-disk file kinds and settings files, with the version this build writes and the versions it reads (`sparkles migrate --check` prints the same registry). Left out for anonymous callers when auth is on.",
+            "properties": {
+              "kinds": {
+                "items": {
+                  "properties": {
+                    "class": {
+                      "enum": [
+                        "primary",
+                        "derived",
+                        "config",
+                        "archive"
+                      ],
+                      "type": "string"
+                    },
+                    "files": {
+                      "type": "string"
+                    },
+                    "id": {
+                      "type": "string"
+                    },
+                    "marker": {
+                      "type": "string"
+                    },
+                    "reads": {
+                      "items": {
+                        "type": "integer"
+                      },
+                      "type": "array"
+                    },
+                    "writes": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "files",
+                    "marker",
+                    "class",
+                    "writes",
+                    "reads"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "settings": {
+                "items": {
+                  "properties": {
+                    "member": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "scope": {
+                      "enum": [
+                        "dataset",
+                        "server"
+                      ],
+                      "type": "string"
+                    },
+                    "writes": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "scope",
+                    "member",
+                    "writes"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "sparkles": {
+                "type": "string"
+              },
+              "unmarkedSettings": {
+                "items": {
+                  "properties": {
+                    "name": {
+                      "type": "string"
+                    },
+                    "reason": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "reason"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            },
+            "type": "object"
+          },
           "limits": {
             "$ref": "#/components/schemas/Limits"
           },
           "readOnly": {
             "type": "boolean"
+          },
+          "refusedDatasets": {
+            "items": {
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "reason": {
+                  "description": "Why the dataset is registered but not served, such as an index format this release does not read. The member lists the refused datasets the caller may read, and all of them for a server administrator, who alone gets the full message, which names paths.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "name",
+                "reason"
+              ],
+              "type": "object"
+            },
+            "type": "array"
           },
           "startDateTime": {
             "description": "Fuseki's name for `startedAt`.",
@@ -13310,6 +13845,185 @@
           "readOnly",
           "datasets",
           "auth"
+        ],
+        "type": "object"
+      },
+      "ServerMemory": {
+        "description": "The query memory pool and the caches the datasets share, with each dataset's bytes in them.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#budgets"
+        },
+        "properties": {
+          "caches": {
+            "properties": {
+              "block": {
+                "properties": {
+                  "bytes": {
+                    "type": "integer"
+                  },
+                  "capacityBytes": {
+                    "type": "integer"
+                  },
+                  "entries": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "capacityBytes",
+                  "bytes",
+                  "entries"
+                ],
+                "type": "object"
+              },
+              "history": {
+                "properties": {
+                  "bytes": {
+                    "type": "integer"
+                  },
+                  "capacityBytes": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "capacityBytes",
+                  "bytes"
+                ],
+                "type": "object"
+              },
+              "result": {
+                "properties": {
+                  "bytes": {
+                    "type": "integer"
+                  },
+                  "capacityBytes": {
+                    "type": "integer"
+                  },
+                  "entries": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "capacityBytes",
+                  "bytes",
+                  "entries"
+                ],
+                "type": "object"
+              },
+              "service": {
+                "properties": {
+                  "bytes": {
+                    "type": "integer"
+                  },
+                  "capacityBytes": {
+                    "type": "integer"
+                  },
+                  "entries": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "capacityBytes",
+                  "bytes",
+                  "entries"
+                ],
+                "type": "object"
+              },
+              "shared": {
+                "type": "boolean"
+              }
+            },
+            "type": "object"
+          },
+          "datasets": {
+            "items": {
+              "properties": {
+                "blockBytes": {
+                  "type": "integer"
+                },
+                "blockEntries": {
+                  "type": "integer"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "resultBytes": {
+                  "type": "integer"
+                },
+                "resultEntries": {
+                  "type": "integer"
+                },
+                "serviceBytes": {
+                  "type": "integer"
+                },
+                "serviceEntries": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "name",
+                "blockBytes",
+                "blockEntries",
+                "resultBytes",
+                "resultEntries",
+                "serviceBytes",
+                "serviceEntries"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "pool": {
+            "properties": {
+              "admissionWaitSeconds": {
+                "type": "number"
+              },
+              "admitted": {
+                "type": "integer"
+              },
+              "capacityBytes": {
+                "type": "integer"
+              },
+              "enabled": {
+                "type": "boolean"
+              },
+              "grantedBytes": {
+                "type": "integer"
+              },
+              "rejected": {
+                "description": "Requests answered `503` after the admission wait.",
+                "type": "integer"
+              },
+              "waiting": {
+                "description": "Requests waiting for admission.",
+                "type": "integer"
+              }
+            },
+            "required": [
+              "enabled"
+            ],
+            "type": "object"
+          },
+          "profile": {
+            "enum": [
+              "default",
+              "small"
+            ],
+            "type": "string"
+          },
+          "queryMemoryBytes": {
+            "description": "The budget of one query (`--query-memory-mb`), `null` when unlimited.",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "profile",
+          "queryMemoryBytes",
+          "pool",
+          "caches",
+          "datasets"
         ],
         "type": "object"
       },
@@ -14404,6 +15118,17 @@
               "datasetId": {
                 "type": "string"
               },
+              "io": {
+                "additionalProperties": true,
+                "description": "Reads of the index and vocabulary files; present when the request has `profile=io`. Page fields describe the first-admitted best-effort sample shared by overlapping profiles. Touched and resident counts are additive lower bounds; broughtIn is the nonnegative sample resident-count delta, not a lower bound on the full-set delta or physical I/O. Numeric observations cover actual mapped value, kind and rank loads independently of advice; resident head copies add no mapped observations.",
+                "properties": {
+                  "pagesTruncated": {
+                    "description": "True when the shared profiling epoch omitted pages because of its 65,536-entry inventory or range cap. False records no cap omission and does not promise complete coverage. Process counter snapshots omit this field.",
+                    "type": "boolean"
+                  }
+                },
+                "type": "object"
+              },
               "memory": {
                 "type": "object"
               },
@@ -14488,6 +15213,106 @@
         "required": [
           "queryType",
           "meta"
+        ],
+        "type": "object"
+      },
+      "SparqlDiff": {
+        "properties": {
+          "added": {
+            "description": "Rows only the later state has.",
+            "type": "integer"
+          },
+          "addedRows": {
+            "items": {
+              "additionalProperties": true,
+              "description": "The bound variables as SPARQL JSON terms.",
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "dataset": {
+            "type": "string"
+          },
+          "datasetId": {
+            "type": "string"
+          },
+          "from": {
+            "properties": {
+              "commit": {
+                "$ref": "#/components/schemas/Commit"
+              },
+              "selector": {
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "fromRows": {
+            "description": "Rows at the earlier state.",
+            "type": "integer"
+          },
+          "removed": {
+            "description": "Rows only the earlier state has.",
+            "type": "integer"
+          },
+          "removedRows": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "same": {
+            "description": "Rows both states have, counted as a bag.",
+            "type": "integer"
+          },
+          "to": {
+            "properties": {
+              "commit": {
+                "$ref": "#/components/schemas/Commit"
+              },
+              "selector": {
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "toRows": {
+            "description": "Rows at the later state.",
+            "type": "integer"
+          },
+          "truncated": {
+            "properties": {
+              "added": {
+                "type": "boolean"
+              },
+              "removed": {
+                "type": "boolean"
+              }
+            },
+            "type": "object"
+          },
+          "vars": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "dataset",
+          "datasetId",
+          "from",
+          "to",
+          "vars",
+          "fromRows",
+          "toRows",
+          "same",
+          "added",
+          "removed",
+          "addedRows",
+          "removedRows",
+          "truncated"
         ],
         "type": "object"
       },
@@ -16430,6 +17255,9 @@
               "at": {
                 "type": "string"
               },
+              "carried": {
+                "type": "boolean"
+              },
               "ms": {
                 "type": "number"
               },
@@ -16488,13 +17316,25 @@
               "deletes": {
                 "type": "integer"
               },
+              "indexed": {
+                "type": "integer"
+              },
               "inserts": {
+                "type": "integer"
+              },
+              "overBudget": {
+                "type": "boolean"
+              },
+              "pending": {
                 "type": "integer"
               }
             },
             "required": [
               "inserts",
-              "deletes"
+              "deletes",
+              "indexed",
+              "pending",
+              "overBudget"
             ],
             "type": "object"
           },
@@ -16844,6 +17684,378 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/$/algo/{ds}/projections": {
+      "get": {
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#graph-algorithms"
+        },
+        "operationId": "listAlgorithmProjections",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AlgoProjectionList"
+                }
+              }
+            },
+            "description": "The definitions and the projection cache."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "List the named projections",
+        "tags": [
+          "Graph algorithms"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
+    "/$/algo/{ds}/projections/{name}": {
+      "delete": {
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#graph-algorithms"
+        },
+        "operationId": "deleteAlgorithmProjection",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/name"
+          },
+          {
+            "$ref": "#/components/parameters/ifMatch"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Delete a named projection",
+        "tags": [
+          "Graph algorithms"
+        ],
+        "x-sparkles-permission": "admin"
+      },
+      "get": {
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#graph-algorithms"
+        },
+        "operationId": "getAlgorithmProjection",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/name"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AlgoProjection"
+                }
+              }
+            },
+            "description": "The definition with its revision.",
+            "headers": {
+              "ETag": {
+                "description": "`\"r<N>\"`",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Get a named projection",
+        "tags": [
+          "Graph algorithms"
+        ],
+        "x-sparkles-permission": "read"
+      },
+      "put": {
+        "description": "Stores the definition as the next revision. `If-Match: \"r<N>\"` replaces only revision N, and `If-None-Match: *` only creates. A bare string in `predicates` is a predicate in the algorithm's own direction.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#graph-algorithms"
+        },
+        "operationId": "putAlgorithmProjection",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/name"
+          },
+          {
+            "$ref": "#/components/parameters/ifMatch"
+          },
+          {
+            "$ref": "#/components/parameters/ifNoneMatch"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AlgoProjectionDefinition"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AlgoProjection"
+                }
+              }
+            },
+            "description": "Replaced."
+          },
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AlgoProjection"
+                }
+              }
+            },
+            "description": "Created."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Define a named projection",
+        "tags": [
+          "Graph algorithms"
+        ],
+        "x-sparkles-permission": "admin"
+      }
+    },
+    "/$/algo/{ds}/run": {
+      "post": {
+        "description": "Without `write` the run is the SPARQL query its request stands for, answered as `/{ds}/sparql` answers (`Accept`, `timeout`, `execution` and the budget overrides apply), one row per node, node pair or node and level. `summary=true` returns only the statistics of the run. With `write` the run is a task that computes at the head commit and writes the rows in batched commits, with a run record in the graph. Read-only runs need read through the query endpoint and use Query rate/concurrency limits. Write-back runs need write through the update endpoint and use Update HTTP admission through the 202 response body. Background work uses the existing task queue and algorithm-thread admission, not an HTTP permit. A task can be cancelled with `DELETE /$/tasks/{id}`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#graph-algorithms"
+        },
+        "operationId": "runAlgorithm",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/format"
+          },
+          {
+            "$ref": "#/components/parameters/timeout"
+          },
+          {
+            "$ref": "#/components/parameters/nocache"
+          },
+          {
+            "$ref": "#/components/parameters/execution"
+          },
+          {
+            "description": "Return only the summary of the run.",
+            "in": "query",
+            "name": "summary",
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AlgoRequest"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/sparql-results+json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The rows of the run, or its summary.",
+            "headers": {}
+          },
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Task"
+                }
+              }
+            },
+            "description": "A run with `write`, started as a task."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {},
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Run a graph algorithm",
+        "tags": [
+          "Graph algorithms"
+        ],
+        "x-sparkles-permission": "read or write, by operation"
+      }
+    },
     "/$/asks/{ds}": {
       "delete": {
         "description": "Removes the caller's entries, or the one entry `id` names.",
@@ -20165,6 +21377,82 @@
           ],
           "style": "seq"
         },
+        "x-sparkles-permission": "read"
+      }
+    },
+    "/$/commits/{ds}/timeline": {
+      "get": {
+        "description": "The commits of the branch in buckets of consecutive numbers, with the commits' times, kinds and quad counts, and the ranges whose state can still be read. For a time slider over a long history.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#commits"
+        },
+        "operationId": "commitTimeline",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/branch"
+          },
+          {
+            "description": "The most buckets.",
+            "in": "query",
+            "name": "buckets",
+            "schema": {
+              "default": 200,
+              "maximum": 2000,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The first commit number; the first by default.",
+            "in": "query",
+            "name": "from",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The last commit number; the head by default.",
+            "in": "query",
+            "name": "to",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommitTimeline"
+                }
+              }
+            },
+            "description": "The buckets."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Commit timeline",
+        "tags": [
+          "History"
+        ],
         "x-sparkles-permission": "read"
       }
     },
@@ -27773,9 +29061,44 @@
         "x-sparkles-permission": "any caller"
       }
     },
+    "/$/server/memory": {
+      "get": {
+        "description": "The query memory pool (capacity, bytes granted, requests waiting) and the block, result, SERVICE and history caches, with the bytes each dataset holds in the shared ones.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#budgets"
+        },
+        "operationId": "serverMemory",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServerMemory"
+                }
+              }
+            },
+            "description": "The memory state."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Server memory",
+        "tags": [
+          "Server"
+        ],
+        "x-sparkles-permission": "metrics"
+      }
+    },
     "/$/server/secrets": {
       "get": {
-        "description": "Each secret that `--model-secret`, a stored value, a provider or a lock names, with its source, whether it is locked, when a runtime value was stored and the providers that use it, and whether stored values are sealed. Values are never returned. Needs server `admin`.",
+        "description": "Each secret that `--model-secret`, a stored value, a provider or a lock names, with its source, whether it is locked, when a runtime value was stored and the providers that use it, and whether stored values are sealed and with which key. Values are never returned. Needs server `admin`.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#model-secrets"
         },
@@ -27862,7 +29185,7 @@
         "x-sparkles-permission": "server-admin"
       },
       "put": {
-        "description": "Stores a runtime value for the secret in the data directory with mode 0600, sealed with the key of `serve --secrets-key` when the server has one. It overrides the `--model-secret` source, and requests that start after it use it. A secret that `server.locked` locks is a `409` with `locked-by-config`. Needs server `admin`.",
+        "description": "Stores a runtime value for the secret in the data directory with mode 0600. Builds with the default `backup` feature seal values unless the server runs with `--secrets-key none`. Builds without it keep plaintext. When sealing is enabled, the first value stored without a configured key generates `<dataDir>/secrets.key`. It overrides the `--model-secret` source, and requests that start after it use it. A secret that `server.locked` locks is a `409` with `locked-by-config`. Needs server `admin`.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#model-secrets"
         },
@@ -31066,6 +32389,9 @@
             "$ref": "#/components/parameters/execution"
           },
           {
+            "$ref": "#/components/parameters/profile"
+          },
+          {
             "$ref": "#/components/parameters/nocache"
           },
           {
@@ -31273,6 +32599,9 @@
           },
           {
             "$ref": "#/components/parameters/execution"
+          },
+          {
+            "$ref": "#/components/parameters/profile"
           },
           {
             "$ref": "#/components/parameters/nocache"
@@ -32623,6 +33952,18 @@
             "name": "graph",
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "description": "Only the changes whose subject or object is this term, an N-Triples term or a bare IRI. Repeat the parameter for several, up to 1,000. Not for RDF Patch.",
+            "in": "query",
+            "name": "term",
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 1000,
+              "type": "array"
             }
           },
           {
@@ -35174,6 +36515,9 @@
             "$ref": "#/components/parameters/execution"
           },
           {
+            "$ref": "#/components/parameters/profile"
+          },
+          {
             "$ref": "#/components/parameters/nocache"
           },
           {
@@ -35292,6 +36636,9 @@
           },
           {
             "$ref": "#/components/parameters/execution"
+          },
+          {
+            "$ref": "#/components/parameters/profile"
           },
           {
             "$ref": "#/components/parameters/nocache"
@@ -36037,6 +37384,9 @@
             "$ref": "#/components/parameters/execution"
           },
           {
+            "$ref": "#/components/parameters/profile"
+          },
+          {
             "$ref": "#/components/parameters/nocache"
           },
           {
@@ -36155,6 +37505,9 @@
           },
           {
             "$ref": "#/components/parameters/execution"
+          },
+          {
+            "$ref": "#/components/parameters/profile"
           },
           {
             "$ref": "#/components/parameters/nocache"
@@ -36335,6 +37688,161 @@
         "summary": "Explain an empty result",
         "tags": [
           "SPARQL"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
+    "/{ds}/sparql/diff": {
+      "post": {
+        "description": "Runs one SELECT query at two states and returns the rows only one of them has, as bags of their terms. The server keeps a hash for each row of the earlier result and no row, then reads the later result against them and the earlier query once more to list up to `limit` differing rows of each side. The request counts twice against the `query` rate limit. A query that returns different rows when it runs again is refused with `409`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#comparing-a-query-between-two-states"
+        },
+        "operationId": "sparqlDiff",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "description": "A selector of the earlier state.",
+            "in": "query",
+            "name": "from",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A selector of the later state; the head by default.",
+            "in": "query",
+            "name": "to",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The most differing rows listed for each side.",
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "default": 100,
+              "maximum": 10000,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/branch"
+          },
+          {
+            "$ref": "#/components/parameters/reasoning"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "from": {
+                    "type": "string"
+                  },
+                  "limit": {
+                    "type": "integer"
+                  },
+                  "query": {
+                    "type": "string"
+                  },
+                  "to": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "query"
+                ],
+                "type": "object"
+              }
+            },
+            "application/sparql-query": {
+              "schema": {
+                "type": "string"
+              }
+            },
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "properties": {
+                  "query": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "query"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "description": "The SELECT query.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SparqlDiff"
+                }
+              }
+            },
+            "description": "The differing rows and the counts."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "410": {
+            "$ref": "#/components/responses/Gone"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Diff a query between two states",
+        "tags": [
+          "History"
         ],
         "x-sparkles-permission": "read"
       }
@@ -37620,6 +39128,13 @@
         "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#stored-queries"
       },
       "name": "Stored queries"
+    },
+    {
+      "description": "PageRank, communities, similarity and embeddings on projections of a dataset.",
+      "externalDocs": {
+        "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#graph-algorithms"
+      },
+      "name": "Graph algorithms"
     },
     {
       "description": "Read-only GraphQL over a dataset, and its mapping schema.",

@@ -240,6 +240,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b281d307588d634de920874890732659e2e7672f72b5e10e81badc1a8a83621e"
 dependencies = [
  "aws-lc-sys",
+ "untrusted 0.7.1",
  "zeroize",
 ]
 
@@ -2628,7 +2629,7 @@ dependencies = [
  "cfg-if",
  "getrandom 0.2.17",
  "libc",
- "untrusted",
+ "untrusted 0.9.0",
  "windows-sys 0.52.0",
 ]
 
@@ -2777,7 +2778,7 @@ dependencies = [
  "aws-lc-rs",
  "ring",
  "rustls-pki-types",
- "untrusted",
+ "untrusted 0.9.0",
 ]
 
 [[package]]
@@ -3127,6 +3128,7 @@ dependencies = [
  "toml",
  "tracing",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -3134,11 +3136,14 @@ name = "sparkles-backup"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "aws-lc-rs",
+ "base64 0.23.1",
  "bytes",
  "chrono",
  "chrono-tz",
  "croner",
  "futures",
+ "getrandom 0.4.3",
  "libc",
  "lz4_flex 0.14.0",
  "object_store",
@@ -3151,6 +3156,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -3191,6 +3197,7 @@ dependencies = [
  "regex-automata",
  "reqwest",
  "rustc-hash 2.1.3",
+ "same-file",
  "serde",
  "serde_json",
  "sha1",
@@ -3299,6 +3306,7 @@ dependencies = [
  "sha2",
  "spargebra",
  "sparkles-core",
+ "stacker",
  "tempfile",
  "tracing",
 ]
@@ -3319,6 +3327,7 @@ dependencies = [
  "rustc-hash 2.1.3",
  "serde",
  "serde_json",
+ "sha2",
  "smallvec",
  "spargebra",
  "sparkles-core",
@@ -4064,6 +4073,12 @@ dependencies = [
  "uniffi_meta",
  "weedle2",
 ]
+
+[[package]]
+name = "untrusted"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a156c684c91ea7d62626509bce3cb4e1d9ed5c4d978f7b4352658f96a4c26b4a"
 
 [[package]]
 name = "untrusted"

@@ -30,7 +30,7 @@ main() {
   cd "$(dirname "$0")/.."
 
   full=(
-    fmt:check ui:fmt:check node:fmt:check lint:doc-paths
+    fmt:check ui:fmt:check node:fmt:check lint:doc-paths test:bench-scripts
     lint ui:check fmt:wasm py:lint jvm:lint node:lint
     test ui:test lint:features
     py:test jvm:rust-test jvm:test node:test node:client:check licenses:check
@@ -84,6 +84,7 @@ main() {
     case "$t" in
       lint | lint:features | test | ui:check | ui:test | licenses:check) prep+=(ui:build) ;;
       ui:fmt:check) prep+=(ui:install) ;;
+      node:fmt:check | node:client:check) prep+=(node:install) ;;
       node:test) prep+=(node:build) ;;
       jvm:test) prep+=(jvm:native) ;;
     esac

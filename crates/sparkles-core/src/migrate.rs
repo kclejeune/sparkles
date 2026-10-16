@@ -1,0 +1,1523 @@
+//! Upgrades of a closed database's files to the versions this build writes, for
+//! `sparkles migrate`.
+//!
+//! [`plan`] reads the version of every versioned file of a database (see
+//! [`crate::formats`]) and lists the registered [`Step`]s that would upgrade the ones
+//! not at the version this build writes. [`migrate`] runs them on a copy of the
+//! database in a sibling directory, checks the copy with [`crate::check`], and swaps it
+//! in by two renames. A copy that passed the check carries a mark, so that a run that
+//! stopped between the renames is finished by [`recover`], which [`migrate`] calls
+//! first, and a store refuses to open the database meanwhile (see [`pending`]).
+//!
+//! [`plan`] never changes anything. [`migrate`] holds the migration lock, a file next to
+//! the database that covers planning, recovery, the copy and both renames, and the
+//! database's own lock until the renames start. It refuses a database that holds a
+//! symlink, since the copy would leave it out, and one whose `.pre-migrate-*` directory
+//! exists.
+//!
+//! A step is a function from one version of a file kind to the next. Register a new one
+//! in [`STEPS`]. Its version must be in the kind's `reads` in [`crate::formats`] unless
+//! the step is the only way to read it (an explicit migration), in which case the
+//! store's refusal of the old version names `sparkles migrate`.
+//!
+//! The server never runs steps itself. It reads the versions inside the window
+//! directly, upgrades a file lazily the next time it writes it, and rebuilds derived
+//! indexes in the background.
+
+use crate::error::{Error, Result};
+use crate::formats::{self, FileKind};
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+
+/// An upgrade of one file kind from one version to the next.
+pub struct Step {
+    /// the [`FileKind::id`] it upgrades
+    pub kind: &'static str,
+    pub from: u32,
+    pub to: u32,
+    /// what it does, for `--check`
+    pub summary: &'static str,
+    /// Upgrade the file at the path (relative to the database's directory) of a closed
+    /// database in `root`.
+    pub run: fn(root: &Path, file: &Path) -> Result<()>,
+}
+
+/// The registered steps.
+pub const STEPS: &[Step] = &[Step {
+    kind: "delta-vocab",
+    from: 1,
+    to: 2,
+    summary: "rewrite a legacy delta vocabulary as a framed one, as the first write to it would",
+    run: delta_vocab_framed,
+}];
+
+fn delta_vocab_framed(root: &Path, file: &Path) -> Result<()> {
+    crate::commit::require_reader(root, crate::vocab::delta::FRAMED_READER)?;
+    crate::vocab::delta::convert_legacy_file(&root.join(file))?;
+    Ok(())
+}
+
+/// Whether a registered step upgrades version `from` of the kind `kind`.
+pub fn upgrades(kind: &str, from: u32) -> bool {
+    STEPS.iter().any(|s| s.kind == kind && s.from == from)
+}
+
+fn step(kind: &str, from: u32) -> Option<&'static Step> {
+    STEPS.iter().find(|s| s.kind == kind && s.from == from)
+}
+
+/// The version of one file.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileVersion {
+    pub kind: &'static str,
+    /// relative to the database's directory
+    pub file: String,
+    pub version: u32,
+    /// whether this build reads the version without an upgrade
+    pub readable: bool,
+}
+
+/// A step the upgrade of a database would run.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlannedStep {
+    pub kind: &'static str,
+    pub file: String,
+    pub from: u32,
+    pub to: u32,
+    pub summary: &'static str,
+}
+
+/// What [`plan`] found in a database.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Plan {
+    pub root: PathBuf,
+    /// the versions of dataset.json, if it exists and this build reads it
+    pub dataset: Option<crate::commit::DatasetVersions>,
+    pub files: Vec<FileVersion>,
+    pub steps: Vec<PlannedStep>,
+    /// files this build reads neither directly nor after a step, with the refusal
+    pub refused: Vec<String>,
+    /// a migration that did not finish, which the next run without `--check` finishes or
+    /// undoes
+    pub interrupted: Option<String>,
+}
+
+impl Plan {
+    /// Whether this build reads every file of the database, directly or after the planned
+    /// steps.
+    pub fn in_window(&self) -> bool {
+        self.refused.is_empty()
+    }
+
+    /// Whether this build opens the database now: it is inside the window and no
+    /// interrupted migration is pending, which a store refuses until `sparkles migrate`
+    /// finishes or undoes it.
+    pub fn opens(&self) -> bool {
+        self.in_window() && self.interrupted.is_none()
+    }
+}
+
+fn add(
+    plan: &mut Plan,
+    kind: &'static FileKind,
+    file: String,
+    version: u32,
+    written_by: Option<&str>,
+) {
+    let readable = kind.reads(version);
+    if version != kind.writes {
+        // follow the steps from this version as far as they go
+        let mut v = version;
+        while let Some(s) = step(kind.id, v) {
+            plan.steps.push(PlannedStep {
+                kind: kind.id,
+                file: file.clone(),
+                from: s.from,
+                to: s.to,
+                summary: s.summary,
+            });
+            v = s.to;
+        }
+        if !readable && !kind.reads(v) {
+            plan.refused
+                .push(kind.refuse(&file, version, written_by).to_string());
+        }
+    }
+    plan.files.push(FileVersion {
+        kind: kind.id,
+        file,
+        version,
+        readable,
+    });
+}
+
+fn generations(dir: &Path) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(dir)? {
+        let e = e?;
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.starts_with("gen-") && e.file_type()?.is_dir() {
+            out.push(name);
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Read the versions of a database's files and list the steps an upgrade would run.
+/// Nothing is changed, and a migration that did not finish is only reported in
+/// [`Plan::interrupted`]. The migration lock is taken, so a plan of a database that
+/// [`migrate`] is working on fails with [`Error::Locked`] and does not read directories
+/// that are being renamed.
+pub fn plan(root: &Path) -> Result<Plan> {
+    let root = &absolute(root)?;
+    require_named(root)?;
+    // A directory that cannot be written to has no migration running in it, so a plan
+    // there reads without the lock.
+    let _mlock = match lock_migration(root) {
+        Ok(l) => Some(l),
+        Err(Error::Io(e))
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
+            ) =>
+        {
+            None
+        }
+        Err(e) => return Err(e),
+    };
+    plan_locked(root)
+}
+
+/// [`plan`] with the migration lock held.
+fn plan_locked(root: &Path) -> Result<Plan> {
+    let written_by = crate::commit::read_written_by(root);
+    let by = written_by.as_deref();
+    let mut plan = Plan {
+        root: root.to_path_buf(),
+        dataset: None,
+        files: Vec::new(),
+        steps: Vec::new(),
+        refused: Vec::new(),
+        interrupted: None,
+    };
+    let work = work_dir(root);
+    if work.is_dir() {
+        plan.interrupted = Some(format!(
+            "an interrupted migration left {}; run without --check to finish or undo it",
+            work.display()
+        ));
+        if !root.exists() {
+            // the checked copy is not in place yet, so there is nothing to read
+            return Ok(plan);
+        }
+    }
+    inspect_dir(&mut plan, root, "", by)?;
+    // Startup uses the same physical enumeration, including retained branches.
+    for branch in formats::branch_directories(root)? {
+        let name = branch.file_name().unwrap().to_string_lossy();
+        inspect_dir(&mut plan, &branch, &format!("branches/{name}/"), by)?;
+    }
+    Ok(plan)
+}
+
+/// What opening the store in `dir` checks: its `dataset.json`, its registered settings
+/// files other than the informational ones, and the files of its generations. `prefix`
+/// names a branch's directory in the messages and is empty for the root, whose
+/// `dataset.json` versions the plan reports.
+fn inspect_dir(plan: &mut Plan, dir: &Path, prefix: &str, by: Option<&str>) -> Result<()> {
+    match crate::commit::read_dataset_versions(dir) {
+        Ok(d) if prefix.is_empty() => plan.dataset = d,
+        Ok(_) => {}
+        Err(e) => plan.refused.push(format!("{prefix}{e}")),
+    }
+    for e in formats::dataset_dir_refusals(dir) {
+        // the message already names the directory
+        plan.refused.push(e.to_string());
+    }
+    inspect_store(plan, dir, prefix, by)
+}
+
+fn inspect_store(plan: &mut Plan, dir: &Path, prefix: &str, by: Option<&str>) -> Result<()> {
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    for g in generations(dir)? {
+        let gdir = dir.join(&g);
+        let rel = format!("{prefix}{g}");
+        if let Ok(b) = std::fs::read(gdir.join("meta.json")) {
+            // only the version: a newer meta may have another shape
+            match crate::builder::index_meta_version(&b, &format!("{rel}/meta.json")) {
+                Ok(v) => add(plan, &formats::INDEX, rel.clone(), v, by),
+                // one damaged generation does not stop the rest of the report
+                Err(e) => plan.refused.push(e.to_string()),
+            }
+        }
+        let wal = gdir.join("wal.log");
+        if wal.exists() {
+            match crate::store::wal::file_version(&wal) {
+                Ok(v) => add(plan, &formats::WAL, format!("{rel}/wal.log"), v, by),
+                Err(Error::Unsupported(_)) => add(
+                    plan,
+                    &formats::WAL,
+                    format!("{rel}/wal.log"),
+                    newer_than(&formats::WAL),
+                    by,
+                ),
+                Err(e) => plan.refused.push(e.to_string()),
+            }
+        }
+        let dv = gdir.join("delta.vocab");
+        if dv.exists() {
+            let v = crate::vocab::delta::file_version(&dv)?;
+            // a legacy file without entries is written framed by its first write
+            let empty = v == 1 && std::fs::metadata(&dv)?.len() == 0;
+            if !empty {
+                add(
+                    plan,
+                    &formats::DELTA_VOCAB,
+                    format!("{rel}/delta.vocab"),
+                    v,
+                    by,
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A version past every one `kind` reads, for a file whose header refused to parse.
+fn newer_than(kind: &FileKind) -> u32 {
+    kind.reads.last().copied().unwrap_or(0) + 1
+}
+
+/// What [`migrate`] did.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Outcome {
+    pub root: PathBuf,
+    pub steps: Vec<PlannedStep>,
+    /// where the database before the upgrade was kept, with `keep_old`
+    pub kept: Option<PathBuf>,
+}
+
+/// The checked copy's recovery state, removed after publication and cleanup.
+const CHECKED_MARK: &str = ".migrate-checked";
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum CleanupMode {
+    KeepOld,
+    RemoveOld,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CheckedMark {
+    format: u32,
+    mode: CleanupMode,
+    old_directory: String,
+}
+
+impl CheckedMark {
+    /// Only the originating run's single generated sibling can be removed.
+    fn old_path(&self, root: &Path) -> Result<PathBuf> {
+        let name = &self.old_directory;
+        let root_name = root.file_name().unwrap_or_default().to_string_lossy();
+        let version = name
+            .strip_prefix(".pre-migrate-")
+            .and_then(|s| s.strip_suffix(&format!("-{root_name}")));
+        let valid = !name.contains(['/', '\\', ':'])
+            && matches!(
+                Path::new(name).components().collect::<Vec<_>>().as_slice(),
+                [std::path::Component::Normal(_)]
+            )
+            && version.is_some_and(|v| {
+                !v.is_empty()
+                    && v.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b".-+".contains(&b))
+            })
+            && name != root_name.as_ref()
+            && name
+                != work_dir(root)
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .as_ref()
+            && name
+                != sibling(root, ".migrate.lock-")
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .as_ref();
+        if !valid {
+            return Err(Error::Corrupt(format!(
+                "{}: unsafe oldDirectory in {CHECKED_MARK}; inspect the migration copies and restore by hand",
+                root.display()
+            )));
+        }
+        Ok(root.with_file_name(name))
+    }
+}
+
+/// The sibling directory a migration builds the upgraded copy in.
+fn work_dir(root: &Path) -> PathBuf {
+    sibling(root, ".migrate-")
+}
+
+/// The sibling directory the database before the upgrade is moved to.
+fn old_dir(root: &Path) -> PathBuf {
+    sibling(
+        root,
+        &format!(".pre-migrate-{}-", formats::SPARKLES_VERSION),
+    )
+}
+
+fn sibling(root: &Path, prefix: &str) -> PathBuf {
+    let name = root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    root.with_file_name(format!("{prefix}{name}"))
+}
+
+/// The work directory of a [`migrate`] of `root` that has not finished, if there is one.
+/// Nothing is changed. A database with a pending migration is not opened (see
+/// [`check_not_pending`]), and the next [`migrate`] of it finishes or undoes the run.
+pub fn pending(root: &Path) -> Result<Option<PathBuf>> {
+    let root = absolute(root)?;
+    if root.file_name().is_none() {
+        return Ok(None);
+    }
+    let work = work_dir(&root);
+    Ok(work.is_dir().then_some(work))
+}
+
+/// Refuse a database whose migration has not finished, for [`crate::store::Store::open`].
+/// The root may be missing, which is what a run that stopped between its two renames
+/// leaves, and opening it would create an empty database next to the checked copy.
+pub(crate) fn check_not_pending(root: &Path) -> Result<()> {
+    match pending(root)? {
+        None => Ok(()),
+        Some(w) => Err(Error::Unsupported(format!(
+            "{}: an interrupted `sparkles migrate` left {}; run `sparkles migrate` on this database again (without --check) to finish or undo it before opening it",
+            absolute(root)?.display(),
+            w.display()
+        ))),
+    }
+}
+
+/// Finish or undo a [`migrate`] of `root` that stopped part way, with the locks of
+/// [`migrate_with`] held.
+///
+/// * Without a work directory there is nothing to do, except that a mark left in the
+///   database by a run that stopped right after the swap is cleaned up.
+/// * A copy next to an existing database was never swapped in, and is removed.
+/// * With the database missing, a checked copy takes its place, since the run stopped
+///   between its two renames. A work directory without the mark of a passed check is
+///   not touched and is reported, because only outside interference produces it.
+fn recover_locked(root: &Path) -> Result<Option<std::fs::File>> {
+    let work = work_dir(root);
+    if !work.is_dir() {
+        // The originating marker, rather than this binary's version, names the old copy.
+        if let Some(mark) = read_mark(root, root)? {
+            finish_swap(root, &mark)?;
+        }
+        return Ok(None);
+    }
+    let mark = read_mark(&work, root)?;
+    if root.exists() {
+        if let Some(mark) = &mark {
+            let old = mark.old_path(root)?;
+            if old.exists() {
+                return Err(Error::Corrupt(format!(
+                    "{} exists next to the checked copy {} and the previous files {}; move the new {} away and run again, or restore the previous files by hand",
+                    root.display(),
+                    work.display(),
+                    old.display(),
+                    root.display()
+                )));
+            }
+        }
+        // A valid or unchecked copy next to the unchanged root was never swapped in.
+        remove_work(&work)?;
+        return Ok(None);
+    }
+    let Some(mark) = mark else {
+        return Err(Error::Corrupt(format!(
+            "{} is missing and {} has no mark of a passed check; inspect the previous sibling copies and restore the database by hand",
+            root.display(),
+            work.display()
+        )));
+    };
+    std::fs::rename(&work, root)?;
+    sync_parent(root)?;
+    let lock = crate::store::lock_database(root)?;
+    finish_swap(root, &mark)?;
+    Ok(Some(lock))
+}
+
+/// Validate recovery metadata before a database lock could create or update a file.
+/// Recovery rereads it under that lock before changing the directory state.
+fn check_recovery_marks(root: &Path) -> Result<()> {
+    read_mark(root, root)?;
+    read_mark(&work_dir(root), root)?;
+    Ok(())
+}
+
+/// Read only understood checked state. Bare legacy modes cannot name their old copy.
+fn read_mark(dir: &Path, root: &Path) -> Result<Option<CheckedMark>> {
+    let path = dir.join(CHECKED_MARK);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    if matches!(bytes.trim_ascii(), b"keep-old" | b"remove-old") {
+        return Err(Error::Unsupported(format!(
+            "{}: legacy checked state does not record the original old directory; inspect the sibling copies and recover through a known original location or restore by hand; no migration files were changed",
+            path.display()
+        )));
+    }
+    let invalid = |e| {
+        Error::Corrupt(format!(
+            "{}: invalid checked migration state: {e}",
+            path.display()
+        ))
+    };
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(invalid)?;
+    let version = value
+        .get("format")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| {
+            Error::Corrupt(format!(
+                "{}: checked migration state has no unsigned format version",
+                path.display()
+            ))
+        })?;
+    // Check the version before decoding fields whose schema may change in that version.
+    if version != u64::from(formats::MIGRATION_STATE.writes) {
+        return Err(Error::Unsupported(format!(
+            "{} has checked migration format {version}; this build reads format {}; recover with a release that reads the recorded format",
+            path.display(),
+            formats::MIGRATION_STATE.writes
+        )));
+    }
+    // The version probe collapses object keys. Decode the original bytes so the
+    // typed reader can reject duplicate known fields, including escaped key names.
+    let mark: CheckedMark = serde_json::from_slice(&bytes).map_err(invalid)?;
+    mark.old_path(root)?;
+    Ok(Some(mark))
+}
+
+/// Keep the marker until cleanup succeeds, so interrupted cleanup can be retried.
+fn finish_swap(root: &Path, mark: &CheckedMark) -> Result<()> {
+    let old = mark.old_path(root)?;
+    if mark.mode == CleanupMode::RemoveOld && old.exists() {
+        remove_work(&old)?;
+        sync_parent(root)?;
+    }
+    std::fs::remove_file(root.join(CHECKED_MARK))?;
+    crate::store::sync_dir(root)
+}
+
+/// Finish or undo a [`migrate`] of `root` that stopped part way, under the migration
+/// lock and the database's own lock. [`migrate`] does the same before it plans.
+pub fn recover(root: &Path) -> Result<()> {
+    let root = &absolute(root)?;
+    require_named(root)?;
+    let _mlock = lock_migration(root)?;
+    check_recovery_marks(root)?;
+    let db = if root.exists() {
+        Some(crate::store::lock_database(root)?)
+    } else {
+        None
+    };
+    // a rolled-forward database stays locked until this returns
+    let _rolled = recover_locked(root)?;
+    drop(db);
+    Ok(())
+}
+
+/// A root without a final component (`/` or `..`) has no sibling to work in.
+fn require_named(root: &Path) -> Result<()> {
+    if root.file_name().is_none() {
+        return Err(Error::Invalid(format!(
+            "{} does not name a database directory",
+            root.display()
+        )));
+    }
+    Ok(())
+}
+
+/// The lock that serializes migrations of one database: a file next to the database,
+/// `.migrate.lock-<name>`, which survives both renames of a swap. It is left in place
+/// after the run, since removing a lock file races with the processes waiting for it.
+fn lock_migration(root: &Path) -> Result<std::fs::File> {
+    use std::io::{Read, Write};
+    // a name that no work or old directory of another database can have: `.migrate-a.lock`
+    // would be the work directory of a database named `a.lock`
+    let path = sibling(root, ".migrate.lock-");
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)?;
+    match f.try_lock() {
+        Ok(()) => {
+            f.set_len(0)?;
+            writeln!(f, "{}", std::process::id())?;
+            Ok(f)
+        }
+        Err(std::fs::TryLockError::WouldBlock) => {
+            let mut pid = String::new();
+            let _ = std::fs::File::open(&path).and_then(|mut f| f.read_to_string(&mut pid));
+            Err(Error::Locked {
+                path,
+                pid: pid.trim().parse().ok(),
+            })
+        }
+        Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
+    }
+}
+
+/// An absolute root that stays usable when the final directory is moved aside.
+/// Parent components follow physical filesystem semantics, including symlinks, by
+/// resolving only the existing parent. The final basename is never canonicalized.
+/// Paths without parent components keep supporting new nested or missing roots.
+fn absolute(root: &Path) -> Result<PathBuf> {
+    let absolute = std::path::absolute(root)?;
+    if !absolute
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        return Ok(absolute);
+    }
+    let stable_path = |detail| {
+        Error::Invalid(format!(
+            "{}: cannot resolve the database parent ({detail}); name the database through its stable existing parent and retry",
+            root.display()
+        ))
+    };
+    let name = absolute
+        .file_name()
+        .ok_or_else(|| stable_path("no final database name".to_string()))?;
+    let parent = absolute
+        .parent()
+        .ok_or_else(|| stable_path("no parent directory".to_string()))?;
+    let parent = std::fs::canonicalize(parent).map_err(|e| stable_path(e.to_string()))?;
+    Ok(parent.join(name))
+}
+
+fn sync_parent(root: &Path) -> Result<()> {
+    let parent = match root.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    crate::store::sync_dir(parent)
+}
+
+/// Mark the work directory as checked, durably.
+fn write_mark(work: &Path, mark: &CheckedMark) -> Result<()> {
+    let path = work.join(CHECKED_MARK);
+    let mut f = std::fs::File::create(&path)?;
+    std::io::Write::write_all(
+        &mut f,
+        &serde_json::to_vec(mark).map_err(|e| Error::Invalid(e.to_string()))?,
+    )?;
+    f.sync_all()?;
+    crate::store::sync_dir(work)?;
+    // the work directory's own entry must be durable before the root is moved aside
+    sync_parent(work)
+}
+
+/// Copy the files and directories of `from` into the existing directory `to`. The
+/// process lock and the checked mark stay behind. An entry that is neither a regular
+/// file nor a directory is refused, since a copy would silently leave it out.
+fn copy_contents(from: &Path, to: &Path) -> Result<()> {
+    for e in std::fs::read_dir(from)? {
+        let e = e?;
+        let name = e.file_name();
+        if name == "sparkles.lock" || name == CHECKED_MARK {
+            continue;
+        }
+        let t = e.file_type()?;
+        if t.is_dir() {
+            std::fs::create_dir(to.join(&name))?;
+            copy_contents(&e.path(), &to.join(&name))?;
+        } else if t.is_file() {
+            std::fs::copy(e.path(), to.join(&name))?;
+            std::fs::File::open(to.join(&name))?.sync_all()?;
+        } else {
+            return Err(Error::Invalid(format!(
+                "{}: `sparkles migrate` does not copy symlinks or special files; replace it with the files it points to and run again",
+                e.path().display()
+            )));
+        }
+    }
+    crate::store::sync_dir(to)
+}
+
+/// Whether a process with effective uid `euid` may migrate a database owned by `owner`:
+/// the copy must get the owner of every file, which only the owner or root can arrange.
+fn may_migrate(euid: u32, owner: u32) -> bool {
+    euid == 0 || euid == owner
+}
+
+fn not_owner(root: &Path, owner: u32) -> Error {
+    Error::Invalid(format!(
+        "{}: owned by uid {owner}; run `sparkles migrate` as that user or as root",
+        root.display()
+    ))
+}
+
+/// Refuse to start a copy that could not be completed or cleaned up: a root named through
+/// a symlink, which the swap would replace with a directory next to the link, a root
+/// without its owner's write bit, which the copy takes and which then refuses the mark,
+/// and a process that cannot give the copy the database's owner.
+fn preflight_owner(root: &Path) -> Result<()> {
+    if std::fs::symlink_metadata(root)?.file_type().is_symlink() {
+        return Err(Error::Invalid(format!(
+            "{}: is a symlink; `sparkles migrate` replaces the database directory, so run it on the directory the link points to",
+            root.display()
+        )));
+    }
+    preflight_unix(root)
+}
+
+#[cfg(unix)]
+fn preflight_unix(root: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(root)?;
+    if meta.mode() & 0o200 == 0 {
+        return Err(Error::Invalid(format!(
+            "{}: its owner has no write permission on it; give the owner write permission (`chmod u+w`) and run again",
+            root.display()
+        )));
+    }
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    if may_migrate(euid, meta.uid()) {
+        Ok(())
+    } else {
+        Err(not_owner(root, meta.uid()))
+    }
+}
+
+#[cfg(not(unix))]
+fn preflight_unix(_root: &Path) -> Result<()> {
+    Ok(())
+}
+
+/// Remove a migration copy, or the database a migration replaced. Either may hold
+/// read-only directories, so its directories first get their owner's permissions back.
+fn remove_work(work: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    fn writable(dir: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(m) = std::fs::symlink_metadata(dir)
+            && m.is_dir()
+        {
+            let mode = m.permissions().mode();
+            if mode & 0o700 != 0o700 {
+                let _ =
+                    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode | 0o700));
+            }
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for e in entries.flatten() {
+                    if e.file_type().is_ok_and(|t| t.is_dir()) {
+                        writable(&e.path());
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(unix)]
+    writable(work);
+    std::fs::remove_dir_all(work)
+}
+
+/// Give every entry of the copy `to` the mode and owner of the same entry of `from`,
+/// directories after their contents, so that a read-only directory is filled before
+/// its mode is set. An entry a step added has no counterpart and takes the owner of
+/// `owner` (the database's root) and keeps its mode. Called after the steps ran, so the
+/// files they rewrote take the mode and owner of the file they replace.
+#[cfg(unix)]
+fn copy_tree_meta(from: &Path, to: &Path, owner: &std::fs::Metadata, root: &Path) -> Result<()> {
+    for e in std::fs::read_dir(to)? {
+        let e = e?;
+        let (f, t) = (from.join(e.file_name()), e.path());
+        if e.file_type()?.is_dir() {
+            copy_tree_meta(&f, &t, owner, root)?;
+        } else {
+            copy_meta(&f, &t, owner, root)?;
+        }
+    }
+    copy_meta(from, to, owner, root)
+}
+
+#[cfg(not(unix))]
+fn copy_tree_meta(_: &Path, _: &Path, _: &std::fs::Metadata, _: &Path) -> Result<()> {
+    Ok(())
+}
+
+/// Give `to` the owner and mode of `from`, or the owner of `owner` when `from` does not
+/// exist. The owner comes first, since a change of owner clears the set-id bits.
+#[cfg(unix)]
+fn copy_meta(from: &Path, to: &Path, owner: &std::fs::Metadata, root: &Path) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    // the copy holds no symlink, and a symlinked root is refused before the copy
+    let src = match std::fs::metadata(from) {
+        Ok(m) => Some(m),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.into()),
+    };
+    let want = src.as_ref().unwrap_or(owner);
+    let have = std::fs::symlink_metadata(to)?;
+    if have.uid() != want.uid() || have.gid() != want.gid() {
+        std::os::unix::fs::chown(to, Some(want.uid()), Some(want.gid())).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                not_owner(root, want.uid())
+            } else {
+                e.into()
+            }
+        })?;
+    }
+    if let Some(src) = &src {
+        std::fs::set_permissions(to, std::fs::Permissions::from_mode(src.mode() & 0o7777))?;
+    }
+    Ok(())
+}
+
+/// Upgrade the closed database at `root`: run the steps of [`plan`] on a copy, check the
+/// copy, and swap it in. With `keep_old`, the database as it was stays in a sibling
+/// directory named `.pre-migrate-<version>-<name>`, otherwise it is removed. A database
+/// outside the window is refused, as is one whose copy fails the check, one that holds a
+/// symlink, and one whose `.pre-migrate-<version>-<name>` exists already. A database that
+/// a store has open fails with [`Error::Locked`], and so does a second migration of it.
+/// The catalog's lock is held by the caller, so no server has the database open.
+pub fn migrate(root: &Path, keep_old: bool) -> Result<Outcome> {
+    migrate_with(root, keep_old, &mut |_| Ok(()))
+}
+
+/// [`migrate`] with a hook called at named points (`copied`, `checked`, `moved-aside`,
+/// `swapped`), for interruption tests. An error at `before-check` stands for a check
+/// that fails to run, which removes the copy like any error before the mark.
+#[doc(hidden)]
+pub fn migrate_with(
+    root: &Path,
+    keep_old: bool,
+    hook: &mut dyn FnMut(&str) -> Result<()>,
+) -> Result<Outcome> {
+    let (plan, out) = migrate_planned_with(root, keep_old, hook)?;
+    match out {
+        Some(o) => Ok(o),
+        None => Err(Error::Unsupported(plan.refused.join("; "))),
+    }
+}
+
+/// [`migrate`] that also returns the [`Plan`] it ran under the locks, for a report. The
+/// outcome is `None` when the database is outside the window, which the plan explains.
+pub fn migrate_planned(root: &Path, keep_old: bool) -> Result<(Plan, Option<Outcome>)> {
+    migrate_planned_with(root, keep_old, &mut |_| Ok(()))
+}
+
+fn migrate_planned_with(
+    root: &Path,
+    keep_old: bool,
+    hook: &mut dyn FnMut(&str) -> Result<()>,
+) -> Result<(Plan, Option<Outcome>)> {
+    let root = &absolute(root)?;
+    require_named(root)?;
+    // Exclusion runs through the whole command. The migration lock covers planning,
+    // recovery, the copy and both renames. The database's own lock comes before recovery
+    // so that a live store makes the command fail before anything is touched.
+    let _mlock = lock_migration(root)?;
+    check_recovery_marks(root)?;
+    let mut db_lock = if root.exists() {
+        Some(crate::store::lock_database(root)?)
+    } else {
+        None
+    };
+    if let Some(rolled) = recover_locked(root)? {
+        // recovery rolled a checked copy forward and kept it locked
+        db_lock = Some(rolled);
+    }
+
+    let plan = plan_locked(root)?;
+    if !plan.in_window() {
+        return Ok((plan, None));
+    }
+    let mut out = Outcome {
+        root: root.to_path_buf(),
+        steps: plan.steps.clone(),
+        kept: None,
+    };
+    if plan.steps.is_empty() {
+        return Ok((plan, Some(out)));
+    }
+    let old = old_dir(root);
+    if old.exists() {
+        return Err(Error::Invalid(format!(
+            "{} exists from an earlier run; move or remove it before migrating again",
+            old.display()
+        )));
+    }
+    let mark = CheckedMark {
+        format: formats::MIGRATION_STATE.writes,
+        mode: if keep_old {
+            CleanupMode::KeepOld
+        } else {
+            CleanupMode::RemoveOld
+        },
+        old_directory: old.file_name().unwrap().to_string_lossy().into_owned(),
+    };
+    mark.old_path(root)?;
+    preflight_owner(root)?;
+    let work = work_dir(root);
+    std::fs::create_dir(&work)?;
+    copy_contents(root, &work).inspect_err(|_| {
+        let _ = remove_work(&work);
+    })?;
+    hook("copied")?;
+    for p in &plan.steps {
+        let s = step(p.kind, p.from).expect("planned from STEPS");
+        (s.run)(&work, Path::new(&p.file)).inspect_err(|_| {
+            let _ = remove_work(&work);
+        })?;
+    }
+    // the copy, and the files the steps rewrote, take the modes and owners of the originals
+    let owner = std::fs::metadata(root)?;
+    copy_tree_meta(root, &work, &owner, root).inspect_err(|_| {
+        let _ = remove_work(&work);
+    })?;
+    // Until the mark is durable the copy is only a candidate, so any error removes it and
+    // leaves the database as it was. After that, recovery owns the copy.
+    let report = hook("before-check")
+        .and_then(|()| crate::check::check(&work, &crate::check::CheckOptions { quick: false }))
+        .inspect_err(|_| {
+            let _ = remove_work(&work);
+        })?;
+    if report.status == crate::check::Status::Error {
+        let _ = remove_work(&work);
+        return Err(Error::Corrupt(format!(
+            "{}: the upgraded copy failed `sparkles check` with {} error(s); the database is unchanged",
+            root.display(),
+            report.errors
+        )));
+    }
+    write_mark(&work, &mark).inspect_err(|_| {
+        let _ = remove_work(&work);
+    })?;
+    hook("checked")?;
+    // The database's lock is released before its directory is renamed, since a directory
+    // with an open handle cannot be renamed on every platform. From here on exclusion
+    // comes from the migration lock and from the pending work directory, which
+    // Store::open refuses after it has taken the database's lock, so no store can open
+    // the old files while they are copied away or write to files the copy lacks.
+    drop(db_lock);
+    std::fs::rename(root, &old)?;
+    sync_parent(root)?;
+    hook("moved-aside")?;
+    std::fs::rename(&work, root)?;
+    sync_parent(root)?;
+    hook("swapped")?;
+    finish_swap(root, &mark)?;
+    if keep_old {
+        out.kept = Some(old);
+    }
+    Ok((plan, Some(out)))
+}
+
+#[cfg(test)]
+mod path_tests;
+#[cfg(test)]
+mod recovery_tests;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{Store, StoreOptions};
+
+    /// A database whose current delta vocabulary is legacy (as a release before framed
+    /// files wrote it), with one commit that uses its terms.
+    pub(super) fn legacy_database(root: &Path) -> String {
+        let s = Store::open(root, StoreOptions::default()).unwrap();
+        crate::sparql::update::update(
+            &s,
+            "INSERT DATA { <http://e/a> <http://e/p> \"new term\" }",
+            &crate::sparql::QueryOptions::default(),
+        )
+        .unwrap();
+        let gen_name = s.snapshot().generation.name.clone();
+        drop(s);
+        let dv = root.join(&gen_name).join("delta.vocab");
+        let b = std::fs::read(&dv).unwrap();
+        let parsed = crate::vocab::delta::parse_delta(&b).unwrap();
+        let mut legacy = Vec::new();
+        for k in &parsed.keys {
+            legacy.extend_from_slice(&(k.len() as u32).to_le_bytes());
+            legacy.extend_from_slice(k);
+        }
+        assert!(!legacy.is_empty());
+        std::fs::write(&dv, &legacy).unwrap();
+        gen_name
+    }
+
+    fn count(root: &Path) -> usize {
+        let s = Store::open(root, StoreOptions::default()).unwrap();
+        s.snapshot().len() as usize
+    }
+
+    /// A failure before the copy is marked as checked removes the copy, so the database
+    /// is not left pending.
+    #[test]
+    fn a_failure_before_the_mark_removes_the_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        legacy_database(&root);
+        let r = migrate_with(&root, false, &mut |at| {
+            if at == "before-check" {
+                Err(Error::Invalid("stop".into()))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(r.is_err(), "{r:?}");
+        assert!(!work_dir(&absolute(&root).unwrap()).exists());
+        Store::open(&root, StoreOptions::default()).unwrap();
+    }
+
+    #[test]
+    fn a_legacy_delta_vocabulary_is_upgraded_on_a_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        let g = legacy_database(&root);
+        let p = plan(&root).unwrap();
+        assert!(p.in_window(), "{:?}", p.refused);
+        assert_eq!(p.steps.len(), 1, "{:?}", p.steps);
+        assert_eq!(p.steps[0].file, format!("{g}/delta.vocab"));
+        let out = migrate(&root, true).unwrap();
+        assert_eq!(out.steps.len(), 1);
+        let kept = out.kept.unwrap();
+        assert!(kept.join(&g).join("delta.vocab").exists());
+        assert_eq!(
+            crate::vocab::delta::file_version(&root.join(&g).join("delta.vocab")).unwrap(),
+            2
+        );
+        assert!(plan(&root).unwrap().steps.is_empty());
+        assert_eq!(count(&root), 1);
+        // nothing left to do
+        assert!(migrate(&root, false).unwrap().steps.is_empty());
+    }
+
+    #[test]
+    fn an_interrupted_migration_finishes_or_leaves_the_database_intact() {
+        for at in ["copied", "checked", "moved-aside"] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("db");
+            let g = legacy_database(&root);
+            let e = migrate_with(&root, false, &mut |p| {
+                if p == at {
+                    Err(Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(e.is_err(), "{at}");
+            // recovery alone: before the swap the database is as it was, after it the
+            // checked copy is in place
+            recover(&root).unwrap();
+            assert!(root.exists(), "{at}");
+            assert_nothing_pending(dir.path(), &root, at);
+            let v = crate::vocab::delta::file_version(&root.join(&g).join("delta.vocab")).unwrap();
+            assert_eq!(v, if at == "moved-aside" { 2 } else { 1 }, "{at}");
+            assert_eq!(count(&root), 1, "{at}");
+        }
+    }
+
+    #[test]
+    fn the_next_migrate_finishes_an_interrupted_one() {
+        for at in ["copied", "checked", "moved-aside"] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("db");
+            let g = legacy_database(&root);
+            let e = migrate_with(&root, false, &mut |p| {
+                if p == at {
+                    Err(Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(e.is_err(), "{at}");
+            migrate(&root, false).unwrap();
+            assert!(root.exists(), "{at}");
+            assert_nothing_pending(dir.path(), &root, at);
+            let v = crate::vocab::delta::file_version(&root.join(&g).join("delta.vocab")).unwrap();
+            assert_eq!(v, 2, "{at}");
+            assert_eq!(count(&root), 1, "{at}");
+        }
+    }
+
+    #[test]
+    fn sync_parent_of_a_single_component_path() {
+        sync_parent(Path::new("db")).unwrap();
+    }
+
+    /// Serializes the tests that change the working directory.
+    static CWD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct RestoreCwd(PathBuf);
+    impl Drop for RestoreCwd {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_relative_root_is_migrated() {
+        let _g = CWD.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        let g = legacy_database(&root);
+        let _restore = RestoreCwd(std::env::current_dir().unwrap());
+        std::env::set_current_dir(dir.path()).unwrap();
+        let out = migrate(Path::new("db"), false).unwrap();
+        assert_eq!(out.steps.len(), 1);
+        assert!(root.exists());
+        assert_eq!(
+            crate::vocab::delta::file_version(&root.join(&g).join("delta.vocab")).unwrap(),
+            2
+        );
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            // the migration lock file stays next to the database
+            .filter(|n| !n.starts_with(".migrate.lock-"))
+            .collect();
+        assert_eq!(left, vec!["db".to_string()], "{left:?}");
+    }
+
+    #[test]
+    fn a_newer_index_is_refused_and_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        drop(Store::open(&root, StoreOptions::default()).unwrap());
+        let meta = root.join("gen-0001").join("meta.json");
+        let mut m: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&meta).unwrap()).unwrap();
+        m["format_version"] = 99.into();
+        std::fs::write(&meta, serde_json::to_vec(&m).unwrap()).unwrap();
+        let p = plan(&root).unwrap();
+        assert!(!p.in_window());
+        assert!(p.refused[0].contains("index version 99"), "{:?}", p.refused);
+        let e = migrate(&root, false).unwrap_err().to_string();
+        assert!(e.contains("newer release"), "{e}");
+    }
+
+    /// A database with one branch, and the directory of the branch.
+    fn branched_database(root: &Path) -> PathBuf {
+        let s = Store::open(root, StoreOptions::default()).unwrap();
+        s.create_branch("dev", &Default::default()).unwrap();
+        drop(s);
+        let mut dirs: Vec<_> = std::fs::read_dir(root.join("branches"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.is_dir())
+            .collect();
+        assert_eq!(dirs.len(), 1, "{dirs:?}");
+        dirs.pop().unwrap()
+    }
+
+    #[test]
+    fn a_branch_with_a_newer_settings_file_is_outside_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        let branch = branched_database(&root);
+        let id = branch.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(plan(&root).unwrap().in_window());
+        std::fs::write(branch.join("compaction.json"), br#"{"format": 2}"#).unwrap();
+        let p = plan(&root).unwrap();
+        assert!(!p.in_window());
+        assert!(
+            p.refused
+                .iter()
+                .any(|r| r.contains(&format!("branches/{id}")) && r.contains("compaction.json")),
+            "{:?}",
+            p.refused
+        );
+        let e = migrate(&root, false).expect_err("refused");
+        assert!(matches!(e, Error::Unsupported(_)), "{e:?}");
+    }
+
+    #[test]
+    fn a_branch_dataset_json_needing_a_later_reader_is_outside_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        let branch = branched_database(&root);
+        let path = branch.join("dataset.json");
+        if let Ok(b) = std::fs::read(&path) {
+            let mut v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+            v["minimumReader"] = 99.into();
+            std::fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
+        } else {
+            // a branch directory without its own dataset.json takes the root's id
+            let b = std::fs::read(root.join("dataset.json")).unwrap();
+            let mut v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+            v["minimumReader"] = 99.into();
+            std::fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
+        }
+        let p = plan(&root).unwrap();
+        assert!(!p.in_window(), "{:?}", p.refused);
+    }
+
+    #[test]
+    fn a_newer_origin_file_stays_inside_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        drop(Store::open(&root, StoreOptions::default()).unwrap());
+        std::fs::write(root.join("origin.json"), br#"{"originFormat": 9}"#).unwrap();
+        std::fs::write(root.join("restore.json"), br#"{"restoreFormat": 9}"#).unwrap();
+        let p = plan(&root).unwrap();
+        assert!(p.in_window(), "{:?}", p.refused);
+    }
+
+    /// Every path under `dir` whose file name is `name`.
+    fn find(dir: &Path, name: &str) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for e in std::fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            if p.file_name().is_some_and(|n| n == name) {
+                out.push(p.clone());
+            }
+            if p.is_dir() {
+                out.extend(find(&p, name));
+            }
+        }
+        out
+    }
+
+    fn assert_nothing_pending(parent: &Path, root: &Path, at: &str) {
+        assert!(!work_dir(root).exists(), "{at}");
+        assert!(!old_dir(root).exists(), "{at}");
+        assert!(find(parent, CHECKED_MARK).is_empty(), "{at}");
+    }
+
+    #[test]
+    fn an_open_after_an_interrupted_swap_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        let g = legacy_database(&root);
+        let e = migrate_with(&root, false, &mut |p| {
+            if p == "moved-aside" {
+                Err(Error::Cancelled)
+            } else {
+                Ok(())
+            }
+        });
+        assert!(e.is_err());
+        let e = Store::open(&root, StoreOptions::default())
+            .err()
+            .expect("an open of a database with a pending swap is refused");
+        assert!(matches!(e, Error::Unsupported(_)), "{e:?}");
+        assert!(e.to_string().contains(".migrate-db"), "{e}");
+        assert!(!root.exists(), "the open created the database");
+        // the next migrate finishes the swap
+        migrate(&root, false).unwrap();
+        assert_eq!(count(&root), 1);
+        assert_eq!(
+            crate::vocab::delta::file_version(&root.join(&g).join("delta.vocab")).unwrap(),
+            2
+        );
+        assert_nothing_pending(dir.path(), &root, "after the finish");
+    }
+
+    #[test]
+    fn an_open_during_a_copy_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        let g = legacy_database(&root);
+        let mut refused = false;
+        migrate_with(&root, false, &mut |p| {
+            if p == "copied" {
+                refused = Store::open(&root, StoreOptions::default()).is_err();
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert!(refused);
+        assert_eq!(
+            crate::vocab::delta::file_version(&root.join(&g).join("delta.vocab")).unwrap(),
+            2
+        );
+        assert_eq!(count(&root), 1);
+    }
+
+    #[test]
+    fn a_missing_root_without_a_checked_copy_is_not_rolled_forward() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        let work = work_dir(&root);
+        std::fs::create_dir(&work).unwrap();
+        std::fs::write(work.join("x"), b"x").unwrap();
+        let e = migrate(&root, false).expect_err("refused");
+        assert!(matches!(e, Error::Corrupt(_)), "{e:?}");
+        assert!(work.join("x").exists());
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn a_run_that_stopped_after_the_swap_is_cleaned_up_by_the_next_one() {
+        for keep in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("db");
+            let g = legacy_database(&root);
+            let e = migrate_with(&root, keep, &mut |p| {
+                if p == "swapped" {
+                    Err(Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(e.is_err());
+            // the new database is in place with the mark of the unfinished cleanup
+            assert!(root.join(CHECKED_MARK).exists());
+            assert!(old_dir(&root).exists());
+            recover(&root).unwrap();
+            assert!(!root.join(CHECKED_MARK).exists(), "keep {keep}");
+            assert_eq!(old_dir(&root).exists(), keep, "keep {keep}");
+            assert!(!work_dir(&root).exists());
+            assert_eq!(
+                crate::vocab::delta::file_version(&root.join(&g).join("delta.vocab")).unwrap(),
+                2
+            );
+            assert_eq!(count(&root), 1);
+        }
+    }
+
+    #[test]
+    fn a_concurrent_check_does_not_disturb_a_running_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        let g = legacy_database(&root);
+        let mut during = None;
+        migrate_with(&root, false, &mut |p| {
+            if p == "copied" {
+                during = Some(plan(&root));
+            }
+            Ok(())
+        })
+        .unwrap();
+        let e = during
+            .unwrap()
+            .expect_err("the check waits for the migration");
+        assert!(matches!(e, Error::Locked { .. }), "{e:?}");
+        assert_eq!(count(&root), 1);
+        assert_eq!(
+            crate::vocab::delta::file_version(&root.join(&g).join("delta.vocab")).unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn check_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        legacy_database(&root);
+        let work = work_dir(&root);
+        std::fs::create_dir(&work).unwrap();
+        std::fs::write(work.join("stale"), b"stale").unwrap();
+        let p = plan(&root).unwrap();
+        assert!(p.interrupted.is_some());
+        assert_eq!(std::fs::read(work.join("stale")).unwrap(), b"stale");
+        migrate(&root, false).unwrap();
+        assert!(!work.exists());
+        assert!(plan(&root).unwrap().interrupted.is_none());
+    }
+
+    #[test]
+    fn a_live_store_blocks_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        legacy_database(&root);
+        let _open = Store::open(&root, StoreOptions::default()).unwrap();
+        let e = migrate(&root, false).expect_err("a store has the database open");
+        assert!(matches!(e, Error::Locked { .. }), "{e:?}");
+        assert!(!work_dir(&root).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        legacy_database(&root);
+        let target = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(target.path(), root.join("linked")).unwrap();
+        let e = migrate(&root, false).expect_err("symlinks are not copied");
+        assert!(matches!(e, Error::Invalid(_)), "{e:?}");
+        assert!(root.join("linked").is_symlink());
+        assert!(!work_dir(&root).exists());
+    }
+
+    #[test]
+    fn an_existing_kept_directory_is_not_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        legacy_database(&root);
+        let old = old_dir(&root);
+        std::fs::create_dir(&old).unwrap();
+        std::fs::write(old.join("marker"), b"mine").unwrap();
+        let e = migrate(&root, true).expect_err("the earlier copy is kept");
+        assert!(matches!(e, Error::Invalid(_)), "{e:?}");
+        assert!(old.join("marker").exists());
+        assert!(!work_dir(&root).exists());
+    }
+
+    #[test]
+    fn the_lock_file_of_one_database_is_not_the_work_directory_of_another() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let other = dir.path().join("a.lock");
+        legacy_database(&a);
+        drop(Store::open(&other, StoreOptions::default()).unwrap());
+        migrate(&a, false).unwrap();
+        assert!(pending(&other).unwrap().is_none());
+        drop(Store::open(&other, StoreOptions::default()).unwrap());
+        assert!(plan(&other).unwrap().interrupted.is_none());
+    }
+
+    #[test]
+    fn a_root_created_next_to_a_checked_copy_keeps_both() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        legacy_database(&root);
+        migrate_with(&root, false, &mut |p| {
+            if p == "moved-aside" {
+                Err(Error::Cancelled)
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+        // something created the root again after the first rename
+        std::fs::create_dir(&root).unwrap();
+        let e = migrate(&root, false).expect_err("both sides are kept");
+        assert!(matches!(e, Error::Corrupt(_)), "{e:?}");
+        assert!(work_dir(&root).is_dir());
+        assert!(old_dir(&root).is_dir());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod mode_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn the_owner_of_a_database_may_migrate_it() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let owner = std::fs::metadata(tmp.path()).unwrap().uid();
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        assert!(may_migrate(euid, owner));
+        preflight_owner(tmp.path()).unwrap();
+        if euid != 0 {
+            assert!(!may_migrate(euid, euid + 1));
+        }
+        assert!(may_migrate(0, 5) && may_migrate(5, 5) && !may_migrate(6, 5));
+    }
+
+    /// A database named through a symlink is refused before anything is copied: the swap
+    /// would replace the link with a directory on the link's file system.
+    #[test]
+    fn a_symlinked_root_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        tests::legacy_database(&real);
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let link = tmp.path().join("db");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let e = migrate(&link, false).unwrap_err().to_string();
+        assert!(e.contains("symlink"), "{e}");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(!work_dir(&absolute(&link).unwrap()).exists());
+        // through its real path it migrates and keeps its mode
+        migrate(&real, false).unwrap();
+        let mode = std::fs::metadata(&real).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    /// A root without the owner's write bit is refused before anything is copied, since
+    /// the copy would take that mode and could not take its mark or be removed.
+    #[test]
+    fn a_read_only_root_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("db");
+        tests::legacy_database(&root);
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let r = migrate(&root, false);
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let e = r.unwrap_err().to_string();
+        assert!(e.contains("write"), "{e}");
+        assert!(!work_dir(&absolute(&root).unwrap()).exists());
+    }
+
+    /// A failure after the copy took a read-only generation directory's mode still
+    /// removes the copy, so the database is not left pending.
+    #[test]
+    fn a_failed_run_removes_a_copy_with_read_only_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("db");
+        let g = tests::legacy_database(&root);
+        std::fs::set_permissions(root.join(&g), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let r = migrate_with(&root, false, &mut |at| {
+            if at == "before-check" {
+                Err(Error::Invalid("stop".into()))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(r.is_err());
+        let work = work_dir(&absolute(&root).unwrap());
+        let left = work.exists();
+        if left {
+            // let the temporary directory be removed
+            let _ = std::fs::set_permissions(work.join(&g), std::fs::Permissions::from_mode(0o755));
+        }
+        std::fs::set_permissions(root.join(&g), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!left, "the copy was left behind");
+        crate::store::Store::open(&root, crate::store::StoreOptions::default()).unwrap();
+    }
+
+    #[test]
+    fn migrate_keeps_directory_modes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("db");
+        let g = tests::legacy_database(&root);
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(root.join(&g), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let dv = root.join(&g).join("delta.vocab");
+        std::fs::set_permissions(&dv, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let ds = root.join("dataset.json");
+        std::fs::set_permissions(&ds, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let out = migrate(&root, false).unwrap();
+        assert!(!out.steps.is_empty(), "the fixture needs a step");
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&root), 0o700, "root mode");
+        assert_eq!(mode(&root.join(&g)), 0o700, "generation mode");
+        // a step keeps the mode of the file it rewrites
+        assert_eq!(mode(&dv), 0o600, "{:o}", mode(&dv));
+        assert_eq!(mode(&ds), 0o600, "{:o}", mode(&ds));
+    }
+}

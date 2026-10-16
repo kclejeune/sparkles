@@ -86,12 +86,12 @@ pub(super) fn schemas() -> Map<String, J> {
             "allOf": [
                 sref("Error"),
                 obj(&["budget"], json!({
-                    "budget": string_enum(&["memory", "result-bytes", "outbound-bytes", "validation-work", "rows", "rows-produced", "dataset-bytes"]),
+                    "budget": string_enum(&["memory", "result-bytes", "outbound-bytes", "validation-work", "rows", "rows-produced", "dataset-bytes", "server-memory"]),
                     "limit": { "type": "integer", "description": "Bytes, or rows for `rows` and `rows-produced`." },
                     "requested": { "type": "integer" },
                 })),
             ],
-            "description": "A `507` for a request over one of its budgets.",
+            "description": "A `507` for a request over one of its budgets. The `server-memory` budget is a `503` with `Retry-After`, because the server's query memory pool is in use and a retry can succeed.",
             "externalDocs": { "url": api_doc("budgets") },
         }),
     );
@@ -135,6 +135,35 @@ pub(super) fn schemas() -> Map<String, J> {
                 "auth": obj(&["enabled"], json!({ "enabled": { "type": "boolean" } })),
                 "startDateTime": { "type": "string", "description": "Fuseki's name for `startedAt`." },
                 "uptime": { "type": "number", "description": "Fuseki's uptime in seconds." },
+                "formats": {
+                    "type": "object",
+                    "description": "The on-disk file kinds and settings files, with the version this build writes and the versions it reads (`sparkles migrate --check` prints the same registry). Left out for anonymous callers when auth is on.",
+                    "properties": {
+                        "sparkles": { "type": "string" },
+                        "kinds": array(obj(&["id", "files", "marker", "class", "writes", "reads"], json!({
+                            "id": { "type": "string" },
+                            "files": { "type": "string" },
+                            "marker": { "type": "string" },
+                            "class": string_enum(&["primary", "derived", "config", "archive"]),
+                            "writes": { "type": "integer" },
+                            "reads": array(json!({ "type": "integer" })),
+                        }))),
+                        "settings": array(obj(&["name", "scope", "member", "writes"], json!({
+                            "name": { "type": "string" },
+                            "scope": string_enum(&["dataset", "server"]),
+                            "member": { "type": "string" },
+                            "writes": { "type": "integer" },
+                        }))),
+                        "unmarkedSettings": array(obj(&["name", "reason"], json!({
+                            "name": { "type": "string" },
+                            "reason": { "type": "string" },
+                        }))),
+                    },
+                },
+                "refusedDatasets": array(obj(&["name", "reason"], json!({
+                    "name": { "type": "string" },
+                    "reason": { "type": "string", "description": "Why the dataset is registered but not served, such as an index format this release does not read. The member lists the refused datasets the caller may read, and all of them for a server administrator, who alone gets the full message, which names paths." },
+                }))),
             }),
         ),
     );
@@ -563,6 +592,62 @@ pub(super) fn schemas() -> Map<String, J> {
             },
         }),
     );
+    put(
+        "SparqlDiff",
+        json!({
+            "type": "object",
+            "required": ["dataset", "datasetId", "from", "to", "vars", "fromRows", "toRows", "same", "added", "removed", "addedRows", "removedRows", "truncated"],
+            "properties": {
+                "dataset": { "type": "string" },
+                "datasetId": { "type": "string" },
+                "from": { "type": "object", "properties": { "selector": { "type": "string" }, "commit": sref("Commit") } },
+                "to": { "type": "object", "properties": { "selector": { "type": "string" }, "commit": sref("Commit") } },
+                "vars": array(json!({ "type": "string" })),
+                "fromRows": { "type": "integer", "description": "Rows at the earlier state." },
+                "toRows": { "type": "integer", "description": "Rows at the later state." },
+                "same": { "type": "integer", "description": "Rows both states have, counted as a bag." },
+                "added": { "type": "integer", "description": "Rows only the later state has." },
+                "removed": { "type": "integer", "description": "Rows only the earlier state has." },
+                "addedRows": array(json!({ "type": "object", "description": "The bound variables as SPARQL JSON terms.", "additionalProperties": true })),
+                "removedRows": array(json!({ "type": "object", "additionalProperties": true })),
+                "truncated": { "type": "object", "properties": { "added": { "type": "boolean" }, "removed": { "type": "boolean" } } },
+            },
+        }),
+    );
+    put(
+        "CommitTimeline",
+        json!({
+            "type": "object",
+            "required": ["dataset", "datasetId", "head", "firstSeq", "lastSeq", "commits", "bucketWidth", "readable", "buckets"],
+            "properties": {
+                "dataset": { "type": "string" },
+                "datasetId": { "type": "string" },
+                "head": { "type": "integer" },
+                "firstSeq": { "type": "integer" },
+                "lastSeq": { "type": "integer" },
+                "commits": { "type": "integer", "description": "The commits in range whose metadata is retained." },
+                "bucketWidth": { "type": "integer", "description": "The commit numbers each bucket spans." },
+                "oldestReconstructable": nullable("integer"),
+                "readable": { "type": "array", "items": { "type": "object", "properties": { "from": { "type": "integer" }, "to": { "type": "integer" } } } },
+                "buckets": array(json!({
+                    "type": "object",
+                    "required": ["firstSeq", "lastSeq", "firstTime", "lastTime", "commits", "kinds", "merges", "snapshots"],
+                    "properties": {
+                        "firstSeq": { "type": "integer" },
+                        "lastSeq": { "type": "integer" },
+                        "firstTime": { "type": "string" },
+                        "lastTime": { "type": "string" },
+                        "commits": { "type": "integer" },
+                        "inserted": { "type": "integer", "description": "Quads added by the bucket's commits; left out for a caller limited to some graphs." },
+                        "deleted": { "type": "integer", "description": "Quads removed by the bucket's commits; left out for a caller limited to some graphs." },
+                        "kinds": { "type": "object", "additionalProperties": { "type": "integer" } },
+                        "merges": { "type": "integer" },
+                        "snapshots": { "type": "integer" },
+                    },
+                })),
+            },
+        }),
+    );
     // ---------------------------------------------------------------- branches --
     let commit_ref = || {
         json!({
@@ -978,6 +1063,9 @@ pub(super) fn schemas() -> Map<String, J> {
                         "rowsProduced": { "type": "integer" },
                         "commit": { "type": "integer" },
                         "datasetId": { "type": "string" },
+                        "io": { "type": "object", "properties": {
+                            "pagesTruncated": { "type": "boolean", "description": "True when the shared profiling epoch omitted pages because of its 65,536-entry inventory or range cap. False records no cap omission and does not promise complete coverage. Process counter snapshots omit this field." }
+                        }, "additionalProperties": true, "description": "Reads of the index and vocabulary files; present when the request has `profile=io`. Page fields describe the first-admitted best-effort sample shared by overlapping profiles. Touched and resident counts are additive lower bounds; broughtIn is the nonnegative sample resident-count delta, not a lower bound on the full-set delta or physical I/O. Numeric observations cover actual mapped value, kind and rank loads independently of advice; resident head copies add no mapped observations." },
                     },
                 },
             },
@@ -1024,7 +1112,7 @@ pub(super) fn schemas() -> Map<String, J> {
                 "prefixesRemoved": { "type": "integer" },
                 "rows": { "type": "integer", "description": "The rows read, up to a `TA` that aborted the patch." },
                 "aborted": { "type": "boolean", "description": "A `TA` row aborted the patch, and nothing was applied." },
-                "prevChecked": { "type": "boolean", "description": "The patch's `prev` header named a commit of this dataset, which was the head." },
+                "prevChecked": { "type": "boolean", "description": "An own-dataset `prev` was successfully checked against the transaction head." },
                 "timing": { "type": "object" },
             },
         }),

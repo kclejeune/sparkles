@@ -2365,3 +2365,27 @@ async fn selected_branch_backups_follow_identity_and_authorization_after_rename(
     assert_eq!(copy.store.snapshot().len(), 2);
     assert_eq!(copy.store.branches().unwrap().len(), 1);
 }
+
+#[test]
+fn a_newer_restore_record_is_ignored() {
+    let dir = tempfile::tempdir().unwrap();
+    let id = "00000000-0000-0000-0000-000000000000";
+    let record = |format: u32| {
+        json!({
+            "restoreFormat": format,
+            "repository": {"name": "local", "id": id},
+            "backup": "b1",
+            "source": {"datasetId": id, "seq": 3, "name": "wiki"},
+            "identity": "new",
+            "time": "2026-01-01T00:00:00Z",
+        })
+    };
+    let writes = sparkles::formats::settings_file("restore.json")
+        .unwrap()
+        .writes;
+    let path = dir.path().join("restore.json");
+    std::fs::write(&path, record(writes + 1).to_string()).unwrap();
+    assert!(restored_from(dir.path()).is_none());
+    std::fs::write(&path, record(writes).to_string()).unwrap();
+    assert_eq!(restored_from(dir.path()).unwrap()["backup"], "b1");
+}

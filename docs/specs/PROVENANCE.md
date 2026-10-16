@@ -1821,7 +1821,7 @@ implementation landed.
     Computer Programming*, Vol. 3, and Kuiper, Boncz and Mühleisen, "Robust External Hash
     Aggregation in the Solid State Age" (ICDE 2024);
   - the Linux `open(2)` manual page (`O_TMPFILE`) and the cgroup v2 documentation.
-- **Implementation:** not built. The spec plans no new dependency. Spill encryption uses
+- **Implementation:** Phase 1 (shared caches and the query memory pool) is built, with no new dependency and from the spec alone. Phases 2 and 3 are not built. The spec plans no new dependency. Spill encryption uses
   `aws-lc-rs`, which `sparkles-backup` already uses for encrypted repositories, and the
   caches stay on `quick_cache`. No code from other database systems is adopted.
 - **Rejected** (spec §12):
@@ -1871,7 +1871,7 @@ implementation landed.
   - the public PostgreSQL documentation of `PREPARE` and `plan_cache_mode`, and Apache
     Jena's documentation of `ParameterizedSparqlString` and `QueryExec.substitution`,
     for the API, without code from either.
-- **Implementation:** not built. The spec plans no new dependency.
+- **Implementation:** Phase 1 (shared caches and the query memory pool) is built, with no new dependency and from the spec alone. Phases 2 and 3 are not built. The spec plans no new dependency.
 - **Rejected** (spec §12):
   - a generic plan for every set of constants;
   - re-planning on every commit;
@@ -2114,7 +2114,7 @@ implementation landed.
   - Traag, Waltman and van Eck, "From Louvain to Leiden" (Scientific Reports, 2019);
   - W3C PROV-O and SKOS;
   - the Sparkles code and specs C11, C12, C12b, C17, C18, C19, F06, F08, F13 and F14.
-- **Implementation:** not built. The spec plans no new dependency. Microsoft's GraphRAG
+- **Implementation:** Phase 1 (shared caches and the query memory pool) is built, with no new dependency and from the spec alone. Phases 2 and 3 are not built. The spec plans no new dependency. Microsoft's GraphRAG
   package is not used.
 - **Rejected** (spec §12):
   - summaries in a side store;
@@ -2134,7 +2134,7 @@ implementation landed.
   - the PostgreSQL documentation of `CREATE TRIGGER` and trigger recursion;
   - W3C SPARQL 1.1 Update;
   - the Sparkles code and specs C09, C10, C12, C15, C21, F06, F13 and P06.
-- **Implementation:** not built. The spec plans no new dependency.
+- **Implementation:** Phase 1 (shared caches and the query memory pool) is built, with no new dependency and from the spec alone. Phases 2 and 3 are not built. The spec plans no new dependency.
 - **Rejected** (spec §8):
   - a SPARQL grammar extension for batches;
   - batches by `LIMIT` and `OFFSET`;

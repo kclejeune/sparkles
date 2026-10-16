@@ -102,6 +102,9 @@ lsp-types = { workspace = true, optional = true }
 # PDF conversion for ingestion (feature `pdf`, spec C18 §7.1.1): an exact pin, because a
 # new version can change the Markdown and with it the offsets of stored renditions
 pdf-inspector = { version = "=1.25.2", default-features = false, optional = true }
+# Office documents for ingestion (feature `office`, spec C18 §7.1): DOCX, PPTX, XLSX and
+# OpenDocument files, read from their XML parts
+sparkles-office = { workspace = true, optional = true }
 # the model store (spec F12): `sparkles models` and `serve --models-dir`; local embedding
 # models with Candle under the feature `embed-local`
 sparkles-modelstore.workspace = true
@@ -122,11 +125,13 @@ aws-lc-rs = "1"
 # the formatter's test-only fault switch (`SPARKLES_FMT_FAULT`), so the tests can show that
 # `sparkles fmt` and `POST /$/format` refuse output that fails the safety checks
 sparkles-fmt = { workspace = true, features = ["fault-injection"] }
+# small documents of every Office format for the ingestion tests
+sparkles-office = { workspace = true, features = ["fixtures"] }
 # the Rust client, tested against this crate's binary (tests/rust_client.rs)
 sparkles-client = { workspace = true, features = ["blocking"] }
 
 [features]
-default = ["reasoning", "shacl", "shex", "mimalloc", "text", "geo", "geo-epsg", "otel", "auth", "mcp", "memory", "backup", "fmt", "tls", "graphql", "pdf"]
+default = ["reasoning", "shacl", "shex", "mimalloc", "text", "geo", "geo-epsg", "otel", "auth", "mcp", "memory", "backup", "fmt", "tls", "graphql", "pdf", "office"]
 # RDFS / OWL RL / Jena-rules materialization (`/$/reason`, `sparkles infer`)
 reasoning = ["dep:sparkles-reasoner", "sparkles/reasoning"]
 # SHACL validation (`/{ds}/shacl`, `sparkles shacl`)
@@ -164,6 +169,9 @@ memory = ["mcp", "auth", "dep:sparkles-memory-import", "dep:tower"]
 # PDF conversion in ingestion (`POST /$/ingest/{ds}`, `sparkles ingest`) with pdf-inspector;
 # without it a PDF is refused with `unsupported-format` (spec C18 §7.1.1)
 pdf = ["mcp", "dep:pdf-inspector"]
+# Office documents in ingestion (DOCX, PPTX, XLSX, ODT, ODP, ODS): the converter of
+# sparkles-office; without it these formats are refused with `unsupported-format`
+office = ["mcp", "dep:sparkles-office"]
 # OCR of scanned PDF pages: PDFium and ONNX Runtime loaded at run time from paths the
 # operator gives, with the PP-OCR models from a directory (`serve --pdf-ocr-models`); never
 # downloads a model. Off by default and not part of release builds. pdf-inspector's OCR
@@ -176,7 +184,7 @@ pdf-ocr = ["pdf", "pdf-inspector/ocr"]
 embed-local = ["dep:sparkles-embed"]
 # backup repositories on a filesystem or S3: `/$/repositories`, `/$/backups/{ds}`,
 # `/$/backup-policies`, `sparkles repo …`, `sparkles backup create|list|restore|…`
-backup = ["dep:sparkles-backup", "dep:toml", "sparkles/backup"]
+backup = ["dep:sparkles-backup", "dep:toml", "dep:zeroize", "sparkles/backup"]
 backup-encryption = ["backup", "sparkles/backup-encryption", "sparkles-backup/encryption"]
 # the formatter: `sparkles fmt`, `sparkles lsp` and `POST /$/format`
 fmt = [

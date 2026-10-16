@@ -2,6 +2,7 @@
   import type { Term } from '$lib/api';
   import { toasts } from '$lib/app.svelte';
   import { displayIri, displayTerm, isVectorLiteral, toSparql, type PrefixMap } from '$lib/rdf';
+  import { MARK_SIGN, MARK_WORD, type Mark } from '$lib/rowdiff';
   import { sortedOrder, type SortSpec } from '$lib/table';
   import Icon from './Icon.svelte';
   import TermView from './TermView.svelte';
@@ -14,6 +15,7 @@
     cited,
     highlight = null,
     onhover,
+    marks,
   }: {
     vars: string[];
     rows: (Term | null)[][];
@@ -25,6 +27,12 @@
     highlight?: { row: number } | null;
     /** The row under the pointer (0-based), or null when it leaves the rows. */
     onhover?: (row: number | null) => void;
+    /**
+     * The change of each row between two states (the time slider's compare mode), parallel
+     * to `rows`. A change column shows `+` for an added row and `−` for a removed one, and
+     * removed rows are struck through.
+     */
+    marks?: readonly Mark[];
   } = $props();
 
   const ROW_H = 26;
@@ -82,8 +90,12 @@
   );
   const visible = $derived(order.slice(start, end));
   const rnWidth = $derived(Math.max(44, String(rows.length).length * 8 + 20));
-  const template = $derived(`${rnWidth}px ${widths.map((w) => `${w}px`).join(' ')} minmax(0, 1fr)`);
-  const totalW = $derived(rnWidth + widths.reduce((a, b) => a + b, 0));
+  const CHG_W = 34;
+  const chgWidth = $derived(marks ? CHG_W : 0);
+  const template = $derived(
+    `${rnWidth}px ${marks ? `${CHG_W}px ` : ''}${widths.map((w) => `${w}px`).join(' ')} minmax(0, 1fr)`,
+  );
+  const totalW = $derived(rnWidth + chgWidth + widths.reduce((a, b) => a + b, 0));
 
   function toggleSort(col: number) {
     if (!sort || sort.col !== col) sort = { col, dir: 1 };
@@ -153,6 +165,15 @@
 >
   <div class="head" style:grid-template-columns={template} style:min-width="{totalW}px" role="row">
     <div class="cell rn" role="columnheader">#</div>
+    {#if marks}
+      <div
+        class="cell chg"
+        role="columnheader"
+        title="Added (+) or removed (−) since the earlier state"
+      >
+        ±
+      </div>
+    {/if}
     {#each vars as v, c (v + c)}
       <div
         class="cell th"
@@ -186,6 +207,8 @@
           class="tr"
           class:odd={(start + k) % 2 === 1}
           class:hl={highlight?.row === ri}
+          class:added={marks?.[ri] === 'added'}
+          class:removed={marks?.[ri] === 'removed'}
           style:grid-template-columns={template}
           role="row"
           aria-selected={highlight?.row === ri ? true : undefined}
@@ -195,6 +218,16 @@
             {#if cited?.has(ri)}<span class="cite-mark" title="Cited by the summary">◂</span
               >{/if}{ri + 1}
           </div>
+          {#if marks}
+            <div
+              class="cell chg"
+              role="gridcell"
+              aria-label={marks[ri] ? MARK_WORD[marks[ri]] : undefined}
+              title={marks[ri] && marks[ri] !== 'kept' ? MARK_WORD[marks[ri]] : undefined}
+            >
+              {MARK_SIGN[marks[ri] ?? 'kept']}
+            </div>
+          {/if}
           {#each row as term, c (c)}
             <div class="cell td" role="gridcell">
               <span class="val"><TermView {term} {prefixes} {onopen} /></span>
@@ -292,6 +325,30 @@
   }
   .tr .rn {
     background: var(--surface);
+  }
+  .chg {
+    justify-content: center;
+    font-weight: 700;
+    color: var(--text-3);
+  }
+  .tr.added .chg {
+    color: var(--added);
+    background: var(--added-soft);
+  }
+  .tr.removed .chg {
+    color: var(--removed);
+    background: var(--removed-soft);
+  }
+  .tr.added {
+    box-shadow: inset 3px 0 0 var(--added);
+  }
+  .tr.removed {
+    box-shadow: inset 3px 0 0 var(--removed);
+  }
+  .tr.removed .val {
+    text-decoration: line-through;
+    text-decoration-thickness: 1px;
+    color: var(--text-2);
   }
   .th {
     padding: 0;

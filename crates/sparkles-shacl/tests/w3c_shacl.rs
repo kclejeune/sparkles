@@ -373,6 +373,180 @@ fn run_suite_in(name: &str, dir: &Path, manifest: &str) {
     );
 }
 
+// ------------------------------------------------------------ node expressions ----
+
+/// The `sht:EvalNodeExpr` entries of a manifest and the manifests it includes: the file
+/// of each (the test's data and shapes graph) and the entry's IRI.
+fn collect_expr_tests(manifest: &str, out: &mut Vec<(String, String)>) {
+    let g = load_graph(manifest);
+    let me = nn(manifest);
+    for inc in g
+        .objects_for_subject_predicate(me.as_ref(), &nn(&format!("{MF}include")))
+        .map(TermRef::into_owned)
+        .collect::<Vec<_>>()
+    {
+        if let Term::NamedNode(n) = inc {
+            collect_expr_tests(n.as_str(), out);
+        }
+    }
+    let Some(entries) = obj(&g, &Term::NamedNode(me), &format!("{MF}entries")) else {
+        return;
+    };
+    for e in list(&g, &entries) {
+        if obj(&g, &e, &format!("{RDF}type"))
+            == Some(Term::NamedNode(nn(&format!("{SHT}EvalNodeExpr"))))
+            && let Term::NamedNode(n) = &e
+        {
+            out.push((manifest.to_string(), n.as_str().to_string()));
+        }
+    }
+}
+
+/// Term equality, or the same value for two literals of one numeric datatype (the suite
+/// writes `"00"^^xsd:decimal` for what a processor may write `0.0`).
+fn same_node(e: &Term, a: &Term) -> bool {
+    if e == a {
+        return true;
+    }
+    if let (Term::Literal(x), Term::Literal(y)) = (e, a)
+        && x.datatype() == y.datatype()
+        && let (Ok(p), Ok(q)) = (x.value().parse::<f64>(), y.value().parse::<f64>())
+    {
+        return p == q;
+    }
+    false
+}
+
+fn run_expr_test(file: &str, entry: &str) -> Result<(), String> {
+    let store = Store::in_memory(StoreOptions::default());
+    let src = Source::from_path(&url_to_path(file), None).map_err(|e| e.to_string())?;
+    store.load(&[src]).map_err(|e| format!("load: {e}"))?;
+    let snap = store.snapshot();
+    let g = store_graph(&store);
+    let e = Term::NamedNode(nn(entry));
+    let action = obj(&g, &e, &format!("{MF}action")).ok_or("no mf:action")?;
+    let expr = obj(&g, &action, &format!("{SHT}nodeExpr")).ok_or("no sht:nodeExpr")?;
+    let focus = obj(&g, &action, &format!("{SHT}focusNode"));
+    let ignore_order = matches!(
+        obj(&g, &action, &format!("{SHT}ignoreOrder")),
+        Some(Term::Literal(l)) if l.value() == "true"
+    );
+    let mut scope = Vec::new();
+    if let Term::BlankNode(b) = &action {
+        for t in g.triples_for_subject(b.as_ref()) {
+            if let Some(name) = t.predicate.as_str().strip_prefix(&format!("{SHT}scope-")) {
+                scope.push((name.to_string(), t.object.into_owned()));
+            }
+        }
+    }
+    let result = obj(&g, &e, &format!("{MF}result")).ok_or("no mf:result")?;
+    let expected = list(&g, &result);
+    let actual = sparkles_shacl::eval_expression_in_graph(
+        &snap,
+        g.clone(),
+        true,
+        &expr,
+        focus.as_ref(),
+        &scope,
+        &ValidateOptions::default(),
+    )
+    .map_err(|e| format!("error: {e:#}"))?;
+    let ok = if ignore_order {
+        let mut left = actual.clone();
+        expected.len() == actual.len()
+            && expected
+                .iter()
+                .all(|x| match left.iter().position(|y| same_node(x, y)) {
+                    Some(i) => {
+                        left.remove(i);
+                        true
+                    }
+                    None => false,
+                })
+    } else {
+        expected.len() == actual.len() && expected.iter().zip(&actual).all(|(x, y)| same_node(x, y))
+    };
+    if ok {
+        Ok(())
+    } else {
+        let show = |v: &[Term]| v.iter().map(Term::to_string).collect::<Vec<_>>().join(" ");
+        Err(format!(
+            "expected ( {} ), got ( {} ){}",
+            show(&expected),
+            show(&actual),
+            if ignore_order { ", any order" } else { "" }
+        ))
+    }
+}
+
+#[test]
+fn w3c_shacl12_node_expr() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/shacl12");
+    // the sht:Validate tests of sh:expression and sh:nodeByExpression
+    run_suite_in(
+        "SHACL 1.2 node expression constraints",
+        &dir,
+        "node-expr/manifest.ttl",
+    );
+    // the sht:EvalNodeExpr tests of the node expression library
+    let mut tests = Vec::new();
+    collect_expr_tests(
+        &path_to_url(&dir.join("node-expr/manifest.ttl")),
+        &mut tests,
+    );
+    let known: BTreeSet<String> = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/known-failures.txt"),
+    )
+    .unwrap_or_default()
+    .lines()
+    .map(|l| l.split_whitespace().next().unwrap_or("").to_string())
+    .filter(|l| !l.is_empty() && !l.starts_with('#'))
+    .collect();
+    let filter = std::env::var("SPARKLES_SHACL_FILTER").ok();
+    let (mut pass, mut fail) = (0, 0);
+    let mut new_failures = Vec::new();
+    let mut fixed = Vec::new();
+    for (file, entry) in &tests {
+        let short = entry
+            .rsplit_once("/tests/shacl12/")
+            .map(|x| x.1.to_string())
+            .unwrap_or_else(|| entry.clone());
+        if filter.as_ref().is_some_and(|f| !short.contains(f.as_str())) {
+            continue;
+        }
+        let r =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_expr_test(file, entry)))
+                .unwrap_or_else(|_| Err("panic".into()));
+        match r {
+            Ok(()) => {
+                pass += 1;
+                if known.contains(&short) {
+                    fixed.push(short);
+                }
+            }
+            Err(e) => {
+                fail += 1;
+                if !known.contains(&short) {
+                    eprintln!("FAIL {short}\n{e}");
+                    new_failures.push(short);
+                }
+            }
+        }
+    }
+    eprintln!(
+        "\nSHACL 1.2 node expressions: {pass} passed, {fail} failed ({} tests)",
+        tests.len()
+    );
+    if !fixed.is_empty() {
+        eprintln!("now passing (remove from known failures): {fixed:?}");
+    }
+    assert!(
+        new_failures.is_empty(),
+        "{} unexpected failures: {new_failures:#?}",
+        new_failures.len()
+    );
+}
+
 #[test]
 fn w3c_shacl_core() {
     run_suite("SHACL Core", "core/manifest.ttl");

@@ -300,6 +300,43 @@ export type IngestResult = {
   preview?: { rows: number; triples: string[] };
   drafted?: 'model' | 'default';
   warnings?: string[];
+  links?: IngestLink[];
+  // a workbook's mapping drafts, one for each sheet (§7.8)
+  sheets?: IngestSheetDraft[];
+};
+
+/** What entity linking did for one IRI column of a mapping draft (§7.8). */
+export type IngestLink = {
+  column: string;
+  types: string[];
+  commit?: number | null;
+  distinct: number;
+  tried: number;
+  linked: number;
+  weak: number;
+  minted: number;
+  ambiguousTotal: number;
+  ambiguous: {
+    value: string;
+    rows: number;
+    candidates: { iri: string; label?: string; types?: string[] }[];
+  }[];
+};
+
+/** The mapping draft of one sheet of a workbook, with the sheet as CSV to upload. */
+export type IngestSheetDraft = {
+  sheet: string;
+  index: number;
+  csv?: string;
+  file?: string;
+  rows?: number;
+  triples?: number;
+  mapping?: Record<string, unknown>;
+  preview?: { rows: number; triples: string[] };
+  drafted?: 'model' | 'default';
+  warnings?: string[];
+  links?: IngestLink[];
+  error?: { code: string; message?: string };
 };
 
 export type IngestTask = {
@@ -326,7 +363,7 @@ export type IngestTask = {
 export type IngestTaskList = {
   dataset: string;
   tasks: IngestTask[];
-  capabilities: { pdf: boolean; ocr: boolean };
+  capabilities: { pdf: boolean; ocr: boolean; office: boolean };
 };
 
 const WAITING: IngestStatus[] = [

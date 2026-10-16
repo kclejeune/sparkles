@@ -23,6 +23,8 @@ pub(super) struct Request {
     pub execution: ExecutionMode,
     /// the declared and runtime prefixes, for graph results (spec C20 §5)
     pub prefixes: std::collections::BTreeMap<String, String>,
+    /// the I/O profile of the request (`profile=io`)
+    pub io: Option<Arc<sparkles::ioacct::Profile>>,
 }
 
 /// The mode actually run for a request. Automatic execution falls back to eager
@@ -51,6 +53,7 @@ pub(super) async fn run(ds: Arc<Dataset>, request: Request) -> ApiResult {
         native_graph,
         execution,
         prefixes: prefix_map,
+        io,
     } = request;
     let execution = effective_mode(execution, thrift);
     let at = history::at_param(&params)?;
@@ -104,6 +107,7 @@ pub(super) async fn run(ds: Arc<Dataset>, request: Request) -> ApiResult {
             let metadata = Some(results::NativeJsonMetadata {
                 commit: seq,
                 dataset_id: &dataset_id,
+                io: io.as_deref(),
             });
             let result = match &mut cursor {
                 QueryExecution::Eager(result)
@@ -124,6 +128,7 @@ pub(super) async fn run(ds: Arc<Dataset>, request: Request) -> ApiResult {
                     &prefix_map,
                     seq,
                     &dataset_id,
+                    io.as_deref(),
                 ),
                 QueryExecution::Select(cursor) if format == SolutionsFormat::Sparkles => {
                     results::write_cursor_native_json(cursor, &mut *writer, send, metadata)

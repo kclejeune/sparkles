@@ -8,7 +8,8 @@
 # datasets, runtime changes survive a reload and a restart, locks and declared datasets
 # are refused at runtime, a locked model provider field is refused while the CLI changes
 # another one, and a switch to other settings and model roles reloads the
-# server without restarting it.
+# server without restarting it. A DOCX upload is converted in a child process of the
+# server under the unit's hardening and the smallest `--convert-memory`.
 { self }:
 {
   name = "sparkles";
@@ -19,6 +20,11 @@
       imports = [ self.nixosModules.default ];
       services.sparkles = {
         enable = true;
+        # the conversion child at the smallest address-space limit the flag takes
+        extraArgs = [
+          "--convert-memory"
+          "256"
+        ];
         datasets = {
           demo = { };
           archive.path = "/srv/sparkles-archive";
@@ -346,6 +352,36 @@
     assert abs(c["policy"]["deltaRatio"] - 0.1) < 1e-9, c
     assert c["policy"]["idleSeconds"] == 0, c
     machine.succeed("systemctl show -p ExecStart sparkles.service | grep -q -- '--max-clones 1'")
+    # a server that fails at every start backs off instead of restarting every 5 s
+    machine.succeed("systemctl show -p RestartMaxDelayUSec --value sparkles.service | grep -qx 5min")
+
+    # An automatic compaction's build threads lower their priority with setpriority,
+    # which the unit's ~@resources filter once answered by killing the server (SIGSYS).
+    # Crossing minQuads makes one due.
+    machine.succeed(
+        "{ echo 'INSERT DATA {'; for i in $(seq 6000); do echo \"<urn:s$i> <urn:q> $i .\"; done; echo '}'; } > /tmp/bulk.ru"
+    )
+    machine.succeed(
+        f"curl -sf {base}/demo/update -H 'Content-Type: application/sparql-update' --data-binary @/tmp/bulk.ru"
+    )
+    for _ in range(240):
+        c = json.loads(machine.succeed(f"curl -sf {base}/\\$/compaction/demo"))
+        if c["automaticRuns"] >= 1 and c["state"] != "running":
+            break
+        time.sleep(0.5)
+    else:
+        raise Exception(f"no automatic compaction ran: {c}")
+    assert c["failures"] == 0, c
+    restarts = machine.succeed("systemctl show -p NRestarts --value sparkles.service").strip()
+    assert restarts == "0", f"sparkles restarted {restarts} times during compaction"
+    out = machine.succeed(
+        f"curl -sf {base}/demo/sparql -H 'Accept: text/csv' --data-urlencode "
+        + "'query=SELECT (SUM(?v) AS ?s) WHERE { ?x <urn:p> ?v }'"
+    )
+    assert last_value(out) == "49", out
+    machine.succeed(
+        f"curl -sf {base}/demo/update --data-urlencode 'update=DELETE WHERE {{ ?s <urn:q> ?o }}'"
+    )
 
     # the admin API and the embedded UI are reachable through the proxy
     machine.succeed(f"curl -sf {base}/\\$/datasets | grep -q scratch")
@@ -477,6 +513,27 @@
     # requests still pass
     assert status(f"--interface 127.0.0.2 {base}/\\$/ping") == "200"
     assert status(f"--interface 127.0.0.2 {ask}") == "200"
+
+    # a Word document is converted in a child process under the unit's system call filter,
+    # its other hardening and a 256 MiB address space, and registered without extraction
+    import base64, io, zipfile
+    w = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr(
+            "word/document.xml",
+            f"<w:document {w}><w:body><w:p><w:r><w:t>Ana Lima leads the platform team.</w:t></w:r></w:p></w:body></w:document>",
+        )
+    machine.succeed(f"echo {base64.b64encode(buf.getvalue()).decode()} | base64 -d > /tmp/note.docx")
+    task = json.loads(
+        machine.succeed(
+            f"curl -sf -F extract=false -F 'file=@/tmp/note.docx;filename=note.docx' {base}/\\$/ingest/demo"
+        )
+    )
+    t = json.loads(machine.succeed(f"curl -sf \"{base}/\\$/ingest/demo/{task['id']}?wait=60\""))
+    assert t["status"] == "done", t
+    assert t["result"]["outcome"] == "registered" and t["result"]["format"] == "docx", t
+    machine.fail("journalctl -u sparkles.service | grep -q 'conversion child could not start'")
 
   '';
 }

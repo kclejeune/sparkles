@@ -1,6 +1,7 @@
 // SPARQL used by the Explore page (resource graph + ontology browser).
 import * as api from './api';
 import type { Term } from './api';
+import { CANDIDATES_PER_QUERY, candidateQuery, edgeIdOf, type EdgeTriple } from './explore-time';
 import { sparqlIri, sparqlString } from './rdf';
 
 const P = `PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
@@ -71,8 +72,11 @@ export type Neighbour = { predicate: string; term: Term; label?: string; incomin
 export async function neighbours(
   ds: string,
   iri: string,
+  at?: string,
+  signal?: AbortSignal,
 ): Promise<{ out: Neighbour[]; inc: Neighbour[]; label?: string }> {
   const node = sparqlIri(iri);
+  const o = { ...opts, ...(at ? { at } : {}), signal };
   const [outRows, incRows] = await Promise.all([
     api.select(
       ds,
@@ -83,7 +87,7 @@ SELECT ?p ?o (SAMPLE(?l) AS ?label) WHERE {
 }
 GROUP BY ?p ?o
 LIMIT 100`,
-      opts,
+      o,
     ),
     api.select(
       ds,
@@ -94,7 +98,7 @@ SELECT ?s ?p (SAMPLE(?l) AS ?label) WHERE {
 }
 GROUP BY ?s ?p
 LIMIT 100`,
-      opts,
+      o,
     ),
   ]);
   const out = outRows
@@ -107,18 +111,48 @@ LIMIT 100`,
   return { out, inc, label };
 }
 
+/**
+ * The ids of the drawn edges of `triples` that hold in `ds` at `at` (the head by default),
+ * read as `neighbours` reads the graph, so that the answer is about the view that is drawn.
+ */
+export async function presentEdges(
+  ds: string,
+  triples: readonly EdgeTriple[],
+  at?: string,
+  signal?: AbortSignal,
+): Promise<Set<string>> {
+  const found = new Set<string>();
+  const o = { ...opts, ...(at ? { at } : {}), signal };
+  const queries: string[] = [];
+  for (let i = 0; i < triples.length; i += CANDIDATES_PER_QUERY) {
+    const q = candidateQuery(triples.slice(i, i + CANDIDATES_PER_QUERY));
+    if (q) queries.push(q);
+  }
+  const answers = await Promise.all(queries.map((q) => api.select(ds, q, o)));
+  for (const rows of answers)
+    for (const r of rows) if (r.s && r.p && r.o) found.add(edgeIdOf([r.s, r.p, r.o]));
+  return found;
+}
+
 export type Details = {
   props: { p: string; o: Term }[];
   incoming: { s: Term; p: string }[];
   incomingTotal: number;
 };
 
-export async function details(ds: string, iri: string): Promise<Details> {
+/** A resource's properties and referrers, at the state `at` names (the head by default). */
+export async function details(
+  ds: string,
+  iri: string,
+  at?: string,
+  signal?: AbortSignal,
+): Promise<Details> {
   const node = sparqlIri(iri);
+  const o = { ...opts, ...(at ? { at } : {}), signal };
   const [props, incoming, count] = await Promise.all([
-    api.select(ds, `SELECT ?p ?o WHERE { ${node} ?p ?o } LIMIT 1000`, opts),
-    api.select(ds, `SELECT ?s ?p WHERE { ?s ?p ${node} } LIMIT 200`, opts),
-    api.select(ds, `SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ${node} }`, opts),
+    api.select(ds, `SELECT ?p ?o WHERE { ${node} ?p ?o } LIMIT 1000`, o),
+    api.select(ds, `SELECT ?s ?p WHERE { ?s ?p ${node} } LIMIT 200`, o),
+    api.select(ds, `SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ${node} }`, o),
   ]);
   return {
     props: props.filter((r) => r.p && r.o).map((r) => ({ p: v(r.p)!, o: r.o! })),
@@ -255,6 +289,7 @@ export function constraintSummary(
   if (c.datatype) parts.push(`datatype ${short(c.datatype)}`);
   for (const k of c.class ?? []) parts.push(`class ${short(k)}`);
   if (c.nodeKind) parts.push(`nodeKind ${short(c.nodeKind)}`);
+  if (c.values?.length) parts.push(`in [${c.values.join(' ')}]`);
   for (const o of c.other ?? [])
     parts.push(`+${o.replace(/^.*[#/]/, '').replace(/ConstraintComponent$/, '')}`);
   return parts.length ? parts.join(' · ') : 'no constraints';
@@ -271,7 +306,7 @@ export function constraintChips(
   short: (iri: string) => string,
 ): { text: string; title: string; enforcement: api.Enforcement }[] {
   return lines
-    .filter((l) => l.constraint.path === predicate)
+    .filter((l) => l.constraint.path === predicate && !l.constraint.inverse)
     .map((l) => {
       const e = enforcementText(l.constraint.enforcement);
       return {
@@ -454,7 +489,7 @@ export function schemaFromSummary(s: api.SchemaSummary): Schema {
  */
 export async function loadSchema(
   ds: string,
-  opts: { graph?: string; reasoning?: boolean } = {},
+  opts: { graph?: string; reasoning?: boolean; at?: string; signal?: AbortSignal } = {},
 ): Promise<Schema> {
   return schemaFromSummary(await api.schema(ds, { ...opts, limit: 5000 }));
 }

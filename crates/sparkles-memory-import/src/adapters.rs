@@ -25,14 +25,19 @@ pub struct Roots {
     pub claude: PathBuf,
     /// `CODEX_HOME`, else `~/.codex`
     pub codex: PathBuf,
-    /// `~/.gemini`
+    /// `$GEMINI_CLI_HOME/.gemini`, else `~/.gemini`
     pub gemini: PathBuf,
+    /// `~/.cursor`
+    pub cursor: PathBuf,
+    /// `COPILOT_HOME`, else `~/.copilot`
+    pub copilot: PathBuf,
     /// the directory of Claude Code's managed `CLAUDE.md`
     pub managed: PathBuf,
 }
 
 impl Roots {
-    /// The roots from the environment: `HOME`, `CLAUDE_CONFIG_DIR` and `CODEX_HOME`.
+    /// The roots from the environment: `HOME`, `CLAUDE_CONFIG_DIR`, `CODEX_HOME`,
+    /// `GEMINI_CLI_HOME` and `COPILOT_HOME`.
     pub fn from_env() -> Roots {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
@@ -52,7 +57,11 @@ impl Roots {
         Roots {
             claude: var("CLAUDE_CONFIG_DIR").unwrap_or_else(|| home.join(".claude")),
             codex: var("CODEX_HOME").unwrap_or_else(|| home.join(".codex")),
-            gemini: home.join(".gemini"),
+            gemini: var("GEMINI_CLI_HOME")
+                .map(|h| h.join(".gemini"))
+                .unwrap_or_else(|| home.join(".gemini")),
+            cursor: home.join(".cursor"),
+            copilot: var("COPILOT_HOME").unwrap_or_else(|| home.join(".copilot")),
             managed,
             home,
         }
@@ -167,6 +176,8 @@ pub fn scan(req: &Request) -> Scan {
             Adapter::ClaudeCode => s.claude_code(),
             Adapter::Codex => s.codex(),
             Adapter::Generic => s.generic(),
+            // these read transcripts only, which the command line handles
+            Adapter::GeminiCli | Adapter::Cursor | Adapter::Copilot | Adapter::Aider => {}
         }
     }
     let mut areas: Vec<String> = std::mem::take(&mut s.out.areas);

@@ -409,23 +409,30 @@ pub fn write_solutions(
 // Keep prefetch preparation out of the generic serializer's row loop and stack frame.
 #[inline(never)]
 fn prefetch_answer(r: &QueryResult, n: usize) {
-    let ids = r.table.cols.iter().flat_map(|col| {
-        col[..n]
-            .iter()
-            .filter(|id| id.tag() == Tag::Vocab)
-            .map(|id| id.payload())
-    });
+    let ids = || {
+        r.table.cols.iter().flat_map(|col| {
+            col[..n.min(col.len())]
+                .iter()
+                .filter(|id| id.tag() == Tag::Vocab)
+                .map(|id| id.payload())
+        })
+    };
     let vocab = &r.ctx.snap.generation.vocab;
     if n < PREFETCH_BLOCKS_BELOW {
+        // A warm answer's blocks were all asked for before: one bit test per term then
+        // replaces collecting, sorting and filtering them (spec X07 §9, gate 4).
+        if vocab.prefetch_would_skip(ids()) {
+            return;
+        }
         // A few hundred terms are cheap to sort, and asking for just their blocks reads
         // far less than whole sparse-index groups. A cold 35-row star lookup at 1.05M
         // made 93 page faults here one after another, which was most of its time.
-        let mut ids: Vec<u64> = ids.collect();
+        let mut ids: Vec<u64> = ids().collect();
         ids.sort_unstable();
         ids.dedup();
         vocab.prefetch_sorted(&ids);
     } else {
-        vocab.prefetch_terms(ids);
+        vocab.prefetch_terms(ids());
     }
 }
 
@@ -605,6 +612,9 @@ pub fn write_jena_graph(
 pub struct NativeJsonMetadata<'a> {
     pub commit: u64,
     pub dataset_id: &'a str,
+    /// the request asked for the I/O profile (`profile=io`): its report goes into the
+    /// metadata, written after the rows
+    pub io: Option<&'a crate::ioacct::Profile>,
 }
 
 /// Write the rich native result without building an intermediate JSON document.
@@ -651,6 +661,8 @@ pub fn write_cursor_native_json(
         commit: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         dataset_id: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        io: Option<crate::ioacct::IoReport>,
     }
     fn json(w: &mut impl Write, v: &impl Serialize) -> Result<()> {
         serde_json::to_writer(w, v).map_err(|e| Error::Io(e.into()))
@@ -722,10 +734,12 @@ pub fn write_cursor_native_json(
                     plan: cursor.plan(),
                     memory: NativeMemory {
                         peak_bytes: stats.mem_peak_bytes,
+                        granted_bytes: stats.granted_bytes,
                     },
                     rows_produced: stats.rows_produced,
                     commit: metadata.as_ref().map(|m| m.commit),
                     dataset_id: metadata.as_ref().map(|m| m.dataset_id),
+                    io: metadata.as_ref().and_then(|m| m.io).map(|p| p.report()),
                 },
             )
         })?;
@@ -790,9 +804,12 @@ pub fn write_cursor_graph_native_json(
         serde_json::to_writer(&mut writer, &stats.timing).map_err(|e| Error::Io(e.into()))?;
         writer.write_all(b",\"plan\":")?;
         serde_json::to_writer(&mut writer, cursor.plan()).map_err(|e| Error::Io(e.into()))?;
+        let granted = stats
+            .granted_bytes
+            .map_or(String::new(), |g| format!(",\"grantedBytes\":{g}"));
         write!(
             writer,
-            ",\"memory\":{{\"peakBytes\":{}}},\"rowsProduced\":{},\"describeTruncated\":{}",
+            ",\"memory\":{{\"peakBytes\":{}{granted}}},\"rowsProduced\":{},\"describeTruncated\":{}",
             stats.mem_peak_bytes,
             stats.rows_produced,
             cursor.describe_truncated()
@@ -800,6 +817,10 @@ pub fn write_cursor_graph_native_json(
         if let Some(meta) = metadata {
             write!(writer, ",\"commit\":{},\"datasetId\":", meta.commit)?;
             serde_json::to_writer(&mut writer, meta.dataset_id).map_err(|e| Error::Io(e.into()))?;
+            if let Some(p) = meta.io {
+                writer.write_all(b",\"io\":")?;
+                serde_json::to_writer(&mut writer, &p.report()).map_err(|e| Error::Io(e.into()))?;
+            }
         }
         writer.write_all(b"}}")?;
         Ok(stats)
@@ -905,10 +926,16 @@ impl Serialize for NativeJson<'_> {
                 plan: &r.plan,
                 memory: NativeMemory {
                     peak_bytes: r.mem_peak_bytes,
+                    granted_bytes: r.ctx.grant().map(|g| g.peak()),
                 },
                 rows_produced: r.rows_produced,
                 commit: self.metadata.as_ref().map(|m| m.commit),
                 dataset_id: self.metadata.as_ref().map(|m| m.dataset_id),
+                io: self
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.io)
+                    .map(|p| p.report()),
             },
         )?;
         map.end()
@@ -928,12 +955,17 @@ struct NativeMeta<'a> {
     commit: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     dataset_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    io: Option<crate::ioacct::IoReport>,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct NativeMemory {
     peak_bytes: u64,
+    /// the most the query held of the server's memory pool
+    #[serde(skip_serializing_if = "Option::is_none")]
+    granted_bytes: Option<u64>,
 }
 
 struct NativeRows<'a> {
@@ -944,6 +976,12 @@ struct NativeRows<'a> {
 impl Serialize for NativeRows<'_> {
     fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
         let mut seq = s.serialize_seq(Some(self.n))?;
+        // the terms of a small answer lie on scattered vocabulary pages: overlap their
+        // cold reads as the other result writers do
+        let ahead = self.n.min(DECODE_ROWS).min(self.r.table.len());
+        if ahead >= 2 && crate::index::io_hints() {
+            prefetch_answer(self.r, ahead);
+        }
         for i in 0..self.n {
             seq.serialize_element(&NativeRow { r: self.r, i })?;
         }
@@ -1185,6 +1223,11 @@ pub fn sparkles_json(r: &QueryResult, send: Option<usize>) -> J {
             }
         }
     }
+    let mut memory = json!({ "peakBytes": r.mem_peak_bytes });
+    // the most the query held of the server's memory pool
+    if let Some(g) = r.ctx.grant() {
+        memory["grantedBytes"] = json!(g.peak());
+    }
     out.insert(
         "meta".into(),
         json!({
@@ -1192,7 +1235,7 @@ pub fn sparkles_json(r: &QueryResult, send: Option<usize>) -> J {
             "sentRows": n,
             "timing": r.timing,
             "plan": r.plan,
-            "memory": { "peakBytes": r.mem_peak_bytes },
+            "memory": memory,
             "rowsProduced": r.rows_produced,
         }),
     );

@@ -37,6 +37,8 @@ mod data;
 pub mod guard;
 pub mod incremental;
 mod localize;
+mod nodeeval;
+pub mod nodeexpr;
 pub mod path;
 pub mod report;
 pub mod shapes;
@@ -45,6 +47,8 @@ pub mod syntax;
 mod validate;
 pub mod vocab;
 
+pub use nodeeval::{eval_expression, eval_expression_in_graph};
+pub use nodeexpr::ExprId;
 pub use path::PropertyPath;
 pub use report::{ValidationReport, ValidationResult};
 pub use shapes::{Constraint, NodeKind, Shape, Shapes, Target};
@@ -54,3 +58,17 @@ pub use validate::{TooManyResults, ValidateOptions, validate, validate_node};
 
 /// Lexical validity of an XSD literal (as used by `sh:datatype`; see [`sparkles_core::xsd`]).
 pub use sparkles_core::xsd::is_valid as is_valid_literal;
+
+/// A node expression could not be evaluated (the draft's *evaluation failure*): an
+/// argument that gave several nodes where one is allowed, an arithmetic error in
+/// `shnex:sum`, a class that is not an IRI, or functions that call themselves too deep.
+#[derive(Debug)]
+pub struct ExprFailure(pub String);
+
+impl std::fmt::Display for ExprFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "node expression failure: {}", self.0)
+    }
+}
+
+impl std::error::Error for ExprFailure {}

@@ -1,6 +1,6 @@
 //! HTTP layer: SPARQL 1.1 Protocol, Graph Store Protocol, Fuseki `/$/` admin API.
 
-use crate::auth::{Level, Principal};
+use crate::auth::{Level, Principal, ServerPerm};
 use crate::obs::{CancelOnDrop, Op, Outcome, RequestReport};
 use crate::state::{AppState, Dataset, DbType, now, uptime_secs};
 use axum::body::Bytes;
@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
+mod algo;
 pub(crate) mod branches;
 mod budgets;
 mod changes;
@@ -48,8 +49,10 @@ pub(crate) mod schema;
 pub(crate) use schema::constraints::ShapesRequest;
 pub(crate) mod sd;
 mod shex;
+mod sparql_diff;
 mod stream;
 mod tabular;
+mod timeline;
 mod validation;
 
 pub use sparkles::reasoning::INFERRED_GRAPH;
@@ -103,6 +106,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/$/openapi.yaml", get(crate::openapi::serve_yaml))
         .merge(crate::auth::routes())
         .route("/$/server", get(server_info).post(server_info))
+        .route("/$/server/memory", get(server_memory))
         .route("/$/metrics", get(crate::obs::metrics_endpoint))
         .route("/$/ready", get(crate::obs::ready_endpoint))
         .route("/$/ready/{ds}", get(crate::obs::ready_dataset))
@@ -149,6 +153,27 @@ pub fn router(state: Arc<AppState>) -> Router {
                 .put(budgets::put_quota)
                 .delete(budgets::delete_quota),
         )
+        // Body-aware run admission wraps this route's restore guard, and only this
+        // route pays for it (the global restore guard skips it, see `ALGO_RUN`).
+        .route(
+            "/$/algo/{ds}/run",
+            post(algo::run)
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    restoring_guard,
+                ))
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    algo::admit_run,
+                )),
+        )
+        .route("/$/algo/{ds}/projections", get(algo::list))
+        .route(
+            "/$/algo/{ds}/projections/{name}",
+            get(algo::get_one)
+                .put(algo::put_one)
+                .delete(algo::delete_one),
+        )
         .route("/$/queries/{ds}", get(queries::list))
         .route(
             "/$/queries/{ds}/{name}",
@@ -159,6 +184,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/$/queries/{ds}/{name}/versions", get(queries::versions))
         .route("/{ds}/queries/{name}", get(queries::run).post(queries::run))
         .route("/$/commits/{ds}", get(list_commits))
+        .route("/$/commits/{ds}/timeline", get(timeline::timeline))
         .route("/$/commits/{ds}/{reference}", get(get_commit))
         .route(
             "/$/branches/{ds}",
@@ -189,6 +215,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/{ds}", any(dataset_root))
         .route("/{ds}/sparql", any(query_endpoint))
         .route("/{ds}/query", any(query_endpoint))
+        .route("/{ds}/sparql/diff", post(sparql_diff::sparql_diff))
         .route("/{ds}/update", post(update_endpoint))
         .route("/{ds}/data", any(gsp))
         .route("/{ds}/get", get(gsp).head(gsp))
@@ -294,7 +321,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         // hidden dataset stays a 404)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
-            restoring_guard,
+            global_restoring_guard,
         ))
         .layer(axum::middleware::from_fn(error_request_id))
         // for extractors without a ceiling of their own (see `limited_body!`)
@@ -312,6 +339,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         ))
         .layer(tower_http::decompression::RequestDecompressionLayer::new())
         .layer(axum::middleware::from_fn(crate::compress::mark_encoded));
+    // admission to the query memory pool, inside the rate limiter so that its
+    // concurrency caps answer first
+    let app = app.layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        crate::server_memory::admit,
+    ));
     // inside `observe` (limited requests are logged and counted) and CORS (browsers
     // can read the 429); inside the auth layer, which puts the principal in the request
     let app = match &state.rate_limit {
@@ -389,6 +422,9 @@ impl IntoResponse for ApiError {
             .and_then(|b| BudgetKind::ALL.into_iter().find(|k| k.as_str() == b));
         let outcome = match self.0 {
             StatusCode::REQUEST_TIMEOUT => Some(Outcome::Timeout),
+            StatusCode::SERVICE_UNAVAILABLE if budget == Some(BudgetKind::ServerMemory) => {
+                Some(Outcome::Budget)
+            }
             StatusCode::SERVICE_UNAVAILABLE => Some(Outcome::Cancelled),
             StatusCode::INSUFFICIENT_STORAGE if budget.is_some() => Some(Outcome::Budget),
             _ => None,
@@ -414,6 +450,10 @@ impl IntoResponse for ApiError {
         if let Some(t) = turtle.as_ref().and_then(J::as_str) {
             resp.extensions_mut()
                 .insert(validation::RejectionTurtle(t.to_string()));
+        }
+        if budget == Some(BudgetKind::ServerMemory) {
+            resp.headers_mut()
+                .insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
         }
         resp.extensions_mut().insert(ErrorJson(body));
         resp
@@ -459,6 +499,13 @@ async fn error_request_id(req: axum::extract::Request, next: axum::middleware::N
         .and_then(|v| v.to_str().ok())
         .is_some_and(|a| a.contains("text/turtle"));
     let mut resp = next.run(req).await;
+    finalize_error_response(&mut resp, id, turtle);
+    resp
+}
+
+/// Finalize error bodies before a body-owned admission permit is installed. Once
+/// consumed, the markers make later outer formatting calls leave that body intact.
+fn finalize_error_response(resp: &mut Response, id: Option<String>, turtle: bool) {
     if let Some(validation::RejectionTurtle(t)) = resp.extensions_mut().remove()
         && turtle
     {
@@ -470,10 +517,28 @@ async fn error_request_id(req: axum::extract::Request, next: axum::middleware::N
         resp.headers_mut()
             .insert(header::CONTENT_LENGTH, t.len().into());
         *resp.body_mut() = axum::body::Body::from(t);
-        return resp;
+        return;
     }
-    add_request_id(&mut resp, id);
-    resp
+    add_request_id(resp, id);
+}
+
+/// The route of graph algorithm runs, which has its own admission and restore guard.
+const ALGO_RUN: &str = "/$/algo/{ds}/run";
+
+/// [`restoring_guard`] for every route but [`ALGO_RUN`], which has its own.
+async fn global_restoring_guard(
+    st: St,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if req
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .is_some_and(|m| m.as_str() == ALGO_RUN)
+    {
+        return next.run(req).await;
+    }
+    restoring_guard(st, req, next).await
 }
 
 /// Answer `503` with `Retry-After: 5` to any request whose `{ds}` is being replaced in
@@ -502,6 +567,8 @@ async fn restoring_guard(
     {
         return next.run(req).await;
     }
+    #[cfg(test)]
+    algo::probe::event(req.extensions(), "restore");
     let checked = st
         .catalog
         .get_for_request(&ds)
@@ -578,8 +645,14 @@ impl From<Error> for ApiError {
             Error::BudgetExceeded(b) if b.kind == BudgetKind::DecompressedBytes => {
                 StatusCode::PAYLOAD_TOO_LARGE
             }
+            // the server's query memory is in use: a retry can succeed
+            Error::BudgetExceeded(b) if b.kind == BudgetKind::ServerMemory => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             Error::BudgetExceeded(_) => StatusCode::INSUFFICIENT_STORAGE,
-            Error::Poisoned | Error::TextUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            Error::Poisoned | Error::WriterBusy | Error::TextUnavailable(_) => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             Error::Service(_) => StatusCode::BAD_GATEWAY,
             Error::NotPermitted(_) => StatusCode::FORBIDDEN,
             Error::StorageFull(_) => StatusCode::INSUFFICIENT_STORAGE,
@@ -687,8 +760,16 @@ pub(crate) async fn blocking<T: Send + 'static>(
 ) -> ApiResult<T> {
     let span = tracing::Span::current();
     let held = crate::ratelimit::hold();
+    #[cfg(test)]
+    let probe = algo::probe::current();
     tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _completion = probe.blocking.clone().map(algo::probe::Completion);
         let _held = held;
+        #[cfg(test)]
+        if let Some(gate) = probe.blocking {
+            gate.wait();
+        }
         span.in_scope(f)
     })
     .await
@@ -1029,6 +1110,8 @@ fn query_options(st: &AppState, ds: &Dataset, params: &Params) -> QueryOptions {
         timeout: Some(timeout_param(st, params)),
         max_rows: Some(st.limits.max_rows),
         max_memory_bytes: st.limits.query_memory_bytes,
+        // the grant the request was admitted with, if the server has a memory pool
+        grant: crate::server_memory::current_grant(),
         max_rows_produced: st.limits.max_rows_produced,
         no_cache: params.get("nocache").is_some_and(truthy),
         default_graph_uris: params.all("default-graph-uri"),
@@ -1183,6 +1266,7 @@ pub(crate) async fn run_query(
     query: String,
     bindings: Vec<(String, oxrdf::Term)>,
 ) -> ApiResult {
+    let io = io_profile(&params, &p)?;
     let execution = match params.get("execution") {
         None | Some("eager") => sparkles::sparql::ExecutionMode::Eager,
         Some("streaming") => sparkles::sparql::ExecutionMode::Streaming,
@@ -1203,6 +1287,10 @@ pub(crate) async fn run_query(
     // a client that disconnects drops this future: the flag stops the query at its
     // next check
     let (cancel, _cancel_on_drop) = cancel_on_drop();
+    #[cfg(test)]
+    {
+        *algo::probe::current().cancel.lock() = Some(cancel.clone());
+    }
     opts.cancel = Some(cancel);
     let limit = asked.result_limit(st.limits.max_result_bytes);
     let sfmt = solutions_format(&params, &headers);
@@ -1227,6 +1315,7 @@ pub(crate) async fn run_query(
                 native_graph,
                 execution,
                 prefixes,
+                io,
             },
         )
         .await;
@@ -1351,6 +1440,7 @@ pub(crate) async fn run_query(
                 &prefixes,
                 seq,
                 &dataset_id,
+                io.as_deref(),
             )
         };
         // phase spans once serialization has ended (the request span is current here)
@@ -1412,6 +1502,29 @@ pub(crate) async fn run_query(
     Ok(report.attach(resp))
 }
 
+/// The I/O profile a request asked for with `profile=io`, started before the query is
+/// parsed so that it covers the resolution of the query's constants. The profile counts the
+/// reads of the whole process, so only a caller with the `metrics` permission may ask for it
+/// (without authentication everyone has it), and any other value is refused. An eager
+/// response drops the profile once its metadata is written, and a streaming one keeps it
+/// until the body ends.
+pub(crate) fn io_profile(
+    params: &Params,
+    p: &Principal,
+) -> ApiResult<Option<Arc<sparkles::ioacct::Profile>>> {
+    match params.get("profile") {
+        None => Ok(None),
+        Some("io") if p.has(crate::auth::ServerPerm::Metrics) => {
+            Ok(Some(Arc::new(sparkles::ioacct::Profile::start())))
+        }
+        Some("io") => Err(err(
+            StatusCode::FORBIDDEN,
+            "profile=io requires the metrics permission",
+        )),
+        Some(_) => Err(err(StatusCode::BAD_REQUEST, "profile must be io")),
+    }
+}
+
 /// Query texts whose last run was quick (see `inline`).
 static QUICK: std::sync::LazyLock<inline::QuickQueries> =
     std::sync::LazyLock::new(Default::default);
@@ -1429,6 +1542,7 @@ fn serialize_result(
     prefixes: &std::collections::BTreeMap<String, String>,
     seq: u64,
     dataset_id: &str,
+    io: Option<&sparkles::ioacct::Profile>,
 ) -> sparkles::Result<()> {
     if sparkles_doc {
         results::write_native_json(
@@ -1438,6 +1552,7 @@ fn serialize_result(
             Some(results::NativeJsonMetadata {
                 commit: seq,
                 dataset_id,
+                io,
             }),
         )
     } else if is_graph {
@@ -2042,6 +2157,10 @@ async fn update_endpoint(
         max_rows: Some(st.limits.max_rows),
         max_memory_bytes: st.limits.query_memory_bytes,
         max_rows_produced: st.limits.max_rows_produced,
+        // the grant the request was admitted with. The dataset's pool serves a server
+        // where admission did not run
+        grant: crate::server_memory::current_grant(),
+        pool: ds.dataset.query_options().pool,
         ..Default::default()
     };
     budgets::Overrides::parse(&params)?.apply(&mut opts);
@@ -3415,6 +3534,10 @@ pub(crate) fn redact_dataset_info(info: &mut J) {
     }
 }
 
+/// What a caller that is not a server administrator reads as the reason a dataset is
+/// refused, since the full message names the data directory.
+const REFUSED_REASON_REDACTED: &str = "this release does not read the dataset's files; a server administrator can see why in the server log or in GET /$/server";
+
 /// `GET /$/server`; anonymous callers (with auth) do not get the version and limits.
 async fn server_info(State(st): St, Extension(p): Extension<Principal>) -> Json<J> {
     let mut doc = json!({
@@ -3432,8 +3555,38 @@ async fn server_info(State(st): St, Extension(p): Extension<Principal>) -> Json<
     if !p.is_anonymous() {
         doc["version"] = env!("CARGO_PKG_VERSION").into();
         doc["limits"] = st.limits.json(st.default_timeout);
+        // the file versions this build writes and reads, so an operator can see which
+        // databases it opens
+        doc["formats"] = sparkles::formats::report();
+        // A refused dataset is listed like a served one, to the callers that may read
+        // it. The reason names paths, so only a server administrator gets it whole. A
+        // server without auth answers as the local principal, which administers it.
+        let admin = p.has(ServerPerm::ServerAdmin);
+        let refused: Vec<J> = st
+            .catalog
+            .refused()
+            .into_iter()
+            .filter(|(name, _)| admin || p.level_any_branch(name).is_some_and(|l| l >= Level::Read))
+            .map(|(name, reason)| {
+                let reason = if admin {
+                    reason
+                } else {
+                    REFUSED_REASON_REDACTED.to_string()
+                };
+                json!({ "name": name, "reason": reason })
+            })
+            .collect();
+        if !refused.is_empty() {
+            doc["refusedDatasets"] = refused.into();
+        }
     }
     Json(doc)
+}
+
+/// `GET /$/server/memory`: the query memory pool, the shared caches and their bytes per
+/// dataset (permission `metrics`).
+async fn server_memory(State(st): St) -> Json<J> {
+    Json(crate::server_memory::report(&st))
 }
 
 async fn list_datasets(State(st): St, Extension(p): Extension<Principal>) -> Json<J> {
@@ -3481,7 +3634,7 @@ async fn create_dataset(
     let (name, kind, geo, text) = if let Some(format) = assembler {
         let server = fuseki::assembler::Server {
             union_default_graph: st.store_opts.union_default_graph,
-            gsp_direct_naming: st.gsp_direct_naming,
+            gsp_direct_naming: &st.gsp_direct_naming,
         };
         let spec = fuseki::assembler::parse(&body, format, &server)
             .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
@@ -4899,6 +5052,8 @@ mod obs_tests;
 #[cfg(test)]
 mod patch_tests;
 #[cfg(test)]
+mod pool_tests;
+#[cfg(test)]
 mod router_tests;
 #[cfg(all(test, feature = "text"))]
 mod text_tests;
@@ -5004,6 +5159,31 @@ mod spool_tests {
 #[cfg(test)]
 mod tests {
     use super::{negotiate, syntax_error_body};
+
+    #[test]
+    fn writer_busy_maps_to_service_unavailable() {
+        use super::{ApiError, Error, StatusCode};
+
+        let busy = ApiError::from(Error::WriterBusy);
+        assert_eq!(busy.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            busy.1,
+            serde_json::json!({"error": "another write is in progress"})
+        );
+        for (error, expected) in [
+            (
+                Error::PreconditionFailed("changed".into()),
+                StatusCode::PRECONDITION_FAILED,
+            ),
+            (
+                Error::NotPermitted("protected".into()),
+                StatusCode::FORBIDDEN,
+            ),
+            (Error::Poisoned, StatusCode::SERVICE_UNAVAILABLE),
+        ] {
+            assert_eq!(ApiError::from(error).0, expected);
+        }
+    }
 
     #[test]
     fn syntax_errors() {

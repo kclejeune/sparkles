@@ -322,3 +322,32 @@ fn a_clone_cancelled_during_its_text_build_leaves_nothing() {
     );
     assert!(!dst.exists());
 }
+
+/// A clone that shares the source's generation reads its `meta.json` version first, so a
+/// newer meta in another shape is refused as newer, not reported as damaged.
+#[test]
+fn a_shared_generation_with_a_newer_meta_is_unsupported() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = Store::open(&dir.path().join("src"), StoreOptions::default()).unwrap();
+    s.load(&[Source::from_bytes(
+        TRIG.as_bytes().to_vec(),
+        RdfFormat::TriG,
+        None,
+    )])
+    .unwrap();
+    assert!(s.snapshot().delta.is_empty());
+    let current = std::fs::read_to_string(dir.path().join("src/CURRENT")).unwrap();
+    let meta = dir
+        .path()
+        .join("src")
+        .join(current.trim())
+        .join("meta.json");
+    let mut v: serde_json::Value = serde_json::from_slice(&std::fs::read(&meta).unwrap()).unwrap();
+    v["format_version"] = 3.into();
+    v.as_object_mut().unwrap().remove("created");
+    std::fs::write(&meta, serde_json::to_vec(&v).unwrap()).unwrap();
+    match s.clone_to(&dir.path().join("dst"), &CloneOptions::default()) {
+        Err(sparkles_core::error::Error::Unsupported(_)) => {}
+        other => panic!("{:?}", other.map(|_| ())),
+    }
+}

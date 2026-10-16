@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { draftShapesPath, type DraftShape, type ShapesDraft } from './api';
-import { draftText, exclusions, parseSupport, summaryLine } from './shapes-draft';
+import { draftText, exclusions, parseSupport, pathLabel, summaryLine } from './shapes-draft';
 
 const shape = (over: Partial<DraftShape> = {}): DraftShape => ({
   shape: 'urn:x-sparkles:shape:t:PersonShape',
@@ -30,7 +30,7 @@ const shape = (over: Partial<DraftShape> = {}): DraftShape => ({
 });
 
 const draft = (shapes: DraftShape[]): ShapesDraft => ({
-  draftFormat: 1,
+  draftFormat: 2,
   dataset: 't',
   snapshot: { version: 1, generation: 'mem', computedAt: '2026-10-02T00:00:00Z' },
   selection: { graph: 'default', reasoning: false },
@@ -38,6 +38,7 @@ const draft = (shapes: DraftShape[]): ShapesDraft => ({
     support: 0.5,
     minInstances: 1,
     maxIn: 10,
+    maxInverse: 10,
     maxCount: 1,
     closed: false,
     base: 'urn:x-sparkles:shape:t:',
@@ -112,5 +113,14 @@ describe('draftShapesPath', () => {
       '/$/schema/my%20ds/shapes?support=0.9&closed=true&graph=http%3A%2F%2Fex.org%2Fg&class=http%3A%2F%2Fex.org%2FA',
     );
     expect(draftShapesPath('t', { support: 1, graph: 'default' })).toBe('/$/schema/t/shapes');
+  });
+});
+
+describe('pathLabel', () => {
+  it('marks inverse paths and sequences', () => {
+    const p = { path: 'ex:p', instances: 1, maxValues: 1, constraints: [], rejected: [] };
+    expect(pathLabel(p)).toBe('ex:p');
+    expect(pathLabel({ ...p, inverse: true })).toBe('^ex:p');
+    expect(pathLabel({ ...p, then: 'ex:q' })).toBe('ex:p/ex:q');
   });
 });

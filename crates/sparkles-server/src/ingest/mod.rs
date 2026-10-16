@@ -3,7 +3,8 @@
 //!
 //! - [`convert`] turns Markdown, HTML and PDF into the text of a rendition (§7.1), with
 //!   PDF through pdf-inspector behind the `pdf` feature and OCR behind `pdf-ocr`
-//!   (§7.1.1).
+//!   (§7.1.1), and Word, PowerPoint and OpenDocument files through `sparkles-office`
+//!   behind `office`; spreadsheets are mapped sheet by sheet (§7.8).
 //! - [`pipeline`] runs one ingestion as its caller: conversion, `register_source` on the
 //!   review branch, the cost estimate and its confirmation (§7.9), extraction through the
 //!   `extract` role with escalation along its list (§7.4), linking (§7.5) and
@@ -22,7 +23,12 @@ mod csv;
 mod extract;
 mod html;
 pub mod http;
+#[cfg(any(feature = "pdf", feature = "office"))]
+pub mod isolate;
+mod link;
 pub mod maintain;
+#[cfg(feature = "office")]
+pub(crate) mod office;
 #[cfg(feature = "pdf")]
 mod pdf;
 pub mod pipeline;
@@ -54,15 +60,37 @@ pub const MAX_TASKS: usize = 500;
 /// The most tasks that may be active at once.
 pub const MAX_ACTIVE: usize = 32;
 
+/// The default `--convert-memory`, in MiB.
+pub const DEFAULT_CONVERT_MEMORY_MIB: u64 = 2048;
+
 /// `serve` flags of ingestion.
-#[derive(clap::Args, Clone, Debug, Default)]
+#[derive(clap::Args, Clone, Debug)]
 pub struct IngestServeArgs {
-    /// How many PDF conversions may run at once; a conversion that overruns its
-    /// deadline keeps its slot until it ends (spec C18 §7.1.1)
+    /// How many PDF and Office conversions may run at once (spec C18 §7.1.1)
     #[arg(long, value_name = "N", default_value_t = DEFAULT_PDF_WORKERS)]
     pub pdf_workers: usize,
+    /// The address-space limit of each PDF or Office conversion's child process on Linux,
+    /// in MiB (at least 256; give at least 4096 with OCR)
+    #[arg(long, value_name = "MIB", default_value_t = DEFAULT_CONVERT_MEMORY_MIB)]
+    pub convert_memory: u64,
+    /// Convert PDF and Office files on threads of the server instead of in child
+    /// processes; a conversion that overruns its deadline then keeps its slot until it
+    /// ends, and its memory is bounded only by the converters' own limits
+    #[arg(long)]
+    pub convert_in_process: bool,
     #[command(flatten)]
     pub ocr: OcrArgs,
+}
+
+impl Default for IngestServeArgs {
+    fn default() -> IngestServeArgs {
+        IngestServeArgs {
+            pdf_workers: DEFAULT_PDF_WORKERS,
+            convert_memory: DEFAULT_CONVERT_MEMORY_MIB,
+            convert_in_process: false,
+            ocr: OcrArgs::default(),
+        }
+    }
 }
 
 /// The OCR flags of `serve` and `sparkles ingest` (feature `pdf-ocr`).
@@ -133,13 +161,19 @@ pub struct PdfRuntime {
     used: Mutex<usize>,
     cv: Condvar,
     ocr: Option<OcrConfig>,
+    /// the child processes that conversions run in, when the binary provides them
+    #[cfg(any(feature = "pdf", feature = "office"))]
+    isolation: Option<isolate::Isolation>,
+    /// why conversions are refused: the child processes could not start safely
+    #[cfg(any(feature = "pdf", feature = "office"))]
+    broken: Option<String>,
 }
 
-/// One running PDF conversion's worker slot.
-#[cfg(feature = "pdf")]
+/// One running PDF or Office conversion's worker slot.
+#[cfg(any(feature = "pdf", feature = "office"))]
 pub struct PdfSlot(Arc<PdfRuntime>);
 
-#[cfg(feature = "pdf")]
+#[cfg(any(feature = "pdf", feature = "office"))]
 impl Drop for PdfSlot {
     fn drop(&mut self) {
         *self.0.used.lock() -= 1;
@@ -154,11 +188,56 @@ impl PdfRuntime {
             used: Mutex::new(0),
             cv: Condvar::new(),
             ocr,
+            #[cfg(any(feature = "pdf", feature = "office"))]
+            isolation: None,
+            #[cfg(any(feature = "pdf", feature = "office"))]
+            broken: None,
         }
     }
 
+    /// Run conversions in child processes as `iso` says.
+    #[cfg(any(feature = "pdf", feature = "office"))]
+    pub fn with_isolation(mut self, iso: Option<isolate::Isolation>) -> PdfRuntime {
+        self.isolation = iso;
+        self
+    }
+
+    #[cfg(any(feature = "pdf", feature = "office"))]
+    pub fn isolation(&self) -> Option<&isolate::Isolation> {
+        self.isolation.as_ref()
+    }
+
+    /// Refuse every conversion with `why`, because its child process cannot start safely.
+    #[cfg(any(feature = "pdf", feature = "office"))]
+    pub fn with_broken(mut self, why: Option<String>) -> PdfRuntime {
+        self.broken = why;
+        self
+    }
+
+    /// The refusal of a conversion when the child processes cannot start safely.
+    #[cfg(any(feature = "pdf", feature = "office"))]
+    pub fn child_refusal(&self) -> Option<convert::Refusal> {
+        self.broken.as_ref().map(|why| {
+            convert::Refusal::new(
+                "conversion-failed",
+                500,
+                format!(
+                    "this server cannot convert PDF and Office files: its conversion child \
+                     could not start safely ({why}); restart it with --convert-in-process to \
+                     convert on threads without the child's limits"
+                ),
+            )
+        })
+    }
+
+    /// The OCR configuration, which a conversion child is given.
+    #[cfg(any(feature = "pdf", feature = "office"))]
+    pub fn ocr_config(&self) -> Option<&OcrConfig> {
+        self.ocr.as_ref()
+    }
+
     /// A worker slot, waiting until `deadline` for one.
-    #[cfg(feature = "pdf")]
+    #[cfg(any(feature = "pdf", feature = "office"))]
     pub fn acquire(this: &Arc<PdfRuntime>, deadline: Instant) -> Option<PdfSlot> {
         let mut used = this.used.lock();
         while *used >= this.max {
@@ -175,9 +254,9 @@ impl PdfRuntime {
         self.ocr.as_ref()
     }
 
-    /// Whether this server converts PDFs, and reads scanned pages by OCR.
+    /// Whether this server converts PDFs and Office documents, and reads scanned pages by OCR.
     pub fn capabilities(&self) -> Value {
-        json!({ "pdf": cfg!(feature = "pdf"), "ocr": self.ocr.is_some() })
+        json!({ "pdf": cfg!(feature = "pdf"), "ocr": self.ocr.is_some(), "office": cfg!(feature = "office") })
     }
 }
 
@@ -430,10 +509,41 @@ pub struct Runtime {
     pub review: crate::mcp::memory::pending::Registry,
 }
 
+/// The PDF workers of `args`, with child processes when the binary provides them and
+/// `--convert-in-process` is not given.
+/// The PDF workers of `args`, with child processes when the binary provides them, the
+/// platform is Linux and `--convert-in-process` is not given. A child is started once
+/// here to check that it can set its limits. When it cannot, conversions are refused
+/// with an error that names the reason, rather than run without the limits.
+fn pdf_runtime(args: &IngestServeArgs) -> PdfRuntime {
+    let rt = PdfRuntime::new(args.pdf_workers, args.ocr.config());
+    #[cfg(any(feature = "pdf", feature = "office"))]
+    let rt = {
+        // RLIMIT_AS is enforced on Linux only: macOS accepts it and does not apply it
+        let iso = isolate::child_exe()
+            .filter(|_| !args.convert_in_process && cfg!(target_os = "linux"))
+            .map(|exe| isolate::Isolation {
+                exe,
+                // below this the binary itself cannot start its threads
+                memory: args.convert_memory.max(256).saturating_mul(1 << 20),
+                prefix: Vec::new(),
+            });
+        let broken = iso.as_ref().and_then(|i| isolate::probe(i).err());
+        if let Some(why) = &broken {
+            tracing::error!(
+                "PDF and Office conversions are refused: the conversion child could not start \
+                 safely ({why}); --convert-in-process converts on threads instead"
+            );
+        }
+        rt.with_isolation(iso).with_broken(broken)
+    };
+    rt
+}
+
 impl Runtime {
     pub fn new(args: &IngestServeArgs) -> Runtime {
         Runtime {
-            pdf: Arc::new(PdfRuntime::new(args.pdf_workers, args.ocr.config())),
+            pdf: Arc::new(pdf_runtime(args)),
             tasks: Mutex::default(),
             review: Default::default(),
         }

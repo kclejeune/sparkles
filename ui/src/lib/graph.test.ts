@@ -61,4 +61,25 @@ describe('triplesToGraph', () => {
     expect(node.id).toBe('<<( <http://ex.org/a> <http://ex.org/p> <http://ex.org/b> )>>');
     expect(node.label).toBe('<<triple>>');
   });
+
+  it('marks edges and nodes that a later state added or removed', () => {
+    const triples: Triple[] = [
+      [u('alice'), u('knows'), u('bob')],
+      [u('alice'), u('knows'), u('carol')],
+      [u('alice'), u('name'), lit('Alice')],
+    ];
+    const g = triplesToGraph(triples, WELL_KNOWN, { marks: ['removed', 'added', 'kept'] });
+    expect(g.edges.map((e) => e.change)).toEqual(['removed', 'added', 'kept']);
+    const by = (l: string) => g.nodes.find((n) => n.label === l)?.change;
+    expect(by('bob')).toBe('removed');
+    expect(by('carol')).toBe('added');
+    // alice is in a kept triple, so she is neither
+    expect(by('alice')).toBe('kept');
+  });
+
+  it('leaves the changes out without marks', () => {
+    const g = triplesToGraph([[u('a'), u('p'), u('b')]], WELL_KNOWN);
+    expect(g.nodes[0].change).toBeUndefined();
+    expect(g.edges[0].change).toBeUndefined();
+  });
 });

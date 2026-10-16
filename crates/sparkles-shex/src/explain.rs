@@ -79,6 +79,9 @@ impl Explainer<'_, '_, '_> {
                     }
                 }
             }
+            Se::Or(xs) if xs.is_empty() => self.push(ShexFailure::NoMatch {
+                detail: "the shape is abstract and no shape that extends it matches".to_string(),
+            }),
             Se::Or(xs) => {
                 for &x in xs {
                     self.se(x, node, w)?;
@@ -124,6 +127,14 @@ impl Explainer<'_, '_, '_> {
     fn shape(&mut self, sid: ShapeId, node: Id, w: &mut Worker<'_>) -> anyhow::Result<()> {
         let env = self.env;
         let shape = &env.ir.shapes[sid.index()];
+        if shape.ext.is_some() {
+            self.push(ShexFailure::NoMatch {
+                detail: "no way of dividing the arcs between the shape and the shapes it \
+                         extends satisfies them all"
+                    .to_string(),
+            });
+            return Ok(());
+        }
         let mut neigh = std::mem::take(&mut self.neigh);
         neigh::fetch_all(env.data, &env.plan, node, sid, &mut neigh)?;
         let before = self.out.len();

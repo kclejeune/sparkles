@@ -7,6 +7,7 @@
 
 import { randomUUID } from 'node:crypto';
 import ox from 'oxigraph';
+import { pastView, resolveAt } from './history.mjs';
 
 const RDF = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#';
 const RDFS = 'http://www.w3.org/2000/01/rdf-schema#';
@@ -420,7 +421,16 @@ const matchesPattern = (pattern, g) =>
   pattern.endsWith('*') ? g.startsWith(pattern.slice(0, -1)) : g === pattern;
 
 /** `POST /{ds}/recall`. */
-function recall(ds, body) {
+function recall(live, body) {
+  // a past state (`at` or `atCommit`): the same recall over the store of that commit
+  let ds = live;
+  let readSeq = live.commits.at(-1)?.seq ?? 0;
+  if (body.at || body.atCommit != null) {
+    const r = resolveAt(live, body.at ?? `commit:${body.atCommit}`);
+    if (r.error) return { error: r.error };
+    readSeq = r.seq;
+    if (r.store) ds = pastView(live, r.store);
+  }
   const store = ds.store;
   const c = compactor(ds.prefixes);
   const memory = ds.memory ?? { agentGraphs: [], agents: {} };
@@ -551,7 +561,7 @@ function recall(ds, body) {
   const subjects = new Set(entities.map((e) => e.iri));
   const out = {
     dataset: ds.name,
-    commit: ds.commits.at(-1)?.seq ?? 0,
+    commit: readSeq,
     entities,
     citations,
     conflicts: [],

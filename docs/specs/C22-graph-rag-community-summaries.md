@@ -441,3 +441,13 @@ evaluation.
 ## Outcome
 
 Not built. See [ROADMAP](../ROADMAP.md) item 12.
+
+### Shared memory representation follow-up
+
+[Roadmap](../ROADMAP.md) item 81 plans a shared profile for agent memory and personal
+knowledge in [C17](C17-agent-memory.md#shared-memory-representation) and
+[C18](C18-natural-language-questions-and-ingest.md#shared-memory-workflows). It is
+deferred and does not block the existing community-summary phases. When adopted, the
+profile must let a report cite the same assertion and source identities used by recall
+and personal notes. A generated report retains its provenance and review status, and
+does not itself establish the truth or independent corroboration of its inputs.

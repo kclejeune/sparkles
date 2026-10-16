@@ -268,7 +268,7 @@ fn need_of(route: &str, method: &Method) -> Option<Need> {
 
 /// `x-sparkles-permission` for a need.
 fn permission(route: &str, need: Option<Need>) -> String {
-    if route == "/{ds}" {
+    if route == "/{ds}" || route == "/$/algo/{ds}/run" {
         return "read or write, by operation".into();
     }
     match need {
@@ -650,6 +650,14 @@ fn parameters() -> Map<String, J> {
         ),
     );
     put(
+        "profile",
+        q(
+            "profile",
+            json!({ "type": "string", "enum": ["io"] }),
+            "`io` adds an `io` object to the metadata of the `application/x-sparkles+json` result, with what the query read from the index and vocabulary files and the time spent doing so. The counters are process-wide, so concurrent queries add to them. Overlapping profiles share at most 65,536 first-admitted pages; pagesTruncated reports cap omissions, not completeness. Page counts describe the retained sample, and broughtIn is its diagnostic nonnegative resident-count delta rather than physical I/O. Numeric mapped loads are observed independently of advice, including hints-off and previously hinted reads. The counters cover the whole process, so the parameter needs the `metrics` permission and answers `403` without it. Any other value answers `400`.",
+        ),
+    );
+    put(
         "send",
         q(
             "send",
@@ -883,6 +891,11 @@ fn tags() -> J {
             "Stored queries",
             "Named, parameterized queries of a dataset.",
             "stored-queries"
+        ),
+        t(
+            "Graph algorithms",
+            "PageRank, communities, similarity and embeddings on projections of a dataset.",
+            "graph-algorithms"
         ),
         t(
             "GraphQL",

@@ -36,6 +36,11 @@ Counts and commit numbers use `bigint`; integer arguments also accept safe JavaS
 
 Queries, updates, loads and transactions accept `signal` and millisecond `timeout`; writes accept `message`, `ifHead` and `noWait`. A transaction callback sees pending changes through its `tx` parameter. Dataset writes and snapshot-capturing administration inside that callback reject instead of waiting on the callback's writer lock. A timeout rolls back even if the callback never settles. Escaped transactions reject after ending. `update(text, { dryRun: true })` reports the intended changes without creating a commit.
 
+`ds.algorithms.stats(request, { signal, timeout })` carries the same cancellation
+token and absolute deadline into computation and algorithm-slot admission. Work stops
+at its next cooperative check, and the returned promise waits for native cleanup.
+This does not preempt a native operation between checks.
+
 `load` accepts a string, bytes, a Node.js Readable, a Web ReadableStream, an async iterable of byte chunks, or `{ path }`. `loadFiles` loads several paths atomically. Paths infer RDF format/compression from their extension. Streams require an explicit format. `dump` returns a Web ReadableStream; `dumpToFile` and `dumpToString` are convenience methods. `queryToStream` serializes results on a Rust thread; pass `accept` for TSV, SPARQL JSON or an RDF result format.
 
 `ds.changes({ after, signal })` yields recorded commits and their RDF/JS changes, waiting for engine notifications between commits. Its `return()` and `close()` cancel a pending wait; closing the dataset closes its streams and transactions. History gaps fail explicitly. If a commit exceeds the configured `maxQuads`, increase that ceiling before resuming from the last complete cursor.

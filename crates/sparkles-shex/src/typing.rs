@@ -52,6 +52,7 @@ const PARALLEL_MIN: usize = 512;
 pub struct Limits {
     pub deadline: Option<Instant>,
     pub cancel: Option<Arc<AtomicBool>>,
+    pub cancellation: Option<sparkles_core::task::Cancellation>,
 }
 
 impl Limits {
@@ -64,7 +65,10 @@ impl Limits {
         {
             return Err(sparkles_core::Error::Cancelled);
         }
-        if self.deadline.is_some_and(|d| Instant::now() > d) {
+        if let Some(cancellation) = &self.cancellation {
+            cancellation.check()?;
+        }
+        if self.deadline.is_some_and(|d| Instant::now() >= d) {
             return Err(sparkles_core::Error::Timeout);
         }
         Ok(())
@@ -91,6 +95,9 @@ pub struct Env<'a> {
     /// per shape expression: no reference or shape below it, so it is evaluated at the
     /// value instead of through a pair
     pure: Vec<bool>,
+    /// the predicates whose incoming arcs a shape that extends others reads (empty when
+    /// no shape does)
+    pub(crate) ext_inverse: Vec<Id>,
 }
 
 /// Per-thread scratch: a neighbourhood buffer and the semantic-action state.
@@ -159,12 +166,22 @@ impl<'a> Env<'a> {
             max_partitions: opts.max_partitions,
             max_pairs: opts.max_pairs,
             limits: Limits {
-                deadline: opts.timeout.map(|t| Instant::now() + t),
+                deadline: opts
+                    .deadline
+                    .into_iter()
+                    .chain(opts.timeout.map(|t| Instant::now() + t))
+                    .min(),
                 cancel: opts.cancel.clone(),
+                cancellation: opts.cancellation.clone(),
             },
             parallel: opts.parallel,
             pool: opts.pool.clone(),
             pure: pure.into_iter().map(|p| p.unwrap_or(false)).collect(),
+            ext_inverse: if ir.shapes.iter().any(|s| s.ext.is_some()) {
+                Env::inverse_predicates(ir, snap)
+            } else {
+                Vec::new()
+            },
         }
     }
 
@@ -267,6 +284,9 @@ impl<'a> Env<'a> {
         read: &Read<'_>,
         w: &mut Worker<'_>,
     ) -> anyhow::Result<Tri> {
+        if self.ir.shapes[sid.index()].ext.is_some() {
+            return self.ext_shape(sid, node, read, w);
+        }
         let Worker { neigh, cx, .. } = w;
         if neigh::fetch(self.data, &self.plan, node, sid, neigh)? == FetchOutcome::FailFast {
             return Ok(Tri::False);

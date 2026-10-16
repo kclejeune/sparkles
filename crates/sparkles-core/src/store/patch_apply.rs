@@ -51,7 +51,7 @@ pub struct PatchOutcome {
     pub deleted: u64,
     /// a `TA` row aborted the patch: nothing was applied
     pub aborted: bool,
-    /// the patch named a commit of this dataset in `prev`, and it was the head
+    /// an own-dataset `prev` was successfully checked against the transaction head
     pub prev_checked: bool,
     /// `PA` rows that changed the prefix map
     pub prefixes_set: u64,
@@ -228,7 +228,7 @@ impl Store {
         let mut opts = o.write.clone();
         // the leading headers decide the precondition, the message and the blank nodes
         let mut first = None;
-        let mut prev_checked = false;
+        let mut prev_requested = false;
         let mut stored = false;
         while let Some(row) = reader.next_row()? {
             let PatchRow::Header(name, value) = &row else {
@@ -238,7 +238,7 @@ impl Store {
             match name.as_str() {
                 "prev" => {
                     if let Some(n) = self.own_commit(value) {
-                        prev_checked = true;
+                        prev_requested = true;
                         stored = true;
                         opts.precondition = Some(prev_precondition(
                             opts.precondition.take(),
@@ -252,6 +252,8 @@ impl Store {
             }
         }
         let mut txn = self.try_write_with(CommitKind::Patch, opts)?;
+        let mut head_check_ran = txn.opts.dry_run.is_none() && txn.opts.precondition.is_some();
+        let mut prev_checked = prev_requested && head_check_ran;
         let mut labels = Labels {
             stored,
             local: HashMap::new(),
@@ -283,13 +285,15 @@ impl Store {
                 PatchRow::Header(name, value) => match name.as_str() {
                     "prev" => {
                         if let Some(n) = self.own_commit(&value) {
-                            prev_checked = true;
                             let head = txn.guard.head.seq;
                             if n != head {
-                                return Err(
-                                    PatchError::prev_mismatch(&value_iri(&value), n, head).into()
-                                );
+                                return Err(self.after_refusal(
+                                    PatchError::prev_mismatch(&value_iri(&value), n, head).into(),
+                                    Some(&txn.opts),
+                                ));
                             }
+                            prev_checked = true;
+                            head_check_ran = true;
                         }
                     }
                     "message" if txn.opts.message.is_none() => {
@@ -351,16 +355,13 @@ impl Store {
             }
         }
         if aborted {
-            let head = txn.guard.head;
+            if head_check_ran && self.current.load().commit < txn.guard.head.seq {
+                self.drain_group(&mut txn.guard, Some(&txn.opts))?;
+            }
+            let receipt = txn.published_abort_receipt()?;
             drop(txn);
             return Ok(PatchOutcome {
-                receipt: Receipt {
-                    dataset_id: self.owner_dataset_id(),
-                    committed: false,
-                    commit: head,
-                    validation: None,
-                    annotation: self.annotation(head.seq).unwrap_or_default(),
-                },
+                receipt,
                 rows,
                 inserted: 0,
                 deleted: 0,
@@ -481,6 +482,35 @@ impl Store {
             *cur = next;
         }
         Ok((set, removed))
+    }
+}
+
+impl WriteTxn<'_> {
+    /// Capture one published identity while this transaction still owns the writer.
+    /// Publication appends metadata before swapping current; catalog newest can be ahead.
+    fn published_abort_receipt(&self) -> Result<Receipt> {
+        let catalog = self.store.catalog.lock();
+        let seq = self.store.current.load().commit;
+        let commit = catalog.get(seq).ok_or_else(|| {
+            Error::Corrupt(format!(
+                "published commit {seq} is missing from the commit catalog"
+            ))
+        })?;
+        // The writer excludes pruning and new annotation appends during this capture.
+        let annotation = self
+            .store
+            .annotations
+            .lock()
+            .get(seq)
+            .cloned()
+            .unwrap_or_default();
+        Ok(Receipt {
+            dataset_id: self.store.owner_dataset_id(),
+            committed: false,
+            commit,
+            validation: None,
+            annotation,
+        })
     }
 }
 

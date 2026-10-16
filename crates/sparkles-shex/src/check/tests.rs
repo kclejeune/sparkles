@@ -117,6 +117,7 @@ pub(crate) fn schema(decls: Vec<(&str, ShapeExpr)>) -> Schema {
         shapes: decls
             .into_iter()
             .map(|(label, expr)| ShapeDecl {
+                is_abstract: false,
                 label: l(label),
                 expr,
             })
@@ -249,6 +250,7 @@ fn negation_messages() {
     let mk = |extra: Vec<String>, v: ShapeExpr| Schema {
         prefixes: vec![("ex".into(), "http://ex.org/".into())],
         shapes: vec![ShapeDecl {
+            is_abstract: false,
             label: Label::Iri(ex("S")),
             expr: ShapeExpr::Shape(Box::new(Shape {
                 extra,

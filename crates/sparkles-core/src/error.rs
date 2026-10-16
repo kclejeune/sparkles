@@ -4,7 +4,7 @@ use std::io;
 pub enum Error {
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
-    /// An exclusive database or catalog lock is held by another opener.
+    /// A database or catalog lock is held by another opener, or its directory changed.
     #[error("{}", locked_message(path, *pid))]
     Locked {
         path: std::path::PathBuf,
@@ -67,8 +67,10 @@ pub enum Error {
     /// did not hold; nothing was written.
     #[error("{0}")]
     PreconditionFailed(String),
-    /// A write asked not to wait ([`WriteOptions::no_wait`](crate::guard::WriteOptions))
-    /// found the writer lock taken; nothing was written.
+    /// A write that asked not to wait ([`WriteOptions::no_wait`](crate::guard::WriteOptions))
+    /// would have had to wait. Another write held the writer lock, or with group commit a
+    /// fence was running, commits were queued, or the write's own commit would have
+    /// waited for a fence. Nothing was written, and the write can be retried.
     #[error("another write is in progress")]
     WriterBusy,
     /// A dry run ([`WriteOptions::dry_run`](crate::guard::WriteOptions)) stopped where
@@ -163,10 +165,13 @@ pub enum BudgetKind {
     DatasetBytes,
     /// quads a caller's triple-level access rules hide at one commit
     HiddenQuads,
+    /// the server-wide query memory pool could not admit a request or grow a query's
+    /// grant; a retry can succeed when the server is less busy
+    ServerMemory,
 }
 
 impl BudgetKind {
-    pub const ALL: [BudgetKind; 9] = [
+    pub const ALL: [BudgetKind; 10] = [
         BudgetKind::Rows,
         BudgetKind::Memory,
         BudgetKind::ResultBytes,
@@ -176,6 +181,7 @@ impl BudgetKind {
         BudgetKind::RowsProduced,
         BudgetKind::DatasetBytes,
         BudgetKind::HiddenQuads,
+        BudgetKind::ServerMemory,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -189,6 +195,7 @@ impl BudgetKind {
             BudgetKind::RowsProduced => "rows-produced",
             BudgetKind::DatasetBytes => "dataset-bytes",
             BudgetKind::HiddenQuads => "hidden-quads",
+            BudgetKind::ServerMemory => "server-memory",
         }
     }
 }
@@ -250,6 +257,12 @@ impl std::fmt::Display for Budget {
                 f,
                 "the access rules of this request hide more than {} quads at this commit",
                 self.limit
+            ),
+            BudgetKind::ServerMemory => write!(
+                f,
+                "the server's query memory is in use (pool of {}, request needs about {}); retry shortly",
+                human_bytes(self.limit),
+                human_bytes(self.requested)
             ),
         }
     }
@@ -328,7 +341,9 @@ fn locked_message(path: &std::path::Path, pid: Option<u32>) -> String {
             "directory {path} is in use by another process (pid {pid}); stop it or talk to it over HTTP"
         ),
         None => {
-            format!("directory {path} is in use by another opener; stop it or talk to it over HTTP")
+            format!(
+                "directory {path} is in use by another opener or its lock changed; retry the open, stop the other opener or talk to it over HTTP"
+            )
         }
     }
 }
@@ -355,7 +370,9 @@ mod tests {
         assert!(!own.contains("Some("), "{own}");
         let unknown = locked(None);
         assert!(
-            unknown.contains("another opener") && !unknown.contains("None"),
+            unknown.contains("another opener")
+                && unknown.contains("retry the open")
+                && !unknown.contains("None"),
             "{unknown}"
         );
     }

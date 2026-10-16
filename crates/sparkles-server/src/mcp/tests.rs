@@ -310,6 +310,7 @@ fn expected_input_schemas() -> Vec<(&'static str, Value)> {
                 "minInstances": {"type":"integer","minimum":1,"default":1},
                 "maxIn": {"type":"integer","minimum":0,"maximum":64,"default":10,"description":"Largest sh:in list (0: none)"},
                 "maxCount": {"type":"integer","minimum":0,"default":1,"description":"Largest sh:maxCount drafted (0: none)"},
+                "maxInverse": {"type":"integer","minimum":0,"maximum":1000,"default":10,"description":"Most inverse property shapes drafted per class (0: none)"},
                 "closed": {"type":"boolean","default":false},
                 "atCommit": at, "at": sel,
                 "timeoutSeconds": to}}),
@@ -379,6 +380,22 @@ fn expected_input_schemas() -> Vec<(&'static str, Value)> {
                 "weight": {"type":"string","description":"The property of an edge's RDF 1.2 reifier that holds its weight"},
                 "defaultWeight": {"type":"number","minimum":0,"description":"The weight of an edge without one (with weight)"},
                 "graph": {"type":"string","default":"default","description":"`default` or a named graph IRI to search in"},
+                "reasoning": rs,
+                "timeoutSeconds": to,
+                "atCommit": at, "at": sel}}),
+        ),
+        (
+            "graph_algorithm",
+            json!({"type":"object","additionalProperties":false,"required":["algorithm"],"properties":{
+                "dataset": ds,
+                "algorithm": {"enum":["pageRank","betweenness","wcc","scc","labelPropagation","louvain","leiden","nodeSimilarity","triangleCount","clustering","kCore","bfs","sssp","fastRP","node2vec"],"description":"The algorithm of SERVICE algo:<name>"},
+                "projection": {"type":"string","description":"The name of a stored projection. Not with predicates, direction, nodeClasses or weight"},
+                "predicates": {"type":"array","items":{"type":"string"},"maxItems":20,"description":"The predicates whose triples are edges (default: every predicate between resources but rdf:type)"},
+                "direction": {"enum":["forward","backward","undirected"],"description":"How edges are followed (default: the algorithm's own)"},
+                "nodeClasses": {"type":"array","items":{"type":"string"},"maxItems":20,"description":"Keep the nodes with one of these rdf:type classes"},
+                "weight": {"type":"string","description":"The property of an edge's RDF 1.2 reifier that holds its weight"},
+                "params": {"type":"object","description":"The algorithm's parameters, named as in algo: without the prefix, such as maxIterations, seed, topK or source (an IRI)"},
+                "limit": {"type":"integer","minimum":1,"maximum":100,"default":20,"description":"The most rows returned: the best by the algorithm's main measure"},
                 "reasoning": rs,
                 "timeoutSeconds": to,
                 "atCommit": at, "at": sel}}),
@@ -463,6 +480,7 @@ fn expected_input_schemas() -> Vec<(&'static str, Value)> {
                 "k": {"type":"integer","minimum":1,"maximum":20,"default":5,"description":"Candidates per mention"},
                 "labelPredicates": {"type":"array","items":{"type":"string"},"minItems":1,"maxItems":20,"description":"The predicates that hold labels (default: rdfs:label, skos:prefLabel, schema:name and the other usual ones, then skos:altLabel)"},
                 "graphs": {"type":"array","items":{"type":"string"},"minItems":1,"maxItems":20,"description":"Graph IRIs to search, or `default` (default: every graph you may read)"},
+"vectors": {"type":"boolean","default":true,"description":"false searches by label and full text only, so no mention or context is embedded by a vector index's provider"},
                 "reasoning": rs,
                 "timeoutSeconds": to,
                 "atCommit": at, "at": sel}}),
@@ -585,6 +603,7 @@ async fn a03_tool_list() {
             "explain_query",
             "describe_resource",
             "find_paths",
+            "graph_algorithm",
             "list_commits",
             "list_changes",
             #[cfg(feature = "text")]
@@ -762,9 +781,12 @@ async fn draft_shapes_tool() {
     assert_eq!(
         s["shapes"][0]["excluding"],
         json!([
+            {"path": "http://ex.org/age", "component": "minInclusive", "excluded": 1},
+            {"path": "http://ex.org/age", "component": "maxInclusive", "excluded": 1},
             {"path": "http://www.w3.org/2000/01/rdf-schema#label", "component": "datatype", "excluded": 1},
             {"path": "http://www.w3.org/2000/01/rdf-schema#label", "component": "languageIn", "excluded": 1},
-            {"path": "http://ex.org/knows", "component": "minCount", "excluded": 1}])
+            {"path": "http://ex.org/knows", "component": "minCount", "excluded": 1},
+            {"path": "^http://ex.org/knows", "component": "minCount", "excluded": 1}])
     );
     let (text, meta) = c.error("draft_shapes", json!({"support": 2})).await;
     assert!(text.contains("support"), "{text}");

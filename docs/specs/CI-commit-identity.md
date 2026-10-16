@@ -420,7 +420,7 @@ record (`op = 3`) puts its 24 spare bytes to use. Today they are always zero.
 | 17..25 | `timestamp_ms` i64 LE (Unix epoch, already clamped) |
 | 25 | `kind` code |
 | 26 | record version `2` (`0` = legacy record) |
-| 27 | flags (`1` = the write bypassed write-time validation) |
+| 27 | flags (`1` = the write bypassed write-time validation, `2` = the commit's annotation was written without its own sync because the commit belongs to a group, so replay expects it in `annotations.bin`) |
 | 28 | how many commits just before this one may not have been durable when it was written |
 | 29..33 | CRC-32 (IEEE, `flate2::Crc`) over this transaction's data records followed by bytes 0..29 of this record |
 
@@ -780,6 +780,15 @@ Later features build on the receipts. Search watermarks ([F03](F03-full-text-sea
 record `forkedFrom` ([C06](C06-clone-to-sandbox.md)), backups and restores
 ([F05](F05-snapshot-repositories.md)) and write-time validation summaries
 ([C10](C10-write-time-validation.md)) all use them.
+
+An aborted RDF Patch reports one published commit identity, including its matching
+annotation, even while an independent grouped write is waiting for its fence. A plain
+abort does not wait for that write. If the patch successfully checked a head
+precondition against a pending prefix, its abort waits for the fence and propagates a
+failed fence instead of reporting an identity that was never published. Dry runs keep
+their admission drain. A leading `H prev` skipped by an aborted dry run reports
+`prevChecked: false`, while a successful late comparison reports `true`. Ordinary
+previews report their precondition result without changing the store.
 
 **Deviations from the spec.**
 

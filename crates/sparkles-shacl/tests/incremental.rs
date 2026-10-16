@@ -127,6 +127,8 @@ struct ShapeGen<'r> {
     helpers: usize,
     /// also the SHACL 1.2 list constraints
     lists: bool,
+    /// also SHACL 1.2 node expressions
+    exprs: bool,
 }
 
 impl ShapeGen<'_> {
@@ -158,11 +160,58 @@ impl ShapeGen<'_> {
         format!("<{EX}H{}>", (i + 1 + self.r.below(3)).min(self.helpers + 2))
     }
 
+    /// A node expression that gives true or false, for `sh:expression`: paths from the
+    /// focus node, counts, shapes (`from` bounds the helpers a reference may name) and the
+    /// value node, and sometimes a lookup of instances that no path anchors.
+    fn bool_expr(&mut self, from: usize) -> String {
+        let path = self.path(1);
+        match self.r.below(8) {
+            0 => format!(
+                "[ <http://www.w3.org/ns/sparql#greater-than> ( [ shnex:count [ shnex:pathValues {path} ] ] {} ) ]",
+                self.r.below(3)
+            ),
+            1 => format!("[ shnex:exists [ shnex:pathValues {path} ] ]"),
+            2 if from <= self.helpers => format!(
+                "[ shnex:matchAll {} ; shnex:nodes [ shnex:pathValues {path} ] ]",
+                self.helper(from)
+            ),
+            3 => "[ <http://www.w3.org/ns/sparql#isIRI> ( [ shnex:var \"value\" ] ) ]".into(),
+            4 if from <= self.helpers => format!(
+                "[ shnex:exists [ shnex:filterShape {} ; shnex:nodes [ shnex:pathValues {path} ] ] ]",
+                self.helper(from)
+            ),
+            5 => format!(
+                "[ <http://www.w3.org/ns/sparql#less-than> ( [ shnex:count [ shnex:flatMap [ shnex:pathValues {} ] ; shnex:nodes [ shnex:pathValues {path} ] ] ] {} ) ]",
+                pred(self.r.below(PREDS)),
+                1 + self.r.below(3)
+            ),
+            // reads the graph at the value node
+            6 => format!(
+                "[ shnex:exists [ shnex:pathValues {} ; shnex:focusNode [ shnex:var \"value\" ] ] ]",
+                pred(self.r.below(PREDS))
+            ),
+            // not anchored: finds nodes by their class
+            _ => format!(
+                "[ shnex:exists [ shnex:instancesOf {} ] ]",
+                class(self.r.below(CLASSES))
+            ),
+        }
+    }
+
     /// Constraints of a property shape (or the value constraints of a node shape).
     fn constraints(&mut self, depth: usize, from: usize) -> String {
         let mut cs = Vec::new();
         let mut qualified = false;
         for _ in 0..1 + self.r.below(3) {
+            if self.exprs && self.r.chance(30) {
+                let e = if self.r.chance(20) && from <= self.helpers {
+                    format!("sh:nodeByExpression {}", self.helper(from))
+                } else {
+                    format!("sh:expression {}", self.bool_expr(from))
+                };
+                cs.push(e);
+                continue;
+            }
             let c = match self.r.below(if self.lists { 28 } else { 24 }) {
                 0 => format!("sh:minCount {}", self.r.below(3)),
                 1 => format!("sh:maxCount {}", 1 + self.r.below(2)),
@@ -235,7 +284,21 @@ impl ShapeGen<'_> {
     fn property(&mut self, depth: usize, from: usize) -> String {
         let iri = self.fresh("ps");
         let path = self.path(2);
-        let cs = self.constraints(depth, from);
+        let mut cs = self.constraints(depth, from);
+        if self.exprs {
+            match self.r.below(10) {
+                0 => cs.push_str(&format!(
+                    " ; sh:values [ shnex:pathValues {} ]",
+                    self.path(1)
+                )),
+                1 => cs.push_str(&format!(" ; sh:defaultValue {}", node(self.r.below(NODES)))),
+                2 => cs.push_str(&format!(
+                    " ; sh:deactivated [ shnex:exists [ shnex:pathValues {} ] ]",
+                    self.path(1)
+                )),
+                _ => {}
+            }
+        }
         self.out.push_str(&format!(
             "{iri} a sh:PropertyShape ; sh:path {path} ; {cs} .\n"
         ));
@@ -270,6 +333,21 @@ impl ShapeGen<'_> {
                 ts.push(format!("sh:targetWhere {w}"));
                 continue;
             }
+            if self.exprs && self.r.chance(15) {
+                ts.push(if self.r.chance(60) {
+                    format!(
+                        "sh:targetNode [ shnex:concat ( {} {} ) ]",
+                        node(self.r.below(NODES)),
+                        node(self.r.below(NODES))
+                    )
+                } else {
+                    format!(
+                        "sh:targetNode [ shnex:instancesOf {} ]",
+                        class(self.r.below(CLASSES))
+                    )
+                });
+                continue;
+            }
             ts.push(match self.r.below(5) {
                 0 | 1 => format!("sh:targetClass {}", class(self.r.below(CLASSES))),
                 2 => format!("sh:targetSubjectsOf {}", pred(self.r.below(PREDS))),
@@ -290,6 +368,7 @@ impl ShapeGen<'_> {
     fn generate(mut self, sparql: bool, recursive: bool) -> String {
         self.out.push_str(
             "@prefix sh: <http://www.w3.org/ns/shacl#> .\n\
+             @prefix shnex: <http://www.w3.org/ns/shacl-node-expr#> .\n\
              @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n\
              @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n",
         );
@@ -413,7 +492,7 @@ impl ShapeGen<'_> {
     }
 }
 
-fn shapes_text(r: &mut Rng, sparql: bool, recursive: bool, lists: bool) -> String {
+fn shapes_text(r: &mut Rng, sparql: bool, recursive: bool, lists: bool, exprs: bool) -> String {
     let helpers = 1 + r.below(3);
     ShapeGen {
         r,
@@ -421,6 +500,7 @@ fn shapes_text(r: &mut Rng, sparql: bool, recursive: bool, lists: bool) -> Strin
         n: 0,
         helpers,
         lists,
+        exprs,
     }
     .generate(sparql, recursive)
 }
@@ -465,6 +545,10 @@ fn identity(r: &J) -> String {
     let mut r = r.clone();
     r.as_object_mut().unwrap().remove("messages");
     r.as_object_mut().unwrap().remove("details");
+    // the blank node of a node expression is labelled afresh by each parse
+    if r["sourceConstraint"]["type"] == "bnode" {
+        r.as_object_mut().unwrap().remove("sourceConstraint");
+    }
     r.to_string()
 }
 
@@ -524,11 +608,18 @@ struct Tally {
 }
 
 /// Run one random scenario; returns what it saw.
-fn scenario(seed: u64, mode: GuardMode, policy: BaselinePolicy, lists: bool, tally: &mut Tally) {
+fn scenario(
+    seed: u64,
+    mode: GuardMode,
+    policy: BaselinePolicy,
+    lists: bool,
+    exprs: bool,
+    tally: &mut Tally,
+) {
     let mut r = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
     let sparql = r.chance(30);
     let recursive = r.chance(20);
-    let text = shapes_text(&mut r, sparql, recursive, lists);
+    let text = shapes_text(&mut r, sparql, recursive, lists, exprs);
     let shapes = Shapes::parse(&text, RdfFormat::Turtle, None)
         .unwrap_or_else(|e| panic!("seed {seed}: {e:#}\n{text}"));
     let store = Store::in_memory(StoreOptions::default());
@@ -737,10 +828,16 @@ fn steps() -> usize {
 }
 
 fn run(mode: GuardMode, policy: BaselinePolicy, first: u64) -> Tally {
-    run_with(mode, policy, first, false)
+    run_with(mode, policy, first, false, false)
 }
 
-fn run_with(mode: GuardMode, policy: BaselinePolicy, first: u64, lists: bool) -> Tally {
+fn run_with(
+    mode: GuardMode,
+    policy: BaselinePolicy,
+    first: u64,
+    lists: bool,
+    exprs: bool,
+) -> Tally {
     let mut t = Tally::default();
     // `SPARKLES_DIFF_SEED=n` runs one scenario of every test
     let only: Option<u64> = std::env::var("SPARKLES_DIFF_SEED")
@@ -751,7 +848,7 @@ fn run_with(mode: GuardMode, policy: BaselinePolicy, first: u64, lists: bool) ->
         None => first..first + seeds(),
     };
     for seed in range {
-        scenario(seed, mode, policy, lists, &mut t);
+        scenario(seed, mode, policy, lists, exprs, &mut t);
     }
     eprintln!("{mode:?} {policy:?}: {t:?}");
     t
@@ -794,11 +891,155 @@ fn grandfather_rejects_only_new_blocking_results() {
 /// not: the incremental results equal full validation's.
 #[test]
 fn list_constraints_equal_full_validation() {
-    let t = run_with(GuardMode::Warn, BaselinePolicy::Strict, 300, true);
+    let t = run_with(GuardMode::Warn, BaselinePolicy::Strict, 300, true, false);
     assert!(
         t.strategies.get("Incremental").copied().unwrap_or(0) > t.writes / 4,
         "{t:?}"
     );
-    let t = run_with(GuardMode::Reject, BaselinePolicy::Grandfather, 400, true);
+    let t = run_with(
+        GuardMode::Reject,
+        BaselinePolicy::Grandfather,
+        400,
+        true,
+        false,
+    );
     assert!(t.rejected > 0, "{t:?}");
+}
+
+/// Shapes with SHACL 1.2 node expressions (`sh:expression`, `sh:nodeByExpression`,
+/// `sh:values`, `sh:defaultValue`, `sh:deactivated` and target expressions): the
+/// incremental results equal full validation's, whether an expression is localized or
+/// the shape falls back.
+#[test]
+fn node_expressions_equal_full_validation() {
+    let t = run_with(GuardMode::Warn, BaselinePolicy::Strict, 500, false, true);
+    assert!(
+        t.strategies.get("Incremental").copied().unwrap_or(0) > t.writes / 4,
+        "{t:?}"
+    );
+    let t = run_with(
+        GuardMode::Reject,
+        BaselinePolicy::Grandfather,
+        600,
+        false,
+        true,
+    );
+    assert!(t.rejected > 0, "{t:?}");
+    run_with(GuardMode::Reject, BaselinePolicy::Strict, 700, true, true);
+}
+
+/// A value node that `sh:values` computes (a constant here) is not reached over the
+/// property's path, so an expression that reads the graph at `value` cannot be localized
+/// under that path.
+#[test]
+fn computed_value_nodes_read_at_value_fall_back() {
+    let shapes = format!(
+        "@prefix sh: <{SH}> . @prefix ex: <{EX}> .
+         @prefix shnex: <http://www.w3.org/ns/shacl-node-expr#> .
+         ex:S a sh:NodeShape ; sh:targetNode ex:x ;
+           sh:property [ sh:path ex:p ; sh:values ex:c ;
+             sh:expression [ shnex:exists [ shnex:pathValues ex:q ;
+                                            shnex:focusNode [ shnex:var \"value\" ] ] ] ] ."
+    );
+    let store = Store::in_memory(StoreOptions::default());
+    store
+        .load(&[Source::from_bytes(
+            format!(
+                "<{EX}x> <{EX}p> <{EX}y> .\n<{EX}y> <{EX}q> \"1\" .\n<{EX}c> <{EX}q> \"1\" .\n"
+            )
+            .into_bytes(),
+            RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+    match guard::set_config(
+        &store,
+        Some(config(GuardMode::Reject, BaselinePolicy::Strict, &shapes)),
+    ) {
+        Ok(SetOutcome::Installed(..)) => {}
+        Ok(_) => panic!("the data should conform"),
+        Err(e) => panic!("{e:#}"),
+    }
+    // ex:c, a computed value node, loses its ex:q: full validation reports ex:x
+    let res = update(
+        &store,
+        &format!("DELETE DATA {{ <{EX}c> <{EX}q> \"1\" }}"),
+        &QueryOptions::default(),
+    );
+    match res {
+        Err(Error::Rejected(_)) => {}
+        Err(e) => panic!("{e}"),
+        Ok(st) => panic!(
+            "accepted: {:?}",
+            st.commit.and_then(|c| c.validation).map(|v| (
+                v.status,
+                v.strategy,
+                v.fallback.clone(),
+                v.blocking
+            ))
+        ),
+    }
+}
+
+/// Each `shnex:concat` below lists the one before it twice. The analysis of the shape must
+/// not walk the shared expression once per path, which takes 2^60 steps, and a
+/// configuration that is too big to localize falls back to full validation.
+#[test]
+fn doubling_expressions_are_analyzed_within_a_budget() {
+    let levels = 60;
+    let mut shapes = format!(
+        "@prefix sh: <{SH}> . @prefix ex: <{EX}> .
+         @prefix shnex: <http://www.w3.org/ns/shacl-node-expr#> .
+         _:e0 shnex:pathValues ex:q .\n"
+    );
+    for i in 1..levels {
+        shapes.push_str(&format!(
+            "_:e{i} shnex:concat ( _:e{} _:e{} ) .\n",
+            i - 1,
+            i - 1
+        ));
+    }
+    // the doubling branch is never taken, so evaluation stays cheap
+    shapes.push_str(&format!(
+        "ex:S a sh:NodeShape ; sh:targetNode ex:x ;
+           sh:property [ sh:path ex:p ;
+             sh:values [ shnex:if [ shnex:exists [ shnex:pathValues ex:none ] ] ;
+                         shnex:then _:e{} ] ] .\n",
+        levels - 1
+    ));
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                format!("<{EX}x> <{EX}p> <{EX}y> .\n").into_bytes(),
+                RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+        let r = guard::set_config(
+            &store,
+            Some(config(GuardMode::Reject, BaselinePolicy::Strict, &shapes)),
+        )
+        .map(|o| matches!(o, SetOutcome::Installed(..)))
+        .map_err(|e| format!("{e:#}"));
+        let w = update(
+            &store,
+            &format!("INSERT DATA {{ <{EX}x> <{EX}q> \"1\" }}"),
+            &QueryOptions::default(),
+        )
+        .map(|st| {
+            st.commit
+                .and_then(|c| c.validation)
+                .map(|v| (v.strategy, v.fallback.clone()))
+        })
+        .map_err(|e| e.to_string());
+        let _ = tx.send((r, w));
+    });
+    let (installed, write) = rx
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("the analysis of a doubling expression did not finish");
+    assert_eq!(installed, Ok(true));
+    let (_, fallback) = write.unwrap().expect("the write was validated");
+    assert_eq!(fallback.as_deref(), Some("budget"));
 }

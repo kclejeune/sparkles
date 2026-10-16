@@ -24,11 +24,12 @@ use spargebra::{GraphUpdateOperation, Query, Update};
 /// with room for the levels a query form adds.
 pub const MAX_ALGEBRA_DEPTH: usize = 2 * spargebra::nesting::MAX_DEPTH + 64;
 
-/// The stack each level of the algebra may take while it is planned and evaluated, with
-/// room to spare: in a release build the executor takes about 7 KiB a level and the
-/// planner 4 KiB; a debug build takes several times more.
+/// The stack allowance per measured plan level. Lowering blank-node property lists adds
+/// plan nodes, and debug owned-executor frames need 256 KiB per measured level. Release
+/// frames need less space. These are virtual stack requests, not resident or query-budget
+/// memory. BGP-aware planning depths can exceed MAX_ALGEBRA_DEPTH; with_stack caps requests.
 const STACK_PER_LEVEL: usize = if cfg!(debug_assertions) {
-    128 << 10
+    256 << 10
 } else {
     16 << 10
 };

@@ -34,6 +34,11 @@ pub const FILES: [&str; 4] = [
 /// The validation state of the last validated commit (see [`StatusFile`]). Not one of
 /// [`FILES`]: a copy of the database starts with an unknown state.
 pub const STATUS_FILE: &str = "validation-status.json";
+
+/// The typing of the head a ShEx guard keeps between runs (`sparkles-shex` writes and
+/// reads it). Like [`STATUS_FILE`] it is not one of [`FILES`], so a copy of the
+/// database, a branch or a backup starts without it.
+pub const TYPING_FILE: &str = "validation-typing.bin";
 /// The reasoner's graph of materialized inferences.
 pub const INFERRED_GRAPH: &str = "urn:x-sparkles:inferred";
 
@@ -48,6 +53,8 @@ pub fn config_language(root: &Path) -> Result<Option<GuardLanguage>> {
     };
     let j: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|e| Error::Invalid(format!("{CONFIG_FILE}: {e}")))?;
+    // a version newer than this build writes is refused as unsupported
+    crate::formats::check_settings(CONFIG_FILE, &j)?;
     match j.get("language") {
         None => Ok(Some(GuardLanguage::Shacl)),
         Some(l) => serde_json::from_value(l.clone()).map(Some).map_err(|_| {
@@ -298,12 +305,22 @@ impl StatusFile {
         })
     }
 
-    /// Remove the file of `root` (a missing file is fine).
+    /// Remove the status file of `root`, and the typing file and the temporary files
+    /// that go with it (a missing file is fine). A configuration that is replaced or
+    /// removed leaves none of them behind.
     pub fn remove(root: &Path) -> Result<()> {
-        match std::fs::remove_file(root.join(STATUS_FILE)) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
-            _ => Ok(()),
+        for f in [
+            STATUS_FILE.to_string(),
+            TYPING_FILE.to_string(),
+            format!("{STATUS_FILE}.tmp"),
+            format!("{TYPING_FILE}.tmp"),
+        ] {
+            match std::fs::remove_file(root.join(f)) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+                _ => {}
+            }
         }
+        Ok(())
     }
 }
 

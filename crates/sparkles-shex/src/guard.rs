@@ -229,6 +229,7 @@ pub struct ShexValidationStatus {
 }
 
 mod incremental;
+mod persist;
 
 /// Affected nodes past which a write is validated in full (the walk that finds them
 /// stops there).
@@ -274,6 +275,9 @@ pub(crate) struct Model {
     pub(crate) reads: Option<Vec<String>>,
     /// what a write can affect
     plan: incremental::Plan,
+    /// the SHA-256 of the schema copy's text, which identifies the schema the typing
+    /// file belongs to
+    pub(crate) digest: String,
 }
 
 impl Model {
@@ -281,6 +285,7 @@ impl Model {
         Model {
             reads: read_predicates(loaded.compiled.ir(), &map),
             plan: incremental::Plan::new(loaded.compiled.ir(), &map),
+            digest: sha256_hex(loaded.text.as_bytes()),
             schema: Arc::new(loaded.compiled),
             map,
             shape_count: loaded.shape_count,
@@ -347,6 +352,9 @@ pub struct ShexGuard {
     baseline: Mutex<Option<Baseline>>,
     exact: Mutex<Option<Exact>>,
     typing: Mutex<Option<HeadTyping>>,
+    /// the commit whose typing `validation-typing.bin` holds (see [`persist`]), while it
+    /// is there
+    saved: Mutex<Option<u64>>,
     /// the database directory and the SHA-256 of its `validation.json`, where the state
     /// of each validated commit is kept
     persist: Option<(PathBuf, String)>,
@@ -373,6 +381,7 @@ impl ShexGuard {
             model: parking_lot::RwLock::new(Arc::new(Model::new(loaded, map))),
             exact: Mutex::new(None),
             typing: Mutex::new(None),
+            saved: Mutex::new(None),
             persist,
             cfg,
             pending: Mutex::new(None),
@@ -400,6 +409,7 @@ impl ShexGuard {
             baseline: Mutex::new(None),
             exact: Mutex::new(None),
             typing: Mutex::new(None),
+            saved: Mutex::new(None),
             persist: None,
             counters: DecisionCounts::default(),
             last_full: AtomicU64::new(u64::MAX),
@@ -548,8 +558,10 @@ impl ShexGuard {
             data_graph: graphs.data_graph,
             extra_graphs: graphs.extra_graphs,
             exclude_graphs: graphs.exclude_graphs,
-            timeout: Some(deadline.saturating_duration_since(Instant::now())),
+            timeout: None,
+            deadline: o.deadline.into_iter().chain([deadline]).min(),
             cancel: o.cancel.clone(),
+            cancellation: o.cancellation.clone(),
             only_nonconformant: true,
             // a guard never runs SERVICE
             selector_query: Some(sparkles_core::sparql::QueryOptions {
@@ -1032,7 +1044,8 @@ impl ShexGuard {
 /// the map's `{FOCUS p …}` selectors; `None` when it may read any (a CLOSED shape reads
 /// every outgoing arc of its nodes, a SPARQL selector anything).
 fn read_predicates(ir: &Ir, map: &ShapeMap) -> Option<Vec<String>> {
-    if ir.shapes.iter().any(|s| s.closed) {
+    // a shape that extends others reads every outgoing arc of its nodes
+    if ir.shapes.iter().any(|s| s.closed || s.ext.is_some()) {
         return None;
     }
     let mut ps: Vec<String> = ir
@@ -1124,6 +1137,7 @@ impl CommitGuard for ShexGuard {
     }
 
     fn committed(&self, seq: u64) {
+        self.forget_saved_typing();
         let p = self.pending.lock().take();
         match p {
             Some(p) if p.seq == seq => {
@@ -1168,7 +1182,16 @@ impl CommitGuard for ShexGuard {
         }
     }
 
-    fn bypassed(&self) {
+    fn close(&self, head: &sparkles_core::commit::CommitInfo, snapshot: &Snapshot) {
+        self.save_typing(head, snapshot);
+    }
+
+    fn rekey(&self, old: &Snapshot, new: &Snapshot) {
+        self.rekey_typing(old, new);
+    }
+
+    fn bypassed(&self, _seq: u64) {
+        self.forget_saved_typing();
         self.counters.count(GuardStatus::Bypassed);
         if let Some(b) = self.baseline.lock().as_mut() {
             b.conforms = None;
@@ -1490,7 +1513,9 @@ pub fn install(store: &Store) -> Result<Option<Arc<ShexGuard>>> {
         Some((root.to_path_buf(), hash.clone())),
     ));
     // the state of the head, when the status file records it for this configuration
-    let head = store.head_commit().seq;
+    let snap = store.snapshot();
+    let head_commit = store.head_commit();
+    let head = head_commit.seq;
     if let Some(b) = StatusFile::read(root, head, &hash) {
         *g.exact.lock() = Some(Exact {
             commit: head,
@@ -1499,6 +1524,8 @@ pub fn install(store: &Store) -> Result<Option<Arc<ShexGuard>>> {
         });
         g.associations.store(b.total, Ordering::Relaxed);
         *g.baseline.lock() = Some(b);
+        // the typing of the head, when the last close kept it
+        g.restore_typing(&snap, &head_commit);
     }
     store.set_guard(Some(g.clone()));
     store.set_guard_required(true);
@@ -1542,7 +1569,7 @@ pub fn set_config(
     cfg.check()?;
     let view = Arc::new(txn.view());
     let in_graphs = cfg.schema.graphs.is_some();
-    let mut loaded = match cfg.schema.inline.take() {
+    let loaded = match cfg.schema.inline.take() {
         _ if in_graphs => load_graphs(&cfg, &view)?,
         Some(text) => {
             cfg.schema.sha256 = Some(sha256_hex(text.as_bytes()));
@@ -1574,7 +1601,8 @@ pub fn set_config(
         }
     }
     let file = loaded.file;
-    let text = std::mem::take(&mut loaded.text);
+    // the model keeps the text's digest, so the text stays in `loaded` until then
+    let text = loaded.text.clone();
     let mut guard = ShexGuard::new(cfg, loaded, map, None);
     if root.is_none() && !in_graphs {
         guard.copy = Some(text.clone());

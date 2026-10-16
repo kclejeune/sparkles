@@ -955,6 +955,8 @@ export type Enforcement = 'reject-on-write' | 'warn-on-write' | 'validated-on-re
 /** One property shape with a predicate path. */
 export type PropertyConstraint = {
   path: string;
+  /** The constraint is on the subjects that point at the instance over `path` (ShEx `^p`). */
+  inverse?: boolean;
   shape?: string;
   severity: string;
   enforcement: Enforcement;
@@ -963,6 +965,8 @@ export type PropertyConstraint = {
   datatype?: string;
   class?: string[];
   nodeKind?: string;
+  /** The value set of a ShEx node constraint, as N-Triples terms. */
+  values?: string[];
   /** Constraint components of the shape's other constraints. */
   other?: string[];
 };
@@ -1045,11 +1049,14 @@ export type SchemaOptions = {
   /** Page size (1–10000). */
   limit?: number;
   timeout?: number;
+  /** Read the state at a commit, time or snapshot (`42`, `commit:42`, `snapshot:NAME`). */
+  at?: string;
   signal?: AbortSignal;
 };
 
 function schemaParams(opts: SchemaOptions, cursor?: string): string {
   const p = new URLSearchParams();
+  if (opts.at) p.set('at', opts.at);
   if (opts.graph) p.set('graph', opts.graph);
   if (opts.declaredGraph) p.set('declaredGraph', opts.declaredGraph);
   if (opts.reasoning != null) p.set('reasoning', String(opts.reasoning));
@@ -1843,6 +1850,53 @@ export function commits(
   });
 }
 
+/** One run of consecutive commits of `GET /$/commits/{ds}/timeline`. */
+export type TimelineBucket = {
+  firstSeq: number;
+  lastSeq: number;
+  firstTime: string;
+  lastTime: string;
+  commits: number;
+  /** Quads added and removed by the commits; absent for a caller limited to some graphs. */
+  inserted?: number;
+  deleted?: number;
+  /** The commits of each kind (`update`, `merge`, ...). */
+  kinds: Record<string, number>;
+  merges: number;
+  snapshots: number;
+};
+
+export type CommitTimeline = {
+  dataset: string;
+  datasetId: string;
+  head: number;
+  firstSeq: number;
+  lastSeq: number;
+  /** The commits in range whose metadata is retained. */
+  commits: number;
+  /** The commit numbers each bucket spans. */
+  bucketWidth: number;
+  oldestReconstructable?: number | null;
+  readable: { from: number; to: number }[];
+  buckets: TimelineBucket[];
+};
+
+/** The commits of a branch in at most `buckets` runs, for a slider over a long history. */
+export function commitTimeline(
+  ds: string,
+  opts: { buckets?: number; from?: number; to?: number; signal?: AbortSignal } = {},
+): Promise<CommitTimeline> {
+  const p = new URLSearchParams();
+  if (opts.buckets != null) p.set('buckets', String(opts.buckets));
+  if (opts.from != null) p.set('from', String(opts.from));
+  if (opts.to != null) p.set('to', String(opts.to));
+  const qs = p.toString();
+  return json<CommitTimeline>(`/$/commits/${enc(ds)}/timeline${qs ? `?${qs}` : ''}`, {
+    signal: opts.signal,
+    cache: 'no-store',
+  });
+}
+
 // --- branches and merges (F09) -------------------------------------------------------
 
 /** A branch of a dataset (`GET /$/branches/{ds}`). */
@@ -2360,8 +2414,17 @@ export type VectorIndexStatus = {
   generation: string;
   /** Vectors in the generation's base (the packed rows). */
   rows: number;
-  /** Changes since the base that searches add exactly. */
-  overlay: { inserts: number; deletes: number };
+  /**
+   * Changes since the base. Of the inserts, `indexed` are in the graph, which the server
+   * adds them to in the background, and `pending` are still searched exactly.
+   */
+  overlay: {
+    inserts: number;
+    deletes: number;
+    indexed?: number;
+    pending?: number;
+    overBudget?: boolean;
+  };
   skipped: { malformed: number; wrongDimension: number; zeroNorm: number };
   /** `residency`: `heap` (built in this process) or `mmap` (read in place from the file). */
   memory: { segmentBytes: number; hnswBytes: number; residency: string };
@@ -2376,7 +2439,8 @@ export type VectorIndexStatus = {
   exactThreshold: number;
   /** The index file of a persistent store; `opened`: read from it, not built. */
   files?: { bytes: number; opened: boolean };
-  lastBuild?: { at: string; ms: number; rows: number };
+  /** `carried`: the graph was carried over from the previous generation. */
+  lastBuild?: { at: string; ms: number; rows: number; carried?: boolean };
   /** The embedding worker, for an index that computes its vectors. */
   embedding?: EmbeddingStatus;
 };
@@ -2611,6 +2675,11 @@ export type DiffOptions = {
   /** list the changed quads (at most `limit` of them) */
   quads?: boolean;
   limit?: number;
+  /** a diff across branches: `from` is read on `fromBranch` (its head by default), `to` on `toBranch` */
+  fromBranch?: string;
+  toBranch?: string;
+  /** only the changes whose subject or object is one of these terms (IRIs or N-Triples) */
+  terms?: string[];
   signal?: AbortSignal;
 };
 
@@ -2621,8 +2690,58 @@ export function diff(ds: string, opts: DiffOptions = {}): Promise<Diff> {
   if (opts.graph) p.set('graph', opts.graph);
   if (opts.quads) p.set('quads', 'true');
   if (opts.limit != null) p.set('limit', String(opts.limit));
+  if (opts.fromBranch) p.set('fromBranch', opts.fromBranch);
+  if (opts.toBranch) p.set('toBranch', opts.toBranch);
+  for (const t of opts.terms ?? []) p.append('term', t);
   const qs = p.toString();
   return json<Diff>(`/${enc(ds)}/diff${qs ? `?${qs}` : ''}`, {
+    signal: opts.signal,
+  });
+}
+
+/** `POST /{ds}/sparql/diff`: the rows a SELECT query returns at one state and not the other. */
+export type SparqlDiff = {
+  dataset: string;
+  datasetId: string;
+  from: { selector: string; commit: Commit };
+  to: { selector: string; commit: Commit };
+  vars: string[];
+  /** Rows at the earlier and the later state. */
+  fromRows: number;
+  toRows: number;
+  /** Rows both have, counted as a bag. */
+  same: number;
+  /** Rows only the later state has, and only the earlier one has. */
+  added: number;
+  removed: number;
+  addedRows: Partial<Record<string, Term>>[];
+  removedRows: Partial<Record<string, Term>>[];
+  /** A list was cut at `limit` rows. */
+  truncated: { added: boolean; removed: boolean };
+};
+
+export type SparqlDiffOptions = {
+  query: string;
+  /** The earlier state, as a selector of `at`. */
+  from: string;
+  /** The later state (default: the head). */
+  to?: string;
+  /** The most rows listed for each side (default 100). */
+  limit?: number;
+  reasoning?: boolean;
+  signal?: AbortSignal;
+};
+
+/** Compare a SELECT query between two states on the server. */
+export function sparqlDiff(ds: string, opts: SparqlDiffOptions): Promise<SparqlDiff> {
+  const p = new URLSearchParams({ from: opts.from });
+  if (opts.to) p.set('to', opts.to);
+  if (opts.limit != null) p.set('limit', String(opts.limit));
+  if (opts.reasoning != null) p.set('reasoning', String(opts.reasoning));
+  return json<SparqlDiff>(`/${enc(ds)}/sparql/diff?${p}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/sparql-query' },
+    body: opts.query,
     signal: opts.signal,
   });
 }
@@ -2840,6 +2959,10 @@ export type DraftConstraint = {
 
 export type DraftProperty = {
   path: string;
+  /** The values are the subjects that point at the instance over `path`. */
+  inverse?: boolean;
+  /** A sequence path: the values of `then` at the values of `path`. */
+  then?: string;
   instances: number;
   maxValues: number;
   constraints: DraftConstraint[];
@@ -2865,6 +2988,7 @@ export type ShapesDraft = {
     minInstances: number;
     maxIn: number;
     maxCount: number;
+    maxInverse: number;
     closed: boolean;
     base: string;
     classes: string[];
@@ -2955,12 +3079,15 @@ export type ProfileOptions = {
   graph?: string;
   reasoning?: boolean;
   classes?: string[];
+  /** Read the state at a commit, time or snapshot. */
+  at?: string;
   signal?: AbortSignal;
 };
 
 /** The URL of a profiles request. */
 export function schemaProfilesPath(ds: string, opts: ProfileOptions = {}): string {
   const p = new URLSearchParams();
+  if (opts.at) p.set('at', opts.at);
   if (opts.graph && opts.graph !== 'default') p.set('graph', opts.graph);
   if (opts.reasoning != null) p.set('reasoning', String(opts.reasoning));
   for (const c of opts.classes ?? []) p.append('class', c);

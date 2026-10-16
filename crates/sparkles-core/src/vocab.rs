@@ -19,6 +19,7 @@ pub(crate) use sync::{LazySync, PendingSync};
 
 use crate::disk::WritebackFile;
 use crate::error::Result;
+use crate::ioacct::{self, IoFile, Phase};
 use memmap2::Mmap;
 use rustc_hash::FxHashMap;
 use std::fs::File;
@@ -84,8 +85,12 @@ impl Sparse {
     fn first_hint(&self, g: usize) -> bool {
         let (word, bit) = (&self.hinted[g / 64], 1u64 << (g % 64));
         // a plain load first, so that warm lookups do not write the shared word
-        word.load(AtomicOrdering::Relaxed) & bit == 0
-            && word.fetch_or(bit, AtomicOrdering::Relaxed) & bit == 0
+        let first = word.load(AtomicOrdering::Relaxed) & bit == 0
+            && word.fetch_or(bit, AtomicOrdering::Relaxed) & bit == 0;
+        if first {
+            ioacct::vocab_group_hinted();
+        }
+        first
     }
     fn key(&self, g: usize) -> &[u8] {
         let end = self
@@ -212,9 +217,9 @@ impl Bytes {
     }
 
     /// Ask for bytes `[start, end)` to be read ahead (a mapped file only).
-    fn will_need(&self, start: usize, end: usize) {
+    fn will_need(&self, file: IoFile, start: usize, end: usize) {
         if let Bytes::Map(m) = self {
-            crate::index::will_need(m, start, end.saturating_sub(start));
+            crate::index::will_need(file, m, start, end.saturating_sub(start));
         }
     }
 }
@@ -232,8 +237,6 @@ struct Ahead {
 }
 
 impl Ahead {
-    const WINDOW: usize = 1 << 20;
-
     /// The pass reads `block` next.
     #[inline]
     fn at(&mut self, v: &Vocab, block: usize) {
@@ -245,14 +248,18 @@ impl Ahead {
         if offset + OFFSETS_WINDOW / 2 >= self.offsets_until {
             let from = offset.max(self.offsets_until);
             let to = (offset + OFFSETS_WINDOW).min(v.offsets.as_slice().len());
-            v.offsets.will_need(from, to);
+            v.offsets.will_need(IoFile::VocabOff, from, to);
             self.offsets_until = to;
         }
         let pos = v.block_offset(block);
-        if self.until < self.end && pos + Self::WINDOW / 2 >= self.until {
+        let window = match crate::index::read_window() {
+            0 => 1 << 20,
+            w => w,
+        };
+        if self.until < self.end && pos + window / 2 >= self.until {
             let from = pos.max(self.until);
-            let to = (pos + Self::WINDOW).min(self.end);
-            v.data.will_need(from, to);
+            let to = (pos + window).min(self.end);
+            v.data.will_need(IoFile::VocabData, from, to);
             self.until = to;
         }
     }
@@ -383,17 +390,61 @@ impl Vocab {
     }
     #[inline]
     fn block_offset(&self, b: usize) -> usize {
+        // Observe residency before the first mapped load, including offsets read
+        // while preparing hints or binary-searching block starts.
+        if ioacct::profiling() {
+            self.touch_offset(b);
+        }
         let o = self.offsets.as_slice();
         u64::from_le_bytes(o[b * 8..b * 8 + 8].try_into().unwrap()) as usize
     }
 
     /// First key of block `b` (stored uncompressed).
     fn block_first(&self, b: usize) -> &[u8] {
+        self.touch_block(b);
         let data = self.data.as_slice();
         let mut pos = self.block_offset(b);
         let _shared = read_varint(data, &mut pos);
         let len = read_varint(data, &mut pos) as usize;
         &data[pos..pos + len]
+    }
+
+    /// Record the page of block `b`'s offset as read (profile only, out of line so that
+    /// [`Vocab::block_offset`] stays small).
+    #[cold]
+    #[inline(never)]
+    fn touch_offset(&self, b: usize) {
+        if let Bytes::Map(o) = &self.offsets {
+            ioacct::touch(IoFile::VocabOff, o.as_ptr(), b * 8, 8);
+        }
+    }
+
+    /// Record the pages of front-coded block `b` as read (profile only). The hot paths
+    /// that call it on every block carry the check alone.
+    #[inline(always)]
+    fn touch_block(&self, b: usize) {
+        if ioacct::profiling() {
+            self.touch_block_profiled(b);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn touch_block_profiled(&self, b: usize) {
+        if let Bytes::Map(m) = &self.data {
+            let start = self.block_offset(b);
+            let end = if b + 1 < self.num_blocks() {
+                self.block_offset(b + 1)
+            } else {
+                m.len()
+            };
+            ioacct::touch(
+                IoFile::VocabData,
+                m.as_ptr(),
+                start,
+                end.saturating_sub(start),
+            );
+        }
     }
 
     /// Decode a whole block, invoking `f(index_in_block, key)`; stops when `f` returns false.
@@ -402,6 +453,8 @@ impl Vocab {
         let mut pos = self.block_offset(b);
         let start = b * FC_BLOCK;
         let n = FC_BLOCK.min((self.len as usize) - start);
+        ioacct::vocab_blocks_scanned(1);
+        self.touch_block(b);
         // Single-key callers own this fresh buffer throughout their scan.
         let mut key = Vec::with_capacity(64);
         for i in 0..n {
@@ -434,6 +487,8 @@ impl Vocab {
         key.clear();
         let data = self.data.as_slice();
         let mut pos = self.block_offset(b);
+        ioacct::vocab_blocks_scanned(1);
+        self.touch_block(b);
         let start = b * FC_BLOCK;
         let n = FC_BLOCK.min((self.len as usize) - start);
         for i in 0..n {
@@ -454,6 +509,7 @@ impl Vocab {
         if id >= self.len {
             return None;
         }
+        let _t = ioacct::timer(Phase::VocabRead);
         let b = (id as usize) / FC_BLOCK;
         let want = (id as usize) % FC_BLOCK;
         let mut out = None;
@@ -482,6 +538,7 @@ impl Vocab {
         mut reserve: impl FnMut(usize) -> std::result::Result<(), E>,
         mut f: impl FnMut(u64, &[u8]) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), E> {
+        let _t = ioacct::timer(Phase::VocabRead);
         let mut ahead = self.ahead_for(ids);
         if ahead.end == 0 && ids.len() > 1 {
             // scattered ids: ask for their blocks at once, so that a cold vocabulary
@@ -501,6 +558,8 @@ impl Vocab {
                 .min(FC_BLOCK.min(self.len as usize - b * FC_BLOCK) - 1);
             let mut w = 0;
             let mut pos = self.block_offset(b);
+            ioacct::vocab_blocks_scanned(1);
+            self.touch_block(b);
             key.clear();
             for at in 0..=last {
                 let shared = read_varint(data, &mut pos) as usize;
@@ -546,6 +605,7 @@ impl Vocab {
         mut f: impl FnMut(u64, &[u8]),
         read_ahead: bool,
     ) {
+        let _t = ioacct::timer(Phase::VocabRead);
         let mut ahead = if read_ahead {
             self.ahead_for(ids)
         } else {
@@ -595,7 +655,7 @@ impl Vocab {
             return;
         }
         const GAP: usize = 64 << 10;
-        fn advise(m: &Mmap, ranges: impl Iterator<Item = (usize, usize)>) {
+        fn advise(file: IoFile, m: &Mmap, ranges: impl Iterator<Item = (usize, usize)>) {
             let mut cur: Option<(usize, usize)> = None;
             for (s, e) in ranges {
                 let e = e.min(m.len());
@@ -605,14 +665,14 @@ impl Vocab {
                 cur = match cur {
                     Some((cs, ce)) if s <= ce + GAP => Some((cs, ce.max(e))),
                     Some((cs, ce)) => {
-                        crate::index::will_need(m, cs, ce - cs);
+                        crate::index::will_need(file, m, cs, ce - cs);
                         Some((s, e))
                     }
                     None => Some((s, e)),
                 };
             }
             if let Some((cs, ce)) = cur {
-                crate::index::will_need(m, cs, ce - cs);
+                crate::index::will_need(file, m, cs, ce - cs);
             }
         }
         let (Bytes::Map(data), Bytes::Map(offsets)) = (&self.data, &self.offsets) else {
@@ -640,8 +700,13 @@ impl Vocab {
             seen |= bit;
             word.fetch_or(bit, AtomicOrdering::Relaxed) & bit == 0
         });
-        advise(offsets, blocks.iter().map(|&b| (b * 8, b * 8 + 16)));
         advise(
+            IoFile::VocabOff,
+            offsets,
+            blocks.iter().map(|&b| (b * 8, b * 8 + 16)),
+        );
+        advise(
+            IoFile::VocabData,
             data,
             blocks.iter().map(|&b| {
                 let end = if b + 1 < self.num_blocks() {
@@ -652,6 +717,37 @@ impl Vocab {
                 (self.block_offset(b), end)
             }),
         );
+    }
+
+    /// Whether [`Vocab::prefetch_sorted`] would ask for nothing for these ids (in any
+    /// order, with repeats): the hints are off, the vocabulary is not mapped, or every
+    /// block that holds one of them was asked for before. A warm serializer checks this
+    /// first and then skips collecting and sorting its ids. It asks for nothing itself.
+    pub(crate) fn prefetch_would_skip(&self, ids: impl Iterator<Item = u64>) -> bool {
+        if !crate::index::io_hints()
+            || !matches!((&self.data, &self.offsets), (Bytes::Map(_), Bytes::Map(_)))
+        {
+            return true;
+        }
+        let mut last = usize::MAX;
+        for id in ids {
+            if id >= self.len {
+                continue;
+            }
+            let b = id as usize / FC_BLOCK;
+            if b == last {
+                continue;
+            }
+            last = b;
+            let asked = self
+                .prefetched
+                .get(b / 64)
+                .map_or(0, |w| w.load(AtomicOrdering::Relaxed));
+            if asked & (1u64 << (b % 64)) == 0 {
+                return false;
+            }
+        }
+        true
     }
 
     /// Read ahead what evaluating these ids' values reads (ids sorted ascending), for a
@@ -667,6 +763,17 @@ impl Vocab {
         {
             let maybe: Vec<u64> = ids.iter().copied().filter(|&id| num.may_hold(id)).collect();
             num.get_many(&maybe);
+        }
+    }
+
+    /// Ask for the pages that evaluating these ids' values reads (ids sorted ascending), for
+    /// a FILTER over a few rows: the front-coded blocks of every id and the numeric
+    /// column's pages (see [`numeric::NumColumn::advise_ids`]). It reads no value, so a
+    /// warm call costs the block lookups alone.
+    pub fn prefetch_value_pages(&self, ids: &[u64]) {
+        self.prefetch_sorted(ids);
+        if let Some(num) = &self.num {
+            num.advise_ids(ids);
         }
     }
 
@@ -701,17 +808,62 @@ impl Vocab {
         for g in groups {
             let lo = g * IDX_BLOCKS;
             let hi = ((g + 1) * IDX_BLOCKS).min(self.num_blocks());
-            self.offsets.will_need(lo * 8, (hi + 1) * 8);
+            self.offsets
+                .will_need(IoFile::VocabOff, lo * 8, (hi + 1) * 8);
             let end = s
                 .offsets
                 .get(g + 1)
                 .map_or(self.data.as_slice().len(), |&o| o as usize);
-            self.data.will_need(s.offsets[g] as usize, end);
+            self.data
+                .will_need(IoFile::VocabData, s.offsets[g] as usize, end);
+        }
+    }
+
+    /// Whether the vocabulary has a sparse index, which [`Vocab::prefetch_keys`] needs.
+    pub fn has_sparse(&self) -> bool {
+        self.sparse.is_some()
+    }
+
+    /// Ask for the sparse-index groups that hold these keys, all at once, before the keys
+    /// are looked up one after the other with [`Vocab::find`] (which would wait for each
+    /// group before looking for the next key). Groups read before are left alone. Does
+    /// nothing without a sparse index or with the read hints off.
+    pub fn prefetch_keys<K: AsRef<[u8]>>(&self, keys: &[K]) {
+        let Some(s) = &self.sparse else { return };
+        if !crate::index::io_hints() || self.num_blocks() == 0 {
+            return;
+        }
+        let mut groups: Vec<usize> = keys
+            .iter()
+            .filter_map(|k| {
+                let key = k.as_ref();
+                let g = partition_point_by(s.len(), |g| s.key(g) <= key);
+                g.checked_sub(1)
+            })
+            .collect();
+        groups.sort_unstable();
+        groups.dedup();
+        let nb = self.num_blocks();
+        for g in groups {
+            if !s.first_hint(g) {
+                continue;
+            }
+            let (lo, hi) = (g * IDX_BLOCKS, ((g + 1) * IDX_BLOCKS).min(nb));
+            self.offsets
+                .will_need(IoFile::VocabOff, lo * 8, (hi + 1) * 8);
+            let end = s
+                .offsets
+                .get(g + 1)
+                .map_or(self.data.as_slice().len(), |&o| o as usize);
+            self.data
+                .will_need(IoFile::VocabData, s.offsets[g] as usize, end);
         }
     }
 
     /// Binary search: `Ok(id)` if present, `Err(insertion point)` otherwise.
     pub fn find(&self, key: &[u8]) -> std::result::Result<u64, u64> {
+        ioacct::vocab_find();
+        let _t = ioacct::timer(Phase::VocabFind);
         let nb = self.num_blocks();
         if nb == 0 {
             return Err(0);
@@ -730,13 +882,14 @@ impl Vocab {
             hi = ((g + 1) * IDX_BLOCKS).min(nb);
             if crate::index::io_hints() && s.first_hint(g) {
                 if let Bytes::Map(m) = &self.offsets {
-                    crate::index::will_need(m, lo * 8, (hi - lo) * 8);
+                    crate::index::will_need(IoFile::VocabOff, m, lo * 8, (hi - lo) * 8);
                 }
                 let end = s
                     .offsets
                     .get(g + 1)
                     .map_or(self.data.as_slice().len(), |&o| o as usize);
-                self.data.will_need(s.offsets[g] as usize, end);
+                self.data
+                    .will_need(IoFile::VocabData, s.offsets[g] as usize, end);
             }
             // block `lo` starts with the group's key, which is not above `key`
             lo += 1;
@@ -766,6 +919,140 @@ impl Vocab {
             }
         });
         result
+    }
+
+    /// Fallible checked reconstruction for call-owned projection scratch. Public
+    /// dictionary readers retain their existing allocation and access paths.
+    fn scan_block_checked(
+        &self,
+        b: usize,
+        reserve: &mut impl FnMut(usize) -> crate::error::Result<()>,
+        mut f: impl FnMut(usize, &[u8]) -> crate::error::Result<bool>,
+    ) -> crate::error::Result<()> {
+        let data = self.data.as_slice();
+        let mut pos = self.block_offset(b);
+        let n = FC_BLOCK.min(self.len as usize - b * FC_BLOCK);
+        let mut key = Vec::new();
+        for i in 0..n {
+            let shared = read_varint(data, &mut pos) as usize;
+            let len = read_varint(data, &mut pos) as usize;
+            let need = key
+                .len()
+                .min(shared)
+                .checked_add(len)
+                .ok_or_else(|| crate::error::Error::invalid("vocabulary scratch overflows"))?;
+            if need > key.capacity() {
+                reserve(need)?;
+                key.try_reserve_exact(need - key.len()).map_err(|e| {
+                    crate::error::Error::invalid(format!("vocabulary allocation failed: {e}"))
+                })?;
+                if key.capacity() != need {
+                    return Err(crate::error::Error::invalid(
+                        "unsupported vocabulary scratch capacity",
+                    ));
+                }
+                #[cfg(any(test, feature = "failpoints"))]
+                crate::algo::observe_projection(crate::algo::ProjectionEvent::Materialized(
+                    "vocab-scratch-allocated",
+                    key.capacity(),
+                ));
+            }
+            key.truncate(shared);
+            key.extend_from_slice(&data[pos..pos + len]);
+            pos += len;
+            if !f(i, &key)? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn get_with_fallible<T>(
+        &self,
+        id: u64,
+        mut reserve: impl FnMut(usize) -> crate::error::Result<()>,
+        mut f: impl FnMut(&[u8]) -> T,
+    ) -> crate::error::Result<Option<T>> {
+        if id >= self.len {
+            return Ok(None);
+        }
+        let b = id as usize / FC_BLOCK;
+        self.ahead_for(&[id]).at(self, b);
+        let wanted = id as usize % FC_BLOCK;
+        let mut result = None;
+        self.scan_block_checked(b, &mut reserve, |i, key| {
+            if i == wanted {
+                result = Some(f(key));
+                Ok(false)
+            } else {
+                Ok(true)
+            }
+        })?;
+        Ok(result)
+    }
+
+    pub(crate) fn find_with_checked(
+        &self,
+        key: &[u8],
+        mut reserve: impl FnMut(usize) -> crate::error::Result<()>,
+    ) -> crate::error::Result<std::result::Result<u64, u64>> {
+        let nb = self.num_blocks();
+        if nb == 0 {
+            return Ok(Err(0));
+        }
+        // last block whose first key <= key
+        let (mut lo, mut hi) = (0usize, nb);
+        if let Some(s) = &self.sparse {
+            // the group of blocks that holds the key, from memory; then only its offsets
+            // and data are read, each asked for in one request
+            let g = partition_point_by(s.len(), |g| s.key(g) <= key);
+            if g == 0 {
+                return Ok(Err(0));
+            }
+            let g = g - 1;
+            lo = g * IDX_BLOCKS;
+            hi = ((g + 1) * IDX_BLOCKS).min(nb);
+            if crate::index::io_hints() && s.first_hint(g) {
+                if let Bytes::Map(m) = &self.offsets {
+                    crate::index::will_need(IoFile::VocabOff, m, lo * 8, (hi - lo) * 8);
+                }
+                let end = s
+                    .offsets
+                    .get(g + 1)
+                    .map_or(self.data.as_slice().len(), |&o| o as usize);
+                self.data
+                    .will_need(IoFile::VocabData, s.offsets[g] as usize, end);
+            }
+            // block `lo` starts with the group's key, which is not above `key`
+            lo += 1;
+        }
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if self.block_first(mid) <= key {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo == 0 {
+            return Ok(Err(0));
+        }
+        let b = lo - 1;
+        let mut result = Err(((b + 1) * FC_BLOCK).min(self.len as usize) as u64);
+        self.scan_block_checked(b, &mut reserve, |i, k| {
+            Ok(match k.cmp(key) {
+                std::cmp::Ordering::Less => true,
+                std::cmp::Ordering::Equal => {
+                    result = Ok((b * FC_BLOCK + i) as u64);
+                    false
+                }
+                std::cmp::Ordering::Greater => {
+                    result = Err((b * FC_BLOCK + i) as u64);
+                    false
+                }
+            })
+        })?;
+        Ok(result)
     }
 
     /// Id range `[lo, hi)` of keys with the given byte prefix.
@@ -1125,6 +1412,351 @@ impl AppendVocab {
 mod tests {
     use super::*;
 
+    /// Profiles are process-wide. Run each exact counter case without other tests.
+    fn isolated_vocab_profile(test: &str) -> bool {
+        if std::env::var_os("SPARKLES_VOCAB_PROFILE_CHILD").is_some() {
+            return false;
+        }
+        let modes: &[&str] = if test.contains("sorted_reads") {
+            &["off", "no-ahead", "pre-hint"]
+        } else {
+            &["off"]
+        };
+        for mode in modes {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &format!("vocab::tests::{test}"), "--nocapture"])
+                .env("SPARKLES_VOCAB_PROFILE_CHILD", "1")
+                .env("SPARKLES_VOCAB_PROFILE_MODE", mode)
+                .env(
+                    "SPARKLES_IO_HINTS",
+                    if *mode == "off" { "off" } else { "on" },
+                )
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{mode}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        true
+    }
+
+    fn profile_keys(dir: &Path, n: usize) -> Vec<Vec<u8>> {
+        let keys: Vec<_> = (0..n)
+            .map(|i| format!("<urn:profile:{i:08}>").into_bytes())
+            .collect();
+        let mut writer = VocabWriter::create(dir).unwrap();
+        for key in &keys {
+            writer.push(key).unwrap();
+        }
+        writer.finish().unwrap();
+        keys
+    }
+
+    fn assert_vocab_profile(report: &ioacct::IoReport, blocks: u64) {
+        eprintln!("vocab profile: {report:?}");
+        assert_eq!(report.vocab.blocks_scanned, blocks, "scanned blocks");
+        let pages = report.pages.as_ref().expect("actual mapped reads recorded");
+        for file in ["vocab.off", "vocab.dat"] {
+            assert!(pages[file].touched > 0, "{file}: {report:?}");
+        }
+    }
+
+    fn bulk_profile(checked: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = profile_keys(dir.path(), 2 * FC_BLOCK + 3);
+        let vocab = Vocab::open(dir.path()).unwrap();
+        let mode = std::env::var("SPARKLES_VOCAB_PROFILE_MODE").unwrap_or_else(|_| "off".into());
+        let id = keys.len() as u64 - 1;
+        if mode == "pre-hint" {
+            assert!(crate::index::io_hints());
+            let before = ioacct::IoSnapshot::now();
+            vocab.prefetch_sorted(&[id]);
+            assert!(ioacct::IoSnapshot::now().since(&before).readahead_bytes() > 0);
+        }
+        let profile = ioacct::Profile::start();
+        let mut got = Vec::new();
+        if checked {
+            // A one-id checked pass has no automatic dense or scattered look-ahead.
+            assert_eq!(vocab.ahead_for(&[id]).end, 0);
+            vocab
+                .get_sorted_checked(
+                    &[id],
+                    |_| Ok::<_, ()>(()),
+                    |id, key| {
+                        got.push((id, key.to_vec()));
+                        Ok(())
+                    },
+                )
+                .unwrap();
+        } else {
+            vocab.get_sorted_with_ahead(
+                &[id],
+                |id, key| got.push((id, key.to_vec())),
+                mode != "no-ahead",
+            );
+        }
+        assert_eq!(got, vec![(id, keys[id as usize].clone())]);
+        let report = profile.report();
+        assert!(
+            report.readahead.is_empty(),
+            "no advice during the single-id profile"
+        );
+        assert_vocab_profile(&report, 1);
+    }
+
+    #[test]
+    fn sorted_reads_record_actual_pages() {
+        if isolated_vocab_profile("sorted_reads_record_actual_pages") {
+            return;
+        }
+        bulk_profile(false);
+    }
+
+    #[test]
+    fn checked_sorted_reads_record_actual_pages() {
+        if isolated_vocab_profile("checked_sorted_reads_record_actual_pages") {
+            return;
+        }
+        bulk_profile(true);
+    }
+
+    #[test]
+    fn profiled_bulk_boundaries_and_errors() {
+        if isolated_vocab_profile("profiled_bulk_boundaries_and_errors") {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let keys = profile_keys(dir.path(), 2 * FC_BLOCK + 3);
+        let vocab = Vocab::open(dir.path()).unwrap();
+        let last = vocab.len() - 1;
+        for checked in [false, true] {
+            let profile = ioacct::Profile::start();
+            let ids = [0, 15, 16, last, vocab.len(), u64::MAX];
+            let mut got = Vec::new();
+            if checked {
+                vocab
+                    .get_sorted_checked(
+                        &ids,
+                        |_| Ok::<_, ()>(()),
+                        |id, key| {
+                            got.push((id, key.to_vec()));
+                            Ok(())
+                        },
+                    )
+                    .unwrap();
+            } else {
+                vocab.get_sorted(&ids, |id, key| got.push((id, key.to_vec())));
+            }
+            let expected: Vec<_> = ids[..4]
+                .iter()
+                .map(|&id| (id, keys[id as usize].clone()))
+                .collect();
+            assert_eq!(got, expected);
+            assert_vocab_profile(&profile.report(), 3);
+        }
+        for ids in [&[][..], &[vocab.len(), u64::MAX][..]] {
+            let profile = ioacct::Profile::start();
+            vocab.get_sorted(ids, |_, _| panic!("invalid id decoded"));
+            vocab
+                .get_sorted_checked(
+                    ids,
+                    |_| panic!("invalid id reserved"),
+                    |_, _| -> Result<()> { panic!("invalid id decoded") },
+                )
+                .unwrap();
+            let report = profile.report();
+            assert_eq!(report.vocab.blocks_scanned, 0);
+            assert!(report.pages.is_none());
+            assert!(report.readahead.is_empty());
+        }
+        // Callback and reservation errors stop at the block actually entered. No
+        // successful later scan is invented, and reconstruction still reserves first.
+        for reserve_error in [false, true] {
+            let profile = ioacct::Profile::start();
+            let mut callbacks = 0;
+            let result = vocab.get_sorted_checked(
+                &[0, 16, last],
+                |_| {
+                    if reserve_error {
+                        Err("reserve")
+                    } else {
+                        Ok(())
+                    }
+                },
+                |id, key| {
+                    callbacks += 1;
+                    assert_eq!(key, keys[id as usize]);
+                    if id == 16 { Err("callback") } else { Ok(()) }
+                },
+            );
+            assert_eq!(
+                result,
+                Err(if reserve_error { "reserve" } else { "callback" })
+            );
+            assert_eq!(callbacks, if reserve_error { 0 } else { 2 });
+            assert_vocab_profile(&profile.report(), if reserve_error { 1 } else { 2 });
+        }
+        // Binary-search probes read a block's first key, but do not traverse a
+        // decoder. They still observe its offset and data pages before reading.
+        let profile = ioacct::Profile::start();
+        assert_eq!(vocab.block_first(1), keys[FC_BLOCK]);
+        assert_vocab_profile(&profile.report(), 0);
+        drop(profile);
+        let profile = ioacct::Profile::start();
+        let ids: Vec<_> = (0..16).collect();
+        let _ahead = vocab.ahead_for(&ids);
+        let report = profile.report();
+        assert_eq!(report.vocab.blocks_scanned, 0);
+        let pages = report.pages.unwrap();
+        assert!(pages["vocab.off"].touched > 0);
+        assert!(
+            !pages.contains_key("vocab.dat"),
+            "offset preparation is not a data read"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cold_offset_is_observed_before_lookup() {
+        if isolated_vocab_profile("cold_offset_is_observed_before_lookup") {
+            return;
+        }
+        use std::os::fd::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let keys = profile_keys(dir.path(), 65536);
+        let vocab = Vocab::open(dir.path()).unwrap();
+        let Bytes::Map(offsets) = &vocab.offsets else {
+            panic!("mapped offsets");
+        };
+        // SAFETY: sysconf has no pointer arguments or other preconditions.
+        let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
+        let id = 48000;
+        let at = (id as usize / FC_BLOCK * 8) / page * page;
+        assert!(at >= page && at + page < offsets.len());
+        let file = File::open(dir.path().join("vocab.off")).unwrap();
+        file.sync_all().unwrap();
+        // SAFETY: the whole mapping is an owned immutable test file. DONTNEED drops
+        // only its PTEs; fadvise then requests eviction only of this file's pages.
+        unsafe {
+            assert_eq!(
+                libc::madvise(
+                    offsets.as_ptr().cast_mut().cast(),
+                    offsets.len(),
+                    libc::MADV_RANDOM
+                ),
+                0
+            );
+            assert_eq!(
+                libc::madvise(
+                    offsets.as_ptr().cast_mut().cast(),
+                    offsets.len(),
+                    libc::MADV_DONTNEED
+                ),
+                0
+            );
+            assert_eq!(
+                libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED),
+                0
+            );
+        }
+        let resident = || {
+            let mut state = 0u8;
+            // SAFETY: at is a page-aligned offset inside the live mapping and state
+            // has the one output byte required for this one-page query.
+            assert_eq!(
+                unsafe {
+                    libc::mincore(offsets.as_ptr().add(at).cast_mut().cast(), page, &mut state)
+                },
+                0
+            );
+            state & 1
+        };
+        let before = resident();
+        eprintln!("independent target offset page={at}, resident before lookup={before}");
+        if before != 0 {
+            // some file systems keep the page after fadvise: the case proves nothing
+            eprintln!("skipped: the private offset page was not evicted");
+            return;
+        }
+        let profile = ioacct::Profile::start();
+        assert_eq!(vocab.get(id), Some(keys[id as usize].clone()));
+        let after = resident();
+        let report = profile.report();
+        eprintln!("independent resident after lookup={after}; {report:?}");
+        assert_eq!(after, 1);
+        let offset_io = &report.pages.as_ref().unwrap()["vocab.off"];
+        assert_eq!(offset_io.touched, 1);
+        assert_eq!(offset_io.resident_after, 1);
+        assert_eq!(
+            offset_io.resident_before, 0,
+            "offset was observed after its first load"
+        );
+        assert_eq!(offset_io.brought_in, 1);
+    }
+
+    #[test]
+    fn projection_find_matches_public_search_and_rejects_before_growth() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = write_keys(dir.path(), 3 * FC_BLOCK * IDX_BLOCKS + 77);
+        let v = Vocab::open(dir.path()).unwrap();
+        for key in keys
+            .iter()
+            .step_by(127)
+            .chain([b"".to_vec(), b"zzzz".to_vec()].iter())
+        {
+            assert_eq!(v.find_with_checked(key, |_| Ok(())).unwrap(), v.find(key));
+            let mut absent = key.clone();
+            absent.push(0);
+            assert_eq!(
+                v.find_with_checked(&absent, |_| Ok(())).unwrap(),
+                v.find(&absent)
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = VocabWriter::create(dir.path()).unwrap();
+        let keys = [
+            b"<a".to_vec(),
+            format!("<b{}", "x".repeat(4096)).into_bytes(),
+            b"<c".to_vec(),
+        ];
+        for key in &keys {
+            writer.push(key).unwrap();
+        }
+        writer.finish().unwrap();
+        let v = Vocab::open(dir.path()).unwrap();
+        for allowed in [0, 1] {
+            let observed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let seen = observed.clone();
+            crate::algo::set_projection_observer(Some(std::sync::Arc::new(move |event| {
+                if let crate::algo::ProjectionEvent::Materialized("vocab-scratch-allocated", _) =
+                    event
+                {
+                    seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            })));
+            let mut calls = 0;
+            let result = v.find_with_checked(&keys[2], |_| {
+                calls += 1;
+                if calls > allowed {
+                    Err(crate::Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            });
+            crate::algo::set_projection_observer(None);
+            assert!(matches!(result, Err(crate::Error::Cancelled)));
+            assert_eq!(observed.load(std::sync::atomic::Ordering::Relaxed), allowed);
+        }
+        assert_eq!(
+            v.get_with_fallible(2, |_| Ok(()), |key| key.to_vec())
+                .unwrap(),
+            Some(keys[2].clone())
+        );
+        assert_eq!(v.get_with_fallible(3, |_| Ok(()), |_| ()).unwrap(), None);
+    }
     #[test]
     fn checked_decode_reserves_intermediate_keys_before_growth() {
         let keys = [
@@ -1418,6 +2050,30 @@ mod tests {
         }
     }
 
+    /// A warm answer asks [`Vocab::prefetch_sorted`] for nothing, and the serializer
+    /// learns that without sorting its ids: [`Vocab::prefetch_would_skip`] is true once
+    /// every block of the ids was asked for, and asking it changes nothing.
+    #[test]
+    fn prefetch_would_skip_only_blocks_asked_for_before() {
+        let dir = tempfile::tempdir().unwrap();
+        write_keys(dir.path(), 4 * FC_BLOCK + 3);
+        let v = Vocab::open(dir.path()).unwrap();
+        let (a, b, far) = (1, FC_BLOCK as u64 + 2, 3 * FC_BLOCK as u64);
+        if !crate::index::io_hints() {
+            assert!(v.prefetch_would_skip([a, b, far].into_iter()));
+            return;
+        }
+        assert!(!v.prefetch_would_skip([b, a].into_iter()));
+        // asking leaves the blocks to be prefetched
+        assert!(!v.prefetch_would_skip([a].into_iter()));
+        v.prefetch_sorted(&[a, b]);
+        assert!(v.prefetch_would_skip([b, a, a + 1].into_iter()));
+        assert!(!v.prefetch_would_skip([a, far].into_iter()));
+        // ids past the vocabulary have no block to ask for
+        assert!(v.prefetch_would_skip([a, v.len(), u64::MAX].into_iter()));
+        assert!(v.prefetch_would_skip(std::iter::empty()));
+    }
+
     #[test]
     fn front_coded_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
@@ -1513,6 +2169,60 @@ mod tests {
         assert_eq!(v.find(&keys[i]), Ok(i as u64));
         assert!(!s.first_hint(5) || !crate::index::io_hints());
         assert_eq!(v.find(&keys[i]), Ok(i as u64));
+    }
+
+    #[test]
+    fn prefetch_keys_asks_for_every_group_before_the_lookups() {
+        // the hint counter is process-wide, so the case runs alone in a child process
+        const CHILD: &str = "SPARKLES_PREFETCH_KEYS_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "vocab::tests::prefetch_keys_asks_for_every_group_before_the_lookups",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let keys = write_keys(dir.path(), 64 * FC_BLOCK * IDX_BLOCKS);
+        let v = Vocab::open(dir.path()).unwrap();
+        let s = v.sparse.as_ref().unwrap();
+        let group = |i: usize| i / (FC_BLOCK * IDX_BLOCKS);
+        let picks = [
+            5 * FC_BLOCK * IDX_BLOCKS + 3,
+            9 * FC_BLOCK * IDX_BLOCKS,
+            70_000,
+        ];
+        let hinted = || crate::ioacct::IoSnapshot::now().vocab_groups_hinted;
+        let start = hinted();
+        v.prefetch_keys(&picks.iter().map(|&i| keys[i].clone()).collect::<Vec<_>>());
+        if crate::index::io_hints() {
+            // each group has been asked for once, so a second batch and the lookups ask for none
+            let groups: std::collections::HashSet<usize> =
+                picks.iter().map(|&i| group(i)).collect();
+            assert_eq!(hinted() - start, groups.len() as u64);
+            for &i in &picks {
+                assert!(!s.first_hint(group(i)), "group of key {i}");
+            }
+            v.prefetch_keys(&[keys[picks[0]].clone()]);
+            assert_eq!(hinted() - start, groups.len() as u64);
+        }
+        for &i in &picks {
+            assert_eq!(v.find(&keys[i]), Ok(i as u64));
+        }
+        // keys outside the vocabulary, before its first key or in no group, do no harm
+        v.prefetch_keys(&[b"".to_vec(), b"\xff\xff".to_vec()]);
     }
 
     #[test]

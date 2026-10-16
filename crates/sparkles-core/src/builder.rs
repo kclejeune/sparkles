@@ -33,6 +33,7 @@ use crate::id::{self, Id, Tag};
 use crate::index::{Key, Perm, PermWriter};
 use crate::io::{QuadSink, Source, parse_source};
 use crate::sparql::cdt;
+use crate::store::QuadKey;
 use crate::vocab::Vocab;
 use oxrdf::{GraphName, NamedOrBlankNode, Quad, Term};
 use parking_lot::Mutex;
@@ -160,6 +161,34 @@ pub struct IndexMeta {
 
 pub const FORMAT_VERSION: u32 = 2;
 
+/// The `format_version` of a generation's `meta.json` whose bytes are `bytes`, read on
+/// its own so that a newer meta in another shape is refused as newer instead of being
+/// reported as damaged. A missing version, or one that is not a `u32`, is
+/// [`Error::Corrupt`]. `what` names the file in messages.
+pub fn index_meta_version(bytes: &[u8], what: &str) -> Result<u32> {
+    let v: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|e| Error::Corrupt(format!("{what}: {e}")))?;
+    meta_version_of(&v, what)
+}
+
+fn meta_version_of(v: &serde_json::Value, what: &str) -> Result<u32> {
+    v.get("format_version")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+        .ok_or_else(|| Error::Corrupt(format!("{what}: format_version is missing or not a u32")))
+}
+
+/// Read the `meta.json` of the generation in `dir`: its version first, checked against
+/// the index versions this build reads, then the rest. `written_by` names the release
+/// that wrote the database, for the refusal.
+pub fn read_index_meta(dir: &Path, written_by: Option<&str>) -> Result<IndexMeta> {
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("meta.json"))?)
+        .map_err(|e| Error::Corrupt(format!("meta.json: {e}")))?;
+    let version = meta_version_of(&v, "meta.json")?;
+    crate::formats::INDEX.check(&dir.display().to_string(), version, written_by)?;
+    serde_json::from_value(v).map_err(|e| Error::Corrupt(format!("meta.json: {e}")))
+}
+
 struct BatchInfo {
     id: usize,
     /// the place of the batch in the order of `id`, set before the vocabulary merge
@@ -217,6 +246,19 @@ pub struct Builder {
     /// the start of the current phase and of the build
     phases: Mutex<(iostat::Phases, iostat::Phases)>,
     hot: hotkeys::HotKeys,
+    /// the quads taken from sources, as vocabulary keys, when a caller wants them
+    tap: Option<ChangeTap>,
+}
+
+/// The quads that a build takes from its sources, as vocabulary keys, up to a cap. The
+/// change log reads them as the new quads of a bulk commit, so it need not compare the
+/// states before and after the commit. Quads that the build copies from a snapshot are not
+/// collected.
+struct ChangeTap {
+    cap: u64,
+    count: AtomicU64,
+    overflow: AtomicBool,
+    keys: Mutex<Vec<QuadKey>>,
 }
 
 /// The messages of a long-running build, one per phase (`building POS`). A build does
@@ -256,7 +298,31 @@ impl Builder {
             interrupt: None,
             tmp_bytes: Default::default(),
             phases: Mutex::new((iostat::Phases::start(), iostat::Phases::start())),
+            tap: None,
         })
+    }
+
+    /// Collect the quads that [`add_source`](Self::add_source) takes, as keys, unless
+    /// there are more than `cap` of them. The keys are held in memory until
+    /// [`take_tapped`](Self::take_tapped).
+    pub(crate) fn with_change_tap(mut self, cap: u64) -> Self {
+        self.tap = Some(ChangeTap {
+            cap,
+            count: AtomicU64::new(0),
+            overflow: AtomicBool::new(false),
+            keys: Mutex::new(Vec::new()),
+        });
+        self
+    }
+
+    /// The quads the sources gave, as keys in the order of their batches, once every
+    /// source is added. `None` without a tap, or when there were more than its cap.
+    pub(crate) fn take_tapped(&self) -> Option<Vec<QuadKey>> {
+        let t = self.tap.as_ref()?;
+        if t.overflow.load(Ordering::Relaxed) {
+            return None;
+        }
+        Some(std::mem::take(&mut *t.keys.lock()))
     }
 
     pub fn with_progress(mut self, f: MessageFn) -> Self {
@@ -316,6 +382,8 @@ impl Builder {
             keybuf: Vec::with_capacity(128),
             taken: 0,
             last: Default::default(),
+            tapped: Vec::new(),
+            tap_keys: FxHashMap::default(),
         }
     }
 
@@ -1100,6 +1168,10 @@ pub struct Encoder<'b> {
     /// the last subject and predicate IRIs and their batch-local ids: N-Triples files
     /// usually repeat them on consecutive lines
     last: [(String, u64); 2],
+    /// the keys of the quads taken since the last flush, for the builder's tap
+    tapped: Vec<QuadKey>,
+    /// the keys of the batch-local ids seen since the last flush, shared by those quads
+    tap_keys: FxHashMap<u64, Arc<[u8]>>,
 }
 
 impl Encoder<'_> {
@@ -1208,7 +1280,58 @@ impl Encoder<'_> {
             GraphName::BlankNode(b) => Id::bnode(self.scope.get(b.as_str(), &self.b.next_bnode)).0,
         };
         self.quads.push([s, p, o, g]);
+        if self.b.tap.is_some() {
+            self.tap_quad([g, s, p, o]);
+        }
         self.maybe_flush()
+    }
+
+    /// The key of a term id this encoder gave out.
+    fn tap_key(&mut self, id: u64) -> Arc<[u8]> {
+        if let Some(k) = self.tap_keys.get(&id) {
+            return k.clone();
+        }
+        let i = Id(id);
+        let key: Vec<u8> = match i.tag() {
+            Tag::Local => self.keys.key(i.payload() as u32).to_vec(),
+            Tag::BNode => {
+                let mut k = vec![b'_'];
+                k.extend_from_slice(&i.payload().to_be_bytes());
+                k
+            }
+            _ if i == Id::DEFAULT_GRAPH => Vec::new(),
+            _ => id::inline_to_literal(i)
+                .map(|l| {
+                    let mut k = Vec::new();
+                    id::write_literal_key(&l, &mut k);
+                    k
+                })
+                .unwrap_or_default(),
+        };
+        let key: Arc<[u8]> = key.into();
+        self.tap_keys.insert(id, key.clone());
+        key
+    }
+
+    /// Note the quad `[g, s, p, o]` just pushed for the builder's tap.
+    fn tap_quad(&mut self, q: [u64; 4]) {
+        let Some(t) = &self.b.tap else { return };
+        if t.overflow.load(Ordering::Relaxed) {
+            return;
+        }
+        if t.count.fetch_add(1, Ordering::Relaxed) >= t.cap {
+            t.overflow.store(true, Ordering::Relaxed);
+            self.tapped = Vec::new();
+            self.tap_keys.clear();
+            return;
+        }
+        let k = [
+            self.tap_key(q[0]),
+            self.tap_key(q[1]),
+            self.tap_key(q[2]),
+            self.tap_key(q[3]),
+        ];
+        self.tapped.push(k);
     }
 
     /// Push a pre-encoded quad (compaction path): ids are kept, keys go to the vocabulary.
@@ -1238,6 +1361,12 @@ impl Encoder<'_> {
     }
 
     pub fn flush(&mut self) -> Result<()> {
+        if !self.tapped.is_empty()
+            && let Some(t) = &self.b.tap
+        {
+            t.keys.lock().append(&mut self.tapped);
+        }
+        self.tap_keys.clear();
         let written = self
             .b
             .write_batch(&self.keys, &self.quads, &mut self.order, &mut self.rank);

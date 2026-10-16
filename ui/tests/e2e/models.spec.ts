@@ -67,6 +67,8 @@ open('the Models section edits providers, roles and keys', async ({ page, reques
   await gw2.getByLabel('New key for gw2').fill(RUNTIME_KEY);
   await gw2.getByRole('button', { name: 'Save key' }).click();
   await expect(page.getByText('Stored a new key for gw2')).toBeVisible();
+  // the server runs without --secrets-key, so it sealed the key with one it generated
+  await expect(keys.getByTestId('secrets-storage')).toContainText('secrets.key');
   await expect(gw2).toContainText('set here');
   await expect(gw2).toContainText('Used by gw2');
   await expect(gw2.getByLabel('New key for gw2')).toHaveCount(0);

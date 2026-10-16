@@ -733,47 +733,57 @@ fn large_term_decode_fails_without_truncating_the_literal() {
 
 #[test]
 fn charged_regex_key_filters_cover_planning_and_count_fallbacks() {
-    let dir = tempfile::tempdir().unwrap();
-    let s = Store::open(dir.path(), StoreOptions::default()).unwrap();
-    let data = (0..5000)
-        .map(|i| format!("<urn:s:{i}> <urn:p> \"Ada {i}\" .\n"))
-        .collect::<String>();
-    s.load(&[Source::from_bytes(
-        data.into_bytes(),
-        RdfFormat::Turtle,
-        None,
-    )])
-    .unwrap();
-    s.compact().unwrap();
-    for body in [
-        "REGEX(?o, \"Ada\")",
-        "REGEX(STR(?o), \"^Ada\")",
-        "REGEX(?o, \"ada\", \"i\")",
-    ] {
-        for prefix in ["SELECT ?s ?o", "SELECT (COUNT(*) AS ?count)"] {
-            let q = format!("{prefix} WHERE {{ ?s <urn:p> ?o FILTER({body}) }}");
-            let expected = bag(query(s.snapshot(), &q, &Default::default()).unwrap().rows());
-            for memory in [256 << 10, 16 << 20] {
-                let opts = QueryOptions {
-                    max_memory_bytes: Some(memory),
-                    ..Default::default()
-                };
-                let mut c =
-                    select_cursor(s.snapshot(), &q, &opts, &CursorOptions::default()).unwrap();
-                let mut rows = Vec::new();
-                while let Some(b) = c
-                    .next_batch()
-                    .unwrap_or_else(|e| panic!("{q}; {memory}: {e}"))
-                {
-                    for i in 0..b.len() {
-                        rows.push(b.row(i).unwrap());
+    // The fixed budget includes metadata and scratch for each Rayon worker.
+    // Keep the parallel count path without scaling that overhead with the host.
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap()
+        .install(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let s = Store::open(dir.path(), StoreOptions::default()).unwrap();
+            let data = (0..5000)
+                .map(|i| format!("<urn:s:{i}> <urn:p> \"Ada {i}\" .\n"))
+                .collect::<String>();
+            s.load(&[Source::from_bytes(
+                data.into_bytes(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+            s.compact().unwrap();
+            for body in [
+                "REGEX(?o, \"Ada\")",
+                "REGEX(STR(?o), \"^Ada\")",
+                "REGEX(?o, \"ada\", \"i\")",
+            ] {
+                for prefix in ["SELECT ?s ?o", "SELECT (COUNT(*) AS ?count)"] {
+                    let q = format!("{prefix} WHERE {{ ?s <urn:p> ?o FILTER({body}) }}");
+                    let expected =
+                        bag(query(s.snapshot(), &q, &Default::default()).unwrap().rows());
+                    for memory in [256 << 10, 16 << 20] {
+                        let opts = QueryOptions {
+                            max_memory_bytes: Some(memory),
+                            ..Default::default()
+                        };
+                        let mut c =
+                            select_cursor(s.snapshot(), &q, &opts, &CursorOptions::default())
+                                .unwrap();
+                        let mut rows = Vec::new();
+                        while let Some(b) = c
+                            .next_batch()
+                            .unwrap_or_else(|e| panic!("{q}; {memory}: {e}"))
+                        {
+                            for i in 0..b.len() {
+                                rows.push(b.row(i).unwrap());
+                            }
+                        }
+                        assert_eq!(bag(rows), expected, "{q}; {memory}");
+                        assert!(c.stats().mem_peak_bytes <= memory);
                     }
                 }
-                assert_eq!(bag(rows), expected, "{q}; {memory}");
-                assert!(c.stats().mem_peak_bytes <= memory);
             }
-        }
-    }
+        });
 }
 
 #[test]
@@ -1219,6 +1229,7 @@ fn native_cursor_json_has_final_metadata_and_unknown_total_when_stopped() {
             Some(NativeJsonMetadata {
                 commit: 42,
                 dataset_id: "dataset-id",
+                io: None,
             }),
         )
         .unwrap();

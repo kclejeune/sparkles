@@ -421,6 +421,182 @@ async fn a54_pdf_pages_and_spans() {
     );
 }
 
+/// An Office file as an upload.
+#[cfg(feature = "office")]
+fn office_upload(bytes: &[u8], name: &str, extra: &[(&str, &str)]) -> Request<Body> {
+    let mut parts: Vec<Part> = extra
+        .iter()
+        .map(|(k, v)| (*k, None, None, v.as_bytes()))
+        .collect();
+    parts.push(("file", Some(name), Some("application/octet-stream"), bytes));
+    multipart("/$/ingest/org", &parts)
+}
+
+/// Word and PowerPoint files become Markdown renditions. A slide's marker is a page
+/// marker, so the rendition records the slides as pages, and a file is recognized by its
+/// contents when its name and type say nothing.
+#[cfg(feature = "office")]
+#[tokio::test]
+async fn office_documents_become_renditions() {
+    use sparkles_office::fixtures;
+    let (_st, app) = app(None);
+    let v = ingest(&app, office_upload(&fixtures::docx(), "report.docx", &[])).await;
+    assert_eq!(v["status"], "done", "{v}");
+    assert_eq!(v["result"]["outcome"], "registered", "{v}");
+    assert_eq!(v["result"]["format"], "docx", "{v}");
+    let rv = review(&app, v["result"]["branch"].as_str().unwrap()).await;
+    let src = &rv["sources"][0];
+    assert_eq!(src["title"], "Q3 report");
+    let text = src["text"].as_str().unwrap();
+    assert!(
+        text.starts_with("# Quarterly report\n\n# Teams\n\nAna Lima moved"),
+        "{text}"
+    );
+    assert!(text.contains("| Name | Team \\| unit |"), "{text}");
+    assert!(src["pages"].is_null(), "{src}");
+    // a presentation: slides are pages, and the file's name is not needed
+    let v = ingest(&app, office_upload(&fixtures::pptx(), "upload", &[])).await;
+    assert_eq!(v["status"], "done", "{v}");
+    assert_eq!(v["result"]["format"], "pptx", "{v}");
+    assert_eq!(v["result"]["pages"].as_array().unwrap().len(), 2, "{v}");
+    let rv = review(&app, v["result"]["branch"].as_str().unwrap()).await;
+    let src = &rv["sources"][0];
+    let text = src["text"].as_str().unwrap();
+    assert!(text.contains("<!-- Page 2 -->\n\n# Slide 2"), "{text}");
+    assert!(
+        text.contains("Notes:\n\nMention the Berlin office."),
+        "{text}"
+    );
+    let pages = src["pages"].as_array().unwrap();
+    assert_eq!(pages.len(), 2, "{src}");
+    assert_eq!(pages[1]["page"], 2);
+    // an OpenDocument presentation
+    let v = ingest(&app, office_upload(&fixtures::odp(), "deck.odp", &[])).await;
+    assert_eq!(v["result"]["pages"].as_array().unwrap().len(), 2, "{v}");
+    // a damaged file and a legacy file are refused with their reasons
+    let v = ingest(
+        &app,
+        office_upload(b"PK\x03\x04 not a zip", "bad.docx", &[]),
+    )
+    .await;
+    assert_eq!(v["status"], "failed", "{v}");
+    assert_eq!(v["error"]["code"], "conversion-failed", "{v}");
+    let mut ole = vec![0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
+    ole.extend_from_slice(&[0; 32]);
+    let v = ingest(&app, office_upload(&ole, "old.docx", &[])).await;
+    assert_eq!(v["error"]["code"], "unsupported-format", "{v}");
+    // so is one whose name says nothing about Office, which was once read as text
+    let v = ingest(&app, office_upload(&ole, "x.doc", &[])).await;
+    assert_eq!(v["error"]["code"], "unsupported-format", "{v}");
+}
+
+/// A workbook gets one mapping draft for each visible sheet with data (§7.8), each with
+/// the sheet's CSV to upload.
+#[cfg(feature = "office")]
+#[tokio::test]
+async fn a_workbook_is_drafted_sheet_by_sheet() {
+    use sparkles_office::fixtures;
+    let (_st, app) = app(None);
+    let v = ingest(&app, office_upload(&fixtures::xlsx(), "people.xlsx", &[])).await;
+    assert_eq!(v["status"], "done", "{v}");
+    let r = &v["result"];
+    assert_eq!(r["outcome"], "mapping-drafts", "{v}");
+    assert_eq!(r["format"], "xlsx");
+    let sheets = r["sheets"].as_array().unwrap();
+    assert_eq!(sheets.len(), 1, "{v}");
+    let s = &sheets[0];
+    assert_eq!(s["sheet"], "People");
+    assert_eq!(s["index"], 1);
+    assert_eq!(s["drafted"], "default");
+    assert_eq!(s["rows"], 3, "{s}");
+    assert!(
+        s["csv"]
+            .as_str()
+            .unwrap()
+            .starts_with("id,name,start,active\n")
+    );
+    let ods = ingest(&app, office_upload(&fixtures::ods(), "people.ods", &[])).await;
+    assert_eq!(ods["result"]["sheets"][0]["rows"], 1, "{ods}");
+}
+
+/// A workbook of tiny sheets with the given names, each with a header and one row.
+#[cfg(feature = "office")]
+fn workbook_of(names: &[&str]) -> Vec<u8> {
+    const X: &str = r#"xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships""#;
+    let mut wb = format!("<workbook {X}><sheets>");
+    let mut rels = String::from(
+        r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
+    );
+    let sheet = format!(
+        r#"<worksheet {X}><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>name</t></is></c></row><row r="2"><c r="A2" t="inlineStr"><is><t>Ana</t></is></c></row></sheetData></worksheet>"#
+    );
+    for (i, n) in names.iter().enumerate() {
+        let k = i + 1;
+        wb.push_str(&format!(
+            r#"<sheet name="{n}" sheetId="{k}" r:id="rId{k}"/>"#
+        ));
+        rels.push_str(&format!(
+            r#"<Relationship Id="rId{k}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>"#
+        ));
+    }
+    wb.push_str("</sheets></workbook>");
+    rels.push_str("</Relationships>");
+    sparkles_office::fixtures::container(&[
+        ("xl/workbook.xml", &wb),
+        ("xl/_rels/workbook.xml.rels", &rels),
+        ("xl/worksheets/sheet1.xml", &sheet),
+    ])
+}
+
+/// The sheets of a workbook get distinct row namespaces even when their names slug alike
+/// or the workbook's name is long, and a workbook is drafted up to 20 sheets.
+#[cfg(feature = "office")]
+#[tokio::test]
+async fn workbook_sheets_get_distinct_bases_and_a_cap() {
+    let (_st, app) = app(None);
+    let stem = "a-workbook-with-a-rather-long-name-over-forty";
+    assert!(stem.len() > 40);
+    let f = workbook_of(&["People", "Teams", "Q1 Sales", "Q1-Sales"]);
+    let v = ingest(&app, office_upload(&f, &format!("{stem}.xlsx"), &[])).await;
+    assert_eq!(v["status"], "done", "{v}");
+    let bases: Vec<&str> = v["result"]["sheets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["base"].as_str().unwrap())
+        .collect();
+    assert_eq!(bases.len(), 4, "{v}");
+    let distinct: std::collections::HashSet<&str> = bases.iter().copied().collect();
+    assert_eq!(distinct.len(), 4, "{bases:?}");
+    assert!(bases[0].ends_with(":s1-people:"), "{bases:?}");
+    // a base in the request still wins for every sheet
+    let v = ingest(
+        &app,
+        office_upload(
+            &f,
+            &format!("{stem}.xlsx"),
+            &[("base", "http://example.org/p/")],
+        ),
+    )
+    .await;
+    let sheets = v["result"]["sheets"].as_array().unwrap();
+    assert!(
+        sheets.iter().all(|s| s["base"] == "http://example.org/p/"),
+        "{v}"
+    );
+
+    let names: Vec<String> = (1..=25).map(|i| format!("Sheet {i}")).collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let v = ingest(&app, office_upload(&workbook_of(&refs), "many.xlsx", &[])).await;
+    assert_eq!(v["status"], "done", "{v}");
+    assert_eq!(v["result"]["sheets"].as_array().unwrap().len(), 20, "{v}");
+    let notes = v["result"]["notes"].to_string();
+    assert!(
+        notes.contains("25 sheets") && notes.contains("5 are left out"),
+        "{notes}"
+    );
+}
+
 /// A55: without OCR, scanned pages are refused with their pages and reasons, and
 /// `allowPartial` registers the other pages.
 #[cfg(feature = "pdf")]
@@ -482,6 +658,7 @@ async fn a56_conversion_is_deterministic() {
         max_text: super::convert::MAX_TEXT_BYTES,
         deadline: std::time::Instant::now() + Duration::from_secs(30),
         pdf: Arc::default(),
+        max_images: 0,
     };
     let pdf = fixtures::report();
     let a = super::convert::convert(&pdf, super::convert::Format::Pdf, &o).unwrap();
@@ -516,6 +693,7 @@ fn ocr_without_models_fails() {
         max_text: super::convert::MAX_TEXT_BYTES,
         deadline: std::time::Instant::now() + Duration::from_secs(30),
         pdf: Arc::new(rt),
+        max_images: 0,
     };
     let e =
         super::convert::convert(&fixtures::scanned(), super::convert::Format::Pdf, &o).unwrap_err();
@@ -760,8 +938,8 @@ async fn a18_csv_mapping_draft() {
         let a = json!({
             "subjectColumn": "id", "class": class,
             "columns": [
-                { "column": "id", "predicate": "", "kind": "literal", "datatype": "", "lang": "" },
-                { "column": "team", "predicate": member, "kind": "iri", "datatype": "", "lang": "" }
+                { "column": "id", "predicate": "", "kind": "literal", "datatype": "", "lang": "", "linkClass": "" },
+                { "column": "team", "predicate": member, "kind": "iri", "datatype": "", "lang": "", "linkClass": "" }
             ]
         });
         (200, mock::openai(&a.to_string()))
@@ -1320,4 +1498,196 @@ async fn retention_task() {
     )
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+}
+
+/// §7.8: the values of an IRI column that names an existing class are linked with
+/// `link_entities`. An exact link goes into the mapping's lookup and replaces the minted
+/// IRI, an ambiguous value is listed with its candidates and stays minted, and the
+/// upload with the drafted mapping writes the same IRIs.
+#[tokio::test]
+async fn a_csv_draft_links_its_iri_columns() {
+    let m = MockModel::start(|r, _| {
+        let s = &r.body["response_format"]["json_schema"]["schema"]["properties"];
+        let pick = |e: &Value, needle: &str| {
+            e["enum"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_str)
+                .find(|v| v.contains(needle))
+                .unwrap_or_else(|| panic!("{e}"))
+                .to_string()
+        };
+        let col = &s["columns"]["items"]["properties"];
+        let a = json!({
+            "subjectColumn": "id", "class": pick(&s["class"], "Person"),
+            "columns": [
+                { "column": "id", "predicate": "", "kind": "literal", "datatype": "", "lang": "", "linkClass": "" },
+                { "column": "team", "predicate": pick(&col["predicate"], "memberOf"), "kind": "iri",
+                  "datatype": "", "lang": "", "linkClass": pick(&col["linkClass"], "OrganizationalUnit") }
+            ]
+        });
+        (200, mock::openai(&a.to_string()))
+    });
+    let (_st, app) = app(Some([&m.url(), &m.url()]));
+    enable(&app).await;
+    let r = Request::post("/org/update")
+        .header(header::CONTENT_TYPE, "application/sparql-update")
+        .body(Body::from(
+            r#"PREFIX ex: <http://example.org/> PREFIX org: <http://www.w3.org/ns/org#> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+               INSERT DATA { GRAPH <https://example.org/hr> {
+                 ex:plat1 a org:OrganizationalUnit ; rdfs:label "Platform"@en .
+                 ex:plat2 a org:OrganizationalUnit ; rdfs:label "Platform"@en . } }"#,
+        ))
+        .unwrap();
+    let (s, _) = send(&app, r).await;
+    assert!(s.is_success());
+    let csv = "id,team\n1,Payments team\n2,Payments team\n3,payments  TEAM\n4,Platform\n5,Platform\n6,Growth\n";
+    let v = ingest(
+        &app,
+        multipart(
+            "/$/ingest/org",
+            &[
+                ("base", None, None, b"http://example.org/people/"),
+                ("file", Some("people.csv"), Some("text/csv"), csv.as_bytes()),
+            ],
+        ),
+    )
+    .await;
+    assert_eq!(v["status"], "done", "{v}");
+    let r = &v["result"];
+    assert_eq!(r["outcome"], "mapping-draft", "{v}");
+    assert_eq!(r["rows"], 6);
+    let l = &r["links"][0];
+    assert_eq!(l["column"], "team", "{r}");
+    assert_eq!(l["distinct"], 4, "{l}");
+    assert_eq!(l["linked"], 2, "the two spellings of Payments team: {l}");
+    assert_eq!(l["minted"], 2, "{l}");
+    assert_eq!(l["ambiguousTotal"], 1, "{l}");
+    assert_eq!(l["ambiguous"][0]["value"], "Platform");
+    assert_eq!(l["ambiguous"][0]["rows"], 2);
+    assert_eq!(l["ambiguous"][0]["candidates"].as_array().unwrap().len(), 2);
+    // the preview uses the lookup, and the minted IRIs remain for the rest
+    let preview: Vec<&str> = r["preview"]["triples"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    let has = |s: &str| preview.iter().any(|t| t.contains(s));
+    assert!(
+        has(
+            "<http://example.org/people/1> <http://www.w3.org/ns/org#memberOf> <http://example.org/payments>"
+        ),
+        "{preview:?}"
+    );
+    assert!(
+        has(
+            "<http://example.org/people/3> <http://www.w3.org/ns/org#memberOf> <http://example.org/payments>"
+        ),
+        "{preview:?}"
+    );
+    assert!(
+        has(
+            "<http://example.org/people/6> <http://www.w3.org/ns/org#memberOf> <http://example.org/people/Growth>"
+        ),
+        "{preview:?}"
+    );
+    assert!(
+        has(
+            "<http://example.org/people/4> <http://www.w3.org/ns/org#memberOf> <http://example.org/people/Platform>"
+        ),
+        "{preview:?}"
+    );
+    // no cell value was embedded, and the lookup is in the mapping
+    let team = r["mapping"]["tableSchema"]["columns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "team")
+        .unwrap();
+    assert_eq!(
+        team["urn:x-sparkles:lookup"],
+        json!([{ "rdf:value": ["Payments team", "payments  TEAM"], "@id": "http://example.org/payments" }]),
+        "{team}"
+    );
+    // the same file with the same mapping converts to the same IRIs
+    let mapping = r["mapping"].to_string();
+    let up = Request::post("/org/upload?dryRun=true")
+        .header(
+            header::CONTENT_TYPE,
+            "multipart/form-data; boundary=sparkles-ingest-boundary",
+        )
+        .body(Body::from(
+            [
+                "--sparkles-ingest-boundary\r\nContent-Disposition: form-data; name=\"mapping\"\r\n\r\n",
+                &mapping,
+                "\r\n--sparkles-ingest-boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"people.csv\"\r\n\r\n",
+                csv,
+                "\r\n--sparkles-ingest-boundary--\r\n",
+            ]
+            .concat(),
+        ))
+        .unwrap();
+    let (s, d) = send(&app, up).await;
+    assert_eq!(s, StatusCode::OK, "{d}");
+    assert_eq!(d["commit"]["inserted"], 12, "{d}");
+}
+
+/// A pre-merge count must never overwrite a completed post-merge refresh.
+#[tokio::test]
+async fn review_refresh_publication_is_ordered() {
+    use crate::mcp::memory::pending::{
+        self,
+        tests::{Paused, idle, old_refresh},
+    };
+    let (st, app) = app(None);
+    memory(&app, json!({})).await;
+    let fact = json!({ "s": "<http://example.org/ana>", "p": format!("<{MEMBER_OF}>"),
+        "o": "<http://example.org/payments>" });
+    session(&app, "s1", json!({ "facts": [fact] })).await;
+    session(&app, "s2", json!({ "facts": [fact] })).await;
+    let v = maintain(&app, "/$/memory/org/consolidate", json!({})).await;
+    assert_eq!(v["result"]["outcome"], "proposed", "{v}");
+    let branch = v["result"]["branch"].as_str().unwrap();
+    idle(&st);
+    let ds = st.get("org").unwrap();
+    // Invalidate a possible cached fingerprint without changing inbox contents.
+    ds.store
+        .load(&[Source::from_bytes(
+            b"<urn:x> <urn:p> <urn:o> .".to_vec(),
+            RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+    let paused = Paused::new(&st, "old-refresh");
+    let old = old_refresh(&st, &ds);
+    paused.entered();
+    // Use the actual merge without scheduling another route touch that could mask
+    // the stale overwrite. Replacement coalescing is tested independently.
+    ds.store.merge(branch, "main", &Default::default()).unwrap();
+    let fresh = paused.fresh(&st, &ds);
+    old.join().unwrap();
+    let refreshed = fresh.join().unwrap().unwrap();
+    assert!(
+        refreshed
+            .kinds(|_| true)
+            .values()
+            .all(|kind| kind.open == 0)
+    );
+    let metrics = crate::obs::metrics_json(&st);
+    for kind in ["session", "consolidation"] {
+        assert!(
+            metrics["memoryReview"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["dataset"] == "org" && r["kind"] == kind && r["pending"] == 0),
+            "{metrics}"
+        );
+    }
+    let current = pending::current(&st, &ds).unwrap();
+    assert!(current.kinds(|_| true).values().all(|k| k.open == 0));
+    let (_, maintenance) = send(&app, req("GET", "/$/memory/org/maintenance", Value::Null)).await;
+    assert_eq!(maintenance["review"]["open"], 0, "{maintenance}");
 }

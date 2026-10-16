@@ -1,0 +1,6 @@
+# name	url	sha256	license
+# The BSBM tools (data generator and test driver, version 0.2) are GPL-3.0. They run as
+# separate processes and are downloaded at run time, only when SPARKLES_ALLOW_GPL_BENCHMARK=1
+# is set, and never committed (docs/specs/X06 section 4). Their query templates and
+# parameter files stay inside the download.
+bsbmtools-v0.2.zip	https://sourceforge.net/projects/bsbmtools/files/bsbmtools/bsbmtools-0.2/bsbmtools-v0.2.zip/download	40f5e59baadec3af0014b7647989d3e0fc0476af25e84a4bc9d7f8cd81520aaa	GPL-3.0

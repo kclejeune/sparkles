@@ -449,21 +449,59 @@ fn errors_have_positions_and_expectations() {
 }
 
 #[test]
-fn shex_2_2_is_named() {
-    assert_eq!(
-        err("ABSTRACT ex:S {}"),
-        "line 3, column 1: ABSTRACT is ShEx 2.2 syntax (abstract shapes), which is not supported"
-    );
-    assert_eq!(
-        err("ex:S extends @ex:T {}"),
-        "line 3, column 6: EXTENDS is ShEx 2.2 syntax (extending shapes), which is not \
-         supported"
-    );
+fn shex_2_2_drafts_keyword_is_named() {
     assert_eq!(
         err("ex:S CLOSED RESTRICTS @ex:T {}"),
         "line 3, column 13: RESTRICTS is ShEx 2.2 syntax (restricting shapes), which is not \
          supported"
     );
+}
+
+#[test]
+fn extends_and_abstract() {
+    let s = parse(
+        "PREFIX ex: <http://ex.org/>
+         ABSTRACT ex:A { ex:p . }
+         ex:B EXTENDS @ex:A EXTENDS @<http://ex.org/C> CLOSED { ex:q . } AND @ex:R
+         ex:C { }
+         ex:R { }
+         ex:D @ex:C OR EXTENDS @ex:A { }",
+        None,
+    )
+    .unwrap();
+    assert!(s.shapes[0].is_abstract);
+    assert!(!s.shapes[1].is_abstract);
+    let ShapeExpr::And(parts) = &s.shapes[1].expr else {
+        panic!("a conjunction")
+    };
+    let ShapeExpr::Shape(b) = &parts[0] else {
+        panic!("a shape")
+    };
+    assert_eq!(
+        b.extends,
+        [
+            Label::Iri("http://ex.org/A".into()),
+            Label::Iri("http://ex.org/C".into())
+        ]
+    );
+    assert!(b.is_closed());
+    // an extension inside a disjunction
+    let ShapeExpr::Or(parts) = &s.shapes[4].expr else {
+        panic!("a disjunction")
+    };
+    let ShapeExpr::Shape(d) = &parts[1] else {
+        panic!("a shape")
+    };
+    assert_eq!(d.extends, [Label::Iri("http://ex.org/A".into())]);
+}
+
+#[test]
+fn extends_needs_a_reference() {
+    assert_eq!(
+        err("ex:S EXTENDS ex:T {}"),
+        "line 3, column 14: expected a shape reference ('@') after EXTENDS, found 'ex:T'"
+    );
+    assert!(parse("ABSTRACT {}", None).is_err());
 }
 
 #[test]

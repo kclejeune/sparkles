@@ -403,6 +403,7 @@ pub fn draft_of(
             min_instances: r.min_instances,
             max_in: crate::schema::draft::DEFAULT_MAX_IN,
             max_count: 1,
+            max_inverse: crate::schema::draft::DEFAULT_MAX_INVERSE,
             closed: false,
             base: crate::schema::draft::default_base(name),
             prefixes: prefixes.clone(),

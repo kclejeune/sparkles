@@ -1,0 +1,178 @@
+import { describe, expect, it } from 'vitest';
+import type { Term } from './api';
+import {
+  compareResults,
+  compareRows,
+  diffRows,
+  diffTriples,
+  filterDiff,
+  isTooLarge,
+  rowAnnouncement,
+  rowKey,
+  serverRows,
+  serverSummary,
+} from './rowdiff';
+
+const u = (v: string): Term => ({ type: 'uri', value: v });
+const lit = (v: string, datatype?: string, lang?: string): Term => ({
+  type: 'literal',
+  value: v,
+  ...(datatype ? { datatype } : {}),
+  ...(lang ? { 'xml:lang': lang } : {}),
+});
+const b = (v: string): Term => ({ type: 'bnode', value: v });
+
+describe('diffRows', () => {
+  it('marks added, removed and kept rows, with removed rows last', () => {
+    const left = [[u('ex:alice'), u('ex:bob')]];
+    const right = [[u('ex:alice'), u('ex:carol')]];
+    const d = diffRows(left, right);
+    expect(d.marks).toEqual(['added', 'removed']);
+    expect(d.rows).toEqual([right[0], left[0]]);
+    expect([d.added, d.removed, d.unchanged]).toEqual([1, 1, 0]);
+  });
+
+  it('keeps the right order for kept rows', () => {
+    const a = [u('a')];
+    const c = [u('c')];
+    const d = diffRows([a, c], [c, a]);
+    expect(d.rows).toEqual([c, a]);
+    expect(d.marks).toEqual(['kept', 'kept']);
+  });
+
+  it('compares bags, so a duplicate is one added or removed row', () => {
+    const a = [u('a')];
+    expect(diffRows([a], [a, a]).marks).toEqual(['kept', 'added']);
+    expect(diffRows([a, a], [a]).marks).toEqual(['kept', 'removed']);
+    const d = diffRows([a, a, a], [a]);
+    expect([d.added, d.removed, d.unchanged]).toEqual([0, 2, 1]);
+  });
+
+  it('tells an unbound cell from an empty literal', () => {
+    expect(rowKey([null])).not.toBe(rowKey([lit('')]));
+    expect(diffRows([[null]], [[lit('')]]).marks).toEqual(['added', 'removed']);
+    expect(diffRows([[u('a'), null]], [[u('a'), null]]).marks).toEqual(['kept']);
+  });
+
+  it('keeps blank nodes by label', () => {
+    expect(diffRows([[b('x')]], [[b('x')]]).marks).toEqual(['kept']);
+    expect(diffRows([[b('x')]], [[b('y')]]).marks).toEqual(['added', 'removed']);
+  });
+
+  it('tells literals apart by datatype and language', () => {
+    const xsdInt = 'http://www.w3.org/2001/XMLSchema#integer';
+    const xsdStr = 'http://www.w3.org/2001/XMLSchema#string';
+    expect(diffRows([[lit('1')]], [[lit('1', xsdInt)]]).marks).toEqual(['added', 'removed']);
+    expect(diffRows([[lit('a', undefined, 'en')]], [[lit('a', undefined, 'de')]]).marks).toEqual([
+      'added',
+      'removed',
+    ]);
+    // a plain literal is an xsd:string
+    expect(diffRows([[lit('a')]], [[lit('a', xsdStr)]]).marks).toEqual(['kept']);
+  });
+
+  it('does not run columns together', () => {
+    expect(diffRows([[u('ab'), u('c')]], [[u('a'), u('bc')]]).marks).toEqual(['added', 'removed']);
+  });
+
+  it('handles empty sides', () => {
+    expect(diffRows([], []).rows).toEqual([]);
+    expect(diffRows([], [[u('a')]]).marks).toEqual(['added']);
+    expect(diffRows([[u('a')]], []).marks).toEqual(['removed']);
+  });
+});
+
+describe('compareRows', () => {
+  it('gives up past the limit and keeps the counts', () => {
+    const rows = Array.from({ length: 5 }, (_, i) => [u(`r${i}`)]);
+    const r = compareRows(rows, rows.slice(0, 2), 4);
+    expect(isTooLarge(r)).toBe(true);
+    expect(r).toMatchObject({ left: 5, right: 2 });
+    expect(isTooLarge(compareRows(rows, rows, 5))).toBe(false);
+  });
+});
+
+describe('diffTriples', () => {
+  it('keys triples like rows', () => {
+    const t = (o: string): [Term, Term, Term] => [u('s'), u('p'), u(o)];
+    const d = diffTriples([t('a'), t('b')], [t('b'), t('c')]);
+    expect(d.marks).toEqual(['kept', 'added', 'removed']);
+    expect(d.rows).toEqual([t('b'), t('c'), t('a')]);
+  });
+});
+
+describe('filterDiff', () => {
+  const d = diffRows([[u('a')], [u('b')]], [[u('b')], [u('c')]]);
+  it('keeps the rows a chip names', () => {
+    expect(filterDiff(d, 'all').rows).toHaveLength(3);
+    expect(filterDiff(d, 'added').rows).toEqual([[u('c')]]);
+    expect(filterDiff(d, 'removed').rows).toEqual([[u('a')]]);
+    expect(filterDiff(d, 'unchanged').marks).toEqual(['kept']);
+  });
+});
+
+describe('rowAnnouncement', () => {
+  it('says what changed', () => {
+    expect(rowAnnouncement('Commit 3', { added: 1, removed: 1 })).toBe(
+      'Commit 3: 1 row added, 1 removed',
+    );
+    expect(rowAnnouncement('Commit 3', { added: 3, removed: 0 })).toBe('Commit 3: 3 rows added');
+    expect(rowAnnouncement('Commit 3', { added: 0, removed: 2 })).toBe('Commit 3: 2 rows removed');
+    expect(rowAnnouncement('Commit 3', { added: 0, removed: 0 })).toBe('Commit 3: no rows changed');
+    expect(rowAnnouncement('Commit 3', null)).toBe('Commit 3');
+  });
+});
+
+describe('a comparison made on the server', () => {
+  const d = {
+    vars: ['s', 'o'],
+    addedRows: [{ s: u('a'), o: lit('1') }, { s: u('b') }],
+    removedRows: [{ s: u('c'), o: lit('2') }],
+  };
+
+  it('lists the removed rows first, then the added ones, with unbound cells left empty', () => {
+    const t = serverRows(d);
+    expect(t.vars).toEqual(['s', 'o']);
+    expect(t.marks).toEqual(['removed', 'added', 'added']);
+    expect(t.rows[0]).toEqual([u('c'), lit('2')]);
+    expect(t.rows[2]).toEqual([u('b'), null]);
+  });
+
+  it('summarizes the counts and says when a list is cut', () => {
+    const base = { added: 1204, removed: 87, same: 18000, ...d };
+    expect(serverSummary({ ...base, truncated: { added: false, removed: false } })).toBe(
+      '1,204 rows added, 87 removed, 18,000 unchanged',
+    );
+    expect(serverSummary({ ...base, truncated: { added: true, removed: false } })).toBe(
+      '1,204 rows added, 87 removed, 18,000 unchanged. Listing 2 of the added',
+    );
+    expect(
+      serverSummary({ ...base, added: 1, truncated: { added: false, removed: false } }),
+    ).toMatch(/^1 row added/);
+  });
+});
+
+describe('compareResults', () => {
+  const meta = (sent: number, total = sent) => ({ sentRows: sent, totalRows: total }) as never;
+  const a = [u('a')];
+  const c = [u('c')];
+
+  it('compares complete tables and complete graphs as bags', () => {
+    const d = compareResults({ rows: [a], meta: meta(1) }, { rows: [a, c], meta: meta(2) });
+    expect(d && !isTooLarge(d) && d.marks).toEqual(['kept', 'added']);
+    const t: [Term, Term, Term] = [u('s'), u('p'), u('o')];
+    const g = compareResults({ triples: [], meta: meta(0) }, { triples: [t], meta: meta(1) });
+    expect(g && !isTooLarge(g) && g.added).toBe(1);
+  });
+
+  it('compares counts only when a read cut its rows, whichever side', () => {
+    const cut = compareResults({ rows: [a], meta: meta(1, 5) }, { rows: [a, c], meta: meta(2) });
+    expect(cut).toEqual({ tooLarge: true, cut: true, left: 5, right: 2 });
+    const cutRight = compareResults({ rows: [a], meta: meta(1) }, { rows: [a], meta: meta(1, 9) });
+    expect(cutRight && isTooLarge(cutRight) && cutRight.cut).toBe(true);
+  });
+
+  it('says nothing about a table against a graph', () => {
+    expect(compareResults({ rows: [a], meta: meta(1) }, { triples: [], meta: meta(0) })).toBeNull();
+  });
+});

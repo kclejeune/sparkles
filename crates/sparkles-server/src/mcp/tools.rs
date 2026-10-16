@@ -113,6 +113,7 @@ fn dispatch(t: &Tools, name: &str, args: Map<String, Value>) -> Result<Outcome, 
         "explain_query" => t.explain_query(args),
         "describe_resource" => t.describe_resource(args),
         "find_paths" => t.find_paths(args),
+        "graph_algorithm" => t.graph_algorithm(args),
         "list_commits" => t.list_commits(args),
         "list_changes" => t.list_changes(args),
         #[cfg(feature = "text")]
@@ -1692,7 +1693,7 @@ fn constraints_json(
             let mut ce = json!({
                 "class": terms.iri(&c.class),
                 "properties": c.properties.iter().map(|p| json!({
-                    "path": terms.iri(&p.path),
+                    "path": if p.inverse { format!("^{}", terms.iri(&p.path)) } else { terms.iri(&p.path) },
                     "constraints": p.summary(|i| terms.iri(i)),
                     "enforcement": p.enforcement,
                 })).collect::<Vec<_>>(),

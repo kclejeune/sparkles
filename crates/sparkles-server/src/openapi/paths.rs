@@ -113,6 +113,7 @@ fn query_params(o: Op) -> Op {
         "branch",
         "send",
         "execution",
+        "profile",
         "nocache",
         "memoryMb",
         "maxRows",
@@ -420,6 +421,7 @@ pub(super) fn add_all(p: &mut Paths) {
     schema(p);
     admin(p);
     queries(p);
+    algorithms(p);
     graphql(p);
     history(p);
     branches(p);
@@ -492,6 +494,12 @@ fn server(p: &mut Paths) {
                     "application/json": { "schema": sref("MetricsSnapshot") },
                 })),
             ),
+    );
+    p.add(
+        op(GET, "/$/server/memory", "serverMemory", "Server", "Server memory")
+            .doc("The query memory pool (capacity, bytes granted, requests waiting) and the block, result, SERVICE and history caches, with the bytes each dataset holds in the shared ones.")
+            .see("budgets")
+            .json("200", "The memory state.", "ServerMemory"),
     );
     p.add(
         op(GET, "/$/ready", "ready", "Server", "Readiness check")
@@ -1014,6 +1022,91 @@ fn admin(p: &mut Paths) {
     );
 }
 
+fn algorithms(p: &mut Paths) {
+    p.add(
+        op(
+            POST,
+            "/$/algo/{ds}/run",
+            "runAlgorithm",
+            "Graph algorithms",
+            "Run a graph algorithm",
+        )
+        .doc("Without `write` the run is the SPARQL query its request stands for, answered as `/{ds}/sparql` answers (`Accept`, `timeout`, `execution` and the budget overrides apply), one row per node, node pair or node and level. `summary=true` returns only the statistics of the run. With `write` the run is a task that computes at the head commit and writes the rows in batched commits, with a run record in the graph. Read-only runs need read through the query endpoint and use Query rate/concurrency limits. Write-back runs need write through the update endpoint and use Update HTTP admission through the 202 response body. Background work uses the existing task queue and algorithm-thread admission, not an HTTP permit. A task can be cancelled with `DELETE /$/tasks/{id}`.")
+        .see("graph-algorithms")
+        .params(&["format", "timeout", "nocache", "execution"])
+        .query("summary", json!({ "type": "boolean" }), "Return only the summary of the run.")
+        .json_body(true, "AlgoRequest")
+        .resp_h(
+            "200",
+            "The rows of the run, or its summary.",
+            Some(json!({ "application/sparql-results+json": { "schema": { "type": "object" } } })),
+            json!({}),
+        )
+        .resp("202", "A run with `write`, started as a task.", Some(json!({ "application/json": { "schema": sref("Task") } })))
+        .errors(&[400, 409, 413, 429, 503, 507]),
+    );
+    p.add(
+        op(
+            GET,
+            "/$/algo/{ds}/projections",
+            "listAlgorithmProjections",
+            "Graph algorithms",
+            "List the named projections",
+        )
+        .see("graph-algorithms")
+        .json(
+            "200",
+            "The definitions and the projection cache.",
+            "AlgoProjectionList",
+        ),
+    );
+    p.add(
+        op(
+            GET,
+            "/$/algo/{ds}/projections/{name}",
+            "getAlgorithmProjection",
+            "Graph algorithms",
+            "Get a named projection",
+        )
+        .see("graph-algorithms")
+        .resp_h(
+            "200",
+            "The definition with its revision.",
+            Some(json!({ "application/json": { "schema": sref("AlgoProjection") } })),
+            json!({ "ETag": { "description": "`\"r<N>\"`", "schema": { "type": "string" } } }),
+        ),
+    );
+    p.add(
+        op(
+            PUT,
+            "/$/algo/{ds}/projections/{name}",
+            "putAlgorithmProjection",
+            "Graph algorithms",
+            "Define a named projection",
+        )
+        .doc("Stores the definition as the next revision. `If-Match: \"r<N>\"` replaces only revision N, and `If-None-Match: *` only creates. A bare string in `predicates` is a predicate in the algorithm's own direction.")
+        .see("graph-algorithms")
+        .params(&["ifMatch", "ifNoneMatch"])
+        .json_body(true, "AlgoProjectionDefinition")
+        .json("200", "Replaced.", "AlgoProjection")
+        .json("201", "Created.", "AlgoProjection")
+        .errors(&[400, 412]),
+    );
+    p.add(
+        op(
+            DELETE,
+            "/$/algo/{ds}/projections/{name}",
+            "deleteAlgorithmProjection",
+            "Graph algorithms",
+            "Delete a named projection",
+        )
+        .see("graph-algorithms")
+        .param("ifMatch")
+        .no_content("Deleted.")
+        .errors(&[412]),
+    );
+}
+
 fn queries(p: &mut Paths) {
     p.add(
         op(
@@ -1485,6 +1578,27 @@ fn history(p: &mut Paths) {
     p.add(
         op(
             GET,
+            "/$/commits/{ds}/timeline",
+            "commitTimeline",
+            "History",
+            "Commit timeline",
+        )
+        .doc("The commits of the branch in buckets of consecutive numbers, with the commits' times, kinds and quad counts, and the ranges whose state can still be read. For a time slider over a long history.")
+        .see("commits")
+        .param("branch")
+        .query(
+            "buckets",
+            json!({ "type": "integer", "minimum": 1, "maximum": 2000, "default": 200 }),
+            "The most buckets.",
+        )
+        .query("from", int(), "The first commit number; the first by default.")
+        .query("to", int(), "The last commit number; the head by default.")
+        .json("200", "The buckets.", "CommitTimeline")
+        .errors(&[400]),
+    );
+    p.add(
+        op(
+            GET,
             "/$/commits/{ds}/{reference}",
             "getCommit",
             "History",
@@ -1584,6 +1698,11 @@ fn history(p: &mut Paths) {
             )
             .query("to", s(), "A selector; by default the head.")
             .query("graph", s(), "A graph IRI or `default`.")
+            .query(
+                "term",
+                json!({ "type": "array", "items": { "type": "string" }, "maxItems": 1000 }),
+                "Only the changes whose subject or object is this term, an N-Triples term or a bare IRI. Repeat the parameter for several, up to 1,000. Not for RDF Patch.",
+            )
             .query("quads", boolean(), "JSON: list the quads.")
             .query("limit", int(), "The most quads listed.")
             .param("format")
@@ -1599,6 +1718,26 @@ fn history(p: &mut Paths) {
             )
             .resp("304", "Not modified.", None)
             .errors(&[400, 410, 507]),
+    );
+    p.add(
+        op(POST, "/{ds}/sparql/diff", "sparqlDiff", "History", "Diff a query between two states")
+            .doc("Runs one SELECT query at two states and returns the rows only one of them has, as bags of their terms. The server keeps a hash for each row of the earlier result and no row, then reads the later result against them and the earlier query once more to list up to `limit` differing rows of each side. The request counts twice against the `query` rate limit. A query that returns different rows when it runs again is refused with `409`.")
+            .see("comparing-a-query-between-two-states")
+            .query("from", s(), "A selector of the earlier state.")
+            .query("to", s(), "A selector of the later state; the head by default.")
+            .query("limit", json!({ "type": "integer", "minimum": 1, "maximum": 10000, "default": 100 }), "The most differing rows listed for each side.")
+            .params(&["branch", "reasoning"])
+            .body(
+                true,
+                "The SELECT query.",
+                json!({
+                    "application/sparql-query": { "schema": { "type": "string" } },
+                    "application/x-www-form-urlencoded": { "schema": { "type": "object", "required": ["query"], "properties": { "query": { "type": "string" } } } },
+                    "application/json": { "schema": { "type": "object", "required": ["query"], "properties": { "query": { "type": "string" }, "from": { "type": "string" }, "to": { "type": "string" }, "limit": { "type": "integer" } } } },
+                }),
+            )
+            .json("200", "The differing rows and the counts.", "SparqlDiff")
+            .errors(&[400, 408, 409, 410, 507]),
     );
     p.add(
         op(GET, "/{ds}/changes", "changes", "History", "Change feed")
@@ -2651,13 +2790,13 @@ fn assist(p: &mut Paths) {
     );
     p.add(
         op(GET, "/$/server/secrets", "listSecrets", "Server", "List model secrets")
-            .doc("Each secret that `--model-secret`, a stored value, a provider or a lock names, with its source, whether it is locked, when a runtime value was stored and the providers that use it, and whether stored values are sealed. Values are never returned. Needs server `admin`.")
+            .doc("Each secret that `--model-secret`, a stored value, a provider or a lock names, with its source, whether it is locked, when a runtime value was stored and the providers that use it, and whether stored values are sealed and with which key. Values are never returned. Needs server `admin`.")
             .see("model-secrets")
             .json("200", "The secrets.", "SecretList"),
     );
     p.add(
         op(PUT, "/$/server/secrets/{name}", "putSecret", "Server", "Store a model secret")
-            .doc("Stores a runtime value for the secret in the data directory with mode 0600, sealed with the key of `serve --secrets-key` when the server has one. It overrides the `--model-secret` source, and requests that start after it use it. A secret that `server.locked` locks is a `409` with `locked-by-config`. Needs server `admin`.")
+            .doc("Stores a runtime value for the secret in the data directory with mode 0600. Builds with the default `backup` feature seal values unless the server runs with `--secrets-key none`. Builds without it keep plaintext. When sealing is enabled, the first value stored without a configured key generates `<dataDir>/secrets.key`. It overrides the `--model-secret` source, and requests that start after it use it. A secret that `server.locked` locks is a `409` with `locked-by-config`. Needs server `admin`.")
             .see("model-secrets")
             .json_body(true, "SecretValue")
             .no_content("Stored.")

@@ -53,6 +53,7 @@ fn from_text(t: &str) -> Option<Value> {
 fn schema(v: &Vocabulary) -> Value {
     let mut classes = v.class_enum.clone();
     classes.push(String::new());
+    let link_classes = classes.clone();
     let mut preds = v.predicate_enum.clone();
     preds.push(String::new());
     json!({
@@ -62,12 +63,13 @@ fn schema(v: &Vocabulary) -> Value {
             "subjectColumn":{"type":"string","description":"The column whose value identifies the row's entity, or empty to number the rows"},
             "class":{"type":"string","enum":classes},
             "columns":{"type":"array","items":{"type":"object","additionalProperties":false,
-                "required":["column","predicate","kind","datatype","lang"],"properties":{
+                "required":["column","predicate","kind","datatype","lang","linkClass"],"properties":{
                 "column":{"type":"string","description":"The column's header"},
                 "predicate":{"type":"string","enum":preds,"description":"Empty to leave the column out"},
                 "kind":{"type":"string","enum":["literal","iri"],"description":"iri when the value names another entity"},
                 "datatype":{"type":"string","enum":DATATYPES},
-                "lang":{"type":"string","description":"The language tag of text values, or empty"}}}}}
+                "lang":{"type":"string","description":"The language tag of text values, or empty"},
+                "linkClass":{"type":"string","enum":link_classes,"description":"For an iri column, the class of the existing entities its values name, or empty when the values are new"}}}}}
     })
 }
 
@@ -84,27 +86,186 @@ pub fn draft(
     format: Format,
     name: Option<&str>,
 ) -> Result<Value, Failed> {
-    let ctx = r.ctx;
     let tsv = format == Format::Tsv;
     let name = name.unwrap_or(if tsv { "table.tsv" } else { "table.csv" });
+    let table = Table {
+        bytes: &req.bytes,
+        tsv,
+        format: format.name(),
+        name,
+        base: None,
+    };
+    draft_table(r, req, ds, table)
+}
+
+/// The most CSV text a workbook's result carries inline, over all its sheets.
+#[cfg(feature = "office")]
+const INLINE_CSV_BYTES: usize = 2 << 20;
+
+/// The most sheets of a workbook that are drafted. Each draft is a model call, so a
+/// workbook of hundreds of sheets would otherwise cost hundreds of them.
+#[cfg(feature = "office")]
+const MAX_SHEETS: usize = 20;
+
+/// Draft the mappings of a workbook, one for each visible sheet with data (§7.8). Each
+/// sheet is converted to CSV and drafted like an uploaded table named
+/// `<workbook>-<sheet>.csv`, so its rows get their own namespace, which includes the
+/// sheet's position so that sheets with equal or truncated names stay apart. At most 20
+/// sheets are drafted. A sheet's CSV travels
+/// with its draft, up to a total of 2 MiB, because it is the file to upload with the
+/// mapping. A sheet whose draft fails is reported with its error and the others go on.
+#[cfg(feature = "office")]
+pub fn workbook(
+    r: &mut Run,
+    req: &Request,
+    ds: &Dataset,
+    format: Format,
+    name: Option<&str>,
+) -> Result<Value, Failed> {
+    let ctx = r.ctx;
+    let name = name.unwrap_or("workbook");
     if req.bytes.len() > super::convert::MAX_INPUT_BYTES {
         return Err(Failed::new(
             "too-large",
             format!(
-                "the table has {} bytes; a mapping draft reads at most {}: map it with sparkles csv",
+                "the workbook has {} bytes; ingestion takes at most {}",
                 req.bytes.len(),
                 super::convert::MAX_INPUT_BYTES
             ),
         ));
     }
-    let base = req.base.clone().unwrap_or_else(|| default_base(name));
+    ctx.progress.status(super::Status::Converting, 0.05, None);
+    let o = super::convert::Options {
+        allow_partial: false,
+        max_input: super::convert::MAX_INPUT_BYTES,
+        max_text: super::convert::MAX_TEXT_BYTES,
+        deadline: ctx.deadline,
+        pdf: ctx.pdf.clone(),
+        max_images: 0,
+    };
+    let sheets = super::office::sheets(&req.bytes, format, &o)?;
+    if sheets.is_empty() {
+        return Err(Failed::new(
+            "empty",
+            "the workbook has no visible sheet with data",
+        ));
+    }
+    let stem = name.rsplit_once('.').map_or(name, |(s, _)| s);
+    let mut drafts: Vec<Value> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
+    let mut inline = 0usize;
+    if sheets.len() > MAX_SHEETS {
+        notes.push(format!(
+            "the workbook has {} sheets with data; the first {MAX_SHEETS} are drafted and {} are left out",
+            sheets.len(),
+            sheets.len() - MAX_SHEETS
+        ));
+    }
+    for sh in sheets.into_iter().take(MAX_SHEETS) {
+        r.check()?;
+        let mut slug = super::pipeline::slug(&sh.name);
+        if slug.is_empty() {
+            slug = format!("sheet{}", sh.index);
+        }
+        let file = format!("{}-{slug}.csv", super::pipeline::slug(stem));
+        // the position keeps the namespaces apart when two names slug alike or are cut
+        // at the same length
+        let base = format!(
+            "urn:sparkles:table:{}:s{}-{slug}:",
+            super::pipeline::slug(stem),
+            sh.index
+        );
+        let base = req.base.is_none().then_some(base.as_str());
+        let table = Table {
+            bytes: sh.csv.as_bytes(),
+            tsv: false,
+            format: "csv",
+            name: &file,
+            base,
+        };
+        match draft_table(r, req, ds, table) {
+            Ok(mut d) => {
+                d["sheet"] = sh.name.clone().into();
+                d["index"] = sh.index.into();
+                if inline + sh.csv.len() <= INLINE_CSV_BYTES {
+                    inline += sh.csv.len();
+                    d["csv"] = sh.csv.clone().into();
+                } else {
+                    notes.push(format!(
+                        "the sheet {:?} is too long to send with its draft: convert it to CSV and upload that",
+                        sh.name
+                    ));
+                }
+                drafts.push(d);
+            }
+            Err(f) => {
+                let code = f.0["code"].as_str().unwrap_or("");
+                if matches!(code, "cancelled" | "timeout" | "budget-exceeded") {
+                    return Err(f);
+                }
+                drafts.push(json!({ "sheet": sh.name, "index": sh.index, "error": f.0 }));
+            }
+        }
+    }
+    if req.base.is_some() && drafts.len() > 1 {
+        notes.push("all sheets use the same base, so rows with the same key in two sheets name the same entity".into());
+    }
+    let mut out = json!({
+        "outcome": "mapping-drafts",
+        "format": format.name(),
+        "file": name,
+        "sheets": drafts,
+    });
+    if !notes.is_empty() {
+        out["notes"] = notes.into();
+    }
+    Ok(out)
+}
+
+/// A table to draft a mapping for.
+struct Table<'a> {
+    bytes: &'a [u8],
+    tsv: bool,
+    format: &'a str,
+    name: &'a str,
+    /// the base of its rows when the request names none
+    base: Option<&'a str>,
+}
+
+/// Draft the mapping of a table given as bytes: a CSV or TSV upload, or one sheet of a
+/// workbook as CSV.
+fn draft_table(r: &mut Run, req: &Request, ds: &Dataset, table: Table) -> Result<Value, Failed> {
+    let Table {
+        bytes,
+        tsv,
+        format,
+        name,
+        base,
+    } = table;
+    let ctx = r.ctx;
+    if bytes.len() > super::convert::MAX_INPUT_BYTES {
+        return Err(Failed::new(
+            "too-large",
+            format!(
+                "the table has {} bytes; a mapping draft reads at most {}: map it with sparkles csv",
+                bytes.len(),
+                super::convert::MAX_INPUT_BYTES
+            ),
+        ));
+    }
+    // the request's base wins, then the caller's, then one made of the table's name
+    let base = req
+        .base
+        .clone()
+        .or_else(|| base.map(str::to_string))
+        .unwrap_or_else(|| default_base(name));
     oxiri::Iri::parse(base.as_str())
         .map_err(|e| Failed::new("bad-argument", format!("base {base:?} is not an IRI: {e}")))?;
     ctx.progress.status(super::Status::Converting, 0.05, None);
     let mut o = Options::new(Mapping::Default { key: None }, name);
     o.tsv = tsv;
     o.base = Some(base.clone());
-    let default = tabular::default_metadata(&req.bytes[..], &o, None)
+    let default = tabular::default_metadata(bytes, &o, None)
         .map_err(|e| Failed::new("invalid-table", e.to_string()))?;
     let columns: Vec<(String, String)> = default["tableSchema"]["columns"]
         .as_array()
@@ -133,11 +294,11 @@ pub fn draft(
     }
     let mut notes: Vec<String> = Vec::new();
     let mut pair_used = None;
-    let metadata = if use_model && columns.len() <= MAX_COLUMNS {
+    let (mut metadata, specs) = if use_model && columns.len() <= MAX_COLUMNS {
         let profile = req.profile.clone().unwrap_or_else(|| "default".into());
         let vocab = Vocabulary::read(r, &profile)?;
         let models = ctx.models.expect("pairs need models");
-        let sample = sample_lines(&req.bytes, SAMPLE_ROWS + 1);
+        let sample = sample_lines(bytes, SAMPLE_ROWS + 1);
         let user = prompt(&vocab, &sample, tsv);
         let out_schema = OutputSchema {
             name: "TableMapping",
@@ -194,13 +355,13 @@ pub fn draft(
         match answer {
             Some(a) => {
                 let prefixes = crate::mcp::tools::dataset_prefixes(ds);
-                build(&a, &columns, &base, &prefixes, tsv, &mut notes)
+                build(&a, &columns, &base, &prefixes, &vocab, tsv, &mut notes)
             }
             None => {
                 if notes.is_empty() {
                     notes.push("no provider answered: the draft is the default mapping".into());
                 }
-                default.clone()
+                (default.clone(), Vec::new())
             }
         }
     } else {
@@ -209,7 +370,7 @@ pub fn draft(
                 "the table has more than {MAX_COLUMNS} columns: the draft is the default mapping"
             ));
         }
-        default.clone()
+        (default.clone(), Vec::new())
     };
     r.check()?;
     ctx.progress.status(
@@ -217,14 +378,18 @@ pub fn draft(
         0.7,
         Some("converting the table".into()),
     );
-    let text = serde_json::to_string_pretty(&metadata).unwrap_or_default();
-    let md = tabular::csvw::parse(&text, None).map_err(|e| {
-        Failed::new(
-            "invalid-mapping",
-            format!("the drafted mapping does not parse: {e}"),
-        )
-    })?;
+    let parse = |m: &Value| {
+        let text = serde_json::to_string_pretty(m).unwrap_or_default();
+        tabular::csvw::parse(&text, None).map_err(|e| {
+            Failed::new(
+                "invalid-mapping",
+                format!("the drafted mapping does not parse: {e}"),
+            )
+        })
+    };
+    let md = parse(&metadata)?;
     let mut o = Options::new(Mapping::Csvw(Arc::new(md)), name);
+    o.tally = specs.iter().map(|s| s.column.clone()).collect();
     o.tsv = tsv;
     o.base = Some(base.clone());
     o.table = Some(0);
@@ -242,8 +407,21 @@ pub fn draft(
         Ok(())
     }));
     let fail = |e: sparkles::error::Error| Failed::new("invalid-table", e.to_string());
-    let stats = tabular::convert(&req.bytes[..], &o, &mut |_| Ok(())).map_err(fail)?;
-    let head = sample_lines(&req.bytes, PREVIEW_ROWS + 1);
+    let stats = tabular::convert(bytes, &o, &mut |_| Ok(())).map_err(fail)?;
+    // the IRI columns of existing classes, linked: the lookups change the IRIs and
+    // never the counts, so the preview below is the only conversion that sees them
+    let mut links: Vec<Value> = Vec::new();
+    if !specs.is_empty() {
+        let l = super::link::link(r, &specs, &stats.tallies)?;
+        if !l.lookups.is_empty() {
+            super::link::apply(&mut metadata, &l.lookups);
+            o.mapping = Mapping::Csvw(Arc::new(parse(&metadata)?));
+        }
+        links = l.report;
+        notes.extend(l.notes);
+    }
+    o.tally.clear();
+    let head = sample_lines(bytes, PREVIEW_ROWS + 1);
     let mut preview: Vec<String> = Vec::new();
     let pstats = tabular::convert(head.as_bytes(), &o, &mut |t| {
         if preview.len() < PREVIEW_TRIPLES {
@@ -254,7 +432,7 @@ pub fn draft(
     .map_err(fail)?;
     let mut out = json!({
         "outcome": "mapping-draft",
-        "format": format.name(),
+        "format": format,
         "file": name,
         "base": base,
         "rows": stats.rows,
@@ -268,6 +446,9 @@ pub fn draft(
             percent_encoding::utf8_percent_encode(&ds.name, percent_encoding::NON_ALPHANUMERIC)
         ),
     });
+    if !links.is_empty() {
+        out["links"] = links.into();
+    }
     if let Some(p) = pair_used {
         out["pair"] = json!({ "provider": p.provider, "model": p.model });
     }
@@ -316,7 +497,7 @@ fn prompt(v: &Vocabulary, sample: &str, tsv: bool) -> String {
         if tsv { "tab-separated" } else { "CSV" },
         sample.trim_end()
     ));
-    s.push_str("Choose the column that identifies each row's entity (subjectColumn, empty to number the rows) and the class of the rows' entities. For every column give the predicate it maps to (empty to leave it out), its kind (iri when its value names another entity, else literal), the datatype of a literal (empty for a plain string) and the language of text values (empty if none). Use only the classes and predicates listed.");
+    s.push_str("Choose the column that identifies each row's entity (subjectColumn, empty to number the rows) and the class of the rows' entities. For every column give the predicate it maps to (empty to leave it out), its kind (iri when its value names another entity, else literal), the datatype of a literal (empty for a plain string), the language of text values (empty if none) and, for an iri column whose values are the names of entities that may already exist in the dataset, the class of those entities in linkClass (empty otherwise). Use only the classes and predicates listed.");
     s
 }
 
@@ -326,9 +507,10 @@ fn build(
     columns: &[(String, String)],
     base: &str,
     prefixes: &std::collections::BTreeMap<String, String>,
+    vocab: &Vocabulary,
     tsv: bool,
     notes: &mut Vec<String>,
-) -> Value {
+) -> (Value, Vec<super::link::Spec>) {
     let expand = |s: &str| -> Option<String> {
         crate::mcp::memory::iri_arg(s, prefixes, "iri")
             .ok()
@@ -342,6 +524,7 @@ fn build(
             .map(|(n, _)| n.clone())
     };
     let mut cols: Vec<Value> = Vec::new();
+    let mut specs: Vec<super::link::Spec> = Vec::new();
     let answer: Vec<&Value> = a["columns"].as_array().into_iter().flatten().collect();
     for (name, title) in columns {
         let m = answer
@@ -357,6 +540,12 @@ fn build(
                 c["propertyUrl"] = p.into();
                 if m["kind"] == "iri" {
                     c["valueUrl"] = format!("{base}{{{name}}}").into();
+                    if let Some(types) = link_types(m, vocab, name, notes) {
+                        specs.push(super::link::Spec {
+                            column: name.clone(),
+                            types,
+                        });
+                    }
                 } else {
                     let dt = m["datatype"].as_str().unwrap_or("");
                     c["datatype"] = if DATATYPES.contains(&dt) && !dt.is_empty() {
@@ -410,7 +599,53 @@ fn build(
     if tsv {
         m["dialect"] = json!({ "delimiter": "\t", "quoteChar": null });
     }
-    m
+    if specs.len() > super::link::MAX_COLUMNS {
+        notes.push(format!(
+            "the first {} of {} IRI columns with existing classes are linked; the others mint their IRIs",
+            super::link::MAX_COLUMNS,
+            specs.len()
+        ));
+        specs.truncate(super::link::MAX_COLUMNS);
+    }
+    (m, specs)
+}
+
+/// The classes the entities of an IRI column may have: the classes the profile declares
+/// for the predicate's objects, else the model's `linkClass`. None when neither names a
+/// class of the profile, and then the column mints its IRIs.
+fn link_types(
+    m: &Value,
+    vocab: &Vocabulary,
+    column: &str,
+    notes: &mut Vec<String>,
+) -> Option<Vec<String>> {
+    let named = m["linkClass"]
+        .as_str()
+        .filter(|c| !c.is_empty() && vocab.class_enum.iter().any(|e| e == c));
+    let ranges: Vec<String> = m["predicate"]
+        .as_str()
+        .and_then(|p| vocab.predicate(p))
+        .map(|p| {
+            p.ranges
+                .iter()
+                .filter(|c| vocab.class_enum.contains(c))
+                .take(5)
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    if !ranges.is_empty() {
+        if let Some(c) = named
+            && !ranges.iter().any(|r| r == c)
+        {
+            notes.push(format!(
+                "the model named {c} for the column {column}, and the profile declares {} for its predicate: the profile's classes link it",
+                ranges.join(", ")
+            ));
+        }
+        return Some(ranges);
+    }
+    named.map(|c| vec![c.to_string()])
 }
 
 #[cfg(test)]
@@ -438,12 +673,39 @@ mod tests {
             "subjectColumn": "id", "class": "ex:Person",
             "columns": [
                 {"column":"Name","predicate":"ex:name","kind":"literal","datatype":"","lang":"en"},
-                {"column":"team","predicate":"ex:memberOf","kind":"iri","datatype":"","lang":""},
+                {"column":"team","predicate":"ex:memberOf","kind":"iri","datatype":"","lang":"","linkClass":"ex:Team"},
                 {"column":"notes","predicate":"","kind":"literal","datatype":"","lang":""}
             ]
         });
+        let vocab = Vocabulary {
+            classes: Vec::new(),
+            predicates: vec![super::super::extract::Predicate {
+                iri: "ex:memberOf".into(),
+                label: None,
+                object: "iri".into(),
+                datatypes: Vec::new(),
+                languages: Vec::new(),
+                ranges: vec!["ex:Group".into()],
+            }],
+            language: None,
+            class_enum: vec!["ex:Person".into(), "ex:Team".into(), "ex:Group".into()],
+            predicate_enum: vec!["ex:name".into(), "ex:memberOf".into()],
+        };
         let mut notes = Vec::new();
-        let m = build(&a, &cols, "http://example.org/p/", &p, false, &mut notes);
+        let (m, specs) = build(
+            &a,
+            &cols,
+            "http://example.org/p/",
+            &p,
+            &vocab,
+            false,
+            &mut notes,
+        );
+        // the profile's declared range wins over the model's class, with a note
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].column, "team");
+        assert_eq!(specs[0].types, ["ex:Group"]);
+        assert!(notes[0].contains("ex:Team"), "{notes:?}");
         let text = m.to_string();
         let md = tabular::csvw::parse(&text, None).unwrap();
         let mut o = Options::new(Mapping::Csvw(Arc::new(md)), "t.csv");

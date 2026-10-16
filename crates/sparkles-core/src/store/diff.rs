@@ -19,7 +19,7 @@
 
 use super::*;
 use crate::history::{At, Resolved};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::hash_map::Entry;
 use std::time::Instant;
 
@@ -81,9 +81,22 @@ pub struct DiffOptions {
     /// The graphs the caller may read (`None`: every graph). Changes in other graphs are
     /// left out before they count against `max_quads`.
     pub graphs: Option<Arc<crate::access::GraphAccess>>,
+    /// Only the changes whose subject or object is one of these terms (term keys, as
+    /// [`crate::id::term_key`] writes them). `None` keeps every change.
+    pub terms: Option<Arc<FxHashSet<Arc<[u8]>>>>,
 }
 
 impl DiffOptions {
+    /// Keep only the changes whose subject or object is one of `terms`.
+    pub fn only_terms<'a>(mut self, terms: impl IntoIterator<Item = &'a oxrdf::Term>) -> Self {
+        let set: FxHashSet<Arc<[u8]>> = terms
+            .into_iter()
+            .map(|t| Arc::from(crate::id::term_key(t)))
+            .collect();
+        self.terms = Some(Arc::new(set));
+        self
+    }
+
     pub(super) fn check(&self) -> Result<()> {
         if self
             .cancel
@@ -341,6 +354,12 @@ impl Net<'_> {
     fn toggle(&mut self, k: QuadKey, added: bool) -> Result<()> {
         if let Some(a) = self.opts.graphs.as_ref().filter(|a| !a.reads_everything())
             && !visible_key(a, &mut self.readable, &k)
+        {
+            return Ok(());
+        }
+        if let Some(t) = &self.opts.terms
+            && !t.contains(&*k[1])
+            && !t.contains(&*k[3])
         {
             return Ok(());
         }

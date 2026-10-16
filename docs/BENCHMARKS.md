@@ -440,6 +440,50 @@ These cold medians switch the first two features together.
 | 1.01B `category-tree` | 369.7 to 371.1 | 364.5 to 365.2 |
 | 1.01B `top-linked` | 949 to 1,000 | 946 to 964 |
 
+#### Cold reads after X07
+
+The tables above were measured before the cold-read work of [X07](specs/X07-cold-sparse-reads.md),
+which adds one read window per scan pass, batched hints for a query's constants and
+first-scan prefetch. The figures below were measured on a Namespace instance (AMD EPYC,
+8 vCPU, 16 GB, Linux 7.1.4), not on the host of the tables above, which is about 1.5 to
+2 times slower on these queries. Each is the median of 11 fresh-server requests with the
+page cache dropped, through HTTP with TSV output, for the base commit and the build with
+the changes. They show the change from the work and are not comparable with the other
+engines' figures.
+
+| Cold, Namespace, median ms | 1.05M base | 1.05M new | 10.5M base | 10.5M new | 105M base | 105M new |
+|---|---:|---:|---:|---:|---:|---:|
+| `star-lookup` | 7.3 | 7.9 | 33.1 | 25.0 | 21.9 | 14.4 |
+| `employee-docs` | 6.4 | 6.2 | 23.9 | 23.3 | 20.2 | 13.0 |
+| `values-star` | 4.9 | 4.3 | 17.1 | 11.6 | 5.0 | 4.3 |
+| `path-plus` | 3.6 | 3.7 | 2.7 | 2.5 | 1,381 | 1,383 |
+| `contains` | 6.9 | 6.4 | 15.6 | 17.0 | 88.9 | 91.7 |
+| `export-500k` | 147 | 150 | 173 | 184 | 179 | 207 |
+
+Another run of the same instance, with a quieter host, measured 10.5M `star-lookup` at
+24.6 ms for the base and 14.5 ms for the new build. The noise of the table above is larger
+than that, so the ratios are better evidence than the milliseconds. A repeat of
+`export-500k` on that Namespace instance with 21 runs gave 167.6 and 178.1 ms at 105M.
+The repeat with `prefetch_constants`, `prefetch_first_scan`, `prefetch_terms` and
+`parallel_decode` disabled showed the same slowdown while `ReadAhead` and the vocabulary
+window changes remained active. The ablation was incomplete, and the cause remains
+unresolved.
+
+Roadmap item 4 and [X07 §9](specs/X07-cold-sparse-reads.md#9-targets), including A5,
+retain the follow-up on quiet forge. After correctness review and integration, compare
+the corrected default with the approved baseline. Repeat that comparison with the
+candidate's four flags disabled and `SPARKLES_READ_WINDOW_KB=0`. Window zero retains the
+original 1 MiB vocabulary window. The cold targets, such as `star-lookup` at 10.5M within
+17.3 ms, still require that host's measurements.
+
+These measurements predate the cancellation, decoded-cache budget and advised-coverage
+repairs. The corrected read-ahead path counts existing outstanding bytes and coalesced
+gaps, allows one next-block extension and restores advice after cache eviction. Its
+warm and cold measurements and no-profile overhead gate remain pending on integrated
+source. Vocabulary profiling also observes mapped offsets before loading them and
+accounts for ordinary and fallible bulk decodes independently of advice. These
+correctness tests establish no new speed result or counter-cost measurement.
+
 ### Full-text search
 
 The comparison uses Sparkles' Tantivy-backed `text:query`, Fuseki's Lucene-backed
@@ -486,14 +530,31 @@ exact search on the same vectors, and no other vector engine was measured.
 
 | Search | Recall@10 against exact | Mean (ms) | p50 (ms) | p99 (ms) |
 |---|---:|---:|---:|---:|
-| Exact | 1.0000 | 5.458 | 5.476 | 6.109 |
-| HNSW `ef=16` | 0.9916 | 0.257 | 0.251 | 0.336 |
-| HNSW `ef=32` | 0.9982 | 0.309 | 0.299 | 0.413 |
-| HNSW `ef=64` | 0.9993 | 0.429 | 0.418 | 0.783 |
-| HNSW `ef=128` | 0.9993 | 0.655 | 0.648 | 0.927 |
-| HNSW `ef=256` | 0.9993 | 1.181 | 1.169 | 1.554 |
+| Exact | 1.0000 | 5.39 | 5.44 | 5.99 |
+| HNSW `ef=16` | 0.9903 | 0.45 | 0.52 | 0.60 |
+| HNSW `ef=32` | 0.9994 | 0.72 | 0.72 | 0.86 |
+| HNSW `ef=64` | 0.9994 | 0.46 | 0.35 | 0.94 |
+| HNSW `ef=128` | 0.9994 | 0.54 | 0.54 | 0.65 |
+| HNSW `ef=256` | 0.9994 | 0.92 | 0.91 | 1.37 |
+
+The index was built by the 2026-10-13 build, which builds the graph over a half-precision
+copy of the vectors. The previous build reached 0.9921 recall at `ef=16` and 0.9989 from
+`ef=32` up. Its `ef=128` mean was 0.66 ms and its `ef=256` mean 1.14 ms, so the new graph
+answers the higher settings about 18 % faster.
+
+Means below about 0.7 ms are not comparable between runs on this host. The same binary
+answered the 1,000 `ef=16` queries in 0.29 ms at the median in one pass and 0.60 ms in the
+next, and cheap settings were often slower than `ef=64`. Both the old and the new build
+showed this, so it comes from the client and the processor's idle states rather than from
+the search.
 
 These figures describe this synthetic distribution, not all vectors.
+
+The vector maintenance work was also screened on a Namespace instance (8 AMD EPYC vCPUs)
+with the interleaved A/B harness and the 27-query SPARQL suite over 100,000 people. These
+are Namespace numbers, not forge numbers. Both binaries returned the same answers, and the
+geometric mean of server execution time was 0.962 of the previous build's, which is within
+the harness's noise.
 
 ### Path search
 
@@ -634,6 +695,27 @@ checks. The table lists the changes larger than 25%.
 | `range_pushdown` | `optional-chain` 1.3× slower (93.0 against 73.2 ms) |
 | `topk_first_key` | `expr-order-key` 8.3× slower (174.1 against 20.9 ms) |
 
+### The fixed cost of a plain query
+
+The graph algorithm work (F14) first put every query behind a memory ledger, which added a
+fixed cost to queries that never call an algorithm. A plain query now charges a lock-free
+fast account and creates the ledger only when it calls an algorithm, keeps an output lease
+or moves to a cursor. The runs used forge with the 1.05M triple dataset and the small
+queries of the suite, where a fixed cost per query is the largest share of the time.
+
+| Comparison | Measure | Result |
+|---|---|---|
+| Lazy ledger against the build before it | Instructions per HTTP request on the small queries | 6 to 9 thousand fewer |
+| Lazy ledger against the build before it | Median execution time of distinct-obj | 3.75 µs down to 3.19 µs |
+| Lazy ledger against origin/main at 20f01c82 | Execution time of the three smallest queries | 0.5 to 0.7 µs higher |
+| Lazy ledger against origin/main at 20f01c82 | Wall time of the four flagged small queries | 0.7 to 3.3% higher |
+
+The baseline is origin/main at 20f01c82, the release before F14. The remaining 0.5 to 0.7
+µs on the smallest queries is spread over the operator result plumbing. The fast account
+adds a mutex, four atomic counters and a lazily set grant to each query context and saves
+the ledger allocation of a plain query, so a plain query does not use more memory than it
+did before.
+
 ## Loading and index builds
 
 Sparkles builds its index in one parallel pass. Parsing and vocabulary merging run on all
@@ -687,7 +769,8 @@ Decompression runs as one stream in front of the parallel parser and adds 0.1–
 | Full-text index, 1.05M triples | **0.41 s** (Fuseki 4.37, QLever 1.86) | 13.1 MB (QLever **11.1**, Fuseki 24.9) |
 | Full-text index, 10.5M triples | **6.48 s** (Fuseki 25.98, QLever 19.35) | 122.5 MB (QLever **99.9**, Fuseki 227.8) |
 | Full-text document store, every string literal of 10.5M (1,540,012 documents) | 6.17 s with zstd, 6.07 s with LZ4 | 114.1 MB with zstd (the default), 117.3 MB with LZ4 |
-| HNSW vector index, 100,000 × 384 dimensions, `M=16`, `efConstruction=128` | 14.0 s | 163 MB of mapped files, 1,019.5 MB peak RSS |
+| HNSW vector index, 100,000 × 384 dimensions, `M=16`, `efConstruction=128` | 6.43 s (14.02 s before the half-precision build) | 163 MB of mapped files, 1,044.4 MB peak RSS |
+| HNSW vector index, 1,000,000 × 384 dimensions, in-process example | 63.5 s, down from 139.5 s. USearch 2.26.2 in half precision takes 50.0 s. | Recall@10 is 0.963 at `ef=128`. Peak RSS is 12.6 GB, up from 10.2 GB. |
 | Spatial index, 180,640 geometries | 0.54 s | 13.8 MiB |
 | RDFS materialization, 1,001,418 triples to 2,751,996 with inferences | 3.974 s, of which inference takes 2.323 s | — |
 | Numeric column added to the DBpedia index by `sparkles vocab-index` | 4.8 s | 20.7 MB |
@@ -727,6 +810,24 @@ at the switch. On 100,000 point features with 500 commits before each compaction
 more during its build, the median writer lock at the switch is 4.9 ms without a spatial
 index, 64.5 ms when the spatial base is built at the switch, and 25.3 ms when it is built
 with the generation, which is the default.
+
+### Document conversion in a child process
+
+The server converts each PDF and Office document in a child process with resource limits
+(spec C18 §7.1.1). This is a development measurement on a shared 16-core Linux laptop,
+not a quiet-machine benchmark. Each figure is over 200 conversions of the 5 KB DOCX
+fixture with the release binary, made by the ignored test `ingest::isolate::tests::overhead`.
+
+| 5 KB DOCX | Median | 90th percentile |
+|---|---:|---:|
+| In process | 41 µs | 54 µs |
+| On a thread, the fallback path | 85 µs | 184 µs |
+| In a child process | 8.5 ms | 9.5 ms |
+
+Starting `/bin/true` took 2 to 4 ms on the same machine, so most of the child's cost is
+starting a process. The child adds about 10 ms to each document, which is small next to
+the model calls of an ingestion. Each running conversion may also use up to
+`--convert-memory`, 2 GiB by default, of address space beside the server.
 
 ## Writes and updates
 
@@ -782,6 +883,75 @@ completes all 50,000 inserts with contiguous receipts and the correct final stat
 | Acknowledged transactions/s | 221.5–231.8 | **529.0–543.3** | 201.1–204.0 | **402.3–406.9** |
 | Request p50 (ms) | 19.016–19.211 | **9.051–9.104** | 19.338–19.415 | **9.709–9.735** |
 | Request p99 (ms) | 39.972–41.342 | **15.693–15.894** | 41.066–41.200 | **16.089–16.171** |
+
+### Group commit on Namespace instances
+
+These runs are approximate screens of group commit, not the published numbers above. They
+ran on ephemeral Namespace instances (8 vCPUs, ext4, AMD EPYC) with `scripts/nsc-writes.sh`,
+which alternates the variants in one instance, the server on six CPUs and the client on two.
+The instances are shared, so ranges are wide, and a quiet run is the exception. The
+dataset is the 10.5M-triple one (1,000,000 people). The default writer is `off`. The
+group commit variant is `--experimental-group-commit`, which includes the idle fast path:
+a commit that finds no other writer waiting and no fence running synchronizes as the default
+writer does.
+
+| Serial commits, 10.5M, 8 rounds of 5,000 | Default | Group commit | Ratio |
+|---|---:|---:|---:|
+| Literal insert, p50 / p90 (ms) | 0.183 / 0.218 | 0.184 / 0.223 | 1.005 / 1.021 |
+| IRI insert, p50 / p90 (ms) | 0.177 / 0.217 | 0.178 / 0.222 | 1.003 / 1.023 |
+
+The serial literal, IRI and commit-message throughput figures from these runs are
+withdrawn. The client excluded warmups from latency samples but included them in the
+elapsed denominator used for serial transactions per second. Delete seeding was already
+untimed. The retained latency rows excluded warmups and remain provisional Namespace evidence.
+Corrected serial throughput requires new measurements.
+
+An earlier serial run on a noisier instance had group commit 6.5% above at p50 and 19% above at
+p90 for literal inserts, with a spread of 3.7× between the fastest and slowest default-writer
+runs. Without the idle fast path, group commit was 4% to 9% slower than the default writer
+in serial runs at 1.05M, which is why the path exists.
+
+The instances sync in about 0.2 ms, which hides the cost of a slow device. The runs below add
+4 ms to every synchronization and write-through write (`delay-us=4000` in
+`scripts/nsc-writes.sh`), which reproduces the default writer's 230 transactions/s on
+`forge`. Four rounds each.
+
+| 10.5M, 4 ms synchronization | Default | Group commit | Ratio |
+|---|---:|---:|---:|
+| Four writers with two readers, transactions/s | 233 | 466 | 2.0 |
+| Four writers with two readers, writer p50 (ms) | 17.1 | 8.5 | 0.50 |
+| Sixteen writers, transactions/s | 229 | 1,783 | 7.8 |
+| Four writers, commit message on every update, transactions/s | 112.8 | 429.0 | 3.8 |
+| Sixteen writers, commit message on every update, transactions/s | 112.7 | 1,636.6 | 14.5 |
+
+A commit message costs the default writer a second synchronization, for the annotation
+file. The concurrent message rows show the cost of that additional synchronization.
+Group commit synchronizes both files in one fence. In the
+sixteen-writer message run, the largest deviation of a writer's share from the mean was 0.002 for
+group commit and 0.063 for the default writer.
+
+The reader p99 at 10.5M with four writers and two readers was measured on `forge` in the
+next section. The 40% regression above did not reproduce on these instances. With the fast device (80,000
+changes) p99 was 5.20 ms for the default writer and 4.16 ms for group commit. With the 4 ms
+synchronization it was 0.85, 0.89 and 0.73 ms for the default writer, group commit without
+the idle path and group commit with it, and in a later run 0.91 and 1.09 ms for the default
+writer and group commit, with ranges of 0.66 to 2.56 and 0.73 to 1.87 ms. These overlap, so
+the tail needed `forge` to settle.
+
+### Reader tail of group commit on forge
+
+Four writers and two readers ran against the 10.5M dataset on `forge` with its NVMe device,
+six rounds per setting, on 2026-10-16. In the paced run both settings were held to 3,452
+transactions/s, the most the default writer reaches. The paced run is the X09 acceptance
+gate, and the unpaced run shows the read cost of the higher write rate that group commit
+allows.
+
+| Measure | Unpaced, default | Unpaced, group commit | Ratio | Paced, default | Paced, group commit | Ratio |
+|---|--:|--:|--:|--:|--:|--:|
+| Transactions/s | 3,452.5 | 5,995.8 | 1.737 | 3,426.7 | 3,449.7 | 1.007 |
+| Writer p50 (ms) | 1.126 | 0.634 | 0.563 | 1.119 | 0.712 | 0.636 |
+| Reader p50 (ms) | 0.482 | 0.332 | 0.689 | 0.478 | 0.496 | 1.037 |
+| Reader p99 (ms) | 4.639 | 5.039 | 1.086 | 3.980 | 3.986 | 1.002 |
 
 ### Concurrent writers with snapshot readers
 
@@ -1295,7 +1465,12 @@ than 10%. Fluree's warm advantages on small lookups at 1.05M are within 10%.
     rejects `knows-reach` at 10.5M. Fluree has no result cache.
   * Oxigraph loads with `oxigraph load` and then `oxigraph optimize`, the compaction its
     loader recommends before read-heavy workloads, and serves with
-    `oxigraph serve --timeout-s 600`.
+    `oxigraph serve --timeout-s 600`. The harness reads the N-Triples from standard input.
+    With `--file`, Oxigraph 0.5.11 parses N-Triples in parallel chunks and turns a blank
+    node label used in two chunks into two nodes. The figures above predate this change.
+    The synthetic data and WatDiv contain no blank nodes and the DBpedia load already read
+    standard input, so the figures are not affected, but the load times of a later refresh
+    will be about 3x longer than with `--file`.
 * **Isolation.** Each engine runs alone on the machine, one after another, in a systemd
   scope with a 12 GiB memory limit and no swap, so an engine that runs out of memory is
   killed on its own. The OS page cache is warm except in the cold runs.
@@ -1328,9 +1503,12 @@ so only its row count is checked.
   disk spill, so a query whose operator state outgrows its budget fails.
 * **Data larger than RAM.** Every store fits in memory except the DBpedia index of
   28.7 GiB under a 14 GiB limit.
-* **Other standard benchmarks.** LUBM, BSBM, SP²Bench, WatDiv's stress testing and the
-  Wikidata query log were not run. The synthetic suite has a regular shape, and its 28
-  queries are hand-picked.
+* **Other standard benchmarks.** The tables above include no figures for LUBM, BSBM or
+  SP²Bench. The harnesses for all three exist and are described in
+  [BENCHMARKING.md](BENCHMARKING.md), but their comparisons have not been run on the
+  reference machine. OWL2Bench, LDBC, WatDiv's stress testing and the Wikidata query log
+  have no harness yet. The synthetic suite has a regular shape, and its 28 queries are
+  hand-picked.
 * **Long runs.** Hours of sustained writes and compaction under load were not compared
   with other engines.
 * **Spatial and query-time reasoning.** GeoSPARQL workloads and query-time reasoning were
@@ -1351,6 +1529,12 @@ comparisons.
   the same settings as `ENGINES` and `ANSWERS_ONLY=1`.
 * `mise run bench:watdiv [scale]` runs WatDiv, and `scripts/bench-text.sh` the full-text
   comparison.
+* `mise run bench:sp2b 10m`, `mise run bench:lubm 100` and
+  `SPARKLES_ALLOW_GPL_BENCHMARK=1 mise run bench:bsbm 10m` run the standard suites. Each
+  writes a result record and a run manifest that name the Sparkles commit, the engine
+  versions and the data checksums, and `scripts/bench-regressions.py compare` compares two
+  records. A refresh puts the figures of its records into this document, with the
+  measurement window in the context table.
 * `mise run bench:billion full` runs DBpedia. Run it on a quiet machine right after
   `fstrim`, because an untrimmed SSD stalls the load's writes and slows cold lookups.
   `scripts/bench-billion.sh` records the last trim, the free space and the I/O pressure,

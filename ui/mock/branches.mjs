@@ -395,7 +395,7 @@ function planMerge(ds, source, target, o = {}) {
 }
 
 /** A change of a merge as the diff JSON lists it. */
-const changeJson = ({ op, quad: q }) => ({
+export const changeJson = ({ op, quad: q }) => ({
   op,
   subject: String(q.subject),
   predicate: String(q.predicate),
@@ -803,7 +803,7 @@ function commitGraph(ds, url) {
 // the changes of commits, for `GET /{ds}/diff`
 
 /** The changes each commit made (`[{op, quad}]`), by commit object. */
-const changesOf = new WeakMap();
+export const changesOf = new WeakMap();
 
 /** Remember what `commit` changed: the N-Quads lines (without " .") it added and removed. */
 export function recordChanges(commit, added, removed) {
@@ -843,6 +843,26 @@ export function handleDiff(req, res, url, seg, ctx) {
       if (had && had.op !== ch.op) net.delete(k);
       else net.set(k, ch);
     }
+  // across branches (`fromBranch`, `toBranch`): the heads of the two are compared
+  if (url.searchParams.has('fromBranch') || url.searchParams.has('toBranch')) {
+    const pick = (name) => (!name || name === MAIN ? ds : ds.branchSet.get(name));
+    const a = pick(url.searchParams.get('fromBranch'));
+    const b = pick(url.searchParams.get('toBranch'));
+    if (!a || !b) return (ctx.fail(res, 404, 'no such branch'), true);
+    net.clear();
+    const qa = quadMap(a.store);
+    const qb = quadMap(b.store);
+    for (const [k, q] of qa) if (!qb.has(k)) net.set(k, { op: '-', quad: q });
+    for (const [k, q] of qb) if (!qa.has(k)) net.set(k, { op: '+', quad: q });
+  }
+  // `term=`: only the changes whose subject or object is one of the terms
+  const terms = url.searchParams
+    .getAll('term')
+    .map((t) => (/^[<"_]/.test(t.trim()) ? t.trim() : `<${t.trim()}>`));
+  if (terms.length)
+    for (const [k, ch] of net)
+      if (!terms.includes(String(ch.quad.subject)) && !terms.includes(String(ch.quad.object)))
+        net.delete(k);
   const changes = [...net.values()].sort((a, b) => (a.op === b.op ? 0 : a.op === '-' ? -1 : 1));
   const at = (seq) => list.find((c) => c.seq === seq) ?? { seq, ref: `commit:${seq}` };
   const limit = Number(url.searchParams.get('limit') ?? 1000);

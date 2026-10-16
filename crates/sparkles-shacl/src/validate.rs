@@ -1,6 +1,7 @@
 //! The validation engine (SHACL §3–4).
 
 use crate::data::DataGraph;
+use crate::nodeeval::Scope;
 use crate::path::{CPath, PropertyPath};
 use crate::report::{ValidationReport, ValidationResult};
 use crate::shapes::{Candidates, Constraint, Qualified, ShapeId, Shapes, Target};
@@ -36,10 +37,27 @@ pub struct ValidateOptions {
     /// to bound the threads one caller's validations may use.
     pub pool: Option<Arc<rayon::ThreadPool>>,
     pub timeout: Option<Duration>,
+    /// Absolute bound shared with an enclosing operation, without phase renewal.
+    pub deadline: Option<Instant>,
+    /// Additional cancellation sources, checked with the existing single flag.
+    pub cancellation: Option<sparkles_core::task::Cancellation>,
     pub cancel: Option<Arc<AtomicBool>>,
     /// Stop with [`TooManyResults`] once the report would hold more results than this.
     pub max_results: Option<usize>,
+    /// The most units of work one node expression evaluation may take. Each evaluation of a
+    /// sub-expression is one unit, and so is each node that a concatenation or a mapping
+    /// appends. The nodes that a read of the data returns are not counted, so a large
+    /// result is fine. A shared sub-expression counts each time it is evaluated, so a
+    /// doubling expression graph stops here and not after exhausting memory. The name
+    /// predates the accounting and the field counts units of work, not nodes. At the
+    /// default the ids a concatenation appends take 128 MiB, which is a floor, because
+    /// the output and the appended vector are both live and each worker thread of a
+    /// parallel validation can hold one.
+    pub max_expr_nodes: u64,
 }
+
+/// The default of [`ValidateOptions::max_expr_nodes`].
+pub const DEFAULT_MAX_EXPR_NODES: u64 = 1 << 24;
 
 /// A report that would hold more than [`ValidateOptions::max_results`] results.
 #[derive(Debug)]
@@ -64,8 +82,11 @@ impl Default for ValidateOptions {
             parallel: true,
             pool: None,
             timeout: None,
+            deadline: None,
+            cancellation: None,
             cancel: None,
             max_results: None,
+            max_expr_nodes: DEFAULT_MAX_EXPR_NODES,
         }
     }
 }
@@ -199,6 +220,12 @@ impl Out {
 #[derive(Default)]
 pub(crate) struct Cx {
     stack: Vec<(ShapeId, Id)>,
+    /// nesting of node expression evaluations
+    pub depth: usize,
+    /// units of work of the top-level evaluation in progress, counted against the budget
+    pub expr_work: u64,
+    /// nodes that its evaluations produced, which set how often the deadline is checked
+    pub expr_seen: u64,
 }
 
 pub(crate) struct Engine<'a> {
@@ -207,11 +234,16 @@ pub(crate) struct Engine<'a> {
     /// store id of each term of the shapes' term table
     pub ids: Vec<Id>,
     paths: Vec<Option<CPath>>,
+    /// the compiled path of each `shnex:pathValues` expression
+    pub expr_paths: Vec<Option<CPath>>,
     parallel: bool,
     pool: Option<Arc<rayon::ThreadPool>>,
     pub deadline: Option<Instant>,
     pub cancel: Option<Arc<AtomicBool>>,
+    pub cancellation: Option<sparkles_core::task::Cancellation>,
     max_results: Option<usize>,
+    /// the most nodes one node expression evaluation may work through
+    pub max_expr_nodes: u64,
     /// results collected so far (checked against `max_results`)
     collected: AtomicUsize,
 }
@@ -225,12 +257,36 @@ fn msg(s: String) -> Vec<Literal> {
 }
 
 impl<'a> Engine<'a> {
+    pub(crate) fn new_for_expressions(
+        shapes: &'a Shapes,
+        data: &'a DataGraph,
+        ids: Vec<Id>,
+        opts: &ValidateOptions,
+    ) -> Result<Engine<'a>> {
+        Engine::new(shapes, data, ids, opts)
+    }
+
     fn new(
         shapes: &'a Shapes,
         data: &'a DataGraph,
         ids: Vec<Id>,
         opts: &ValidateOptions,
     ) -> Result<Engine<'a>> {
+        let lookup = |n: &NamedNode| {
+            data.snap
+                .lookup_iri(n.as_str())
+                .unwrap_or(Id::local(u64::MAX >> 8))
+        };
+        let expr_paths = shapes
+            .exprs
+            .iter()
+            .map(|e| match e {
+                crate::nodeexpr::Expr::PathValues { path, .. } => {
+                    Some(CPath::compile(path, &mut |n| lookup(n)))
+                }
+                _ => None,
+            })
+            .collect();
         let paths = shapes
             .shapes
             .iter()
@@ -249,23 +305,33 @@ impl<'a> Engine<'a> {
             data,
             ids,
             paths,
+            expr_paths,
             parallel: opts.parallel,
             pool: opts.pool.clone(),
-            deadline: opts.timeout.map(|t| Instant::now() + t),
+            deadline: opts
+                .deadline
+                .into_iter()
+                .chain(opts.timeout.map(|t| Instant::now() + t))
+                .min(),
             cancel: opts.cancel.clone(),
+            cancellation: opts.cancellation.clone(),
             max_results: opts.max_results,
+            max_expr_nodes: opts.max_expr_nodes,
             collected: AtomicUsize::new(0),
         })
     }
 
-    fn check_limits(&self) -> Result<()> {
+    pub(crate) fn check_limits(&self) -> Result<()> {
         if let Some(c) = &self.cancel
             && c.load(AtomicOrdering::Relaxed)
         {
             bail!("validation cancelled");
         }
+        if let Some(cancellation) = &self.cancellation {
+            cancellation.check()?;
+        }
         if let Some(d) = self.deadline
-            && Instant::now() > d
+            && Instant::now() >= d
         {
             bail!("validation timed out");
         }
@@ -381,6 +447,13 @@ impl<'a> Engine<'a> {
         for t in &self.shapes.shapes[si].targets {
             let nodes = match *t {
                 Target::Node(t) => vec![self.id(t)],
+                Target::Expr(e) => {
+                    // the shape is the focus node of its target expression
+                    let shape_node = self.shapes.shapes[si].node.clone();
+                    let focus = self.lit_id(&shape_node);
+                    let mut cx = Cx::default();
+                    self.eval(e, focus, &Scope::default(), &mut cx)?
+                }
                 Target::Class(c) => self.data.instances(self.id(c))?,
                 Target::SubjectsOf(p) => self.data.subjects_of(self.id(p))?,
                 Target::ObjectsOf(p) => self.data.objects_of(self.id(p))?,
@@ -411,6 +484,12 @@ impl<'a> Engine<'a> {
         for t in &self.shapes.shapes[si].targets {
             let hit = match *t {
                 Target::Node(t) => self.id(t) == f,
+                Target::Expr(e) => {
+                    let shape_node = self.shapes.shapes[si].node.clone();
+                    let focus = self.lit_id(&shape_node);
+                    self.eval(e, focus, &Scope::default(), &mut Cx::default())?
+                        .contains(&f)
+                }
                 Target::Class(c) => self.data.is_instance(f, self.id(c))?,
                 Target::SubjectsOf(p) => !self.data.objects(f, self.id(p))?.is_empty(),
                 Target::ObjectsOf(p) => !self.data.subjects(self.id(p), f)?.is_empty(),
@@ -432,7 +511,7 @@ impl<'a> Engine<'a> {
     }
 
     /// The nodes that may conform to shape `si` (see [`Shapes::candidates`]).
-    fn candidates(&self, si: ShapeId) -> Result<Vec<Id>> {
+    pub(crate) fn candidates(&self, si: ShapeId) -> Result<Vec<Id>> {
         let pred = |p: &NamedNode| {
             self.data
                 .snap
@@ -492,10 +571,13 @@ impl<'a> Engine<'a> {
         cx: &mut Cx,
     ) -> Result<()> {
         let shape = &self.shapes.shapes[si];
-        if shape.deactivated {
+        if self.deactivated_at(si, focus, cx)? {
             return Ok(());
         }
-        let values = self.value_nodes(si, focus)?;
+        let mut values = self.value_nodes(si, focus)?;
+        if shape.path.is_some() && (shape.values.is_some() || shape.default_value.is_some()) {
+            values = self.extend_values(si, focus, values, cx)?;
+        }
         for c in &shape.constraints {
             self.check(si, c, focus, &values, out, cx)?;
             if out.stop() {
@@ -507,7 +589,7 @@ impl<'a> Engine<'a> {
 
     /// Does `v` conform to shape `si`?
     pub(crate) fn conforms(&self, si: ShapeId, v: Id, cx: &mut Cx) -> Result<bool> {
-        if self.shapes.shapes[si].deactivated || cx.stack.contains(&(si, v)) {
+        if cx.stack.contains(&(si, v)) || self.deactivated_at(si, v, cx)? {
             return Ok(true);
         }
         if cx.stack.len() > 512 {
@@ -675,7 +757,7 @@ impl<'a> Engine<'a> {
         })
     }
 
-    fn show(&self, id: Id) -> String {
+    pub(crate) fn show(&self, id: Id) -> String {
         self.data
             .term(id)
             .map(|t| t.to_string())
@@ -1255,6 +1337,67 @@ impl<'a> Engine<'a> {
             Constraint::Component(cc) => {
                 self.check_component(si, cc, focus, values, out)?;
             }
+            Constraint::Expression(e) => {
+                // for each value node v, the expression evaluated at the focus node with
+                // `value` bound to v must give exactly ( true )
+                let source = Some(self.shapes.expr_nodes[*e].clone());
+                for &v in values {
+                    let r = self.eval(*e, focus, &Scope::with_var("value", v), cx)?;
+                    if !self.only_true(&r) {
+                        self.report(
+                            out,
+                            si,
+                            focus,
+                            path(),
+                            Some(v),
+                            comp(),
+                            source.clone(),
+                            || {
+                                msg(format!(
+                                    "Expression {} does not give true for {}",
+                                    self.shapes.expr_nodes[*e],
+                                    self.show(v)
+                                ))
+                            },
+                        )?;
+                        if out.stop() {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            Constraint::NodeByExpression(e) => {
+                for &v in values {
+                    let computed = self.eval(*e, v, &Scope::default(), cx)?;
+                    for s in computed {
+                        let term = self.term(s)?;
+                        // a node no shape declaration describes has no constraints
+                        let Some(&target) = self.shapes.by_node.get(&term) else {
+                            continue;
+                        };
+                        if !self.conforms(target, v, cx)? {
+                            self.report(
+                                out,
+                                si,
+                                focus,
+                                path(),
+                                Some(v),
+                                comp(),
+                                Some(term.clone()),
+                                || {
+                                    msg(format!(
+                                        "NodeByExpression[{term}] at focusNode {}",
+                                        self.show(v)
+                                    ))
+                                },
+                            )?;
+                            if out.stop() {
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -1285,4 +1428,70 @@ pub(crate) fn lang_matches(tag: &str, range: &str) -> bool {
     }
     let (tag, range) = (tag.to_ascii_lowercase(), range.to_ascii_lowercase());
     tag == range || (tag.starts_with(&range) && tag.as_bytes().get(range.len()) == Some(&b'-'))
+}
+
+#[cfg(test)]
+mod control_tests {
+    use super::*;
+    use sparkles_core::io::{RdfFormat, Source};
+    use sparkles_core::store::{Store, StoreOptions};
+
+    #[test]
+    fn operation_controls_reach_engine_and_sparql_context() {
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                b"<urn:focus> <urn:p> <urn:o> .".to_vec(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let snap = store.snapshot();
+        let shapes = Shapes::parse("@prefix sh: <http://www.w3.org/ns/shacl#> . <urn:S> a sh:NodeShape ; sh:targetNode <urn:focus> ; sh:sparql [ sh:select 'SELECT $this WHERE {}' ] .", RdfFormat::Turtle, None).unwrap();
+        let si = shapes
+            .shapes
+            .iter()
+            .position(|s| s.node == Term::NamedNode(NamedNode::new_unchecked("urn:S")))
+            .unwrap();
+        let constraint = shapes.shapes[si]
+            .constraints
+            .iter()
+            .find_map(|c| match c {
+                Constraint::Sparql(c) => Some(c),
+                _ => None,
+            })
+            .unwrap();
+        for source in 0..4 {
+            let flag = Arc::new(AtomicBool::new(false));
+            let primary = Arc::new(AtomicBool::new(source == 1));
+            let opts = ValidateOptions {
+                cancel: Some(primary),
+                cancellation: Some(sparkles_core::task::Cancellation::from_flags(
+                    [flag.clone()],
+                )),
+                deadline: (source == 2).then(Instant::now),
+                timeout: (source == 3).then_some(Duration::ZERO),
+                ..Default::default()
+            };
+            let (mut data, ids) = DataGraph::new(snap.clone(), None, &[], &[], &shapes).unwrap();
+            let focus = data.resolve(
+                &Term::NamedNode(NamedNode::new_unchecked("urn:focus")),
+                false,
+            );
+            let engine = Engine::new(&shapes, &data, ids, &opts).unwrap();
+            if source == 0 {
+                assert!(engine.check_limits().is_ok());
+                flag.store(true, AtomicOrdering::Relaxed);
+            }
+            let native = engine.check_limits().unwrap_err();
+            // check_sparql directly enters its query context, bypassing Engine's
+            // outer limit check, so this proves propagation to actual Ctx checks.
+            let query = engine
+                .check_sparql(si, constraint, focus, &mut Out::collect())
+                .unwrap_err();
+            let expected = if source < 2 { "cancel" } else { "timed out" };
+            assert!(native.to_string().contains(expected), "{native}");
+            assert!(query.to_string().contains(expected), "{query}");
+        }
+    }
 }

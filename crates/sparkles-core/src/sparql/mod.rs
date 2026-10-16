@@ -1,11 +1,14 @@
 //! SPARQL 1.1 query & update engine (ARQ equivalent).
 
 pub mod aggext;
+pub mod algorun;
+pub mod algosvc;
 pub mod arqpf;
 pub mod cache;
 pub mod catalog;
 pub mod cdt;
 pub mod charsets;
+mod constkeys;
 pub mod ctx;
 pub mod cursor;
 mod cursor_regex;
@@ -31,7 +34,9 @@ mod keyprobe;
 pub mod lateral;
 pub mod pathsearch;
 pub mod plan;
+pub mod pool;
 mod propertyext;
+pub(crate) mod query_memory;
 pub mod rdfs;
 mod registeredagg;
 pub mod results;
@@ -48,6 +53,7 @@ mod zipper;
 
 use crate::error::{Error, Result};
 use crate::id::Id;
+use crate::ioacct;
 use crate::store::Snapshot;
 pub use ctx::{Ctx, DatasetSpec, Optimizations};
 pub use cursor::{
@@ -80,6 +86,10 @@ pub struct QueryOptions {
     /// Immutable application scalar and aggregate callbacks resolved for this query only.
     pub extensions: Option<Arc<extensions::ExtensionRegistry>>,
     pub timeout: Option<Duration>,
+    /// An absolute deadline, intersected with the relative timeout without renewal.
+    pub deadline: Option<Instant>,
+    /// Additional cancellation sources, intersected with `cancel` at work checks.
+    pub cancellation: Option<crate::task::Cancellation>,
     /// options for write guards (updates)
     pub write: crate::guard::WriteOptions,
     /// protocol `default-graph-uri` (overrides FROM)
@@ -89,10 +99,18 @@ pub struct QueryOptions {
     pub base_iri: Option<String>,
     /// Maximum rows in an intermediate table or distinct CONSTRUCT graph output.
     pub max_rows: Option<usize>,
-    /// Budget for the estimated memory of intermediate results and retained CONSTRUCT
-    /// output (`None`: unlimited);
+    /// Budget for the estimated memory of intermediate results and retained decoded
+    /// graph output (`None`: unlimited);
     /// exceeding it fails with [`Error::BudgetExceeded`].
     pub max_memory_bytes: Option<u64>,
+    /// The query's reservation in a server-wide memory pool (see [`pool`]). The server
+    /// admits the request and passes the grant it got, and the query grows and shrinks
+    /// it with its charges. An update's WHERE clauses share it, one at a time.
+    pub grant: Option<Arc<pool::PoolGrant>>,
+    /// A pool to take a grant from when `grant` is unset. The query then starts with an
+    /// empty grant and fails with [`BudgetKind::ServerMemory`](crate::BudgetKind) when
+    /// the pool cannot cover its charges. Nothing queues.
+    pub pool: Option<Arc<pool::QueryPool>>,
     /// Budget for the rows all operators of a query produce together, including
     /// distinct CONSTRUCT output (`None`: unlimited); exceeding it fails with
     /// [`Error::BudgetExceeded`]. An update's WHERE clauses share one count.
@@ -133,6 +151,9 @@ pub struct QueryOptions {
     /// RDFS on read: patterns match the RDFS closure of each graph with respect to this
     /// schema (see [`rdfs`]).
     pub rdfs: Option<Arc<rdfs::RdfsOnRead>>,
+    /// The named projections of the dataset, for `algo:projection` in a graph algorithm
+    /// call (see [`crate::algo::catalog`]).
+    pub algo_projections: Option<Arc<crate::algo::catalog::Catalog>>,
     /// The outbound budget the request spends (`None`: a new one from
     /// [`outbound`](Self::outbound)), shared by several requests that count as one.
     pub outbound_budget: Option<Arc<crate::outbound::RequestBudget>>,
@@ -160,6 +181,35 @@ pub struct QueryOptions {
     /// dataset fills each of those fields that the caller left unset. The engine itself
     /// does not read it.
     pub defaults_applied: bool,
+}
+
+impl QueryOptions {
+    /// The grant a query under these options holds: the one given, else an empty one from
+    /// the pool.
+    pub(crate) fn query_grant(&self) -> Option<Arc<pool::PoolGrant>> {
+        match (&self.grant, &self.pool) {
+            (Some(g), _) => Some(g.clone()),
+            (None, Some(p)) => Some(Arc::new(p.empty_grant())),
+            (None, None) => None,
+        }
+    }
+
+    /// The earlier absolute or relative bound, anchored once by the caller.
+    pub(crate) fn effective_deadline(&self, started: Instant) -> Result<Option<Instant>> {
+        let relative = self
+            .timeout
+            .map(|timeout| {
+                started
+                    .checked_add(timeout)
+                    .ok_or_else(|| Error::invalid("query timeout is too large"))
+            })
+            .transpose()?;
+        Ok(earlier_deadline(self.deadline, relative))
+    }
+}
+
+pub(crate) fn earlier_deadline(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
+    a.into_iter().chain(b).min()
 }
 
 /// `snap` with the request's union default graph setting, if it overrides the store's.
@@ -277,7 +327,7 @@ pub struct QueryResult {
     pub quads: Vec<Quad>,
     pub plan: PlanInfo,
     pub timing: Timing,
-    /// Peak estimated memory of intermediate results and CONSTRUCT output (see
+    /// Peak estimated memory of intermediate results and decoded graph output (see
     /// [`QueryOptions::max_memory_bytes`]).
     pub mem_peak_bytes: u64,
     /// Rows produced by all operators and distinct CONSTRUCT output (see
@@ -401,7 +451,11 @@ fn make_ctx(
     // the store's limit on one geometry operation
     #[cfg(feature = "geo")]
     ctx.geo.set_op_vertices(op_vertices);
-    ctx.deadline = opts.timeout.map(|t| Instant::now() + t);
+    ctx.deadline = match opts.timeout {
+        Some(_) => opts.effective_deadline(Instant::now())?,
+        None => opts.deadline,
+    };
+    ctx.cancellation = opts.cancellation.clone();
     if let Some(c) = &opts.cancel {
         ctx.cancel = c.clone();
     }
@@ -411,6 +465,7 @@ fn make_ctx(
     if let Some(m) = opts.max_memory_bytes {
         ctx.mem_limit = m;
     }
+    ctx.set_grant(opts.query_grant());
     if let Some(m) = opts.max_rows_produced {
         ctx.max_rows_produced = m;
     }
@@ -429,6 +484,7 @@ fn make_ctx(
         None => None,
     };
     ctx.use_cache = !opts.no_cache;
+    ctx.algo_projections = opts.algo_projections.clone();
     ctx.extensions = opts.extensions.clone();
     if let Some(s) = &opts.service_scope {
         ctx.service_scope = s.clone();
@@ -651,14 +707,7 @@ fn prepare_query(
     let mut ctx = make_ctx(snap, opts, dataset, base)?;
     if let Some(started) = cursor_started.filter(|_| automatic.is_none()) {
         ctx.enable_cursor_accounting()?;
-        ctx.deadline = opts
-            .timeout
-            .map(|timeout| {
-                started
-                    .checked_add(timeout)
-                    .ok_or_else(|| Error::invalid("cursor timeout is too large"))
-            })
-            .transpose()?;
+        ctx.deadline = opts.effective_deadline(started)?;
     }
     ctx.configure_extensions(pattern);
     let mut ctx = Arc::new(ctx);
@@ -666,6 +715,16 @@ fn prepare_query(
         ctx.attach_cursor_owner();
     }
     crate::geo::validate_query(pattern, &mut |w| ctx.warn(w))?;
+    // the keys are collected only when asking for their groups can do something
+    if ctx.opt.prefetch_constants
+        && crate::index::io_hints()
+        && ctx.snap.generation.vocab.has_sparse()
+    {
+        ctx.snap
+            .generation
+            .vocab
+            .prefetch_keys(&constkeys::constant_keys(pattern));
+    }
     let mut planner = Planner::new(&ctx);
     planner.source = Some(parsed);
     let mut bound: Vec<(table::VarId, Id)> = Vec::new();
@@ -689,7 +748,10 @@ fn prepare_query(
         Query::Describe { .. } => (QueryKind::Describe, pattern.clone()),
     };
     let planned = rdfs::apply(&ctx, &pattern);
+    ioacct::mark("plan");
     let node = planner.plan(&planned, &ActiveGraph::Default, Vec::new())?;
+    ioacct::mark("planned");
+    exec::prefetch_scans(&ctx, &node);
     if let Some(automatic) = automatic
         && bound.is_empty()
         && cursor::auto_streaming(&ctx, &node, kind, automatic)
@@ -698,14 +760,7 @@ fn prepare_query(
         let mutable = Arc::get_mut(&mut ctx)
             .ok_or_else(|| Error::invalid("automatic cursor context is shared"))?;
         mutable.enable_cursor_accounting()?;
-        mutable.deadline = opts
-            .timeout
-            .map(|timeout| {
-                started
-                    .checked_add(timeout)
-                    .ok_or_else(|| Error::invalid("cursor timeout is too large"))
-            })
-            .transpose()?;
+        mutable.deadline = opts.effective_deadline(started)?;
         ctx.attach_cursor_owner();
     }
     ctx.check()?;
@@ -763,6 +818,7 @@ fn execute_prepared(
         Ok(r) => r,
         Err(e) => return Err(failed(e, None, None)),
     };
+    ioacct::mark("executed");
     plan.warnings = ctx.warnings();
     if ctx.graphs.is_some() {
         plan.redact();

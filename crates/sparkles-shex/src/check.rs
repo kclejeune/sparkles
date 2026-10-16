@@ -1,13 +1,17 @@
-//! Structural checks of a closed schema: references and inclusions resolve, no label
-//! reaches itself without passing through a shape, `&include` names a triple
-//! expression, no negated reference cycle (through NOT or EXTRA), unique labels, and the
-//! facet rules; plus the strata of the dependency graph.
+//! Structural checks of a closed schema: references, extensions and inclusions resolve,
+//! no label reaches itself without passing through a shape, `&include` names a triple
+//! expression, no negated reference cycle (through NOT or EXTRA), no extension cycle,
+//! no reference to an abstract shape that nothing concrete extends, unique labels, and
+//! the facet rules; plus the strata of the dependency graph.
 //!
 //! The dependency graph has a node per declaration, one for START, and one per
 //! triple-constraint value expression (each gets its own pair kind, see
 //! [`crate::compile`]). An edge runs from a node to every declaration its expression
 //! references and to the value expressions of the triple constraints in its shapes
-//! (`&include`s expanded). An edge is negative when it is under an odd number of NOTs,
+//! (`&include`s expanded), to the labels a shape extends, and, from a reference, to the
+//! declarations that extend the label it names (a reference to a label is satisfied by
+//! any of its concrete descendants). An edge is negative when it is under an odd number
+//! of NOTs,
 //! or when it leads to the value expression of a triple constraint whose predicate is
 //! EXTRA in the enclosing shape: whether that value conforms decides whether the arc
 //! may be left unmatched, so the shape is not monotone in it.
@@ -38,6 +42,25 @@ pub struct Checked<'a> {
     pub num_strata: u32,
     /// the stratum of each triple-constraint value expression, by address
     value_strata: FxHashMap<usize, u32>,
+    /// who extends whom
+    pub hierarchy: Hierarchy,
+}
+
+/// The extension hierarchy graph (ShEx 2.2): an edge from a declaration to each label
+/// that a shape nested in its expression (through AND, OR, NOT and references) extends.
+#[derive(Clone, Debug, Default)]
+pub struct Hierarchy {
+    /// per declaration, the declarations it directly extends
+    pub parents: Vec<Vec<usize>>,
+    /// per declaration, the declarations that extend it directly or through others
+    pub descendants: Vec<Vec<usize>>,
+}
+
+impl Hierarchy {
+    /// Is any declaration extending anything?
+    pub fn is_empty(&self) -> bool {
+        self.parents.iter().all(Vec::is_empty)
+    }
 }
 
 impl Checked<'_> {
@@ -63,7 +86,9 @@ pub fn check(schema: &Schema) -> Result<Checked<'_>, SchemaError> {
     cx.resolve()?;
     cx.check_include_cycles()?;
     cx.check_reference_cycles()?;
-    let graph = Graph::build(&cx);
+    let hierarchy = cx.hierarchy()?;
+    cx.check_abstract_references(&hierarchy)?;
+    let graph = Graph::build(&cx, &hierarchy);
     let strata = graph.strata(&cx)?;
     let nd = schema.shapes.len();
     let num_strata = strata.iter().max().map_or(0, |m| m + 1);
@@ -80,6 +105,7 @@ pub fn check(schema: &Schema) -> Result<Checked<'_>, SchemaError> {
         start_stratum: strata[nd],
         num_strata,
         value_strata,
+        hierarchy,
     })
 }
 
@@ -265,15 +291,26 @@ impl<'a> Cx<'a> {
             ShapeExpr::Or(v) | ShapeExpr::And(v) => v.iter().try_for_each(|x| self.resolve_se(x)),
             ShapeExpr::Not(x) => self.resolve_se(x),
             ShapeExpr::Nc(nc) => check_facets(nc).map_err(SchemaError::new),
-            ShapeExpr::Shape(s) => s.expression.iter().try_for_each(|t| self.resolve_te(t)),
-            ShapeExpr::External => Ok(()),
-            ShapeExpr::Ref(l) => match self.decls.get(l) {
-                None => Err(self.err(format!("reference to undefined shape {}", self.show(l)))),
-                Some(&i) if matches!(self.schema.shapes[i].expr, ShapeExpr::External) => {
-                    Err(self.err(format!("external shape {} has no definition", self.show(l))))
+            ShapeExpr::Shape(s) => {
+                for l in &s.extends {
+                    self.resolve_label(l, "extension of")?;
                 }
-                Some(_) => Ok(()),
-            },
+                s.expression.iter().try_for_each(|t| self.resolve_te(t))
+            }
+            ShapeExpr::External => Ok(()),
+            ShapeExpr::Ref(l) => self.resolve_label(l, "reference to"),
+        }
+    }
+
+    /// A label that a reference or an extension names is declared, and not an EXTERNAL
+    /// shape without a definition.
+    fn resolve_label(&self, l: &Label, what: &str) -> Result<(), SchemaError> {
+        match self.decls.get(l) {
+            None => Err(self.err(format!("{what} undefined shape {}", self.show(l)))),
+            Some(&i) if matches!(self.schema.shapes[i].expr, ShapeExpr::External) => {
+                Err(self.err(format!("external shape {} has no definition", self.show(l))))
+            }
+            Some(_) => Ok(()),
         }
     }
 
@@ -345,6 +382,131 @@ impl<'a> Cx<'a> {
             )));
         }
         Ok(())
+    }
+}
+
+impl Cx<'_> {
+    /// The extension hierarchy graph, or the error for a cycle in it.
+    fn hierarchy(&self) -> Result<Hierarchy, SchemaError> {
+        let n = self.schema.shapes.len();
+        let mut parents: Vec<Vec<usize>> = Vec::with_capacity(n);
+        for d in &self.schema.shapes {
+            let mut labels = Vec::new();
+            let mut seen = FxHashSet::default();
+            self.nested_extends(&d.expr, &mut seen, &mut labels);
+            let mut p: Vec<usize> = labels.iter().map(|l| self.decls[l]).collect();
+            p.sort_unstable();
+            p.dedup();
+            parents.push(p);
+        }
+        if let Some(cycle) = find_cycle(&parents) {
+            let path: Vec<String> = cycle
+                .iter()
+                .map(|&i| self.show(&self.schema.shapes[i].label))
+                .collect();
+            return Err(self.err(format!("extension cycle: {}", path.join(" -> "))));
+        }
+        // descendants: the reverse graph's reachability
+        let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for (c, ps) in parents.iter().enumerate() {
+            for &p in ps {
+                children[p].push(c);
+            }
+        }
+        let descendants = (0..n)
+            .map(|i| {
+                let mut seen = FxHashSet::default();
+                let mut stack = children[i].clone();
+                while let Some(c) = stack.pop() {
+                    if seen.insert(c) {
+                        stack.extend(&children[c]);
+                    }
+                }
+                let mut v: Vec<usize> = seen.into_iter().collect();
+                v.sort_unstable();
+                v
+            })
+            .collect();
+        Ok(Hierarchy {
+            parents,
+            descendants,
+        })
+    }
+
+    /// The labels extended by the shapes nested in `e`: in it, and in the declarations it
+    /// references.
+    fn nested_extends<'a>(
+        &'a self,
+        e: &'a ShapeExpr,
+        seen: &mut FxHashSet<&'a Label>,
+        out: &mut Vec<&'a Label>,
+    ) {
+        match e {
+            ShapeExpr::Or(v) | ShapeExpr::And(v) => {
+                v.iter().for_each(|x| self.nested_extends(x, seen, out))
+            }
+            ShapeExpr::Not(x) => self.nested_extends(x, seen, out),
+            ShapeExpr::Shape(s) => out.extend(&s.extends),
+            ShapeExpr::Ref(l) => {
+                if seen.insert(l) {
+                    self.nested_extends(&self.schema.shapes[self.decls[l]].expr, seen, out);
+                }
+            }
+            ShapeExpr::Nc(_) | ShapeExpr::External => {}
+        }
+    }
+
+    /// Every reference names a shape that is not abstract or has a descendant that is.
+    fn check_abstract_references(&self, h: &Hierarchy) -> Result<(), SchemaError> {
+        let concrete = |i: usize| {
+            !self.schema.shapes[i].is_abstract
+                || h.descendants[i]
+                    .iter()
+                    .any(|&d| !self.schema.shapes[d].is_abstract)
+        };
+        let mut refs = Vec::new();
+        for e in self.top_exprs() {
+            all_refs(e, &mut refs);
+        }
+        for l in refs {
+            if !concrete(self.decls[l]) {
+                return Err(self.err(format!(
+                    "{} is abstract and nothing that is not abstract extends it, so a \
+                     reference to it can never be satisfied",
+                    self.show(l)
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Every shape reference in `e`, in nested shapes and triple-constraint values too.
+fn all_refs<'a>(e: &'a ShapeExpr, out: &mut Vec<&'a Label>) {
+    match e {
+        ShapeExpr::Or(v) | ShapeExpr::And(v) => v.iter().for_each(|x| all_refs(x, out)),
+        ShapeExpr::Not(x) => all_refs(x, out),
+        ShapeExpr::Ref(l) => out.push(l),
+        ShapeExpr::Shape(s) => {
+            if let Some(t) = &s.expression {
+                te_refs(t, out);
+            }
+        }
+        ShapeExpr::Nc(_) | ShapeExpr::External => {}
+    }
+}
+
+fn te_refs<'a>(t: &'a TripleExpr, out: &mut Vec<&'a Label>) {
+    match t {
+        TripleExpr::EachOf(g) | TripleExpr::OneOf(g) => {
+            g.exprs.iter().for_each(|x| te_refs(x, out))
+        }
+        TripleExpr::Tc(tc) => {
+            if let Some(v) = &tc.value_expr {
+                all_refs(v, out);
+            }
+        }
+        TripleExpr::Include(_) => {}
     }
 }
 
@@ -543,16 +705,18 @@ struct Graph<'a> {
     value_index: FxHashMap<usize, usize>,
     /// (node, shape, triple expression, under an odd number of NOTs) already walked
     walked: FxHashSet<(usize, usize, usize, bool)>,
+    hierarchy: &'a Hierarchy,
 }
 
 impl<'a> Graph<'a> {
-    fn build(cx: &Cx<'a>) -> Graph<'a> {
+    fn build(cx: &Cx<'a>, hierarchy: &'a Hierarchy) -> Graph<'a> {
         let n = cx.schema.shapes.len();
         let mut g = Graph {
             edges: vec![Vec::new(); n + 1],
             values: Vec::new(),
             value_index: FxHashMap::default(),
             walked: FxHashSet::default(),
+            hierarchy,
         };
         for (i, d) in cx.schema.shapes.iter().enumerate() {
             g.walk_se(cx, i, &d.expr, false);
@@ -579,8 +743,18 @@ impl<'a> Graph<'a> {
             ShapeExpr::Ref(l) => {
                 let to = cx.decls[l];
                 self.edges[from].push((to, odd.then_some(Neg::Not)));
+                // the reference is also satisfied through the declarations that extend it
+                for &d in &self.hierarchy.descendants[to] {
+                    self.edges[from].push((d, odd.then_some(Neg::Not)));
+                }
             }
             ShapeExpr::Shape(s) => {
+                for l in &s.extends {
+                    self.edges[from].push((cx.decls[l], odd.then_some(Neg::Not)));
+                }
+                if !s.extra.is_empty() && !s.extends.is_empty() {
+                    self.extra_edges(cx, from, s);
+                }
                 if let Some(t) = &s.expression {
                     self.walk_te(cx, from, s, t, odd);
                 }
@@ -608,6 +782,72 @@ impl<'a> Graph<'a> {
                     odd.then_some(Neg::Not)
                 };
                 self.edges[from].push((to, neg));
+            }
+        }
+    }
+
+    /// The triple constraints that a shape's ancestors contribute for a predicate of its
+    /// EXTRA: whether their values conform decides whether an arc may be left over, as
+    /// for the shape's own, so the edges to those values are negative.
+    fn extra_edges(&mut self, cx: &Cx<'a>, from: usize, s: &'a Shape) {
+        let mut stack: Vec<usize> = s.extends.iter().map(|l| cx.decls[l]).collect();
+        let mut seen = FxHashSet::default();
+        while let Some(d) = stack.pop() {
+            if !seen.insert(d) {
+                continue;
+            }
+            stack.extend(&self.hierarchy.parents[d]);
+            let mut te_seen = FxHashSet::default();
+            self.extra_in_expr(cx, from, &cx.schema.shapes[d].expr, s, &mut te_seen);
+        }
+    }
+
+    fn extra_in_expr(
+        &mut self,
+        cx: &Cx<'a>,
+        from: usize,
+        e: &'a ShapeExpr,
+        of: &'a Shape,
+        seen: &mut FxHashSet<usize>,
+    ) {
+        match e {
+            ShapeExpr::Or(v) | ShapeExpr::And(v) => v
+                .iter()
+                .for_each(|x| self.extra_in_expr(cx, from, x, of, seen)),
+            ShapeExpr::Not(x) => self.extra_in_expr(cx, from, x, of, seen),
+            ShapeExpr::Shape(sh) => {
+                if let Some(t) = &sh.expression {
+                    self.extra_in_te(cx, from, t, of, seen);
+                }
+            }
+            ShapeExpr::Nc(_) | ShapeExpr::External | ShapeExpr::Ref(_) => {}
+        }
+    }
+
+    fn extra_in_te(
+        &mut self,
+        cx: &Cx<'a>,
+        from: usize,
+        t: &'a TripleExpr,
+        of: &'a Shape,
+        seen: &mut FxHashSet<usize>,
+    ) {
+        if !seen.insert(addr(t)) {
+            return;
+        }
+        match t {
+            TripleExpr::EachOf(g) | TripleExpr::OneOf(g) => g
+                .exprs
+                .iter()
+                .for_each(|x| self.extra_in_te(cx, from, x, of, seen)),
+            TripleExpr::Include(l) => self.extra_in_te(cx, from, cx.tes[l], of, seen),
+            TripleExpr::Tc(tc) => {
+                if let Some(v) = &tc.value_expr
+                    && of.extra.contains(&tc.predicate)
+                {
+                    let to = self.value_node(cx, v, &tc.predicate);
+                    self.edges[from].push((to, Some(Neg::Extra(tc.predicate.clone()))));
+                }
             }
         }
     }

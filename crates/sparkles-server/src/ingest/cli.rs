@@ -112,6 +112,7 @@ pub fn run_cli(args: IngestArgs, store_opts: StoreOptions) -> Result<()> {
     st.ingest = super::Runtime::new(&super::IngestServeArgs {
         pdf_workers: 1,
         ocr: args.ocr.clone(),
+        ..Default::default()
     });
     let st = Arc::new(st);
     st.attach(&args.dataset, DbType::Persistent, Some(&args.loc))?;
@@ -209,6 +210,34 @@ fn print_human(line: &Value) {
                 "{}",
                 serde_json::to_string_pretty(&r["mapping"]).unwrap_or_default()
             );
+        }
+        Some("mapping-drafts") => {
+            println!(
+                "{file}: {} sheets",
+                r["sheets"].as_array().map_or(0, Vec::len)
+            );
+            for d in r["sheets"].as_array().into_iter().flatten() {
+                if let Some(e) = d.get("error") {
+                    println!(
+                        "  sheet {}: {}: {}",
+                        s(&d["sheet"]),
+                        s(&e["code"]),
+                        s(&e["message"])
+                    );
+                    continue;
+                }
+                println!(
+                    "  sheet {}: mapping draft ({}), {} rows, {} triples",
+                    s(&d["sheet"]),
+                    s(&d["drafted"]),
+                    d["rows"],
+                    d["triples"]
+                );
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&d["mapping"]).unwrap_or_default()
+                );
+            }
         }
         Some(o) => {
             println!("{file}: {o}");

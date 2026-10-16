@@ -789,7 +789,7 @@ fn adapters_of(names: &[String]) -> Result<Vec<Adapter>, CmdError> {
         .map(|n| {
             Adapter::parse(n).ok_or_else(|| {
                 CmdError::usage(format!(
-                    "unknown harness {n:?} (claude-code, codex or generic)"
+                    "unknown harness {n:?} (claude-code, codex, gemini-cli, cursor, copilot, aider or generic)"
                 ))
             })
         })
@@ -964,11 +964,7 @@ fn import(
         let harnesses: Vec<Harness> = req
             .adapters
             .iter()
-            .filter_map(|a| match a {
-                Adapter::ClaudeCode => Some(Harness::ClaudeCode),
-                Adapter::Codex => Some(Harness::Codex),
-                Adapter::Generic => None,
-            })
+            .filter_map(|a| a.transcript_harness())
             .collect();
         let run = transcripts::Run {
             conn: &conn,
@@ -1438,6 +1434,8 @@ fn list_all_sources(conn: &Conn, base: &str) -> Result<Vec<Value>, CmdError> {
                     "Codex" => "codex",
                     "GeminiCli" => "gemini-cli",
                     "Cursor" => "cursor",
+                    "Copilot" => "copilot",
+                    "Aider" => "aider",
                     _ => "generic",
                 })
                 .unwrap_or("generic")
@@ -1735,12 +1733,7 @@ fn transcript_status(
 ) -> Result<Value, CmdError> {
     let allowed = settings["imports"]["transcripts"].as_bool() == Some(true);
     let opted = env.cfg.transcripts.contains(&project.key);
-    let found = transcripts::find(
-        roots,
-        project,
-        &[Harness::ClaudeCode, Harness::Codex],
-        false,
-    );
+    let found = transcripts::find(roots, project, &Harness::ALL, false);
     let q = format!(
         "SELECT DISTINCT ?g WHERE {{ GRAPH ?g {{ ?g <{}> ?d }} FILTER(STRSTARTS(STR(?g), {}) && CONTAINS(STR(?g), \"/sessions/\")) }}",
         vocab::SPK_CONTENT_DIGEST,
@@ -2861,6 +2854,8 @@ fn harness_segment(iri: Option<&str>) -> String {
             "Codex" => "codex",
             "GeminiCli" => "gemini-cli",
             "Cursor" => "cursor",
+            "Copilot" => "copilot",
+            "Aider" => "aider",
             _ => "generic",
         })
         .unwrap_or("generic")

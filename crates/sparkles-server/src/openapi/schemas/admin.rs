@@ -32,6 +32,7 @@ fn last_build(count: &str) -> J {
 pub(super) fn put_all(put: &mut dyn FnMut(&str, J)) {
     history(put);
     queries(put);
+    algorithms(put);
     indexes(put);
     reasoning(put);
     validation(put);
@@ -285,6 +286,95 @@ fn queries(put: &mut dyn FnMut(&str, J)) {
     );
 }
 
+// -------------------------------------------------------- graph algorithms --
+
+fn algorithms(put: &mut dyn FnMut(&str, J)) {
+    let predicate = json!({
+        "oneOf": [
+            string(),
+            obj(&["iri"], json!({ "iri": string(), "direction": string_enum(&["forward", "backward", "undirected"]) })),
+        ],
+        "description": "An IRI (a prefixed name in a run request), or an object with the direction this predicate is read in.",
+    });
+    let definition = json!({
+        "predicates": array(predicate),
+        "direction": string_enum(&["forward", "backward", "undirected"]),
+        "nodeClasses": strings(),
+        "weight": { "type": "string", "description": "The property of an edge's reifier that holds its weight." },
+        "defaultWeight": num(),
+        "aggregate": string_enum(&["none", "sum", "max", "count"]),
+    });
+    put(
+        "AlgoProjectionDefinition",
+        doc(
+            closed(&[], definition.clone()),
+            "The edges of a projection. Without `predicates` every predicate between resources counts, except `rdf:type`. An empty `predicates` list is refused.",
+            "graph-algorithms",
+        ),
+    );
+    put(
+        "AlgoProjection",
+        doc(
+            obj(
+                &["name", "revision", "updated", "definition"],
+                json!({
+                    "name": string(),
+                    "revision": { "type": "integer", "description": "1 for a new projection, one more for each replacement." },
+                    "updated": string(),
+                    "author": string(),
+                    "definition": sref("AlgoProjectionDefinition"),
+                }),
+            ),
+            "A named projection of a dataset. A PUT sends the definition, or this object with its `definition` member.",
+            "graph-algorithms",
+        ),
+    );
+    put(
+        "AlgoProjectionList",
+        doc(
+            obj(
+                &["dataset", "projections", "cache"],
+                json!({
+                    "dataset": string(),
+                    "projections": array(sref("AlgoProjection")),
+                    "cache": obj(&["bytes", "entries"], json!({ "bytes": int(), "entries": int() })),
+                    "warning": { "type": "string", "description": "Why `algo.json` could not be read. The list is then empty and refuses changes." },
+                }),
+            ),
+            "A dataset's named projections and the size of the cache of built projections.",
+            "graph-algorithms",
+        ),
+    );
+    put(
+        "AlgoRequest",
+        doc(
+            closed(
+                &["algorithm"],
+                json!({
+                    "algorithm": string_enum(&["pageRank", "betweenness", "wcc", "scc", "labelPropagation", "louvain", "leiden", "nodeSimilarity", "triangleCount", "clustering", "kCore", "bfs", "sssp", "fastRP", "node2vec"]),
+                    "projection": {
+                        "oneOf": [string(), sref("AlgoProjectionDefinition")],
+                        "description": "The name of a stored projection, or a definition.",
+                    },
+                    "params": any_object("The parameters of the algorithm, named as in `algo:` without the prefix, such as `maxIterations`, `seed` or `topK`."),
+                    "write": closed(
+                        &["graph", "predicates"],
+                        json!({
+                            "graph": string(),
+                            "mode": string_enum(&["replace", "merge"]),
+                            "predicates": { "type": "object", "additionalProperties": string(), "description": "The predicate that each output is written with, such as `{\"score\": \"ex:rank\"}`." },
+                            "batchSize": int(),
+                            "atomic": boolean(),
+                        }),
+                    ),
+                }),
+            ),
+            "A run of one algorithm. With `write` the results are written to a graph in batched commits.",
+            "graph-algorithms",
+        ),
+    );
+}
+
 // ----------------------------------------------------------------- indexes --
 
 fn indexes(put: &mut dyn FnMut(&str, J)) {
@@ -423,7 +513,16 @@ fn indexes(put: &mut dyn FnMut(&str, J)) {
                     "message": string(),
                     "generation": string(),
                     "rows": int(),
-                    "overlay": obj(&["inserts", "deletes"], json!({ "inserts": int(), "deletes": int() })),
+                    "overlay": obj(
+                        &["inserts", "deletes", "indexed", "pending", "overBudget"],
+                        json!({
+                            "inserts": int(),
+                            "deletes": int(),
+                            "indexed": int(),
+                            "pending": int(),
+                            "overBudget": boolean(),
+                        }),
+                    ),
                     "skipped": obj(
                         &["malformed", "wrongDimension", "zeroNorm"],
                         json!({ "malformed": int(), "wrongDimension": int(), "zeroNorm": int() }),
@@ -435,7 +534,10 @@ fn indexes(put: &mut dyn FnMut(&str, J)) {
                     "hnsw": or_null(hnsw),
                     "exactThreshold": int(),
                     "files": obj(&["bytes", "opened"], json!({ "bytes": int(), "opened": boolean() })),
-                    "lastBuild": last_build("rows"),
+                    "lastBuild": obj(
+                        &["at", "ms"],
+                        json!({ "at": string(), "ms": num(), "rows": int(), "carried": boolean() }),
+                    ),
                     "embedding": obj(
                         &["state", "model", "endpoint", "backlog", "appliedSeq", "headSeq"],
                         json!({

@@ -19,7 +19,7 @@ fn bad(msg: impl Into<String>) -> ApiError {
 }
 
 /// A term parameter: N-Triples syntax, or a bare IRI.
-fn term_param(key: &str, v: &str) -> ApiResult<oxrdf::Term> {
+pub(super) fn term_param(key: &str, v: &str) -> ApiResult<oxrdf::Term> {
     let v = v.trim();
     let parsed = if v.starts_with('<') || v.starts_with('"') || v.starts_with("_:") {
         v.parse::<oxrdf::Term>().map_err(|e| e.to_string())
@@ -111,6 +111,7 @@ pub(super) async fn history(
         descending,
         access: view,
         cancel: opts.cancel.clone(),
+        cancellation: opts.cancellation.clone(),
         deadline: opts.timeout.map(|t| std::time::Instant::now() + t),
     };
     let r = blocking({

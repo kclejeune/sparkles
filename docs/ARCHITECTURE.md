@@ -162,7 +162,9 @@ only the columns they need, and decoded blocks are cached.
 
 The base vocabulary is front-coded and memory-mapped. A sparse in-memory vocabulary
 index narrows cold lookups to a group of blocks. Read hints suppress indiscriminate
-kernel read-ahead and prefetch the byte ranges an index scan will actually use.
+kernel read-ahead. A query asks for the vocabulary groups of its constants together and for
+the blocks of its small scans before it runs, and every longer scan keeps its own window of
+read requests ahead of it. A `profile=io` request reports what a query read.
 These mechanisms optimize disk reads independently of result caching.
 
 Updating all sorted files in place would discard their useful immutability. Instead,

@@ -154,8 +154,8 @@ optimization mechanisms and implemented decisions across the design specs.
 * **Query.** Passes the SPARQL 1.1 and 1.2 W3C suites, with Jena ARQ extensions,
   federated `SERVICE`, query plans and execution budgets.
 * **Search.** Jena-compatible full-text search, HNSW vector similarity, embeddings
-  computed on write by a provider or a local model, path search and indexed GeoSPARQL
-  1.1.
+  computed on write by a provider or a local model, path search, graph algorithms and
+  indexed GeoSPARQL 1.1.
 * **Reasoning and validation.** Incremental RDFS, OWL 2 RL and Jena rules, SHACL and
   ShEx validation, and schema reports.
 * **Server.** Fuseki endpoints and administration, authentication and access control,
@@ -214,14 +214,12 @@ orders every item by difficulty and impact and links each to its design spec.
 * **Now.**
   * Benchmarks: BSBM, SP²Bench, LUBM, LDBC and Wikidata query logs, with every
     comparison refreshed at the current head.
-  * Memory: caches sized across the whole server and a shared query memory pool.
   * Writes: group commit as the default.
   * Reads: faster cold sparse lookups.
 * **Next.**
   * Execution: batch-oriented joins with disk spill, and QLever's predicate patterns
     and FSST vocabulary compression.
-  * Graph algorithms: a library with node embeddings, and GraphRAG summaries built on
-    it.
+  * Graph algorithms: the Graphalytics benchmark and the UI for the shipped library.
   * Reasoning: materialization fast enough to leave on, with `owl:sameAs` handled by
     representatives and rules evaluated over the compressed indexes.
   * Data model: SHACL 1.2 and ShEx 2.2.
@@ -240,7 +238,7 @@ orders every item by difficulty and impact and links each to its design spec.
 
 The web UI is embedded in the server. It has a query editor with results as tables,
 graphs and maps, a resource explorer, schema and validation views, branch history and
-merges, the Ask bar, and agent memory. The first screenshots show an answered question,
+merges, a time slider over past commits, the Ask bar, and agent memory. The first screenshots show an answered question,
 agent memory, the map view and a merge preview.
 
 <table>
@@ -289,6 +287,14 @@ agent memory, the map view and a merge preview.
   <tr>
     <td>A query an agent handed over for review</td>
     <td>An answer in progress, at the summary step</td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/time-slider.png" alt="The query page with the time slider in compare mode, marking one team membership as added and one as removed between two commits"></td>
+    <td><img src="docs/images/time-slider-graph.png" alt="The resource explorer with the time slider in compare mode, drawing a new edge in green and a removed one as a dashed ghost"></td>
+  </tr>
+  <tr>
+    <td>A query compared between two commits</td>
+    <td>A graph compared between two commits</td>
   </tr>
 </table>
 

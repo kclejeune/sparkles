@@ -1,5 +1,5 @@
 use super::primitive;
-use crate::{BackupError, Result, blob, layout};
+use crate::{Result, blob, layout};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use std::io::{Cursor, Read};
@@ -256,21 +256,7 @@ pub fn stored_blob_limit(plain: u64) -> Result<u64> {
         .checked_add(48)
         .ok_or_else(|| invalid("encrypted blob size overflow"))
 }
-pub(crate) fn invalid(message: &str) -> BackupError {
-    BackupError::invalid_backup("encryption", message)
-}
-pub(crate) fn decode_bounded(value: &str, limit: usize) -> Result<Vec<u8>> {
-    if value.len() > limit.saturating_add(2) / 3 * 4 {
-        return Err(invalid("encoded value exceeds limit"));
-    }
-    let bytes = STANDARD
-        .decode(value)
-        .map_err(|_| invalid("invalid encoded value"))?;
-    if bytes.len() > limit {
-        return Err(invalid("decoded value exceeds limit"));
-    }
-    Ok(bytes)
-}
+pub(crate) use crate::seal::{decode_bounded, invalid};
 fn decode_id(value: &str) -> Result<[u8; 32]> {
     if !layout::valid_blob_id(value) {
         return Err(invalid("invalid keyed blob identity"));

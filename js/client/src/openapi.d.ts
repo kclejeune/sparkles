@@ -4,6 +4,65 @@
  */
 
 export interface paths {
+    "/$/algo/{ds}/projections": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List the named projections */
+        get: operations["listAlgorithmProjections"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/algo/{ds}/projections/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get a named projection */
+        get: operations["getAlgorithmProjection"];
+        /**
+         * Define a named projection
+         * @description Stores the definition as the next revision. `If-Match: "r<N>"` replaces only revision N, and `If-None-Match: *` only creates. A bare string in `predicates` is a predicate in the algorithm's own direction.
+         */
+        put: operations["putAlgorithmProjection"];
+        post?: never;
+        /** Delete a named projection */
+        delete: operations["deleteAlgorithmProjection"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/algo/{ds}/run": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Run a graph algorithm
+         * @description Without `write` the run is the SPARQL query its request stands for, answered as `/{ds}/sparql` answers (`Accept`, `timeout`, `execution` and the budget overrides apply), one row per node, node pair or node and level. `summary=true` returns only the statistics of the run. With `write` the run is a task that computes at the head commit and writes the rows in batched commits, with a run record in the graph. Read-only runs need read through the query endpoint and use Query rate/concurrency limits. Write-back runs need write through the update endpoint and use Update HTTP admission through the 202 response body. Background work uses the existing task queue and algorithm-thread admission, not an HTTP permit. A task can be cancelled with `DELETE /$/tasks/{id}`.
+         */
+        post: operations["runAlgorithm"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/asks/{ds}": {
         parameters: {
             query?: never;
@@ -728,6 +787,26 @@ export interface paths {
          * @description Newest first, or oldest first after `after`. On a branch other than `main`, its own commits come first, then those it shares with its upstream; each commit names the branch that made it.
          */
         get: operations["listCommits"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/commits/{ds}/timeline": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Commit timeline
+         * @description The commits of the branch in buckets of consecutive numbers, with the commits' times, kinds and quad counts, and the ranges whose state can still be read. For a time slider over a long history.
+         */
+        get: operations["commitTimeline"];
         put?: never;
         post?: never;
         delete?: never;
@@ -2220,6 +2299,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/$/server/memory": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Server memory
+         * @description The query memory pool (capacity, bytes granted, requests waiting) and the block, result, SERVICE and history caches, with the bytes each dataset holds in the shared ones.
+         */
+        get: operations["serverMemory"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/server/secrets": {
         parameters: {
             query?: never;
@@ -2229,7 +2328,7 @@ export interface paths {
         };
         /**
          * List model secrets
-         * @description Each secret that `--model-secret`, a stored value, a provider or a lock names, with its source, whether it is locked, when a runtime value was stored and the providers that use it, and whether stored values are sealed. Values are never returned. Needs server `admin`.
+         * @description Each secret that `--model-secret`, a stored value, a provider or a lock names, with its source, whether it is locked, when a runtime value was stored and the providers that use it, and whether stored values are sealed and with which key. Values are never returned. Needs server `admin`.
          */
         get: operations["listSecrets"];
         put?: never;
@@ -2250,7 +2349,7 @@ export interface paths {
         get?: never;
         /**
          * Store a model secret
-         * @description Stores a runtime value for the secret in the data directory with mode 0600, sealed with the key of `serve --secrets-key` when the server has one. It overrides the `--model-secret` source, and requests that start after it use it. A secret that `server.locked` locks is a `409` with `locked-by-config`. Needs server `admin`.
+         * @description Stores a runtime value for the secret in the data directory with mode 0600. Builds with the default `backup` feature seal values unless the server runs with `--secrets-key none`. Builds without it keep plaintext. When sealing is enabled, the first value stored without a configured key generates `<dataDir>/secrets.key`. It overrides the `--model-secret` source, and requests that start after it use it. A secret that `server.locked` locks is a `409` with `locked-by-config`. Needs server `admin`.
          */
         put: operations["putSecret"];
         post?: never;
@@ -3325,6 +3424,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/{ds}/sparql/diff": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Diff a query between two states
+         * @description Runs one SELECT query at two states and returns the rows only one of them has, as bags of their terms. The server keeps a hash for each row of the earlier result and no row, then reads the later result against them and the earlier query once more to list up to `limit` differing rows of each side. The request counts twice against the `query` rate limit. A query that returns different rows when it runs again is refused with `409`.
+         */
+        post: operations["sparqlDiff"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/{ds}/sparql/explain": {
         parameters: {
             query?: never;
@@ -3434,6 +3553,64 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** @description A named projection of a dataset. A PUT sends the definition, or this object with its `definition` member. */
+        AlgoProjection: {
+            author?: string;
+            definition: components["schemas"]["AlgoProjectionDefinition"];
+            name: string;
+            /** @description 1 for a new projection, one more for each replacement. */
+            revision: number;
+            updated: string;
+        };
+        /** @description The edges of a projection. Without `predicates` every predicate between resources counts, except `rdf:type`. An empty `predicates` list is refused. */
+        AlgoProjectionDefinition: {
+            /** @enum {string} */
+            aggregate?: "none" | "sum" | "max" | "count";
+            defaultWeight?: number;
+            /** @enum {string} */
+            direction?: "forward" | "backward" | "undirected";
+            nodeClasses?: string[];
+            predicates?: (string | {
+                /** @enum {string} */
+                direction?: "forward" | "backward" | "undirected";
+                iri: string;
+            })[];
+            /** @description The property of an edge's reifier that holds its weight. */
+            weight?: string;
+        };
+        /** @description A dataset's named projections and the size of the cache of built projections. */
+        AlgoProjectionList: {
+            cache: {
+                bytes: number;
+                entries: number;
+            };
+            dataset: string;
+            projections: components["schemas"]["AlgoProjection"][];
+            /** @description Why `algo.json` could not be read. The list is then empty and refuses changes. */
+            warning?: string;
+        };
+        /** @description A run of one algorithm. With `write` the results are written to a graph in batched commits. */
+        AlgoRequest: {
+            /** @enum {string} */
+            algorithm: "pageRank" | "betweenness" | "wcc" | "scc" | "labelPropagation" | "louvain" | "leiden" | "nodeSimilarity" | "triangleCount" | "clustering" | "kCore" | "bfs" | "sssp" | "fastRP" | "node2vec";
+            /** @description The parameters of the algorithm, named as in `algo:` without the prefix, such as `maxIterations`, `seed` or `topK`. */
+            params?: {
+                [key: string]: unknown;
+            };
+            /** @description The name of a stored projection, or a definition. */
+            projection?: string | components["schemas"]["AlgoProjectionDefinition"];
+            write?: {
+                atomic?: boolean;
+                batchSize?: number;
+                graph: string;
+                /** @enum {string} */
+                mode?: "replace" | "merge";
+                /** @description The predicate that each output is written with, such as `{"score": "ex:rank"}`. */
+                predicates: {
+                    [key: string]: string;
+                };
+            };
+        };
         /** @description Feedback on an answer. */
         AskFeedback: {
             /** @description At most 1000 characters. */
@@ -4109,10 +4286,10 @@ export interface components {
             /** @description The brief as plain text. Its first line says that the lines are recalled data. */
             text: string;
         };
-        /** @description A `507` for a request over one of its budgets. */
+        /** @description A `507` for a request over one of its budgets. The `server-memory` budget is a `503` with `Retry-After`, because the server's query memory pool is in use and a retry can succeed. */
         BudgetError: components["schemas"]["Error"] & {
             /** @enum {string} */
-            budget: "memory" | "result-bytes" | "outbound-bytes" | "validation-work" | "rows" | "rows-produced" | "dataset-bytes";
+            budget: "memory" | "result-bytes" | "outbound-bytes" | "validation-work" | "rows" | "rows-produced" | "dataset-bytes" | "server-memory";
             /** @description Bytes, or rows for `rows` and `rows-produced`. */
             limit?: number;
             requested?: number;
@@ -4358,6 +4535,38 @@ export interface components {
             commit: components["schemas"]["Commit"];
             dataset: string;
             datasetId: string;
+        };
+        CommitTimeline: {
+            /** @description The commit numbers each bucket spans. */
+            bucketWidth: number;
+            buckets: {
+                commits: number;
+                /** @description Quads removed by the bucket's commits; left out for a caller limited to some graphs. */
+                deleted?: number;
+                firstSeq: number;
+                firstTime: string;
+                /** @description Quads added by the bucket's commits; left out for a caller limited to some graphs. */
+                inserted?: number;
+                kinds: {
+                    [key: string]: number;
+                };
+                lastSeq: number;
+                lastTime: string;
+                merges: number;
+                snapshots: number;
+            }[];
+            /** @description The commits in range whose metadata is retained. */
+            commits: number;
+            dataset: string;
+            datasetId: string;
+            firstSeq: number;
+            head: number;
+            lastSeq: number;
+            oldestReconstructable?: number | null;
+            readable: {
+                from?: number;
+                to?: number;
+            }[];
         };
         /** @description The settings a dataset overrides. `0` turns off the size, idle and age triggers it is the limit of. An unknown setting is a `400`. */
         CompactionPolicy: {
@@ -5481,7 +5690,7 @@ export interface components {
             message?: string;
             /** @description From 0 to 1. */
             progress: number;
-            /** @description The outcome (`registered`, `proposed`, `no-facts`, `preview`, `merged`, `approved`, `already-registered` or `mapping-draft`), with the source, rendition, branch, pages, proposals, or a table's mapping draft and preview. A consolidation's outcome is `proposed`, `merged`, `dry-run`, `nothing-to-consolidate`, `no-facts` or `pending-review`, with the branch, the repeated facts, the duplicates and the conflicts. A retention's is `deleted`, `dry-run` or `nothing-to-delete`, with each session graph and why it is kept or deleted. */
+            /** @description The outcome (`registered`, `proposed`, `no-facts`, `preview`, `merged`, `approved`, `already-registered`, `mapping-draft` or `mapping-drafts`), with the source, rendition, branch, pages, proposals, a table's mapping draft and preview, or a workbook's drafts for each sheet. A consolidation's outcome is `proposed`, `merged`, `dry-run`, `nothing-to-consolidate`, `no-facts` or `pending-review`, with the branch, the repeated facts, the duplicates and the conflicts. A retention's is `deleted`, `dry-run` or `nothing-to-delete`, with each session graph and why it is kept or deleted. */
             result?: {
                 [key: string]: unknown;
             };
@@ -5493,10 +5702,11 @@ export interface components {
                 [key: string]: unknown;
             };
         };
-        /** @description The caller's ingestion tasks, newest first, and whether this server converts PDFs and reads scanned pages. */
+        /** @description The caller's ingestion tasks, newest first, and whether this server converts PDFs and Office documents and reads scanned pages. */
         IngestTaskList: {
             capabilities: {
                 ocr: boolean;
+                office: boolean;
                 pdf: boolean;
             };
             dataset: string;
@@ -5814,6 +6024,16 @@ export interface components {
                 budgetExceeded: {
                     [key: string]: number;
                 } | null;
+                commits: {
+                    /** @description Fences whose synchronization failed. */
+                    failures: number;
+                    /** @description Commits that took the ordinary path, by the first condition that kept them out of a group. */
+                    fallbacks: {
+                        [key: string]: number;
+                    };
+                    /** @description Group commit fences that synchronized successfully since the dataset was opened. Failed fences are counted in failures. */
+                    fences: number;
+                };
                 deltaDeletes: number;
                 deltaInserts: number;
                 diskBytes: number;
@@ -5830,6 +6050,8 @@ export interface components {
                         tail: number;
                     };
                 } | null;
+                /** @description Whether concurrent commits of this persistent dataset share one synchronization. */
+                groupCommit: boolean;
                 name: string;
                 quads: number;
                 /** @description 0 means unlimited. */
@@ -6167,7 +6389,7 @@ export interface components {
             inserted?: number;
             prefixesRemoved?: number;
             prefixesSet?: number;
-            /** @description The patch's `prev` header named a commit of this dataset, which was the head. */
+            /** @description An own-dataset `prev` was successfully checked against the transaction head. */
             prevChecked?: boolean;
             /** @description The rows read, up to a `TA` that aborted the patch. */
             rows?: number;
@@ -7039,6 +7261,10 @@ export interface components {
         };
         /** @description The model secrets. A value is never returned. */
         SecretList: {
+            /** @description Where the server keeps the key: `locked` in a locked page that core dumps leave out, or `heap` in a buffer that is zeroed on release when a protected page is unavailable. `null` until there is a key. */
+            keyMemory: ("locked" | "heap") | null;
+            /** @description Where the key that seals the values comes from: `configured` for `serve --secrets-key` or the systemd credential `sparkles-secrets-key`, `generated` for the key the server keeps in `<dataDir>/secrets.key`, which it writes when it first stores a value with sealing enabled. `null` for plaintext values. */
+            keySource: ("configured" | "generated") | null;
             secrets: {
                 /** @description The notification channels that name the secret (spec C21). */
                 channels?: string[];
@@ -7060,7 +7286,7 @@ export interface components {
                 source: "declared" | "runtime" | "missing";
             }[];
             /**
-             * @description How runtime values are kept in the data directory: `sealed` with the key of `serve --secrets-key`, or `plaintext` in files with mode 0600.
+             * @description How runtime values are kept in the data directory: `sealed` by default in builds with the `backup` feature, or `plaintext` in files with mode 0600 when the server runs with `--secrets-key none` or was built without that feature.
              * @enum {string}
              */
             storage: "sealed" | "plaintext";
@@ -7075,8 +7301,37 @@ export interface components {
                 enabled: boolean;
             };
             datasets: components["schemas"]["DatasetInfo"][];
+            /** @description The on-disk file kinds and settings files, with the version this build writes and the versions it reads (`sparkles migrate --check` prints the same registry). Left out for anonymous callers when auth is on. */
+            formats?: {
+                kinds?: {
+                    /** @enum {string} */
+                    class: "primary" | "derived" | "config" | "archive";
+                    files: string;
+                    id: string;
+                    marker: string;
+                    reads: number[];
+                    writes: number;
+                }[];
+                settings?: {
+                    member: string;
+                    name: string;
+                    /** @enum {string} */
+                    scope: "dataset" | "server";
+                    writes: number;
+                }[];
+                sparkles?: string;
+                unmarkedSettings?: {
+                    name: string;
+                    reason: string;
+                }[];
+            };
             limits?: components["schemas"]["Limits"];
             readOnly: boolean;
+            refusedDatasets?: {
+                name: string;
+                /** @description Why the dataset is registered but not served, such as an index format this release does not read. The member lists the refused datasets the caller may read, and all of them for a server administrator, who alone gets the full message, which names paths. */
+                reason: string;
+            }[];
             /** @description Fuseki's name for `startedAt`. */
             startDateTime?: string;
             /** Format: date-time */
@@ -7086,6 +7341,55 @@ export interface components {
             uptimeSeconds: number;
             /** @description Left out for anonymous callers when auth is on. */
             version?: string;
+        };
+        /** @description The query memory pool and the caches the datasets share, with each dataset's bytes in them. */
+        ServerMemory: {
+            caches: {
+                block?: {
+                    bytes: number;
+                    capacityBytes: number;
+                    entries: number;
+                };
+                history?: {
+                    bytes: number;
+                    capacityBytes: number;
+                };
+                result?: {
+                    bytes: number;
+                    capacityBytes: number;
+                    entries: number;
+                };
+                service?: {
+                    bytes: number;
+                    capacityBytes: number;
+                    entries: number;
+                };
+                shared?: boolean;
+            };
+            datasets: {
+                blockBytes: number;
+                blockEntries: number;
+                name: string;
+                resultBytes: number;
+                resultEntries: number;
+                serviceBytes: number;
+                serviceEntries: number;
+            }[];
+            pool: {
+                admissionWaitSeconds?: number;
+                admitted?: number;
+                capacityBytes?: number;
+                enabled: boolean;
+                grantedBytes?: number;
+                /** @description Requests answered `503` after the admission wait. */
+                rejected?: number;
+                /** @description Requests waiting for admission. */
+                waiting?: number;
+            };
+            /** @enum {string} */
+            profile: "default" | "small";
+            /** @description The budget of one query (`--query-memory-mb`), `null` when unlimited. */
+            queryMemoryBytes: number | null;
         };
         /** @description A server-wide settings kind with its layers and sources. */
         ServerSettingsKind: {
@@ -7375,6 +7679,13 @@ export interface components {
             meta: {
                 commit?: number;
                 datasetId?: string;
+                /** @description Reads of the index and vocabulary files; present when the request has `profile=io`. Page fields describe the first-admitted best-effort sample shared by overlapping profiles. Touched and resident counts are additive lower bounds; broughtIn is the nonnegative sample resident-count delta, not a lower bound on the full-set delta or physical I/O. Numeric observations cover actual mapped value, kind and rank loads independently of advice; resident head copies add no mapped observations. */
+                io?: {
+                    /** @description True when the shared profiling epoch omitted pages because of its 65,536-entry inventory or range cap. False records no cap omission and does not promise complete coverage. Process counter snapshots omit this field. */
+                    pagesTruncated?: boolean;
+                } & {
+                    [key: string]: unknown;
+                };
                 memory?: Record<string, never>;
                 plan?: components["schemas"]["PlanNode"] | components["schemas"]["CursorPlan"];
                 rowsProduced?: number;
@@ -7395,6 +7706,39 @@ export interface components {
             rows?: (null | components["schemas"]["RdfTerm"])[][];
             triples?: components["schemas"]["RdfTerm"][][];
             vars?: string[];
+        };
+        SparqlDiff: {
+            /** @description Rows only the later state has. */
+            added: number;
+            addedRows: {
+                [key: string]: unknown;
+            }[];
+            dataset: string;
+            datasetId: string;
+            from: {
+                commit?: components["schemas"]["Commit"];
+                selector?: string;
+            };
+            /** @description Rows at the earlier state. */
+            fromRows: number;
+            /** @description Rows only the earlier state has. */
+            removed: number;
+            removedRows: {
+                [key: string]: unknown;
+            }[];
+            /** @description Rows both states have, counted as a bag. */
+            same: number;
+            to: {
+                commit?: components["schemas"]["Commit"];
+                selector?: string;
+            };
+            /** @description Rows at the later state. */
+            toRows: number;
+            truncated: {
+                added?: boolean;
+                removed?: boolean;
+            };
+            vars: string[];
         };
         /** @description SPARQL 1.1 Query Results JSON: `results` for SELECT, `boolean` for ASK. */
         SparqlResults: {
@@ -7968,6 +8312,7 @@ export interface components {
             } | null;
             lastBuild?: {
                 at: string;
+                carried?: boolean;
                 ms: number;
                 rows?: number;
             };
@@ -7984,7 +8329,10 @@ export interface components {
             name: string;
             overlay: {
                 deletes: number;
+                indexed: number;
                 inserts: number;
+                overBudget: boolean;
+                pending: number;
             };
             predicate: string;
             progress?: number;
@@ -8392,6 +8740,8 @@ export interface components {
         nocache: boolean;
         /** @description The backup policy. */
         policy: string;
+        /** @description `io` adds an `io` object to the metadata of the `application/x-sparkles+json` result, with what the query read from the index and vocabulary files and the time spent doing so. The counters are process-wide, so concurrent queries add to them. Overlapping profiles share at most 65,536 first-admitted pages; pagesTruncated reports cap omissions, not completeness. Page counts describe the retained sample, and broughtIn is its diagnostic nonnegative resident-count delta rather than physical I/O. Numeric mapped loads are observed independently of advice, including hints-off and previously hinted reads. The counters cover the whole process, so the parameter needs the `metrics` permission and answers `403` without it. Any other value answers `400`. */
+        profile: "io";
         /** @description Include materialized inferences. The default is true when the dataset has any. */
         reasoning: boolean;
         /** @description Add a commit receipt to the body. */
@@ -8448,6 +8798,201 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    listAlgorithmProjections: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The definitions and the projection cache. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AlgoProjectionList"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getAlgorithmProjection: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
+                name: components["parameters"]["name"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The definition with its revision. */
+            200: {
+                headers: {
+                    /** @description `"r<N>"` */
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AlgoProjection"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    putAlgorithmProjection: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Entity tags. A write needs a tag that names the current head. */
+                "If-Match"?: components["parameters"]["ifMatch"];
+                /** @description Entity tags, or `*`. */
+                "If-None-Match"?: components["parameters"]["ifNoneMatch"];
+            };
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
+                name: components["parameters"]["name"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AlgoProjectionDefinition"];
+            };
+        };
+        responses: {
+            /** @description Replaced. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AlgoProjection"];
+                };
+            };
+            /** @description Created. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AlgoProjection"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            412: components["responses"]["PreconditionFailed"];
+            default: components["responses"]["Error"];
+        };
+    };
+    deleteAlgorithmProjection: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Entity tags. A write needs a tag that names the current head. */
+                "If-Match"?: components["parameters"]["ifMatch"];
+            };
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
+                name: components["parameters"]["name"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            412: components["responses"]["PreconditionFailed"];
+            default: components["responses"]["Error"];
+        };
+    };
+    runAlgorithm: {
+        parameters: {
+            query?: {
+                /** @description The response format, in place of `Accept`. Fuseki's `output` and `results` are the same parameter. */
+                format?: components["parameters"]["format"];
+                /** @description Seconds. Capped at the server's `--max-timeout`. */
+                timeout?: components["parameters"]["timeout"];
+                /** @description Bypass the query result cache. */
+                nocache?: components["parameters"]["nocache"];
+                /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto conservatively selects streaming for large immutable SELECT scans and eligible uncached OPTIONAL counts, and eager execution otherwise. The default remains eager. Explicit streaming SELECT does not support Thrift results, and auto runs those requests eagerly. Deadlines include blocked response writes; late failures abort the body. */
+                execution?: components["parameters"]["execution"];
+                /** @description Return only the summary of the run. */
+                summary?: boolean;
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AlgoRequest"];
+            };
+        };
+        responses: {
+            /** @description The rows of the run, or its summary. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/sparql-results+json": Record<string, never>;
+                };
+            };
+            /** @description A run with `write`, started as a task. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Task"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            413: components["responses"]["PayloadTooLarge"];
+            429: components["responses"]["TooManyRequests"];
+            503: components["responses"]["Unavailable"];
+            507: components["responses"]["InsufficientStorage"];
+            default: components["responses"]["Error"];
+        };
+    };
     listAsks: {
         parameters: {
             query?: {
@@ -9981,6 +10526,43 @@ export interface operations {
                     "application/json": components["schemas"]["CommitList"];
                 };
             };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    commitTimeline: {
+        parameters: {
+            query?: {
+                /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
+                branch?: components["parameters"]["branch"];
+                /** @description The most buckets. */
+                buckets?: number;
+                /** @description The first commit number; the first by default. */
+                from?: number;
+                /** @description The last commit number; the head by default. */
+                to?: number;
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The buckets. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommitTimeline"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
@@ -13560,6 +14142,29 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    serverMemory: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The memory state. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ServerMemory"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
     listSecrets: {
         parameters: {
             query?: never;
@@ -15043,6 +15648,8 @@ export interface operations {
                 send?: components["parameters"]["send"];
                 /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto conservatively selects streaming for large immutable SELECT scans and eligible uncached OPTIONAL counts, and eager execution otherwise. The default remains eager. Explicit streaming SELECT does not support Thrift results, and auto runs those requests eagerly. Deadlines include blocked response writes; late failures abort the body. */
                 execution?: components["parameters"]["execution"];
+                /** @description `io` adds an `io` object to the metadata of the `application/x-sparkles+json` result, with what the query read from the index and vocabulary files and the time spent doing so. The counters are process-wide, so concurrent queries add to them. Overlapping profiles share at most 65,536 first-admitted pages; pagesTruncated reports cap omissions, not completeness. Page counts describe the retained sample, and broughtIn is its diagnostic nonnegative resident-count delta rather than physical I/O. Numeric mapped loads are observed independently of advice, including hints-off and previously hinted reads. The counters cover the whole process, so the parameter needs the `metrics` permission and answers `403` without it. Any other value answers `400`. */
+                profile?: components["parameters"]["profile"];
                 /** @description Bypass the query result cache. */
                 nocache?: components["parameters"]["nocache"];
                 /** @description A lower memory budget, in MiB. */
@@ -15198,6 +15805,8 @@ export interface operations {
                 send?: components["parameters"]["send"];
                 /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto conservatively selects streaming for large immutable SELECT scans and eligible uncached OPTIONAL counts, and eager execution otherwise. The default remains eager. Explicit streaming SELECT does not support Thrift results, and auto runs those requests eagerly. Deadlines include blocked response writes; late failures abort the body. */
                 execution?: components["parameters"]["execution"];
+                /** @description `io` adds an `io` object to the metadata of the `application/x-sparkles+json` result, with what the query read from the index and vocabulary files and the time spent doing so. The counters are process-wide, so concurrent queries add to them. Overlapping profiles share at most 65,536 first-admitted pages; pagesTruncated reports cap omissions, not completeness. Page counts describe the retained sample, and broughtIn is its diagnostic nonnegative resident-count delta rather than physical I/O. Numeric mapped loads are observed independently of advice, including hints-off and previously hinted reads. The counters cover the whole process, so the parameter needs the `metrics` permission and answers `403` without it. Any other value answers `400`. */
+                profile?: components["parameters"]["profile"];
                 /** @description Bypass the query result cache. */
                 nocache?: components["parameters"]["nocache"];
                 /** @description A lower memory budget, in MiB. */
@@ -15838,6 +16447,8 @@ export interface operations {
                 to?: string;
                 /** @description A graph IRI or `default`. */
                 graph?: string;
+                /** @description Only the changes whose subject or object is this term, an N-Triples term or a bare IRI. Repeat the parameter for several, up to 1,000. Not for RDF Patch. */
+                term?: string[];
                 /** @description JSON: list the quads. */
                 quads?: boolean;
                 /** @description The most quads listed. */
@@ -16921,6 +17532,8 @@ export interface operations {
                 send?: components["parameters"]["send"];
                 /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto conservatively selects streaming for large immutable SELECT scans and eligible uncached OPTIONAL counts, and eager execution otherwise. The default remains eager. Explicit streaming SELECT does not support Thrift results, and auto runs those requests eagerly. Deadlines include blocked response writes; late failures abort the body. */
                 execution?: components["parameters"]["execution"];
+                /** @description `io` adds an `io` object to the metadata of the `application/x-sparkles+json` result, with what the query read from the index and vocabulary files and the time spent doing so. The counters are process-wide, so concurrent queries add to them. Overlapping profiles share at most 65,536 first-admitted pages; pagesTruncated reports cap omissions, not completeness. Page counts describe the retained sample, and broughtIn is its diagnostic nonnegative resident-count delta rather than physical I/O. Numeric mapped loads are observed independently of advice, including hints-off and previously hinted reads. The counters cover the whole process, so the parameter needs the `metrics` permission and answers `403` without it. Any other value answers `400`. */
+                profile?: components["parameters"]["profile"];
                 /** @description Bypass the query result cache. */
                 nocache?: components["parameters"]["nocache"];
                 /** @description A lower memory budget, in MiB. */
@@ -16988,6 +17601,8 @@ export interface operations {
                 send?: components["parameters"]["send"];
                 /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto conservatively selects streaming for large immutable SELECT scans and eligible uncached OPTIONAL counts, and eager execution otherwise. The default remains eager. Explicit streaming SELECT does not support Thrift results, and auto runs those requests eagerly. Deadlines include blocked response writes; late failures abort the body. */
                 execution?: components["parameters"]["execution"];
+                /** @description `io` adds an `io` object to the metadata of the `application/x-sparkles+json` result, with what the query read from the index and vocabulary files and the time spent doing so. The counters are process-wide, so concurrent queries add to them. Overlapping profiles share at most 65,536 first-admitted pages; pagesTruncated reports cap omissions, not completeness. Page counts describe the retained sample, and broughtIn is its diagnostic nonnegative resident-count delta rather than physical I/O. Numeric mapped loads are observed independently of advice, including hints-off and previously hinted reads. The counters cover the whole process, so the parameter needs the `metrics` permission and answers `403` without it. Any other value answers `400`. */
+                profile?: components["parameters"]["profile"];
                 /** @description Bypass the query result cache. */
                 nocache?: components["parameters"]["nocache"];
                 /** @description A lower memory budget, in MiB. */
@@ -17284,6 +17899,8 @@ export interface operations {
                 send?: components["parameters"]["send"];
                 /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto conservatively selects streaming for large immutable SELECT scans and eligible uncached OPTIONAL counts, and eager execution otherwise. The default remains eager. Explicit streaming SELECT does not support Thrift results, and auto runs those requests eagerly. Deadlines include blocked response writes; late failures abort the body. */
                 execution?: components["parameters"]["execution"];
+                /** @description `io` adds an `io` object to the metadata of the `application/x-sparkles+json` result, with what the query read from the index and vocabulary files and the time spent doing so. The counters are process-wide, so concurrent queries add to them. Overlapping profiles share at most 65,536 first-admitted pages; pagesTruncated reports cap omissions, not completeness. Page counts describe the retained sample, and broughtIn is its diagnostic nonnegative resident-count delta rather than physical I/O. Numeric mapped loads are observed independently of advice, including hints-off and previously hinted reads. The counters cover the whole process, so the parameter needs the `metrics` permission and answers `403` without it. Any other value answers `400`. */
+                profile?: components["parameters"]["profile"];
                 /** @description Bypass the query result cache. */
                 nocache?: components["parameters"]["nocache"];
                 /** @description A lower memory budget, in MiB. */
@@ -17351,6 +17968,8 @@ export interface operations {
                 send?: components["parameters"]["send"];
                 /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto conservatively selects streaming for large immutable SELECT scans and eligible uncached OPTIONAL counts, and eager execution otherwise. The default remains eager. Explicit streaming SELECT does not support Thrift results, and auto runs those requests eagerly. Deadlines include blocked response writes; late failures abort the body. */
                 execution?: components["parameters"]["execution"];
+                /** @description `io` adds an `io` object to the metadata of the `application/x-sparkles+json` result, with what the query read from the index and vocabulary files and the time spent doing so. The counters are process-wide, so concurrent queries add to them. Overlapping profiles share at most 65,536 first-admitted pages; pagesTruncated reports cap omissions, not completeness. Page counts describe the retained sample, and broughtIn is its diagnostic nonnegative resident-count delta rather than physical I/O. Numeric mapped loads are observed independently of advice, including hints-off and previously hinted reads. The counters cover the whole process, so the parameter needs the `metrics` permission and answers `403` without it. Any other value answers `400`. */
+                profile?: components["parameters"]["profile"];
                 /** @description Bypass the query result cache. */
                 nocache?: components["parameters"]["nocache"];
                 /** @description A lower memory budget, in MiB. */
@@ -17427,6 +18046,63 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             408: components["responses"]["Timeout"];
+            default: components["responses"]["Error"];
+        };
+    };
+    sparqlDiff: {
+        parameters: {
+            query?: {
+                /** @description A selector of the earlier state. */
+                from?: string;
+                /** @description A selector of the later state; the head by default. */
+                to?: string;
+                /** @description The most differing rows listed for each side. */
+                limit?: number;
+                /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
+                branch?: components["parameters"]["branch"];
+                /** @description Include materialized inferences. The default is true when the dataset has any. */
+                reasoning?: components["parameters"]["reasoning"];
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        /** @description The SELECT query. */
+        requestBody: {
+            content: {
+                "application/json": {
+                    from?: string;
+                    limit?: number;
+                    query: string;
+                    to?: string;
+                };
+                "application/sparql-query": string;
+                "application/x-www-form-urlencoded": {
+                    query: string;
+                };
+            };
+        };
+        responses: {
+            /** @description The differing rows and the counts. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SparqlDiff"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            409: components["responses"]["Conflict"];
+            410: components["responses"]["Gone"];
+            507: components["responses"]["InsufficientStorage"];
             default: components["responses"]["Error"];
         };
     };
