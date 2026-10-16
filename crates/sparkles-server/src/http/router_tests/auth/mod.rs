@@ -15,6 +15,7 @@ mod cli_grants;
 mod graphql;
 pub(super) mod graphs;
 mod idp;
+mod io_profile;
 mod limits;
 mod oidc;
 mod proxy;

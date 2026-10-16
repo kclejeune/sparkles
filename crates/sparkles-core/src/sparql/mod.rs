@@ -8,6 +8,7 @@ pub mod cache;
 pub mod catalog;
 pub mod cdt;
 pub mod charsets;
+mod constkeys;
 pub mod ctx;
 pub mod cursor;
 mod cursor_regex;
@@ -52,6 +53,7 @@ mod zipper;
 
 use crate::error::{Error, Result};
 use crate::id::Id;
+use crate::ioacct;
 use crate::store::Snapshot;
 pub use ctx::{Ctx, DatasetSpec, Optimizations};
 pub use cursor::{
@@ -713,6 +715,16 @@ fn prepare_query(
         ctx.attach_cursor_owner();
     }
     crate::geo::validate_query(pattern, &mut |w| ctx.warn(w))?;
+    // the keys are collected only when asking for their groups can do something
+    if ctx.opt.prefetch_constants
+        && crate::index::io_hints()
+        && ctx.snap.generation.vocab.has_sparse()
+    {
+        ctx.snap
+            .generation
+            .vocab
+            .prefetch_keys(&constkeys::constant_keys(pattern));
+    }
     let mut planner = Planner::new(&ctx);
     planner.source = Some(parsed);
     let mut bound: Vec<(table::VarId, Id)> = Vec::new();
@@ -736,7 +748,10 @@ fn prepare_query(
         Query::Describe { .. } => (QueryKind::Describe, pattern.clone()),
     };
     let planned = rdfs::apply(&ctx, &pattern);
+    ioacct::mark("plan");
     let node = planner.plan(&planned, &ActiveGraph::Default, Vec::new())?;
+    ioacct::mark("planned");
+    exec::prefetch_scans(&ctx, &node);
     if let Some(automatic) = automatic
         && bound.is_empty()
         && cursor::auto_streaming(&ctx, &node, kind, automatic)
@@ -803,6 +818,7 @@ fn execute_prepared(
         Ok(r) => r,
         Err(e) => return Err(failed(e, None, None)),
     };
+    ioacct::mark("executed");
     plan.warnings = ctx.warnings();
     if ctx.graphs.is_some() {
         plan.redact();

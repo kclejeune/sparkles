@@ -11,7 +11,7 @@ use super::table::{Materialized, Table, VarId};
 use super::value::{NumOp, Value, arith, order_cmp};
 use crate::error::{Error, Result};
 use crate::id::Id;
-use crate::index::{Block, Key, O, P, Perm, S, pad};
+use crate::index::{Block, ColMask, Key, O, P, Perm, S, pad};
 use crate::store::Chunk;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -1157,6 +1157,108 @@ fn merge_counters(
 }
 
 // ------------------------------------------------------------------ scans ------
+
+/// Ask the kernel for the blocks of the scans of a plan before any operator runs (spec X07
+/// §5.2). A scan with few blocks is then read in parallel instead of one block after the
+/// other, and the two blocks at the ends of its range, which `count` decodes while the
+/// scan is set up, arrive together with the rest. The scan still decodes its blocks as it
+/// goes, so that decoding overlaps the reads of the blocks after them.
+///
+/// Each block is asked for the columns the reader decodes: a block wholly inside the range
+/// needs the scan's columns only, and a block at an end of the range also the columns
+/// that bound it. A range scan asks for the blocks of its id ranges. A scan whose first
+/// block is cached is skipped, so a warm plan costs one lookup per scan. A scan of many
+/// blocks, or one under a `LIMIT`, reads ahead as it goes instead (see
+/// [`crate::index::ReadAhead`]).
+pub(super) fn prefetch_scans(ctx: &Ctx, n: &Node) {
+    /// scans of more blocks than this are left to their own read-ahead
+    const FEW_BLOCKS: usize = 64;
+    if !ctx.opt.prefetch_first_scan || !crate::index::io_hints() {
+        return;
+    }
+    /// The columns the reader decodes of block `b` of the range `[lo, hi]`: the scan's own
+    /// inside the range, and the ones that bound it at an end.
+    fn wanted(
+        index: &crate::index::PermIndex,
+        scan: ColMask,
+        (lo, hi): &(Key, Key),
+        b: usize,
+    ) -> ColMask {
+        let m = &index.blocks[b];
+        if m.first >= *lo && m.last <= *hi {
+            scan
+        } else {
+            scan | crate::index::bound_cols(lo, hi)
+        }
+    }
+    /// The blocks of a scan with the columns the reader decodes of each, or nothing for a
+    /// scan of more than `FEW_BLOCKS` blocks.
+    fn blocks(ctx: &Ctx, spec: &ScanSpec, ranges: &[(Key, Key)]) -> Vec<(usize, ColMask)> {
+        let index = ctx.snap.perm(spec.perm);
+        let scan = scan_mask(ctx, spec);
+        let mut out: Vec<(usize, ColMask)> = Vec::new();
+        for range in ranges {
+            let (b0, b1) = index.key_block_range(&range.0, &range.1);
+            if b1 - b0 > FEW_BLOCKS {
+                return Vec::new();
+            }
+            for b in b0..b1 {
+                let mask = wanted(index, scan, range, b);
+                match out.last_mut() {
+                    Some((last, wanted)) if *last == b => *wanted |= mask,
+                    _ => out.push((b, mask)),
+                }
+            }
+            if out.len() > FEW_BLOCKS {
+                return Vec::new();
+            }
+        }
+        out
+    }
+    fn walk(ctx: &Ctx, n: &Node, limited: bool) {
+        // (a `COUNT` scan answers from the block metadata and decodes at most the blocks at
+        // the ends of its range, which `count` asks for itself)
+        let ranges = match &n.kind {
+            Kind::Scan(spec) if !limited => Some((
+                spec,
+                vec![(pad(&spec.prefix, 0), pad(&spec.prefix, u64::MAX))],
+            )),
+            Kind::RangeScan(spec, range) if !limited => {
+                let at = |v: u64, fill: u64| {
+                    let mut k = pad(&spec.prefix, fill);
+                    k[spec.prefix.len()] = v;
+                    k
+                };
+                let ranges = (range.ranges.iter())
+                    .map(|r| (at(r.lo, 0), at(r.hi, u64::MAX)))
+                    .collect();
+                Some((spec, ranges))
+            }
+            _ => None,
+        };
+        if let Some((spec, ranges)) = ranges {
+            let index = ctx.snap.perm(spec.perm);
+            // a warm scan costs this one probe, before any other block is listed
+            let first = ranges.iter().find_map(|r| {
+                let (b0, b1) = index.key_block_range(&r.0, &r.1);
+                (b0 < b1).then(|| (b0, wanted(index, scan_mask(ctx, spec), r, b0)))
+            });
+            if let Some((b, mask)) = first
+                && !ctx.snap.cache.has_cols(index, b, mask)
+            {
+                for (b, mask) in blocks(ctx, spec, &ranges) {
+                    index.prefetch(&ctx.snap.cache, b, mask);
+                }
+            }
+        }
+        let limited = limited || matches!(n.kind, Kind::Slice { limit: Some(_), .. });
+        for c in &n.children {
+            walk(ctx, c, limited);
+        }
+    }
+    walk(ctx, n, false);
+    crate::ioacct::mark("scans prefetched");
+}
 
 /// Key columns a scan reads: its variables, the graph (unless every graph passes) and
 /// the repeated-variable columns. The others are never decoded for whole blocks.
@@ -3851,7 +3953,7 @@ fn anti_join(
 /// each front-coded block is touched once (in parallel); per-row lookups are then O(1)
 /// and lock-free.
 fn decode_for(ctx: &Ctx, t: &Table, exprs: &[&Expr]) -> Option<super::expr::DecodedCols> {
-    if ctx.is_cursor() || t.len() < 4096 || !exprs.iter().any(|e| super::expr::needs_values(e)) {
+    if t.len() < 2 || !exprs.iter().any(|e| super::expr::needs_values(e)) {
         return None;
     }
     let mut vars = Vec::new();
@@ -3860,6 +3962,18 @@ fn decode_for(ctx: &Ctx, t: &Table, exprs: &[&Expr]) -> Option<super::expr::Deco
     }
     vars.sort_unstable();
     vars.dedup();
+    if t.len() < 4096 {
+        // The rows are evaluated one at a time, each reading the terms it needs. On a
+        // cold vocabulary every term is a page fault that waits for the one before it.
+        // Ask for all their blocks first, so that the reads overlap.
+        if ctx.opt.prefetch_terms && crate::index::io_hints() {
+            prefetch_column_terms(ctx, t, &vars);
+        }
+        return None;
+    }
+    if ctx.is_cursor() {
+        return None;
+    }
     let vocab = &ctx.snap.generation.vocab;
     let mut out: super::expr::DecodedCols = vec![None; t.width()];
     for v in vars {
@@ -3897,6 +4011,23 @@ fn decode_for(ctx: &Ctx, t: &Table, exprs: &[&Expr]) -> Option<super::expr::Deco
         out[c] = Some(vals);
     }
     Some(out)
+}
+
+/// Ask for the vocabulary pages of the terms in the columns of `vars` of a small table
+/// (see [`decode_for`]).
+fn prefetch_column_terms(ctx: &Ctx, t: &Table, vars: &[VarId]) {
+    let mut ids: Vec<u64> = vars
+        .iter()
+        .filter_map(|&v| t.col_of(v))
+        .flat_map(|c| t.cols[c].iter())
+        .filter(|id| id.tag() == crate::id::Tag::Vocab)
+        .map(|id| id.payload())
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.len() >= 2 {
+        ctx.snap.generation.vocab.prefetch_value_pages(&ids);
+    }
 }
 
 /// The values of base vocabulary ids (sorted, distinct), in their order: numbers from

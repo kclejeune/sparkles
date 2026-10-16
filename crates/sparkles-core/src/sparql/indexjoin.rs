@@ -800,28 +800,64 @@ fn block_range(
 /// blocks first costs more than the reads it would overlap.
 const PREFETCH_RANGES: usize = 16_384;
 
+/// The ranges and blocks a join prefetch walks between two request checks.
+const PREFETCH_CHECK_STEPS: u32 = 1024;
+
 /// Ask the kernel to read the blocks of `ranges` in `perm` that the cache lacks, all
 /// at once, before the reader decodes them one by one (`Optimizations::prefetch_blocks`):
 /// on a cold server their reads then overlap. `cols` are the key columns the reader
-/// decodes besides the ones that bound the ranges.
-fn prefetch(ctx: &Ctx, perm: Perm, ranges: &Ranges, cols: ColMask) {
+/// decodes besides the ones that bound the ranges. `rule` is the reader's, so the graph and
+/// repeated-variable columns are asked for exactly when [`read_ranges`] decodes them.
+fn prefetch(ctx: &Ctx, perm: Perm, ranges: &Ranges, cols: ColMask, rule: &RowRule) -> Result<()> {
+    ctx.check()?;
     if !ctx.opt.prefetch_blocks || ranges.len() > PREFETCH_RANGES || ranges.len() < 2 {
-        return;
+        return Ok(());
     }
     let idx = ctx.snap.perm(perm);
-    let mask = cols | ranges.bound_mask() | (1 << perm.col_of(G));
+    let mut mask = cols | ranges.bound_mask();
+    if !matches!(rule.graph, GraphFilter::All) {
+        mask |= 1 << rule.graph_col;
+    }
+    for &(a, b) in rule.eqs {
+        mask |= (1 << a) | (1 << b);
+    }
+    if !ctx.opt.selective_columns {
+        mask = ALL_COLS;
+    }
     let mut last = None;
+    // created at the first block the cache lacks, so a warm request builds nothing
+    let mut warm: Option<crate::index::WarmColumns> = None;
+    // a check reads the clock when the request has a deadline, so the loop checks once
+    // per `PREFETCH_CHECK_STEPS` ranges and blocks rather than at every one
+    let mut steps = 0u32;
     for i in 0..ranges.len() {
+        steps += 1;
+        if steps >= PREFETCH_CHECK_STEPS {
+            steps = 0;
+            ctx.check()?;
+        }
         let (lo, hi) = ranges.get(i);
         let (b0, b1) = idx.key_block_range(&lo, &hi);
         for b in b0..b1 {
+            steps += 1;
+            if steps >= PREFETCH_CHECK_STEPS {
+                steps = 0;
+                ctx.check()?;
+            }
             // consecutive ranges often share a block
             if last != Some(b) {
-                idx.prefetch(&ctx.snap.cache, b, mask);
                 last = Some(b);
+                if idx.prefetch(&ctx.snap.cache, b, mask) && ctx.opt.parallel_decode {
+                    warm.get_or_insert_with(|| ctx.snap.cache.warm_columns(idx))
+                        .add(b, mask);
+                }
             }
         }
     }
+    if let Some(warm) = warm {
+        warm.finish(&|| ctx.check())?;
+    }
+    ctx.check()
 }
 
 /// Clusters of consecutive ranges read by one scan each: a range joins the cluster when
@@ -1265,7 +1301,7 @@ fn read_probes(
             // tables in the walk's pattern order, then back in the probes' order
             let mut parts: Vec<Table> = order.iter().map(|&i| out[i].clone()).collect();
             let mask = cols.iter().flatten().fold(0, |m, &c| m | (1 << c));
-            prefetch(ctx, Perm::Spo, &walk, mask);
+            prefetch(ctx, Perm::Spo, &walk, mask, &rule)?;
             if gallop {
                 read_ranges_gallop(ctx, Perm::Spo, &walk, &cols, &rule, &mut parts, stats)?;
             } else {
@@ -1292,7 +1328,7 @@ fn read_probes(
         };
         let cols = vec![p.scan.cols.iter().map(|c| c.0).collect::<Vec<_>>()];
         let mask = cols[0].iter().fold(0, |m, &c| m | (1 << c));
-        prefetch(ctx, p.scan.perm, ranges, mask);
+        prefetch(ctx, p.scan.perm, ranges, mask, &rule)?;
         let out = std::slice::from_mut(t);
         if gallop {
             read_ranges_gallop(ctx, p.scan.perm, ranges, &cols, &rule, out, stats)?;
@@ -1543,4 +1579,67 @@ fn combine(
         len: li.len(),
         sorted,
     })
+}
+
+#[cfg(test)]
+mod prefetch_tests {
+    use super::*;
+    use crate::store::{Store, StoreOptions};
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    /// The rule of a scan of the default graph: no graph column, no repeated variables.
+    fn rule() -> RowRule<'static> {
+        RowRule {
+            graph: &GraphFilter::All,
+            graph_col: Perm::Spo.col_of(G),
+            eqs: &[],
+            dedup: false,
+        }
+    }
+
+    /// A prefetch checks the request a bounded number of times, not once per range and
+    /// block: with a deadline each check reads the clock (spec X07 §9, gate 4).
+    #[test]
+    fn prefetch_checks_the_request_a_bounded_number_of_times() {
+        let store = Store::in_memory(StoreOptions::default());
+        let keys: Vec<u64> = (0..1000).collect();
+        let ranges = Ranges::Keys {
+            prefix: &[],
+            keys: &keys,
+        };
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.deadline = Some(Instant::now() + Duration::from_secs(600));
+        let before = crate::sparql::ctx::CHECKS.with(|n| n.get());
+        prefetch(&ctx, Perm::Spo, &ranges, ALL_COLS, &rule()).unwrap();
+        let checks = crate::sparql::ctx::CHECKS.with(|n| n.get()) - before;
+        assert!(checks <= 4, "{checks} checks for 1,000 ranges");
+    }
+
+    #[test]
+    fn prefetch_propagates_request_checks_even_when_optional_work_is_disabled() {
+        let store = Store::in_memory(StoreOptions::default());
+        let ranges = Ranges::Keys {
+            prefix: &[],
+            keys: &[1, 2],
+        };
+        for enabled in [false, true] {
+            let mut ctx = Ctx::new(store.snapshot());
+            ctx.opt.prefetch_blocks = enabled;
+            ctx.opt.parallel_decode = enabled;
+            ctx.cancel.store(true, Ordering::Relaxed);
+            assert!(matches!(
+                prefetch(&ctx, Perm::Spo, &ranges, ALL_COLS, &rule()),
+                Err(Error::Cancelled)
+            ));
+            ctx.cancel.store(false, Ordering::Relaxed);
+            ctx.deadline = Some(Instant::now() - Duration::from_secs(1));
+            assert!(matches!(
+                prefetch(&ctx, Perm::Spo, &ranges, ALL_COLS, &rule()),
+                Err(Error::Timeout)
+            ));
+            ctx.deadline = None;
+            prefetch(&ctx, Perm::Spo, &ranges, ALL_COLS, &rule()).unwrap();
+        }
+    }
 }

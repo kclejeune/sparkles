@@ -220,3 +220,79 @@ async fn an_update_outgrowing_its_admission_grant_answers_503() {
     assert!(status.is_success(), "{status} {body}");
     assert_eq!(pool(&s).granted(), 0);
 }
+
+// X07 metadata and X08 grants must survive the same serialization paths.
+#[tokio::test]
+async fn native_io_and_grant_metadata_survive_eager_streaming_and_early_stop() {
+    let s = server(256, Duration::from_secs(2));
+    for (mode, send, status, rows) in [
+        ("eager", "", "complete", 1),
+        ("streaming", "", "complete", 1),
+        ("streaming", "&send=0", "stopped", 0),
+    ] {
+        let (code, _, body) = get(
+            &s.app,
+            &format!("{Q}&profile=io&format=sparkles&execution={mode}{send}"),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{body}");
+        let j: J = serde_json::from_str(&body).unwrap();
+        if mode == "streaming" {
+            assert_eq!(j["meta"]["status"], status, "{j}");
+        } else {
+            // Eager metadata has no cursor status field.
+            assert!(j["meta"].get("status").is_none(), "{j}");
+            assert_eq!(j["meta"]["totalRows"], 1, "{j}");
+        }
+        assert_eq!(j["meta"]["sentRows"], rows, "{j}");
+        assert_eq!(j["meta"]["memory"]["grantedBytes"], 16 * MB, "{j}");
+        assert!(j["meta"]["io"].is_object(), "{j}");
+        assert!(j["meta"]["io"]["pagesTruncated"].is_boolean(), "{j}");
+        assert!(j["meta"]["io"]["minorFaults"].is_number(), "{j}");
+        assert_eq!(pool(&s).granted(), 0);
+    }
+}
+
+#[tokio::test]
+async fn dropping_profiled_streaming_body_releases_its_query_grant() {
+    let s = server(256, Duration::from_secs(2));
+    // A large literal makes one row exceed the serialization threshold. The producer
+    // cannot finish through the bounded channel while this response remains unpolled.
+    let payload = "x".repeat(super::stream::STREAM_AFTER + 16 * super::stream::CHUNK);
+    s.state
+        .get("ds")
+        .unwrap()
+        .store
+        .load(&[Source::from_bytes(
+            format!("<urn:large> <urn:p> \"{payload}\" .\n").into_bytes(),
+            oxrdfio::RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+    let response = s
+        .app
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "{Q}&profile=io&format=sparkles&execution=streaming"
+            ))
+            .header(header::ACCEPT, "application/x-sparkles+json")
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        pool(&s).granted() >= 16 * MB,
+        "unconsumed producer retains its grant"
+    );
+    drop(response);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while pool(&s).granted() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled serializer releases its grant");
+}

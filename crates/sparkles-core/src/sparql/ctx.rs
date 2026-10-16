@@ -191,10 +191,21 @@ pub struct Optimizations {
     /// ORDER BY with LIMIT keeps the best rows in a bounded heap of offset + limit rows,
     /// evaluating the later keys only for rows whose first key can still enter
     pub topk_heap: bool,
+    /// the vocabulary groups that hold a query's constants are requested together before
+    /// the planner looks the constants up one after the other
+    pub prefetch_constants: bool,
+    /// a FILTER, BIND or ORDER BY over a table of fewer than 4,096 rows asks for the
+    /// vocabulary pages of the terms it evaluates before the first row
+    pub prefetch_terms: bool,
+    /// the blocks of a plan's scans with few blocks are requested before any operator runs
+    pub prefetch_first_scan: bool,
+    /// the columns of the blocks that an index join has asked the kernel for are decoded
+    /// in parallel on a pool of the cache's own, before the reader gets to them
+    pub parallel_decode: bool,
 }
 
 impl Optimizations {
-    pub const NAMES: [&str; 34] = [
+    pub const NAMES: [&str; 38] = [
         "range_pushdown",
         "incremental_group",
         "count_join_runs",
@@ -229,6 +240,10 @@ impl Optimizations {
         "text_subject_pushdown",
         "vector_topk",
         "topk_heap",
+        "prefetch_constants",
+        "prefetch_terms",
+        "prefetch_first_scan",
+        "parallel_decode",
     ];
 
     /// Everything on.
@@ -267,6 +282,10 @@ impl Optimizations {
         text_subject_pushdown: true,
         vector_topk: true,
         topk_heap: true,
+        prefetch_constants: true,
+        prefetch_terms: true,
+        prefetch_first_scan: true,
+        parallel_decode: true,
     };
 
     /// Everything off: the generic operators only.
@@ -305,6 +324,10 @@ impl Optimizations {
         text_subject_pushdown: false,
         vector_topk: false,
         topk_heap: false,
+        prefetch_constants: false,
+        prefetch_terms: false,
+        prefetch_first_scan: false,
+        parallel_decode: false,
     };
 
     fn flag(&mut self, name: &str) -> Option<&mut bool> {
@@ -343,6 +366,10 @@ impl Optimizations {
             "text_subject_pushdown" => &mut self.text_subject_pushdown,
             "vector_topk" => &mut self.vector_topk,
             "topk_heap" => &mut self.topk_heap,
+            "prefetch_constants" => &mut self.prefetch_constants,
+            "prefetch_terms" => &mut self.prefetch_terms,
+            "prefetch_first_scan" => &mut self.prefetch_first_scan,
+            "parallel_decode" => &mut self.parallel_decode,
             _ => return None,
         })
     }
@@ -447,6 +474,9 @@ pub struct Ctx {
     /// RDFS on read (see [`super::rdfs`])
     pub rdfs: Option<Arc<super::rdfs::RdfsSchema>>,
     pub opt: Optimizations,
+    /// the I/O counters when the query began, taken only under a profile (see
+    /// [`Ctx::io_stats`]); boxed, so that a context without a profile stays small
+    io_start: Option<Box<crate::ioacct::IoSnapshot>>,
     /// parsed geometries of this query
     pub geo: crate::geo::memo::GeoMemo,
     /// notes for the plan's reader, without duplicates (see [`Ctx::warn`])
@@ -484,6 +514,12 @@ struct CursorMemory {
     decoded_reserved: AtomicU64,
     owner: parking_lot::Mutex<Weak<Ctx>>,
     regex: super::cursor_regex::RegexCache,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`Ctx::check`] calls on this thread (for tests of per-query overhead)
+    pub(crate) static CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl Ctx {
@@ -534,12 +570,28 @@ impl Ctx {
             algo_projections: None,
             rdfs: None,
             opt: Optimizations::default(),
+            io_start: crate::ioacct::profiling()
+                .then(|| Box::new(crate::ioacct::IoSnapshot::now())),
             geo: Default::default(),
             warnings: Default::default(),
             failed: Default::default(),
             sampled: Default::default(),
             stars: Default::default(),
             probes: Default::default(),
+        }
+    }
+
+    /// What the read path counted since this context was made: index columns decoded,
+    /// bytes asked of the kernel and vocabulary lookups (see [`crate::ioacct`]). The
+    /// counters are process-wide, so reads of queries that run at the same time are
+    /// included. The starting counters are taken only while a [`Profile`](crate::ioacct::Profile)
+    /// is alive, so the result is meaningful only for a query made under one: otherwise it
+    /// holds everything the process has counted.
+    pub fn io_stats(&self) -> crate::ioacct::IoSnapshot {
+        let now = crate::ioacct::IoSnapshot::now();
+        match &self.io_start {
+            Some(start) => now.since(start),
+            None => now.since(&Default::default()),
         }
     }
 
@@ -746,6 +798,8 @@ impl Ctx {
 
     #[inline]
     pub fn check(&self) -> Result<()> {
+        #[cfg(test)]
+        CHECKS.with(|n| n.set(n.get() + 1));
         self.check_cursor_memory()?;
         if self.calls_extensions
             && let Some(state) = &self.extension_failure

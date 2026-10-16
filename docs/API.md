@@ -1548,6 +1548,10 @@ Query parameters beyond the standard protocol:
 
   A write whose client disconnects is cancelled and commits nothing, even while it waits
   for the dataset's writer lock. A commit that has already started completes.
+* `profile=io` adds an `io` object to the metadata of an `application/x-sparkles+json`
+  result. It needs the `metrics` permission, which every caller has without authentication,
+  and answers `403` otherwise. Any other value of `profile` answers `400`. See
+  [the I/O profile](#the-io-profile).
 * `execution=eager|streaming|auto` chooses how the query runs. The default is `eager`.
   `streaming` supports SELECT in JSON, XML, CSV, TSV and native Sparkles JSON, ASK,
   and CONSTRUCT and DESCRIBE in RDF or native Sparkles JSON. The query reads from a
@@ -7295,6 +7299,63 @@ first row. It reports `fullInputBeforeOutput` and a `reason`, but `materializes`
 false, so the strict policy that refuses eager fallback still accepts the sort.
 `growingState` warns that an operator keeps state that grows as it runs, such as
 generated strings. The batch size alone does not limit that state.
+
+### The I/O profile
+
+With `profile=io`, the metadata of a native result has an `io` object. It reports what the
+query read from the index and vocabulary files, which helps explain the time of a first
+query after a restart. The counters cover the whole process, so the profile needs the
+`metrics` permission, as `/$/metrics` does. A caller without it gets a `403`, and a value
+of `profile` other than `io` gets a `400`. A streaming response keeps the profile running
+until its body ends.
+
+```ts
+type IoProfile = {
+  index: Record<string, {                  // by permutation: spo, sop, pso, pos, osp, ops, gspo
+    columnsDecoded: number; decodedBytes: number; compressedBytes: number }>;
+  readahead: Record<string, {              // by file: the permutations, vocab.dat, vocab.off, vocab.num
+    requests: number; bytes: number }>;    // WILLNEED requests to the kernel
+  vocab: { finds: number; groupsHinted: number; blocksScanned: number };
+  numericPagesRequested: number;
+  timeMs?: { vocabLookup: number; vocabRead: number; indexDecode: number; indexWait: number };
+  majorFaults?: number; minorFaults?: number;
+  pages?: Record<string, { touched: number; residentBefore: number;
+                           residentAfter: number; broughtIn: number }>;
+  pagesTruncated?: boolean;
+  events?: { atUs: number; file: string; what: string; bytes: number }[];
+};
+```
+
+The counters are process-wide, so they include the reads of any query that runs at the
+same time. The profile is meant for one query on a quiet server. `vocab.finds` and
+`vocab.blocksScanned` are counted only while a profile runs, because a scan of the
+vocabulary adds to them millions of times from many threads. `vocabLookup` is the time
+in key lookups, which resolve the constants of the query. `vocabRead` is the time reading
+terms by id. `indexDecode` is the time decompressing index columns, and `indexWait` is the
+time to read their pages into memory before decoding. The times are summed over threads.
+`pages` comes from `mincore(2)` on the pages the query asked for or read, and `events`
+lists the first 512 requests in order. Overlapping profiles share one epoch inventory
+of at most 65,536 distinct file, mapping and page entries. It retains the first admitted
+pages and bounds report scratch storage by that sample. `pagesTruncated` is true when
+an inventory or range cap omitted pages. It is false when no cap omission was recorded,
+which does not guarantee complete coverage. Process counter snapshots omit the flag.
+
+All `pages` fields describe the retained best-effort sample. `touched`, `residentBefore`
+and `residentAfter` are additive lower bounds on those counts for the full observed set.
+`broughtIn` is `max(residentAfter - residentBefore, 0)` for the sample. It is neither a
+lower bound on the full-set delta nor a physical-I/O count, especially when pages are
+evicted. Platforms without mapped page observations report a false truncation flag and
+no page entries. The bounded shared inventory and event log add memory while profiles
+are active, outside any one query's grant. Their allocation size depends on the allocator.
+Profiling adds observation work, whose corrected-source cost remains to be measured.
+Numeric profiles record mapped value loads in both single and bulk lookup paths. Kinds
+and rank entries are observed before access only when read from the mapping, rather
+than a resident copy. These observations work with hints disabled or already issued.
+`numericPagesRequested` keeps counting numeric advice pages and does not count actual
+loads. Observation adds no advice and does not reset the mapping's once-only hint bits.
+
+The same counters are in `/$/metrics` as `sparkles_index_columns_decoded_total`,
+`sparkles_index_readahead_bytes_total` and `sparkles_vocab_groups_read_total`.
 
 ## Explain
 

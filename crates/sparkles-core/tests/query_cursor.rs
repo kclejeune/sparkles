@@ -1229,6 +1229,7 @@ fn native_cursor_json_has_final_metadata_and_unknown_total_when_stopped() {
             Some(NativeJsonMetadata {
                 commit: 42,
                 dataset_id: "dataset-id",
+                io: None,
             }),
         )
         .unwrap();

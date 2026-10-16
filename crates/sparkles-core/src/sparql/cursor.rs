@@ -2302,6 +2302,8 @@ struct Scan {
 }
 
 struct BaseScan {
+    /// read-ahead over the blocks of the current range
+    ahead: crate::index::ReadAhead,
     next: usize,
     end: usize,
     block: Option<crate::index::Block>,
@@ -2374,6 +2376,7 @@ impl Scan {
             }
             let charge = OwnedCharge::new(ctx, cache_bytes)?;
             self.base = Some(BaseScan {
+                ahead: Default::default(),
                 next: 0,
                 end: 0,
                 block: None,
@@ -2400,6 +2403,7 @@ impl Scan {
                     self.at += 1;
                     base.next = 0;
                     base.end = 0;
+                    base.ahead = Default::default();
                     continue;
                 }
                 if Arc::strong_count(&base._charge) > 1 {
@@ -2410,15 +2414,30 @@ impl Scan {
                 }
                 let metadata = &index.blocks[base.next];
                 let whole = metadata.first >= lo && metadata.last <= hi;
-                let block = ctx.snap.cache.get_cols(
-                    index,
-                    base.next,
-                    if whole {
+                let columns = |b: usize| {
+                    let m = &index.blocks[b];
+                    if m.first >= lo && m.last <= hi {
                         mask
                     } else {
                         mask | crate::index::bound_cols(&lo, &hi)
-                    },
-                )?;
+                    }
+                };
+                let wanted = columns(base.next);
+                let block = match ctx.snap.cache.get_cols_cached(index, base.next, wanted) {
+                    Some(block) => block,
+                    None => {
+                        let hint = base.ahead.before(
+                            index,
+                            &ctx.snap.cache,
+                            base.next,
+                            base.end,
+                            &columns,
+                        );
+                        ctx.snap
+                            .cache
+                            .get_cols_hinted(index, base.next, wanted, hint)?
+                    }
+                };
                 (base.row, base.row_end) = if whole {
                     (0, block.len())
                 } else {
@@ -2454,6 +2473,7 @@ impl Scan {
                     self.at += 1;
                     base.next = 0;
                     base.end = 0;
+                    base.ahead = Default::default();
                 }
             }
             return Ok(SharedAttempt::Ready(Some(batch)));
@@ -2527,6 +2547,7 @@ impl Scan {
                     self.at += 1;
                     base.next = 0;
                     base.end = 0;
+                    base.ahead = Default::default();
                     break;
                 }
                 let metadata = &index.blocks[base.next];
@@ -2537,15 +2558,30 @@ impl Scan {
                         crate::index::BLOCK_ROWS as u64 * 32 + 512,
                     )?);
                 }
-                let block = ctx.snap.cache.get_cols(
-                    index,
-                    base.next,
-                    if whole {
+                let columns = |b: usize| {
+                    let m = &index.blocks[b];
+                    if m.first >= lo && m.last <= hi {
                         mask
                     } else {
                         mask | crate::index::bound_cols(&lo, &hi)
-                    },
-                )?;
+                    }
+                };
+                let wanted = columns(base.next);
+                let block = match ctx.snap.cache.get_cols_cached(index, base.next, wanted) {
+                    Some(block) => block,
+                    None => {
+                        let hint = base.ahead.before(
+                            index,
+                            &ctx.snap.cache,
+                            base.next,
+                            base.end,
+                            &columns,
+                        );
+                        ctx.snap
+                            .cache
+                            .get_cols_hinted(index, base.next, wanted, hint)?
+                    }
+                };
                 (base.row, base.row_end) = if whole {
                     (0, block.len())
                 } else {
@@ -2602,6 +2638,7 @@ impl Scan {
                 && let Ok(charge) = OwnedCharge::new(ctx, cache_bytes)
             {
                 self.base = Some(BaseScan {
+                    ahead: Default::default(),
                     next: 0,
                     end: 0,
                     block: None,
@@ -2704,6 +2741,130 @@ fn successor(mut key: Key) -> Option<Key> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn evicted_skipped_read_ahead_column(mode: &str) {
+        use crate::index::{
+            BLOCK_ROWS, BlockCache, Perm, advice_page_size, read_ahead_fixture,
+            read_ahead_reference,
+        };
+        use crate::store::{Store, StoreOptions};
+        let (_dir, idx) = read_ahead_fixture(6);
+        let store = Store::in_memory(StoreOptions::default());
+        let mut snapshot = (*store.snapshot()).clone();
+        drop(store);
+        Arc::get_mut(&mut snapshot.generation)
+            .expect("owned fixture generation")
+            .perms[Perm::Spo.index()] = idx;
+        snapshot.cache = Arc::new(BlockCache::new(64 << 20));
+        let ctx = Arc::new(Ctx::new(Arc::new(snapshot)));
+        let var = ctx.var("s");
+        let spec = ScanSpec {
+            perm: Perm::Spo,
+            prefix: vec![],
+            cols: vec![(1, var)],
+            eqs: vec![],
+            graph: super::super::plan::GraphFilter::All,
+            graph_col: 3,
+            dedup: false,
+        };
+        let index = ctx.snap.perm(Perm::Spo);
+        ctx.snap.cache.get_cols(index, 1, 2).unwrap();
+        let before = ctx.snap.cache.misses();
+        let target = index.blocks[1].offset as usize + index.blocks[1].col_len[0] as usize;
+        let target_end = target + index.blocks[1].col_len[1] as usize;
+        assert!(target_end - target > 128 << 10);
+        assert!(target_end - target > advice_page_size());
+        assert!(index.blocks[0].col_len[2] > 64 << 10);
+        assert!(index.blocks[1].col_len[2] > 64 << 10);
+        let expected = read_ahead_reference(6 * BLOCK_ROWS);
+        let trace = index.trace_hints();
+        let mut scan = Scan::new(spec, None);
+        let mut n = 0;
+        loop {
+            let rows = if mode == "shared" {
+                match scan.next_shared(&ctx, &[var], BLOCK_ROWS).unwrap() {
+                    SharedAttempt::Ready(Some(batch)) => {
+                        for &id in &batch.block.cols[1][batch.start..batch.end] {
+                            assert_eq!(id, expected[n as usize]);
+                            n += 1;
+                        }
+                        batch.end - batch.start
+                    }
+                    SharedAttempt::Ready(None) => break,
+                    _ => panic!("shared fixture unexpectedly declined"),
+                }
+            } else {
+                let vars = if mode == "count" { &[][..] } else { &[var][..] };
+                let Some(buffer) = scan.next(&ctx, vars, BLOCK_ROWS).unwrap() else {
+                    break;
+                };
+                if mode == "count" {
+                    n += buffer.table.len as u64;
+                } else {
+                    for id in &buffer.table.cols[0] {
+                        assert_eq!(id.0, expected[n as usize]);
+                        n += 1;
+                    }
+                }
+                buffer.table.len
+            };
+            if n == BLOCK_ROWS as u64 {
+                assert!(
+                    !trace
+                        .spans()
+                        .iter()
+                        .any(|&(a, z)| a < target_end && z > target),
+                    "fixture accidentally hinted skipped block"
+                );
+                ctx.snap.cache.evict_column(index, 1, 1);
+            }
+            if rows == 0 {
+                break;
+            }
+        }
+        assert_eq!(n, 6 * BLOCK_ROWS as u64);
+        assert_eq!(ctx.snap.cache.misses() - before, 6);
+        let spans = trace.spans();
+        eprintln!(
+            "{mode} target=({target},{target_end}), page={}, misses={}, rows={n}, target advice={:?}",
+            advice_page_size(),
+            ctx.snap.cache.misses() - before,
+            spans
+                .iter()
+                .filter(|&&(a, z)| a < target_end && z > target)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            spans.iter().any(|&(a, z)| a < target_end && z > target),
+            crate::index::io_hints(),
+            "{mode}: an evicted column requires fallback advice when hints are enabled"
+        );
+        assert_eq!(
+            crate::index::advice_covers_span(&spans, (target, target_end)),
+            crate::index::io_hints(),
+            "{mode}: complete evicted column needs advice"
+        );
+        if !crate::index::io_hints() {
+            assert!(spans.is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_cursor_eviction_restores_read_ahead() {
+        evicted_skipped_read_ahead_column("shared");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn owned_cursor_eviction_restores_read_ahead() {
+        evicted_skipped_read_ahead_column("owned");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn count_cursor_eviction_restores_read_ahead() {
+        evicted_skipped_read_ahead_column("count");
+    }
 
     #[test]
     fn automatic_counts_preserve_enabled_result_caches() {

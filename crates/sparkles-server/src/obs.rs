@@ -1863,6 +1863,7 @@ pub fn render_prometheus(st: &AppState) -> String {
     crate::mcp::branches::metrics(&mut o);
     #[cfg(feature = "mcp")]
     crate::mcp::memory::pending::metrics(st, &mut o);
+    io_metrics(&mut o);
     if let Some(rss) = resident_bytes() {
         family(
             &mut o,
@@ -1873,6 +1874,54 @@ pub fn render_prometheus(st: &AppState) -> String {
         let _ = writeln!(o, "process_resident_memory_bytes {rss}");
     }
     o
+}
+
+/// What the read path asked of the kernel and decoded since the process started, as
+/// Prometheus counters (spec X07 §4). They are process-wide: datasets share the readers.
+fn io_metrics(o: &mut String) {
+    use sparkles::index::Perm;
+    use sparkles::ioacct::{IoFile, IoSnapshot};
+    let s = IoSnapshot::now();
+    fn family(o: &mut String, name: &str, help: &str) {
+        let _ = writeln!(o, "# HELP {name} {help}");
+        let _ = writeln!(o, "# TYPE {name} counter");
+    }
+    family(
+        o,
+        "sparkles_index_columns_decoded_total",
+        "Index block columns decoded, by permutation.",
+    );
+    for p in Perm::ALL {
+        let _ = writeln!(
+            o,
+            "sparkles_index_columns_decoded_total{{permutation=\"{}\"}} {}",
+            p.name(),
+            s.cols_decoded[p.index()]
+        );
+    }
+    family(
+        o,
+        "sparkles_index_readahead_bytes_total",
+        "Bytes of index and vocabulary files requested from the kernel with WILLNEED, by file.",
+    );
+    for f in IoFile::ALL {
+        let _ = writeln!(
+            o,
+            "sparkles_index_readahead_bytes_total{{file=\"{}\"}} {}",
+            f.name(),
+            s.willneed_bytes[f as usize]
+        );
+    }
+    family(
+        o,
+        "sparkles_vocab_groups_read_total",
+        "Vocabulary groups read ahead by a first lookup.",
+    );
+    let _ = writeln!(
+        o,
+        "sparkles_vocab_groups_read_total {}",
+        s.vocab_groups_hinted
+    );
 }
 
 /// The JSON snapshot of the registry (`/$/metrics?format=json`) for the UI.
@@ -1984,6 +2033,7 @@ pub fn metrics_json(st: &AppState) -> J {
         "uptimeSeconds": st.started.elapsed().as_secs_f64(),
         "ready": ready(st).0,
         "processResidentBytes": resident_bytes(),
+        "io": sparkles::ioacct::IoSnapshot::now().report(),
         "limits": st.limits.json(st.default_timeout),
         "bucketBounds": BUCKETS.to_vec(),
         "active": active,

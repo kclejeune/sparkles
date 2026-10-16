@@ -9,6 +9,7 @@
 
 use crate::error::{Error, Result};
 use crate::id::Id;
+use crate::ioacct::IoFile;
 use crate::vocab::write_varint;
 use memmap2::Mmap;
 use std::fs::File;
@@ -118,11 +119,122 @@ pub(crate) fn map_random(f: &File) -> std::io::Result<Mmap> {
     Ok(m)
 }
 
+#[cfg(test)]
+type HintSpans = std::rc::Rc<std::cell::RefCell<Vec<(usize, usize)>>>;
+#[cfg(test)]
+type HintSink = (usize, HintSpans);
+#[cfg(test)]
+thread_local! {
+    static HINT_TRACE: std::cell::RefCell<Option<HintSink>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct HintTrace {
+    spans: HintSpans,
+    previous: Option<HintSink>,
+}
+#[cfg(test)]
+impl HintTrace {
+    pub(crate) fn spans(&self) -> Vec<(usize, usize)> {
+        self.spans.borrow().clone()
+    }
+}
+#[cfg(test)]
+impl Drop for HintTrace {
+    fn drop(&mut self) {
+        HINT_TRACE.with(|trace| {
+            *trace.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`ReadAhead::before`] calls on this thread (for tests of warm-path overhead)
+    static READ_AHEAD_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn read_ahead_fixture(blocks: usize) -> (tempfile::TempDir, PermIndex) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut writer = PermWriter::create(dir.path(), Perm::Spo).unwrap();
+    let mut random = 0x123456789abcdefu64;
+    for i in 0..(blocks * BLOCK_ROWS) as u64 {
+        random ^= random << 13;
+        random ^= random >> 7;
+        random ^= random << 17;
+        let x = random;
+        random ^= random << 13;
+        random ^= random >> 7;
+        random ^= random << 17;
+        writer.push([i, x, random, 0]).unwrap();
+    }
+    writer.finish(dir.path(), Perm::Spo).unwrap();
+    let idx = PermIndex::open(dir.path(), Perm::Spo).unwrap();
+    (dir, idx)
+}
+
+#[cfg(test)]
+pub(crate) fn read_ahead_reference(rows: usize) -> Vec<u64> {
+    let mut random = 0x123456789abcdefu64;
+    (0..rows)
+        .map(|_| {
+            random ^= random << 13;
+            random ^= random >> 7;
+            random ^= random << 17;
+            let value = random;
+            random ^= random << 13;
+            random ^= random >> 7;
+            random ^= random << 17;
+            value
+        })
+        .collect()
+}
+
+/// Independent test oracle over raw attempted advice, without production coverage state.
+#[cfg(test)]
+pub(crate) fn advice_covers_span(spans: &[(usize, usize)], (from, to): (usize, usize)) -> bool {
+    if from >= to {
+        return true;
+    }
+    let mut sorted = spans.to_vec();
+    sorted.sort_unstable();
+    let mut through = from;
+    for (start, end) in sorted {
+        if end <= through {
+            continue;
+        }
+        if start > through {
+            return false;
+        }
+        through = end;
+        if through >= to {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn advice_page_size() -> usize {
+    // SAFETY: sysconf has no pointer arguments or other preconditions.
+    usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap()
+}
+
 /// Ask the kernel to start reading `len` bytes of `m` at `off` (see [`io_hints`]).
 #[inline]
-pub(crate) fn will_need(m: &Mmap, off: usize, len: usize) {
+pub(crate) fn will_need(file: IoFile, m: &Mmap, off: usize, len: usize) -> bool {
     #[cfg(unix)]
     if len > 0 && off <= m.len() && len <= m.len() - off && io_hints() {
+        #[cfg(test)]
+        HINT_TRACE.with(|trace| {
+            if let Some((mapping, spans)) = &*trace.borrow()
+                && *mapping == m.as_ptr() as usize
+            {
+                spans.borrow_mut().push((off, off + len));
+            }
+        });
+        crate::ioacct::willneed(file, m.as_ptr(), off, len);
         // Linux caps a WILLNEED request's read-ahead. A single hint for an export's
         // tens of MiB leaves its tail to synchronous faults on a Random mapping.
         // Issue bounded requests so the entire requested range is covered.
@@ -134,12 +246,175 @@ pub(crate) fn will_need(m: &Mmap, off: usize, len: usize) {
                 WINDOW.min(off + len - start),
             );
         }
+        return true;
     }
     #[cfg(not(unix))]
-    let _ = (m, off, len);
+    let _ = (file, m, off, len);
+    false
 }
 
 pub type Key = [u64; 4];
+
+/// Target compressed bytes requested ahead by one [`ReadAhead`] pass. Whole-block
+/// progress may extend it through one next block and its coalesced gap.
+/// `SPARKLES_READ_WINDOW_KB` changes it for experiments, and 0 turns the windows off: every
+/// block then asks for its own columns just before it is decoded, as before the windows.
+pub fn read_window() -> usize {
+    static W: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *W.get_or_init(|| {
+        std::env::var("SPARKLES_READ_WINDOW_KB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map_or(
+                4 << 20,
+                |kb| if kb == 0 { 0 } else { (kb << 10).max(64 << 10) },
+            )
+    })
+}
+
+/// Read-ahead of one pass over consecutive blocks of a permutation (spec X07 §5.3).
+///
+/// The files are mapped for random access (see [`io_hints`]), so the kernel reads nothing
+/// ahead of a page fault. A pass asks for its own bytes in a window that runs ahead of it:
+/// the first request covers about 1 MiB and each refill, made when the pass has used half of
+/// what was requested, doubles up to [`read_window`]. A short range is read by the first
+/// request alone, which overlaps the reads of its blocks as the plan-time prefetch does. A
+/// long one keeps a window of reads in flight, as the kernel's read-ahead would have, and
+/// a scan that stops early has requested at most the target plus one next-block extension,
+/// including its coalesced gap. This counts requested bytes, not physical I/O completion.
+/// The window belongs to the pass, so concurrent passes over one file share no state and the
+/// mapping's advice never changes.
+#[derive(Default)]
+pub struct ReadAhead {
+    /// Blocks before this one were examined, including decoded cache skips.
+    requested: usize,
+    /// Actual requested compressed byte union still ahead of this pass.
+    covered: std::collections::VecDeque<(usize, usize)>,
+    /// request more when the pass reaches this block
+    refill_at: usize,
+    /// Target outstanding advice bytes, including existing unconsumed coverage.
+    window: usize,
+    #[cfg(test)]
+    lookup_inspections: usize,
+}
+
+impl ReadAhead {
+    const FIRST: usize = 1 << 20;
+
+    /// The pass reads block `b` next, of the blocks up to `end`. `columns` gives the
+    /// columns the pass reads of a block. Returns whether a cache miss needs current-block
+    /// fallback advice. Such fallback never requests blocks beyond the one being reached.
+    pub fn before(
+        &mut self,
+        idx: &PermIndex,
+        cache: &BlockCache,
+        b: usize,
+        end: usize,
+        columns: &dyn Fn(usize) -> ColMask,
+    ) -> bool {
+        #[cfg(test)]
+        READ_AHEAD_CALLS.with(|n| n.set(n.get() + 1));
+        let limit = read_window();
+        if !io_hints() || limit == 0 {
+            return true;
+        }
+        let Some(data) = idx.data.as_ref() else {
+            return true;
+        };
+        let Some(block) = idx.blocks.get(b) else {
+            return true;
+        };
+        let at = block.offset as usize;
+        while self.covered.front().is_some_and(|&(_, z)| z <= at) {
+            self.covered.pop_front();
+        }
+        if let Some((a, _)) = self.covered.front_mut() {
+            *a = (*a).max(at);
+        }
+        if b >= self.refill_at && self.requested < end {
+            self.window = if self.window == 0 {
+                Self::FIRST.min(limit)
+            } else {
+                self.window.saturating_mul(2).min(limit)
+            };
+            let mut used = self.covered.iter().map(|&(a, z)| z - a).sum::<usize>();
+            let mut examined = 0usize;
+            let mut blk = b.max(self.requested);
+            let mut run: Option<(usize, usize)> = None;
+            const GAP: usize = 64 << 10;
+            // Existing outstanding advice consumes the budget. The one addition that
+            // crosses it may extend through one next block and a bridged gap, never
+            // another full window. A separate traversal cap also bounds cached/empty
+            // spans, each of which consumes at least one unit of examined work.
+            while blk < end && used < self.window && examined < self.window {
+                let mask = columns(blk);
+                let span = idx.span(blk, mask);
+                examined = examined.saturating_add(span.map_or(1, |(a, z)| (z - a).max(1)));
+                if let Some((from, to)) = span
+                    && !cache.has_cols(idx, blk, mask)
+                {
+                    run = match run {
+                        Some((a, z)) if from <= z.saturating_add(GAP) => {
+                            used = used.saturating_add(to.saturating_sub(z));
+                            Some((a, z.max(to)))
+                        }
+                        previous => {
+                            if let Some((a, z)) = previous {
+                                self.hint(idx, data, a, z);
+                            }
+                            used = used.saturating_add(to - from);
+                            Some((from, to))
+                        }
+                    };
+                }
+                blk += 1;
+            }
+            if let Some((a, z)) = run {
+                self.hint(idx, data, a, z);
+            }
+            self.requested = blk;
+            self.refill_at = if blk >= end {
+                usize::MAX
+            } else {
+                b.saturating_add(((blk.saturating_sub(b)) / 2).max(1))
+            };
+        }
+        // A cached column skipped at look-ahead may have been evicted since. Only
+        // actual advice, not the examined endpoint, can suppress miss-time fallback.
+        !idx.span(b, columns(b))
+            .is_none_or(|(a, z)| self.covers(a, z))
+    }
+
+    fn covers(&mut self, from: usize, to: usize) -> bool {
+        // Coverage is sorted and merged. A future interval cannot cover a hole
+        // before its start, so do not walk the rest of the future window there.
+        for &(start, end) in &self.covered {
+            #[cfg(test)]
+            {
+                self.lookup_inspections += 1;
+            }
+            if start > from {
+                return false;
+            }
+            if end >= to {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn hint(&mut self, idx: &PermIndex, data: &Mmap, from: usize, to: usize) {
+        if will_need(IoFile::of_perm(idx.perm), data, from, to - from) {
+            if let Some((_, end)) = self.covered.back_mut()
+                && from <= *end
+            {
+                *end = (*end).max(to);
+            } else {
+                self.covered.push_back((from, to));
+            }
+        }
+    }
+}
 
 /// Position of each component in a quad array `[s, p, o, g]`.
 pub const S: usize = 0;
@@ -708,26 +983,47 @@ impl PermIndex {
     /// Ask the kernel to start reading the columns in `mask` of block `b` (and those
     /// between them), unless the cache holds them decoded. A reader that knows the
     /// blocks it will visit asks for all of them first, so that a cold server reads them
-    /// in parallel instead of one after another (see [`io_hints`]).
-    pub fn prefetch(&self, cache: &BlockCache, b: usize, mask: ColMask) {
+    /// in parallel instead of one after another (see [`io_hints`]). Returns whether the
+    /// cache lacked a column of `mask` in block `b`, whether or not hints are on, so that
+    /// a caller can skip its other cold-path work for blocks that are warm.
+    pub fn prefetch(&self, cache: &BlockCache, b: usize, mask: ColMask) -> bool {
         let mask = mask & ALL_COLS;
-        if mask == 0 || !io_hints() || cache.has_cols(self, b, mask) {
-            return;
+        if mask == 0 || cache.has_cols(self, b, mask) {
+            return false;
         }
-        let (Some(data), Some(m)) = (self.data.as_ref(), self.blocks.get(b)) else {
-            return;
-        };
+        if !io_hints() {
+            return true;
+        }
+        if let (Some(data), Some((from, to))) = (self.data.as_ref(), self.span(b, mask)) {
+            will_need(IoFile::of_perm(self.perm), data, from, to - from);
+        }
+        true
+    }
+
+    /// The bytes of the file that hold the columns in `mask` of block `b` (and the columns
+    /// between them): `[from, to)`.
+    fn span(&self, b: usize, mask: ColMask) -> Option<(usize, usize)> {
+        let mask = mask & ALL_COLS;
+        let m = self.blocks.get(b)?;
+        if mask == 0 {
+            return None;
+        }
         let first = mask.trailing_zeros() as usize;
         let last = 7 - mask.leading_zeros() as usize;
         let at = |c: usize| {
             m.offset as usize + m.col_len[..c].iter().map(|&l| l as usize).sum::<usize>()
         };
-        let (from, to) = (at(first), at(last + 1));
-        will_need(data, from, to - from);
+        Some((at(first), at(last + 1)))
     }
 
     /// Decode one column of a block (columns are compressed separately).
     pub fn decode_col(&self, b: usize, c: usize) -> Result<Arc<[u64]>> {
+        self.decode_col_hinted(b, c, true)
+    }
+
+    /// [`decode_col`](Self::decode_col), asking the kernel for the column's bytes first
+    /// only when `hint`: a pass that has read ahead (see [`ReadAhead`]) has asked already.
+    pub fn decode_col_hinted(&self, b: usize, c: usize, hint: bool) -> Result<Arc<[u64]>> {
         let m = &self.blocks[b];
         let data = self
             .data
@@ -736,17 +1032,28 @@ impl PermIndex {
         let off = m.offset as usize + m.col_len[..c].iter().map(|&l| l as usize).sum::<usize>();
         // this column and the block's later ones, which a scan usually decodes next: one
         // read on a cold file instead of a page fault per page
-        will_need(
-            data,
-            off,
-            m.col_len[c..].iter().map(|&l| l as usize).sum::<usize>(),
-        );
+        if hint {
+            will_need(
+                IoFile::of_perm(self.perm),
+                data,
+                off,
+                m.col_len[c..].iter().map(|&l| l as usize).sum::<usize>(),
+            );
+        }
         let bytes = data.get(off..off + m.col_len[c] as usize).ok_or_else(|| {
             Error::Corrupt(format!(
                 "{}.dat: block {b} ends past the end of the file",
                 self.perm.name()
             ))
         })?;
+        crate::ioacct::column_decoded(self.perm, m.rows as usize, bytes.len());
+        if crate::ioacct::profiling() {
+            crate::ioacct::touch(IoFile::of_perm(self.perm), data.as_ptr(), off, bytes.len());
+            // the wait for the pages, apart from the decoding
+            let _wait = crate::ioacct::timer(crate::ioacct::Phase::IndexWait);
+            crate::ioacct::fault_in(bytes);
+        }
+        let _decode = crate::ioacct::timer(crate::ioacct::Phase::IndexDecode);
         decode_column(bytes, m.rows as usize)
     }
 
@@ -860,6 +1167,33 @@ pub struct BlockCache {
     misses: std::sync::atomic::AtomicU64,
     /// decoded blocks are added (false: a read-through view, see [`BlockCache::read_through`])
     fill: bool,
+    #[cfg(test)]
+    decode_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static DECODE_POOL_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The threads that decode blocks ahead of a reader (see [`BlockCache::warm`]). They are
+/// not the global pool, so a parallel scan that uses it does not queue point lookups. The
+/// pool starts at the first request that decodes ahead, not with a cache, so a process
+/// that never does holds no threads. `None` when the threads could not be started, and the
+/// caller then decodes on its own thread.
+fn decode_pool() -> Option<&'static rayon::ThreadPool> {
+    #[cfg(test)]
+    DECODE_POOL_CALLS.with(|n| n.set(n.get() + 1));
+    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let cpus = std::thread::available_parallelism().map_or(2, |n| n.get());
+        rayon::ThreadPoolBuilder::new()
+            .num_threads((cpus / 2).clamp(2, 8))
+            .thread_name(|i| format!("sparkles-decode-{i}"))
+            .build()
+            .ok()
+    })
+    .as_ref()
 }
 
 #[derive(Clone)]
@@ -885,6 +1219,8 @@ impl BlockCache {
             hits: Default::default(),
             misses: Default::default(),
             fill: true,
+            #[cfg(test)]
+            decode_hook: None,
         }
     }
 
@@ -897,6 +1233,8 @@ impl BlockCache {
             hits: Default::default(),
             misses: Default::default(),
             fill: true,
+            #[cfg(test)]
+            decode_hook: None,
         }
     }
 
@@ -911,6 +1249,8 @@ impl BlockCache {
             hits: Default::default(),
             misses: Default::default(),
             fill: false,
+            #[cfg(test)]
+            decode_hook: None,
         }
     }
 
@@ -921,6 +1261,18 @@ impl BlockCache {
 
     /// A block with the columns in `mask` (the others are empty).
     pub fn get_cols(&self, idx: &PermIndex, b: usize, mask: ColMask) -> Result<Block> {
+        self.get_cols_hinted(idx, b, mask, true)
+    }
+
+    /// [`get_cols`](Self::get_cols) for a pass that has read the block ahead (`hint`
+    /// false, see [`ReadAhead`]).
+    pub fn get_cols_hinted(
+        &self,
+        idx: &PermIndex,
+        b: usize,
+        mask: ColMask,
+        hint: bool,
+    ) -> Result<Block> {
         let mut cols: [Arc<[u64]>; 4] = std::array::from_fn(|_| empty_col());
         for (c, col) in cols.iter_mut().enumerate() {
             if mask & (1 << c) == 0 {
@@ -935,7 +1287,11 @@ impl BlockCache {
                 None => {
                     self.misses
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let v = idx.decode_col(b, c)?;
+                    #[cfg(test)]
+                    if let Some(hook) = &self.decode_hook {
+                        hook();
+                    }
+                    let v = idx.decode_col_hinted(b, c, hint)?;
                     if self.fill {
                         self.cache.insert(key, v.clone());
                     }
@@ -947,6 +1303,75 @@ impl BlockCache {
             cols,
             rows: idx.blocks[b].rows as usize,
         })
+    }
+
+    /// A block with the columns in `mask` if the cache holds all of them decoded, counting
+    /// a hit for each, and nothing otherwise (no miss, no hit, no decode). A pass uses it
+    /// to skip its read-ahead bookkeeping for warm blocks.
+    pub fn get_cols_cached(&self, idx: &PermIndex, b: usize, mask: ColMask) -> Option<Block> {
+        let mut cols: [Arc<[u64]>; 4] = std::array::from_fn(|_| empty_col());
+        let mut found = 0u64;
+        for (c, col) in cols.iter_mut().enumerate() {
+            if mask & (1 << c) == 0 {
+                continue;
+            }
+            *col = self
+                .cache
+                .get(&(idx.uid, b as u32, self.ns << 8 | c as u32))?;
+            found += 1;
+        }
+        self.hits
+            .fetch_add(found, std::sync::atomic::Ordering::Relaxed);
+        Some(Block {
+            cols,
+            rows: idx.blocks[b].rows as usize,
+        })
+    }
+
+    /// Decode the columns in `mask` of `blocks` that the cache lacks, in parallel on a pool
+    /// of its own, and keep them. A scan or join that has asked the kernel for these
+    /// blocks decodes them one by one otherwise, and on a lookup that touches dozens of
+    /// blocks for a few rows each the decoding is most of the time. Only columns the reader
+    /// decodes anyway are decoded. Does nothing for a read-through view, which keeps no
+    /// blocks, for few columns, or when the distinct missing decoded bytes exceed cache
+    /// capacity. Checks stop optional work cooperatively. Already-started decodes may finish.
+    pub fn warm(
+        &self,
+        idx: &PermIndex,
+        blocks: &[usize],
+        mask: ColMask,
+        check: &(dyn Fn() -> Result<()> + Sync),
+    ) -> Result<()> {
+        check()?;
+        let mut work = self.warm_columns(idx);
+        for &b in blocks {
+            check()?;
+            work.add(b, mask);
+        }
+        work.finish(check)
+    }
+
+    /// A bounded candidate set shared with join prefetch, so even enumeration stops
+    /// retaining work once the distinct missing columns exceed the decoded byte budget.
+    pub(crate) fn warm_columns<'a>(&'a self, idx: &'a PermIndex) -> WarmColumns<'a> {
+        WarmColumns {
+            cache: self,
+            idx,
+            work: Vec::new(),
+            seen: Default::default(),
+            bytes: 0,
+            budget: self.cache.capacity() / 8,
+            eligible: self.fill,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn evict_column(&self, idx: &PermIndex, b: usize, c: u8) {
+        assert!(
+            self.cache
+                .remove(&(idx.uid, b as u32, self.ns << 8 | u32::from(c)))
+                .is_some()
+        );
     }
 
     /// Whether the columns in `mask` of block `b` are decoded in the cache, without
@@ -1001,7 +1426,88 @@ impl BlockCache {
     }
 }
 
+/// Optional decoded columns for one permutation and one prefetch request. This is
+/// an admission estimate, not a reservation against other cache users or eviction.
+pub(crate) struct WarmColumns<'a> {
+    cache: &'a BlockCache,
+    idx: &'a PermIndex,
+    work: Vec<(usize, u8)>,
+    seen: rustc_hash::FxHashSet<(usize, u8)>,
+    bytes: u64,
+    /// the most decoded bytes one request may add, an eighth of the cache so that one
+    /// request cannot push out what the other queries hold
+    budget: u64,
+    eligible: bool,
+}
+
+impl WarmColumns<'_> {
+    pub(crate) fn add(&mut self, b: usize, mask: ColMask) {
+        if !self.eligible {
+            return;
+        }
+        for c in 0..4u8 {
+            let key = (b, c);
+            if mask & (1 << c) == 0
+                || self.seen.contains(&key)
+                || self
+                    .cache
+                    .cache
+                    .peek(&(self.idx.uid, b as u32, self.cache.ns << 8 | u32::from(c)))
+                    .is_some()
+            {
+                continue;
+            }
+            // Match BlockWeighter exactly, including partial tails and empty columns.
+            // Overflow declines the entire optional request before any decode occurs.
+            let next = u64::from(self.idx.blocks[b].rows)
+                .checked_mul(8)
+                .and_then(|weight| self.bytes.checked_add(weight.max(1)));
+            let Some(bytes) = next.filter(|&n| n <= self.budget) else {
+                self.eligible = false;
+                self.work = Vec::new();
+                self.seen = Default::default();
+                self.bytes = 0;
+                return;
+            };
+            self.bytes = bytes;
+            self.seen.insert(key);
+            self.work.push(key);
+        }
+    }
+
+    pub(crate) fn finish(self, check: &(dyn Fn() -> Result<()> + Sync)) -> Result<()> {
+        use rayon::prelude::*;
+        check()?;
+        // Below this the hand-off costs about what decoding saves. Keep the existing
+        // threshold; capacity admission never warms a partial prefix of an oversized set.
+        const MIN_COLUMNS: usize = 16;
+        if self.eligible && self.work.len() >= MIN_COLUMNS {
+            let decode = |&(b, c): &(usize, u8)| -> Result<()> {
+                check()?;
+                // Only check errors propagate: an advisory decode error remains
+                // for the consuming reader to encounter if it needs this column.
+                let _ = self.cache.get_cols_hinted(self.idx, b, 1 << c, false);
+                Ok(())
+            };
+            match decode_pool() {
+                Some(pool) => pool.install(|| self.work.par_iter().try_for_each(decode))?,
+                None => self.work.iter().try_for_each(decode)?,
+            }
+        }
+        // Cancellation during the final already-started decode must not be hidden.
+        check()
+    }
+}
+
 impl PermIndex {
+    #[cfg(test)]
+    pub(crate) fn trace_hints(&self) -> HintTrace {
+        let spans = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mapping = self.data.as_ref().unwrap().as_ptr() as usize;
+        let previous = HINT_TRACE.with(|trace| trace.replace(Some((mapping, spans.clone()))));
+        HintTrace { spans, previous }
+    }
+
     /// Exact number of base rows with the given key prefix.
     pub fn count(&self, cache: &BlockCache, prefix: &[u64]) -> Result<u64> {
         if prefix.is_empty() {
@@ -1017,6 +1523,20 @@ impl PermIndex {
             return Ok(0);
         }
         let (lo_key, hi_key) = (*lo_key, *hi_key);
+        // the blocks at the two ends of the range are decoded one after the other below:
+        // ask for both first, so that a cold server reads them together
+        let bc = bound_cols(&lo_key, &hi_key);
+        let partial = |e: usize| {
+            let m = &self.blocks[e];
+            !(m.first >= lo_key && m.last <= hi_key)
+        };
+        // each end block that bounds the range, which costs one lookup when it is cached
+        let ends = if hi - 1 == lo { 1 } else { 2 };
+        for e in [lo, hi - 1].into_iter().take(ends) {
+            if partial(e) {
+                self.prefetch(cache, e, bc);
+            }
+        }
         let mut total = 0u64;
         // interior blocks fully contained in the range need no decoding
         let mut b = lo;
@@ -1126,11 +1646,27 @@ impl PermIndex {
     ) -> Result<()> {
         let (lo, hi) = self.key_block_range(lo_key, hi_key);
         let bounds = bound_cols(lo_key, hi_key);
-        for b in lo..hi {
+        let mut ahead = ReadAhead::default();
+        let columns = |b: usize| {
             let m = &self.blocks[b];
             let mask = mask_of(b);
+            if m.first >= *lo_key && m.last <= *hi_key {
+                mask
+            } else {
+                mask | bounds
+            }
+        };
+        for b in lo..hi {
+            let m = &self.blocks[b];
+            let mask = columns(b);
             let whole = m.first >= *lo_key && m.last <= *hi_key;
-            let blk = cache.get_cols(self, b, if whole { mask } else { mask | bounds })?;
+            let blk = match cache.get_cols_cached(self, b, mask) {
+                Some(blk) => blk,
+                None => {
+                    let hint = ahead.before(self, cache, b, hi, &columns);
+                    cache.get_cols_hinted(self, b, mask, hint)?
+                }
+            };
             let go_on = if whole {
                 f(&blk, 0, blk.len())?
             } else {
@@ -1215,6 +1751,906 @@ mod tests {
         assert!(!idx.contains(&cache, &[5, 5, 10, 0]).unwrap());
         let est = idx.estimate(&[7]);
         assert!(est > 0);
+    }
+
+    #[test]
+    fn read_ahead_covers_a_short_range_in_one_request_and_a_long_one_in_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = PermWriter::create(dir.path(), Perm::Spo).unwrap();
+        for s in 0..(6 * BLOCK_ROWS as u64) {
+            w.push([s, s % 7, s % 13, 0]).unwrap();
+        }
+        w.finish(dir.path(), Perm::Spo).unwrap();
+        let idx = PermIndex::open(dir.path(), Perm::Spo).unwrap();
+        let cache = BlockCache::new(1 << 26);
+        assert_eq!(idx.blocks.len(), 6);
+        let all = |_: usize| ALL_COLS;
+        let enabled = io_hints() && read_window() != 0;
+        let trace = idx.trace_hints();
+        // a short range: the first request covers every block
+        let mut ra = ReadAhead::default();
+        ra.before(&idx, &cache, 0, 6, &all);
+        if enabled {
+            let total = idx
+                .blocks
+                .iter()
+                .map(|m| m.col_len.iter().map(|&n| n as usize).sum::<usize>())
+                .sum::<usize>();
+            assert!(ra.requested > 0 && ra.requested <= 6);
+            if total <= ReadAhead::FIRST.min(read_window()) {
+                assert_eq!(ra.requested, 6);
+                assert_eq!(ra.refill_at, usize::MAX);
+            }
+        } else {
+            assert_eq!((ra.requested, ra.refill_at, ra.window), (0, 0, 0));
+            assert!(trace.spans().is_empty());
+        }
+        // The same position cannot add another refill or grow the target.
+        let before = (ra.requested, ra.window, trace.spans().len());
+        ra.before(&idx, &cache, 0, 6, &all);
+        assert_eq!((ra.requested, ra.window, trace.spans().len()), before);
+        // the blocks are 100s of KB each, so a request of the 1 MiB first window stops short
+        // of the sixth block, and the next one starts where it ended
+        let mut ra = ReadAhead::default();
+        let end = idx.blocks.len();
+        ra.window = 1; // the first window is the smallest allowed: one block per request
+        ra.before(&idx, &cache, 0, end, &all);
+        if enabled {
+            assert!(ra.requested >= 1 && ra.requested <= end);
+        } else {
+            assert_eq!(ra.requested, 0);
+            assert!(trace.spans().is_empty());
+        }
+        let first = ra.requested;
+        if enabled && first < end {
+            assert!(ra.refill_at > 0 && ra.refill_at < end);
+            ra.before(&idx, &cache, ra.refill_at, end, &all);
+            assert!(ra.requested > first);
+        }
+        // scanning with read-ahead gives the rows of a scan without it
+        let mut n = 0u64;
+        idx.for_each_key_range_cols(&cache, &[0; 4], &[u64::MAX; 4], ALL_COLS, |blk, s, e| {
+            let first = n;
+            n += (e - s) as u64;
+            assert_eq!(blk.cols[0][s], blk.key(s)[0]);
+            for row in s..e {
+                let value = first + (row - s) as u64;
+                assert_eq!(blk.key(row), [value, value % 7, value % 13, 0]);
+            }
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(n, 6 * BLOCK_ROWS as u64);
+    }
+
+    #[test]
+    fn warm_decodes_the_columns_in_parallel_and_keeps_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = PermWriter::create(dir.path(), Perm::Spo).unwrap();
+        for s in 0..(4 * BLOCK_ROWS as u64) {
+            w.push([s, s % 7, s % 13, 0]).unwrap();
+        }
+        w.finish(dir.path(), Perm::Spo).unwrap();
+        let idx = PermIndex::open(dir.path(), Perm::Spo).unwrap();
+        let cache = BlockCache::new(1 << 26);
+        let mask = ALL_COLS;
+        let blocks: Vec<usize> = (0..idx.blocks.len()).collect();
+        assert!(!cache.has_cols(&idx, 2, mask));
+        // too few columns to be worth the hand-off: nothing is decoded
+        cache.warm(&idx, &blocks[..2], mask, &|| Ok(())).unwrap();
+        assert!(!cache.has_cols(&idx, 0, mask));
+        cache.warm(&idx, &blocks, mask, &|| Ok(())).unwrap();
+        for b in &blocks {
+            assert!(cache.has_cols(&idx, *b, mask));
+        }
+        // the warmed columns equal a direct decode
+        let blk = cache.get_cols(&idx, 3, mask).unwrap();
+        for c in 0..4 {
+            assert_eq!(&*blk.cols[c], &*idx.decode_col(3, c).unwrap());
+        }
+        // a read-through view keeps nothing
+        let through = cache.read_through();
+        let empty = BlockCache::new(1 << 26);
+        empty
+            .read_through()
+            .warm(&idx, &blocks, mask, &|| Ok(()))
+            .unwrap();
+        assert!(!empty.has_cols(&idx, 0, mask));
+        let _ = through;
+    }
+
+    fn warm_fixture(rows: usize) -> (tempfile::TempDir, PermIndex) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = PermWriter::create(dir.path(), Perm::Spo).unwrap();
+        for i in 0..rows as u64 {
+            writer.push([i, i % 7, i % 13, 0]).unwrap();
+        }
+        writer.finish(dir.path(), Perm::Spo).unwrap();
+        let idx = PermIndex::open(dir.path(), Perm::Spo).unwrap();
+        (dir, idx)
+    }
+
+    #[test]
+    fn cache_construction_does_not_start_the_decode_pool() {
+        let before = DECODE_POOL_CALLS.with(|n| n.get());
+        let shared = SharedBlocks::new(128 << 20);
+        let view = BlockCache::attach(&shared, 7);
+        let _through = view.read_through();
+        let _private = BlockCache::new(16 << 20);
+        assert_eq!(DECODE_POOL_CALLS.with(|n| n.get()), before);
+        // the pool starts when a request decodes ahead
+        let (_dir, idx) = warm_fixture(8 * BLOCK_ROWS);
+        view.warm(&idx, &(0..8).collect::<Vec<_>>(), ALL_COLS, &|| Ok(()))
+            .unwrap();
+        assert_eq!(DECODE_POOL_CALLS.with(|n| n.get()), before + 1);
+        let pool = decode_pool().expect("a decode pool");
+        assert!(pool.current_num_threads() >= 2);
+        pool.install(|| {
+            assert!(
+                std::thread::current()
+                    .name()
+                    .unwrap()
+                    .starts_with("sparkles-decode-")
+            );
+        });
+    }
+
+    #[test]
+    fn shared_warm_peek_and_eviction_keep_namespace_ownership() {
+        let (_dir, idx) = warm_fixture(4 * BLOCK_ROWS);
+        let shared = SharedBlocks::new(64 << 20);
+        let a = BlockCache::attach(&shared, 17);
+        let b = BlockCache::attach(&shared, 23);
+        let a2 = BlockCache::attach(&shared, 17);
+        let blocks: Vec<_> = (0..idx.blocks.len()).collect();
+        a.warm(&idx, &blocks, ALL_COLS, &|| Ok(())).unwrap();
+        let mut same = a2.warm_columns(&idx);
+        let mut other = b.warm_columns(&idx);
+        for &block in &blocks {
+            same.add(block, ALL_COLS);
+            other.add(block, ALL_COLS);
+        }
+        assert!(same.work.is_empty(), "same namespace reuses warmed columns");
+        assert_eq!(
+            other.work.len(),
+            16,
+            "other namespace must decode its own columns"
+        );
+        other.finish(&|| Ok(())).unwrap();
+        let per_namespace = (4 * BLOCK_ROWS * 4 * 8) as u64;
+        let usage = shared.usage();
+        assert_eq!(usage[&17].bytes, per_namespace);
+        assert_eq!(usage[&23].bytes, per_namespace);
+        assert_eq!(shared.bytes(), 2 * per_namespace);
+        let held = b.get_cols(&idx, 0, 1 << 1).unwrap();
+        b.evict_column(&idx, 0, 1);
+        assert!(!b.has_cols(&idx, 0, 1 << 1));
+        assert!(a.has_cols(&idx, 0, ALL_COLS));
+        assert!(a2.has_cols(&idx, 0, ALL_COLS));
+        assert_eq!(
+            &*held.cols[1],
+            &*idx.decode_col(0, 1).unwrap(),
+            "Arc survives eviction"
+        );
+        let before = shared.bytes();
+        b.read_through()
+            .warm(&idx, &blocks, ALL_COLS, &|| Ok(()))
+            .unwrap();
+        assert_eq!(shared.bytes(), before);
+        assert!(!b.has_cols(&idx, 0, 1 << 1));
+        assert!(shared.bytes() <= shared.capacity());
+    }
+
+    #[test]
+    fn oversized_shared_warm_keeps_existing_namespace_entries() {
+        let (_dir, idx) = warm_fixture(4 * BLOCK_ROWS);
+        let shared = SharedBlocks::new(1 << 20);
+        let a = BlockCache::attach(&shared, 1);
+        let b = BlockCache::attach(&shared, 2);
+        let held = a.get_cols(&idx, 0, 1).unwrap();
+        let before = shared.bytes();
+        b.warm(&idx, &[0, 1, 2, 3], ALL_COLS, &|| Ok(())).unwrap();
+        assert_eq!(
+            b.misses(),
+            0,
+            "oversized optional work does not decode a prefix"
+        );
+        assert_eq!(shared.bytes(), before);
+        assert!(a.has_cols(&idx, 0, 1));
+        assert!(!b.has_cols(&idx, 0, 1));
+        assert_eq!(&*held.cols[0], &*idx.decode_col(0, 0).unwrap());
+    }
+
+    fn warm_checked(
+        cache: &BlockCache,
+        idx: &PermIndex,
+        blocks: &[usize],
+        mask: ColMask,
+        check: &(dyn Fn() -> Result<()> + Sync),
+    ) -> Result<()> {
+        cache.warm(idx, blocks, mask, check)
+    }
+
+    #[test]
+    fn warm_cancellation_stops_after_the_inflight_pool_wave() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let (_dir, idx) = warm_fixture(8 * BLOCK_ROWS);
+        let mut cache = BlockCache::new(64 << 20);
+        let width = decode_pool().unwrap().current_num_threads();
+        let entered = Arc::new(AtomicUsize::new(0));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let expired = Arc::new(AtomicBool::new(false));
+        let release = Arc::new((parking_lot::Mutex::new(false), parking_lot::Condvar::new()));
+        let (tx, rx) = mpsc::channel();
+        cache.decode_hook = Some(Arc::new({
+            let entered = entered.clone();
+            let release = release.clone();
+            let expired = expired.clone();
+            move || {
+                if entered.fetch_add(1, Ordering::SeqCst) < width {
+                    let _ = tx.send(());
+                    let mut go = release.0.lock();
+                    while !*go {
+                        if release
+                            .1
+                            .wait_for(&mut go, Duration::from_secs(5))
+                            .timed_out()
+                        {
+                            expired.store(true, Ordering::SeqCst);
+                            break;
+                        }
+                    }
+                }
+            }
+        }));
+        let cache = Arc::new(cache);
+        let worker = std::thread::spawn({
+            let cache = cache.clone();
+            let cancelled = cancelled.clone();
+            move || {
+                warm_checked(&cache, &idx, &(0..8).collect::<Vec<_>>(), ALL_COLS, &|| {
+                    if cancelled.load(Ordering::SeqCst) {
+                        Err(Error::Cancelled)
+                    } else {
+                        Ok(())
+                    }
+                })
+            }
+        });
+        let observed = (0..width).try_for_each(|_| rx.recv_timeout(Duration::from_secs(3)));
+        cancelled.store(true, Ordering::SeqCst);
+        *release.0.lock() = true;
+        release.1.notify_all();
+        let result = worker.join().unwrap();
+        assert!(
+            observed.is_ok(),
+            "first pool wave did not enter: {observed:?}"
+        );
+        assert!(!expired.load(Ordering::SeqCst));
+        eprintln!(
+            "pool width={width}, decoded={}, result={result:?}",
+            cache.misses()
+        );
+        assert!(
+            cache.misses() <= width as u64,
+            "optional decode continued after cancellation"
+        );
+        assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
+    }
+
+    #[test]
+    fn warm_expired_deadline_decodes_nothing() {
+        let (_dir, idx) = warm_fixture(4 * BLOCK_ROWS);
+        let cache = BlockCache::new(64 << 20);
+        let deadline = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let result = warm_checked(&cache, &idx, &[0, 1, 2, 3], ALL_COLS, &|| {
+            if std::time::Instant::now() > deadline {
+                Err(Error::Timeout)
+            } else {
+                Ok(())
+            }
+        });
+        eprintln!("decoded={}, result={result:?}", cache.misses());
+        assert_eq!(cache.misses(), 0);
+        assert!(matches!(result, Err(Error::Timeout)), "{result:?}");
+    }
+
+    #[test]
+    fn warm_oversized_request_skips_optional_decodes() {
+        let (_dir, idx) = warm_fixture(32 * BLOCK_ROWS);
+        let cache = BlockCache::new(8 << 20);
+        warm_checked(
+            &cache,
+            &idx,
+            &(0..32).collect::<Vec<_>>(),
+            ALL_COLS,
+            &|| Ok(()),
+        )
+        .unwrap();
+        let warmed = cache.misses();
+        for b in 0..32 {
+            let block = cache.get(&idx, b).unwrap();
+            for row in 0..BLOCK_ROWS {
+                let i = (b * BLOCK_ROWS + row) as u64;
+                assert_eq!(block.key(row), [i, i % 7, i % 13, 0]);
+            }
+        }
+        eprintln!("optional={warmed}, total decoded={}", cache.misses());
+        assert_eq!(warmed, 0, "oversized optional warmup must be skipped");
+        assert_eq!(cache.misses(), 128);
+    }
+
+    #[test]
+    fn warm_admits_at_most_an_eighth_of_the_cache_per_request() {
+        let (_dir, idx) = warm_fixture(8 * BLOCK_ROWS);
+        // 8 blocks of 4 columns fill the cache, which one request may not
+        let cache = BlockCache::new(8 * 4 * BLOCK_ROWS as u64 * 8);
+        cache
+            .warm(&idx, &(0..8).collect::<Vec<_>>(), ALL_COLS, &|| Ok(()))
+            .unwrap();
+        assert_eq!(cache.misses(), 0);
+        // while a request of 16 columns in a cache of 128 columns is admitted
+        let cache = BlockCache::new(8 * 16 * BLOCK_ROWS as u64 * 8);
+        cache
+            .warm(&idx, &[0, 1, 2, 3], ALL_COLS, &|| Ok(()))
+            .unwrap();
+        assert_eq!(cache.misses(), 16);
+    }
+
+    #[test]
+    fn warm_checks_after_the_final_decode_and_preserves_advisory_errors() {
+        let (_dir, mut idx) = warm_fixture(4 * BLOCK_ROWS);
+        let cache = BlockCache::new(64 << 20);
+        let result = cache.warm(&idx, &[0, 1, 2, 3], ALL_COLS, &|| {
+            if cache.misses() == 16 {
+                Err(Error::Cancelled)
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(cache.misses(), 16);
+        assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
+        // Missing mapped data takes the real decoder's Corrupt path. Optional warmup
+        // still defers it to consumption rather than turning unused advice into failure.
+        idx.data = None;
+        let cache = BlockCache::new(64 << 20);
+        cache
+            .warm(&idx, &[0, 1, 2, 3], ALL_COLS, &|| Ok(()))
+            .unwrap();
+        assert_eq!(cache.misses(), 16);
+        assert!(matches!(cache.get(&idx, 0), Err(Error::Corrupt(_))));
+    }
+
+    #[test]
+    fn warm_budget_is_selective_and_deduplicates_missing_columns() {
+        let (_dir, idx) = warm_fixture(8 * BLOCK_ROWS);
+        let mask = (1 << 1) | (1 << 3);
+        let cache = BlockCache::new(64 << 20);
+        cache
+            .warm(&idx, &(0..8).collect::<Vec<_>>(), mask, &|| Ok(()))
+            .unwrap();
+        assert_eq!(cache.misses(), 16);
+        for b in 0..8 {
+            assert!(cache.has_cols(&idx, b, mask));
+            assert!(!cache.has_cols(&idx, b, 1));
+            let got = cache.get_cols(&idx, b, mask).unwrap();
+            for c in [1, 3] {
+                assert_eq!(got.cols[c], idx.decode_col(b, c).unwrap());
+            }
+        }
+        // a request may add an eighth of the cache
+        let cache = BlockCache::new(4 * BLOCK_ROWS as u64 * 8 * 4 * 8);
+        let duplicates = (0..4).cycle().take(64).collect::<Vec<_>>();
+        cache.warm(&idx, &duplicates, ALL_COLS, &|| Ok(())).unwrap();
+        assert_eq!(
+            cache.misses(),
+            16,
+            "budget and work count distinct missing keys"
+        );
+    }
+
+    #[test]
+    fn warm_budget_counts_partial_tails_and_only_missing_bytes() {
+        let (_dir, idx) = warm_fixture(4 * BLOCK_ROWS + 17);
+        let full = 4 * BLOCK_ROWS as u64 * 8 * 4;
+        let cache = BlockCache::new((full + 17 * 8 * 4) * 8);
+        cache
+            .warm(&idx, &[0, 1, 2, 3, 4], ALL_COLS, &|| Ok(()))
+            .unwrap();
+        assert_eq!(
+            cache.misses(),
+            20,
+            "partial tail fits the exact decoded byte budget"
+        );
+        let (_dir, idx) = warm_fixture(12 * BLOCK_ROWS);
+        let mask = 3;
+        let cache = BlockCache::new(16 * BLOCK_ROWS as u64 * 8 * 8);
+        for b in 0..4 {
+            cache.get_cols(&idx, b, mask).unwrap();
+        }
+        assert_eq!(cache.misses(), 8);
+        cache
+            .warm(&idx, &(0..12).collect::<Vec<_>>(), mask, &|| Ok(()))
+            .unwrap();
+        assert_eq!(
+            cache.misses(),
+            24,
+            "cached columns consume no new warm budget"
+        );
+    }
+
+    #[test]
+    fn warm_tiny_read_through_and_disqualified_work_stay_bounded() {
+        let (_dir, idx) = warm_fixture(4 * BLOCK_ROWS);
+        for bytes in [0, 1, 64 << 10] {
+            let cache = BlockCache::new(bytes);
+            cache
+                .warm(&idx, &[0, 1, 2, 3], ALL_COLS, &|| Ok(()))
+                .unwrap();
+            assert_eq!(cache.misses(), 0);
+            let block = cache.get(&idx, 0).unwrap();
+            assert_eq!(block.key(10), [10, 3, 10, 0]);
+        }
+        let cache = BlockCache::new(64 << 20).read_through();
+        cache
+            .warm(&idx, &[0, 1, 2, 3], ALL_COLS, &|| Ok(()))
+            .unwrap();
+        assert_eq!(cache.misses(), 0);
+        assert_eq!(cache.get(&idx, 0).unwrap().key(10), [10, 3, 10, 0]);
+        assert_eq!(cache.entries(), 0);
+        let cache = BlockCache::new(1);
+        let mut work = cache.warm_columns(&idx);
+        for b in (0..4).cycle().take(1024) {
+            work.add(b, ALL_COLS);
+        }
+        assert!(!work.eligible);
+        assert!(work.work.is_empty() && work.seen.is_empty());
+        assert_eq!(work.bytes, 0);
+        assert_eq!(work.work.capacity(), 0);
+        work.finish(&|| Ok(())).unwrap();
+        assert_eq!(cache.misses(), 0);
+    }
+
+    #[test]
+    fn advice_union_requires_complete_spans() {
+        for (spans, expected) in [
+            (vec![], false),
+            (vec![(10, 10)], false),
+            (vec![(10, 11)], false),
+            (vec![(19, 20)], false),
+            (vec![(0, 12), (13, 30)], false),
+            (vec![(10, 20)], true),
+            (vec![(0, 30)], true),
+            (vec![(15, 20), (10, 15)], true),
+            (vec![(16, 20), (10, 16), (10, 16), (12, 18)], true),
+            (vec![(0, 5), (20, 30)], false),
+        ] {
+            assert_eq!(advice_covers_span(&spans, (10, 20)), expected, "{spans:?}");
+        }
+        assert!(advice_covers_span(&[], (10, 10)));
+    }
+
+    #[test]
+    fn read_ahead_sorted_coverage_lookup_edges() {
+        let mut ahead = ReadAhead::default();
+        assert!(!ahead.covers(10, 20));
+        ahead.covered.extend([(10, 20), (30, 40), (50, 60)]);
+        for (from, to, expected) in [
+            (0, 5, false),
+            (20, 30, false),
+            (25, 35, false),
+            (10, 20, true),
+            (12, 18, true),
+            (30, 40, true),
+            (12, 21, false),
+            (30, 41, false),
+            (55, 60, true),
+            (60, 61, false),
+            (65, 70, false),
+        ] {
+            assert_eq!(ahead.covers(from, to), expected, "[{from}, {to})");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_ahead_sorted_coverage_lookup_has_bounded_work() {
+        let (_dir, idx) = read_ahead_fixture(128);
+        let cache = BlockCache::new(64 << 20);
+        for b in (0..idx.blocks.len()).step_by(2) {
+            cache.get_cols(&idx, b, 1).unwrap();
+        }
+        for pair in idx.blocks.windows(2) {
+            let gap = pair[1].offset - pair[0].offset - u64::from(pair[0].col_len[0]);
+            assert!(gap > 64 << 10, "selective spans must remain separate");
+        }
+        let before = cache.misses();
+        let trace = idx.trace_hints();
+        let mut ahead = ReadAhead::default();
+        let mut rows = 0;
+        for b in 0..idx.blocks.len() {
+            let hint = ahead.before(&idx, &cache, b, idx.blocks.len(), &|_| 1);
+            if b == 0 && io_hints() && read_window() != 0 {
+                assert_eq!(ahead.requested, 128);
+                assert_eq!(ahead.covered.len(), 64, "many actual future intervals");
+                assert_eq!(trace.spans().len(), 64);
+            }
+            let block = cache.get_cols_hinted(&idx, b, 1, hint).unwrap();
+            for &value in block.cols[0].iter() {
+                assert_eq!(value, rows);
+                rows += 1;
+            }
+        }
+        assert_eq!(rows, 128 * BLOCK_ROWS as u64);
+        assert_eq!(cache.misses() - before, 64);
+        let inspections = ahead.lookup_inspections;
+        eprintln!("128 real blocks, 64 cached skips, actual containment comparisons={inspections}");
+        assert!(
+            inspections <= 4 * idx.blocks.len(),
+            "coverage lookup exceeds linear pass bound"
+        );
+        if !io_hints() || read_window() == 0 {
+            assert_eq!(inspections, 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_ahead_evicted_skipped_column_gets_fallback_advice() {
+        let (_dir, idx) = read_ahead_fixture(6);
+        let cache = BlockCache::new(64 << 20);
+        cache.get_cols(&idx, 1, 2).unwrap();
+        let before = cache.misses();
+        let trace = idx.trace_hints();
+        let target_start = idx.blocks[1].offset as usize + idx.blocks[1].col_len[0] as usize;
+        let target = (
+            target_start,
+            target_start + idx.blocks[1].col_len[1] as usize,
+        );
+        assert!(target.1 - target.0 > 128 << 10);
+        assert!(target.1 - target.0 > advice_page_size());
+        assert!(idx.blocks[0].col_len[2] > 64 << 10);
+        assert!(idx.blocks[1].col_len[2] > 64 << 10);
+        let expected = read_ahead_reference(6 * BLOCK_ROWS);
+        let mut n = 0;
+        let mut previously_hinted = false;
+        idx.for_each_key_range_cols(&cache, &[0; 4], &[u64::MAX; 4], 2, |block, start, end| {
+            if n == 0 {
+                previously_hinted = trace
+                    .spans()
+                    .iter()
+                    .any(|&(a, z)| a < target.1 && z > target.0);
+                cache.evict_column(&idx, 1, 1);
+            }
+            for row in start..end {
+                assert_eq!(block.cols[1][row], expected[n as usize]);
+                n += 1;
+            }
+            Ok(true)
+        })
+        .unwrap();
+        assert!(
+            !previously_hinted,
+            "fixture must not coalesce across the skipped block"
+        );
+        assert_eq!(n, 6 * BLOCK_ROWS as u64);
+        assert_eq!(
+            cache.misses() - before,
+            6,
+            "evicted column must miss during consumption"
+        );
+        let spans = trace.spans();
+        eprintln!(
+            "eager target={target:?}, page={}, misses={}, rows={n}, target advice={:?}",
+            advice_page_size(),
+            cache.misses() - before,
+            spans
+                .iter()
+                .filter(|&&(a, z)| a < target.1 && z > target.0)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            spans.iter().any(|&(a, z)| a < target.1 && z > target.0),
+            io_hints(),
+            "an evicted column needs fallback advice when hints are enabled"
+        );
+        assert_eq!(
+            advice_covers_span(&spans, target),
+            io_hints(),
+            "complete evicted column needs advice"
+        );
+        if !io_hints() {
+            assert!(spans.is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_ahead_actual_outstanding_bytes_obey_the_window() {
+        let (_dir, idx) = read_ahead_fixture(128);
+        for mask in [2, 5] {
+            let cache = BlockCache::new(1);
+            let trace = idx.trace_hints();
+            let mut ahead = ReadAhead::default();
+            let mut max_outstanding = 0;
+            let limit = read_window();
+            let enabled = limit > 0 && io_hints();
+            let mut violations = Vec::new();
+            for b in 0..idx.blocks.len() {
+                ahead.before(&idx, &cache, b, idx.blocks.len(), &|_| mask);
+                if enabled {
+                    assert!(
+                        ahead.requested > b,
+                        "every positive window must progress even for an oversized block"
+                    );
+                } else {
+                    assert_eq!((ahead.requested, ahead.window), (0, 0));
+                    assert!(trace.spans().is_empty());
+                }
+                assert!(
+                    ahead
+                        .covered
+                        .front()
+                        .is_none_or(|&(a, _)| a >= idx.blocks[b].offset as usize)
+                );
+                let once = trace.spans().len();
+                ahead.before(&idx, &cache, b, idx.blocks.len(), &|_| mask);
+                assert_eq!(
+                    trace.spans().len(),
+                    once,
+                    "same position must not refill twice"
+                );
+                // Independent oracle from actual advice and on-disk block metadata, not
+                // ReadAhead's counters. Merge the requested byte union beyond this block.
+                let at = idx.blocks[b].offset as usize
+                    + idx.blocks[b]
+                        .col_len
+                        .iter()
+                        .map(|&n| n as usize)
+                        .sum::<usize>();
+                let mut spans = trace
+                    .spans()
+                    .into_iter()
+                    .filter_map(|(a, z)| (z > at).then_some((a.max(at), z)))
+                    .collect::<Vec<_>>();
+                spans.sort_unstable();
+                let mut merged: Vec<(usize, usize)> = Vec::new();
+                for (a, z) in spans {
+                    if let Some(last) = merged.last_mut()
+                        && a <= last.1
+                    {
+                        last.1 = last.1.max(z);
+                    } else {
+                        merged.push((a, z));
+                    }
+                }
+                let total = merged.iter().map(|&(a, z)| z - a).sum::<usize>();
+                max_outstanding = max_outstanding.max(total);
+                // One next block's requested compressed column span and its possible
+                // 64KiB gap is the extension. Do not allow unrelated columns to inflate
+                // this oracle's allowance for a selective mask.
+                let extension = idx
+                    .blocks
+                    .iter()
+                    .map(|m| {
+                        let first = mask.trailing_zeros() as usize;
+                        let last = (u8::BITS - 1 - mask.leading_zeros()) as usize;
+                        m.col_len[first..=last]
+                            .iter()
+                            .map(|&n| n as usize)
+                            .sum::<usize>()
+                    })
+                    .max()
+                    .unwrap()
+                    + (64 << 10);
+                if total > limit + extension {
+                    violations.push((b, total, limit, extension));
+                }
+            }
+            eprintln!(
+                "limit={limit}, max actual outstanding={max_outstanding}, violations={violations:?}"
+            );
+            assert!(
+                violations.is_empty(),
+                "outstanding advice exceeds target plus one block extension"
+            );
+        }
+    }
+
+    #[test]
+    fn a_warm_pass_does_no_read_ahead_bookkeeping() {
+        let (_dir, idx) = read_ahead_fixture(8);
+        let cache = BlockCache::new(64 << 20);
+        let (lo, hi) = ([0; 4], [u64::MAX; 4]);
+        let mut rows = 0;
+        let pass = |rows: &mut usize| {
+            idx.for_each_key_range_cols(&cache, &lo, &hi, 0b11, |b, s, e| {
+                *rows += e - s;
+                assert_eq!(b.cols[0].len(), b.len());
+                Ok(true)
+            })
+            .unwrap();
+        };
+        pass(&mut rows);
+        let calls = READ_AHEAD_CALLS.with(|n| n.get());
+        assert!(
+            calls >= 8,
+            "the cold pass asks the read-ahead for each block"
+        );
+        let misses = cache.misses();
+        pass(&mut rows);
+        assert_eq!(rows, 2 * 8 * BLOCK_ROWS);
+        assert_eq!(
+            READ_AHEAD_CALLS.with(|n| n.get()),
+            calls,
+            "the warm pass consulted the read-ahead"
+        );
+        assert_eq!(cache.misses(), misses);
+    }
+
+    /// The cold end block of a count is asked for even when the other end is cached.
+    #[test]
+    fn count_between_hints_a_cold_end_when_the_other_is_warm() {
+        if !io_hints() {
+            return;
+        }
+        let (_dir, idx) = read_ahead_fixture(8);
+        let cache = BlockCache::new(64 << 20);
+        let (lo, hi) = (
+            [BLOCK_ROWS as u64 / 2, 0, 0, 0],
+            [6 * BLOCK_ROWS as u64 + 5, u64::MAX, u64::MAX, u64::MAX],
+        );
+        let bounds = bound_cols(&lo, &hi);
+        cache.get_cols(&idx, 0, bounds).unwrap();
+        assert!(!cache.has_cols(&idx, 6, bounds));
+        let m = &idx.blocks[6];
+        let end = m.offset as usize + m.col_len.iter().map(|&l| l as usize).sum::<usize>();
+        let trace = idx.trace_hints();
+        idx.count_between(&cache, &lo, &hi).unwrap();
+        let inside = |s: &&(usize, usize)| s.0 >= m.offset as usize && s.1 <= end;
+        let asked = trace.spans();
+        let asked = asked.iter().filter(inside).count();
+        // one request from the prefetch, one from the decode of the block
+        assert!(asked >= 2, "{asked} requests for the cold end block");
+    }
+
+    #[test]
+    fn prefetch_reports_whether_the_cache_lacks_a_column() {
+        let (_dir, idx) = read_ahead_fixture(2);
+        let cache = BlockCache::new(64 << 20);
+        assert!(idx.prefetch(&cache, 0, ALL_COLS));
+        cache.get_cols(&idx, 0, ALL_COLS).unwrap();
+        assert!(!idx.prefetch(&cache, 0, ALL_COLS));
+        assert!(idx.prefetch(&cache, 1, ALL_COLS));
+        assert!(!idx.prefetch(&cache, 1, 0));
+        // a partly cached block still lacks a column
+        cache.get_cols(&idx, 1, 0b1).unwrap();
+        assert!(!idx.prefetch(&cache, 1, 0b1));
+        assert!(idx.prefetch(&cache, 1, 0b11));
+    }
+
+    #[test]
+    fn get_cols_cached_counts_hits_only_for_a_complete_block() {
+        let (_dir, idx) = read_ahead_fixture(1);
+        let cache = BlockCache::new(64 << 20);
+        cache.get_cols(&idx, 0, 0b1).unwrap();
+        let (hits, misses) = (cache.hits(), cache.misses());
+        assert!(cache.get_cols_cached(&idx, 0, 0b11).is_none());
+        assert_eq!((cache.hits(), cache.misses()), (hits, misses));
+        let block = cache.get_cols_cached(&idx, 0, 0b1).unwrap();
+        assert_eq!(block.cols[0].len(), block.len());
+        assert_eq!((cache.hits(), cache.misses()), (hits + 1, misses));
+    }
+
+    #[test]
+    fn read_ahead_cached_and_empty_masks_make_bounded_progress() {
+        let (_dir, idx) = read_ahead_fixture(8);
+        let enabled = io_hints() && read_window() > 0;
+        let cache = BlockCache::new(64 << 20);
+        for b in 0..8 {
+            cache.get_cols(&idx, b, 1).unwrap();
+        }
+        let trace = idx.trace_hints();
+        let mut cached = ReadAhead {
+            window: 1,
+            ..Default::default()
+        };
+        for b in 0..8 {
+            let hint = cached.before(&idx, &cache, b, 8, &|_| 1);
+            assert!(hint, "cache presence is not hint coverage");
+            assert!(if enabled {
+                cached.requested > b
+            } else {
+                cached.requested == 0
+            });
+            assert!(cached.covered.is_empty());
+            cache.get_cols_hinted(&idx, b, 1, hint).unwrap();
+        }
+        assert_eq!(cached.requested, if enabled { 8 } else { 0 });
+        assert!(trace.spans().is_empty(), "cache hits need no fallback I/O");
+        let mut empty = ReadAhead {
+            window: 1,
+            ..Default::default()
+        };
+        empty.before(&idx, &cache, 0, 8, &|_| 0);
+        assert_eq!(
+            empty.requested,
+            if enabled { 2 } else { 0 },
+            "zero spans must consume traversal budget"
+        );
+        let first = empty.requested;
+        empty.before(&idx, &cache, 0, 8, &|_| 0);
+        assert_eq!(empty.requested, first);
+        for b in 1..8 {
+            empty.before(&idx, &cache, b, 8, &|_| 0);
+        }
+        assert_eq!(empty.requested, if enabled { 8 } else { 0 });
+        assert!(empty.covered.is_empty() && trace.spans().is_empty());
+        let mut mixed = ReadAhead {
+            window: 1,
+            ..Default::default()
+        };
+        for b in 0..8 {
+            mixed.before(&idx, &cache, b, 8, &|next| {
+                if next % 3 == 0 { 0 } else { 1 }
+            });
+            assert!(if enabled {
+                mixed.requested > b
+            } else {
+                mixed.requested == 0
+            });
+        }
+        assert_eq!(
+            mixed.requested,
+            if enabled { 8 } else { 0 },
+            "zero-mask gaps cannot stall a cached pass"
+        );
+        assert!(mixed.covered.is_empty() && trace.spans().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_ahead_charges_coalesced_gaps_and_prunes_consumed_coverage() {
+        let (_dir, idx) = warm_fixture(64 * BLOCK_ROWS);
+        let cache = BlockCache::new(1);
+        let trace = idx.trace_hints();
+        let mut ahead = ReadAhead::default();
+        // Only the first column is needed. The actual advised range bridges all
+        // small intervening columns and gaps, so selected-column lengths alone lie.
+        ahead.before(&idx, &cache, 0, 64, &|_| 1);
+        let spans = trace.spans();
+        let selected = (0..ahead.requested)
+            .map(|b| idx.blocks[b].col_len[0] as usize)
+            .sum::<usize>();
+        let actual = spans.iter().map(|&(a, z)| z - a).sum::<usize>();
+        if io_hints() && read_window() > 0 {
+            assert!(actual > selected);
+        } else {
+            assert_eq!(actual, 0);
+            assert_eq!(ahead.requested, 0);
+        }
+        assert_eq!(
+            actual,
+            ahead.covered.iter().map(|&(a, z)| z - a).sum::<usize>()
+        );
+        let once = spans.len();
+        ahead.before(&idx, &cache, 0, 64, &|_| 1);
+        assert_eq!(
+            trace.spans().len(),
+            once,
+            "early stop requests nothing else"
+        );
+        for b in 1..64 {
+            ahead.before(&idx, &cache, b, 64, &|_| if b % 3 == 0 { 0 } else { 1 });
+            let at = idx.blocks[b].offset as usize;
+            assert!(ahead.covered.front().is_none_or(|&(a, _)| a >= at));
+        }
+        assert!(
+            ahead.covered.len() <= 1,
+            "consumed history must not accumulate"
+        );
     }
 
     #[test]

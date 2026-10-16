@@ -1063,6 +1063,9 @@ pub(super) fn schemas() -> Map<String, J> {
                         "rowsProduced": { "type": "integer" },
                         "commit": { "type": "integer" },
                         "datasetId": { "type": "string" },
+                        "io": { "type": "object", "properties": {
+                            "pagesTruncated": { "type": "boolean", "description": "True when the shared profiling epoch omitted pages because of its 65,536-entry inventory or range cap. False records no cap omission and does not promise complete coverage. Process counter snapshots omit this field." }
+                        }, "additionalProperties": true, "description": "Reads of the index and vocabulary files; present when the request has `profile=io`. Page fields describe the first-admitted best-effort sample shared by overlapping profiles. Touched and resident counts are additive lower bounds; broughtIn is the nonnegative sample resident-count delta, not a lower bound on the full-set delta or physical I/O. Numeric observations cover actual mapped value, kind and rank loads independently of advice; resident head copies add no mapped observations." },
                     },
                 },
             },

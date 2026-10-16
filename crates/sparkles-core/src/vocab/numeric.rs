@@ -333,15 +333,38 @@ impl NumColumn {
     }
 
     #[inline]
+    fn touch_mapped(&self, at: usize, len: usize) {
+        if crate::ioacct::profiling()
+            && let Bytes::Map(map) = &self.bytes
+        {
+            crate::ioacct::touch(crate::ioacct::IoFile::VocabNum, map.as_ptr(), at, len);
+        }
+    }
+
+    #[inline]
     fn kind_word(&self, w: usize) -> u64 {
-        word(self.head(), HEADER + w * 8)
+        let at = HEADER + w * 8;
+        if self.head.is_none() {
+            self.touch_mapped(at, 8);
+        }
+        word(self.head(), at)
     }
 
     #[inline]
     fn rank_at(&self, g: usize) -> u64 {
-        let b = self.head();
         let at = self.rank + g * 4;
+        if self.head.is_none() {
+            self.touch_mapped(at, 4);
+        }
+        let b = self.head();
         u32::from_le_bytes(b[at..at + 4].try_into().unwrap()) as u64
+    }
+
+    #[inline]
+    fn value_word(&self, b: &[u8], r: u64) -> u64 {
+        let at = self.values + r as usize * 8;
+        self.touch_mapped(at, 8);
+        word(b, at)
     }
 
     /// The kind of base id `id` and, for a valued kind, the index of its value.
@@ -372,7 +395,7 @@ impl NumColumn {
         match self.locate(id) {
             (NOT_NUMERIC, _) => Numeric::NotNumeric,
             (k, r) if k & 8 != 0 && r < self.count => {
-                Numeric::of(k, word(self.bytes.as_slice(), self.values + r as usize * 8))
+                Numeric::of(k, self.value_word(self.bytes.as_slice(), r))
             }
             _ => Numeric::Unknown,
         }
@@ -383,7 +406,7 @@ impl NumColumn {
     /// [`crate::index::io_hints`]). Nearby chunks are asked for in one request. A warm
     /// pass makes no system call, and a cold one finds its pages read by a few large
     /// requests rather than one fault per page.
-    fn advise(&self, ranges: impl Iterator<Item = (usize, usize)>) {
+    fn advise(&self, ranges: impl Iterator<Item = (usize, usize)>) -> bool {
         let len = self.bytes.as_slice().len();
         let mut fresh = Vec::new();
         for (s, e) in ranges {
@@ -397,8 +420,9 @@ impl NumColumn {
             }
         }
         let (Some(&first), Some(&last)) = (fresh.first(), fresh.last()) else {
-            return;
+            return false;
         };
+        crate::ioacct::numeric_pages(fresh.len() as u64);
         // When the chunks cover a good part of their span, one request for the whole
         // span reads faster than many small ones, at the cost of the gaps between them.
         let gap = if fresh.len() * DENSE >= last + 1 - first {
@@ -411,19 +435,63 @@ impl NumColumn {
             if c >= cur.0 && c <= cur.1.saturating_add(gap) {
                 cur.1 = cur.1.max(c + 1);
             } else {
-                self.bytes
-                    .will_need(cur.0 * HINT_CHUNK, (cur.1 * HINT_CHUNK).min(len));
+                self.bytes.will_need(
+                    crate::ioacct::IoFile::VocabNum,
+                    cur.0 * HINT_CHUNK,
+                    (cur.1 * HINT_CHUNK).min(len),
+                );
                 cur = (c, c + 1);
             }
         }
-        self.bytes
-            .will_need(cur.0 * HINT_CHUNK, (cur.1 * HINT_CHUNK).min(len));
+        self.bytes.will_need(
+            crate::ioacct::IoFile::VocabNum,
+            cur.0 * HINT_CHUNK,
+            (cur.1 * HINT_CHUNK).min(len),
+        );
+        true
+    }
+
+    /// Ask for the pages that [`NumColumn::get_many`] would read for `ids` (best sorted
+    /// ascending), without reading the values or building a result. A column whose head is
+    /// mapped gets the pages of the kinds and the rank first, and every column gets the
+    /// pages of the values. Each page is asked for once in the life of the mapping, so a
+    /// warm request makes no system call. It locates each id, which costs a memory read
+    /// when the head is resident.
+    pub fn advise_ids(&self, ids: &[u64]) {
+        if !crate::index::io_hints() || ids.len() < 2 {
+            return;
+        }
+        if self.head.is_none() {
+            let inside = || ids.iter().filter_map(|&id| self.position(id));
+            self.advise(inside().map(|id| {
+                let first = (id / RANK_IDS) * RANK_IDS / 16;
+                (
+                    HEADER + first as usize * 8,
+                    HEADER + (id / 16 + 1) as usize * 8,
+                )
+            }));
+            self.advise(inside().map(|id| {
+                let at = self.rank + (id / RANK_IDS) as usize * 4;
+                (at, at + 4)
+            }));
+        }
+        self.advise(
+            ids.iter()
+                .map(|&id| self.locate(id))
+                .filter(|&(k, r)| k & 8 != 0 && r < self.count)
+                .map(|(_, r)| {
+                    let at = self.values + r as usize * 8;
+                    (at, at + 8)
+                }),
+        );
     }
 
     /// What the column says about each of `ids` (best sorted ascending), reading a cold
     /// column in large requests: first the kinds and rank entries of the ids, unless
     /// they are in memory, then the values they point to.
     pub fn get_many(&self, ids: &[u64]) -> Vec<Numeric> {
+        #[cfg(test)]
+        GET_MANY_CALLS.with(|n| n.set(n.get() + 1));
         let hints = crate::index::io_hints() && ids.len() > 1;
         if hints && self.head.is_none() {
             let inside = || ids.iter().filter_map(|&id| self.position(id));
@@ -456,13 +524,17 @@ impl NumColumn {
             .into_iter()
             .map(|(k, r)| match k {
                 NOT_NUMERIC => Numeric::NotNumeric,
-                k if k & 8 != 0 && r < self.count => {
-                    Numeric::of(k, word(b, self.values + r as usize * 8))
-                }
+                k if k & 8 != 0 && r < self.count => Numeric::of(k, self.value_word(b, r)),
                 _ => Numeric::Unknown,
             })
             .collect()
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`NumColumn::get_many`] calls on this thread (for tests of what a query reads)
+    pub(crate) static GET_MANY_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Builds `vocab.num` while a vocabulary is written, one key at a time in id order.
@@ -652,6 +724,471 @@ pub(crate) mod tests {
     use crate::id::{inline_id, term_key};
     use crate::vocab::{Vocab, VocabWriter};
     use oxrdf::{Literal, NamedNode, Term};
+
+    #[cfg(unix)]
+    const PROFILE_NUMBERS: u64 = 32781;
+
+    #[cfg(unix)]
+    fn numeric_profile_child(name: &str) -> bool {
+        if std::env::var_os("SPARKLES_NUMERIC_PROFILE_CHILD").is_some() {
+            return false;
+        }
+        let modes: &[&str] = if matches!(
+            name,
+            "profile_observes_single_numeric_reads" | "profile_observes_bulk_numeric_reads"
+        ) {
+            &["off", "on", "pre-hint"]
+        } else {
+            &["off"]
+        };
+        for &mode in modes {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    &format!("vocab::numeric::tests::{name}"),
+                    "--nocapture",
+                ])
+                .env("SPARKLES_NUMERIC_PROFILE_CHILD", "1")
+                .env("SPARKLES_NUMERIC_PROFILE_MODE", mode)
+                .env(
+                    "SPARKLES_IO_HINTS",
+                    if mode == "off" { "off" } else { "on" },
+                )
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{mode}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        true
+    }
+
+    #[cfg(unix)]
+    fn numeric_profile_fixture() -> (tempfile::TempDir, NumColumn) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = NumWriter::create(dir.path()).unwrap();
+        for i in 0..PROFILE_NUMBERS {
+            writer
+                .push(&term_key(
+                    &Literal::new_typed_literal(format!("{i:08}"), oxrdf::vocab::xsd::INT).into(),
+                ))
+                .unwrap();
+        }
+        assert_eq!(
+            writer.finish(dir.path(), PROFILE_NUMBERS).unwrap(),
+            PROFILE_NUMBERS
+        );
+        let num = NumColumn::open(dir.path(), PROFILE_NUMBERS, PROFILE_NUMBERS).unwrap();
+        assert!(matches!(num.bytes, Bytes::Map(_)));
+        assert!(num.head.is_some());
+        (dir, num)
+    }
+
+    #[cfg(unix)]
+    fn numeric_expected_page(at: usize, len: usize) -> std::collections::BTreeSet<usize> {
+        // Independent SPKVNUM2 byte layout and system page size, not locate().
+        // SAFETY: sysconf has no pointer arguments or other preconditions.
+        let ps = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
+        (at / ps..(at + len).div_ceil(ps)).collect()
+    }
+
+    #[cfg(unix)]
+    fn numeric_value_offset(id: u64) -> usize {
+        let kinds = PROFILE_NUMBERS.div_ceil(16) as usize * 8;
+        let ranks = (PROFILE_NUMBERS.div_ceil(128) as usize * 4).next_multiple_of(8);
+        48 + kinds + ranks + id as usize * 8
+    }
+
+    #[cfg(unix)]
+    fn assert_numeric_pages(
+        num: &NumColumn,
+        report: &crate::ioacct::IoReport,
+        expected: &std::collections::BTreeSet<usize>,
+    ) {
+        let touched = report
+            .pages
+            .as_ref()
+            .and_then(|p| p.get("vocab.num"))
+            .map_or(0, |p| p.touched);
+        let Bytes::Map(map) = &num.bytes else {
+            panic!("owned mapped fixture")
+        };
+        let actual: std::collections::BTreeSet<_> =
+            crate::ioacct::sampled_page_indices(crate::ioacct::IoFile::VocabNum, map.as_ptr())
+                .into_iter()
+                .collect();
+        eprintln!("actual numeric page indices={actual:?}, expected={expected:?}; {report:?}");
+        assert_eq!(
+            touched,
+            expected.len() as u64,
+            "actual mapped numeric reads must be observed"
+        );
+        assert_eq!(&actual, expected, "independent full page-set oracle");
+    }
+
+    /// A request for the pages of some values marks their chunks once, with the column's
+    /// head in memory as well as mapped, and a repeat asks for nothing (review N1).
+    #[cfg(unix)]
+    #[test]
+    fn advise_ids_hints_value_pages_once() {
+        if !crate::index::io_hints() {
+            return;
+        }
+        let bits =
+            |n: &NumColumn| -> Vec<u64> { n.hinted.iter().map(|b| b.load(Relaxed)).collect() };
+        for resident in [true, false] {
+            let (_dir, mut num) = numeric_profile_fixture();
+            if !resident {
+                num.head = None;
+            }
+            let ids = [100, 9_000, 16_001, 30_000];
+            let before = bits(&num);
+            num.advise_ids(&ids);
+            let first = bits(&num);
+            assert_ne!(first, before, "resident head: {resident}");
+            // the value of the last id lies in a chunk that no other read marks
+            let at = num.values + num.locate(30_000).1 as usize * 8;
+            let chunk = at / HINT_CHUNK;
+            assert!(first[chunk / 64] & (1 << (chunk % 64)) != 0, "value chunk");
+            num.advise_ids(&ids);
+            assert_eq!(bits(&num), first, "a repeat marks nothing");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_observes_single_numeric_reads() {
+        if numeric_profile_child("profile_observes_single_numeric_reads") {
+            return;
+        }
+        let (_dir, num) = numeric_profile_fixture();
+        let id = 16001;
+        let mode = std::env::var("SPARKLES_NUMERIC_PROFILE_MODE").unwrap_or_else(|_| "off".into());
+        if mode == "pre-hint" {
+            assert_eq!(
+                num.get_many(&[id, id + 1]),
+                [Numeric::Integer(id as i64), Numeric::Integer(id as i64 + 1)]
+            );
+        }
+        let bits: Vec<_> = num.hinted.iter().map(|n| n.load(Relaxed)).collect();
+        let profile = crate::ioacct::Profile::start();
+        assert_eq!(num.get(id), Numeric::Integer(id as i64));
+        let report = profile.report();
+        assert_eq!(report.numeric_pages_requested, 0, "touching is not advice");
+        assert_eq!(
+            num.hinted
+                .iter()
+                .map(|n| n.load(Relaxed))
+                .collect::<Vec<_>>(),
+            bits
+        );
+        assert_numeric_pages(
+            &num,
+            &report,
+            &numeric_expected_page(numeric_value_offset(id), 8),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_observes_bulk_numeric_reads() {
+        if numeric_profile_child("profile_observes_bulk_numeric_reads") {
+            return;
+        }
+        let (_dir, num) = numeric_profile_fixture();
+        let ids = [16001, 16002, 16001];
+        let expected = [
+            Numeric::Integer(16001),
+            Numeric::Integer(16002),
+            Numeric::Integer(16001),
+        ];
+        let mode = std::env::var("SPARKLES_NUMERIC_PROFILE_MODE").unwrap_or_else(|_| "off".into());
+        if mode == "pre-hint" {
+            assert_eq!(num.get_many(&ids), expected);
+        }
+        let bits: Vec<_> = num.hinted.iter().map(|n| n.load(Relaxed)).collect();
+        let profile = crate::ioacct::Profile::start();
+        assert_eq!(num.get_many(&ids), expected);
+        let report = profile.report();
+        if mode != "on" {
+            assert_eq!(report.numeric_pages_requested, 0);
+            assert_eq!(
+                num.hinted
+                    .iter()
+                    .map(|n| n.load(Relaxed))
+                    .collect::<Vec<_>>(),
+                bits
+            );
+        } else {
+            assert_eq!(report.numeric_pages_requested, 1);
+        }
+        let pages: std::collections::BTreeSet<_> = ids
+            .iter()
+            .flat_map(|&id| numeric_expected_page(numeric_value_offset(id), 8))
+            .collect();
+        assert_numeric_pages(&num, &report, &pages);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_observes_mapped_kind_words() {
+        if numeric_profile_child("profile_observes_mapped_kind_words") {
+            return;
+        }
+        let (_dir, mut num) = numeric_profile_fixture();
+        num.head = None;
+        let profile = crate::ioacct::Profile::start();
+        assert_eq!(num.kind_word(1000), 0x8888_8888_8888_8888);
+        assert_numeric_pages(
+            &num,
+            &profile.report(),
+            &numeric_expected_page(48 + 1000 * 8, 8),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_observes_mapped_rank_words() {
+        if numeric_profile_child("profile_observes_mapped_rank_words") {
+            return;
+        }
+        let (_dir, mut num) = numeric_profile_fixture();
+        num.head = None;
+        let profile = crate::ioacct::Profile::start();
+        assert_eq!(num.rank_at(125), 16000);
+        assert_numeric_pages(
+            &num,
+            &profile.report(),
+            &numeric_expected_page(48 + PROFILE_NUMBERS.div_ceil(16) as usize * 8 + 125 * 4, 4),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_numeric_boundaries_cover_resident_and_mapped_heads() {
+        if numeric_profile_child("profile_numeric_boundaries_cover_resident_and_mapped_heads") {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = NumWriter::create(dir.path()).unwrap();
+        for i in 0..PROFILE_NUMBERS {
+            writer
+                .push_kind(
+                    match i {
+                        16001 => UNKNOWN,
+                        16002 => NOT_NUMERIC,
+                        _ => INTEGER,
+                    },
+                    i,
+                )
+                .unwrap();
+        }
+        for _ in 0..GAP + 1 {
+            writer.push_kind(NOT_NUMERIC, 0).unwrap();
+        }
+        let tail = PROFILE_NUMBERS + GAP + 1;
+        writer.push_kind(INTEGER, 777).unwrap();
+        assert_eq!(
+            writer.finish(dir.path(), tail + 1).unwrap(),
+            PROFILE_NUMBERS - 1
+        );
+        let expected_value = |id| match id {
+            16001 => Numeric::Unknown,
+            16002 => Numeric::NotNumeric,
+            i if i < PROFILE_NUMBERS => Numeric::Integer(i as i64),
+            i if i == tail => Numeric::Integer(777),
+            _ => Numeric::NotNumeric,
+        };
+        // Derive load ranges from the fixture's documented two segments and SPKVNUM2
+        // layout, without calling locate(), kind_word(), rank_at() or layout().
+        let expected_pages = |ids: &[u64], mapped: bool| {
+            let positions = PROFILE_NUMBERS + 1;
+            let rank = 48 + positions.div_ceil(16) as usize * 8;
+            let values = rank + (positions.div_ceil(128) as usize * 4).next_multiple_of(8);
+            let mut pages = std::collections::BTreeSet::new();
+            for &id in ids {
+                let pos = if id < PROFILE_NUMBERS {
+                    id
+                } else if id == tail {
+                    PROFILE_NUMBERS
+                } else {
+                    continue;
+                };
+                if mapped {
+                    pages.extend(numeric_expected_page(48 + (pos / 16) as usize * 8, 8));
+                }
+                if matches!(id, 16001 | 16002) {
+                    continue;
+                }
+                if mapped {
+                    pages.extend(numeric_expected_page(rank + (pos / 128) as usize * 4, 4));
+                    let first_word = (pos / 128) * 8;
+                    for word in first_word..pos / 16 {
+                        pages.extend(numeric_expected_page(48 + word as usize * 8, 8));
+                    }
+                }
+                let value = pos - u64::from(pos > 16001) - u64::from(pos > 16002);
+                pages.extend(numeric_expected_page(values + value as usize * 8, 8));
+            }
+            pages
+        };
+        let cases: &[&[u64]] = &[
+            &[],
+            &[43],
+            &[43, 43],
+            &[PROFILE_NUMBERS - 1],
+            &[tail],
+            &[16001],
+            &[16002],
+            &[PROFILE_NUMBERS + 7],
+            &[u64::MAX],
+            &[16001, 16002, PROFILE_NUMBERS + 7, u64::MAX],
+            &[43, PROFILE_NUMBERS - 1, tail, 43],
+        ];
+        for mapped in [false, true] {
+            for &ids in cases {
+                for bulk in [false, true] {
+                    let mut num = NumColumn::open(dir.path(), tail + 1, tail + 1).unwrap();
+                    assert_eq!(num.segments(), 2);
+                    if mapped {
+                        num.head = None;
+                    }
+                    let profile = crate::ioacct::Profile::start();
+                    let actual = if bulk {
+                        num.get_many(ids)
+                    } else {
+                        ids.iter().map(|&id| num.get(id)).collect()
+                    };
+                    assert_eq!(
+                        actual,
+                        ids.iter().map(|&id| expected_value(id)).collect::<Vec<_>>()
+                    );
+                    let report = profile.report();
+                    assert_eq!(report.numeric_pages_requested, 0);
+                    assert_eq!(report.pages_truncated, Some(false));
+                    assert_numeric_pages(&num, &report, &expected_pages(ids, mapped));
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cold_numeric_value_is_observed_before_load() {
+        if numeric_profile_child("cold_numeric_value_is_observed_before_load") {
+            return;
+        }
+        use std::os::fd::AsRawFd;
+        let (dir, num) = numeric_profile_fixture();
+        let Bytes::Map(map) = &num.bytes else {
+            panic!("owned mapped fixture")
+        };
+        // SAFETY: sysconf has no pointer arguments or other preconditions.
+        let ps = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
+        let id = 16001;
+        let at = numeric_value_offset(id) / ps * ps;
+        assert!(at >= ps && at + ps < map.len());
+        let file = File::open(dir.path().join(FILE)).unwrap();
+        file.sync_all().unwrap();
+        // SAFETY: the live private mapping is immutable. These operations affect only
+        // its owned pages/PTEs, and never truncate or scan the mapped bytes.
+        unsafe {
+            assert_eq!(
+                libc::madvise(map.as_ptr().cast_mut().cast(), map.len(), libc::MADV_RANDOM),
+                0
+            );
+            assert_eq!(
+                libc::madvise(
+                    map.as_ptr().cast_mut().cast(),
+                    map.len(),
+                    libc::MADV_DONTNEED
+                ),
+                0
+            );
+            assert_eq!(
+                libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED),
+                0
+            );
+        }
+        let resident = || {
+            let mut state = 0u8;
+            // SAFETY: at is a page-aligned offset inside this live owned mapping;
+            // state supplies the one initialized output byte for one page.
+            assert_eq!(
+                unsafe { libc::mincore(map.as_ptr().add(at).cast_mut().cast(), ps, &mut state) },
+                0
+            );
+            state & 1
+        };
+        let before = resident();
+        eprintln!("independent numeric value page={at}, resident before={before}");
+        if before != 0 {
+            // some file systems keep the page after fadvise: the case proves nothing
+            eprintln!("skipped: the owned numeric page was not evicted");
+            return;
+        }
+        let profile = crate::ioacct::Profile::start();
+        assert_eq!(num.get(id), Numeric::Integer(id as i64));
+        let after = resident();
+        let report = profile.report();
+        eprintln!("independent numeric resident after={after}; {report:?}");
+        assert_eq!(after, 1);
+        assert_numeric_pages(
+            &num,
+            &report,
+            &numeric_expected_page(numeric_value_offset(id), 8),
+        );
+        let page = &report.pages.as_ref().unwrap()["vocab.num"];
+        assert_eq!(
+            (page.resident_before, page.resident_after, page.brought_in),
+            (0, 1, 1)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn numeric_filter_bind_profiles_reads_and_preserves_literal_identity() {
+        if numeric_profile_child(
+            "numeric_filter_bind_profiles_reads_and_preserves_literal_identity",
+        ) {
+            return;
+        }
+        use crate::sparql::{Optimizations, QueryOptions, query};
+        let store = crate::store::Store::in_memory(Default::default());
+        store.load(&[crate::io::Source::from_bytes(
+            b"<urn:a> <urn:p> \"0042\"^^<http://www.w3.org/2001/XMLSchema#int> .\n<urn:b> <urn:p> \"0007\"^^<http://www.w3.org/2001/XMLSchema#int> .\n".to_vec(), oxrdfio::RdfFormat::NTriples, None)]).unwrap();
+        let options = QueryOptions {
+            no_cache: true,
+            optimizations: Some(Optimizations::NONE),
+            ..Default::default()
+        };
+        let profile = crate::ioacct::Profile::start();
+        let result = query(
+            store.snapshot(),
+            "SELECT ?n ?twice WHERE { ?s <urn:p> ?n FILTER(?n > 40) BIND(?n + ?n AS ?twice) }",
+            &options,
+        )
+        .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result.rows()[0][0],
+            Some(Literal::new_typed_literal("0042", oxrdf::vocab::xsd::INT).into())
+        );
+        assert!(
+            matches!(result.ctx.value(result.table.cols[1][0]), Some(Value::Integer(n)) if i64::from(n) == 84)
+        );
+        let id = result.table.cols[0][0];
+        assert_eq!(id.tag(), crate::id::Tag::Vocab);
+        // A base numeric id takes the actual Ctx::column_value fast path, not key fallback.
+        assert!(matches!(result.ctx.value(id), Some(Value::Integer(n)) if i64::from(n) == 42));
+        let report = profile.report();
+        assert!(report.pages.as_ref().unwrap()["vocab.num"].touched > 0);
+        assert_eq!(report.numeric_pages_requested, 0);
+        assert_eq!(report.pages_truncated, Some(false));
+    }
 
     /// Equal values of equal types, NaN and the sign of zero included.
     fn same(a: &Value, b: &Value) -> bool {
