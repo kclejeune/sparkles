@@ -4837,12 +4837,18 @@ audio and video remain, and so do the follow-ups listed at the end of this secti
   headers claim, and a DOCTYPE is refused. A review of the first version found small
   files that asked for gigabytes anyway, such as a Word list level of 4e10, one shared
   string used by thousands of cells, a row repeated 1,000 times, or a table row whose
-  `gridSpan` pads every other row. One output budget, `Limits::max_output` (128 MiB by
-  default), now covers everything a conversion holds besides its input and XML trees,
-  which is the Markdown blocks and table slots, the sparse rows of a sheet and the CSV of
-  all sheets together. Every path that makes the output larger than the input charges the
-  budget before it allocates, and the conversion fails with `too-large` when the budget
-  is gone. The tradeoff is memory for safety. A conversion may hold up to 128 MiB of
+  `gridSpan` pads every other row. A second review found notes and text boxes whose
+  paragraphs were collected once for every level of nesting, and ODT notes inside notes
+  that took exponential time. One output budget, `Limits::max_output`, which is 128 MiB
+  by default, now covers everything a conversion holds besides its input and XML trees,
+  which is the Markdown blocks and table slots, the sparse rows of a sheet, the shared
+  strings, the text of notes and the CSV of all sheets together. The paths that can
+  multiply the size of the input charge the budget before they allocate. Those are
+  repeated and padded cells, table slots, shared strings and the spaces of `text:s`. Text
+  that is copied once from the input is bounded by the limits on the input, and each
+  paragraph of a note, a text box or a notes shape is read once however deeply its
+  elements nest. A note inside a note is left out. The conversion fails with `too-large`
+  when the budget is gone. The tradeoff is memory for safety. A conversion may hold up to 128 MiB of
   output beside its input and trees, and at most `--pdf-workers` conversions run at once.
   Sheets are stored sparsely, a repeated row is stored once, and the rendering of a
   table is checked against the text limit after every row. Each XML attribute counts as a

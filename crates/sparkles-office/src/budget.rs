@@ -1,6 +1,6 @@
-//! One byte counter per conversion. Every path that makes the output bigger than the
-//! input charges it before it allocates, so a small file cannot ask for far more memory
-//! than [`Limits::max_output`](crate::Limits::max_output).
+//! One byte counter per conversion. The paths that can make the output much bigger than
+//! the input charge it before they allocate, so a small file cannot ask for far more
+//! memory than [`Limits::max_output`](crate::Limits::max_output).
 
 use crate::{Error, Limits};
 use std::time::Instant;

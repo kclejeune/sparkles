@@ -12,10 +12,14 @@
 //! (a ZIP bomb stops at the limit, whatever its header says), the nodes of an XML tree,
 //! the cells of a sheet and the text that comes out. One output budget, [`Limits::max_output`],
 //! also bounds everything a conversion holds besides the input and its XML trees: Markdown
-//! blocks and table slots, sheet rows and the CSV of all sheets together. Every path that
-//! can make the output larger than the input charges it before it allocates, so a small
-//! file cannot ask for gigabytes. The tradeoff is memory for safety: a conversion may hold
-//! up to `max_output` bytes (128 MiB by default) beside its input and XML trees. A file
+//! blocks and table slots, sheet rows, shared strings, the text of notes and the CSV of all
+//! sheets together. The paths that can multiply the size of the input, which are repeated
+//! and padded cells, table slots, shared strings and the spaces of `text:s`, charge it
+//! before they allocate, and text that is copied once from the input is bounded by the
+//! limits on the input. A small file therefore cannot ask for gigabytes. The tradeoff is
+//! memory for safety. A conversion may hold up to `max_output` bytes, which is 128 MiB by
+//! default, beside its input and XML trees. A conversion also stops at
+//! [`Limits::deadline`]. A file
 //! past a limit is refused with [`Error::TooLarge`]. A damaged file gives [`Error::Corrupt`] and never a panic, which
 //! the tests and the cargo-fuzz targets of `fuzz/` check.
 
