@@ -409,23 +409,30 @@ pub fn write_solutions(
 // Keep prefetch preparation out of the generic serializer's row loop and stack frame.
 #[inline(never)]
 fn prefetch_answer(r: &QueryResult, n: usize) {
-    let ids = r.table.cols.iter().flat_map(|col| {
-        col[..n.min(col.len())]
-            .iter()
-            .filter(|id| id.tag() == Tag::Vocab)
-            .map(|id| id.payload())
-    });
+    let ids = || {
+        r.table.cols.iter().flat_map(|col| {
+            col[..n.min(col.len())]
+                .iter()
+                .filter(|id| id.tag() == Tag::Vocab)
+                .map(|id| id.payload())
+        })
+    };
     let vocab = &r.ctx.snap.generation.vocab;
     if n < PREFETCH_BLOCKS_BELOW {
+        // A warm answer's blocks were all asked for before: one bit test per term then
+        // replaces collecting, sorting and filtering them (spec X07 §9, gate 4).
+        if vocab.prefetch_would_skip(ids()) {
+            return;
+        }
         // A few hundred terms are cheap to sort, and asking for just their blocks reads
         // far less than whole sparse-index groups. A cold 35-row star lookup at 1.05M
         // made 93 page faults here one after another, which was most of its time.
-        let mut ids: Vec<u64> = ids.collect();
+        let mut ids: Vec<u64> = ids().collect();
         ids.sort_unstable();
         ids.dedup();
         vocab.prefetch_sorted(&ids);
     } else {
-        vocab.prefetch_terms(ids);
+        vocab.prefetch_terms(ids());
     }
 }
 

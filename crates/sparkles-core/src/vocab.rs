@@ -719,6 +719,37 @@ impl Vocab {
         );
     }
 
+    /// Whether [`Vocab::prefetch_sorted`] would ask for nothing for these ids (in any
+    /// order, with repeats): the hints are off, the vocabulary is not mapped, or every
+    /// block that holds one of them was asked for before. A warm serializer checks this
+    /// first and then skips collecting and sorting its ids. It asks for nothing itself.
+    pub(crate) fn prefetch_would_skip(&self, ids: impl Iterator<Item = u64>) -> bool {
+        if !crate::index::io_hints()
+            || !matches!((&self.data, &self.offsets), (Bytes::Map(_), Bytes::Map(_)))
+        {
+            return true;
+        }
+        let mut last = usize::MAX;
+        for id in ids {
+            if id >= self.len {
+                continue;
+            }
+            let b = id as usize / FC_BLOCK;
+            if b == last {
+                continue;
+            }
+            last = b;
+            let asked = self
+                .prefetched
+                .get(b / 64)
+                .map_or(0, |w| w.load(AtomicOrdering::Relaxed));
+            if asked & (1u64 << (b % 64)) == 0 {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Read ahead what evaluating these ids' values reads (ids sorted ascending), for a
     /// sort of a few thousand rows: the front-coded blocks of every id, as
     /// [`Vocab::prefetch_sorted`] does, and with a numeric column the column's pages of
@@ -1823,6 +1854,30 @@ mod tests {
                 assert_eq!(got, expected);
             }
         }
+    }
+
+    /// A warm answer asks [`Vocab::prefetch_sorted`] for nothing, and the serializer
+    /// learns that without sorting its ids: [`Vocab::prefetch_would_skip`] is true once
+    /// every block of the ids was asked for, and asking it changes nothing.
+    #[test]
+    fn prefetch_would_skip_only_blocks_asked_for_before() {
+        let dir = tempfile::tempdir().unwrap();
+        write_keys(dir.path(), 4 * FC_BLOCK + 3);
+        let v = Vocab::open(dir.path()).unwrap();
+        let (a, b, far) = (1, FC_BLOCK as u64 + 2, 3 * FC_BLOCK as u64);
+        if !crate::index::io_hints() {
+            assert!(v.prefetch_would_skip([a, b, far].into_iter()));
+            return;
+        }
+        assert!(!v.prefetch_would_skip([b, a].into_iter()));
+        // asking leaves the blocks to be prefetched
+        assert!(!v.prefetch_would_skip([a].into_iter()));
+        v.prefetch_sorted(&[a, b]);
+        assert!(v.prefetch_would_skip([b, a, a + 1].into_iter()));
+        assert!(!v.prefetch_would_skip([a, far].into_iter()));
+        // ids past the vocabulary have no block to ask for
+        assert!(v.prefetch_would_skip([a, v.len(), u64::MAX].into_iter()));
+        assert!(v.prefetch_would_skip(std::iter::empty()));
     }
 
     #[test]
