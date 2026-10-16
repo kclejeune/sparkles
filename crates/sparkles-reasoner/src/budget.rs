@@ -18,6 +18,10 @@
 //!
 //! The peak is the highest total charged at any time, which the run reports as
 //! `peakBytes`.
+//!
+//! Each holder takes its charges from the budget in steps, of 16 KiB or a 16,384th of
+//! the limit when that is smaller, and keeps up to two steps of what it frees. The
+//! steps held unused count against the limit and in the peak.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -43,6 +47,8 @@ impl MemoryExceeded {
 /// The memory a run has charged, its peak and its limit.
 pub(crate) struct Budget {
     limit: usize,
+    /// the bytes a holder takes at once, see [`MAX_STEP`]
+    step: usize,
     used: AtomicUsize,
     peak: AtomicUsize,
 }
@@ -61,6 +67,7 @@ impl Budget {
     pub fn new(limit: Option<usize>) -> Arc<Budget> {
         Arc::new(Budget {
             limit: limit.unwrap_or(usize::MAX),
+            step: limit.map_or(MAX_STEP, |l| (l >> STEP_SHIFT).min(MAX_STEP)),
             used: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
         })
@@ -146,7 +153,7 @@ impl Budget {
 pub(crate) struct Held {
     budget: Arc<Budget>,
     bytes: usize,
-    /// charged to the budget and not used yet, see [`STEP`]
+    /// charged to the budget and not used yet, see [`MAX_STEP`]
     credit: usize,
 }
 
@@ -157,9 +164,14 @@ impl std::fmt::Debug for Held {
 }
 
 /// The bytes a holder takes from the budget at once when a charge does not fit what
-/// it took before: small charges then do not each update the counter all threads
-/// share. A holder keeps at most twice this unused.
-const STEP: usize = 16 << 10;
+/// it took before: 16 KiB, or a 16,384th of the limit when that is smaller. Small
+/// charges then do not each update the counter all threads share. A holder keeps at
+/// most two steps unused.
+const MAX_STEP: usize = 16 << 10;
+
+/// A step is the limit shifted right by this many bits, when that is under
+/// [`MAX_STEP`].
+const STEP_SHIFT: u32 = 14;
 
 impl Held {
     pub fn new(budget: &Arc<Budget>) -> Held {
@@ -243,13 +255,14 @@ impl Drop for Held {
     }
 }
 
-/// Charge `n` bytes more than `credit` holds, with a [`STEP`] beyond when that fits, and
+/// Charge `n` bytes more than `credit` holds, with a step beyond when that fits, and
 /// add them to `credit`.
 #[inline]
 fn take(budget: &Budget, n: usize, credit: &mut usize) -> Result<(), MemoryExceeded> {
     let need = n - *credit;
-    if budget.try_charge(need + STEP).is_ok() {
-        *credit += need + STEP;
+    let want = need.saturating_add(budget.step);
+    if budget.try_charge(want).is_ok() {
+        *credit += want;
     } else {
         budget.try_charge(need)?;
         *credit += need;
@@ -257,12 +270,12 @@ fn take(budget: &Budget, n: usize, credit: &mut usize) -> Result<(), MemoryExcee
     Ok(())
 }
 
-/// Give back what `credit` holds beyond two [`STEP`]s.
+/// Give back what `credit` holds beyond two steps.
 #[inline]
 fn give_back(budget: &Budget, credit: &mut usize) {
-    if *credit > 2 * STEP {
-        budget.release(*credit - STEP);
-        *credit = STEP;
+    if *credit > 2 * budget.step {
+        budget.release(*credit - budget.step);
+        *credit = budget.step;
     }
 }
 
@@ -281,7 +294,7 @@ pub(crate) struct Meter<'b> {
     /// charges fail past the limit; otherwise they are made anyway
     strict: bool,
     bytes: usize,
-    /// charged to the budget and not used yet, see [`STEP`]
+    /// charged to the budget and not used yet, see [`MAX_STEP`]
     credit: usize,
 }
 
@@ -423,9 +436,9 @@ mod tests {
         assert_eq!(b.used(), 60);
         h.try_grow(40).unwrap();
         assert_eq!(b.peak(), 100);
-        // what a holder frees stays charged to it for its next charges
+        // a limit this small gives steps of 0 bytes: what a holder frees is released
         h.shrink(90);
-        assert_eq!(b.used(), 100);
+        assert_eq!(b.used(), 10);
         h.try_grow(90).unwrap();
         assert_eq!(b.used(), 100);
         b.charge(200);
@@ -442,21 +455,44 @@ mod tests {
         let b = Budget::unlimited();
         let mut h = Held::new(&b);
         h.try_grow(10).unwrap();
-        assert_eq!(b.used(), 10 + STEP);
-        h.try_grow(STEP).unwrap();
-        assert_eq!(b.used(), 10 + STEP);
+        assert_eq!(b.used(), 10 + MAX_STEP);
+        h.try_grow(MAX_STEP).unwrap();
+        assert_eq!(b.used(), 10 + MAX_STEP);
         h.try_grow(1).unwrap();
-        assert_eq!(b.used(), 11 + 2 * STEP);
+        assert_eq!(b.used(), 11 + 2 * MAX_STEP);
         // all of it freed: one step stays
-        h.shrink(STEP + 11);
-        assert_eq!(b.used(), STEP);
+        h.shrink(MAX_STEP + 11);
+        assert_eq!(b.used(), MAX_STEP);
         let mut m = Meter::new(&b, true);
         m.add(5).unwrap();
-        assert_eq!(b.used(), 2 * STEP + 5);
+        assert_eq!(b.used(), 2 * MAX_STEP + 5);
         assert_eq!(m.into_bytes(), 5);
-        assert_eq!(b.used(), STEP + 5);
+        assert_eq!(b.used(), MAX_STEP + 5);
         b.release(5);
         drop(h);
+        assert_eq!(b.used(), 0);
+    }
+
+    #[test]
+    fn steps_scale_with_the_limit() {
+        assert_eq!(Budget::new(Some(1 << 20)).step, 64);
+        assert_eq!(Budget::new(Some(1 << 30)).step, 16 << 10);
+        assert_eq!(Budget::new(None).step, 16 << 10);
+        let b = Budget::new(Some(10_000));
+        assert_eq!(b.step, 0);
+        let mut h = Held::new(&b);
+        h.try_grow(10).unwrap();
+        assert_eq!(b.used(), 10);
+        h.shrink(10);
+        assert_eq!(b.used(), 0);
+    }
+
+    #[test]
+    fn absurd_charges_fail() {
+        let b = Budget::new(Some(1 << 20));
+        assert!(Held::new(&b).try_grow(usize::MAX).is_err());
+        assert_eq!(b.used(), 0);
+        assert!(Meter::new(&b, true).add(usize::MAX).is_err());
         assert_eq!(b.used(), 0);
     }
 }

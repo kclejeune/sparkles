@@ -351,3 +351,65 @@ fn f16_incremental_reports_peak() {
         r.peak_bytes
     );
 }
+
+/// RDFS data of `n` triples for the thread-count test: a class chain, a property with a
+/// domain, a range and a super-property, and instances that use them.
+fn rdfs_store(n: usize) -> Store {
+    let mut ttl = String::from(
+        "ex:A rdfs:subClassOf ex:B . ex:B rdfs:subClassOf ex:C .\n\
+         ex:p rdfs:domain ex:D . ex:p rdfs:range ex:E . ex:p rdfs:subPropertyOf ex:q .\n",
+    );
+    for i in 0..n {
+        if i % 2 == 0 {
+            ttl.push_str(&format!("ex:i{i} a ex:A .\n"));
+        } else {
+            ttl.push_str(&format!("ex:i{i} ex:p ex:i{} .\n", i - 1));
+        }
+    }
+    let s = Store::in_memory(StoreOptions::default());
+    load(&s, &ttl);
+    s
+}
+
+/// A limit just above the peak of a run on one thread holds on 4 and 16 threads: the
+/// steps that holders keep unused scale with the limit, so on small data they do not
+/// by themselves push a run over a limit that is close to its need.
+#[test]
+fn f16_limit_holds_on_many_threads() {
+    let _one = one_at_a_time();
+    for (n, exact_limit) in [(300usize, 1usize << 20), (3_000, 16 << 20)] {
+        let s = rdfs_store(n);
+        let snap = s.snapshot();
+        let with = |threads: usize, max_memory: usize| ReasonOptions {
+            max_memory: Some(max_memory),
+            threads: Some(threads),
+            ..Default::default()
+        };
+        // the limit of the first run gives a step of 64 or 1,024 bytes, so its peak is
+        // within a few KB of the need
+        let (_, one) = infer(snap.clone(), &Profile::Rdfs, &with(1, exact_limit)).unwrap();
+        let p1 = one.peak_bytes as usize;
+        let limit = p1 + p1 / 50;
+        let mut worst = 0usize;
+        for threads in [1usize, 4, 16] {
+            for run in 0..10 {
+                let (_, r) = infer(snap.clone(), &Profile::Rdfs, &with(threads, limit))
+                    .unwrap_or_else(|e| {
+                        panic!("n {n}, {threads} threads, run {run}, limit {limit}: {e:#}")
+                    });
+                let peak = r.peak_bytes as usize;
+                assert!(
+                    peak <= limit,
+                    "n {n}, {threads} threads: peak {peak} over {limit}"
+                );
+                if threads == 16 {
+                    worst = worst.max(peak);
+                }
+            }
+        }
+        eprintln!(
+            "n {n}: 1-thread peak {p1}, limit {limit}, largest 16-thread peak {worst} ({:.3} of the 1-thread peak)",
+            worst as f64 / p1 as f64
+        );
+    }
+}
