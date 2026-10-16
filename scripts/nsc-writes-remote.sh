@@ -71,17 +71,21 @@ for v in $VARIANTS; do
   fi
 done
 
+# a paced run sends the writers' requests at WRITE_RATE per second in total
+: "${WRITE_RATE:=0}"
+PACE=
+[ "$WRITE_RATE" = 0 ] || PACE="--write-rate $WRITE_RATE"
 scenario_args() { # <scenario> -> write-bench arguments
   case $1 in
     serial-literal) echo "serial --op literal --changes $CHANGES" ;;
     serial-iri) echo "serial --op iri --changes $CHANGES" ;;
     serial-delete) echo "serial --op delete --changes $CHANGES" ;;
-    writers) echo "writers --clients 4 --changes $WRITER_CHANGES" ;;
-    writers16) echo "writers --clients 16 --changes $WRITER_CHANGES" ;;
-    mixed) echo "mixed --clients 4 --readers 2 --changes $MIXED_CHANGES" ;;
+    writers) echo "writers --clients 4 --changes $WRITER_CHANGES $PACE" ;;
+    writers16) echo "writers --clients 16 --changes $WRITER_CHANGES $PACE" ;;
+    mixed) echo "mixed --clients 4 --readers 2 --changes $MIXED_CHANGES $PACE" ;;
     serial-message) echo "serial --op literal --message a-commit-message --changes $CHANGES" ;;
-    writers-message) echo "writers --clients 4 --message a-commit-message --changes $WRITER_CHANGES" ;;
-    writers16-message) echo "writers --clients 16 --message a-commit-message --changes $WRITER_CHANGES" ;;
+    writers-message) echo "writers --clients 4 --message a-commit-message --changes $WRITER_CHANGES $PACE" ;;
+    writers16-message) echo "writers --clients 16 --message a-commit-message --changes $WRITER_CHANGES $PACE" ;;
     *) fail "unknown scenario $1" ;;
   esac
 }

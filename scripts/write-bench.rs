@@ -8,20 +8,27 @@
 //!     write-bench --addr 127.0.0.1:3030 --ds bench writers --clients 4 --changes 50000
 //!     write-bench --addr 127.0.0.1:3030 --ds bench mixed --clients 4 --readers 2 --changes 5000
 //!     write-bench --addr 127.0.0.1:3030 --ds bench writers --clients 4 --message "a commit"
+//!     write-bench --addr 127.0.0.1:3030 --ds bench mixed --clients 4 --write-rate 200
 //!
 //! Every update is one HTTP request that inserts or deletes one triple, sent on a kept-alive
 //! connection, so a latency is the server's whole answer. The receipts (the
 //! `Sparkles-Commit` header) of all successful workload writes, including warmups, are
 //! required, and the run fails unless they are distinct and contiguous. Untimed delete
 //! seeds also require exactly one valid receipt. Serial throughput excludes warmups.
-//! The result is one
-//! JSON object on stdout.
+//! A request is sent again on a new connection only when writing it failed, or when the
+//! server had already closed the kept-alive connection before it was sent. A request whose
+//! answer cannot be read counts as an error and fails the run, because the server may
+//! have committed it. The result is one JSON object on stdout.
 //!
 //! Scenarios
 //!   serial   one client, `--changes` requests after `--warmup` untimed ones
 //!   writers  `--clients` clients share `--changes` requests
 //!   mixed    as writers, with `--readers` readers that each ask for a count at `--rate`
 //!            requests per second until the writers are done
+//! `--write-rate N` paces the writers of writers and mixed to N requests per second in
+//! total. Each client sends on its own schedule of N / clients requests per second, as the
+//! readers do, so two servers can be compared at the same commit rate. Without it, every
+//! client sends its next request as soon as the last one is answered.
 //! Operations (`--op`, writers and mixed always use `literal`)
 //!   literal  a new subject and a new literal, so the commit adds a term to the vocabulary
 //!   iri      a new edge between two people of the generated dataset (scripts/gen-data.py)
@@ -58,20 +65,49 @@ impl Conn {
         s.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
         s
     }
-    fn request(&mut self, req: &[u8]) -> Resp {
-        for attempt in 0..2 {
-            if self.s.write_all(req).is_ok()
-                && let Some(r) = self.read()
-            {
-                return r;
-            }
-            if attempt == 0 {
-                // the server closed an idle connection: dial again once
-                self.s = Conn::dial(&self.addr);
-                self.buf.clear();
+    fn redial(&mut self) {
+        self.s = Conn::dial(&self.addr);
+        self.buf.clear();
+    }
+    /// Dial again if the server closed the kept-alive connection while it was idle. Call it
+    /// outside the timed span; it sends nothing.
+    fn ready(&mut self) {
+        if !self.buf.is_empty() {
+            return;
+        }
+        // With nothing sent, anything but "no data yet" means the connection is unusable:
+        // the server closed it, reset it, or said something no request asked for.
+        let closed = self.s.set_nonblocking(true).is_ok()
+            && !matches!(
+                self.s.peek(&mut [0u8; 1]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
+            );
+        self.s.set_nonblocking(false).unwrap();
+        if closed {
+            self.redial();
+        }
+    }
+    /// Send `req` and read its answer. The request is sent again on a new connection only
+    /// when writing it failed. Once it was written the server may have run it, so a failed
+    /// read is an error and is never retried.
+    fn request(&mut self, req: &[u8]) -> Result<Resp, String> {
+        if self.s.write_all(req).is_err() {
+            self.redial();
+            self.s
+                .write_all(req)
+                .map_err(|e| format!("send to {}: {e}", self.addr))?;
+        }
+        match self.read() {
+            Some(r) => Ok(r),
+            None => {
+                // the connection's state is unknown, so the next request gets a new one
+                self.redial();
+                Err(format!(
+                    "no answer from {} after the request was sent",
+                    self.addr
+                ))
             }
         }
-        panic!("no answer from {}", self.addr);
     }
     fn read(&mut self) -> Option<Resp> {
         let mut chunk = [0u8; 16384];
@@ -200,6 +236,7 @@ struct Args {
     clients: usize,
     readers: usize,
     rate: f64,
+    write_rate: f64,
     changes: usize,
     warmup: usize,
     people: usize,
@@ -215,6 +252,7 @@ fn parse() -> Args {
         clients: 4,
         readers: 2,
         rate: 25.0,
+        write_rate: 0.0,
         changes: 5000,
         warmup: 200,
         people: 100_000,
@@ -236,6 +274,7 @@ fn parse() -> Args {
             "--clients" => a.clients = val().parse().unwrap(),
             "--readers" => a.readers = val().parse().unwrap(),
             "--rate" => a.rate = val().parse().unwrap(),
+            "--write-rate" => a.write_rate = val().parse().unwrap(),
             "--changes" => a.changes = val().parse().unwrap(),
             "--warmup" => a.warmup = val().parse().unwrap(),
             "--people" => a.people = val().parse().unwrap(),
@@ -250,6 +289,14 @@ fn parse() -> Args {
     assert!(
         ["serial", "writers", "mixed"].contains(&a.scenario.as_str()),
         "scenario: serial, writers or mixed"
+    );
+    assert!(
+        a.write_rate >= 0.0 && a.write_rate.is_finite(),
+        "--write-rate must be a number of requests per second"
+    );
+    assert!(
+        a.write_rate == 0.0 || a.scenario != "serial",
+        "--write-rate paces writers and mixed only"
     );
     a
 }
@@ -310,7 +357,13 @@ fn main() {
     if op == "delete" {
         let mut c = Conn::new(&a.addr);
         for i in 0..a.changes + a.warmup {
-            let r = c.request(&update_request(&a.ds, &a.addr, &update(&a, "iri", i)));
+            c.ready();
+            let r = c
+                .request(&update_request(&a.ds, &a.addr, &update(&a, "iri", i)))
+                .unwrap_or_else(|e| {
+                    eprintln!("delete setup request {} failed: {e}", i + 1);
+                    std::process::exit(2);
+                });
             if r.status != 200 || r.commit.is_none() {
                 eprintln!(
                     "delete setup request {} failed: HTTP {}, valid Sparkles-Commit receipt {}, {}",
@@ -334,7 +387,7 @@ fn main() {
     let receipts = Arc::new(Mutex::new(Vec::<u64>::new()));
     let start_gate = Arc::new(std::sync::Barrier::new(clients + 1));
     let mut writers = Vec::new();
-    for _ in 0..clients {
+    for k in 0..clients {
         let (a, op, next, receipts, gate) = (
             a.clone(),
             op.clone(),
@@ -350,7 +403,23 @@ fn main() {
             let mut missing_receipts = 0usize;
             let (mut timed_start, mut timed_end) = (None, None);
             gate.wait();
+            // with --write-rate, client k of n sends every n / rate seconds, offset by k / rate
+            let period = (a.write_rate > 0.0)
+                .then(|| Duration::from_secs_f64(clients as f64 / a.write_rate));
+            let mut due = Instant::now()
+                + Duration::from_secs_f64(if a.write_rate > 0.0 {
+                    k as f64 / a.write_rate
+                } else {
+                    0.0
+                });
             loop {
+                if let Some(period) = period {
+                    let now = Instant::now();
+                    if now < due {
+                        std::thread::sleep(due - now);
+                    }
+                    due += period;
+                }
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 if i >= total {
                     break;
@@ -359,12 +428,21 @@ fn main() {
                 if a.scenario == "serial" && i == a.warmup {
                     timed_start = Some(Instant::now());
                 }
+                c.ready();
                 let t = Instant::now();
                 let r = c.request(&req);
                 let ms = t.elapsed().as_secs_f64() * 1e3;
                 if a.scenario == "serial" && i >= a.warmup {
                     timed_end = Some(Instant::now());
                 }
+                let r = match r {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("update request {}: {e}", i + 1);
+                        errors += 1;
+                        continue;
+                    }
+                };
                 if r.status != 200 {
                     errors += 1;
                     continue;
@@ -408,8 +486,16 @@ fn main() {
                         std::thread::sleep(due - now);
                     }
                     due += period;
+                    c.ready();
                     let t = Instant::now();
-                    let r = c.request(&req);
+                    let r = match c.request(&req) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            eprintln!("count request: {e}");
+                            bad += 1;
+                            continue;
+                        }
+                    };
                     lat.push(t.elapsed().as_secs_f64() * 1e3);
                     // counts and commits never go back within one reader
                     let text = String::from_utf8_lossy(&r.body);
@@ -472,10 +558,11 @@ fn main() {
         .map(|n| (*n as f64 - mean_share).abs() / mean_share.max(1.0))
         .fold(0.0, f64::max);
     println!(
-        "{{\"scenario\":\"{}\",\"op\":\"{}\",\"clients\":{},\"changes\":{},\"errors\":{},\"missing_receipts\":{},\"seconds\":{:.3},\"tps\":{:.1},\"writers\":{},\"receipts_contiguous\":{},\"receipts_distinct\":{},\"first_receipt\":{},\"per_client\":{:?},\"max_share_deviation\":{:.3},\"readers\":{},\"reader_violations\":{}}}",
+        "{{\"scenario\":\"{}\",\"op\":\"{}\",\"clients\":{},\"write_rate\":{},\"changes\":{},\"errors\":{},\"missing_receipts\":{},\"seconds\":{:.3},\"tps\":{:.1},\"writers\":{},\"receipts_contiguous\":{},\"receipts_distinct\":{},\"first_receipt\":{},\"per_client\":{:?},\"max_share_deviation\":{:.3},\"readers\":{},\"reader_violations\":{}}}",
         a.scenario,
         op,
         clients,
+        a.write_rate,
         timed,
         errors,
         missing_receipts,

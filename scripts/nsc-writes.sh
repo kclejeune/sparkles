@@ -6,7 +6,8 @@
 #
 #   scripts/nsc-writes.sh [options] NAME=REF[:FLAGS] NAME=REF[:FLAGS] [...]
 #
-# A variant is a name, a git revision of this repository or a path to a built `sparkles`
+# A variant is a name (a shell identifier: letters, digits and underscores, not starting
+# with a digit), a git revision of this repository or a path to a built `sparkles`
 # binary, and optionally the global flags (before `serve`) to run it with, so one binary
 # can be compared with itself under different flags. The token delay-us=N among the flags
 # adds N microseconds to every synchronization and write-through write of the store's files
@@ -37,6 +38,9 @@
 #   --changes N         requests of the serial scenarios (default 3000)
 #   --writer-changes N  requests of the writers scenarios (default 20000)
 #   --mixed-changes N   requests of the mixed scenario (default 5000)
+#   --write-rate N      pace the writers of the writers and mixed scenarios to N requests
+#                       per second in total, so variants compare at the same commit rate
+#                       (default 0, unpaced)
 #   --server-cpus L     the servers' CPU list (default 0-5)
 #   --client-cpus L     the client's CPU list (default 6-7)
 #   --cargo-args "..."  extra `cargo build` flags
@@ -54,6 +58,7 @@ ROUNDS=3
 CHANGES=3000
 WRITER_CHANGES=20000
 MIXED_CHANGES=5000
+WRITE_RATE=0
 SERVER_CPUS=0-5
 CLIENT_CPUS=6-7
 CARGO_ARGS=
@@ -80,6 +85,7 @@ while [ $# -gt 0 ]; do
     --changes) CHANGES=$2 ;;
     --writer-changes) WRITER_CHANGES=$2 ;;
     --mixed-changes) MIXED_CHANGES=$2 ;;
+    --write-rate) WRITE_RATE=$2 ;;
     --server-cpus) SERVER_CPUS=$2 ;;
     --client-cpus) CLIENT_CPUS=$2 ;;
     --cargo-args) CARGO_ARGS=$2 ;;
@@ -98,6 +104,11 @@ while [ $# -gt 0 ]; do
   shift 2
 done
 [ ${#ARGS[@]} -ge 2 ] || usage 1
+[[ $WRITE_RATE =~ ^[0-9]+([.][0-9]+)?$ ]] || die "--write-rate needs a number of requests per second, not $WRITE_RATE"
+for spec in "${ARGS[@]}"; do
+  # the remote script keeps each variant's settings in variables named after it
+  [[ ${spec%%=*} =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "variant name ${spec%%=*} is not a shell identifier (letters, digits and underscores)"
+done
 for t in nsc zstd python3 cargo rustc cc flock; do command -v "$t" > /dev/null || die "$t is not on PATH"; done
 if [ -n "$OUT" ]; then
   # Resolve symlinks and .. in the parent, while preserving the final name so
@@ -287,11 +298,12 @@ ROUNDS=$ROUNDS
 CHANGES=$CHANGES
 WRITER_CHANGES=$WRITER_CHANGES
 MIXED_CHANGES=$MIXED_CHANGES
+WRITE_RATE=$WRITE_RATE
 SERVER_CPUS=$SERVER_CPUS
 CLIENT_CPUS=$CLIENT_CPUS
 EOF
 note "data: $PEOPLE people (scripts/gen-data.py), $(du -h "$DATA" | cut -f1) compressed"
-note "settings: variants $VARIANTS, scenarios $SCENARIOS, $ROUNDS rounds, serial $CHANGES, writers $WRITER_CHANGES, mixed $MIXED_CHANGES requests, server CPUs $SERVER_CPUS, client CPUs $CLIENT_CPUS"
+note "settings: variants $VARIANTS, scenarios $SCENARIOS, $ROUNDS rounds, serial $CHANGES, writers $WRITER_CHANGES, mixed $MIXED_CHANGES requests, write rate $WRITE_RATE/s (0: unpaced), server CPUs $SERVER_CPUS, client CPUs $CLIENT_CPUS"
 
 # ---------------------------------------------------------------------------- instance
 ID=

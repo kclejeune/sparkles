@@ -376,6 +376,15 @@ and comparison methodology. [DEVELOPMENT.md](DEVELOPMENT.md) covers building and
   built snapshots with their supplied path and staged hash. The launcher gives each
   default run a unique results directory. `--out` requires a new destination and
   refuses any existing file, directory or symlink before opening evidence files.
+* `scripts/write-bench.rs` is the client of `scripts/nsc-writes.sh`. It sends each update
+  as one request on a kept-alive connection and requires distinct, contiguous receipts.
+  It sends a request again on a new connection only when writing it failed or the server
+  had closed the idle connection before it was sent. A request whose answer cannot be read
+  is an error that fails the run, because the server may have committed it. With
+  `--write-rate N`, the writers of the `writers` and `mixed` scenarios send N requests per
+  second in total, each client on its own schedule, so two variants can be compared at the
+  same commit rate. `nsc-writes.sh --write-rate N` passes the rate to those scenarios, and
+  variant names must be shell identifiers.
 * `scripts/gen-data.py N` generates a synthetic dataset for benchmarking.
 * `scripts/gen-geo.py N` generates a GeoSPARQL dataset and its queries. The data has
   points around cities, lines, polygons and an administrative hierarchy.
