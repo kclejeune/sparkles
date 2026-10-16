@@ -57,7 +57,9 @@ pub(super) fn same(a: Option<&Arc<PoolGrant>>, b: Option<&Arc<PoolGrant>>) -> bo
 #[cfg(test)]
 thread_local! {
     /// Ledger creations and lock acquisitions on this thread (for tests of the
-    /// per-query cost of queries that never need the ledger).
+    /// per-query cost of queries that never need the ledger). The counter is
+    /// thread-local, so ledger work on other threads, such as rayon workers, is not
+    /// counted.
     pub(crate) static LEDGER_OPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 impl QueryMemoryLedger {
@@ -165,8 +167,7 @@ impl QueryMemoryLedger {
         }
     }
     pub(crate) fn owner_by_id(&self, id: u64) -> Arc<MemoryOwner> {
-        self.state
-            .lock()
+        self.lock()
             .owners
             .iter()
             .find(|a| a.owner.id == id)
@@ -623,7 +624,11 @@ mod tests {
     }
 
     /// Queries that call no graph algorithm and keep no lease take no ledger lock and
-    /// create no ledger: the per-query cost F14 added must stay off their path.
+    /// create no ledger: the per-query cost F14 added must stay off their path. Updates
+    /// run their WHERE clause on the same context and take no ledger either, so one is
+    /// covered too. The counter is thread-local, so it sees only the calling thread.
+    /// Ledger work on rayon workers is not counted, and this small dataset stays below
+    /// the thresholds of the parallel kernels, so this test guards the serial paths.
     #[test]
     fn plain_queries_take_no_ledger_operations() {
         use crate::io::{RdfFormat, Source};
@@ -662,15 +667,45 @@ mod tests {
              ?p ex:name ?n ; ex:age ?a ; ex:knows ?k }",
             "SELECT ?p ?n ?a WHERE { ?p ex:worksFor ex:o3 ; ex:name ?n ; ex:age ?a }",
             "SELECT ?p ?d ?t WHERE { ?p ex:worksFor ex:o3 . ?p ex:authorOf ?d . ?d ex:title ?t }",
+            "SELECT ?p ?a WHERE { ?p ex:name ?n OPTIONAL { ?p ex:age ?a FILTER(?a > 50) } }",
+            "SELECT ?p ?x WHERE { ?p ex:knows+ ?x } LIMIT 500",
+            "SELECT ?p ?x WHERE { ex:p5 (ex:knows|ex:worksFor)* ?x . BIND(ex:p5 AS ?p) }",
+            "CONSTRUCT { ?p ex:friend ?o } WHERE { ?p ex:knows ?o . ?o ex:worksFor ex:o3 }",
+            "DESCRIBE ex:p3 ex:p4",
         ] {
             let before = LEDGER_OPS.with(|n| n.get());
             let r = query(store.snapshot(), q, &opts).unwrap();
-            assert!(!r.rows().is_empty(), "{q}");
+            assert!(!r.rows().is_empty() || !r.triples.is_empty(), "{q}");
             let ops = LEDGER_OPS.with(|n| n.get()) - before;
             eprintln!("{ops} ledger operations for {q}");
             assert_eq!(ops, 0, "{ops} ledger operations for {q}");
         }
+        let before = LEDGER_OPS.with(|n| n.get());
+        crate::sparql::update::update(
+            &store,
+            "INSERT { ?p ex:colleague ?q } WHERE { ?p ex:worksFor ?o . ?q ex:worksFor ?o . \
+             FILTER(?p != ?q) }",
+            &opts,
+        )
+        .unwrap();
+        assert_eq!(
+            LEDGER_OPS.with(|n| n.get()),
+            before,
+            "ledger operations for an update"
+        );
         assert_eq!(pool.granted(), 0);
+    }
+    /// A grant set after the first charge would leave that charge on the old grant,
+    /// which debug builds refuse.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "the grant is set before the first charge")]
+    fn set_grant_after_a_charge_is_refused() {
+        let pool = QueryPool::new(64 * MB);
+        let mut ctx = context();
+        ctx.set_grant(Some(Arc::new(pool.empty_grant())));
+        ctx.check_output((MB / 8) as usize, 1).unwrap();
+        ctx.set_grant(None);
     }
     /// Charges made before the ledger exists move to its first owner: they grow and
     /// release there, the eager contribution stays admitted once, and the ledger
@@ -680,7 +715,7 @@ mod tests {
         let pool = QueryPool::new(64 * MB);
         let grant = Arc::new(pool.empty_grant());
         let mut ctx = context();
-        ctx.grant = Some(grant.clone());
+        ctx.reconfigure_grant(Some(grant.clone()));
         ctx.mem_limit = 8 * MB;
         let before = LEDGER_OPS.with(|n| n.get());
         let held = ctx.charge(3 * MB).unwrap();
@@ -718,7 +753,7 @@ mod tests {
             let pool = QueryPool::new(1 << 40);
             let grant = Arc::new(pool.empty_grant());
             let mut ctx = context();
-            ctx.grant = Some(grant.clone());
+            ctx.reconfigure_grant(Some(grant.clone()));
             let ctx = Arc::new(ctx);
             let barrier = Arc::new(std::sync::Barrier::new(5));
             let threads: Vec<_> = (0..4)
@@ -758,9 +793,9 @@ mod tests {
         let b = Arc::new(pool.empty_grant());
         let mut ctx = context();
         ctx.mem_limit = 16 * MB;
-        ctx.grant = Some(a.clone());
+        ctx.reconfigure_grant(Some(a.clone()));
         std::mem::forget(ctx.charge(4 * MB).unwrap());
-        ctx.grant = Some(b.clone());
+        ctx.reconfigure_grant(Some(b.clone()));
         drop(ctx.charge(2 * MB).unwrap());
         assert_eq!((a.used(), b.used()), (4 * MB, 2 * MB));
         ctx.mem_limit = 5 * MB;
@@ -769,9 +804,9 @@ mod tests {
         );
         assert_eq!((a.used(), b.used()), (4 * MB, 2 * MB));
         ctx.mem_limit = 16 * MB;
-        ctx.grant = None;
+        ctx.reconfigure_grant(None);
         drop(ctx.charge(MB).unwrap());
-        ctx.grant = Some(a.clone());
+        ctx.reconfigure_grant(Some(a.clone()));
         drop(ctx.charge(MB).unwrap());
         assert_eq!((a.used(), b.used()), (5 * MB, 2 * MB));
         let weak = Arc::downgrade(ctx.memory());
@@ -786,7 +821,7 @@ mod tests {
         let pool = QueryPool::new(0);
         let mut ctx = context();
         for _ in 0..100 {
-            ctx.grant = Some(Arc::new(pool.empty_grant()));
+            ctx.reconfigure_grant(Some(Arc::new(pool.empty_grant())));
             assert!(
                 matches!(ctx.charge(1),Err(Error::BudgetExceeded(x)) if x.kind==BudgetKind::ServerMemory)
             );
@@ -802,16 +837,16 @@ mod tests {
         let a = Arc::new(pool.empty_grant());
         let b = Arc::new(pool.empty_grant());
         let mut ctx = context();
-        ctx.grant = Some(a.clone());
+        ctx.reconfigure_grant(Some(a.clone()));
         drop(ctx.charge(4 * MB).unwrap());
-        ctx.grant = Some(b.clone());
+        ctx.reconfigure_grant(Some(b.clone()));
         std::mem::forget(ctx.charge(2 * MB).unwrap());
         ctx.enable_cursor_accounting().unwrap();
         assert_eq!((a.used(), b.used()), (0, 2 * MB));
         assert!(ctx.cursor_decode(2000));
         let b_before = b.used();
         assert!(b_before > 2 * MB);
-        ctx.grant = Some(a.clone());
+        ctx.reconfigure_grant(Some(a.clone()));
         assert!(ctx.cursor_decode(4000));
         assert!(a.used() > 0);
         let keep = ctx.charge(300).unwrap();
@@ -827,10 +862,10 @@ mod tests {
         let a = Arc::new(pool.empty_grant());
         let b = Arc::new(pool.empty_grant());
         let mut ctx = context();
-        ctx.grant = Some(a.clone());
+        ctx.reconfigure_grant(Some(a.clone()));
         ctx.mem_limit = 4 * MB;
         let ctl = Control::for_query(&ctx, 8 * MB).unwrap();
-        ctx.grant = Some(b.clone());
+        ctx.reconfigure_grant(Some(b.clone()));
         ctx.mem_limit = MB;
         let output = Buffer::<u8>::new("query-ledger-output", 2 * MB as usize, &ctl)
             .unwrap()
@@ -865,7 +900,7 @@ mod tests {
         let mut ctx = context();
         let pool = QueryPool::new(64 * MB);
         let grant = Arc::new(pool.empty_grant());
-        ctx.grant = Some(grant.clone());
+        ctx.reconfigure_grant(Some(grant.clone()));
         let root = Control::for_query(&ctx, 100).unwrap();
         let frame = root.query_frame().unwrap();
         let data = Buffer::<u8>::new("service-first", 80, &frame)
@@ -976,7 +1011,7 @@ mod tests {
         let pool = QueryPool::new(4 * MB);
         let grant = Arc::new(pool.empty_grant());
         let mut ctx = context();
-        ctx.grant = Some(grant.clone());
+        ctx.reconfigure_grant(Some(grant.clone()));
         let controls = [
             Control::for_query(&ctx, 8 * MB).unwrap(),
             Control::for_query(&ctx, 8 * MB).unwrap(),

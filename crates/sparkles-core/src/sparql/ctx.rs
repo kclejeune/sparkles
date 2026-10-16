@@ -448,8 +448,9 @@ pub struct Ctx {
     /// Budget for the estimated bytes of intermediate results alive at once
     /// (`u64::MAX`: unlimited). See [`Ctx::charge`] and [`Ctx::check_output`].
     pub mem_limit: u64,
-    /// Current public grant configuration; contributions retain their original grant.
-    pub grant: Option<Arc<super::pool::PoolGrant>>,
+    /// The grant the query charges, fixed before its first charge (see [`Ctx::set_grant`]).
+    /// Contributions retain the grant they were admitted under.
+    grant: Option<Arc<super::pool::PoolGrant>>,
     /// Budget for the rows all operators produce together (`u64::MAX`: unlimited). See
     /// [`Ctx::produced`].
     pub max_rows_produced: u64,
@@ -613,11 +614,31 @@ impl Ctx {
         )
     }
 
-    /// Set the public grant before any charge, and fix it as the fast account's grant
-    /// without a lazy initialization on the first charge.
+    /// The grant the query charges, if it has one.
+    pub fn grant(&self) -> Option<&Arc<PoolGrant>> {
+        self.grant.as_ref()
+    }
+
+    /// Set the grant before any charge, and fix it as the fast account's grant without
+    /// a lazy initialization on the first charge. A grant that changes after a charge
+    /// would leave charges on the old one, so a call after the first charge is a bug
+    /// that debug builds refuse.
     pub(crate) fn set_grant(&mut self, grant: Option<Arc<PoolGrant>>) {
-        debug_assert!(self.fast.grant.get().is_none() && self.memory.get().is_none());
+        debug_assert!(
+            self.memory.get().is_none()
+                && self.fast.live.load(Ordering::Relaxed) == 0
+                && self.fast.eager.load(Ordering::Relaxed) == 0
+                && self.fast.peak.load(Ordering::Relaxed) == 0,
+            "the grant is set before the first charge"
+        );
         self.fast.grant = std::sync::OnceLock::from(grant.clone());
+        self.grant = grant;
+    }
+
+    /// Change the grant after charges were made, to test that the ledger keeps each
+    /// contribution on the grant it was admitted under.
+    #[cfg(test)]
+    pub(crate) fn reconfigure_grant(&mut self, grant: Option<Arc<PoolGrant>>) {
         self.grant = grant;
     }
 
@@ -2132,7 +2153,7 @@ mod charge_tests {
 
     fn pooled(store: &Store, grant: &Arc<super::super::pool::PoolGrant>) -> Ctx {
         let mut ctx = Ctx::new(store.snapshot());
-        ctx.grant = Some(grant.clone());
+        ctx.set_grant(Some(grant.clone()));
         ctx
     }
 

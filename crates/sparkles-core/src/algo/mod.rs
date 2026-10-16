@@ -183,7 +183,7 @@ impl Control {
 
     pub(crate) fn for_query(ctx: &crate::sparql::Ctx, limit: u64) -> Result<Self> {
         let ledger = ctx.memory().clone();
-        let owner = ledger.owner(ctx.grant.as_ref())?;
+        let owner = ledger.owner(ctx.grant())?;
         let mut control = Self::with_cancellation(
             ctx.cancel.clone(),
             ctx.cancellation.clone(),
