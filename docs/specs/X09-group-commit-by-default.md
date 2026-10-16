@@ -241,7 +241,9 @@ deployments that try the flag before the default changes.
   commit of a disconnected request.
 - **`no_wait`.** A write with `no_wait` never waits for a fence. It fails with
   `Error::WriterBusy` when it finds a fence running or commits queued once it holds the
-  writer lock, and when its own commit would be grouped, before anything reaches the WAL.
+  writer lock, and when its own commit would be grouped, before its guard runs and before
+  anything reaches the WAL. After a failed fence it fails with `Error::Poisoned`, since a
+  retry cannot succeed until the store is reopened.
   The server's in-place updates set `no_wait` and retry a `WriterBusy` on the blocking
   pool, so a runtime worker never parks in a fence.
 - **Fairness.** The queue is first in, first out, and prefixes are published in order.
@@ -591,7 +593,9 @@ Four points differ from the design.
    head is the speculative head and the refusal stands. The test checks both outcomes, and
    that nothing is reported before the fence is done. With `no_wait`, a data-dependent
    refusal that needs to drain instead returns `WriterBusy`, rather than the usual
-   precondition or permission refusal, since it cannot wait. This is a core write option,
+   precondition or permission refusal, since it cannot wait. A `no_wait` write is also
+   refused with `WriterBusy` when it finds a fence running or commits queued, and when its
+   own commit would be grouped. After a failed fence it is refused with `Poisoned`. This is a core write option,
    with no HTTP header. The HTTP error conversion maps an escaping `WriterBusy` to 503.
    The server's internal inline attempt instead retries it through the blocking path.
 4. **Full-text, spatial and embedding datasets stay on the ordinary path.** The design had

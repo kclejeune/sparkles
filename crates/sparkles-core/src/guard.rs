@@ -116,8 +116,11 @@ pub struct WriteOptions {
     pub author: Option<Arc<str>>,
     /// checked once the writer lock is held, before anything is written
     pub precondition: Option<Precondition>,
-    /// fail with [`Error::WriterBusy`](crate::Error::WriterBusy) instead of waiting
-    /// when another write holds the writer lock
+    /// Fail with [`Error::WriterBusy`](crate::Error::WriterBusy) instead of waiting for
+    /// another write. With group commit this also covers a running fence, queued commits
+    /// and a commit that would be grouped, since a grouped commit waits for its fence. On a
+    /// store whose group commit has failed, the write fails with
+    /// [`Error::Poisoned`](crate::Error::Poisoned), which no retry can fix.
     pub no_wait: bool,
     /// The graphs the write may change (`None`: every graph). An insert or delete in
     /// another graph fails with [`Error::NotPermitted`](crate::Error::NotPermitted)

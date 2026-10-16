@@ -295,7 +295,9 @@ client are the same type.
 Update options are `baseIri`, `prefixes`, `timeout`, `signal`, `message`, `ifHead` and
 `noWait`. `ifHead` is a commit number that must still be the head, which is the engine's
 write precondition. `noWait` makes a write fail with `ConflictError` instead of waiting
-when another write holds the writer.
+when another write holds the writer. With group commit it also fails that way while a fence
+runs or commits are queued, or when its own commit would be grouped. After a failed fence it
+fails with `StorageError` instead, which a retry cannot fix.
 
 ### 3.4 Quads
 

@@ -2248,8 +2248,11 @@ is absent. A missing graph is still a `404` on `GET`, whatever the conditions sa
 
 With group commit, a precondition or permission refusal based on the dataset's state
 waits for earlier writes to become durable. The core `WriteOptions::no_wait` option
-returns `WriterBusy` when that refusal would need to wait. The HTTP error conversion
-maps an escaping `WriterBusy` to `503`. There is no HTTP header for this option.
+never waits. It returns `WriterBusy` when another write holds the writer lock, when a
+group commit fence is running or commits are queued, when the write's own commit would be
+grouped, and when a refusal would need to wait. After a failed fence it returns
+`Poisoned`, because the dataset accepts no write until it is reopened. The HTTP error
+conversion maps an escaping `WriterBusy` to `503`. There is no HTTP header for this option.
 Ordinary HTTP writes leave it disabled. The server's internal inline attempt enables
 it, consumes `WriterBusy` and retries through the blocking path.
 
