@@ -227,7 +227,8 @@ pub struct ServeAdditions {
     pub update_timeout: Option<f64>,
     pub union_default_graph: bool,
     pub read_only: bool,
-    pub gsp_direct_naming: bool,
+    /// the values of `--gsp-direct-naming`
+    pub gsp_direct_naming: Vec<String>,
     pub metrics_fuseki_names: bool,
     pub auto_reason: bool,
     /// data files to load into in-memory datasets: dataset, file, graph
@@ -282,7 +283,7 @@ pub fn for_serve(path: &Path, data_dir: &Path, own_auth: bool) -> Result<ServeAd
     add.update_timeout = s.update_timeout;
     add.union_default_graph = s.union_default_graph;
     add.read_only = s.read_only;
-    add.gsp_direct_naming = s.gsp_direct_naming;
+    add.gsp_direct_naming = write::direct_naming_values(s);
     add.metrics_fuseki_names = s.metrics_fuseki_names;
     add.auto_reason = s.auto_reason;
     for ds in &plan.datasets {

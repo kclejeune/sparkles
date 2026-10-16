@@ -453,6 +453,33 @@ until someone presses Publish. Set the variable `MAVEN_PUBLISHING_TYPE` to `auto
 to release them as soon as they validate. Artifacts on Maven Central can never be
 changed or deleted, so check a deployment in the Portal before you release it.
 
+### Changing an on-disk format
+
+`crates/sparkles-core/src/formats.rs` declares every kind of file Sparkles keeps, the
+version it writes and the versions it reads, and every settings file with its version
+member. A change to a file's format starts there. Its module documentation describes the
+four kinds of change, from an additive member that needs no version to an upgrade step
+in `crates/sparkles-core/src/migrate.rs`. A new file kind or settings file is added to
+the registry in the same commit that first writes it, and its reader refuses a newer
+version through `FileKind::check` or `formats::check_settings`. A change that an older
+release would misread also raises `minimumReader` before the first file in the new form
+is written ([`commit::require_reader`](../crates/sparkles-core/src/commit.rs)).
+
+A store checks every settings file of a dataset against the registry when it opens the
+dataset, before it writes any file, so a settings file from a newer release refuses the
+whole dataset. A settings file that a release rewrites through a typed struct drops the
+members that struct does not know, so an additive member of such a file must be safe to
+lose when an older release rewrites the file, or the change needs a `format` bump.
+`dataset.json` keeps unknown members on a rewrite, and so do the files that the server
+writes as raw JSON values.
+
+`testsuite/formats/<label>/` holds databases written by earlier commits or releases,
+made by `scripts/format-fixture.sh BIN LABEL` with that release's binary. The tests
+`crates/sparkles-core/tests/formats.rs` and `crates/sparkles-server/tests/cli_formats.rs`
+open every fixture, compare its recorded answers, write, compact and restore its
+backups. A change that breaks a fixture inside the window needs a reader for the old
+form or a migration step, not a new fixture.
+
 ## Nix
 
 The flake is built on flake-parts, rust-overlay and crane, with the toolchain from

@@ -462,6 +462,16 @@ run = "nix build .#sparkles-jena.mitmCache.updateScript -o target/jvm-nix-deps-u
 
 # --------------------------------------------------------------------- Node bindings ----
 
+[tasks."node:install"]
+description = "Install Node workspace dependencies"
+dir = "js"
+run = "pnpm install --frozen-lockfile"
+sources = ["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", "*/package.json", "engine/npm/*/package.json"]
+outputs = ["node_modules/.modules.yaml"]
+# The output above marks a finished run; the task writes more than it, so the task
+# cache, which restores only declared outputs, stays off.
+cache = { enabled = false }
+
 [tasks."node:native"]
 tools = { node = "24" }
 description = "Build and stage the host's Node-API addon (NODE_PROFILE=dev for a debug build)"
@@ -470,7 +480,7 @@ run = "scripts/node-native.sh"
 [tasks."node:build"]
 tools = { node = "24" }
 description = "Build the shared RDF/JS contracts, remote client and native engine packages"
-depends = ["node:native"]
+depends = ["node:install", "node:native"]
 run = "pnpm --dir js build"
 
 [tasks."node:test"]
@@ -498,6 +508,7 @@ run = [
 [tasks."node:client:gen"]
 tools = { node = "24" }
 description = "Regenerate the remote TypeScript client's OpenAPI types"
+depends = ["node:install"]
 run = "pnpm --dir js client:gen"
 
 [tasks."node:client:check"]
@@ -505,11 +516,13 @@ sources = ["@group:js", "docs/openapi.json"]
 outputs = []
 tools = { node = "24" }
 description = "Check that the TypeScript client's generated OpenAPI types are current"
+depends = ["node:install"]
 run = "pnpm --dir js client:check"
 
 [tasks."node:fmt"]
 tools = { node = "24" }
 description = "Format the JavaScript and TypeScript bindings"
+depends = ["node:install"]
 run = "pnpm --dir js format"
 
 [tasks."node:fmt:check"]
@@ -517,6 +530,7 @@ sources = ["@group:js"]
 outputs = []
 tools = { node = "24" }
 description = "Check JavaScript and TypeScript formatting"
+depends = ["node:install"]
 run = "pnpm --dir js format:check"
 
 [tasks."node:lock"]
@@ -756,7 +770,7 @@ scripts/bench-lubm.sh "$usage_universities" "$(realpath -m "$usage_workdir")"
 description = "BSBM Explore or Business Intelligence: per-template times and query mixes per hour with 1, 4 and 16 clients on the five engines of bench (the GPL-3.0 BSBM tools are downloaded when SPARKLES_ALLOW_GPL_BENCHMARK=1)"
 depends = ["build"]
 usage = '''
-arg "[scale]" default="2000" help="products (2000 is about 377k triples) or a size: 1m, 10m or 100m"
+arg "[scale]" default="2000" help="products (2000 is about 725k triples) or a size: 1m, 10m or 100m"
 arg "[workdir]" default="target/bench-bsbm" help="tools, data, queries, indexes and results/ (summary.md, record.json, driver XML)"
 flag "--usecase <u>" default="explore" help="explore or bi"
 flag "--instances <n>" default="3" help="query instances per template"
@@ -766,6 +780,8 @@ flag "--bsbm-warmup <n>" default="50" help="warm-up query mixes per driver run"
 flag "--skip-qmph" help="skip the query-mix runs"
 flag "--runs <n>" default="10" help="measured runs per query instance"
 flag "--warmup <n>" default="2" help="warm-up runs per query instance"
+flag "--cold-runs <n>" default="0" help="restarts per query instance for the cold measurement (0: none)"
+flag "--queries <list>" help="only these templates or instances (explore-q2 bi-q1-2 …)"
 flag "--skip-load" help="reuse indexes from a previous run in the same workdir"
 flag "--answers-only" help="only check answers across engines; time nothing"
 flag "--engines <list>" default="sparkles jena qlever fluree oxigraph" help="engines to run"
@@ -774,6 +790,7 @@ flag "--port-base <port>" default="48300" help="the first of the five server por
 run = '''
 USECASE="$usage_usecase" INSTANCES="$usage_instances" CLIENTS="$usage_clients" BSBM_RUNS="$usage_bsbm_runs" \
 BSBM_WARMUP="$usage_bsbm_warmup" SKIP_QMPH="${usage_skip_qmph:+1}" RUNS="$usage_runs" WARMUP="$usage_warmup" \
+COLD_RUNS="$usage_cold_runs" QUERIES="${usage_queries:-}" \
 ENGINES="$usage_engines" SKIP_LOAD="${usage_skip_load:+1}" ANSWERS_ONLY="${usage_answers_only:+1}" \
 PORT_BASE="$usage_port_base" scripts/bench-bsbm.sh "$usage_scale" "$(realpath -m "$usage_workdir")"
 '''

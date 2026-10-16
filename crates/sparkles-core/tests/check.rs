@@ -427,7 +427,7 @@ fn a_wal_checksum_mismatch_mid_log_is_an_error() {
     let (_d, root) = fresh();
     let path = gen_dir(&root).join("wal.log");
     let mut b = std::fs::read(&path).unwrap();
-    b[5] ^= 0x01; // a data record of the first transaction
+    b[33 + 5] ^= 0x01; // a data record of the first transaction, after the header
     std::fs::write(&path, &b).unwrap();
     let r = run(&root, true);
     assert_eq!(status(&r, "wal"), Status::Error, "{}", r.to_text());

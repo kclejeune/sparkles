@@ -47,6 +47,7 @@ impl Dataset {
                 store: self.store().options().clone(),
                 name: self.name().map(str::to_string),
                 closure_cache_triples: self.state().closure_cache_triples,
+                pool: self.state().pool.clone(),
                 ..Default::default()
             },
         );

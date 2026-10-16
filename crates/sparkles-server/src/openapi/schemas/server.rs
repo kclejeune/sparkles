@@ -11,6 +11,7 @@ fn counters(description: &str) -> J {
 
 pub(super) fn put_all(put: &mut dyn FnMut(&str, J)) {
     metrics(put);
+    server_memory(put);
     fuseki(put);
     compaction(put);
 }
@@ -123,6 +124,55 @@ fn metrics(put: &mut dyn FnMut(&str, J)) {
             ),
             "The counters of `/$/metrics` as JSON (`?format=json`).",
             "metrics",
+        ),
+    );
+}
+
+fn server_memory(put: &mut dyn FnMut(&str, J)) {
+    let cache_use = obj(
+        &["capacityBytes", "bytes", "entries"],
+        json!({ "capacityBytes": int(), "bytes": int(), "entries": int() }),
+    );
+    put(
+        "ServerMemory",
+        doc(
+            obj(
+                &["profile", "queryMemoryBytes", "pool", "caches", "datasets"],
+                json!({
+                    "profile": string_enum(&["default", "small"]),
+                    "queryMemoryBytes": { "type": ["integer", "null"], "description": "The budget of one query (`--query-memory-mb`), `null` when unlimited." },
+                    "pool": obj(&["enabled"], json!({
+                        "enabled": boolean(),
+                        "capacityBytes": int(),
+                        "grantedBytes": int(),
+                        "waiting": { "type": "integer", "description": "Requests waiting for admission." },
+                        "admitted": int(),
+                        "rejected": { "type": "integer", "description": "Requests answered `503` after the admission wait." },
+                        "admissionWaitSeconds": num(),
+                    })),
+                    "caches": obj(&[], json!({
+                        "shared": boolean(),
+                        "block": cache_use.clone(),
+                        "result": cache_use.clone(),
+                        "service": cache_use,
+                        "history": obj(&["capacityBytes", "bytes"], json!({ "capacityBytes": int(), "bytes": int() })),
+                    })),
+                    "datasets": array(obj(
+                        &["name", "blockBytes", "blockEntries", "resultBytes", "resultEntries", "serviceBytes", "serviceEntries"],
+                        json!({
+                            "name": string(),
+                            "blockBytes": int(),
+                            "blockEntries": int(),
+                            "resultBytes": int(),
+                            "resultEntries": int(),
+                            "serviceBytes": int(),
+                            "serviceEntries": int(),
+                        }),
+                    )),
+                }),
+            ),
+            "The query memory pool and the caches the datasets share, with each dataset's bytes in them.",
+            "budgets",
         ),
     );
 }

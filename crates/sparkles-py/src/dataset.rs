@@ -168,6 +168,9 @@ pub fn apply_defaults(
     args: &QueryArgs<'_>,
 ) -> PyResult<()> {
     opts.rdfs = defaults.rdfs.clone();
+    if opts.pool.is_none() && opts.grant.is_none() {
+        opts.pool = defaults.pool.clone();
+    }
     opts.describe = describe_options(defaults.describe.clone(), args.describe.as_ref())?;
     opts.defaults_applied = true;
     Ok(())

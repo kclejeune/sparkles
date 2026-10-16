@@ -999,6 +999,10 @@ pub fn runtime(st: &AppState, ds: &Dataset, kind: &Kind) -> anyhow::Result<Value
             if kind.shared {
                 m.retain(|k, _| kind.members.contains(&k.as_str()));
             }
+            // the file's version member (checked by read_file) is not a setting
+            if let Some(f) = sparkles::formats::settings_file(kind.file) {
+                m.remove(f.member);
+            }
             Value::Object(m)
         }
         Some(_) => anyhow::bail!("{} of {} is not a JSON object", kind.file, ds.name),
@@ -1025,8 +1029,11 @@ pub fn store_runtime(
     if kind.shared
         && let Some(Value::Object(old)) = crate::assist::read_file(st, ds, kind.file)?
     {
+        // the version member is written again by write_file, and alone it does not
+        // keep the file
+        let member = sparkles::formats::settings_file(kind.file).map(|f| f.member);
         for (k, v) in old {
-            if !kind.members.contains(&k.as_str()) {
+            if !kind.members.contains(&k.as_str()) && Some(k.as_str()) != member {
                 m.insert(k, v);
             }
         }

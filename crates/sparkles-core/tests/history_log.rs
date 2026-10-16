@@ -513,6 +513,161 @@ fn bulk_commits_are_recorded_or_summarized() {
 }
 
 #[test]
+fn small_bulk_commits_into_large_datasets_are_recorded() {
+    use sparkles_core::store::ReplaceTarget;
+    // the limit applies to what a bulk commit changes, not to the size of the states
+    for persistent in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let o = StoreOptions {
+            bulk_threshold: 10,
+            change_log_bulk_max_quads: 100,
+            ..opts()
+        };
+        let s = if persistent {
+            Store::open(&dir.path().join("db"), o).unwrap()
+        } else {
+            Store::in_memory(o)
+        };
+        let ttl = |n: usize, off: usize, g: Option<&str>| {
+            let body: String = (off..off + n)
+                .map(|i| match g {
+                    Some(g) => format!("<urn:s{i}> <urn:p> \"{i}\" <{g}> .\n"),
+                    None => format!("<urn:s{i}> <urn:p> \"{i}\" .\n"),
+                })
+                .collect();
+            Source::from_bytes(
+                body.into_bytes(),
+                if g.is_some() {
+                    RdfFormat::NQuads
+                } else {
+                    RdfFormat::NTriples
+                },
+                None,
+            )
+        };
+        s.load(&[ttl(300, 0, None)]).unwrap(); // commit 1: 300 quads
+        let before = live(&s);
+        // commit 2: 40 new quads and 3 that the dataset holds already, in a bulk build
+        s.load(&[ttl(43, 297, None)]).unwrap();
+        let after = live(&s);
+        assert_eq!(after.len(), 340);
+        assert_eq!(
+            recorded(&s, 2),
+            delta(&before, &after),
+            "persistent {persistent}"
+        );
+        s.compact().unwrap();
+        // the commit's states are collected or not, its changes stay in the log
+        let r = s.history_changes(&HistoryQuery::default()).unwrap();
+        assert!(
+            r.unrecorded.iter().all(|u| u.from > 2 || u.to < 2),
+            "{:?}",
+            r.unrecorded
+        );
+        // commit 3: a graph of 25 quads, then its replacement by 20 others
+        s.load(&[ttl(25, 1000, Some("urn:g"))]).unwrap();
+        let before = live(&s);
+        s.replace(
+            ReplaceTarget::Named(NamedNode::new("urn:g").unwrap()),
+            &[ttl(20, 2000, Some("urn:g"))],
+        )
+        .unwrap();
+        let after = live(&s);
+        let (rem, add) = recorded(&s, 4);
+        assert_eq!((rem.len(), add.len()), (25, 20));
+        assert_eq!((rem, add), delta(&before, &after));
+        // blank nodes, inline numbers, language tags and triple terms keep their keys
+        let before = live(&s);
+        let mixed: String = (0..20)
+            .map(|i| {
+                format!(
+                    "_:b{i} <urn:p> {i}, {i}.5, \"t{i}\"@en, <<( <urn:s{i}> <urn:p> _:b{i} )>> .\n"
+                )
+            })
+            .collect();
+        s.load(&[Source::from_bytes(
+            mixed.into_bytes(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+        let after = live(&s);
+        let (rem, add) = recorded(&s, 5);
+        assert_eq!((rem.len(), add.len()), (0, 80));
+        assert_eq!((rem, add), delta(&before, &after));
+        // a bulk load of more than the limit is still a summary
+        s.load(&[ttl(120, 5000, None)]).unwrap();
+        let r = s.history_changes(&HistoryQuery::default()).unwrap();
+        // and so is the first load, which put 300 quads into an empty dataset
+        let gaps: Vec<(u64, UnrecordedReason)> =
+            r.unrecorded.iter().map(|u| (u.from, u.reason)).collect();
+        assert_eq!(
+            gaps,
+            [(1, UnrecordedReason::Bulk), (6, UnrecordedReason::Bulk)]
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_lookup_error_makes_a_bulk_commit_a_summary() {
+    use sparkles_core::store::ReplaceTarget;
+    use std::os::unix::fs::FileExt;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let s = Store::open(
+        &root,
+        StoreOptions {
+            bulk_threshold: 1,
+            change_log_bulk_max_quads: 100,
+            ..opts()
+        },
+    )
+    .unwrap();
+    let nq = |lines: Vec<String>| {
+        Source::from_bytes(lines.join("\n").into_bytes(), RdfFormat::NQuads, None)
+    };
+    // commit 1: 20,000 default-graph quads and 10 quads of a named graph
+    let mut first: Vec<String> = (0..20_000)
+        .map(|i| format!("<urn:s{i:06}> <urn:p> <urn:o> ."))
+        .collect();
+    first.extend((0..10).map(|i| format!("<urn:a{i}> <urn:p> <urn:o> <urn:g> .")));
+    s.load(&[nq(first)]).unwrap();
+    // the first block of the SPO index becomes unreadable
+    let current = std::fs::read_to_string(root.join("CURRENT")).unwrap();
+    let spo = root.join(current.trim()).join("spo.dat");
+    let f = std::fs::OpenOptions::new().write(true).open(&spo).unwrap();
+    f.write_all_at(&[255; 4], 0).unwrap();
+    f.sync_all().unwrap();
+    // commit 2: the graph is replaced by 10 others
+    let new: Vec<String> = (0..10)
+        .map(|i| format!("<urn:z{i}> <urn:p> <urn:o> <urn:g> ."))
+        .collect();
+    s.replace(
+        ReplaceTarget::Named(NamedNode::new("urn:g").unwrap()),
+        &[nq(new)],
+    )
+    .expect("the build reads GSPO, so a corrupt SPO block must not fail the replace");
+    let r = s.history_changes(&HistoryQuery::default()).unwrap();
+    let in2 = r.changes.iter().filter(|c| c.commit.seq == 2);
+    let (adds, removes) = in2.fold((0, 0), |(a, d), c| match c.op {
+        DiffOp::Add => (a + 1, d),
+        _ => (a, d + 1),
+    });
+    if (adds, removes) == (0, 0) {
+        assert!(
+            r.unrecorded
+                .iter()
+                .any(|u| u.from <= 2 && 2 <= u.to && u.reason == UnrecordedReason::Bulk),
+            "{:?}",
+            r.unrecorded
+        );
+    } else {
+        assert_eq!((adds, removes), (10, 10), "{:?}", r.unrecorded);
+    }
+}
+
+#[test]
 fn retention_drops_whole_segments_from_the_oldest() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("db");

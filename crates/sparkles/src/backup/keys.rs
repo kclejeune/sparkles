@@ -1,11 +1,16 @@
 //! Bounded operator-only local key resolution. Configuration holds references only.
-use super::config::{KeySource, RepositoryEncryption};
+//!
+//! Reading a key input ([`read_key`]) is part of the `backup` feature, since a server
+//! seals its runtime secrets with a key from the same sources in every build. Turning
+//! inputs into repository keys ([`resolve`]) needs `backup-encryption`.
+use super::config::KeySource;
+#[cfg(feature = "backup-encryption")]
+use super::config::RepositoryEncryption;
 use anyhow::{Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
-use sparkles_backup::{
-    Ctl,
-    crypto::{EncryptionOptions, LocalKey, LocalKeySource, Passphrase},
-};
+use sparkles_backup::Ctl;
+#[cfg(feature = "backup-encryption")]
+use sparkles_backup::crypto::{EncryptionOptions, LocalKey, LocalKeySource, Passphrase};
 use std::{
     io::Read,
     path::{Path, PathBuf},
@@ -154,7 +159,7 @@ fn read_private(
 /// base64. Raw input that is entirely printable ASCII is refused, because it is
 /// almost certainly a typed password rather than random key bytes. A random
 /// 32-byte key is all printable with a probability of about 10^-13.
-fn decode_key(bytes: &[u8], label: &str) -> Result<Zeroizing<[u8; 32]>> {
+pub fn decode_key(bytes: &[u8], label: &str) -> Result<Zeroizing<[u8; 32]>> {
     let text = bytes
         .iter()
         .all(|b| b.is_ascii_graphic() || b.is_ascii_whitespace());
@@ -390,8 +395,95 @@ async fn command(
     Ok(bytes)
 }
 
+/// The bytes of the key input `key`, as given: a file that only its owner can read, an
+/// environment variable, a systemd credential or the output of a command.
+async fn read_input(
+    key: &KeySource,
+    label: &str,
+    context: &KeyContext,
+    ctl: &Ctl,
+) -> Result<Zeroizing<Vec<u8>>> {
+    ctl.check()?;
+    let bytes = match key {
+        KeySource::File { path } | KeySource::PassphraseFile { path } => {
+            let path = path.clone();
+            let context = context.clone();
+            let owned = label.to_string();
+            tokio::task::spawn_blocking(move || read_private(&path, &context, &owned, None))
+                .await
+                .map_err(|_| unavailable(label, "key file worker failed"))??
+        }
+        KeySource::Env { var } => {
+            let value = std::env::var_os(var)
+                .ok_or_else(|| unavailable(label, "key environment variable is missing"))?;
+            #[cfg(unix)]
+            let bytes = {
+                use std::os::unix::ffi::OsStringExt;
+                Zeroizing::new(value.into_vec())
+            };
+            #[cfg(not(unix))]
+            let bytes = Zeroizing::new(
+                value
+                    .into_string()
+                    .map_err(|_| unavailable(label, "key environment value is not text"))?
+                    .into_bytes(),
+            );
+            bytes
+        }
+        KeySource::Credential { name } => {
+            let directory = context
+                .credential_directory
+                .as_ref()
+                .filter(|p| p.is_absolute())
+                .ok_or_else(|| unavailable(label, "credential directory is unavailable"))?;
+            let path = directory
+                .join(name)
+                .to_str()
+                .ok_or_else(|| unavailable(label, "credential path is not text"))?
+                .to_owned();
+            let directory = directory.clone();
+            let context = context.clone();
+            let owned = label.to_string();
+            tokio::task::spawn_blocking(move || {
+                read_private(&path, &context, &owned, Some(&directory))
+            })
+            .await
+            .map_err(|_| unavailable(label, "credential worker failed"))??
+        }
+        KeySource::Command { argv, timeout_secs } => {
+            command(argv, *timeout_secs, ctl, label).await?
+        }
+    };
+    ctl.check()?;
+    if bytes.is_empty() || bytes.len() > LIMIT {
+        bail!(
+            "{}",
+            unavailable(label, "key input must contain 1..4096 bytes")
+        );
+    }
+    Ok(bytes)
+}
+
+/// The 32-byte key of the input `key`, read once and decoded as raw bytes, 64
+/// hexadecimal digits or canonical base64. A passphrase file is refused, since it is
+/// not a key. Unlike [`resolve`], this works on every platform: the caller decides
+/// where the key is kept.
+pub async fn read_key(
+    key: &KeySource,
+    label: &str,
+    context: &KeyContext,
+    ctl: &Ctl,
+) -> Result<Zeroizing<[u8; 32]>> {
+    if matches!(key, KeySource::PassphraseFile { .. }) {
+        bail!("{}", unavailable(label, "a passphrase file is not a key"));
+    }
+    let bytes = read_input(key, label, context, ctl).await?;
+    decode_key(&bytes, label)
+}
+
 /// Resolve online inputs once for a repository handle. Offline recovery inputs can be
 /// supplied separately to key-add and need not be kept in this configuration.
+#[cfg(feature = "backup-encryption")]
 pub async fn resolve(
     settings: &RepositoryEncryption,
     context: &KeyContext,
@@ -406,78 +498,13 @@ pub async fn resolve(
         ..Default::default()
     };
     for input in &settings.keys {
-        ctl.check()?;
-        let (mut bytes, source) = match &input.key {
-            KeySource::File { path } | KeySource::PassphraseFile { path } => {
-                let path = path.clone();
-                let context = context.clone();
-                let label = input.label.clone();
-                (
-                    tokio::task::spawn_blocking(move || {
-                        read_private(&path, &context, &label, None)
-                    })
-                    .await
-                    .map_err(|_| unavailable(&input.label, "key file worker failed"))??,
-                    LocalKeySource::File,
-                )
-            }
-            KeySource::Env { var } => {
-                let value = std::env::var_os(var).ok_or_else(|| {
-                    unavailable(&input.label, "key environment variable is missing")
-                })?;
-                #[cfg(unix)]
-                let bytes = {
-                    use std::os::unix::ffi::OsStringExt;
-                    Zeroizing::new(value.into_vec())
-                };
-                #[cfg(not(unix))]
-                let bytes = Zeroizing::new(
-                    value
-                        .into_string()
-                        .map_err(|_| {
-                            unavailable(&input.label, "key environment value is not text")
-                        })?
-                        .into_bytes(),
-                );
-                (bytes, LocalKeySource::Env)
-            }
-            KeySource::Credential { name } => {
-                let directory = context
-                    .credential_directory
-                    .as_ref()
-                    .filter(|p| p.is_absolute())
-                    .ok_or_else(|| {
-                        unavailable(&input.label, "credential directory is unavailable")
-                    })?;
-                let path = directory
-                    .join(name)
-                    .to_str()
-                    .ok_or_else(|| unavailable(&input.label, "credential path is not text"))?
-                    .to_owned();
-                let directory = directory.clone();
-                let context = context.clone();
-                let label = input.label.clone();
-                (
-                    tokio::task::spawn_blocking(move || {
-                        read_private(&path, &context, &label, Some(&directory))
-                    })
-                    .await
-                    .map_err(|_| unavailable(&input.label, "credential worker failed"))??,
-                    LocalKeySource::Credential,
-                )
-            }
-            KeySource::Command { argv, timeout_secs } => (
-                command(argv, *timeout_secs, ctl, &input.label).await?,
-                LocalKeySource::Command,
-            ),
+        let mut bytes = read_input(&input.key, &input.label, context, ctl).await?;
+        let source = match &input.key {
+            KeySource::File { .. } | KeySource::PassphraseFile { .. } => LocalKeySource::File,
+            KeySource::Env { .. } => LocalKeySource::Env,
+            KeySource::Credential { .. } => LocalKeySource::Credential,
+            KeySource::Command { .. } => LocalKeySource::Command,
         };
-        ctl.check()?;
-        if bytes.is_empty() || bytes.len() > LIMIT {
-            bail!(
-                "{}",
-                unavailable(&input.label, "key input must contain 1..4096 bytes")
-            );
-        }
         if matches!(input.key, KeySource::PassphraseFile { .. }) {
             out.passphrases
                 .push(Passphrase::new(&input.label, std::mem::take(&mut *bytes))?);
@@ -492,7 +519,11 @@ pub async fn resolve(
     Ok(out)
 }
 
-#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+#[cfg(all(
+    test,
+    feature = "backup-encryption",
+    any(target_os = "linux", target_os = "android")
+))]
 mod tests {
     use super::super::config::KeyInput;
     use super::*;

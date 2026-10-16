@@ -234,14 +234,12 @@ fn sorting_spills_past_its_budget_and_cleans_up() {
     std::fs::remove_dir_all(&parent).unwrap();
 }
 
-/// A reader of `text` that, after `fail_after` bytes, checks that spill files exist and
-/// then fails or waits past a deadline.
+/// A reader of `text` that, after `fail_after` bytes, observes spill files and fails.
 struct Interrupted<'a> {
     text: &'a [u8],
     at: usize,
     fail_after: usize,
     parent: &'a Path,
-    sleep: Option<Duration>,
     saw_spills: bool,
 }
 
@@ -249,14 +247,7 @@ impl Read for Interrupted<'_> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         if self.at >= self.fail_after {
             self.saw_spills = entries(self.parent) > 0;
-            match self.sleep.take() {
-                Some(d) => std::thread::sleep(d),
-                None if self.fail_after < self.text.len() => {
-                    return Err(io::Error::other("the connection went away"));
-                }
-                None => {}
-            }
-            self.fail_after = usize::MAX;
+            return Err(io::Error::other("the connection went away"));
         }
         let end = self
             .text
@@ -267,6 +258,27 @@ impl Read for Interrupted<'_> {
         out[..n].copy_from_slice(&self.text[self.at..end]);
         self.at = end;
         Ok(n)
+    }
+}
+
+/// Wait past the deadline after the formatter has created real spill files.
+/// Small chunks let this observation happen after only a short input prefix.
+struct DeadlineAfterSpill<'a> {
+    reader: io::Cursor<&'a [u8]>,
+    parent: &'a Path,
+    deadline: Instant,
+    saw_spills: bool,
+}
+
+impl Read for DeadlineAfterSpill<'_> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if !self.saw_spills && entries(self.parent) > 0 {
+            self.saw_spills = true;
+            while let Some(remaining) = self.deadline.checked_duration_since(Instant::now()) {
+                std::thread::sleep(remaining);
+            }
+        }
+        self.reader.read(out)
     }
 }
 
@@ -289,7 +301,6 @@ fn spill_files_go_on_errors_and_cancellation() {
         at: 0,
         fail_after: half,
         parent: &parent,
-        sleep: None,
         saw_spills: false,
     };
     let e = format_lines(
@@ -303,28 +314,33 @@ fn spill_files_go_on_errors_and_cancellation() {
     assert!(r.saw_spills, "nothing spilled before the failure");
     assert_eq!(entries(&parent), 0, "spill files left after a read error");
 
-    // the deadline passes half way
+    // Expire after the first spill, without first parsing half the large input.
+    let deadline = Instant::now() + Duration::from_millis(1500);
     let o_late = Options {
-        deadline: Some(Instant::now() + Duration::from_millis(1500)),
+        deadline: Some(deadline),
         ..o.clone()
     };
-    let mut r = Interrupted {
-        text: text.as_bytes(),
-        at: 0,
-        fail_after: half,
+    let mut r = DeadlineAfterSpill {
+        reader: io::Cursor::new(text.as_bytes()),
         parent: &parent,
-        sleep: Some(Duration::from_millis(2000)),
+        deadline,
         saw_spills: false,
     };
-    let e = format_lines(
-        BufReader::new(&mut r),
+    let chunk_bytes = 1 << 10;
+    let e = format_stream_chunked(
+        BufReader::with_capacity(chunk_bytes, &mut r),
         io::sink(),
         Language::NTriples,
         &o_late,
         &cfg,
+        chunk_bytes,
     );
     assert_eq!(e.unwrap_err(), FormatError::Timeout);
-    assert!(r.saw_spills);
+    assert!(r.saw_spills, "nothing spilled before the deadline passed");
+    assert!(
+        r.reader.position() < 16 << 10,
+        "read too far before expiring"
+    );
     assert_eq!(entries(&parent), 0, "spill files left after a timeout");
 
     // the output fails (sorted output is written once the input is read)

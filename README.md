@@ -214,7 +214,6 @@ orders every item by difficulty and impact and links each to its design spec.
 * **Now.**
   * Benchmarks: BSBM, SP²Bench, LUBM, LDBC and Wikidata query logs, with every
     comparison refreshed at the current head.
-  * Memory: caches sized across the whole server and a shared query memory pool.
   * Writes: group commit as the default.
   * Reads: faster cold sparse lookups.
 * **Next.**

@@ -1,0 +1,13 @@
+count count
+names names
+ages ages
+graphs graphs
+bnodes bnodes
+triple-terms triple-terms
+text text
+geo geo
+vector vector
+names-at-snapshot names --at snapshot:release-1
+count-at-snapshot count --at snapshot:release-1
+names-at-4 names --at commit:4
+names-dev names --branch dev

@@ -6,7 +6,8 @@
     bench-record.py build     --suite NAME --scale LABEL --results DIR --manifest FILE --out record.json
     bench-record.py validate  record.json...
 
-`manifest` writes the run manifest at the start of a run: the Sparkles commit and binary
+`manifest` writes the run manifest at the start of a run: the commit of the scripts' checkout,
+the commit of the Sparkles binary when it is known, and the binary
 hash, every engine's version, binary hash and license, the host, the memory limit, the CPU
 pinning, the data hashes and the start time. `finish` adds the end time.
 
@@ -22,8 +23,9 @@ pinning, the data hashes and the start time. `finish` adds the end time.
 * `inference.json`: the materialization of the LUBM suite,
 * `extra.json`: optional `{"settings": {…}, "results": [ … ]}` merged into the record.
 
-Which query files count is decided by `--queries` (a list of names); without it every
-`*.json` file in the directory that is not one of the files above is taken as a query.
+Which queries count is decided by `--queries` (a list of names). Without it every `*.json` file
+in the directory that is not one of the files above is taken as a query, and so is every query
+name in `answers.json`, which gives a query that was only answer-checked its answer result.
 
 `validate` checks a record against the shape below and exits with status 1 on the first
 file that does not conform.
@@ -38,7 +40,8 @@ Record 1 (every field is required unless marked optional):
     results     list of
         engine       sparkles | jena | qlever | fluree | oxigraph | …
         query        string
-        mode         warm | cold | update | throughput | qmph | load
+        mode         warm | cold | update | throughput | qmph | load | answer
+                     (answer: a query that was only answer-checked, with no timing)
         clients      integer
         durability   synced | written | memory | null
         status       ok | timeout | error | oom | wrong-answer
@@ -76,10 +79,11 @@ LICENSES = {
 # written (OS cache), synced or memory: docs/specs/X06 §5.1, from each engine's documentation
 DURABILITY = {"sparkles": "synced", "jena": "synced", "oxigraph": "written", "qlever": "memory", "fluree": "synced"}
 STATUSES = {"ok", "timeout", "error", "oom", "wrong-answer"}
-MODES = {"warm", "cold", "update", "throughput", "qmph", "load"}
+MODES = {"warm", "cold", "update", "throughput", "qmph", "load", "answer"}
 AUX = {"load", "load-details", "answers", "mem", "rss", "rss-probe", "churn", "mixed", "cold", "cold-runs",
        "qmph", "extra", "manifest", "record", "update-latency", "inference"}
 CURL_TIMEOUT = 28
+MAX_TIME_S = None  # the harness's request limit in seconds, set by `build --max-time`
 
 
 def engine_name(n):
@@ -151,17 +155,32 @@ def version_of(path, args):
     return out.splitlines()[0] if out else "unknown"
 
 
+def nix_package(path):
+    """(store path, package name, version) when the binary lives in the Nix store, else None.
+    Store paths look like /nix/store/<hash>-<name>-<version>/bin/<binary>."""
+    real = os.path.realpath(path)
+    parts = real.split("/")
+    if len(parts) < 4 or parts[1:3] != ["nix", "store"]:
+        return None
+    store = "/".join(parts[:4])
+    package = parts[3].split("-", 1)[1] if "-" in parts[3] else parts[3]
+    m = re.match(r".*?-(\d[\w.+]*)$", package)
+    return store, package, m.group(1) if m else None
+
+
 def cmd_manifest(a):
     m = {"suite": a.suite, "started": now(), "ended": None, "host": host_info(a.workdir)}
     sp = {"binary": a.sparkles, "version": version_of(a.sparkles, ["--version"])}
     if a.sparkles and os.path.exists(a.sparkles):
         sp["sha256"] = sha256(a.sparkles)
-    if a.commit:
-        sp["commit"] = a.commit
-    else:
-        sp["commit"] = run(["git", "-C", os.path.dirname(os.path.abspath(__file__)), "rev-parse", "HEAD"]) or "unknown"
-        if run(["git", "-C", os.path.dirname(os.path.abspath(__file__)), "status", "--porcelain", "--untracked-files=no"]):
-            sp["commit"] += "+dirty"
+    # The commit of the checkout that holds these scripts says nothing about the binary, which
+    # may be a release or a build of another revision. The binary's own commit is recorded only
+    # when the caller knows it (--binary-commit, or SPARKLES_COMMIT in the environment).
+    here = os.path.dirname(os.path.abspath(__file__))
+    sp["scripts_commit"] = run(["git", "-C", here, "rev-parse", "HEAD"]) or "unknown"
+    if run(["git", "-C", here, "status", "--porcelain", "--untracked-files=no"]):
+        sp["scripts_commit"] += "+dirty"
+    sp["binary_commit"] = a.binary_commit or os.environ.get("SPARKLES_COMMIT") or None
     m["sparkles"] = sp
     engines = {}
     for spec in a.engine:
@@ -171,6 +190,14 @@ def cmd_manifest(a):
         if path and os.path.exists(path):
             e["sha256"] = sha256(path)
             e["version"] = version_of(path, ["--version"])
+            store = nix_package(path)
+            if store:
+                # a package from nixpkgs is identified by its store path, and its version is the
+                # package's when the binary does not report a real one
+                e["store_path"], e["package"], pkg_version = store
+                e["reported_version"] = e["version"]
+                if pkg_version and (e["version"] == "unknown" or "unknown" in e["version"]):
+                    e["version"] = pkg_version
         else:
             e["version"] = "unknown"
         engines[name] = e
@@ -218,7 +245,8 @@ def fingerprints(answers):
     out = {}
     for q, per in (answers or {}).items():
         ok = {e: v for e, v in per.items() if v.get("rows") != "error"}
-        digest = {e: v.get("value") or v.get("exact") or str(v.get("rows")) for e, v in ok.items()}
+        digest = {e: (v.get("value") or v.get("exact") or str(v.get("rows"))) + ("/" + v["order"] if v.get("order") else "")
+                  for e, v in ok.items()}
         vals = list(digest.values())
         ref = None
         if vals:
@@ -238,9 +266,16 @@ def fingerprints(answers):
     return out
 
 
-def status_of(codes, answer):
-    if codes and any(c != 0 for c in codes):
-        return "timeout" if all(c in (0, CURL_TIMEOUT) for c in codes) and CURL_TIMEOUT in codes else "error"
+def status_of(codes, samples_s, answer):
+    """ok, timeout, error or wrong-answer. A failed run is a timeout when curl gave up (exit 28)
+    or when it took as long as the harness's request limit (--max-time), which is how a server's
+    own timeout shows, since it answers with an HTTP error."""
+    failed = [(c, t) for c, t in zip(codes or [], samples_s) if c != 0]
+    if failed:
+        limit = MAX_TIME_S * 0.95 if MAX_TIME_S else None
+        if all(c == CURL_TIMEOUT or (limit is not None and t >= limit) for c, t in failed):
+            return "timeout"
+        return "error"
     if answer is not None and answer["agrees"] is False:
         return "wrong-answer"
     return "ok"
@@ -248,7 +283,7 @@ def status_of(codes, answer):
 
 def result(engine, query, mode, samples_s, codes, answer, clients=1, **extra):
     ok = [s * 1000 for s, c in zip(samples_s, codes or [0] * len(samples_s)) if c == 0]
-    st = status_of(codes, answer)
+    st = status_of(codes, samples_s, answer)
     r = {
         "engine": engine,
         "query": query,
@@ -277,12 +312,13 @@ def hyperfine_results(d, name, mode, fps, clients=1, query=None):
 
 def pool(results):
     """Results of the instances `<template>-<i>` of one template, as one result per template: the
-    samples of all instances together, the worst status, and one answer for the whole template."""
+    samples of all instances together, the worst status, and one answer for the whole template, whose
+    hash covers each instance's name and hash, so a change in which instance gives which answer shows."""
     order = {"ok": 0, "wrong-answer": 1, "timeout": 2, "oom": 3, "error": 4}
     groups, out = {}, []
     for r in results:
         m = re.fullmatch(r"(.+)-(\d+)", r["query"])
-        if r["mode"] not in ("warm", "cold") or not m:
+        if r["mode"] not in ("warm", "cold", "answer") or not m:
             out.append(r)
             continue
         groups.setdefault((r["engine"], m.group(1), r["mode"], r["clients"]), []).append(r)
@@ -292,7 +328,10 @@ def pool(results):
         answer = None
         if all(answers):
             agrees = None if any(x["agrees"] is None for x in answers) else all(x["agrees"] for x in answers)
-            h = hashlib.sha256("".join(sorted(str(x["hash"]) for x in answers)).encode()).hexdigest()[:16]
+            pairs = sorted(((int(re.fullmatch(r".+-(\d+)", r["query"]).group(1)), r["query"], r["answer"]) for r in rs),
+                           key=lambda t: (t[0], t[1]))
+            text = "\n".join(f"{name}\t{a['hash']}" for _, name, a in pairs)
+            h = hashlib.sha256(text.encode()).hexdigest()[:16]
             answer = {"rows": sum(x["rows"] for x in answers), "hash": h, "agrees": agrees, "instances": len(rs)}
         out.append({
             "engine": engine, "query": template, "mode": mode, "clients": clients,
@@ -305,16 +344,29 @@ def pool(results):
 
 
 def cmd_build(a):
+    global MAX_TIME_S
+    MAX_TIME_S = float(a.max_time) if a.max_time else None
     d = a.results
     man = json.load(open(a.manifest)) if a.manifest else {}
     answers = load_json(d, "answers.json")
     fps = fingerprints(answers)
-    names = a.queries or sorted(f[:-5] for f in os.listdir(d)
-                                if f.endswith(".json") and f[:-5] not in AUX and not f.startswith("throughput")
-                                and not f.endswith(".new.json"))
+    names = a.queries or sorted({f[:-5] for f in os.listdir(d)
+                                 if f.endswith(".json") and f[:-5] not in AUX and not f.startswith("throughput")
+                                 and not f.endswith(".new.json")} | set(answers or {}))
     results = []
     for n in names:
         results += hyperfine_results(d, n, "warm", fps)
+    # a query that was answer-checked and not timed (ANSWERS_ONLY) still gets its fingerprint
+    timed = {(r["engine"], r["query"]) for r in results}
+    for q in names:
+        for e, v in ((answers or {}).get(q) or {}).items():
+            en = engine_name(e)
+            if (en, q) in timed:
+                continue
+            fp = fps.get((q, en))
+            st = "error" if v.get("rows") == "error" else "wrong-answer" if fp and fp["agrees"] is False else "ok"
+            results.append({"engine": en, "query": q, "mode": "answer", "clients": 1, "durability": None,
+                            "samples_ms": [], "median_ms": None, "p95_ms": None, "answer": fp, "status": st})
     results += hyperfine_results(d, "update-latency", "update", fps)
     for f in sorted(os.listdir(d)):
         if f.startswith("throughput") and f.endswith(".json"):
@@ -336,8 +388,10 @@ def cmd_build(a):
         for q, med in per.items():
             runs = cold_runs.get(e, {}).get(q, {})
             times = runs.get("times") or ([med] if med != "error" else ["error"])
-            rec = result(en, q, "cold", [t if t != "error" else 0 for t in times],
-                         [0 if t != "error" else 1 for t in times], fps.get((q, en)))
+            num = [isinstance(t, (int, float)) for t in times]
+            rec = result(en, q, "cold", [t if n else 0 for t, n in zip(times, num)],
+                         [0 if n else (CURL_TIMEOUT if t == "timeout" else 1) for t, n in zip(times, num)],
+                         fps.get((q, en)))
             if runs.get("ready"):
                 rec["ready_s"] = runs["ready"]
             results.append(rec)
@@ -348,7 +402,7 @@ def cmd_build(a):
                 "engine": en, "query": v.get("query", "mix"), "mode": "qmph", "clients": int(clients),
                 "durability": None, "samples_ms": [], "median_ms": None, "p95_ms": None, "answer": None,
                 "status": v.get("status", "ok"), "qmph": v.get("qmph"),
-                **{k: v[k] for k in ("qps", "runs", "timeouts", "seconds") if k in v},
+                **{k: v[k] for k in ("qps", "runs", "timeouts", "seconds", "disagreeing_queries", "driver_status") if k in v},
             })
     if a.pool_instances:
         results = pool(results)
@@ -449,7 +503,7 @@ def main():
     m.add_argument("--out", required=True)
     m.add_argument("--suite", required=True)
     m.add_argument("--sparkles", default="")
-    m.add_argument("--commit", default="")
+    m.add_argument("--binary-commit", default="", help="the commit the Sparkles binary was built from, if known")
     m.add_argument("--engine", action="append", default=[], help="name=path of an engine's binary")
     m.add_argument("--data", action="append", default=[],
                    help="name=path|license|params, or name=sha256:HEX|license|params")
@@ -473,6 +527,7 @@ def main():
     b.add_argument("--timer", default="hyperfine+curl")
     b.add_argument("--pool-instances", action="store_true",
                    help="one result per template for queries named <template>-<i> (samples pooled)")
+    b.add_argument("--max-time", default="", help="the request limit in seconds: a failed run that took this long is a timeout")
     b.add_argument("--throughput-requests", default="")
     b.add_argument("--throughput-clients", default="16")
     b.set_defaults(f=cmd_build)

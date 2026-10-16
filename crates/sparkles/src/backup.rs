@@ -10,7 +10,6 @@
 
 pub use sparkles_backup::*;
 pub mod config;
-#[cfg(feature = "backup-encryption")]
 pub mod keys;
 pub mod policy;
 pub mod registry;

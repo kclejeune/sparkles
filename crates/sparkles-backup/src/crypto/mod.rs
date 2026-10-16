@@ -3,14 +3,12 @@
 
 mod floor;
 mod manage;
-mod memory;
+pub(crate) use crate::seal::{memory, primitive};
 pub(crate) mod objects;
-mod primitive;
 pub(crate) mod repository;
-mod secret;
 pub(crate) mod slots;
+pub use crate::seal::{KeyMemory, SEALED_SECRET_PREFIX, SecretSealer};
 pub(crate) use repository::{KeyState, Snapshot};
-pub use secret::{SEALED_SECRET_PREFIX, SecretSealer};
 pub use slots::{EncryptionOptions, KeySlotSummary, LocalKey, LocalKeySource, Passphrase};
 
 #[cfg(test)]

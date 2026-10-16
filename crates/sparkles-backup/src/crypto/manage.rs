@@ -682,7 +682,7 @@ impl Repository {
                 crate::manifest::validate(
                     manifest,
                     self.marker.piece_bytes,
-                    sparkles_core::builder::FORMAT_VERSION,
+                    sparkles_core::formats::READABLE_INDEX_FORMATS,
                 )?;
             }
             if manifests.iter().any(|m| {

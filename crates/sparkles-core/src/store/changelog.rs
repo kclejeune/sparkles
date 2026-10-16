@@ -41,9 +41,15 @@
 //! have no author, which the write-ahead log does not hold.
 //!
 //! **Bulk commits** have no write-ahead log records. Their changes are recorded when
-//! they are small enough to compare cheaply (the dataset was empty, or both states
-//! together hold at most `change_log_bulk_max_quads` quads), and otherwise as a summary
-//! with the commit's counts. History queries report the commits they could not see.
+//! they are small: the dataset was empty and the new state holds at most
+//! `change_log_bulk_max_quads` quads, both states together hold at most that many, or the
+//! quads the commit can have changed number at most that many. Those are the quads it
+//! loads, the quads of the graphs it drops and its transaction's own changes, counted with
+//! duplicates, so a commit that rewrites many quads it keeps can be a summary even when it
+//! changes few. A larger one is recorded as a summary with the commit's counts. The build
+//! collects those quads, and the log keeps the ones that differ between the states, so a
+//! small commit into a large dataset reads neither state in full. History queries report
+//! the commits they could not see.
 //!
 //! **Retention.** Whole segments are dropped from the oldest, by commit count, age or
 //! total size. The open segment always stays.
@@ -118,7 +124,14 @@ struct SettingsFile {
 pub(crate) fn read_settings(root: &Path) -> Result<ChangeLogSettings> {
     match std::fs::read(root.join(CHANGE_LOG_FILE)) {
         Ok(b) => {
-            let f: SettingsFile = serde_json::from_slice(&b)
+            let mut v: serde_json::Value = serde_json::from_slice(&b)
+                .map_err(|e| Error::Corrupt(format!("{CHANGE_LOG_FILE}: {e}")))?;
+            crate::formats::check_settings(CHANGE_LOG_FILE, &v)?;
+            // a file without the member is format 1
+            if let Some(o) = v.as_object_mut() {
+                o.entry("format").or_insert(1.into());
+            }
+            let f: SettingsFile = serde_json::from_value(v)
                 .map_err(|e| Error::Corrupt(format!("{CHANGE_LOG_FILE}: {e}")))?;
             Ok(f.settings)
         }
@@ -141,7 +154,7 @@ fn write_settings(root: &Path, s: &ChangeLogSettings) -> Result<()> {
     };
     write_atomic(
         &root.join(CHANGE_LOG_FILE),
-        &serde_json::to_vec_pretty(&f).expect("settings serialize"),
+        &crate::formats::settings_to_vec(CHANGE_LOG_FILE, &f)?,
     )
 }
 
@@ -1884,8 +1897,16 @@ impl Store {
         state_change_keys(&sa, &sb, max)
     }
 
+    /// The most quads a bulk build is to collect for the change log (`None` when the log
+    /// is off).
+    pub(super) fn bulk_change_cap(&self) -> Option<u64> {
+        let log = self.changelog.as_ref().filter(|l| l.is_enabled())?;
+        Some(log.limits.bulk_max_quads)
+    }
+
     /// Queue the changes of bulk commit `c`, from state `before` to `after` (writer
-    /// lock held, before the commit is published).
+    /// lock held, before the commit is published). `candidates` are the quads that the
+    /// build found can have changed, for a commit into a dataset too large to compare.
     pub(super) fn log_bulk_commit(
         &self,
         c: &CommitInfo,
@@ -1893,11 +1914,14 @@ impl Store {
         author: Option<Arc<str>>,
         before: &Snapshot,
         after: &Snapshot,
+        candidates: Option<BulkCandidates<'_>>,
     ) {
         let Some(log) = self.changelog.as_ref().filter(|l| l.is_enabled()) else {
             return;
         };
-        let body = state_change_keys(before, after, log.limits.bulk_max_quads)
+        let max = log.limits.bulk_max_quads;
+        let body = state_change_keys(before, after, max)
+            .or_else(|| candidates.and_then(|k| candidate_changes(before, after, k, max)))
             .map_or(PendingBody::Summary, PendingBody::Keys);
         log.push(Pending {
             commit: ChangeCommit::of(c, author, message),
@@ -1988,6 +2012,68 @@ fn state_change_keys(a: &Snapshot, b: &Snapshot, max: u64) -> Option<Vec<(QuadKe
     )
 }
 
+/// The quads that a bulk build found can have changed. Every change of the commit is one
+/// of them, and the log checks each against both states.
+pub(super) struct BulkCandidates<'a> {
+    /// the quads of the build's sources, `None` when there were more than the limit
+    pub sources: Option<Vec<QuadKey>>,
+    /// the quads of the graphs the build dropped, `None` when there were more than the limit
+    pub dropped: Option<Vec<[Id; 4]>>,
+    /// the snapshot whose ids `dropped`, `log` and `bulk` use
+    pub view: &'a Snapshot,
+    /// the changes of the transaction before its bulk batch, if it had one
+    pub log: &'a [(u8, [Id; 4])],
+    /// the quads of the transaction's bulk batch
+    pub bulk: &'a [[Id; 4]],
+}
+
+/// The net changes from `before` to `after` of a bulk commit whose changed quads are among
+/// `k`, if there are at most `max` of those (`None` otherwise).
+fn candidate_changes(
+    before: &Snapshot,
+    after: &Snapshot,
+    k: BulkCandidates<'_>,
+    max: u64,
+) -> Option<Vec<(QuadKey, bool)>> {
+    let mut quads = k.sources?;
+    let dropped = k.dropped?;
+    let n = quads.len() as u64 + dropped.len() as u64 + k.log.len() as u64 + k.bulk.len() as u64;
+    if n > max {
+        return None;
+    }
+    let mut keys = Keys::new(&k.view.generation);
+    for q in dropped
+        .iter()
+        .chain(k.bulk)
+        .chain(k.log.iter().map(|(_, q)| q))
+    {
+        quads.push(keys.quad(q).ok()?);
+    }
+    quads.sort_unstable();
+    quads.dedup();
+    // a term missing from a state's dictionary means the quad is absent there; a read
+    // error means nothing is known, and the commit becomes a summary
+    let holds = |s: &Snapshot, q: &QuadKey| -> Option<bool> {
+        let ids: Option<Vec<Id>> = [1, 2, 3, 0]
+            .iter()
+            .map(|&i| super::diff::key_id(s, &q[i]))
+            .collect();
+        match ids {
+            None => Some(false),
+            Some(i) => s.contains(&[i[0], i[1], i[2], i[3]]).ok(),
+        }
+    };
+    let mut out = Vec::new();
+    for q in quads {
+        match (holds(before, &q)?, holds(after, &q)?) {
+            (false, true) => out.push((q, true)),
+            (true, false) => out.push((q, false)),
+            _ => {}
+        }
+    }
+    Some(out)
+}
+
 /// The key of a quad (the default graph's is empty).
 pub(crate) fn quad_key(q: &Quad) -> QuadKey {
     let g: Arc<[u8]> = match &q.graph_name {
@@ -2002,4 +2088,29 @@ pub(crate) fn quad_key(q: &Quad) -> QuadKey {
         Arc::from(id::iri_key(q.predicate.as_str())),
         Arc::from(id::term_key(&q.object)),
     ]
+}
+
+#[cfg(test)]
+mod settings_format_tests {
+    use super::*;
+
+    #[test]
+    fn a_newer_change_log_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let newer = crate::formats::settings_file(CHANGE_LOG_FILE)
+            .unwrap()
+            .writes
+            + 1;
+        std::fs::write(
+            dir.path().join(CHANGE_LOG_FILE),
+            format!(r#"{{"format": {newer}, "keepCommits": 5}}"#),
+        )
+        .unwrap();
+        assert!(matches!(
+            read_settings(dir.path()),
+            Err(Error::Unsupported(_))
+        ));
+        std::fs::write(dir.path().join(CHANGE_LOG_FILE), r#"{"keepCommits": 5}"#).unwrap();
+        assert_eq!(read_settings(dir.path()).unwrap().keep_commits, Some(5));
+    }
 }

@@ -414,6 +414,7 @@ The graph for A1 to A6 has the triples `a→b`, `b→c`, `c→d`, `a→e`, `e→
 4. **Zero-weight edges in `path:allShortest`.** Dijkstra's algorithm records the parents
    of a node only until the node is settled. With edges of weight zero between nodes at
    the same distance, some equally cheap paths can be missed. Positive weights are exact.
+   The Roadmap follow-ups at the end of the Outcome record the fix.
 
 ## 10. Sources
 
@@ -511,8 +512,8 @@ of sweeping whole levels.
 
 **Not built at first.** Edges from a nested pattern, a direction per predicate, a
 `path:edge` binding of the edge as a triple term and the Cypher frontend's use of the
-operator were not built with Phase 1. Zero-weight edges can hide equally cheap paths
-from `path:allShortest`, as §9 says.
+operator were not built with Phase 1. Zero-weight edges hid equally cheap paths from
+`path:allShortest`, as §9 says, until the fix recorded below.
 
 **Later additions (2026-10-03).** The MCP server gained a dedicated tool, `find_paths`,
 which writes the search's block from its arguments and returns the paths with their
@@ -602,6 +603,35 @@ Acceptance examples:
   simple path of its least cost, as the brute-force enumeration in
   `crates/sparkles-core/tests/path_search.rs` computes it. The weighted differential
   test gains a weight of 0 among the random weights.
+
+**Landed (2026-10-13).** `dijkstra` in `pathsearch.rs` now follows the design above. With
+`path:allShortest` it records an edge into a settled node as another parent when the
+cost is equal, and it keeps popping nodes after the last target is settled until the
+next cost in the heap is higher. `Tree::paths` skips a parent that is already on the
+path it is building, so zero-weight cycles end and the paths stay simple. The other modes
+keep their earlier behaviour. The regression test `all_shortest_over_zero_weight_edges`
+in `crates/sparkles-core/tests/path_search.rs` covers A-Z1 and A-Z2 with names that put
+the target before and after the middle node in the dictionary, and with an unbound
+target. The weighted differential test now draws zero weights too and runs 40 graphs
+instead of 6. A review found that the walk over recorded parents could explore
+exponentially many dead branches when a zero-weight cycle lies beyond the target, since
+those branches can only return through a node already on the path. For `allShortest`,
+`Tree::paths` now follows a parent of the same cost only when that parent reaches the root
+off the path. A parent that the search settled before every node of the path does so at
+once, because its first parents were settled still earlier. A cheaper parent does so at
+once too. Other parents are searched. `path:shortest` does no pruning, since its first
+parents form a tree. A second review found that the search over other parents did not
+count toward the deadline, and that pruning made reconstruction quadratic on a long
+zero-weight chain. The walk and the pruning search now count their steps together and
+check the deadline and cancellation every 4096 steps, which bounds a search whose real
+paths are too many. The settling-order map that makes the quick test possible costs about 32 bytes
+per settled node, which is charged to the query's memory budget, and it buys linear
+reconstruction on zero-weight chains. The tests are `all_shortest_prunes_a_zero_weight_cycle_behind_the_target`,
+`all_shortest_path_enumeration_honours_the_timeout`, the `tree_tests` unit tests
+`pruning_work_is_checked_against_the_deadline`, `single_path_reconstruction_is_linear` and
+`all_shortest_reconstruction_of_a_two_way_zero_weight_chain_is_linear` with its one-way
+twin, and `zero_weight_chains_reconstruct_inside_the_deadline` and
+`all_shortest_charges_its_settling_order_to_the_memory_budget`.
 
 **Cypher integration** (with item 20, Tier 3, [F01](F01-cypher.md)). Phase 3, the Cypher frontend's use of this operator for
 `shortestPath` and `allShortestPaths`, waits for [F01](F01-cypher.md). Nothing in the

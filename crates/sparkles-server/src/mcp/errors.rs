@@ -135,8 +135,11 @@ impl ErrorContext<'_> {
                     BudgetKind::RowsProduced => ("budget-rows-produced", "rows-produced"),
                     BudgetKind::DatasetBytes => ("budget-dataset-bytes", "dataset-bytes"),
                     BudgetKind::HiddenQuads => ("budget-hidden-quads", "hidden-quads"),
+                    BudgetKind::ServerMemory => ("budget-server-memory", "server-memory"),
                 };
-                let mut t = ToolError::new(code, 507, b.to_string()).hint(BUDGET_HINT);
+                // the server's memory is in use, so a retry can succeed
+                let status = if b.kind == BudgetKind::ServerMemory { 503 } else { 507 };
+                let mut t = ToolError::new(code, status, b.to_string()).hint(BUDGET_HINT);
                 t.budget = Some(budget);
                 t
             }

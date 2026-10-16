@@ -236,8 +236,7 @@ impl ServerLayers {
             return Ok(());
         };
         let v = match std::fs::read(&path) {
-            Ok(b) => serde_json::from_slice::<Value>(&b)
-                .with_context(|| format!("{} is not JSON", path.display()))?,
+            Ok(b) => read_layer(&path, &b)?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Value::Object(Map::new()),
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
@@ -257,8 +256,7 @@ impl ServerLayers {
                     _ => {}
                 }
             } else {
-                let mut bytes = serde_json::to_vec_pretty(v).unwrap_or_default();
-                bytes.push(b'\n');
+                let bytes = layer_bytes(&path, v);
                 super::secrets::write_atomic(&path, &bytes, 0o644)?;
             }
         }
@@ -290,8 +288,7 @@ impl ServerLayers {
             }
             let path = dir.join(kind.file);
             let v = match std::fs::read(&path) {
-                Ok(b) => serde_json::from_slice::<Value>(&b)
-                    .with_context(|| format!("{} is not JSON", path.display()))?,
+                Ok(b) => read_layer(&path, &b)?,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Value::Object(Map::new()),
                 Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
             };
@@ -314,8 +311,7 @@ impl ServerLayers {
                     _ => {}
                 }
             } else {
-                let mut bytes = serde_json::to_vec_pretty(v).unwrap_or_default();
-                bytes.push(b'\n');
+                let bytes = layer_bytes(&path, v);
                 super::secrets::write_atomic(&path, &bytes, 0o644)?;
             }
         }
@@ -654,4 +650,40 @@ pub async fn write(
         Ok(r)
     })
     .await
+}
+
+/// A runtime layer read from its file: JSON, with its `format` member checked against
+/// the registry ([`sparkles::formats::SETTINGS`]) and then removed, since it is not a
+/// setting.
+fn read_layer(path: &std::path::Path, b: &[u8]) -> anyhow::Result<Value> {
+    use anyhow::Context;
+    let mut v = serde_json::from_slice::<Value>(b)
+        .with_context(|| format!("{} is not JSON", path.display()))?;
+    if let Some(f) = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(sparkles::formats::settings_file)
+    {
+        sparkles::formats::check_settings(f.name, &v)
+            .with_context(|| format!("reading {}", path.display()))?;
+        if let Some(m) = v.as_object_mut() {
+            m.remove(f.member);
+        }
+    }
+    Ok(v)
+}
+
+/// The bytes of a runtime layer's file, with its `format` member.
+fn layer_bytes(path: &std::path::Path, v: &Value) -> Vec<u8> {
+    let mut v = v.clone();
+    if let Some(f) = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(sparkles::formats::settings_file)
+    {
+        sparkles::formats::stamp_settings(f.name, &mut v);
+    }
+    let mut bytes = serde_json::to_vec_pretty(&v).unwrap_or_default();
+    bytes.push(b'\n');
+    bytes
 }

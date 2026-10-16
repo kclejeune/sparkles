@@ -722,6 +722,7 @@ pub fn write_cursor_native_json(
                     plan: cursor.plan(),
                     memory: NativeMemory {
                         peak_bytes: stats.mem_peak_bytes,
+                        granted_bytes: stats.granted_bytes,
                     },
                     rows_produced: stats.rows_produced,
                     commit: metadata.as_ref().map(|m| m.commit),
@@ -790,9 +791,12 @@ pub fn write_cursor_graph_native_json(
         serde_json::to_writer(&mut writer, &stats.timing).map_err(|e| Error::Io(e.into()))?;
         writer.write_all(b",\"plan\":")?;
         serde_json::to_writer(&mut writer, cursor.plan()).map_err(|e| Error::Io(e.into()))?;
+        let granted = stats
+            .granted_bytes
+            .map_or(String::new(), |g| format!(",\"grantedBytes\":{g}"));
         write!(
             writer,
-            ",\"memory\":{{\"peakBytes\":{}}},\"rowsProduced\":{},\"describeTruncated\":{}",
+            ",\"memory\":{{\"peakBytes\":{}{granted}}},\"rowsProduced\":{},\"describeTruncated\":{}",
             stats.mem_peak_bytes,
             stats.rows_produced,
             cursor.describe_truncated()
@@ -905,6 +909,7 @@ impl Serialize for NativeJson<'_> {
                 plan: &r.plan,
                 memory: NativeMemory {
                     peak_bytes: r.mem_peak_bytes,
+                    granted_bytes: r.ctx.grant.as_ref().map(|g| g.peak()),
                 },
                 rows_produced: r.rows_produced,
                 commit: self.metadata.as_ref().map(|m| m.commit),
@@ -934,6 +939,9 @@ struct NativeMeta<'a> {
 #[serde(rename_all = "camelCase")]
 struct NativeMemory {
     peak_bytes: u64,
+    /// the most the query held of the server's memory pool
+    #[serde(skip_serializing_if = "Option::is_none")]
+    granted_bytes: Option<u64>,
 }
 
 struct NativeRows<'a> {
@@ -1185,6 +1193,11 @@ pub fn sparkles_json(r: &QueryResult, send: Option<usize>) -> J {
             }
         }
     }
+    let mut memory = json!({ "peakBytes": r.mem_peak_bytes });
+    // the most the query held of the server's memory pool
+    if let Some(g) = &r.ctx.grant {
+        memory["grantedBytes"] = json!(g.peak());
+    }
     out.insert(
         "meta".into(),
         json!({
@@ -1192,7 +1205,7 @@ pub fn sparkles_json(r: &QueryResult, send: Option<usize>) -> J {
             "sentRows": n,
             "timing": r.timing,
             "plan": r.plan,
-            "memory": { "peakBytes": r.mem_peak_bytes },
+            "memory": memory,
             "rowsProduced": r.rows_produced,
         }),
     );

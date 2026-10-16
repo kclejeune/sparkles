@@ -29,13 +29,13 @@ pub struct Spec {
 }
 
 /// The server settings a description is checked against.
-pub struct Server {
+pub struct Server<'a> {
     pub union_default_graph: bool,
-    pub gsp_direct_naming: bool,
+    pub gsp_direct_naming: &'a crate::state::GspDirectNaming,
 }
 
 /// Read a description in `format`.
-pub fn parse(body: &[u8], format: oxrdfio::RdfFormat, server: &Server) -> Result<Spec, String> {
+pub fn parse(body: &[u8], format: oxrdfio::RdfFormat, server: &Server<'_>) -> Result<Spec, String> {
     let mut triples = Vec::new();
     for q in oxrdfio::RdfParser::from_format(format)
         .with_base_iri("http://base/")
@@ -87,11 +87,22 @@ fn as_subject(t: &Term) -> Option<NamedOrBlankNode> {
 
 /// The operations Sparkles serves and the endpoint names it serves them at (`""` is the
 /// dataset URL itself).
-fn served(op: &str, server: &Server) -> Result<&'static [&'static str], String> {
-    if matches!(op, "gsp-direct-rw" | "gsp-direct-r") && !server.gsp_direct_naming {
-        return Err(format!(
-            "fuseki:{op} needs a server started with --gsp-direct-naming"
-        ));
+fn served(op: &str, name: &str, server: &Server<'_>) -> Result<&'static [&'static str], String> {
+    if matches!(op, "gsp-direct-rw" | "gsp-direct-r") {
+        match server.gsp_direct_naming.mode(name) {
+            None => {
+                return Err(format!(
+                    "fuseki:{op} needs a server started with --gsp-direct-naming for /{name}"
+                ));
+            }
+            Some(crate::state::DirectMode::Read) if op == "gsp-direct-rw" => {
+                return Err(format!(
+                    "fuseki:gsp-direct-rw: /{name} serves direct graph names read-only \
+                     (--gsp-direct-naming={name}=read)"
+                ));
+            }
+            _ => {}
+        }
     }
     crate::fuseki_config::endpoints::served_names(op)
         .ok_or_else(|| format!("the operation fuseki:{op} is not supported"))
@@ -174,7 +185,7 @@ impl Description {
         t.is_empty() || t.iter().any(|t| *t == format!("{FUSEKI}Service"))
     }
 
-    fn spec(&self, server: &Server) -> Result<Spec, String> {
+    fn spec(&self, server: &Server<'_>) -> Result<Spec, String> {
         let svc = self.service()?;
         let f = |l: &str| format!("{FUSEKI}{l}");
         let legacy = [
@@ -240,7 +251,7 @@ impl Description {
             endpoints.push((op, ename));
         }
         for (op, ename) in &endpoints {
-            let names = served(op, server)?;
+            let names = served(op, &name, server)?;
             if !names.contains(&ename.as_str()) {
                 let at: Vec<String> = names
                     .iter()
@@ -284,7 +295,7 @@ impl Description {
         Ok(Spec { name, kind })
     }
 
-    fn dataset_kind(&self, ds: &NamedOrBlankNode, server: &Server) -> Result<DbType, String> {
+    fn dataset_kind(&self, ds: &NamedOrBlankNode, server: &Server<'_>) -> Result<DbType, String> {
         let types = self.types(ds);
         let known = [
             format!("{TDB2}DatasetTDB2"),
@@ -389,9 +400,9 @@ fn hint(iri: &str) -> &'static str {
 mod tests {
     use super::*;
 
-    const SERVER: Server = Server {
+    const SERVER: Server<'static> = Server {
         union_default_graph: false,
-        gsp_direct_naming: false,
+        gsp_direct_naming: &crate::state::GspDirectNaming::OFF,
     };
 
     fn spec(ttl: &str) -> Result<Spec, String> {
@@ -400,6 +411,42 @@ mod tests {
              @prefix tdb: <{TDB1}> .\n@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n{ttl}"
         );
         parse(doc.as_bytes(), oxrdfio::RdfFormat::Turtle, &SERVER)
+    }
+
+    fn parse_with(ttl: &str, naming: &crate::state::GspDirectNaming) -> Result<Spec, String> {
+        let doc = format!(
+            "@prefix fuseki: <{FUSEKI}> .\n@prefix ja: <{JA}> .\n@prefix tdb2: <{TDB2}> .\n\
+             @prefix tdb: <{TDB1}> .\n@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n{ttl}"
+        );
+        let server = Server {
+            union_default_graph: false,
+            gsp_direct_naming: naming,
+        };
+        parse(doc.as_bytes(), oxrdfio::RdfFormat::Turtle, &server)
+    }
+
+    #[test]
+    fn direct_endpoints_need_their_dataset_named() {
+        use crate::state::GspDirectNaming;
+        let naming = |v: &[&str]| {
+            GspDirectNaming::parse(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap()
+        };
+        let body = |op: &str| {
+            format!(
+                r#"<#s> a fuseki:Service ; fuseki:name "new" ;
+                     fuseki:endpoint [ fuseki:operation fuseki:update ] ;
+                     fuseki:endpoint [ fuseki:operation fuseki:{op} ] ;
+                     fuseki:dataset [ a ja:MemoryDataset ] ."#
+            )
+        };
+        for op in ["gsp-direct-rw", "gsp-direct-r"] {
+            let e = parse_with(&body(op), &naming(&["other=read"])).unwrap_err();
+            assert!(e.contains("--gsp-direct-naming"), "{op}: {e}");
+            assert!(parse_with(&body(op), &naming(&[""])).is_ok(), "{op}");
+        }
+        let e = parse_with(&body("gsp-direct-rw"), &naming(&["new=read"])).unwrap_err();
+        assert!(e.contains("read-only"), "{e}");
+        assert!(parse_with(&body("gsp-direct-r"), &naming(&["new=read"])).is_ok());
     }
 
     #[test]

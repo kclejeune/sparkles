@@ -329,9 +329,9 @@ impl Repository {
                         == security.epoch().map(u64::from)
             });
             crate::repo::sort_newest_first(&mut ms);
-            let parent = ms
-                .into_iter()
-                .find(|m| crate::manifest::validate(m, piece, index_format).is_ok());
+            let parent = ms.into_iter().find(|m| {
+                crate::manifest::validate(m, piece, std::slice::from_ref(&index_format)).is_ok()
+            });
             let mut plans = Vec::with_capacity(files.len());
             for (i, f) in files.iter().enumerate() {
                 let prior = parent
